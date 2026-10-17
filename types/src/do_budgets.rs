@@ -1,9 +1,11 @@
-//! The workerd budget table, shared as data.
+//! The traffic-cost budget tables, shared as data: the scheduler
+//! Durable Object drives' row budgets and the traffic lanes' Worker CPU
+//! budgets.
 //!
 //! Data only, so it compiles on every target and every consumer (the
 //! edge's probe routes and host drift gate, the admin crate's budget
-//! renderer, and the stow#452 launch gate's fixture) reads the same
-//! table.
+//! renderer, and the traffic-cost projection and CPU pass) reads the
+//! same tables.
 
 /// One probe budget row — statements, cursor counters and wall time.
 ///
@@ -477,5 +479,110 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_read: 8,
         rows_written: 2,
         wall_ms: 60,
+    },
+];
+
+/// One traffic lane's Worker CPU budget — milliseconds of isolate CPU
+/// per lane event, measured by the Traffic cost test's profiler pass
+/// (`stow-admin traffic-cost cpu`).
+///
+/// The measured quantity is the CPU the edge isolate spends executing
+/// one event, sampled by V8's profiler through the dev inspector — the
+/// Worker's own handler plus any scheduler Durable Object code the event
+/// runs, which shares the isolate under `wrangler dev`. It therefore
+/// reads at or above the Worker CPU Cloudflare bills for the event,
+/// never below it.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerCpuBudget {
+    /// The lane (`admin/src/traffic_cost/lanes.rs`) — the report row's
+    /// key.
+    pub lane: &'static str,
+    /// Budgeted CPU milliseconds per lane event.
+    pub cpu_ms: f64,
+}
+
+impl WorkerCpuBudget {
+    /// `true` when the measured per-event CPU exceeds the budget.
+    #[must_use]
+    pub fn over_budget(&self, cpu_ms: f64) -> bool {
+        cpu_ms > self.cpu_ms
+    }
+}
+
+/// The Worker CPU budget table, one row per traffic lane. A lane the
+/// profiler pass measures without a row here fails the test, as a
+/// scheduler route without a drive does.
+///
+/// How a row's number is derived: the lane's measured CPU per event —
+/// the smallest of the profiler pass's three rounds in a Traffic cost
+/// run, read from that run's `worker-cpu.json` — times a 2× margin,
+/// rounded up to the next 5 ms. The 2× is the same headroom `DO_BUDGETS`
+/// keeps over its measured rows: room for ordinary code growth, while a
+/// change that doubles a lane's CPU fails. Each row's comment names the
+/// run and the measured value it came from.
+///
+/// A budget is also bounded by the allowance, not only by the
+/// measurement: `stow-admin traffic-cost project` prices every route
+/// at its full budget under the launch model and fails when that month
+/// passes half of the Worker CPU allowance (`cpu_ms_at_budget`), and
+/// prints each route's share of the allowance at its measured figure
+/// and at its budget.
+///
+/// The values below are provisional until the first Traffic cost run
+/// on CI reports measured figures; that run replaces them by the rule
+/// above.
+pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
+    WorkerCpuBudget {
+        lane: "site",
+        cpu_ms: 20.0,
+    },
+    WorkerCpuBudget {
+        lane: "stats",
+        cpu_ms: 30.0,
+    },
+    WorkerCpuBudget {
+        // The pointer GET plus the digest-addressed slice GET.
+        lane: "index-pull",
+        cpu_ms: 40.0,
+    },
+    WorkerCpuBudget {
+        // A covered bundle streamed through the byte path — stow#738
+        // measured 11–24 ms mean on the deployed Worker.
+        lane: "bundle-fetch",
+        cpu_ms: 50.0,
+    },
+    WorkerCpuBudget {
+        lane: "status-read",
+        cpu_ms: 30.0,
+    },
+    WorkerCpuBudget {
+        lane: "admin-status",
+        cpu_ms: 30.0,
+    },
+    WorkerCpuBudget {
+        lane: "queue-read",
+        cpu_ms: 40.0,
+    },
+    WorkerCpuBudget {
+        lane: "queue-mutate",
+        cpu_ms: 40.0,
+    },
+    WorkerCpuBudget {
+        lane: "trusted-submit",
+        cpu_ms: 60.0,
+    },
+    WorkerCpuBudget {
+        lane: "admission",
+        cpu_ms: 80.0,
+    },
+    WorkerCpuBudget {
+        lane: "enqueue-redeem",
+        cpu_ms: 60.0,
+    },
+    WorkerCpuBudget {
+        // The signed `workflow_run` callback: HMAC check, the records
+        // artifact's cosign verification, and the completion.
+        lane: "workflow-callback",
+        cpu_ms: 80.0,
     },
 ];

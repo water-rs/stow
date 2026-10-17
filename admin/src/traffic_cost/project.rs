@@ -1,13 +1,27 @@
-//! `stow-admin launch-gate` — the stow#452 deterministic launch-cost
-//! gate.
+//! `stow-admin traffic-cost project` — the Traffic cost test's verdict
+//! over what the run measured (stow#452, stow#772).
 //!
-//! The gate multiplies the launch model's per-event monthly counts by
-//! the per-event costs the `scheduler-budget` job measured in the same
-//! CI run (`budget-report.json`), and fails the job when any projected
-//! monthly usage exceeds its allowance. Nothing it reads is a checked-in
-//! constant: the report's `*_budget` columns carry the in-code budget
-//! each row was measured against, and the allowance lines come from
-//! `watchdog`'s single allowance table.
+//! It reads the scheduler budget reports at both fixture sizes, the
+//! report re-measured after the peak drive, and the Worker CPU report,
+//! and fails on:
+//!
+//! - any drive over its row budget in any report (statements, rows read,
+//!   rows written — `DO_BUDGETS`);
+//! - a drive whose rows read or written grow with the stored bulk: the
+//!   large fixture's count more than 10% plus 50 rows over the small
+//!   one's;
+//! - a product whose projected monthly usage exceeds half its included
+//!   allowance, projected from the small report and from the post-load
+//!   report;
+//! - a peak second whose serialized Durable Object wall exceeds half a
+//!   second.
+//!
+//! The projection multiplies the launch model's per-event monthly counts
+//! by the per-event costs measured in the same run. Nothing it reads is a
+//! checked-in constant: the reports' `*_budget` columns carry the budget
+//! each row was measured against, Worker CPU per event is the profiler's
+//! measurement (`cpu.rs`), and the allowances come from `watchdog`'s
+//! single allowance table.
 //!
 //! The Durable-Object numbers decompose per event kind rather than per
 //! route: the alarm lane is priced as `alarm pass (idle)` invocations
@@ -17,33 +31,44 @@
 //! assumption). A report whose pass claimed nothing while the model
 //! projects builds is refused rather than priced at zero.
 //!
-//! Only the measured dimensions gate: worker requests, DO requests/rows
-//! /duration, and the claim lane's counted-D1 coverage reads. Worker CPU
-//! ms, subrequests, worker-side D1 and R2 ops carry per-event constants
-//! and print as diagnostics only — the probe does not measure them
-//! (stow#452 F3).
+//! Subrequests, worker-side D1 and R2 ops carry per-event constants the
+//! run does not measure; they print as diagnostics and never gate. An
+//! event whose Worker CPU no lane can measure is named in the output
+//! with the reason, so the gap stays visible.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
 use stow_types::launch_model::{EventKind, LaunchModel};
 use stow_types::stow_error;
 
+use stow_types::do_budgets::WORKER_CPU_BUDGETS;
+
+use super::cpu::WorkerCpuReport;
 use crate::render::{Output, Table, emit};
 use crate::watchdog::{
     D1_ROWS_READ_MONTHLY, D1_ROWS_WRITTEN_MONTHLY, DO_DURATION_GB_S_MONTHLY, DO_REQUESTS_MONTHLY,
-    DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY, WORKER_REQUESTS_MONTHLY,
+    DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY, WORKER_CPU_MS_MONTHLY, WORKER_REQUESTS_MONTHLY,
 };
 
-/// The launch gate — `stow-admin launch-gate --report
-/// budget-report-100000.json --model launch-model.toml`.
+/// The verdict — `stow-admin traffic-cost project`.
 #[derive(Debug, Args)]
-pub struct LaunchGateArgs {
-    /// The `scheduler-budget` harness report from this CI run.
+pub struct ProjectArgs {
+    /// The scheduler budget report on the small fixture (100k rows).
     #[arg(long)]
-    pub report: PathBuf,
+    pub small: PathBuf,
+    /// The scheduler budget report on the large fixture (1M rows), same
+    /// shape — the growth check's other side.
+    #[arg(long)]
+    pub large: PathBuf,
+    /// The scheduler budget report re-measured after the peak drive.
+    #[arg(long)]
+    pub after: PathBuf,
+    /// The Worker CPU report `traffic-cost cpu` wrote.
+    #[arg(long)]
+    pub cpu: PathBuf,
     /// The checked-in launch model `launch-model.toml`.
     #[arg(long, default_value = "launch-model.toml")]
     pub model: PathBuf,
@@ -67,6 +92,14 @@ const PEAK_SERIALIZED_S_PER_S: f64 = 0.5;
 /// a single-task insert prices against.
 const SUBMIT_BATCH_TASKS: f64 = 3.0;
 
+/// The growth rule: a drive grows with the stored bulk when its count
+/// on the large fixture exceeds the small one's by more than this
+/// fraction …
+const GROWTH_FRACTION: f64 = 0.1;
+
+/// … plus this many rows.
+const GROWTH_SLACK_ROWS: f64 = 50.0;
+
 /// The measured cost of one scheduler drive call, looked up in the
 /// harness report by row name.
 #[derive(Debug, Clone, Copy, Default)]
@@ -84,14 +117,25 @@ struct DriveCost {
     d1_rows_written: f64,
 }
 
+/// Where an event's Worker CPU comes from.
+#[derive(Debug, Clone, Copy)]
+enum CpuPricing {
+    /// (lane, events of that lane per event) — measured by the CPU pass.
+    Lanes(&'static [(&'static str, f64)]),
+    /// The event is no Worker request (it runs inside the Durable
+    /// Object), so the Worker bills it no CPU.
+    NoWorkerRequest,
+    /// A Worker request no lane can drive yet — the reason is printed.
+    Unmeasured(&'static str),
+}
+
 /// One traffic kind's cost vector. `drives` names the report rows the
 /// event invokes; `claims` the dispatches inside the pass lane it
 /// causes (only [`EventKind::Build`] — one claim each). The gated
 /// fields are structural counts (`do_requests`, `worker_requests`) or
-/// measured report reads; the `*_cpu_ms`/`subrequests`/`d1_rows_*`/
-/// `r2_ops` constants describe the handler's shape and print as
-/// diagnostics only — the probe does not measure them, so they can
-/// never trip the gate (stow#452 F3).
+/// measured reads (report rows, Worker CPU lanes); the `subrequests`/
+/// `d1_rows_*`/`r2_ops` constants describe the handler's shape and print
+/// as diagnostics only — nothing measures them, so they never gate.
 #[derive(Debug, Clone, Copy)]
 struct EventCost {
     /// The traffic kind this prices.
@@ -107,8 +151,8 @@ struct EventCost {
     claims: f64,
     /// Billed worker requests per event (index pulls are two).
     worker_requests: f64,
-    /// Worker CPU milliseconds per event — diagnostic only.
-    worker_cpu_ms: f64,
+    /// Where the event's Worker CPU comes from.
+    cpu: CpuPricing,
     /// Subrequests per event — diagnostic only.
     subrequests: f64,
     /// Worker-side D1 `rows_read` per event — diagnostic only; the
@@ -133,7 +177,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 0.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 3.0,
+        cpu: CpuPricing::Lanes(&[("bundle-fetch", 1.0)]),
         subrequests: 1.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -146,7 +190,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 0.0,
         claims: 0.0,
         worker_requests: 2.0,
-        worker_cpu_ms: 3.0,
+        cpu: CpuPricing::Lanes(&[("index-pull", 1.0)]),
         subrequests: 2.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -162,7 +206,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 40.0,
+        cpu: CpuPricing::Lanes(&[("admission", 1.0)]),
         subrequests: 2.0,
         d1_rows_read: 64.0,
         d1_rows_written: 3.0,
@@ -181,7 +225,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 2.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 8.0,
+        cpu: CpuPricing::Lanes(&[("enqueue-redeem", 1.0)]),
         subrequests: 0.0,
         d1_rows_read: 1.0,
         d1_rows_written: 5.0,
@@ -203,7 +247,10 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 15.0,
+        cpu: CpuPricing::Unmeasured(
+            "POST /api/v1/requests verifies Turnstile at challenges.cloudflare.com and reads the \
+             stable channel manifest from static.rust-lang.org — no lane drives it off the network",
+        ),
         subrequests: 3.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -218,7 +265,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 5.0,
+        cpu: CpuPricing::Lanes(&[("status-read", 1.0)]),
         subrequests: 0.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -231,7 +278,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 0.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 3.0,
+        cpu: CpuPricing::Lanes(&[("site", 1.0)]),
         subrequests: 0.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -244,7 +291,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 0.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 10.0,
+        cpu: CpuPricing::Lanes(&[("stats", 1.0)]),
         subrequests: 0.0,
         d1_rows_read: 30.0,
         d1_rows_written: 1.0,
@@ -260,7 +307,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 0.0,
         claims: 0.0,
         worker_requests: 0.0,
-        worker_cpu_ms: 0.0,
+        cpu: CpuPricing::NoWorkerRequest,
         subrequests: 0.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -273,7 +320,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 5.0,
+        cpu: CpuPricing::Lanes(&[("admin-status", 1.0)]),
         subrequests: 0.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -286,7 +333,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 10.0,
+        cpu: CpuPricing::Unmeasured("no lane drives POST /api/v1/admin/index/published"),
         subrequests: 2.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -299,7 +346,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 0.0,
         claims: 0.0,
         worker_requests: 0.0,
-        worker_cpu_ms: 0.0,
+        cpu: CpuPricing::NoWorkerRequest,
         subrequests: 0.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -312,7 +359,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 0.0,
         claims: 1.0,
         worker_requests: 0.0,
-        worker_cpu_ms: 0.0,
+        cpu: CpuPricing::NoWorkerRequest,
         subrequests: 0.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -325,7 +372,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
-        worker_cpu_ms: 15.0,
+        cpu: CpuPricing::Lanes(&[("workflow-callback", 1.0)]),
         subrequests: 4.0,
         d1_rows_read: 2.0,
         d1_rows_written: 15.0,
@@ -341,7 +388,7 @@ const EVENT_COSTS: &[EventCost] = &[
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 0.0,
-        worker_cpu_ms: 0.0,
+        cpu: CpuPricing::NoWorkerRequest,
         subrequests: 0.0,
         d1_rows_read: 0.0,
         d1_rows_written: 0.0,
@@ -376,6 +423,17 @@ pub struct RouteShare {
     pub share: f64,
 }
 
+/// A Worker route whose CPU no lane measures, with its volume.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnmeasuredCpu {
+    /// The event's route label.
+    pub route: &'static str,
+    /// Projected monthly events.
+    pub monthly_events: f64,
+    /// Why no lane drives it.
+    pub reason: &'static str,
+}
+
 /// A projected breach — the gate fails on any of these.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Breach {
@@ -391,8 +449,30 @@ pub struct Breach {
     pub top_route: &'static str,
 }
 
-/// The gate's verdict: every usage line, the peak check, the top-N
-/// routes and any breaches.
+/// One Worker route's CPU in the monthly projection — the measured
+/// figure and the budget, each against the Worker CPU allowance, so a
+/// budget reads as the share of the allowance it lets the route spend.
+#[derive(Debug, serde::Serialize)]
+pub struct RouteCpu {
+    /// The route label.
+    pub route: &'static str,
+    /// Projected monthly events.
+    pub monthly_events: f64,
+    /// Measured CPU milliseconds per event (Σ over its lanes).
+    pub measured_ms_per_event: f64,
+    /// Budgeted CPU milliseconds per event (Σ over its lanes'
+    /// `WORKER_CPU_BUDGETS` rows).
+    pub budget_ms_per_event: f64,
+    /// Projected monthly CPU milliseconds at the measured figure.
+    pub projected_ms: f64,
+    /// `projected_ms` over the monthly Worker CPU allowance.
+    pub share: f64,
+    /// The same share were the route to spend its whole budget.
+    pub share_at_budget: f64,
+}
+
+/// One report's projection: every usage line, the peak check, the
+/// top-N routes and any breaches.
 #[derive(Debug, serde::Serialize)]
 pub struct GateEvaluation {
     /// Per-product projected usage lines.
@@ -403,8 +483,15 @@ pub struct GateEvaluation {
     pub peak_bound_s_per_s: f64,
     /// Heaviest routes by allowance share.
     pub top_routes: Vec<RouteShare>,
-    /// Diagnostic-only dimensions (subrequests, R2 ops).
+    /// Diagnostic-only dimensions (subrequests, worker-side D1, R2 ops).
     pub diagnostics: Vec<UsageLine>,
+    /// Every measured Worker route's projected monthly CPU.
+    pub cpu_routes: Vec<RouteCpu>,
+    /// Projected monthly Worker CPU were every route to spend its whole
+    /// budget — gated against the same bound as the measured line.
+    pub worker_cpu_ms_at_budget: f64,
+    /// Worker routes whose CPU the projection does not carry.
+    pub unmeasured_cpu: Vec<UnmeasuredCpu>,
     /// Empty on a pass.
     pub breaches: Vec<Breach>,
 }
@@ -424,6 +511,8 @@ impl GateEvaluation {
 struct Projection {
     /// Projected monthly worker requests.
     worker_requests: f64,
+    /// Projected monthly Worker CPU milliseconds — measured per lane.
+    worker_cpu_ms: f64,
     /// Projected monthly DO invocations.
     do_requests: f64,
     /// Projected monthly DO rows read.
@@ -437,9 +526,6 @@ struct Projection {
     d1_read: f64,
     /// Projected monthly D1 rows written — measured, as above.
     d1_written: f64,
-    /// Projected monthly worker CPU milliseconds — diagnostic constant,
-    /// not gated (the probe does not measure it).
-    diag_worker_cpu_ms: f64,
     /// Projected monthly subrequests — diagnostic, not gated.
     diag_subrequests: f64,
     /// Projected monthly worker-side D1 reads — diagnostic, not gated.
@@ -453,27 +539,75 @@ struct Projection {
     peak_serialized_ms: f64,
     /// One share entry per event kind, for the top-N table.
     per_route: Vec<RouteShare>,
+    /// Per-route Worker CPU, measured and at budget.
+    cpu_routes: Vec<RouteCpu>,
+    /// Projected monthly Worker CPU milliseconds at budget.
+    worker_cpu_ms_at_budget: f64,
+    /// Worker routes the CPU line leaves out.
+    unmeasured_cpu: Vec<UnmeasuredCpu>,
+}
+
+/// A lane's CPU budget per event, from `WORKER_CPU_BUDGETS`.
+fn lane_budget_ms(lane: &str) -> Result<f64, String> {
+    WORKER_CPU_BUDGETS
+        .iter()
+        .find(|budget| budget.lane == lane)
+        .map(|budget| budget.cpu_ms)
+        .ok_or_else(|| format!("lane `{lane}` has no WORKER_CPU_BUDGETS row"))
 }
 
 /// Fold one event kind's monthly and peak counts into the projection.
-/// Returns the route's heaviest allowance share.
 fn fold_kind(
     model: &LaunchModel,
     cost: &EventCost,
     drive: &dyn Fn(&'static str) -> Result<DriveCost, String>,
     claim_marginal: &DriveCost,
+    cpu: &WorkerCpuReport,
     projection: &mut Projection,
 ) -> Result<(), String> {
     let monthly = model.monthly_events(cost.kind);
     let peak_per_s = model.peak_events_per_second(cost.kind);
     projection.worker_requests = monthly.mul_add(cost.worker_requests, projection.worker_requests);
     projection.do_requests = monthly.mul_add(cost.do_requests, projection.do_requests);
-    projection.diag_worker_cpu_ms =
-        monthly.mul_add(cost.worker_cpu_ms, projection.diag_worker_cpu_ms);
     projection.diag_subrequests = monthly.mul_add(cost.subrequests, projection.diag_subrequests);
     projection.diag_d1_read = monthly.mul_add(cost.d1_rows_read, projection.diag_d1_read);
     projection.diag_d1_written = monthly.mul_add(cost.d1_rows_written, projection.diag_d1_written);
     projection.diag_r2_ops = monthly.mul_add(cost.r2_ops, projection.diag_r2_ops);
+    let mut kind_cpu_ms = 0.0;
+    match cost.cpu {
+        CpuPricing::Lanes(lanes) => {
+            let mut budget_ms = 0.0;
+            for (lane, events) in lanes {
+                kind_cpu_ms = events.mul_add(cpu.lane_cpu_ms(lane)?, kind_cpu_ms);
+                budget_ms = events.mul_add(lane_budget_ms(lane)?, budget_ms);
+            }
+            projection.worker_cpu_ms_at_budget =
+                monthly.mul_add(budget_ms, projection.worker_cpu_ms_at_budget);
+            projection.cpu_routes.push(RouteCpu {
+                route: cost.route,
+                monthly_events: monthly,
+                measured_ms_per_event: kind_cpu_ms,
+                budget_ms_per_event: budget_ms,
+                projected_ms: monthly * kind_cpu_ms,
+                share: monthly * kind_cpu_ms / WORKER_CPU_MS_MONTHLY,
+                share_at_budget: monthly * budget_ms / WORKER_CPU_MS_MONTHLY,
+            });
+        }
+        CpuPricing::NoWorkerRequest => {
+            if cost.worker_requests > 0.0 {
+                return Err(format!(
+                    "`{}` is a Worker request priced as none — its CPU needs a lane",
+                    cost.route
+                ));
+            }
+        }
+        CpuPricing::Unmeasured(reason) => projection.unmeasured_cpu.push(UnmeasuredCpu {
+            route: cost.route,
+            monthly_events: monthly,
+            reason,
+        }),
+    }
+    projection.worker_cpu_ms = monthly.mul_add(kind_cpu_ms, projection.worker_cpu_ms);
     let mut kind_read = 0.0;
     let mut kind_written = 0.0;
     let mut kind_wall_ms = 0.0;
@@ -526,6 +660,10 @@ fn fold_kind(
             monthly * cost.worker_requests / WORKER_REQUESTS_MONTHLY,
         ),
         (
+            "worker_cpu_ms",
+            monthly * kind_cpu_ms / WORKER_CPU_MS_MONTHLY,
+        ),
+        (
             "d1_rows_read",
             monthly * kind_d1_read / D1_ROWS_READ_MONTHLY,
         ),
@@ -548,9 +686,8 @@ fn fold_kind(
     Ok(())
 }
 
-/// The product/dimension rows the gate bounds, projected by `fold` —
-/// every line a measured quantity or a structural count; the unmeasured
-/// constants print separately as diagnostics (stow#452 F3).
+/// The product/dimension rows the gate bounds — every line a measured
+/// quantity or a structural count.
 fn usage_lines(projection: &Projection) -> Vec<UsageLine> {
     vec![
         UsageLine {
@@ -558,6 +695,12 @@ fn usage_lines(projection: &Projection) -> Vec<UsageLine> {
             dimension: "requests",
             projected: projection.worker_requests,
             allowance: WORKER_REQUESTS_MONTHLY,
+        },
+        UsageLine {
+            product: "workers",
+            dimension: "cpu_ms",
+            projected: projection.worker_cpu_ms,
+            allowance: WORKER_CPU_MS_MONTHLY,
         },
         UsageLine {
             product: "durable_objects",
@@ -599,18 +742,9 @@ fn usage_lines(projection: &Projection) -> Vec<UsageLine> {
 }
 
 /// Ungated dimensions printed for context only — per-event constants
-/// the probe does not measure, kept visible so a growing one is seen.
-/// The per-request CPU ceiling itself is a deploy invariant
-/// (`edge/Skyzen.toml` `cpu_ms = 15000`), enforced by workerd, not a
-/// projection this gate can observe (stow#452 F8).
+/// nothing measures, kept visible so a growing one is seen.
 fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
     vec![
-        UsageLine {
-            product: "workers",
-            dimension: "cpu_ms",
-            projected: projection.diag_worker_cpu_ms,
-            allowance: f64::INFINITY,
-        },
         UsageLine {
             product: "workers",
             dimension: "subrequests",
@@ -638,13 +772,18 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
     ]
 }
 
-/// Project the launch model's monthly events against the measured
-/// report rows and the watchdog allowance table.
+/// Project the launch model's monthly events against one report's
+/// measured rows, the measured Worker CPU and the watchdog allowance
+/// table.
 #[expect(
     clippy::cast_precision_loss,
     reason = "measured counters fit f64 exactly past any launch traffic"
 )]
-fn evaluate(model: &LaunchModel, report: &SchedulerBudgetReport) -> Result<GateEvaluation, String> {
+fn evaluate(
+    model: &LaunchModel,
+    report: &SchedulerBudgetReport,
+    cpu: &WorkerCpuReport,
+) -> Result<GateEvaluation, String> {
     let measured: BTreeMap<&str, DriveCost> = report
         .rows
         .iter()
@@ -695,7 +834,7 @@ fn evaluate(model: &LaunchModel, report: &SchedulerBudgetReport) -> Result<GateE
 
     let mut projection = Projection::default();
     for cost in EVENT_COSTS {
-        fold_kind(model, cost, &drive, &claim_marginal, &mut projection)?;
+        fold_kind(model, cost, &drive, &claim_marginal, cpu, &mut projection)?;
     }
 
     let usage = usage_lines(&projection);
@@ -730,6 +869,24 @@ fn evaluate(model: &LaunchModel, report: &SchedulerBudgetReport) -> Result<GateE
             });
         }
     }
+    // The budgets themselves must fit the allowance: a route may spend
+    // its whole budget and the month must still stay inside the bound,
+    // so a budget raised past what the allowance carries fails here
+    // whatever the run measured.
+    let cpu_bound = WORKER_CPU_MS_MONTHLY * ALLOWANCE_FRACTION;
+    if projection.worker_cpu_ms_at_budget > cpu_bound {
+        breaches.push(Breach {
+            product: "workers",
+            dimension: "cpu_ms_at_budget",
+            projected: projection.worker_cpu_ms_at_budget,
+            bound: cpu_bound,
+            top_route: projection
+                .cpu_routes
+                .iter()
+                .max_by(|a, b| a.share_at_budget.total_cmp(&b.share_at_budget))
+                .map_or("n/a", |route| route.route),
+        });
+    }
     let peak_s = projection.peak_serialized_ms / 1000.0;
     if peak_s > PEAK_SERIALIZED_S_PER_S {
         breaches.push(Breach {
@@ -746,15 +903,181 @@ fn evaluate(model: &LaunchModel, report: &SchedulerBudgetReport) -> Result<GateE
         peak_bound_s_per_s: PEAK_SERIALIZED_S_PER_S,
         top_routes,
         diagnostics,
+        cpu_routes: projection.cpu_routes,
+        worker_cpu_ms_at_budget: projection.worker_cpu_ms_at_budget,
+        unmeasured_cpu: projection.unmeasured_cpu,
         breaches,
     })
 }
 
-/// Human rendering — the per-product projection table, the peak check,
-/// the top-5 routes and the verdict.
-fn render_evaluation(evaluation: &GateEvaluation) -> String {
+/// One drive's counts on both fixture sizes.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GrowthRow {
+    /// The drive.
+    pub name: String,
+    /// `rowsRead` on the small fixture.
+    pub read_small: u64,
+    /// `rowsRead` on the large fixture.
+    pub read_large: u64,
+    /// `rowsWritten` on the small fixture.
+    pub written_small: u64,
+    /// `rowsWritten` on the large fixture.
+    pub written_large: u64,
+    /// Whether either count grows with the stored bulk.
+    pub grows: bool,
+}
+
+/// The growth check: every drive's counts on both fixtures. A drive
+/// may legitimately be bounded by a held quantity — lane depth, the
+/// 24 h outcome window, in-flight count, the report's own size — and
+/// the fixture pins those across sizes, so only the stored bulk grows.
+#[expect(clippy::cast_precision_loss, reason = "row counters fit f64 exactly")]
+fn growth(
+    small: &SchedulerBudgetReport,
+    large: &SchedulerBudgetReport,
+) -> Result<Vec<GrowthRow>, String> {
+    if small.queue_rows >= large.queue_rows {
+        return Err(format!(
+            "the small report holds {} queue rows and the large one {} — the growth check \
+             needs the small fixture first",
+            small.queue_rows, large.queue_rows
+        ));
+    }
+    let grows =
+        |a: u64, b: u64| b as f64 > (a as f64).mul_add(1.0 + GROWTH_FRACTION, GROWTH_SLACK_ROWS);
+    let rows: Vec<GrowthRow> = small
+        .rows
+        .iter()
+        .map(|a| {
+            let b = large
+                .rows
+                .iter()
+                .find(|b| b.name == a.name)
+                .ok_or_else(|| format!("the large report carries no row for `{}`", a.name))?;
+            Ok(GrowthRow {
+                name: a.name.clone(),
+                read_small: a.rows_read,
+                read_large: b.rows_read,
+                written_small: a.rows_written,
+                written_large: b.rows_written,
+                grows: grows(a.rows_read, b.rows_read) || grows(a.rows_written, b.rows_written),
+            })
+        })
+        .collect::<Result<_, String>>()?;
+    if let Some(extra) = large
+        .rows
+        .iter()
+        .find(|b| !small.rows.iter().any(|a| a.name == b.name))
+    {
+        return Err(format!(
+            "the small report carries no row for `{}`",
+            extra.name
+        ));
+    }
+    Ok(rows)
+}
+
+/// A drive over its row budget in one of the reports.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OverBudget {
+    /// Which report — `small`, `large` or `after`.
+    pub report: &'static str,
+    /// Its fixture size.
+    pub queue_rows: u64,
+    /// The drive.
+    pub name: String,
+}
+
+/// The whole verdict.
+#[derive(Debug, serde::Serialize)]
+pub struct Verdict {
+    /// Drives over a row budget, in any report.
+    pub over_budget: Vec<OverBudget>,
+    /// The growth check, row by row.
+    pub growth: Vec<GrowthRow>,
+    /// The projection from the small report — the clean fixture.
+    pub projection: GateEvaluation,
+    /// The projection from the post-load report.
+    pub projection_after_load: GateEvaluation,
+}
+
+impl Verdict {
+    /// Every failure, one line each.
+    fn failures(&self) -> Vec<String> {
+        let mut failures: Vec<String> = self
+            .over_budget
+            .iter()
+            .map(|row| {
+                format!(
+                    "{} report ({} rows): `{}` over its row budget",
+                    row.report, row.queue_rows, row.name
+                )
+            })
+            .collect();
+        failures.extend(
+            self.growth
+                .iter()
+                .filter(|row| row.grows)
+                .map(|row| format!("`{}` grows with the stored rows", row.name)),
+        );
+        for (label, evaluation) in [
+            ("clean", &self.projection),
+            ("post-load", &self.projection_after_load),
+        ] {
+            failures.extend(evaluation.breaches.iter().map(|breach| {
+                format!(
+                    "{label} projection: {} {} {:.3e} over bound {:.3e} — driver: {}",
+                    breach.product,
+                    breach.dimension,
+                    breach.projected,
+                    breach.bound,
+                    breach.top_route
+                )
+            }));
+        }
+        failures
+    }
+}
+
+/// Collect the over-budget rows of one report.
+fn over_budget(label: &'static str, report: &SchedulerBudgetReport) -> Vec<OverBudget> {
+    report
+        .rows
+        .iter()
+        .filter(|row| row.over_budget)
+        .map(|row| OverBudget {
+            report: label,
+            queue_rows: report.queue_rows,
+            name: row.name.clone(),
+        })
+        .collect()
+}
+
+/// Judge every input.
+fn judge(
+    model: &LaunchModel,
+    small: &SchedulerBudgetReport,
+    large: &SchedulerBudgetReport,
+    after: &SchedulerBudgetReport,
+    cpu: &WorkerCpuReport,
+) -> Result<Verdict, String> {
+    let mut over = over_budget("small", small);
+    over.extend(over_budget("large", large));
+    over.extend(over_budget("after", after));
+    Ok(Verdict {
+        over_budget: over,
+        growth: growth(small, large)?,
+        projection: evaluate(model, small, cpu)?,
+        projection_after_load: evaluate(model, after, cpu)?,
+    })
+}
+
+/// Human rendering of one projection — the per-product table, the peak
+/// check, the top-5 routes, the diagnostics and the unmeasured routes.
+fn render_evaluation(title: &str, evaluation: &GateEvaluation) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
+    let _ = writeln!(out, "{title}");
     let mut table = Table::new(&[
         "product",
         "dimension",
@@ -796,69 +1119,150 @@ fn render_evaluation(evaluation: &GateEvaluation) -> String {
     let _ = writeln!(out, "\n{}", top.render());
     let mut diag = Table::new(&["diagnostics (unmeasured)", "projected/mo"]);
     for line in &evaluation.diagnostics {
-        diag.push([line.dimension.to_owned(), format!("{:.3e}", line.projected)]);
+        diag.push([
+            format!("{} {}", line.product, line.dimension),
+            format!("{:.3e}", line.projected),
+        ]);
     }
     let _ = writeln!(out, "\n{}", diag.render());
-    if evaluation.passes() {
-        let _ = writeln!(out, "\nlaunch-cost gate: PASS");
+    let mut cpu = Table::new(&[
+        "Worker CPU per route",
+        "events/mo",
+        "ms/event",
+        "budget ms/event",
+        "ms/mo",
+        "share",
+        "share at budget",
+    ]);
+    for route in &evaluation.cpu_routes {
+        cpu.push([
+            route.route.to_owned(),
+            format!("{:.3e}", route.monthly_events),
+            format!("{:.2}", route.measured_ms_per_event),
+            format!("{:.2}", route.budget_ms_per_event),
+            format!("{:.3e}", route.projected_ms),
+            format!("{:.2}%", 100.0 * route.share),
+            format!("{:.2}%", 100.0 * route.share_at_budget),
+        ]);
+    }
+    let _ = writeln!(out, "\n{}", cpu.render());
+    let _ = writeln!(
+        out,
+        "Worker CPU at budget: {:.3e} ms/mo, {:.1}% of the allowance (bound {:.0}%)",
+        evaluation.worker_cpu_ms_at_budget,
+        100.0 * evaluation.worker_cpu_ms_at_budget / WORKER_CPU_MS_MONTHLY,
+        100.0 * ALLOWANCE_FRACTION
+    );
+    if !evaluation.unmeasured_cpu.is_empty() {
+        let mut gaps = Table::new(&["Worker CPU not measured", "events/mo", "why"]);
+        for gap in &evaluation.unmeasured_cpu {
+            gaps.push([
+                gap.route.to_owned(),
+                format!("{:.3e}", gap.monthly_events),
+                gap.reason.to_owned(),
+            ]);
+        }
+        let _ = writeln!(out, "\n{}", gaps.render());
+    }
+    out
+}
+
+/// Human rendering of the verdict.
+fn render_verdict(verdict: &Verdict) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut table = Table::new(&["drive", "rows_read", "rows_written", ""]);
+    for row in &verdict.growth {
+        table.push([
+            row.name.clone(),
+            format!("{}→{}", row.read_small, row.read_large),
+            format!("{}→{}", row.written_small, row.written_large),
+            if row.grows { "GROWS" } else { "" }.to_owned(),
+        ]);
+    }
+    let _ = writeln!(
+        out,
+        "growth check (small → large fixture):\n{}",
+        table.render()
+    );
+    let _ = writeln!(
+        out,
+        "\n{}",
+        render_evaluation("projection — clean fixture:", &verdict.projection)
+    );
+    let _ = writeln!(
+        out,
+        "{}",
+        render_evaluation(
+            "projection — after the peak drive:",
+            &verdict.projection_after_load
+        )
+    );
+    let failures = verdict.failures();
+    if failures.is_empty() {
+        let _ = writeln!(out, "traffic cost: PASS");
     } else {
-        let _ = writeln!(out, "\nlaunch-cost gate: FAIL");
-        for breach in &evaluation.breaches {
-            let _ = writeln!(
-                out,
-                "  {} {} projected {:.3e} exceeds bound {:.3e} — driver: {}",
-                breach.product, breach.dimension, breach.projected, breach.bound, breach.top_route
-            );
+        let _ = writeln!(out, "traffic cost: FAIL");
+        for failure in &failures {
+            let _ = writeln!(out, "  {failure}");
         }
     }
     out
 }
 
-/// `stow-admin launch-gate` — evaluate and exit nonzero on a breach.
-pub async fn run(args: &LaunchGateArgs, output: Output) -> stow_types::error::Result<()> {
-    let report_text = tokio::fs::read_to_string(&args.report)
+/// Read and decode one JSON input.
+async fn read_json<T: serde::de::DeserializeOwned>(
+    what: &str,
+    path: &Path,
+) -> stow_types::error::Result<T> {
+    let text = tokio::fs::read_to_string(path)
         .await
-        .map_err(|error| stow_error!("read budget report {}: {error}", args.report.display()))?;
-    let report: SchedulerBudgetReport = serde_json::from_str(&report_text)
-        .map_err(|error| stow_error!("parse budget report {}: {error}", args.report.display()))?;
-    let model_text = tokio::fs::read_to_string(&args.model)
-        .await
-        .map_err(|error| stow_error!("read launch model {}: {error}", args.model.display()))?;
-    let model = LaunchModel::from_toml(&model_text)
-        .map_err(|error| stow_error!("load launch model {}: {error}", args.model.display()))?;
-    let evaluation = evaluate(&model, &report).map_err(|error| stow_error!("{error}"))?;
-    emit(output, &evaluation, render_evaluation)?;
-    if evaluation.passes() {
+        .map_err(|error| stow_error!("read {what} {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|error| stow_error!("parse {what} {}: {error}", path.display()))
+}
+
+/// `stow-admin traffic-cost project` — judge and exit nonzero on any
+/// failure.
+pub async fn run(args: &ProjectArgs, output: Output) -> stow_types::error::Result<()> {
+    let small: SchedulerBudgetReport = read_json("budget report", &args.small).await?;
+    let large: SchedulerBudgetReport = read_json("budget report", &args.large).await?;
+    let after: SchedulerBudgetReport = read_json("budget report", &args.after).await?;
+    let cpu: WorkerCpuReport = read_json("Worker CPU report", &args.cpu).await?;
+    let model = super::read_model(&args.model).await?;
+    let verdict =
+        judge(&model, &small, &large, &after, &cpu).map_err(|error| stow_error!("{error}"))?;
+    emit(output, &verdict, render_verdict)?;
+    let failures = verdict.failures();
+    if failures.is_empty() {
         Ok(())
     } else {
-        Err(stow_error!(
-            "launch-cost gate: {} dimension(s) over bound",
-            evaluation.breaches.len()
-        ))
+        Err(stow_error!("traffic cost: {} failure(s)", failures.len()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use stow_types::api::{SchedulerBudgetReport, SchedulerBudgetRow};
-    use stow_types::do_budgets::DO_BUDGETS;
+    use stow_types::do_budgets::{DO_BUDGETS, WORKER_CPU_BUDGETS};
     use stow_types::launch_model::LaunchModel;
 
-    use super::{evaluate, render_evaluation};
+    use super::{evaluate, growth, judge, render_verdict};
+    use crate::traffic_cost::cpu::{WorkerCpuReport, WorkerCpuRow};
 
     /// A fixture report built on the absolute budget bounds: every
-    /// drive's measurement sits at half its budget — the ~2× headroom
-    /// the `DO_BUDGETS` table documents — so the fixture is the harness
-    /// report a healthy run produces.
+    /// drive's measurement sits at `scale(name)` of its budget — half is
+    /// the ~2× headroom the `DO_BUDGETS` table documents, so the fixture
+    /// is the report a healthy run produces.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         clippy::cast_precision_loss,
         reason = "fixture counters sit far inside both types' ranges"
     )]
-    fn fixture_report(scale: impl Fn(&str) -> f64) -> SchedulerBudgetReport {
+    fn fixture_report(queue_rows: u64, scale: impl Fn(&str) -> f64) -> SchedulerBudgetReport {
         SchedulerBudgetReport {
-            queue_rows: 100_000,
+            queue_rows,
             // The production dispatch cap (45) minus the fixture's 30
             // in-flight rows: the slots the hot pass claims.
             dispatch_limit: 45,
@@ -890,34 +1294,100 @@ mod tests {
         }
     }
 
+    /// Every lane at `scale(lane)` of its CPU budget.
+    fn fixture_cpu(scale: impl Fn(&str) -> f64) -> WorkerCpuReport {
+        WorkerCpuReport {
+            sampling_interval_us: 100,
+            idle_window_ms: 3000,
+            idle_cpu_ms: 0.0,
+            rows: WORKER_CPU_BUDGETS
+                .iter()
+                .map(|budget| {
+                    let cpu_ms = budget.cpu_ms * scale(budget.lane);
+                    WorkerCpuRow {
+                        lane: budget.lane.to_owned(),
+                        events_per_round: 20,
+                        rounds_cpu_ms: vec![cpu_ms],
+                        cpu_ms,
+                        budget_ms: budget.cpu_ms,
+                        over_budget: budget.over_budget(cpu_ms),
+                    }
+                })
+                .collect(),
+        }
+    }
+
     /// The checked-in model — the gate test reads the real file so a
     /// regenerated model is always what the fixture is judged against.
-    const MODEL_TOML: &str = include_str!("../../launch-model.toml");
+    const MODEL_TOML: &str = include_str!("../../../launch-model.toml");
 
-    #[test]
-    fn fixture_report_passes_the_gate() {
-        let model = LaunchModel::from_toml(MODEL_TOML).expect("model");
-        let report = fixture_report(|_| 0.5);
-        let evaluation = evaluate(&model, &report).expect("evaluate");
-        assert!(evaluation.passes(), "{}", render_evaluation(&evaluation));
-        let rendered = render_evaluation(&evaluation);
-        assert!(rendered.contains("launch-cost gate: PASS"), "{rendered}");
+    fn model() -> LaunchModel {
+        LaunchModel::from_toml(MODEL_TOML).expect("model")
     }
 
     #[test]
-    fn an_raised_drive_cost_fails_the_gate() {
-        let model = LaunchModel::from_toml(MODEL_TOML).expect("model");
+    fn a_healthy_run_passes() {
+        let small = fixture_report(100_000, |_| 0.5);
+        let large = fixture_report(1_000_000, |_| 0.5);
+        let after = fixture_report(100_000, |_| 0.5);
+        let verdict =
+            judge(&model(), &small, &large, &after, &fixture_cpu(|_| 0.5)).expect("judge");
+        let rendered = render_verdict(&verdict);
+        assert!(verdict.failures().is_empty(), "{rendered}");
+        assert!(rendered.contains("traffic cost: PASS"), "{rendered}");
+        assert!(rendered.contains("workers"), "{rendered}");
+        assert!(rendered.contains("cpu_ms"), "{rendered}");
+        assert!(rendered.contains("Worker CPU per route"), "{rendered}");
+        assert!(rendered.contains("Worker CPU at budget"), "{rendered}");
+    }
+
+    #[test]
+    fn a_raised_drive_cost_fails_the_projection() {
         // 30× the hot alarm pass's written cost lifts the DO
         // rows_written projection past its bound.
-        let report = fixture_report(|name| if name == "alarm pass" { 15.0 } else { 0.5 });
-        let evaluation = evaluate(&model, &report).expect("evaluate");
-        assert!(!evaluation.passes(), "{}", render_evaluation(&evaluation));
-        let rendered = render_evaluation(&evaluation);
-        assert!(rendered.contains("launch-cost gate: FAIL"), "{rendered}");
-        assert!(
-            rendered.contains("durable_objects rows_written"),
-            "{rendered}"
+        let report = fixture_report(
+            100_000,
+            |name| if name == "alarm pass" { 15.0 } else { 0.5 },
         );
+        let evaluation = evaluate(&model(), &report, &fixture_cpu(|_| 0.5)).expect("evaluate");
+        assert!(!evaluation.passes());
+        assert!(
+            evaluation
+                .breaches
+                .iter()
+                .any(|breach| breach.product == "durable_objects"
+                    && breach.dimension == "rows_written"),
+            "{:?}",
+            evaluation.breaches
+        );
+    }
+
+    /// Worker CPU enters the projection: a bundle fetch costing 100×
+    /// its budget pushes the month past half the CPU allowance.
+    #[test]
+    fn a_raised_worker_cpu_fails_the_projection() {
+        let report = fixture_report(100_000, |_| 0.5);
+        let cpu = fixture_cpu(|lane| if lane == "bundle-fetch" { 100.0 } else { 0.5 });
+        let evaluation = evaluate(&model(), &report, &cpu).expect("evaluate");
+        assert!(
+            evaluation
+                .breaches
+                .iter()
+                .any(|breach| breach.product == "workers" && breach.dimension == "cpu_ms"),
+            "{:?}",
+            evaluation.breaches
+        );
+    }
+
+    /// A CPU report missing a lane the projection prices is refused,
+    /// never priced at zero.
+    #[test]
+    fn a_missing_cpu_lane_is_refused() {
+        let report = fixture_report(100_000, |_| 0.5);
+        let mut cpu = fixture_cpu(|_| 0.5);
+        cpu.rows.retain(|row| row.lane != "bundle-fetch");
+        let error = evaluate(&model(), &report, &cpu).expect_err("missing lane must refuse");
+        assert!(error.contains("bundle-fetch"), "{error}");
     }
 
     /// A pass that claimed nothing measures no claim price; with the
@@ -925,22 +1395,112 @@ mod tests {
     /// rather than project a zero claim cost (stow#452 F1).
     #[test]
     fn a_zero_claim_report_is_refused() {
-        let model = LaunchModel::from_toml(MODEL_TOML).expect("model");
-        let mut report = fixture_report(|_| 0.5);
+        let mut report = fixture_report(100_000, |_| 0.5);
         report.claimed_tasks = 0;
-        let error = evaluate(&model, &report).expect_err("zero-claims must refuse");
+        let error = evaluate(&model(), &report, &fixture_cpu(|_| 0.5))
+            .expect_err("zero-claims must refuse");
         assert!(error.contains("claims 0 tasks"), "{error}");
+    }
+
+    /// A drive whose rows track the stored bulk fails the growth check;
+    /// one inside 10% + 50 rows passes.
+    #[test]
+    fn rows_that_grow_with_the_fixture_fail() {
+        let small = fixture_report(100_000, |_| 0.5);
+        let flat = fixture_report(
+            1_000_000,
+            |name| if name == "GET /status" { 0.55 } else { 0.5 },
+        );
+        assert!(
+            growth(&small, &flat)
+                .expect("growth")
+                .iter()
+                .all(|row| !row.grows)
+        );
+        let mut grown = fixture_report(1_000_000, |_| 0.5);
+        let row = grown
+            .rows
+            .iter_mut()
+            .find(|row| row.name == "GET /tasks")
+            .expect("row");
+        row.rows_read *= 10;
+        let rows = growth(&small, &grown).expect("growth");
+        let grows: Vec<&str> = rows
+            .iter()
+            .filter(|row| row.grows)
+            .map(|row| row.name.as_str())
+            .collect();
+        assert_eq!(grows, ["GET /tasks"]);
+    }
+
+    /// An over-budget row in the post-load report fails the verdict.
+    #[test]
+    fn an_over_budget_row_after_the_drive_fails() {
+        let small = fixture_report(100_000, |_| 0.5);
+        let large = fixture_report(1_000_000, |_| 0.5);
+        let after = fixture_report(
+            100_000,
+            |name| if name == "GET /status" { 1.5 } else { 0.5 },
+        );
+        let verdict =
+            judge(&model(), &small, &large, &after, &fixture_cpu(|_| 0.5)).expect("judge");
+        let failures = verdict.failures();
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("after report") && failure.contains("GET /status")),
+            "{failures:?}"
+        );
     }
 
     #[test]
     fn every_event_cost_drive_has_a_report_row() {
-        let report = fixture_report(|_| 0.5);
+        let report = fixture_report(100_000, |_| 0.5);
         let names: std::collections::BTreeSet<&str> =
             report.rows.iter().map(|row| row.name.as_str()).collect();
         for cost in super::EVENT_COSTS {
             for (name, _) in cost.drives {
                 assert!(names.contains(name), "no report row for `{name}`");
             }
+        }
+    }
+
+    /// Every lane the projection prices has a CPU budget row.
+    #[test]
+    fn every_priced_cpu_lane_has_a_budget() {
+        for cost in super::EVENT_COSTS {
+            if let super::CpuPricing::Lanes(lanes) = cost.cpu {
+                for (lane, _) in lanes {
+                    assert!(
+                        WORKER_CPU_BUDGETS.iter().any(|budget| budget.lane == *lane),
+                        "no Worker CPU budget for `{lane}`"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_cpu_budgets_fit_the_allowance() {
+        let report = fixture_report(100_000, |_| 0.5);
+        let evaluation = evaluate(&model(), &report, &fixture_cpu(|_| 0.5)).expect("evaluate");
+        let bound = super::WORKER_CPU_MS_MONTHLY * super::ALLOWANCE_FRACTION;
+        assert!(
+            evaluation.worker_cpu_ms_at_budget <= bound,
+            "WORKER_CPU_BUDGETS project {:.3e} ms/mo at budget, over the {bound:.3e} bound",
+            evaluation.worker_cpu_ms_at_budget
+        );
+        let priced = super::EVENT_COSTS
+            .iter()
+            .filter(|cost| matches!(cost.cpu, super::CpuPricing::Lanes(_)))
+            .count();
+        assert_eq!(evaluation.cpu_routes.len(), priced);
+        for route in &evaluation.cpu_routes {
+            assert!(
+                (route.measured_ms_per_event - route.budget_ms_per_event / 2.0).abs() < 1e-9,
+                "{} measured at half its budget",
+                route.route
+            );
         }
     }
 }

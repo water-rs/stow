@@ -1,7 +1,7 @@
 //! The scheduler route list both cost gates drive. The host-side gate
 //! (`cost_gate.rs`, `cargo test -p stow-edge`) runs this same list on a
 //! small fixture against `counting_memory_db` as a fast pre-check; the
-//! workerd harness (`budget.rs`, `scripts/scheduler-budget.sh`) runs it
+//! workerd harness (`budget.rs`, `scripts/traffic-cost.sh`) runs it
 //! on the 100k production fixture inside the Durable Object, where
 //! `CfDurableDb` reports the real `rowsRead`/`rowsWritten` Cloudflare
 //! bills. One drive list keeps the two harnesses honest: a route that
