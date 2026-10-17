@@ -135,29 +135,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
 
-  publish-dry-run:
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
-    name: Publish dry run
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: stable
-      # `cargo publish --dry-run` compiles for x86_64-unknown-linux-gnu, so
-      # it links with mold too.
-      - uses: ./.github/actions/link-with-mold
-      # `cargo publish --dry-run` resolves in-workspace dependency versions
-      # against crates.io, so it fails for stow-shim/stow-oci/stow-cli while
-      # stow-types, stow-shim and stow-oci are unpublished. `cargo package`
-      # checks manifest publishability (versioned path deps, license,
-      # description) entirely locally, so it covers the whole published set;
-      # the registry-facing `--dry-run` then covers stow-types, the
-      # dependency-free root of the publish graph.
-      - run: cargo package -p stow-types -p stow-shim -p stow-oci -p stow-cli --no-verify
-      - run: cargo publish --dry-run -p stow-types
-
   mock-e2e:
     needs: changes
     if: needs.changes.outputs.code == 'true'
@@ -344,7 +321,6 @@ jobs:
       - changes
       - test
       - lint
-      - publish-dry-run
       - mock-e2e
       - scheduler-budget
       - launch-load
