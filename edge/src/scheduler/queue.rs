@@ -17,6 +17,10 @@ use crate::errors::QueueError;
 /// `host_side` is part of the identity — the same crate mints both a
 /// target-side node and a host-side node at the host triple, and each
 /// side is covered only when the catalog serves that side's unit shapes.
+/// `dependency_identity` is too (stow#787): two nodes sharing the tuple
+/// but resolving different dependency closures are different nodes, and
+/// a publication under another context serves neither the dependent's
+/// digest-keyed edges nor a pending row waiting to build this one.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SemanticTaskIdentity {
     pub crate_name: String,
@@ -25,6 +29,9 @@ pub struct SemanticTaskIdentity {
     pub target: String,
     pub rustc_version: String,
     pub host_side: bool,
+    /// The Merkle digest the node's task id commits to — coverage is
+    /// exact contextual identity, never the bare tuple.
+    pub dependency_identity: String,
     /// The node's explicit-spelling flag (stow#736): semantic data,
     /// not identity — two catalog memberships of one node differ only
     /// in the shape set they require, never in the node's task id.
@@ -4492,6 +4499,7 @@ async fn retire_covered_rows(
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
             host_side: row.host_side != 0,
+            dependency_identity: row.dependency_identity.clone(),
             explicit_spelling: spelling_of(row.explicit_spelling),
         })
         .collect::<Vec<_>>();
@@ -4511,6 +4519,7 @@ async fn retire_covered_rows(
             target: row.target.clone(),
             rustc_version: row.rustc_version.clone(),
             host_side: row.host_side != 0,
+            dependency_identity: row.dependency_identity.clone(),
             explicit_spelling: spelling_of(row.explicit_spelling),
         };
         if row.preserve_lockfile == 0 && covered.contains(&identity) {
@@ -4624,7 +4633,7 @@ async fn select_dispatchable_page(
     page_rows: i64,
 ) -> Result<Vec<TaskRow>, QueueError> {
     let sql = dispatchable_page_sql(
-        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.explicit_spelling, q.preserve_lockfile, q.dispatch_attempts, q.dispatch_key",
+        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.explicit_spelling, q.preserve_lockfile, q.dependency_identity, q.dispatch_attempts, q.dispatch_key",
         full_family,
     );
     let cutoff = dispatch_cutoff_modifier(settings.dispatch_min_age_minutes);
@@ -6992,6 +7001,7 @@ struct TaskRow {
     host_side: i64,
     explicit_spelling: i64,
     preserve_lockfile: i64,
+    dependency_identity: String,
     dispatch_key: String,
 }
 
