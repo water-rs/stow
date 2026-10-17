@@ -7,7 +7,6 @@ CREATE TABLE IF NOT EXISTS queue (
     rustc_version TEXT NOT NULL,
     downloads INTEGER NOT NULL DEFAULT 0,
     miss_count INTEGER NOT NULL DEFAULT 0,
-    request_count INTEGER NOT NULL DEFAULT 1,
     priority INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
     error_msg TEXT,

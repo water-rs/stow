@@ -346,7 +346,6 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "rustc_version",
     "downloads",
     "miss_count",
-    "request_count",
     "priority",
     "status",
     "lane",
@@ -502,7 +501,7 @@ fn queue_seed_insert_sql(
                 '[]', \
                 {target_case}, \
                 CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
-                n % 5000, 1, 1, n % 7, \
+                n % 5000, 1, n % 7, \
                 CASE WHEN n <= {pending_end} THEN 'pending' \
                      WHEN n <= {completed_end} THEN 'completed' \
                      WHEN n <= {failed_end} THEN 'failed' \

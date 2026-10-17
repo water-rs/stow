@@ -263,10 +263,14 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
+        // Fully deduplicated resubmit (stow#784): an update is emitted
+        // only when a request changes stored state, so the measured
+        // shape is the status probe plus the task_nodes conflict
+        // probes — and zero writes.
         name: "POST /admin/enqueue (resubmit)",
-        statements: 16,
-        rows_read: 1_600,
-        rows_written: 100,
+        statements: 4,
+        rows_read: 100,
+        rows_written: 0,
         wall_ms: 400,
     },
     DriveBudget {

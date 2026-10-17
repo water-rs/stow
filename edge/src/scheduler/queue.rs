@@ -209,9 +209,7 @@ impl Default for SchedulerSettings {
 }
 
 /// Priority is the third precedence operand of `queue.value` — dispatch
-/// orders on value before the FIFO tie-breakers, and `request_count` is
-/// deliberately absent from it: hammering one pending task must never
-/// inflate its value to overtake older work.
+/// orders on value before the FIFO tie-breakers.
 fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> {
     let downloads_bucket = downloads / 1000;
     let downloads_bucket = i64::try_from(downloads_bucket)
@@ -298,8 +296,8 @@ pub const ENQUEUE_JSON_BATCH_ROWS: usize = 2000;
 /// half; a full-slice retire then costs ~45 statements.
 const SLICE_ROWID_DELETE_BATCH: usize = 90;
 
-/// One re-request folded per task for the bulk `UPDATE queue`:
-/// `occurrences` counts how many requests in the chunk named the row,
+/// One re-request folded per task for the bulk `UPDATE queue` — emitted
+/// only when the request changes stored state (`plan_enqueue` decides):
 /// `downloads` the highest the chunk reported, `redispatch` the
 /// at-most-one resurrection a row can take in one batch (once `pending`
 /// it cannot resurrect again in the same pass), and `human` whether any
@@ -307,7 +305,6 @@ const SLICE_ROWID_DELETE_BATCH: usize = 90;
 #[derive(serde::Serialize)]
 struct BatchedUpdate {
     task_id: String,
-    occurrences: u32,
     downloads: i64,
     redispatch: u8,
     human: u8,
@@ -532,9 +529,10 @@ async fn check_update_band_bound(
 }
 
 /// `UPDATE queue` for every re-requested row in the chunk, one statement
-/// per slice. Semantics of the old per-request `update_existing_task`,
-/// carried per JSON entry: downloads keep the max, `request_count`
-/// grows by the occurrence count, priority recomputes from downloads and
+/// per slice. The batch only holds rows the request actually moves
+/// (`plan_enqueue` filters pure re-requests out — stow#784), so every
+/// write here is a real state change: downloads keep the max, priority
+/// recomputes from downloads and
 /// `miss_count` (`first_requested_at` untouched — the FIFO operand stays
 /// put, though a higher recomputed priority can still move the row up in
 /// `value` order), resurrection bumps the retry-cycle `attempt`, and the
@@ -554,7 +552,6 @@ async fn apply_batched_updates(
         db.query(&format!(
             "UPDATE queue \
              SET downloads = MAX(downloads, e ->> 'downloads'), \
-                 request_count = request_count + (e ->> 'occurrences'), \
                  priority = (MAX(downloads, e ->> 'downloads') / 1000) + miss_count * 10, \
                  status = CASE WHEN e ->> 'redispatch' = 1 THEN 'pending' ELSE status END, \
                  attempt = attempt + (e ->> 'redispatch'), \
@@ -661,6 +658,11 @@ async fn apply_batched_inserts(
     // timestamps once so a row's key and columns carry the same
     // instant. A present stat must decode positive; corruption fails
     // the batch rather than silently repricing to 1.
+    // A pure resubmit batch carries no inserts — skip the cost probe
+    // entirely rather than running an empty `json_each` (stow#784).
+    if inserts.is_empty() {
+        return Ok(0);
+    }
     let stats = probe_insert_costs(db, inserts).await?;
     // The probe rides its `now` column on the same statement — one
     // probe per batch, so the batch's key/column timestamps agree.
@@ -705,10 +707,10 @@ async fn apply_batched_inserts(
         let inserted_rows = db
             .query(&format!(
                 "INSERT INTO queue \
-                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, dependency_identity, downloads, miss_count, request_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
+                 (task_id, crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, dependency_identity, downloads, miss_count, priority, status, preserve_lockfile, lane, attempt, generation_id, first_requested_at, created_at, unpublished_deps, deps_met, blocked, wake_at, dispatch_family, value, dispatch_key, dispatch_eligible) \
                  SELECT e ->> 'task_id', e ->> 'crate_name', e ->> 'version', e ->> 'features_json', \
                         e ->> 'target', e ->> 'rustc_version', e ->> 'host_side', e ->> 'explicit_spelling', e ->> 'dependency_identity', e ->> 'downloads', \
-                        0, 1, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
+                        0, e ->> 'priority', 'pending', e ->> 'preserve_lockfile', e ->> 'lane', \
                         1, lower(hex(randomblob(16))), e ->> 'first_requested_at', \
                         e ->> 'created_at', \
                         e ->> 'unpublished_deps', e ->> 'deps_met', e ->> 'blocked', \
@@ -1001,9 +1003,9 @@ async fn enqueue_inner(
     // against the edge set just written, so a task is born gated and no
     // statement revisits it. `queue_dependencies` carries no foreign key,
     // so an edge for a not-yet-inserted task is sound. Inserts precede
-    // updates so a later occurrence of a just-inserted task lands its
-    // `request_count` contribution — the per-request loop applied it
-    // through `update_existing_task`.
+    // updates so a later occurrence of a just-inserted task lands on
+    // the update path the per-request loop applied through
+    // `update_existing_task`.
     // Resubmits recompute `priority` from the new downloads max —
     // the prospective `priority + demand` of every updated row must
     // stay under `PRIORITY_MAX` before a single write lands, or the
@@ -1249,6 +1251,8 @@ struct EnqueuePlan {
 struct TaskStatusProbe {
     status: String,
     explicit_spelling: i64,
+    lane: String,
+    downloads: i64,
 }
 
 /// One existence probe for the chunk, over every task id it can
@@ -1266,7 +1270,8 @@ async fn probe_task_statuses(
     for chunk in probe_ids.chunks(ENQUEUE_JSON_BATCH_ROWS) {
         let rows = db
             .query(
-                "SELECT task_id, status, explicit_spelling FROM queue \
+                "SELECT task_id, status, explicit_spelling, lane, downloads \
+                 FROM queue \
                  WHERE task_id IN (SELECT value FROM json_each(?))",
             )
             .bind(enqueue_json(chunk)?)
@@ -1279,6 +1284,8 @@ async fn probe_task_statuses(
                 TaskStatusProbe {
                     status: row.status,
                     explicit_spelling: row.explicit_spelling,
+                    lane: row.lane,
+                    downloads: row.downloads,
                 },
             );
         }
@@ -1369,27 +1376,45 @@ fn plan_enqueue(
                 && request_explicit == 1
                 && probe.explicit_spelling == 0;
             let redispatch = resurrects(probe.status.as_str(), lane) || flaggap;
-            let update = updates
-                .entry(entry.task_id.clone())
-                .or_insert_with(|| BatchedUpdate {
-                    task_id: entry.task_id.clone(),
-                    occurrences: 0,
-                    downloads,
-                    redispatch: 0,
-                    human: 0,
-                    explicit: 0,
-                });
-            update.occurrences += 1;
-            update.downloads = update.downloads.max(downloads);
-            update.redispatch |= u8::from(redispatch);
-            update.human |= u8::from(lane == TaskLane::Human);
-            update.explicit |= request_explicit;
+            // stow#784: a re-request that moves nothing writes nothing —
+            // a fully deduplicated resubmit must not rewrite every row
+            // (and its index entries) just to bump bookkeeping. An
+            // update is emitted only for a real change: a resurrection,
+            // a miss→human lane move, an explicit-spelling upgrade the
+            // row can still take (the UPDATE's CASE refuses it on a
+            // committed in-flight row), or a higher downloads value.
+            let lane_move = lane == TaskLane::Human && probe.lane != "human";
+            let explicit_upgrade = request_explicit == 1
+                && probe.explicit_spelling == 0
+                && (redispatch || !matches!(probe.status.as_str(), "dispatched" | "running"));
+            if redispatch || lane_move || explicit_upgrade || downloads > probe.downloads {
+                let update =
+                    updates
+                        .entry(entry.task_id.clone())
+                        .or_insert_with(|| BatchedUpdate {
+                            task_id: entry.task_id.clone(),
+                            downloads,
+                            redispatch: 0,
+                            human: 0,
+                            explicit: 0,
+                        });
+                update.downloads = update.downloads.max(downloads);
+                update.redispatch |= u8::from(redispatch);
+                update.human |= u8::from(lane == TaskLane::Human);
+                update.explicit |= request_explicit;
+            }
             if redispatch {
                 statuses.insert(
                     entry.task_id.clone(),
                     TaskStatusProbe {
                         status: "pending".to_owned(),
                         explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
+                        lane: if lane == TaskLane::Human {
+                            "human".to_owned()
+                        } else {
+                            probe.lane.clone()
+                        },
+                        downloads: probe.downloads.max(downloads),
                     },
                 );
             } else {
@@ -1398,6 +1423,12 @@ fn plan_enqueue(
                     TaskStatusProbe {
                         status: probe.status.clone(),
                         explicit_spelling: probe.explicit_spelling.max(i64::from(request_explicit)),
+                        lane: if lane == TaskLane::Human {
+                            "human".to_owned()
+                        } else {
+                            probe.lane.clone()
+                        },
+                        downloads: probe.downloads.max(downloads),
                     },
                 );
             }
@@ -1422,6 +1453,8 @@ fn plan_enqueue(
                 TaskStatusProbe {
                     status: "pending".to_owned(),
                     explicit_spelling: i64::from(request_explicit),
+                    lane: lane.as_str().to_owned(),
+                    downloads,
                 },
             );
             // A task id commits to its whole dependency subgraph, so a
@@ -5128,7 +5161,6 @@ struct AdminTaskRow {
     error_msg: Option<String>,
     downloads: i64,
     miss_count: i64,
-    request_count: i64,
     dispatch_attempts: u32,
     preserve_lockfile: i64,
     github_run_id: Option<String>,
@@ -5145,7 +5177,7 @@ struct AdminTaskRow {
 
 const ADMIN_TASK_COLUMNS: &str = "task_id, crate_name, version, features_json, target, \
      rustc_version, lane, attempt, error_msg, downloads, miss_count, \
-     request_count, dispatch_attempts, preserve_lockfile, \
+     dispatch_attempts, preserve_lockfile, \
      github_run_id, first_requested_at, created_at, updated_at, host_side, \
      CAST(value AS TEXT) AS value";
 
@@ -5184,10 +5216,6 @@ impl AdminTaskRow {
             miss_count: u32::try_from(self.miss_count).map_err(|_| QueueError::Overflow {
                 field: "miss_count",
                 value: self.miss_count.cast_unsigned(),
-            })?,
-            request_count: u32::try_from(self.request_count).map_err(|_| QueueError::Overflow {
-                field: "request_count",
-                value: self.request_count.cast_unsigned(),
             })?,
             dispatch_attempts: self.dispatch_attempts,
             preserve_lockfile: self.preserve_lockfile != 0,
@@ -6872,7 +6900,6 @@ async fn requeue_incomplete_shape_deps(
              SET status = 'pending', \
                  attempt = attempt + 1, \
              error_msg = '', \
-             request_count = request_count + 1, \
              deps_met = {deps_met}, \
              blocked = {blocked}, \
              not_before = {next_not_before}, \
@@ -6969,6 +6996,8 @@ struct TaskStatusRow {
     task_id: String,
     status: String,
     explicit_spelling: i64,
+    lane: String,
+    downloads: i64,
 }
 
 /// One `GROUP BY status, lane, blocked` aggregate row from [`status`].
