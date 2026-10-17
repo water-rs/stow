@@ -1,7 +1,8 @@
-//! The local CI server's run listing — `stow-build serve`'s `GET /tasks`
-//! answer, read by `stow-admin preheat manual --dispatch-url` and the
-//! `Preheat cost` lane (stow#773). One wire type, so the server and its
-//! readers cannot drift.
+//! The local CI server's `GET /tasks` run listing.
+//!
+//! `stow-build serve`'s answer, read by `stow-admin preheat manual
+//! --dispatch-url` and the `Preheat cost` lane (stow#773). One wire
+//! type, so the server and its readers cannot drift.
 
 use serde::{Deserialize, Serialize};
 

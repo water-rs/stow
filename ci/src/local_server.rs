@@ -132,6 +132,7 @@ impl LocalServerState {
         if status == "completed" {
             entry.completed_at_ms = Some(now);
         }
+        drop(runs);
     }
 
     /// Record why a run failed.
@@ -246,7 +247,10 @@ async fn list_tasks(State(state): State<LocalServerState>) -> Response {
         .values()
         .cloned()
         .collect();
-    json_response(&stow_types::local_ci::LocalCiTasks { tasks }, StatusCode::OK)
+    json_response(
+        &stow_types::local_ci::LocalCiTasks { tasks },
+        StatusCode::OK,
+    )
 }
 
 /// `POST /dispatch` — the scheduler's one local fan-out: `build-crate`
@@ -284,7 +288,9 @@ async fn dispatch(
 fn unix_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 fn bad_request(error: &str) -> serde_json::Value {

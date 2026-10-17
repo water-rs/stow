@@ -101,7 +101,7 @@ pub const GROWTH_TOLERANCE_ROWS: f64 = 50.0;
 /// `true` when `later` exceeds `earlier` past the stow#433 tolerance.
 #[must_use]
 pub fn grew(earlier: f64, later: f64) -> bool {
-    later > earlier * (1.0 + GROWTH_TOLERANCE_FRACTION) + GROWTH_TOLERANCE_ROWS
+    later > earlier.mul_add(1.0 + GROWTH_TOLERANCE_FRACTION, GROWTH_TOLERANCE_ROWS)
 }
 
 /// One probe budget row — statements, cursor counters and wall time.

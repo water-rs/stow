@@ -2578,7 +2578,8 @@ async fn local_run_states(
     let url = format!("{base}/tasks");
     // The shared bounded idempotent read — the local server is
     // unauthenticated, so no operator token rides it.
-    let tasks: stow_types::local_ci::LocalCiTasks = crate::github::get_url_json(&url, None, Backoff::new()).await?;
+    let tasks: stow_types::local_ci::LocalCiTasks =
+        crate::github::get_url_json(&url, None, Backoff::new()).await?;
     Ok(tasks
         .tasks
         .into_iter()
@@ -3870,7 +3871,7 @@ mod tests {
             crate::test_server::Step::Respond {
                 status: 200,
                 retry_after: None,
-                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7"}]}"#,
+                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7","dispatched_at_ms":0,"completed_at_ms":0,"error":null,"delivery_errors":[]}]}"#,
             },
         ])
         .await;
@@ -4313,6 +4314,10 @@ mod tests {
                                             "status": "completed",
                                             "conclusion": "success",
                                             "html_url": format!("http://localhost/run/{run_id}"),
+                                            "dispatched_at_ms": 0,
+                                            "completed_at_ms": 0,
+                                            "error": null,
+                                            "delivery_errors": [],
                                         })
                                     })
                                     .collect()

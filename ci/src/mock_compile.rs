@@ -101,10 +101,9 @@ enum OutputKind {
 /// Every file rustc writes for `parsed`, in rustc's emission order:
 /// dep-info, metadata, then each crate type's link output.
 fn planned_outputs(parsed: &ParsedRustcArgs) -> stow_types::error::Result<Vec<PlannedOutput>> {
-    let out_dir = parsed
-        .out_dir
-        .as_deref()
-        .ok_or_else(|| stow_types::stow_error!("mock compile of {} has no --out-dir", parsed.crate_name))?;
+    let out_dir = parsed.out_dir.as_deref().ok_or_else(|| {
+        stow_types::stow_error!("mock compile of {} has no --out-dir", parsed.crate_name)
+    })?;
     let stem = format!("{}{}", parsed.crate_name, parsed.extra_filename);
     let mut outputs = Vec::new();
     if parsed.emit.contains("dep-info") {
@@ -128,7 +127,10 @@ fn planned_outputs(parsed: &ParsedRustcArgs) -> stow_types::error::Result<Vec<Pl
                 "lib" | "rlib" => (format!("lib{stem}.rlib"), OutputKind::Data),
                 "proc-macro" | "dylib" | "cdylib" => (naming.dynamic(&stem), OutputKind::Data),
                 "staticlib" => (naming.static_lib(&stem), OutputKind::Data),
-                "bin" => (format!("{stem}{}", naming.exe_suffix), OutputKind::Executable),
+                "bin" => (
+                    format!("{stem}{}", naming.exe_suffix),
+                    OutputKind::Executable,
+                ),
                 other => {
                     return Err(stow_types::stow_error!(
                         "mock compile of {} has crate type {other} with no known output",
@@ -224,7 +226,10 @@ fn write_output(output: &PlannedOutput, parsed: &ParsedRustcArgs) -> stow_types:
     match output.kind {
         OutputKind::Data => {}
         OutputKind::DepInfo => {
-            let input = parsed.input_path.as_deref().unwrap_or_else(|| Path::new(""));
+            let input = parsed
+                .input_path
+                .as_deref()
+                .unwrap_or_else(|| Path::new(""));
             writeln!(file, "{}: {}", output.path.display(), input.display())?;
             writeln!(file)?;
             writeln!(file, "{}:", input.display())?;

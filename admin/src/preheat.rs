@@ -757,33 +757,33 @@ fn resolve_binaries(
 }
 
 /// One resolved binary's contribution to the plan: its task count.
-#[derive(Debug, serde::Serialize)]
-struct BinaryContribution {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BinaryContribution {
     /// The binary crate's crates.io name.
-    binary: String,
+    pub binary: String,
     /// How many enqueue requests its resolve graphs produced.
-    tasks: usize,
+    pub tasks: usize,
 }
 
 /// A binary that failed to resolve, with its reason.
-#[derive(Debug, serde::Serialize)]
-struct SkippedBinary {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SkippedBinary {
     /// The binary crate's crates.io name.
-    binary: String,
+    pub binary: String,
     /// Why resolution failed — fetch or resolver.
-    reason: String,
+    pub reason: String,
 }
 
 /// The plan `top-binaries` previews and applies: every task every
 /// binary produced, plus per-binary outcomes.
-#[derive(Debug, serde::Serialize)]
-struct BinariesPlan {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BinariesPlan {
     /// Every enqueue request across every binary and target.
-    tasks: Vec<EnqueueRequest>,
+    pub tasks: Vec<EnqueueRequest>,
     /// How many requests each binary produced.
-    per_binary: Vec<BinaryContribution>,
+    pub per_binary: Vec<BinaryContribution>,
     /// Binaries resolution failed on, with their reasons.
-    skipped: Vec<SkippedBinary>,
+    pub skipped: Vec<SkippedBinary>,
 }
 
 /// The Analytics Engine query template; `__LIMIT__`, `__SINCE_DAYS__`,

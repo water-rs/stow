@@ -275,8 +275,9 @@ log "rustc $RUSTC_VERSION; top/top-binaries limit $LIMIT; projects ${PROJECTS:-a
 log "dispatch caps: $MAX_JOBS ($MAX_MACOS_JOBS macOS)"
 
 cd "$REPO_ROOT"
-log "building stow-build (mock compiler), stow-mock-registry, stow-admin"
+log "building stow-cli, stow-build (mock compiler), stow-mock-registry, stow-admin"
 cargo build \
+    -p stow-cli --features stow-cli/mock-verify \
     -p stow-build --features stow-build/mock-verify,stow-build/mock-compile \
     -p stow-mock-registry -p stow-admin \
     >"$LOG_DIR/cargo-build.log" 2>&1 \
@@ -469,9 +470,8 @@ start_lanes() {
 # Runs the local CI has seen: in flight, and successfully completed.
 local_ci_counts() {
     curl -fsS --max-time 30 "${LOCAL_CI_URL}/tasks" | jq -r '
-        [.tasks[] | select(.status != "completed")] | length as $inflight
-        | [.tasks[] | select(.conclusion == "success")] | length as $succeeded
-        | "\($inflight) \($succeeded)"'
+        .tasks as $tasks
+        | "\([$tasks[] | select(.status != "completed")] | length) \([$tasks[] | select(.conclusion == "success")] | length)"'
 }
 
 ROUND=0

@@ -367,7 +367,7 @@ async fn store_slice(
         .await
         .wrap_err_with(|| format!("create index dir {}", dir.display()))?;
     let keep = blob_name(manifest_digest);
-    let tmp = dir.join(format!(".tmp-{}", std::process::id()));
+    let tmp = unique_tmp(dir, ".blob")?;
     async_fs::write(&tmp, blob)
         .await
         .wrap_err_with(|| format!("write index blob {}", tmp.display()))?;
@@ -384,7 +384,11 @@ async fn store_slice(
         .wrap_err_with(|| format!("traverse index dir {}", dir.display()))?
     {
         let name = entry.file_name();
-        if name != POINTER_FILE && name != keep.as_str() {
+        // `.<hint>.tmp-*` staging files belong to writes in flight —
+        // evicting one fails the sibling's commit, so only the pointer,
+        // the blob just committed and dot-less stale blobs are touched.
+        let staging = name.to_str().is_some_and(|name| name.starts_with('.'));
+        if !staging && name != POINTER_FILE && name != keep.as_str() {
             async_fs::remove_file(entry.path())
                 .await
                 .wrap_err_with(|| format!("evict stale index blob {}", entry.path().display()))?;
@@ -393,11 +397,26 @@ async fn store_slice(
     Ok(())
 }
 
+/// A fresh uniquely-named staging path inside `dir`: concurrent writes
+/// to the same slice dir — the local CI's in-process publish validation
+/// (stow#773) fetches the same slices from every dispatched task — must
+/// not stage over one another's temp file. `tempfile` guarantees the
+/// name no sibling call picked.
+fn unique_tmp(dir: &Path, hint: &str) -> stow_types::error::Result<PathBuf> {
+    Ok(tempfile::Builder::new()
+        .prefix(&format!(".{hint}.tmp-"))
+        .tempfile_in(dir)
+        .wrap_err_with(|| format!("create index staging file in {}", dir.display()))?
+        .into_temp_path()
+        .keep()
+        .map_err(|error| stow_types::stow_error!("keep index staging path: {error}"))?)
+}
+
 async fn write_pointer(dir: &Path, pointer: &SlicePointer) -> stow_types::error::Result<()> {
     async_fs::create_dir_all(dir)
         .await
         .wrap_err_with(|| format!("create index dir {}", dir.display()))?;
-    let tmp = dir.join(format!(".{POINTER_FILE}.tmp-{}", std::process::id()));
+    let tmp = unique_tmp(dir, POINTER_FILE)?;
     async_fs::write(&tmp, serde_json::to_vec(pointer)?)
         .await
         .wrap_err_with(|| format!("write index pointer {}", tmp.display()))?;
