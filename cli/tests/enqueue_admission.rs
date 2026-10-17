@@ -239,6 +239,10 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
+        // The fixture build's target dir must stay under `dir` — an
+        // exported `CARGO_TARGET_DIR` would relocate it and the drain
+        // log the test polls would never appear.
+        .env_remove("CARGO_TARGET_DIR")
         .output()
         .expect("run stow-cli build");
 
@@ -329,6 +333,10 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
         .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
+        // The fixture build's target dir must stay under `dir` — an
+        // exported `CARGO_TARGET_DIR` would relocate it and the drain
+        // log the test polls would never appear.
+        .env_remove("CARGO_TARGET_DIR")
         .output()
         .expect("run stow-cli build");
     assert!(
@@ -462,6 +470,10 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
             .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
             .env("CARGO_INCREMENTAL", "0")
             .env_remove("RUST_LOG")
+            // The fixture's target dir must live under `dir` — a
+            // developer-exported `CARGO_TARGET_DIR` would relocate it
+            // and the journal/drain-log reads below would find nothing.
+            .env_remove("CARGO_TARGET_DIR")
             .output()
             .expect("run cargo build");
         assert!(

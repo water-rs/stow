@@ -1438,8 +1438,14 @@ fn predict_from_inputs(
         .cloned()
         .map(into_api_dependency)
         .collect::<stow_types::error::Result<Vec<_>>>()?;
-    let analysis =
-        resolve::analyze_dependency_graph(&rows, &entries, &expanded_in, resolve::host_glibc())?;
+    let analysis = resolve::analyze_dependency_graph(
+        &rows,
+        &entries,
+        &expanded_in,
+        &project.target,
+        &project.rustc_version,
+        resolve::host_glibc(),
+    )?;
 
     // The wrapper's decision path resolves each compiled unit against
     // the per-side node table — the entries' cargo-resolved feature sets
