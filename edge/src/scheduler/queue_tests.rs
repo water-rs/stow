@@ -5666,6 +5666,173 @@ async fn human_daily_budget_refuses_the_submit_that_would_exceed_it() {
     ));
 }
 
+/// The day's spend under `human_daily_task_budget` — `None` when no
+/// charge statement has ever landed.
+async fn budget_spent(db: &DurableDb) -> Option<i64> {
+    db.query("SELECT task_count FROM human_daily_task_budget WHERE day = date('now')")
+        .fetch_scalar_optional::<i64>()
+        .await
+        .expect("budget spend")
+}
+
+/// stow#796: the charge follows what the plan moves, not what the
+/// batch names. A resubmit of an already-queued human task inserts
+/// nothing and promotes nothing, so it issues no statement against
+/// `human_daily_task_budget` at all; a fresh human request pays 1,
+/// a miss→human promotion pays 1, and a human request that
+/// resurrects a completed row pays 1 — the budget prices
+/// human-triggered builds, and a resurrect creates one.
+#[tokio::test]
+async fn the_human_budget_charge_follows_the_plan() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let batch = || vec![human_request("asked"), request("missed", &[])];
+    assert_eq!(enqueue(&db, &batch()).await.expect("first submit"), 2);
+    assert_eq!(
+        budget_spent(&db).await,
+        Some(1),
+        "the fresh human request pays 1"
+    );
+
+    // The whole batch again — every row already queued. The plan
+    // moves nothing, so no write statement fires and the budget row
+    // is untouched (the workerd gate saw the row the host backend
+    // used not to count).
+    log.lock().expect("log").clear();
+    assert_eq!(enqueue(&db, &batch()).await.expect("resubmit"), 0);
+    let statements = log.lock().expect("log").clone();
+    let written: u64 = statements.iter().map(|s| s.rows_written).sum();
+    assert_eq!(
+        written, 0,
+        "a fully deduplicated resubmit writes nothing: {statements:?}"
+    );
+    assert!(
+        !statements
+            .iter()
+            .any(|s| s.sql.contains("human_daily_task_budget")),
+        "a no-op submit issues no charge statement"
+    );
+    assert_eq!(
+        budget_spent(&db).await,
+        Some(1),
+        "the resubmit spent nothing"
+    );
+
+    // The trusted lane measures the same no-op.
+    log.lock().expect("log").clear();
+    assert_eq!(
+        super::enqueue_trusted(&db, &batch(), &settings())
+            .await
+            .expect("trusted resubmit"),
+        0
+    );
+    let written: u64 = log
+        .lock()
+        .expect("log")
+        .iter()
+        .map(|s| s.rows_written)
+        .sum();
+    assert_eq!(written, 0, "a trusted resubmit writes nothing either");
+
+    // Re-asking for the miss-lane row on the human lane is a real
+    // move — the lane promotion pays 1.
+    let mut promote = request("missed", &[]);
+    promote.source = EnqueueSource::HumanRequest;
+    super::enqueue_trusted(&db, &[promote], &settings())
+        .await
+        .expect("promotion");
+    assert_eq!(
+        budget_spent(&db).await,
+        Some(2),
+        "a miss→human promotion pays the budget"
+    );
+    let lane: String = db
+        .query("SELECT lane FROM queue WHERE task_id = ?")
+        .bind(task_id_on("missed", TARGET))
+        .fetch_scalar::<String>()
+        .await
+        .expect("lane");
+    assert_eq!(lane, "human", "the promotion moved the lane");
+
+    // And a resubmit of the now-human row charges nothing again.
+    enqueue(&db, &[human_request("asked")])
+        .await
+        .expect("human resubmit");
+    assert_eq!(budget_spent(&db).await, Some(2));
+
+    // A completed human row re-asked on the human lane resurrects —
+    // the budget prices human-triggered builds, and a resurrect
+    // creates one without a lane move.
+    mark_active(&db, "asked", TARGET, "completed").await;
+    enqueue(&db, &[human_request("asked")])
+        .await
+        .expect("human resurrect");
+    assert_eq!(
+        budget_spent(&db).await,
+        Some(3),
+        "a human-lane resurrect pays the budget"
+    );
+    let status: String = db
+        .query("SELECT status FROM queue WHERE task_id = ?")
+        .bind(task_id_on("asked", TARGET))
+        .fetch_scalar::<String>()
+        .await
+        .expect("status");
+    assert_eq!(status, "pending", "the resurrect re-queued the row");
+
+    // Re-asking while it is pending again charges nothing.
+    enqueue(&db, &[human_request("asked")])
+        .await
+        .expect("resubmit while pending");
+    assert_eq!(budget_spent(&db).await, Some(3));
+}
+
+/// A batch whose charge exceeds the day's remaining budget is refused
+/// before a single write lands — including the node-store upsert the
+/// write phase leads with (stow#796).
+#[tokio::test]
+async fn an_over_budget_submit_writes_nothing() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let budget_settings = SchedulerSettings {
+        human_daily_task_budget: 2,
+        ..settings()
+    };
+    super::enqueue(&db, &[human_request("one")], &budget_settings)
+        .await
+        .expect("first human task fits");
+    assert_eq!(budget_spent(&db).await, Some(1));
+
+    // Two fresh human tasks against one remaining slot: refused, and
+    // nothing — not even `task_nodes` — is written.
+    log.lock().expect("log").clear();
+    let error = super::enqueue(
+        &db,
+        &[human_request("two"), human_request("three")],
+        &budget_settings,
+    )
+    .await
+    .expect_err("a batch over the remaining budget must be refused");
+    assert!(matches!(
+        error,
+        QueueError::HumanDailyBudgetExhausted {
+            attempted: 2,
+            budget: 2
+        }
+    ));
+    let statements = log.lock().expect("log").clone();
+    let written: u64 = statements.iter().map(|s| s.rows_written).sum();
+    assert_eq!(
+        written, 0,
+        "a refused submit leaves no write behind: {statements:?}"
+    );
+    assert_eq!(budget_spent(&db).await, Some(1));
+    let queued: i64 = db
+        .query("SELECT count(*) FROM queue WHERE crate_name IN ('two', 'three')")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("queue count");
+    assert_eq!(queued, 0, "the refused batch queued nothing");
+}
+
 /// `tasks_status` must surface `preserve_lockfile`: it is the flag
 /// that says whether the task's dependency closure is reproducible
 /// from crates.io, and every status consumer reads it off this row.
