@@ -1315,12 +1315,16 @@ echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache via
 #
 # The post-0.6.0 production failure shape (run 35995412018): a proc-macro
 # build compiled its host deps itself because no host-side node had
-# published them. `preheat plan` runs the edge's own resolver over the
-# published tarball: a proc-macro crate lands on the runner-family host
-# as a host-side node, and every crates.io dependency that is host-side
-# in its unit graph becomes a host-side task the root's edges gate on.
+# published them. `preheat plan` resolves the published tarball
+# in-process and prunes the batch against coverage computed from the
+# published index slices — the same verified pull `index export` makes,
+# so it takes the same mock env: the registry as the OCI base and the
+# mock public key as the signature trust (stow#774: without them the
+# coverage pull goes to the real GHCR and dies on the token exchange).
 # wasm32 is the failing task's target spelling.
 isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
+    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     "$BIN/stow-admin" --json preheat plan \
     "${HOST_DEPS_CRATE}@${HOST_DEPS_VERSION}" \
     --features-json '[]' \
