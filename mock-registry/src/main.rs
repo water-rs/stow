@@ -488,6 +488,8 @@ fn registry_app_with_probe(
             get(serve_edge_bundle).head(serve_edge_bundle),
         )
         .route("/analytics_engine/sql", post(analytics_engine_sql))
+        .route("/user", get(github_user))
+        .route("/{owner}/{repo}/info/refs", get(github_info_refs))
         .with_state(MockRegistryState {
             registry_root,
             token_realm: format!("http://{listen}/token"),
@@ -1929,6 +1931,72 @@ async fn analytics_engine_sql(
     .into_response()
 }
 
+/// The login the GitHub stub reports for any presented user credential —
+/// the trusted lanes' caller label. The operator's real login is not
+/// knowable to the mock and never needed.
+const MOCK_GITHUB_LOGIN: &str = "stow-mock-operator";
+
+/// GitHub's error envelope — `{"message": …}` at `status`.
+fn github_error(status: StatusCode, message: &str) -> Response<Body> {
+    (status, Json(serde_json::json!({ "message": message }))).into_response()
+}
+
+/// `GET /user` — the label half of the edge's bearer check
+/// (`edge/src/github_auth.rs`, stow#793). Every presented user
+/// credential answers the fixed [`MOCK_GITHUB_LOGIN`]: the mock cannot
+/// resolve the operator's real login and never needs it. An absent
+/// credential is GitHub's 401, and an installation token (`ghs_`, what
+/// CI's `GITHUB_TOKEN` is) is GitHub's 403 — user endpoints refuse it,
+/// so the edge falls back to its credential-class label exactly as in
+/// production.
+async fn github_user(State(state): State<MockRegistryState>, headers: HeaderMap) -> Response<Body> {
+    state.record(&Method::GET, "/user");
+    let Some(token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return github_error(StatusCode::UNAUTHORIZED, "Requires authentication");
+    };
+    if token.starts_with("ghs_") {
+        return github_error(
+            StatusCode::FORBIDDEN,
+            "Resource not accessible by integration",
+        );
+    }
+    Json(serde_json::json!({ "login": MOCK_GITHUB_LOGIN })).into_response()
+}
+
+/// `GET /{owner}/{repo}.git/info/refs?service=git-receive-pack` — the
+/// smart-HTTP probe the edge's bearer check uses for push capability:
+/// GitHub answers the advertisement only when the credential may write,
+/// and the mock answers it for every presented credential — the mock
+/// stack's operators all hold push. The probe keys on the status alone
+/// and never reads the body, so the answer is the pkt-line flush of an
+/// empty advertisement under the advertisement media type.
+async fn github_info_refs(
+    State(state): State<MockRegistryState>,
+    headers: HeaderMap,
+    AxumPath((owner, repo)): AxumPath<(String, String)>,
+) -> Response<Body> {
+    let path = format!("/{owner}/{repo}/info/refs");
+    state.record(&Method::GET, &path);
+    if repo.strip_suffix(".git").is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !headers.contains_key(header::AUTHORIZATION) {
+        return github_error(StatusCode::UNAUTHORIZED, "Requires authentication");
+    }
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/x-git-receive-pack-advertisement",
+        )],
+        "0000",
+    )
+        .into_response()
+}
+
 /// The edge byte path for hosts that run no worker (the bench lane):
 /// `GET|HEAD /api/v1/bundles/{rustc_version}/{digest}` serves the blob the
 /// digest names —
@@ -2309,6 +2377,82 @@ mod tests {
             .await
             .expect("forged response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The GitHub trust stub (stow#793): `/user` and
+    /// `{owner}/{repo}.git/info/refs` are the endpoints the edge's
+    /// bearer check calls — both refuse an absent credential, a user
+    /// token earns the fixed login and push capability, and an
+    /// installation token gets GitHub's user-endpoint 403.
+    #[tokio::test]
+    async fn github_trust_stub() {
+        let root = tempfile::tempdir().expect("registry root");
+        let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
+
+        // Unauthenticated: GitHub's 401 on both endpoints.
+        for uri in [
+            "/user",
+            "/water-rs/stow.git/info/refs?service=git-receive-pack",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        // A user token: `/user` answers the fixed login.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/user")
+                    .header(header::AUTHORIZATION, "Bearer ghp_mock-token")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("user response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("user body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("user json");
+        assert_eq!(body["login"], "stow-mock-operator");
+
+        // An installation token: GitHub's user-endpoint 403 — the
+        // edge then labels the caller by credential class.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/user")
+                    .header(header::AUTHORIZATION, "Bearer ghs_mock-installation")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("installation response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The push probe sends Basic — any presented credential passes.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/water-rs/stow.git/info/refs?service=git-receive-pack")
+                    .header(header::AUTHORIZATION, "Basic eC1hY2Nlc3MtdG9rZW46bW9jaw==")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("probe response");
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";

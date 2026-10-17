@@ -528,12 +528,6 @@ BEGIN
     ON CONFLICT (status, lane, blocked) DO UPDATE SET n = n + 1;
 END;
 
--- The repair pass's candidate set: only completed rows that have not been
--- shape-checked. Once the backlog drains the index is empty and the alarm
--- pays one index probe for it.
-CREATE INDEX IF NOT EXISTS idx_queue_shape_requeue
-ON queue (task_id) WHERE status = 'completed' AND shape_requeue = 0;
-
 CREATE INDEX IF NOT EXISTS idx_queue_dependencies_dep
 ON queue_dependencies (depends_on_task_id);
 

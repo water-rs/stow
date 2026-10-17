@@ -51,6 +51,21 @@ impl DriveBudget {
     }
 }
 
+/// The flatness tolerance a scale check applies between two fixture
+/// sizes or wave layers (stow#433, stow#785): a per-event cost may
+/// exceed its earlier value by this fraction ...
+pub const GROWTH_TOLERANCE_FRACTION: f64 = 0.10;
+/// ... plus this many rows.
+pub const GROWTH_TOLERANCE_ROWS: f64 = 50.0;
+
+/// `true` when `later` exceeds `earlier` past the growth tolerance —
+/// the "same per event at every layer" assertion `stow#785` applies
+/// to the alarm pass, slice report and submit reads.
+#[must_use]
+pub fn grew(earlier: f64, later: f64) -> bool {
+    later > earlier.mul_add(1.0 + GROWTH_TOLERANCE_FRACTION, GROWTH_TOLERANCE_ROWS)
+}
+
 /// The workerd budget table the host gate carries.
 ///
 /// Measured in the units Cloudflare bills, filled from the harness's
@@ -287,28 +302,31 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
-        // The accepted development ceiling is 303 reads — the latest
-        // 100k workerd gate measured 157 under it, without wall-time
-        // or write headroom.
+        // The whole route (stow#785): the report — with the
+        // commit-time shape repair — plus the `dispatch_pending`
+        // claiming tail. The 100k workerd lane measured 36
+        // statements, 622 reads and 407 writes.
         name: "POST /index/published (full)",
-        statements: 8,
-        rows_read: 303,
-        rows_written: 800,
+        statements: 60,
+        rows_read: 800,
+        rows_written: 600,
         wall_ms: 500,
     },
     DriveBudget {
         // The delta's gate writes are the matched edges' `dep_met`
         // flips plus their owners' `unpublished_deps` adjustments —
         // 1 + the delta's direct dependents, never the queue or the
-        // graph (stow#521). `rowsRead` counts workerd's internal index
-        // seeks: the per-edge `dep_match` probes, the slice-row
+        // graph (stow#521) — plus the report-time repair, which can
+        // requeue the deps the retire uncovered, and the claiming
+        // tail. `rowsRead` counts workerd's internal index seeks:
+        // the per-edge `dep_match` probes, the slice-row
         // re-evaluation per matched edge and the owner PK seeks.
-        // The accepted development ceiling is 488 reads — the latest
-        // 100k workerd gate measured 486 under it.
+        // The 100k workerd lane measured 39 statements, 1177 reads
+        // and 614 writes.
         name: "POST /index/published (delta)",
-        statements: 8,
-        rows_read: 488,
-        rows_written: 200,
+        statements: 70,
+        rows_read: 1_400,
+        rows_written: 900,
         wall_ms: 500,
     },
     DriveBudget {
