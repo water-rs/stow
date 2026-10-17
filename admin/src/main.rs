@@ -9,6 +9,7 @@
 //! stdout writers are the final renderers in `render.rs`.
 
 mod artifacts;
+mod builds;
 mod cache;
 mod cloudflare;
 mod coverage;
@@ -101,6 +102,8 @@ enum Command {
     Preheat(preheat::PreheatArgs),
     /// Inspect GitHub Actions build runs.
     Runs(runs::RunsArgs),
+    /// The daily failed-build digest (stow#778).
+    Builds(builds::BuildsArgs),
     /// Inspect and prune the artifact catalog.
     Artifacts(artifacts::ArtifactsArgs),
     /// GitHub Actions cache usage and eviction.
@@ -233,6 +236,7 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         Command::Coverage(args) => coverage::run(&Edge::connect().await?, args, output).await,
         Command::Preheat(args) => preheat::run(args, output).await,
         Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
+        Command::Builds(args) => builds::run(&github_token().await?, args, output).await,
         Command::Artifacts(args) => artifacts::run(&Edge::connect().await?, args, output).await,
         Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
         Command::Maintenance(args) => maintenance::run(args, output).await,
