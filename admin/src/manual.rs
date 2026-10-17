@@ -3744,11 +3744,14 @@ mod tests {
         assert_eq!(runs[0].workflow_run_id, 7);
         let heads = server.join().await;
         assert_eq!(heads.len(), 2);
-        for head in &heads {
+        for request in &heads {
             assert!(
-                !head.headers.contains_key(http::header::AUTHORIZATION),
+                !request
+                    .head
+                    .headers
+                    .contains_key(http::header::AUTHORIZATION),
                 "the local read must not send an Authorization header: {:?}",
-                head.headers
+                request.head.headers
             );
         }
     }

@@ -392,6 +392,13 @@ pub enum GetArtifactError {
     /// never help.
     #[error("{0}", status = PAYLOAD_TOO_LARGE)]
     TooLarge(String),
+    /// The scheduler refused a report that conflicts with the state it
+    /// holds — a delta slice report on a stale `base_generation`, or a
+    /// request outcome naming a superseded attempt. Retrying the same
+    /// report can never apply; the caller resyncs (a full slice
+    /// report) or drops it (a superseded outcome).
+    #[error("{0}", status = CONFLICT)]
+    SchedulerConflict(String),
     /// The scheduler refused a submit with 429 — on the human lane the
     /// daily task budget, on the miss lane the pending-depth cap.
     /// Handlers that know the retry semantics answer a `Retry-After`
@@ -423,6 +430,14 @@ impl From<SchedulerClientError> for GetArtifactError {
             SchedulerClientError::Http {
                 status: 503, body, ..
             } => Self::DispatchFrozen(scheduler_error_message(&body).to_owned()),
+            // A 409 is a conflict with the object's live state — the
+            // slice-generation conflict and the superseded-attempt
+            // refusal — and flattening it to 400 would hide the
+            // resync signal the reporter keys on. The message unwraps
+            // the same `{"error": ...}` envelope as the 429/503 arms.
+            SchedulerClientError::Http {
+                status: 409, body, ..
+            } => Self::SchedulerConflict(scheduler_error_message(&body).to_owned()),
             // A 4xx from the scheduler is a client problem — e.g. a
             // submit naming a task the queue never held — and the body
             // is the scheduler's own client-safe message, so it reaches
@@ -472,7 +487,7 @@ impl From<ResolverError> for GetArtifactError {
 
 #[cfg(test)]
 mod tests {
-    use super::{GetArtifactError, ResolverError};
+    use super::{GetArtifactError, ResolverError, SchedulerClientError};
     use skyzen::{HttpError as _, StatusCode};
 
     /// An upstream fetch failure stays a server error — its detail is
@@ -484,5 +499,25 @@ mod tests {
             "fetch crates.io: refused".to_owned(),
         ));
         assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The scheduler's 409 — here a delta slice report on a stale
+    /// `base_generation` — keeps its status and its `{"error": ...}`
+    /// message through the admin index route's forward path, because the
+    /// reporter's resync keys on the conflict code (stow#780).
+    #[test]
+    fn scheduler_conflict_maps_to_409() {
+        let error = GetArtifactError::from(SchedulerClientError::Http {
+            url: "https://scheduler.internal/index/published".to_owned(),
+            status: 409,
+            body:
+                r#"{"error":"slice report base generation 3 conflicts with the live generation 1"}"#
+                    .to_owned(),
+        });
+        assert_eq!(error.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            error.to_string(),
+            "slice report base generation 3 conflicts with the live generation 1"
+        );
     }
 }
