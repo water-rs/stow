@@ -491,6 +491,12 @@ fn queue_seed_insert_sql(
             ),
         ),
     );
+    // `shape_requeue` seeds 0 on every row — the state production
+    // actually carries: only the requeue itself writes the latch, in
+    // the same statement that flips the row back to `pending`, so a
+    // stored `completed` row is never latched (stow#785 — seeding 1
+    // there hid the repair scan's completed-history cost from the
+    // drives).
     format!(
         "WITH RECURSIVE seq(n) AS ({seq_source}) \
          {verb} INTO queue ({columns}) \
@@ -516,7 +522,7 @@ fn queue_seed_insert_sql(
                 {updated_at}, \
                 CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
                 0, \
-                0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
+                0, 1, 0, \
                 CASE WHEN n > {failed_end} THEN 'run-' || n ELSE NULL END, \
                 lower(hex(randomblob(16))), \
                 0, 0, {wake}, {family}, {value}, {key}, \
@@ -1118,7 +1124,7 @@ pub async fn rearm(
     // The mutation drives' exact targets. `pending_row`/`failed_row`
     // and friends are the same positional helpers the drives select
     // with, so the restore cannot drift from the selectors.
-    let restored = [
+    let mut restored = vec![
         101, // the resync's fixture identity (its edge set re-seeded below)
         FixtureShape::pending_row(701),
         FixtureShape::pending_row(702),
@@ -1130,6 +1136,17 @@ pub async fn rearm(
         shape.running_row(),
         shape.dispatched_row(0),
     ];
+    // The delta report's retire band: its dispatch tail's shape
+    // requeue can flip those completed deps back to `pending` (the
+    // repair the corrected `shape_requeue` seed finally lets the
+    // drives see, stow#785) — re-seed them to completed truth.
+    {
+        let live = shape.slice_live_rows(0);
+        let first = shape.slice_first_row(0);
+        for i in 0..super::drives::DELTA_ROWS {
+            restored.push(first + (live - 1 - i) * 9);
+        }
+    }
     // The attempt the running target is at *before* the upsert rewrites
     // it to the seeded 1 — read first so the restore below can step the
     // epoch forward instead of letting the next pass reuse it.
@@ -1200,7 +1217,7 @@ pub async fn rearm(
     // dependents of every dep a drive touched — recomputed through the
     // same expressions the production transitions use, over a set
     // bounded by the touched ids, not by the queue.
-    let mut touched: Vec<u32> = restored.to_vec();
+    let mut touched: Vec<u32> = restored.clone();
     touched.extend_from_slice(&claimed_ns);
     for i in 0..super::drives::DELTA_ROWS {
         touched.push(first + (live - 1 - i) * 9);

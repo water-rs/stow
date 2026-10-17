@@ -2967,9 +2967,15 @@ async fn a_submit_gates_each_new_task_on_its_published_deps() {
     // a native target dep requires, and `dep-short` at only the linked
     // shape. Publish it after the fabricated edges exist so the real
     // slice-delta path initializes the persisted `dep_met` flags.
-    super::record_published_slice(&db, TARGET, RUSTC, None, None, &gate_pub_rows(), &[])
-        .await
-        .expect("record shared published slice");
+    super::record_published_slice(
+        &db,
+        &settings(),
+        TARGET,
+        RUSTC,
+        &slice_report(None, None, &gate_pub_rows(), &[]),
+    )
+    .await
+    .expect("record shared published slice");
     assert_pair_flags_after_publication(&db).await;
 
     let inserted = enqueue(
@@ -3939,9 +3945,15 @@ async fn publish(db: &DurableDb, crate_name: &str) {
             unit_shape: shape(UnitSide::Target, UnitInvocation::Native, *kind),
         })
         .collect::<Vec<_>>();
-    super::record_published_slice(db, TARGET, RUSTC, None, None, &rows, &[])
-        .await
-        .expect("record published slice");
+    super::record_published_slice(
+        db,
+        &settings(),
+        TARGET,
+        RUSTC,
+        &slice_report(None, None, &rows, &[]),
+    )
+    .await
+    .expect("record published slice");
 }
 
 /// The same, carrying the row's unit shape — what `index report`
@@ -3957,9 +3969,31 @@ async fn publish_shapes(db: &DurableDb, crate_name: &str, target: &str, shapes: 
             unit_shape: *shape,
         })
         .collect::<Vec<_>>();
-    super::record_published_slice(db, target, RUSTC, None, None, &rows, &[])
-        .await
-        .expect("record shaped published slice");
+    super::record_published_slice(
+        db,
+        &settings(),
+        target,
+        RUSTC,
+        &slice_report(None, None, &rows, &[]),
+    )
+    .await
+    .expect("record shaped published slice");
+}
+
+/// The report body every test publish shares — `generation` is only
+/// set by resync paths, which name it explicitly.
+fn slice_report(
+    base_generation: Option<i64>,
+    generation: Option<i64>,
+    added: &[stow_types::api::PublishedSliceRow],
+    retired: &[stow_types::api::PublishedSliceRow],
+) -> stow_types::api::PublishedSliceReport {
+    stow_types::api::PublishedSliceReport {
+        base_generation,
+        generation,
+        added: added.to_vec(),
+        retired: retired.to_vec(),
+    }
 }
 
 /// Completed is not servable: a dependency whose build landed but
@@ -4274,12 +4308,10 @@ async fn a_slice_delta_flips_the_matched_edges_and_moves_the_counter() {
     // rows: the first-dep edge is already met and must not flip.
     super::record_published_slice(
         &db,
+        &settings(),
         TARGET,
         RUSTC,
-        Some(1),
-        None,
-        &dep_slice_rows("second-dep"),
-        &[],
+        &slice_report(Some(1), None, &dep_slice_rows("second-dep"), &[]),
     )
     .await
     .expect("delta publish second-dep");
@@ -4324,12 +4356,10 @@ async fn a_slice_delta_retire_flips_the_edges_back_and_increments_the_counter() 
     // delta reports against it.
     super::record_published_slice(
         &db,
+        &settings(),
         TARGET,
         RUSTC,
-        Some(1),
-        None,
-        &[],
-        &dep_slice_rows("dep"),
+        &slice_report(Some(1), None, &[], &dep_slice_rows("dep")),
     )
     .await
     .expect("delta retire dep");
@@ -4436,12 +4466,15 @@ async fn net_zero_slice_flips_refresh_blocked_and_replays_preserve_counters() {
     for base in [1, 2] {
         super::record_published_slice(
             &db,
+            &settings(),
             TARGET,
             RUSTC,
-            Some(base),
-            None,
-            &dep_slice_rows("failed-dep"),
-            &dep_slice_rows("other-dep"),
+            &slice_report(
+                Some(base),
+                None,
+                &dep_slice_rows("failed-dep"),
+                &dep_slice_rows("other-dep"),
+            ),
         )
         .await
         .expect("swap or replay slice membership");
@@ -4468,9 +4501,15 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
     .expect("enqueue dependencies");
     let mut initial_rows = dep_slice_rows("dep-a");
     initial_rows.extend(dep_slice_rows("dep-b"));
-    super::record_published_slice(&db, TARGET, RUSTC, None, None, &initial_rows, &[])
-        .await
-        .expect("publish nonfatal dependencies");
+    super::record_published_slice(
+        &db,
+        &settings(),
+        TARGET,
+        RUSTC,
+        &slice_report(None, None, &initial_rows, &[]),
+    )
+    .await
+    .expect("publish nonfatal dependencies");
     enqueue(
         &db,
         &[request(
@@ -4504,12 +4543,10 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
     retired.extend(dep_slice_rows("dep-b"));
     super::record_published_slice(
         &db,
+        &settings(),
         TARGET,
         RUSTC,
-        Some(1),
-        None,
-        &dep_slice_rows("fatal-dep"),
-        &retired,
+        &slice_report(Some(1), None, &dep_slice_rows("fatal-dep"), &retired),
     )
     .await
     .expect("clear fatal and retire two nonfatal deps");
@@ -4523,12 +4560,10 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
 
     super::record_published_slice(
         &db,
+        &settings(),
         TARGET,
         RUSTC,
-        Some(2),
-        None,
-        &retired,
-        &dep_slice_rows("fatal-dep"),
+        &slice_report(Some(2), None, &retired, &dep_slice_rows("fatal-dep")),
     )
     .await
     .expect("reintroduce fatal blocker and serve nonfatal deps");
@@ -4542,12 +4577,10 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
 
     super::record_published_slice(
         &db,
+        &settings(),
         TARGET,
         RUSTC,
-        Some(3),
-        None,
-        &[],
-        &dep_slice_rows("dep-a"),
+        &slice_report(Some(3), None, &[], &dep_slice_rows("dep-a")),
     )
     .await
     .expect("retire a nonfatal dependency while fatal remains unmet");
@@ -4883,9 +4916,15 @@ async fn a_larger_slice_reports_whole() {
             })
         })
         .collect::<Vec<_>>();
-    super::record_published_slice(&db, TARGET, RUSTC, None, None, &rows, &[])
-        .await
-        .expect("record wide slice");
+    super::record_published_slice(
+        &db,
+        &settings(),
+        TARGET,
+        RUSTC,
+        &slice_report(None, None, &rows, &[]),
+    )
+    .await
+    .expect("record wide slice");
 
     let last = format!("crate-{}", REPORT_ROWS - 1);
     enqueue(&db, &[request("parent", &[dependency(&last)])])
@@ -6268,10 +6307,13 @@ async fn a_small_slot_pass_reads_one_page_not_the_frontier() {
 }
 
 /// A dependency reported `completed` whose published rows never
-/// covered a dependent's required shapes is not done: the claim pass
-/// re-queues it once — behind the existing backoff — so the rebuild
-/// republishes real shapes (stow#367). The latch holds, so a still-
-/// uncovered second completion does not loop the rebuild.
+/// covered a dependent's required shapes is not done — but the verdict
+/// is decidable only at the report that publishes the dep's own rows
+/// (stow#785): between `complete()` and the slice report every freshly
+/// built dep *looks* uncovered, so a claiming pass must not repair —
+/// the report whose rows still miss the required shape re-queues it
+/// once, behind the existing backoff (stow#367). The latch holds, so a
+/// still-uncovered second completion does not loop the rebuild.
 #[tokio::test]
 async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
     let db = memory_db().await.expect("memory db");
@@ -6283,13 +6325,31 @@ async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
         .expect("enqueue parent");
     mark_active(&db, "dep", TARGET, "completed").await;
 
+    // stow#785 regression: the pass cannot requeue before any report —
+    // "completed with an unmet edge" is undecidable at claim time.
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
-    assert!(
-        claimed.is_empty(),
-        "the requeued dep sits behind its backoff and the parent stays gated"
+    assert!(claimed.is_empty(), "the parent stays gated");
+    assert_eq!(
+        row_column(&db, "dep", "status").await,
+        "completed",
+        "a pass before the dep's own report cannot judge coverage"
     );
+
+    // The report that publishes the dep's rows — still missing the
+    // edge's invocation — is the event that decides.
+    publish_shapes(
+        &db,
+        "dep",
+        TARGET,
+        &[shape(
+            UnitSide::Target,
+            UnitInvocation::Target,
+            UnitKind::Linked,
+        )],
+    )
+    .await;
     assert_eq!(row_column(&db, "dep", "status").await, "pending");
     let latch = db
         .query("SELECT shape_requeue FROM queue WHERE task_id = ?")
@@ -6323,14 +6383,28 @@ async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
     .await
     .expect("complete dep");
 
+    // A still-uncovered follow-up report sees the latch — no second
+    // requeue — even though the repair statement ran.
+    publish_shapes(
+        &db,
+        "dep",
+        TARGET,
+        &[shape(
+            UnitSide::Target,
+            UnitInvocation::Target,
+            UnitKind::Unlinked,
+        )],
+    )
+    .await;
+    assert_eq!(
+        row_column(&db, "dep", "status").await,
+        "completed",
+        "the latch blocks a second re-queue"
+    );
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim after second completion");
-    assert!(
-        claimed.is_empty(),
-        "the latch blocks a second re-queue; the parent waits for the publish"
-    );
-    assert_eq!(row_column(&db, "dep", "status").await, "completed");
+    assert!(claimed.is_empty(), "the parent waits for coverage");
 
     publish(&db, "dep").await;
     let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
@@ -7487,7 +7561,23 @@ async fn stale_recovery_and_shape_requeue_reprice_against_moved_cost() {
     .execute()
     .await
     .expect("resolve edge identity");
-    super::requeue_incomplete_shape_deps(&db, &settings())
+    // The repair now fires at the report that publishes the dep's
+    // rows (stow#785) — feed the changed-row payload directly.
+    let identity: String = db
+        .query("SELECT dependency_identity FROM queue WHERE task_id = ?")
+        .bind(task_id_on("shaped", TARGET))
+        .fetch_scalar::<String>()
+        .await
+        .expect("shaped identity");
+    let changed = serde_json::json!([{
+        "crate_name": "shaped",
+        "version": VERSION,
+        "features_json": "[]",
+        "unit_side": 0,
+        "dependency_identity": identity,
+    }])
+    .to_string();
+    super::requeue_incomplete_shape_deps(&db, &settings(), &changed, TARGET, RUSTC)
         .await
         .expect("shape requeue");
     assert_eq!(status_of(&db, "shaped").await, "pending");
@@ -8106,9 +8196,15 @@ async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    super::record_published_slice(&db, TARGET, RUSTC, None, None, &slice_rows, &[])
-        .await
-        .expect("publish dep slice");
+    super::record_published_slice(
+        &db,
+        &settings(),
+        TARGET,
+        RUSTC,
+        &slice_report(None, None, &slice_rows, &[]),
+    )
+    .await
+    .expect("publish dep slice");
 
     let claimed = super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
         .await
@@ -8182,9 +8278,15 @@ async fn dispatch_fails_on_a_missing_node_naming_it() {
             unit_shape: shape(UnitSide::Target, UnitInvocation::Native, *kind),
         })
         .collect::<Vec<_>>();
-    super::record_published_slice(&db, TARGET, RUSTC, None, None, &rows, &[])
-        .await
-        .expect("publish leaf slice");
+    super::record_published_slice(
+        &db,
+        &settings(),
+        TARGET,
+        RUSTC,
+        &slice_report(None, None, &rows, &[]),
+    )
+    .await
+    .expect("publish leaf slice");
 
     // Delete the leaf's node row: the store can no longer serve it.
     db.query("DELETE FROM task_nodes WHERE task_id = ?")
@@ -8261,5 +8363,141 @@ async fn resubmit_rows_written_per_statement() {
     assert_eq!(
         total_written, 0,
         "a fully deduplicated resubmit writes nothing (stow#784)"
+    );
+}
+
+/// `completed` stored completed rows exactly as `complete` leaves
+/// them (`shape_requeue = 0`) plus `owners` blocked pending rows, each
+/// holding an unmet edge onto a distinct failed dep — the blocked set
+/// and the completed set vary independently.
+async fn seed_blocked_fixture(db: &DurableDb, owners: u32, completed: u32) {
+    let insert_queue = "INSERT INTO queue (task_id, crate_name, version, features_json, target, \
+         rustc_version, dependency_identity, explicit_spelling, status, attempt, \
+         dispatch_family) \
+         VALUES (?, ?, '1.0.0', '[]', 'x86_64-unknown-linux-gnu', '1.85.0', ?, 0, \
+         ?, 1, 'linux')";
+    for i in 0..completed {
+        db.query(insert_queue)
+            .bind(format!("t{i}"))
+            .bind(format!("c{i}"))
+            .bind(format!("d{i}"))
+            .bind("completed")
+            .execute()
+            .await
+            .expect("seed completed row");
+    }
+    for i in 0..owners {
+        db.query(insert_queue)
+            .bind(format!("f{i}"))
+            .bind(format!("fc{i}"))
+            .bind(format!("fd{i}"))
+            .bind("failed")
+            .execute()
+            .await
+            .expect("seed failed dep");
+        db.query(insert_queue)
+            .bind(format!("w{i}"))
+            .bind(format!("wc{i}"))
+            .bind(format!("wd{i}"))
+            .bind("pending")
+            .execute()
+            .await
+            .expect("seed pending owner");
+        db.query(
+            "INSERT INTO queue_dependencies \
+             (task_id, depends_on_task_id, dep_dependency_identity, dep_met) \
+             VALUES (?, ?, ?, 0)",
+        )
+        .bind(format!("w{i}"))
+        .bind(format!("f{i}"))
+        .bind(format!("fd{i}"))
+        .execute()
+        .await
+        .expect("seed unmet edge");
+    }
+}
+
+/// stow#785: per-event cost tracks the event, not stored rows. The
+/// claiming pass does no repair — its reads are flat across all four
+/// combinations of 20 vs 200 blocked pending owners and 20 vs 200
+/// completed rows — and a slice report's reads track its own delta,
+/// never the queue it lands on (within the `do_budgets` growth
+/// tolerance). Structural pins keep the repair statement out of the
+/// pass and driven from the report payload, not from stored history.
+#[tokio::test]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "row counts are far below f64's exact-integer range"
+)]
+async fn per_event_costs_track_the_event_not_stored_history() {
+    let mut pass_reads = Vec::new();
+    let mut report_reads = Vec::new();
+    for (owners, completed) in [(20_u32, 20_u32), (200, 20), (20, 200), (200, 200)] {
+        let (db, log) = counting_memory_db().await.expect("counting db");
+        seed_blocked_fixture(&db, owners, completed).await;
+        log.lock().expect("log").clear();
+
+        let claimed = super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
+            .await
+            .expect("claim");
+        assert!(claimed.is_empty());
+        let pass = log.lock().expect("log").clone();
+        assert!(
+            !pass.iter().any(|s| s.sql.contains("shape_requeue = 1")),
+            "the alarm pass does no repair — the verdict lives in the report"
+        );
+        pass_reads.push(pass.iter().map(|s| s.rows_read).sum::<u64>());
+
+        // A fixed two-row report naming an identity no queue row
+        // carries: its reads must track the delta, not the stored
+        // queue behind it.
+        log.lock().expect("log").clear();
+        let rows = [UnitKind::Linked, UnitKind::Unlinked]
+            .iter()
+            .map(|kind| stow_types::api::PublishedSliceRow {
+                dependency_identity: dep_identity("probe-dep"),
+                crate_name: "probe-dep".parse().expect("crate name"),
+                version: VERSION.parse().expect("semver"),
+                features_json: FeaturesJson::default(),
+                unit_shape: shape(UnitSide::Target, UnitInvocation::Native, *kind),
+            })
+            .collect::<Vec<_>>();
+        super::record_published_slice(
+            &db,
+            &settings(),
+            TARGET,
+            RUSTC,
+            &slice_report(None, None, &rows, &[]),
+        )
+        .await
+        .expect("record report");
+        let report = log.lock().expect("log").clone();
+        let repair = report
+            .iter()
+            .find(|s| s.sql.contains("shape_requeue = 0"))
+            .expect("the report ran the shape-repair candidate probe");
+        assert!(
+            repair.sql.contains("json_each") && !repair.sql.contains("o.status = 'pending'"),
+            "the repair must drive from the report's own payload, \
+             not stored rows: {}",
+            repair.sql
+        );
+        report_reads.push(report.iter().map(|s| s.rows_read).sum::<u64>());
+    }
+    let (pass_min, pass_max) = (
+        pass_reads.iter().copied().min().expect("min"),
+        pass_reads.iter().copied().max().expect("max"),
+    );
+    assert!(
+        !stow_types::do_budgets::grew(pass_min as f64, pass_max as f64),
+        "pass reads grew with stored rows: {pass_reads:?}"
+    );
+    let (report_min, report_max) = (
+        report_reads.iter().copied().min().expect("min"),
+        report_reads.iter().copied().max().expect("max"),
+    );
+    assert!(
+        !stow_types::do_budgets::grew(report_min as f64, report_max as f64),
+        "report reads grew with stored rows: {report_reads:?}"
     );
 }

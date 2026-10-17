@@ -298,22 +298,29 @@ const BUDGETS: &[RouteBudget] = &[
     // The explicit full report — first publish and `index report --full`
     // resyncs — whose server-side diff reads the live slice (a
     // legitimate bound: the report body names every row).
+    // The whole route (stow#785): the report — with its commit-time
+    // shape repair — plus the `dispatch_pending` claiming tail and
+    // wake re-plan. The 10k host gate measured 37 statements, 106
+    // reads, 101 writes.
     RouteBudget {
         name: "POST /index/published (full)",
-        statements: 8,
-        rows_read: 500,
-        rows_written: 150,
+        statements: 90,
+        rows_read: 600,
+        rows_written: 300,
         scan_allowlist: &[],
     },
     // A report whose membership moved by DELTA_ROWS: the gate writes
     // touch only the changed rows' matched edges and their owners'
     // counters, so its cost is proportional to the delta, never to the
-    // slice or the graph (stow#521).
+    // slice or the graph (stow#521) — plus the same dispatch tail as
+    // the full drive and the report-time shape repair, which can
+    // requeue the deps the retire just uncovered. The 10k host gate
+    // measured 39 statements, 171 reads, 84 writes.
     RouteBudget {
         name: "POST /index/published (delta)",
-        statements: 16,
-        rows_read: 60,
-        rows_written: 200,
+        statements: 110,
+        rows_read: 600,
+        rows_written: 300,
         scan_allowlist: &[],
     },
     // The alarm's dispatch pass on a warm queue: the claim pages at
@@ -325,11 +332,7 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 90,
         rows_read: 400,
         rows_written: 150,
-        // `idx_queue_shape_requeue` is a partial index — `WHERE
-        // status='completed' AND shape_requeue=0` — so EXPLAIN calls the
-        // walk a SCAN but it covers only completed rows a prior pass
-        // already flagged for repair: a ~0-entry set on a warm queue.
-        scan_allowlist: &["idx_queue_shape_requeue"],
+        scan_allowlist: &[],
     },
     RouteBudget {
         // The pass's fixed floor under paused dispatch: recovery probes
@@ -338,7 +341,7 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 12,
         rows_read: 80,
         rows_written: 4,
-        scan_allowlist: &["idx_queue_shape_requeue"],
+        scan_allowlist: &[],
     },
     RouteBudget {
         // One real dispatch pass over the floored queue — the same
@@ -349,7 +352,7 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 90,
         rows_read: 500,
         rows_written: 150,
-        scan_allowlist: &["idx_queue_shape_requeue"],
+        scan_allowlist: &[],
     },
     // Every demand-feed cap below is PROVISIONAL: host-measured on the
     // 10k gate, pending actual workerd billed measurements — host
