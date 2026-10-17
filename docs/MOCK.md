@@ -128,7 +128,8 @@ never calls the edge — and reports completion through the same
 fixture's `STOW_GITHUB_WEBHOOK_SECRET`. `stow-admin index sync` then
 mirrors the verified records into D1 behind the developer's GitHub
 token (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`), which the edge
-checks against the owner's push access to `water-rs/stow`.
+checks for push access to `water-rs/stow` — against the mock registry's
+GitHub stub (`STOW_GITHUB_API_URL`), never the real API.
 The edge owns the only D1-write credential.
 
 ## Bring services up
