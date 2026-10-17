@@ -55,7 +55,7 @@ pub enum PriorAlarm {
 /// (`status`, `error_msg`), `recover_stale_active_tasks` (`status`,
 /// `error_msg`, `deps_met`, `blocked`, `wake_at`),
 /// `requeue_incomplete_shape_deps` (`status`, `attempt`, `error_msg`,
-/// `request_count`, `deps_met`, `blocked`, `not_before`, `wake_at`,
+/// `deps_met`, `blocked`, `not_before`, `wake_at`,
 /// `shape_requeue`), and `apply_key_updates` (`value`, `dispatch_key`,
 /// `dispatch_eligible`) on the transitioned ids (stow#525).
 #[derive(Debug, Clone, skyzen::FromRow)]
@@ -64,7 +64,6 @@ pub struct RestoreQueueRow {
     status: String,
     attempt: i64,
     error_msg: Option<String>,
-    request_count: i64,
     deps_met: i64,
     blocked: i64,
     not_before: Option<String>,
@@ -86,7 +85,7 @@ pub struct RestoreQueueRow {
 
 /// The `RestoreQueueRow` column list, kept beside the struct so the
 /// snapshot queries and the restore UPDATE can't drift apart.
-const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, request_count, \
+const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, \
      deps_met, blocked, not_before, wake_at, CAST(value AS TEXT) AS value, dispatch_key, \
      dispatch_eligible, \
      generation_id, dispatch_attempts, github_run_id, claimed_at, updated_at, shape_requeue";
@@ -1498,7 +1497,7 @@ pub const DRIVES: &[Drive] = &[
                     match db
                         .query(
                             "UPDATE queue SET status = ?, attempt = ?, error_msg = ?, \
-                                 request_count = ?, deps_met = ?, blocked = ?, \
+                                 deps_met = ?, blocked = ?, \
                                  not_before = ?, wake_at = ?, value = CAST(? AS INTEGER), \
                                  dispatch_key = ?, dispatch_eligible = ?, \
                                  generation_id = ?, dispatch_attempts = ?, \
@@ -1509,7 +1508,6 @@ pub const DRIVES: &[Drive] = &[
                         .bind(row.status.clone())
                         .bind(row.attempt)
                         .bind(row.error_msg.clone())
-                        .bind(row.request_count)
                         .bind(row.deps_met)
                         .bind(row.blocked)
                         .bind(row.not_before.clone())

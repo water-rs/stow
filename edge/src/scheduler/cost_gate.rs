@@ -275,14 +275,15 @@ const BUDGETS: &[RouteBudget] = &[
         rows_written: 20,
         scan_allowlist: &[],
     },
-    // The same batch submitted again: writes collapse to the task
-    // upserts and the budget charge — the edge set is identical, so
-    // the delta sync deletes nothing and the insert conflicts out.
+    // The same batch submitted again, fully deduplicated (stow#784):
+    // `plan_enqueue` emits an update only when a request moves stored
+    // state, so the whole resubmit is the status probe plus the
+    // task_nodes upsert conflicts — zero rows written.
     RouteBudget {
         name: "POST /admin/enqueue (resubmit)",
-        statements: 16,
-        rows_read: 120,
-        rows_written: 12,
+        statements: 4,
+        rows_read: 20,
+        rows_written: 0,
         scan_allowlist: &[],
     },
     RouteBudget {
