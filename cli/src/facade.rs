@@ -38,7 +38,7 @@ const WILDCARD: &str = "*";
 /// The bound on a facade's wait for a pending serve map: long enough for
 /// the driver's fresh slice fetch to land, short enough that a stuck
 /// fetch cannot stall the build's unit queue past it (stow#347).
-const SERVE_MAP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const SERVE_MAP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The serve decision, distilled to what a facade can look up before its
 /// runtime exists: which `(crate, version)` pairs this build could serve,
@@ -58,11 +58,12 @@ pub struct ServeMap {
     pub host: Vec<(String, String)>,
     /// The map may still grow: the driver wrote it from its cached slices
     /// alone because the fresh index fetch could not finish before cargo
-    /// started (stow#347). A facade whose crate the map names but whose
-    /// unit it does not cover asks the supervisor — `AwaitServeMap` over
-    /// the build's existing transport — to hold it until the driver's
-    /// full analysis rewrites this file with `pending` cleared, rather
-    /// than compiling a unit the fetch may be about to cover.
+    /// started (stow#347). A facade serving a registry unit the map does
+    /// not cover asks the supervisor — `AwaitServeMap` over the build's
+    /// existing transport — to hold it until the driver's next write
+    /// clears the flag, rather than compiling a unit the fetch may be
+    /// about to cover (stow#788: "pending" means a fetch is in flight,
+    /// so the set of names it can add is not yet closed).
     #[serde(default)]
     pub pending: bool,
 }
@@ -115,20 +116,6 @@ impl ServeMap {
             entry_name == canonical_name && (entry_version == version || entry_version == WILDCARD)
         })
     }
-
-    /// Whether the build ever covered `name`: any version, either side.
-    /// A pending map's wait applies only to a crate this could still
-    /// gain coverage for — the local artifacts or a previous slice
-    /// already know it, so the fresh fetch plausibly adds the shape
-    /// this unit needs; a crate nobody covered waits on a lottery, and
-    /// stalling every first-wave unit on that measured about 0.8 s over
-    /// cargo's own noise (stow#347).
-    fn names(&self, canonical_name: &str) -> bool {
-        self.target
-            .iter()
-            .chain(&self.host)
-            .any(|(entry_name, _)| entry_name == canonical_name)
-    }
 }
 
 /// What the facade settled before the runtime starts.
@@ -156,7 +143,12 @@ pub enum FastPath {
 /// principle but not in fact fails the build rather than silently
 /// compiling without it.
 pub fn try_invocation() -> stow_types::error::Result<FastPath> {
-    let args = crate::process_args();
+    try_invocation_with(&crate::process_args())
+}
+
+/// [`try_invocation`] over a spelled argv — the process's own comes
+/// from `crate::process_args`; a test hands the facade's argv in.
+fn try_invocation_with(args: &[OsString]) -> stow_types::error::Result<FastPath> {
     if args.get(1).and_then(|arg| arg.to_str()) != Some("rustc") {
         return Ok(FastPath::Defer);
     }
@@ -198,13 +190,13 @@ pub fn try_invocation() -> stow_types::error::Result<FastPath> {
     if invocation_covers(&map) {
         return Ok(FastPath::Defer);
     }
-    // A pending map's "not covered" is provisional — but only for a
-    // crate the build already covers at some shape. A crate the local
-    // artifacts and the cached slices never covered waits on a
-    // lottery, and measured against cargo that stall is above noise, so
-    // the facade compiles and units arriving after the final write
-    // still defer on it (stow#347).
-    if map.pending && map.names(&canonical_crate_name(&crate_name)) {
+    // A pending map's "not covered" is provisional while the build's
+    // fetch is still in flight: this is a registry unit (the
+    // `detect_registry_crate_version` gate above), so the settled map
+    // may cover it — wait for the final write rather than compiling a
+    // unit the fetch is about to cover (stow#347, stow#788).
+    // Non-registry and local units never reach this point.
+    if map.pending {
         await_serve_map(&endpoint, &token)?;
         map = ServeMap::read(&map_path)?;
         if invocation_covers(&map) {
@@ -346,6 +338,12 @@ impl ServeMapSignal {
     /// parked and the ones that have not asked yet.
     pub fn complete(&self) {
         self.latch.complete();
+    }
+
+    /// Whether the final write has landed — the at-once check for a
+    /// caller that waits only on a still-pending signal.
+    pub fn has_completed(&self) -> bool {
+        self.latch.has_completed()
     }
 
     /// Wait for [`Self::complete`], whether the completion lands before
@@ -772,5 +770,169 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), signal.wait())
             .await
             .expect("a waiter after completion returns at once");
+    }
+
+    /// The facade's fast path reads process env, and env is global to
+    /// the test process — one guard serializes every test that sets it,
+    /// for the same reason the lib tests hold theirs.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The argv cargo hands its wrapper for a registry crate unit:
+    /// `<wrapper> rustc <rustc> <unit args>` — `demo` 1.0.0 spelled
+    /// for a target, out of a registry src path.
+    fn registry_unit_argv(
+        out_dir: &std::path::Path,
+        registry_src: &std::path::Path,
+    ) -> Vec<std::ffi::OsString> {
+        let mut argv = vec![
+            std::ffi::OsString::from("stow"),
+            std::ffi::OsString::from("rustc"),
+            std::ffi::OsString::from("no-such-rustc"),
+            std::ffi::OsString::from("--crate-name"),
+            std::ffi::OsString::from("demo"),
+            std::ffi::OsString::from("--crate-type"),
+            std::ffi::OsString::from("lib"),
+            std::ffi::OsString::from("--emit"),
+            std::ffi::OsString::from("dep-info,metadata,link"),
+            std::ffi::OsString::from("--out-dir"),
+            out_dir.as_os_str().to_os_string(),
+            std::ffi::OsString::from("-C"),
+            std::ffi::OsString::from("metadata=demometa"),
+            std::ffi::OsString::from("-C"),
+            std::ffi::OsString::from("extra-filename=-demometa"),
+            std::ffi::OsString::from("--target"),
+            std::ffi::OsString::from("aarch64-apple-darwin"),
+        ];
+        argv.push(
+            registry_src
+                .join("index.crates.io-0123abcd/demo-1.0.0/src/lib.rs")
+                .into_os_string(),
+        );
+        argv
+    }
+
+    /// stow#788: a registry unit a pending map does not name waits for
+    /// the final write — the build's fetch may be about to cover it —
+    /// and re-reads the file before deciding. The settled write covers
+    /// the unit here, so the answer is the plan path, not a compile.
+    #[test]
+    fn a_pending_map_holds_an_unnamed_registry_unit() {
+        use std::time::{Duration, Instant};
+
+        let _guard = env_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let map_path = dir.path().join("serve-map.json");
+        let mut pending = map(&[], &[]);
+        pending.pending = true;
+        std::fs::write(&map_path, serde_json::to_vec(&pending).expect("map"))
+            .expect("write pending map");
+        let (port, server) =
+            serve_one_await(Duration::from_millis(150), &super::Answer::ServeMapReady);
+        let binary =
+            crate::supervisor::BinaryIdentity::of(&std::env::current_exe().expect("current exe"))
+                .expect("binary identity");
+        unsafe {
+            std::env::set_var(super::STOW_SERVE_MAP_FILE_ENV, &map_path);
+            std::env::set_var(crate::supervisor::ENDPOINT_ENV, format!("tcp:{port}"));
+            std::env::set_var(crate::supervisor::TOKEN_ENV, "the-token");
+            std::env::set_var(crate::supervisor::BINARY_ENV, binary.encode());
+            std::env::remove_var(crate::STOW_TRACE_WRAPPED_COMPILERS_ENV);
+            std::env::remove_var("STOW_IDENTITY_TRACE");
+        }
+        let args = registry_unit_argv(
+            &dir.path().join("deps"),
+            &dir.path().join("cargo_home/registry/src"),
+        );
+        let started = Instant::now();
+        let facade = std::thread::spawn(move || super::try_invocation_with(&args));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !facade.is_finished(),
+            "an unnamed registry unit answered before the map settled"
+        );
+        // The fetch's answer lands while the facade is parked: the
+        // settled map covers the unit, so the re-read defers it.
+        std::fs::write(
+            &map_path,
+            serde_json::to_vec(&map(&[("demo", "1.0.0")], &[])).expect("map"),
+        )
+        .expect("write settled map");
+        let outcome = facade
+            .join()
+            .expect("facade thread")
+            .expect("try_invocation");
+        server.join().expect("server thread");
+        let waited = started.elapsed();
+        unsafe {
+            std::env::remove_var(super::STOW_SERVE_MAP_FILE_ENV);
+            std::env::remove_var(crate::supervisor::ENDPOINT_ENV);
+            std::env::remove_var(crate::supervisor::TOKEN_ENV);
+            std::env::remove_var(crate::supervisor::BINARY_ENV);
+        }
+        assert!(waited >= Duration::from_millis(150), "{waited:?}");
+        assert!(
+            matches!(outcome, super::FastPath::Defer),
+            "the settled map covers the unit, so it defers to the plan path"
+        );
+    }
+
+    /// A settled map's "uncovered" is final: the facade goes straight to
+    /// the uncovered path — the wait must not even connect. The endpoint
+    /// accepts but answers no `AwaitServeMap`, so any wait would fail the
+    /// time bound (stow#347).
+    #[test]
+    fn a_settled_map_never_waits() {
+        use std::time::{Duration, Instant};
+
+        let _guard = env_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let map_path = dir.path().join("serve-map.json");
+        std::fs::write(&map_path, serde_json::to_vec(&map(&[], &[])).expect("map"))
+            .expect("write settled map");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accept the facade");
+            let mut sink = [0_u8; 4096];
+            while peer.read(&mut sink).is_ok_and(|read| read > 0) {}
+        });
+        let binary =
+            crate::supervisor::BinaryIdentity::of(&std::env::current_exe().expect("current exe"))
+                .expect("binary identity");
+        unsafe {
+            std::env::set_var(super::STOW_SERVE_MAP_FILE_ENV, &map_path);
+            std::env::set_var(crate::supervisor::ENDPOINT_ENV, format!("tcp:{port}"));
+            std::env::set_var(crate::supervisor::TOKEN_ENV, "the-token");
+            std::env::set_var(crate::supervisor::BINARY_ENV, binary.encode());
+            std::env::remove_var(crate::STOW_TRACE_WRAPPED_COMPILERS_ENV);
+            std::env::remove_var("STOW_IDENTITY_TRACE");
+        }
+        let args = registry_unit_argv(
+            &dir.path().join("deps"),
+            &dir.path().join("cargo_home/registry/src"),
+        );
+        let started = Instant::now();
+        let result = super::try_invocation_with(&args);
+        let elapsed = started.elapsed();
+        unsafe {
+            std::env::remove_var(super::STOW_SERVE_MAP_FILE_ENV);
+            std::env::remove_var(crate::supervisor::ENDPOINT_ENV);
+            std::env::remove_var(crate::supervisor::TOKEN_ENV);
+            std::env::remove_var(crate::supervisor::BINARY_ENV);
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a settled map must not wait: {elapsed:?}"
+        );
+        // `no-such-rustc` cannot spawn — the observed mark landed and
+        // the uncovered path ran: it reached the compile without the
+        // wait's hold.
+        assert!(result.is_err(), "the uncovered path ran rustc");
     }
 }
