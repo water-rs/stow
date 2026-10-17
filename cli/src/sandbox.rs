@@ -23,7 +23,10 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
-use heel::{Access, IpcRouter, Sandbox, SandboxConfigBuilder, SecurityConfig};
+use heel::{
+    Access, IpcRouter, IpcUnconfigured, Sandbox, SandboxConfig, SandboxConfigBuilder,
+    SecurityConfig,
+};
 use stow_types::error::Context;
 
 /// Whether heel has a backend for this platform (Linux, macOS, Windows).
@@ -197,9 +200,6 @@ impl BuildSandbox {
                 std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
             ))
             .heel_binary(request.runtime_executable);
-        if let Some(router) = request.ipc.take() {
-            builder = builder.ipc(router);
-        }
         for (path, access, reason) in sandbox_grants(&request).await? {
             // The kernel resolves paths through `/var` → `/private/var`
             // and friends; a grant spelled through a symlink does not
@@ -211,16 +211,17 @@ impl BuildSandbox {
             tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
             builder = builder.grant(path, access);
         }
+        let ipc = request.ipc.take();
         Ok(match request.network {
             SandboxNetwork::Allow => Self::AllowNetwork(
-                Sandbox::with_config(builder.network(heel::AllowAll).build())
+                Sandbox::with_config(build_config(builder.network(heel::AllowAll), ipc))
                     .await
                     .map_err(|error| {
                         stow_types::stow_error!("create the cargo build sandbox: {error}")
                     })?,
             ),
             SandboxNetwork::Deny => Self::DenyNetwork(
-                Sandbox::with_config(builder.network(heel::DenyAll).build())
+                Sandbox::with_config(build_config(builder.network(heel::DenyAll), ipc))
                     .await
                     .map_err(|error| {
                         stow_types::stow_error!("create the cargo build sandbox: {error}")
@@ -711,6 +712,20 @@ fn driver_probe_grants(
 /// inside a bounded burst while still finishing the usual one-driver
 /// set in a single wave.
 const PROBE_CONCURRENCY: usize = 8;
+
+/// Seal a configured builder, applying the supervisor's IPC router
+/// when one is registered — `ipc` moves the builder into the
+/// `IpcConfigured` typestate (heel#59), so the optional router can only
+/// be applied where `build` erases the difference.
+fn build_config<N: heel::NetworkPolicy>(
+    builder: SandboxConfigBuilder<N, IpcUnconfigured>,
+    ipc: Option<IpcRouter>,
+) -> SandboxConfig<N> {
+    match ipc {
+        Some(router) => builder.ipc(router).build(),
+        None => builder.build(),
+    }
+}
 
 /// The triples the build compiles for: an explicit `--target` or
 /// `CARGO_BUILD_TARGET`, plus the rustc host — build scripts and proc

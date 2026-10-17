@@ -86,12 +86,15 @@ clippy.multiple_crate_versions =  { level = "allow", priority = 1 }
 inherits = "release"
 lto = "thin"
 
-# heel's write-ahead audit log (lexoliu/heel#39) and its Windows grant fix
-# (lexoliu/heel#46: one ACL write per granted tree and no propagation from an
-# ancestor's traverse entry, which cut a Windows build sandbox's creation
-# from minutes to well under a second) are not in a release yet; the pin is
-# the exact commit on heel's dev and moves to a crates.io version once one
-# carries them.
+# heel's Windows grant fixes (lexoliu/heel#75): the AppContainer backend asks
+# Windows what the container already holds on a path — its package SID and
+# ALL APPLICATION PACKAGES — and writes an ACL entry only where that falls
+# short, so a read grant on a system directory changes nothing, and a
+# sandbox removes every entry it wrote when it drops. The pin also carries
+# 0.4.x: the native launch (heel#59), the IPC endpoint typestate and pipe
+# fixes, and process priorities. No crates.io release carries #75 yet, so
+# the pin is the exact commit on heel's dev and moves to a crates.io
+# version once one does.
 [patch.crates-io]
 # zenwave's QUIC keep-alive (zen-rs/zenwave#93): without it an HTTP/3 request
 # whose server takes longer than 30 s to answer dies at quinn's idle timeout,
@@ -106,7 +109,7 @@ lto = "thin"
 # in a release yet; the pin is the exact commit on zenwave's dev and moves to
 # a crates.io version once one carries them.
 zenwave = { git = "https://github.com/zen-rs/zenwave", rev = "776f9fd7d7626406b6300961e3a856e8f5297c69" }
-heel = { git = "https://github.com/lexoliu/heel", rev = "da72ac1abd8a7de66b7a4540fae9e2979e9b7616" }
+heel = { git = "https://github.com/lexoliu/heel", rev = "3296b90b2f0ce08fdba27f478f8fa586a97e8afb" }
 # cargo 0.99 (stow-resolver) pins rusqlite 0.40 → libsqlite3-sys ^0.38;
 # sqlx-sqlite releases cap below it, so two `links = "sqlite3"` crates
 # would conflict. sqlx main at this rev is 0.9.0 and allows
