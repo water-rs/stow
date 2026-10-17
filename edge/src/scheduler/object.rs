@@ -189,6 +189,7 @@ impl DurableObject for Scheduler {
             // carry; production requests hit the guard and 404.
             "/budget".post(scheduler_budget),
             "/budget/seed".post(scheduler_budget_seed),
+            "/budget/ledger".at(scheduler_budget_ledger),
             // Trusted demand batches — #522's demand input; reached
             // from `POST /api/v1/admin/scheduler/demand`.
             "/demand".post(scheduler_demand),
@@ -280,7 +281,26 @@ async fn scheduler_budget(
     ))
 }
 
-fn budget_probe_enabled(env: &WasmEnv) -> bool {
+/// `GET /budget/ledger` — the per-operation billed rows the meter booked
+/// since the last reset (stow#773). Same guard as the seed endpoint.
+/// Reached from `GET /api/v1/admin/scheduler/budget/ledger`.
+async fn scheduler_budget_ledger(
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::SchedulerLedger>> {
+    if !budget_probe_enabled(&env) {
+        return Err(
+            Error::msg("scheduler budget probe is not enabled on this deploy")
+                .set_status(StatusCode::NOT_FOUND),
+        );
+    }
+    Ok(Json(meter::ledger(&db).await.map_err(to_error)?))
+}
+
+/// Whether this deploy carries the budget probe — `STOW_SCHEDULER_BUDGET=1`,
+/// the mock stack only. The probe routes answer and the meter books its
+/// per-operation ledger only then.
+pub(super) fn budget_probe_enabled(env: &WasmEnv) -> bool {
     read_optional_string_binding(env, budget::BUDGET_PROBE_BINDING)
         .is_some_and(|value| value == "1")
 }
@@ -1103,6 +1123,11 @@ async fn record_published_index(
 async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static str> {
     let multiplier = cost_budget_multiplier(&env)?;
     let (db, meter) = Meter::wrap(db);
+    let meter = if budget_probe_enabled(&env) {
+        meter.with_ledger_op(stow_types::do_budgets::LEDGER_OP_ALARM.to_owned())
+    } else {
+        meter
+    };
     let result = async {
         dispatch_pending(&env, &db).await.map_err(|error| {
             tracing::error!(%error, "scheduler alarm dispatch_pending failed");

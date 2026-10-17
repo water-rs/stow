@@ -316,7 +316,7 @@ enum Dispatch {
 
 /// One run's state as the driver reads it — task-id keyed, so the
 /// GitHub `workflow_runs` rows (`display_title`) and the local server's
-/// `MockTaskRun` list fold onto the same record. Both title shapes parse
+/// `LocalCiRun` list fold onto the same record. Both title shapes parse
 /// through `parse_run_title`: a run whose title is not `<rustc>-<task_id>`
 /// is not one this wave could have dispatched.
 #[derive(Debug, Clone)]
@@ -2578,7 +2578,7 @@ async fn local_run_states(
     let url = format!("{base}/tasks");
     // The shared bounded idempotent read — the local server is
     // unauthenticated, so no operator token rides it.
-    let tasks: LocalTasksResponse = crate::github::get_url_json(&url, None, Backoff::new()).await?;
+    let tasks: stow_types::local_ci::LocalCiTasks = crate::github::get_url_json(&url, None, Backoff::new()).await?;
     Ok(tasks
         .tasks
         .into_iter()
@@ -2667,24 +2667,9 @@ struct GitRefObject {
     sha: String,
 }
 
-/// The local CI server's `GET /tasks` shape.
-#[derive(serde::Deserialize)]
-struct LocalTasksResponse {
-    tasks: Vec<LocalTaskRun>,
-}
-
 #[derive(serde::Deserialize)]
 struct WorkflowDispatchResponse {
     workflow_run_id: u64,
-}
-
-#[derive(serde::Deserialize)]
-struct LocalTaskRun {
-    workflow_run_id: u64,
-    display_title: String,
-    status: String,
-    conclusion: Option<String>,
-    html_url: String,
 }
 
 #[cfg(test)]

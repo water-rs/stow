@@ -75,7 +75,7 @@ pub async fn run_rustc_capture_wrapper(
     };
     if !original_parsed.is_restorable_artifact() || is_generated_wrapper_unit(&original_parsed) {
         let started = Instant::now();
-        let status = Command::new(rustc).args(&args).status().await?;
+        let status = rustc_status(rustc, &args).await?;
         // Cargo units that produce nothing restorable — and the generated
         // wrapper package's own units — are still reported, so a record
         // forged inside the sandbox collides with this genuine one instead
@@ -120,7 +120,7 @@ pub async fn run_rustc_capture_wrapper(
     }
 
     let started = Instant::now();
-    let output = Command::new(rustc).args(&effective_args).output().await?;
+    let output = rustc_output(rustc, &effective_args).await?;
     if !output.status.success() {
         replay_rustc_output(&output).await?;
         std::process::exit(output.status.code().unwrap_or(1));
@@ -148,6 +148,43 @@ pub async fn run_rustc_capture_wrapper(
     .await?;
     replay_rustc_output(&output).await?;
     std::process::exit(0);
+}
+
+/// Run the rustc cargo asked for and wait on its exit, its output
+/// streaming straight through. A `mock-compile` build lets the mock write
+/// the unit's outputs instead when the switch is on.
+async fn rustc_status(
+    rustc: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+) -> stow_types::error::Result<std::process::ExitStatus> {
+    #[cfg(feature = "mock-compile")]
+    if let Some(stderr) = crate::mock_compile::compile(args)? {
+        let mut handle = std::io::stderr().lock();
+        handle
+            .write_all(&stderr)
+            .wrap_err("write mock artifact notifications")?;
+        handle.flush().wrap_err("flush mock artifact notifications")?;
+        return Ok(std::process::ExitStatus::default());
+    }
+    Ok(Command::new(rustc).args(args).status().await?)
+}
+
+/// Run the rustc cargo asked for and capture its output for replay — or,
+/// in a `mock-compile` build with the switch on, the mock's outputs and
+/// the notifications they owe cargo.
+async fn rustc_output(
+    rustc: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+) -> stow_types::error::Result<async_process::Output> {
+    #[cfg(feature = "mock-compile")]
+    if let Some(stderr) = crate::mock_compile::compile(args)? {
+        return Ok(async_process::Output {
+            status: std::process::ExitStatus::default(),
+            stdout: Vec::new(),
+            stderr,
+        });
+    }
+    Ok(Command::new(rustc).args(args).output().await?)
 }
 
 /// Record a compiled restorable unit: the materialized output identities

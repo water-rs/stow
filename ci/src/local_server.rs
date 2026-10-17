@@ -33,29 +33,11 @@ use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
 use stow_types::api::{BuildTaskPayload, RequestDispatch};
+use stow_types::local_ci::LocalCiRun;
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
 
 type HmacSha256 = Hmac<Sha256>;
-
-/// One dispatched run's state, as `GET /tasks` reports it — the local
-/// stand-in for a GitHub Actions workflow run.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct MockTaskRun {
-    /// Numeric GitHub-compatible run identity, stable for this dispatch.
-    pub workflow_run_id: u64,
-    /// The run's name — `<rustc>-<task_id>`, the same shape
-    /// `build-crate.yml`'s `run-name` stamps on the real API.
-    pub display_title: String,
-    /// `queued`, `in_progress`, or `completed` — the GitHub Actions
-    /// `status` field's spelling.
-    pub status: &'static str,
-    /// `success` or `failure` once `status` is `completed`; `null`
-    /// before, exactly like the API.
-    pub conclusion: Option<&'static str>,
-    /// Where a human would look — the failure list prints it.
-    pub html_url: String,
-}
 
 /// Per-process state injected into every `/dispatch` invocation.
 #[derive(Clone)]
@@ -73,7 +55,7 @@ pub struct LocalServerState {
     /// Root directory the mock OCI registry serves out of.
     pub mock_registry_root: String,
     /// Every dispatched task's run state, served by `GET /tasks`.
-    pub runs: Arc<Mutex<BTreeMap<String, MockTaskRun>>>,
+    pub runs: Arc<Mutex<BTreeMap<String, LocalCiRun>>>,
     /// The local equivalent of GitHub assigning a fresh id to every
     /// workflow dispatch, including repeated task/attempt keys.
     next_run_id: Arc<AtomicU64>,
@@ -130,17 +112,50 @@ impl LocalServerState {
         status: &'static str,
         conclusion: Option<&'static str>,
     ) {
-        let entry = MockTaskRun {
-            workflow_run_id,
-            display_title: display_title.to_string(),
-            status,
-            conclusion,
-            html_url: format!("http://{}/tasks/{workflow_run_id}", self.listen),
-        };
-        self.runs
+        let now = unix_millis();
+        let mut runs = self.runs.lock().expect("runs mutex poisoned");
+        let entry = runs
+            .entry(workflow_run_id.to_string())
+            .or_insert_with(|| LocalCiRun {
+                workflow_run_id,
+                display_title: display_title.to_string(),
+                status: status.to_owned(),
+                conclusion: conclusion.map(str::to_owned),
+                html_url: format!("http://{}/tasks/{workflow_run_id}", self.listen),
+                dispatched_at_ms: now,
+                completed_at_ms: None,
+                error: None,
+                delivery_errors: Vec::new(),
+            });
+        status.clone_into(&mut entry.status);
+        entry.conclusion = conclusion.map(str::to_owned);
+        if status == "completed" {
+            entry.completed_at_ms = Some(now);
+        }
+    }
+
+    /// Record why a run failed.
+    fn record_error(&self, workflow_run_id: u64, error: &str) {
+        if let Some(run) = self
+            .runs
             .lock()
             .expect("runs mutex poisoned")
-            .insert(workflow_run_id.to_string(), entry);
+            .get_mut(&workflow_run_id.to_string())
+        {
+            run.error = Some(error.to_owned());
+        }
+    }
+
+    /// Record one refused `workflow_run` delivery attempt.
+    fn record_delivery_error(&self, workflow_run_id: u64, error: &str) {
+        if let Some(run) = self
+            .runs
+            .lock()
+            .expect("runs mutex poisoned")
+            .get_mut(&workflow_run_id.to_string())
+        {
+            run.delivery_errors.push(error.to_owned());
+        }
     }
 
     /// `run_title` under `build-crate.yml`'s convention for a task —
@@ -182,11 +197,6 @@ struct DispatchResponse {
     workflow_run_id: u64,
     run_url: String,
     html_url: String,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct TasksResponse {
-    tasks: Vec<MockTaskRun>,
 }
 
 /// Bind and serve the dev dispatch endpoint.
@@ -236,7 +246,7 @@ async fn list_tasks(State(state): State<LocalServerState>) -> Response {
         .values()
         .cloned()
         .collect();
-    json_response(&TasksResponse { tasks }, StatusCode::OK)
+    json_response(&stow_types::local_ci::LocalCiTasks { tasks }, StatusCode::OK)
 }
 
 /// `POST /dispatch` — the scheduler's one local fan-out: `build-crate`
@@ -270,6 +280,13 @@ async fn dispatch(
     }
 }
 
+/// Now as Unix milliseconds — the run record's clock.
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+}
+
 fn bad_request(error: &str) -> serde_json::Value {
     serde_json::json!({ "error": error })
 }
@@ -285,6 +302,7 @@ fn dispatch_build(state: LocalServerState, task: BuildTaskPayload) -> Response {
             run_dispatched_task(state_for_task.clone(), task.clone(), workflow_run_id).await
         {
             tracing::error!(task_id = %task.task_id, %error, "local CI dispatched task failed");
+            state_for_task.record_error(workflow_run_id, &error.to_string());
             state_for_task.mark_build_run(&task, workflow_run_id, "completed", Some("failure"));
             if let Err(report_error) = report_failed_task(
                 &state_for_task,
@@ -400,6 +418,8 @@ struct DispatchLayout {
     upload_plan_path: PathBuf,
     /// Artifact records `populate` writes for the records-artifact step.
     records_path: PathBuf,
+    /// The build stage's stderr — its final error names why it failed.
+    build_log_path: PathBuf,
 }
 
 impl DispatchLayout {
@@ -419,6 +439,7 @@ impl DispatchLayout {
         Ok(Self {
             upload_plan_path: output_dir.join("upload-plan.json"),
             records_path: task_root.join("records.json"),
+            build_log_path: task_root.join("build-stage.log"),
             task_root,
             output_dir,
         })
@@ -467,21 +488,18 @@ async fn run_dispatched_task(
     // else, exactly as the production build job does.
     let status = run_build_stage(&exe, &task_json, &layout).await?;
     if !status.success() {
-        let error = format!("stow-build exited with status {status}");
-        state.mark_build_run(&task, workflow_run_id, "completed", Some("failure"));
-        post_workflow_run(
-            &state,
-            &task_workflow_run(
-                &state,
-                &task,
-                workflow_run_id,
-                Some("failure"),
-                Some(error.clone()),
-            ),
-        )
-        .await?;
+        let error = format!(
+            "stow-build exited with status {status}: {}",
+            stage_error(&layout.build_log_path).await
+        );
         return Err(stow_types::stow_error!("{error}"));
     }
+    // The trusted publish stage's checks, run here exactly as `stow-build
+    // publish` runs them before its push: the mock registry below stands
+    // in for GHCR and cosign, not for the validation that gates them.
+    crate::validated_build_output(&task, &layout.output_dir)
+        .await
+        .map_err(|error| error.wrap_err("publish-stage validation"))?;
 
     // `stow-build build` exits non-zero when any cargo phase failed — the
     // outcome is binary now: a live process reached this line means the
@@ -505,7 +523,7 @@ async fn run_dispatched_task(
         .await;
     }
 
-    populate_mock_registry(&exe, &state, &task, workflow_run_id, &layout).await?;
+    populate_mock_registry(&exe, &state, &layout).await?;
     push_records(
         &state,
         &task,
@@ -519,7 +537,24 @@ async fn run_dispatched_task(
         &state,
         &task_workflow_run(&state, &task, workflow_run_id, Some("success"), None),
     )
-    .await
+    .await?;
+    // The runner a dispatch stands in for is ephemeral: a landed run
+    // leaves nothing behind, so a whole preheat wave does not keep every
+    // crate's unpacked workspace on disk. A failed run keeps its tree.
+    async_fs::remove_dir_all(&layout.task_root).await?;
+    Ok(())
+}
+
+/// The build stage's own final error: a `stow-build` that fails exits
+/// through `main`'s `Err`, which prints `Error: …` last on stderr.
+async fn stage_error(build_log_path: &Path) -> String {
+    match async_fs::read_to_string(build_log_path).await {
+        Ok(log) => log.rfind("Error: ").map_or_else(
+            || "no stage error recorded".to_owned(),
+            |at| log[at..].trim_end().to_owned(),
+        ),
+        Err(error) => format!("read {}: {error}", build_log_path.display()),
+    }
 }
 
 /// Spawn the untrusted `stow-build build` stage. It receives only the task
@@ -547,6 +582,7 @@ async fn run_build_stage(
             layout.task_root.join("workspace"),
         )
         .env("STOW_BUILD_TASK_JSON", task_json)
+        .stderr(std::fs::File::create(&layout.build_log_path)?)
         .status()
         .await?)
 }
@@ -565,8 +601,6 @@ async fn upload_plan_len(upload_plan_path: &Path) -> stow_types::error::Result<u
 async fn populate_mock_registry(
     exe: &Path,
     state: &LocalServerState,
-    task: &BuildTaskPayload,
-    workflow_run_id: u64,
     layout: &DispatchLayout,
 ) -> stow_types::error::Result<()> {
     let mock_registry_exe = exe
@@ -601,20 +635,9 @@ async fn populate_mock_registry(
     if populate_status.success() {
         return Ok(());
     }
-    let error = format!("mock registry populate exited with status {populate_status}");
-    state.mark_build_run(task, workflow_run_id, "completed", Some("failure"));
-    post_workflow_run(
-        state,
-        &task_workflow_run(
-            state,
-            task,
-            workflow_run_id,
-            Some("failure"),
-            Some(error.clone()),
-        ),
-    )
-    .await?;
-    Err(stow_types::stow_error!("{error}"))
+    Err(stow_types::stow_error!(
+        "mock registry populate exited with status {populate_status}"
+    ))
 }
 
 /// Write the build's records artifact into the mock registry — the same
@@ -785,6 +808,7 @@ async fn post_workflow_run(
         match attempt_result {
             Ok(()) => return Ok(()),
             Err(error) => {
+                state.record_delivery_error(run.workflow_run_id, &error.to_string());
                 last_error = Some(stow_types::stow_error!("POST {url}: {error}"));
                 if attempt + 1 < MAX_ATTEMPTS {
                     sleep(Duration::from_millis(250)).await;

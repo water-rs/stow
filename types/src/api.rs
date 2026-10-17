@@ -1948,6 +1948,33 @@ pub struct SchedulerBudgetReport {
     pub over_budget: bool,
 }
 
+/// What `GET /api/v1/admin/scheduler/budget/ledger` returns: the
+/// scheduler Durable Object's billed `rowsRead`/`rowsWritten` booked per
+/// operation since the store was reset — the per-event view of the cost
+/// `do_meter` holds per day. The object books it only on deploys
+/// carrying `STOW_SCHEDULER_BUDGET=1` (the mock stack); the `Preheat
+/// cost` lane (stow#773) snapshots it between layers and diffs.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerLedger {
+    /// One row per operation the object ran, in `op` order.
+    pub ops: Vec<SchedulerLedgerOp>,
+}
+
+/// One operation's accumulated cost in a [`SchedulerLedger`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerLedgerOp {
+    /// The operation: `<METHOD> <route>` for a request (a request id
+    /// segment collapses to `{id}`), or
+    /// [`crate::do_budgets::LEDGER_OP_ALARM`] for an alarm pass.
+    pub op: String,
+    /// How many times the operation ran.
+    pub events: u64,
+    /// `rowsRead` the operation's statements were billed, summed.
+    pub rows_read: u64,
+    /// `rowsWritten` the operation's statements were billed, summed.
+    pub rows_written: u64,
+}
+
 /// One node identity a demand batch reports demand for (stow#522).
 ///
 /// The Analytics Engine source omits `host_side`, so an entry names

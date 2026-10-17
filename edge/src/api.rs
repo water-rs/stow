@@ -476,6 +476,19 @@ pub async fn admin_scheduler_budget(
     ))
 }
 
+/// `GET /api/v1/admin/scheduler/budget/ledger`
+///
+/// The scheduler Durable Object's billed `rowsRead`/`rowsWritten` per
+/// operation since the store's last reset — what the `Preheat cost`
+/// lane (stow#773) diffs between a wave's layers. Same deploy-var guard
+/// as the seed route.
+pub async fn admin_scheduler_budget_ledger(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::SchedulerLedger>, GetArtifactError> {
+    Ok(Json(scheduler_client::scheduler_ledger(&scheduler).await?))
+}
+
 /// `POST /api/v1/admin/scheduler/demand`
 ///
 /// Apply one demand batch to the scheduler's unbuilt closure

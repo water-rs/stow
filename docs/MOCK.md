@@ -36,6 +36,40 @@ the topology and verification details behind it. Follow it when you
 want the services left running, a larger preheat than a single crate,
 or a real consumer project instead of the throwaway one.
 
+## Preheat cost
+
+`scripts/preheat-cost.sh` runs a whole preheat wave on the same three
+services and prices it in the rows the scheduler Durable Object is
+billed for (stow#773). The production lanes — `preheat top`, `preheat
+top-binaries`, `preheat projects submit` over `preheat/projects.toml`
+— submit the real resolved graph across every CI target while the
+wave runs; every dispatch is a real `stow-build build` and publish
+validation whose rustc invocations a mock compiler answers with empty
+outputs (`STOW_BUILD_MOCK_COMPILE`, compiled in only with the
+`mock-compile` feature); publish rounds release the graph layer by
+layer; then the same lists are resubmitted the way the daily cron
+does. The edge runs the budget-probe manifest at production's
+dispatch caps and cost multiplier, and its probe ledger (`stow-admin
+preheat cost ledger`) is read at every lane and round boundary.
+
+`stow-admin preheat cost report` turns the run into
+`preheat-cost-report.json` — per event kind (submit, alarm dispatch,
+completion, slice report) per layer, wave and resubmit totals, nodes
+per target, wall time — and fails when the wave or resubmit totals
+pass the preheat budget in `types/src/do_budgets.rs`, a per-event cost
+grows from the first layer to the last past the scheduler-budget
+tolerance, a node is dispatched before its dependencies are
+published, a submitted node never publishes, or the object answers
+`overloaded`. The full wave is CI-sized; locally, reduce it:
+
+```sh
+STOW_PREHEAT_COST_TARGETS="$(rustc -vV | sed -n 's/^host: //p')" \
+STOW_PREHEAT_COST_LIMIT=3 STOW_PREHEAT_COST_PROJECTS=2 \
+  scripts/preheat-cost.sh
+```
+
+`docs/ENVIRONMENT.md` lists every tunable.
+
 ## Prerequisites
 
 ```sh

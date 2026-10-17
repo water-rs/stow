@@ -18,6 +18,7 @@ const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_RESET_URL: &str = "https://scheduler.internal/reset";
 const SCHEDULER_BUDGET_SEED_URL: &str = "https://scheduler.internal/budget/seed";
 const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
+const SCHEDULER_BUDGET_LEDGER_URL: &str = "https://scheduler.internal/budget/ledger";
 const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
 
 pub async fn send_enqueue(
@@ -211,6 +212,14 @@ pub async fn scheduler_budget(
     request: &stow_types::api::SchedulerBudgetRequest,
 ) -> Result<stow_types::api::SchedulerBudgetReport, SchedulerClientError> {
     post_json(namespace, SCHEDULER_BUDGET_URL, request).await
+}
+
+/// `GET /budget/ledger` — the probe deploy's per-operation billed rows
+/// (stow#773).
+pub async fn scheduler_ledger(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::SchedulerLedger, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_BUDGET_LEDGER_URL).await
 }
 
 /// `POST /demand` — apply one durable demand batch (stow#522 I7):

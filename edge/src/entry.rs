@@ -173,8 +173,13 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
                 "/queue/promote".post(api::admin_queue_promote),
                 "/queue/purge".post(api::admin_queue_purge),
                 "/scheduler/reset".post(api::admin_scheduler_reset),
-                "/scheduler/budget".post(api::admin_scheduler_budget),
-                "/scheduler/budget/seed".post(api::admin_scheduler_budget_seed),
+                // Nested to stay under the router's route-tuple arity —
+                // the URLs are unchanged.
+                "/scheduler/budget".route((
+                    "".post(api::admin_scheduler_budget),
+                    "/seed".post(api::admin_scheduler_budget_seed),
+                    "/ledger".at(api::admin_scheduler_budget_ledger),
+                )),
                 "/scheduler/demand".post(api::admin_scheduler_demand),
                 "/scheduler/demand-feed".route((
                     "/query".post(api::admin_scheduler_demand_feed_query),

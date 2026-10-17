@@ -27,6 +27,8 @@ mod consume;
 mod context_tests;
 mod dep_scan;
 mod local_server;
+#[cfg(feature = "mock-compile")]
+mod mock_compile;
 mod object_arch;
 mod plan;
 mod rlib_members;
@@ -49,6 +51,10 @@ const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
 const STOW_GITHUB_WEBHOOK_SECRET_ENV: &str = "STOW_GITHUB_WEBHOOK_SECRET";
+/// `mock_compile::STOW_BUILD_MOCK_COMPILE_ENV`, named here for the refusal
+/// a build without the feature makes.
+#[cfg(not(feature = "mock-compile"))]
+const MOCK_COMPILE_ENV: &str = "STOW_BUILD_MOCK_COMPILE";
 
 #[derive(Debug, Parser)]
 #[command(name = "stow-build", about, version)]
@@ -114,6 +120,15 @@ fn tokio_runtime() -> stow_types::error::Result<tokio::runtime::Runtime> {
 }
 
 async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<()> {
+    // The mock compiler exists only in a `mock-compile` build; a switch
+    // that reaches any other build must not quietly compile for real.
+    #[cfg(not(feature = "mock-compile"))]
+    if std::env::var_os(MOCK_COMPILE_ENV).is_some() {
+        return Err(stow_types::stow_error!(
+            "{MOCK_COMPILE_ENV} is set, but this stow-build was built without the \
+             `mock-compile` feature"
+        ));
+    }
     let task = load_task_payload()?;
     async_fs::create_dir_all(output_dir).await?;
     let built = task::build(&task, output_dir).await?;
@@ -153,32 +168,7 @@ async fn publish(
     task: &BuildTaskPayload,
     input_dir: &std::path::Path,
 ) -> stow_types::error::Result<u32> {
-    let output = stage::read_build_output(input_dir).await?;
-    let closure = closure::resolve(task).await?;
-    // Every cache-consumption claim is only as good as the signed index
-    // vouching for it — the publisher pulls the slices itself rather than
-    // trusting the untrusted job's copy. No claims means the old failure
-    // surface: never require the network the publish path did not need
-    // before.
-    let index_slices = if output.consumed.is_empty() {
-        Vec::new()
-    } else {
-        let config = stow_cli::build_consume::ConsumeConfig::load()
-            .map_err(|error| error.wrap_err("load config to verify consumed artifact claims"))?;
-        consume::slices_for_task(&config, task)
-            .await
-            .map_err(|error| {
-                error.wrap_err("fetch index slices to verify consumed artifact claims")
-            })?
-    };
-    validate::validate_plan(
-        task,
-        &output.task,
-        &output.plan,
-        &closure,
-        &output.consumed,
-        &index_slices,
-    )?;
+    let output = validated_build_output(task, input_dir).await?;
 
     let credentials = stow_oci::RegistryCredentials::from_env()?;
     // One client for the whole publish: the artifact push and the
@@ -217,6 +207,46 @@ async fn publish(
         "publish stage completed"
     );
     Ok(upload_outcome.newly_pushed)
+}
+
+/// Every check the trusted stage makes before anything is pushed: the
+/// build output re-read with its digests re-derived, the plan bound to
+/// the dispatched task and to a dependency closure resolved here, and
+/// each consumption claim verified against the signed index. `publish`
+/// runs it before pushing to GHCR; the local CI runs the same function
+/// before writing the mock registry, so a mock build lands only what
+/// production would have accepted.
+async fn validated_build_output(
+    task: &BuildTaskPayload,
+    input_dir: &std::path::Path,
+) -> stow_types::error::Result<stage::BuildOutput> {
+    let output = stage::read_build_output(input_dir).await?;
+    let closure = closure::resolve(task).await?;
+    // Every cache-consumption claim is only as good as the signed index
+    // vouching for it — the publisher pulls the slices itself rather than
+    // trusting the untrusted job's copy. No claims means the old failure
+    // surface: never require the network the publish path did not need
+    // before.
+    let index_slices = if output.consumed.is_empty() {
+        Vec::new()
+    } else {
+        let config = stow_cli::build_consume::ConsumeConfig::load()
+            .map_err(|error| error.wrap_err("load config to verify consumed artifact claims"))?;
+        consume::slices_for_task(&config, task)
+            .await
+            .map_err(|error| {
+                error.wrap_err("fetch index slices to verify consumed artifact claims")
+            })?
+    };
+    validate::validate_plan(
+        task,
+        &output.task,
+        &output.plan,
+        &closure,
+        &output.consumed,
+        &index_slices,
+    )?;
+    Ok(output)
 }
 
 /// Measure every planned artifact's glibc floor from its output bytes —

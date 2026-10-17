@@ -133,8 +133,7 @@ const HOURS_PER_MONTH: f64 = 720.0;
 //   <https://developers.cloudflare.com/durable-objects/platform/pricing/>
 // - D1 Paid — 25G rows read/mo, 50M rows written/mo.
 //   <https://developers.cloudflare.com/d1/platform/pricing/>
-pub const DO_ROWS_READ_MONTHLY: f64 = 25e9;
-pub const DO_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
+pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY};
 pub const DO_REQUESTS_MONTHLY: f64 = 1e6;
 pub const DO_DURATION_GB_S_MONTHLY: f64 = 400e3;
 pub const WORKER_REQUESTS_MONTHLY: f64 = 10e6;

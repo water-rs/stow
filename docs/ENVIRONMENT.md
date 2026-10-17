@@ -123,6 +123,7 @@ the run, so publish never calls the edge); `stow-build serve --listen
 | `STOW_BUILD_RUSTC_CAPTURE_DIR` | build (set by the runner for its rustc wrapper) | Per-rustc-invocation capture sink for output snapshots and identity sidecars. |
 | `STOW_BUILD_CAPTURE_IPC` | build (set by the runner inside the heel sandbox) | IPC socket the rustc wrapper streams capture records to; the host collector, not the wrapper, owns record persistence. |
 | `STOW_BUILD_WRAPPER_CRATE_NAME` | build (set by the runner inside the heel sandbox) | Package name of the generated wrapper package the task crate builds under; the rustc wrapper records its units as observed scaffolding, never publishable artifacts. |
+| `STOW_BUILD_MOCK_COMPILE` | build (set by the `Preheat cost` lane's local CI) | `1` makes the capture wrapper answer every compiling rustc invocation with empty outputs at the paths rustc would write, instead of running rustc; probes (`--print`, stdin sources) still run the real compiler. Honoured only by a `stow-build` compiled with the `mock-compile` feature — any other build refuses to start when it is set. See `scripts/preheat-cost.sh`. |
 | `STOW_GLIBC_SYSROOT` | build (set by the Linux leg of `build-crate.yml`) | Root of the glibc-2.28 sysroot the Linux build job installs under `$HOME/stow-glibc-2.28` — the heel sandbox grants the whole tree to the untrusted crate build so its compiles and links read the sysroot's headers and libraries. The job's PATH shim dir (`<root>/bin`, canonical driver names carrying `-B`/`--sysroot`) is reached through the `PATH` passthrough; `STOW_GLIBC_SYSROOT` itself rides the toolchain passthrough like every other `CC_*`/`CARGO_TARGET_*` variable. |
 | The toolchain passthrough: `CC` / `CXX` / `AR` / `RANLIB`, `CFLAGS` / `CXXFLAGS` / `CPPFLAGS` / `LDFLAGS`, `SDKROOT` / `DEVELOPER_DIR`, the MSVC developer environment (`LIB`, `INCLUDE`, `VCINSTALLDIR`, `VCToolsInstallDir`, `WindowsSdkDir`, `WindowsSdkBinPath`, `WindowsSdkVerBinPath`, `WindowsSDKVersion`, `WindowsSDKLibVersion`, `UniversalCRTSdkDir`, `UCRTVersion`), and every name beginning `CARGO_TARGET_` (except `CARGO_TARGET_DIR`), `CC_`, `CXX_`, `AR_`, `RANLIB_`, `CFLAGS_`, `CXXFLAGS_`, `CPPFLAGS_`, `LDFLAGS_` or `PKG_CONFIG_` | build (set by the job) | Handed unchanged into the sandboxed crate build; the Android SDK/NDK roots (`ANDROID_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_NDK`, `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_NDK_LATEST_HOME`) pass only to an Android task. The aarch64 Linux leg sets `PKG_CONFIG_aarch64_unknown_linux_gnu=aarch64-linux-gnu-pkg-config`, the cross pkg-config that finds the arm64 system libraries it installs, per target so a build script compiling for the host keeps the native one. |
 | `GHCR_USERNAME` / `GHCR_TOKEN` | publish | Credentials for `oci-client` to push bundles to GHCR. Required. |
@@ -133,6 +134,23 @@ the run, so publish never calls the edge); `stow-build serve --listen
 | `GH_TOKEN` / `GITHUB_TOKEN` | serve (falls back to `gh auth token`) | Developer GitHub credential the edge's trusted endpoints accept outside Actions. |
 | `STOW_MOCK_PUBLIC_KEY_PATH` / `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign key pair and mock registry root the local dispatcher populates. Required. |
 | `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), visible in CI logs here. |
+
+## scripts/preheat-cost.sh
+
+The `Preheat cost` lane (stow#773): a whole preheat wave and the daily
+resubmit driven through the mock stack, priced in the scheduler's
+billed rows. `docs/MOCK.md` describes the run.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STOW_PREHEAT_COST_WORK_DIR` | fresh `mktemp -d` | Work dir for keys, registry, edge state, logs, ledger snapshots and `preheat-cost-report.json`. Must be empty. |
+| `STOW_PREHEAT_COST_LIMIT` | `100` | `--limit` of `preheat top` and `preheat top-binaries` — the production `preheat-admin.yml` value. |
+| `STOW_PREHEAT_COST_PROJECTS` | every listed repository | `preheat projects submit --limit`: resolve only the first N repositories of `preheat/projects.toml`. |
+| `STOW_PREHEAT_COST_TARGETS` | every `CI_TARGET_TRIPLES` entry | Comma-separated `--targets` for every lane. |
+| `STOW_PREHEAT_COST_MAX_JOBS` / `STOW_PREHEAT_COST_MAX_MACOS_JOBS` | `45` / `16` | The scheduler's dispatch caps for the run — `edge/Skyzen.toml`'s production values, replacing the mock manifest's. |
+| `STOW_PREHEAT_COST_DEADLINE` | `21600` | Seconds the wave (and, separately, the resubmit) may run before the script fails. |
+| `STOW_PREHEAT_COST_EDGE_RSS_MB` | `1200` | Restart the `wrangler dev` edge at an idle point once its process tree passes this resident size. |
+| `STOW_E2E_TOOLCHAIN` / `STOW_E2E_READY_DEADLINE` | `stable` / `600` | The rustup toolchain the run builds for, and how long each service may take to come up — shared with `scripts/mock-e2e.sh`. |
 
 ## stow-mock-registry
 
