@@ -1,7 +1,8 @@
-//! The `Preheat cost` lane's report (stow#773): what one preheat wave and
-//! one daily resubmit cost the scheduler Durable Object, in the rows
-//! Cloudflare bills, and whether the wave ran the graph the way the
-//! model says it must.
+//! The `Preheat cost` lane's report (stow#773).
+//!
+//! What one preheat wave and one daily resubmit cost the scheduler
+//! Durable Object, in the rows Cloudflare bills, and whether the wave
+//! ran the graph the way the model says it must.
 //!
 //! `scripts/preheat-cost.sh` drives the wave on the mock stack and
 //! leaves its observations in a work directory; `stow-admin preheat
@@ -155,7 +156,7 @@ pub struct WaveObservations {
 }
 
 /// One kind's cost over a span.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KindCost {
     /// The kind.
     pub kind: EventKind,
@@ -207,7 +208,7 @@ pub struct PhaseCost {
 
 /// One layer of the wave: the builds one publish round released, their
 /// completions, and the round's report.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LayerCost {
     /// 1-based layer number.
     pub layer: usize,
@@ -220,7 +221,7 @@ pub struct LayerCost {
 }
 
 /// One lane's submit cost.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneCost {
     /// Which lane, and in which phase.
     pub lane: String,
@@ -396,7 +397,10 @@ fn lane_costs(phase_name: &str, phase: &PhaseObservations) -> crate::error::Resu
                 phase: phase_name.to_owned(),
                 submitted: lane.submitted,
                 submit: kind(&kind_costs(&ops), EventKind::Submit).clone(),
-                wall_ms: lane.after.taken_at_ms.saturating_sub(lane.before.taken_at_ms),
+                wall_ms: lane
+                    .after
+                    .taken_at_ms
+                    .saturating_sub(lane.before.taken_at_ms),
             })
         })
         .collect()
@@ -410,6 +414,10 @@ fn check(name: impl Into<String>, passed: bool, detail: impl Into<String>) -> Ch
     }
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "row counts stay far below f64's exact-integer range"
+)]
 fn totals_check(name: &str, cost: &PhaseCost) -> Check {
     let passed = (cost.rows_read as f64) <= cost.budget_rows_read
         && (cost.rows_written as f64) <= cost.budget_rows_written;
@@ -493,7 +501,7 @@ fn submit_growth_check(lanes: &[LaneCost]) -> Check {
     let slack = crate::do_budgets::GROWTH_TOLERANCE_ROWS * last.submit.events as f64
         / last.submitted as f64;
     let over = |earlier: f64, later: f64| {
-        later > earlier * (1.0 + crate::do_budgets::GROWTH_TOLERANCE_FRACTION) + slack
+        later > earlier.mul_add(1.0 + crate::do_budgets::GROWTH_TOLERANCE_FRACTION, slack)
     };
     check(
         name,
@@ -633,10 +641,10 @@ fn published_check(observed: &WaveObservations) -> Check {
                 })
                 .filter_map(|run| run.error.as_deref())
                 .next_back();
-            match last_error {
-                Some(error) => format!("{task_id}: {error}"),
-                None => format!("{task_id}: never published"),
-            }
+            last_error.map_or_else(
+                || format!("{task_id}: never published"),
+                |error| format!("{task_id}: {error}"),
+            )
         })
         .collect();
     check(
@@ -645,7 +653,12 @@ fn published_check(observed: &WaveObservations) -> Check {
         if missing.is_empty() {
             format!("{} nodes served by the final slices", observed.nodes.len())
         } else {
-            format!("{} of {} unpublished: {}", missing.len(), observed.nodes.len(), summarise(&missing))
+            format!(
+                "{} of {} unpublished: {}",
+                missing.len(),
+                observed.nodes.len(),
+                summarise(&missing)
+            )
         },
     )
 }
@@ -705,7 +718,12 @@ fn submit_failure_check(observed: &WaveObservations) -> Check {
 /// The first few lines of a long list, and how many were left out.
 fn summarise(lines: &[String]) -> String {
     const SHOWN: usize = 10;
-    let shown = lines.iter().take(SHOWN).cloned().collect::<Vec<_>>().join("; ");
+    let shown = lines
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
     if lines.len() > SHOWN {
         format!("{shown}; … and {} more", lines.len() - SHOWN)
     } else {
@@ -739,7 +757,10 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
         check(
             "Resubmit rebuilt nothing",
             resubmit.dispatched_runs == 0,
-            format!("{} runs dispatched by the resubmit", resubmit.dispatched_runs),
+            format!(
+                "{} runs dispatched by the resubmit",
+                resubmit.dispatched_runs
+            ),
         ),
         check(
             "Wave ran in at least three layers",
@@ -859,8 +880,9 @@ mod tests {
                     layer * 100,
                     ledger(layer * 10, 20, completion_growth * (layer - 1) * layer / 2),
                 ),
-                published: BTreeSet::from([["a", "b", "c"][usize::try_from(layer - 1).unwrap()]
-                    .to_owned()]),
+                published: BTreeSet::from([
+                    ["a", "b", "c"][usize::try_from(layer - 1).unwrap()].to_owned()
+                ]),
             })
             .collect();
         let end = rounds.last().unwrap().end.clone();

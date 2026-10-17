@@ -173,6 +173,18 @@ async fn lane_plan(lane: &str, dir: &Path) -> stow_types::error::Result<LanePlan
             tasks: envelope.plan.tasks,
             outcome: envelope.result,
         })
+    } else if lane == "top-binaries" {
+        let envelope: Planned<crate::preheat::BinariesPlan, SubmitOutcome> =
+            read_json(&plan_path).await?;
+        Ok(LanePlan {
+            // `skipped` holds resolve/shape skips — a ranked binary that
+            // ships no binary target is an expected lane outcome, not a
+            // submit failure; a failed submit POST fails the lane
+            // itself, which the exit status above reports.
+            submit_failures: Vec::new(),
+            tasks: envelope.plan.tasks,
+            outcome: envelope.result,
+        })
     } else {
         let envelope: Planned<Vec<EnqueueRequest>, SubmitOutcome> = read_json(&plan_path).await?;
         Ok(LanePlan {
@@ -184,9 +196,7 @@ async fn lane_plan(lane: &str, dir: &Path) -> stow_types::error::Result<LanePlan
 }
 
 /// Every task id a round's `index export` carried records for.
-fn published_task_ids(
-    records: &[ArtifactRecord],
-) -> BTreeSet<String> {
+fn published_task_ids(records: &[ArtifactRecord]) -> BTreeSet<String> {
     records
         .iter()
         .map(|record| {
@@ -213,11 +223,16 @@ async fn phase(dir: &Path) -> stow_types::error::Result<(PhaseObservations, Vec<
             .and_then(|name| name.to_str())
             .and_then(|name| name.split_once('-'))
             .map(|(_, lane)| lane.to_owned())
-            .ok_or_else(|| stow_error!("lane directory {} is not <NN>-<lane>", lane_dir.display()))?;
+            .ok_or_else(|| {
+                stow_error!("lane directory {} is not <NN>-<lane>", lane_dir.display())
+            })?;
         let plan = lane_plan(&name, &lane_dir).await?;
         lanes.push(LaneRun {
             lane: name,
-            submitted: plan.outcome.as_ref().map_or(0, |outcome| u64::from(outcome.submitted)),
+            submitted: plan
+                .outcome
+                .as_ref()
+                .map_or(0, |outcome| u64::from(outcome.submitted)),
             submit_failures: plan.submit_failures,
             before: read_json(&lane_dir.join("before.json")).await?,
             after: read_json(&lane_dir.join("after.json")).await?,
@@ -323,7 +338,15 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
 }
 
 fn render_report(report: &PreheatCostReport) -> String {
-    let mut phases = Table::new(&["phase", "rows read", "budget", "rows written", "budget", "runs", "wall s"]);
+    let mut phases = Table::new(&[
+        "phase",
+        "rows read",
+        "budget",
+        "rows written",
+        "budget",
+        "runs",
+        "wall s",
+    ]);
     for (name, phase) in [("wave", &report.wave), ("resubmit", &report.resubmit)] {
         phases.push([
             name.to_owned(),
@@ -335,7 +358,15 @@ fn render_report(report: &PreheatCostReport) -> String {
             (phase.wall_ms / 1000).to_string(),
         ]);
     }
-    let mut layers = Table::new(&["layer", "published", "runs", "kind", "events", "read/event", "written/event"]);
+    let mut layers = Table::new(&[
+        "layer",
+        "published",
+        "runs",
+        "kind",
+        "events",
+        "read/event",
+        "written/event",
+    ]);
     for layer in &report.layers {
         for kind in &layer.kinds {
             let Some((read, written)) = kind.per_event() else {

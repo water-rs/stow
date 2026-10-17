@@ -340,8 +340,10 @@ pub fn ledger_op(method: &str, path: &str) -> String {
     let route = path.strip_prefix("/requests/").map_or_else(
         || path.to_owned(),
         |rest| {
-            rest.split_once('/')
-                .map_or_else(|| "/requests/{id}".to_owned(), |(_, tail)| format!("/requests/{{id}}/{tail}"))
+            rest.split_once('/').map_or_else(
+                || "/requests/{id}".to_owned(),
+                |(_, tail)| format!("/requests/{{id}}/{tail}"),
+            )
         },
     );
     format!("{method} {route}")
@@ -360,8 +362,14 @@ async fn book_ledger(db: &DurableDb, op: &str, read: u64, written: u64) -> Resul
            rows_written = probe_meter.rows_written + excluded.rows_written",
     )
     .bind(op.to_owned())
-    .bind(i64::try_from(read).map_err(|_| format!("probe ledger {op}: rowsRead {read} overflows i64"))?)
-    .bind(i64::try_from(written).map_err(|_| format!("probe ledger {op}: rowsWritten {written} overflows i64"))?)
+    .bind(
+        i64::try_from(read)
+            .map_err(|_| format!("probe ledger {op}: rowsRead {read} overflows i64"))?,
+    )
+    .bind(
+        i64::try_from(written)
+            .map_err(|_| format!("probe ledger {op}: rowsWritten {written} overflows i64"))?,
+    )
     .execute()
     .await
     .map_err(|error| format!("book probe ledger {op}: {error}"))?;
@@ -426,10 +434,7 @@ impl skyzen::middleware::Middleware for MeterGuard {
             .as_ref()
             .is_some_and(super::object::budget_probe_enabled)
         {
-            meter.with_ledger_op(ledger_op(
-                request.method().as_str(),
-                request.uri().path(),
-            ))
+            meter.with_ledger_op(ledger_op(request.method().as_str(), request.uri().path()))
         } else {
             meter
         };

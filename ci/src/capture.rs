@@ -163,7 +163,9 @@ async fn rustc_status(
         handle
             .write_all(&stderr)
             .wrap_err("write mock artifact notifications")?;
-        handle.flush().wrap_err("flush mock artifact notifications")?;
+        handle
+            .flush()
+            .wrap_err("flush mock artifact notifications")?;
         return Ok(std::process::ExitStatus::default());
     }
     Ok(Command::new(rustc).args(args).status().await?)
