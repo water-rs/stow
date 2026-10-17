@@ -160,6 +160,7 @@ fn semantic_identity(crate_name: &str) -> SemanticTaskIdentity {
         target: TARGET.to_owned(),
         rustc_version: RUSTC.to_owned(),
         host_side: false,
+        dependency_identity: dep_identity(crate_name).to_string(),
         explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     }
 }
@@ -1069,7 +1070,6 @@ async fn demand_can_cross_the_floor() {
         &settings(),
         &[super::BatchedUpdate {
             task_id: task_id_on("rise", TARGET),
-            occurrences: 1,
             // `priority = downloads / 1000` reaches 1 — exactly the
             // floor, the boundary the flag must take.
             downloads: 1_000,
@@ -2491,8 +2491,8 @@ async fn demand_at_bound_then_rising_resubmit_is_refused() {
         "band error: {error}"
     );
 
-    // Nothing changed: demand, downloads and request count are the
-    // pre-resubmit values.
+    // Nothing changed: demand and downloads are the pre-resubmit
+    // values.
     assert_eq!(demand_of(&db, "bound", TARGET).await, super::PRIORITY_MAX);
     let downloads: i64 = db
         .query("SELECT downloads FROM queue WHERE task_id = ?")
@@ -2500,13 +2500,7 @@ async fn demand_at_bound_then_rising_resubmit_is_refused() {
         .fetch_scalar::<i64>()
         .await
         .expect("downloads");
-    let request_count: i64 = db
-        .query("SELECT request_count FROM queue WHERE task_id = ?")
-        .bind(task_id_on("bound", TARGET))
-        .fetch_scalar::<i64>()
-        .await
-        .expect("request_count");
-    assert_eq!((downloads, request_count), (0, 1));
+    assert_eq!(downloads, 0);
 
     // Below the bound the same resubmit is ordinary: the sibling
     // takes downloads 5000 → priority 5, demand still folded.
@@ -3426,6 +3420,60 @@ async fn claim_retires_tasks_the_catalog_already_covers() {
 
 fn crate_task_id(crate_name: &str) -> String {
     task_id_on(crate_name, TARGET)
+}
+
+/// stow#787: two resolutions mint the same semantic tuple at two
+/// different dependency closures — "dep" as a leaf in one lane's graph,
+/// "dep" over "dep-child" in another's. When the first variant's build
+/// publishes, the catalog serves the tuple; the claim-time coverage
+/// oracle matches that bare tuple and retires the second variant's row
+/// without a build — but its dependents' edges gate on
+/// `dependency_identity`-exact slice rows that can now never exist.
+/// Coverage must be contextual: a different-context publication does
+/// not retire the pending node.
+#[tokio::test]
+async fn coverage_retirement_requires_the_same_dependency_context() {
+    let db = memory_db().await.expect("memory db");
+    // dep's second context: the same tuple, a subgraph with a child.
+    let dep_other_context = request("dep", &[dependency("dep-child")]);
+    let dep_other_context_id = dep_other_context.task_id().expect("dep task id");
+    enqueue(
+        &db,
+        &[
+            dependency("dep-child"),
+            dep_other_context.clone(),
+            request("owner", std::slice::from_ref(&dep_other_context)),
+        ],
+    )
+    .await
+    .expect("enqueue");
+
+    // dep-child's publication releases dep's second-context node; the
+    // catalog covering dep's *tuple* (the first context's artifacts)
+    // is what production's `covered_semantic_identities` answers —
+    // FixedCoverage replays that answer.
+    publish(&db, "dep-child").await;
+    let oracle = FixedCoverage {
+        covered: BTreeSet::from([semantic_identity("dep")]),
+        asked: std::sync::Mutex::new(Vec::new()),
+    };
+    let settings = SchedulerSettings {
+        dispatch: Dispatch::from_max_concurrent_jobs(10),
+        dispatch_min_age_minutes: 0,
+        ..settings()
+    };
+
+    let claimed = super::claim_dispatchable_tasks(&db, &settings, &oracle)
+        .await
+        .expect("claim");
+
+    assert!(
+        claimed
+            .iter()
+            .any(|task| task.task_id == dep_other_context_id),
+        "a tuple-covered but context-unpublished node must still build: \
+         the edges naming its digest can never otherwise be served"
+    );
 }
 
 /// Both rows are eligible to claim here: the miss row is aged past the
@@ -6297,11 +6345,10 @@ async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
 struct QueueCounters {
     status: String,
     attempt: i64,
-    request_count: i64,
 }
 
 async fn queue_counters(db: &DurableDb, crate_name: &str) -> QueueCounters {
-    db.query("SELECT status, attempt, request_count FROM queue WHERE task_id = ?")
+    db.query("SELECT status, attempt FROM queue WHERE task_id = ?")
         .bind(task_id_on(crate_name, TARGET))
         .fetch_one::<QueueCounters>()
         .await
@@ -6310,16 +6357,15 @@ async fn queue_counters(db: &DurableDb, crate_name: &str) -> QueueCounters {
 
 /// Seed a row as failed with known counters so the assertions about
 /// what one chunk did to it are exact.
-async fn seed_failed(db: &DurableDb, crate_name: &str, attempt: i64, request_count: i64) {
+async fn seed_failed(db: &DurableDb, crate_name: &str, attempt: i64) {
     enqueue(db, &[request(crate_name, &[])])
         .await
         .expect("seed enqueue");
     db.query(
-        "UPDATE queue SET status = 'failed', attempt = ?, request_count = ?, \
+        "UPDATE queue SET status = 'failed', attempt = ?, \
              error_msg = 'boom' WHERE task_id = ?",
     )
     .bind(attempt)
-    .bind(request_count)
     .bind(task_id_on(crate_name, TARGET))
     .execute()
     .await
@@ -6334,7 +6380,7 @@ async fn seed_failed(db: &DurableDb, crate_name: &str, attempt: i64, request_cou
 #[tokio::test]
 async fn a_chunk_never_revives_a_failed_dependency() {
     let db = memory_db().await.expect("memory db");
-    seed_failed(&db, "dep", 7, 5).await;
+    seed_failed(&db, "dep", 7).await;
 
     enqueue(
         &db,
@@ -6349,8 +6395,8 @@ async fn a_chunk_never_revives_a_failed_dependency() {
 
     let row = queue_counters(&db, "dep").await;
     assert_eq!(
-        (row.status.as_str(), row.attempt, row.request_count),
-        ("failed", 7, 5),
+        (row.status.as_str(), row.attempt),
+        ("failed", 7),
         "a request never revives a terminal row"
     );
     for parent in ["p1", "p2", "p3"] {
@@ -6359,13 +6405,13 @@ async fn a_chunk_never_revives_a_failed_dependency() {
 }
 
 /// The dep's own request is no different from its dependents':
-/// re-requesting a `failed` row counts the request —
-/// `request_count` +1 — and changes nothing else. `blocked` rows
+/// re-requesting a `failed` row changes nothing at all (stow#784:
+/// a pure dedup request writes no row). `blocked` rows
 /// behave identically (`resurrects` names neither).
 #[tokio::test]
 async fn dep_request_never_revives_a_failed_dep_in_one_chunk() {
     let db = memory_db().await.expect("memory db");
-    seed_failed(&db, "dep", 7, 5).await;
+    seed_failed(&db, "dep", 7).await;
 
     enqueue(
         &db,
@@ -6376,9 +6422,9 @@ async fn dep_request_never_revives_a_failed_dep_in_one_chunk() {
 
     let dep = queue_counters(&db, "dep").await;
     assert_eq!(
-        (dep.status.as_str(), dep.attempt, dep.request_count),
-        ("failed", 7, 6),
-        "request counted, status untouched"
+        (dep.status.as_str(), dep.attempt),
+        ("failed", 7),
+        "deduplicated request writes nothing, status untouched"
     );
     assert_eq!(
         row_column(&db, "parent", "CAST(blocked AS TEXT)").await,
@@ -6387,12 +6433,11 @@ async fn dep_request_never_revives_a_failed_dep_in_one_chunk() {
 }
 
 /// Order inside the chunk is irrelevant — parent first lands the
-/// same as dep first: the failed row counts one request and keeps
-/// its terminal status.
+/// same as dep first: the failed row keeps its terminal status.
 #[tokio::test]
 async fn parent_request_before_its_failed_dep_in_one_chunk() {
     let db = memory_db().await.expect("memory db");
-    seed_failed(&db, "dep", 7, 5).await;
+    seed_failed(&db, "dep", 7).await;
 
     enqueue(
         &db,
@@ -6403,8 +6448,8 @@ async fn parent_request_before_its_failed_dep_in_one_chunk() {
 
     let dep = queue_counters(&db, "dep").await;
     assert_eq!(
-        (dep.status.as_str(), dep.attempt, dep.request_count),
-        ("failed", 7, 6),
+        (dep.status.as_str(), dep.attempt),
+        ("failed", 7),
         "same outcome either order: no resurrection"
     );
 }
@@ -8165,5 +8210,56 @@ async fn dispatch_fails_on_a_missing_node_naming_it() {
     assert!(
         error.starts_with("failed|") && error.contains(&missing_id),
         "the hard dispatch error names the missing node id: {error}"
+    );
+}
+
+/// stow#784 evidence: a trusted resubmit whose every task already
+/// exists writes ~nothing per the ledger contract — this prints the
+/// second submit's per-statement rows (host `changes()`-level counts;
+/// the DO additionally bills index maintenance on touched columns).
+#[tokio::test]
+async fn resubmit_rows_written_per_statement() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let deps: Vec<EnqueueRequest> = (0..4).map(|d| dependency(&format!("dep{d}"))).collect();
+    let batch: Vec<EnqueueRequest> = (0..50)
+        .map(|i| request(&format!("crate{i}"), &deps))
+        .collect();
+    assert_eq!(
+        super::enqueue_trusted(&db, &batch, &settings())
+            .await
+            .expect("first submit"),
+        50
+    );
+    log.lock().expect("log").clear();
+    let inserted = super::enqueue_trusted(&db, &batch, &settings())
+        .await
+        .expect("resubmit");
+    assert_eq!(inserted, 0);
+    let statements = log.lock().expect("log").clone();
+    let mut total_read = 0u64;
+    let mut total_written = 0u64;
+    for statement in &statements {
+        total_read += statement.rows_read;
+        total_written += statement.rows_written;
+        eprintln!(
+            "resubmit stmt: read={} written={} :: {:.160}",
+            statement.rows_read,
+            statement.rows_written,
+            statement
+                .sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    eprintln!(
+        "resubmit totals: statements={} rows_read={} rows_written={}",
+        statements.len(),
+        total_read,
+        total_written
+    );
+    assert_eq!(
+        total_written, 0,
+        "a fully deduplicated resubmit writes nothing (stow#784)"
     );
 }

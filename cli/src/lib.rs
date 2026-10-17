@@ -721,6 +721,14 @@ pub(crate) struct BuildContext {
     /// settles by construction — a driver with no pending map answers
     /// at once (stow#347).
     pub(crate) serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
+    /// The "the cache policy's allow set is committed" signal the plan
+    /// path waits on when an invocation's marker is absent
+    /// (stow#788): armed pending only while a supervised build's
+    /// deferred enrichment still owes the policy directory its coarse
+    /// commit, released by the commit itself or by the guard that
+    /// drops with a failed or aborted enrichment. The standalone
+    /// wrapper's settles by construction — no commit is coming.
+    pub(crate) policy_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
     /// The build's in-flight local compiles, shared with the supervisor:
     /// a post-compile waits on the ones its `--extern` set names before
     /// reading their `materialized_outputs` rows (stow#618). The
@@ -872,6 +880,7 @@ impl BuildContext {
                 prefetch_candidates,
             })),
             serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+            policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
             // No supervisor shares a standalone invocation's registry —
             // the wait finds nothing and returns at once.
             in_flight: crate::supervisor::server::InFlightUnits::default(),
@@ -1286,11 +1295,29 @@ async fn decide_rustc_invocation(
         );
         return decide_local_only(rustc, &parsed, env_cache, ctx).await;
     }
-    let exact_public_cache_allowed = match cache_policy::public_cache_allowed(
+    // A missing allow marker while the enrichment still owes the policy
+    // directory its commit is "undecided", not "denied": wait out the
+    // commit — bounded — and take the marker once more before ruling
+    // (stow#788). A completed or absent latch is the old path: deny on
+    // absence at once.
+    let mut policy_answer = cache_policy::public_cache_allowed(
         ctx.policy_dir.as_deref(),
         &parsed,
         ctx.public_cache_target.as_deref(),
-    ) {
+    );
+    if policy_answer == Some(false) && !ctx.policy_ready.has_completed() {
+        let _ = tokio::time::timeout(
+            crate::facade::SERVE_MAP_WAIT_TIMEOUT,
+            ctx.policy_ready.wait(),
+        )
+        .await;
+        policy_answer = cache_policy::public_cache_allowed(
+            ctx.policy_dir.as_deref(),
+            &parsed,
+            ctx.public_cache_target.as_deref(),
+        );
+    }
+    let exact_public_cache_allowed = match policy_answer {
         Some(false) => {
             tracing::debug!(
                 crate_name = %parsed.crate_name,
@@ -5338,7 +5365,7 @@ mod tests {
         use std::time::Duration;
 
         use crate::supervisor::protocol::{Observed, Request, write_frame};
-        use crate::supervisor::{Endpoint, server};
+        use crate::supervisor::{Endpoint, server, server::Handler as _};
         use crate::{AnalysisFacts, BuildContext, BuildSupervisor, WrapperEnvBase};
 
         /// A `tracing` writer whose buffer the test can inspect — the
@@ -5447,6 +5474,33 @@ mod tests {
             server::InFlightUnits,
             Arc<BuildSupervisor>,
         ) {
+            fixture_ctx(root, |in_flight| BuildContext {
+                policy_dir: None,
+                public_cache_target: Some(HOST_TARGET.to_owned()),
+                public_cache_disabled: false,
+                analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
+                    semantic_fallback_enabled: false,
+                    unit_nodes: None,
+                    prefetch_candidates: std::collections::BTreeMap::new(),
+                })),
+                serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+                policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+                in_flight: in_flight.clone(),
+            })
+            .await
+        }
+
+        /// [`fixture`] with the caller's `BuildContext` — the
+        /// policy-race tests drive `policy_dir`/`policy_ready`
+        /// (stow#788).
+        async fn fixture_ctx(
+            root: &Path,
+            ctx: impl FnOnce(&server::InFlightUnits) -> BuildContext,
+        ) -> (
+            crate::config::StowConfig,
+            server::InFlightUnits,
+            Arc<BuildSupervisor>,
+        ) {
             let config = test_config(root);
             config.ensure_dirs().await.expect("ensure cache dirs");
             let base = Arc::new(WrapperEnvBase {
@@ -5470,18 +5524,7 @@ mod tests {
                 );
             let handler = Arc::new(BuildSupervisor {
                 env_cache,
-                ctx: BuildContext {
-                    policy_dir: None,
-                    public_cache_target: Some(HOST_TARGET.to_owned()),
-                    public_cache_disabled: false,
-                    analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
-                        semantic_fallback_enabled: false,
-                        unit_nodes: None,
-                        prefetch_candidates: std::collections::BTreeMap::new(),
-                    })),
-                    serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
-                    in_flight: in_flight.clone(),
-                },
+                ctx: ctx(&in_flight),
                 observations: std::sync::Mutex::new(Vec::new()),
                 resolution_done: crate::ResolutionDone::pending(),
             });
@@ -5571,6 +5614,167 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
+        }
+
+        /// The `BuildContext` a deferred build hands its supervisor when
+        /// the policy directory is seeded empty and the enrichment still
+        /// owes it the coarse allow commit (stow#788).
+        fn pending_policy_ctx(
+            policy_dir: std::path::PathBuf,
+            ready: &Arc<crate::facade::ServeMapSignal>,
+            in_flight: &server::InFlightUnits,
+        ) -> BuildContext {
+            BuildContext {
+                policy_dir: Some(policy_dir),
+                public_cache_target: Some(HOST_TARGET.to_owned()),
+                public_cache_disabled: false,
+                analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
+                    semantic_fallback_enabled: false,
+                    unit_nodes: None,
+                    prefetch_candidates: std::collections::BTreeMap::new(),
+                })),
+                serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+                policy_ready: std::sync::Arc::clone(ready),
+                in_flight: in_flight.clone(),
+            }
+        }
+
+        /// stow#788: a covered unit that reaches the policy check before
+        /// its allow marker lands waits out the commit instead of
+        /// compiling — the marker lands mid-wait, and the unit is
+        /// served. The artifact is staged locally the way the build's
+        /// own prefetch would land it.
+        #[tokio::test]
+        async fn a_unit_before_its_allow_marker_waits_and_serves() {
+            let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _default = tracing::subscriber::set_default(subscriber);
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+            let policy_dir = tempdir.path().join("policy");
+            std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+            let policy_ready = Arc::new(crate::facade::ServeMapSignal::pending());
+            let (_config, _in_flight, handler) = fixture_ctx(tempdir.path(), |in_flight| {
+                pending_policy_ctx(policy_dir.clone(), &policy_ready, in_flight)
+            })
+            .await;
+
+            let args = unit_args(&registry_src, &out_dir, "demo", "1.0.0", "demometa", &[]);
+
+            let deciding = {
+                let handler = Arc::clone(&handler);
+                let args = args.clone();
+                tokio::spawn(async move { handler.plan(OsString::from("rustc"), args).await })
+            };
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            assert!(
+                !deciding.is_finished(),
+                "a missing marker answered before the policy commit landed"
+            );
+
+            // The enrichment's commit: the marker lands, then the latch
+            // releases — the order `run_build_enrichment` writes it.
+            crate::cache_policy::write_policy_entries(
+                &policy_dir,
+                &[crate::cache_policy::CachePolicyEntry {
+                    target: HOST_TARGET.to_owned(),
+                    crate_name: "demo".to_owned(),
+                }],
+            )
+            .await
+            .expect("write the allow marker");
+            policy_ready.complete();
+
+            let decision = deciding.await.expect("join the plan");
+            let logs = {
+                let buffer = log.0.lock().expect("log buffer");
+                String::from_utf8_lossy(&buffer).into_owned()
+            };
+            drop(decision);
+            // The marker was honored: the unit ran its lookup — the
+            // slice check only runs on the allowed path — rather than
+            // being denied by timing. With nothing cached it still
+            // compiles, but the allow it waited for was real.
+            assert!(
+                logs.contains("skipping registry serves"),
+                "the allowed path must reach the lookup chain: {logs}"
+            );
+            assert!(
+                !logs.contains("disabled by stow cache policy"),
+                "the waited unit must not see the early deny: {logs}"
+            );
+
+            // A served leaf mints no local-build marker: a dependent
+            // carrying its rlib is not forced to compile behind it.
+            let dependent_args = unit_args(
+                &registry_src,
+                &out_dir,
+                "consumer",
+                "2.0.0",
+                "consmeta",
+                &[("demo", &out_dir.join("libdemo-demometa.rlib"))],
+            );
+            let dependent = crate::rustc_args::ParsedRustcArgs::parse(&dependent_args)
+                .expect("parse dependent");
+            assert!(
+                !crate::must_build_locally(&dependent, HOST_TARGET, Some(&policy_dir)),
+                "a served dependency must not start the local-build cascade"
+            );
+        }
+
+        /// stow#788: once the commit lands without the unit's marker the
+        /// deny is final and immediate — an all-miss build's answer is
+        /// the old path's: one `exists()`, no wait.
+        #[tokio::test]
+        async fn a_marker_absent_after_the_commit_denies_without_waiting() {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+            let policy_dir = tempdir.path().join("policy");
+            std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+            let policy_ready = Arc::new(crate::facade::ServeMapSignal::pending());
+            let (_config, _in_flight, handler) = fixture_ctx(tempdir.path(), |in_flight| {
+                pending_policy_ctx(policy_dir.clone(), &policy_ready, in_flight)
+            })
+            .await;
+            let args = unit_args(&registry_src, &out_dir, "demo", "1.0.0", "demometa", &[]);
+
+            // While the commit is owed, the decision parks on it.
+            let deciding = {
+                let handler = Arc::clone(&handler);
+                let args = args.clone();
+                tokio::spawn(async move { handler.plan(OsString::from("rustc"), args).await })
+            };
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert!(!deciding.is_finished());
+            policy_ready.complete();
+            let decision = deciding.await.expect("join the plan");
+            assert!(
+                matches!(decision, server::Decision::Compile(_)),
+                "no marker after the commit is a real deny"
+            );
+
+            // Once the latch is settled the same question costs one
+            // marker check — an all-miss build waits on nothing.
+            let started = std::time::Instant::now();
+            let decision = handler.plan(OsString::from("rustc"), args).await;
+            assert!(
+                matches!(decision, server::Decision::Compile(_)),
+                "the settled deny still compiles"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "a settled latch is not a wait: {:?}",
+                started.elapsed()
+            );
         }
 
         /// A dependent whose report the supervisor handles while its

@@ -37,6 +37,40 @@ and on every pull request and merge group into `main` — which is what
 keeps the trusted build path — dispatch → build → publish → CLI cache
 hit — continuously tested on a clean runner.
 
+## Traffic cost
+
+`scripts/traffic-cost.sh` runs the same three services against the
+production-shaped scheduler fixture instead of a single crate, and
+answers whether launch user traffic fits the Cloudflare allowance
+without overloading the scheduler. In one stack start it:
+
+1. seeds the fixture at 1M and then 100k queue rows and runs every
+   scheduler drive (`edge/src/scheduler/drives.rs`) through the Durable
+   Object's budget probe, reading workerd's billed `rowsRead` and
+   `rowsWritten`;
+2. measures Worker CPU per traffic lane with the isolate's V8 CPU
+   profiler, reached through `wrangler dev --inspector-port`
+   (`stow-admin traffic-cost cpu`);
+3. drives every lane at the launch model's peak rate for thirty
+   minutes (`stow-admin traffic-cost peak`);
+4. runs the drives again on the loaded fixture;
+5. judges the run (`stow-admin traffic-cost project`): row budgets,
+   growth with stored rows, the monthly projection against half of each
+   product's allowance (Worker CPU included), and peak serialized
+   Durable Object wall.
+
+Between steps it waits until the dispatch stub reports no build run in
+progress, so a dispatch callback from one step never lands in the next
+step's measurement, and it stops the services in reverse start order.
+Every lane stays on the machine except the trusted endpoints' GitHub
+push-permission check. The tunables are listed in
+`docs/ENVIRONMENT.md`. CI runs it as the release gate's `Traffic cost`
+job and uploads `reports/` on every run.
+
+```sh
+GH_TOKEN=$(gh auth token) scripts/traffic-cost.sh
+```
+
 The rest of this doc is the manual recipe the script automates, with
 the topology and verification details behind it. Follow it when you
 want the services left running, a larger preheat than a single crate,

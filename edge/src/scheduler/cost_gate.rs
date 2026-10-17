@@ -2,8 +2,8 @@
 //! `cargo test -p stow-edge`. It is *not* the number Cloudflare bills:
 //! the host backend exposes no scan-step counters, so `rows_read` here
 //! is the statements' result cardinality and `rows_written` their
-//! `changes()`. The merge gate is the workerd harness
-//! (`budget.rs` + `scripts/scheduler-budget.sh`), which replays the
+//! `changes()`. The billed gate is the workerd harness
+//! (`budget.rs` + `scripts/traffic-cost.sh`), which replays the
 //! same [`drives`] list on the 100k fixture inside the Durable Object
 //! and reports the real cursor counters. This test keeps the host
 //! proxies honest on a small fixture — a regression that goes
@@ -275,14 +275,15 @@ const BUDGETS: &[RouteBudget] = &[
         rows_written: 20,
         scan_allowlist: &[],
     },
-    // The same batch submitted again: writes collapse to the task
-    // upserts and the budget charge — the edge set is identical, so
-    // the delta sync deletes nothing and the insert conflicts out.
+    // The same batch submitted again, fully deduplicated (stow#784):
+    // `plan_enqueue` emits an update only when a request moves stored
+    // state, so the whole resubmit is the status probe plus the
+    // task_nodes upsert conflicts — zero rows written.
     RouteBudget {
         name: "POST /admin/enqueue (resubmit)",
-        statements: 16,
-        rows_read: 120,
-        rows_written: 12,
+        statements: 4,
+        rows_read: 20,
+        rows_written: 0,
         scan_allowlist: &[],
     },
     RouteBudget {

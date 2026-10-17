@@ -1,7 +1,7 @@
 //! The scheduler route list both cost gates drive. The host-side gate
 //! (`cost_gate.rs`, `cargo test -p stow-edge`) runs this same list on a
 //! small fixture against `counting_memory_db` as a fast pre-check; the
-//! workerd harness (`budget.rs`, `scripts/scheduler-budget.sh`) runs it
+//! workerd harness (`budget.rs`, `scripts/traffic-cost.sh`) runs it
 //! on the 100k production fixture inside the Durable Object, where
 //! `CfDurableDb` reports the real `rowsRead`/`rowsWritten` Cloudflare
 //! bills. One drive list keeps the two harnesses honest: a route that
@@ -55,7 +55,7 @@ pub enum PriorAlarm {
 /// (`status`, `error_msg`), `recover_stale_active_tasks` (`status`,
 /// `error_msg`, `deps_met`, `blocked`, `wake_at`),
 /// `requeue_incomplete_shape_deps` (`status`, `attempt`, `error_msg`,
-/// `request_count`, `deps_met`, `blocked`, `not_before`, `wake_at`,
+/// `deps_met`, `blocked`, `not_before`, `wake_at`,
 /// `shape_requeue`), and `apply_key_updates` (`value`, `dispatch_key`,
 /// `dispatch_eligible`) on the transitioned ids (stow#525).
 #[derive(Debug, Clone, skyzen::FromRow)]
@@ -64,7 +64,6 @@ pub struct RestoreQueueRow {
     status: String,
     attempt: i64,
     error_msg: Option<String>,
-    request_count: i64,
     deps_met: i64,
     blocked: i64,
     not_before: Option<String>,
@@ -86,7 +85,7 @@ pub struct RestoreQueueRow {
 
 /// The `RestoreQueueRow` column list, kept beside the struct so the
 /// snapshot queries and the restore UPDATE can't drift apart.
-const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, request_count, \
+const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, \
      deps_met, blocked, not_before, wake_at, CAST(value AS TEXT) AS value, dispatch_key, \
      dispatch_eligible, \
      generation_id, dispatch_attempts, github_run_id, claimed_at, updated_at, shape_requeue";
@@ -1397,6 +1396,7 @@ pub const DRIVES: &[Drive] = &[
                         target: String,
                         rustc_version: String,
                         host_side: i64,
+                        dependency_identity: String,
                     }
                     let d1 = ctx
                         .d1
@@ -1407,7 +1407,7 @@ pub const DRIVES: &[Drive] = &[
                         identities.extend(
                             db.query(
                                 "SELECT crate_name, version, features_json, target, \
-                                        rustc_version, host_side FROM queue \
+                                        rustc_version, host_side, dependency_identity FROM queue \
                                  WHERE task_id IN (SELECT value FROM json_each(?))",
                             )
                             .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
@@ -1422,6 +1422,7 @@ pub const DRIVES: &[Drive] = &[
                                 target: row.target,
                                 rustc_version: row.rustc_version,
                                 host_side: row.host_side != 0,
+                                dependency_identity: row.dependency_identity,
                                 explicit_spelling:
                                     stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                             }),
@@ -1496,7 +1497,7 @@ pub const DRIVES: &[Drive] = &[
                     match db
                         .query(
                             "UPDATE queue SET status = ?, attempt = ?, error_msg = ?, \
-                                 request_count = ?, deps_met = ?, blocked = ?, \
+                                 deps_met = ?, blocked = ?, \
                                  not_before = ?, wake_at = ?, value = CAST(? AS INTEGER), \
                                  dispatch_key = ?, dispatch_eligible = ?, \
                                  generation_id = ?, dispatch_attempts = ?, \
@@ -1507,7 +1508,6 @@ pub const DRIVES: &[Drive] = &[
                         .bind(row.status.clone())
                         .bind(row.attempt)
                         .bind(row.error_msg.clone())
-                        .bind(row.request_count)
                         .bind(row.deps_met)
                         .bind(row.blocked)
                         .bind(row.not_before.clone())

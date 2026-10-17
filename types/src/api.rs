@@ -2609,8 +2609,6 @@ pub struct QueueTask {
     pub downloads: u64,
     /// Cache misses this row is responsible for.
     pub miss_count: u32,
-    /// Cache-hit requests this row has served demand for.
-    pub request_count: u32,
     /// Dispatches attempted against this row.
     pub dispatch_attempts: u32,
     /// Whether the row builds against its checked-in lockfile.
