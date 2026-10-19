@@ -937,6 +937,7 @@ fn msvc_toolchain_grants(targets: &[String]) -> Vec<(PathBuf, Access, &'static s
 
 /// Returns only entries `find_msvc_tools` prepended to the host's value.
 /// Host PATH/LIB/INCLUDE entries are not toolchain entries to grant.
+#[cfg(windows)]
 fn added_entries(composed: &OsStr, host: Option<&OsStr>) -> Vec<PathBuf> {
     let host_entries = host
         .map(|host| std::env::split_paths(host).collect::<Vec<_>>())
@@ -1328,6 +1329,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
     fn added_entries_keeps_only_composed_paths_not_in_the_host() {
         let composed = std::env::join_paths([
