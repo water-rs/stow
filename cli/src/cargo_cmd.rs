@@ -643,7 +643,7 @@ async fn run_mirrored_upgrade_build(
         .as_ref()
         .and_then(|analysis| analysis.servable_units.clone());
 
-    let cache_policy_entries = prepare_build_cache_plan(
+    let cache_policy_entries = Box::pin(prepare_build_cache_plan(
         config,
         project,
         &mirror.current_dir(),
@@ -651,7 +651,7 @@ async fn run_mirrored_upgrade_build(
         public_cache_mode,
         mirror_analysis,
         budget,
-    )
+    ))
     .await?;
 
     if let Some(config) = config
@@ -744,7 +744,7 @@ fn build_mirror_project_context(
 /// Read-only, and that is the whole contract: the dependency graph never
 /// leaves the machine, nothing is posted, and nothing is enqueued.
 pub async fn predict(args: CargoCommandArgs, state_db: &StateDb) -> stow_types::error::Result<()> {
-    let Some(analysis) = analyze_for_prediction(args, state_db).await? else {
+    let Some(analysis) = Box::pin(analyze_for_prediction(args, state_db)).await? else {
         return Ok(());
     };
     write_stdout(&render_prediction_summary(&analysis))
@@ -2535,7 +2535,7 @@ async fn run_pinned_mirror_build(
     // so it sizes its own allowance from that.
     let budget = CacheBudget::for_covered_units(mirror_prefetch.len());
 
-    let cache_policy_entries = prepare_build_cache_plan(
+    let cache_policy_entries = Box::pin(prepare_build_cache_plan(
         Some(config),
         project,
         &pinned.mirror.current_dir(),
@@ -2543,7 +2543,7 @@ async fn run_pinned_mirror_build(
         public_cache_mode,
         Some(mirror_analysis),
         &budget,
-    )
+    ))
     .await?;
 
     match try_run_top_crate_with_cached_dependencies(

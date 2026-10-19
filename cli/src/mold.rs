@@ -1690,7 +1690,10 @@ mod tests {
     /// directory and nothing else — injected into the walk under test, so
     /// no test ever touches the process environment its siblings share.
     struct IsolatedProject {
+        #[cfg(unix)]
         tempdir: tempfile::TempDir,
+        #[cfg(not(unix))]
+        _tempdir: tempfile::TempDir,
         project: PathBuf,
         cargo_home: PathBuf,
         env: std::collections::HashMap<String, OsString>,
@@ -1728,7 +1731,10 @@ mod tests {
             cargo_home.clone().into_os_string(),
         )]);
         IsolatedProject {
+            #[cfg(unix)]
             tempdir,
+            #[cfg(not(unix))]
+            _tempdir: tempdir,
             project,
             cargo_home,
             env,
@@ -2299,6 +2305,7 @@ mod tests {
     /// use: the resolution's subprocesses are spawned by `cargo-config2`
     /// and `ld_mold_resolves` against real binaries, so the fixture
     /// names counting wrappers as `RUSTC` and `linker`.
+    #[cfg(unix)]
     fn counting_script(dir: &Path, name: &str, counter: &Path, body: &str) -> PathBuf {
         let script = dir.join(name);
         std::fs::write(
@@ -2320,6 +2327,7 @@ mod tests {
     }
 
     /// The lines a counting script recorded so far.
+    #[cfg(unix)]
     fn counter_lines(counter: &Path) -> Vec<String> {
         std::fs::read_to_string(counter)
             .unwrap_or_default()
@@ -2330,6 +2338,7 @@ mod tests {
 
     /// The fixture's injected environment as the `vars` vector
     /// `cargo_config_for_link_eval` and `link_env_vars` take.
+    #[cfg(unix)]
     fn fixture_vars(fixture: &IsolatedProject) -> Vec<(OsString, OsString)> {
         fixture
             .env
@@ -2342,6 +2351,7 @@ mod tests {
     /// build rustc it resolves and the shared `-vV` of its executable —
     /// then [`provision_resolved`] against `pool`, the call a cache row
     /// serves.
+    #[cfg(unix)]
     async fn resolve_with_cache(
         fixture: &IsolatedProject,
         tools_dir: &Path,
@@ -2369,6 +2379,7 @@ mod tests {
     /// reachable through the injected `PATH` — never the process's — so
     /// every probe the resolution runs leaves a line, and no test
     /// touches the environment its siblings share (stow#608).
+    #[cfg(unix)]
     struct CountingFixture {
         tools: tempfile::TempDir,
         /// The state DB's parent — field position only keeps it alive.
@@ -2385,6 +2396,7 @@ mod tests {
     /// the configured driver, and `PATH` carrying the tools dir so the
     /// driver's bare name resolves under the injected environment —
     /// `-fuse-ld=mold` resolves without linking anything.
+    #[cfg(unix)]
     async fn counting_fixture() -> CountingFixture {
         let tools = tempfile::tempdir().expect("tools");
         let rustc_counter = tools.path().join("rustc.count");

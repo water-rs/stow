@@ -322,7 +322,7 @@ async fn async_main() -> stow_types::error::Result<std::process::ExitStatus> {
     // command loads shares it, so this is the only place that has to
     // know what is open.
     let state_db = StateDb::default();
-    let result = run_cli(cli, &state_db).await;
+    let result = Box::pin(run_cli(cli, &state_db)).await;
     // Closed on every path, before the runtime goes away (stow#682).
     state_db.close().await;
     result
@@ -350,7 +350,7 @@ async fn run_cli(
         }
         CliCommand::Rustc(command) => return run_rustc_wrapper(command, state_db).await,
         CliCommand::Cc(command) => return run_cc_wrapper(command, state_db).await,
-        CliCommand::Predict(command) => cargo_cmd::predict(command, state_db).await,
+        CliCommand::Predict(command) => Box::pin(cargo_cmd::predict(command, state_db)).await,
         CliCommand::Setup(args) => commands::setup_project(args, state_db).await,
         CliCommand::Update => commands::update_self().await,
         CliCommand::Status => commands::status_project(state_db).await,

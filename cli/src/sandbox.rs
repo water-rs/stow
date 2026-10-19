@@ -895,7 +895,7 @@ fn msvc_toolchain_grants(targets: &[String]) -> Vec<(PathBuf, Access, &'static s
             }
             for (key, value) in tool.env() {
                 let host = std::env::var_os(key);
-                let access = if env_name::eq(&key, "PATH") {
+                let access = if env_name::eq(key, "PATH") {
                     Access::READ | Access::EXEC
                 } else {
                     Access::READ

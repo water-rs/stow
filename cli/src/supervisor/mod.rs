@@ -258,14 +258,19 @@ pub enum Listener {
 
 impl Listener {
     /// The endpoint that reaches this listener.
+    #[cfg(unix)]
     #[must_use]
     pub fn endpoint(&self) -> Endpoint {
-        match self {
-            #[cfg(unix)]
-            Self::Unix { dir, .. } => Endpoint::Unix(dir.path().join(SOCKET_NAME)),
-            #[cfg(not(unix))]
-            Self::Loopback { port, .. } => Endpoint::Loopback(*port),
-        }
+        let Self::Unix { dir, .. } = self;
+        Endpoint::Unix(dir.path().join(SOCKET_NAME))
+    }
+
+    /// The endpoint that reaches this listener.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub const fn endpoint(&self) -> Endpoint {
+        let Self::Loopback { port, .. } = self;
+        Endpoint::Loopback(*port)
     }
 
     /// Accept one connection.

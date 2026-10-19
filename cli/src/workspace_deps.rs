@@ -2798,6 +2798,7 @@ mod unit_graph_tests {
     };
     use stow_types::api::ResolvedDependencyGraphEntry;
 
+    #[cfg(unix)]
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
 
     fn write(root: &Path, relative: &str, contents: &str) {
