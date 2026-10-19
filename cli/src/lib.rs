@@ -747,6 +747,13 @@ pub(crate) struct BuildContext {
 #[derive(Debug, Clone)]
 pub(crate) struct Latch {
     done: tokio::sync::watch::Sender<bool>,
+    /// Test observation (stow#810): how many waits have found the latch
+    /// pending and parked on it. A test reaches the point where a
+    /// decision is provably held by the latch through this, rather than
+    /// sleeping and asserting the decision has not finished — which
+    /// passes just as well when it never started.
+    #[cfg(test)]
+    parked: tokio::sync::watch::Sender<usize>,
 }
 
 impl Latch {
@@ -755,7 +762,24 @@ impl Latch {
     pub(crate) fn pending() -> Self {
         Self {
             done: tokio::sync::watch::channel(false).0,
+            #[cfg(test)]
+            parked: tokio::sync::watch::channel(0).0,
         }
+    }
+
+    /// Resolve once `waits` waits have parked on this latch — each
+    /// subscribed while it was pending, so a [`Self::complete`] from here
+    /// on is what releases them.
+    #[cfg(test)]
+    pub(crate) async fn parked(&self, waits: usize) {
+        let mut parked = self.parked.subscribe();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            parked.wait_for(|count| *count >= waits),
+        )
+        .await
+        .expect("no wait parked on the latch")
+        .expect("the latch outlives its observation");
     }
 
     /// Fire it: release every waiter, present and late alike.
@@ -776,6 +800,8 @@ impl Latch {
     pub(crate) async fn wait(&self) {
         let mut receiver = self.done.subscribe();
         if !*receiver.borrow() {
+            #[cfg(test)]
+            self.parked.send_modify(|count| *count += 1);
             let _ = receiver.changed().await;
         }
     }
@@ -5298,14 +5324,16 @@ mod tests {
         let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
 
         // The lookup starts while the slice is still absent: it must
-        // not answer before the build's fetch has settled.
+        // not answer before the build's fetch has settled — it parks on
+        // the signal, and from there only the settle answers it.
         let mut lookup = std::pin::pin!(cache.slice(&config, TARGET, RUSTC, &signal));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut lookup)
-                .await
-                .is_err(),
-            "the lookup answered while the build's fetch was still in flight"
-        );
+        tokio::select! {
+            biased;
+            _ = &mut lookup => {
+                panic!("the lookup answered while the build's fetch was still in flight")
+            }
+            () = signal.parked(1) => {}
+        }
         let digest = crate::index::write_cached_test_slice(
             &config,
             TARGET,
@@ -5532,12 +5560,13 @@ mod tests {
             let mut serve = std::pin::pin!(super::try_remote_serves(
                 &env, &parsed, &request, &ctx, true, &mut tally,
             ));
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(500), &mut serve)
-                    .await
-                    .is_err(),
-                "the lookup missed on a pending slice without waiting for the fetch"
-            );
+            tokio::select! {
+                biased;
+                _ = &mut serve => {
+                    panic!("the lookup missed on a pending slice without waiting for the fetch")
+                }
+                () = signal.parked(1) => {}
+            }
             assert!(
                 !crate::circuit::negative_cache_contains(&config, &env.cache_key)
                     .await
@@ -6047,17 +6076,6 @@ mod tests {
             .expect("list stored crates")
         }
 
-        async fn wait_until(mut predicate: impl FnMut() -> bool, what: &str, timeout: Duration) {
-            let deadline = std::time::Instant::now() + timeout;
-            while !predicate() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "timed out waiting for {what}"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-
         /// The `BuildContext` a deferred build hands its supervisor when
         /// the policy directory is seeded empty and the enrichment still
         /// owes it the coarse allow commit (stow#788).
@@ -6115,11 +6133,9 @@ mod tests {
                 let args = args.clone();
                 tokio::spawn(async move { handler.plan(OsString::from("rustc"), args).await })
             };
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            assert!(
-                !deciding.is_finished(),
-                "a missing marker answered before the policy commit landed"
-            );
+            // The decision found no marker and parked on the owed
+            // commit: from here only the commit can answer it.
+            policy_ready.parked(1).await;
 
             // The enrichment's commit: the marker lands, then the latch
             // releases — the order `run_build_enrichment` writes it.
@@ -6195,8 +6211,7 @@ mod tests {
                 let args = args.clone();
                 tokio::spawn(async move { handler.plan(OsString::from("rustc"), args).await })
             };
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            assert!(!deciding.is_finished());
+            policy_ready.parked(1).await;
             policy_ready.complete();
             let decision = deciding.await.expect("join the plan");
             assert!(
@@ -6232,7 +6247,7 @@ mod tests {
             let (config, in_flight, handler) = fixture(tempdir.path()).await;
             let supervisor = server::start(
                 handler,
-                in_flight,
+                in_flight.clone(),
                 &std::env::current_exe().expect("current exe"),
             )
             .expect("start supervisor");
@@ -6262,10 +6277,13 @@ mod tests {
             send_observed(&mut consumer_conn, &token, &consumer_args, Some(true)).await;
 
             // No flush here — the report's bookkeeping is what waits, so
-            // the connection's next frame cannot be answered yet. Give it
-            // a beat to prove the wait is real: nothing may be stored
-            // while the dependency is in flight.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // the connection's next frame cannot be answered yet. The
+            // dependent's bookkeeping parks on the dependency's flight;
+            // from there nothing may be stored while it is in flight.
+            let dep_rlib =
+                crate::artifact_cache::path_to_string(&out_dir.join("libdep-depmeta.rlib"))
+                    .expect("utf-8 extern path");
+            in_flight.parked_on(&dep_rlib, 1).await;
             assert!(
                 stored_crates(&config).await.is_empty(),
                 "nothing may be stored while the dependency is in flight"
@@ -6276,15 +6294,9 @@ mod tests {
             // store included — has run to its end.
             flush_frames(&mut dep_conn, &token).await;
 
-            // The dependent's wait releases now and its store lands.
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while stored_crates(&config).await.len() != 2 {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the dependent was not stored"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            // The dependent's wait releases now; its connection's flush
+            // answers only once that bookkeeping — store included — ran.
+            flush_frames(&mut consumer_conn, &token).await;
             assert_eq!(stored_crates(&config).await, vec!["consumer", "dep"]);
         }
 
@@ -6341,22 +6353,18 @@ mod tests {
             send_observed(&mut consumer_conn, &token, &consumer_args, None).await;
             send_observed(&mut consumer_conn, &token, &consumer_args, Some(true)).await;
             // The dependent's bookkeeping waits only until the dead
-            // connection's flight completes — then the flush answers.
+            // connection's flight completes — then the flush answers, and
+            // the bookkeeping that logs the skip has run to its end.
             flush_frames(&mut consumer_conn, &token).await;
 
-            wait_until(
-                || {
-                    let captured = log.0.lock().expect("log buffer");
-                    String::from_utf8_lossy(&captured).contains("bookkeeping was never recorded")
-                },
-                "the unrecorded-dependency debug line",
-                Duration::from_secs(10),
-            )
-            .await;
             let captured = {
                 let captured = log.0.lock().expect("log buffer");
                 String::from_utf8_lossy(&captured).into_owned()
             };
+            assert!(
+                captured.contains("bookkeeping was never recorded"),
+                "the unrecorded-dependency debug line:\n{captured}"
+            );
             assert!(
                 captured.contains("consumer2"),
                 "the debug line names the skipped unit:\n{captured}"

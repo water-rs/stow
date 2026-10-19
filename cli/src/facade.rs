@@ -353,6 +353,14 @@ impl ServeMapSignal {
     pub async fn wait(&self) {
         self.latch.wait().await;
     }
+
+    /// Resolve once `waits` waits have parked on the still-pending
+    /// signal — the test observation [`crate::Latch::parked`] carries
+    /// (stow#810).
+    #[cfg(test)]
+    pub(crate) async fn parked(&self, waits: usize) {
+        self.latch.parked(waits).await;
+    }
 }
 
 impl Default for ServeMapSignal {
@@ -639,23 +647,31 @@ mod tests {
     /// unix socket's close (stow#347).
     #[test]
     fn the_wait_rides_the_loopback_transport() {
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
+        // The peer stamps the instant it lets its answer go; a wait that
+        // returned before that stamp did not wait for the peer's word.
+        let (released_tx, released_rx) = std::sync::mpsc::channel::<Instant>();
         let (port, server) = serve_one_await(
-            move || std::thread::sleep(Duration::from_millis(80)),
+            move || released_tx.send(Instant::now()).expect("stamp the release"),
             &super::Answer::ServeMapReady,
         );
         let started = Instant::now();
         super::await_serve_map(&Endpoint::Loopback(port), "the-token").expect("the wait");
-        let waited = started.elapsed();
+        let returned = Instant::now();
         let request = server.join().expect("server thread");
+        let released = released_rx.recv().expect("the peer's release stamp");
         assert_eq!(
             request,
             super::Request::AwaitServeMap(super::AwaitServeMap {
                 token: "the-token".to_owned()
             })
         );
-        assert!(waited >= Duration::from_millis(80), "{waited:?}");
+        assert!(
+            returned >= released,
+            "the wait returned before the peer answered"
+        );
+        let waited = returned.duration_since(started);
         assert!(waited < super::SERVE_MAP_WAIT_TIMEOUT, "{waited:?}");
     }
 
@@ -748,10 +764,8 @@ mod tests {
     /// a protocol bug the facade surfaces, not a release (stow#347).
     #[test]
     fn a_refused_wait_fails_loudly() {
-        use std::time::Duration;
-
         let (port, server) = serve_one_await(
-            move || std::thread::sleep(Duration::ZERO),
+            || {},
             &super::Answer::Failed {
                 message: "supervisor token mismatch".to_owned(),
             },
@@ -829,7 +843,15 @@ mod tests {
     /// the unit here, so the answer is the plan path, not a compile.
     #[test]
     fn a_pending_map_holds_an_unnamed_registry_unit() {
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
+
+        /// What the test hears first: the server's word that the wait
+        /// frame arrived, or the facade's own return.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Step {
+            Parked,
+            Returned,
+        }
 
         let _guard = env_guard();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -838,12 +860,21 @@ mod tests {
         pending.pending = true;
         std::fs::write(&map_path, serde_json::to_vec(&pending).expect("map"))
             .expect("write pending map");
-        // The server answers on the test's word, not a fixed hold: the
-        // settled map is on disk before the answer may leave, on any
-        // runner (stow#810).
+        // The server reports when the facade's wait frame has arrived —
+        // the facade read the pending map and parked — and answers only
+        // on the test's word: the settled map is on disk after the park
+        // and before the answer may leave, on any runner (stow#810). The
+        // facade reports its own return on the same channel, so a facade
+        // that answers without parking fails the test instead of
+        // hanging it.
+        let (step_tx, step_rx) = std::sync::mpsc::channel::<Step>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server_step = step_tx.clone();
         let (port, server) = serve_one_await(
-            move || release_rx.recv().expect("the test's release"),
+            move || {
+                server_step.send(Step::Parked).expect("report the park");
+                release_rx.recv().expect("the test's release");
+            },
             &super::Answer::ServeMapReady,
         );
         let binary =
@@ -863,12 +894,14 @@ mod tests {
         );
         let facade = std::thread::spawn(move || {
             let outcome = super::try_invocation_with(&args);
-            (Instant::now(), outcome)
+            let answered = Instant::now();
+            step_tx.send(Step::Returned).expect("report the return");
+            (answered, outcome)
         });
-        std::thread::sleep(Duration::from_millis(60));
-        assert!(
-            !facade.is_finished(),
-            "an unnamed registry unit answered before the map settled"
+        assert_eq!(
+            step_rx.recv().expect("the first step"),
+            Step::Parked,
+            "an unnamed registry unit answered before it parked on the serve-map wait"
         );
         // The fetch's answer lands while the facade is parked: the
         // settled map covers the unit, so the re-read defers it.

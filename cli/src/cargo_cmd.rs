@@ -5509,9 +5509,9 @@ mod tests {
                 .await
             }
         });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        // The gated resolve parks on the latch; from there only the
+        // completion lets it run.
+        resolution_done.parked(1).await;
         assert!(
             !started.load(std::sync::atomic::Ordering::SeqCst),
             "the unit-graph resolve ran before cargo's resolution was over"
@@ -5896,13 +5896,9 @@ mod tests {
         let command = tokio::spawn(async move {
             super::passthrough_command(&project, "build", &cargo_args, project.current_dir()).await
         });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !command.is_finished(),
-            "the passthrough command assembled before the mold selection resolved"
-        );
+        // The released `--config` value in the assembled args is the
+        // proof the command waited: it exists only behind the
+        // selection's await (stow#810).
         release
             .send(vec![
                 "target.x86_64-unknown-linux-gnu.linker=\"clang\"".to_owned(),
@@ -5959,13 +5955,8 @@ mod tests {
             };
             super::cargo_command(&plan).await
         });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            !command.is_finished(),
-            "the supervised cargo command assembled before the mold selection resolved"
-        );
+        // As on the passthrough: the released `--config` value in the
+        // assembled args proves the command waited for the selection.
         release
             .send(vec![
                 "target.x86_64-unknown-linux-gnu.linker=\"clang\"".to_owned(),
@@ -6021,9 +6012,16 @@ mod tests {
             flag.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(vec!["selected".to_owned()])
         });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
+        // Nothing but a reader can poll the provisioning: no task was
+        // spawned to drive it, so the flag is settled until the read —
+        // not merely unset after a few scheduler turns (stow#810).
+        assert_eq!(
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks(),
+            0,
+            "a deferred selection spawned its provisioning"
+        );
         assert!(
             !polled.load(std::sync::atomic::Ordering::SeqCst),
             "a deferred selection's provisioning ran without a reader"

@@ -687,6 +687,15 @@ struct StubSupervision {
     open_connections: usize,
 }
 
+/// The stub's census and the notification its connection threads raise
+/// when the last open connection drains, so [`drain_stub`] waits on that
+/// event instead of sampling the count (stow#810).
+#[derive(Debug, Default)]
+struct StubSupervisor {
+    census: std::sync::Mutex<StubSupervision>,
+    drained: std::sync::Condvar,
+}
+
 /// The crate a supervisor frame compiled: `--crate-name`'s value in the
 /// decoded argv. Frames with no argv — `Compiled`, `AwaitServeMap` —
 /// name no crate.
@@ -779,21 +788,29 @@ fn serve_stub_connection(
 /// A supervisor that answers every plan with `Compile` and every report
 /// with `Recorded`, while counting which frames each crate produced.
 /// Returns the loopback endpoint pieces and the shared count map.
-fn spawn_stub_supervisor() -> (String, std::sync::Arc<std::sync::Mutex<StubSupervision>>) {
+fn spawn_stub_supervisor() -> (String, std::sync::Arc<StubSupervisor>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub supervisor");
     let port = listener.local_addr().expect("local addr").port();
-    let counts = std::sync::Arc::new(std::sync::Mutex::new(StubSupervision::default()));
-    let accept_counts = std::sync::Arc::clone(&counts);
+    let stub = std::sync::Arc::new(StubSupervisor::default());
+    let accept_stub = std::sync::Arc::clone(&stub);
     std::thread::spawn(move || {
         let mut connections = Vec::new();
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
-            accept_counts.lock().expect("frame counts").open_connections += 1;
+            accept_stub
+                .census
+                .lock()
+                .expect("frame counts")
+                .open_connections += 1;
             connections.push(std::thread::spawn({
-                let counts = std::sync::Arc::clone(&accept_counts);
+                let stub = std::sync::Arc::clone(&accept_stub);
                 move || {
-                    serve_stub_connection(stream, &counts);
-                    counts.lock().expect("frame counts").open_connections -= 1;
+                    serve_stub_connection(stream, &stub.census);
+                    let mut census = stub.census.lock().expect("frame counts");
+                    census.open_connections -= 1;
+                    if census.open_connections == 0 {
+                        stub.drained.notify_all();
+                    }
                 }
             }));
         }
@@ -801,7 +818,7 @@ fn spawn_stub_supervisor() -> (String, std::sync::Arc<std::sync::Mutex<StubSuper
             let _ = connection.join();
         }
     });
-    (format!("tcp:{port}"), counts)
+    (format!("tcp:{port}"), stub)
 }
 
 /// The census is final only once every connection thread has drained
@@ -811,8 +828,9 @@ fn spawn_stub_supervisor() -> (String, std::sync::Arc<std::sync::Mutex<StubSuper
 /// (accept is FIFO, so a handshake still queued at the build's exit is
 /// counted before the probe), and `open_connections == 0` after the
 /// probe's own close is the connection threads' word that every frame
-/// was counted.
-fn drain_stub(endpoint: &str, counts: &std::sync::Mutex<StubSupervision>) {
+/// was counted — raised on `drained` by the thread that closes the last
+/// one.
+fn drain_stub(endpoint: &str, stub: &StubSupervisor) {
     let port: u16 = endpoint
         .strip_prefix("tcp:")
         .expect("a tcp loopback endpoint")
@@ -848,14 +866,20 @@ fn drain_stub(endpoint: &str, counts: &std::sync::Mutex<StubSupervision>) {
         "the probe must be answered: {answer:?}"
     );
     drop(probe);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while counts.lock().expect("frame counts").open_connections != 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the stub's connections never drained: {counts:?}"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    let (census, wait) = stub
+        .drained
+        .wait_timeout_while(
+            stub.census.lock().expect("frame counts"),
+            std::time::Duration::from_secs(30),
+            |census| census.open_connections != 0,
+        )
+        .expect("frame counts");
+    let undrained = wait.timed_out().then(|| format!("{census:?}"));
+    drop(census);
+    assert!(
+        undrained.is_none(),
+        "the stub's connections never drained: {undrained:?}"
+    );
 }
 
 /// What the stub exports as `STOW_SUPERVISOR_BINARY`: the identity of
@@ -890,7 +914,7 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
     let cargo_home = tempfile::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
-    let (endpoint, counts) = spawn_stub_supervisor();
+    let (endpoint, stub) = spawn_stub_supervisor();
     let supervisor_binary = supervisor_binary();
     let map_path = dir.path().join("serve-map.json");
     std::fs::write(&map_path, "{\"target\":[],\"host\":[]}").expect("write serve map");
@@ -923,9 +947,9 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
     // Connection threads finish the instant each facade closes its
     // stream; the build's exit guarantees all frames were sent, and the
     // lock sees them once the stub has drained them.
-    drain_stub(&endpoint, &counts);
+    drain_stub(&endpoint, &stub);
     let (cfg_if_plans, cfg_if_marks, cfg_if_reports, probe_plans, debug) = {
-        let counts = counts.lock().expect("frame counts");
+        let counts = stub.census.lock().expect("frame counts");
         let values = (
             counts.plans.get("cfg_if").copied().unwrap_or(0),
             counts.observed_marks.get("cfg_if").copied().unwrap_or(0),
@@ -964,7 +988,7 @@ fn a_covered_unit_still_takes_the_plan_path() {
     let cargo_home = tempfile::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
-    let (endpoint, counts) = spawn_stub_supervisor();
+    let (endpoint, stub) = spawn_stub_supervisor();
     let supervisor_binary = supervisor_binary();
     // `cfg-if` compiles unspelled — no `--target` on a native build — so
     // the host side carries it, at any version. Map entries are
@@ -994,9 +1018,9 @@ fn a_covered_unit_still_takes_the_plan_path() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    drain_stub(&endpoint, &counts);
+    drain_stub(&endpoint, &stub);
     let (cfg_if_plans, cfg_if_observed, debug) = {
-        let counts = counts.lock().expect("frame counts");
+        let counts = stub.census.lock().expect("frame counts");
         let values = (
             counts.plans.get("cfg_if").copied().unwrap_or(0),
             counts.observed_marks.get("cfg_if").copied().unwrap_or(0)
