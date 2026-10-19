@@ -27,6 +27,7 @@ use heel::{
     Access, IpcRouter, IpcUnconfigured, Sandbox, SandboxConfig, SandboxConfigBuilder,
     SecurityConfig,
 };
+use stow_types::env_name;
 use stow_types::error::Context;
 
 /// Whether heel has a backend for this platform (Linux, macOS, Windows).
@@ -509,8 +510,9 @@ fn toolchain_grant_dirs() -> Vec<(PathBuf, Access, &'static str)> {
         &["CARGO_TARGET_", "CC_", "CXX_", "AR_", "RANLIB_", "LD"];
     let mut dirs: Vec<(PathBuf, Access, &'static str)> = std::env::vars_os()
         .filter_map(|(name, value)| {
-            let name = name.to_str()?;
-            if TOOLCHAIN_ROOT_VARS.contains(&name) || ANDROID_ROOT_VARS.contains(&name) {
+            if env_name::eq_any(&name, TOOLCHAIN_ROOT_VARS)
+                || env_name::eq_any(&name, ANDROID_ROOT_VARS)
+            {
                 let dir = PathBuf::from(value);
                 return dir.is_dir().then(|| {
                     (
@@ -520,10 +522,7 @@ fn toolchain_grant_dirs() -> Vec<(PathBuf, Access, &'static str)> {
                     )
                 });
             }
-            if TOOLCHAIN_EXE_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-            {
+            if env_name::starts_with_any(&name, TOOLCHAIN_EXE_PREFIXES) {
                 // The value must name a real file: a bare name resolves
                 // through PATH (covered by the cargo/rustc dirs and the
                 // system rules), and a non-file value —
@@ -815,14 +814,10 @@ fn rustflag_b_dirs(targets: &[String], config: Option<&cargo_config2::Config>) -
 fn toolchain_drivers(targets: &[String], config: Option<&cargo_config2::Config>) -> Vec<PathBuf> {
     let mut spellings: Vec<OsString> = vec![OsString::from("cc"), OsString::from("c++")];
     for (name, value) in std::env::vars_os() {
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let toolchain_exe = matches!(name, "CC" | "CXX" | "LD")
-            || name.starts_with("CC_")
-            || name.starts_with("CXX_")
-            || name.starts_with("LD_")
-            || (name.starts_with("CARGO_TARGET_") && name.ends_with("_LINKER"));
+        let toolchain_exe = env_name::eq_any(&name, &["CC", "CXX", "LD"])
+            || env_name::starts_with_any(&name, &["CC_", "CXX_", "LD_"])
+            || (env_name::starts_with(&name, "CARGO_TARGET_")
+                && env_name::ends_with(&name, "_LINKER"));
         if toolchain_exe {
             spellings.push(value);
         }
@@ -899,7 +894,7 @@ fn msvc_toolchain_grants(targets: &[String]) -> Vec<(PathBuf, Access, &'static s
                 ));
             }
             for (key, value) in tool.env() {
-                let access = if key.as_os_str() == "PATH" {
+                let access = if env_name::eq(&key, "PATH") {
                     Access::READ | Access::EXEC
                 } else {
                     Access::READ
@@ -946,9 +941,9 @@ fn msvc_toolchain_grants(targets: &[String]) -> Vec<(PathBuf, Access, &'static s
 /// absent: `CARGO_REGISTRIES_*_TOKEN` and friends never match a prefix
 /// below, and `env`/`SSH_AUTH_SOCK`-style secrets die with the list.
 ///
-/// `names` is the parent environment's variable names; the task's
-/// platform decides which toolchain roots apply — the Android ones only
-/// for a build that could use them.
+/// `names` is the parent environment's variable names, matched the way
+/// the host's environment does — case-insensitively on Windows, where the
+/// search path is stored `Path`.
 fn sandbox_env_names(names: impl Iterator<Item = String>) -> Vec<String> {
     const EXACT: &[&str] = &[
         "PATH",
@@ -1039,12 +1034,10 @@ fn sandbox_env_names(names: impl Iterator<Item = String>) -> Vec<String> {
     ];
     names
         .filter(|name| {
-            name != "CARGO_TARGET_DIR"
-                && name != "CARGO_HOME"
-                && name != "RUSTUP_HOME"
-                && (EXACT.contains(&name.as_str())
-                    || ANDROID_ROOT_VARS.contains(&name.as_str())
-                    || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+            !env_name::eq_any(name, &["CARGO_TARGET_DIR", "CARGO_HOME", "RUSTUP_HOME"])
+                && (env_name::eq_any(name, EXACT)
+                    || env_name::eq_any(name, ANDROID_ROOT_VARS)
+                    || env_name::starts_with_any(name, PREFIXES))
         })
         .collect()
 }
@@ -1172,6 +1165,42 @@ pub async fn fetch_dependencies(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sandbox_env_admits_the_search_path_under_host_rules() {
+        // Windows stores the search path as `Path` and compares names
+        // case-insensitively, so it must pass the allowlist there — the
+        // failure the runner hit (stow#779). Everywhere else `Path` is a
+        // different variable from `PATH` and stays out.
+        let admitted = sandbox_env_names(["Path".to_owned()].into_iter());
+        #[cfg(windows)]
+        assert_eq!(admitted, vec!["Path".to_owned()]);
+        #[cfg(not(windows))]
+        assert_eq!(admitted, Vec::<String>::new());
+        assert_eq!(
+            sandbox_env_names(["PATH".to_owned()].into_iter()),
+            vec!["PATH".to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_sandbox_env_excludes_the_overridden_dirs_under_host_rules() {
+        // `CARGO_TARGET_` is an admitted prefix, so the three directories
+        // stow sets itself are refused by name — under the host's rules:
+        // on Windows the lowercase spelling is the same variable and is
+        // refused too, while elsewhere it never matched the allowlist.
+        for name in [
+            "CARGO_TARGET_DIR",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "cargo_target_dir",
+        ] {
+            assert_eq!(
+                sandbox_env_names([name.to_owned()].into_iter()),
+                Vec::<String>::new()
+            );
+        }
+    }
 
     #[test]
     fn the_fetch_carries_the_builds_offline_flag() {

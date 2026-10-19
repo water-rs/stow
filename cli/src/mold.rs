@@ -35,6 +35,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use sha2::Digest as _;
+use stow_types::env_name;
 use stow_types::error::Context;
 use tracing::Instrument as _;
 
@@ -679,8 +680,8 @@ const LINK_ENV_VARS: &[&str] = &[
 /// under the `CARGO_TARGET_` prefix, in particular not
 /// `CARGO_TARGET_DIR`).
 fn is_target_table_env(key: &str) -> bool {
-    key.strip_prefix("CARGO_TARGET_")
-        .is_some_and(|rest| rest.ends_with("_LINKER") || rest.ends_with("_RUSTFLAGS"))
+    env_name::starts_with(key, "CARGO_TARGET_")
+        && (env_name::ends_with(key, "_LINKER") || env_name::ends_with(key, "_RUSTFLAGS"))
 }
 
 /// The environment map the link resolution reads — the allowlist above
@@ -698,8 +699,14 @@ fn link_env_vars(
         let Ok(key) = key.into_string() else {
             continue;
         };
-        if LINK_ENV_VARS.contains(&key.as_str()) || is_target_table_env(&key) {
-            map.insert(key, value);
+        // The key the resolution digests is one spelling per variable —
+        // the allowlist's own for an exact match, the uppercase
+        // convention for a `CARGO_TARGET_*` one — so the same
+        // configuration keys the same however the host spelled it.
+        if let Some(listed) = env_name::matching(&key, LINK_ENV_VARS) {
+            map.insert(listed.to_owned(), value);
+        } else if is_target_table_env(&key) {
+            map.insert(env_name::canonical(&key), value);
         }
     }
     if de_wrapped {

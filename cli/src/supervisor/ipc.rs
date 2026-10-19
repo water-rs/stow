@@ -104,7 +104,10 @@ impl<H: Handler> heel::ipc::IpcCommand for SupervisorIpc<H> {
 
     type Response = Option<Answer>;
 
-    fn handle(&self, call: IpcCall) -> impl Future<Output = Option<Answer>> + Send {
+    fn handle(
+        &self,
+        call: IpcCall,
+    ) -> impl Future<Output = Result<Option<Answer>, heel::IpcError>> + Send {
         let conversations = Arc::clone(&self.conversations);
         let handler = Arc::clone(&self.handler);
         let tickets = self.tickets.clone();
@@ -112,7 +115,7 @@ impl<H: Handler> heel::ipc::IpcCommand for SupervisorIpc<H> {
         let in_flight = self.in_flight.clone();
         let rt = self.rt.clone();
         async move {
-            match call.body {
+            Ok(match call.body {
                 IpcCallBody::Close => {
                     conversations
                         .lock()
@@ -158,7 +161,7 @@ impl<H: Handler> heel::ipc::IpcCommand for SupervisorIpc<H> {
                         .append(&mut marks);
                     answer
                 }
-            }
+            })
         }
     }
 }

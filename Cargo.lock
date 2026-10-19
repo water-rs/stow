@@ -3075,7 +3075,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c91d8cffac8849493a82233811bd02b2b183b8cf39bf704de0fa0841b737595"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -3713,8 +3713,8 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.4.2"
-source = "git+https://github.com/lexoliu/heel?rev=3296b90b2f0ce08fdba27f478f8fa586a97e8afb#3296b90b2f0ce08fdba27f478f8fa586a97e8afb"
+version = "0.5.0"
+source = "git+https://github.com/lexoliu/heel?branch=dev#6a32d8c23e73c0dafd58659c94038cb39237c539"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -4081,7 +4081,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

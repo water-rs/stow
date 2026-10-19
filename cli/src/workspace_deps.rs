@@ -8,6 +8,7 @@ use glob::glob;
 use semver::Version;
 use serde::Deserialize;
 use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
+use stow_types::env_name;
 use stow_types::error::Context;
 use stow_types::public_cache::UnitSide;
 
@@ -488,7 +489,7 @@ fn unstable_feature_gate(
 ) -> stow_types::error::Result<()> {
     let mut enabled = Vec::<String>::new();
     for (key, _value) in std::env::vars() {
-        if let Some(name) = key.strip_prefix("CARGO_UNSTABLE_") {
+        if let Some(name) = env_name::strip_prefix(&key, "CARGO_UNSTABLE_") {
             enabled.push(format!("CARGO_UNSTABLE_{name}"));
         }
     }
