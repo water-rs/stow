@@ -99,19 +99,20 @@ impl ConsumeConfig {
 /// TTL cache can predate that publish and silently stage nothing for a
 /// dependency the gate promised, which is exactly the own-node failure
 /// consumption exists to prevent. `stow check`/`stow index status` keep
-/// the TTL through [`crate::index::ensure_slice`]; this path does not.
+/// the TTL through [`crate::index::ensure_slice`]; this path does not,
+/// and for the same reason it never falls back to the cached slice when
+/// the registry cannot be asked.
 ///
 /// # Errors
 ///
-/// Returns an error when no usable slice can be produced; the caller
-/// treats that as consumption being unavailable, never as data. A
-/// registry failure still falls back to the verified cache, if any.
+/// Returns an error when the registry cannot confirm the slice or the
+/// slice fails verification; the build fails with it (stow#817).
 pub async fn ensure_slice(
     config: &ConsumeConfig,
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<IndexSlice> {
-    crate::index::refresh_slice(&config.0, target, rustc_version).await
+    crate::index::confirmed_slice(&config.0, target, rustc_version).await
 }
 
 /// A verified published bundle staged for a build task's sandbox, with the

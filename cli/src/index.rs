@@ -12,10 +12,12 @@
 //! short-circuits the network entirely; past it, one manifest request
 //! re-validates the digest and only a moved digest costs a download and
 //! re-verification. Network failure with a cached slice logs at `info` and
-//! serves it; no cached slice and no reachable registry is a hard error
-//! naming the tag — resolution then proceeds only from signed bytes.
+//! serves it — except on the build prefetch's path, which takes only the
+//! registry's answer; no cached slice and no reachable registry is a hard
+//! error naming the tag — resolution then proceeds only from signed bytes.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -98,7 +100,7 @@ pub async fn ensure_slice(
     if let Some(slice) = slices.get(&key) {
         return Ok(slice.clone());
     }
-    let slice = fetch_slice(config, target, rustc_version, false).await?;
+    let slice = fetch_slice(config, target, rustc_version, Revalidation::PastInterval).await?;
     slices.insert(key, slice.clone());
     drop(slices);
     Ok(slice)
@@ -139,7 +141,41 @@ pub async fn refresh_slice(
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<IndexSlice> {
-    fetch_slice(config, target, rustc_version, true).await
+    fetch_slice(config, target, rustc_version, Revalidation::Always).await
+}
+
+/// The build prefetch's slice: the registry's current answer and nothing
+/// older. A cached slice may predate the publish the scheduler's
+/// dependency gate counted, so serving it when the registry cannot be
+/// reached would stage nothing for a dependency the gate promised and
+/// compile it instead (stow#817).
+///
+/// # Errors
+///
+/// Returns an error when the registry is unreachable, when the fetched
+/// artifact fails signature or digest verification, or when the cached
+/// bytes cannot be decoded.
+pub async fn confirmed_slice(
+    config: &StowConfig,
+    target: &str,
+    rustc_version: &str,
+) -> stow_types::error::Result<IndexSlice> {
+    fetch_slice(config, target, rustc_version, Revalidation::Required).await
+}
+
+/// How much of the cached slice [`fetch_slice`] may serve without the
+/// registry confirming it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Revalidation {
+    /// A pointer inside `index_refresh_interval` serves as-is; past it the
+    /// registry is asked, and the cached slice serves when it cannot
+    /// answer.
+    PastInterval,
+    /// The registry is always asked, and the cached slice serves when it
+    /// cannot answer.
+    Always,
+    /// The registry is always asked, and only its answer serves.
+    Required,
 }
 
 /// Every cached slice under `cache_dir/index/`, for `stow index status`.
@@ -203,11 +239,11 @@ async fn fetch_slice(
     config: &StowConfig,
     target: &str,
     rustc_version: &str,
-    force: bool,
+    revalidation: Revalidation,
 ) -> stow_types::error::Result<IndexSlice> {
     let dir = slice_dir(config, target, rustc_version);
     let pointer = read_pointer(&dir).await;
-    if !force
+    if revalidation == Revalidation::PastInterval
         && let Some(pointer) = &pointer
         && pointer_is_fresh(pointer, config.index_refresh_interval)
         && let Some(slice) = load_cached(&dir, pointer).await?
@@ -245,10 +281,17 @@ async fn fetch_slice(
                     if let Some(slice) = load_cached(&dir, &pointer).await? {
                         return Ok(slice);
                     }
-                    // The tag still names the foreign-format manifest —
-                    // it is the *published* slice that cannot be read:
-                    // the pull below surfaces that `Format` error.
+                    // A sibling refresh evicted the blob since the
+                    // pointer was read, and the pull below fetches it
+                    // again; or the tag still names the foreign-format
+                    // manifest — it is the *published* slice that cannot
+                    // be read, and the pull surfaces that `Format` error.
                 }
+            }
+            Err(error) if revalidation == Revalidation::Required => {
+                return Err(stow_types::stow_error!(
+                    "revalidate index slice {tag}: {error}"
+                ));
             }
             Err(error) => {
                 tracing::info!(
@@ -273,13 +316,7 @@ async fn fetch_slice(
         rustc_version,
     )
     .await?;
-    store_slice(&dir, &manifest_digest, &blob).await?;
-    let pointer = SlicePointer {
-        row_count: index.rows.len() as u64,
-        manifest_digest: manifest_digest.clone(),
-        fetched_at: now_secs(),
-    };
-    write_pointer(&dir, &pointer).await?;
+    commit_slice(&dir, &manifest_digest, blob, index.rows.len() as u64).await?;
     Ok(IndexSlice {
         manifest_digest,
         index,
@@ -355,25 +392,46 @@ async fn download_verified_slice(
     Ok((blob, manifest_digest, index))
 }
 
-/// Atomically swap the verified blob into `dir`: temp-write, rename over
-/// the digest-named slot, then drop every other blob so one slice dir never
-/// holds two generations.
+/// What a refresh writes once its download verified: the blob, then the
+/// pointer naming it.
+async fn commit_slice(
+    dir: &Path,
+    manifest_digest: &str,
+    blob: Vec<u8>,
+    row_count: u64,
+) -> stow_types::error::Result<()> {
+    store_slice(dir, manifest_digest, blob).await?;
+    write_pointer(
+        dir,
+        &SlicePointer {
+            manifest_digest: manifest_digest.to_owned(),
+            fetched_at: now_secs(),
+            row_count,
+        },
+    )
+    .await
+}
+
+/// Atomically swap the verified blob into `dir`: stage it, rename it over
+/// the digest-named slot, then drop every other blob so one slice dir
+/// never holds two generations.
+///
+/// Refreshes of one slice share this directory — two `stow` processes on
+/// one `cache_dir`, every local CI build of one target — and run it at
+/// once exactly when a new generation lands (stow#817). Eviction leaves
+/// staging files alone, since each belongs to a sibling's write in
+/// flight, and a stale blob a sibling evicted first is already the end
+/// state eviction wants.
 async fn store_slice(
     dir: &Path,
     manifest_digest: &str,
-    blob: &[u8],
+    blob: Vec<u8>,
 ) -> stow_types::error::Result<()> {
     async_fs::create_dir_all(dir)
         .await
         .wrap_err_with(|| format!("create index dir {}", dir.display()))?;
     let keep = blob_name(manifest_digest);
-    let tmp = dir.join(format!(".tmp-{}", std::process::id()));
-    async_fs::write(&tmp, blob)
-        .await
-        .wrap_err_with(|| format!("write index blob {}", tmp.display()))?;
-    async_fs::rename(&tmp, dir.join(&keep))
-        .await
-        .wrap_err_with(|| format!("commit index blob into {}", dir.display()))?;
+    commit_file(dir, "blob", &keep, blob).await?;
     let mut entries = async_fs::read_dir(dir)
         .await
         .wrap_err_with(|| format!("read index dir {}", dir.display()))?;
@@ -384,10 +442,17 @@ async fn store_slice(
         .wrap_err_with(|| format!("traverse index dir {}", dir.display()))?
     {
         let name = entry.file_name();
-        if name != POINTER_FILE && name != keep.as_str() {
-            async_fs::remove_file(entry.path())
-                .await
-                .wrap_err_with(|| format!("evict stale index blob {}", entry.path().display()))?;
+        let staging = name.to_str().is_some_and(|name| name.starts_with('.'));
+        if staging || name == POINTER_FILE || name == keep.as_str() {
+            continue;
+        }
+        match async_fs::remove_file(entry.path()).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).wrap_err_with(|| {
+                    format!("evict stale index blob {}", entry.path().display())
+                });
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -397,14 +462,43 @@ async fn write_pointer(dir: &Path, pointer: &SlicePointer) -> stow_types::error:
     async_fs::create_dir_all(dir)
         .await
         .wrap_err_with(|| format!("create index dir {}", dir.display()))?;
-    let tmp = dir.join(format!(".{POINTER_FILE}.tmp-{}", std::process::id()));
-    async_fs::write(&tmp, serde_json::to_vec(pointer)?)
-        .await
-        .wrap_err_with(|| format!("write index pointer {}", tmp.display()))?;
-    async_fs::rename(&tmp, dir.join(POINTER_FILE))
-        .await
-        .wrap_err_with(|| format!("commit index pointer in {}", dir.display()))?;
-    Ok(())
+    commit_file(
+        dir,
+        POINTER_FILE,
+        POINTER_FILE,
+        serde_json::to_vec(pointer)?,
+    )
+    .await
+}
+
+/// Write `bytes` as `dir/name` atomically: staged under a `.<hint>.tmp-*`
+/// name no concurrent writer to `dir` shares — a per-process name let two
+/// writers in one process rename each other's staging file away — then
+/// renamed over `name`. A write that fails removes its staging file.
+async fn commit_file(
+    dir: &Path,
+    hint: &str,
+    name: &str,
+    bytes: Vec<u8>,
+) -> stow_types::error::Result<()> {
+    let dir = dir.to_path_buf();
+    let prefix = format!(".{hint}.tmp-");
+    let committed = dir.join(name);
+    smol::unblock(move || {
+        let mut staged = tempfile::Builder::new()
+            .prefix(&prefix)
+            .tempfile_in(&dir)
+            .wrap_err_with(|| format!("create index staging file in {}", dir.display()))?;
+        staged
+            .write_all(&bytes)
+            .wrap_err_with(|| format!("write index staging file {}", staged.path().display()))?;
+        staged
+            .persist(&committed)
+            .map_err(|error| error.error)
+            .wrap_err_with(|| format!("commit {}", committed.display()))?;
+        Ok(())
+    })
+    .await
 }
 
 async fn read_pointer(dir: &Path) -> Option<SlicePointer> {
@@ -412,19 +506,25 @@ async fn read_pointer(dir: &Path) -> Option<SlicePointer> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Decode the cached blob `pointer` selects. `None` when the blob carries
-/// a foreign `format_version` — not corruption, a publish format this
-/// build does not read; the caller re-pulls (or, on the read-only path,
-/// counts the slice as absent). Any other decode failure is corrupt
+/// Decode the cached blob `pointer` selects. `None` when the blob is gone
+/// — a sibling refresh that committed another generation evicted it
+/// after this pointer was read (stow#817) — or carries a foreign
+/// `format_version`, a publish format this build does not read. Neither
+/// is corruption: the caller re-pulls (or, on the read-only path, counts
+/// the slice as absent). Any other read or decode failure is corrupt
 /// cache and is surfaced.
 async fn load_cached(
     dir: &Path,
     pointer: &SlicePointer,
 ) -> stow_types::error::Result<Option<IndexSlice>> {
     let path = dir.join(blob_name(&pointer.manifest_digest));
-    let bytes = async_fs::read(&path)
-        .await
-        .wrap_err_with(|| format!("read cached index {}", path.display()))?;
+    let bytes = match async_fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).wrap_err_with(|| format!("read cached index {}", path.display()));
+        }
+    };
     let index = match smol::unblock(move || ArtifactIndex::decode(&bytes)).await {
         Ok(index) => index,
         Err(stow_types::index::IndexDecodeError::Format { .. }) => return Ok(None),
@@ -491,16 +591,7 @@ pub async fn write_cached_test_slice(
     let blob = stow_types::index::encode(index)
         .map_err(|error| stow_types::stow_error!("encode test index slice: {error}"))?;
     let digest = "sha256:test-slice-manifest".to_owned();
-    store_slice(&dir, &digest, &blob).await?;
-    write_pointer(
-        &dir,
-        &SlicePointer {
-            manifest_digest: digest.clone(),
-            fetched_at: now_secs(),
-            row_count: index.rows.len() as u64,
-        },
-    )
-    .await?;
+    commit_slice(&dir, &digest, blob, index.rows.len() as u64).await?;
     Ok(digest)
 }
 
@@ -550,6 +641,8 @@ pub fn index_test_row(c_metadata: &str) -> stow_types::index::ArtifactIndexRow {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use stow_types::identity::{TargetTriple, WireRustcVersion};
     use stow_types::index::{ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndexHeader, ArtifactIndexRow};
 
@@ -627,7 +720,7 @@ mod tests {
         let blob = stow_types::index::encode(&index).expect("encode");
         let digest = "sha256:deadbeef".to_owned();
 
-        store_slice(&dir, &digest, &blob).await.expect("store");
+        store_slice(&dir, &digest, blob).await.expect("store");
         write_pointer(
             &dir,
             &SlicePointer {
@@ -660,9 +753,7 @@ mod tests {
         let mut index = test_index(vec![test_row("aaaa")]);
         index.header.format_version += 1;
         let blob = stow_types::index::encode(&index).expect("encode");
-        store_slice(&dir, "sha256:aaaa", &blob)
-            .await
-            .expect("store");
+        store_slice(&dir, "sha256:aaaa", blob).await.expect("store");
         write_pointer(
             &dir,
             &SlicePointer {
@@ -691,7 +782,7 @@ mod tests {
         let dir = slice_dir(&config, TARGET, RUSTC);
         let blob = stow_types::index::encode(&test_index(vec![test_row("aaaa")])).expect("encode");
 
-        store_slice(&dir, "sha256:aaaa", &blob)
+        store_slice(&dir, "sha256:aaaa", blob.clone())
             .await
             .expect("first store");
         write_pointer(
@@ -704,7 +795,7 @@ mod tests {
         )
         .await
         .expect("pointer");
-        store_slice(&dir, "sha256:bbbb", &blob)
+        store_slice(&dir, "sha256:bbbb", blob)
             .await
             .expect("second store");
 
@@ -729,9 +820,7 @@ mod tests {
         let dir = slice_dir(&config, TARGET, RUSTC);
         let index = test_index(vec![test_row("aaaa")]);
         let blob = stow_types::index::encode(&index).expect("encode");
-        store_slice(&dir, "sha256:aaaa", &blob)
-            .await
-            .expect("store");
+        store_slice(&dir, "sha256:aaaa", blob).await.expect("store");
         write_pointer(
             &dir,
             &SlicePointer {
@@ -810,6 +899,180 @@ mod tests {
         assert!(
             slice_fetch_pending(&eager, TARGET, RUSTC).await,
             "a zero interval revalidates every call"
+        );
+    }
+
+    /// stow#817: with a cached slice and a registry that cannot confirm
+    /// it, `stow index refresh` serves the cache, while the build prefetch
+    /// fails naming the slice — a cached slice may predate the publish its
+    /// task was dispatched on.
+    #[tokio::test]
+    async fn the_build_slice_never_falls_back_to_the_cache() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        // A registry that answers every request `404` — a refusal, which
+        // the client does not retry, unlike a dropped connection.
+        let registry = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = registry.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            for stream in registry.incoming() {
+                let mut stream = stream.expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let read = std::io::Read::read(&mut stream, &mut buffer).expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .expect("respond");
+            }
+        });
+        let config = StowConfig {
+            registry_base_url: format!("http://{address}"),
+            ..test_config(tempdir.path())
+        };
+        let dir = slice_dir(&config, TARGET, RUSTC);
+        let blob = stow_types::index::encode(&test_index(vec![test_row("aaaa")])).expect("encode");
+        commit_slice(&dir, "sha256:aaaa", blob, 1)
+            .await
+            .expect("seed the cache");
+
+        let refreshed = refresh_slice(&config, TARGET, RUSTC)
+            .await
+            .expect("refresh serves the cached slice");
+        assert_eq!(refreshed.manifest_digest, "sha256:aaaa");
+        let error = confirmed_slice(&config, TARGET, RUSTC)
+            .await
+            .expect_err("the build path takes only the registry's answer");
+        assert!(
+            error.to_string().contains(&format!(
+                "revalidate index slice {}",
+                index_tag(TARGET, RUSTC)
+            )),
+            "names the slice: {error}"
+        );
+    }
+
+    /// stow#817: refreshes that share one slice directory — two `stow`
+    /// processes on one `cache_dir`, every local CI build of one target —
+    /// all commit the same new generation at once when it lands, while
+    /// readers still hold the previous generation's pointer. Every
+    /// refresh succeeds, every read is either the slice its pointer names
+    /// or "not cached", and each generation leaves exactly its own blob.
+    #[test]
+    fn concurrent_refreshes_across_generation_changes_all_succeed() {
+        const REFRESHES: usize = 6;
+        const READERS: usize = 2;
+        const GENERATIONS: usize = 40;
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let dir = slice_dir(&config, TARGET, RUSTC);
+        let generation_slice = |generation: usize| {
+            let mut index = test_index(vec![test_row("aaaa")]);
+            index.header.generation = i64::try_from(generation).expect("generation");
+            let blob = stow_types::index::encode(&index).expect("encode");
+            (format!("sha256:{generation:064x}"), blob)
+        };
+        let (digest, blob) = generation_slice(0);
+        smol::block_on(commit_slice(&dir, &digest, blob, 1)).expect("seed generation 0");
+
+        // Each thread records its failures and keeps meeting the barrier:
+        // a thread that panicked mid-generation would strand the rest.
+        let barrier = std::sync::Barrier::new(REFRESHES + READERS);
+        let committed = AtomicUsize::new(0);
+        let failures = std::thread::scope(|scope| {
+            let refreshes = (0..REFRESHES).map(|_| {
+                scope.spawn(|| {
+                    let mut failures = Vec::new();
+                    for generation in 1..=GENERATIONS {
+                        let (digest, blob) = generation_slice(generation);
+                        barrier.wait();
+                        if let Err(error) = smol::block_on(commit_slice(&dir, &digest, blob, 1)) {
+                            failures.push(format!("refresh to generation {generation}: {error:#}"));
+                        }
+                        committed.fetch_add(1, Ordering::SeqCst);
+                        barrier.wait();
+                    }
+                    failures
+                })
+            });
+            // Readers read until every refresh of the generation has
+            // committed, so reads land all over the window in which the
+            // pointer can still name a blob a sibling just evicted.
+            let readers = (0..READERS).map(|_| {
+                scope.spawn(|| {
+                    let mut failures = Vec::new();
+                    for generation in 1..=GENERATIONS {
+                        barrier.wait();
+                        loop {
+                            let generation_committed =
+                                committed.load(Ordering::SeqCst) >= REFRESHES * generation;
+                            match smol::block_on(cached_slice(&config, TARGET, RUSTC)) {
+                                Err(error) => failures.push(format!(
+                                    "read during generation {generation}: {error:#}"
+                                )),
+                                Ok(Some(slice))
+                                    if slice.manifest_digest
+                                        != format!(
+                                            "sha256:{:064x}",
+                                            slice.index.header.generation
+                                        ) =>
+                                {
+                                    failures.push(format!(
+                                        "read during generation {generation} served generation {} under pointer {}",
+                                        slice.index.header.generation, slice.manifest_digest
+                                    ));
+                                }
+                                Ok(_) => {}
+                            }
+                            if generation_committed {
+                                break;
+                            }
+                        }
+                        barrier.wait();
+                    }
+                    failures
+                })
+            });
+            refreshes
+                .collect::<Vec<_>>()
+                .into_iter()
+                .chain(readers.collect::<Vec<_>>())
+                .flat_map(|thread| thread.join().expect("refresh thread"))
+                .collect::<Vec<_>>()
+        });
+        assert!(
+            failures.is_empty(),
+            "{} failures across {} refreshes:\n{}",
+            failures.len(),
+            REFRESHES * GENERATIONS,
+            failures.join("\n")
+        );
+
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "current.json".to_owned(),
+                blob_name(&format!("sha256:{GENERATIONS:064x}"))
+            ],
+            "the last generation's blob and pointer, no stale blob or staging file"
         );
     }
 }

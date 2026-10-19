@@ -635,43 +635,39 @@ fn lockfile_packages(
 /// The consumption prefetch (stow#299): pull the signed index slices and
 /// stage the verified bundles this task's dependency closure could be
 /// served, so each sandboxed rustc unit compiles only what the cache
-/// cannot vouch for. A cache that cannot answer is an optimization that
-/// did not happen — the build compiles everything exactly as before —
-/// while a bundle that fails any check is skipped and its unit compiles.
-/// The store stays out of `output_dir`: that directory is the publish
-/// job's hand-off, and staged bundles are not its contents.
+/// cannot vouch for. A bundle that never arrived is skipped and its unit
+/// compiles. The store stays out of `output_dir`: that directory is the
+/// publish job's hand-off, and staged bundles are not its contents.
 ///
 /// Returns the store `TempDir` — the lifetime owner the caller must hold
 /// for the build — plus the staged store path, or `(None, None)` when
-/// nothing verified or consumption could not be set up: consumption is an
-/// optimization, and an unavailable cache leaves a complete build.
+/// nothing verified or the task has no dependency to consume.
 ///
-/// A bundle the signed index vouches for that does not verify is not that
-/// case and is not swallowed. It says the published artifact and the
-/// signature over it disagree, on the machine whose output every user
-/// installs, and a build that quietly compiled past it would turn the one
-/// failure the verification chain exists to catch into nothing but a slow
-/// build.
+/// A task with dependencies was dispatched because every one of them is
+/// published, so a slice, config or registry failure here is not a cold
+/// cache. Building on would compile the whole dependency closure and fail
+/// much later on the foreign-unit check, far from the cause (stow#817);
+/// the build fails with the failure instead. A bundle the signed index
+/// vouches for that does not verify fails it too: it says the published
+/// artifact and the signature over it disagree, on the machine whose
+/// output every user installs.
 async fn stage_consumption_store(
     task: &BuildTaskPayload,
     unit_graphs: &[PhaseUnitGraph],
 ) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
+    if task.dependency_subgraph.nodes.is_empty() {
+        return Ok((None, None));
+    }
     let store_dir = TempDir::new()?;
     let packages = consumption_packages(task, unit_graphs);
-    let staged = match consume::prefetch(task, packages, store_dir.path()).await {
-        Ok(consumption) if consumption.artifacts > 0 => Some(consumption.store_dir),
-        Ok(_) => None,
-        Err(stow_cli::build_consume::StageFailure::Unavailable(error)) => {
-            tracing::warn!(
-                task_id = %task.task_id,
-                %error,
-                "cache consumption unavailable; building without it"
-            );
-            None
-        }
-        Err(stow_cli::build_consume::StageFailure::Unverifiable(error)) => return Err(error),
-    };
-    Ok(staged.map_or_else(|| (None, None), |path| (Some(store_dir), Some(path))))
+    let consumption = consume::prefetch(task, packages, store_dir.path())
+        .await
+        .map_err(|error| error.wrap_err("stage cache consumption"))?;
+    Ok(if consumption.artifacts > 0 {
+        (Some(store_dir), Some(consumption.store_dir))
+    } else {
+        (None, None)
+    })
 }
 
 /// One cargo `--unit-graph` answer for one phase×invocation spelling,
@@ -2524,6 +2520,68 @@ mod tests {
                 nodes: Vec::new(),
             },
         }
+    }
+
+    /// Point the consumption config at a registry no slice can be read
+    /// from, without any network: the scheme is refused before a request.
+    fn unreadable_registry(cache_dir: &Path) {
+        // SAFETY: nextest runs each test in its own process, and every
+        // test that sets these sets the same values.
+        unsafe {
+            std::env::set_var("STOW_CACHE_DIR", cache_dir);
+            std::env::set_var("STOW_REGISTRY_BASE_URL", "ftp://127.0.0.1");
+        }
+    }
+
+    /// stow#817: a task with published dependencies that cannot read its
+    /// slice fails with the slice error — building on would compile the
+    /// closure the scheduler promised it would be served.
+    #[test]
+    fn a_task_whose_slice_cannot_be_read_fails_naming_the_slice() {
+        let cache_dir = TempDir::new().expect("cache dir");
+        unreadable_registry(cache_dir.path());
+        let mut task = task_with_features(&[]);
+        task.dependency_subgraph = TaskSubgraph {
+            root_deps: vec![0],
+            nodes: vec![SubgraphNode {
+                crate_name: CrateName::parse("cfg-if").expect("crate name"),
+                version: CrateVersion::new(semver::Version::new(1, 0, 4)),
+                features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
+                host_side: false,
+                keys_apart: false,
+                deps: Vec::new(),
+            }],
+        };
+
+        let error = smol::block_on(super::stage_consumption_store(&task, &[]))
+            .expect_err("an unreadable slice fails the build");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("index slice for aarch64-apple-darwin"),
+            "names the slice: {text}"
+        );
+        assert!(text.contains("ftp"), "carries the underlying error: {text}");
+    }
+
+    /// A task with no dependency node has nothing published to consume,
+    /// which the task itself says: no config, slice or registry is asked.
+    #[test]
+    fn a_task_without_dependencies_consumes_nothing() {
+        let cache_dir = TempDir::new().expect("cache dir");
+        unreadable_registry(cache_dir.path());
+        let (store, path) = smol::block_on(super::stage_consumption_store(
+            &task_with_features(&[]),
+            &[],
+        ))
+        .expect("nothing to consume is not a failure");
+        assert!(store.is_none() && path.is_none());
+        assert!(
+            std::fs::read_dir(cache_dir.path())
+                .expect("cache dir")
+                .next()
+                .is_none(),
+            "no slice was fetched"
+        );
     }
 
     /// The release the ambient run toolchain's `rustc` reports — parsed
