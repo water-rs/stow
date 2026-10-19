@@ -284,6 +284,9 @@ pub enum SeedPhase {
     /// The staging hour's current-generation bulk plus its 256-row
     /// obsolete tail — `n` runs `1..=feed_staged_pages + 256`.
     FeedStaged,
+    /// The breaker's stored bulk — `n` runs `1..=outcome_bucket_rows`
+    /// (stow#816).
+    OutcomeBuckets,
 }
 
 impl SeedPhase {
@@ -298,6 +301,7 @@ impl SeedPhase {
             Self::FeedHeaders => feed_hist_hours(shape),
             Self::FeedPages => feed_hist_pages(shape),
             Self::FeedStaged => feed_staged_pages(shape) + FEED_OBSOLETE_TAIL,
+            Self::OutcomeBuckets => outcome_bucket_rows(shape),
         }
     }
 
@@ -321,7 +325,8 @@ impl SeedPhase {
             Self::DepsMet => Some(Self::FeedHeaders),
             Self::FeedHeaders => Some(Self::FeedPages),
             Self::FeedPages => Some(Self::FeedStaged),
-            Self::FeedStaged => None,
+            Self::FeedStaged => Some(Self::OutcomeBuckets),
+            Self::OutcomeBuckets => None,
         }
     }
 }
@@ -1302,7 +1307,8 @@ pub const fn counted_table(phase: SeedPhase) -> Option<CountedTable> {
         | SeedPhase::DepsMet
         | SeedPhase::FeedHeaders
         | SeedPhase::FeedPages
-        | SeedPhase::FeedStaged => None,
+        | SeedPhase::FeedStaged
+        | SeedPhase::OutcomeBuckets => None,
     }
 }
 
@@ -1370,6 +1376,9 @@ pub async fn seed_batch(
                 if hi >= phase.range_end(shape) {
                     fix_feed_staging_counters(db, shape).await?;
                 }
+            }
+            SeedPhase::OutcomeBuckets => {
+                seed_outcome_buckets_chunk(db, shape, n, hi).await?;
             }
         }
     }
@@ -1509,6 +1518,51 @@ async fn fix_feed_staging_counters(db: &DurableDb, shape: FixtureShape) -> Resul
     Ok(())
 }
 
+/// `queue_rows/16` outcome buckets (clamped `108–64_000`) — the stored
+/// bulk a `attempt_outcome_buckets` scan must be priced against, grown
+/// with the fixture so the bulk-growth check reads it (stow#816). The
+/// floor is the full key space: nine targets times twelve
+/// five-minute offsets.
+fn outcome_bucket_rows(shape: FixtureShape) -> u32 {
+    (shape.queue_rows / 16).clamp(108, 64_000)
+}
+
+/// One bounded `OutcomeBuckets` chunk. Each `n` writes a distinct
+/// `(target, bucket)` key — the target rotates every `offsets` rows,
+/// the bucket steps one width per row — so the table ends at exactly
+/// `outcome_bucket_rows` records whatever the replay. The buckets sit
+/// at and ahead of the current one: the completion expiry delete can
+/// never retire the bulk a scan must be measured against inside a
+/// probe run. `OR IGNORE` keeps a replayed cursor a dedupe pass.
+async fn seed_outcome_buckets_chunk(
+    db: &DurableDb,
+    shape: FixtureShape,
+    n: u32,
+    hi: u32,
+) -> Result<(), QueueError> {
+    if hi <= n {
+        return Ok(());
+    }
+    let offsets = outcome_bucket_rows(shape).div_ceil(target_count());
+    let target_case = target_case_sql(&format!("(n / {offsets})"));
+    let bucket_secs = super::queue::OUTCOME_BUCKET_SECS;
+    db.query(&format!(
+        "WITH RECURSIVE seq(n) AS ({}) \
+         INSERT OR IGNORE INTO attempt_outcome_buckets \
+             (target, bucket, outcomes, failures) \
+         SELECT {target_case}, \
+                (unixepoch('now') / {bucket_secs}) * {bucket_secs} \
+                    + (n % {offsets}) * {bucket_secs}, \
+                n % 5 + 1, 0 \
+         FROM seq",
+        seq_sql(n, hi),
+    ))
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("seed outcome buckets: {error}")))?;
+    Ok(())
+}
+
 /// Seed the whole fixture on the host path — the same chunks the/// Seed the whole fixture on the host path — the same chunks the
 /// workerd probe writes, looped until the seed reports done.
 ///
@@ -1570,6 +1624,12 @@ const SEED_TABLES: &[&str] = &[
     // bulk` breach, same defect class as `task_nodes`).
     "demand_feed_pages",
     "demand_feed_hours",
+    // The breaker's outcome bulk is fixture state the same way: the
+    // seed writes it `INSERT OR IGNORE` with time-derived keys, so a
+    // previous size's rows — or a previous run's buckets — survive the
+    // wipe and grow past the new shape's proportion (stow#816, same
+    // defect class as the feed tables above).
+    "attempt_outcome_buckets",
 ];
 
 /// `POST /budget/seed` — load the fixture through the operator path,
@@ -1800,6 +1860,7 @@ const fn seed_phase_tag(phase: SeedPhase) -> &'static str {
         SeedPhase::FeedHeaders => "feed_headers",
         SeedPhase::FeedPages => "feed_pages",
         SeedPhase::FeedStaged => "feed_staged",
+        SeedPhase::OutcomeBuckets => "outcome_buckets",
     }
 }
 
@@ -1815,6 +1876,7 @@ fn parse_seed_phase(tag: &str) -> Option<SeedPhase> {
         "feed_headers" => Some(SeedPhase::FeedHeaders),
         "feed_pages" => Some(SeedPhase::FeedPages),
         "feed_staged" => Some(SeedPhase::FeedStaged),
+        "outcome_buckets" => Some(SeedPhase::OutcomeBuckets),
         _ => None,
     }
 }
@@ -1965,12 +2027,13 @@ mod tests {
     }
 
     /// The reset wipe's table list is the seed's whole write set: a
-    /// reset seed at a smaller size must leave the feed tables holding
-    /// exactly the new shape's rows. The feed phases insert `OR
-    /// IGNORE` with ids that roll from 1, so anything the smaller seed
-    /// does not write is stale bulk surviving the wipe (stow#772 — the
-    /// 1M fixture's staged pages persisted into the 100k shape and the
-    /// cleanup drive read them as live bulk).
+    /// reset seed at a smaller size must leave the feed tables and the
+    /// outcome-bucket bulk holding exactly the new shape's rows. The
+    /// feed phases insert `OR IGNORE` with ids that roll from 1, so
+    /// anything the smaller seed does not write is stale bulk
+    /// surviving the wipe (stow#772 — the 1M fixture's staged pages
+    /// persisted into the 100k shape and the cleanup drive read them
+    /// as live bulk).
     #[tokio::test]
     async fn reset_seed_clears_the_feed_tables_the_seed_writes() {
         let db = memory_db().await.expect("memory db");
@@ -2019,6 +2082,16 @@ mod tests {
         .execute()
         .await
         .expect("plant stale page");
+        // The outcome buckets clamp to the same count too — a stale
+        // row under a key the seed never writes stands in the same
+        // way (stow#816).
+        db.query(
+            "INSERT INTO attempt_outcome_buckets (target, bucket, outcomes, failures) \
+             VALUES ('stale-target', 1, 1, 0)",
+        )
+        .execute()
+        .await
+        .expect("plant stale outcome bucket");
         run(true, 200).await;
 
         let small = FixtureShape { queue_rows: 200 };
@@ -2041,6 +2114,16 @@ mod tests {
             pages,
             i64::from(feed_hist_pages(small) + feed_staged_pages(small) + FEED_OBSOLETE_TAIL),
             "retained pages plus staging bulk and its obsolete tail — no stale rows"
+        );
+        let buckets = db
+            .query("SELECT COUNT(*) FROM attempt_outcome_buckets")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count outcome buckets");
+        assert_eq!(
+            buckets,
+            i64::from(outcome_bucket_rows(small)),
+            "seeded outcome bulk — no stale rows"
         );
     }
 

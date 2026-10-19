@@ -1866,7 +1866,7 @@ struct BuildStatsRow {
 /// The time granularity `attempt_outcome_buckets` counts in — five
 /// minutes, so a 60-minute window sums at most 12 buckets per target
 /// whatever the completion traffic.
-const OUTCOME_BUCKET_SECS: i64 = 300;
+pub const OUTCOME_BUCKET_SECS: i64 = 300;
 
 /// Count one completion report against the breaker's window and expire
 /// what aged out. The read set of a completion is constant in traffic:
@@ -1884,15 +1884,18 @@ async fn record_attempt_outcome(
     target: &str,
     window_minutes: u32,
 ) -> Result<(), QueueError> {
-    db.query(
+    // The bucket width is SQL text, never a bound parameter: the
+    // Durable Object binds every JS number as a double, so
+    // `(unixepoch('now') / ?) * ?` was float arithmetic and the
+    // "bucket" landed as the current second — one row per completion
+    // instead of one per five minutes (stow#816).
+    db.query(&format!(
         "INSERT INTO attempt_outcome_buckets (target, bucket, outcomes, failures) \
-         VALUES (?, (unixepoch('now') / ?) * ?, 1, ?) \
+         VALUES (?, (unixepoch('now') / {OUTCOME_BUCKET_SECS}) * {OUTCOME_BUCKET_SECS}, 1, ?) \
          ON CONFLICT(target, bucket) DO UPDATE SET \
-             outcomes = outcomes + 1, failures = failures + excluded.failures",
-    )
+             outcomes = outcomes + 1, failures = failures + excluded.failures"
+    ))
     .bind(target.to_owned())
-    .bind(OUTCOME_BUCKET_SECS)
-    .bind(OUTCOME_BUCKET_SECS)
     .bind(i64::from(!report.success))
     .execute()
     .await
@@ -1920,11 +1923,13 @@ async fn record_attempt_outcome(
         .execute()
         .await
         .map_err(|error| format!("expire old generation outcome rows: {error}"))?;
-    db.query("DELETE FROM attempt_outcome_buckets WHERE bucket < unixepoch('now') - ?")
-        .bind(i64::from(window_minutes) * 60)
-        .execute()
-        .await
-        .map_err(|error| format!("expire old attempt outcome buckets: {error}"))?;
+    db.query(
+        "DELETE FROM attempt_outcome_buckets WHERE bucket < unixepoch('now') - CAST(? AS INTEGER)",
+    )
+    .bind(i64::from(window_minutes) * 60)
+    .execute()
+    .await
+    .map_err(|error| format!("expire old attempt outcome buckets: {error}"))?;
     Ok(())
 }
 
@@ -2124,7 +2129,10 @@ async fn persist_pending_completion(
 
 /// Apply one exact pending event after its run id has been bound. The event
 /// stays durable until `complete` succeeds; a stale row consumes it without
-/// allowing it to affect a later generation.
+/// allowing it to affect a later generation. Returns whether a failure
+/// outcome was recorded — the caller's breaker-evaluation gate (stow#816):
+/// the completion route already evaluates on every failure report, so a
+/// pass owes the check only for failures it applied itself.
 async fn apply_pending_completion_for_binding(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -2132,7 +2140,7 @@ async fn apply_pending_completion_for_binding(
     generation_id: &str,
     github_run_id: &str,
     window_minutes: u32,
-) -> Result<(), QueueError> {
+) -> Result<bool, QueueError> {
     db.query(
         "DELETE FROM pending_run_completions \
          WHERE task_id = ? AND github_run_id != ?",
@@ -2155,7 +2163,7 @@ async fn apply_pending_completion_for_binding(
         .await
         .map_err(|error| format!("load bound pending completion for {task_id}: {error}"))?;
     let Some(pending) = pending else {
-        return Ok(());
+        return Ok(false);
     };
     let report = BuildCompleteReport {
         task_id: pending.task_id,
@@ -2172,27 +2180,30 @@ async fn apply_pending_completion_for_binding(
         github_run_id: Some(pending.github_run_id.clone()),
         finished_at: Some(pending.received_at),
     };
-    match complete(db, settings, &report, window_minutes).await {
-        Ok(()) | Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => {
-            db.query("DELETE FROM pending_run_completions WHERE github_run_id = ?")
-                .bind(pending.github_run_id)
-                .execute()
-                .await
-                .map_err(|error| format!("consume pending completion for {task_id}: {error}"))?;
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    // A stale or unknown event is consumed without an outcome — only
+    // a `complete` that landed counts toward the caller's gate.
+    let applied = match complete(db, settings, &report, window_minutes).await {
+        Ok(()) => true,
+        Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => false,
+        Err(error) => return Err(error),
+    };
+    db.query("DELETE FROM pending_run_completions WHERE github_run_id = ?")
+        .bind(pending.github_run_id)
+        .execute()
+        .await
+        .map_err(|error| format!("consume pending completion for {task_id}: {error}"))?;
+    Ok(applied && !report.success)
 }
 
 /// Recover pending events after a DO restart. The join is driven by the
 /// currently bound in-flight rows, so it reads only identities that can
-/// still apply and never scans historical workflow runs.
+/// still apply and never scans historical workflow runs. Returns whether
+/// any applied event recorded a failure outcome.
 pub async fn reconcile_pending_completions(
     db: &DurableDb,
     settings: &SchedulerSettings,
     window_minutes: u32,
-) -> Result<(), QueueError> {
+) -> Result<bool, QueueError> {
     let rows = db
         .query(
             "SELECT q.task_id, q.generation_id, q.github_run_id \
@@ -2205,8 +2216,9 @@ pub async fn reconcile_pending_completions(
         .fetch_all::<BoundPendingCompletionRow>()
         .await
         .map_err(|error| format!("list bound pending completions: {error}"))?;
+    let mut failure_applied = false;
     for row in rows {
-        apply_pending_completion_for_binding(
+        failure_applied |= apply_pending_completion_for_binding(
             db,
             settings,
             &row.task,
@@ -2216,7 +2228,7 @@ pub async fn reconcile_pending_completions(
         )
         .await?;
     }
-    Ok(())
+    Ok(failure_applied)
 }
 
 /// Bind the run a `workflow_dispatch` response returned to the claimed
@@ -4832,12 +4844,11 @@ pub async fn github_app_token(
     db: &DurableDb,
 ) -> Result<Option<crate::github_app::InstallationToken>, QueueError> {
     let row = db
-        .query(
+        .query(&format!(
             "SELECT token, expires_at FROM github_app_token \
              WHERE id = 1 AND CAST(strftime('%s', expires_at) AS INTEGER) \
-             > CAST(strftime('%s', 'now') AS INTEGER) + ?",
-        )
-        .bind(GITHUB_APP_TOKEN_MIN_REMAINING_SECS)
+             > CAST(strftime('%s', 'now') AS INTEGER) + {GITHUB_APP_TOKEN_MIN_REMAINING_SECS}"
+        ))
         .fetch_optional::<GitHubAppTokenRow>()
         .await
         .map_err(|error| format!("load github app token: {error}"))?;
@@ -5084,7 +5095,7 @@ pub async fn evaluate_freeze_trip(
     let buckets = db
         .query(
             "SELECT target, outcomes, failures FROM attempt_outcome_buckets \
-             WHERE bucket >= unixepoch('now') - ? \
+             WHERE bucket >= unixepoch('now') - CAST(? AS INTEGER) \
              ORDER BY target, bucket",
         )
         .bind(i64::from(settings.window_minutes) * 60)
@@ -5910,7 +5921,7 @@ async fn earliest_pending_eligible_ms(
     // The plan is a pure function of `now_ms`; bind the rendered clock
     // rather than calling wall-clock `datetime('now')` inside the probes.
     let now = db
-        .query("SELECT datetime(? / 1000, 'unixepoch')")
+        .query("SELECT datetime(CAST(? AS INTEGER) / 1000, 'unixepoch')")
         .bind(now_ms)
         .fetch_scalar::<String>()
         .await

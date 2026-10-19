@@ -642,6 +642,12 @@ CREATE TABLE IF NOT EXISTS attempt_outcome_buckets (
     PRIMARY KEY (target, bucket)
 );
 
+-- Both reads bound on `bucket` alone — the breaker's window SELECT and
+-- the completion's expiry DELETE — and the (target, bucket) primary key
+-- cannot serve a target-agnostic range, so `bucket` gets its own index.
+CREATE INDEX IF NOT EXISTS idx_attempt_outcome_buckets_bucket
+ON attempt_outcome_buckets (bucket);
+
 -- Generation-keyed failure evidence: raw outcome rows kept for
 -- failures only — the class and example-run evidence the trip alert
 -- prints is read once, when the check trips, so successes never land

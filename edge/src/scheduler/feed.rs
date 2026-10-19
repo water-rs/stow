@@ -500,7 +500,7 @@ pub async fn feed_complete(
                 (SELECT p.chain_hash FROM demand_feed_pages p \
                  WHERE p.hour = demand_feed_hours.hour \
                    AND p.generation = demand_feed_hours.generation \
-                   AND p.page_no = ? - 1) = ?)",
+                   AND p.page_no = CAST(? AS INTEGER) - 1) = ?)",
     )
     .bind(page_count)
     .bind(entry_count)
