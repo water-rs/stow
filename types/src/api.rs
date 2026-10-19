@@ -2662,8 +2662,10 @@ pub struct AdminInFlight {
     pub attempt: u32,
     /// Dispatches attempted against this row.
     pub dispatch_attempts: u32,
-    /// Last state-transition timestamp — the stale-dispatch lease clock.
-    pub updated_at: String,
+    /// The live generation's claim instant — the stale-dispatch lease
+    /// clock. Immutable for the generation; a re-request bumping
+    /// `updated_at` cannot postpone recovery (stow#786).
+    pub claimed_at: String,
     /// GitHub Actions run id, once the run has reported back.
     #[serde(default)]
     pub github_run_id: Option<String>,

@@ -396,7 +396,7 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         // Bounded by held quantities: the outcomes walk is the last
         // 24 h of completions (`FixtureShape::LAST_24H_ROWS`, an
-        // `idx_queue_updated_at` range), and the in-flight section by
+        // `idx_queue_terminal_updated` range), and the in-flight section by
         // the dispatch cap (`FixtureShape::IN_FLIGHT_ROWS`) — neither
         // tracks the stored queue bulk.
         name: "GET /admin/status",
@@ -531,9 +531,11 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
-        // The age selector walks `idx_queue_updated_at` — the rows it
-        // reads are bounded by the page limit, and the 24 h window it
-        // lands in is held at `FixtureShape::LAST_24H_ROWS`.
+        // The age selector's exact term still ranges `updated_at`
+        // while the implied `first_requested_at` bound does the index
+        // walk — the rows it reads are bounded by the page limit, and
+        // the 24 h window it lands in is held at
+        // `FixtureShape::LAST_24H_ROWS`.
         name: "GET /tasks?older_than=86400",
         setup: None,
         run: |db, _shape, _settings, _ctx| {
@@ -1377,7 +1379,7 @@ pub const DRIVES: &[Drive] = &[
                     .query(
                         "SELECT COUNT(*) FROM queue \
                          WHERE status IN ('dispatched', 'running') \
-                           AND updated_at <= datetime('now', ?)",
+                           AND claimed_at <= datetime('now', ?)",
                     )
                     .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
                     .fetch_scalar::<u64>()
@@ -2137,7 +2139,7 @@ async fn snapshot_claim_surface(
         .query(
             "SELECT COUNT(*) FROM queue \
              WHERE status IN ('dispatched', 'running') \
-               AND updated_at <= datetime('now', ?)",
+               AND claimed_at <= datetime('now', ?)",
         )
         .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
         .fetch_scalar::<u64>()

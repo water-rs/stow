@@ -80,17 +80,18 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 600,
         rows_written: 0,
         // Index-ordered tail read: the ORDER BY walks
-        // `idx_queue_updated_at` and stops at the page's LIMIT — the
-        // plan prints SCAN but reads only the newest page.
-        scan_allowlist: &["SCAN queue USING INDEX idx_queue_updated_at"],
+        // `idx_queue_first_requested` and stops at the page's LIMIT —
+        // the plan prints SCAN but reads only the newest page.
+        scan_allowlist: &["SCAN queue USING INDEX idx_queue_first_requested"],
     },
     RouteBudget {
         name: "GET /tasks?status=failed",
         statements: 2,
         rows_read: 600,
         rows_written: 0,
-        // The status equality bounds the walk to the failed group of
-        // `idx_queue_status_updated`; the LIMIT stops it at a page.
+        // The spelled `status IN ('completed','failed')` term bounds
+        // the walk to the failed group of `idx_queue_terminal_updated`;
+        // the LIMIT stops it at a page.
         scan_allowlist: &[],
     },
     RouteBudget {
@@ -98,8 +99,8 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 2,
         rows_read: 600,
         rows_written: 0,
-        // `status = 'pending'` lands `idx_queue_status_updated` on the
-        // pending group; `blocked` is filtered out by the residual.
+        // `status = 'pending'` walks `idx_queue_pending_first` on the
+        // unblocked arm; `first_requested_at` orders the page.
         scan_allowlist: &[],
     },
     RouteBudget {
@@ -108,8 +109,8 @@ const BUDGETS: &[RouteBudget] = &[
         rows_read: 600,
         rows_written: 0,
         // `status='pending' AND blocked=1` walks the
-        // `idx_queue_pending_live` partial index, whose (blocked,
-        // updated_at) key bounds the walk to the blocked group.
+        // `idx_queue_pending_first` partial index, whose (blocked,
+        // first_requested_at) key bounds the walk to the blocked group.
         scan_allowlist: &[],
     },
     RouteBudget {
@@ -117,7 +118,7 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 2,
         rows_read: 600,
         rows_written: 0,
-        // `idx_queue_target_updated` bounds the walk to the target's
+        // `idx_queue_target_first` bounds the walk to the target's
         // own group.
         scan_allowlist: &[],
     },
@@ -126,7 +127,7 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 2,
         rows_read: 600,
         rows_written: 0,
-        // `idx_queue_crate_updated` bounds the walk to the crate's rows.
+        // `idx_queue_crate_first` bounds the walk to the crate's rows.
         scan_allowlist: &[],
     },
     RouteBudget {
@@ -134,8 +135,10 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 2,
         rows_read: 600,
         rows_written: 0,
-        // `updated_at < now - older_than` is a range probe on
-        // `idx_queue_updated_at`, not a scan.
+        // `updated_at < now - older_than` keeps its exact semantics;
+        // the implied `first_requested_at` bound the selector emits
+        // beside it is what becomes the range probe on
+        // `idx_queue_first_requested`.
         scan_allowlist: &[],
     },
     RouteBudget {

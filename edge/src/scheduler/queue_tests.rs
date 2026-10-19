@@ -11,7 +11,7 @@ use crate::errors::QueueError;
 use crate::scheduler::test_db::{
     StatementLog, counting_memory_db, counting_memory_db_raw, memory_db, memory_db_raw,
 };
-use skyzen_services::durable::DurableDb;
+use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::public_cache::{ExplicitSpelling, UnitInvocation, UnitKind, UnitShape, UnitSide};
 
 const fn shape(side: UnitSide, invocation: UnitInvocation, kind: UnitKind) -> UnitShape {
@@ -276,17 +276,25 @@ fn host_dependency_on(consumer_target: &str, crate_name: &str) -> EnqueueRequest
 }
 
 /// Force a row into an in-flight status with a deterministic `updated_at`
-/// — a state no public queue function produces (claim always stamps
-/// `datetime('now')`), so one raw UPDATE is required.
+/// and `claimed_at` — a state no public queue function produces (claim
+/// always stamps `datetime('now')` on both), so one raw UPDATE is
+/// required. `claimed_at` is the stale-lease clock (stow#786): a
+/// forced in-flight row without one has no lease at all.
 async fn mark_active(db: &DurableDb, crate_name: &str, target: &str, status: &str) {
-    db.query("UPDATE queue SET status = ?, updated_at = ?               WHERE crate_name = ? AND target = ?")
-        .bind(status.to_owned())
-        .bind(ROW_TS.to_owned())
-        .bind(crate_name.to_owned())
-        .bind(target)
-        .execute()
-        .await
-        .expect("mark task active");
+    db.query(
+        "UPDATE queue SET status = ?, updated_at = ?, claimed_at = ?, \
+             first_requested_at = MIN(first_requested_at, ?) \
+             WHERE crate_name = ? AND target = ?",
+    )
+    .bind(status.to_owned())
+    .bind(ROW_TS.to_owned())
+    .bind(ROW_TS.to_owned())
+    .bind(ROW_TS.to_owned())
+    .bind(crate_name.to_owned())
+    .bind(target)
+    .execute()
+    .await
+    .expect("mark task active");
 }
 
 /// `enqueue` always stamps `first_requested_at = datetime('now')`; tests
@@ -7701,7 +7709,9 @@ async fn stale_recovery_and_shape_requeue_reprice_against_moved_cost() {
 
     // Stale-lease recovery: running, past the stale window → pending.
     db.query(
-        "UPDATE queue SET status = 'running', updated_at = datetime('now', '-2 days') \
+        "UPDATE queue SET status = 'running', updated_at = datetime('now', '-2 days'), \
+             claimed_at = datetime('now', '-2 days'), \
+             first_requested_at = MIN(first_requested_at, datetime('now', '-2 days')) \
              WHERE crate_name = 'stale'",
     )
     .execute()
@@ -8531,6 +8541,98 @@ async fn resubmit_rows_written_per_statement() {
         total_written, 0,
         "a fully deduplicated resubmit writes nothing (stow#784)"
     );
+}
+
+/// stow#786: a node several requests of one submit share is upserted
+/// into `task_nodes` once — the task id commits to every column but
+/// `explicit_spelling`, so a second occurrence could only re-probe the
+/// conflict (a billed read on the DO). Measured on the upsert's bound
+/// payload: across the submit's `INSERT INTO task_nodes` statements,
+/// no `task_id` appears twice.
+#[tokio::test]
+async fn shared_subgraph_nodes_upsert_once_per_submit() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let deps: Vec<EnqueueRequest> = (0..4).map(|d| dependency(&format!("dep{d}"))).collect();
+    let batch = vec![request("left", &deps), request("right", &deps)];
+    assert_eq!(
+        super::enqueue_trusted(&db, &batch, &settings())
+            .await
+            .expect("submit"),
+        2
+    );
+    let mut upserted = Vec::new();
+    for statement in log.lock().expect("log").iter() {
+        if !statement.sql.contains("INSERT INTO task_nodes") {
+            continue;
+        }
+        let [DbValue::Text(payload)] = statement.params.as_slice() else {
+            panic!("task_nodes upsert binds one json payload: {statement:?}");
+        };
+        for row in
+            serde_json::from_str::<Vec<serde_json::Value>>(payload).expect("node rows payload")
+        {
+            upserted.push(row["task_id"].as_str().expect("task_id string").to_owned());
+        }
+    }
+    let unique: BTreeSet<&String> = upserted.iter().collect();
+    assert_eq!(
+        upserted.len(),
+        unique.len(),
+        "every node upserts once per submit (stow#786): {upserted:?}"
+    );
+    assert_eq!(
+        upserted.len(),
+        6,
+        "two roots plus the four deps both requests share"
+    );
+}
+
+/// stow#786: `first_requested_at <= updated_at` is the invariant the
+/// age selector's implied bound leans on — an `older_than` match must
+/// never be dropped by a row whose request stamp sits ahead of its
+/// transition stamp. The fixture is seeded production-shaped; this
+/// drives every writer the suite has (submit, claim, bind, resubmit,
+/// complete, publish) over a real graph, then audits the whole table.
+#[tokio::test]
+async fn first_requested_at_never_exceeds_updated_at() {
+    let (db, _log) = counting_memory_db().await.expect("counting db");
+    let deps: Vec<EnqueueRequest> = (0..4).map(|d| dependency(&format!("dep{d}"))).collect();
+    let batch = vec![request("left", &deps), request("right", &deps)];
+    super::enqueue_trusted(&db, &batch, &settings())
+        .await
+        .expect("submit");
+    let audit = || async {
+        db.query("SELECT COUNT(*) FROM queue WHERE first_requested_at > updated_at")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("invariant audit")
+    };
+    assert_eq!(audit().await, 0, "after submit");
+    for claimed in super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
+        .await
+        .expect("claim")
+    {
+        assert_eq!(audit().await, 0, "after claim");
+        super::bind_dispatch_run(&db, &claimed.task_id, &claimed.generation_id, "run-1")
+            .await
+            .expect("bind");
+        assert_eq!(audit().await, 0, "after bind");
+        super::complete_run(
+            &db,
+            &settings(),
+            &report_with_run(&claimed.task_id, true, "run-1"),
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("complete");
+        assert_eq!(audit().await, 0, "after complete");
+    }
+    // The resubmit writer (`apply_batched_updates`) bumps `updated_at`
+    // on stored rows — including the completed ones.
+    super::enqueue_trusted(&db, &batch, &settings())
+        .await
+        .expect("resubmit");
+    assert_eq!(audit().await, 0, "after resubmit");
 }
 
 /// `completed` stored completed rows exactly as `complete` leaves

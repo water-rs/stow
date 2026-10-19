@@ -40,7 +40,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 const TARGET = "x86_64-unknown-linux-gnu";
 const RUSTC = "1.98.1";
 const DO = "https://scheduler.invalid";
-const STALE_LEASE_MS = 10 * 60 * 1000; // STOW_STALE_DISPATCH_MINUTES="10"
+const STALE_LEASE_MS = 7 * 24 * 60 * 60 * 1000; // STOW_STALE_DISPATCH_MINUTES="10080"
 
 type Env2 = typeof env & Record<string, string>;
 
@@ -258,7 +258,7 @@ describe("scheduler idle proof (stow#593)", () => {
 		// disconnected or no-op instance cannot pass this check.
 		const armed = await getAlarm(stub);
 		expect(armed).not.toBeNull();
-		// The lease is `updated_at + STOW_STALE_DISPATCH_MINUTES` — now + 10m
+		// The lease is `claimed_at + STOW_STALE_DISPATCH_MINUTES` — now + 7d
 		// within a generous tolerance for test clock skew.
 		expect(Math.abs((armed as number) - (Date.now() + STALE_LEASE_MS))).toBeLessThan(
 			60_000,

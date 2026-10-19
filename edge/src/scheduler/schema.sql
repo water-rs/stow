@@ -136,16 +136,14 @@ CREATE TABLE IF NOT EXISTS queue (
     UNIQUE(crate_name, version, features_json, target, rustc_version, host_side, dependency_identity)
 );
 
--- Status and lane are the queue's hot predicates: status() groups by them,
--- claim and recover filter on them.
-CREATE INDEX IF NOT EXISTS idx_queue_status_lane
-ON queue (status, lane);
-
 -- Request status positions count a human lane prefix by dispatch key.
 -- Keep lane before the range key so the bounded human-depth walk does not
 -- scan pending miss rows; all selected columns are covered by the index.
+-- Partial on `pending` — the position queries carry the literal filter,
+-- and claim/complete transitions no longer rewrite the entry (stow#786).
 CREATE INDEX IF NOT EXISTS idx_queue_human_position
-ON queue (status, lane, dispatch_key);
+ON queue (lane, dispatch_key)
+WHERE status = 'pending';
 
 -- Dependency edges between queue tasks. The dep_* columns hold the
 -- dependency's semantic identity verbatim so DEPENDENCY_NOT_BLOCKED_SQL
@@ -442,7 +440,8 @@ ON demand_feed_pages (hour, generation, applied, page_no);
 -- positive admission floor excludes the under-floor bulk before the
 -- `dispatch_key` walk reads it (stow#525).
 CREATE INDEX IF NOT EXISTS idx_queue_claim
-ON queue (status, deps_met, dispatch_eligible, dispatch_key, dispatch_family, lane, first_requested_at, not_before);
+ON queue (deps_met, dispatch_eligible, dispatch_key, dispatch_family, lane, first_requested_at, not_before)
+WHERE status = 'pending';
 
 -- The alarm's wake probes: `SELECT 1 … wake_at <= now LIMIT 1` (already
 -- dispatchable) and `MIN(wake_at) … wake_at > now` (earliest deferred
@@ -453,36 +452,45 @@ ON queue (status, deps_met, dispatch_eligible, dispatch_key, dispatch_family, la
 -- under-floor rows is excluded by equality before the `wake_at` walk —
 -- no bulk read against the floor (stow#525).
 CREATE INDEX IF NOT EXISTS idx_queue_wake
-ON queue (status, deps_met, dispatch_eligible, dispatch_family, wake_at);
+ON queue (deps_met, dispatch_eligible, dispatch_family, wake_at)
+WHERE status = 'pending';
 
 -- Admin's oldest-pending MIN and the 24h outcome window.
 CREATE INDEX IF NOT EXISTS idx_queue_status_first
 ON queue (status, first_requested_at);
 
-CREATE INDEX IF NOT EXISTS idx_queue_status_updated
-ON queue (status, updated_at);
+-- The terminal transitions' order index: the `?status=failed|completed`
+-- listing and the 24h outcome window range on `updated_at` inside each
+-- status arm. Partial on the terminal statuses — a pending or in-flight
+-- row never enters it, so insert and claim writes skip it entirely
+-- (stow#786).
+CREATE INDEX IF NOT EXISTS idx_queue_terminal_updated
+ON queue (status, updated_at)
+WHERE status IN ('completed', 'failed');
 
--- `list_tasks`'s newest-first tail read: the ORDER BY walks this index
--- and stops at the page's LIMIT.
-CREATE INDEX IF NOT EXISTS idx_queue_updated_at
-ON queue (updated_at);
+-- `list_tasks`'s newest-request-first tail read: `first_requested_at`
+-- is written once at insert and never rewritten, so the ORDER BY walks
+-- this index and stops at the page's LIMIT — and every later queue-row
+-- write leaves the entry alone (stow#786).
+CREATE INDEX IF NOT EXISTS idx_queue_first_requested
+ON queue (first_requested_at);
 
 -- The pending/blocked selectors' page: pending rows ordered newest
--- first within each `blocked` arm, so a `?status=pending` or
+-- request first within each `blocked` arm, so a `?status=pending` or
 -- `?status=blocked` listing stops at its LIMIT instead of walking the
 -- pending set until enough unfiltered rows accumulate.
-CREATE INDEX IF NOT EXISTS idx_queue_pending_live
-ON queue (blocked, updated_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_queue_pending_first
+ON queue (blocked, first_requested_at) WHERE status = 'pending';
 
 -- `list_tasks` selector bounds: a `target` or `crate_name` filtered
 -- listing walks the matching group of its own index under the same
--- newest-first ordering instead of scanning `idx_queue_updated_at` for
--- matches.
-CREATE INDEX IF NOT EXISTS idx_queue_target_updated
-ON queue (target, updated_at);
+-- newest-request-first ordering instead of scanning
+-- `idx_queue_first_requested` for matches.
+CREATE INDEX IF NOT EXISTS idx_queue_target_first
+ON queue (target, first_requested_at);
 
-CREATE INDEX IF NOT EXISTS idx_queue_crate_updated
-ON queue (crate_name, updated_at);
+CREATE INDEX IF NOT EXISTS idx_queue_crate_first
+ON queue (crate_name, first_requested_at);
 
 -- The exact (status, lane) counts `status()` reports, maintained by
 -- trigger instead of a whole-queue GROUP BY on every request. The
@@ -755,7 +763,7 @@ CREATE TABLE IF NOT EXISTS crate_build_stats (
 
 -- The cost-move refresh's exact probe: `WHERE status = 'pending'
 -- AND crate_name = ? AND target = ?`. Without it the refresh falls
--- back to `idx_queue_crate_updated` (crate_name only) and reads the
+-- back to `idx_queue_crate_first` (crate_name only) and reads the
 -- crate's whole history — every completed, failed and other-target
 -- row — instead of just the pending set it may rewrite.
 CREATE INDEX IF NOT EXISTS idx_queue_pending_crate_target
