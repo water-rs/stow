@@ -1080,40 +1080,36 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
             .expect("cargo fetch");
         assert!(status.success(), "cargo fetch on the consumer failed");
 
-        // Native spelling: no `--target` — cargo dedups `shared` into
-        // one unit; the conversion must re-split the resolver's twins.
-        let native = stow_cli::resolve_exact_dependency_graph(
-            &manifest,
-            "check",
-            &[],
-            None,
-            manifest.parent().unwrap(),
-            host.as_str(),
-            rustc,
-            None,
-        )
-        .await
-        .expect("native unit graph");
-        // Explicit spelling: `--target <host triple>` — cargo keeps the
-        // two sides distinct; the conversion must agree anyway.
         // `--target` rides in `cargo_args` — `resolve_exact`'s `target`
         // parameter only names the triple cargo was given, it does not
         // spell the flag itself.
-        let explicit = stow_cli::resolve_exact_dependency_graph(
-            &manifest,
-            "check",
-            &[
-                std::ffi::OsString::from("--target"),
-                std::ffi::OsString::from(host.as_str()),
-            ],
-            Some(host.as_str()),
-            manifest.parent().unwrap(),
-            host.as_str(),
-            rustc,
-            None,
-        )
-        .await
-        .expect("explicit-target unit graph");
+        let explicit_args = [
+            std::ffi::OsString::from("--target"),
+            std::ffi::OsString::from(host.as_str()),
+        ];
+        let unit_graph = |explicit: bool| {
+            let (cargo_args, target) = if explicit {
+                (&explicit_args[..], Some(host.as_str()))
+            } else {
+                (&[][..], None)
+            };
+            stow_cli::resolve_exact_dependency_graph(
+                &manifest,
+                "check",
+                cargo_args,
+                target,
+                manifest.parent().unwrap(),
+                host.as_str(),
+                rustc,
+                None,
+            )
+        };
+        // Native spelling: no `--target` — cargo dedups `shared` into
+        // one unit; the conversion must re-split the resolver's twins.
+        let native = unit_graph(false).await.expect("native unit graph");
+        // Explicit spelling: `--target <host triple>` — cargo keeps the
+        // two sides distinct; the conversion must agree anyway.
+        let explicit = unit_graph(true).await.expect("explicit-target unit graph");
 
         for (label, graph, target) in [
             ("native", &native, None),
