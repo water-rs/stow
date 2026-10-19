@@ -426,7 +426,6 @@ fn queue_seed_insert_sql(
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
     let lane_case = &fixture_lane_case_sql(pending_end, human_pin, human_end);
-    let first_at = "datetime('now', '-' || (n % 2880) || ' minutes')";
     let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
     // The claimable set is exactly the planted window (the human-lane
     // pin + `DISPATCH_ELIGIBLE_ROWS`) at every size (stow#588): a
@@ -462,6 +461,18 @@ fn queue_seed_insert_sql(
               THEN datetime('now', '+1 day') \
               WHEN n <= {last_24h} THEN datetime('now', '-' || (n % 1440) || ' minutes') \
               ELSE datetime('now', '-' || (1440 + n % 38880) || ' minutes') END"
+    );
+    // `first_requested_at <= updated_at` is the production invariant —
+    // every writer moves `updated_at` forward from an insert-time
+    // value equal to `first_requested_at` — so the request stamp is
+    // the transition stamp minus an offset, never an independent
+    // value that could sit ahead of it (stow#786). In-flight rows
+    // keep their request just ahead of the −30-minute claim stamp the
+    // lease models.
+    let first_at = &format!(
+        "CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
+              THEN datetime('now', '-35 minutes') \
+              ELSE datetime({updated_at}, '-' || (60 + n % 4320) || ' minutes') END"
     );
     let task_id = "printf('%064x', n)";
     let bands_expr = format!(

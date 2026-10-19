@@ -1041,12 +1041,11 @@ async fn enqueue_inner(
     // The content-addressed node store: every submit upserts every
     // node of each request's resolved subgraph, root included, so a
     // claimed task's `dependency_subgraph` can later be rebuilt by
-    // walking task ids alone (stow#588). Insert-or-ignore — dedup is
-    // by task id; storage grows with distinct nodes, not requests.
-    let node_rows: Vec<BatchedNodeRow> = prepared
-        .iter()
-        .flat_map(|entry| entry.nodes.iter().cloned())
-        .collect();
+    // walking task ids alone (stow#588). Dedup is by task id —
+    // `batch_node_rows` folds the duplicates shared subgraphs carry,
+    // so storage and upsert probes grow with distinct nodes, not
+    // requests.
+    let node_rows = batch_node_rows(&prepared);
     upsert_task_nodes(db, &node_rows).await?;
     let edge_owner_ids: Vec<String> = plan.edge_inserts.keys().cloned().collect();
     let edges: Vec<BatchedDepEdge> = plan.edge_inserts.into_values().flatten().collect();
@@ -1176,6 +1175,26 @@ struct Prepared<'r> {
     /// Every node of the request's resolved subgraph, root included —
     /// upserted into `task_nodes` by the write phase.
     nodes: Vec<BatchedNodeRow>,
+}
+
+/// The batch's node-store rows, deduplicated by task id: a node
+/// several requests share arrives once per subgraph, and the id
+/// commits to every column but `explicit_spelling`, so the kept row
+/// carries the batch's strongest flag and each duplicate would only
+/// re-probe the upsert's conflict — a billed read for nothing
+/// (stow#786).
+fn batch_node_rows(prepared: &[Prepared]) -> Vec<BatchedNodeRow> {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut rows: Vec<BatchedNodeRow> = Vec::new();
+    for row in prepared.iter().flat_map(|entry| &entry.nodes) {
+        if let Some(&slot) = seen.get(row.task_id.as_str()) {
+            rows[slot].explicit_spelling = rows[slot].explicit_spelling.max(row.explicit_spelling);
+        } else {
+            seen.insert(row.task_id.as_str(), rows.len());
+            rows.push(row.clone());
+        }
+    }
+    rows
 }
 
 /// The node-store rows one request's resolved subgraph contributes:
@@ -5263,13 +5282,22 @@ fn selector_predicate(
                 // `blocked`/`pending` exist only on stored `pending`
                 // rows (the derived status is the raw one for every
                 // other state): the persisted `blocked` flag splits the
-                // two, and `idx_queue_pending_live (blocked, updated_at)
-                // WHERE status = 'pending'` bounds each arm's listing to
-                // its own group, newest first.
+                // two, and `idx_queue_pending_first (blocked,
+                // first_requested_at) WHERE status = 'pending'` bounds
+                // each arm's listing to its own group, newest first.
                 QueueTaskStatus::Pending | QueueTaskStatus::Blocked => {
                     predicates.push(format!("{qualifier}status = 'pending'"));
                     predicates.push(format!("{qualifier}blocked = ?"));
                     values.push(i64::from(matches!(status, QueueTaskStatus::Blocked)).into());
+                }
+                // The terminal partial `idx_queue_terminal_updated`
+                // (`WHERE status IN ('completed','failed')`) is used
+                // only when the literal IN term is spelled, so the
+                // terminal arms carry it alongside the equality.
+                QueueTaskStatus::Completed | QueueTaskStatus::Failed => {
+                    predicates.push(format!("{qualifier}status IN ('completed', 'failed')"));
+                    predicates.push(format!("{qualifier}status = ?"));
+                    values.push(status.as_str().into());
                 }
                 _ => {
                     predicates.push(format!("{qualifier}status = ?"));
@@ -5290,7 +5318,17 @@ fn selector_predicate(
             values.push(crate_name.as_str().into());
         }
         if let Some(older_than_secs) = selector.older_than_secs {
+            // The exact predicate (time since the last transition) plus
+            // the implied bound it carries: `first_requested_at` is
+            // never ahead of `updated_at`, so every row old enough to
+            // match the first also matches the second. The second term
+            // gives the planner an index range on an immutable column
+            // when no terminal index applies (stow#786).
             predicates.push(format!("{qualifier}updated_at <= datetime('now', ?)"));
+            values.push(format!("-{older_than_secs} seconds").into());
+            predicates.push(format!(
+                "{qualifier}first_requested_at <= datetime('now', ?)"
+            ));
             values.push(format!("-{older_than_secs} seconds").into());
         }
         if predicates.is_empty() {
@@ -5308,7 +5346,10 @@ fn selector_predicate(
     Ok((predicates.join(" AND "), values))
 }
 
-/// Queue rows matching a selector, newest state transition first.
+/// Queue rows matching a selector, ordered newest first — by state
+/// transition for terminal statuses, by request instant otherwise:
+/// `first_requested_at` is immutable, so non-terminal listings walk an
+/// index no queue-row write rewrites (stow#786).
 pub async fn list_tasks(
     db: &DurableDb,
     selector: &QueueSelector,
@@ -5328,10 +5369,18 @@ pub async fn list_tasks(
     let limit = selector
         .limit
         .map_or(ADMIN_LIST_LIMIT, |limit| limit.clamp(1, ADMIN_LIST_LIMIT));
+    let order_column = if matches!(
+        selector.status,
+        Some(QueueTaskStatus::Completed | QueueTaskStatus::Failed)
+    ) {
+        "updated_at"
+    } else {
+        "first_requested_at"
+    };
     let sql = format!(
         "SELECT {ADMIN_TASK_COLUMNS}, ({}) AS status, \
          ({}) AS blocked_by FROM queue {where_clause} \
-         ORDER BY updated_at DESC LIMIT {limit}",
+         ORDER BY {order_column} DESC LIMIT {limit}",
         effective_status_sql(),
         blocked_by_sql()
     );
@@ -5405,7 +5454,8 @@ pub async fn apply_mutation(
              not_before = '1970-01-01 00:00:00', deps_met = {deps_met}, \
              blocked = {blocked}, wake_at = {wake}, \
              updated_at = datetime('now') \
-             WHERE status = 'failed' AND {predicate}",
+             WHERE status IN ('completed', 'failed') \
+                 AND status = 'failed' AND {predicate}",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
             wake = wake_at_sql(
@@ -5594,9 +5644,9 @@ pub async fn admin_status(db: &DurableDb) -> Result<AdminStatus, QueueError> {
     let in_flight_rows = db
         .query(
             "SELECT task_id, crate_name, version, target, rustc_version, status, \
-             attempt, dispatch_attempts, updated_at, github_run_id \
+             attempt, dispatch_attempts, claimed_at, github_run_id \
              FROM queue WHERE status IN ('dispatched', 'running') \
-             ORDER BY updated_at",
+             ORDER BY claimed_at",
         )
         .fetch_all::<AdminInFlightRow>()
         .await
@@ -5659,7 +5709,7 @@ struct AdminInFlightRow {
     status: String,
     attempt: u32,
     dispatch_attempts: u32,
-    updated_at: String,
+    claimed_at: Option<String>,
     github_run_id: Option<String>,
 }
 
@@ -5684,7 +5734,9 @@ impl AdminInFlightRow {
                 .ok_or_else(|| invariant(format!("unknown status `{}`", self.status)))?,
             attempt: self.attempt,
             dispatch_attempts: self.dispatch_attempts,
-            updated_at: self.updated_at,
+            claimed_at: self
+                .claimed_at
+                .ok_or_else(|| invariant("an in-flight row carries no claimed_at".to_owned()))?,
             github_run_id: self.github_run_id,
         })
     }
@@ -5737,7 +5789,7 @@ pub struct AlarmInputs {
     /// Earliest moment any unblocked pending row in a family with a free
     /// dispatch slot becomes dispatchable.
     pub earliest_pending_eligible_ms: Option<i64>,
-    /// Earliest `updated_at + stale_dispatch_minutes` over dispatched/running
+    /// Earliest `claimed_at + stale_dispatch_minutes` over dispatched/running
     /// rows — when the oldest in-flight build becomes recoverable. Must be
     /// `Some` whenever `capacity` is `Exhausted`; `next_alarm` enforces
     /// this before delegating.
@@ -5903,15 +5955,17 @@ async fn earliest_pending_eligible_ms(
 }
 
 /// Earliest epoch-ms at which an in-flight (dispatched/running) row's lease
-/// goes stale: `updated_at + stale_dispatch_minutes`, minimized. May be in
-/// the past (already recoverable).
+/// goes stale: `claimed_at + stale_dispatch_minutes`, minimized. May be in
+/// the past (already recoverable). The lease clocks the claim, not the
+/// last transition — a re-request bumping `updated_at` on a live row must
+/// not postpone its recovery (stow#786).
 async fn earliest_active_lease_expiry_ms(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) -> Result<Option<i64>, QueueError> {
     let lease_epoch = db
         .query(
-            "SELECT CAST(strftime('%s', MIN(datetime(updated_at, ?))) AS INTEGER) AS lease_epoch \
+            "SELECT CAST(strftime('%s', MIN(datetime(claimed_at, ?))) AS INTEGER) AS lease_epoch \
              FROM queue \
              WHERE status IN ('dispatched', 'running')",
         )
@@ -6772,6 +6826,35 @@ struct SchemaObject {
 /// code and the alarm assume the schema exists — when it does not,
 /// their own SQL fails loudly, which is the fail-fast.
 pub async fn reset(db: &DurableDb) -> Result<SchedulerResetReport, QueueError> {
+    // The lease and stale recovery clock `claimed_at` (stow#786): a
+    // store carrying an in-flight row without one would hold a task no
+    // recovery can ever reclaim — `MIN`/`<=` skip NULL — so the
+    // migration refuses to land over it. The probe only runs where a
+    // queue table already stands.
+    let queue_exists = db
+        .query(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'queue'",
+        )
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("probe queue table presence: {error}"))?
+        > 0;
+    if queue_exists {
+        let unclocked = db
+            .query(
+                "SELECT COUNT(*) FROM queue \
+                 WHERE status IN ('dispatched', 'running') AND claimed_at IS NULL",
+            )
+            .fetch_scalar::<i64>()
+            .await
+            .map_err(|error| format!("probe unclocked in-flight rows: {error}"))?;
+        if unclocked > 0 {
+            return Err(QueueError::Invariant(format!(
+                "refusing to migrate: {unclocked} in-flight queue row(s) carry a NULL claimed_at"
+            )));
+        }
+    }
     // The store's objects minus SQLite's own (`sqlite_sequence` and
     // friends) and the platform's internal tables — GLOB keeps the
     // `_` literals.
@@ -6890,7 +6973,7 @@ async fn recover_stale_active_tasks(
                  blocked = {blocked}, wake_at = {wake}, \
                  updated_at = datetime('now') \
              WHERE status IN ('dispatched', 'running') \
-               AND updated_at <= datetime('now', ?) \
+               AND claimed_at <= datetime('now', ?) \
              RETURNING task_id",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),

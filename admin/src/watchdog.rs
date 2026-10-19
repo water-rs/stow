@@ -749,7 +749,7 @@ impl Watcher<'_> {
         let freshest = status
             .in_flight
             .iter()
-            .map(|task| task.updated_at.as_str())
+            .map(|task| task.claimed_at.as_str())
             .max()
             .map(str::to_owned);
         let stalled = pending > 0

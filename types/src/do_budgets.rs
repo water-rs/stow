@@ -351,10 +351,14 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         // probes, the freeze and binding reads, the wake-time re-arm —
         // that every alarm wake pays regardless of what it claims. The
         // launch gate (stow#452) separates alarm invocations from the
-        // claims they make through this row.
+        // claims they make through this row. The `claimed_at` lease
+        // probes (re-arm MIN and the stale-recovery DELETE/UPDATE) read
+        // the in-flight set — bounded by the dispatch cap
+        // (`STOW_MAX_CONCURRENT_JOBS`), not by a stale-row range
+        // (stow#786).
         name: "alarm pass (idle)",
         statements: 20,
-        rows_read: 300,
+        rows_read: 320,
         rows_written: 8,
         wall_ms: 300,
     },
