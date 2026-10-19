@@ -5054,18 +5054,21 @@ mod tests {
     }
 
     /// A `StowConfig` whose every path and endpoint is a throwaway — the
-    /// env-base tests' shared fixture.
+    /// env-base tests' shared fixture. Its windows outlast any test, so a
+    /// slice written fresh stays fresh and a negative-cache entry stays
+    /// recorded however slow the runner; a test that wants either expired
+    /// sets it to zero (stow#806).
     fn env_base_test_config(dir: &tempfile::TempDir) -> crate::config::StowConfig {
         crate::config::StowConfig {
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: dir.path().join("cache"),
             request_timeout: std::time::Duration::from_millis(50),
-            negative_cache_ttl: std::time::Duration::from_secs(1),
-            circuit_reset_after: std::time::Duration::from_secs(1),
+            negative_cache_ttl: std::time::Duration::from_mins(10),
+            circuit_reset_after: std::time::Duration::from_mins(10),
             circuit_trip_threshold: 1,
             artifact_cache_max_bytes: 1,
-            index_refresh_interval: std::time::Duration::from_secs(1),
+            index_refresh_interval: std::time::Duration::from_mins(10),
             verify_mode: crate::config::VerifyMode::GithubCi,
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
