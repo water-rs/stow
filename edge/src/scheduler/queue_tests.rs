@@ -10,6 +10,7 @@ use super::{
 use crate::errors::QueueError;
 use crate::scheduler::test_db::{
     StatementLog, counting_memory_db, counting_memory_db_raw, memory_db, memory_db_raw,
+    real_bind_db,
 };
 use skyzen_services::durable::{DbValue, DurableDb};
 use stow_types::public_cache::{ExplicitSpelling, UnitInvocation, UnitKind, UnitShape, UnitSide};
@@ -7046,6 +7047,59 @@ async fn a_completion_reads_a_constant_row_count_as_the_window_fills() {
              it read {} — the read set must be window-bounded, not volume-\
              bounded",
         reads[0], reads[1]
+    );
+}
+
+/// stow#816: the Durable Object binds every JS number as a double, so
+/// `(unixepoch('now') / ?) * ?` was float arithmetic and the "bucket"
+/// landed as the current second — one row per completion. Under a
+/// backend that binds the way the DO binds, the recorded bucket must
+/// still be an INTEGER multiple of the bucket width.
+#[tokio::test]
+async fn outcome_bucket_stays_aligned_under_the_do_binding() {
+    #[derive(Debug, skyzen::FromRow)]
+    struct BucketRow {
+        bucket: f64,
+        kind: String,
+    }
+    let db = real_bind_db().await.expect("real-bind db");
+    super::record_attempt_outcome(
+        &db,
+        &super::BuildCompleteReport {
+            task_id: "aligned".to_owned(),
+            generation_id: "gen-aligned".to_owned(),
+            attempt: 1,
+            success: true,
+            error: None,
+            finished_at: None,
+            github_run_id: None,
+        },
+        "gen-aligned",
+        TARGET,
+        TEST_WINDOW_MINUTES,
+    )
+    .await
+    .expect("record outcome");
+
+    let row = db
+        .query("SELECT bucket, typeof(bucket) AS kind FROM attempt_outcome_buckets")
+        .fetch_one::<BucketRow>()
+        .await
+        .expect("the recorded bucket");
+    assert_eq!(
+        row.kind, "integer",
+        "the bucket must store as INTEGER — a REAL bucket is per-second float arithmetic"
+    );
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the stored INTEGER bucket fits i64"
+    )]
+    let bucket = row.bucket as i64;
+    assert_eq!(
+        bucket % super::OUTCOME_BUCKET_SECS,
+        0,
+        "bucket {bucket} is not a multiple of {}",
+        super::OUTCOME_BUCKET_SECS
     );
 }
 /// `POST /requests` input for `crate_name` — mirrors the edge's

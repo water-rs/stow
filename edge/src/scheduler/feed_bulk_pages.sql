@@ -9,6 +9,6 @@ INSERT OR IGNORE INTO demand_feed_pages
     (hour, generation, page_no, entry_count, page_hash, chain_hash,
      payload, applied)
 SELECT strftime('%Y-%m-%dT%H', '2018-01-01 00:00',
-                '+' || ((n - 1) % ? + 1) || ' hours'),
-       (n - 1) % ? + 1, (n - 1) / ?, 4,
+                '+' || ((n - 1) % CAST(? AS INTEGER) + 1) || ' hours'),
+       (n - 1) % CAST(? AS INTEGER) + 1, (n - 1) / CAST(? AS INTEGER), 4,
        printf('%064x', n), printf('%064x', n + 1), '[]', 1 FROM seq

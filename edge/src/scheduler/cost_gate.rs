@@ -521,6 +521,7 @@ const GATED_TABLES: &[&str] = &[
     "queue_dependencies",
     "published_slices",
     "published_slice_rows",
+    "attempt_outcome_buckets",
 ];
 
 /// SQL keywords that may legitimately follow a table reference — a
@@ -1162,6 +1163,10 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
         .await
         .expect("re-arm (baseline)");
+    // The fixture seeds `attempt_outcome_buckets` to sized bulk, so the
+    // target's `outcomes` sum is the seed's plus each pass's own
+    // transition — the delta is what counts once per completion.
+    let seeded_outcomes = running_outcomes(&db, shape).await;
     run_drives(&db, shape, &settings, &ctx, &log).await;
 
     // The complete drive lands `completed` + stamps the run id; the
@@ -1180,7 +1185,7 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     );
     assert_eq!(
         running_outcomes(&db, shape).await,
-        1,
+        seeded_outcomes + 1,
         "the first pass's completed transition counted once"
     );
     let claimed = ctx.claimed_ids();
@@ -1223,7 +1228,7 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     // increase is the form, not +1.
     assert_eq!(
         running_outcomes(&db, shape).await,
-        2,
+        seeded_outcomes + 2,
         "the second pass's completed transition counted once more"
     );
     assert!(

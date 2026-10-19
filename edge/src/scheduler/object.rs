@@ -1229,10 +1229,16 @@ pub(super) async fn dispatch_pass(
 ) -> Result<Vec<String>> {
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let freeze = freeze_settings(env)?;
-    queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
+    // The breaker is evaluated only when this reconcile applied a
+    // failure — the completion route already evaluates on every failed
+    // report, so a pass that applied nothing owes the window read only
+    // to failures it landed itself (stow#816).
+    if queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
         .await
-        .map_err(to_error)?;
-    evaluate_dispatch_freeze(env, db, &freeze).await?;
+        .map_err(to_error)?
+    {
+        evaluate_dispatch_freeze(env, db, &freeze).await?;
+    }
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
@@ -1319,10 +1325,12 @@ pub(super) async fn dispatch_pass(
     // A completion may have been persisted while this pass was waiting for
     // the dispatch response. Consume it now that all returned identities are
     // bound; the same join also makes this path restart-safe.
-    queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
+    if queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
         .await
-        .map_err(to_error)?;
-    evaluate_dispatch_freeze(env, db, &freeze).await?;
+        .map_err(to_error)?
+    {
+        evaluate_dispatch_freeze(env, db, &freeze).await?;
+    }
 
     Ok(task_ids)
 }

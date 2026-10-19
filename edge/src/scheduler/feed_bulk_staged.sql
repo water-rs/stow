@@ -3,7 +3,7 @@
 -- it stage current-generation depth, the 256-row tail above it is the
 -- obsolete generation 7 the retire index is measured against.
 WITH RECURSIVE seq(n) AS (
-    SELECT ? UNION ALL SELECT n + 1 FROM seq WHERE n < ?
+    SELECT CAST(? AS INTEGER) UNION ALL SELECT n + 1 FROM seq WHERE n < ?
 )
 INSERT OR IGNORE INTO demand_feed_pages
     (hour, generation, page_no, entry_count, page_hash, chain_hash,

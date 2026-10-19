@@ -150,6 +150,75 @@ async fn memory_backend() -> Result<SqliteBackend, QueueError> {
     })
 }
 
+/// A `SqliteBackend` wrapper that binds every numeric parameter as
+/// REAL — the only numeric shape the Durable Object's SQL API knows.
+/// Workerd's `SqlStorage::BindingValue` is bytes | string | double, so
+/// a JS number — `DbValue::Integer` or `Boolean` alike — lands as a
+/// double and arithmetic on it is floating point. Tests that must see
+/// the arithmetic production actually runs route through it (stow#816).
+#[derive(Debug, Clone)]
+struct RealBindBackend {
+    inner: SqliteBackend,
+}
+
+/// `params` as the DO binds them: every number coerced to a double.
+fn real_bind_params(params: &[DbValue]) -> Vec<DbValue> {
+    params
+        .iter()
+        .map(|param| match param {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "the f64 conversion IS the Durable Object's binding"
+            )]
+            DbValue::Integer(value) => DbValue::Real(*value as f64),
+            DbValue::Boolean(value) => DbValue::Real(f64::from(u8::from(*value))),
+            value => value.clone(),
+        })
+        .collect()
+}
+
+impl DurableDbBackend for RealBindBackend {
+    async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        self.inner.query(query, &real_bind_params(params)).await
+    }
+
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, DurableDbError> {
+        self.inner.execute(query, &real_bind_params(params)).await
+    }
+
+    async fn database_size(&self) -> Result<u64, DurableDbError> {
+        self.inner.database_size().await
+    }
+
+    async fn sync(&self) -> Result<(), DurableDbError> {
+        self.inner.sync().await
+    }
+}
+
+/// Open a fresh in-memory queue database (schema applied) on a
+/// [`RealBindBackend`] — every statement sees parameters bound the way
+/// the Durable Object binds them, so a test exercises the arithmetic
+/// production actually runs instead of the host's integer binds.
+///
+/// # Errors
+///
+/// Returns `QueueError::Sql` if the pool cannot be opened or `reset`
+/// fails.
+pub async fn real_bind_db() -> Result<DurableDb, QueueError> {
+    let inner = memory_backend().await?;
+    let db = DurableDb::new(RealBindBackend {
+        inner: inner.clone(),
+    });
+    queue::reset(&db).await?;
+    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    inner.close_ddl_permit();
+    Ok(db)
+}
+
 /// A `SqliteBackend` wrapper that appends every statement and its wall
 /// time to a shared log before returning the real result.
 #[derive(Debug, Clone)]

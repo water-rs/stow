@@ -8,6 +8,7 @@ WITH RECURSIVE seq(n) AS (
 INSERT OR IGNORE INTO demand_feed_pages
     (hour, generation, page_no, entry_count, page_hash, chain_hash,
      payload, applied)
-SELECT '2022-01-01T00', 7, ? + n, 4,
-       printf('%064x', ? + n + 100000), printf('%064x', ? + n + 100001),
+SELECT '2022-01-01T00', 7, CAST(? AS INTEGER) + n, 4,
+       printf('%064x', CAST(? AS INTEGER) + n + 100000),
+       printf('%064x', CAST(? AS INTEGER) + n + 100001),
        '[]', 0 FROM seq
