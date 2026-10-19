@@ -222,8 +222,20 @@ check_children_alive() {
 # `rustup_home()` from the real environment inside its sandbox, so the
 # toolchain (and the version install above) must live there anyway.
 # `ISOLATED_ENV` is set once `RUSTUP_HOME_REAL` is known, below.
+# A `CARGO_PROFILE_*` override the calling job exports to speed up its own
+# build is dropped: profile settings are part of a unit's identity, and the
+# builder publishes under cargo's defaults, so a consumer that inherited
+# one would compute a different key and miss for a reason unrelated to
+# what this lane tests.
 isolated_env() {
-    env "${ISOLATED_ENV[@]}" "$@"
+    local name
+    local -a dropped=()
+    for name in $(compgen -e); do
+        case "$name" in
+            CARGO_PROFILE_*) dropped+=(-u "$name") ;;
+        esac
+    done
+    env "${dropped[@]}" "${ISOLATED_ENV[@]}" "$@"
 }
 
 # Every stow-cli call carries the full mock env — config, cache, verify
