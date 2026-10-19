@@ -265,15 +265,21 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
 
     // The admission minted by this build's misses is posted by the
     // detached `__drain-misses` child — `stow build` returns when cargo
-    // does — so the enqueue post lands after the command exits. Poll for
-    // it instead of asserting on an empty capture.
+    // does — so the enqueue post lands after the command exits. The
+    // drain lives in another process, so poll the disk for its end: it
+    // claims the journal before it posts and removes the claim only once
+    // every post is done, so a post captured with no journal or claim
+    // left is the whole drain's output — the count below is final
+    // (stow#810).
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     let (request_line, body) = loop {
         let found = {
             let requests = captured.lock().expect("captured requests lock");
             requests.first().cloned()
         };
-        if let Some(pair) = found {
+        if let Some(pair) = found
+            && drain_finished(&target_dir)
+        {
             break pair;
         }
         assert!(
@@ -283,7 +289,6 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
-    std::thread::sleep(std::time::Duration::from_millis(200));
     assert_eq!(
         captured.lock().expect("captured requests lock").len(),
         1,
@@ -383,6 +388,22 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+/// Whether the detached drain has run to its end: every miss journal
+/// under `target_dir` — and every `…jsonl.draining-<pid>` claim, which
+/// carries the journal's name — is gone. A drain removes its claim only
+/// after its last post, so nothing it will ever post is still pending.
+fn drain_finished(target_dir: &Path) -> bool {
+    std::fs::read_dir(target_dir)
+        .expect("read the target dir")
+        .flatten()
+        .all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("stow-misses.")
+        })
 }
 
 /// Forensics for a drain that never posted: the detached child's

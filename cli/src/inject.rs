@@ -910,11 +910,17 @@ mod tests {
             super::write_file_if_changed(&path, b"crate: crate.d\n")
                 .await
                 .expect("initial write");
-            let before = std::fs::metadata(&path)
-                .expect("metadata before")
-                .modified()
-                .expect("mtime before");
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // A fixed mtime far in the past: any rewrite moves it to now,
+            // whatever the filesystem's timestamp granularity — no sleep
+            // to step past a tick (stow#810).
+            let before =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open the dep-info file")
+                .set_modified(before)
+                .expect("set the dep-info mtime");
             super::write_file_if_changed(&path, b"crate: crate.d\n")
                 .await
                 .expect("idempotent write");
