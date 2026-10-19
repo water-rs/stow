@@ -254,12 +254,13 @@ one `index.<target>.<rustc>` OCI artifact per (target, rustc) pair — that
 `~/.stow/index/<target>/<rustc>/` on demand. `stow index refresh` does the
 fetch explicitly for the rustc it probes (or for `--target` /
 `--rustc-version` when given) and prints the resolved tag, row count, and
-manifest digest. Within `STOW_INDEX_REFRESH_SECS` (default 600,
-`index_refresh_secs` in the config file) a cached pointer serves as-is
-and a refresh is a no-op; past it one manifest request revalidates the
-digest and the slice re-downloads only on change. With no cached slice
-and the registry unreachable, refresh fails hard — the same condition
-the wrapper degrades to plain cargo over.
+manifest digest. `stow check`/`build`/`test` serve a cached pointer
+as-is within `STOW_INDEX_REFRESH_SECS` (default 600,
+`index_refresh_secs` in the config file); `stow index refresh` ignores
+the interval. Either way one manifest request revalidates the digest
+and the slice re-downloads only on change. With no cached slice and the
+registry unreachable, refresh fails hard — the same condition the
+wrapper degrades to plain cargo over.
 
 `stow index status` lists every verified slice in the local cache — one
 `index:`/`target:`/`rustc-version:`/`rows:`/`fetched-at:`/

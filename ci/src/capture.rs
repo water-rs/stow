@@ -317,8 +317,11 @@ fn elapsed_millis(started: Instant) -> u64 {
 /// against real output identities, and the publish stage must see which
 /// crates the plan legitimately skips.
 ///
-/// A miss, or an entry that fails to load, compiles the unit as before; an
-/// entry whose recorded identity disagrees with the key it was stored
+/// A miss compiles the unit as before. An entry that exists but fails to
+/// load was staged and verified by the host moments earlier, so the
+/// failure is the build's, not a cold cache, and compiling past it would
+/// compile a unit the task was promised it would be served (stow#817).
+/// An entry whose recorded identity disagrees with the key it was stored
 /// under is an inconsistency in the only side that could write it, so the
 /// build fails rather than serve bytes whose identity was never matched.
 async fn serve_consumed_artifact(
@@ -335,21 +338,18 @@ async fn serve_consumed_artifact(
     // index vouches for it in; the unit's own effective target is the only
     // namespace a serve may draw from — a hit anywhere else would be a
     // compile key the claim's slice never published.
-    let bundle = match stow_cli::build_consume::load_served_bundle(
+    let Some(bundle) = stow_cli::build_consume::load_served_bundle(
         &store_dir.join(effective_target),
         capture_dir,
         &stable_identity.compile_key,
-    ) {
-        Ok(bundle) => bundle,
-        Err(error) => {
-            eprintln!(
-                "stow-build: consume-store entry {} unreadable ({error}); compiling the unit",
-                stable_identity.compile_key
-            );
-            return Ok(None);
-        }
-    };
-    let Some(bundle) = bundle else {
+    )
+    .map_err(|error| {
+        error.wrap_err(format!(
+            "load consume-store entry {}",
+            stable_identity.compile_key
+        ))
+    })?
+    else {
         return Ok(None);
     };
     if bundle.compile_key != stable_identity.compile_key {

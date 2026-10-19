@@ -1819,7 +1819,7 @@ impl WrapperEnvCache {
             // a fresh memo pending — one redundant retry a miss pays —
             // where the other order can flag a stale memo settled,
             // which is the stow#797 miss this flag exists to catch.
-            let fetch_pending = index::slice_fetch_pending(config, target, rustc_version).await;
+            let fetch_pending = index::slice_fetch_pending(config, target, rustc_version).await?;
             if let Some(slice) = index::cached_slice(config, target, rustc_version).await? {
                 let index = smol::unblock(move || SliceIndex::new(slice)).await;
                 return Ok(std::sync::Arc::new(SliceMemo::new(

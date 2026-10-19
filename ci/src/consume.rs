@@ -9,10 +9,12 @@
 //! The chain is the CLI's own: pull the signed index slice, digest-check
 //! each bundle against the row's `bundle_digest`, cosign-verify it against
 //! the pinned `build-crate.yml` identity, then stage it under a read-only
-//! grant for the capture wrapper to inject. A bundle that fails any step
-//! is skipped — the unit compiles — and a failed slice disables
-//! consumption for the run: the same trust level as before this existed,
-//! because nothing unverified is ever injected.
+//! grant for the capture wrapper to inject. A bundle that never arrived
+//! is skipped — the unit compiles — and nothing unverified is ever
+//! injected. A slice that cannot be read fails the build: the scheduler
+//! dispatched the task because its dependencies are published, so a build
+//! that cannot see them would compile its whole closure instead of the
+//! one crate it was dispatched for (stow#817).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -23,6 +25,7 @@ use std::time::Instant;
 use futures_util::StreamExt;
 use stow_cli::build_consume::{self, ConsumeConfig, IndexSlice};
 use stow_types::api::BuildTaskPayload;
+use stow_types::error::Context as _;
 use stow_types::index::ArtifactIndexRow;
 use stow_types::public_cache::canonical_crate_name;
 
@@ -49,27 +52,37 @@ pub struct Consumption {
     pub artifacts: usize,
 }
 
-/// The signed index slices a task's dependency closure can legitimately
-/// hit: the task target's, plus the host's when they differ — proc-macro
-/// and build-dependency units key for the host triple, so their rows live
-/// in the host slice, not the task target's. Both are signature-verified
-/// inside [`build_consume::ensure_slice`] before a row is ever used.
+/// The signed index slices this task's dependency nodes were published
+/// to: the task target's when a node sits on the target side, the host's
+/// when one sits on the host side — proc-macro and build-dependency units
+/// key for the host triple, so their rows live in the host slice, not the
+/// task target's. The scheduler dispatched the task only once every node
+/// was in its slice, so each slice named here exists, and one that cannot
+/// be read is an error; a task with no dependency nodes names none. Each
+/// is signature-verified inside [`build_consume::ensure_slice`] before a
+/// row is ever used.
 pub async fn slices_for_task(
     config: &ConsumeConfig,
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<Vec<IndexSlice>> {
-    let task_slice =
-        build_consume::ensure_slice(config, task.target.as_str(), task.rustc_version.as_str())
-            .await?;
-    let host_target = capture::detect_rustc_toolchain(&OsString::from("rustc"))
-        .await?
-        .host_target;
-    if host_target == task.target.as_str() {
-        return Ok(vec![task_slice]);
+    let nodes = &task.dependency_subgraph.nodes;
+    let mut targets = BTreeSet::new();
+    if nodes.iter().any(|node| !node.host_side) {
+        targets.insert(task.target.as_str().to_owned());
     }
-    let host_slice =
-        build_consume::ensure_slice(config, &host_target, task.rustc_version.as_str()).await?;
-    Ok(vec![task_slice, host_slice])
+    if nodes.iter().any(|node| node.host_side) {
+        targets.insert(
+            capture::detect_rustc_toolchain(&OsString::from("rustc"))
+                .await?
+                .host_target,
+        );
+    }
+    futures_util::future::try_join_all(targets.iter().map(|target| async move {
+        build_consume::ensure_slice(config, target, task.rustc_version.as_str())
+            .await
+            .map_err(|error| error.wrap_err(format!("index slice for {target}")))
+    }))
+    .await
 }
 
 /// Fetch and stage the published artifacts this task's dependencies can be
@@ -84,19 +97,16 @@ pub async fn slices_for_task(
 ///
 /// # Errors
 ///
-/// Returns an error when the config or the index slices cannot be
-/// obtained — the caller treats that as "consumption disabled"
-/// and builds exactly as before. A bundle that could not be *fetched* is
-/// logged and skipped the same way: it removes one candidate, never the
-/// task. A bundle that arrived and failed verification is neither, and
-/// propagates — see [`build_consume::StageFailure`].
+/// Returns an error when the config, the index slices or the registry
+/// session cannot be obtained, and when a bundle the signed index vouches
+/// for arrived and failed verification — see
+/// [`build_consume::StageFailure`]. A bundle that could not be *fetched*
+/// is logged and skipped: it removes one candidate, never the task.
 pub async fn prefetch(
     task: &BuildTaskPayload,
     packages: Vec<dep_scan::ConsumablePackage>,
     store_dir: &Path,
-) -> Result<Consumption, build_consume::StageFailure> {
-    let unavailable = build_consume::StageFailure::Unavailable;
-
+) -> stow_types::error::Result<Consumption> {
     // Everything past here is the CLI's verified-download chain, and that
     // chain's HTTP client resolves DNS through a Tokio reactor. The build
     // stage runs on smol, where calling it panics outright. The network
@@ -106,8 +116,7 @@ pub async fn prefetch(
     let task = task.clone();
     let store_dir = store_dir.to_path_buf();
     on_a_tokio_runtime(move || async move { stage_candidates(&task, &packages, &store_dir).await })
-        .await
-        .map_err(unavailable)?
+        .await?
 }
 
 /// Run `work` on a Tokio runtime of its own, on a blocking thread.
@@ -140,28 +149,27 @@ where
 ///
 /// # Errors
 ///
-/// [`build_consume::StageFailure::Unavailable`] when consumption could not
-/// be set up at all, [`build_consume::StageFailure::Unverifiable`] when a
-/// bundle the signed index vouches for did not verify.
+/// Returns an error when consumption cannot be set up — no config, an
+/// unreadable slice, no registry session — or when a bundle the signed
+/// index vouches for did not verify.
 async fn stage_candidates(
     task: &BuildTaskPayload,
     packages: &[dep_scan::ConsumablePackage],
     store_dir: &Path,
-) -> Result<Consumption, build_consume::StageFailure> {
-    // Setting consumption up is the part that may simply not be possible:
-    // no config, no published slice yet. All of it reports as unavailable,
-    // and the build runs exactly as it did before consumption existed.
-    let unavailable = build_consume::StageFailure::Unavailable;
-    let config = ConsumeConfig::load().map_err(unavailable)?;
-    let slices = slices_for_task(&config, task).await.map_err(unavailable)?;
+) -> stow_types::error::Result<Consumption> {
+    // Every slice named here holds a dependency the scheduler saw
+    // published before it dispatched the task, so failing to set
+    // consumption up is not a cold cache: building on would compile what
+    // the task was promised it would be served.
+    let config = ConsumeConfig::load().wrap_err("load the cache-consumption config")?;
+    let slices = slices_for_task(&config, task).await?;
     let candidates = candidates(&slices, packages);
 
     // The prefetch pulls bundle blobs straight from GHCR by digest — the
     // offline-edge build never touches the byte path (stow#455). One
     // anonymous session mints one bearer for the whole batch.
-    let registry =
-        stow_oci::RegistryBase::parse(config.registry_base_url()).map_err(unavailable)?;
-    let http = config.registry_http().await.map_err(unavailable)?;
+    let registry = stow_oci::RegistryBase::parse(config.registry_base_url())?;
+    let http = config.registry_http().await?;
     let session = registry.session(
         &stow_types::registry::cache_repository(&task.rustc_version),
         &http,
@@ -208,7 +216,7 @@ async fn stage_candidates(
 async fn stage_all<'a, Stage, Staging>(
     candidates: Vec<(&'a IndexSlice, &'a ArtifactIndexRow)>,
     stage: Stage,
-) -> Result<usize, build_consume::StageFailure>
+) -> stow_types::error::Result<usize>
 where
     Stage: Fn(&'a IndexSlice, &'a ArtifactIndexRow) -> Staging + Send + Sync,
     Staging: Future<Output = Result<(), build_consume::StageFailure>> + Send,
@@ -239,13 +247,11 @@ where
             Err(build_consume::StageFailure::Unverifiable(error)) => {
                 // Returning drops the stream, which cancels the
                 // candidates still in flight.
-                return Err(build_consume::StageFailure::Unverifiable(
-                    stow_types::stow_error!(
-                        "the signed index vouches for `{}` {} (compile key {}) but its bundle did not verify: {error}",
-                        row.crate_name.as_str(),
-                        row.version,
-                        row.compile_key
-                    ),
+                return Err(stow_types::stow_error!(
+                    "the signed index vouches for `{}` {} (compile key {}) but its bundle did not verify: {error}",
+                    row.crate_name.as_str(),
+                    row.version,
+                    row.compile_key
                 ));
             }
         }
@@ -596,9 +602,6 @@ mod tests {
             .await
             .expect_err("an unverifiable candidate fails the stage");
 
-            let StageFailure::Unverifiable(error) = error else {
-                panic!("expected StageFailure::Unverifiable, got {error:?}");
-            };
             let text = error.to_string();
             assert!(text.contains("forged"), "the row's crate name: {text}");
             assert!(text.contains("2.3.4"), "the row's version: {text}");
