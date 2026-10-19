@@ -1365,6 +1365,33 @@ fn dep_edges(entry: &Prepared<'_>) -> Result<Vec<BatchedDepEdge>, QueueError> {
     Ok(edges)
 }
 
+/// Fold one re-request's contribution into the task's [`BatchedUpdate`]
+/// — the first moving occurrence seeds it, and every occurrence lifts
+/// the maxima its flags describe (`plan_enqueue` emits it only when
+/// the row's stored state actually changes).
+fn fold_update(
+    updates: &mut BTreeMap<String, BatchedUpdate>,
+    entry: &Prepared<'_>,
+    downloads: i64,
+    redispatch: bool,
+    lane: TaskLane,
+    request_explicit: u8,
+) {
+    let update = updates
+        .entry(entry.task_id.clone())
+        .or_insert_with(|| BatchedUpdate {
+            task_id: entry.task_id.clone(),
+            downloads,
+            redispatch: 0,
+            human: 0,
+            explicit: 0,
+        });
+    update.downloads = update.downloads.max(downloads);
+    update.redispatch |= u8::from(redispatch);
+    update.human |= u8::from(lane == TaskLane::Human);
+    update.explicit |= request_explicit;
+}
+
 /// Replay the per-request loop's state machine in memory, in request
 /// order: each request's own insert/update, then its dep sync. A task
 /// appearing twice in one chunk sees what its earlier occurrence left
@@ -1406,30 +1433,21 @@ fn plan_enqueue(
             let redispatch = resurrects(probe.status.as_str(), lane) || flaggap;
             // stow#784: a re-request that moves nothing writes nothing —
             // a fully deduplicated resubmit must not rewrite every row
-            // (and its index entries) just to bump bookkeeping. An
-            // update is emitted only for a real change: a resurrection,
-            // a miss→human lane move, an explicit-spelling upgrade the
-            // row can still take (the UPDATE's CASE refuses it on a
-            // committed in-flight row), or a higher downloads value.
+            // just to bump bookkeeping. An update is emitted only for a
+            // real change: a resurrection, a miss→human lane move, an
+            // explicit-spelling upgrade the row can still take, or a
+            // higher downloads value — which stow#818 bounds to rows
+            // still pending dispatch, the only status `priority`
+            // orders; every other row takes the count inside the next
+            // move it makes (a resurrection carries it anyway).
             let lane_move = lane == TaskLane::Human && probe.lane != "human";
             let explicit_upgrade = request_explicit == 1
                 && probe.explicit_spelling == 0
                 && (redispatch || !matches!(probe.status.as_str(), "dispatched" | "running"));
-            if redispatch || lane_move || explicit_upgrade || downloads > probe.downloads {
-                let update =
-                    updates
-                        .entry(entry.task_id.clone())
-                        .or_insert_with(|| BatchedUpdate {
-                            task_id: entry.task_id.clone(),
-                            downloads,
-                            redispatch: 0,
-                            human: 0,
-                            explicit: 0,
-                        });
-                update.downloads = update.downloads.max(downloads);
-                update.redispatch |= u8::from(redispatch);
-                update.human |= u8::from(lane == TaskLane::Human);
-                update.explicit |= request_explicit;
+            let downloads_bump = downloads > probe.downloads && probe.status == "pending";
+            let moved = redispatch || lane_move || explicit_upgrade || downloads_bump;
+            if moved {
+                fold_update(&mut updates, entry, downloads, redispatch, lane, request_explicit);
             }
             // The stored-state moves the budget pays for (stow#796):
             // the lane promotion, or a human request putting a
@@ -1456,7 +1474,14 @@ fn plan_enqueue(
                     } else {
                         probe.lane.clone()
                     },
-                    downloads: probe.downloads.max(downloads),
+                    // Only a written row takes the count — the mirror
+                    // holds what the row will carry, so a later
+                    // occurrence's mover still compares the truth.
+                    downloads: if moved {
+                        probe.downloads.max(downloads)
+                    } else {
+                        probe.downloads
+                    },
                 },
             );
         } else {
