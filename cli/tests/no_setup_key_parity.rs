@@ -56,7 +56,7 @@ fn verbose_build(project: &Path, cargo_home: &Path, edge_url: &str, cache_dir: &
         .args(["build", "-v"])
         .current_dir(project)
         .env("CARGO_HOME", cargo_home);
-    hermetic_stow_env(&mut build, edge_url, cache_dir);
+    hermetic_stow_env(&mut build, edge_url, cache_dir, &project.join("stow-home"));
     let output = build.output().expect("run stow-cli build -v");
     assert!(
         output.status.success(),
@@ -152,7 +152,12 @@ fn a_setup_free_build_keys_like_the_setup_path() {
         .arg("setup")
         .current_dir(&project)
         .env("CARGO_HOME", &setup_home);
-    hermetic_stow_env(&mut setup, &edge_url, &cache_dir);
+    hermetic_stow_env(
+        &mut setup,
+        &edge_url,
+        &cache_dir,
+        &project.join("stow-home"),
+    );
     let status = setup.status().expect("run stow-cli setup");
     assert!(status.success(), "stow-cli setup failed");
     let setup_argv = rustc_argv_for(

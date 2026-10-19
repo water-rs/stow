@@ -196,7 +196,7 @@ pub fn key_of(project: &KeyInputs<'_>) -> stow_types::error::Result<String> {
     // each `--config` value — hashed as cargo sees them (source label
     // + parsed form).
     for (name, document) in
-        crate::mold::cargo_config_documents(project.current_dir, project.cargo_args)
+        crate::mold::cargo_config_documents(project.current_dir, project.cargo_args, None)
     {
         hasher.update(name.as_bytes());
         hasher.update(&[0]);
@@ -494,6 +494,7 @@ mod tests {
             &zed,
             "x86_64-unknown-linux-gnu",
             &stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+            None,
         ))
         .expect("resolve zed");
         let json = serde_json::to_string(&graph).expect("encode");

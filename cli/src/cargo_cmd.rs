@@ -2012,6 +2012,7 @@ async fn expanded_graph(
             host_triple,
             &stow_types::identity::WireRustcVersion::parse(project.rustc_version.as_str())
                 .wrap_err("parse rustc_version")?,
+            None,
         ),
     )
     .await?;
