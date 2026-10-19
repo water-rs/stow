@@ -625,18 +625,23 @@ mod tests {
         );
     }
 
+    /// The tools dir's contract, exercised against an injected data dir —
+    /// calling `tools_dir` itself would resolve through the developer's
+    /// home (stow#800).
     #[test]
-    fn tools_dir_is_absolute_and_outside_the_system_temp_dir() {
-        let dir = super::tools_dir().expect("resolve tools dir");
+    fn tools_dir_is_absolute_and_nested_under_the_data_dir() {
+        let data_local = tempfile::tempdir().expect("data-local dir");
+        let dir = crate::wrapper_shim::tools_dir_in(data_local.path());
         assert!(
             dir.is_absolute(),
             "tools dir {} is not absolute",
             dir.display()
         );
         assert!(
-            !dir.starts_with(std::env::temp_dir()),
-            "tools dir {} lives under the system temp dir",
-            dir.display()
+            dir.starts_with(data_local.path()),
+            "tools dir {} is not under the data dir {}",
+            dir.display(),
+            data_local.path().display()
         );
         assert_eq!(
             dir.file_name().and_then(std::ffi::OsStr::to_str),

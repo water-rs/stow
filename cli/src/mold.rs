@@ -1289,18 +1289,21 @@ fn link_eval_config(
 /// arguments it does not model. Readers needing the documents
 /// themselves — the `[unstable]` scan (also unmodeled) and the cache
 /// key — share this; resolved values go through `cargo-config2`.
+/// `cargo_home` pins the global file's location; `None` lets the crate
+/// resolve `CARGO_HOME` itself.
 pub fn cargo_config_documents(
     cargo_dir: &Path,
     cargo_args: &[std::ffi::OsString],
+    cargo_home: Option<&Path>,
 ) -> Vec<(String, toml_edit::DocumentMut)> {
     let mut documents = Vec::new();
+    let walk = cargo_home.map_or_else(
+        || cargo_config2::Walk::new(cargo_dir),
+        |home| cargo_config2::Walk::with_cargo_home(cargo_dir, Some(home.to_path_buf())),
+    );
     // The walk yields closest-first and only existing files — reverse
     // to keep the documents in cargo's merge order.
-    for path in cargo_config2::Walk::new(cargo_dir)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-    {
+    for path in walk.collect::<Vec<_>>().into_iter().rev() {
         let Ok(contents) = std::fs::read_to_string(&path) else {
             continue;
         };

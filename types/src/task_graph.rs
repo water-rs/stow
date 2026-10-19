@@ -217,6 +217,254 @@ impl ResolvedTaskGraph {
     }
 }
 
+/// The identity a resolved node takes inside one subgraph — borrowed
+/// for interning, so a repeat occurrence costs a map lookup and no
+/// construction. `scope` is the carrying subgraph's root target: a
+/// target-side node keys at its root's own target, so the same wire
+/// node inside two differently-rooted subgraphs is two resolved nodes —
+/// and a node legitimately has different dependency contexts per scope.
+#[derive(PartialEq, Eq, Hash)]
+struct UnionKey<'a> {
+    scope: &'a str,
+    crate_name: &'a str,
+    version: &'a semver::Version,
+    features: &'a [String],
+    target: &'a str,
+    rustc_version: &'a str,
+    host_side: bool,
+}
+
+/// One expanded-graph entry's contribution to
+/// [`shared_dependency_identities`]: the identity the entry's own node
+/// resolves at and the dependency subgraph it carries (stow#790).
+#[derive(Debug)]
+pub struct DigestEntry<'a> {
+    /// The entry's own task identity — the same fields
+    /// [`crate::api::TaskSubgraph::resolve`]'s root takes.
+    pub identity: &'a TaskNodeIdentity,
+    /// The root's own explicit-spelling flag — presentation data; it
+    /// never enters the digest.
+    pub root_spelling: crate::public_cache::ExplicitSpelling,
+    /// The dependency subgraph the entry carries.
+    pub subgraph: &'a crate::api::TaskSubgraph,
+}
+
+/// Every entry's root dependency digest in one bottom-up pass —
+/// the memoized equivalent of per-entry [`crate::api::TaskSubgraph`]
+/// resolves (stow#790).
+///
+/// A node's digest is derived from its own identity and its
+/// dependencies' digests, so each distinct node is computed once.
+///
+/// Wire nodes deduplicate on the six-field [`TaskNodeIdentity`]
+/// [`crate::api::TaskSubgraph::resolve`] derives — crate, version,
+/// canonical features, the entry-root-scoped target, rustc and side —
+/// and a second occurrence of a node declaring a different dependency
+/// set is an inconsistent wire, refused like every other shape the
+/// per-entry resolve rejects: out-of-range indexes, self-edges, cycles
+/// and a root target with no runner family all fail the whole call.
+///
+/// `entries[i]`'s result is the digest its own subgraph resolves to —
+/// `entry.subgraph.resolve(entry.identity, entry.root_spelling)`'s
+/// `dependency_identity(0)` — and the returned vector lines up with
+/// `entries` one for one.
+///
+/// # Errors
+/// Everything [`crate::api::TaskSubgraph::resolve`] rejects, plus a
+/// node whose two declarations disagree on its dependencies.
+pub fn shared_dependency_identities<'a>(
+    entries: &'a [DigestEntry<'a>],
+) -> crate::error::Result<Vec<DependencyIdentity>> {
+    let mut index_of = std::collections::HashMap::<UnionKey<'a>, usize>::new();
+    let mut nodes = Vec::<ResolvedTaskNode>::new();
+    let mut declared = Vec::<Option<Vec<usize>>>::new();
+    let mut root_indexes = Vec::with_capacity(entries.len());
+    let mut scratch = Vec::<usize>::new();
+
+    for entry in entries {
+        // The same derivation `TaskSubgraph::resolve` applies: host
+        // nodes key at the root target's family host triple, target
+        // nodes at the root's own target — so a wire node's identity is
+        // scoped to the subgraph it arrived in.
+        let host_triple = crate::api::runner_family(entry.identity.target.as_str())
+            .ok_or_else(|| {
+                stow_error!(
+                    "task target `{}` maps to no runner family — host-side subgraph nodes have no host triple to key on",
+                    entry.identity.target
+                )
+            })?
+            .host_triple();
+        let mut wire_indexes = Vec::with_capacity(entry.subgraph.nodes.len());
+        for node in &entry.subgraph.nodes {
+            wire_indexes.push(intern_union_node(
+                &mut index_of,
+                &mut nodes,
+                &mut declared,
+                UnionKey {
+                    scope: entry.identity.target.as_str(),
+                    crate_name: node.crate_name.as_str(),
+                    version: node.version.as_semver(),
+                    features: node.features_json.features(),
+                    target: if node.host_side {
+                        host_triple
+                    } else {
+                        entry.identity.target.as_str()
+                    },
+                    rustc_version: entry.identity.rustc_version.as_str(),
+                    host_side: node.host_side,
+                },
+                || resolved_wire_node(node, entry.identity, host_triple),
+            )?);
+        }
+        let root_key = UnionKey {
+            scope: entry.identity.target.as_str(),
+            crate_name: entry.identity.crate_name.as_str(),
+            version: entry.identity.version.as_semver(),
+            features: entry.identity.features_json.features(),
+            target: entry.identity.target.as_str(),
+            rustc_version: entry.identity.rustc_version.as_str(),
+            host_side: entry.identity.host_side,
+        };
+        let root_index =
+            intern_union_node(&mut index_of, &mut nodes, &mut declared, root_key, || {
+                Ok(ResolvedTaskNode {
+                    identity: entry.identity.clone(),
+                    explicit_spelling: entry.root_spelling,
+                    dependencies: Vec::new(),
+                })
+            })?;
+        root_indexes.push(root_index);
+
+        declare_union_deps(
+            root_index,
+            &entry.subgraph.root_deps,
+            &wire_indexes,
+            &mut declared,
+            &mut scratch,
+            &nodes,
+        )?;
+        for (wire, node) in entry.subgraph.nodes.iter().enumerate() {
+            declare_union_deps(
+                wire_indexes[wire],
+                &node.deps,
+                &wire_indexes,
+                &mut declared,
+                &mut scratch,
+                &nodes,
+            )?;
+        }
+    }
+
+    for (index, node) in nodes.iter_mut().enumerate() {
+        node.dependencies = declared[index].take().unwrap_or_default();
+    }
+    let graph = ResolvedTaskGraph::resolve(nodes)?;
+    root_indexes
+        .iter()
+        .map(|&index| {
+            graph
+                .dependency_identity(index)
+                .cloned()
+                .ok_or_else(|| stow_error!("resolved task graph yields no digest for node {index}"))
+        })
+        .collect()
+}
+
+/// The resolved node one wire [`crate::api::SubgraphNode`] becomes
+/// under `root`: the same construction [`crate::api::TaskSubgraph::resolve`]
+/// applies — host nodes key at the family's host triple, target nodes
+/// at the root's own target.
+fn resolved_wire_node(
+    node: &crate::api::SubgraphNode,
+    root: &TaskNodeIdentity,
+    host_triple: &'static str,
+) -> crate::error::Result<ResolvedTaskNode> {
+    Ok(ResolvedTaskNode {
+        identity: TaskNodeIdentity {
+            crate_name: node.crate_name.clone(),
+            version: node.version.clone(),
+            features_json: node.features_json.clone(),
+            target: TargetTriple::parse(if node.host_side {
+                host_triple
+            } else {
+                root.target.as_str()
+            })?,
+            rustc_version: root.rustc_version.clone(),
+            host_side: node.host_side,
+        },
+        explicit_spelling: if node.keys_apart {
+            crate::public_cache::ExplicitSpelling::KeysApart
+        } else {
+            crate::public_cache::ExplicitSpelling::KeysAsNative
+        },
+        dependencies: Vec::new(),
+    })
+}
+
+/// Intern one union node by its wire-scoped identity: a repeat
+/// occurrence costs a map lookup and returns the existing index.
+fn intern_union_node<'a>(
+    index_of: &mut std::collections::HashMap<UnionKey<'a>, usize>,
+    nodes: &mut Vec<ResolvedTaskNode>,
+    declared: &mut Vec<Option<Vec<usize>>>,
+    key: UnionKey<'a>,
+    node: impl FnOnce() -> crate::error::Result<ResolvedTaskNode>,
+) -> crate::error::Result<usize> {
+    if let Some(&index) = index_of.get(&key) {
+        return Ok(index);
+    }
+    let index = nodes.len();
+    nodes.push(node()?);
+    declared.push(None);
+    index_of.insert(key, index);
+    Ok(index)
+}
+
+/// Record one union node's declared dependency set, mapped through the
+/// carrying subgraph's wire indexes. A second declaration of the same
+/// node must name the same set — a forged or inconsistent wire has no
+/// canonical digest to compute, so it fails like the other
+/// resolve-time violations.
+fn declare_union_deps(
+    index: usize,
+    deps: &[u32],
+    wire_indexes: &[usize],
+    declared: &mut [Option<Vec<usize>>],
+    scratch: &mut Vec<usize>,
+    nodes: &[ResolvedTaskNode],
+) -> crate::error::Result<()> {
+    scratch.clear();
+    for &dep in deps {
+        let wire = usize::try_from(dep).map_err(|error| stow_error!("{error}"))?;
+        let Some(&dep_index) = wire_indexes.get(wire) else {
+            let node = &nodes[index].identity;
+            return Err(stow_error!(
+                "task graph node {} {} depends on missing node {wire}",
+                node.crate_name,
+                node.version,
+            ));
+        };
+        scratch.push(dep_index);
+    }
+    scratch.sort_unstable();
+    scratch.dedup();
+    match &mut declared[index] {
+        Some(existing) if existing != scratch => {
+            let node = &nodes[index].identity;
+            Err(stow_error!(
+                "task graph node {} {} is declared with conflicting dependency sets",
+                node.crate_name,
+                node.version,
+            ))
+        }
+        slot @ None => {
+            *slot = Some(std::mem::take(scratch));
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 // The wire shape is the input nodes alone: computed digests and task
 // ids are re-derived by `resolve` on read, so a serialized graph can
 // never carry a forged identity.
@@ -541,6 +789,69 @@ mod tests {
             tampered.dependency_identity(1).unwrap(),
             &DependencyIdentity::leaf().unwrap()
         );
+    }
+
+    /// stow#790: the shared bottom-up pass mints, for every entry, the
+    /// same root digest its own subgraph resolves to — over a
+    /// multi-level graph with host-side nodes and shared deps, so the
+    /// per-root target derivation (host nodes key at the family host
+    /// triple, target nodes at the root's own) is exercised on both
+    /// sides.
+    #[test]
+    fn shared_pass_matches_per_entry_resolve() {
+        // wasm32 builds on the Linux family — its host triple is the
+        // Linux runner, a different platform than the consumer target.
+        const TARGET: &str = "wasm32-unknown-unknown";
+        const HOST: &str = "x86_64-unknown-linux-gnu";
+        let resolved = ResolvedTaskGraph::resolve(vec![
+            leaf("leaf", "1.0.0", &[]),
+            node(
+                identity("leaf-host", "1.0.0", &["macro"], HOST, RUSTC, true),
+                &[],
+            ),
+            node(identity("shared", "1.4.0", &[], TARGET, RUSTC, false), &[0]),
+            node(
+                identity("mid-host", "2.0.0", &[], HOST, RUSTC, true),
+                &[1, 2],
+            ),
+            node(
+                identity("root", "3.0.0", &["full"], TARGET, RUSTC, false),
+                &[2, 3],
+            ),
+            node(
+                identity("root-host", "3.0.0", &[], HOST, RUSTC, true),
+                &[3, 0],
+            ),
+        ])
+        .unwrap();
+
+        let subgraphs = (0..resolved.nodes().len())
+            .map(|index| crate::api::TaskSubgraph::from_resolved(&resolved, index).unwrap())
+            .collect::<Vec<_>>();
+        let entries = resolved
+            .nodes()
+            .iter()
+            .zip(&subgraphs)
+            .map(|(node, subgraph)| DigestEntry {
+                identity: &node.identity,
+                root_spelling: node.explicit_spelling,
+                subgraph,
+            })
+            .collect::<Vec<_>>();
+
+        let digests = shared_dependency_identities(&entries).unwrap();
+        for (index, entry) in entries.iter().enumerate() {
+            let own = entry
+                .subgraph
+                .resolve(entry.identity, entry.root_spelling)
+                .unwrap();
+            assert_eq!(
+                &digests[index],
+                own.dependency_identity(0).unwrap(),
+                "node {index} ({}) digest differs",
+                entry.identity.crate_name
+            );
+        }
     }
 
     /// stow#736: the explicit-spelling flag is semantic graph data,

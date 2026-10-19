@@ -33,7 +33,14 @@ pub fn client(config: &StowConfig) -> impl Client {
 /// Whether `STOW_NO_ANALYTICS` is set to `1`.
 #[must_use]
 pub fn analytics_opted_out() -> bool {
-    std::env::var(NO_ANALYTICS_ENV).ok().as_deref() == Some("1")
+    analytics_opted_out_in(|key| std::env::var(key).ok())
+}
+
+/// [`analytics_opted_out`] with the environment injected, so a caller —
+/// or a test — answers `STOW_NO_ANALYTICS` from its own lookup instead
+/// of the process's.
+fn analytics_opted_out_in(env: impl Fn(&str) -> Option<String>) -> bool {
+    env(NO_ANALYTICS_ENV).as_deref() == Some("1")
 }
 
 /// Per-request header middleware: the `stow-cli/<version> (<os>)` user
@@ -87,11 +94,25 @@ impl Middleware for EdgeHeaders {
 
 #[cfg(test)]
 mod tests {
-    use super::analytics_opted_out;
+    use super::{NO_ANALYTICS_ENV, analytics_opted_out_in};
+
+    /// An environment lookup over `values` — the test answers
+    /// `STOW_NO_ANALYTICS` itself rather than reading whatever the
+    /// developer's shell exported (stow#800).
+    fn env<'a>(values: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + use<'a> {
+        move |key| {
+            values
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
 
     #[test]
     fn opt_out_reflects_the_environment_variable() {
-        let expected = std::env::var("STOW_NO_ANALYTICS").ok().as_deref() == Some("1");
-        assert_eq!(analytics_opted_out(), expected);
+        assert!(analytics_opted_out_in(env(&[(NO_ANALYTICS_ENV, "1")])));
+        assert!(!analytics_opted_out_in(env(&[(NO_ANALYTICS_ENV, "0")])));
+        assert!(!analytics_opted_out_in(env(&[])));
+        assert!(!analytics_opted_out_in(env(&[("OTHER", "1")])));
     }
 }

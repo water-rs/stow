@@ -504,16 +504,54 @@ pub async fn write_cached_test_slice(
     Ok(digest)
 }
 
+/// A syntactically valid index row keyed by `c_metadata` — the
+/// slice-memo tests need a row whose key a lookup can name (stow#797).
 #[cfg(test)]
-mod tests {
+pub fn index_test_row(c_metadata: &str) -> stow_types::index::ArtifactIndexRow {
     use semver::Version;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
-        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
-        WireRustcVersion,
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, DependencyIdentity,
+        FeaturesJson,
     };
-    use stow_types::index::{ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndexHeader, ArtifactIndexRow};
+    use stow_types::index::ArtifactIndexRow;
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+
+    ArtifactIndexRow {
+        dependency_identity: DependencyIdentity::leaf().expect("leaf identity"),
+        crate_name: CrateName::parse("serde").expect("crate name"),
+        version: CrateVersion::new(Version::new(1, 0, 219)),
+        features_json: FeaturesJson::canonicalize(vec!["default".to_owned()]).expect("features"),
+        dependency_c_metadata_json: DependencyCMetadataJson::default(),
+        c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
+        compile_key: format!("{c_metadata}{c_metadata}"),
+        bundle_digest: format!("sha256:{c_metadata:0>64}"),
+        bundle_size: 1234,
+        artifact_kind: ArtifactKind::Rlib,
+        crate_types: vec![RustCrateType::Rlib],
+        profile: Profile {
+            opt_level: "3".to_owned(),
+            debuginfo: 0,
+            debug_assertions: false,
+            overflow_checks: false,
+            panic: PanicStrategy::Unwind,
+            strip: StripLevel::None,
+        },
+        emit: vec!["link".to_owned(), "metadata".to_owned()],
+        min_glibc: None,
+        unit_shape: UnitShape {
+            side: UnitSide::Target,
+            invocation: UnitInvocation::Native,
+            kind: UnitKind::Linked,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use stow_types::identity::{TargetTriple, WireRustcVersion};
+    use stow_types::index::{ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndexHeader, ArtifactIndexRow};
 
     use super::*;
     use crate::config::VerifyMode;
@@ -542,36 +580,7 @@ mod tests {
     }
 
     fn test_row(c_metadata: &str) -> ArtifactIndexRow {
-        ArtifactIndexRow {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity"),
-            crate_name: CrateName::parse("serde").expect("crate name"),
-            version: CrateVersion::new(Version::new(1, 0, 219)),
-            features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
-                .expect("features"),
-            dependency_c_metadata_json: DependencyCMetadataJson::default(),
-            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
-            compile_key: format!("{c_metadata}{c_metadata}"),
-            bundle_digest: format!("sha256:{c_metadata:0>64}"),
-            bundle_size: 1234,
-            artifact_kind: ArtifactKind::Rlib,
-            crate_types: vec![RustCrateType::Rlib],
-            profile: Profile {
-                opt_level: "3".to_owned(),
-                debuginfo: 0,
-                debug_assertions: false,
-                overflow_checks: false,
-                panic: PanicStrategy::Unwind,
-                strip: StripLevel::None,
-            },
-            emit: vec!["link".to_owned(), "metadata".to_owned()],
-            min_glibc: None,
-            unit_shape: stow_types::public_cache::UnitShape {
-                side: stow_types::public_cache::UnitSide::Target,
-                invocation: stow_types::public_cache::UnitInvocation::Native,
-                kind: stow_types::public_cache::UnitKind::Linked,
-            },
-        }
+        index_test_row(c_metadata)
     }
 
     fn test_index(rows: Vec<ArtifactIndexRow>) -> ArtifactIndex {

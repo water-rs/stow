@@ -5,7 +5,14 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use crate::support::hermetic_stow_env;
+use crate::support::{hermetic_stow_env, sealed_home_env};
+
+/// The home the fixture's child processes get — one directory per
+/// fixture, shared by every command the test runs in `dir` so `stow
+/// setup`'s installs are visible to the builds (stow#800).
+fn fixture_home(dir: &Path) -> std::path::PathBuf {
+    dir.join("stow-home")
+}
 
 /// Write a single-binary fixture package whose `[dependencies]` table is
 /// `dependencies`, then resolve it now so the builds under test are not
@@ -22,12 +29,13 @@ pub fn write_fixture(dir: &Path, cargo_home: &Path, dependencies: &str) {
     .expect("write manifest");
     std::fs::create_dir_all(dir.join("src")).expect("create src");
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
-    let fetched = Command::new("cargo")
+    let mut fetch = Command::new("cargo");
+    fetch
         .arg("fetch")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run cargo fetch");
+        .env("CARGO_HOME", cargo_home);
+    sealed_home_env(&mut fetch, &fixture_home(dir));
+    let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
         "cargo fetch failed:\n{}",
@@ -49,12 +57,18 @@ pub fn refused_url() -> String {
 /// selection, kept out of the builds under test (stow#294: a Linux
 /// `stow build` refuses to run without it).
 pub fn stow_setup_in(dir: &Path, cargo_home: &Path) {
-    let setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    setup
         .arg("setup")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run stow-cli setup");
+        .env("CARGO_HOME", cargo_home);
+    // Setup reads `StowConfig::load` (and on Linux writes a link-cache
+    // row into its state DB): without the sealed home and the pinned
+    // stow variables it would consult the developer's `~/.stow` and
+    // user-level config, and mold would install under the real home.
+    let home = fixture_home(dir);
+    hermetic_stow_env(&mut setup, &refused_url(), &home.join("stow-cache"), &home);
+    let setup = setup.output().expect("run stow-cli setup");
     assert!(
         setup.status.success(),
         "stow setup failed:\n{}",
@@ -99,7 +113,7 @@ pub fn stow_build_in_with_env(
     env: &[(&str, &str)],
 ) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
-    hermetic_stow_env(&mut command, edge_url, cache_dir);
+    hermetic_stow_env(&mut command, edge_url, cache_dir, &fixture_home(dir));
     command
         .args(args)
         .current_dir(dir)
