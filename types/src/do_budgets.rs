@@ -93,19 +93,6 @@ pub const PREHEAT_BUDGET: PreheatBudget = PreheatBudget {
     resubmit_of_wave: 0.01,
 };
 
-/// The flatness tolerance the stow#433 scale check applies between
-/// fixture sizes (`scripts/scheduler-budget.sh`): a per-event cost may
-/// exceed its smaller-size value by this fraction ...
-pub const GROWTH_TOLERANCE_FRACTION: f64 = 0.10;
-/// ... plus this many rows.
-pub const GROWTH_TOLERANCE_ROWS: f64 = 50.0;
-
-/// `true` when `later` exceeds `earlier` past the stow#433 tolerance.
-#[must_use]
-pub fn grew(earlier: f64, later: f64) -> bool {
-    later > earlier.mul_add(1.0 + GROWTH_TOLERANCE_FRACTION, GROWTH_TOLERANCE_ROWS)
-}
-
 /// One probe budget row — statements, cursor counters and wall time.
 ///
 /// These are the numbers that gate a merge: each was measured on the
