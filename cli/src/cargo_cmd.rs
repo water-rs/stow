@@ -1302,8 +1302,9 @@ async fn analyze_workspace_prediction(
 /// rewrites the serve map with the full pass's answer (stow#347). With
 /// no cached graph the answer is the serve map alone — nothing is
 /// counted and nothing is ranked — and the lockfile's registry packages
-/// are read, once on a blocking thread, only when the local listing
-/// holds units a missing graph cannot name (stow#608).
+/// are read, once on a blocking thread, only when the map has units a
+/// missing graph cannot name: the local listing's units or a slice's
+/// index rows (stow#608, stow#617, stow#805).
 async fn analyze_workspace_prediction_lite(
     project: &ProjectContext,
     config: &StowConfig,
