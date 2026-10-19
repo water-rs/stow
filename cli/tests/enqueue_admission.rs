@@ -231,6 +231,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         "stow setup failed:\n{}",
         String::from_utf8_lossy(&setup.stderr)
     );
+    let target_dir = dir.path().join("target");
     let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     build
         .arg("build")
@@ -250,10 +251,9 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
-        // The fixture build's target dir must stay under `dir` — an
-        // exported `CARGO_TARGET_DIR` would relocate it and the drain
-        // log the test polls would never appear.
-        .env_remove("CARGO_TARGET_DIR")
+        // The drain log and journals the test reads live in the target
+        // dir it names here, never one cargo or the environment picks.
+        .env("CARGO_TARGET_DIR", &target_dir)
         .output()
         .expect("run stow-cli build");
 
@@ -279,7 +279,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         assert!(
             std::time::Instant::now() < deadline,
             "timed out waiting for the drained /api/v1/enqueue post{}",
-            drain_diagnostics(&dir.path().join("target"))
+            drain_diagnostics(&target_dir)
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
@@ -333,6 +333,7 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
         url
     };
 
+    let target_dir = dir.path().join("target");
     let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     build
         .arg("build")
@@ -349,10 +350,9 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
         .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
-        // The fixture build's target dir must stay under `dir` — an
-        // exported `CARGO_TARGET_DIR` would relocate it and the drain
-        // log the test polls would never appear.
-        .env_remove("CARGO_TARGET_DIR")
+        // The drain log and journals the test reads live in the target
+        // dir it names here, never one cargo or the environment picks.
+        .env("CARGO_TARGET_DIR", &target_dir)
         .output()
         .expect("run stow-cli build");
     assert!(
@@ -363,7 +363,6 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
 
     // The detached drain runs after `stow build` returns: poll its log
     // for the named failure and the journal back under its own name.
-    let target_dir = dir.path().join("target");
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     loop {
         let log = std::fs::read_to_string(target_dir.join("stow-drain.log")).unwrap_or_default();
@@ -493,10 +492,9 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
             .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
             .env("CARGO_INCREMENTAL", "0")
             .env_remove("RUST_LOG")
-            // The fixture's target dir must live under `dir` — a
-            // developer-exported `CARGO_TARGET_DIR` would relocate it
-            // and the journal/drain-log reads below would find nothing.
-            .env_remove("CARGO_TARGET_DIR")
+            // The journal and drain log the test reads live in the
+            // target dir it names here.
+            .env("CARGO_TARGET_DIR", dir.join("target"))
             .output()
             .expect("run cargo build");
         assert!(

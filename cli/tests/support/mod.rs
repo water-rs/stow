@@ -59,16 +59,27 @@ pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path
 /// toolchains — a rustup shim under a redirected `HOME` would resolve
 /// none. Compiler-hijack variables a developer might export are
 /// cleared; a test that needs one sets it after this call.
+///
+/// Every directory a variable names exists before the child runs: on
+/// Windows `dirs` resolves the config and local-data dirs through
+/// `SHGetKnownFolderPath` without `KF_FLAG_DONT_VERIFY`, which fails on a
+/// folder that does not exist, and stow then skips its config entirely.
 pub fn sealed_home_env(command: &mut Command, home: &Path) {
-    std::fs::create_dir_all(home).expect("create the test's home dir");
+    let dirs = [
+        ("HOME", home.to_path_buf()),
+        ("USERPROFILE", home.to_path_buf()),
+        ("XDG_CONFIG_HOME", home.join(".config")),
+        ("XDG_DATA_HOME", home.join(".local").join("share")),
+        ("XDG_CACHE_HOME", home.join(".cache")),
+        ("APPDATA", home.join("AppData").join("Roaming")),
+        ("LOCALAPPDATA", home.join("AppData").join("Local")),
+    ];
+    for (key, dir) in dirs {
+        std::fs::create_dir_all(&dir)
+            .unwrap_or_else(|error| panic!("create {key} dir {}: {error}", dir.display()));
+        command.env(key, dir);
+    }
     command
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join(".config"))
-        .env("XDG_DATA_HOME", home.join(".local/share"))
-        .env("XDG_CACHE_HOME", home.join(".cache"))
-        .env("USERPROFILE", home)
-        .env("APPDATA", home.join("AppData/Roaming"))
-        .env("LOCALAPPDATA", home.join("AppData/Local"))
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CC")
