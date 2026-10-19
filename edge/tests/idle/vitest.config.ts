@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
+import { unstable_splitSqlQuery } from "wrangler";
 
 // The real workerd build — the bundle `skyzen build --provider cloudflare
 // --manifest edge/Skyzen.mock.toml` emits — not a reimplementation. The
@@ -46,7 +47,16 @@ export default defineConfig({
 				),
 			},
 			miniflare: {
-				bindings: { TEST_D1_SCHEMA: d1Schema },
+				// The operator applies the schema with `wrangler d1 execute
+				// --file`, which splits the file statement-wise and batches
+				// prepared statements — never `exec`, which treats each line
+				// as a statement and dies on this file's comment lines. The
+				// same splitter produces the statements the test batches.
+				bindings: {
+					TEST_D1_STATEMENTS: JSON.stringify(
+						unstable_splitSqlQuery(d1Schema),
+					),
+				},
 				outboundService: "dispatch-stub",
 				workers: [
 					{

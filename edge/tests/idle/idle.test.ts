@@ -57,6 +57,7 @@ function enqueue(name: string, deps: unknown[] = [], downloads = 100) {
 		rustc_version: RUSTC,
 		downloads,
 		source: "CacheMiss",
+		explicit_spelling: "keys-as-native",
 		dependency_subgraph: {
 			r: deps.map((_, i) => i),
 			n: deps,
@@ -150,7 +151,15 @@ async function statusCounts(stub: DurableObjectStub) {
 }
 
 beforeAll(async () => {
-	await env.STOW_DB.exec((env as Env2).TEST_D1_SCHEMA);
+	// `wrangler d1 execute --file` — the operator path — batches prepared
+	// statements; `D1Database.exec` splits on newlines instead, so it
+	// cannot load a file whose statements span lines and carry comments.
+	const statements = JSON.parse(
+		(env as Env2).TEST_D1_STATEMENTS,
+	) as string[];
+	await env.STOW_DB.batch(
+		statements.map((sql) => env.STOW_DB.prepare(sql)),
+	);
 });
 
 // A submit whose rows are immediately eligible arms a real alarm at
