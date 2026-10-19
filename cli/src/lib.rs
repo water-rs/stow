@@ -5054,18 +5054,21 @@ mod tests {
     }
 
     /// A `StowConfig` whose every path and endpoint is a throwaway — the
-    /// env-base tests' shared fixture.
+    /// env-base tests' shared fixture. Its windows outlast any test, so a
+    /// slice written fresh stays fresh and a negative-cache entry stays
+    /// recorded however slow the runner; a test that wants either expired
+    /// sets it to zero (stow#806).
     fn env_base_test_config(dir: &tempfile::TempDir) -> crate::config::StowConfig {
         crate::config::StowConfig {
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: dir.path().join("cache"),
             request_timeout: std::time::Duration::from_millis(50),
-            negative_cache_ttl: std::time::Duration::from_secs(1),
-            circuit_reset_after: std::time::Duration::from_secs(1),
+            negative_cache_ttl: std::time::Duration::from_mins(10),
+            circuit_reset_after: std::time::Duration::from_mins(10),
             circuit_trip_threshold: 1,
             artifact_cache_max_bytes: 1,
-            index_refresh_interval: std::time::Duration::from_secs(1),
+            index_refresh_interval: std::time::Duration::from_mins(10),
             verify_mode: crate::config::VerifyMode::GithubCi,
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
@@ -5899,10 +5902,10 @@ mod tests {
             .expect("write rmeta");
         }
 
-        /// A `BuildSupervisor` whose local base for the `rustc` spelling
-        /// the fixture's frames carry is already memoized with a temp-dir
-        /// config — the cell is set, so `observed` never touches the
-        /// process environment or probes a toolchain.
+        /// A `BuildSupervisor` whose bases for the `rustc` spelling the
+        /// fixture's frames carry are already memoized with a temp-dir
+        /// config — the cells are set, so `observed` and `plan` never
+        /// touch the process environment or probe a toolchain.
         async fn fixture(
             root: &Path,
         ) -> (
@@ -5950,14 +5953,17 @@ mod tests {
             });
             let in_flight = server::InFlightUnits::default();
             let env_cache = crate::WrapperEnvCache::new(config.state_db.clone());
-            env_cache
-                .local_bases
-                .lock()
-                .expect("env base map mutex")
-                .insert(
-                    OsString::from("rustc"),
-                    Arc::new(tokio::sync::OnceCell::from(Some(base))),
-                );
+            // Both base maps get the fixture's cell: an unset cell loads
+            // through `StowConfig::load`, which reads the developer's
+            // `~/.stow` — a real index slice for the host there would
+            // serve the fixture's units from state the test never wrote
+            // (stow#800).
+            let cell = Arc::new(tokio::sync::OnceCell::from(Some(base)));
+            for map in [&env_cache.local_bases, &env_cache.env_bases] {
+                map.lock()
+                    .expect("env base map mutex")
+                    .insert(OsString::from("rustc"), Arc::clone(&cell));
+            }
             let handler = Arc::new(BuildSupervisor {
                 env_cache,
                 ctx: ctx(&in_flight),

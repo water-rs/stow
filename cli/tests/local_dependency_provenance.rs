@@ -29,6 +29,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use build_fixture::{refused_url, stow_build_in_with_env, stow_setup_in};
+use support::sealed_home_env;
 
 /// The debug event `must_build_locally` emits when a linked `--extern`
 /// artifact is already locally built — emitted in the supervisor, which
@@ -83,12 +84,13 @@ fn write_fixture(dir: &Path, cargo_home: &Path) {
     // Resolve `quote`'s chain now, so the builds under test are not also
     // network tests — the fetch shares the isolated CARGO_HOME the
     // builds use.
-    let fetched = Command::new("cargo")
+    let mut fetch = Command::new("cargo");
+    fetch
         .arg("fetch")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run cargo fetch");
+        .env("CARGO_HOME", cargo_home);
+    sealed_home_env(&mut fetch, &dir.join("stow-home"));
+    let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
         "cargo fetch failed:\n{}",
