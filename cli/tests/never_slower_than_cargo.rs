@@ -12,7 +12,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 
-use stow_cli::protocol::{Answer, Request};
+use stow_cli::protocol::{Answer, Plan, Request};
 
 mod support;
 
@@ -682,6 +682,9 @@ struct StubSupervision {
     compiled: std::collections::BTreeMap<String, usize>,
     observed_marks: std::collections::BTreeMap<String, usize>,
     observed_reports: std::collections::BTreeMap<String, usize>,
+    /// Connections accepted but not yet drained to their close — the
+    /// count [`drain_stub`] waits out before the census is read.
+    open_connections: usize,
 }
 
 /// The crate a supervisor frame compiled: `--crate-name`'s value in the
@@ -785,9 +788,13 @@ fn spawn_stub_supervisor() -> (String, std::sync::Arc<std::sync::Mutex<StubSuper
         let mut connections = Vec::new();
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
+            accept_counts.lock().expect("frame counts").open_connections += 1;
             connections.push(std::thread::spawn({
                 let counts = std::sync::Arc::clone(&accept_counts);
-                move || serve_stub_connection(stream, &counts)
+                move || {
+                    serve_stub_connection(stream, &counts);
+                    counts.lock().expect("frame counts").open_connections -= 1;
+                }
             }));
         }
         for connection in connections {
@@ -795,6 +802,60 @@ fn spawn_stub_supervisor() -> (String, std::sync::Arc<std::sync::Mutex<StubSuper
         }
     });
     (format!("tcp:{port}"), counts)
+}
+
+/// The census is final only once every connection thread has drained
+/// its stream to EOF, and a fixed beat after the build's exit guesses
+/// at that drain — the race stow#810 names. The probe's answer is the
+/// accept loop's word that it took every connection the build opened
+/// (accept is FIFO, so a handshake still queued at the build's exit is
+/// counted before the probe), and `open_connections == 0` after the
+/// probe's own close is the connection threads' word that every frame
+/// was counted.
+fn drain_stub(endpoint: &str, counts: &std::sync::Mutex<StubSupervision>) {
+    let port: u16 = endpoint
+        .strip_prefix("tcp:")
+        .expect("a tcp loopback endpoint")
+        .parse()
+        .expect("a loopback port");
+    let mut probe = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .expect("connect the drain probe");
+    let request = Request::Plan(Plan::new(
+        "test-token".to_owned(),
+        std::ffi::OsStr::new("rustc"),
+        &[
+            std::ffi::OsString::from("--crate-name"),
+            std::ffi::OsString::from("drain_probe"),
+        ],
+    ));
+    let body = serde_json::to_vec(&request).expect("encode probe frame");
+    probe
+        .write_all(
+            &u32::try_from(body.len())
+                .expect("frame length")
+                .to_le_bytes(),
+        )
+        .and_then(|()| probe.write_all(&body))
+        .and_then(|()| probe.flush())
+        .expect("write probe frame");
+    let mut length = [0_u8; 4];
+    probe.read_exact(&mut length).expect("read answer length");
+    let mut body = vec![0_u8; u32::from_le_bytes(length) as usize];
+    probe.read_exact(&mut body).expect("read answer body");
+    let answer: Answer = serde_json::from_slice(&body).expect("decode probe answer");
+    assert!(
+        matches!(answer, Answer::Compile { .. }),
+        "the probe must be answered: {answer:?}"
+    );
+    drop(probe);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while counts.lock().expect("frame counts").open_connections != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stub's connections never drained: {counts:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// What the stub exports as `STOW_SUPERVISOR_BINARY`: the identity of
@@ -862,7 +923,7 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
     // Connection threads finish the instant each facade closes its
     // stream; the build's exit guarantees all frames were sent, and the
     // lock sees them once the stub has drained them.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    drain_stub(&endpoint, &counts);
     let (cfg_if_plans, cfg_if_marks, cfg_if_reports, probe_plans, debug) = {
         let counts = counts.lock().expect("frame counts");
         let values = (
@@ -933,7 +994,7 @@ fn a_covered_unit_still_takes_the_plan_path() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    drain_stub(&endpoint, &counts);
     let (cfg_if_plans, cfg_if_observed, debug) = {
         let counts = counts.lock().expect("frame counts");
         let values = (

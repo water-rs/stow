@@ -598,12 +598,14 @@ mod tests {
         assert!(decoded.pending);
     }
 
-    /// Accept one `AwaitServeMap` frame on a loopback listener and
-    /// answer it with `answer` — after `hold`, so the test can see the
-    /// wait actually waited. Returns the port the facade connects to
-    /// and the frame the peer read.
+    /// Accept one `AwaitServeMap` frame on a loopback listener, run
+    /// `release`, then answer it with `answer` — the caller's word on
+    /// when the answer may leave, so the test orders its own act
+    /// against a signal rather than racing a fixed hold (stow#810).
+    /// Returns the port the facade connects to and the frame the peer
+    /// read.
     fn serve_one_await(
-        hold: std::time::Duration,
+        release: impl FnOnce() + Send + 'static,
         answer: &super::Answer,
     ) -> (u16, std::thread::JoinHandle<super::Request>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
@@ -616,7 +618,7 @@ mod tests {
             let mut body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
             peer.read_exact(&mut body).expect("read body");
             let request: super::Request = serde_json::from_slice(&body).expect("request frame");
-            std::thread::sleep(hold);
+            release();
             let encoded = serde_json::to_vec(&answer).expect("answer frame");
             peer.write_all(
                 &u32::try_from(encoded.len())
@@ -639,8 +641,10 @@ mod tests {
     fn the_wait_rides_the_loopback_transport() {
         use std::time::{Duration, Instant};
 
-        let (port, server) =
-            serve_one_await(Duration::from_millis(80), &super::Answer::ServeMapReady);
+        let (port, server) = serve_one_await(
+            move || std::thread::sleep(Duration::from_millis(80)),
+            &super::Answer::ServeMapReady,
+        );
         let started = Instant::now();
         super::await_serve_map(&Endpoint::Loopback(port), "the-token").expect("the wait");
         let waited = started.elapsed();
@@ -715,13 +719,14 @@ mod tests {
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (mut peer, _) = listener.accept().expect("accept the facade");
             let mut length_bytes = [0_u8; 4];
             peer.read_exact(&mut length_bytes).expect("read length");
             let mut body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
             peer.read_exact(&mut body).expect("read body");
-            std::thread::sleep(Duration::from_secs(2));
+            release_rx.recv().expect("the test's release");
         });
         let started = Instant::now();
         super::await_serve_map_within(
@@ -732,9 +737,10 @@ mod tests {
         .expect("the bounded timeout ends the wait quietly");
         let waited = started.elapsed();
         assert!(
-            waited >= Duration::from_millis(50) && waited < Duration::from_secs(2),
+            waited >= Duration::from_millis(50) && !server.is_finished(),
             "the wait ended on its own bound, not the peer's: {waited:?}"
         );
+        release_tx.send(()).expect("release the peer");
         server.join().expect("server thread");
     }
 
@@ -745,7 +751,7 @@ mod tests {
         use std::time::Duration;
 
         let (port, server) = serve_one_await(
-            Duration::ZERO,
+            move || std::thread::sleep(Duration::ZERO),
             &super::Answer::Failed {
                 message: "supervisor token mismatch".to_owned(),
             },
@@ -832,8 +838,14 @@ mod tests {
         pending.pending = true;
         std::fs::write(&map_path, serde_json::to_vec(&pending).expect("map"))
             .expect("write pending map");
-        let (port, server) =
-            serve_one_await(Duration::from_millis(150), &super::Answer::ServeMapReady);
+        // The server answers on the test's word, not a fixed hold: the
+        // settled map is on disk before the answer may leave, on any
+        // runner (stow#810).
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (port, server) = serve_one_await(
+            move || release_rx.recv().expect("the test's release"),
+            &super::Answer::ServeMapReady,
+        );
         let binary =
             crate::supervisor::BinaryIdentity::of(&std::env::current_exe().expect("current exe"))
                 .expect("binary identity");
@@ -849,8 +861,10 @@ mod tests {
             &dir.path().join("deps"),
             &dir.path().join("cargo_home/registry/src"),
         );
-        let started = Instant::now();
-        let facade = std::thread::spawn(move || super::try_invocation_with(&args));
+        let facade = std::thread::spawn(move || {
+            let outcome = super::try_invocation_with(&args);
+            (Instant::now(), outcome)
+        });
         std::thread::sleep(Duration::from_millis(60));
         assert!(
             !facade.is_finished(),
@@ -863,19 +877,21 @@ mod tests {
             serde_json::to_vec(&map(&[("demo", "1.0.0")], &[])).expect("map"),
         )
         .expect("write settled map");
-        let outcome = facade
-            .join()
-            .expect("facade thread")
-            .expect("try_invocation");
+        let released = Instant::now();
+        release_tx.send(()).expect("release the server's answer");
+        let (answered, outcome) = facade.join().expect("facade thread");
+        let outcome = outcome.expect("try_invocation");
         server.join().expect("server thread");
-        let waited = started.elapsed();
         unsafe {
             std::env::remove_var(super::STOW_SERVE_MAP_FILE_ENV);
             std::env::remove_var(crate::supervisor::ENDPOINT_ENV);
             std::env::remove_var(crate::supervisor::TOKEN_ENV);
             std::env::remove_var(crate::supervisor::BINARY_ENV);
         }
-        assert!(waited >= Duration::from_millis(150), "{waited:?}");
+        assert!(
+            answered >= released,
+            "the facade's answer arrived before the test released it"
+        );
         assert!(
             matches!(outcome, super::FastPath::Defer),
             "the settled map covers the unit, so it defers to the plan path"
