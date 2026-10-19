@@ -21,6 +21,17 @@
 #   5. `stow index refresh` + `stow check` a throwaway consumer crate in
 #      mock-key verify mode and assert the dependency was served from the
 #      cache via local index resolution and a direct digest pull
+#   6. the host-side node pipeline (stow#774): `stow-admin preheat plan`
+#      snafu-derive@0.9.2 for wasm32-unknown-unknown mints its proc-macro
+#      tree as host-side tasks on the runner-family host triple; the
+#      batch submits to the scheduler and builds wave by wave — each
+#      time the queue drains to gated-but-pending the slices publish so
+#      the next layer's gate opens — until every task reports; then the
+#      catalog asserts every host dep registered under the host triple
+#      at unit_side=host and none under wasm32, and a second consumer
+#      (snafu-derive as a normal dependency, heck as a build dependency)
+#      `stow check`s natively and under `--target wasm32` with cache
+#      hits on every host dep on both invocations
 #
 # All state (keys, registry root, edge persist dir, stow cache, logs, the
 # local-CI dispatch tree) lives under a single work dir so the run never
@@ -31,7 +42,7 @@
 #   STOW_E2E_WORK_DIR        work dir instead of a fresh mktemp (CI log upload)
 #   STOW_E2E_TOOLCHAIN       rustup toolchain for the run (default: stable)
 #   STOW_E2E_READY_DEADLINE  seconds to wait for each service (default: 600)
-#   STOW_E2E_TASK_DEADLINE   seconds to wait for the scheduler (default: 600)
+#   STOW_E2E_TASK_DEADLINE   seconds to wait for the scheduler (default: 1200)
 set -euo pipefail
 # Job control gives every background service its own process group, so the
 # cleanup trap can kill whole trees — including grandchildren like
@@ -61,9 +72,15 @@ if [ -z "$EDGE_BEARER" ]; then
     fi
 fi
 READY_DEADLINE="${STOW_E2E_READY_DEADLINE:-600}"
-TASK_DEADLINE="${STOW_E2E_TASK_DEADLINE:-600}"
+TASK_DEADLINE="${STOW_E2E_TASK_DEADLINE:-1200}"
 TASK_CRATE=itoa
 TASK_FEATURES='["default"]'
+# The host-deps scenario's reproduction input: the proc-macro release
+# whose host-side deps went unpublished in production (run 35995412018),
+# at the failing task's target spelling.
+HOST_DEPS_CRATE=snafu-derive
+HOST_DEPS_VERSION=0.9.2
+CONSUMER_TARGET=wasm32-unknown-unknown
 
 # `stow-build` pins the task's rustc version via RUSTUP_TOOLCHAIN, so the
 # whole run must use a toolchain whose `rustc --version` is itself a
@@ -205,8 +222,20 @@ check_children_alive() {
 # `rustup_home()` from the real environment inside its sandbox, so the
 # toolchain (and the version install above) must live there anyway.
 # `ISOLATED_ENV` is set once `RUSTUP_HOME_REAL` is known, below.
+# A `CARGO_PROFILE_*` override the calling job exports to speed up its own
+# build is dropped: profile settings are part of a unit's identity, and the
+# builder publishes under cargo's defaults, so a consumer that inherited
+# one would compute a different key and miss for a reason unrelated to
+# what this lane tests.
 isolated_env() {
-    env "${ISOLATED_ENV[@]}" "$@"
+    local name
+    local -a dropped=()
+    for name in $(compgen -e); do
+        case "$name" in
+            CARGO_PROFILE_*) dropped+=(-u "$name") ;;
+        esac
+    done
+    env "${dropped[@]}" "${ISOLATED_ENV[@]}" "$@"
 }
 
 # Every stow-cli call carries the full mock env — config, cache, verify
@@ -222,6 +251,109 @@ stow_cli() {
         "$BIN/stow-cli" "$@"
 }
 
+# The export → publish → report → sync pass index-publish.yml drives,
+# run per wave: `index export --out-dir` reads and verifies the records
+# artifacts (mock-key trust) in one pass, then `index publish` delegates
+# each slice's signed push to `stow-mock-registry publish-index`,
+# `index report` feeds the scheduler gate's published_slice_rows, and
+# `index sync` replays new-records.json into the D1 catalog — catalog
+# reads hold only once the sync has landed. The out-dir is fixed across
+# calls because its `.prev` sidecars are what the export reads to stamp
+# each slice's next generation (a missing `.prev` is legal only at
+# generation 1). $1 tags the per-wave log files.
+publish_slices() {
+    local tag="$1"
+    isolated_env \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
+        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+        "$BIN/stow-admin" index export \
+        --out-dir "$WORK_DIR/index-export" \
+        --rustc-version "$RUSTC_VERSION" \
+        >"$LOG_DIR/index-export-$tag.log" 2>&1 \
+        || die "stow-admin index export failed — see $LOG_DIR/index-export-$tag.log"
+    local pairs
+    pairs="$(python3 -c 'import json,sys
+for s in json.load(open(sys.argv[1])):
+    print(s["index_file"], s["folded_file"])' "$WORK_DIR/index-export/slices.json")" \
+        || die "reading $WORK_DIR/index-export/slices.json failed"
+    echo "$pairs" | while read -r index_file folded_file; do
+        [ -n "$index_file" ] || continue
+        isolated_env \
+            STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+            STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+            "$BIN/stow-admin" index publish \
+            --file "$WORK_DIR/index-export/$index_file" \
+            --folded "$WORK_DIR/index-export/$folded_file" \
+            >>"$LOG_DIR/index-publish-$tag.log" 2>&1 \
+            || die "stow-admin index publish failed for $index_file — see $LOG_DIR/index-publish-$tag.log"
+        isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+            "$BIN/stow-admin" index report \
+            --file "$WORK_DIR/index-export/$index_file" \
+            >>"$LOG_DIR/index-report-$tag.log" 2>&1 \
+            || die "stow-admin index report failed for $index_file — see $LOG_DIR/index-report-$tag.log"
+    done
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+        "$BIN/stow-admin" index sync \
+        --file "$WORK_DIR/index-export/new-records.json" \
+        >>"$LOG_DIR/index-sync-$tag.log" 2>&1 \
+        || die "stow-admin index sync failed — see $LOG_DIR/index-sync-$tag.log"
+}
+
+# Throwaway-consumer warm-up shared by both scenarios: `cargo fetch`
+# fills the isolated CARGO_HOME the way any real consumer machine
+# already is — stow's post-pin mirror analysis runs
+# `cargo metadata --offline`, which needs the registry index and crate
+# sources present locally, and on a truly cold cache stow degrades to
+# plain cargo by design (the no-slowdown floor), which would silently
+# skip the very path this lane exists to exercise. `stow setup` follows
+# in the order a user runs it: on Linux it provisions mold and writes
+# the linker selection into the isolated CARGO_HOME's config.toml, and
+# a build without that selection refuses to start. $2 tags the logs.
+prepare_consumer() {
+    local dir="$1" tag="$2"
+    (
+        cd "$dir"
+        isolated_env cargo fetch
+    ) >"$LOG_DIR/consumer-fetch-$tag.log" 2>&1 \
+        || die "cargo fetch failed — see $LOG_DIR/consumer-fetch-$tag.log"
+    (
+        cd "$dir"
+        stow_cli setup
+    ) >"$LOG_DIR/stow-setup-$tag.log" 2>&1 \
+        || die "stow setup failed — see $LOG_DIR/stow-setup-$tag.log"
+    [ -f "$WORK_DIR/cargo-home/config.toml" ] \
+        || die "stow setup wrote no $WORK_DIR/cargo-home/config.toml"
+}
+
+# crate_stats is the CLI's own evidence a unit was served from the
+# signed slice rather than compiled: every named crate (canonical rustc
+# spelling — dashes are underscores) must show at least $1 cumulative
+# hits and zero errors.
+assert_served() {
+    local min_hits="$1" dep canonical hits errors
+    shift
+    local state_db="$WORK_DIR/stow-cache/state-v3.sqlite3"
+    [ -f "$state_db" ] || die "stow state DB missing at $state_db"
+    for dep in "$@"; do
+        canonical="${dep//-/_}"
+        hits="$(sqlite3 "$state_db" "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$canonical'")"
+        errors="$(sqlite3 "$state_db" "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$canonical'")"
+        echo "[mock-e2e] $dep: hits=$hits errors=$errors"
+        [ "$hits" -ge "$min_hits" ] \
+            || die "$dep was not served from the cache (hits=$hits, expected at least $min_hits)"
+        [ "$errors" -eq 0 ] || die "$dep fetch recorded $errors errors"
+    done
+}
+
+# The catalog's D1 behind the dev edge — `wrangler d1 execute --local`
+# reads the persist dir directly; --json prints `[{results: [...]}]`.
+d1() {
+    wrangler d1 execute stow-mock --local \
+        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
+        --persist-to "$WORK_DIR/edge-state" \
+        --command "$1" --json 2>/dev/null
+}
+
 require_command cargo
 require_command rustc
 require_command rustup
@@ -229,6 +361,7 @@ require_command openssl
 require_command curl
 require_command jq
 require_command sqlite3
+require_command python3
 require_command skyzen
 require_command wrangler
 
@@ -268,12 +401,18 @@ resolved="$(RUSTUP_TOOLCHAIN="$RUSTC_VERSION" rustc --version | awk '{print $2}'
 echo "[mock-e2e] work dir: $WORK_DIR"
 echo "[mock-e2e] toolchain: $RUSTUP_TOOLCHAIN (rustc $RUSTC_VERSION, host $HOST_TARGET)"
 
-# `skyzen dev` compiles the edge to wasm32 on the run's toolchain.
-if ! rustup target list --installed --toolchain "$RUSTUP_TOOLCHAIN" \
-    | grep -qx wasm32-unknown-unknown; then
-    echo "[mock-e2e] installing wasm32-unknown-unknown for $RUSTUP_TOOLCHAIN"
-    rustup target add --toolchain "$RUSTUP_TOOLCHAIN" wasm32-unknown-unknown
-fi
+# `skyzen build` compiles the edge to wasm32 on the run's toolchain, and
+# the host-deps scenario's `--target wasm32` consumer check compiles the
+# consumer crate for wasm32 — both need the std, and so does the pinned
+# $RUSTC_VERSION toolchain the sandboxed builds re-resolve.
+for toolchain in "$RUSTUP_TOOLCHAIN" "$RUSTC_VERSION"; do
+    if ! rustup target list --installed --toolchain "$toolchain" \
+        | grep -qx "$CONSUMER_TARGET"; then
+        echo "[mock-e2e] installing $CONSUMER_TARGET for $toolchain"
+        rustup target add --toolchain "$toolchain" "$CONSUMER_TARGET" \
+            || die "could not install $CONSUMER_TARGET for $toolchain"
+    fi
+done
 
 cd "$REPO_ROOT"
 echo "[mock-e2e] building stow-cli, stow-build, stow-mock-registry, stow-admin"
@@ -937,7 +1076,9 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 
 # The dispatch tree (.tmp/local-ci-dispatch) is written under the server's
-# cwd; keep it inside the work dir.
+# cwd; keep it inside the work dir. The builder keeps its own cache: a
+# build's slice prefetch must not warm the consumer's cache — a slice it
+# caches mid-publish is one the consumer's own ensure would reuse stale.
 (
     cd "$WORK_DIR/local-ci"
     # The builds this server runs consume the mock registry and an
@@ -946,7 +1087,7 @@ fi
     exec env "${ISOLATED_ENV[@]}" \
         STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
         STOW_VERIFY_MODE="mock-key" \
-        STOW_CACHE_DIR="$WORK_DIR/stow-cache" \
+        STOW_CACHE_DIR="$WORK_DIR/ci-cache" \
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
         STOW_GITHUB_WEBHOOK_SECRET="mock-github-webhook-secret" \
@@ -1001,49 +1142,10 @@ done
 
 # The consumer resolves artifacts through the signed local index, so the
 # slices the runs' records feed must exist in the mock registry before
-# `stow check` runs: `index export --out-dir` reads and verifies the
-# records artifacts (mock-key trust) in one pass, and `index publish`
-# delegates each slice's signed push to `stow-mock-registry
-# publish-index`, which writes the same layout the GHCR path produces.
-isolated_env \
-    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
-    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
-    "$BIN/stow-admin" index export \
-    --out-dir "$WORK_DIR/index-export" \
-    --rustc-version "$RUSTC_VERSION" \
-    >"$LOG_DIR/index-export.log" 2>&1 \
-    || die "stow-admin index export failed — see $LOG_DIR/index-export.log"
-
-pairs="$(python3 -c 'import json,sys
-for s in json.load(open(sys.argv[1])):
-    print(s["index_file"], s["folded_file"])' "$WORK_DIR/index-export/slices.json")" \
-    || die "reading $WORK_DIR/index-export/slices.json failed"
-echo "$pairs" | while read -r index_file folded_file; do
-    [ -n "$index_file" ] || continue
-    isolated_env \
-        STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
-        STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-        "$BIN/stow-admin" index publish \
-        --file "$WORK_DIR/index-export/$index_file" \
-        --folded "$WORK_DIR/index-export/$folded_file" \
-        >>"$LOG_DIR/index-publish.log" 2>&1 \
-        || die "stow-admin index publish failed for $index_file — see $LOG_DIR/index-publish.log"
-    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-        "$BIN/stow-admin" index report \
-        --file "$WORK_DIR/index-export/$index_file" \
-        >>"$LOG_DIR/index-report.log" 2>&1 \
-        || die "stow-admin index report failed for $index_file — see $LOG_DIR/index-report.log"
-done
-
-# D1's catalog is a read model of the records the export just folded:
-# `index sync` replays `new-records.json` into it, as index-publish.yml
-# does after its publish loop. The miss derivation reads it, so a
-# covered graph mints no admission only once the sync has landed.
-isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" index sync \
-    --file "$WORK_DIR/index-export/new-records.json" \
-    >"$LOG_DIR/index-sync.log" 2>&1 \
-    || die "stow-admin index sync failed — see $LOG_DIR/index-sync.log"
+# `stow check` runs. D1's catalog is a read model of the records the
+# export folds — the miss derivation reads it, so a covered graph mints
+# no admission only once the sync has landed.
+publish_slices "itoa"
 
 # Exercise the consumer-facing commands before `check`: refresh pulls and
 # verifies the signed slice, status reports the cached row set the
@@ -1096,35 +1198,12 @@ curl -fsS --max-time 10 -H "Authorization: Bearer ${registry_token}" \
     || die "index slice index.${HOST_TARGET}.${RUSTC_VERSION} missing after the manual wave"
 
 # Throwaway consumer pinned to the exact version the scheduler just built.
+# `stow status` below reads the config.toml `stow setup` writes.
 CONSUMER="$WORK_DIR/itoa-consumer"
-isolated_env cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new.log" 2>&1 \
-    || die "cargo new failed — see $LOG_DIR/consumer-new.log"
+isolated_env cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new-itoa.log" 2>&1 \
+    || die "cargo new failed — see $LOG_DIR/consumer-new-itoa.log"
 printf 'itoa = "=%s"\n' "$TASK_VERSION" >>"$CONSUMER/Cargo.toml"
-
-# Warm the isolated CARGO_HOME the way any real consumer machine already
-# is: stow's post-pin mirror analysis runs `cargo metadata --offline`,
-# which needs the registry index and crate sources present locally. On a
-# truly cold cache stow degrades to plain cargo by design (the
-# no-slowdown floor), which would silently skip the very path this lane
-# exists to exercise.
-(
-    cd "$CONSUMER"
-    isolated_env cargo fetch
-) >"$LOG_DIR/consumer-fetch.log" 2>&1 \
-    || die "cargo fetch failed — see $LOG_DIR/consumer-fetch.log"
-
-# `stow setup` first, the order a user follows: on Linux it provisions
-# mold and writes the linker selection into the isolated CARGO_HOME's
-# config.toml, and a build without that selection refuses to start.
-# `stow status` reads the same file below.
-(
-    cd "$CONSUMER"
-    stow_cli setup
-) >"$LOG_DIR/stow-setup.log" 2>&1 \
-    || die "stow setup failed — see $LOG_DIR/stow-setup.log"
-
-[ -f "$WORK_DIR/cargo-home/config.toml" ] \
-    || die "stow setup wrote no $WORK_DIR/cargo-home/config.toml"
+prepare_consumer "$CONSUMER" itoa
 
 (
     cd "$CONSUMER"
@@ -1139,13 +1218,7 @@ printf 'itoa = "=%s"\n' "$TASK_VERSION" >>"$CONSUMER/Cargo.toml"
     || die "stow status failed — see $LOG_DIR/stow-status.log"
 cat "$LOG_DIR/stow-status.log"
 
-STATE_DB="$WORK_DIR/stow-cache/state-v3.sqlite3"
-[ -f "$STATE_DB" ] || die "stow state DB missing at $STATE_DB"
-hits="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$TASK_CRATE'")"
-errors="$(sqlite3 "$STATE_DB" "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$TASK_CRATE'")"
-echo "[mock-e2e] $TASK_CRATE cache stats: hits=$hits errors=$errors"
-[ "$hits" -ge 1 ] || die "$TASK_CRATE was not served from the cache (hits=$hits)"
-[ "$errors" -eq 0 ] || die "$TASK_CRATE fetch recorded $errors errors"
+assert_served 1 "$TASK_CRATE"
 
 # --- byte path: bundles served by digest, Workers Cache in front of GHCR ---
 #
@@ -1248,4 +1321,239 @@ jq -e '.[0].request.crate_name == "libc"' <<<"$admissions" >/dev/null \
     || die "admission request does not echo the miss: $admissions"
 echo "[mock-e2e] uncovered graph: 1 admission with PoW challenge (expected)"
 
-echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache via the local index"\n
+echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache via the local index"
+
+# --- stow#774: host-side nodes ------------------------------------------
+#
+# The post-0.6.0 production failure shape (run 35995412018): a proc-macro
+# build compiled its host deps itself because no host-side node had
+# published them. `preheat plan` resolves the published tarball
+# in-process and prunes the batch against coverage computed from the
+# published index slices — the same verified pull `index export` makes,
+# so it takes the same mock env: the registry as the OCI base and the
+# mock public key as the signature trust (stow#774: without them the
+# coverage pull goes to the real GHCR and dies on the token exchange).
+# wasm32 is the failing task's target spelling.
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
+    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+    "$BIN/stow-admin" --json preheat plan \
+    "${HOST_DEPS_CRATE}@${HOST_DEPS_VERSION}" \
+    --features-json '[]' \
+    --target "$CONSUMER_TARGET" \
+    --rustc-version "$RUSTC_VERSION" \
+    >"$WORK_DIR/preheat-plan-host-deps.json" 2>"$LOG_DIR/preheat-plan-host-deps.log" \
+    || die "stow-admin preheat plan failed — see $LOG_DIR/preheat-plan-host-deps.log"
+
+# The JSON plan carries the resolved task batch per target; host-side
+# nodes mint under the runner-family host triple, so the wasm32 plan's
+# tasks are the snafu-derive host tree at host side.
+plan_tasks="$(jq '[.targets[].tasks[]]' "$WORK_DIR/preheat-plan-host-deps.json")"
+task_count="$(jq 'length' <<<"$plan_tasks")"
+[ "$task_count" -ge 2 ] \
+    || die "plan returned $task_count tasks — expected snafu-derive plus host deps"
+echo "[mock-e2e] host-deps plan: $task_count tasks"
+jq -r '.[] | "  \(.crate_name) \(.version) target=\(.target) host_side=\(.host_side) deps=\(.dependency_subgraph.root_deps | length)"' \
+    <<<"$plan_tasks"
+
+# Every task in this plan must be host-side on the host triple: a
+# proc-macro's whole unit graph is host units.
+host_side_count="$(jq '[.[] | select(.host_side == true)] | length' <<<"$plan_tasks")"
+[ "$host_side_count" -eq "$task_count" ] \
+    || die "plan minted non-host-side tasks: $(jq -c '[.[] | select(.host_side != true)]' <<<"$plan_tasks")"
+HECK_VERSION="$(jq -r '.[] | select(.crate_name == "heck") | .version' <<<"$plan_tasks" | head -1)"
+[ -n "$HECK_VERSION" ] \
+    || die "plan has no heck task — snafu-derive's host dep was not minted"
+jq -e ".[] | select(.crate_name == \"$HOST_DEPS_CRATE\")" <<<"$plan_tasks" >/dev/null \
+    || die "plan has no $HOST_DEPS_CRATE task"
+echo "[mock-e2e] heck version resolved by the plan: $HECK_VERSION"
+
+# The demand-feed fixtures park on absent anchors for the rest of the
+# run — pending counts them forever — so the wave loop measures the
+# batch as a delta over the status counts taken the moment before
+# submit.
+status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")" \
+    || die "scheduler status read before the host-deps submit failed"
+read -r base_pending base_inflight base_completed base_failed <<<"$(jq -r \
+    '[.pending, .dispatched + .running, .completed, .failed] | map(tostring) | join(" ")' \
+    <<<"$status_json")"
+
+submit_json="$(curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
+    -H "Authorization: Bearer $EDGE_BEARER" \
+    -H 'content-type: application/json' \
+    --data "$plan_tasks")"
+echo "[mock-e2e] host-deps submit: $submit_json"
+
+# --- build waves --------------------------------------------------------
+#
+# The gate opens a dependent only when the published index serves every
+# shape its edge requires — host-side deps of a host-side owner need all
+# four (both invocations, both kinds). Publish waves release the queue
+# depth-first: each round drains the unblocked tasks, then runs the
+# export/publish/report/sync pass so the next layer can go.
+deadline=$((SECONDS + TASK_DEADLINE))
+wave=0
+last_completed=-1
+last_publish=0
+while :; do
+    check_children_alive
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+    if [ -z "$status_json" ]; then
+        sleep 5
+        continue
+    fi
+    read -r pending_n inflight_n completed_n failed_n <<<"$(jq -r \
+        '[.pending, .dispatched + .running, .completed, .failed] | map(tostring) | join(" ")' \
+        <<<"$status_json")"
+    waiting=$((pending_n - base_pending))
+    inflight=$((inflight_n - base_inflight))
+    completed_n=$((completed_n - base_completed))
+    failed_n=$((failed_n - base_failed))
+    echo "[mock-e2e] host-deps: $completed_n/$task_count completed, $waiting gated, $inflight in flight, $failed_n failed ($status_json)"
+    [ "$failed_n" -eq 0 ] \
+        || die "scheduler reported a failed host-deps task: $status_json"
+    if [ "$waiting" -eq 0 ] && [ "$inflight" -eq 0 ]; then
+        [ "$completed_n" -eq "$task_count" ] \
+            || die "host-deps graph drained at $completed_n completed tasks, expected $task_count"
+        break
+    fi
+    if [ "$waiting" -gt 0 ] && [ "$inflight" -eq 0 ] \
+        && { [ "$completed_n" -gt "$last_completed" ] || [ "$last_publish" -lt "$((SECONDS - 30))" ]; }; then
+        # Every dispatched task reported; the pending set is gated on
+        # the index — publish the slices so the next wave releases. The
+        # second arm republishes while the queue sits idle-but-pending:
+        # the DO's gate re-evaluates per generation, so a publish that
+        # landed between evaluations is cheap insurance against a
+        # missed wake.
+        wave=$((wave + 1))
+        echo "[mock-e2e] publishing slices (host-deps wave $wave)"
+        publish_slices "host-deps-wave-$wave"
+        last_completed="$completed_n"
+        last_publish=$SECONDS
+    fi
+    [ "$SECONDS" -ge "$deadline" ] \
+        && die "scheduler did not finish the host-deps graph within ${TASK_DEADLINE}s (last status: $status_json)"
+    sleep 5
+done
+echo "[mock-e2e] all $task_count host-deps tasks completed — the own-node check passed on every build"
+
+# One last pass so the final wave's records fold into the slices the
+# consumer lanes fetch and the catalog reads below see every row —
+# every CI_TARGET_TRIPLES member ends an export pass with a slice, so
+# the wasm32 tag `index refresh --target` pulls exists even though no
+# target-side node ever ran.
+publish_slices "host-deps-final"
+
+# --- catalog assertions --------------------------------------------------
+#
+# The catalog's artifacts table must register every host-side unit under
+# the host triple with its stamped unit shape — side=host (1), both
+# invocations (0=native, 1=target), linked (1): cargo links host units in
+# every phase, so check and build merge to one row each.
+heck_shapes="$(d1 "SELECT DISTINCT unit_invocation, unit_linked FROM artifacts \
+    WHERE crate_name = 'heck' AND target = '$HOST_TARGET' AND unit_side = 1")"
+echo "[mock-e2e] heck host-side shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
+[ "$(jq '.[0].results | length' <<<"$heck_shapes")" = "2" ] \
+    || die "heck host-side rows are not the two linked shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
+for want in '{"unit_invocation":0,"unit_linked":1}' '{"unit_invocation":1,"unit_linked":1}'; do
+    jq -e ".[0].results | map({unit_invocation, unit_linked}) | index($want) != null" \
+        <<<"$heck_shapes" >/dev/null \
+        || die "heck host-side rows miss shape $want"
+done
+
+# A host unit must never register under the task's *target* — the pre-#349
+# bug shape that produced heck@wasm32 at the consumer's key.
+heck_wasm="$(d1 "SELECT count(*) AS n FROM artifacts \
+    WHERE crate_name = 'heck' AND target = '$CONSUMER_TARGET'")"
+[ "$(jq -r '.[0].results[0].n' <<<"$heck_wasm")" = "0" ] \
+    || die "heck registered under $CONSUMER_TARGET — the task-target registration bug is back"
+
+# Every host dep lands under the host triple at host side.
+for dep in "$HOST_DEPS_CRATE" proc-macro2 quote syn unicode-ident; do
+    n="$(d1 "SELECT count(DISTINCT unit_invocation || '-' || unit_linked) AS n FROM artifacts \
+        WHERE crate_name = '$dep' AND target = '$HOST_TARGET' AND unit_side = 1" \
+        | jq -r '.[0].results[0].n')"
+    [ "$n" = "2" ] || die "$dep covers $n host shapes under $HOST_TARGET, expected 2"
+done
+echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
+
+# The proc-macro unit's honest floor — measured by the sysrooted build
+# the way production links — must sit at or under the index's published
+# baseline: an above-baseline row publishes but `index report` excludes
+# it, so the lanes below would find snafu-derive unservable forever.
+# Versions order numerically, not as strings (2.4 < 2.34), so the
+# highest floor is picked with `sort -V` rather than SQL's max(). The
+# floor exists only where the build linked an ELF — the sysroot runs on
+# Linux alone.
+if [ "$(uname -s)" = "Linux" ]; then
+    snafu_floors="$(d1 "SELECT min_glibc FROM artifacts \
+        WHERE crate_name = '$HOST_DEPS_CRATE' AND min_glibc != ''")"
+    floor="$(jq -r '.[0].results[].min_glibc' <<<"$snafu_floors" | sort -V | tail -1)"
+    [ -n "$floor" ] \
+        || die "$HOST_DEPS_CRATE's linked unit registered no glibc floor — the sysroot build did not measure it"
+    [ "$(printf '%s\n2.28\n' "$floor" | sort -V | tail -1)" = "2.28" ] \
+        || die "$HOST_DEPS_CRATE's glibc floor $floor exceeds the 2.28 baseline — the build linked outside the sysroot"
+fi
+
+# --- consumer repro ------------------------------------------------------
+#
+# A consumer whose build compiles snafu-derive's host units itself is
+# exactly the failure shape. `stow check` serves each unit from the index
+# slice of the platform its rustc invocation records — host units come
+# from the host slice at the invocation spelling's own key.
+#
+# The consumer's own `stow check` fetches its slices — the wasm32 check
+# ensures the wasm32 AND the host slice it resolves host units from.
+# Nothing refreshes the host slice by hand: this lane would mask a
+# consumer that never fetches it (stow#367). `index status` asserts the
+# fetch happened once the builds ran.
+stow_cli index refresh --target "$CONSUMER_TARGET" >"$LOG_DIR/index-refresh-wasm32.log" 2>&1 \
+    || die "stow index refresh ($CONSUMER_TARGET) failed — see $LOG_DIR/index-refresh-wasm32.log"
+
+# A consumer pinned to the exact versions the scheduler just built —
+# snafu-derive as an ordinary dependency makes cargo compile the whole
+# proc-macro tree as host units of the consumer's build.
+CONSUMER="$WORK_DIR/snafu-consumer"
+isolated_env cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new-snafu.log" 2>&1 \
+    || die "cargo new failed — see $LOG_DIR/consumer-new-snafu.log"
+# snafu-derive as a normal dependency compiles as the consumer's
+# proc-macro host unit; heck under [build-dependencies] compiles as the
+# build script's host unit — the two consumer spellings a host-side node
+# serves. A declared-but-unused dep still compiles.
+printf 'snafu-derive = "=%s"\n\n[build-dependencies]\nheck = "=%s"\n' "$HOST_DEPS_VERSION" "$HECK_VERSION" \
+    >>"$CONSUMER/Cargo.toml"
+printf 'fn main() {}\n' >"$CONSUMER/build.rs"
+prepare_consumer "$CONSUMER" snafu
+
+# The host slice this run already cached for itoa is still inside the
+# CLI's refresh interval, and it predates every host-deps record: both
+# consumer checks revalidate the tag's digest so they see the slices the
+# host-deps waves just published. They still fetch the slices themselves.
+# Native consumer: host units at the native invocation spelling.
+(
+    cd "$CONSUMER"
+    STOW_INDEX_REFRESH_SECS=0 stow_cli check
+) >"$LOG_DIR/stow-check-native.log" 2>&1 \
+    || die "native stow check failed — see $LOG_DIR/stow-check-native.log"
+assert_served 1 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
+
+# wasm32 consumer: the production spelling — host units at the --target
+# invocation's own key. The served artifacts land in the same build's own
+# target dir, so the second check re-serves them, not re-compiles.
+(
+    cd "$CONSUMER"
+    STOW_INDEX_REFRESH_SECS=0 stow_cli check --target "$CONSUMER_TARGET"
+) >"$LOG_DIR/stow-check-wasm32.log" 2>&1 \
+    || die "wasm32 stow check failed — see $LOG_DIR/stow-check-wasm32.log"
+assert_served 2 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
+
+# The wasm32 check had to fetch the host slice itself — assert it landed.
+stow_cli index status >"$LOG_DIR/index-status-host-deps.log" 2>&1 \
+    || die "stow index status failed — see $LOG_DIR/index-status-host-deps.log"
+cat "$LOG_DIR/index-status-host-deps.log"
+grep -q "target: $HOST_TARGET" "$LOG_DIR/index-status-host-deps.log" \
+    || die "index status lists no slice for $HOST_TARGET"
+grep -q "target: $CONSUMER_TARGET" "$LOG_DIR/index-status-host-deps.log" \
+    || die "index status lists no slice for $CONSUMER_TARGET"
+
+echo "[mock-e2e] OK — $HOST_DEPS_CRATE $HOST_DEPS_VERSION's host deps built as host-side nodes, gated on published shapes, and served a native and a $CONSUMER_TARGET consumer with the own-node check passing on every task"
