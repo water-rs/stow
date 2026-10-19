@@ -1399,12 +1399,18 @@ fn predict_from_inputs(
         .as_ref()
         .map_or_else(Vec::new, |expanded| expanded.entries.clone());
     // The lockfile's registry packages exist only to name this build's
-    // units for the serve map's local half, and a unit graph names them
-    // better — so the file is read, ahead of the map build, only when
-    // there is no graph and the local listing holds units to admit
-    // (stow#617). A build whose lockfile cargo has not written yet, and
-    // one with nothing local to admit, never opens the file (stow#608).
-    let lockfile_packages = if expanded.is_none() && !local_units.is_empty() {
+    // units for the serve map, and a unit graph names them better — so
+    // the file is read, ahead of the map build, only when there is no
+    // graph and the map has units to name: the local listing's units
+    // (stow#617) or a slice's index rows (stow#805). A build whose
+    // lockfile cargo has not written yet, and one with nothing to
+    // admit, never opens the file (stow#608).
+    let slices_carry_rows = [&slice, &host_slice]
+        .into_iter()
+        .flatten()
+        .any(|slice| !slice.index.rows.is_empty());
+    let lockfile_packages = if expanded.is_none() && (!local_units.is_empty() || slices_carry_rows)
+    {
         workspace_deps::lockfile_registry_packages(&project.workspace_root)?.unwrap_or_default()
     } else {
         BTreeSet::new()
@@ -1497,20 +1503,22 @@ fn predict_from_inputs(
 /// plan round trip, while a unit it wrongly excludes compiles despite an
 /// artifact being available.
 ///
-/// The two halves admit against different sets. Index rows still
-/// intersect the expanded graph's own per-side units — index coverage
-/// claims a feature set and a side only the graph proves — so with no
-/// cached graph they contribute nothing. The local half asks for less:
-/// the exact-key local lookup the plan path runs needs neither a graph
-/// nor a slice, so a locally stored unit is admitted whenever the
-/// build's units name it *as far as known* — the graph's per-side sets
-/// when a graph is cached, `lockfile_packages` on both sides when it is
-/// not (stow#617). Without the graph the side is unknowable, and a
-/// wrong side costs the round trip the map already tolerates; the
-/// unit's side itself still comes from its row's platform. The caller
-/// reads the lockfile only when the local listing holds units to admit
-/// (stow#608), and a lockfile cargo has not written yet reads as an
-/// empty set — no local half, no error — so the in-build enrichment
+/// The two halves admit against the build's units *as far as the map
+/// can prove them*: the expanded graph's own per-side unit sets when a
+/// graph is cached — index coverage claims a feature set and a side
+/// only the graph proves — and `lockfile_packages` on both sides when
+/// it is not (stow#617, stow#805). A lockfile cannot tell the sides
+/// apart, and the pair set errs on covering: a unit wrongly included
+/// costs a plan round trip, a unit wrongly excluded compiles despite an
+/// artifact being available. The local half still asks for less than
+/// the index half: the exact-key local lookup the plan path runs needs
+/// neither a graph nor a slice, so a locally stored unit is admitted
+/// whenever the build's units name it. Without the graph the side is
+/// unknowable, and a wrong side costs the round trip the map already
+/// tolerates; the unit's side itself still comes from its row's
+/// platform. The caller reads the lockfile only when the map has units
+/// to name (stow#608), and a lockfile cargo has not written yet reads
+/// as an empty set — no fallback, no error — so the in-build enrichment
 /// covers such a build as today.
 fn build_serve_map(
     project: &ProjectContext,
@@ -1570,20 +1578,19 @@ fn build_serve_map(
     let consumer_units = unit_pairs(false);
     let host_units = unit_pairs(true);
     // The units this build compiles as far as the map can prove: the
-    // expanded graph's own sets when one is cached — the index half
-    // reads them alone — and the lockfile's registry packages on both
-    // sides when it is not (stow#617).
+    // expanded graph's own sets when one is cached, and the lockfile's
+    // registry packages on both sides when it is not (stow#617).
     let lockfile_units = canonical_lockfile_packages(lockfile_packages);
     let (consumer_known, host_known) = if expanded_entries.is_empty() {
         (&lockfile_units, &lockfile_units)
     } else {
         (&consumer_units, &host_units)
     };
-    let consumer_servable: BTreeSet<(String, String)> = consumer_units
+    let consumer_servable: BTreeSet<(String, String)> = consumer_known
         .intersection(&consumer_index_pairs)
         .cloned()
         .collect();
-    let host_servable: BTreeSet<(String, String)> = host_units
+    let host_servable: BTreeSet<(String, String)> = host_known
         .intersection(&host_index_pairs)
         .cloned()
         .collect();
@@ -6290,6 +6297,146 @@ mod tests {
                 ("b".to_owned(), "2.0.0".to_owned())
             ]
         );
+    }
+
+    /// An index row naming `name` at `version` — the serve-map tests
+    /// need the pair the map intersects, on a row `row_servable_on_host`
+    /// admits (`min_glibc: None`).
+    fn index_row(name: &str, version: &str) -> stow_types::index::ArtifactIndexRow {
+        let mut row = crate::index::index_test_row("deadbeef");
+        row.crate_name = stow_types::identity::CrateName::parse(name).expect("crate name");
+        row.version = stow_types::identity::CrateVersion::new(
+            semver::Version::parse(version).expect("version"),
+        );
+        row
+    }
+
+    /// A verified slice over `rows` — `build_serve_map` and the lite
+    /// pass read only `index.rows`, so the pointer fields carry test
+    /// constants.
+    fn slice_for(rows: Vec<stow_types::index::ArtifactIndexRow>) -> crate::index::IndexSlice {
+        crate::index::IndexSlice {
+            manifest_digest: "sha256:deadbeef".to_owned(),
+            index: stow_types::index::ArtifactIndex {
+                header: stow_types::index::ArtifactIndexHeader {
+                    format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
+                    target: stow_types::identity::TargetTriple::parse("aarch64-apple-darwin")
+                        .expect("target"),
+                    rustc_version: stow_types::identity::WireRustcVersion::parse("1.91.1")
+                        .expect("rustc"),
+                    generated_at: "2026-10-19T00:00:00Z".to_owned(),
+                    generation: 1,
+                    row_count: rows.len() as u64,
+                },
+                rows,
+            },
+        }
+    }
+
+    /// `local_only_map` for the index half: the map `build_serve_map`
+    /// produces over index rows, with no expanded graph and no local
+    /// units.
+    fn index_rows_map(
+        project: &ProjectContext,
+        consumer_rows: &[stow_types::index::ArtifactIndexRow],
+        host_rows: &[stow_types::index::ArtifactIndexRow],
+        lockfile_packages: &[(&str, &str)],
+    ) -> crate::facade::ServeMap {
+        let host_slice = (!host_rows.is_empty()).then(|| slice_for(host_rows.to_vec()));
+        let lockfile_packages = lockfile_packages
+            .iter()
+            .map(|(name, version)| {
+                (
+                    (*name).to_owned(),
+                    semver::Version::parse(version).expect("version"),
+                )
+            })
+            .collect();
+        build_serve_map(
+            project,
+            consumer_rows,
+            host_slice.as_ref(),
+            &[],
+            &[],
+            &lockfile_packages,
+        )
+    }
+
+    /// stow#805: a cold project — no cached expanded graph — serves the
+    /// lockfile's registry packages the slice covers. A native build
+    /// spells no `--target`, so the covered pair lands on the host list.
+    #[test]
+    fn a_cold_project_serves_index_units_natively() {
+        let project = project_context();
+        let consumer_rows = [index_row("a", "1.0.0"), index_row("b", "2.0.0")];
+        let map = index_rows_map(
+            &project,
+            &consumer_rows,
+            &[],
+            &[("a", "1.0.0"), ("c", "3.0.0")],
+        );
+        assert_eq!(map.target, Vec::<(String, String)>::new());
+        assert_eq!(map.host, vec![("a".to_owned(), "1.0.0".to_owned())]);
+    }
+
+    /// stow#805 under a spelled `--target`: a lockfile cannot name a
+    /// side, so a package the consumer slice covers lands on the target
+    /// list and one the host slice covers on the host list.
+    #[test]
+    fn a_cold_project_serves_index_units_on_both_sides_of_a_target_build() {
+        let project = ProjectContext {
+            target: "aarch64-apple-ios".to_owned(),
+            target_given: true,
+            ..project_context()
+        };
+        let consumer_rows = [index_row("b", "2.0.0")];
+        let host_rows = [index_row("a", "1.0.0")];
+        let map = index_rows_map(
+            &project,
+            &consumer_rows,
+            &host_rows,
+            &[("a", "1.0.0"), ("b", "2.0.0")],
+        );
+        assert_eq!(map.target, vec![("b".to_owned(), "2.0.0".to_owned())]);
+        assert_eq!(map.host, vec![("a".to_owned(), "1.0.0".to_owned())]);
+    }
+
+    /// stow#805 through the real pass: no cached graph and no local
+    /// units, but a slice row the lockfile names — the lockfile read
+    /// runs for the index half and the map covers it.
+    #[tokio::test]
+    async fn a_lockfile_named_index_unit_lands_in_the_serve_map() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let cache = tempfile::tempdir().expect("cache");
+        std::fs::write(
+            workspace.path().join("Cargo.lock"),
+            "version = 4\n\n\
+             [[package]]\nname = \"probe\"\nversion = \"0.1.0\"\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.0\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+        )
+        .expect("write lockfile");
+        let config = test_config(cache.path());
+        let project = ProjectContext {
+            workspace_root: workspace.path().to_path_buf(),
+            manifest_path: workspace.path().join("Cargo.toml"),
+            ..project_context()
+        };
+        let prediction = super::analyze_workspace_prediction_from(
+            &project,
+            &config,
+            super::AnalysisInputs {
+                slice: Some(slice_for(vec![index_row("cfg-if", "1.0.0")])),
+                host_slice: None,
+                expanded: None,
+                slice_pending: false,
+            },
+        )
+        .await
+        .expect("analysis");
+        let map = prediction.servable_units.expect("a serve map");
+        assert_eq!(map.target, Vec::<(String, String)>::new());
+        assert_eq!(map.host, vec![("cfg_if".to_owned(), "1.0.0".to_owned())]);
     }
 
     /// With a cached expanded graph nothing changes: the local half is
