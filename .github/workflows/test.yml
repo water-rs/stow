@@ -134,6 +134,36 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
 
+  # The scheduler idle proof (stow#593): the real workerd build under
+  # @cloudflare/vitest-plugin, proving an empty scheduler deletes its
+  # alarm instead of re-arming. It lives here rather than release-gate
+  # because a regression must block a merge, not a release.
+  edge-idle:
+    needs: changes
+    if: github.event_name == 'schedule' || needs.changes.outputs.code == 'true'
+    name: Edge idle suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: ./.github/actions/link-with-mold
+      # The same wasm edge bundle the mock-e2e lane builds, so this job
+      # restores that cache instead of saving a second copy of it.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: skyzen build --provider cloudflare --manifest edge/Skyzen.mock.toml
+      - run: bun install
+        working-directory: edge/tests/idle
+      - run: bun run test
+        working-directory: edge/tests/idle
+
   # One check to require. Rulesets and the merge queue name this job instead
   # of every leg: it needs all of them, `if: always()` runs it past a failed
   # or cancelled need, and the verdict reads `needs.*.result` so such a leg
@@ -144,6 +174,7 @@ jobs:
       - changes
       - test
       - lint
+      - edge-idle
     if: always()
     name: CI gate
     runs-on: ubuntu-latest
