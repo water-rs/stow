@@ -17,6 +17,7 @@ fn fixture_home(dir: &Path) -> std::path::PathBuf {
 /// Write a single-binary fixture package whose `[dependencies]` table is
 /// `dependencies`, then resolve it now so the builds under test are not
 /// also network tests.
+#[allow(dead_code)] // not every fixture binary uses the plain-manifest writer
 pub fn write_fixture(dir: &Path, cargo_home: &Path, dependencies: &str) {
     std::fs::write(
         dir.join("Cargo.toml"),
@@ -75,6 +76,7 @@ pub fn stow_setup_in(dir: &Path, cargo_home: &Path) {
     );
 }
 
+#[allow(dead_code)] // callers needing extra env use stow_build_in_with_env
 pub fn stow_build_in(
     dir: &Path,
     args: &[&str],

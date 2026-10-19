@@ -493,10 +493,9 @@ async fn send_capture_record(record: CapturedRustcArtifact) -> stow_types::error
                 endpoint.display()
             )
         })?;
-        let accepted: Result<(), String> = client
-            .call(STOW_CAPTURE_COMMAND, &record)
-            .map_err(|error| stow_types::stow_error!("send capture record over IPC: {error}"))?;
-        accepted.map_err(|error| stow_types::stow_error!("capture IPC rejected record: {error}"))
+        client
+            .call::<_, ()>(STOW_CAPTURE_COMMAND, &record)
+            .map_err(|error| stow_types::stow_error!("send capture record over IPC: {error}"))
     })
     .await
 }
@@ -1442,9 +1441,9 @@ impl CaptureCollector {
 }
 
 /// The `stow-capture` host command: park each record until the collector
-/// drains. `Response` carries `Err` only when the channel is closed — a
-/// duplicate is not reported to the caller, it aborts the phase at drain.
-/// Cloned once per phase; every clone feeds the same collector channel.
+/// drains. A closed channel fails the call — a duplicate is not reported
+/// to the caller, it aborts the phase at drain. Cloned once per phase;
+/// every clone feeds the same collector channel.
 #[derive(Clone)]
 pub struct StowCaptureCommand {
     sender: smol::channel::Sender<CapturedRustcArtifact>,
@@ -1456,18 +1455,18 @@ impl heel::IpcCommand for StowCaptureCommand {
     }
 
     type Args = CapturedRustcArtifact;
-    type Response = Result<(), String>;
+    type Response = ();
 
     fn handle(
         &self,
         record: CapturedRustcArtifact,
-    ) -> impl std::future::Future<Output = Self::Response> + Send {
+    ) -> impl std::future::Future<Output = Result<(), heel::IpcError>> + Send {
         std::future::ready(self.sender.try_send(record).map_err(|error| {
             let record = error.into_inner();
-            format!(
+            heel::IpcError::remote(format!(
                 "capture collector is closed; cannot record {} {}",
                 record.crate_name, record.c_metadata
-            )
+            ))
         }))
     }
 }
@@ -2019,10 +2018,9 @@ mod tests {
             let sent = record.clone();
             smol::unblock(move || {
                 let mut client = heel::IpcClient::connect(&endpoint).expect("connect");
-                let accepted: Result<(), String> = client
-                    .call(super::STOW_CAPTURE_COMMAND, &sent)
+                client
+                    .call::<_, ()>(super::STOW_CAPTURE_COMMAND, &sent)
                     .expect("call");
-                accepted.expect("accepted");
             })
             .await;
 

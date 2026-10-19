@@ -17,13 +17,12 @@
 //! spans the build, so supervision costs no extra process.
 
 pub mod client;
+pub mod ipc;
 pub mod os_bytes;
 pub mod protocol;
 pub mod server;
 
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use stow_types::error::Context;
 
@@ -144,6 +143,12 @@ pub enum Endpoint {
     Unix(PathBuf),
     /// A loopback TCP listener on this port — the Windows transport.
     Loopback(u16),
+    /// heel's IPC socket — a Unix socket on Unix, a named pipe on
+    /// Windows — the only transport a `deny network*` profile leaves
+    /// open (stow#779). The path is heel's, spelled for
+    /// `heel::IpcClient::connect`; the frames inside it are this
+    /// crate's, tunneled one supervisor exchange per IPC call.
+    Ipc(PathBuf),
 }
 
 impl Endpoint {
@@ -154,6 +159,7 @@ impl Endpoint {
             #[cfg(unix)]
             Self::Unix(path) => format!("unix:{}", path.display()),
             Self::Loopback(port) => format!("tcp:{port}"),
+            Self::Ipc(path) => format!("ipc:{}", path.display()),
         }
     }
 
@@ -172,6 +178,9 @@ impl Endpoint {
         #[cfg(unix)]
         if let Some(path) = raw.strip_prefix("unix:") {
             return Ok(Self::Unix(PathBuf::from(path)));
+        }
+        if let Some(path) = raw.strip_prefix("ipc:") {
+            return Ok(Self::Ipc(PathBuf::from(path)));
         }
         Err(format!("unrecognised supervisor endpoint {raw:?}"))
     }
@@ -249,14 +258,19 @@ pub enum Listener {
 
 impl Listener {
     /// The endpoint that reaches this listener.
+    #[cfg(unix)]
     #[must_use]
     pub fn endpoint(&self) -> Endpoint {
-        match self {
-            #[cfg(unix)]
-            Self::Unix { dir, .. } => Endpoint::Unix(dir.path().join(SOCKET_NAME)),
-            #[cfg(not(unix))]
-            Self::Loopback { port, .. } => Endpoint::Loopback(*port),
-        }
+        let Self::Unix { dir, .. } = self;
+        Endpoint::Unix(dir.path().join(SOCKET_NAME))
+    }
+
+    /// The endpoint that reaches this listener.
+    #[cfg(not(unix))]
+    #[must_use]
+    pub const fn endpoint(&self) -> Endpoint {
+        let Self::Loopback { port, .. } = self;
+        Endpoint::Loopback(*port)
     }
 
     /// Accept one connection.
@@ -363,6 +377,9 @@ pub async fn connect(endpoint: &Endpoint) -> Result<Stream, String> {
             .await
             .map(Stream::Loopback)
             .map_err(|error| format!("connect to supervisor on port {port}: {error}")),
+        Endpoint::Ipc(_) => {
+            Err("an IPC endpoint is not a stream transport: client::Connection opens it".to_owned())
+        }
     }
 }
 

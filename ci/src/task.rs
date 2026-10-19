@@ -9,6 +9,7 @@ use heel::{Access, Sandbox, SandboxConfigBuilder};
 use sha2::Digest as _;
 use stow_types::api::BuildTaskPayload;
 use stow_types::capture::CapturedRustcArtifact;
+use stow_types::env_name;
 use tempfile::TempDir;
 use zenwave::{Client, ResponseExt};
 
@@ -1852,10 +1853,10 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
     let android = targets_android(target);
     names
         .filter(|name| {
-            name != "CARGO_TARGET_DIR"
-                && (EXACT.contains(&name.as_str())
-                    || (android && ANDROID_ROOT_VARS.contains(&name.as_str()))
-                    || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
+            !env_name::eq(name, "CARGO_TARGET_DIR")
+                && (env_name::eq_any(name, EXACT)
+                    || (android && env_name::eq_any(name, ANDROID_ROOT_VARS))
+                    || env_name::starts_with_any(name, PREFIXES))
         })
         .collect()
 }
@@ -1886,15 +1887,12 @@ fn toolchain_grant_dirs(
     let android = targets_android(target);
     let mut dirs: Vec<PathBuf> = vars
         .filter_map(|(name, value)| {
-            let name = name.to_str()?;
-            if TOOLCHAIN_ROOT_VARS.contains(&name) || (android && ANDROID_ROOT_VARS.contains(&name))
+            if env_name::eq_any(&name, TOOLCHAIN_ROOT_VARS)
+                || (android && env_name::eq_any(&name, ANDROID_ROOT_VARS))
             {
                 return Some(PathBuf::from(value));
             }
-            if TOOLCHAIN_EXE_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
-            {
+            if env_name::starts_with_any(&name, TOOLCHAIN_EXE_PREFIXES) {
                 return PathBuf::from(value).parent().map(Path::to_path_buf);
             }
             None
@@ -2018,7 +2016,11 @@ impl MsvcToolchain {
             // name still resolves to the host's, and is skipped entirely
             // when it is the host's own bin directory — a native x64
             // task.
-            let mut dirs: Vec<PathBuf> = match toolchain.env.iter().find(|(key, _)| key == "PATH") {
+            let mut dirs: Vec<PathBuf> = match toolchain
+                .env
+                .iter()
+                .find(|(key, _)| env_name::eq(key, "PATH"))
+            {
                 Some((_, value)) => std::env::split_paths(value).collect(),
                 None => std::env::var_os("PATH")
                     .map(|value| std::env::split_paths(&value).collect())
@@ -2032,7 +2034,11 @@ impl MsvcToolchain {
             let path = std::env::join_paths(&dirs).map_err(|error| {
                 stow_types::stow_error!("compose the sandbox PATH for {target}: {error}")
             })?;
-            match toolchain.env.iter_mut().find(|(key, _)| key == "PATH") {
+            match toolchain
+                .env
+                .iter_mut()
+                .find(|(key, _)| env_name::eq(key, "PATH"))
+            {
                 Some((_, value)) => *value = path,
                 None => toolchain.env.push(("PATH".into(), path)),
             }

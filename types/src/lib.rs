@@ -15,6 +15,7 @@ pub mod bundle_schema;
 pub mod capture;
 pub mod crate_info;
 pub mod do_budgets;
+pub mod env_name;
 pub mod error;
 pub mod fixture;
 pub mod glibc;

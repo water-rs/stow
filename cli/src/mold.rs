@@ -35,6 +35,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use sha2::Digest as _;
+use stow_types::env_name;
 use stow_types::error::Context;
 use tracing::Instrument as _;
 
@@ -608,7 +609,10 @@ fn resolve_link_from(
 /// The `COMPILER_PATH` a build at this config would run under, per
 /// cargo's `env` precedence: `force` entries beat the ambient variable,
 /// plain entries lose to it and apply only when it is unset.
-fn effective_compiler_path(config: &cargo_config2::Config, env: EnvLookup<'_>) -> Option<OsString> {
+pub fn effective_compiler_path(
+    config: &cargo_config2::Config,
+    env: EnvLookup<'_>,
+) -> Option<OsString> {
     let ambient = env("COMPILER_PATH");
     // `CARGO_ENV_<name>` overrides a `[env]` file entry the way cargo
     // applies it — below `force` and the ambient variable, above the
@@ -676,8 +680,8 @@ const LINK_ENV_VARS: &[&str] = &[
 /// under the `CARGO_TARGET_` prefix, in particular not
 /// `CARGO_TARGET_DIR`).
 fn is_target_table_env(key: &str) -> bool {
-    key.strip_prefix("CARGO_TARGET_")
-        .is_some_and(|rest| rest.ends_with("_LINKER") || rest.ends_with("_RUSTFLAGS"))
+    env_name::starts_with(key, "CARGO_TARGET_")
+        && (env_name::ends_with(key, "_LINKER") || env_name::ends_with(key, "_RUSTFLAGS"))
 }
 
 /// The environment map the link resolution reads — the allowlist above
@@ -695,8 +699,14 @@ fn link_env_vars(
         let Ok(key) = key.into_string() else {
             continue;
         };
-        if LINK_ENV_VARS.contains(&key.as_str()) || is_target_table_env(&key) {
-            map.insert(key, value);
+        // The key the resolution digests is one spelling per variable —
+        // the allowlist's own for an exact match, the uppercase
+        // convention for a `CARGO_TARGET_*` one — so the same
+        // configuration keys the same however the host spelled it.
+        if let Some(listed) = env_name::matching(&key, LINK_ENV_VARS) {
+            map.insert(listed.to_owned(), value);
+        } else if is_target_table_env(&key) {
+            map.insert(env_name::canonical(&key), value);
         }
     }
     if de_wrapped {
@@ -1177,7 +1187,7 @@ fn codegen_options(rustflags: &[String]) -> Vec<&str> {
 
 /// The last `-C linker=` among `rustflags` — the codegen option that
 /// overrides a configured `linker` key.
-fn rustflags_linker(rustflags: &[String]) -> Option<String> {
+pub fn rustflags_linker(rustflags: &[String]) -> Option<String> {
     codegen_options(rustflags)
         .into_iter()
         .filter_map(|option| option.strip_prefix("linker="))
@@ -1187,7 +1197,7 @@ fn rustflags_linker(rustflags: &[String]) -> Option<String> {
 
 /// Every `-B` directory among `rustflags`' `link-arg`/`link-args` values,
 /// in the order they reach the driver.
-fn b_dirs(rustflags: &[String]) -> Vec<PathBuf> {
+pub fn b_dirs(rustflags: &[String]) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     for option in codegen_options(rustflags) {
         let Some((key, value)) = option.split_once('=') else {
@@ -1680,7 +1690,10 @@ mod tests {
     /// directory and nothing else — injected into the walk under test, so
     /// no test ever touches the process environment its siblings share.
     struct IsolatedProject {
+        #[cfg(unix)]
         tempdir: tempfile::TempDir,
+        #[cfg(not(unix))]
+        _tempdir: tempfile::TempDir,
         project: PathBuf,
         cargo_home: PathBuf,
         env: std::collections::HashMap<String, OsString>,
@@ -1718,7 +1731,10 @@ mod tests {
             cargo_home.clone().into_os_string(),
         )]);
         IsolatedProject {
+            #[cfg(unix)]
             tempdir,
+            #[cfg(not(unix))]
+            _tempdir: tempdir,
             project,
             cargo_home,
             env,
@@ -2289,6 +2305,7 @@ mod tests {
     /// use: the resolution's subprocesses are spawned by `cargo-config2`
     /// and `ld_mold_resolves` against real binaries, so the fixture
     /// names counting wrappers as `RUSTC` and `linker`.
+    #[cfg(unix)]
     fn counting_script(dir: &Path, name: &str, counter: &Path, body: &str) -> PathBuf {
         let script = dir.join(name);
         std::fs::write(
@@ -2310,6 +2327,7 @@ mod tests {
     }
 
     /// The lines a counting script recorded so far.
+    #[cfg(unix)]
     fn counter_lines(counter: &Path) -> Vec<String> {
         std::fs::read_to_string(counter)
             .unwrap_or_default()
@@ -2320,6 +2338,7 @@ mod tests {
 
     /// The fixture's injected environment as the `vars` vector
     /// `cargo_config_for_link_eval` and `link_env_vars` take.
+    #[cfg(unix)]
     fn fixture_vars(fixture: &IsolatedProject) -> Vec<(OsString, OsString)> {
         fixture
             .env
@@ -2332,6 +2351,7 @@ mod tests {
     /// build rustc it resolves and the shared `-vV` of its executable —
     /// then [`provision_resolved`] against `pool`, the call a cache row
     /// serves.
+    #[cfg(unix)]
     async fn resolve_with_cache(
         fixture: &IsolatedProject,
         tools_dir: &Path,
@@ -2359,6 +2379,7 @@ mod tests {
     /// reachable through the injected `PATH` — never the process's — so
     /// every probe the resolution runs leaves a line, and no test
     /// touches the environment its siblings share (stow#608).
+    #[cfg(unix)]
     struct CountingFixture {
         tools: tempfile::TempDir,
         /// The state DB's parent — field position only keeps it alive.
@@ -2375,6 +2396,7 @@ mod tests {
     /// the configured driver, and `PATH` carrying the tools dir so the
     /// driver's bare name resolves under the injected environment —
     /// `-fuse-ld=mold` resolves without linking anything.
+    #[cfg(unix)]
     async fn counting_fixture() -> CountingFixture {
         let tools = tempfile::tempdir().expect("tools");
         let rustc_counter = tools.path().join("rustc.count");

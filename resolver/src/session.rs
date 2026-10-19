@@ -34,6 +34,7 @@ use cargo::ops::Packages;
 use cargo::util::GlobalContext;
 use cargo_util_terminal::Shell;
 use stow_types::api::{CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, runner_family};
+use stow_types::env_name;
 use stow_types::identity::WireRustcVersion;
 use tracing::{debug, info};
 
@@ -296,7 +297,7 @@ impl Resolver {
     /// certs, git's auth helpers) through.
     fn sanitized_env() -> HashMap<String, String> {
         std::env::vars()
-            .filter(|(name, _)| !name.starts_with("CARGO") && !name.starts_with("RUST"))
+            .filter(|(name, _)| !env_name::starts_with_any(name, &["CARGO", "RUST"]))
             .collect()
     }
 

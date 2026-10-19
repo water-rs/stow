@@ -89,6 +89,28 @@ pub struct StowConfig {
     /// paid for eagerly.
     #[serde(skip, default = "Arc::default")]
     pub artifact_cache_staging: Arc<OnceCell<Arc<crate::artifact_cache::StagingDir>>>,
+    /// Experimental opt-ins, from the config file's `[experimental]`
+    /// table: the heel sandbox a build's cargo runs inside (stow#779).
+    #[serde(default)]
+    pub experimental: ExperimentalConfig,
+}
+
+/// The `[experimental]` table: features a user opts into knowing they
+/// may still change shape.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExperimentalConfig {
+    /// `experimental.sandbox = true`: run the cargo build inside a heel
+    /// sandbox (stow#779). The `--sandbox` flag enables the same thing
+    /// for one invocation.
+    #[serde(default)]
+    pub sandbox: bool,
+    /// `experimental.sandbox_deny_network = true`: the sandbox above,
+    /// plus a deny on every network connection the build attempts —
+    /// only the rustc wrapper's socket to this stow process stays
+    /// reachable. The `--sandbox-deny-network` flag enables it for one
+    /// invocation and implies `--sandbox`.
+    #[serde(default)]
+    pub sandbox_deny_network: bool,
 }
 
 impl StowConfig {
@@ -270,6 +292,9 @@ impl StowConfig {
             trust_material: Arc::default(),
             registry_http: Arc::default(),
             artifact_cache_staging: Arc::default(),
+            experimental: file_config
+                .and_then(|config| config.experimental)
+                .unwrap_or_default(),
         })
     }
 
@@ -312,6 +337,9 @@ impl StowConfig {
             trust_material: Arc::default(),
             registry_http: Arc::default(),
             artifact_cache_staging: Arc::default(),
+            experimental: file_config
+                .and_then(|config| config.experimental)
+                .unwrap_or_default(),
         })
     }
 
@@ -485,6 +513,7 @@ struct StowUserConfig {
     artifact_cache_max_bytes: Option<u64>,
     index_refresh_secs: Option<u64>,
     verify_mode: Option<String>,
+    experimental: Option<ExperimentalConfig>,
     #[cfg(feature = "mock-verify")]
     mock_public_key_path: Option<String>,
 }

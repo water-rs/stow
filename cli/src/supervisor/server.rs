@@ -197,7 +197,7 @@ impl Drop for Supervisor {
 }
 
 /// Messages the ticket task owns the state for.
-enum Ticket<P> {
+pub enum Ticket<P> {
     Allocate(P, oneshot::Sender<u64>),
     Take(u64, oneshot::Sender<Option<P>>),
 }
@@ -286,7 +286,7 @@ where
 /// 128 bits of randomness, hex. The Unix socket's mode already keeps other
 /// users out; this is what protects the loopback listener, which every
 /// local process can connect to.
-fn mint_token() -> String {
+pub fn mint_token() -> String {
     let mut bytes = [0u8; 16];
     getrandom(&mut bytes);
     hex::encode(bytes)
@@ -308,7 +308,7 @@ fn getrandom(bytes: &mut [u8; 16]) {
     bytes.copy_from_slice(&blake3::hash(seed.as_bytes()).as_bytes()[..16]);
 }
 
-async fn run_tickets<P>(mut messages: mpsc::UnboundedReceiver<Ticket<P>>) {
+pub async fn run_tickets<P>(mut messages: mpsc::UnboundedReceiver<Ticket<P>>) {
     let mut next = 1u64;
     let mut pending = std::collections::HashMap::<u64, P>::new();
     while let Some(message) = messages.recv().await {
@@ -475,7 +475,7 @@ impl Drop for Completion {
 /// A flight one connection started and has not yet reported: the
 /// uncovered path's mark pairs with its report by position, the plan
 /// path's `Compile` answer pairs with the report's ticket.
-struct ConnectionMark {
+pub struct ConnectionMark {
     ticket: Option<u64>,
     completion: Completion,
 }
@@ -656,7 +656,7 @@ async fn serve_connection<S, H>(
 /// Answer the request, or `None` when the request is one-way — an
 /// observation carries no reply because the facade that sent it is not
 /// waiting on one.
-async fn answer_request<H: Handler>(
+pub async fn answer_request<H: Handler>(
     handler: &Arc<H>,
     tickets: &mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: &str,

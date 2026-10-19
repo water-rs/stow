@@ -45,6 +45,35 @@ workspace mirror instead of prompting. Recommended for CI.
 stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 ```
 
+`--sandbox` (experimental) runs the cargo build inside a heel sandbox:
+cargo, rustc, every build script, proc-macro and linker it spawns are cut
+off from the machine outside a declared grant set — the workspace and the
+target directory are read/write (writes under the target directory only;
+sources stay read-only), the toolchain, cargo registry and stow's wrapper
+shims are read, credentials files (`credentials`/`credentials.toml`) and
+the home directory are never granted, the clipboard is denied, and the
+environment is an allowlist. Stow fetches dependencies first, then the
+sandboxed cargo runs offline; a sandbox that cannot be set up fails the
+command — there is no unsandboxed fallback.
+
+`--sandbox-deny-network` goes further and denies the build all network
+access: the only channel out of the sandbox is the socket the rustc
+wrapper uses to reach the supervising stow process.
+
+```sh
+stow build --sandbox
+stow build --sandbox-deny-network
+```
+
+The same switches exist in the config file, so an `experimental` table
+enables them for every cargo-running command:
+
+```toml
+[experimental]
+sandbox = true
+sandbox_deny_network = true
+```
+
 ## `stow predict`
 
 Read-only cache-coverage analysis. It posts nothing and enqueues nothing:
