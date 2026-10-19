@@ -160,7 +160,15 @@ pub fn tools_dir() -> stow_types::error::Result<PathBuf> {
     let base = dirs::data_local_dir().ok_or_else(|| {
         stow_types::stow_error!("resolve per-user local data directory for stow tools")
     })?;
-    Ok(base.join("stow").join("tools"))
+    Ok(tools_dir_in(&base))
+}
+
+/// The tools dir under an explicit per-user local data directory —
+/// [`tools_dir`] resolves the platform's; a test pins its own so nothing
+/// reads the developer's home.
+#[must_use]
+pub fn tools_dir_in(data_local_dir: &Path) -> PathBuf {
+    data_local_dir.join("stow").join("tools")
 }
 
 /// Idempotently materialize the rustc / cc wrappers under `tools_dir`,

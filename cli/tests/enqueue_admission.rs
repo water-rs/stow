@@ -19,7 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod support;
 
-use support::hermetic_stow_env;
+use support::{hermetic_stow_env, sealed_home_env};
 
 const TARGET: &str = "x86_64-unknown-linux-gnu";
 const RUSTC_VERSION: &str = "1.85.0";
@@ -187,12 +187,13 @@ fn write_crate(dir: &Path, cargo_home: &Path) {
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
     // The fetch must share the isolated CARGO_HOME the build uses.
-    let fetched = Command::new("cargo")
+    let mut fetch = Command::new("cargo");
+    fetch
         .arg("fetch")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run cargo fetch");
+        .env("CARGO_HOME", cargo_home);
+    sealed_home_env(&mut fetch, &dir.join("stow-home"));
+    let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
         "cargo fetch failed:\n{}",
@@ -218,19 +219,30 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         .arg("setup")
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path());
-    hermetic_stow_env(&mut setup, &edge_url, cache.path());
+    hermetic_stow_env(
+        &mut setup,
+        &edge_url,
+        cache.path(),
+        &dir.path().join("stow-home"),
+    );
     let setup = setup.output().expect("run stow-cli setup");
     assert!(
         setup.status.success(),
         "stow setup failed:\n{}",
         String::from_utf8_lossy(&setup.stderr)
     );
+    let target_dir = dir.path().join("target");
     let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     build
         .arg("build")
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path());
-    hermetic_stow_env(&mut build, &edge_url, cache.path());
+    hermetic_stow_env(
+        &mut build,
+        &edge_url,
+        cache.path(),
+        &dir.path().join("stow-home"),
+    );
     let output = build
         // The public cache only serves recent stable toolchains; pin the
         // probed identity so the analysis runs even when the host rustc is
@@ -239,10 +251,9 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
-        // The fixture build's target dir must stay under `dir` — an
-        // exported `CARGO_TARGET_DIR` would relocate it and the drain
-        // log the test polls would never appear.
-        .env_remove("CARGO_TARGET_DIR")
+        // The drain log and journals the test reads live in the target
+        // dir it names here, never one cargo or the environment picks.
+        .env("CARGO_TARGET_DIR", &target_dir)
         .output()
         .expect("run stow-cli build");
 
@@ -268,7 +279,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
         assert!(
             std::time::Instant::now() < deadline,
             "timed out waiting for the drained /api/v1/enqueue post{}",
-            drain_diagnostics(&dir.path().join("target"))
+            drain_diagnostics(&target_dir)
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
@@ -322,21 +333,26 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
         url
     };
 
+    let target_dir = dir.path().join("target");
     let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     build
         .arg("build")
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path());
-    hermetic_stow_env(&mut build, &dead_edge, cache.path());
+    hermetic_stow_env(
+        &mut build,
+        &dead_edge,
+        cache.path(),
+        &dir.path().join("stow-home"),
+    );
     let output = build
         .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
         .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
         .env("CARGO_INCREMENTAL", "0")
         .env_remove("RUST_LOG")
-        // The fixture build's target dir must stay under `dir` — an
-        // exported `CARGO_TARGET_DIR` would relocate it and the drain
-        // log the test polls would never appear.
-        .env_remove("CARGO_TARGET_DIR")
+        // The drain log and journals the test reads live in the target
+        // dir it names here, never one cargo or the environment picks.
+        .env("CARGO_TARGET_DIR", &target_dir)
         .output()
         .expect("run stow-cli build");
     assert!(
@@ -347,7 +363,6 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
 
     // The detached drain runs after `stow build` returns: poll its log
     // for the named failure and the journal back under its own name.
-    let target_dir = dir.path().join("target");
     let deadline = std::time::Instant::now() + std::time::Duration::from_mins(1);
     loop {
         let log = std::fs::read_to_string(target_dir.join("stow-drain.log")).unwrap_or_default();
@@ -462,18 +477,24 @@ fn standalone_wrapper_journals_misses_and_the_next_build_drains_them() {
         command
             .arg("build")
             .current_dir(dir)
-            .env("CARGO_HOME", cargo_home.path())
-            .env("RUSTC_WRAPPER", &shim);
-        hermetic_stow_env(&mut command, &edge_url, cache.path());
+            .env("CARGO_HOME", cargo_home.path());
+        hermetic_stow_env(
+            &mut command,
+            &edge_url,
+            cache.path(),
+            &dir.join("stow-home"),
+        );
+        // After the seal — it clears an ambient `RUSTC_WRAPPER`, and the
+        // shim is the wiring under test.
+        command.env("RUSTC_WRAPPER", &shim);
         let output = command
             .env("STOW_PUBLIC_CACHE_RUSTC_VERSION", RUSTC_VERSION)
             .env("STOW_PUBLIC_CACHE_TARGET", TARGET)
             .env("CARGO_INCREMENTAL", "0")
             .env_remove("RUST_LOG")
-            // The fixture's target dir must live under `dir` — a
-            // developer-exported `CARGO_TARGET_DIR` would relocate it
-            // and the journal/drain-log reads below would find nothing.
-            .env_remove("CARGO_TARGET_DIR")
+            // The journal and drain log the test reads live in the
+            // target dir it names here.
+            .env("CARGO_TARGET_DIR", dir.join("target"))
             .output()
             .expect("run cargo build");
         assert!(

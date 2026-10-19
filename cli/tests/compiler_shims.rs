@@ -11,14 +11,29 @@
 use std::path::Path;
 use std::process::Command;
 
+// The shared fixture carries helpers this test does not call; each
+// integration binary lints them per target.
+#[allow(dead_code)]
+mod build_fixture;
+mod support;
+
+use build_fixture::refused_url;
+use support::hermetic_stow_env;
+
 fn setup_in(dir: &Path) -> toml::Value {
     let cargo_home = dir.join("cargo-home");
-    let status = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    setup
         .arg("setup")
         .current_dir(dir)
-        .env("CARGO_HOME", &cargo_home)
-        .status()
-        .expect("run stow-cli setup");
+        .env("CARGO_HOME", &cargo_home);
+    // Setup loads `StowConfig::load` and installs tools under the
+    // resolved home — the sealed home keeps the developer's `~/.stow`,
+    // user-level stow config and exported compiler variables out of it
+    // (stow#800).
+    let home = dir.join("stow-home");
+    hermetic_stow_env(&mut setup, &refused_url(), &home.join("stow-cache"), &home);
+    let status = setup.status().expect("run stow-cli setup");
     assert!(status.success(), "stow-cli setup failed");
     let config = std::fs::read_to_string(cargo_home.join("config.toml"))
         .expect("read generated cargo config.toml");
@@ -128,6 +143,15 @@ fn cc_is_invoked_with_compiler_arguments_only() {
         .map(|stem| stem.to_string_lossy().to_lowercase());
     let msvc_family = stem.is_some_and(|stem| stem == "cl" || stem.contains("clang-cl"));
     let mut command = Command::new(scoped_env_value(&config, "CC"));
+    // The shim re-enters `stow-cli`, which reads the stow config — the
+    // sealed home keeps the developer's `~/.stow` out of it (stow#800).
+    let home = dir.path().join("stow-home");
+    hermetic_stow_env(
+        &mut command,
+        &refused_url(),
+        &home.join("stow-cache"),
+        &home,
+    );
     if msvc_family {
         command.arg(format!("-Fo{}", object.display()));
     } else {
@@ -174,10 +198,14 @@ fn the_launcher_and_the_compilers_are_three_different_shims() {
 fn an_explicit_toolchain_survives_setup() {
     let dir = tempfile::tempdir().expect("temp dir");
     let cargo_home = dir.path().join("cargo-home");
-    let status = Command::new(env!("CARGO_BIN_EXE_stow-cli"))
+    let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    setup
         .arg("setup")
         .current_dir(dir.path())
-        .env("CARGO_HOME", &cargo_home)
+        .env("CARGO_HOME", &cargo_home);
+    let home = dir.path().join("stow-home");
+    hermetic_stow_env(&mut setup, &refused_url(), &home.join("stow-cache"), &home);
+    let status = setup
         .env("CC", "/usr/bin/clang")
         .env("CXX", "/usr/bin/clang++")
         // Setup runs inside a stow-wired build with these already exported;
