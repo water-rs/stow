@@ -86,7 +86,9 @@ top-binaries`, `preheat projects submit` over `preheat/projects.toml`
 wave runs; every dispatch is a real `stow-build build` and publish
 validation whose rustc invocations a mock compiler answers with empty
 outputs (`STOW_BUILD_MOCK_COMPILE`, compiled in only with the
-`mock-compile` feature); publish rounds release the graph layer by
+`mock-compile` feature) and answers as the host of the runner the
+task's target is dispatched to, so one machine builds every target's
+host-side nodes as its runner would; publish rounds release the graph layer by
 layer; then the same lists are resubmitted the way the daily cron
 does. The edge runs the budget-probe manifest at production's
 dispatch caps and cost multiplier, and its probe ledger (`stow-admin

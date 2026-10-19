@@ -490,6 +490,38 @@ mod tests {
         .unwrap();
     }
 
+    /// A host unit keyed under a host other than the runner's — what a
+    /// build on the wrong machine produces, and what the mock compiler's
+    /// runner emulation exists to avoid — is refused, never published
+    /// under the task's runner.
+    #[test]
+    fn rejects_a_host_unit_from_another_runner_host() {
+        let mut task = task();
+        task.target = TargetTriple::parse("x86_64-unknown-linux-gnu").unwrap();
+        let mut host_unit = planned("demo", "1.0.0");
+        host_unit.target = TargetTriple::parse("aarch64-apple-darwin").unwrap();
+        host_unit.oci_reference = oci_reference(
+            &planned_artifact_key(&host_unit).unwrap(),
+            host_unit.c_metadata.as_str(),
+        );
+        let error = validate_plan(
+            &task,
+            &task,
+            &[host_unit],
+            &closure(&[("demo", "1.0.0")]),
+            &[],
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "targets aarch64-apple-darwin but the task targets x86_64-unknown-linux-gnu \
+                 on a runner hosting x86_64-unknown-linux-gnu"
+            ),
+            "{error}"
+        );
+    }
+
     #[test]
     fn rejects_foreign_target_and_rustc() {
         let mut other_target = planned("demo", "1.0.0");

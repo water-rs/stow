@@ -15,6 +15,18 @@
 //! Probes stay real. An invocation that prints (`--print`), reads its
 //! source from stdin, or names no `--out-dir` is cargo or a build script
 //! asking rustc a question, and its answer is read, not written to disk.
+//!
+//! The mock also stands in for the runner a task is dispatched to. A
+//! production build runs on the runner its target's `build-crate` job
+//! names, so its host units — build scripts, proc macros, the whole of a
+//! host-side node — compile for that runner's host triple. One machine
+//! hosting every target's builds must answer as each of those hosts: the
+//! host is [`runner_host`] of the task's target — the runner mapping the
+//! scheduler dispatches by — and every place a build learns its host from
+//! rustc (`rustc -vV`, the target-info probes cargo sends without a
+//! `--target`, the triple a target-less unit is keyed and named under)
+//! answers with it. The real rustc still answers each probe, asked about
+//! that triple.
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -26,6 +38,12 @@ use stow_types::rustc::ParsedRustcArgs;
 /// inherits it, and the sandboxed phases receive it explicitly.
 pub const STOW_BUILD_MOCK_COMPILE_ENV: &str = "STOW_BUILD_MOCK_COMPILE";
 
+/// The host triple the capture wrapper answers as — [`runner_host`] of
+/// the task's target, set by the build stage on every process that
+/// reaches the wrapper (the sandboxed phases, the unit-graph resolves).
+/// The wrapper has no task of its own to derive it from.
+pub const STOW_BUILD_MOCK_HOST_ENV: &str = "STOW_BUILD_MOCK_HOST";
+
 /// What a build script's mock binary runs: a successful exit with no
 /// `cargo:` directives, so cargo proceeds to the unit it gates. An empty
 /// file is not executable, and cargo runs the build script.
@@ -35,6 +53,125 @@ const BUILD_SCRIPT_STUB: &str = "#!/bin/sh\nexit 0\n";
 #[must_use]
 pub fn enabled() -> bool {
     std::env::var_os(STOW_BUILD_MOCK_COMPILE_ENV).is_some_and(|value| value == "1")
+}
+
+/// The host triple a build for `target` runs on: the host of the runner
+/// family `build-crate.yml` dispatches the target to
+/// ([`stow_types::api::runner_family`]), the same mapping the scheduler's
+/// dispatch caps and the publish validation read.
+///
+/// # Errors
+/// Returns an error when no runner family builds `target`.
+pub fn runner_host(target: &str) -> stow_types::error::Result<&'static str> {
+    stow_types::api::runner_family(target)
+        .map(stow_types::api::RunnerFamily::host_triple)
+        .ok_or_else(|| {
+            stow_types::stow_error!("mock compile: no runner family builds target {target}")
+        })
+}
+
+/// The host this wrapper process answers as, from
+/// [`STOW_BUILD_MOCK_HOST_ENV`] — required whenever the mock is on: a
+/// wrapper that fell back to the machine's own host would key every host
+/// unit under a runner the task is not dispatched to.
+///
+/// # Errors
+/// Returns an error when the variable is unset or not UTF-8.
+pub fn emulated_host() -> stow_types::error::Result<String> {
+    std::env::var(STOW_BUILD_MOCK_HOST_ENV).map_err(|error| {
+        stow_types::stow_error!(
+            "mock compile is on but {STOW_BUILD_MOCK_HOST_ENV} is not usable: {error}"
+        )
+    })
+}
+
+/// A question cargo asks rustc about its host, and how the mock has the
+/// real rustc answer it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HostProbe {
+    /// `rustc -vV`: run as asked, then report `host` as the emulated
+    /// triple ([`rewrite_version_host`]).
+    Version,
+    /// A target-less `--print` / stdin probe: run with `--target` set to
+    /// the emulated host — the answer cargo reads as its host's.
+    Print(Vec<OsString>),
+}
+
+/// Whether `args` asks rustc about the host, and the invocation that
+/// answers it as `host`. A probe that names a `--target` asks about that
+/// target and passes through untouched, as does every compile.
+#[must_use]
+pub fn host_probe(args: &[OsString], host: &str) -> Option<HostProbe> {
+    if args.iter().any(|arg| arg == "-vV") {
+        return Some(HostProbe::Version);
+    }
+    let prints = args.iter().any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg == "--print" || arg.starts_with("--print="))
+    });
+    let from_stdin = args.iter().any(|arg| arg == "-");
+    let names_target = args.iter().any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg == "--target" || arg.starts_with("--target="))
+    });
+    if !(prints || from_stdin) || names_target {
+        return None;
+    }
+    let mut probe = args.to_vec();
+    probe.push(OsString::from("--target"));
+    probe.push(OsString::from(host));
+    Some(HostProbe::Print(probe))
+}
+
+/// `rustc -vV`'s answer with its `host:` line naming `host`.
+///
+/// # Errors
+/// Returns an error when the output is not UTF-8 or has no `host:` line.
+pub fn rewrite_version_host(stdout: &[u8], host: &str) -> stow_types::error::Result<Vec<u8>> {
+    let text = std::str::from_utf8(stdout)
+        .map_err(|error| stow_types::stow_error!("rustc -vV output is not UTF-8: {error}"))?;
+    let mut found = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("host: ") {
+            found = true;
+            out.push_str("host: ");
+            out.push_str(host);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+        }
+    }
+    if !found {
+        return Err(stow_types::stow_error!("rustc -vV output has no host line"));
+    }
+    Ok(out.into_bytes())
+}
+
+/// The `build.rustc-wrapper` a unit-graph resolve runs under, so the
+/// cargo that plans the build sees the same host the sandboxed phases'
+/// cargo does: a script in `dir` that enters this executable's capture
+/// wrapper with the mock switched on and `host` emulated. A resolve only
+/// probes rustc, which the wrapper answers before any capture.
+///
+/// # Errors
+/// Returns an error when the script cannot be written.
+pub async fn unit_graph_wrapper(dir: &Path, host: &str) -> stow_types::error::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    let path = dir.join("stow-mock-host-rustc");
+    let script = format!(
+        "#!/bin/sh\nexec env {STOW_BUILD_MOCK_COMPILE_ENV}=1 {STOW_BUILD_MOCK_HOST_ENV}={} {} rustc \"$@\"\n",
+        shell_quote(host),
+        shell_quote(&exe.to_string_lossy()),
+    );
+    async_fs::write(&path, script).await?;
+    make_executable(&path)?;
+    Ok(path)
+}
+
+/// `value` as one single-quoted POSIX shell word.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Whether `args` is a compile the mock stands in for: an input source
@@ -65,7 +202,11 @@ pub fn compile(args: &[OsString]) -> stow_types::error::Result<Option<Vec<u8>>> 
     if !replaces(args, &parsed) {
         return Ok(None);
     }
-    let outputs = planned_outputs(&parsed)?;
+    let host = emulated_host()?;
+    let outputs = planned_outputs(&parsed, &host)?;
+    if let Some(alias) = build_script_run_path(&parsed, &host) {
+        write_output(&alias, &parsed)?;
+    }
     let mut stderr = Vec::new();
     for output in &outputs {
         write_output(output, &parsed)?;
@@ -100,7 +241,10 @@ enum OutputKind {
 
 /// Every file rustc writes for `parsed`, in rustc's emission order:
 /// dep-info, metadata, then each crate type's link output.
-fn planned_outputs(parsed: &ParsedRustcArgs) -> stow_types::error::Result<Vec<PlannedOutput>> {
+fn planned_outputs(
+    parsed: &ParsedRustcArgs,
+    host: &str,
+) -> stow_types::error::Result<Vec<PlannedOutput>> {
     let out_dir = parsed.out_dir.as_deref().ok_or_else(|| {
         stow_types::stow_error!("mock compile of {} has no --out-dir", parsed.crate_name)
     })?;
@@ -121,7 +265,7 @@ fn planned_outputs(parsed: &ParsedRustcArgs) -> stow_types::error::Result<Vec<Pl
         });
     }
     if parsed.emit.contains("link") {
-        let naming = Naming::of(parsed.target.as_deref());
+        let naming = Naming::of(parsed.target.as_deref().unwrap_or(host));
         for crate_type in &parsed.crate_types {
             let (file_name, kind) = match crate_type.as_str() {
                 "lib" | "rlib" => (format!("lib{stem}.rlib"), OutputKind::Data),
@@ -148,8 +292,40 @@ fn planned_outputs(parsed: &ParsedRustcArgs) -> stow_types::error::Result<Vec<Pl
     Ok(outputs)
 }
 
+/// Where cargo will execute a build script the mock compiled for an
+/// emulated host whose executables are named differently from this
+/// machine's. Cargo names a build script's outputs from the host rustc
+/// reports — `build_script_build-<hash>.exe` for a Windows runner, which
+/// it hard-links to `build-script-build.exe` — but runs it under the
+/// executable suffix cargo itself was built with. On the runner the two
+/// agree; here the stub must also sit where cargo runs it. `None` when
+/// they already agree or `parsed` is no build script.
+fn build_script_run_path(parsed: &ParsedRustcArgs, host: &str) -> Option<PlannedOutput> {
+    let built_for_host = parsed.target.is_none();
+    let is_build_script = parsed.crate_name.starts_with("build_script_")
+        && parsed
+            .crate_types
+            .iter()
+            .any(|crate_type| crate_type == "bin")
+        && parsed.emit.contains("link");
+    let host_suffix = Naming::of(host).exe_suffix;
+    if !built_for_host || !is_build_script || host_suffix == std::env::consts::EXE_SUFFIX {
+        return None;
+    }
+    let out_dir = parsed.out_dir.as_deref()?;
+    Some(PlannedOutput {
+        path: out_dir.join(format!(
+            "{}{}",
+            parsed.crate_name.replace('_', "-"),
+            std::env::consts::EXE_SUFFIX
+        )),
+        emit: "link",
+        kind: OutputKind::Executable,
+    })
+}
+
 /// The platform naming rustc applies to a link output, from the unit's
-/// `--target` (or the host, for a unit compiled without one).
+/// `--target` (or the emulated host, for a unit compiled without one).
 struct Naming {
     dll_prefix: &'static str,
     dll_suffix: &'static str,
@@ -159,16 +335,7 @@ struct Naming {
 }
 
 impl Naming {
-    fn of(target: Option<&str>) -> Self {
-        let Some(target) = target else {
-            return Self {
-                dll_prefix: std::env::consts::DLL_PREFIX,
-                dll_suffix: std::env::consts::DLL_SUFFIX,
-                static_prefix: if cfg!(windows) { "" } else { "lib" },
-                static_suffix: if cfg!(windows) { ".lib" } else { ".a" },
-                exe_suffix: std::env::consts::EXE_SUFFIX,
-            };
-        };
+    fn of(target: &str) -> Self {
         if target.contains("-windows-") {
             Self {
                 dll_prefix: "",
@@ -263,7 +430,12 @@ mod tests {
 
     use stow_types::rustc::ParsedRustcArgs;
 
-    use super::{OutputKind, planned_outputs, replaces};
+    use super::{
+        HostProbe, OutputKind, build_script_run_path, host_probe, planned_outputs, replaces,
+        rewrite_version_host, runner_host,
+    };
+
+    const LINUX_HOST: &str = "x86_64-unknown-linux-gnu";
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
@@ -288,7 +460,7 @@ mod tests {
         ]);
         let parsed = ParsedRustcArgs::parse(&argv).expect("parse");
         assert!(replaces(&argv, &parsed));
-        let outputs = planned_outputs(&parsed).expect("plan");
+        let outputs = planned_outputs(&parsed, LINUX_HOST).expect("plan");
         let names = outputs
             .iter()
             .map(|output| output.path.to_string_lossy().into_owned())
@@ -318,7 +490,7 @@ mod tests {
             "/t/build/x",
         ]);
         let parsed = ParsedRustcArgs::parse(&argv).expect("parse");
-        let outputs = planned_outputs(&parsed).expect("plan");
+        let outputs = planned_outputs(&parsed, LINUX_HOST).expect("plan");
         let link = outputs.last().expect("link output");
         assert!(link.kind == OutputKind::Executable);
         assert!(
@@ -340,5 +512,106 @@ mod tests {
         ]);
         let parsed = ParsedRustcArgs::parse(&argv).expect("parse");
         assert!(!replaces(&argv, &parsed));
+    }
+
+    /// Every CI target answers as its runner family's host — the
+    /// `build-crate.yml` runner map — and a target no runner builds is
+    /// refused rather than given the machine's own host.
+    #[test]
+    fn each_ci_target_runs_on_its_runner_family_host() {
+        let expected = [
+            ("aarch64-apple-darwin", "aarch64-apple-darwin"),
+            ("aarch64-apple-ios", "aarch64-apple-darwin"),
+            ("aarch64-apple-ios-sim", "aarch64-apple-darwin"),
+            ("aarch64-linux-android", LINUX_HOST),
+            ("x86_64-unknown-linux-gnu", LINUX_HOST),
+            ("aarch64-unknown-linux-gnu", LINUX_HOST),
+            ("x86_64-pc-windows-msvc", "x86_64-pc-windows-msvc"),
+            ("aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"),
+            ("wasm32-unknown-unknown", LINUX_HOST),
+        ];
+        assert_eq!(
+            expected.map(|(target, _)| target).as_slice(),
+            stow_types::api::CI_TARGET_TRIPLES
+        );
+        for (target, host) in expected {
+            assert_eq!(runner_host(target).expect("CI target"), host, "{target}");
+        }
+        assert!(runner_host("x86_64-apple-darwin").is_err());
+    }
+
+    #[test]
+    fn version_probe_reports_the_emulated_host() {
+        assert_eq!(
+            host_probe(&args(&["-vV"]), LINUX_HOST),
+            Some(HostProbe::Version)
+        );
+        let real = b"rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\nhost: aarch64-apple-darwin\nrelease: 1.99.0\n";
+        let rewritten = rewrite_version_host(real, "x86_64-pc-windows-msvc").expect("rewrite");
+        assert_eq!(
+            String::from_utf8(rewritten).expect("utf8"),
+            "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\nhost: x86_64-pc-windows-msvc\nrelease: 1.99.0\n"
+        );
+        assert!(rewrite_version_host(b"rustc 1.99.0\n", LINUX_HOST).is_err());
+    }
+
+    #[test]
+    fn a_targetless_probe_asks_about_the_emulated_host() {
+        let probe = args(&[
+            "-",
+            "--crate-name",
+            "___",
+            "--print=file-names",
+            "--crate-type",
+            "bin",
+            "--print=cfg",
+        ]);
+        let Some(HostProbe::Print(asked)) = host_probe(&probe, "x86_64-pc-windows-msvc") else {
+            panic!("a target-less probe is a host probe");
+        };
+        assert_eq!(
+            &asked[asked.len() - 2..],
+            args(&["--target", "x86_64-pc-windows-msvc"]).as_slice()
+        );
+        let targeted = args(&["-", "--print=cfg", "--target", "aarch64-apple-ios"]);
+        assert_eq!(host_probe(&targeted, LINUX_HOST), None);
+        let compile = args(&["--crate-name", "serde", "src/lib.rs", "--out-dir", "/t"]);
+        assert_eq!(host_probe(&compile, LINUX_HOST), None);
+    }
+
+    /// A target-less unit — a build script — is named for the emulated
+    /// host, so cargo finds the `.exe` it planned for a Windows runner.
+    #[test]
+    fn a_host_unit_is_named_for_the_emulated_host() {
+        let argv = args(&[
+            "--crate-name",
+            "build_script_build",
+            "build.rs",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info,link",
+            "-C",
+            "extra-filename=-aa",
+            "--out-dir",
+            "/t/build/x",
+        ]);
+        let parsed = ParsedRustcArgs::parse(&argv).expect("parse");
+        let outputs = planned_outputs(&parsed, "x86_64-pc-windows-msvc").expect("plan");
+        let link = outputs.last().expect("link output");
+        assert_eq!(
+            link.path.to_string_lossy(),
+            "/t/build/x/build_script_build-aa.exe"
+        );
+        // Cargo runs it under its own executable suffix, not the
+        // emulated host's: the stub sits there too.
+        let run = build_script_run_path(&parsed, "x86_64-pc-windows-msvc");
+        if std::env::consts::EXE_SUFFIX == ".exe" {
+            assert!(run.is_none());
+        } else {
+            let run = run.expect("a run path for a foreign suffix");
+            assert_eq!(run.path.to_string_lossy(), "/t/build/x/build-script-build");
+            assert!(run.kind == OutputKind::Executable);
+        }
+        assert!(build_script_run_path(&parsed, LINUX_HOST).is_none() || cfg!(windows));
     }
 }

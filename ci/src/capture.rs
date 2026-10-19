@@ -54,6 +54,10 @@ pub async fn run_rustc_capture_wrapper(
     let rustc = args.get(2).ok_or_else(|| {
         stow_types::stow_error!("rustc capture mode requires rustc path as argv[2]")
     })?;
+    #[cfg(feature = "mock-compile")]
+    if let Some(code) = answer_mock_host_probe(rustc, &args[3..]).await? {
+        std::process::exit(code);
+    }
     let args = remapped_target_dir_args(&pinned_link_args(&args[3..]));
     let original_parsed = match ParsedRustcArgs::parse(&args) {
         Ok(mut parsed) => {
@@ -148,6 +152,49 @@ pub async fn run_rustc_capture_wrapper(
     .await?;
     replay_rustc_output(&output).await?;
     std::process::exit(0);
+}
+
+/// A mock-compile run's host probe, answered as the emulated runner host
+/// (`mock_compile` has the why): `rustc -vV` reports that host, and a
+/// target-less probe asks the real rustc about it. `None` when the mock
+/// is off or `args` is no host probe.
+#[cfg(feature = "mock-compile")]
+async fn answer_mock_host_probe(
+    rustc: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+) -> stow_types::error::Result<Option<i32>> {
+    use crate::mock_compile::{HostProbe, emulated_host, host_probe, rewrite_version_host};
+    if !crate::mock_compile::enabled() {
+        return Ok(None);
+    }
+    let host = emulated_host()?;
+    match host_probe(args, &host) {
+        None => Ok(None),
+        Some(HostProbe::Print(probe)) => Ok(Some(
+            Command::new(rustc)
+                .args(&probe)
+                .status()
+                .await?
+                .code()
+                .unwrap_or(1),
+        )),
+        Some(HostProbe::Version) => {
+            let output = Command::new(rustc).args(args).output().await?;
+            let mut stderr = std::io::stderr().lock();
+            stderr
+                .write_all(&output.stderr)
+                .wrap_err("replay rustc -vV stderr")?;
+            if !output.status.success() {
+                return Ok(Some(output.status.code().unwrap_or(1)));
+            }
+            let mut stdout = std::io::stdout().lock();
+            stdout
+                .write_all(&rewrite_version_host(&output.stdout, &host)?)
+                .wrap_err("write emulated rustc -vV")?;
+            stdout.flush().wrap_err("flush emulated rustc -vV")?;
+            Ok(Some(0))
+        }
+    }
 }
 
 /// Run the rustc cargo asked for and wait on its exit, its output
@@ -915,6 +962,14 @@ pub async fn detect_rustc_toolchain(
         .lines()
         .find_map(|line| line.strip_prefix("host: ").map(str::to_owned))
         .ok_or_else(|| stow_types::stow_error!("rustc -vV output missing host line"))?;
+    // A mock-compile wrapper answers as the task's runner host, exactly
+    // as its `rustc -vV` answer to cargo does.
+    #[cfg(feature = "mock-compile")]
+    let host_target = if crate::mock_compile::enabled() {
+        crate::mock_compile::emulated_host()?
+    } else {
+        host_target
+    };
     Ok(RustcToolchain {
         version,
         host_target,
