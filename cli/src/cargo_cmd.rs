@@ -4525,14 +4525,21 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     let status = status.wrap_err_with(|| format!("run cargo {action}"))?;
     finish_cargo_run(
         plan,
+        CargoRunCleanup { cargo_run, scratch },
         &mut supervisor,
         status,
         before,
         covered_units,
         &handler,
-        scratch,
     )
     .await
+}
+
+/// What `finish_cargo_run` releases, in order: the run — and with it a
+/// sandbox — then the scratch directory the sandbox's grants name.
+struct CargoRunCleanup {
+    cargo_run: CargoRun,
+    scratch: tempfile::TempDir,
 }
 
 /// The build's tail once cargo has exited: the supervisor drains — the
@@ -4541,18 +4548,21 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
 /// in the same order on either transport (stow#317, stow#630, stow#667).
 async fn finish_cargo_run(
     plan: &CargoRunPlan<'_>,
+    cleanup: CargoRunCleanup,
     supervisor: &mut SupervisorHandle,
     status: ExitStatus,
     before: CoverageSnapshot,
     covered_units: usize,
     handler: &std::sync::Arc<crate::BuildSupervisor>,
-    scratch: tempfile::TempDir,
 ) -> stow_types::error::Result<ExitStatus> {
     // Cargo has exited, so every facade has: stop accepting and drain the
     // last connections' post-compile bookkeeping before the runtime goes
     // away — the last unit's store is inside that tail, and so is its
     // miss observation (stow#618).
     supervisor.shutdown().await;
+    // The sandbox's grants name the scratch directory, and its drop revokes
+    // them, so it goes before the directory does.
+    drop(cleanup.cargo_run);
     if let Some(config) = plan.config {
         if status.success() {
             report_cache_coverage(config, before, covered_units).await;
@@ -4576,7 +4586,7 @@ async fn finish_cargo_run(
     // exited, the analysis is gone and the supervisor has drained — so
     // it is removed here rather than at drop: `close` reports a removal
     // failure a `TempDir` drop would swallow (stow#630).
-    if let Err(error) = scratch.close() {
+    if let Err(error) = cleanup.scratch.close() {
         tracing::warn!(%error, "could not remove the build scratch directory");
     }
     Ok(status)
