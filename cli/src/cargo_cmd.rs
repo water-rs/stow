@@ -1816,10 +1816,11 @@ async fn cached_consumer_slices(
     // stale-but-readable generation is provisional too: the map the
     // lite pass writes from it stays provisional until the fetched
     // answer replaces it.
-    let pending = index::slice_fetch_pending(config, &project.target, &project.rustc_version).await
+    let pending = index::slice_fetch_pending(config, &project.target, &project.rustc_version)
+        .await?
         || match host_target.as_deref() {
             Some(target) if host_slice_expected => {
-                index::slice_fetch_pending(config, target, &project.rustc_version).await
+                index::slice_fetch_pending(config, target, &project.rustc_version).await?
             }
             _ => false,
         };
