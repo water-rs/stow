@@ -54,7 +54,7 @@ skyzen = { version = "0.4.3", default-features = false, features = ["json", "hyp
 heel = { version = "0.5", default-features = false }
 utoipa.workspace = true
 executor-core = { version = "0.7", features = ["tokio"] }
-tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread", "sync"] }
 async-net = "2"
 # The machine check on every object the plan stage packs — objects and
 # archive members only, never image parsing (`read` covers COFF, ELF,

@@ -34,6 +34,7 @@ use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
 use stow_types::api::{BuildTaskPayload, RequestDispatch};
 use stow_types::local_ci::LocalCiRun;
+use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
 
@@ -59,6 +60,11 @@ pub struct LocalServerState {
     /// The local equivalent of GitHub assigning a fresh id to every
     /// workflow dispatch, including repeated task/attempt keys.
     next_run_id: Arc<AtomicU64>,
+    /// The runner pool. A dispatch is accepted at once, as GitHub queues
+    /// it, but at most one build per core executes: on Actions every job
+    /// has a machine of its own, here they all share one with the edge
+    /// under test, and an unbounded wave of builds starves it.
+    runners: Arc<Semaphore>,
     /// The bound listen address, filled by `serve` — the `html_url` a
     /// mock run reports.
     pub listen: SocketAddr,
@@ -92,6 +98,11 @@ impl LocalServerState {
             mock_registry_root,
             runs: Arc::new(Mutex::new(BTreeMap::new())),
             next_run_id: Arc::new(AtomicU64::new(1)),
+            runners: Arc::new(Semaphore::new(
+                std::thread::available_parallelism()
+                    .expect("read the machine's available parallelism")
+                    .get(),
+            )),
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         }
     }
@@ -499,6 +510,11 @@ async fn run_dispatched_task(
         .await?;
         return complete_build_run(&state, &task, workflow_run_id, &layout).await;
     }
+    let _runner = state
+        .runners
+        .acquire()
+        .await
+        .expect("the runner pool is never closed");
     let task_json = serde_json::to_string(&task)?;
     let exe = std::env::current_exe()?;
     let layout = DispatchLayout::create(&task.task_id, workflow_run_id)?;
