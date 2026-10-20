@@ -3,7 +3,7 @@
 -- from 2018-01-01 so the PK stays ordered and `INSERT OR IGNORE`
 -- makes a repeat re-arm a dedupe pass.
 WITH RECURSIVE seq(n) AS (
-    SELECT ? UNION ALL SELECT n + 1 FROM seq WHERE n < ?
+    SELECT CAST(? AS INTEGER) UNION ALL SELECT n + 1 FROM seq WHERE n < ?
 )
 INSERT OR IGNORE INTO demand_feed_hours
     (hour, generation, state, staged_pages, staged_entries, applied_pages,
