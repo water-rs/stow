@@ -276,13 +276,15 @@ log "dispatch caps: $MAX_JOBS ($MAX_MACOS_JOBS macOS)"
 
 cd "$REPO_ROOT"
 log "building stow-cli, stow-build (mock compiler), stow-mock-registry, stow-admin"
-cargo build \
+# Release, as toolchain-publish.yml builds the stow-build and stow-cli
+# every build-crate run executes: the wave's wall time is their CPU.
+cargo build --release \
     -p stow-cli --features stow-cli/mock-verify \
     -p stow-build --features stow-build/mock-verify,stow-build/mock-compile \
     -p stow-mock-registry -p stow-admin \
     >"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build failed — see $LOG_DIR/cargo-build.log"
-BIN="$REPO_ROOT/target/debug"
+BIN="$REPO_ROOT/target/release"
 
 mkdir -p "$WORK_DIR/keys"
 openssl ecparam -name prime256v1 -genkey -noout -out "$WORK_DIR/keys/private.pem"
