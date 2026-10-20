@@ -425,3 +425,98 @@ fn missed_invalid_inputs_fail_without_network() {
         server.requests()
     );
 }
+
+/// `stow-admin preheat …` with the edge's environment stripped: no
+/// `STOW_EDGE_URL`, no Actions OIDC. The analytics base, when a test
+/// needs it, is still the loopback seam.
+fn edgeless_command(args: &[&str]) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stow-admin"));
+    cmd.arg("preheat")
+        .args(args)
+        .env_remove("STOW_EDGE_URL")
+        .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
+        .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
+    cmd
+}
+
+#[test]
+fn plan_only_lanes_need_no_edge() {
+    // A plan reaches no edge: `missed` without `--yes` fetches its
+    // analytics from the loopback seam and prints the plan with neither
+    // `STOW_EDGE_URL` nor a credential, and posts nothing.
+    let server = Server::spawn(
+        Fixture {
+            entries: vec![entry(
+                "serde-1.0.228--x86_64-unknown-linux-gnu-r1.98.1-d0000000000000000",
+                42,
+            )],
+            target: "x86_64-unknown-linux-gnu".to_owned(),
+        },
+        VecDeque::new(),
+    );
+    let mut cmd = edgeless_command(&[
+        "missed",
+        "--rustc-version",
+        "1.98.1",
+        "--targets",
+        "x86_64-unknown-linux-gnu",
+    ]);
+    cmd.env("STOW_CF_ANALYTICS_SQL_BASE", server.url())
+        .env("CF_ACCOUNT_ID", "test-account")
+        .env("CF_ANALYTICS_TOKEN", "test-cf-token");
+    let out = run(cmd);
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("dry run"));
+    assert_eq!(server.requests_on("/accounts/").len(), 1);
+    assert!(
+        server
+            .requests_on("/api/v1/scheduler/tasks/submit-ids")
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_submit_without_an_edge_fails_before_it_resolves() {
+    // `--targets not-a-triple` is refused by every lane's own
+    // validation, so which error surfaces says whether the edge was
+    // connected first: the plan-only run reaches the validation, the
+    // `--yes` run stops at the missing edge before any crates.io or
+    // resolver work.
+    for lane in [
+        vec!["top", "--rustc-version", "1.98.1"],
+        vec!["top-binaries", "--rustc-version", "1.98.1"],
+        vec!["binary", "serde"],
+        vec![
+            "projects",
+            "submit",
+            "--file",
+            "projects.toml",
+            "--rustc-version",
+            "1.98.1",
+        ],
+    ] {
+        let plan_only = run(edgeless_command(
+            &[lane.as_slice(), &["--targets", "not-a-triple"]].concat(),
+        ));
+        assert!(!plan_only.status.success());
+        let stderr = String::from_utf8_lossy(&plan_only.stderr);
+        assert!(
+            stderr.contains("is not a CI target") && !stderr.contains("STOW_EDGE_URL"),
+            "{lane:?} plan-only stderr:\n{stderr}"
+        );
+
+        let submit = run(edgeless_command(
+            &[lane.as_slice(), &["--targets", "not-a-triple", "--yes"]].concat(),
+        ));
+        assert!(!submit.status.success());
+        let stderr = String::from_utf8_lossy(&submit.stderr);
+        assert!(
+            stderr.contains("missing STOW_EDGE_URL"),
+            "{lane:?} --yes stderr:\n{stderr}"
+        );
+    }
+}

@@ -26,14 +26,7 @@
 #      or in flight
 #   5. resubmit the same lists, as the daily preheat-cron does, and
 #      drive whatever that releases
-#   6. beside the wave, the production lanes resolve plan-only — the same
-#      three invocations preheat-admin.yml runs at its default limit and
-#      targets, without `--yes`, so nothing is enqueued anywhere — and
-#      the report counts the distinct task identities across them: the
-#      production wave's node count, which the monthly projection
-#      (`stow-admin traffic-cost project`, the release gate's `Monthly
-#      projection` job) scales the measured per-node costs to
-#   7. `stow-admin preheat cost report` reads the probe ledger snapshots
+#   6. `stow-admin preheat cost report` reads the probe ledger snapshots
 #      taken at every lane and round boundary, the local CI's runs and
 #      the final published slices, writes
 #      $WORK_DIR/preheat-cost-report.json and fails on any check: wave or
@@ -43,6 +36,10 @@
 #      dispatched before its dependencies were published, a submitted
 #      node never published, an `overloaded` answer, a failed submit, or
 #      a resubmit that rebuilt anything
+#
+# The monthly projection (`stow-admin traffic-cost project`, the release
+# gate's `Monthly projection` job) also needs the production wave's node
+# count; `scripts/production-wave.sh` counts it in a job of its own.
 #
 # Why the compiler is the mocked seam: everything the scheduler's cost
 # depends on — which tasks exist, their edges, when each completes, the
@@ -64,16 +61,6 @@
 #                                  preheat/projects.toml (default: all)
 #   STOW_PREHEAT_COST_TARGETS      comma-separated targets for every lane
 #                                  (default: every CI_TARGET_TRIPLES entry)
-#   STOW_PREHEAT_COST_PRODUCTION_LIMIT
-#                                  --limit of the plan-only production
-#                                  `preheat top` and `preheat
-#                                  top-binaries` (default: the `limit`
-#                                  input's default in preheat-admin.yml)
-#   STOW_PREHEAT_COST_PRODUCTION_TARGETS
-#                                  comma-separated targets of the
-#                                  plan-only production lanes (default:
-#                                  the `targets` input's default in
-#                                  preheat-admin.yml)
 #   STOW_PREHEAT_COST_MAX_JOBS     scheduler dispatch cap (default 45 —
 #                                  edge/Skyzen.toml)
 #   STOW_PREHEAT_COST_MAX_MACOS_JOBS
@@ -134,11 +121,7 @@ else
 fi
 LOG_DIR="$WORK_DIR/logs"
 COST_DIR="$WORK_DIR/cost"
-# The production lanes' plans hold every task of the production wave —
-# far larger than the reduced run's — so they stay out of `cost/`, which
-# the job uploads.
-PRODUCTION_DIR="$WORK_DIR/production"
-mkdir -p "$LOG_DIR" "$COST_DIR" "$PRODUCTION_DIR"
+mkdir -p "$LOG_DIR" "$COST_DIR"
 
 CHILD_PIDS=()
 CHILD_NAMES=()
@@ -226,7 +209,7 @@ check_children_alive() {
     for i in "${!CHILD_PIDS[@]}"; do
         # The lane runners are children too, and exit when their lanes do.
         case "${CHILD_NAMES[$i]}" in
-            lanes | production-plan) continue ;;
+            lanes) continue ;;
         esac
         kill -0 "${CHILD_PIDS[$i]}" 2>/dev/null || die "${CHILD_NAMES[$i]} exited unexpectedly"
     done
@@ -260,23 +243,12 @@ require_command rustup
 require_command openssl
 require_command curl
 require_command jq
-require_command yq
 require_command skyzen
 require_command wrangler
 
 [ -n "$EDGE_BEARER" ] || die \
     "no GitHub credential for the edge's trusted endpoints — set GH_TOKEN or run \`gh auth login\`"
 
-# The production wave the monthly projection scales to is the one
-# preheat-admin.yml runs, so its defaults come from that file rather
-# than a copy here. preheat-cron.yml dispatches it with the binaries and
-# projects lanes on, so all three lanes count.
-PREHEAT_ADMIN_WORKFLOW="$REPO_ROOT/.github/workflows/preheat-admin.yml"
-workflow_default() {
-    yq ".on.workflow_dispatch.inputs.$1.default" "$PREHEAT_ADMIN_WORKFLOW"
-}
-PRODUCTION_LIMIT="${STOW_PREHEAT_COST_PRODUCTION_LIMIT:-$(workflow_default limit)}"
-PRODUCTION_TARGETS="${STOW_PREHEAT_COST_PRODUCTION_TARGETS:-$(workflow_default targets | tr ' ' ',')}"
 RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
 [ -n "$RUSTC_VERSION" ] || die "could not detect the rustc version"
 
@@ -304,15 +276,8 @@ if [ -n "$TARGETS" ]; then
     done
 fi
 
-for value in "$PRODUCTION_LIMIT" "$PRODUCTION_TARGETS"; do
-    case "$value" in
-        "" | null) die "could not read the production limit and targets from $PREHEAT_ADMIN_WORKFLOW" ;;
-    esac
-done
-
 log "work dir: $WORK_DIR"
 log "rustc $RUSTC_VERSION; top/top-binaries limit $LIMIT; projects ${PROJECTS:-all}; targets ${TARGETS:-every CI target}"
-log "production plan: limit $PRODUCTION_LIMIT; targets $PRODUCTION_TARGETS"
 log "dispatch caps: $MAX_JOBS ($MAX_MACOS_JOBS macOS)"
 
 cd "$REPO_ROOT"
@@ -491,54 +456,6 @@ run_lanes() {
         ${PROJECT_ARGS[@]+"${PROJECT_ARGS[@]}"}
 }
 
-# The production lanes, plan-only: preheat-admin.yml's invocations
-# without `--yes`, so each resolves and prints the tasks it would submit
-# and enqueues nothing. One lane's failure is recorded (the report fails
-# on it), never fatal here.
-plan_production_lane() {
-    local order="$1" lane="$2" status=0
-    shift 2
-    local dir="$PRODUCTION_DIR/lanes/$order-$lane"
-    mkdir -p "$dir"
-    admin --json preheat "$@" >"$dir/plan.json" 2>"$dir/stderr.log" || status=$?
-    echo "$status" >"$dir/exit"
-    [ "$status" -eq 0 ] || echo "[preheat-cost] production lane $lane exited $status — see $dir/stderr.log" >&2
-}
-
-run_production_plan() {
-    plan_production_lane 01 top top \
-        --targets "$PRODUCTION_TARGETS" \
-        --rustc-version "$RUSTC_VERSION" --limit "$PRODUCTION_LIMIT"
-    plan_production_lane 02 top-binaries top-binaries \
-        --targets "$PRODUCTION_TARGETS" \
-        --rustc-version "$RUSTC_VERSION" --limit "$PRODUCTION_LIMIT"
-    plan_production_lane 03 projects projects submit \
-        --file "$REPO_ROOT/preheat/projects.toml" \
-        --targets "$PRODUCTION_TARGETS" \
-        --rustc-version "$RUSTC_VERSION"
-}
-
-PRODUCTION_PID=""
-
-start_production_plan() {
-    run_production_plan >>"$LOG_DIR/production-plan.log" 2>&1 &
-    PRODUCTION_PID=$!
-    CHILD_PIDS+=("$PRODUCTION_PID")
-    CHILD_NAMES+=(production-plan)
-    log "started the production plan (pid $PRODUCTION_PID), log: $LOG_DIR/production-plan.log"
-}
-
-# The plan runs beside the wave; the report needs all three lanes done.
-wait_production_plan() {
-    local deadline=$((SECONDS + PHASE_DEADLINE))
-    while kill -0 "$PRODUCTION_PID" 2>/dev/null; do
-        check_children_alive
-        [ "$SECONDS" -lt "$deadline" ] || die "production plan passed its ${PHASE_DEADLINE}s deadline"
-        sleep "$POLL_SECS"
-    done
-    log "production plan done"
-}
-
 LANES_PID=""
 LANES_IDX=-1
 
@@ -661,7 +578,6 @@ drive_phase() {
 
 mkdir -p "$COST_DIR/wave" "$COST_DIR/resubmit"
 snapshot "$COST_DIR/wave/start.json"
-start_production_plan
 start_lanes wave
 drive_phase wave
 snapshot "$COST_DIR/wave/end.json"
@@ -675,7 +591,6 @@ snapshot "$COST_DIR/resubmit/end.json"
 
 # --- the report -------------------------------------------------------------
 
-wait_production_plan
 scan=(--scan "$LOG_DIR/edge.log" --scan "$LOG_DIR/local-ci.log")
 for stderr_log in "$COST_DIR"/*/lanes/*/stderr.log "$LOG_DIR"/index-report.log; do
     [ -e "$stderr_log" ] && scan+=(--scan "$stderr_log")
@@ -684,7 +599,6 @@ admin preheat cost report \
     --work-dir "$COST_DIR" \
     --rustc-version "$RUSTC_VERSION" \
     --local-ci-url "$LOCAL_CI_URL" \
-    --production-dir "$PRODUCTION_DIR" \
     "${scan[@]}" \
     --out "$WORK_DIR/preheat-cost-report.json" \
     | tee "$LOG_DIR/report.log" \

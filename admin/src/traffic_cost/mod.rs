@@ -11,8 +11,8 @@
 //! - `project` is the monthly projection against half of each allowance
 //!   — user traffic from those reports and the CPU report, plus the
 //!   preheat waves and daily resubmits the Preheat cost report measures
-//!   (stow#775). The release gate runs it in its own job, once both
-//!   tests' reports exist.
+//!   (stow#775). The release gate runs it in its own job, once all
+//!   three tests' reports exist.
 
 use std::path::Path;
 

@@ -117,18 +117,35 @@ STOW_PREHEAT_COST_LIMIT=3 STOW_PREHEAT_COST_PROJECTS=2 \
 
 `docs/ENVIRONMENT.md` lists every tunable.
 
-Beside the wave the script resolves the production lanes plan-only —
-`preheat top`, `preheat top-binaries` and `preheat projects submit` at
-`preheat-admin.yml`'s default limit and targets, without `--yes`, so
-nothing is enqueued — and the report records the distinct task
-identities across them (`production` in `preheat-cost-report.json`).
-That is the production wave's node count. The release gate's `Monthly
-projection` job divides the report's wave and resubmit totals by the
-reduced wave's node count and multiplies by the production count: one
-wave per stable rustc release (`[cadence]` in `launch-model.toml`,
-counted from Rust's release history by `stow-admin launch-model
-export`) plus one resubmit per day, added to each product's traffic
-before comparing with half its allowance. Only the scheduler Durable
+## Production wave
+
+The monthly projection needs the production wave's size, and counting
+it needs no mock stack. `scripts/production-wave.sh` runs the three
+production lanes — `preheat top`, `preheat top-binaries` and `preheat
+projects submit` — at `preheat-admin.yml`'s default limit and targets,
+concurrently and plan-only: without `--yes` a lane resolves and prints
+the tasks it would submit and never connects to an edge, so nothing is
+enqueued. `stow-admin preheat cost production` then counts the distinct
+task identities across the lanes into `production-wave.json`, and fails
+when a lane exited non-zero or planned nothing. It is the release
+gate's own `Production wave` job because production's resolve takes up
+to 100 minutes (the projects lane) and would otherwise compete with the
+Preheat cost job's wave for the runner.
+
+```sh
+scripts/production-wave.sh
+```
+
+## Monthly projection
+
+The release gate's `Monthly projection` job divides the Preheat cost
+report's wave and resubmit totals by the reduced wave's node count and
+multiplies by the production count: one wave per stable rustc release
+(`[cadence]` in `launch-model.toml`, counted from Rust's release
+history by `stow-admin launch-model export`) plus one resubmit per day,
+added to each product's traffic before comparing with half its
+allowance. `stow-admin traffic-cost project` takes the report as
+`--preheat` and the count as `--production`. Only the scheduler Durable
 Object's billed calls and rows are measured; the table marks every
 other dimension `n/m` and prices it from traffic alone.
 

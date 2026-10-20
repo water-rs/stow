@@ -3,8 +3,9 @@
 //! A stable rustc release invalidates the whole public cache, so each
 //! one brings a full preheat wave, and `preheat-cron.yml` resubmits the
 //! whole list every day. The Preheat cost job measures both on a
-//! reduced wave and resolves the production lanes plan-only for the
-//! production node count; this module scales one to the other:
+//! reduced wave; the Production wave job resolves the production lanes
+//! plan-only for the production node count. This module scales one to
+//! the other:
 //!
 //! ```text
 //! monthly = releases/month × (wave cost per node × production nodes)
@@ -20,7 +21,7 @@
 //! never priced at zero.
 
 use stow_types::launch_model::LaunchModel;
-use stow_types::preheat_cost::{PhaseCost, PreheatCostReport};
+use stow_types::preheat_cost::{PhaseCost, PreheatCostReport, ProductionWave};
 
 /// A phase's measured cost per node of the wave that measured it.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
@@ -74,18 +75,22 @@ impl PreheatMonthly {
     /// # Errors
     /// The report measured no nodes, or the production lanes planned none
     /// — either leaves nothing to scale.
-    pub fn new(model: &LaunchModel, report: &PreheatCostReport) -> Result<Self, String> {
+    pub fn new(
+        model: &LaunchModel,
+        report: &PreheatCostReport,
+        production: &ProductionWave,
+    ) -> Result<Self, String> {
         if report.nodes == 0 {
             return Err(
                 "preheat cost report measured 0 nodes — no per-node cost to scale".to_owned(),
             );
         }
-        if report.production.nodes == 0 {
-            return Err("preheat cost report planned 0 production nodes".to_owned());
+        if production.nodes == 0 {
+            return Err("production wave planned 0 nodes".to_owned());
         }
         Ok(Self {
             measured_nodes: report.nodes,
-            production_nodes: report.production.nodes,
+            production_nodes: production.nodes,
             releases_per_month: model.monthly_stable_releases(),
             resubmits_per_month: model.monthly_resubmits(),
             wave: PerNode::of(&report.wave, report.nodes),
@@ -125,14 +130,23 @@ pub fn not_measured(product: &str, dimension: &str) -> &'static str {
     }
 }
 
-/// A report of `nodes` measured nodes and `production` production
-/// nodes, whose wave and resubmit each cost 100 calls, 1000 rows read
-/// and 500 rows written per phase.
+/// A production wave of `nodes` distinct nodes.
 #[cfg(test)]
-pub(super) fn test_report(nodes: u64, production: u64) -> PreheatCostReport {
+pub(super) const fn test_production(nodes: u64) -> ProductionWave {
+    ProductionWave {
+        nodes,
+        nodes_per_target: std::collections::BTreeMap::new(),
+        lanes: Vec::new(),
+    }
+}
+
+/// A report of `nodes` measured nodes whose wave and resubmit each cost
+/// 100 calls, 1000 rows read and 500 rows written per phase.
+#[cfg(test)]
+pub(super) fn test_report(nodes: u64) -> PreheatCostReport {
     use std::collections::BTreeMap;
 
-    use stow_types::preheat_cost::{EventKind, KindCost, ProductionWave};
+    use stow_types::preheat_cost::{EventKind, KindCost};
 
     let phase = PhaseCost {
         kinds: vec![KindCost {
@@ -153,11 +167,6 @@ pub(super) fn test_report(nodes: u64, production: u64) -> PreheatCostReport {
         rustc_version: "1.99.1".to_owned(),
         nodes,
         nodes_per_target: BTreeMap::new(),
-        production: ProductionWave {
-            nodes: production,
-            nodes_per_target: BTreeMap::new(),
-            lanes: Vec::new(),
-        },
         wave: phase.clone(),
         resubmit: phase,
         layers: Vec::new(),
@@ -168,11 +177,12 @@ pub(super) fn test_report(nodes: u64, production: u64) -> PreheatCostReport {
 
 #[cfg(test)]
 mod tests {
-    use super::{PreheatMonthly, not_measured, test_report};
+    use super::{PreheatMonthly, not_measured, test_production, test_report};
     use crate::traffic_cost::test_support::model;
 
     fn monthly(nodes: u64, production: u64) -> PreheatMonthly {
-        PreheatMonthly::new(&model(), &test_report(nodes, production)).expect("scale")
+        PreheatMonthly::new(&model(), &test_report(nodes), &test_production(production))
+            .expect("scale")
     }
 
     /// Per-node cost is the phase total over the measured wave's nodes.
@@ -237,9 +247,11 @@ mod tests {
 
     #[test]
     fn nothing_to_scale_is_refused() {
-        let unmeasured = PreheatMonthly::new(&model(), &test_report(0, 10)).expect_err("0 nodes");
+        let unmeasured = PreheatMonthly::new(&model(), &test_report(0), &test_production(10))
+            .expect_err("0 nodes");
         assert!(unmeasured.contains("0 nodes"), "{unmeasured}");
-        let unplanned = PreheatMonthly::new(&model(), &test_report(10, 0)).expect_err("0 plan");
-        assert!(unplanned.contains("0 production nodes"), "{unplanned}");
+        let unplanned = PreheatMonthly::new(&model(), &test_report(10), &test_production(0))
+            .expect_err("0 plan");
+        assert!(unplanned.contains("0 nodes"), "{unplanned}");
     }
 }

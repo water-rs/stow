@@ -10,10 +10,11 @@
 //! [`analyse`] turns them into a [`PreheatCostReport`]. The analysis is
 //! pure, so every check is unit-tested here rather than in the shell.
 //!
-//! The report also carries the production wave's size ([`ProductionWave`]):
-//! the script resolves the production preheat lanes plan-only, and the
-//! distinct task identities across them are the node count the monthly
-//! projection scales the measured per-node costs to.
+//! The production wave's size ([`ProductionWave`]) is a separate
+//! document: `scripts/production-wave.sh` resolves the production
+//! preheat lanes plan-only, and the distinct task identities across them
+//! ([`count_production`]) are the node count the monthly projection
+//! scales the measured per-node costs to.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -190,6 +191,34 @@ pub struct ProductionWave {
     pub lanes: Vec<ProductionLaneCount>,
 }
 
+impl ProductionWave {
+    /// Every production lane must have planned something: a lane that
+    /// resolved nothing would undercount the production wave the monthly
+    /// projection scales to.
+    ///
+    /// # Errors
+    /// No lane ran, or a lane planned no task.
+    pub fn require_planned(&self) -> crate::error::Result<()> {
+        if self.lanes.is_empty() {
+            return Err(crate::stow_error!("no production lane ran"));
+        }
+        let empty: Vec<&str> = self
+            .lanes
+            .iter()
+            .filter(|lane| lane.planned == 0)
+            .map(|lane| lane.lane.as_str())
+            .collect();
+        if empty.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::stow_error!(
+                "production lane(s) planned nothing: {}",
+                empty.join(", ")
+            ))
+        }
+    }
+}
+
 /// Count the distinct nodes across the production lanes, dedup'd by
 /// task id exactly as the scheduler's queue would.
 #[must_use]
@@ -238,8 +267,6 @@ pub struct WaveObservations {
     pub covered: BTreeSet<String>,
     /// Every place an `overloaded` answer surfaced, one line each.
     pub overload_sightings: Vec<String>,
-    /// The production lanes' plan-only output, in lane order.
-    pub production: Vec<ProductionLane>,
 }
 
 /// One kind's cost over a span.
@@ -357,8 +384,6 @@ pub struct PreheatCostReport {
     pub nodes: u64,
     /// Nodes per target triple.
     pub nodes_per_target: BTreeMap<String, u64>,
-    /// The production wave's size, resolved plan-only.
-    pub production: ProductionWave,
     /// The wave's totals.
     pub wave: PhaseCost,
     /// The resubmit's totals.
@@ -803,33 +828,6 @@ fn overload_check(observed: &WaveObservations) -> Check {
     )
 }
 
-/// Every production lane must have planned something: a lane that
-/// resolved nothing would undercount the production wave the monthly
-/// projection scales to.
-fn production_check(production: &ProductionWave) -> Check {
-    let empty: Vec<String> = production
-        .lanes
-        .iter()
-        .filter(|lane| lane.planned == 0)
-        .map(|lane| lane.lane.clone())
-        .collect();
-    check(
-        "Every production lane planned tasks",
-        !production.lanes.is_empty() && empty.is_empty(),
-        if production.lanes.is_empty() {
-            "no production lane ran".to_owned()
-        } else if empty.is_empty() {
-            format!(
-                "{} distinct nodes from {} lane(s)",
-                production.nodes,
-                production.lanes.len()
-            )
-        } else {
-            format!("planned nothing: {}", empty.join(", "))
-        },
-    )
-}
-
 fn submit_failure_check(observed: &WaveObservations) -> Check {
     let failures: Vec<String> = observed
         .wave
@@ -913,14 +911,11 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
     checks.push(published_check(observed));
     checks.push(overload_check(observed));
     checks.push(submit_failure_check(observed));
-    let production = count_production(&observed.production);
-    checks.push(production_check(&production));
 
     Ok(PreheatCostReport {
         rustc_version: observed.rustc_version.clone(),
         nodes,
         nodes_per_target,
-        production,
         wave,
         resubmit,
         layers,
@@ -1056,7 +1051,6 @@ mod tests {
             runs: vec![run("a", 10), run("b", 95), run("c", 195)],
             covered: BTreeSet::from(["a".to_owned(), "b".to_owned(), "c".to_owned()]),
             overload_sightings: vec![],
-            production: vec![production_lane("top", &[("a", "t1"), ("b", "t1")])],
         }
     }
 
@@ -1159,12 +1153,16 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_production_lane_fails_the_report() {
-        let mut observed = chain(0);
-        observed.production.push(production_lane("projects", &[]));
-        let report = analyse(&observed).expect("analyse");
-        assert_eq!(failed(&report), ["Every production lane planned tasks"]);
-        assert_eq!(report.production.nodes, 2);
+    fn a_lane_that_planned_nothing_is_refused() {
+        let planned = count_production(&[production_lane("top", &[("a", "t1")])]);
+        planned.require_planned().expect("every lane planned");
+        let empty = count_production(&[
+            production_lane("top", &[("a", "t1")]),
+            production_lane("projects", &[]),
+        ]);
+        let error = empty.require_planned().expect_err("an empty lane");
+        assert!(error.to_string().contains("projects"), "{error}");
+        assert!(count_production(&[]).require_planned().is_err());
     }
 
     #[test]

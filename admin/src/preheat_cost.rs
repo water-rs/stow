@@ -1,9 +1,11 @@
-//! `stow-admin preheat cost` — the `Preheat cost` lane's two commands
+//! `stow-admin preheat cost` — the `Preheat cost` lane's commands
 //! (stow#773). `scripts/preheat-cost.sh` drives a preheat wave through
 //! the mock stack and calls `ledger` at every boundary it measures;
 //! `report` reads what the run left in the work directory, runs
 //! [`stow_types::preheat_cost::analyse`] and writes
-//! `preheat-cost-report.json`.
+//! `preheat-cost-report.json`. `production` is the other job's half:
+//! `scripts/production-wave.sh` plans the production lanes without an
+//! edge and it counts their distinct nodes into `production-wave.json`.
 //!
 //! The work directory's layout is this module's contract with the
 //! script, per phase (`wave`, then `resubmit`):
@@ -20,13 +22,14 @@
 //! <phase>/end.json                      ledger when the phase ended
 //! ```
 //!
-//! The production wave's size comes from a third directory the script
-//! fills with the production lanes' plan-only runs (no `--yes`, nothing
-//! enqueued), laid out like a phase's lanes:
+//! The production wave's size comes from a lanes directory
+//! `scripts/production-wave.sh` fills with the production lanes'
+//! plan-only runs (no `--yes`, nothing enqueued), laid out like a
+//! phase's lanes:
 //!
 //! ```text
-//! lanes/<NN>-<lane>/plan.json   the lane's `--json` envelope
-//! lanes/<NN>-<lane>/exit        the lane's exit status
+//! <NN>-<lane>/plan.json   the lane's `--json` envelope
+//! <NN>-<lane>/exit        the lane's exit status
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,7 +41,7 @@ use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::local_ci::LocalCiTasks;
 use stow_types::preheat_cost::{
     LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport, ProductionLane,
-    ProductionTask, Round, WaveObservations, analyse,
+    ProductionTask, ProductionWave, Round, WaveObservations, analyse, count_production,
 };
 use stow_types::public_cache::UnitSide;
 use stow_types::stow_error;
@@ -63,6 +66,10 @@ enum CostCommand {
     /// Analyse a finished run's work directory and write the report;
     /// exits nonzero when any check fails.
     Report(ReportArgs),
+    /// Count the distinct nodes the production preheat lanes planned and
+    /// write `production-wave.json`; exits nonzero when a lane failed or
+    /// planned nothing.
+    Production(ProductionArgs),
 }
 
 #[derive(Args)]
@@ -87,11 +94,18 @@ struct ReportArgs {
     /// lane's, the publish loop's).
     #[arg(long)]
     scan: Vec<PathBuf>,
+    /// Where to write `preheat-cost-report.json`.
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Args)]
+struct ProductionArgs {
     /// The directory holding the production lanes' plan-only runs (layout
     /// in this module's docs).
     #[arg(long)]
-    production_dir: PathBuf,
-    /// Where to write `preheat-cost-report.json`.
+    lanes_dir: PathBuf,
+    /// Where to write `production-wave.json`.
     #[arg(long)]
     out: PathBuf,
 }
@@ -101,6 +115,7 @@ pub async fn run(args: CostArgs, output: Output) -> stow_types::error::Result<()
     match args.command {
         CostCommand::Ledger(args) => ledger(&args).await,
         CostCommand::Report(args) => report(&args, output).await,
+        CostCommand::Production(args) => production(&args, output).await,
     }
 }
 
@@ -226,10 +241,10 @@ fn published_task_ids(records: &[ArtifactRecord]) -> BTreeSet<String> {
         .collect()
 }
 
-/// The lane directories under `dir/lanes` in run order, each with the
-/// lane name its `<NN>-<lane>` directory carries.
-async fn lane_dirs(dir: &Path) -> stow_types::error::Result<Vec<(String, PathBuf)>> {
-    sorted_entries(&dir.join("lanes"))
+/// The lane directories under `lanes` in run order, each with the lane
+/// name its `<NN>-<lane>` directory carries.
+async fn lane_dirs(lanes: &Path) -> stow_types::error::Result<Vec<(String, PathBuf)>> {
+    sorted_entries(lanes)
         .await?
         .into_iter()
         .map(|lane_dir| {
@@ -247,11 +262,11 @@ async fn lane_dirs(dir: &Path) -> stow_types::error::Result<Vec<(String, PathBuf
 }
 
 /// The production lanes' plan-only output. A lane that did not exit
-/// cleanly would undercount the production wave, so it fails the report
+/// cleanly would undercount the production wave, so it fails the count
 /// instead of counting as an empty lane.
-async fn production_lanes(dir: &Path) -> stow_types::error::Result<Vec<ProductionLane>> {
+async fn production_lanes(lanes_dir: &Path) -> stow_types::error::Result<Vec<ProductionLane>> {
     let mut lanes = Vec::new();
-    for (name, lane_dir) in lane_dirs(dir).await? {
+    for (name, lane_dir) in lane_dirs(lanes_dir).await? {
         let plan = lane_plan(&name, &lane_dir).await?;
         if let Some(failure) = plan.submit_failures.first() {
             return Err(stow_error!("production lane {name}: {failure}"));
@@ -286,7 +301,7 @@ async fn phase(
 ) -> stow_types::error::Result<(PhaseObservations, Vec<EnqueueRequest>)> {
     let mut lanes = Vec::new();
     let mut tasks = Vec::new();
-    for (name, lane_dir) in lane_dirs(dir).await? {
+    for (name, lane_dir) in lane_dirs(&dir.join("lanes")).await? {
         let plan = lane_plan(&name, &lane_dir).await?;
         let mut inserted = 0_u64;
         let mut inserted_edges = 0_u64;
@@ -404,7 +419,6 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
         runs: runs.tasks,
         covered,
         overload_sightings: overload_sightings(&args.scan).await?,
-        production: production_lanes(&args.production_dir).await?,
     })?;
     tokio::fs::write(&args.out, serde_json::to_vec_pretty(&report)?)
         .await
@@ -418,6 +432,39 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
         ));
     }
     Ok(())
+}
+
+/// `preheat cost production`: count the production lanes' distinct
+/// nodes, write them as `production-wave.json` and refuse a count a
+/// failed or empty lane would have understated.
+async fn production(args: &ProductionArgs, output: Output) -> stow_types::error::Result<()> {
+    let wave = count_production(&production_lanes(&args.lanes_dir).await?);
+    wave.require_planned()?;
+    tokio::fs::write(&args.out, serde_json::to_vec_pretty(&wave)?)
+        .await
+        .map_err(|error| stow_error!("write {}: {error}", args.out.display()))?;
+    render::emit(output, &wave, render_production)
+}
+
+fn render_production(wave: &ProductionWave) -> String {
+    let mut lanes = Table::new(&["lane", "planned", "new nodes"]);
+    for lane in &wave.lanes {
+        lanes.push([
+            lane.lane.clone(),
+            lane.planned.to_string(),
+            lane.new_nodes.to_string(),
+        ]);
+    }
+    let mut targets = Table::new(&["target", "nodes"]);
+    for (target, count) in &wave.nodes_per_target {
+        targets.push([target.clone(), count.to_string()]);
+    }
+    format!(
+        "production wave: {} distinct nodes\n\n{}\n\n{}",
+        wave.nodes,
+        lanes.render(),
+        targets.render()
+    )
 }
 
 fn render_report(report: &PreheatCostReport) -> String {
@@ -474,20 +521,8 @@ fn render_report(report: &PreheatCostReport) -> String {
             check.detail.clone(),
         ]);
     }
-    let production = report
-        .production
-        .lanes
-        .iter()
-        .map(|lane| {
-            format!(
-                "{}: {} planned, {} new",
-                lane.lane, lane.planned, lane.new_nodes
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
     format!(
-        "{} nodes ({}) on rustc {}\nproduction wave: {} distinct nodes ({production})\n\n{}\n\n{}\n\n{}",
+        "{} nodes ({}) on rustc {}\n\n{}\n\n{}\n\n{}",
         report.nodes,
         report
             .nodes_per_target
@@ -496,7 +531,6 @@ fn render_report(report: &PreheatCostReport) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         report.rustc_version,
-        report.production.nodes,
         phases.render(),
         layers.render(),
         checks.render()

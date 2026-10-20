@@ -2,9 +2,10 @@
 //! Cloudflare product against half its allowance (stow#452, stow#775).
 //!
 //! The release gate's `Monthly projection` job runs it over what the
-//! Traffic cost and Preheat cost jobs measured: the scheduler budget
-//! report on the clean fixture, the one re-measured after the peak
-//! drive, the Worker CPU report, and `preheat-cost-report.json`. It
+//! Traffic cost, Preheat cost and Production wave jobs measured: the
+//! scheduler budget report on the clean fixture, the one re-measured
+//! after the peak drive, the Worker CPU report,
+//! `preheat-cost-report.json` and `production-wave.json`. It
 //! fails when any product's projected monthly usage — user traffic plus
 //! preheat — exceeds half its included allowance.
 //!
@@ -43,7 +44,7 @@ use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
 use stow_types::do_budgets::WORKER_CPU_BUDGETS;
 use stow_types::launch_model::{EventKind, LaunchModel};
-use stow_types::preheat_cost::PreheatCostReport;
+use stow_types::preheat_cost::{PreheatCostReport, ProductionWave};
 use stow_types::stow_error;
 
 use super::cpu::WorkerCpuReport;
@@ -71,6 +72,10 @@ pub struct ProjectArgs {
     /// and the daily resubmit are part of every month's bill.
     #[arg(long)]
     pub preheat: PathBuf,
+    /// The Production wave job's `production-wave.json`: the node count
+    /// the preheat costs scale to. Required for the same reason.
+    #[arg(long)]
+    pub production: PathBuf,
     /// The checked-in launch model `launch-model.toml`.
     #[arg(long, default_value = "launch-model.toml")]
     pub model: PathBuf,
@@ -1014,8 +1019,9 @@ fn project(
     after: &SchedulerBudgetReport,
     cpu: &WorkerCpuReport,
     preheat_report: &PreheatCostReport,
+    production: &ProductionWave,
 ) -> Result<ProjectionReport, String> {
-    let preheat = PreheatMonthly::new(model, preheat_report)?;
+    let preheat = PreheatMonthly::new(model, preheat_report, production)?;
     Ok(ProjectionReport {
         projection: evaluate(model, small, cpu, &preheat)?,
         projection_after_load: evaluate(model, after, cpu, &preheat)?,
@@ -1210,9 +1216,10 @@ pub async fn run(args: &ProjectArgs, output: Output) -> stow_types::error::Resul
     let after: SchedulerBudgetReport = super::read_json("budget report", &args.after).await?;
     let cpu: WorkerCpuReport = super::read_json("Worker CPU report", &args.cpu).await?;
     let preheat: PreheatCostReport = super::read_json("preheat cost report", &args.preheat).await?;
+    let production: ProductionWave = super::read_json("production wave", &args.production).await?;
     let model = super::read_model(&args.model).await?;
-    let report =
-        project(&model, &small, &after, &cpu, &preheat).map_err(|error| stow_error!("{error}"))?;
+    let report = project(&model, &small, &after, &cpu, &preheat, &production)
+        .map_err(|error| stow_error!("{error}"))?;
     emit(output, &report, render_projection)?;
     let failures = report.failures();
     if failures.is_empty() {
@@ -1367,24 +1374,31 @@ mod tests {
         assert_eq!(breach.top_route, super::PREHEAT_ROUTE);
     }
 
-    /// The preheat report is not optional: the CLI refuses a
-    /// projection without it.
+    /// The preheat report and the production wave are not optional: the
+    /// CLI refuses a projection without either.
     #[test]
-    fn the_preheat_report_is_required() {
+    fn the_preheat_report_and_production_wave_are_required() {
         #[derive(Debug, clap::Parser)]
         struct Cli {
             #[command(flatten)]
             args: ProjectArgs,
         }
         let base = ["project", "--small", "s", "--after", "a", "--cpu", "c"];
-        let error = Cli::try_parse_from(base).expect_err("--preheat is required");
-        assert_eq!(
-            error.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-        assert!(error.to_string().contains("--preheat"), "{error}");
+        for (given, missing) in [
+            (["--production", "w"], "--preheat"),
+            (["--preheat", "p"], "--production"),
+        ] {
+            let mut partial = base.to_vec();
+            partial.extend(given);
+            let error = Cli::try_parse_from(partial).expect_err("a required input is missing");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument
+            );
+            assert!(error.to_string().contains(missing), "{error}");
+        }
         let mut with = base.to_vec();
-        with.extend(["--preheat", "p"]);
+        with.extend(["--preheat", "p", "--production", "w"]);
         Cli::try_parse_from(with).expect("complete arguments parse");
     }
 
@@ -1392,10 +1406,18 @@ mod tests {
     fn a_report_without_nodes_cannot_be_projected() {
         let small = fixture_report(100_000, |_| 0.5);
         let after = fixture_report(100_000, |_| 0.5);
-        let mut preheat = crate::traffic_cost::preheat::test_report(10, 10);
+        let mut preheat = crate::traffic_cost::preheat::test_report(10);
         preheat.nodes = 0;
-        let error = project(&model(), &small, &after, &fixture_cpu(|_| 0.5), &preheat)
-            .expect_err("a zero-node wave prices nothing");
+        let production = crate::traffic_cost::preheat::test_production(10);
+        let error = project(
+            &model(),
+            &small,
+            &after,
+            &fixture_cpu(|_| 0.5),
+            &preheat,
+            &production,
+        )
+        .expect_err("a zero-node wave prices nothing");
         assert!(error.contains("0 nodes"), "{error}");
     }
 

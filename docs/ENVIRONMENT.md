@@ -58,7 +58,7 @@ JSON) and sends nothing.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `scheduler demand-feed` (the `/api/v1/admin/scheduler/demand-feed/*` input lane — see the demand-feed runbook below), `dispatch-freeze status\|clear` (the `/api/v1/admin/dispatch-freeze` recovery path), `index sync` and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `preheat manual` and `index export`/`publish` never read it — they run against GitHub and GHCR only. |
+| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `scheduler demand-feed` (the `/api/v1/admin/scheduler/demand-feed/*` input lane — see the demand-feed runbook below), `dispatch-freeze status\|clear` (the `/api/v1/admin/dispatch-freeze` recovery path), `index sync` and the admin index GET (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `preheat manual` and `index export`/`publish` never read it — they run against GitHub and GHCR only. The preheat lanes (`top`, `top-binaries`, `binary`, `missed`, `projects submit`, `plan`) read it only under `--yes`, when they submit: a plan-only run needs neither it nor an edge credential. |
 | `STOW_EDGE_VERSION_OVERRIDE` | _optional_ | Verbatim `Cloudflare-Workers-Version-Overrides` header value (e.g. `stow-edge="<version-id>"`) pinned onto every edge call — `deploy-edge.yml` sets it so trusted calls run on the uploaded candidate before traffic shifts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints and the GitHub REST calls (`runs`, `builds`, `cache`, `preheat projects generate`); the owner must have push access to `water-rs/stow`. |
 | `CF_ACCOUNT_ID` | _required for `preheat missed` and `watchdog`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
@@ -151,12 +151,25 @@ billed rows. `docs/MOCK.md` describes the run.
 | `STOW_PREHEAT_COST_LIMIT` | `100` | `--limit` of `preheat top` and `preheat top-binaries` — the production `preheat-admin.yml` value. |
 | `STOW_PREHEAT_COST_PROJECTS` | every listed repository | `preheat projects submit --limit`: resolve only the first N repositories of `preheat/projects.toml`. |
 | `STOW_PREHEAT_COST_TARGETS` | every `CI_TARGET_TRIPLES` entry | Comma-separated `--targets` for every lane. |
-| `STOW_PREHEAT_COST_PRODUCTION_LIMIT` | the `limit` input's default in `.github/workflows/preheat-admin.yml` | `--limit` of the plan-only production `preheat top` and `preheat top-binaries` whose distinct nodes are the production wave the monthly projection scales to. Nothing is enqueued. |
-| `STOW_PREHEAT_COST_PRODUCTION_TARGETS` | the `targets` input's default in `.github/workflows/preheat-admin.yml` | Comma-separated `--targets` of the plan-only production lanes. |
 | `STOW_PREHEAT_COST_MAX_JOBS` / `STOW_PREHEAT_COST_MAX_MACOS_JOBS` | `45` / `16` | The scheduler's dispatch caps for the run — `edge/Skyzen.toml`'s production values, replacing the mock manifest's. |
 | `STOW_PREHEAT_COST_DEADLINE` | `21600` | Seconds the wave (and, separately, the resubmit) may run before the script fails. |
 | `STOW_PREHEAT_COST_EDGE_RSS_MB` | `1200` | Restart the `wrangler dev` edge at an idle point once its process tree passes this resident size. |
 | `STOW_E2E_TOOLCHAIN` / `STOW_E2E_READY_DEADLINE` | `stable` / `600` | The rustup toolchain the run builds for, and how long each service may take to come up — shared with `scripts/mock-e2e.sh`. |
+
+## scripts/production-wave.sh
+
+The release gate's `Production wave` job: the three production preheat
+lanes resolved plan-only, concurrently, to count the production wave's
+distinct nodes for the monthly projection. No edge, mock stack or edge
+credential is involved (`docs/MOCK.md`).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STOW_PRODUCTION_WAVE_WORK_DIR` | fresh `mktemp -d` | Work dir for `logs/`, `lanes/<NN>-<lane>/` and `production-wave.json`. Must be empty. |
+| `STOW_PRODUCTION_WAVE_LIMIT` | the `limit` input's default in `.github/workflows/preheat-admin.yml` | `--limit` of `preheat top` and `preheat top-binaries`. |
+| `STOW_PRODUCTION_WAVE_TARGETS` | the `targets` input's default in `.github/workflows/preheat-admin.yml` | Comma-separated `--targets` of every lane. |
+| `STOW_PRODUCTION_WAVE_DEADLINE` | `3300` | Seconds each lane may run before it is killed; the count then refuses the lane. |
+| `STOW_E2E_TOOLCHAIN` | `stable` | The rustup toolchain whose version the lanes resolve for (`RUSTUP_TOOLCHAIN`). |
 
 ## stow-mock-registry
 

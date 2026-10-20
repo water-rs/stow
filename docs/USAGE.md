@@ -462,5 +462,7 @@ wave builds only what is missing or previously failed.
 access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
 The exceptions never touch the edge: `preheat manual` needs only the
 GitHub credential (plus crates.io and GHCR), `preheat projects generate`
-touches only GitHub, and `index export`/`publish`/`targets` touch only
-the registry. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
+touches only GitHub, `index export`/`publish`/`targets` touch only
+the registry, and a preheat lane (`top`, `top-binaries`, `binary`,
+`missed`, `projects submit`, `plan`) run without `--yes` only plans and
+needs no edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
