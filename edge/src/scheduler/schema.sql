@@ -712,6 +712,19 @@ CREATE TABLE IF NOT EXISTS do_meter (
     rows_written INTEGER NOT NULL
 );
 
+-- The budget probe's per-operation ledger (stow#773): the same billed
+-- counts `do_meter` folds per day, booked per operation (`<METHOD>
+-- <route>`, or `alarm`) so the `Preheat cost` lane reads what each event
+-- kind costs. Written only on deploys carrying `STOW_SCHEDULER_BUDGET=1`
+-- (the mock stack) — production creates the table and never writes it.
+-- One row per distinct operation.
+CREATE TABLE IF NOT EXISTS probe_meter (
+    op TEXT PRIMARY KEY,
+    events INTEGER NOT NULL,
+    rows_read INTEGER NOT NULL,
+    rows_written INTEGER NOT NULL
+);
+
 -- The human request lane's records (stow#428): one row per admitted
 -- `POST /api/v1/requests`, moved `accepted` -> `resolving` ->
 -- `enqueued` | `failed` by the resolve run's outcome report and the

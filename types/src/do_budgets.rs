@@ -7,6 +7,92 @@
 //! renderer, and the traffic-cost projection and CPU pass) reads the
 //! same tables.
 
+/// Durable Objects `rowsRead` included per month on Workers Paid (SQLite
+/// storage billing): 25 billion.
+/// <https://developers.cloudflare.com/durable-objects/platform/pricing/>
+pub const DO_ROWS_READ_MONTHLY: f64 = 25e9;
+/// Durable Objects `rowsWritten` included per month on Workers Paid:
+/// 50 million — the scarcer of the two by three orders of magnitude, so
+/// every write budget below is the one that binds first.
+pub const DO_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
+
+/// The probe ledger's key for the scheduler alarm — the dispatch pass,
+/// which has no route of its own. Every other ledger key is the
+/// scheduler route as `<METHOD> <path>`.
+pub const LEDGER_OP_ALARM: &str = "alarm";
+
+/// The scheduler cost one preheat wave and one daily resubmit may spend
+/// — the `Preheat cost` lane's (stow#773) totals gate.
+///
+/// Derived from the Workers Paid allowance above and the two mechanisms
+/// that already divide it:
+///
+/// - **The in-edge cost breaker** freezes dispatch once a UTC day's
+///   billed rows pass a thirtieth of the monthly allowance
+///   (`edge/src/scheduler/meter.rs`, `daily_budget`, at the production
+///   multiplier of 1). A wave that crosses it stops itself mid-graph.
+/// - **The launch gate** (stow#452) holds projected user traffic at half
+///   of every allowance — half of each day's thirtieth.
+///
+/// So a wave gets the other half of one day: `1/30 × 1/2 = 1/60` of the
+/// monthly allowance, and a full wave completes inside it in one go —
+/// spreading a wave over several days is not an option. A wave that
+/// does not fit is a scheduler spending too many rows per node. The daily resubmit (`preheat-cron.yml` fires every day)
+/// lands on a graph that is already built: its work is recognising
+/// that, so it is held to a hundredth of a wave — room to read its own
+/// batches, none to rebuild or rewrite the graph.
+///
+/// Both shares are per node, over [`Self::FULL_WAVE_NODES`]: a run of
+/// `n` nodes is held to `n / FULL_WAVE_NODES` of the share, so a
+/// per-node cost that would overrun the full wave fails a reduced-scale
+/// run too.
+#[derive(Debug, Clone, Copy)]
+pub struct PreheatBudget {
+    /// Fraction of each monthly allowance one full wave may spend.
+    pub wave_share: f64,
+    /// Fraction of the wave's share one resubmit may spend.
+    pub resubmit_of_wave: f64,
+}
+
+impl PreheatBudget {
+    /// Nodes in a full production wave: the top-100 crates, the
+    /// top-100 binaries' and the curated projects' lockfiles, resolved
+    /// across every `CI_TARGET_TRIPLES` entry (stow#773's measured
+    /// order of magnitude). The per-node share divides by it.
+    pub const FULL_WAVE_NODES: f64 = 16_000.0;
+
+    /// The (`rowsRead`, `rowsWritten`) one wave of `nodes` may spend.
+    #[must_use]
+    pub fn wave(&self, nodes: u64) -> (f64, f64) {
+        Self::share(self.wave_share, nodes)
+    }
+
+    /// The (`rowsRead`, `rowsWritten`) one resubmit over `nodes` may
+    /// spend.
+    #[must_use]
+    pub fn resubmit(&self, nodes: u64) -> (f64, f64) {
+        Self::share(self.wave_share * self.resubmit_of_wave, nodes)
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "node counts stay far below f64's exact-integer range"
+    )]
+    fn share(share: f64, nodes: u64) -> (f64, f64) {
+        let fraction = nodes as f64 / Self::FULL_WAVE_NODES;
+        (
+            DO_ROWS_READ_MONTHLY * share * fraction,
+            DO_ROWS_WRITTEN_MONTHLY * share * fraction,
+        )
+    }
+}
+
+/// The preheat lane's split of the allowance — see [`PreheatBudget`].
+pub const PREHEAT_BUDGET: PreheatBudget = PreheatBudget {
+    wave_share: 1.0 / 60.0,
+    resubmit_of_wave: 0.01,
+};
+
 /// One probe budget row — statements, cursor counters and wall time.
 ///
 /// These are the numbers that gate a merge: each was measured on the

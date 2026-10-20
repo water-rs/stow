@@ -730,6 +730,33 @@ pub fn runner_host_triple(task: &BuildTaskPayload) -> stow_types::error::Result<
         .host_triple())
 }
 
+/// The triple a unit compiled without `--target` is built for in this
+/// build: the host rustc reports — or, in a mock-compile build, the
+/// runner host the task is dispatched to, the triple its sandboxed
+/// phases' rustc answers as.
+///
+/// # Errors
+/// Returns an error when rustc cannot be asked, or the mock finds no
+/// runner for the task's target.
+#[cfg_attr(
+    not(feature = "mock-compile"),
+    expect(
+        unused_variables,
+        reason = "only the mock reads the task: a real build's host is rustc's"
+    )
+)]
+pub async fn compile_host(task: &BuildTaskPayload) -> stow_types::error::Result<String> {
+    #[cfg(feature = "mock-compile")]
+    if crate::mock_compile::enabled() {
+        return Ok(crate::mock_compile::runner_host(task.target.as_str())?.to_owned());
+    }
+    Ok(
+        crate::capture::detect_rustc_toolchain(&OsString::from("rustc"))
+            .await?
+            .host_target,
+    )
+}
+
 /// The units this build's workspace will compile, read from cargo's own
 /// unit graphs — the consumable set (stow#589). Each graph is computed
 /// with the same argv a phase runs (`cargo_phase_args`, minus the
@@ -747,10 +774,32 @@ pub async fn phase_unit_graphs(
     workspace: &BuildWorkspace,
     cargo_subcommand: CargoSubcommand,
 ) -> stow_types::error::Result<Vec<PhaseUnitGraph>> {
+    // A mock-compile resolve plans under the runner host the sandboxed
+    // phases' cargo sees, or the two would disagree on every cfg-gated
+    // host dependency. The wrapper script lives as long as the resolves.
+    #[cfg(feature = "mock-compile")]
+    let mock_wrapper = if crate::mock_compile::enabled() {
+        let dir = TempDir::new()
+            .map_err(|error| stow_types::stow_error!("create mock host wrapper dir: {error}"))?;
+        let wrapper =
+            crate::mock_compile::unit_graph_wrapper(dir.path(), runner_host_triple(task)?).await?;
+        Some((dir, wrapper))
+    } else {
+        None
+    };
     let mut graphs = Vec::new();
     for &phase in cargo_phases(cargo_subcommand) {
         for &invocation in phase_invocations(task) {
-            let phase_args = cargo_phase_args(workspace, task, phase, invocation).await?;
+            #[cfg_attr(not(feature = "mock-compile"), allow(unused_mut))]
+            let mut phase_args = cargo_phase_args(workspace, task, phase, invocation).await?;
+            #[cfg(feature = "mock-compile")]
+            if let Some((_, wrapper)) = &mock_wrapper {
+                phase_args.push("--config".to_owned());
+                phase_args.push(format!(
+                    "build.rustc-wrapper={}",
+                    toml::Value::String(wrapper.to_string_lossy().into_owned())
+                ));
+            }
             let passes_target = invocation_passes_target(task, invocation).await?;
             let graph = stow_cli::resolve_exact_dependency_graph(
                 workspace.manifest_path(),
@@ -1256,6 +1305,17 @@ pub async fn run_sandboxed_phase(
     // in, but it is never a publishable artifact.
     command = command.env(STOW_BUILD_WRAPPER_CRATE_NAME_ENV, WRAPPER_PACKAGE_NAME);
     command = command.env(STOW_BUILD_TARGET_DIR_REMAP_ENV, TARGET_DIR_VIRTUAL_ROOT);
+    // The sandbox starts with no environment: a mock-compile run's switch
+    // reaches the capture wrapper only through this grant.
+    #[cfg(feature = "mock-compile")]
+    if crate::mock_compile::enabled() {
+        command = command
+            .env(crate::mock_compile::STOW_BUILD_MOCK_COMPILE_ENV, "1")
+            .env(
+                crate::mock_compile::STOW_BUILD_MOCK_HOST_ENV,
+                runner_host_triple(task)?,
+            );
+    }
     // A linux-gnu task's units link with mold, and the pin is part of what
     // the compile key records, so it is a choice the builder makes — the
     // workflow installs mold — not an observation of whatever linker the
@@ -2223,6 +2283,12 @@ impl CargoSubcommand {
 /// Decides whether the trusted build passes `--target`, which in turn decides
 /// whether cargo splits its unit graph into host and target halves.
 pub async fn target_is_host(target: &str) -> stow_types::error::Result<bool> {
+    // A mock-compile build answers as the target's runner, whatever
+    // machine runs it (`mock_compile` has the why).
+    #[cfg(feature = "mock-compile")]
+    if crate::mock_compile::enabled() {
+        return Ok(crate::mock_compile::runner_host(target)? == target);
+    }
     let output = Command::new("rustc")
         .arg("-vV")
         .output()

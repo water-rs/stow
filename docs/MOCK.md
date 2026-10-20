@@ -76,6 +76,42 @@ the topology and verification details behind it. Follow it when you
 want the services left running, a larger preheat than a single crate,
 or a real consumer project instead of the throwaway one.
 
+## Preheat cost
+
+`scripts/preheat-cost.sh` runs a whole preheat wave on the same three
+services and prices it in the rows the scheduler Durable Object is
+billed for (stow#773). The production lanes — `preheat top`, `preheat
+top-binaries`, `preheat projects submit` over `preheat/projects.toml`
+— submit the real resolved graph across every CI target while the
+wave runs; every dispatch is a real `stow-build build` and publish
+validation whose rustc invocations a mock compiler answers with empty
+outputs (`STOW_BUILD_MOCK_COMPILE`, compiled in only with the
+`mock-compile` feature) and answers as the host of the runner the
+task's target is dispatched to, so one machine builds every target's
+host-side nodes as its runner would; publish rounds release the graph layer by
+layer; then the same lists are resubmitted the way the daily cron
+does. The edge runs the budget-probe manifest at production's
+dispatch caps and cost multiplier, and its probe ledger (`stow-admin
+preheat cost ledger`) is read at every lane and round boundary.
+
+`stow-admin preheat cost report` turns the run into
+`preheat-cost-report.json` — per event kind (submit, alarm dispatch,
+completion, slice report) per layer, wave and resubmit totals, nodes
+per target, wall time — and fails when the wave or resubmit totals
+pass the preheat budget in `types/src/do_budgets.rs`, a per-event cost
+grows from the first layer to the last past the scheduler-budget
+tolerance, a node is dispatched before its dependencies are
+published, a submitted node never publishes, or the object answers
+`overloaded`. The full wave is CI-sized; locally, reduce it:
+
+```sh
+STOW_PREHEAT_COST_TARGETS="$(rustc -vV | sed -n 's/^host: //p')" \
+STOW_PREHEAT_COST_LIMIT=3 STOW_PREHEAT_COST_PROJECTS=2 \
+  scripts/preheat-cost.sh
+```
+
+`docs/ENVIRONMENT.md` lists every tunable.
+
 ## Prerequisites
 
 ```sh
@@ -101,7 +137,7 @@ Build the workspace binaries once:
 
 ```sh
 cd /path/to/stow
-cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
+cargo build --release -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 ```
 
 ## Topology
@@ -145,7 +181,7 @@ Open three terminals (or use `tmux`/background processes).
 
 ```sh
 mkdir -p /tmp/stow-bench/mock-registry
-target/debug/stow-mock-registry serve --registry-root /tmp/stow-bench/mock-registry
+target/release/stow-mock-registry serve --registry-root /tmp/stow-bench/mock-registry
 ```
 
 Verify: `curl -i http://127.0.0.1:28123/v2/` returns `401 Unauthorized`
@@ -193,7 +229,7 @@ is enough — the scheduler routes are 500s until the schema exists):
 # Prints `scheduler store reset — <n> objects dropped` and stamps the
 # configured dispatch floor.
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-    target/debug/stow-admin scheduler reset --yes
+    target/release/stow-admin scheduler reset --yes
 ```
 
 Verify: `curl http://127.0.0.1:8788/api/v1/scheduler/status` returns
@@ -208,7 +244,7 @@ STOW_GITHUB_WEBHOOK_SECRET=mock-github-webhook-secret \
 STOW_MOCK_PUBLIC_KEY_PATH=/tmp/stow-bench/keys/public.pem \
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
-target/debug/stow-build serve --listen 127.0.0.1:28124
+target/release/stow-build serve --listen 127.0.0.1:28124
 ```
 
 Verify: the log prints `local CI server listening listen=127.0.0.1:28124`.
@@ -238,7 +274,7 @@ Two preheat shapes are useful:
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin preheat top \
+target/release/stow-admin preheat top \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
@@ -248,7 +284,7 @@ lane's, so tasks land on the latest semver-compatible versions):
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin preheat top-binaries \
+target/release/stow-admin preheat top-binaries \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
@@ -277,12 +313,12 @@ registry (mock-key mode delegates the signed push to
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin index export \
+target/release/stow-admin index export \
   --target aarch64-apple-darwin --rustc-version 1.91.1 \
   --out /tmp/stow-bench/index.bin
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
-target/debug/stow-admin index publish \
+target/release/stow-admin index publish \
   --file /tmp/stow-bench/index.bin \
   --target aarch64-apple-darwin --rustc-version 1.91.1
 ```

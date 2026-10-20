@@ -90,9 +90,6 @@ async fn populate_registry(request: PopulateArgs) -> stow_types::error::Result<(
     create_dir_all(&request.registry_root).await?;
 
     let key_pair = load_key_pair(&request.private_key_path).await?;
-    if let Some(public_key_path) = request.public_key_path.as_ref() {
-        write_public_key(public_key_path, &key_pair).await?;
-    }
     let signer = key_pair
         .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
         .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
@@ -764,21 +761,6 @@ async fn load_key_pair(path: &Path) -> stow_types::error::Result<SigStoreKeyPair
     })
 }
 
-async fn write_public_key(
-    path: &Path,
-    key_pair: &SigStoreKeyPair,
-) -> stow_types::error::Result<()> {
-    if let Some(parent) = path.parent() {
-        create_dir_all(parent).await?;
-    }
-    let public_key = key_pair.public_key_to_pem().map_err(|error| {
-        stow_types::stow_error!("encode mock public key {}: {error}", path.display())
-    })?;
-    write(path, public_key.as_bytes())
-        .await
-        .map_err(|error| stow_types::stow_error!("write public key {}: {error}", path.display()))
-}
-
 async fn write_mock_registry_entry(
     registry_root: &Path,
     signer: &SigStoreSigner,
@@ -1283,8 +1265,6 @@ struct PopulateArgs {
     registry_root: PathBuf,
     #[arg(long = "private-key")]
     private_key_path: PathBuf,
-    #[arg(long = "public-key")]
-    public_key_path: Option<PathBuf>,
     #[arg(long = "records-out")]
     records_output_path: Option<PathBuf>,
 }
@@ -2267,11 +2247,26 @@ mod tests {
     use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput};
     use tower::ServiceExt as _;
 
+    async fn write_public_key(
+        path: &Path,
+        key_pair: &SigStoreKeyPair,
+    ) -> stow_types::error::Result<()> {
+        if let Some(parent) = path.parent() {
+            create_dir_all(parent).await?;
+        }
+        let public_key = key_pair.public_key_to_pem().map_err(|error| {
+            stow_types::stow_error!("encode mock public key {}: {error}", path.display())
+        })?;
+        write(path, public_key.as_bytes()).await.map_err(|error| {
+            stow_types::stow_error!("write public key {}: {error}", path.display())
+        })
+    }
+
     use super::{
-        Arc, Body, MockRegistryState, Mutex, RegistryProbe, SigningScheme, TokenState,
-        analytics_engine_sql, demand_query_hour, log_demand_query, manifest_file_name,
-        registry_app_with_probe, split_reference, write_blob, write_manifest, write_mock_signature,
-        write_public_key,
+        Arc, Body, MockRegistryState, Mutex, Path, RegistryProbe, SigStoreKeyPair, SigningScheme,
+        TokenState, analytics_engine_sql, create_dir_all, demand_query_hour, log_demand_query,
+        manifest_file_name, registry_app_with_probe, split_reference, write, write_blob,
+        write_manifest, write_mock_signature,
     };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-1.98.0/manifests/latest";

@@ -10,7 +10,6 @@
 //! the in-flight registry a dependent's bookkeeping waits on (stow#618).
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,6 +56,17 @@ pub trait Handler: Send + Sync + 'static {
     /// — and immediately when it already is. Every platform speaks this
     /// over the transport it already carries (stow#347).
     fn await_serve_map(self: &Arc<Self>) -> impl Future<Output = ()> + Send;
+
+    /// The host triple `executable`'s rustc compiles target-less units
+    /// for — its `rustc -vV` `host:` line, probed once per executable and
+    /// memoized for the build. A locally compiling unit's recordable
+    /// outputs are named under it, so the lookup never comes back empty:
+    /// a probe that fails is an error the request reports, not a skipped
+    /// mark (stow#618).
+    fn rustc_host_target(
+        self: &Arc<Self>,
+        executable: &std::ffi::OsStr,
+    ) -> impl Future<Output = Result<String, String>> + Send;
 
     /// What the handler needs to remember between asking for a compile and
     /// hearing that it finished.
@@ -481,12 +491,12 @@ pub struct ConnectionMark {
 }
 
 /// The output paths a locally-compiled unit's bookkeeping records in
-/// `materialized_outputs` — the paths a dependent's `--extern` names —
-/// or `None` for an invocation the parser cannot model, which records
-/// nothing either and so has nothing waiting on it.
-fn recordable_output_paths(args: &[OsString]) -> Option<Vec<String>> {
-    let parsed = ParsedRustcArgs::parse(args).ok()?;
-    let paths = crate::artifact_cache::materialized_output_paths(&parsed).ok()?;
+/// `materialized_outputs` — the paths a dependent's `--extern` names,
+/// whose platform naming follows `host`. `None` only when the paths
+/// themselves cannot be derived: nothing records them, so nothing waits
+/// on them.
+fn recordable_output_paths(parsed: &ParsedRustcArgs, host: &str) -> Option<Vec<String>> {
+    let paths = crate::artifact_cache::materialized_output_paths(parsed, host).ok()?;
     paths
         .iter()
         .map(|path| crate::artifact_cache::path_to_string(path))
@@ -717,7 +727,21 @@ async fn answer_plan<H: Handler>(
             return Answer::Failed { message: error };
         }
     };
-    let recordable_paths = recordable_output_paths(&args);
+    // The host names the unit's recordable outputs; an invocation the
+    // parser cannot model records nothing and never probes. A probe
+    // that fails fails the request — the mark a dependent blocks on is
+    // never skipped quietly (stow#618).
+    let recordable_paths = match ParsedRustcArgs::parse(&args) {
+        Ok(parsed) => match handler.rustc_host_target(&executable).await {
+            Ok(host) => recordable_output_paths(&parsed, &host),
+            Err(error) => {
+                return Answer::Failed {
+                    message: format!("could not probe the rustc host target: {error}"),
+                };
+            }
+        },
+        Err(_) => None,
+    };
     match handler.plan(executable, args).await {
         Decision::Served(notifications) => Answer::Served(notifications),
         Decision::Compile(pending) => {
@@ -769,11 +793,23 @@ async fn answer_observation<H: Handler>(
     // it — is what the unit's waiters are blocked on (stow#618).
     let _completion = match observed.success {
         None => {
-            if let Some(paths) = recordable_output_paths(&args) {
-                marks.push(ConnectionMark {
-                    ticket: None,
-                    completion: in_flight.register(paths),
-                });
+            if let Ok(parsed) = ParsedRustcArgs::parse(&args) {
+                match handler.rustc_host_target(&executable).await {
+                    Ok(host) => {
+                        if let Some(paths) = recordable_output_paths(&parsed, &host) {
+                            marks.push(ConnectionMark {
+                                ticket: None,
+                                completion: in_flight.register(paths),
+                            });
+                        }
+                    }
+                    // The frame is one-way, so the probe's failure is
+                    // reported in the build's log rather than answered;
+                    // the observation itself still reaches the handler.
+                    Err(error) => {
+                        tracing::warn!(%error, "supervisor could not probe the rustc host target, registering no in-flight mark");
+                    }
+                }
             }
             None
         }
@@ -889,6 +925,13 @@ mod tests {
         fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
         }
+
+        fn rustc_host_target(
+            self: &Arc<Self>,
+            _executable: &std::ffi::OsStr,
+        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+            std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
+        }
     }
 
     /// The whole round trip a facade makes: ask, be told to compile, run
@@ -1000,6 +1043,13 @@ mod tests {
                         let _ = ready.changed().await;
                     }
                 }
+            }
+
+            fn rustc_host_target(
+                self: &Arc<Self>,
+                _executable: &std::ffi::OsStr,
+            ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+                std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
             }
         }
 
@@ -1189,6 +1239,13 @@ mod tests {
 
         fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
+        }
+
+        fn rustc_host_target(
+            self: &Arc<Self>,
+            _executable: &std::ffi::OsStr,
+        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+            std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
         }
     }
 

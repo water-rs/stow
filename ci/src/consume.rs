@@ -17,7 +17,6 @@
 //! one crate it was dispatched for (stow#817).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -29,7 +28,6 @@ use stow_types::error::Context as _;
 use stow_types::index::ArtifactIndexRow;
 use stow_types::public_cache::canonical_crate_name;
 
-use crate::capture;
 use crate::dep_scan;
 
 /// How many candidates are fetched, verified and staged at once.
@@ -71,11 +69,7 @@ pub async fn slices_for_task(
         targets.insert(task.target.as_str().to_owned());
     }
     if nodes.iter().any(|node| node.host_side) {
-        targets.insert(
-            capture::detect_rustc_toolchain(&OsString::from("rustc"))
-                .await?
-                .host_target,
-        );
+        targets.insert(crate::task::compile_host(task).await?);
     }
     futures_util::future::try_join_all(targets.iter().map(|target| async move {
         build_consume::ensure_slice(config, target, task.rustc_version.as_str())

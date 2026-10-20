@@ -77,6 +77,9 @@ pub enum PreheatCommand {
     /// listed repository and enqueues its crates.io graph as ordinary
     /// crate tasks.
     Projects(crate::projects::ProjectsArgs),
+    /// The `Preheat cost` lane's ledger snapshots and report (stow#773)
+    /// — mock-stack only: the ledger exists on budget-probe deploys.
+    Cost(crate::preheat_cost::CostArgs),
 }
 
 #[derive(Args)]
@@ -180,6 +183,7 @@ pub async fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result
     match args.command {
         PreheatCommand::Manual(manual) => crate::manual::run(manual, output).await,
         PreheatCommand::Projects(args) => crate::projects::run(args, output).await,
+        PreheatCommand::Cost(args) => crate::preheat_cost::run(args, output).await,
         command => {
             let edge = crate::Edge::connect().await?;
             run_on_edge(&edge, command, output).await
@@ -201,8 +205,8 @@ async fn run_on_edge(
         PreheatCommand::TopBinaries(args) => top_binaries(edge, &mut crates_io, args, output).await,
         PreheatCommand::Missed(args) => missed(edge, &crates_io, args, output).await,
         PreheatCommand::Plan(args) => plan(edge, &mut crates_io, args, output).await,
-        PreheatCommand::Projects(_) | PreheatCommand::Manual(_) => {
-            unreachable!("projects and manual commands dispatch before the edge connect")
+        PreheatCommand::Projects(_) | PreheatCommand::Manual(_) | PreheatCommand::Cost(_) => {
+            unreachable!("projects, manual and cost commands dispatch before the edge connect")
         }
     }
 }
@@ -753,33 +757,33 @@ fn resolve_binaries(
 }
 
 /// One resolved binary's contribution to the plan: its task count.
-#[derive(Debug, serde::Serialize)]
-struct BinaryContribution {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BinaryContribution {
     /// The binary crate's crates.io name.
-    binary: String,
+    pub binary: String,
     /// How many enqueue requests its resolve graphs produced.
-    tasks: usize,
+    pub tasks: usize,
 }
 
 /// A binary that failed to resolve, with its reason.
-#[derive(Debug, serde::Serialize)]
-struct SkippedBinary {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SkippedBinary {
     /// The binary crate's crates.io name.
-    binary: String,
+    pub binary: String,
     /// Why resolution failed — fetch or resolver.
-    reason: String,
+    pub reason: String,
 }
 
 /// The plan `top-binaries` previews and applies: every task every
 /// binary produced, plus per-binary outcomes.
-#[derive(Debug, serde::Serialize)]
-struct BinariesPlan {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BinariesPlan {
     /// Every enqueue request across every binary and target.
-    tasks: Vec<EnqueueRequest>,
+    pub tasks: Vec<EnqueueRequest>,
     /// How many requests each binary produced.
-    per_binary: Vec<BinaryContribution>,
+    pub per_binary: Vec<BinaryContribution>,
     /// Binaries resolution failed on, with their reasons.
-    skipped: Vec<SkippedBinary>,
+    pub skipped: Vec<SkippedBinary>,
 }
 
 /// The Analytics Engine query template; `__LIMIT__`, `__SINCE_DAYS__`,

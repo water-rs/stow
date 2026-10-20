@@ -6,7 +6,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use target_lexicon::{BinaryFormat, Triple};
+use target_lexicon::{Architecture, BinaryFormat, OperatingSystem, Triple};
 
 use crate::platform::{PanicStrategy, Profile, StripLevel};
 
@@ -309,15 +309,17 @@ impl ParsedRustcArgs {
     }
 
     /// Path of the emitted dynamic library under `--out-dir`, named per the
-    /// target's binary format (`lib*.so` / `lib*.dylib` / `*.dll`).
+    /// binary format of the triple the unit compiles for (`lib*.so` /
+    /// `lib*.dylib` / `*.dll`): its `--target`, or `host` — the triple the
+    /// compiling rustc reports — for a host unit that spells none.
     ///
     /// Returns `Ok(None)` when the invocation produces no dynamic library.
     ///
     /// # Errors
     /// Returns an error when a dynamic library is produced but `--out-dir` is
-    /// absent, or when the `--target` triple is unparseable or has an
-    /// unsupported binary format.
-    pub fn output_dynamic_library_path(&self) -> Result<Option<PathBuf>, String> {
+    /// absent, or when the triple the output is named under is unparseable or
+    /// has an unsupported binary format.
+    pub fn output_dynamic_library_path(&self, host: &str) -> Result<Option<PathBuf>, String> {
         if !self.produces_dynamic_library() {
             return Ok(None);
         }
@@ -325,15 +327,7 @@ impl ParsedRustcArgs {
             .out_dir
             .as_ref()
             .ok_or_else(|| "dynamic library output requires --out-dir".to_owned())?;
-        let (prefix, extension) = match self.target.as_deref() {
-            Some(target) => dynamic_library_naming(target)?,
-            None => (
-                std::env::consts::DLL_PREFIX,
-                std::env::consts::DLL_SUFFIX
-                    .strip_prefix('.')
-                    .unwrap_or(std::env::consts::DLL_SUFFIX),
-            ),
-        };
+        let (prefix, extension) = dynamic_library_naming(self.target.as_deref().unwrap_or(host))?;
 
         Ok(Some(out_dir.join(format!(
             "{prefix}{}{}.{}",
@@ -350,52 +344,62 @@ impl ParsedRustcArgs {
     }
 
     /// Path of the emitted binary under `--out-dir`
-    /// (`<name><extra-filename><exe-suffix>`), or `None` when the invocation
-    /// is not a `bin` crate or has no `--out-dir`.
-    #[must_use]
-    pub fn output_binary_path(&self) -> Option<PathBuf> {
-        let out_dir = self.out_dir.as_ref()?;
+    /// (`<name><extra-filename><exe-suffix>`), or `Ok(None)` when the
+    /// invocation is not a `bin` crate or has no `--out-dir`.
+    ///
+    /// # Errors
+    /// Returns an error when the triple the output is named under — the
+    /// unit's `--target`, or `host` for a host unit — is unparseable.
+    pub fn output_binary_path(&self, host: &str) -> Result<Option<PathBuf>, String> {
+        let Some(out_dir) = self.out_dir.as_ref() else {
+            return Ok(None);
+        };
         if !self.is_binary() {
-            return None;
+            return Ok(None);
         }
-        Some(out_dir.join(format!(
+        Ok(Some(out_dir.join(format!(
             "{}{}{}",
             self.crate_name,
             self.extra_filename,
-            std::env::consts::EXE_SUFFIX
-        )))
+            executable_suffix(self.target.as_deref().unwrap_or(host))?
+        ))))
     }
 
     /// Path of the artifact a downstream crate would link against: the
     /// `.rlib`, then the binary, then the dynamic library.
     ///
     /// # Errors
-    /// Propagates [`Self::output_dynamic_library_path`]'s error when the
-    /// invocation produces a dynamic library without `--out-dir` or with an
-    /// unparseable target.
-    pub fn output_link_path(&self) -> Result<Option<PathBuf>, String> {
+    /// Propagates [`Self::output_binary_path`]'s and
+    /// [`Self::output_dynamic_library_path`]'s errors when the triple the
+    /// output is named under is unparseable or its format unsupported.
+    pub fn output_link_path(&self, host: &str) -> Result<Option<PathBuf>, String> {
         if let Some(path) = self.output_rlib_path() {
             return Ok(Some(path));
         }
-        if let Some(path) = self.output_binary_path() {
+        if let Some(path) = self.output_binary_path(host)? {
             return Ok(Some(path));
         }
-        self.output_dynamic_library_path()
+        self.output_dynamic_library_path(host)
     }
 
     /// The `build-script-build` alias cargo creates next to the build script
-    /// binary, or `None` when this is not a build script or `--out-dir` is
+    /// binary — named per `host`, the triple the compiling rustc reports —
+    /// or `Ok(None)` when this is not a build script or `--out-dir` is
     /// absent.
-    #[must_use]
-    pub fn build_script_alias_path(&self) -> Option<PathBuf> {
-        let out_dir = self.out_dir.as_ref()?;
+    ///
+    /// # Errors
+    /// Returns an error when `host` is unparseable.
+    pub fn build_script_alias_path(&self, host: &str) -> Result<Option<PathBuf>, String> {
+        let Some(out_dir) = self.out_dir.as_ref() else {
+            return Ok(None);
+        };
         if !self.is_build_script() {
-            return None;
+            return Ok(None);
         }
-        Some(out_dir.join(format!(
+        Ok(Some(out_dir.join(format!(
             "build-script-build{}",
-            std::env::consts::EXE_SUFFIX
-        )))
+            executable_suffix(self.target.as_deref().unwrap_or(host))?
+        ))))
     }
 
     /// The cargo profile this invocation compiles with, defaulting absent
@@ -560,6 +564,25 @@ fn dynamic_library_naming(target: &str) -> Result<(&'static str, &'static str), 
             other.into_str()
         )),
     }
+}
+
+/// The suffix rustc gives an executable `target` compiles: `.exe` on
+/// Windows, `.wasm` on a wasm triple, `.efi` on UEFI, none elsewhere.
+fn executable_suffix(target: &str) -> Result<&'static str, String> {
+    let triple: Triple = target
+        .parse()
+        .map_err(|error| format!("parse target triple `{target}`: {error}"))?;
+    if matches!(
+        triple.architecture,
+        Architecture::Wasm32 | Architecture::Wasm64
+    ) {
+        return Ok(".wasm");
+    }
+    Ok(match triple.operating_system {
+        OperatingSystem::Windows => ".exe",
+        OperatingSystem::Uefi => ".efi",
+        _ => "",
+    })
 }
 
 fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<(), String> {
@@ -821,7 +844,7 @@ fn split_rustflags_env() -> Result<Vec<String>, shell_words::ParseError> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     use super::ParsedRustcArgs;
     use crate::platform::StripLevel;
@@ -1638,11 +1661,55 @@ mod tests {
             assert!(parsed.is_cacheable());
             assert_eq!(
                 parsed
-                    .output_dynamic_library_path()
+                    .output_dynamic_library_path("x86_64-unknown-linux-gnu")
                     .expect("dylib path")
                     .expect("dynamic library output"),
                 PathBuf::from("/tmp/out/libbevy_dylib-dylib123.dylib")
             );
+        });
+    }
+
+    /// A host unit — a proc macro, a `dylib` — spells no `--target`; its
+    /// dynamic library takes the compiling rustc's host naming, which a
+    /// mock-compile run reports as the task's runner host (stow#773).
+    #[test]
+    #[serial_test::serial]
+    fn a_target_less_dylib_is_named_for_the_compiling_host() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "pest_derive",
+                "--crate-type",
+                "proc-macro",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=pm123",
+                "-C",
+                "extra-filename=-pm123",
+            ]))
+            .expect("parser should succeed");
+
+            for (host, expected) in [
+                (
+                    "x86_64-unknown-linux-gnu",
+                    "/tmp/out/libpest_derive-pm123.so",
+                ),
+                ("x86_64-pc-windows-msvc", "/tmp/out/pest_derive-pm123.dll"),
+                (
+                    "aarch64-apple-darwin",
+                    "/tmp/out/libpest_derive-pm123.dylib",
+                ),
+            ] {
+                assert_eq!(
+                    parsed
+                        .output_dynamic_library_path(host)
+                        .expect("dylib path")
+                        .expect("dynamic library output"),
+                    PathBuf::from(expected),
+                    "{host}"
+                );
+            }
         });
     }
 
@@ -1701,12 +1768,14 @@ mod tests {
             assert!(!parsed.produces_dynamic_library());
             assert_eq!(
                 parsed
-                    .output_dynamic_library_path()
+                    .output_dynamic_library_path("aarch64-apple-darwin")
                     .expect("dynamic library path"),
                 None
             );
             assert_eq!(
-                parsed.output_link_path().expect("link path"),
+                parsed
+                    .output_link_path("aarch64-apple-darwin")
+                    .expect("link path"),
                 Some(PathBuf::from("/tmp/out/libunicode_ident-lib123.rlib"))
             );
         });
@@ -1732,19 +1801,63 @@ mod tests {
 
             assert!(parsed.is_build_script());
             assert_eq!(
-                parsed.output_binary_path().expect("build script output"),
-                Path::new("/tmp/out").join(format!(
-                    "build_script_build-fbf81822541b190b{}",
-                    std::env::consts::EXE_SUFFIX
+                parsed
+                    .output_binary_path("aarch64-apple-darwin")
+                    .expect("build script output"),
+                Some(PathBuf::from(
+                    "/tmp/out/build_script_build-fbf81822541b190b"
                 ))
             );
             assert_eq!(
                 parsed
-                    .build_script_alias_path()
+                    .build_script_alias_path("aarch64-apple-darwin")
                     .expect("build script alias"),
-                Path::new("/tmp/out").join(format!(
-                    "build-script-build{}",
-                    std::env::consts::EXE_SUFFIX
+                Some(PathBuf::from("/tmp/out/build-script-build"))
+            );
+        });
+    }
+
+    /// A build script binary is named for the host the compiling rustc
+    /// reports — `.exe` on a Windows runner — not for the machine stow
+    /// happens to run on (stow#773).
+    #[test]
+    #[serial_test::serial]
+    fn a_build_script_is_named_for_the_compiling_host() {
+        with_clean_rustc_env(|| {
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "build_script_build",
+                "--crate-type",
+                "bin",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=e8a2e5854cc9f44b",
+                "-C",
+                "extra-filename=-fbf81822541b190b",
+            ]))
+            .expect("parser should succeed");
+
+            assert_eq!(
+                parsed
+                    .output_binary_path("x86_64-pc-windows-msvc")
+                    .expect("build script output"),
+                Some(PathBuf::from(
+                    "/tmp/out/build_script_build-fbf81822541b190b.exe"
+                ))
+            );
+            assert_eq!(
+                parsed
+                    .build_script_alias_path("x86_64-pc-windows-msvc")
+                    .expect("build script alias"),
+                Some(PathBuf::from("/tmp/out/build-script-build.exe"))
+            );
+            assert_eq!(
+                parsed
+                    .output_binary_path("x86_64-unknown-linux-gnu")
+                    .expect("build script output"),
+                Some(PathBuf::from(
+                    "/tmp/out/build_script_build-fbf81822541b190b"
                 ))
             );
         });

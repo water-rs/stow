@@ -291,7 +291,7 @@ enum Dispatch {
 
 /// One run's state as the driver reads it — task-id keyed, so the
 /// GitHub `workflow_runs` rows (`display_title`) and the local server's
-/// `MockTaskRun` list fold onto the same record. Both title shapes parse
+/// `LocalCiRun` list fold onto the same record. Both title shapes parse
 /// through `parse_run_title`: a run whose title is not `<rustc>-<task_id>`
 /// is not one this wave could have dispatched.
 #[derive(Debug, Clone)]
@@ -2454,7 +2454,8 @@ async fn local_run_states(
     let url = format!("{base}/tasks");
     // The shared bounded idempotent read — the local server is
     // unauthenticated, so no operator token rides it.
-    let tasks: LocalTasksResponse = crate::github::get_url_json(&url, None, Backoff::new()).await?;
+    let tasks: stow_types::local_ci::LocalCiTasks =
+        crate::github::get_url_json(&url, None, Backoff::new()).await?;
     Ok(tasks
         .tasks
         .into_iter()
@@ -2510,24 +2511,9 @@ struct GitRefObject {
     sha: String,
 }
 
-/// The local CI server's `GET /tasks` shape.
-#[derive(serde::Deserialize)]
-struct LocalTasksResponse {
-    tasks: Vec<LocalTaskRun>,
-}
-
 #[derive(serde::Deserialize)]
 struct WorkflowDispatchResponse {
     workflow_run_id: u64,
-}
-
-#[derive(serde::Deserialize)]
-struct LocalTaskRun {
-    workflow_run_id: u64,
-    display_title: String,
-    status: String,
-    conclusion: Option<String>,
-    html_url: String,
 }
 
 #[cfg(test)]
@@ -3730,7 +3716,7 @@ mod tests {
             crate::test_server::Step::Respond {
                 status: 200,
                 retry_after: None,
-                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7"}]}"#,
+                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7","path":".github/workflows/build-crate.yml","dispatched_at_ms":0,"completed_at_ms":0,"error":null,"delivery_errors":[]}]}"#,
             },
         ])
         .await;
@@ -4173,9 +4159,17 @@ mod tests {
                                         serde_json::json!({
                                             "workflow_run_id": run_id,
                                             "display_title": format!("{}-{task_id}", state.rustc),
+                                            "path": format!(
+                                                ".github/workflows/{}",
+                                                stow_types::trusted_builder::WORKFLOW_FILE
+                                            ),
                                             "status": "completed",
                                             "conclusion": "success",
                                             "html_url": format!("http://localhost/run/{run_id}"),
+                                            "dispatched_at_ms": 0,
+                                            "completed_at_ms": 0,
+                                            "error": null,
+                                            "delivery_errors": [],
                                         })
                                     })
                                     .collect()

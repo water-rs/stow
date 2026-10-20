@@ -520,6 +520,7 @@ async fn finish_rustc_compile(
     post: &PostCompile,
     success: bool,
     local_base: Option<&WrapperEnvBase>,
+    env_cache: &WrapperEnvCache,
     ctx: &BuildContext,
 ) -> stow_types::error::Result<Option<artifact_cache::LocalBuildArtifact>> {
     let Some(parsed) = post.parsed.as_ref() else {
@@ -537,6 +538,7 @@ async fn finish_rustc_compile(
                         inject::materialize_local_build_stable_aliases(
                             parsed,
                             &build.identity,
+                            &base.host_target,
                             inject::OutputDirWriters::StowOnly,
                         )
                         .await,
@@ -547,15 +549,21 @@ async fn finish_rustc_compile(
                             &base.config,
                             parsed,
                             &build.identity,
+                            &base.host_target,
                         )
                         .await,
                     );
                     if parsed.is_locally_cacheable() {
                         log_nonfatal_result(
                             "failed to store locally built artifact in the stow cache",
-                            artifact_cache::store_local_build_outputs(&base.config, parsed, &build)
-                                .await
-                                .map(|_| ()),
+                            artifact_cache::store_local_build_outputs(
+                                &base.config,
+                                parsed,
+                                &build,
+                                &base.host_target,
+                            )
+                            .await
+                            .map(|_| ()),
                         );
                     }
                     artifact = Some(build);
@@ -582,7 +590,17 @@ async fn finish_rustc_compile(
                 }
             }
         }
-        check_build_script_output(parsed)?;
+        if parsed.is_build_script() && parsed.out_dir.is_some() {
+            // The binary and its alias are named for the host the
+            // compiling rustc reports — the build's memoized probe of
+            // that executable, one source whether an env base loaded or
+            // not.
+            let host = env_cache
+                .rustc_host_target(&post.executable)
+                .await
+                .map_err(stow_types::error::Error::msg)?;
+            check_build_script_output(parsed, &host)?;
+        }
     }
     Ok(artifact)
 }
@@ -595,11 +613,19 @@ async fn finish_rustc_compile(
 /// (stow#347).
 fn check_build_script_output(
     parsed: &rustc_args::ParsedRustcArgs,
+    host: &str,
 ) -> stow_types::error::Result<()> {
-    let Some(source_path) = parsed.output_binary_path() else {
+    let Some(source_path) = parsed
+        .output_binary_path(host)
+        .map_err(stow_types::error::Error::msg)?
+    else {
         return Ok(());
     };
-    if parsed.build_script_alias_path().is_none() {
+    if parsed
+        .build_script_alias_path(host)
+        .map_err(stow_types::error::Error::msg)?
+        .is_none()
+    {
         return Ok(());
     }
     if !source_path.exists() {
@@ -1055,7 +1081,8 @@ impl BuildSupervisor {
         success: bool,
         local_base: Option<&WrapperEnvBase>,
     ) {
-        if let Ok(Some(build)) = finish_rustc_compile(post, success, local_base, &self.ctx).await
+        if let Ok(Some(build)) =
+            finish_rustc_compile(post, success, local_base, &self.env_cache, &self.ctx).await
             && let Some(parsed) = post.parsed.as_ref()
             && let Some(unit) = miss_journal::observed_unit(parsed, &build)
         {
@@ -1099,6 +1126,13 @@ impl supervisor::server::Handler for BuildSupervisor {
 
     async fn await_serve_map(self: &std::sync::Arc<Self>) {
         self.ctx.serve_map_ready.wait().await;
+    }
+
+    async fn rustc_host_target(
+        self: &std::sync::Arc<Self>,
+        executable: &std::ffi::OsStr,
+    ) -> Result<String, String> {
+        self.env_cache.rustc_host_target(executable).await
     }
 
     async fn observed(self: &std::sync::Arc<Self>, observation: supervisor::server::Observation) {
@@ -1269,8 +1303,14 @@ async fn run_rustc_standalone(
             let status =
                 run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
             let local_base = env_cache.local_base(&command.executable).await;
-            if let Ok(Some(build)) =
-                finish_rustc_compile(&post, status.success(), local_base.as_deref(), &ctx).await
+            if let Ok(Some(build)) = finish_rustc_compile(
+                &post,
+                status.success(),
+                local_base.as_deref(),
+                &env_cache,
+                &ctx,
+            )
+            .await
                 && let (Some(parsed), Some(base)) = (post.parsed.as_ref(), local_base.as_deref())
             {
                 miss_journal::record_observation(
@@ -1585,6 +1625,11 @@ pub(crate) struct WrapperEnvCache {
     /// The local path's bases (`StowConfig::load_local`), shared by
     /// `decide_local_only` and the post-compile finish.
     local_bases: MemoizedBaseMap,
+    /// Each spelling's `rustc -vV` host triple — config-independent, so
+    /// the in-flight marks a dependent's bookkeeping waits on never
+    /// depend on an env base that can legitimately be absent (stow#618);
+    /// the env bases' own `host_target` reads the same cells.
+    host_targets: MemoizedHostMap,
     /// The `PATH` bare spellings resolve through, captured at
     /// construction so the cache reads the environment the build
     /// invoked the wrapper with.
@@ -1612,6 +1657,16 @@ type MemoizedBaseMap = std::sync::Mutex<
     std::collections::HashMap<
         OsString,
         std::sync::Arc<tokio::sync::OnceCell<Option<std::sync::Arc<WrapperEnvBase>>>>,
+    >,
+>;
+
+/// One memoized `rustc -vV` host answer per executable spelling: the
+/// probe runs at most once per spelling per build, and its answer —
+/// the triple or the failure — is what every consumer shares.
+type MemoizedHostMap = std::sync::Mutex<
+    std::collections::HashMap<
+        OsString,
+        std::sync::Arc<tokio::sync::OnceCell<Result<String, String>>>,
     >,
 >;
 
@@ -1726,6 +1781,7 @@ impl WrapperEnvCache {
             seeded: std::sync::Mutex::new(None),
             env_bases: MemoizedBaseMap::default(),
             local_bases: MemoizedBaseMap::default(),
+            host_targets: MemoizedHostMap::default(),
             path: std::env::var_os("PATH").unwrap_or_default(),
             slices: MemoizedSliceMap::default(),
             circuit_tripped: tokio::sync::OnceCell::new(),
@@ -1772,7 +1828,7 @@ impl WrapperEnvCache {
                     return None;
                 }
             };
-            load_wrapper_env_base(rustc, config)
+            load_wrapper_env_base(rustc, config, self.rustc_host_target(rustc))
                 .await
                 .map(std::sync::Arc::new)
         })
@@ -1787,6 +1843,33 @@ impl WrapperEnvCache {
     pub(crate) async fn local_base(&self, rustc: &OsStr) -> Option<std::sync::Arc<WrapperEnvBase>> {
         self.base(&self.local_bases, rustc, StowConfig::load_local)
             .await
+    }
+
+    /// The host triple `rustc` compiles target-less units for — one
+    /// `rustc -vV` probe per executable spelling per build, independent
+    /// of the config the env bases load: the marks dependents block on
+    /// must not vanish because a base that can legitimately be absent
+    /// did not load (stow#618). A spelling that resolves to the seeded
+    /// base's file adopts its host answer rather than probing again.
+    pub(crate) async fn rustc_host_target(&self, rustc: &OsStr) -> Result<String, String> {
+        let cell = self
+            .host_targets
+            .lock()
+            .expect("host target map mutex")
+            .entry(rustc.to_os_string())
+            .or_default()
+            .clone();
+        cell.get_or_init(|| async {
+            let seed = self.seeded.lock().expect("seeded env base mutex").clone();
+            if let Some(seed) = seed
+                && resolves_to_same_file(rustc, &seed.rustc, &self.path).await
+            {
+                return Ok(seed.host_target.clone());
+            }
+            rustc_args::rustc_host_target(rustc).await
+        })
+        .await
+        .clone()
     }
 
     /// The decoded index slice for `(target, rustc)` — read, decompressed
@@ -1899,18 +1982,22 @@ impl WrapperEnvCache {
 
 /// Load the config, probe the rustc and take the version lease — once
 /// for the whole build. Every step can legitimately be unavailable, so
-/// `None` means "run the real rustc".
-async fn load_wrapper_env_base(rustc: &OsStr, config: StowConfig) -> Option<WrapperEnvBase> {
+/// `None` means "run the real rustc". `host_target` is the build's
+/// memoized per-spelling lookup — the source the supervisor's mark
+/// bookkeeping answers from too, not a second probe.
+async fn load_wrapper_env_base(
+    rustc: &OsStr,
+    config: StowConfig,
+    host_target: impl std::future::Future<Output = Result<String, String>>,
+) -> Option<WrapperEnvBase> {
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing rust cache");
         return None;
     }
     // The host triple and the version probe are independent answers from
     // the same rustc — await them together (stow#608).
-    let (host_target, rustc_version) = tokio::join!(
-        rustc_args::rustc_host_target(rustc),
-        rustc_args::detect_rustc_version(rustc),
-    );
+    let (host_target, rustc_version) =
+        tokio::join!(host_target, rustc_args::detect_rustc_version(rustc));
     let host_target = match host_target {
         Ok(target) => target,
         Err(error) => {
@@ -3038,7 +3125,13 @@ async fn materialize_local_cached_bundle(
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
+    match inject::write_artifacts(
+        parsed,
+        &cached_bundle,
+        request.target,
+        inject::OutputDirWriters::StowOnly,
+    )
+    .await
     {
         Ok(()) => finish_local_serve(config, parsed, request, cached_bundle, tally).await,
         Err(error) => {
@@ -3074,7 +3167,9 @@ async fn finish_local_serve(
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
+    if let Err(error) =
+        record_materialized_bundle_outputs(config, parsed, &cached_bundle, request.target).await
+    {
         tracing::debug!(
             error = %error,
             crate_name = %parsed.crate_name,
@@ -3085,7 +3180,7 @@ async fn finish_local_serve(
         tally.failed = true;
         return None;
     }
-    let notifications = match cached_rustc_artifact_notifications(parsed) {
+    let notifications = match cached_rustc_artifact_notifications(parsed, request.target) {
         Ok(notifications) => notifications,
         Err(error) => {
             tracing::debug!(
@@ -3521,8 +3616,13 @@ async fn materialize_semantic_cached_bundle(
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    if let Err(error) =
-        inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
+    if let Err(error) = inject::write_artifacts(
+        parsed,
+        &cached_bundle,
+        &semantic_request.target,
+        inject::OutputDirWriters::StowOnly,
+    )
+    .await
     {
         tracing::debug!(
             error = %error,
@@ -3537,7 +3637,10 @@ async fn materialize_semantic_cached_bundle(
         tally.failed = true;
         return None;
     }
-    if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
+    if let Err(error) =
+        record_materialized_bundle_outputs(config, parsed, &cached_bundle, &semantic_request.target)
+            .await
+    {
         tracing::debug!(
             error = %error,
             crate_name = %parsed.crate_name,
@@ -3551,13 +3654,14 @@ async fn materialize_semantic_cached_bundle(
         tally.failed = true;
         return None;
     }
-    let notifications = match cached_rustc_artifact_notifications(parsed) {
+    let notifications = match cached_rustc_artifact_notifications(parsed, &semantic_request.target)
+    {
         Ok(notifications) => notifications,
         Err(error) => {
             tracing::debug!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                semantic_crate_name = %semantic_request.crate_name,
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    semantic_crate_name = %semantic_request.crate_name,
                 semantic_version = %semantic_request.version,
                 target = %semantic_request.target,
                 rustc_version = %semantic_request.rustc_version,
@@ -3686,7 +3790,13 @@ async fn materialize_downloaded_bundle(
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let config = &env.env_base.config;
-    match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
+    match inject::write_artifacts(
+        parsed,
+        &cached_bundle,
+        request.target,
+        inject::OutputDirWriters::StowOnly,
+    )
+    .await
     {
         Ok(()) => finish_downloaded_serve(env, parsed, request, cached_bundle, tally).await,
         Err(error) => {
@@ -3725,7 +3835,9 @@ async fn finish_downloaded_serve(
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let config = &env.env_base.config;
-    if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
+    if let Err(error) =
+        record_materialized_bundle_outputs(config, parsed, &cached_bundle, request.target).await
+    {
         tracing::debug!(
             error = %error,
             crate_name = %parsed.crate_name,
@@ -3745,7 +3857,7 @@ async fn finish_downloaded_serve(
         tally.failed = true;
         return None;
     }
-    let notifications = match cached_rustc_artifact_notifications(parsed) {
+    let notifications = match cached_rustc_artifact_notifications(parsed, request.target) {
         Ok(notifications) => notifications,
         Err(error) => {
             tracing::debug!(
@@ -4378,6 +4490,7 @@ struct RustcArtifactNotification {
 /// not ask for `artifacts`.
 fn cached_rustc_artifact_notifications(
     parsed: &rustc_args::ParsedRustcArgs,
+    host: &str,
 ) -> stow_types::error::Result<ArtifactNotifications> {
     if !parsed.requests_json_artifact_notifications() {
         return Ok(ArtifactNotifications::default());
@@ -4407,7 +4520,7 @@ fn cached_rustc_artifact_notifications(
     }
     if parsed.emit.contains("link") {
         let artifact = parsed
-            .output_link_path()
+            .output_link_path(host)
             .map_err(stow_types::error::Error::msg)?
             .ok_or_else(|| {
                 stow_types::stow_error!(
@@ -4830,8 +4943,8 @@ mod tests {
         ]))
         .expect("parse rustc args");
 
-        let notifications =
-            cached_rustc_artifact_notifications(&parsed).expect("build artifact notifications");
+        let notifications = cached_rustc_artifact_notifications(&parsed, "aarch64-apple-darwin")
+            .expect("build artifact notifications");
 
         // Byte-identical to the lines rustc itself prints: field order
         // and the `$message_type` tag included (stow#633).
@@ -4868,8 +4981,8 @@ mod tests {
         ]))
         .expect("parse rustc args");
 
-        let notifications =
-            cached_rustc_artifact_notifications(&parsed).expect("build artifact notifications");
+        let notifications = cached_rustc_artifact_notifications(&parsed, "aarch64-apple-darwin")
+            .expect("build artifact notifications");
 
         assert_eq!(
             notifications,
@@ -4901,8 +5014,8 @@ mod tests {
         ]))
         .expect("parse rustc args");
 
-        let notifications =
-            cached_rustc_artifact_notifications(&parsed).expect("build artifact notifications");
+        let notifications = cached_rustc_artifact_notifications(&parsed, "aarch64-apple-darwin")
+            .expect("build artifact notifications");
 
         assert_eq!(
             notifications,
@@ -5123,6 +5236,7 @@ mod tests {
             seeded: std::sync::Mutex::new(None),
             env_bases: super::MemoizedBaseMap::default(),
             local_bases: super::MemoizedBaseMap::default(),
+            host_targets: super::MemoizedHostMap::default(),
             path: path.to_os_string(),
             slices: super::MemoizedSliceMap::default(),
             circuit_tripped: tokio::sync::OnceCell::new(),
@@ -5149,7 +5263,13 @@ mod tests {
         else {
             panic!("the seeded env base must exist on a machine with rustc");
         };
-        let Some(lazy) = super::load_wrapper_env_base(rustc.as_os_str(), config).await else {
+        let Some(lazy) = super::load_wrapper_env_base(
+            rustc.as_os_str(),
+            config,
+            crate::rustc_args::rustc_host_target(rustc.as_os_str()),
+        )
+        .await
+        else {
             panic!("the lazy env base must build on the same rustc");
         };
         assert_eq!(seeded.rustc, lazy.rustc);

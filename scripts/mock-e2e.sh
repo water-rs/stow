@@ -416,13 +416,13 @@ done
 
 cd "$REPO_ROOT"
 echo "[mock-e2e] building stow-cli, stow-build, stow-mock-registry, stow-admin"
-cargo build -p stow-cli --features mock-verify -p stow-build -p stow-mock-registry -p stow-admin \
+cargo build --release -p stow-cli --features mock-verify -p stow-build -p stow-mock-registry -p stow-admin \
     >"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build failed — see $LOG_DIR/cargo-build.log"
-cargo build -p stow-mock-registry --example demand_feed_fixture \
+cargo build --release -p stow-mock-registry --example demand_feed_fixture \
     >>"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build (demand_feed_fixture example) failed — see $LOG_DIR/cargo-build.log"
-BIN="$REPO_ROOT/target/debug"
+BIN="$REPO_ROOT/target/release"
 
 # stow#523: typed demand-feed fixtures — the example writes the
 # enqueue/queue document, per-hour provider documents, typed

@@ -43,6 +43,7 @@ impl OutputDirWriters {
 pub async fn write_artifacts(
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
+    host: &str,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let out_dir = parsed
@@ -55,12 +56,12 @@ pub async fn write_artifacts(
 
     let mut materialized_outputs = BTreeSet::new();
     for file in &bundle.outputs {
-        let output_path = expected_output_path(parsed, out_dir, file)?;
+        let output_path = expected_output_path(parsed, out_dir, file, host)?;
         if materialized_outputs.insert(output_path.clone()) {
             write_artifact_file(&output_path, file, bundle, writers).await?;
         }
     }
-    materialize_cached_bundle_stable_aliases(parsed, bundle, writers).await?;
+    materialize_cached_bundle_stable_aliases(parsed, bundle, host, writers).await?;
     write_dep_info(parsed).await?;
     Ok(())
 }
@@ -118,6 +119,7 @@ pub async fn materialize_original_outputs(
 pub async fn materialize_local_build_stable_aliases(
     parsed: &ParsedRustcArgs,
     identity: &StableRegistryArtifactIdentity,
+    host: &str,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let stable_parsed = parsed_with_stable_identity(parsed, identity);
@@ -136,10 +138,10 @@ pub async fn materialize_local_build_stable_aliases(
     .await?;
     materialize_optional_local_alias(
         parsed
-            .output_dynamic_library_path()
+            .output_dynamic_library_path(host)
             .map_err(stow_types::error::Error::msg)?,
         stable_parsed
-            .output_dynamic_library_path()
+            .output_dynamic_library_path(host)
             .map_err(stow_types::error::Error::msg)?,
         writers,
     )
@@ -150,6 +152,7 @@ pub async fn materialize_local_build_stable_aliases(
 async fn materialize_cached_bundle_stable_aliases(
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
+    host: &str,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
@@ -176,10 +179,10 @@ async fn materialize_cached_bundle_stable_aliases(
     .await?;
     materialize_optional_local_alias(
         parsed
-            .output_dynamic_library_path()
+            .output_dynamic_library_path(host)
             .map_err(stow_types::error::Error::msg)?,
         stable_parsed
-            .output_dynamic_library_path()
+            .output_dynamic_library_path(host)
             .map_err(stow_types::error::Error::msg)?,
         writers,
     )
@@ -218,6 +221,7 @@ pub fn expected_output_path(
     parsed: &ParsedRustcArgs,
     out_dir: &std::path::Path,
     file: &ArtifactBundleFile,
+    host: &str,
 ) -> stow_types::error::Result<std::path::PathBuf> {
     let expected = if file.media_type == stow_types::bundle::STOW_RLIB_MEDIA_TYPE {
         parsed.output_rlib_path()
@@ -227,7 +231,7 @@ pub fn expected_output_path(
         || file.media_type == stow_types::bundle::STOW_PROC_MACRO_MEDIA_TYPE
     {
         parsed
-            .output_dynamic_library_path()
+            .output_dynamic_library_path(host)
             .map_err(stow_types::error::Error::msg)?
     } else {
         return Err(stow_types::stow_error!(
@@ -765,9 +769,14 @@ mod tests {
                 .expect("write cached test artifact");
             let bundle = semantic_test_bundle(cache_dir, tempdir.path(), bundle_file);
 
-            write_artifacts(&parsed, &bundle, OutputDirWriters::StowOnly)
-                .await
-                .expect("semantic bundle should be copied to expected output name");
+            write_artifacts(
+                &parsed,
+                &bundle,
+                "aarch64-apple-darwin",
+                OutputDirWriters::StowOnly,
+            )
+            .await
+            .expect("semantic bundle should be copied to expected output name");
             assert!(out_dir.join(expected_file).exists());
             assert!(out_dir.join("libitoa-0123456789abcdef.rmeta").exists());
             assert!(out_dir.join("itoa-expected.d").exists());

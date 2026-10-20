@@ -99,6 +99,11 @@ pub struct SubmitArgs {
     /// their ordinary git tree.
     #[arg(long)]
     pub source_trees: Option<PathBuf>,
+    /// Resolve only the first N listed repositories — a reduced-scale
+    /// wave over the same reviewed list (the `Preheat cost` lane's
+    /// local runs). Absent submits every listed repository.
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 /// The schema of `preheat/projects.toml`: a reviewed list of
@@ -197,44 +202,44 @@ struct GenerateReport {
 }
 
 /// A listed repository `submit` could not resolve, with its reason.
-#[derive(Debug, serde::Serialize)]
-struct SkippedRepo {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SkippedRepo {
     /// The repository URL as the file carried it.
-    repo: String,
+    pub repo: String,
     /// Why resolution failed — fetch, manifest, or resolver.
-    reason: String,
+    pub reason: String,
 }
 
 /// One repository's contribution to the plan: its task count.
-#[derive(Debug, serde::Serialize)]
-struct RepoContribution {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct RepoContribution {
     /// The repository URL as the file carried it.
-    repo: String,
+    pub repo: String,
     /// How many enqueue requests its resolve graphs produced.
-    tasks: usize,
+    pub tasks: usize,
 }
 
 /// The plan `submit` previews and applies: every task every repository
 /// produced, plus per-repository outcomes.
-#[derive(Debug, serde::Serialize)]
-struct ProjectsPlan {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProjectsPlan {
     /// The repository list the plan was built from.
-    file: String,
+    pub file: String,
     /// Every enqueue request across every repository and target —
     /// deduplication is the scheduler's `task_id`, not a pass here.
-    tasks: Vec<EnqueueRequest>,
+    pub tasks: Vec<EnqueueRequest>,
     /// How many requests each listed repository produced.
-    per_repo: Vec<RepoContribution>,
+    pub per_repo: Vec<RepoContribution>,
     /// Repositories resolution failed on, with their reasons.
-    skipped: Vec<SkippedRepo>,
+    pub skipped: Vec<SkippedRepo>,
     /// Repositories that resolved but whose submit POST failed — a
     /// different fault than a resolve skip, reported separately.
     /// Always empty in a dry run, which submits nothing.
-    submit_failed: Vec<SkippedRepo>,
+    pub submit_failed: Vec<SkippedRepo>,
 }
 
 /// The aggregated answer of the chunked submits `apply` ran.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SubmitOutcome {
     /// How many batches were posted to the scheduler.
     pub batches: usize,
@@ -411,7 +416,10 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
                 .map_err(|error| stow_error!("--targets `{raw}`: {error}"))
         })
         .collect::<stow_types::error::Result<_>>()?;
-    let repos = tokio::runtime::Handle::current().block_on(load_projects_file(&args.file))?;
+    let mut repos = tokio::runtime::Handle::current().block_on(load_projects_file(&args.file))?;
+    if let Some(limit) = args.limit {
+        repos.truncate(limit);
+    }
     // Declared source trees load once, before the pool: every row must
     // name a repository this input actually lists.
     let trees =

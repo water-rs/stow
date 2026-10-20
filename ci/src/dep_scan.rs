@@ -88,9 +88,7 @@ pub async fn scan_artifacts(
     // (proc-macro and build-script subtrees) whatever the consumer's
     // spelling is, so a targetless capture's honest target is this —
     // never the task's.
-    let host_target = crate::capture::detect_rustc_toolchain(&std::ffi::OsString::from("rustc"))
-        .await?
-        .host_target;
+    let host_target = crate::task::compile_host(task).await?;
     let package_index = package_index(&metadata, task);
     // The records the host collector received over IPC — the only capture
     // source the scan trusts. Nothing the sandbox wrote to disk qualifies.

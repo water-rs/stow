@@ -109,7 +109,7 @@ pub fn emit_line(line: &str) {
 /// The plan/apply envelope every mutating command reports: the plan the
 /// operator reviewed, `dry_run: true` while `--yes` was absent, and the
 /// applied result once `--yes` let it run.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Planned<P, R> {
     /// Nothing was applied — the run only rendered the plan.
     pub dry_run: bool,

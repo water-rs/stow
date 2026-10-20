@@ -778,9 +778,10 @@ pub async fn store_local_build_outputs(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
     build: &LocalBuildArtifact,
+    host: &str,
 ) -> stow_types::error::Result<bool> {
     let stable_parsed = parsed_with_stable_identity(parsed, &build.identity);
-    let outputs = local_build_output_specs(parsed, &stable_parsed)?;
+    let outputs = local_build_output_specs(parsed, &stable_parsed, host)?;
     if outputs.is_empty() {
         return Ok(false);
     }
@@ -927,6 +928,7 @@ pub async fn record_materialized_bundle_outputs(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
     bundle: &CachedArtifactBundle,
+    host: &str,
 ) -> stow_types::error::Result<()> {
     let out_dir = parsed.out_dir.as_ref().ok_or_else(|| {
         stow_types::stow_error!("materialized bundle outputs require rustc --out-dir")
@@ -945,7 +947,7 @@ pub async fn record_materialized_bundle_outputs(
     let stable_parsed = parsed_with_stable_identity(parsed, &stable_identity);
 
     for file in &bundle.outputs {
-        let output_path = crate::inject::expected_output_path(parsed, out_dir, file)?;
+        let output_path = crate::inject::expected_output_path(parsed, out_dir, file, host)?;
         record_materialized_output(
             &connection,
             &output_path,
@@ -964,7 +966,7 @@ pub async fn record_materialized_bundle_outputs(
             .await?;
         }
         let stable_output_path =
-            crate::inject::expected_output_path(&stable_parsed, out_dir, file)?;
+            crate::inject::expected_output_path(&stable_parsed, out_dir, file, host)?;
         if stable_output_path != output_path && stable_output_path != original_path {
             record_materialized_output(
                 &connection,
@@ -987,6 +989,7 @@ pub async fn record_materialized_bundle_outputs(
 /// shape at all.
 pub fn materialized_output_paths(
     parsed: &ParsedRustcArgs,
+    host: &str,
 ) -> stow_types::error::Result<Vec<PathBuf>> {
     if parsed.c_metadata.is_none() || !parsed.is_restorable_artifact() {
         return Ok(Vec::new());
@@ -999,7 +1002,7 @@ pub fn materialized_output_paths(
         paths.push(path);
     }
     if let Some(path) = parsed
-        .output_dynamic_library_path()
+        .output_dynamic_library_path(host)
         .map_err(stow_types::error::Error::msg)?
     {
         paths.push(path);
@@ -1011,6 +1014,7 @@ pub async fn record_materialized_local_build_outputs(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
     identity: &StableRegistryArtifactIdentity,
+    host: &str,
 ) -> stow_types::error::Result<()> {
     let connection = config.state_db_pool().await?;
     let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
@@ -1021,8 +1025,8 @@ pub async fn record_materialized_local_build_outputs(
     // name, so it names the same outputs: a shape present under one name
     // and absent under the other is a broken rewrite, not a unit with
     // fewer rows.
-    let cargo_named = materialized_output_paths(parsed)?;
-    let stable_named = materialized_output_paths(&stable_parsed)?;
+    let cargo_named = materialized_output_paths(parsed, host)?;
+    let stable_named = materialized_output_paths(&stable_parsed, host)?;
     if cargo_named.len() != stable_named.len() {
         return Err(stow_types::stow_error!(
             "stable parsed rustc args name {} outputs for crate {}, the invocation names {}",
@@ -1439,6 +1443,7 @@ struct LocalEntryWrite {
 fn local_build_output_specs(
     parsed: &ParsedRustcArgs,
     stable_parsed: &ParsedRustcArgs,
+    host: &str,
 ) -> stow_types::error::Result<Vec<LocalBuildOutput>> {
     let mut outputs = Vec::new();
     if parsed.emit.contains("link") && parsed.produces_rlib() {
@@ -1477,7 +1482,7 @@ fn local_build_output_specs(
     }
     if parsed.emit.contains("link") && parsed.produces_dynamic_library() {
         let source = parsed
-            .output_dynamic_library_path()
+            .output_dynamic_library_path(host)
             .map_err(stow_types::error::Error::msg)?
             .ok_or_else(|| {
                 stow_types::stow_error!(
@@ -1487,7 +1492,7 @@ fn local_build_output_specs(
             })?;
         let file_name = output_file_name(
             &stable_parsed
-                .output_dynamic_library_path()
+                .output_dynamic_library_path(host)
                 .map_err(stow_types::error::Error::msg)?
                 .ok_or_else(|| {
                     stow_types::stow_error!(
@@ -3108,7 +3113,7 @@ pub mod tests {
                 .await
                 .expect("prepare cache");
             assert!(
-                super::store_local_build_outputs(&config, &parsed, &build)
+                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
                     .await
                     .expect("store local build")
             );
@@ -3599,6 +3604,7 @@ pub mod tests {
                     crate_name: "colorchoice".to_owned(),
                     version: "1.0.0".to_owned(),
                 },
+                "aarch64-apple-darwin",
             )
             .await
             .expect("record local build outputs");
@@ -3645,9 +3651,14 @@ pub mod tests {
         let bundle = remote_cached_bundle(&artifact_bundle, tempdir.path());
 
         run_async(async {
-            super::record_materialized_bundle_outputs(&config, &dependency, &bundle)
-                .await
-                .expect("record bundle outputs");
+            super::record_materialized_bundle_outputs(
+                &config,
+                &dependency,
+                &bundle,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record bundle outputs");
 
             let consumer = consumer_parsed_args(
                 tempdir.path(),
@@ -3693,9 +3704,10 @@ pub mod tests {
             prepare_local_cache(&config, "1.91.1")
                 .await
                 .expect("prepare cache");
-            let stored = super::store_local_build_outputs(&config, &parsed, &build)
-                .await
-                .expect("store local build");
+            let stored =
+                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
+                    .await
+                    .expect("store local build");
             assert!(stored);
 
             let entry_dir = config
@@ -3768,9 +3780,10 @@ pub mod tests {
             prepare_local_cache(&config, "1.91.1")
                 .await
                 .expect("prepare cache");
-            let stored = super::store_local_build_outputs(&config, &parsed, &build)
-                .await
-                .expect("store must not error on a dirty build");
+            let stored =
+                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
+                    .await
+                    .expect("store must not error on a dirty build");
             assert!(!stored);
 
             let version_dir = config.artifact_cache_version_dir("1.91.1");
@@ -3808,14 +3821,14 @@ pub mod tests {
                 .await
                 .expect("prepare cache");
             assert!(
-                super::store_local_build_outputs(&config, &parsed, &build)
+                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
                     .await
                     .expect("first store")
             );
             // A second worktree building the same identity must not
             // double-store or error.
             assert!(
-                !super::store_local_build_outputs(&config, &parsed, &build)
+                !super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
                     .await
                     .expect("second store")
             );
@@ -3845,7 +3858,7 @@ pub mod tests {
                 .await
                 .expect("prepare cache");
             assert!(
-                super::store_local_build_outputs(&config, &parsed, &build)
+                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
                     .await
                     .expect("store local build")
             );
@@ -3901,9 +3914,14 @@ pub mod tests {
                 .await
                 .expect("prepare cache");
             assert!(
-                super::store_local_build_outputs(&config, &local_parsed, &local_build)
-                    .await
-                    .expect("store local build")
+                super::store_local_build_outputs(
+                    &config,
+                    &local_parsed,
+                    &local_build,
+                    "aarch64-apple-darwin",
+                )
+                .await
+                .expect("store local build")
             );
             super::store_downloaded_bundle(&config, &remote_request, &remote_bundle)
                 .await
@@ -3987,9 +4005,14 @@ pub mod tests {
                 .expect("stale remote lru timestamp");
 
             assert!(
-                super::store_local_build_outputs(&config, &local_parsed, &local_build)
-                    .await
-                    .expect("store local build")
+                super::store_local_build_outputs(
+                    &config,
+                    &local_parsed,
+                    &local_build,
+                    "aarch64-apple-darwin",
+                )
+                .await
+                .expect("store local build")
             );
             let local_size = list_artifact_cache_entries(&pool, "1.91.1")
                 .await
