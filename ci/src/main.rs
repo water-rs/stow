@@ -78,15 +78,6 @@ enum Stage {
         #[arg(long)]
         input_dir: PathBuf,
     },
-    /// Dev-only: the publish stage's checks without its push. The local
-    /// CI runs them in a process of their own, as Actions runs the
-    /// publish job on a runner of its own.
-    #[command(hide = true)]
-    PublishCheck {
-        /// Directory a `build` stage wrote.
-        #[arg(long)]
-        input_dir: PathBuf,
-    },
     /// Dev-only local dispatch server standing in for GitHub Actions.
     Serve {
         /// Socket address to listen on.
@@ -117,9 +108,6 @@ fn main() -> stow_types::error::Result<()> {
         // reactor; the build stage is smol-only because cargo/rustc
         // capture never touches HTTP.
         Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
-        Stage::PublishCheck { input_dir } => {
-            tokio_runtime()?.block_on(publish_check_stage(&input_dir))
-        }
         Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
     }
 }
@@ -173,12 +161,6 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
         error
     })?;
     tracing::info!(task_id = %task.task_id, pushed, "artifacts pushed");
-    Ok(())
-}
-
-async fn publish_check_stage(input_dir: &std::path::Path) -> stow_types::error::Result<()> {
-    let task = load_task_payload()?;
-    validated_build_output(&task, input_dir).await?;
     Ok(())
 }
 

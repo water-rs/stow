@@ -449,13 +449,6 @@ struct DispatchLayout {
     records_path: PathBuf,
     /// The build stage's stderr — its final error names why it failed.
     build_log_path: PathBuf,
-    /// The publish checks' stderr.
-    publish_log_path: PathBuf,
-    /// Each stage's own `CARGO_HOME`: on Actions the build and publish
-    /// jobs each start on a fresh runner, and a shared one would queue
-    /// every concurrent run on cargo's package cache lock.
-    build_cargo_home: PathBuf,
-    publish_cargo_home: PathBuf,
 }
 
 impl DispatchLayout {
@@ -482,9 +475,6 @@ impl DispatchLayout {
             upload_plan_path: output_dir.join("upload-plan.json"),
             records_path: task_root.join("records.json"),
             build_log_path: task_root.join("build-stage.log"),
-            publish_log_path: task_root.join("publish-check.log"),
-            build_cargo_home: task_root.join("build-cargo-home"),
-            publish_cargo_home: task_root.join("publish-cargo-home"),
             task_root,
             output_dir,
         })
@@ -539,17 +529,12 @@ async fn run_dispatched_task(
         );
         return Err(stow_types::stow_error!("{error}"));
     }
-    // The trusted publish stage's checks, run exactly as `stow-build
+    // The trusted publish stage's checks, run here exactly as `stow-build
     // publish` runs them before its push: the mock registry below stands
     // in for GHCR and cosign, not for the validation that gates them.
-    let status = run_publish_check(&exe, &task_json, &layout).await?;
-    if !status.success() {
-        let error = format!(
-            "publish-stage validation exited with status {status}: {}",
-            stage_error(&layout.publish_log_path).await
-        );
-        return Err(stow_types::stow_error!("{error}"));
-    }
+    crate::validated_build_output(&task, &layout.output_dir)
+        .await
+        .map_err(|error| error.wrap_err("publish-stage validation"))?;
 
     // `stow-build build` exits non-zero when any cargo phase failed — the
     // outcome is binary now: a live process reached this line means the
@@ -640,26 +625,7 @@ async fn run_build_stage(
             layout.task_root.join("workspace"),
         )
         .env("STOW_BUILD_TASK_JSON", task_json)
-        .env("CARGO_HOME", &layout.build_cargo_home)
         .stderr(std::fs::File::create(&layout.build_log_path)?)
-        .status()
-        .await?)
-}
-
-/// Spawn the publish stage's checks on the build stage's output, in a
-/// `CARGO_HOME` of their own.
-async fn run_publish_check(
-    exe: &Path,
-    task_json: &str,
-    layout: &DispatchLayout,
-) -> stow_types::error::Result<std::process::ExitStatus> {
-    Ok(async_process::Command::new(exe)
-        .arg("publish-check")
-        .arg("--input-dir")
-        .arg(&layout.output_dir)
-        .env("STOW_BUILD_TASK_JSON", task_json)
-        .env("CARGO_HOME", &layout.publish_cargo_home)
-        .stderr(std::fs::File::create(&layout.publish_log_path)?)
         .status()
         .await?)
 }
