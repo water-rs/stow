@@ -49,8 +49,6 @@ pub struct LocalServerState {
     /// Shared secret the webhook signature is computed with — the
     /// `STOW_GITHUB_WEBHOOK_SECRET` binding's local value.
     pub webhook_secret: String,
-    /// Filesystem path to the mock cosign public key.
-    pub mock_public_key_path: String,
     /// Filesystem path to the mock cosign private key.
     pub mock_private_key_path: String,
     /// Root directory the mock OCI registry serves out of.
@@ -86,14 +84,12 @@ impl LocalServerState {
     pub fn new(
         edge_url: String,
         webhook_secret: String,
-        mock_public_key_path: String,
         mock_private_key_path: String,
         mock_registry_root: String,
     ) -> Self {
         Self {
             edge_url,
             webhook_secret,
-            mock_public_key_path,
             mock_private_key_path,
             mock_registry_root,
             runs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -669,8 +665,6 @@ async fn populate_mock_registry(
         .arg(PathBuf::from(&state.mock_registry_root))
         .arg("--private-key")
         .arg(PathBuf::from(&state.mock_private_key_path))
-        .arg("--public-key")
-        .arg(PathBuf::from(&state.mock_public_key_path))
         .arg("--records-out")
         .arg(&layout.records_path)
         .status()
@@ -870,13 +864,8 @@ mod tests {
 
     #[test]
     fn repeated_dispatches_keep_distinct_captured_run_ids() {
-        let state = LocalServerState::new(
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        );
+        let state =
+            LocalServerState::new(String::new(), String::new(), String::new(), String::new());
         let first = WorkflowRunReport {
             workflow_run_id: state.allocate_run_id(),
             run_key: "task:1".to_owned(),

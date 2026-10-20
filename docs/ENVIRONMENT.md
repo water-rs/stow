@@ -136,7 +136,7 @@ the run, so publish never calls the edge); `stow-build serve --listen
 | `STOW_GITHUB_WEBHOOK_SECRET` | serve | HMAC key the webhook signature is computed with — the same value the edge verifies `X-Hub-Signature-256` against. Required. |
 | `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` for the edge OIDC token minted when a publish step calls a trusted edge route (`index publish` D1 sync); unused when the run only pushes GHCR artifacts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | serve (falls back to `gh auth token`) | Developer GitHub credential the edge's trusted endpoints accept outside Actions. |
-| `STOW_MOCK_PUBLIC_KEY_PATH` / `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign key pair and mock registry root the local dispatcher populates. Required. |
+| `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign signing key and mock registry root the local dispatcher populates. Required. |
 | `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), visible in CI logs here. |
 
 ## scripts/preheat-cost.sh

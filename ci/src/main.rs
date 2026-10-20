@@ -47,7 +47,6 @@ const STOW_BUILD_TASK_JSON_ENV: &str = "STOW_BUILD_TASK_JSON";
 const GITHUB_RUN_ID_ENV: &str = "GITHUB_RUN_ID";
 const GITHUB_RUN_ATTEMPT_ENV: &str = "GITHUB_RUN_ATTEMPT";
 const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
-const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
 const STOW_GITHUB_WEBHOOK_SECRET_ENV: &str = "STOW_GITHUB_WEBHOOK_SECRET";
@@ -294,7 +293,6 @@ async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<
     let state = local_server::LocalServerState::new(
         env_required(STOW_EDGE_URL_ENV)?,
         env_required(STOW_GITHUB_WEBHOOK_SECRET_ENV)?,
-        env_required(STOW_MOCK_PUBLIC_KEY_PATH_ENV)?,
         env_required(STOW_MOCK_PRIVATE_KEY_PATH_ENV)?,
         env_required(STOW_MOCK_REGISTRY_ROOT_ENV)?,
     );
