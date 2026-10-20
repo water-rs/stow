@@ -266,6 +266,76 @@ pub fn prepare_project_tree(root: &Path, drop_lockfile: bool) -> CargoResult<Mat
     prepare_selected_manifest(&manifest_path, drop_lockfile)
 }
 
+/// Remove every dev-dependency table from each `Cargo.toml` under
+/// `root` — `[dev-dependencies]`, the legacy `dev_dependencies`
+/// spelling, and both spellings inside every `[target.<cfg>]` table.
+///
+/// The fetched-crate lanes call this before resolving: a consumer that
+/// depends on the published crate never resolves those tables — the
+/// registry's dependency metadata does not carry them, and `cargo
+/// install` resolves the package's own manifest with them pruned
+/// (`require_optional_deps` off). Removing them cannot break a
+/// feature, because cargo forbids a feature from enabling a
+/// dev-dependency — nothing that survives the strip can name them.
+/// Left in place they resolve anyway, since the unpacked package is
+/// the workspace root and a member's dev-dependencies join its
+/// resolve: a dev-dependency whose requirement cannot resolve (a
+/// yanked-only release) fails a lane no consumer would ever fail, and
+/// a resolvable one's requirement still unifies with the normal
+/// dependencies, pinning shared nodes below the version a consumer
+/// computes. The project's own lanes — `resolve_git`,
+/// `resolve_project_dir` — keep theirs: a project's own lockfile
+/// legitimately includes its dev-dependencies.
+///
+/// The edit is structural (`toml_edit`), and a manifest carrying no
+/// dev-dependency table is never rewritten — a caller's tree without
+/// them survives byte-for-byte.
+///
+/// # Errors
+/// A manifest that fails to parse, or filesystem failures.
+pub fn strip_dev_dependencies(root: &Path) -> CargoResult<()> {
+    for path in walk(root) {
+        if path.file_name().and_then(|name| name.to_str()) != Some("Cargo.toml") {
+            continue;
+        }
+        let source =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let mut document = source
+            .parse::<toml_edit::DocumentMut>()
+            .with_context(|| format!("parse {}", path.display()))?;
+        if strip_dev_tables(&mut document) {
+            std::fs::write(&path, document.to_string())
+                .with_context(|| format!("write {}", path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// `strip_dev_dependencies`' single-document half; returns whether a
+/// table was removed.
+fn strip_dev_tables(document: &mut toml_edit::DocumentMut) -> bool {
+    const DEV_DEPENDENCIES: [&str; 2] = ["dev-dependencies", "dev_dependencies"];
+    let mut removed = false;
+    let root = document.as_table_mut();
+    for name in DEV_DEPENDENCIES {
+        removed |= root.remove(name).is_some();
+    }
+    if let Some(targets) = root
+        .get_mut("target")
+        .and_then(toml_edit::Item::as_table_like_mut)
+    {
+        for (_cfg, target) in targets.iter_mut() {
+            let Some(target) = target.as_table_like_mut() else {
+                continue;
+            };
+            for name in DEV_DEPENDENCIES {
+                removed |= target.remove(name).is_some();
+            }
+        }
+    }
+    removed
+}
+
 /// Files (not directories) under `root`, shallowest first. The `.git`
 /// dir of a fetched checkout is skipped — a resolve never reads it.
 fn walk(root: &Path) -> Vec<PathBuf> {
