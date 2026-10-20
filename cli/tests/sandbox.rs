@@ -560,3 +560,32 @@ fn unsandboxed_build_lets_the_same_actions_through() {
         "unsandboxed control build failed:\n{stderr}"
     );
 }
+
+/// stow#823: a fresh checkout or a `cargo clean` leaves no target
+/// directory, and every grant is canonicalized before the sandbox
+/// starts — the grant setup must create it itself. The probes are
+/// beside the point here, so the build-script conf is the inert one.
+#[test]
+fn sandboxed_build_creates_its_missing_target_directory() {
+    let env = probe_env(false, "127.0.0.1:9");
+    std::fs::remove_dir(&env.target).expect("remove the fixture's target dir");
+    std::fs::write(
+        env.dir
+            .join("deps")
+            .join("sandbox-probe")
+            .join("probe.conf"),
+        "probes=\n",
+    )
+    .expect("inert probe conf");
+    let output = run_build(&env, &["build", "--sandbox-deny-network", "--offline"]);
+    assert!(
+        output.status.success(),
+        "sandboxed build without a target directory failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        env.target.is_dir(),
+        "the target directory {} was not created",
+        env.target.display()
+    );
+}

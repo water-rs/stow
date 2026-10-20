@@ -286,6 +286,15 @@ async fn sandbox_grants(
     let cargo_home = crate::config::require_cargo_home()?;
     let rustup_home = rustup_home();
     ensure_package_cache_lock(&cargo_home)?;
+    // The target dir is granted below and every grant must
+    // canonicalize, but cargo has not run to create it — a fresh
+    // checkout, or right after `cargo clean` (stow#823).
+    std::fs::create_dir_all(request.target_dir).map_err(|error| {
+        stow_types::stow_error!(
+            "create the target directory {}: {error}",
+            request.target_dir.display()
+        )
+    })?;
 
     let mut grants: Vec<(PathBuf, Access, &'static str)> = request
         .source_roots
