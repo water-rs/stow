@@ -17,6 +17,11 @@ macro_rules! workflow_file {
         "build-crate.yml"
     };
 }
+macro_rules! batch_workflow_file {
+    () => {
+        "build-batch.yml"
+    };
+}
 macro_rules! index_workflow_file {
     () => {
         "index-publish.yml"
@@ -44,6 +49,18 @@ pub const WORKFLOW_FILE: &str = workflow_file!();
 /// whose title is not known yet, not at another workflow's run
 /// (stow#704).
 pub const WORKFLOW_NAME: &str = "build-crate";
+/// Workflow file that carries a batch of build tasks (stow#833).
+///
+/// The dispatched `workflow_dispatch` caller under `.github/workflows/`
+/// whose matrix legs each *call* [`WORKFLOW_FILE`]. Signing stays with
+/// the called workflow: [`CERTIFICATE_IDENTITY`] is unchanged.
+pub const BATCH_WORKFLOW_FILE: &str = batch_workflow_file!();
+/// The `name:` the batch workflow declares.
+///
+/// Same "title not rendered yet" rule as [`WORKFLOW_NAME`] (stow#704):
+/// until GitHub renders the run's `run-name` a batch run's
+/// `display_title` is this name, not another workflow's.
+pub const BATCH_WORKFLOW_NAME: &str = "build-batch";
 /// Branch the trusted workflow runs from. `workflow_dispatch` takes the bare
 /// branch name; the certificate subject carries the full ref.
 pub const BRANCH: &str = branch!();

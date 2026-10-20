@@ -10,7 +10,7 @@
 //! so the registry plus cosign is the only record store and no
 //! `STOW_EDGE_URL` reaches `build-crate.yml`.
 
-use crate::api::ArtifactRecord;
+use crate::api::{ArtifactRecord, BatchId};
 use crate::index::ArtifactIndexRow;
 use crate::registry::MAX_OCI_TAG_LEN;
 
@@ -48,6 +48,36 @@ pub fn run_title(rustc_version: &str, task_id: &str) -> String {
 pub fn parse_run_title(title: &str) -> Option<(&str, &str)> {
     let (rustc_version, task_id) = title.split_once('-')?;
     (!rustc_version.is_empty() && !task_id.is_empty()).then_some((rustc_version, task_id))
+}
+
+/// The `run-name` `build-batch.yml` stamps on its run (stow#833).
+///
+/// The full `<rustc>-b<batch_id>`. `batch_id` is the 32-lowercase-hex
+/// [`BatchId`] the scheduler minted at claim (`lower(hex(randomblob(16)))`,
+/// like `generation_id`). The `b` marker keeps batch titles disjoint
+/// from `build-crate.yml`'s `<rustc>-<task_id>`: a task id can never
+/// be exactly `b` + 32 hex. `index-publish-cron.yml`'s
+/// `${RUN_TITLE%%-*}` still yields the rustc.
+#[must_use]
+pub fn batch_run_title(rustc_version: &str, batch_id: &BatchId) -> String {
+    debug_assert!(
+        !rustc_version.is_empty() && !rustc_version.contains('-'),
+        "rustc version {rustc_version:?} cannot lead a run title"
+    );
+    format!("{rustc_version}-b{batch_id}")
+}
+
+/// The `(rustc_version, batch_id)` a batch run title names.
+///
+/// The inverse of [`batch_run_title`], returning the [`BatchId`]
+/// without its `b` marker. `None` when the title is not
+/// `<rustc>-b<32 lowercase hex>`: the run is not one ours could have
+/// made.
+#[must_use]
+pub fn parse_batch_run_title(title: &str) -> Option<(&str, BatchId)> {
+    let (rustc_version, rest) = title.split_once('-')?;
+    let batch_id = rest.strip_prefix('b')?.parse().ok()?;
+    (!rustc_version.is_empty()).then_some((rustc_version, batch_id))
 }
 
 /// The `run-name` `resolve-request.yml` stamps on its run —
@@ -225,6 +255,54 @@ mod tests {
         assert_eq!(parse_run_title("nodash"), None);
         assert_eq!(parse_run_title("-missingrustc"), None);
         assert_eq!(parse_run_title("1.99.0-"), None);
+    }
+
+    #[test]
+    fn batch_run_title_round_trips() {
+        let batch_id: BatchId = "0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("batch id");
+        assert_eq!(
+            batch_run_title("1.99.0", &batch_id),
+            "1.99.0-b0123456789abcdef0123456789abcdef"
+        );
+        assert_eq!(
+            parse_batch_run_title("1.99.0-b0123456789abcdef0123456789abcdef"),
+            Some(("1.99.0", batch_id))
+        );
+    }
+
+    /// A batch title parses only as `<rustc>-b<32 lowercase hex>` — a
+    /// `build-crate.yml` task title, a resolve title, a short or long
+    /// or mis-cased batch id, or a trailing suffix are all refused.
+    #[test]
+    fn parse_batch_run_title_refuses_malformed_titles() {
+        for title in [
+            // Not a `<rustc>-<id>` split at all.
+            "nodash",
+            "1.99.0-",
+            "-b0123456789abcdef0123456789abcdef",
+            // The `b` marker missing.
+            "1.99.0-0123456789abcdef0123456789abcdef",
+            // Wrong length.
+            "1.99.0-b0123456789abcdef0123456789abcde",
+            "1.99.0-b0123456789abcdef0123456789abcdef0",
+            // Uppercase hex and non-hex characters.
+            "1.99.0-b0123456789ABCDEF0123456789abcdef",
+            "1.99.0-b0123456789abcdef0123456789abcdeg",
+            // A trailing suffix is not part of the id.
+            "1.99.0-b0123456789abcdef0123456789abcdef-extra",
+            // A task run title and a resolve run title.
+            "1.99.0-serde-1.0.0-deadbeef-x86_64_unknown-linux-gnu-1_99_0",
+            "resolve-a1-req-serde-1.0.0",
+        ] {
+            assert_eq!(parse_batch_run_title(title), None, "{title}");
+        }
+        // `run_title` output never parses as a batch title.
+        assert_eq!(
+            parse_batch_run_title(&run_title("1.99.0", "some-task-id")),
+            None
+        );
     }
 
     const BUILD: BuildRun = BuildRun {
