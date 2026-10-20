@@ -1447,7 +1447,14 @@ fn plan_enqueue(
             let downloads_bump = downloads > probe.downloads && probe.status == "pending";
             let moved = redispatch || lane_move || explicit_upgrade || downloads_bump;
             if moved {
-                fold_update(&mut updates, entry, downloads, redispatch, lane, request_explicit);
+                fold_update(
+                    &mut updates,
+                    entry,
+                    downloads,
+                    redispatch,
+                    lane,
+                    request_explicit,
+                );
             }
             // The stored-state moves the budget pays for (stow#796):
             // the lane promotion, or a human request putting a
