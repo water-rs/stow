@@ -73,6 +73,20 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         }
     }
 
+    // The stable sandbox identity's persistent toolchain grants
+    // (stow#815): written once here instead of per build — on Windows
+    // that is the AppContainer profile's ACL work, which blocks, so it
+    // runs off the executor. A build that never saw setup reconciles
+    // whatever is missing on its own. A failure is the command's error,
+    // not a warning.
+    let identity = crate::sandbox::stow_identity()?;
+    let identity_name = identity.name().to_owned();
+    smol::unblock(move || identity.prepare())
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("prepare the {identity_name} sandbox identity: {error}")
+        })?;
+
     tracing::info!(
         path = %config_path.display(),
         rustc_wrapper = %wrappers.rustc,

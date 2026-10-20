@@ -18,14 +18,21 @@
 //! the build. The network choice is carried in the sandbox's type — a
 //! `Sandbox<AllowAll>` or a `Sandbox<DenyAll>` — rather than in a flag a
 //! caller could mis-set.
+//!
+//! The toolchain roots every build reads the same way — the rustup home,
+//! cargo's `registry`/`git`/`bin` and the MSVC installation roots — ride
+//! a stable [`Identity`] as persistent read-only grants instead of the
+//! per-build set (stow#815): on Windows they are written once for the
+//! `heel-id-stow` `AppContainer` profile rather than rewritten per build,
+//! and elsewhere heel folds them into each sandbox's ordinary policy.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
 use heel::{
-    Access, IpcRouter, IpcUnconfigured, Sandbox, SandboxConfig, SandboxConfigBuilder,
-    SecurityConfig,
+    Access, Grant, Identity, IpcRouter, IpcUnconfigured, Sandbox, SandboxConfig,
+    SandboxConfigBuilder, SecurityConfig,
 };
 use stow_types::env_name;
 use stow_types::error::Context;
@@ -197,6 +204,7 @@ impl BuildSandbox {
         let mut builder = SandboxConfigBuilder::default()
             .filesystem_strict(true)
             .security(SecurityConfig::strict())
+            .identity(stow_identity()?)
             .env_passthroughs(sandbox_env_names(
                 std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
             ))
@@ -272,6 +280,69 @@ async fn run<N: heel::NetworkPolicy>(
         .map_err(|error| {
             stow_types::stow_error!("run sandboxed cargo {}: {error}", command.program)
         })
+}
+
+/// The identity every stow sandbox shares (stow#815): `heel-id-stow` on
+/// Windows, where the persistent grants are written once for the
+/// profile's package SID and heel reconciles them at each sandbox start;
+/// on macOS and Linux heel folds them into each sandbox's policy and
+/// [`Identity::prepare`]/[`Identity::remove`] are no-ops, so one path
+/// serves every platform.
+///
+/// The persistent set is a fixed function of the user's environment —
+/// identical for every build and for `stow setup`. It names only roots
+/// every build reads, and none is writable: a build-dependent set would
+/// make concurrent builds revoke each other's grants and pay the
+/// toolchain ACL rewrite again, while a writable one would persist a
+/// hole the per-build boundary exists to close. Writable or
+/// build-shaped grants (sources, the target dir, scratch, shims, the
+/// package-cache lock, PATH tool dirs, env-named linkers, driver probe
+/// answers) stay in [`sandbox_grants`]; where one of those already sits
+/// under a persistent root heel skips it as open, so they are not
+/// filtered here.
+///
+/// # Errors
+///
+/// An invalid identity name (unreachable for `"stow"`) or an
+/// unresolvable cargo home.
+pub fn stow_identity() -> stow_types::error::Result<Identity> {
+    let mut persistent: Vec<(PathBuf, Access)> = Vec::new();
+    if let Some(home) = rustup_home().filter(|home| home.is_dir()) {
+        persistent.push((home, Access::READ | Access::EXEC));
+    }
+    let cargo_home = crate::config::require_cargo_home()?;
+    for (dir, access) in [
+        ("registry", Access::READ),
+        ("git", Access::READ),
+        ("bin", Access::READ | Access::EXEC),
+    ] {
+        let dir = cargo_home.join(dir);
+        if dir.is_dir() {
+            persistent.push((dir, access));
+        }
+    }
+    #[cfg(windows)]
+    for root in msvc_identity_roots() {
+        if root.is_dir() {
+            persistent.push((root, Access::READ | Access::EXEC));
+        }
+    }
+    let mut identity = Identity::named("stow")
+        .map_err(|error| stow_types::stow_error!("the stow sandbox identity name: {error}"))?;
+    for (path, access) in persistent {
+        // Canonicalized like the per-build grants: heel's record and the
+        // reconcile compare spellings, so a symlinked home or a stray
+        // `..` must not give `setup` and a build different spellings of
+        // the same root — the revoke/re-grant churn this exists to remove.
+        let path = path.canonicalize().map_err(|error| {
+            stow_types::stow_error!(
+                "canonicalize the persistent sandbox grant {}: {error}",
+                path.display()
+            )
+        })?;
+        identity = identity.persistent_grant(Grant::new(path, access));
+    }
+    Ok(identity)
 }
 
 /// The filesystem grant set for one build — nothing else on the host is
@@ -1148,10 +1219,80 @@ fn msvc_developer_environment() -> stow_types::error::Result<Vec<(OsString, OsSt
     Ok(envs)
 }
 
+/// The installation roots the MSVC discovery locates for the host —
+/// the Visual Studio root a `link.exe` in the VS 2017+ layout implies
+/// and the Windows kit roots the discovered SDK dirs sit under —
+/// persisted READ|EXEC on the identity so the toolchain ACL is written
+/// once, not per build (stow#815). A `link.exe` outside the VS layout —
+/// an SDK or LLVM linker — names no Visual Studio installation, so it
+/// adds no root; the per-build grants still cover its directory.
 #[cfg(windows)]
-/// Derives developer-prompt variables from a Visual Studio 2017+ linker path.
+fn msvc_identity_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(tool) = find_msvc_tools::find_tool(std::env::consts::ARCH, "link.exe")
+        && let Ok(layout) = visual_studio_layout(tool.path())
+    {
+        roots.push(layout.visual_studio_dir);
+    }
+    if let Some(sdk) = find_msvc_tools::find_windows_sdk(std::env::consts::ARCH) {
+        for dir in sdk.path().chain(sdk.libs()).chain(sdk.include()) {
+            if let Some(root) = windows_kit_root(dir)
+                && !roots.contains(&root)
+            {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+/// The kit installation root a discovered Windows SDK directory lives
+/// under: every dir the discovery reports sits in the kit's `bin`, `lib`
+/// or `include` tree, so the root is the ancestor above that component —
+/// whatever `KitsRoot10` or `InstallationFolder` the registry named,
+/// never a hardcoded drive. A `bin`/`lib`/`include` at a drive root names
+/// no installation, and a dir with none of those components is not an
+/// SDK dir; both yield `None`.
+#[cfg(windows)]
+fn windows_kit_root(dir: &Path) -> Option<PathBuf> {
+    let mut root = PathBuf::new();
+    for component in dir.components() {
+        if component.as_os_str().to_str().is_some_and(|name| {
+            ["bin", "lib", "include"]
+                .iter()
+                .any(|tree| name.eq_ignore_ascii_case(tree))
+        }) {
+            return root
+                .components()
+                .any(|part| matches!(part, std::path::Component::Normal(_)))
+                .then_some(root);
+        }
+        root.push(component.as_os_str());
+    }
+    None
+}
+
+/// The directories the Visual Studio 2017+ layout a `link.exe` path
+/// implies — `VC\Tools\MSVC\<version>\bin\Host<arch>\<arch>\link.exe`
+/// under the installation root — validated component by component so a
+/// linker outside that layout cannot masquerade as an installation
+/// root.
+#[cfg(windows)]
+struct VsLayout {
+    /// `VSCMD_ARG_TGT_ARCH` — the `<arch>` leaf the linker serves.
+    target_arch: OsString,
+    /// `VCToolsInstallDir` — the `MSVC\<version>` directory.
+    version_dir: PathBuf,
+    /// `VCINSTALLDIR` — the `VC` directory.
+    vc_dir: PathBuf,
+    /// `VSINSTALLDIR` — the Visual Studio installation root.
+    visual_studio_dir: PathBuf,
+}
+
+#[cfg(windows)]
+/// Reads the [`VsLayout`] a Visual Studio 2017+ linker path spells.
 /// Paths outside that layout return an error.
-fn developer_prompt_vars(link: &Path) -> stow_types::error::Result<Vec<(OsString, OsString)>> {
+fn visual_studio_layout(link: &Path) -> stow_types::error::Result<VsLayout> {
     let invalid_layout = || {
         stow_types::stow_error!(
             "the linker at {} is not in the Visual Studio 2017+ layout, so the sandbox cannot spell out its developer environment",
@@ -1205,6 +1346,19 @@ fn developer_prompt_vars(link: &Path) -> stow_types::error::Result<Vec<(OsString
     {
         return Err(invalid_layout());
     }
+    Ok(VsLayout {
+        target_arch: target_arch.to_os_string(),
+        version_dir: version_dir.to_path_buf(),
+        vc_dir: vc_dir.to_path_buf(),
+        visual_studio_dir: visual_studio_dir.to_path_buf(),
+    })
+}
+
+#[cfg(windows)]
+/// Derives developer-prompt variables from a Visual Studio 2017+ linker path.
+/// Paths outside that layout return an error.
+fn developer_prompt_vars(link: &Path) -> stow_types::error::Result<Vec<(OsString, OsString)>> {
+    let layout = visual_studio_layout(link)?;
     let with_trailing_backslash = |path: &Path| {
         let mut value = path.as_os_str().to_os_string();
         value.push("\\");
@@ -1213,20 +1367,17 @@ fn developer_prompt_vars(link: &Path) -> stow_types::error::Result<Vec<(OsString
     Ok(vec![
         (
             OsString::from("VSINSTALLDIR"),
-            with_trailing_backslash(visual_studio_dir),
+            with_trailing_backslash(&layout.visual_studio_dir),
         ),
         (
             OsString::from("VCINSTALLDIR"),
-            with_trailing_backslash(vc_dir),
+            with_trailing_backslash(&layout.vc_dir),
         ),
         (
             OsString::from("VCToolsInstallDir"),
-            with_trailing_backslash(version_dir),
+            with_trailing_backslash(&layout.version_dir),
         ),
-        (
-            OsString::from("VSCMD_ARG_TGT_ARCH"),
-            target_arch.to_os_string(),
-        ),
+        (OsString::from("VSCMD_ARG_TGT_ARCH"), layout.target_arch),
     ])
 }
 
@@ -1512,5 +1663,105 @@ mod tests {
                 "aarch64-apple-darwin".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn the_identity_is_a_function_of_the_environment_not_the_build() {
+        // Two builds differing in every build-shaped input — the target
+        // spelled, the args, the dirs — must hold the same persistent
+        // set, or concurrent builds would revoke each other's toolchain
+        // grants and pay the ACL rewrite this removes (stow#815).
+        // `stow_identity` takes no `SandboxRequest` at all: the
+        // signature is the enforcement, and the requests below stand in
+        // for the builds.
+        let dummy = PathBuf::from("/usr/bin/true");
+        let host_args = vec![OsString::from("--release")];
+        let cross_args = vec![
+            OsString::from("--target"),
+            OsString::from("wasm32-unknown-unknown"),
+        ];
+        let host_build = SandboxRequest {
+            network: SandboxNetwork::Allow,
+            source_roots: &[],
+            target_dir: Path::new("/tmp/host-target"),
+            scratch_dir: None,
+            shims_dir: None,
+            runtime_executable: &dummy,
+            rustc_executable: &dummy,
+            host_target: "aarch64-apple-darwin",
+            cargo_dir: Path::new("/tmp/host-project"),
+            cargo_args: &host_args,
+            ipc: None,
+        };
+        let cross_build = SandboxRequest {
+            network: SandboxNetwork::Deny,
+            source_roots: &[],
+            target_dir: Path::new("/tmp/cross-target"),
+            scratch_dir: None,
+            shims_dir: None,
+            runtime_executable: &dummy,
+            rustc_executable: &dummy,
+            host_target: "x86_64-pc-windows-msvc",
+            cargo_dir: Path::new("/tmp/cross-project"),
+            cargo_args: &cross_args,
+            ipc: None,
+        };
+        assert_eq!(
+            stow_identity().expect("the identity builds"),
+            stow_identity().expect("the identity builds"),
+        );
+        // And no persistent grant may reach a directory a build owns —
+        // sources, target dir, scratch, the dir cargo runs in.
+        let identity = stow_identity().expect("the identity builds");
+        for grant in identity.persistent_grants() {
+            for build_dir in [
+                host_build.target_dir,
+                cross_build.target_dir,
+                host_build.cargo_dir,
+                cross_build.cargo_dir,
+            ] {
+                assert!(
+                    !grant.path().starts_with(build_dir),
+                    "persistent grant on {} reaches build-owned {}",
+                    grant.path().display(),
+                    build_dir.display(),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_persistent_grant_is_writable() {
+        // A persistent grant outlives the sandbox: a writable one would
+        // hold open a hole the per-build boundary exists to close.
+        let identity = stow_identity().expect("the identity builds");
+        for grant in identity.persistent_grants() {
+            assert!(
+                !grant.access().can_write(),
+                "persistent grant on {} is writable",
+                grant.path().display(),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_kit_root_reads_the_kit_tree_boundary() {
+        assert_eq!(
+            windows_kit_root(Path::new(r"C:\Windows Kits\10\bin\10.0.26100.0\x64")),
+            Some(PathBuf::from(r"C:\Windows Kits\10"))
+        );
+        assert_eq!(
+            windows_kit_root(Path::new(r"D:\SDKs\8.1\Lib\winv6.3\um\x64")),
+            Some(PathBuf::from(r"D:\SDKs\8.1"))
+        );
+        assert_eq!(
+            windows_kit_root(Path::new(r"C:\Windows Kits\10\Include\10.0.26100.0\ucrt")),
+            Some(PathBuf::from(r"C:\Windows Kits\10"))
+        );
+        // A kit tree directly at a drive root names no installation.
+        assert_eq!(windows_kit_root(Path::new(r"C:\bin\x64")), None);
+        // A dir outside the kit layout derives no root.
+        assert_eq!(windows_kit_root(Path::new(r"C:\tools\rust")), None);
     }
 }
