@@ -306,8 +306,8 @@ pub async fn run(args: ProjectsArgs, output: Output) -> stow_types::error::Resul
             generate(&token, &args, output).await
         }
         ProjectsCommand::Submit(args) => {
-            let edge = crate::Edge::connect().await?;
-            tokio::task::spawn_blocking(move || submit(&edge, &args, output))
+            let edge = crate::Edge::connect_to_submit(args.yes).await?;
+            tokio::task::spawn_blocking(move || submit(edge.as_ref(), &args, output))
                 .await
                 .expect("projects submit panicked")
         }
@@ -406,7 +406,7 @@ async fn generate(
 /// the scheduler as soon as its resolve lands, so a token or network
 /// failure mid-lane costs the wave only the repositories it never
 /// reached, never the work it already did.
-fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::Result<()> {
+fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
     let targets: Vec<TargetTriple> = crate::preheat::ci_targets(args.targets.clone())?
@@ -455,7 +455,10 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
         |_index, repo, result| match result {
             Ok(tasks) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
-                if args.yes && !tasks.is_empty() {
+                // `edge` is present exactly when the run submits.
+                if let Some(edge) = edge
+                    && !tasks.is_empty()
+                {
                     match tokio::runtime::Handle::current().block_on(submit_chunked(edge, &tasks)) {
                         Ok(chunk_outcome) => {
                             outcome.batches += chunk_outcome.batches;
@@ -488,9 +491,9 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
         },
     );
     let envelope = render::Planned {
-        dry_run: !args.yes,
+        dry_run: edge.is_none(),
         plan,
-        result: args.yes.then_some(outcome),
+        result: edge.map(|_| outcome),
     };
     render::emit(output, &envelope, render_projects_plan)
 }

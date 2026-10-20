@@ -583,7 +583,6 @@ async fn run_ensure(
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     render::mutation(
         output,
-        yes,
         planned,
         |envelope: &render::Planned<EnsureOutcome, EnsureOutcome>| {
             let mut out = String::new();
@@ -616,11 +615,11 @@ async fn run_ensure(
             );
             out
         },
-        async move |_plan: &EnsureOutcome| {
+        yes.then_some(async move |_plan: &EnsureOutcome| {
             ensure(token, zone_id, &host, true)
                 .await
                 .map_err(|error| stow_types::stow_error!("{error}"))
-        },
+        }),
     )
     .await
 }
@@ -645,7 +644,6 @@ async fn run_toggle(
     };
     render::mutation(
         output,
-        args.yes,
         plan,
         |envelope: &render::Planned<MaintenancePlan, MaintenanceResult>| {
             let mut out = format!(
@@ -669,7 +667,7 @@ async fn run_toggle(
             );
             out
         },
-        async move |plan: &MaintenancePlan| {
+        args.yes.then_some(async move |plan: &MaintenancePlan| {
             let applied = set_scope(token, zone_id, scope, plan.enabled, &host)
                 .await
                 .map_err(|error| stow_types::stow_error!("{error}"))?;
@@ -677,7 +675,7 @@ async fn run_toggle(
                 rule: plan.rule.clone(),
                 enabled: applied,
             })
-        },
+        }),
     )
     .await
 }

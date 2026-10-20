@@ -37,6 +37,10 @@
 #      node never published, an `overloaded` answer, a failed submit, or
 #      a resubmit that rebuilt anything
 #
+# The monthly projection (`stow-admin traffic-cost project`, the release
+# gate's `Monthly projection` job) also needs the production wave's node
+# count; `scripts/production-wave.sh` counts it in a job of its own.
+#
 # Why the compiler is the mocked seam: everything the scheduler's cost
 # depends on — which tasks exist, their edges, when each completes, the
 # records it publishes — comes from cargo's resolve and unit graph and
@@ -203,8 +207,10 @@ require_command() {
 check_children_alive() {
     local i
     for i in "${!CHILD_PIDS[@]}"; do
-        # The lane runner is a child too, and exits when its lanes do.
-        [ "${CHILD_NAMES[$i]}" = "lanes" ] && continue
+        # The lane runners are children too, and exit when their lanes do.
+        case "${CHILD_NAMES[$i]}" in
+            lanes) continue ;;
+        esac
         kill -0 "${CHILD_PIDS[$i]}" 2>/dev/null || die "${CHILD_NAMES[$i]} exited unexpectedly"
     done
 }

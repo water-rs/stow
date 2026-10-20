@@ -9,6 +9,12 @@
 //! cost report` reads them into [`WaveObservations`] and
 //! [`analyse`] turns them into a [`PreheatCostReport`]. The analysis is
 //! pure, so every check is unit-tested here rather than in the shell.
+//!
+//! The production wave's size ([`ProductionWave`]) is a separate
+//! document: `scripts/production-wave.sh` resolves the production
+//! preheat lanes plan-only, and the distinct task identities across them
+//! ([`count_production`]) are the node count the monthly projection
+//! scales the measured per-node costs to.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -141,6 +147,108 @@ pub struct PhaseObservations {
     pub end: LedgerSnapshot,
 }
 
+/// One task a production lane planned, reduced to what the count needs.
+#[derive(Debug, Clone)]
+pub struct ProductionTask {
+    /// The scheduler's task identity (`task_id` of the enqueue request).
+    pub task_id: String,
+    /// The target the task mints on.
+    pub target: String,
+}
+
+/// One production preheat lane's plan-only output.
+#[derive(Debug, Clone)]
+pub struct ProductionLane {
+    /// `top`, `top-binaries` or `projects`.
+    pub lane: String,
+    /// Every task the lane planned, duplicates included.
+    pub tasks: Vec<ProductionTask>,
+}
+
+/// One production lane's share of the count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductionLaneCount {
+    /// The lane.
+    pub lane: String,
+    /// Tasks the lane planned.
+    pub planned: u64,
+    /// Distinct task ids the lane added that no earlier lane had.
+    pub new_nodes: u64,
+}
+
+/// The production wave's size.
+///
+/// The distinct task identities the production preheat lanes would
+/// submit — the scheduler deduplicates on `task_id`, so a node two lanes
+/// (or two targets' resolves) name is one queue row and one build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProductionWave {
+    /// Distinct nodes across every lane.
+    pub nodes: u64,
+    /// Nodes per target triple.
+    pub nodes_per_target: BTreeMap<String, u64>,
+    /// Each lane's planned and first-seen counts, in lane order.
+    pub lanes: Vec<ProductionLaneCount>,
+}
+
+impl ProductionWave {
+    /// Every production lane must have planned something: a lane that
+    /// resolved nothing would undercount the production wave the monthly
+    /// projection scales to.
+    ///
+    /// # Errors
+    /// No lane ran, or a lane planned no task.
+    pub fn require_planned(&self) -> crate::error::Result<()> {
+        if self.lanes.is_empty() {
+            return Err(crate::stow_error!("no production lane ran"));
+        }
+        let empty: Vec<&str> = self
+            .lanes
+            .iter()
+            .filter(|lane| lane.planned == 0)
+            .map(|lane| lane.lane.as_str())
+            .collect();
+        if empty.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::stow_error!(
+                "production lane(s) planned nothing: {}",
+                empty.join(", ")
+            ))
+        }
+    }
+}
+
+/// Count the distinct nodes across the production lanes, dedup'd by
+/// task id exactly as the scheduler's queue would.
+#[must_use]
+pub fn count_production(lanes: &[ProductionLane]) -> ProductionWave {
+    let mut seen = BTreeSet::<&str>::new();
+    let mut nodes_per_target = BTreeMap::<String, u64>::new();
+    let counts = lanes
+        .iter()
+        .map(|lane| {
+            let mut new_nodes = 0_u64;
+            for task in &lane.tasks {
+                if seen.insert(task.task_id.as_str()) {
+                    new_nodes += 1;
+                    *nodes_per_target.entry(task.target.clone()).or_default() += 1;
+                }
+            }
+            ProductionLaneCount {
+                lane: lane.lane.clone(),
+                planned: lane.tasks.len() as u64,
+                new_nodes,
+            }
+        })
+        .collect();
+    ProductionWave {
+        nodes: seen.len() as u64,
+        nodes_per_target,
+        lanes: counts,
+    }
+}
+
 /// Everything the harness observed.
 #[derive(Debug, Clone)]
 pub struct WaveObservations {
@@ -210,6 +318,17 @@ pub struct PhaseCost {
     pub dispatched_runs: u64,
     /// Wall milliseconds from the phase's first to its last ledger read.
     pub wall_ms: u64,
+}
+
+impl PhaseCost {
+    /// Scheduler calls the phase was billed: every counted operation's
+    /// events, the four kinds and the rest alike. Observers are already
+    /// out of both.
+    #[must_use]
+    pub fn requests(&self) -> u64 {
+        self.kinds.iter().map(|kind| kind.events).sum::<u64>()
+            + self.other_ops.iter().map(|op| op.events).sum::<u64>()
+    }
 }
 
 /// One layer of the wave: the builds one publish round released, their
@@ -810,8 +929,8 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        EventKind, LaneRun, LedgerSnapshot, Node, PhaseObservations, Round, WaveObservations,
-        analyse, ledger_delta,
+        EventKind, LaneRun, LedgerSnapshot, Node, PhaseObservations, ProductionLane,
+        ProductionTask, Round, WaveObservations, analyse, count_production, ledger_delta,
     };
     use crate::api::{SchedulerLedger, SchedulerLedgerOp};
     use crate::local_ci::LocalCiRun;
@@ -935,6 +1054,19 @@ mod tests {
         }
     }
 
+    fn production_lane(lane: &str, tasks: &[(&str, &str)]) -> ProductionLane {
+        ProductionLane {
+            lane: lane.to_owned(),
+            tasks: tasks
+                .iter()
+                .map(|(task_id, target)| ProductionTask {
+                    task_id: (*task_id).to_owned(),
+                    target: (*target).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
     fn failed(report: &super::PreheatCostReport) -> Vec<&str> {
         report.failures().map(|check| check.name.as_str()).collect()
     }
@@ -995,5 +1127,48 @@ mod tests {
     #[test]
     fn a_ledger_that_went_backwards_is_refused() {
         assert!(ledger_delta(&ledger(10, 20, 0), &ledger(5, 20, 0)).is_err());
+    }
+
+    #[test]
+    fn production_nodes_dedupe_by_task_id_across_lanes() {
+        let wave = count_production(&[
+            // `a` twice inside the lane: two targets' resolves of the
+            // same shared node land on one task id.
+            production_lane("top", &[("a", "t1"), ("b", "t1"), ("a", "t1")]),
+            production_lane("top-binaries", &[("b", "t1"), ("c", "t2"), ("d", "t2")]),
+            production_lane("projects", &[("a", "t1"), ("d", "t2"), ("e", "t1")]),
+        ]);
+        assert_eq!(wave.nodes, 5);
+        assert_eq!(wave.nodes_per_target["t1"], 3);
+        assert_eq!(wave.nodes_per_target["t2"], 2);
+        let counts: Vec<(&str, u64, u64)> = wave
+            .lanes
+            .iter()
+            .map(|lane| (lane.lane.as_str(), lane.planned, lane.new_nodes))
+            .collect();
+        assert_eq!(
+            counts,
+            [("top", 3, 2), ("top-binaries", 3, 2), ("projects", 3, 1)]
+        );
+    }
+
+    #[test]
+    fn a_lane_that_planned_nothing_is_refused() {
+        let planned = count_production(&[production_lane("top", &[("a", "t1")])]);
+        planned.require_planned().expect("every lane planned");
+        let empty = count_production(&[
+            production_lane("top", &[("a", "t1")]),
+            production_lane("projects", &[]),
+        ]);
+        let error = empty.require_planned().expect_err("an empty lane");
+        assert!(error.to_string().contains("projects"), "{error}");
+        assert!(count_production(&[]).require_planned().is_err());
+    }
+
+    #[test]
+    fn a_phase_bills_every_counted_operation_as_a_request() {
+        let report = analyse(&chain(0)).expect("analyse");
+        // Four kinds, each 30 events over the three layers.
+        assert_eq!(report.wave.requests(), 4 * 30);
     }
 }

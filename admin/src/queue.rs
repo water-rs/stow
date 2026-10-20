@@ -200,7 +200,6 @@ async fn mutate(
     };
     render::mutation(
         output,
-        args.yes,
         plan,
         |envelope: &render::Planned<QueueMutationPlan, QueueMutationResult>| {
             let plan = &envelope.plan;
@@ -245,10 +244,10 @@ async fn mutate(
             let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |_| {
+        args.yes.then_some(async move |_plan: &QueueMutationPlan| {
             edge.post_json(&format!("/api/v1/admin/queue/{verb}"), &selector)
                 .await
-        },
+        }),
     )
     .await
 }

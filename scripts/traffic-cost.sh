@@ -13,18 +13,23 @@
 #   3. the peak-concurrency drive: every lane at the launch model's peak
 #      rate for 30 minutes (`stow-admin traffic-cost peak`);
 #   4. the budget pass again on the loaded fixture;
-#   5. the verdict (`stow-admin traffic-cost project`): row budgets, rows
+#   5. the verdict (`stow-admin traffic-cost verdict`): row budgets, rows
 #      that grow with the stored bulk (more than 10% + 50 rows from the
-#      small fixture to the large), the monthly projection against half
-#      of each product's allowance (Worker CPU included), and the peak
-#      serialized Durable Object wall.
+#      small fixture to the large), and the peak serialized Durable
+#      Object wall.
 #
 # The test fails on any of: a drive over its row budget, a drive that
-# grows with stored rows, a lane over its CPU budget, a projected product
-# above 50% of its allowance, peak serialized DO wall above 0.5 s/s, any
-# `overloaded` signal or 5xx under the peak drive, a lane error share
-# over 1%, a response outside a lane's designed statuses, or a lane p99
-# over 10 s.
+# grows with stored rows, a lane over its CPU budget, peak serialized DO
+# wall above 0.5 s/s, any `overloaded` signal or 5xx under the peak
+# drive, a lane error share over 1%, a response outside a lane's
+# designed statuses, or a lane p99 over 10 s.
+#
+# The monthly projection against half of each product's allowance is not
+# here: it adds the preheat waves and daily resubmits the Preheat cost
+# job measures, so the release gate's `Monthly projection` job runs it
+# (`stow-admin traffic-cost project`) over this run's budget-small.json,
+# budget-after.json and worker-cpu.json in $WORK_DIR/reports and that
+# job's preheat-cost-report.json.
 #
 # Every service is local: the mock GHCR (`stow-mock-registry`, the
 # edge's GHCR_BASE_URL and the stats SQL endpoint), the edge under
@@ -473,12 +478,11 @@ drain_builds "after the peak drive"
 # The loaded fixture, measured again — no reseed.
 budget_pass "after" --queue-rows "$SMALL"
 
-admin traffic-cost project \
+admin traffic-cost verdict \
     --small "$REPORT_DIR/budget-small.json" \
     --large "$REPORT_DIR/budget-large.json" \
     --after "$REPORT_DIR/budget-after.json" \
-    --cpu "$REPORT_DIR/worker-cpu.json" \
     --model "$REPO_ROOT/launch-model.toml" \
     || die "traffic cost over its bounds — see the verdict above"
 
-echo "[traffic] OK — within every budget and bound"
+echo "[traffic] OK — within every budget and bound; reports for the projection: $REPORT_DIR"

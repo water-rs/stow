@@ -155,7 +155,6 @@ async fn clear(token: &str, args: ClearArgs, output: Output) -> stow_types::erro
     };
     render::mutation(
         output,
-        args.yes,
         plan,
         |envelope: &render::Planned<ClearPlan, ClearResult>| {
             let plan = &envelope.plan;
@@ -190,14 +189,14 @@ async fn clear(token: &str, args: ClearArgs, output: Output) -> stow_types::erro
             let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |plan: &ClearPlan| {
+        args.yes.then_some(async move |plan: &ClearPlan| {
             let mut deleted = 0u32;
             for entry in &plan.entries {
                 github::delete(token, &format!("actions/caches/{}", entry.id)).await?;
                 deleted += 1;
             }
             Ok(ClearResult { deleted })
-        },
+        }),
     )
     .await
 }

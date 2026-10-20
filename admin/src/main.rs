@@ -288,6 +288,17 @@ impl Edge {
         })
     }
 
+    /// The edge for a lane whose plan needs none: connected only when
+    /// the lane will submit (`yes`), so a plan-only run needs neither
+    /// `STOW_EDGE_URL` nor a credential.
+    pub(crate) async fn connect_to_submit(yes: bool) -> stow_types::error::Result<Option<Self>> {
+        if yes {
+            Self::connect().await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
     /// A connection pinned at a loopback base — the demand-feed tests
     /// drive the real post/get paths against a scripted listener.
     #[cfg(test)]
@@ -635,7 +646,6 @@ async fn dispatch_freeze_switch(
     };
     render::mutation(
         output,
-        args.yes,
         plan,
         |envelope: &render::Planned<DispatchFreeze, DispatchFreeze>| {
             let mut out = "clear dispatch freeze\n".to_owned();
@@ -645,9 +655,9 @@ async fn dispatch_freeze_switch(
             let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |plan: &DispatchFreeze| {
+        args.yes.then_some(async move |plan: &DispatchFreeze| {
             edge.post_json("/api/v1/admin/dispatch-freeze", plan).await
-        },
+        }),
     )
     .await
 }
@@ -790,7 +800,6 @@ async fn submit_command(
     .map_err(|error| stow_error!("submit resolver task: {error}"))??;
     render::mutation(
         output,
-        args.yes,
         requests,
         |envelope: &render::Planned<Vec<EnqueueRequest>, SchedulerSubmitResponse>| {
             let mut out = format!("{} task(s)\n", envelope.plan.len());
@@ -815,7 +824,8 @@ async fn submit_command(
             let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |requests: &Vec<EnqueueRequest>| submit(edge, requests).await,
+        args.yes
+            .then_some(async move |requests: &Vec<EnqueueRequest>| submit(edge, requests).await),
     )
     .await
 }
