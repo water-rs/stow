@@ -1,7 +1,7 @@
 name: Release gate
 
 # The checks a release must pass but a routine merge must not wait on: the
-# mock end-to-end and the traffic-cost test. They run three ways —
+# mock end-to-end, the traffic-cost test and the preheat-cost test. They run three ways —
 # `workflow_dispatch` on any ref, nightly on dev's head (03:00 ET), and on
 # pull requests and merge groups into main, where the `main` ruleset
 # requires this workflow's `Release gate` check.
@@ -94,7 +94,7 @@ jobs:
       # Both binaries take the mock trust root: the build job now consumes
       # the cache through the same verified-download chain the CLI uses, and
       # a builder that cannot verify the mock key would quietly skip it.
-      - run: cargo build --features stow-cli/mock-verify,stow-build/mock-verify -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
+      - run: cargo build --release --features stow-cli/mock-verify,stow-build/mock-verify -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
       - run: scripts/mock-e2e.sh
         env:
           STOW_E2E_WORK_DIR: ${{ runner.temp }}/stow-mock-e2e
@@ -163,6 +163,66 @@ jobs:
           path: ${{ runner.temp }}/stow-traffic/logs
           if-no-files-found: ignore
 
+  # The preheat-cost test (stow#773): the same mock stack drives a real
+  # preheat wave through the scheduler — the production lanes submit the
+  # resolved popular-crate graph across every CI target, every dispatch
+  # runs the real build and publish stages with rustc answered by the
+  # mock compiler, publish rounds release the graph layer by layer, and
+  # the same lists are resubmitted the way the daily cron does.
+  # `scripts/preheat-cost.sh` fails on wave or resubmit rows over the
+  # preheat budget, a per-event cost that grows from the first layer to
+  # the last, a node dispatched before its dependencies were published, a
+  # node left unpublished, a resubmit that rebuilds, and any overloaded
+  # answer.
+  preheat-cost:
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    name: Preheat cost
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      # The local edge authenticates its trusted endpoints against the
+      # credential's own repo permissions — GITHUB_TOKEN needs push
+      # (`contents: write`) to pass.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      # The same release build as mock-e2e (stow-build adds only the mock
+      # compiler), so it restores that job's cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - run: scripts/preheat-cost.sh
+        env:
+          STOW_PREHEAT_COST_WORK_DIR: ${{ runner.temp }}/stow-preheat-cost
+          STOW_PREHEAT_COST_LIMIT: 2
+          STOW_PREHEAT_COST_PROJECTS: 0
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The report is the run's numbers — kept on a pass too, so the
+      # monthly projection and the budgets can read it.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: preheat-cost-report
+          path: |
+            ${{ runner.temp }}/stow-preheat-cost/preheat-cost-report.json
+            ${{ runner.temp }}/stow-preheat-cost/cost
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: preheat-cost-logs
+          path: ${{ runner.temp }}/stow-preheat-cost/logs
+          if-no-files-found: ignore
+
 
   # One check to require — the `main` ruleset names `Release gate` — built
   # like test.yml's `CI gate`: it needs every leg, `if: always()` runs it
@@ -173,6 +233,7 @@ jobs:
     needs:
       - mock-e2e
       - traffic-cost
+      - preheat-cost
     if: always()
     name: Release gate
     runs-on: ubuntu-latest
@@ -210,6 +271,7 @@ jobs:
     needs:
       - mock-e2e
       - traffic-cost
+      - preheat-cost
       - gate
     if: always() && github.event_name == 'schedule'
     name: Nightly report

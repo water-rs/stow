@@ -137,7 +137,7 @@ Build the workspace binaries once:
 
 ```sh
 cd /path/to/stow
-cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
+cargo build --release -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 ```
 
 ## Topology
@@ -181,7 +181,7 @@ Open three terminals (or use `tmux`/background processes).
 
 ```sh
 mkdir -p /tmp/stow-bench/mock-registry
-target/debug/stow-mock-registry serve --registry-root /tmp/stow-bench/mock-registry
+target/release/stow-mock-registry serve --registry-root /tmp/stow-bench/mock-registry
 ```
 
 Verify: `curl -i http://127.0.0.1:28123/v2/` returns `401 Unauthorized`
@@ -229,7 +229,7 @@ is enough — the scheduler routes are 500s until the schema exists):
 # Prints `scheduler store reset — <n> objects dropped` and stamps the
 # configured dispatch floor.
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-    target/debug/stow-admin scheduler reset --yes
+    target/release/stow-admin scheduler reset --yes
 ```
 
 Verify: `curl http://127.0.0.1:8788/api/v1/scheduler/status` returns
@@ -244,7 +244,7 @@ STOW_GITHUB_WEBHOOK_SECRET=mock-github-webhook-secret \
 STOW_MOCK_PUBLIC_KEY_PATH=/tmp/stow-bench/keys/public.pem \
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
-target/debug/stow-build serve --listen 127.0.0.1:28124
+target/release/stow-build serve --listen 127.0.0.1:28124
 ```
 
 Verify: the log prints `local CI server listening listen=127.0.0.1:28124`.
@@ -274,7 +274,7 @@ Two preheat shapes are useful:
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin preheat top \
+target/release/stow-admin preheat top \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
@@ -284,7 +284,7 @@ lane's, so tasks land on the latest semver-compatible versions):
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin preheat top-binaries \
+target/release/stow-admin preheat top-binaries \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
@@ -313,12 +313,12 @@ registry (mock-key mode delegates the signed push to
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin index export \
+target/release/stow-admin index export \
   --target aarch64-apple-darwin --rustc-version 1.91.1 \
   --out /tmp/stow-bench/index.bin
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
-target/debug/stow-admin index publish \
+target/release/stow-admin index publish \
   --file /tmp/stow-bench/index.bin \
   --target aarch64-apple-darwin --rustc-version 1.91.1
 ```

@@ -241,10 +241,10 @@ fi
 
 cd "$REPO_ROOT"
 echo "[traffic] building stow-admin, stow-mock-registry and stow-build"
-cargo build -p stow-admin -p stow-mock-registry -p stow-build \
+cargo build --release -p stow-admin -p stow-mock-registry -p stow-build \
     >"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build failed — see $LOG_DIR/cargo-build.log"
-BIN="$REPO_ROOT/target/debug"
+BIN="$REPO_ROOT/target/release"
 
 # P-256 PKCS#8 key pair — the format sigstore accepts (the same block
 # scripts/mock-e2e.sh runs; docs/MOCK.md).

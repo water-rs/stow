@@ -276,8 +276,6 @@ log "dispatch caps: $MAX_JOBS ($MAX_MACOS_JOBS macOS)"
 
 cd "$REPO_ROOT"
 log "building stow-cli, stow-build (mock compiler), stow-mock-registry, stow-admin"
-# Release, as toolchain-publish.yml builds the stow-build and stow-cli
-# every build-crate run executes: the wave's wall time is their CPU.
 cargo build --release \
     -p stow-cli --features stow-cli/mock-verify \
     -p stow-build --features stow-build/mock-verify,stow-build/mock-compile \
