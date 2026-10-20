@@ -36,6 +36,23 @@ pub struct LaunchWindow {
     pub install_days: u64,
 }
 
+/// The stable-release cadence the model assumes.
+///
+/// Every stable rustc release — minor and point — invalidates the whole
+/// public cache (the cache identity pins the exact version), so each one
+/// brings a full preheat wave; the projection prices that wave once per
+/// release.
+///
+/// The count is read from Rust's published release history over the
+/// `period_days` before the window's end, never chosen by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaunchCadence {
+    /// Stable rustc releases (minor and point) published in the period.
+    pub stable_releases: u32,
+    /// Length of the period the releases were counted over, in days.
+    pub period_days: u32,
+}
+
 /// The per-install traffic kinds, each in events per install-day, plus
 /// the flat daily cadences that do not scale with installs.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -110,6 +127,8 @@ pub struct LaunchModel {
     pub scale: LaunchScale,
     /// The measurement window the rates came from.
     pub window: LaunchWindow,
+    /// The stable-release cadence the preheat waves are priced at.
+    pub cadence: LaunchCadence,
     /// Per-install-day rates and flat daily cadences.
     pub rates: LaunchRates,
     /// Event-chain ratios.
@@ -230,6 +249,22 @@ impl LaunchModel {
         self.daily_events(kind) * f64::from(self.scale.days_per_month)
     }
 
+    /// Stable rustc releases — preheat waves — over one monthly window:
+    /// the counted releases spread over their period, scaled to the
+    /// window's days.
+    #[must_use]
+    pub fn monthly_stable_releases(&self) -> f64 {
+        f64::from(self.cadence.stable_releases) * f64::from(self.scale.days_per_month)
+            / f64::from(self.cadence.period_days)
+    }
+
+    /// Daily preheat resubmits over one monthly window — the cron
+    /// resubmits the whole list every day.
+    #[must_use]
+    pub fn monthly_resubmits(&self) -> f64 {
+        f64::from(self.scale.days_per_month)
+    }
+
     /// Events of `kind` in one peak hour: the monthly count spread over
     /// the window's hours and multiplied by the peak factor.
     #[must_use]
@@ -242,5 +277,68 @@ impl LaunchModel {
     #[must_use]
     pub fn peak_events_per_second(&self, kind: EventKind) -> f64 {
         self.peak_hourly_events(kind) / 3600.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LaunchCadence, LaunchModel, LaunchRates, LaunchRatios, LaunchScale, LaunchWindow};
+
+    fn model(stable_releases: u32, period_days: u32, days_per_month: u32) -> LaunchModel {
+        LaunchModel {
+            scale: LaunchScale {
+                installs: 10_000,
+                peak_factor: 10.0,
+                days_per_month,
+            },
+            window: LaunchWindow {
+                days: 7,
+                end: "2026-09-27".to_owned(),
+                install_days: 289,
+            },
+            cadence: LaunchCadence {
+                stable_releases,
+                period_days,
+            },
+            rates: LaunchRates {
+                cli_byte_path_fetch: 0.0,
+                index_pull: 0.0,
+                admission: 0.0,
+                enqueue_redemption: 0.0,
+                human_request: 0.0,
+                request_status_read: 0.0,
+                site_view: 0.0,
+                stats_view: 0.0,
+                miss_node: 0.0,
+                admin_operations_per_day: 0.0,
+                index_publishes_per_day: 0.0,
+            },
+            ratios: LaunchRatios {
+                builds_per_miss: 0.0,
+                callbacks_per_build: 0.0,
+                tasks_per_human_request: 0.0,
+            },
+        }
+    }
+
+    #[test]
+    fn releases_scale_from_their_period_to_the_month() {
+        // 14 releases in 365 days, a 30-day month.
+        let monthly = model(14, 365, 30).monthly_stable_releases();
+        assert!((monthly - 14.0 * 30.0 / 365.0).abs() < 1e-12, "{monthly}");
+        // A period equal to the month is the count itself.
+        assert!((model(3, 30, 30).monthly_stable_releases() - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_cron_resubmits_every_day_of_the_month() {
+        assert!((model(14, 365, 30).monthly_resubmits() - 30.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_cadence_round_trips_through_toml() {
+        let model = model(14, 365, 30);
+        let reparsed = LaunchModel::from_toml(&model.to_toml().expect("serialize")).expect("parse");
+        assert_eq!(reparsed, model);
     }
 }

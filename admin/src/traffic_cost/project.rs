@@ -1,27 +1,24 @@
-//! `stow-admin traffic-cost project` — the Traffic cost test's verdict
-//! over what the run measured (stow#452, stow#772).
+//! `stow-admin traffic-cost project` — the monthly projection of each
+//! Cloudflare product against half its allowance (stow#452, stow#775).
 //!
-//! It reads the scheduler budget reports at both fixture sizes, the
-//! report re-measured after the peak drive, and the Worker CPU report,
-//! and fails on:
+//! The release gate's `Monthly projection` job runs it over what the
+//! Traffic cost and Preheat cost jobs measured: the scheduler budget
+//! report on the clean fixture, the one re-measured after the peak
+//! drive, the Worker CPU report, and `preheat-cost-report.json`. It
+//! fails when any product's projected monthly usage — user traffic plus
+//! preheat — exceeds half its included allowance.
 //!
-//! - any drive over its row budget in any report (statements, rows read,
-//!   rows written — `DO_BUDGETS`);
-//! - a drive whose rows read or written grow with the stored bulk: the
-//!   large fixture's count more than 10% plus 50 rows over the small
-//!   one's;
-//! - a product whose projected monthly usage exceeds half its included
-//!   allowance, projected from the small report and from the post-load
-//!   report;
-//! - a peak second whose serialized Durable Object wall exceeds half a
-//!   second.
-//!
-//! The projection multiplies the launch model's per-event monthly counts
-//! by the per-event costs measured in the same run. Nothing it reads is a
+//! **Traffic** multiplies the launch model's per-event monthly counts by
+//! the per-event costs measured in the same run. Nothing it reads is a
 //! checked-in constant: the reports' `*_budget` columns carry the budget
 //! each row was measured against, Worker CPU per event is the profiler's
 //! measurement (`cpu.rs`), and the allowances come from `watchdog`'s
 //! single allowance table.
+//!
+//! **Preheat** (`preheat.rs`) adds, to each product the Preheat cost
+//! report measures, one wave per stable rustc release plus one resubmit
+//! per day, at the production wave's node count. A product the report
+//! does not measure is printed as such and never priced at zero.
 //!
 //! The Durable-Object numbers decompose per event kind rather than per
 //! route: the alarm lane is priced as `alarm pass (idle)` invocations
@@ -35,40 +32,45 @@
 //! run does not measure; they print as diagnostics and never gate. An
 //! event whose Worker CPU no lane can measure is named in the output
 //! with the reason, so the gap stays visible.
+//!
+//! The measurement checks on the same reports — row budgets, growth with
+//! the stored bulk and the peak serialized wall — are `verdict.rs`.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
+use stow_types::do_budgets::WORKER_CPU_BUDGETS;
 use stow_types::launch_model::{EventKind, LaunchModel};
+use stow_types::preheat_cost::PreheatCostReport;
 use stow_types::stow_error;
 
-use stow_types::do_budgets::WORKER_CPU_BUDGETS;
-
 use super::cpu::WorkerCpuReport;
+use super::preheat::PreheatMonthly;
 use crate::render::{Output, Table, emit};
 use crate::watchdog::{
     D1_ROWS_READ_MONTHLY, D1_ROWS_WRITTEN_MONTHLY, DO_DURATION_GB_S_MONTHLY, DO_REQUESTS_MONTHLY,
     DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY, WORKER_CPU_MS_MONTHLY, WORKER_REQUESTS_MONTHLY,
 };
 
-/// The verdict — `stow-admin traffic-cost project`.
+/// The monthly projection — `stow-admin traffic-cost project`.
 #[derive(Debug, Args)]
 pub struct ProjectArgs {
     /// The scheduler budget report on the small fixture (100k rows).
     #[arg(long)]
     pub small: PathBuf,
-    /// The scheduler budget report on the large fixture (1M rows), same
-    /// shape — the growth check's other side.
-    #[arg(long)]
-    pub large: PathBuf,
     /// The scheduler budget report re-measured after the peak drive.
     #[arg(long)]
     pub after: PathBuf,
     /// The Worker CPU report `traffic-cost cpu` wrote.
     #[arg(long)]
     pub cpu: PathBuf,
+    /// The Preheat cost job's `preheat-cost-report.json`. Required: there
+    /// is no traffic-only projection, because a stable release's wave
+    /// and the daily resubmit are part of every month's bill.
+    #[arg(long)]
+    pub preheat: PathBuf,
     /// The checked-in launch model `launch-model.toml`.
     #[arg(long, default_value = "launch-model.toml")]
     pub model: PathBuf,
@@ -84,21 +86,9 @@ const ALLOWANCE_FRACTION: f64 = 0.5;
 /// over-reads it by 2×, so the projection errs on the bill's side.
 const DO_DURATION_GB_PER_WALL_S: f64 = 0.25;
 
-/// The issue's peak requirement: a peak-second's serialized Durable
-/// Object wall must stay under half a second.
-const PEAK_SERIALIZED_S_PER_S: f64 = 0.5;
-
 /// Tasks the enqueue drives' `submit_batch` carries — the denominator
 /// a single-task insert prices against.
 const SUBMIT_BATCH_TASKS: f64 = 3.0;
-
-/// The growth rule: a drive grows with the stored bulk when its count
-/// on the large fixture exceeds the small one's by more than this
-/// fraction …
-const GROWTH_FRACTION: f64 = 0.1;
-
-/// … plus this many rows.
-const GROWTH_SLACK_ROWS: f64 = 50.0;
 
 /// The measured cost of one scheduler drive call, looked up in the
 /// harness report by row name.
@@ -396,6 +386,127 @@ const EVENT_COSTS: &[EventCost] = &[
     },
 ];
 
+/// The measured drive rows of one budget report, and what one claim
+/// inside an alarm pass costs on top of the idle floor.
+struct Drives {
+    /// Every report row by name.
+    measured: BTreeMap<String, DriveCost>,
+    /// The marginal cost of one claimed task.
+    claim_marginal: DriveCost,
+}
+
+impl Drives {
+    /// Read the report's rows and derive the claim price.
+    ///
+    /// # Errors
+    /// The report lacks a pass row, or claimed nothing while the model
+    /// projects builds.
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "measured counters fit f64 exactly past any launch traffic"
+    )]
+    fn new(model: &LaunchModel, report: &SchedulerBudgetReport) -> Result<Self, String> {
+        let measured: BTreeMap<String, DriveCost> = report
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.name.clone(),
+                    DriveCost {
+                        rows_read: row.rows_read as f64,
+                        rows_written: row.rows_written as f64,
+                        wall_ms: row.wall_ms as f64,
+                        d1_rows_read: row.d1_rows_read as f64,
+                        d1_rows_written: row.d1_rows_written as f64,
+                    },
+                )
+            })
+            .collect();
+        let row = |name: &str| {
+            measured
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("budget report carries no row for `{name}`"))
+        };
+        let hot = row("alarm pass")?;
+        let idle = row("alarm pass (idle)")?;
+        // A report whose pass claimed nothing measures no claim price —
+        // with nonzero build traffic the projection would silently
+        // underprice the Durable Object, so the gate refuses the report
+        // rather than project zero (a zero-claims pass means the probe ran
+        // under a dispatch cap the fixture's in-flight rows already fill).
+        let builds = model.monthly_events(EventKind::Build);
+        if report.claimed_tasks == 0 && builds > 0.0 {
+            return Err(format!(
+                "budget report claims 0 tasks (dispatch_limit {}) while the model projects \
+                 {builds:.0} builds/mo — a pass that cannot claim measured no claim price",
+                report.dispatch_limit
+            ));
+        }
+        // The claims inside a hot pass are what the hot row buys over the
+        // idle floor, spread over the claims the run actually made.
+        let claimed = report.claimed_tasks.max(1) as f64;
+        let claim_marginal = DriveCost {
+            rows_read: (hot.rows_read - idle.rows_read).max(0.0) / claimed,
+            rows_written: (hot.rows_written - idle.rows_written).max(0.0) / claimed,
+            wall_ms: (hot.wall_ms - idle.wall_ms).max(0.0) / claimed,
+            d1_rows_read: (hot.d1_rows_read - idle.d1_rows_read).max(0.0) / claimed,
+            d1_rows_written: (hot.d1_rows_written - idle.d1_rows_written).max(0.0) / claimed,
+        };
+        Ok(Self {
+            measured,
+            claim_marginal,
+        })
+    }
+
+    /// One drive's measured cost.
+    fn drive(&self, name: &str) -> Result<DriveCost, String> {
+        self.measured
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("budget report carries no row for `{name}`"))
+    }
+
+    /// What one event of `cost`'s kind costs the scheduler: its drives'
+    /// rows times their calls, plus the claim price times its claims.
+    fn event(&self, cost: &EventCost) -> Result<DriveCost, String> {
+        let mut total = DriveCost::default();
+        for (name, calls) in cost.drives {
+            total.add(*calls, &self.drive(name)?);
+        }
+        total.add(cost.claims, &self.claim_marginal);
+        Ok(total)
+    }
+}
+
+impl DriveCost {
+    /// `self += calls × other`, field by field.
+    const fn add(&mut self, calls: f64, other: &Self) {
+        self.rows_read = calls.mul_add(other.rows_read, self.rows_read);
+        self.rows_written = calls.mul_add(other.rows_written, self.rows_written);
+        self.wall_ms = calls.mul_add(other.wall_ms, self.wall_ms);
+        self.d1_rows_read = calls.mul_add(other.d1_rows_read, self.d1_rows_read);
+        self.d1_rows_written = calls.mul_add(other.d1_rows_written, self.d1_rows_written);
+    }
+}
+
+/// Serialized scheduler wall per second at the model's peak rate, in
+/// seconds per second — Σ over every event kind of its peak events per
+/// second times its serialized wall. The verdict bounds it.
+pub(super) fn peak_serialized_s(
+    model: &LaunchModel,
+    report: &SchedulerBudgetReport,
+) -> Result<f64, String> {
+    let drives = Drives::new(model, report)?;
+    let mut wall_ms = 0.0;
+    for cost in EVENT_COSTS {
+        wall_ms = model
+            .peak_events_per_second(cost.kind)
+            .mul_add(drives.event(cost)?.wall_ms, wall_ms);
+    }
+    Ok(wall_ms / 1000.0)
+}
+
 /// One product dimension's monthly projection against its allowance.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UsageLine {
@@ -404,10 +515,21 @@ pub struct UsageLine {
     /// The billed dimension (e.g. `requests`, `rows_read`,
     /// `duration_gb_s`).
     pub dimension: &'static str,
-    /// Projected monthly usage at launch traffic.
-    pub projected: f64,
+    /// Projected monthly usage from user traffic at launch scale.
+    pub traffic: f64,
+    /// Projected monthly usage from preheat — one wave per stable
+    /// release plus one resubmit per day. `None` when the Preheat cost
+    /// report does not measure the dimension.
+    pub preheat: Option<f64>,
     /// The included monthly allowance.
     pub allowance: f64,
+}
+
+impl UsageLine {
+    /// Traffic plus preheat — what the bound is compared with.
+    pub fn total(&self) -> f64 {
+        self.traffic + self.preheat.unwrap_or(0.0)
+    }
 }
 
 /// One route's contribution for the report's top-N table.
@@ -434,6 +556,10 @@ pub struct UnmeasuredCpu {
     pub reason: &'static str,
 }
 
+/// The driver a breach names when preheat, not user traffic, is the
+/// larger part of the total.
+const PREHEAT_ROUTE: &str = "preheat (stable-release waves + daily resubmits)";
+
 /// A projected breach — the gate fails on any of these.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Breach {
@@ -441,8 +567,12 @@ pub struct Breach {
     pub product: &'static str,
     /// The over-allowance dimension.
     pub dimension: &'static str,
-    /// Projected monthly usage.
+    /// Projected monthly usage, traffic plus preheat.
     pub projected: f64,
+    /// The user-traffic part of `projected`.
+    pub traffic: f64,
+    /// The preheat part of `projected`.
+    pub preheat: f64,
     /// The gate bound — `allowance × ALLOWANCE_FRACTION`.
     pub bound: f64,
     /// The route driving the projection.
@@ -471,16 +601,12 @@ pub struct RouteCpu {
     pub share_at_budget: f64,
 }
 
-/// One report's projection: every usage line, the peak check, the
-/// top-N routes and any breaches.
+/// One report's projection: every usage line, the top-N routes and any
+/// breaches.
 #[derive(Debug, serde::Serialize)]
 pub struct GateEvaluation {
     /// Per-product projected usage lines.
     pub usage: Vec<UsageLine>,
-    /// Peak-hour serialized DO wall in seconds per second.
-    pub peak_serialized_s_per_s: f64,
-    /// Its bound (0.5).
-    pub peak_bound_s_per_s: f64,
     /// Heaviest routes by allowance share.
     pub top_routes: Vec<RouteShare>,
     /// Diagnostic-only dimensions (subrequests, worker-side D1, R2 ops).
@@ -497,9 +623,9 @@ pub struct GateEvaluation {
 }
 
 /// Σ over every event kind: projected monthly usage per product
-/// dimension, the DO wall seconds that price duration, and the
-/// peak-hour serialized wall — plus the per-route shares for the
-/// report's top-N table and the unmeasured diagnostics.
+/// dimension and the DO wall seconds that price duration — plus the
+/// per-route shares for the report's top-N table and the unmeasured
+/// diagnostics.
 #[derive(Debug, Default)]
 struct Projection {
     /// Projected monthly worker requests.
@@ -527,9 +653,6 @@ struct Projection {
     diag_d1_written: f64,
     /// Projected monthly R2 ops — diagnostic, not gated.
     diag_r2_ops: f64,
-    /// Serialized scheduler wall milliseconds per second at peak —
-    /// the stow#452 serialization bound's numerator.
-    peak_serialized_ms: f64,
     /// One share entry per event kind, for the top-N table.
     per_route: Vec<RouteShare>,
     /// Per-route Worker CPU, measured and at budget.
@@ -594,17 +717,15 @@ fn fold_cpu(
     Ok(kind_cpu_ms)
 }
 
-/// Fold one event kind's monthly and peak counts into the projection.
+/// Fold one event kind's monthly counts into the projection.
 fn fold_kind(
     model: &LaunchModel,
     cost: &EventCost,
-    drive: &dyn Fn(&'static str) -> Result<DriveCost, String>,
-    claim_marginal: &DriveCost,
+    drives: &Drives,
     cpu: &WorkerCpuReport,
     projection: &mut Projection,
 ) -> Result<(), String> {
     let monthly = model.monthly_events(cost.kind);
-    let peak_per_s = model.peak_events_per_second(cost.kind);
     projection.worker_requests = monthly.mul_add(cost.worker_requests, projection.worker_requests);
     projection.do_requests = monthly.mul_add(cost.do_requests, projection.do_requests);
     projection.diag_subrequests = monthly.mul_add(cost.subrequests, projection.diag_subrequests);
@@ -613,36 +734,12 @@ fn fold_kind(
     projection.diag_r2_ops = monthly.mul_add(cost.r2_ops, projection.diag_r2_ops);
     let kind_cpu_ms = fold_cpu(cost, cpu, monthly, projection)?;
     projection.worker_cpu_ms = monthly.mul_add(kind_cpu_ms, projection.worker_cpu_ms);
-    let mut kind_read = 0.0;
-    let mut kind_written = 0.0;
-    let mut kind_wall_ms = 0.0;
-    let mut kind_d1_read = 0.0;
-    let mut kind_d1_written = 0.0;
-    for (name, calls) in cost.drives {
-        let row = drive(name)?;
-        kind_read = calls.mul_add(row.rows_read, kind_read);
-        kind_written = calls.mul_add(row.rows_written, kind_written);
-        kind_wall_ms = calls.mul_add(row.wall_ms, kind_wall_ms);
-        kind_d1_read = calls.mul_add(row.d1_rows_read, kind_d1_read);
-        kind_d1_written = calls.mul_add(row.d1_rows_written, kind_d1_written);
-    }
-    kind_read = cost.claims.mul_add(claim_marginal.rows_read, kind_read);
-    kind_written = cost
-        .claims
-        .mul_add(claim_marginal.rows_written, kind_written);
-    kind_wall_ms = cost.claims.mul_add(claim_marginal.wall_ms, kind_wall_ms);
-    kind_d1_read = cost
-        .claims
-        .mul_add(claim_marginal.d1_rows_read, kind_d1_read);
-    kind_d1_written = cost
-        .claims
-        .mul_add(claim_marginal.d1_rows_written, kind_d1_written);
-    projection.do_rows_read = monthly.mul_add(kind_read, projection.do_rows_read);
-    projection.do_rows_written = monthly.mul_add(kind_written, projection.do_rows_written);
-    projection.do_wall_s += monthly * kind_wall_ms / 1000.0;
-    projection.d1_read = monthly.mul_add(kind_d1_read, projection.d1_read);
-    projection.d1_written = monthly.mul_add(kind_d1_written, projection.d1_written);
-    projection.peak_serialized_ms = peak_per_s.mul_add(kind_wall_ms, projection.peak_serialized_ms);
+    let kind = drives.event(cost)?;
+    projection.do_rows_read = monthly.mul_add(kind.rows_read, projection.do_rows_read);
+    projection.do_rows_written = monthly.mul_add(kind.rows_written, projection.do_rows_written);
+    projection.do_wall_s += monthly * kind.wall_ms / 1000.0;
+    projection.d1_read = monthly.mul_add(kind.d1_rows_read, projection.d1_read);
+    projection.d1_written = monthly.mul_add(kind.d1_rows_written, projection.d1_written);
     // The route's heaviest dimension decides its allowance share — the
     // number the top-N table ranks.
     let shares = [
@@ -652,13 +749,16 @@ fn fold_kind(
         ),
         (
             "do_duration_gb_s",
-            monthly * (kind_wall_ms / 1000.0) * DO_DURATION_GB_PER_WALL_S
+            monthly * (kind.wall_ms / 1000.0) * DO_DURATION_GB_PER_WALL_S
                 / DO_DURATION_GB_S_MONTHLY,
         ),
-        ("do_rows_read", monthly * kind_read / DO_ROWS_READ_MONTHLY),
+        (
+            "do_rows_read",
+            monthly * kind.rows_read / DO_ROWS_READ_MONTHLY,
+        ),
         (
             "do_rows_written",
-            monthly * kind_written / DO_ROWS_WRITTEN_MONTHLY,
+            monthly * kind.rows_written / DO_ROWS_WRITTEN_MONTHLY,
         ),
         (
             "worker_requests",
@@ -670,11 +770,11 @@ fn fold_kind(
         ),
         (
             "d1_rows_read",
-            monthly * kind_d1_read / D1_ROWS_READ_MONTHLY,
+            monthly * kind.d1_rows_read / D1_ROWS_READ_MONTHLY,
         ),
         (
             "d1_rows_written",
-            monthly * kind_d1_written / D1_ROWS_WRITTEN_MONTHLY,
+            monthly * kind.d1_rows_written / D1_ROWS_WRITTEN_MONTHLY,
         ),
     ];
     let (dimension, share) = shares
@@ -692,99 +792,98 @@ fn fold_kind(
 }
 
 /// The product/dimension rows the gate bounds — every line a measured
-/// quantity or a structural count.
-fn usage_lines(projection: &Projection) -> Vec<UsageLine> {
+/// quantity or a structural count — each with the preheat share the
+/// Preheat cost report measures for it.
+fn usage_lines(projection: &Projection, preheat: &PreheatMonthly) -> Vec<UsageLine> {
+    let line =
+        |product: &'static str, dimension: &'static str, traffic: f64, allowance: f64| UsageLine {
+            product,
+            dimension,
+            traffic,
+            preheat: preheat.monthly(product, dimension),
+            allowance,
+        };
     vec![
-        UsageLine {
-            product: "workers",
-            dimension: "requests",
-            projected: projection.worker_requests,
-            allowance: WORKER_REQUESTS_MONTHLY,
-        },
-        UsageLine {
-            product: "workers",
-            dimension: "cpu_ms",
-            projected: projection.worker_cpu_ms,
-            allowance: WORKER_CPU_MS_MONTHLY,
-        },
-        UsageLine {
-            product: "durable_objects",
-            dimension: "requests",
-            projected: projection.do_requests,
-            allowance: DO_REQUESTS_MONTHLY,
-        },
-        UsageLine {
-            product: "durable_objects",
-            dimension: "rows_read",
-            projected: projection.do_rows_read,
-            allowance: DO_ROWS_READ_MONTHLY,
-        },
-        UsageLine {
-            product: "durable_objects",
-            dimension: "rows_written",
-            projected: projection.do_rows_written,
-            allowance: DO_ROWS_WRITTEN_MONTHLY,
-        },
-        UsageLine {
-            product: "durable_objects",
-            dimension: "duration_gb_s",
-            projected: projection.do_wall_s * DO_DURATION_GB_PER_WALL_S,
-            allowance: DO_DURATION_GB_S_MONTHLY,
-        },
-        UsageLine {
-            product: "d1",
-            dimension: "rows_read",
-            projected: projection.d1_read,
-            allowance: D1_ROWS_READ_MONTHLY,
-        },
-        UsageLine {
-            product: "d1",
-            dimension: "rows_written",
-            projected: projection.d1_written,
-            allowance: D1_ROWS_WRITTEN_MONTHLY,
-        },
+        line(
+            "workers",
+            "requests",
+            projection.worker_requests,
+            WORKER_REQUESTS_MONTHLY,
+        ),
+        line(
+            "workers",
+            "cpu_ms",
+            projection.worker_cpu_ms,
+            WORKER_CPU_MS_MONTHLY,
+        ),
+        line(
+            "durable_objects",
+            "requests",
+            projection.do_requests,
+            DO_REQUESTS_MONTHLY,
+        ),
+        line(
+            "durable_objects",
+            "rows_read",
+            projection.do_rows_read,
+            DO_ROWS_READ_MONTHLY,
+        ),
+        line(
+            "durable_objects",
+            "rows_written",
+            projection.do_rows_written,
+            DO_ROWS_WRITTEN_MONTHLY,
+        ),
+        line(
+            "durable_objects",
+            "duration_gb_s",
+            projection.do_wall_s * DO_DURATION_GB_PER_WALL_S,
+            DO_DURATION_GB_S_MONTHLY,
+        ),
+        line("d1", "rows_read", projection.d1_read, D1_ROWS_READ_MONTHLY),
+        line(
+            "d1",
+            "rows_written",
+            projection.d1_written,
+            D1_ROWS_WRITTEN_MONTHLY,
+        ),
     ]
 }
 
 /// Ungated dimensions printed for context only — per-event constants
 /// nothing measures, kept visible so a growing one is seen.
 fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
+    let line = |product: &'static str, dimension: &'static str, traffic: f64| UsageLine {
+        product,
+        dimension,
+        traffic,
+        preheat: None,
+        allowance: f64::INFINITY,
+    };
     vec![
-        UsageLine {
-            product: "workers",
-            dimension: "subrequests",
-            projected: projection.diag_subrequests,
-            allowance: f64::INFINITY,
-        },
-        UsageLine {
-            product: "d1 (worker-side, unmeasured)",
-            dimension: "rows_read",
-            projected: projection.diag_d1_read,
-            allowance: f64::INFINITY,
-        },
-        UsageLine {
-            product: "d1 (worker-side, unmeasured)",
-            dimension: "rows_written",
-            projected: projection.diag_d1_written,
-            allowance: f64::INFINITY,
-        },
-        UsageLine {
-            product: "r2",
-            dimension: "ops",
-            projected: projection.diag_r2_ops,
-            allowance: f64::INFINITY,
-        },
+        line("workers", "subrequests", projection.diag_subrequests),
+        line(
+            "d1 (worker-side, unmeasured)",
+            "rows_read",
+            projection.diag_d1_read,
+        ),
+        line(
+            "d1 (worker-side, unmeasured)",
+            "rows_written",
+            projection.diag_d1_written,
+        ),
+        line("r2", "ops", projection.diag_r2_ops),
     ]
 }
 
-/// Turn each usage line over `ALLOWANCE_FRACTION` of its allowance
-/// into a breach, attributed to the route that dominates the breached
-/// dimension.
+/// Turn each usage line whose total is over `ALLOWANCE_FRACTION` of its
+/// allowance into a breach, attributed to the route that dominates the
+/// breached dimension — or to preheat when it is the larger part.
 fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach> {
     let mut breaches = Vec::new();
     for line in usage {
         let bound = line.allowance * ALLOWANCE_FRACTION;
-        if line.projected > bound {
+        if line.total() > bound {
             // `RouteShare::dimension` keys the share dimension by
             // product prefix — `do_`, `d1_`, `worker_`.
             let prefix = match line.product {
@@ -793,14 +892,21 @@ fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach>
                 other => other,
             };
             let share_key = format!("{prefix}_{}", line.dimension);
-            let top_route = top_routes
-                .iter()
-                .find(|r| r.dimension == share_key)
-                .map_or("n/a", |r| r.route);
+            let preheat = line.preheat.unwrap_or(0.0);
+            let top_route = if preheat > line.traffic {
+                PREHEAT_ROUTE
+            } else {
+                top_routes
+                    .iter()
+                    .find(|r| r.dimension == share_key)
+                    .map_or("n/a", |r| r.route)
+            };
             breaches.push(Breach {
                 product: line.product,
                 dimension: line.dimension,
-                projected: line.projected,
+                projected: line.total(),
+                traffic: line.traffic,
+                preheat,
                 bound,
                 top_route,
             });
@@ -810,71 +916,21 @@ fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach>
 }
 
 /// Project the launch model's monthly events against one report's
-/// measured rows, the measured Worker CPU and the watchdog allowance
-/// table.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "measured counters fit f64 exactly past any launch traffic"
-)]
+/// measured rows, the measured Worker CPU, the preheat share and the
+/// watchdog allowance table.
 fn evaluate(
     model: &LaunchModel,
     report: &SchedulerBudgetReport,
     cpu: &WorkerCpuReport,
+    preheat: &PreheatMonthly,
 ) -> Result<GateEvaluation, String> {
-    let measured: BTreeMap<&str, DriveCost> = report
-        .rows
-        .iter()
-        .map(|row| {
-            (
-                row.name.as_str(),
-                DriveCost {
-                    rows_read: row.rows_read as f64,
-                    rows_written: row.rows_written as f64,
-                    wall_ms: row.wall_ms as f64,
-                    d1_rows_read: row.d1_rows_read as f64,
-                    d1_rows_written: row.d1_rows_written as f64,
-                },
-            )
-        })
-        .collect();
-    let drive = |name: &'static str| -> Result<DriveCost, String> {
-        measured
-            .get(name)
-            .copied()
-            .ok_or_else(|| format!("budget report carries no row for `{name}`"))
-    };
-    let hot = drive("alarm pass")?;
-    let idle = drive("alarm pass (idle)")?;
-    // A report whose pass claimed nothing measures no claim price —
-    // with nonzero build traffic the projection would silently
-    // underprice the Durable Object, so the gate refuses the report
-    // rather than project zero (a zero-claims pass means the probe ran
-    // under a dispatch cap the fixture's in-flight rows already fill).
-    let builds = model.monthly_events(EventKind::Build);
-    if report.claimed_tasks == 0 && builds > 0.0 {
-        return Err(format!(
-            "budget report claims 0 tasks (dispatch_limit {}) while the model projects \
-             {builds:.0} builds/mo — a pass that cannot claim measured no claim price",
-            report.dispatch_limit
-        ));
-    }
-    // The claims inside a hot pass are what the hot row buys over the
-    // idle floor, spread over the claims the run actually made.
-    let claimed = report.claimed_tasks.max(1) as f64;
-    let claim_marginal = DriveCost {
-        rows_read: (hot.rows_read - idle.rows_read).max(0.0) / claimed,
-        rows_written: (hot.rows_written - idle.rows_written).max(0.0) / claimed,
-        wall_ms: (hot.wall_ms - idle.wall_ms).max(0.0) / claimed,
-        d1_rows_read: (hot.d1_rows_read - idle.d1_rows_read).max(0.0) / claimed,
-        d1_rows_written: (hot.d1_rows_written - idle.d1_rows_written).max(0.0) / claimed,
-    };
-
+    let drives = Drives::new(model, report)?;
     let mut projection = Projection::default();
     for cost in EVENT_COSTS {
-        fold_kind(model, cost, &drive, &claim_marginal, cpu, &mut projection)?;
+        fold_kind(model, cost, &drives, cpu, &mut projection)?;
     }
 
-    let usage = usage_lines(&projection);
+    let usage = usage_lines(&projection, preheat);
     let diagnostics = diagnostic_lines(&projection);
 
     let mut top_routes = projection.per_route;
@@ -892,6 +948,8 @@ fn evaluate(
             product: "workers",
             dimension: "cpu_ms_at_budget",
             projected: projection.worker_cpu_ms_at_budget,
+            traffic: projection.worker_cpu_ms_at_budget,
+            preheat: 0.0,
             bound: cpu_bound,
             top_route: projection
                 .cpu_routes
@@ -900,20 +958,8 @@ fn evaluate(
                 .map_or("n/a", |route| route.route),
         });
     }
-    let peak_s = projection.peak_serialized_ms / 1000.0;
-    if peak_s > PEAK_SERIALIZED_S_PER_S {
-        breaches.push(Breach {
-            product: "durable_objects",
-            dimension: "peak_serialized_s_per_s",
-            projected: peak_s,
-            bound: PEAK_SERIALIZED_S_PER_S,
-            top_route: "scheduler alarm pass",
-        });
-    }
     Ok(GateEvaluation {
         usage,
-        peak_serialized_s_per_s: peak_s,
-        peak_bound_s_per_s: PEAK_SERIALIZED_S_PER_S,
         top_routes,
         diagnostics,
         cpu_routes: projection.cpu_routes,
@@ -923,127 +969,36 @@ fn evaluate(
     })
 }
 
-/// One drive's counts on both fixture sizes.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct GrowthRow {
-    /// The drive.
-    pub name: String,
-    /// `rowsRead` on the small fixture.
-    pub read_small: u64,
-    /// `rowsRead` on the large fixture.
-    pub read_large: u64,
-    /// `rowsWritten` on the small fixture.
-    pub written_small: u64,
-    /// `rowsWritten` on the large fixture.
-    pub written_large: u64,
-    /// Whether either count grows with the stored bulk.
-    pub grows: bool,
-}
-
-/// The growth check: every drive's counts on both fixtures. A drive
-/// may legitimately be bounded by a held quantity — lane depth, the
-/// 24 h outcome window, in-flight count, the report's own size — and
-/// the fixture pins those across sizes, so only the stored bulk grows.
-#[expect(clippy::cast_precision_loss, reason = "row counters fit f64 exactly")]
-fn growth(
-    small: &SchedulerBudgetReport,
-    large: &SchedulerBudgetReport,
-) -> Result<Vec<GrowthRow>, String> {
-    if small.queue_rows >= large.queue_rows {
-        return Err(format!(
-            "the small report holds {} queue rows and the large one {} — the growth check \
-             needs the small fixture first",
-            small.queue_rows, large.queue_rows
-        ));
-    }
-    let grows =
-        |a: u64, b: u64| b as f64 > (a as f64).mul_add(1.0 + GROWTH_FRACTION, GROWTH_SLACK_ROWS);
-    let rows: Vec<GrowthRow> = small
-        .rows
-        .iter()
-        .map(|a| {
-            let b = large
-                .rows
-                .iter()
-                .find(|b| b.name == a.name)
-                .ok_or_else(|| format!("the large report carries no row for `{}`", a.name))?;
-            Ok(GrowthRow {
-                name: a.name.clone(),
-                read_small: a.rows_read,
-                read_large: b.rows_read,
-                written_small: a.rows_written,
-                written_large: b.rows_written,
-                grows: grows(a.rows_read, b.rows_read) || grows(a.rows_written, b.rows_written),
-            })
-        })
-        .collect::<Result<_, String>>()?;
-    if let Some(extra) = large
-        .rows
-        .iter()
-        .find(|b| !small.rows.iter().any(|a| a.name == b.name))
-    {
-        return Err(format!(
-            "the small report carries no row for `{}`",
-            extra.name
-        ));
-    }
-    Ok(rows)
-}
-
-/// A drive over its row budget in one of the reports.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct OverBudget {
-    /// Which report — `small`, `large` or `after`.
-    pub report: &'static str,
-    /// Its fixture size.
-    pub queue_rows: u64,
-    /// The drive.
-    pub name: String,
-}
-
-/// The whole verdict.
+/// The whole projection: the preheat share and the monthly evaluation
+/// of the clean and the post-load report.
 #[derive(Debug, serde::Serialize)]
-pub struct Verdict {
-    /// Drives over a row budget, in any report.
-    pub over_budget: Vec<OverBudget>,
-    /// The growth check, row by row.
-    pub growth: Vec<GrowthRow>,
+pub struct ProjectionReport {
+    /// What preheat adds to a month, per node and in total.
+    pub preheat: PreheatMonthly,
     /// The projection from the small report — the clean fixture.
     pub projection: GateEvaluation,
     /// The projection from the post-load report.
     pub projection_after_load: GateEvaluation,
 }
 
-impl Verdict {
+impl ProjectionReport {
     /// Every failure, one line each.
     fn failures(&self) -> Vec<String> {
-        let mut failures: Vec<String> = self
-            .over_budget
-            .iter()
-            .map(|row| {
-                format!(
-                    "{} report ({} rows): `{}` over its row budget",
-                    row.report, row.queue_rows, row.name
-                )
-            })
-            .collect();
-        failures.extend(
-            self.growth
-                .iter()
-                .filter(|row| row.grows)
-                .map(|row| format!("`{}` grows with the stored rows", row.name)),
-        );
+        let mut failures = Vec::new();
         for (label, evaluation) in [
             ("clean", &self.projection),
             ("post-load", &self.projection_after_load),
         ] {
             failures.extend(evaluation.breaches.iter().map(|breach| {
                 format!(
-                    "{label} projection: {} {} {:.3e} over bound {:.3e} — driver: {}",
+                    "{label} projection: {} {} {:.3e} over bound {:.3e} \
+                     (traffic {:.3e} + preheat {:.3e}) — driver: {}",
                     breach.product,
                     breach.dimension,
                     breach.projected,
                     breach.bound,
+                    breach.traffic,
+                    breach.preheat,
                     breach.top_route
                 )
             }));
@@ -1052,69 +1007,107 @@ impl Verdict {
     }
 }
 
-/// Collect the over-budget rows of one report.
-fn over_budget(label: &'static str, report: &SchedulerBudgetReport) -> Vec<OverBudget> {
-    report
-        .rows
-        .iter()
-        .filter(|row| row.over_budget)
-        .map(|row| OverBudget {
-            report: label,
-            queue_rows: report.queue_rows,
-            name: row.name.clone(),
-        })
-        .collect()
-}
-
-/// Judge every input.
-fn judge(
+/// Project both budget reports with the preheat share.
+fn project(
     model: &LaunchModel,
     small: &SchedulerBudgetReport,
-    large: &SchedulerBudgetReport,
     after: &SchedulerBudgetReport,
     cpu: &WorkerCpuReport,
-) -> Result<Verdict, String> {
-    let mut over = over_budget("small", small);
-    over.extend(over_budget("large", large));
-    over.extend(over_budget("after", after));
-    Ok(Verdict {
-        over_budget: over,
-        growth: growth(small, large)?,
-        projection: evaluate(model, small, cpu)?,
-        projection_after_load: evaluate(model, after, cpu)?,
+    preheat_report: &PreheatCostReport,
+) -> Result<ProjectionReport, String> {
+    let preheat = PreheatMonthly::new(model, preheat_report)?;
+    Ok(ProjectionReport {
+        projection: evaluate(model, small, cpu, &preheat)?,
+        projection_after_load: evaluate(model, after, cpu, &preheat)?,
+        preheat,
     })
 }
 
-/// Human rendering of one projection — the per-product table, the peak
-/// check, the top-5 routes, the diagnostics and the unmeasured routes.
+/// Human rendering of the preheat share: its scale and the measured
+/// per-node costs it multiplies.
+fn render_preheat(preheat: &PreheatMonthly) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "preheat: {:.2} stable releases/mo (one wave each) + {:.0} daily resubmits/mo, \
+         at {} production nodes (measured on a {}-node wave)\n",
+        preheat.releases_per_month,
+        preheat.resubmits_per_month,
+        preheat.production_nodes,
+        preheat.measured_nodes,
+    );
+    let mut table = Table::new(&["per node", "DO requests", "rows read", "rows written"]);
+    for (label, cost) in [("wave", &preheat.wave), ("resubmit", &preheat.resubmit)] {
+        table.push([
+            label.to_owned(),
+            format!("{:.2}", cost.requests),
+            format!("{:.2}", cost.rows_read),
+            format!("{:.2}", cost.rows_written),
+        ]);
+    }
+    let _ = write!(out, "{}", table.render());
+    out
+}
+
+/// The per-product table: traffic, preheat and total beside the bound,
+/// and a note on every dimension the Preheat cost report does not
+/// measure.
+fn render_usage(usage: &[UsageLine]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut table = Table::new(&[
+        "product",
+        "dimension",
+        "traffic/mo",
+        "preheat/mo",
+        "total/mo",
+        "allowance/mo",
+        "bound (50%)",
+        "share",
+        "",
+    ]);
+    let mut unmeasured = Vec::new();
+    for line in usage {
+        let bound = line.allowance * ALLOWANCE_FRACTION;
+        table.push([
+            line.product.to_owned(),
+            line.dimension.to_owned(),
+            format!("{:.3e}", line.traffic),
+            line.preheat
+                .map_or_else(|| "n/m".to_owned(), |preheat| format!("{preheat:.3e}")),
+            format!("{:.3e}", line.total()),
+            format!("{:.3e}", line.allowance),
+            format!("{bound:.3e}"),
+            format!("{:.1}%", 100.0 * line.total() / line.allowance),
+            if line.total() > bound { "OVER" } else { "" }.to_owned(),
+        ]);
+        if line.preheat.is_none() {
+            unmeasured.push(format!(
+                "  {} {}: {}",
+                line.product,
+                line.dimension,
+                super::preheat::not_measured(line.product, line.dimension)
+            ));
+        }
+    }
+    let _ = writeln!(out, "{}", table.render());
+    if !unmeasured.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nn/m — preheat not measured by the Preheat cost report (traffic only):\n{}",
+            unmeasured.join("\n")
+        );
+    }
+    out
+}
+
+/// Human rendering of one projection — the per-product table with the
+/// preheat share, the top-5 routes, the diagnostics and the unmeasured
+/// routes.
 fn render_evaluation(title: &str, evaluation: &GateEvaluation) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "{title}");
-    let mut table = Table::new(&[
-        "product",
-        "dimension",
-        "projected/mo",
-        "allowance/mo",
-        "bound (50%)",
-        "share",
-    ]);
-    for line in &evaluation.usage {
-        table.push([
-            line.product.to_owned(),
-            line.dimension.to_owned(),
-            format!("{:.3e}", line.projected),
-            format!("{:.3e}", line.allowance),
-            format!("{:.3e}", line.allowance * ALLOWANCE_FRACTION),
-            format!("{:.1}%", 100.0 * line.projected / line.allowance),
-        ]);
-    }
-    let _ = writeln!(out, "{}", table.render());
-    let _ = writeln!(
-        out,
-        "\npeak serialized DO wall: {:.3} s/s (bound {:.2} s/s)",
-        evaluation.peak_serialized_s_per_s, evaluation.peak_bound_s_per_s
-    );
+    let _ = write!(out, "{}", render_usage(&evaluation.usage));
     let mut top = Table::new(&[
         "top routes (share of allowance)",
         "events/mo",
@@ -1134,7 +1127,7 @@ fn render_evaluation(title: &str, evaluation: &GateEvaluation) -> String {
     for line in &evaluation.diagnostics {
         diag.push([
             format!("{} {}", line.product, line.dimension),
-            format!("{:.3e}", line.projected),
+            format!("{:.3e}", line.traffic),
         ]);
     }
     let _ = writeln!(out, "\n{}", diag.render());
@@ -1180,42 +1173,29 @@ fn render_evaluation(title: &str, evaluation: &GateEvaluation) -> String {
     out
 }
 
-/// Human rendering of the verdict.
-fn render_verdict(verdict: &Verdict) -> String {
+/// Human rendering of the projection.
+fn render_projection(report: &ProjectionReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let mut table = Table::new(&["drive", "rows_read", "rows_written", ""]);
-    for row in &verdict.growth {
-        table.push([
-            row.name.clone(),
-            format!("{}→{}", row.read_small, row.read_large),
-            format!("{}→{}", row.written_small, row.written_large),
-            if row.grows { "GROWS" } else { "" }.to_owned(),
-        ]);
-    }
+    let _ = writeln!(out, "{}", render_preheat(&report.preheat));
     let _ = writeln!(
         out,
-        "growth check (small → large fixture):\n{}",
-        table.render()
-    );
-    let _ = writeln!(
-        out,
-        "\n{}",
-        render_evaluation("projection — clean fixture:", &verdict.projection)
+        "{}",
+        render_evaluation("projection — clean fixture:", &report.projection)
     );
     let _ = writeln!(
         out,
         "{}",
         render_evaluation(
             "projection — after the peak drive:",
-            &verdict.projection_after_load
+            &report.projection_after_load
         )
     );
-    let failures = verdict.failures();
+    let failures = report.failures();
     if failures.is_empty() {
-        let _ = writeln!(out, "traffic cost: PASS");
+        let _ = writeln!(out, "monthly projection: PASS");
     } else {
-        let _ = writeln!(out, "traffic cost: FAIL");
+        let _ = writeln!(out, "monthly projection: FAIL");
         for failure in &failures {
             let _ = writeln!(out, "  {failure}");
         }
@@ -1223,135 +1203,210 @@ fn render_verdict(verdict: &Verdict) -> String {
     out
 }
 
-/// Read and decode one JSON input.
-async fn read_json<T: serde::de::DeserializeOwned>(
-    what: &str,
-    path: &Path,
-) -> stow_types::error::Result<T> {
-    let text = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|error| stow_error!("read {what} {}: {error}", path.display()))?;
-    serde_json::from_str(&text)
-        .map_err(|error| stow_error!("parse {what} {}: {error}", path.display()))
-}
-
-/// `stow-admin traffic-cost project` — judge and exit nonzero on any
-/// failure.
+/// `stow-admin traffic-cost project` — project and exit nonzero on any
+/// breach.
 pub async fn run(args: &ProjectArgs, output: Output) -> stow_types::error::Result<()> {
-    let small: SchedulerBudgetReport = read_json("budget report", &args.small).await?;
-    let large: SchedulerBudgetReport = read_json("budget report", &args.large).await?;
-    let after: SchedulerBudgetReport = read_json("budget report", &args.after).await?;
-    let cpu: WorkerCpuReport = read_json("Worker CPU report", &args.cpu).await?;
+    let small: SchedulerBudgetReport = super::read_json("budget report", &args.small).await?;
+    let after: SchedulerBudgetReport = super::read_json("budget report", &args.after).await?;
+    let cpu: WorkerCpuReport = super::read_json("Worker CPU report", &args.cpu).await?;
+    let preheat: PreheatCostReport = super::read_json("preheat cost report", &args.preheat).await?;
     let model = super::read_model(&args.model).await?;
-    let verdict =
-        judge(&model, &small, &large, &after, &cpu).map_err(|error| stow_error!("{error}"))?;
-    emit(output, &verdict, render_verdict)?;
-    let failures = verdict.failures();
+    let report =
+        project(&model, &small, &after, &cpu, &preheat).map_err(|error| stow_error!("{error}"))?;
+    emit(output, &report, render_projection)?;
+    let failures = report.failures();
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(stow_error!("traffic cost: {} failure(s)", failures.len()))
+        Err(stow_error!(
+            "monthly projection: {} breach(es)",
+            failures.len()
+        ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use stow_types::api::{SchedulerBudgetReport, SchedulerBudgetRow};
-    use stow_types::do_budgets::{DO_BUDGETS, WORKER_CPU_BUDGETS};
-    use stow_types::launch_model::LaunchModel;
+    use clap::Parser as _;
+    use stow_types::do_budgets::WORKER_CPU_BUDGETS;
 
-    use super::{evaluate, growth, judge, render_verdict};
-    use crate::traffic_cost::cpu::{WorkerCpuReport, WorkerCpuRow};
+    use super::{ProjectArgs, evaluate, project};
+    use crate::traffic_cost::preheat::{PerNode, PreheatMonthly};
+    use crate::traffic_cost::test_support::{fixture_cpu, fixture_report, model};
 
-    /// A fixture report built on the absolute budget bounds: every
-    /// drive's measurement sits at `scale(name)` of its budget — half is
-    /// the ~2× headroom the `DO_BUDGETS` table documents, so the fixture
-    /// is the report a healthy run produces.
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss,
-        reason = "fixture counters sit far inside both types' ranges"
-    )]
-    fn fixture_report(queue_rows: u64, scale: impl Fn(&str) -> f64) -> SchedulerBudgetReport {
-        SchedulerBudgetReport {
-            queue_rows,
-            // The production dispatch cap (45) minus the fixture's 30
-            // in-flight rows: the slots the hot pass claims.
-            dispatch_limit: 45,
-            claimed_tasks: 15,
-            over_budget: false,
-            rows: DO_BUDGETS
-                .iter()
-                .map(|budget| {
-                    let factor = scale(budget.name);
-                    SchedulerBudgetRow {
-                        name: budget.name.to_owned(),
-                        statements: (budget.statements as f64 * factor) as u64,
-                        rows_read: (budget.rows_read as f64 * factor) as u64,
-                        rows_written: (budget.rows_written as f64 * factor) as u64,
-                        wall_ms: (budget.wall_ms as f64 * factor) as u64,
-                        d1_rows_read: 0,
-                        d1_rows_written: 0,
-                        d1_elapsed_ms: 0,
-                        statement_budget: budget.statements,
-                        read_budget: budget.rows_read,
-                        write_budget: budget.rows_written,
-                        wall_budget: budget.wall_ms,
-                        over_budget: factor > 1.0,
-                        over_wall: factor > 1.0,
-                        log: Vec::new(),
-                    }
-                })
-                .collect(),
+    /// A preheat share with no cost — the traffic-only baseline the
+    /// tests add to.
+    fn no_preheat() -> PreheatMonthly {
+        preheat_of(PerNode::default(), PerNode::default())
+    }
+
+    /// 1 release a month, 1 resubmit a month, one measured node per
+    /// production node: the monthly preheat is `wave + resubmit`.
+    fn preheat_of(wave: PerNode, resubmit: PerNode) -> PreheatMonthly {
+        PreheatMonthly {
+            measured_nodes: 10,
+            production_nodes: 10,
+            releases_per_month: 1.0,
+            resubmits_per_month: 1.0,
+            wave,
+            resubmit,
         }
     }
 
-    /// Every lane at `scale(lane)` of its CPU budget.
-    fn fixture_cpu(scale: impl Fn(&str) -> f64) -> WorkerCpuReport {
-        WorkerCpuReport {
-            sampling_interval_us: 100,
-            idle_window_ms: 3000,
-            idle_cpu_ms: 0.0,
-            rows: WORKER_CPU_BUDGETS
-                .iter()
-                .map(|budget| {
-                    let cpu_ms = budget.cpu_ms * scale(budget.lane);
-                    WorkerCpuRow {
-                        lane: budget.lane.to_owned(),
-                        events_per_round: 20,
-                        rounds_cpu_ms: vec![cpu_ms],
-                        cpu_ms,
-                        budget_ms: budget.cpu_ms,
-                        over_budget: budget.over_budget(cpu_ms),
-                    }
-                })
-                .collect(),
+    fn rows_written_per_node(rows_written: f64) -> PerNode {
+        PerNode {
+            rows_written,
+            ..PerNode::default()
         }
     }
 
-    /// The checked-in model — the gate test reads the real file so a
-    /// regenerated model is always what the fixture is judged against.
-    const MODEL_TOML: &str = include_str!("../../../launch-model.toml");
-
-    fn model() -> LaunchModel {
-        LaunchModel::from_toml(MODEL_TOML).expect("model")
+    fn usage<'a>(
+        evaluation: &'a super::GateEvaluation,
+        product: &str,
+        dimension: &str,
+    ) -> &'a super::UsageLine {
+        evaluation
+            .usage
+            .iter()
+            .find(|line| line.product == product && line.dimension == dimension)
+            .expect("usage line")
     }
 
     #[test]
     fn a_healthy_run_passes() {
         let small = fixture_report(100_000, |_| 0.5);
-        let large = fixture_report(1_000_000, |_| 0.5);
         let after = fixture_report(100_000, |_| 0.5);
-        let verdict =
-            judge(&model(), &small, &large, &after, &fixture_cpu(|_| 0.5)).expect("judge");
-        let rendered = render_verdict(&verdict);
-        assert!(verdict.failures().is_empty(), "{rendered}");
-        assert!(rendered.contains("traffic cost: PASS"), "{rendered}");
-        assert!(rendered.contains("workers"), "{rendered}");
-        assert!(rendered.contains("cpu_ms"), "{rendered}");
+        let report =
+            project_with(&small, &after, &no_preheat(), &fixture_cpu(|_| 0.5)).expect("project");
+        let rendered = super::render_projection(&report);
+        assert!(report.failures().is_empty(), "{rendered}");
+        assert!(rendered.contains("monthly projection: PASS"), "{rendered}");
+        assert!(rendered.contains("preheat/mo"), "{rendered}");
         assert!(rendered.contains("Worker CPU per route"), "{rendered}");
         assert!(rendered.contains("Worker CPU at budget"), "{rendered}");
+    }
+
+    /// `project` over a hand-built preheat share instead of a report.
+    fn project_with(
+        small: &stow_types::api::SchedulerBudgetReport,
+        after: &stow_types::api::SchedulerBudgetReport,
+        preheat: &PreheatMonthly,
+        cpu: &crate::traffic_cost::cpu::WorkerCpuReport,
+    ) -> Result<super::ProjectionReport, String> {
+        Ok(super::ProjectionReport {
+            projection: evaluate(&model(), small, cpu, preheat)?,
+            projection_after_load: evaluate(&model(), after, cpu, preheat)?,
+            preheat: *preheat,
+        })
+    }
+
+    /// Preheat is added to the products the Preheat cost report
+    /// measures and to no other: the total is traffic plus preheat on a
+    /// Durable Object line, and a Worker line carries no preheat at all.
+    #[test]
+    fn preheat_adds_to_the_measured_products_only() {
+        let report = fixture_report(100_000, |_| 0.5);
+        let cpu = fixture_cpu(|_| 0.5);
+        let base = evaluate(&model(), &report, &cpu, &no_preheat()).expect("evaluate");
+        let with = evaluate(
+            &model(),
+            &report,
+            &cpu,
+            &preheat_of(rows_written_per_node(1_000.0), rows_written_per_node(500.0)),
+        )
+        .expect("evaluate");
+
+        let before = usage(&base, "durable_objects", "rows_written");
+        let after = usage(&with, "durable_objects", "rows_written");
+        assert!((before.traffic - after.traffic).abs() < 1e-6);
+        // 1 wave/mo × 1000 rows/node × 10 nodes + 1 resubmit/mo ×
+        // 500 rows/node × 10 nodes.
+        let preheat = after.preheat.expect("measured");
+        assert!((preheat - 15_000.0).abs() < 1e-6, "{preheat}");
+        assert!((after.total() - (after.traffic + 15_000.0)).abs() < 1e-6);
+
+        let workers = usage(&with, "workers", "requests");
+        assert_eq!(workers.preheat, None);
+        assert!((workers.total() - workers.traffic).abs() < f64::EPSILON);
+    }
+
+    /// Traffic alone is inside the bound; the same traffic plus a
+    /// preheat that fills the rest of it is not — and the breach names
+    /// the preheat as the driver and splits its total.
+    #[test]
+    fn traffic_plus_preheat_over_the_bound_fails() {
+        let small = fixture_report(100_000, |_| 0.5);
+        let after = fixture_report(100_000, |_| 0.5);
+        let cpu = fixture_cpu(|_| 0.5);
+        let base = evaluate(&model(), &small, &cpu, &no_preheat()).expect("evaluate");
+        assert!(base.breaches.is_empty(), "{:?}", base.breaches);
+
+        let line = usage(&base, "durable_objects", "rows_written");
+        let headroom = line
+            .allowance
+            .mul_add(super::ALLOWANCE_FRACTION, -line.traffic);
+        assert!(headroom > 0.0);
+        // The month has one wave and one resubmit of 10 nodes each, so
+        // `x` rows per node and phase is `20 x` a month.
+        let fits = rows_written_per_node(headroom * 0.4 / 10.0);
+        let report = project_with(&small, &after, &preheat_of(fits, fits), &cpu).expect("project");
+        assert!(report.failures().is_empty(), "{:?}", report.failures());
+
+        // A month of preheat as large as the whole allowance: over the
+        // bound, and larger than the traffic it joins.
+        let overflows = rows_written_per_node(line.allowance / 20.0);
+        let report =
+            project_with(&small, &after, &preheat_of(overflows, overflows), &cpu).expect("project");
+        let failures = report.failures();
+        assert_eq!(failures.len(), 2, "clean and post-load: {failures:?}");
+        let breach = &report.projection.breaches[0];
+        assert_eq!(breach.product, "durable_objects");
+        assert_eq!(breach.dimension, "rows_written");
+        assert!(breach.preheat > 0.0 && breach.traffic < breach.bound);
+        assert!(breach.projected > breach.bound);
+        assert_eq!(breach.top_route, super::PREHEAT_ROUTE);
+    }
+
+    /// The preheat report is not optional: the CLI refuses a
+    /// projection without it.
+    #[test]
+    fn the_preheat_report_is_required() {
+        #[derive(Debug, clap::Parser)]
+        struct Cli {
+            #[command(flatten)]
+            args: ProjectArgs,
+        }
+        let base = ["project", "--small", "s", "--after", "a", "--cpu", "c"];
+        let error = Cli::try_parse_from(base).expect_err("--preheat is required");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        assert!(error.to_string().contains("--preheat"), "{error}");
+        let mut with = base.to_vec();
+        with.extend(["--preheat", "p"]);
+        Cli::try_parse_from(with).expect("complete arguments parse");
+    }
+
+    #[test]
+    fn a_report_without_nodes_cannot_be_projected() {
+        let small = fixture_report(100_000, |_| 0.5);
+        let after = fixture_report(100_000, |_| 0.5);
+        let mut preheat = crate::traffic_cost::preheat::test_report(10, 10);
+        preheat.nodes = 0;
+        let error = project(&model(), &small, &after, &fixture_cpu(|_| 0.5), &preheat)
+            .expect_err("a zero-node wave prices nothing");
+        assert!(error.contains("0 nodes"), "{error}");
+    }
+
+    #[test]
+    fn a_missing_cpu_lane_is_refused() {
+        let report = fixture_report(100_000, |_| 0.5);
+        let mut cpu = fixture_cpu(|_| 0.5);
+        cpu.rows.retain(|row| row.lane != "bundle-fetch");
+        let error =
+            evaluate(&model(), &report, &cpu, &no_preheat()).expect_err("missing lane must refuse");
+        assert!(error.contains("bundle-fetch"), "{error}");
     }
 
     #[test]
@@ -1362,8 +1417,8 @@ mod tests {
             100_000,
             |name| if name == "alarm pass" { 15.0 } else { 0.5 },
         );
-        let evaluation = evaluate(&model(), &report, &fixture_cpu(|_| 0.5)).expect("evaluate");
-        assert!(!evaluation.breaches.is_empty());
+        let evaluation =
+            evaluate(&model(), &report, &fixture_cpu(|_| 0.5), &no_preheat()).expect("evaluate");
         assert!(
             evaluation
                 .breaches
@@ -1381,7 +1436,7 @@ mod tests {
     fn a_raised_worker_cpu_fails_the_projection() {
         let report = fixture_report(100_000, |_| 0.5);
         let cpu = fixture_cpu(|lane| if lane == "bundle-fetch" { 100.0 } else { 0.5 });
-        let evaluation = evaluate(&model(), &report, &cpu).expect("evaluate");
+        let evaluation = evaluate(&model(), &report, &cpu, &no_preheat()).expect("evaluate");
         assert!(
             evaluation
                 .breaches
@@ -1392,17 +1447,6 @@ mod tests {
         );
     }
 
-    /// A CPU report missing a lane the projection prices is refused,
-    /// never priced at zero.
-    #[test]
-    fn a_missing_cpu_lane_is_refused() {
-        let report = fixture_report(100_000, |_| 0.5);
-        let mut cpu = fixture_cpu(|_| 0.5);
-        cpu.rows.retain(|row| row.lane != "bundle-fetch");
-        let error = evaluate(&model(), &report, &cpu).expect_err("missing lane must refuse");
-        assert!(error.contains("bundle-fetch"), "{error}");
-    }
-
     /// A pass that claimed nothing measures no claim price; with the
     /// model's nonzero build traffic the gate must refuse the report
     /// rather than project a zero claim cost (stow#452 F1).
@@ -1410,60 +1454,9 @@ mod tests {
     fn a_zero_claim_report_is_refused() {
         let mut report = fixture_report(100_000, |_| 0.5);
         report.claimed_tasks = 0;
-        let error = evaluate(&model(), &report, &fixture_cpu(|_| 0.5))
+        let error = evaluate(&model(), &report, &fixture_cpu(|_| 0.5), &no_preheat())
             .expect_err("zero-claims must refuse");
         assert!(error.contains("claims 0 tasks"), "{error}");
-    }
-
-    /// A drive whose rows track the stored bulk fails the growth check;
-    /// one inside 10% + 50 rows passes.
-    #[test]
-    fn rows_that_grow_with_the_fixture_fail() {
-        let small = fixture_report(100_000, |_| 0.5);
-        let flat = fixture_report(
-            1_000_000,
-            |name| if name == "GET /status" { 0.55 } else { 0.5 },
-        );
-        assert!(
-            growth(&small, &flat)
-                .expect("growth")
-                .iter()
-                .all(|row| !row.grows)
-        );
-        let mut grown = fixture_report(1_000_000, |_| 0.5);
-        let row = grown
-            .rows
-            .iter_mut()
-            .find(|row| row.name == "GET /tasks")
-            .expect("row");
-        row.rows_read *= 10;
-        let rows = growth(&small, &grown).expect("growth");
-        let rising: Vec<&str> = rows
-            .iter()
-            .filter(|row| row.grows)
-            .map(|row| row.name.as_str())
-            .collect();
-        assert_eq!(rising, ["GET /tasks"]);
-    }
-
-    /// An over-budget row in the post-load report fails the verdict.
-    #[test]
-    fn an_over_budget_row_after_the_drive_fails() {
-        let small = fixture_report(100_000, |_| 0.5);
-        let large = fixture_report(1_000_000, |_| 0.5);
-        let after = fixture_report(
-            100_000,
-            |name| if name == "GET /status" { 1.5 } else { 0.5 },
-        );
-        let verdict =
-            judge(&model(), &small, &large, &after, &fixture_cpu(|_| 0.5)).expect("judge");
-        let failures = verdict.failures();
-        assert!(
-            failures
-                .iter()
-                .any(|failure| failure.contains("after report") && failure.contains("GET /status")),
-            "{failures:?}"
-        );
     }
 
     #[test]
@@ -1496,7 +1489,8 @@ mod tests {
     #[test]
     fn the_cpu_budgets_fit_the_allowance() {
         let report = fixture_report(100_000, |_| 0.5);
-        let evaluation = evaluate(&model(), &report, &fixture_cpu(|_| 0.5)).expect("evaluate");
+        let evaluation =
+            evaluate(&model(), &report, &fixture_cpu(|_| 0.5), &no_preheat()).expect("evaluate");
         let bound = super::WORKER_CPU_MS_MONTHLY * super::ALLOWANCE_FRACTION;
         assert!(
             evaluation.worker_cpu_ms_at_budget <= bound,

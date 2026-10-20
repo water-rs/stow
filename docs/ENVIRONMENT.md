@@ -151,6 +151,8 @@ billed rows. `docs/MOCK.md` describes the run.
 | `STOW_PREHEAT_COST_LIMIT` | `100` | `--limit` of `preheat top` and `preheat top-binaries` — the production `preheat-admin.yml` value. |
 | `STOW_PREHEAT_COST_PROJECTS` | every listed repository | `preheat projects submit --limit`: resolve only the first N repositories of `preheat/projects.toml`. |
 | `STOW_PREHEAT_COST_TARGETS` | every `CI_TARGET_TRIPLES` entry | Comma-separated `--targets` for every lane. |
+| `STOW_PREHEAT_COST_PRODUCTION_LIMIT` | the `limit` input's default in `.github/workflows/preheat-admin.yml` | `--limit` of the plan-only production `preheat top` and `preheat top-binaries` whose distinct nodes are the production wave the monthly projection scales to. Nothing is enqueued. |
+| `STOW_PREHEAT_COST_PRODUCTION_TARGETS` | the `targets` input's default in `.github/workflows/preheat-admin.yml` | Comma-separated `--targets` of the plan-only production lanes. |
 | `STOW_PREHEAT_COST_MAX_JOBS` / `STOW_PREHEAT_COST_MAX_MACOS_JOBS` | `45` / `16` | The scheduler's dispatch caps for the run — `edge/Skyzen.toml`'s production values, replacing the mock manifest's. |
 | `STOW_PREHEAT_COST_DEADLINE` | `21600` | Seconds the wave (and, separately, the resubmit) may run before the script fails. |
 | `STOW_PREHEAT_COST_EDGE_RSS_MB` | `1200` | Restart the `wrangler dev` edge at an idle point once its process tree passes this resident size. |

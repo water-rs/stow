@@ -19,6 +19,15 @@
 //! <phase>/rounds/<NN>/new-records.json  the round's `index export` delta
 //! <phase>/end.json                      ledger when the phase ended
 //! ```
+//!
+//! The production wave's size comes from a third directory the script
+//! fills with the production lanes' plan-only runs (no `--yes`, nothing
+//! enqueued), laid out like a phase's lanes:
+//!
+//! ```text
+//! lanes/<NN>-<lane>/plan.json   the lane's `--json` envelope
+//! lanes/<NN>-<lane>/exit        the lane's exit status
+//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -28,8 +37,8 @@ use stow_types::api::{ArtifactRecord, EnqueueRequest, SchedulerLedger};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::local_ci::LocalCiTasks;
 use stow_types::preheat_cost::{
-    LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport, Round, WaveObservations,
-    analyse,
+    LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport, ProductionLane,
+    ProductionTask, Round, WaveObservations, analyse,
 };
 use stow_types::public_cache::UnitSide;
 use stow_types::stow_error;
@@ -78,6 +87,10 @@ struct ReportArgs {
     /// lane's, the publish loop's).
     #[arg(long)]
     scan: Vec<PathBuf>,
+    /// The directory holding the production lanes' plan-only runs (layout
+    /// in this module's docs).
+    #[arg(long)]
+    production_dir: PathBuf,
     /// Where to write `preheat-cost-report.json`.
     #[arg(long)]
     out: PathBuf,
@@ -213,6 +226,53 @@ fn published_task_ids(records: &[ArtifactRecord]) -> BTreeSet<String> {
         .collect()
 }
 
+/// The lane directories under `dir/lanes` in run order, each with the
+/// lane name its `<NN>-<lane>` directory carries.
+async fn lane_dirs(dir: &Path) -> stow_types::error::Result<Vec<(String, PathBuf)>> {
+    sorted_entries(&dir.join("lanes"))
+        .await?
+        .into_iter()
+        .map(|lane_dir| {
+            let name = lane_dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.split_once('-'))
+                .map(|(_, lane)| lane.to_owned())
+                .ok_or_else(|| {
+                    stow_error!("lane directory {} is not <NN>-<lane>", lane_dir.display())
+                })?;
+            Ok((name, lane_dir))
+        })
+        .collect()
+}
+
+/// The production lanes' plan-only output. A lane that did not exit
+/// cleanly would undercount the production wave, so it fails the report
+/// instead of counting as an empty lane.
+async fn production_lanes(dir: &Path) -> stow_types::error::Result<Vec<ProductionLane>> {
+    let mut lanes = Vec::new();
+    for (name, lane_dir) in lane_dirs(dir).await? {
+        let plan = lane_plan(&name, &lane_dir).await?;
+        if let Some(failure) = plan.submit_failures.first() {
+            return Err(stow_error!("production lane {name}: {failure}"));
+        }
+        lanes.push(ProductionLane {
+            tasks: plan
+                .tasks
+                .iter()
+                .map(|task| {
+                    Ok(ProductionTask {
+                        task_id: task.task_id()?,
+                        target: task.target.as_str().to_owned(),
+                    })
+                })
+                .collect::<stow_types::error::Result<_>>()?,
+            lane: name,
+        });
+    }
+    Ok(lanes)
+}
+
 /// A phase's observations plus every task its lanes planned.
 ///
 /// `seen` holds the task ids the queue already carries: a first-seen task
@@ -226,15 +286,7 @@ async fn phase(
 ) -> stow_types::error::Result<(PhaseObservations, Vec<EnqueueRequest>)> {
     let mut lanes = Vec::new();
     let mut tasks = Vec::new();
-    for lane_dir in sorted_entries(&dir.join("lanes")).await? {
-        let name = lane_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .and_then(|name| name.split_once('-'))
-            .map(|(_, lane)| lane.to_owned())
-            .ok_or_else(|| {
-                stow_error!("lane directory {} is not <NN>-<lane>", lane_dir.display())
-            })?;
+    for (name, lane_dir) in lane_dirs(dir).await? {
         let plan = lane_plan(&name, &lane_dir).await?;
         let mut inserted = 0_u64;
         let mut inserted_edges = 0_u64;
@@ -352,6 +404,7 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
         runs: runs.tasks,
         covered,
         overload_sightings: overload_sightings(&args.scan).await?,
+        production: production_lanes(&args.production_dir).await?,
     })?;
     tokio::fs::write(&args.out, serde_json::to_vec_pretty(&report)?)
         .await
@@ -421,8 +474,20 @@ fn render_report(report: &PreheatCostReport) -> String {
             check.detail.clone(),
         ]);
     }
+    let production = report
+        .production
+        .lanes
+        .iter()
+        .map(|lane| {
+            format!(
+                "{}: {} planned, {} new",
+                lane.lane, lane.planned, lane.new_nodes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "{} nodes ({}) on rustc {}\n\n{}\n\n{}\n\n{}",
+        "{} nodes ({}) on rustc {}\nproduction wave: {} distinct nodes ({production})\n\n{}\n\n{}\n\n{}",
         report.nodes,
         report
             .nodes_per_target
@@ -431,6 +496,7 @@ fn render_report(report: &PreheatCostReport) -> String {
             .collect::<Vec<_>>()
             .join(", "),
         report.rustc_version,
+        report.production.nodes,
         phases.render(),
         layers.render(),
         checks.render()

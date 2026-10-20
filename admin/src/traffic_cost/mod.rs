@@ -6,9 +6,13 @@
 //!   profiler and gates each lane against `WORKER_CPU_BUDGETS`;
 //! - `peak` drives every lane at the launch model's peak rate and fails
 //!   on any overload signal or 5xx;
-//! - `project` judges the scheduler budget reports and the CPU report:
-//!   row budgets, growth with stored rows, the monthly projection against
-//!   half of each allowance, and the peak serialized Durable Object wall.
+//! - `verdict` judges the scheduler budget reports: row budgets, growth
+//!   with stored rows, and the peak serialized Durable Object wall;
+//! - `project` is the monthly projection against half of each allowance
+//!   — user traffic from those reports and the CPU report, plus the
+//!   preheat waves and daily resubmits the Preheat cost report measures
+//!   (stow#775). The release gate runs it in its own job, once both
+//!   tests' reports exist.
 
 use std::path::Path;
 
@@ -22,7 +26,11 @@ use crate::render::Output;
 mod cpu;
 mod lanes;
 mod peak;
+mod preheat;
 mod project;
+#[cfg(test)]
+mod test_support;
+mod verdict;
 
 /// `stow-admin traffic-cost`.
 #[derive(Debug, Args)]
@@ -39,8 +47,11 @@ enum TrafficCostCommand {
     /// Drive every traffic lane at the launch model's peak rate and fail
     /// on any overload signal, 5xx, error share or latency bound.
     Peak(peak::PeakArgs),
-    /// Judge the run: row budgets, growth with stored rows, the monthly
-    /// projection against the allowance, and the peak serialized wall.
+    /// Judge the run: row budgets, growth with stored rows and the peak
+    /// serialized wall.
+    Verdict(verdict::VerdictArgs),
+    /// Project the month — user traffic plus the preheat waves and
+    /// resubmits — against half of each product's allowance.
     Project(project::ProjectArgs),
 }
 
@@ -49,6 +60,7 @@ pub async fn run(args: TrafficCostArgs, output: Output) -> stow_types::error::Re
     match args.command {
         TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect().await?, &args, output).await,
         TrafficCostCommand::Peak(args) => peak::run(&Edge::connect().await?, &args, output).await,
+        TrafficCostCommand::Verdict(args) => verdict::run(&args, output).await,
         TrafficCostCommand::Project(args) => project::run(&args, output).await,
     }
 }
@@ -60,4 +72,16 @@ async fn read_model(path: &Path) -> stow_types::error::Result<LaunchModel> {
         .map_err(|error| stow_error!("read launch model {}: {error}", path.display()))?;
     LaunchModel::from_toml(&text)
         .map_err(|error| stow_error!("load launch model {}: {error}", path.display()))
+}
+
+/// Read and decode one JSON input.
+async fn read_json<T: serde::de::DeserializeOwned>(
+    what: &str,
+    path: &Path,
+) -> stow_types::error::Result<T> {
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| stow_error!("read {what} {}: {error}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|error| stow_error!("parse {what} {}: {error}", path.display()))
 }
