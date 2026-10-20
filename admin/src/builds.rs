@@ -32,6 +32,7 @@ use clap::{Args, Subcommand};
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use stow_types::api::{CI_TARGET_TRIPLES, task_id_segment};
 use stow_types::records::parse_run_title;
+use stow_types::runs::{RunFailure, RunJobsPage, classify_failure};
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
 use time::OffsetDateTime;
@@ -39,7 +40,7 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::github::{self, BUILD_WORKFLOW};
 use crate::render::{self, Output};
-use crate::runs::{self, RunFailure, RunJobsPage, classify_failure};
+use crate::runs;
 use crate::watchdog;
 
 /// The digest's issue — the single open record a failing day comments

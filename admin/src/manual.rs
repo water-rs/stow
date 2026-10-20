@@ -30,6 +30,7 @@ use stow_types::index::{ArtifactIndexRow, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::public_cache::{UnitInvocation, required_unit_shapes};
 use stow_types::records::parse_run_title;
 use stow_types::registry::{CacheRepository, cache_repository};
+use stow_types::runs::{GITHUB_CLOCK_ALLOWANCE, RunFailure, RunJobsPage, classify_failure};
 use stow_types::stow_error;
 use stow_types::task_graph::TaskNodeIdentity;
 use stow_types::transient::Backoff;
@@ -38,9 +39,8 @@ use stow_types::trusted_builder::{
 };
 use zenwave::{Client, ResponseExt};
 
-use crate::github::{GITHUB_CLOCK_ALLOWANCE, WriteFailure, classify_write};
+use crate::github::{WriteFailure, classify_write};
 use crate::render::{self, Output};
-use crate::runs::{RunFailure, RunJobsPage, classify_failure};
 
 /// The build-crate runs poll cadence.
 const RUN_POLL_SECONDS: u64 = 30;
@@ -2132,7 +2132,8 @@ impl Dispatch {
     /// nothing ([`Classified::RateLimited`]), a refusal stays the
     /// error it was. And the jobs page itself may not be an answer
     /// yet — a run reports `completed` before its job and step rows
-    /// settle, so an unsettled page inside [`STEP_SETTLE_WINDOW`]
+    /// settle, so an unsettled page inside
+    /// [`STEP_SETTLE_WINDOW`](stow_types::runs::STEP_SETTLE_WINDOW)
     /// defers ([`Classified::Unsettled`]) rather than classify a
     /// half-written picture.
     async fn classify_failed_run(&self, state: &RunState) -> stow_types::error::Result<Classified> {
@@ -2519,7 +2520,6 @@ struct WorkflowDispatchResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runs::{RunJobRow, RunStepRow, VERDICT_STEPS};
     use clap::Parser;
 
     /// Fold one already-classified run state: a `Some` record means the
@@ -3317,226 +3317,6 @@ mod tests {
         bound.task_id = "task".to_owned();
         retain_latest_run(&mut latest, bound, Some(50));
         assert_eq!(latest["task"].workflow_run_id, 50);
-    }
-
-    /// One jobs row for the classifier — `status` is the job's own and
-    /// each step is `(name, status, conclusion)`. A settled page
-    /// reports `completed` everywhere; anything else is GitHub still
-    /// writing it.
-    fn job_row(
-        name: &str,
-        status: &str,
-        conclusion: Option<&str>,
-        completed_at: Option<i64>,
-        steps: &[(&str, &str, Option<&str>)],
-    ) -> RunJobRow {
-        RunJobRow {
-            id: 0,
-            name: name.to_owned(),
-            status: status.to_owned(),
-            conclusion: conclusion.map(str::to_owned),
-            completed_at: completed_at.map(at),
-            steps: steps
-                .iter()
-                .map(|&(name, status, conclusion)| RunStepRow {
-                    name: name.to_owned(),
-                    status: status.to_owned(),
-                    conclusion: conclusion.map(str::to_owned),
-                })
-                .collect(),
-        }
-    }
-
-    /// A failed step named by `VERDICT_STEPS` is the crate's verdict —
-    /// the build stage, the glibc-floor report and the publish stage.
-    #[test]
-    fn a_verdict_step_is_final() {
-        for step in VERDICT_STEPS {
-            let jobs = [job_row(
-                "build",
-                "completed",
-                Some("failure"),
-                Some(1_000_000),
-                &[(*step, "completed", Some("failure"))],
-            )];
-            assert!(
-                matches!(
-                    classify_failure(&jobs, at(1_000_100)),
-                    Ok(Some(RunFailure::Verdict { .. }))
-                ),
-                "{step} is the crate's verdict"
-            );
-        }
-    }
-
-    /// The step run 38019734143 died in — the toolchain install — is
-    /// runner infrastructure, not the crate's verdict.
-    #[test]
-    fn a_setup_step_failure_is_infrastructure() {
-        const TOOLCHAIN_STEP: &str =
-            "Run dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de";
-        let jobs = [job_row(
-            "build adler2 2.0.1 (aarch64-linux-android)",
-            "completed",
-            Some("failure"),
-            Some(1_000_000),
-            &[(TOOLCHAIN_STEP, "completed", Some("failure"))],
-        )];
-        let Ok(Some(RunFailure::Infrastructure { job, step })) =
-            classify_failure(&jobs, at(1_000_100))
-        else {
-            panic!("a toolchain-install failure is infrastructure");
-        };
-        assert_eq!(step.as_deref(), Some(TOOLCHAIN_STEP));
-        assert!(job.contains("adler2"));
-    }
-
-    /// A failed job with no failed step — the runner was lost before a
-    /// step could fail — is infrastructure; so is a failed run with no
-    /// failed job at all (`startup_failure`). Both hold only on a
-    /// settled page.
-    #[test]
-    fn a_failed_job_with_no_failed_step_is_infrastructure() {
-        let jobs = [job_row(
-            "build",
-            "completed",
-            Some("failure"),
-            Some(1_000_000),
-            &[("Check out the repository", "completed", Some("success"))],
-        )];
-        assert!(matches!(
-            classify_failure(&jobs, at(1_000_100)),
-            Ok(Some(RunFailure::Infrastructure { step: None, .. }))
-        ));
-        assert!(matches!(
-            classify_failure(&[], at(1_000_100)),
-            Ok(Some(RunFailure::Infrastructure { step: None, .. }))
-        ));
-    }
-
-    /// stow#765: the settled read of run 38936251869 — the failed job's
-    /// failing step is a `VERDICT_STEPS` step, so the failure is the
-    /// crate's verdict and no rerun is asked.
-    #[test]
-    fn a_settled_verdict_step_failure_is_the_crates_verdict() {
-        let jobs = [job_row(
-            "build foundationdb-gen 0.11.0 (aarch64-unknown-linux-gnu)",
-            "completed",
-            Some("failure"),
-            Some(1_000_000),
-            &[
-                ("Check out the repository", "completed", Some("success")),
-                (
-                    "Run the untrusted build stage",
-                    "completed",
-                    Some("failure"),
-                ),
-            ],
-        )];
-        assert!(matches!(
-            classify_failure(&jobs, at(1_000_100)),
-            Ok(Some(RunFailure::Verdict { .. }))
-        ));
-    }
-
-    /// stow#765: run 38936251869 read mid-settle — the failed job's row
-    /// has landed but the step it failed in still says `in_progress`
-    /// with no conclusion. Inside `STEP_SETTLE_WINDOW` of the job's
-    /// `completed_at` the page defers rather than read as the
-    /// lost-runner shape and rerun a verdict.
-    #[test]
-    fn a_failed_job_settling_inside_the_window_defers() {
-        let jobs = [job_row(
-            "build foundationdb-gen 0.11.0 (aarch64-unknown-linux-gnu)",
-            "completed",
-            Some("failure"),
-            Some(1_000_000 - 30),
-            &[
-                ("Check out the repository", "completed", Some("success")),
-                ("Run the untrusted build stage", "in_progress", None),
-            ],
-        )];
-        assert!(
-            classify_failure(&jobs, at(1_000_000))
-                .expect("classified")
-                .is_none()
-        );
-    }
-
-    /// stow#765: run 38919684562's shape — a lost runner leaves the
-    /// failed job's `in_progress`/`pending` step rows unsettled
-    /// forever. Past `STEP_SETTLE_WINDOW` the first unsettled step is
-    /// where the runner was lost: infrastructure, naming it.
-    #[test]
-    fn a_lost_runners_unsettled_steps_are_infrastructure_past_the_window() {
-        let jobs = [
-            job_row(
-                "build",
-                "completed",
-                Some("success"),
-                Some(1_000_000 - 900),
-                &[("Check out the repository", "completed", Some("success"))],
-            ),
-            job_row(
-                "publish",
-                "completed",
-                Some("failure"),
-                Some(1_000_000 - 600),
-                &[
-                    ("Check out the repository", "completed", Some("success")),
-                    ("Publish the built index slice", "in_progress", None),
-                    ("Post the run summary", "pending", None),
-                ],
-            ),
-        ];
-        let Ok(Some(RunFailure::Infrastructure { job, step })) =
-            classify_failure(&jobs, at(1_000_000))
-        else {
-            panic!("a lost runner is infrastructure");
-        };
-        assert_eq!(job, "publish");
-        assert_eq!(step.as_deref(), Some("Publish the built index slice"));
-    }
-
-    /// A `completed` job always carries `completed_at` — one without it
-    /// is a schema surprise, and the classifier fails fast rather than
-    /// guess at its age.
-    #[test]
-    fn a_completed_failed_job_without_completed_at_fails() {
-        let jobs = [job_row(
-            "build",
-            "completed",
-            Some("failure"),
-            None,
-            &[("Run the untrusted build stage", "in_progress", None)],
-        )];
-        assert!(classify_failure(&jobs, at(1_000_000)).is_err());
-    }
-
-    /// A page whose job rows are not all `completed` defers too — even
-    /// one that already shows a verdict step, because a run's own
-    /// `completed` arrives before its job rows finish.
-    #[test]
-    fn a_page_with_a_job_still_running_defers() {
-        let jobs = [
-            job_row(
-                "build a",
-                "completed",
-                Some("failure"),
-                Some(1_000_000 - 600),
-                &[(
-                    "Run the untrusted build stage",
-                    "completed",
-                    Some("failure"),
-                )],
-            ),
-            job_row("build b", "in_progress", None, None, &[]),
-        ];
-        assert!(
-            classify_failure(&jobs, at(1_000_000))
-                .expect("classified")
-                .is_none()
-        );
     }
 
     /// At `MAX_RUN_ATTEMPTS` an infrastructure failure is final — the

@@ -5,7 +5,7 @@
 use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
-use stow_types::stow_error;
+use stow_types::runs::RunJobsPage;
 use stow_types::transient::Backoff;
 
 use crate::github::{self, BUILD_WORKFLOW};
@@ -248,140 +248,12 @@ pub fn first_error_line(log: &str) -> Option<String> {
 }
 
 // ===== Step classification =====
-
-/// The `build-crate.yml` step names whose failure is the crate's
-/// verdict — the steps that run the crate or judge its outputs; every
-/// other step is runner setup, toolchain install or artifact transfer.
-/// Step names are the contract: keep them in sync with
-/// `.github/workflows/build-crate.yml`.
-pub const VERDICT_STEPS: &[&str] = &[
-    "Run the untrusted build stage",
-    "Report the built outputs' glibc floor",
-    "Run the trusted publish stage",
-];
-/// How long a completed failed job's step rows may take to finish
-/// writing before the page stops being mid-settle and becomes the
-/// lost-runner shape: a run reaching `completed` writes its step rows
-/// within seconds of the job's own `completed_at`, while a runner that
-/// drops communication leaves `in_progress`/`pending` step rows behind
-/// forever (runs 38919684562 and 38410583752 — "The hosted runner lost
-/// communication with the server"). Two minutes is far past every
-/// observed settle, so after the window an unsettled failed job is the
-/// lost-runner case and classifies `Infrastructure`.
-pub const STEP_SETTLE_WINDOW: time::Duration = time::Duration::minutes(2);
-
-/// A completed run's non-success conclusion, classified by which step
-/// failed: `Verdict` is the crate's own outcome — the failed step runs
-/// the crate or judges its outputs; `Infrastructure` names the failed
-/// job and step — runner setup, toolchain install or artifact
-/// transfer — and earns a rerun of the run's failed jobs instead of the
-/// node's verdict. A jobs page read mid-settle is not a class at all —
-/// [`classify_failure`] holds it unsettled until the failed job's step
-/// rows finish writing or outlive [`STEP_SETTLE_WINDOW`], past which
-/// they name where the runner was lost.
-#[derive(Debug)]
-pub enum RunFailure {
-    /// The crate's own outcome — the failed step runs the crate or
-    /// judges its outputs.
-    Verdict {
-        /// The failed job's name.
-        job: String,
-        /// The failed `VERDICT_STEPS` step's name.
-        step: String,
-    },
-    /// Runner infrastructure failed, not the crate.
-    Infrastructure {
-        /// The failed job's name — for the warn log and the report;
-        /// `"-"` when no job ever failed (`startup_failure` — no runner
-        /// took the run).
-        job: String,
-        /// Its first failed step — `None` when the runner was lost
-        /// before any step ran (a cancelled setup, a dropped runner).
-        step: Option<String>,
-    },
-}
-
-/// A job or step row has settled once GitHub reports it `completed` —
-/// a run's own `completed` arrives while its job rows still read
-/// `queued`/`in_progress`/`waiting` and the failed job's steps the
-/// same, so every other value is a page still being written.
-fn row_completed(status: &str) -> bool {
-    status == "completed"
-}
-
-/// Classify a completed failed run by its jobs as of `now`: the first
-/// failed job's first failed step decides — a `VERDICT_STEPS` step is
-/// the crate's verdict and anything else is infrastructure. A failed
-/// job with no failed step (the runner died mid-job) and a failed run
-/// with no failed job at all (`startup_failure` — no runner ever took
-/// it) are infrastructure too.
-///
-/// `None` is "no answer yet", not a class: GitHub lets a run reach
-/// `completed` before its job and step rows do, and a page read
-/// mid-settle shows the failed job without its failed step — the
-/// lost-runner shape — so a verdict would misclassify as
-/// infrastructure and earn a rerun GitHub then refuses (stow#765). A
-/// job still not `completed` defers unconditionally; a failed job
-/// whose step rows are unsettled defers only inside
-/// [`STEP_SETTLE_WINDOW`] of its own `completed_at` — past the window
-/// the first unsettled step is where the runner was lost, and the
-/// class is `Infrastructure` naming it. `now` is the caller's clock:
-/// the comparison grants [`github::GITHUB_CLOCK_ALLOWANCE`] toward the
-/// deferral so local-versus-GitHub skew can never read a
-/// just-completed job as a lost runner.
-pub fn classify_failure(
-    jobs: &[RunJobRow],
-    now: time::OffsetDateTime,
-) -> stow_types::error::Result<Option<RunFailure>> {
-    if jobs.iter().any(|job| !row_completed(&job.status)) {
-        return Ok(None);
-    }
-    let Some(job) = jobs
-        .iter()
-        .find(|job| job.conclusion.as_deref() == Some("failure"))
-    else {
-        return Ok(Some(RunFailure::Infrastructure {
-            job: "-".to_owned(),
-            step: None,
-        }));
-    };
-    if let Some(step) = job.steps.iter().find(|step| !row_completed(&step.status)) {
-        let Some(completed_at) = job.completed_at else {
-            return Err(stow_error!(
-                "jobs page: completed job {:?} carries no completed_at",
-                job.name
-            ));
-        };
-        if now - completed_at < STEP_SETTLE_WINDOW + github::GITHUB_CLOCK_ALLOWANCE {
-            return Ok(None);
-        }
-        return Ok(Some(RunFailure::Infrastructure {
-            job: job.name.clone(),
-            step: Some(step.name.clone()),
-        }));
-    }
-    let Some(step) = job
-        .steps
-        .iter()
-        .find(|step| step.conclusion.as_deref() == Some("failure"))
-    else {
-        return Ok(Some(RunFailure::Infrastructure {
-            job: job.name.clone(),
-            step: None,
-        }));
-    };
-    if VERDICT_STEPS.contains(&step.name.as_str()) {
-        Ok(Some(RunFailure::Verdict {
-            job: job.name.clone(),
-            step: step.name.clone(),
-        }))
-    } else {
-        Ok(Some(RunFailure::Infrastructure {
-            job: job.name.clone(),
-            step: Some(step.name.clone()),
-        }))
-    }
-}
+//
+// `VERDICT_STEPS`, `STEP_SETTLE_WINDOW`, `RunFailure`,
+// `classify_failure` and the jobs-page row types moved to
+// `stow_types::runs` (stow#833) — the edge's batch resolver runs the
+// same classifier. `classify_log` and its `FailureClass` stay here:
+// they read job logs, which only `runs failures` and `watchdog` pull.
 
 // ===== GitHub REST shapes =====
 
@@ -395,52 +267,6 @@ impl github::RunRow for WorkflowRun {
     fn run_id(&self) -> u64 {
         self.id
     }
-}
-
-/// `GET actions/runs/{id}/jobs` — the fields failure classification
-/// needs: each job's status and conclusion and its steps'. The
-/// endpoint serves the latest attempt's jobs by default, exactly the
-/// attempt the run's `run_attempt` names.
-#[derive(Debug, serde::Deserialize)]
-pub struct RunJobsPage {
-    /// The page's job rows.
-    pub jobs: Vec<RunJobRow>,
-}
-
-/// One job row of a [`RunJobsPage`].
-#[derive(Debug, serde::Deserialize)]
-pub struct RunJobRow {
-    /// The job's id — the `jobs/{id}/logs` path segment.
-    pub id: u64,
-    /// The job's display name — the build job's carries
-    /// `build <crate> <version> (<target>)`.
-    pub name: String,
-    /// `queued`/`in_progress`/`completed`/`waiting`/`pending` as
-    /// GitHub serves it — a run's `completed` arrives while its job
-    /// rows are still settling, so classification reads it.
-    pub status: String,
-    /// `success`/`failure`/`skipped`/… — `None` while the job runs.
-    #[serde(default)]
-    pub conclusion: Option<String>,
-    /// GitHub's completion time — null until the job finishes. The
-    /// lost-runner rule measures the failed job's unsettled step rows
-    /// as [`STEP_SETTLE_WINDOW`] past it.
-    #[serde(with = "time::serde::rfc3339::option")]
-    pub completed_at: Option<time::OffsetDateTime>,
-    /// The job's step rows.
-    pub steps: Vec<RunStepRow>,
-}
-
-/// One step row of a [`RunJobRow`].
-#[derive(Debug, serde::Deserialize)]
-pub struct RunStepRow {
-    /// The step's display name — the contract `VERDICT_STEPS` matches.
-    pub name: String,
-    /// The same settle contract the job row's `status` carries.
-    pub status: String,
-    /// The step's conclusion — `None` while it runs.
-    #[serde(default)]
-    pub conclusion: Option<String>,
 }
 
 /// One classified failure, for the report's example lists.
