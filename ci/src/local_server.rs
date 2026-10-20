@@ -428,7 +428,7 @@ fn task_directory_name(task_id: &str) -> stow_types::error::Result<&str> {
 /// workspace the build stage unpacks into, the output directory it writes
 /// to, and the files the two stages exchange.
 struct DispatchLayout {
-    /// Per-task working directory under `.tmp/local-ci-dispatch`.
+    /// Per-run working directory under `.tmp/local-ci-dispatch`.
     task_root: PathBuf,
     /// `stow-build build --output-dir`: plan and content-addressed blobs.
     output_dir: PathBuf,
@@ -441,14 +441,20 @@ struct DispatchLayout {
 }
 
 impl DispatchLayout {
-    /// Create a fresh task directory under `.tmp/local-ci-dispatch`,
-    /// discarding any leftover from a previous run of the same task id.
-    fn create(task_id: &str) -> stow_types::error::Result<Self> {
+    /// Create a fresh run directory under `.tmp/local-ci-dispatch`,
+    /// discarding any leftover from an earlier dispatch with the same run
+    /// id. The directory names the run, not the task: a retried task's
+    /// next attempt gets its own tree, so a failed attempt's
+    /// `build-stage.log` survives for diagnosis (stow#773).
+    fn create(task_id: &str, workflow_run_id: u64) -> stow_types::error::Result<Self> {
         let dispatch_root = std::env::current_dir()?
             .join(".tmp")
             .join("local-ci-dispatch");
         std::fs::create_dir_all(&dispatch_root)?;
-        let task_root = dispatch_root.join(task_directory_name(task_id)?);
+        let task_root = dispatch_root.join(format!(
+            "{}-{workflow_run_id}",
+            task_directory_name(task_id)?
+        ));
         if task_root.exists() {
             std::fs::remove_dir_all(&task_root)?;
         }
@@ -482,7 +488,7 @@ async fn run_dispatched_task(
     // for an artifact-less task — or the edge would record the run as a
     // failure it never was.
     if std::env::var_os("STOW_LOCAL_CI_STUB").is_some() {
-        let layout = DispatchLayout::create(&task.task_id)?;
+        let layout = DispatchLayout::create(&task.task_id, workflow_run_id)?;
         push_records(
             &state,
             &task,
@@ -495,7 +501,7 @@ async fn run_dispatched_task(
     }
     let task_json = serde_json::to_string(&task)?;
     let exe = std::env::current_exe()?;
-    let layout = DispatchLayout::create(&task.task_id)?;
+    let layout = DispatchLayout::create(&task.task_id, workflow_run_id)?;
 
     // The child is the untrusted build stage: it gets the task and nothing
     // else, exactly as the production build job does.

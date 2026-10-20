@@ -214,7 +214,16 @@ fn published_task_ids(records: &[ArtifactRecord]) -> BTreeSet<String> {
 }
 
 /// A phase's observations plus every task its lanes planned.
-async fn phase(dir: &Path) -> stow_types::error::Result<(PhaseObservations, Vec<EnqueueRequest>)> {
+///
+/// `seen` holds the task ids the queue already carries: a first-seen task
+/// is an inserted row, and its direct dependencies are the edges the
+/// submit wrote for it. The wave phase seeds it empty — the harness
+/// resets the store first — and the resubmit keeps accumulating, so each
+/// phase's dedup set is exactly what its submits saw.
+async fn phase(
+    dir: &Path,
+    seen: &mut BTreeSet<String>,
+) -> stow_types::error::Result<(PhaseObservations, Vec<EnqueueRequest>)> {
     let mut lanes = Vec::new();
     let mut tasks = Vec::new();
     for lane_dir in sorted_entries(&dir.join("lanes")).await? {
@@ -227,12 +236,32 @@ async fn phase(dir: &Path) -> stow_types::error::Result<(PhaseObservations, Vec<
                 stow_error!("lane directory {} is not <NN>-<lane>", lane_dir.display())
             })?;
         let plan = lane_plan(&name, &lane_dir).await?;
+        let mut inserted = 0_u64;
+        let mut inserted_edges = 0_u64;
+        if let Some(outcome) = &plan.outcome {
+            // The lane's tasks reached the scheduler: a first-seen task id
+            // is a row it inserted and a dedup anchor for the next lane.
+            for task in &plan.tasks {
+                if seen.insert(task.task_id()?) {
+                    inserted += 1;
+                    inserted_edges += task.depends_on()?.len() as u64;
+                }
+            }
+            if u64::from(outcome.inserted) != inserted {
+                return Err(stow_error!(
+                    "lane {name} posted {inserted} first-seen tasks but the scheduler inserted {}",
+                    outcome.inserted
+                ));
+            }
+        }
         lanes.push(LaneRun {
             lane: name,
             submitted: plan
                 .outcome
                 .as_ref()
                 .map_or(0, |outcome| u64::from(outcome.submitted)),
+            inserted,
+            inserted_edges,
             submit_failures: plan.submit_failures,
             before: read_json(&lane_dir.join("before.json")).await?,
             after: read_json(&lane_dir.join("after.json")).await?,
@@ -279,8 +308,9 @@ async fn overload_sightings(paths: &[PathBuf]) -> stow_types::error::Result<Vec<
 async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
-    let (wave, wave_tasks) = phase(&args.work_dir.join("wave")).await?;
-    let (resubmit, _) = phase(&args.work_dir.join("resubmit")).await?;
+    let mut seen = BTreeSet::new();
+    let (wave, wave_tasks) = phase(&args.work_dir.join("wave"), &mut seen).await?;
+    let (resubmit, _) = phase(&args.work_dir.join("resubmit"), &mut seen).await?;
 
     let mut nodes = BTreeMap::new();
     let mut spellings = BTreeMap::new();

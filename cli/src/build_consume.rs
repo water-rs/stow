@@ -32,8 +32,9 @@ pub use crate::supervisor::protocol::ArtifactNotifications;
 /// output path to name.
 pub fn artifact_notifications(
     parsed: &ParsedRustcArgs,
+    host: &str,
 ) -> stow_types::error::Result<ArtifactNotifications> {
-    crate::cached_rustc_artifact_notifications(parsed)
+    crate::cached_rustc_artifact_notifications(parsed, host)
 }
 
 /// Write notification `lines` to this process's stderr, each
@@ -271,10 +272,12 @@ pub fn load_served_bundle(
 pub async fn serve_bundle_outputs(
     parsed: &ParsedRustcArgs,
     bundle: &ServedBundle,
+    host: &str,
 ) -> stow_types::error::Result<()> {
     inject::write_artifacts(
         parsed,
         &bundle.inner,
+        host,
         inject::OutputDirWriters::UntrustedCodeToo,
     )
     .await

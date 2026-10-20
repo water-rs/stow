@@ -3716,7 +3716,7 @@ mod tests {
             crate::test_server::Step::Respond {
                 status: 200,
                 retry_after: None,
-                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7","dispatched_at_ms":0,"completed_at_ms":0,"error":null,"delivery_errors":[]}]}"#,
+                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7","path":".github/workflows/build-crate.yml","dispatched_at_ms":0,"completed_at_ms":0,"error":null,"delivery_errors":[]}]}"#,
             },
         ])
         .await;
@@ -4159,6 +4159,10 @@ mod tests {
                                         serde_json::json!({
                                             "workflow_run_id": run_id,
                                             "display_title": format!("{}-{task_id}", state.rustc),
+                                            "path": format!(
+                                                ".github/workflows/{}",
+                                                stow_types::trusted_builder::WORKFLOW_FILE
+                                            ),
                                             "status": "completed",
                                             "conclusion": "success",
                                             "html_url": format!("http://localhost/run/{run_id}"),

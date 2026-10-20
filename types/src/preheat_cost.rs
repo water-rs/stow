@@ -102,6 +102,12 @@ pub struct LaneRun {
     pub lane: String,
     /// Tasks the lane posted.
     pub submitted: u64,
+    /// Queue rows the lane's submit inserted; the rest of `submitted`
+    /// deduplicated away.
+    pub inserted: u64,
+    /// `queue_dependencies` rows the lane's submit wrote — the direct
+    /// dependency edges of its inserted tasks.
+    pub inserted_edges: u64,
     /// Lanes whose submit failed — a repository whose POST failed, or
     /// the whole lane's.
     pub submit_failures: Vec<String>,
@@ -229,6 +235,10 @@ pub struct LaneCost {
     pub phase: String,
     /// Tasks posted.
     pub submitted: u64,
+    /// Queue rows the lane's submit inserted.
+    pub inserted: u64,
+    /// `queue_dependencies` rows the lane's submit wrote.
+    pub inserted_edges: u64,
     /// The submit kind's cost while the lane ran.
     pub submit: KindCost,
     /// Wall milliseconds the lane took.
@@ -396,6 +406,8 @@ fn lane_costs(phase_name: &str, phase: &PhaseObservations) -> crate::error::Resu
                 lane: lane.lane.clone(),
                 phase: phase_name.to_owned(),
                 submitted: lane.submitted,
+                inserted: lane.inserted,
+                inserted_edges: lane.inserted_edges,
                 submit: kind(&kind_costs(&ops), EventKind::Submit).clone(),
                 wall_ms: lane
                     .after
@@ -475,8 +487,12 @@ fn growth_checks(layers: &[LayerCost]) -> Vec<Check> {
     .collect()
 }
 
-/// Submit cost per posted task, first lane → last lane: the tolerance's
-/// fixed rows apply per submit event, spread over the lane's tasks.
+/// Submit cost per inserted unit — a queue row or a dependency edge —
+/// first lane → last lane. A deduplicated submission moves nothing, so
+/// the posted count cannot normalize a submit: lanes whose insert shares
+/// differ would read as different per-row costs while paying the same
+/// per row (stow#773). The tolerance's fixed rows apply per submit
+/// event, spread over the units the lane inserted.
 #[allow(
     clippy::cast_precision_loss,
     reason = "row and task counts stay far below f64's exact-integer range"
@@ -484,22 +500,22 @@ fn growth_checks(layers: &[LayerCost]) -> Vec<Check> {
 fn submit_growth_check(lanes: &[LaneCost]) -> Check {
     let measured: Vec<&LaneCost> = lanes
         .iter()
-        .filter(|lane| lane.phase == "wave" && lane.submitted > 0 && lane.submit.events > 0)
+        .filter(|lane| lane.phase == "wave" && lane.inserted > 0 && lane.submit.events > 0)
         .collect();
-    let name = "Submit per-task cost flat across lanes";
+    let name = "Submit per-inserted-unit cost flat across lanes";
     let (Some(first), Some(last)) = (measured.first(), measured.last()) else {
-        return check(name, false, "no wave lane submitted anything");
+        return check(name, false, "no wave lane inserted a task");
     };
-    let per_task = |lane: &LaneCost| {
+    let units = |lane: &LaneCost| (lane.inserted + lane.inserted_edges) as f64;
+    let per_unit = |lane: &LaneCost| {
         (
-            lane.submit.rows_read as f64 / lane.submitted as f64,
-            lane.submit.rows_written as f64 / lane.submitted as f64,
+            lane.submit.rows_read as f64 / units(lane),
+            lane.submit.rows_written as f64 / units(lane),
         )
     };
-    let (r0, w0) = per_task(first);
-    let (r1, w1) = per_task(last);
-    let slack = crate::do_budgets::GROWTH_TOLERANCE_ROWS * last.submit.events as f64
-        / last.submitted as f64;
+    let (r0, w0) = per_unit(first);
+    let (r1, w1) = per_unit(last);
+    let slack = crate::do_budgets::GROWTH_TOLERANCE_ROWS * last.submit.events as f64 / units(last);
     let over = |earlier: f64, later: f64| {
         later > earlier.mul_add(1.0 + crate::do_budgets::GROWTH_TOLERANCE_FRACTION, slack)
     };
@@ -507,8 +523,9 @@ fn submit_growth_check(lanes: &[LaneCost]) -> Check {
         name,
         !over(r0, r1) && !over(w0, w1),
         format!(
-            "{}: {r0:.2} read / {w0:.2} written per task; {}: {r1:.2} read / {w1:.2} written \
-             (tolerance 10% + {slack:.2} rows per task)",
+            "{}: {r0:.2} read / {w0:.2} written per inserted unit; \
+             {}: {r1:.2} read / {w1:.2} written \
+             (tolerance 10% + {slack:.2} rows per unit)",
             first.lane, last.lane
         ),
     )
@@ -889,6 +906,8 @@ mod tests {
         let lane = LaneRun {
             lane: "top".to_owned(),
             submitted: 3,
+            inserted: 3,
+            inserted_edges: 2,
             submit_failures: vec![],
             before: start.clone(),
             after: snapshot(5, ledger(1, 20, 0)),

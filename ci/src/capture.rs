@@ -118,7 +118,7 @@ pub async fn run_rustc_capture_wrapper(
         // the artifact notifications the invocation asked for, the same
         // lines a compile would have printed (stow#633).
         stow_cli::build_consume::write_artifact_notifications(
-            &stow_cli::build_consume::artifact_notifications(&original_parsed)?,
+            &stow_cli::build_consume::artifact_notifications(&original_parsed, &effective_target)?,
         )?;
         std::process::exit(0);
     }
@@ -137,6 +137,7 @@ pub async fn run_rustc_capture_wrapper(
             &original_parsed,
             rewritten_parsed,
             stable_identity,
+            &effective_target,
             &capture_dir,
         )
         .await?;
@@ -146,6 +147,7 @@ pub async fn run_rustc_capture_wrapper(
         &original_parsed,
         effective_parsed,
         stable_identity.as_ref(),
+        &effective_target,
         &capture_dir,
         started,
     )
@@ -243,6 +245,7 @@ async fn record_compiled_capture(
     original_parsed: &ParsedRustcArgs,
     effective_parsed: Option<ParsedRustcArgs>,
     stable_identity: Option<&StableRegistryArtifactIdentity>,
+    host: &str,
     capture_dir: &std::path::Path,
     started: Instant,
 ) -> stow_types::error::Result<()> {
@@ -272,6 +275,7 @@ async fn record_compiled_capture(
             original_alias_source,
             compile_key,
             c_metadata,
+            host,
             capture_dir,
         )
         .await?;
@@ -288,6 +292,7 @@ async fn record_compiled_capture(
         &parsed,
         original_alias_source,
         record_compile_key,
+        host,
         capture_dir,
         elapsed_millis(started),
     )
@@ -458,7 +463,8 @@ async fn serve_consumed_artifact(
         ));
     }
 
-    stow_cli::build_consume::serve_bundle_outputs(original_parsed, &bundle).await?;
+    stow_cli::build_consume::serve_bundle_outputs(original_parsed, &bundle, effective_target)
+        .await?;
     let original_alias_source =
         Some(original_parsed).filter(|original| *original != rewritten_parsed);
     record_capture_output_identities(
@@ -466,6 +472,7 @@ async fn serve_consumed_artifact(
         original_alias_source,
         &stable_identity.compile_key,
         &stable_identity.c_metadata,
+        effective_target,
         capture_dir,
     )
     .await?;
@@ -497,7 +504,7 @@ async fn consumed_capture_record(
     let out_dir = rewritten_parsed.out_dir.clone().ok_or_else(|| {
         stow_types::stow_error!("restorable rustc invocation is missing --out-dir")
     })?;
-    let outputs = collect_outputs(rewritten_parsed, original_alias_source)?;
+    let outputs = collect_outputs(rewritten_parsed, original_alias_source, effective_target)?;
     if outputs.is_empty() {
         return Err(stow_types::stow_error!(
             "consume-store entry for {} produced no outputs after injection",
@@ -846,6 +853,7 @@ async fn materialize_original_output_aliases(
     original_parsed: &ParsedRustcArgs,
     rewritten_parsed: &ParsedRustcArgs,
     identity: &StableRegistryArtifactIdentity,
+    host: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<()> {
     materialize_optional_alias(
@@ -866,10 +874,10 @@ async fn materialize_original_output_aliases(
     .await?;
     materialize_optional_alias(
         rewritten_parsed
-            .output_dynamic_library_path()
+            .output_dynamic_library_path(host)
             .map_err(stow_types::error::Error::msg)?,
         original_parsed
-            .output_dynamic_library_path()
+            .output_dynamic_library_path(host)
             .map_err(stow_types::error::Error::msg)?,
         &identity.compile_key,
         &identity.c_metadata,
@@ -1033,9 +1041,10 @@ async fn record_capture_output_identities(
     original_alias_source: Option<&ParsedRustcArgs>,
     compile_key: &str,
     c_metadata: &str,
+    host: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<()> {
-    for output in collect_outputs(parsed, original_alias_source)? {
+    for output in collect_outputs(parsed, original_alias_source, host)? {
         record_materialized_output_identity(capture_dir, &output.path, compile_key, c_metadata)
             .await?;
     }
@@ -1122,6 +1131,7 @@ async fn build_capture_record(
     parsed: &ParsedRustcArgs,
     original_alias_source: Option<&ParsedRustcArgs>,
     compile_key: String,
+    host: &str,
     capture_dir: &std::path::Path,
     compile_millis: u64,
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
@@ -1134,7 +1144,7 @@ async fn build_capture_record(
     let outputs = snapshot_outputs(
         capture_dir,
         parsed,
-        collect_outputs(parsed, original_alias_source)?,
+        collect_outputs(parsed, original_alias_source, host)?,
     )
     .await?;
     if outputs.is_empty() {
@@ -1215,6 +1225,7 @@ async fn load_recorded_dependencies(
 fn collect_outputs(
     parsed: &ParsedRustcArgs,
     original_alias_source: Option<&ParsedRustcArgs>,
+    host: &str,
 ) -> stow_types::error::Result<Vec<CapturedRustcOutput>> {
     let mut outputs = Vec::new();
     let mut seen_paths = std::collections::BTreeSet::new();
@@ -1224,7 +1235,7 @@ fn collect_outputs(
     let stable_rmeta_path = parsed.output_rmeta_path();
     let stable_rmeta_exists = stable_rmeta_path.as_ref().is_some_and(|path| path.exists());
     let stable_dynamic_library_path = parsed
-        .output_dynamic_library_path()
+        .output_dynamic_library_path(host)
         .map_err(stow_types::error::Error::msg)?;
     let stable_dynamic_library_exists = stable_dynamic_library_path
         .as_ref()
@@ -1271,7 +1282,7 @@ fn collect_outputs(
             &mut outputs,
             &mut seen_paths,
             original_alias_source
-                .output_dynamic_library_path()
+                .output_dynamic_library_path(host)
                 .map_err(stow_types::error::Error::msg)?,
             CapturedRustcOutputKind::DynamicLibrary,
             require_dynamic_library && stable_dynamic_library_exists,
@@ -1703,7 +1714,8 @@ mod tests {
         std::fs::copy(&stable_rlib, &original_rlib).expect("copy original rlib");
         std::fs::copy(&stable_rmeta, &original_rmeta).expect("copy original rmeta");
 
-        let outputs = collect_outputs(&stable, Some(&original)).expect("collect outputs");
+        let outputs = collect_outputs(&stable, Some(&original), "aarch64-apple-darwin")
+            .expect("collect outputs");
         assert_eq!(outputs.len(), 4);
         assert_eq!(
             outputs
@@ -1726,6 +1738,7 @@ mod tests {
                 &stable,
                 Some(&original),
                 "test-compile-key".to_owned(),
+                "aarch64-apple-darwin",
                 &capture_dir,
                 0,
             )
@@ -1772,7 +1785,8 @@ mod tests {
         )
         .expect("write original rmeta");
 
-        let error = collect_outputs(&stable, Some(&original)).expect_err("mismatch should fail");
+        let error = collect_outputs(&stable, Some(&original), "aarch64-apple-darwin")
+            .expect_err("mismatch should fail");
         assert!(
             error
                 .to_string()
@@ -1799,6 +1813,7 @@ mod tests {
                 None,
                 "fedf2529b3e2aa76deadbeef",
                 "fedf2529b3e2aa76",
+                "aarch64-apple-darwin",
                 &capture_dir,
             )
             .await
@@ -1841,7 +1856,8 @@ mod tests {
         )
         .expect("write original rmeta");
 
-        let outputs = collect_outputs(&stable, Some(&original)).expect("collect outputs");
+        let outputs = collect_outputs(&stable, Some(&original), "aarch64-apple-darwin")
+            .expect("collect outputs");
         assert_eq!(outputs.len(), 2);
         assert_eq!(
             outputs
@@ -1912,7 +1928,8 @@ mod tests {
         )
         .expect("write original rmeta");
 
-        let outputs = collect_outputs(&stable, Some(&original)).expect("collect outputs");
+        let outputs = collect_outputs(&stable, Some(&original), "aarch64-apple-darwin")
+            .expect("collect outputs");
         assert_eq!(outputs.len(), 2);
         assert_eq!(
             outputs
@@ -1966,7 +1983,8 @@ mod tests {
         )
         .expect("write original rmeta");
 
-        let outputs = collect_outputs(&stable, Some(&original)).expect("collect outputs");
+        let outputs = collect_outputs(&stable, Some(&original), "aarch64-apple-darwin")
+            .expect("collect outputs");
         assert_eq!(
             outputs
                 .iter()
@@ -1988,6 +2006,44 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    /// A proc-macro host unit spells no `--target`: under mock-compile the
+    /// wrapper answers as the task's runner host, so the captured link
+    /// output must be named for *that* host — `lib<x>.so` on an emulated
+    /// Linux runner, `<x>.dll` on an emulated Windows one — not for the
+    /// machine the wrapper runs on (stow#773).
+    #[test]
+    fn collect_outputs_captures_a_proc_macro_built_for_an_emulated_host() {
+        let tempdir = tempdir().expect("tempdir");
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create out dir");
+
+        for host in [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+            "aarch64-apple-darwin",
+        ] {
+            let mut parsed = parsed_proc_macro("clap_derive", out_dir.clone(), "-6918c2ed04d0730a");
+            parsed.target = None;
+            parsed
+                .emit
+                .extend(["dep-info".to_owned(), "link".to_owned()]);
+
+            let path = parsed
+                .output_dynamic_library_path(host)
+                .expect("dylib path")
+                .expect("dynamic library output");
+            std::fs::write(&path, b"clap-derive-dylib").expect("write dylib");
+
+            let outputs = collect_outputs(&parsed, None, host).expect("collect outputs");
+            let dynamic: Vec<_> = outputs
+                .iter()
+                .filter(|output| output.kind == CapturedRustcOutputKind::DynamicLibrary)
+                .collect();
+            assert_eq!(dynamic.len(), 1, "{host}");
+            assert_eq!(dynamic[0].path, path, "{host}");
+        }
     }
 
     fn sample_record(c_metadata: &str, target_dir: PathBuf) -> super::CapturedRustcArtifact {
