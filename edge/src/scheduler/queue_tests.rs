@@ -5834,6 +5834,137 @@ async fn the_human_budget_charge_follows_the_plan() {
     assert_eq!(budget_spent(&db).await, Some(3));
 }
 
+/// stow#818: a downloads rise alone rewrites only the rows still
+/// pending dispatch — `priority` orders nothing else, so a
+/// dispatched, completed or failed row keeps its stored count until
+/// a move it already makes carries the new one. The pending set's
+/// claim order reprices to the fresh counts, and a resurrection
+/// takes the incoming count in the same write.
+#[tokio::test]
+async fn a_downloads_resubmit_writes_only_pending_rows() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    // A genuinely in-flight row: claimed before the rest of the
+    // graph exists, so its lease is live and stale recovery cannot
+    // re-pend it during the verification claim below.
+    enqueue(&db, &[request("inflight", &[])])
+        .await
+        .expect("enqueue inflight");
+    assert_eq!(
+        super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+            .await
+            .expect("claim inflight")
+            .len(),
+        1
+    );
+    enqueue(
+        &db,
+        &[
+            request("older", &[]),
+            request("popular", &[]),
+            request("done", &[]),
+            request("dead", &[]),
+        ],
+    )
+    .await
+    .expect("enqueue graph");
+    mark_active(&db, "done", TARGET, "completed").await;
+    mark_active(&db, "dead", TARGET, "failed").await;
+    // Both pending rows share one fixed request instant: identical
+    // FIFO operands, so only the resubmit's repriced `value` can
+    // separate them in claim order.
+    set_first_requested_at(&db, "older", PAST_TS).await;
+    set_first_requested_at(&db, "popular", PAST_TS).await;
+
+    // The daily wave's shape: every row's crate reports a higher
+    // count. Only the pending pair may move.
+    log.lock().expect("log").clear();
+    let resubmit = |name: &str, downloads: u64| EnqueueRequest {
+        downloads,
+        ..request(name, &[])
+    };
+    assert_eq!(
+        enqueue(
+            &db,
+            &[
+                resubmit("older", 1_000),
+                resubmit("popular", 50_000),
+                resubmit("inflight", 50_000),
+                resubmit("done", 50_000),
+                resubmit("dead", 50_000),
+            ],
+        )
+        .await
+        .expect("downloads resubmit"),
+        0
+    );
+    let statements = log.lock().expect("log").clone();
+    let batched_update: u64 = statements
+        .iter()
+        .filter(|s| s.sql.contains("SET downloads = MAX"))
+        .map(|s| s.rows_written)
+        .sum();
+    assert_eq!(
+        batched_update, 2,
+        "the resubmit's update touches only the pending rows: {statements:?}"
+    );
+    let written: u64 = statements.iter().map(|s| s.rows_written).sum();
+    assert_eq!(
+        written, 4,
+        "the pending rows' update plus the dispatch-key reprice their \
+         moved priority earns — and nothing else writes: {statements:?}"
+    );
+
+    // The pending pair took the new counts and the priorities they
+    // imply; every non-pending row kept its stored count — a bump
+    // write would have landed `downloads = 50000` there too.
+    assert_eq!(
+        row_column(&db, "older", "CAST(downloads AS TEXT)").await,
+        "1000"
+    );
+    assert_eq!(
+        row_column(&db, "popular", "CAST(priority AS TEXT)").await,
+        "50"
+    );
+    for name in ["inflight", "done", "dead"] {
+        assert_eq!(
+            row_column(&db, name, "CAST(downloads AS TEXT)").await,
+            "0",
+            "{name} kept its stored count"
+        );
+    }
+    // `mark_active`'s fixed `updated_at` is the row-write tripwire:
+    // any resubmit touch would restamp it.
+    assert_eq!(row_column(&db, "done", "updated_at").await, ROW_TS);
+    assert_eq!(row_column(&db, "dead", "updated_at").await, ROW_TS);
+
+    // The pending set's claim order repriced to the new counts:
+    // `popular` claims ahead of the strictly-older `older`.
+    let claimed = super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(claimed[0].crate_name, "popular");
+    assert_eq!(claimed[1].crate_name, "older");
+
+    // A row updated for another reason still takes the larger count:
+    // a human re-request resurrects `done`, and the fresh downloads
+    // land in the same write.
+    enqueue(
+        &db,
+        &[EnqueueRequest {
+            source: EnqueueSource::HumanRequest,
+            ..resubmit("done", 80_000)
+        }],
+    )
+    .await
+    .expect("human resurrect");
+    assert_eq!(row_column(&db, "done", "status").await, "pending");
+    assert_eq!(
+        row_column(&db, "done", "CAST(downloads AS TEXT)").await,
+        "80000"
+    );
+}
+
 /// A batch whose charge exceeds the day's remaining budget is refused
 /// before a single write lands — including the node-store upsert the
 /// write phase leads with (stow#796).
