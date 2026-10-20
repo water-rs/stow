@@ -714,6 +714,154 @@ fn crate_lane_strips_target_dev_dependencies() {
     );
 }
 
+/// stow#831: a feature may name a dev-dependency — hashbrown's
+/// `nightly = ["bumpalo/allocator_api"]` — and for a consumer the
+/// entry is inert, so the strip removes it with the table: the
+/// manifest resolves, and the emptied feature still resolves when a
+/// consumer requests it.
+#[test]
+fn crate_lane_strips_feature_entries_naming_dev_dependencies() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "devdep",
+            version: "1.0.0",
+            deps: vec![],
+            target_deps: vec![],
+            features: &[("x", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    // An unpacked `.crate` root shaped like hashbrown 0.15.5: the only
+    // declaration of `devdep` is the dev-dependency table `nightly`
+    // names.
+    let package_dir = work.path().join("crate-root-0.0.0");
+    std::fs::create_dir_all(package_dir.join("src")).unwrap();
+    std::fs::write(package_dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        package_dir.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "dev-dependencies": { "devdep": "1" },
+            "features": { "nightly": ["devdep/x"] },
+        })),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+    resolver
+        .resolve_package_dir(&package_dir, &ResolveOptions::default(), &targets)
+        .expect("the stripped manifest resolves");
+    resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions {
+                features: vec!["nightly".to_owned()],
+                ..ResolveOptions::default()
+            },
+            &targets,
+        )
+        .expect("the emptied `nightly` feature still resolves when requested");
+}
+
+/// The weak-dependency spelling `name?/feat` purges the same way.
+#[test]
+fn crate_lane_strips_weak_feature_entries_naming_dev_dependencies() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "devdep",
+            version: "1.0.0",
+            deps: vec![],
+            target_deps: vec![],
+            features: &[("x", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    let package_dir = work.path().join("crate-root-0.0.0");
+    std::fs::create_dir_all(package_dir.join("src")).unwrap();
+    std::fs::write(package_dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        package_dir.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "dev-dependencies": { "devdep": "1" },
+            "features": { "nightly": ["devdep?/x"] },
+        })),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions {
+                features: vec!["nightly".to_owned()],
+                ..ResolveOptions::default()
+            },
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .expect("the stripped manifest resolves");
+}
+
+/// A name declared by BOTH `[dependencies]` and `[dev-dependencies]`
+/// keeps its feature entries — only a key the strip removed entirely
+/// is purged, so `f` still enables `x` on `dep`.
+#[test]
+fn crate_lane_keeps_feature_entries_for_a_still_declared_name() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "dep",
+            version: "1.0.0",
+            deps: vec![],
+            target_deps: vec![],
+            features: &[("x", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    let package_dir = work.path().join("crate-root-0.0.0");
+    std::fs::create_dir_all(package_dir.join("src")).unwrap();
+    std::fs::write(package_dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        package_dir.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "dependencies": { "dep": "1" },
+            "dev-dependencies": { "dep": "1", "devdep": "1" },
+            "features": { "f": ["dep/x", "devdep/x"] },
+        })),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions {
+                features: vec!["f".to_owned()],
+                ..ResolveOptions::default()
+            },
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .expect("a still-declared name keeps its feature entry");
+    assert_eq!(
+        units_named(&out, "dep")[0].features,
+        ["x"],
+        "`dep/x` survived the strip and `f` enabled it on `dep`"
+    );
+}
+
 /// A git dep resolves to the sha the dropped lockfile pinned, not the
 /// branch's head.
 #[test]

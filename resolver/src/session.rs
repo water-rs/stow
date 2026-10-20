@@ -549,12 +549,17 @@ impl Resolver {
     /// surviving only as `dropped_lockfile` admission.
     ///
     /// The manifests' dev-dependency tables are removed before the
-    /// resolve — the only in-place manifest mutation this lane makes.
-    /// A consumer of the published crate never resolves them, so
-    /// leaving them in place would fail this lane on dev-dependencies
-    /// (yanked-only releases) no consumer computes, and unify their
-    /// requirements into the crate's normal dependency graph
-    /// (stow#829).
+    /// resolve — along with any feature entry naming a key only those
+    /// tables declared, the only in-place manifest mutation this lane
+    /// makes. A consumer of the published crate never resolves them,
+    /// so leaving them in place would fail this lane on
+    /// dev-dependencies (yanked-only releases) no consumer computes,
+    /// and unify their requirements into the crate's normal dependency
+    /// graph (stow#829). A feature may name a dev-dependency as
+    /// `dep/feature`; the entry is inert for a consumer — cargo
+    /// resolves a dependency's features without its dev-dependencies —
+    /// but invalid once the table is gone, so it is removed with it
+    /// (stow#831).
     ///
     /// # Errors
     /// Manifest, resolve, or emission failures.
