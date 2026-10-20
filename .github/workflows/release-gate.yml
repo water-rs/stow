@@ -178,7 +178,7 @@ jobs:
     if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Preheat cost
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
     permissions:
       # The local edge authenticates its trusted endpoints against the
       # credential's own repo permissions — GITHUB_TOKEN needs push
