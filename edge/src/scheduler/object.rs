@@ -1257,26 +1257,17 @@ pub(super) async fn dispatch_pass(
     settings: &SchedulerSettings,
     coverage: &impl queue::CoverageOracle,
 ) -> Result<Vec<String>> {
-    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
-    let freeze = freeze_settings(env)?;
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
-    let credential_source = credential_source(env)?;
-    // The bindings and handles every step of the pass shares.
-    let scope = PassScope {
-        env,
-        db,
-        settings,
-        github_repo: &github_repo,
-        freeze: &freeze,
-    };
+    let bindings = PassBindings::read(env)?;
+    let scope = bindings.scope(env, db, settings);
     // §4.3: expired leases settle first, so a completion the lease check
     // recovers resolves in this same pass.
-    check_batch_leases(&scope, &credential_source).await?;
+    check_batch_leases(&scope, &bindings.credential_source).await?;
     // §3.2: completed batches resolve before claiming — a resolved
     // batch's freed slots fill this same pass.
-    resolve_ready_batches(&scope, &credential_source).await?;
+    resolve_ready_batches(&scope, &bindings.credential_source).await?;
     let batches = queue::claim_dispatchable_tasks(db, settings, coverage)
         .await
         .map_err(to_error)?;
@@ -1299,27 +1290,27 @@ pub(super) async fn dispatch_pass(
     // minutes of validity remain and otherwise mints a fresh one. A
     // failed mint is a dispatch failure for every claimed batch — the
     // same backoff a failed POST would get.
-    match credential_source {
+    match &bindings.credential_source {
         CredentialSource::LocalCi(url) => {
             tracing::info!(url = %url, "dispatching via local-CI endpoint");
             dispatch_batches(
                 db,
                 settings,
-                &dispatch::LocalCiBuildRuns::new(&url),
+                &dispatch::LocalCiBuildRuns::new(url),
                 batches,
-                &github_repo,
+                &bindings.github_repo,
             )
             .await?;
         }
         CredentialSource::GitHub(config) => {
-            match github_app::installation_token(db, &config).await {
+            match github_app::installation_token(db, config).await {
                 Ok(token) => {
                     dispatch_batches(
                         db,
                         settings,
                         &dispatch::GitHubBuildRuns::new(token),
                         batches,
-                        &github_repo,
+                        &bindings.github_repo,
                     )
                     .await?;
                 }
@@ -1355,6 +1346,65 @@ fn ghcr_config(env: &WasmEnv) -> crate::api::GhcrConfig {
         base_url: read_optional_string_binding(env, crate::entry::GHCR_BASE_URL_BINDING)
             .unwrap_or_else(|| crate::ghcr::default_base_url().to_owned()),
         tokens: crate::registry_auth::RegistryTokens::default(),
+    }
+}
+
+/// The bindings an alarm pass's batch steps read, resolved once per
+/// pass.
+struct PassBindings {
+    github_repo: String,
+    freeze: FreezeSettings,
+    credential_source: CredentialSource,
+}
+
+impl PassBindings {
+    fn read(env: &WasmEnv) -> Result<Self> {
+        Ok(Self {
+            github_repo: read_string_binding(env, GITHUB_REPO_BINDING)?,
+            freeze: freeze_settings(env)?,
+            credential_source: credential_source(env)?,
+        })
+    }
+
+    fn scope<'a>(
+        &'a self,
+        env: &'a WasmEnv,
+        db: &'a DurableDb,
+        settings: &'a SchedulerSettings,
+    ) -> PassScope<'a> {
+        PassScope {
+            env,
+            db,
+            settings,
+            github_repo: &self.github_repo,
+            freeze: &self.freeze,
+        }
+    }
+}
+
+/// Which batch step of an alarm pass the budget probe runs on its own.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum BatchStep {
+    /// §4.3's lease check over the expired batches.
+    Leases,
+    /// §3.2's resolution of the completed batches.
+    Resolution,
+}
+
+/// One batch step of the dispatch pass, exactly as [`dispatch_pass`]
+/// runs it — the budget probe's `alarm pass (batch resolution)` and
+/// `alarm pass (lease check)` drives price the step alone.
+pub(super) async fn run_batch_step(
+    env: &WasmEnv,
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    step: BatchStep,
+) -> Result<()> {
+    let bindings = PassBindings::read(env)?;
+    let scope = bindings.scope(env, db, settings);
+    match step {
+        BatchStep::Leases => check_batch_leases(&scope, &bindings.credential_source).await,
+        BatchStep::Resolution => resolve_ready_batches(&scope, &bindings.credential_source).await,
     }
 }
 

@@ -349,6 +349,72 @@ const BUDGETS: &[RouteBudget] = &[
         rows_written: 4,
         scan_allowlist: &[],
     },
+    // The batch drives (stow#833). Each setup claims one full batch of
+    // `STOW_BATCH_MAX_TASKS` = 40 legs from the planted window and binds
+    // it to a run; the batch's leg count is the per-event bound every
+    // row below names, and none of them reads or writes in proportion to
+    // the queue. Budgeted at the 10k host measurement plus 25%, rounded
+    // down; the 20k fixture measured within it. The route's write is one
+    // keyed `UPDATE build_batches`, so it does not scale with the legs
+    // at all.
+    RouteBudget {
+        // Measured 7 statements, 7 reads, 1 write: the completion
+        // `UPDATE` (1 statement, 1 write) and the six statements of
+        // the `schedule_alarm` re-plan.
+        name: "POST /batches/{id}/complete (success)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 1,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // The conclusion is carried verbatim: the success delivery's
+        // measurement, 7/7/1.
+        name: "POST /batches/{id}/complete (failure)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 1,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // Bounded by `STOW_BATCH_MAX_TASKS` legs: `ready_batches` and
+        // its leg read once, then per leg `complete`'s fenced `UPDATE`,
+        // its outcome counter and window expiry, and the build sample's
+        // insert, cap delete, stats read and write, and the keyed
+        // dispatch-key refresh over the leg's own `(crate, target)`
+        // pending rows — about 11 statements a leg, each leg's median
+        // moving because the fixture holds no earlier sample. Measured
+        // 442 statements, 272 reads, 392 writes (the fixture's
+        // `CRATE_NAME_ROWS` bounds the refresh's set). The batch row's
+        // delete is the last statement.
+        name: "alarm pass (batch resolution)",
+        statements: 550,
+        rows_read: 340,
+        rows_written: 490,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // The same 40 legs all failed: per leg the retry `UPDATE`, its
+        // follow-up refreshes and the outcome counter and evidence rows,
+        // with no build sample — about 7 statements a leg. Measured 283
+        // statements, 121 reads, 201 writes.
+        name: "alarm pass (batch resolution, failure)",
+        statements: 350,
+        rows_read: 150,
+        rows_written: 250,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // One expired bound batch with a live run: the expired-batch
+        // read (`EXPIRED_BATCH_LIMIT` rows at most, and the in-flight
+        // set is bounded by the slot caps) and the keyed lease
+        // extension. Measured 2 statements, 1 read, 1 write.
+        name: "alarm pass (lease check)",
+        statements: 2,
+        rows_read: 1,
+        rows_written: 1,
+        scan_allowlist: &[],
+    },
     RouteBudget {
         // One real dispatch pass over the floored queue — the same
         // claim/plan surface as the hot pass, priced separately so
@@ -1068,31 +1134,19 @@ async fn per_request_cost_gate() {
     );
 }
 
-#[derive(Debug, skyzen::FromRow)]
-struct RunningTarget {
-    attempt: i64,
-    github_run_id: Option<String>,
-    generation_id: String,
-}
-
-async fn running_target(db: &DurableDb, shape: fixture::FixtureShape) -> RunningTarget {
-    db.query("SELECT attempt, github_run_id, generation_id FROM queue WHERE task_id = printf('%064x', ?)")
-        .bind(i64::from(shape.running_row()))
-        .fetch_optional::<RunningTarget>()
+/// Σ `outcomes` and Σ `failures` over every attempt-outcome bucket.
+async fn outcome_totals(db: &DurableDb) -> (i64, i64) {
+    let outcomes = db
+        .query("SELECT COALESCE(SUM(outcomes), 0) FROM attempt_outcome_buckets")
+        .fetch_scalar::<i64>()
         .await
-        .expect("running target query")
-        .expect("running target row")
-}
-
-async fn running_outcomes(db: &DurableDb, shape: fixture::FixtureShape) -> i64 {
-    db.query(
-        "SELECT COALESCE(SUM(outcomes), 0) FROM attempt_outcome_buckets \
-         WHERE target = (SELECT target FROM queue WHERE task_id = printf('%064x', ?))",
-    )
-    .bind(i64::from(shape.running_row()))
-    .fetch_scalar::<i64>()
-    .await
-    .expect("running outcomes")
+        .expect("outcome total");
+    let failures = db
+        .query("SELECT COALESCE(SUM(failures), 0) FROM attempt_outcome_buckets")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("failure total");
+    (outcomes, failures)
 }
 
 async fn status_of(db: &DurableDb, task_id: &str) -> String {
@@ -1103,14 +1157,20 @@ async fn status_of(db: &DurableDb, task_id: &str) -> String {
         .expect("status")
 }
 
-async fn assert_failure_evidence(db: &DurableDb, shape: fixture::FixtureShape, expected: usize) {
+/// The failure evidence the batch-resolution drives leave: one row per
+/// failed leg of each pass, every one on a generation of its own.
+async fn assert_failure_evidence(db: &DurableDb, expected: usize) {
     let generations = db
-        .query("SELECT generation_id FROM attempt_outcomes_v2 WHERE task_id = printf('%064x', ?) AND attempt = 1")
-        .bind(i64::from(shape.dispatched_row(0)))
+        .query("SELECT generation_id FROM attempt_outcomes_v2 WHERE github_run_id = ?")
+        .bind(drives::BATCH_DRIVE_RUN_ID.to_string())
         .fetch_scalars::<String>()
         .await
         .expect("failure generations");
-    assert_eq!(generations.len(), expected, "each pass records its failure");
+    assert_eq!(
+        generations.len(),
+        expected,
+        "each pass records its failures"
+    );
     assert_eq!(
         generations
             .iter()
@@ -1121,6 +1181,33 @@ async fn assert_failure_evidence(db: &DurableDb, shape: fixture::FixtureShape, e
     );
     assert!(generations.iter().all(|generation| generation.len() == 32
         && generation.bytes().all(|byte| byte.is_ascii_hexdigit())));
+}
+
+/// What a pass's batch drives must leave behind besides their recorded
+/// evidence: no build sample or stat the resolved legs filed, and no
+/// queue row bound to a batch the fixture does not hold — apart from
+/// the `claimed` legs of the hot pass, which stay claimed until the
+/// re-arm restores them.
+async fn assert_batch_drives_cleaned_up(db: &DurableDb, claimed: &[String]) {
+    for table in ["crate_build_samples", "crate_build_stats"] {
+        let rows = db
+            .query(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("sample rows");
+        assert_eq!(rows, 0, "{table} outlived the batch drives");
+    }
+    let orphaned = db
+        .query(
+            "SELECT COUNT(*) FROM queue WHERE batch_id IS NOT NULL \
+             AND batch_id NOT IN (SELECT batch_id FROM build_batches) \
+             AND task_id NOT IN (SELECT value FROM json_each(?))",
+        )
+        .bind(serde_json::to_string(claimed).expect("encode claimed ids"))
+        .fetch_scalar::<i64>()
+        .await
+        .expect("orphaned legs");
+    assert_eq!(orphaned, 0, "a leg is still bound to a released batch");
 }
 
 /// The gate truth a re-arm must leave behind. Every stored edge flag
@@ -1205,8 +1292,8 @@ async fn assert_rearm_gate_truth(db: &DurableDb, shape: fixture::FixtureShape, c
 /// fixture prove the restore covers the whole mutation class — and the
 /// probe's own control state carries it: claimed rows restore from the
 /// pass's recorded claim set (a non-pending row the pass never touched
-/// survives), and the running target's `attempt` steps forward so each
-/// pass's completion lands on a fresh epoch.
+/// survives), and each pass's batch drives claim fresh generations, so
+/// their failure evidence accumulates rather than colliding.
 #[tokio::test]
 async fn budget_probe_repeats_on_a_persisted_fixture() {
     every_drive_has_exactly_one_row_in_each_budget_table();
@@ -1250,33 +1337,29 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
         .expect("re-arm (baseline)");
     let seeded_batches = batch_surface(&db).await;
     // The fixture seeds `attempt_outcome_buckets` to sized bulk, so the
-    // target's `outcomes` sum is the seed's plus each pass's own
-    // transition — the delta is what counts once per completion.
-    let seeded_outcomes = running_outcomes(&db, shape).await;
+    // totals are the seed's plus each pass's own transitions — the
+    // delta is what counts once per leg.
+    let (seeded_outcomes, seeded_failures) = outcome_totals(&db).await;
+    let legs = i64::from(settings.batch_max_tasks);
     run_drives(&db, shape, &settings, &ctx, &log).await;
 
-    // The complete drive lands `completed` + stamps the run id; the
-    // same pass's shape-requeue sweep then re-enters the row as
-    // `pending` at `attempt + 1` — the post-pass read is that state,
-    // which is also the state the re-arm restores from. A success
-    // never writes a raw `attempt_outcomes_v2` row: the per-target
-    // bucket's `outcomes` count is the completion's evidence, and it
-    // must increase exactly once per landed transition.
-    let first = running_target(&db, shape).await;
-    let run_id = format!("run-{}", shape.running_row());
+    // The two resolution drives each land one full batch of `legs`
+    // legs: the successful batch counts `legs` outcomes, the failed one
+    // `legs` outcomes and `legs` failures. A landed leg writes no raw
+    // `attempt_outcomes_v2` row on success — the bucket count is its
+    // evidence — and one row per leg on failure, each on the generation
+    // the claim minted. (Each drive's own cleanup already proved its
+    // batch reached its end state.)
     assert_eq!(
-        first.github_run_id.as_deref(),
-        Some(run_id.as_str()),
-        "the pass's completion landed and stamped its run id"
+        outcome_totals(&db).await,
+        (seeded_outcomes + 2 * legs, seeded_failures + legs),
+        "the first pass's leg transitions counted once"
     );
-    assert_eq!(
-        running_outcomes(&db, shape).await,
-        seeded_outcomes + 1,
-        "the first pass's completed transition counted once"
-    );
+    let per_pass_evidence = usize::try_from(legs).expect("leg count fits usize");
+    assert_failure_evidence(&db, per_pass_evidence).await;
     let claimed = ctx.claimed_ids();
-    assert_failure_evidence(&db, shape, 1).await;
     assert!(!claimed.is_empty(), "the gate pass claims rows");
+    assert_batch_drives_cleaned_up(&db, &claimed).await;
     fixture::record_probe_claimed(&db, &claimed)
         .await
         .expect("record claims");
@@ -1309,25 +1392,15 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     }
 
     run_drives(&db, shape, &settings, &ctx, &log).await;
-    let second = running_target(&db, shape).await;
-    assert_eq!(second.github_run_id.as_deref(), Some(run_id.as_str()));
-    assert_ne!(second.generation_id, first.generation_id);
-    assert_failure_evidence(&db, shape, 2).await;
-    // The second pass's own transition — counted once more, on a
-    // fresh generation. The re-arm also steps `attempt` past whatever
-    // the last pass left; the requeue's +1 rides on top, so strict
-    // increase is the form, not +1.
+    // The second pass's own transitions — counted once more, on fresh
+    // generations: the evidence of both passes is distinct throughout.
     assert_eq!(
-        running_outcomes(&db, shape).await,
-        seeded_outcomes + 2,
-        "the second pass's completed transition counted once more"
+        outcome_totals(&db).await,
+        (seeded_outcomes + 4 * legs, seeded_failures + 2 * legs),
+        "the second pass's leg transitions counted once more"
     );
-    assert!(
-        second.attempt > first.attempt,
-        "each pass completes a fresh attempt epoch: {} then {}",
-        first.attempt,
-        second.attempt,
-    );
+    assert_failure_evidence(&db, 2 * per_pass_evidence).await;
+    assert_batch_drives_cleaned_up(&db, &ctx.claimed_ids()).await;
 }
 
 /// A drive that fails mid-pass must still see its cleanup run — the
