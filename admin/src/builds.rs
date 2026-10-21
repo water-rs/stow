@@ -1,13 +1,17 @@
 //! `stow-admin builds digest` — the daily failed-build digest (stow#778).
 //!
 //! Once a day `build-failure-digest.yml` runs this: it enumerates the
-//! `build-crate.yml` runs that completed `failure` inside the window
-//! (the 24 hours to `--until`, default now), reads each run's jobs page
-//! and classifies the failure exactly as the manual preheat driver does
-//! (`runs::classify_failure` — a `VERDICT_STEPS` step is the crate's
-//! verdict, anything else is infrastructure), pulls the failed job's
-//! first error line out of its log, and renders one comment grouping the
-//! failures class → crate@version → targets.
+//! `build-batch.yml` runs that completed `failure` inside the window
+//! (the 24 hours to `--until`, default now), reads each run's jobs
+//! page and classifies every leg with the shared per-leg classifier
+//! (`runs::classify_page` over `stow_types::runs::classify_legs` — a
+//! `VERDICT_STEPS` step is the crate's verdict, anything else is
+//! infrastructure), pulls the failed job's first error line out of
+//! its log, and renders one comment grouping the failures class →
+//! crate@version → targets. A failure is a failed *leg*, keyed by the
+//! label in its `build` job's name (crate, version, target) and its
+//! task hash — one failed leg fails its whole run, so per-run
+//! accounting would read near 100% (stow#833).
 //!
 //! Delivery is the `incident`-labelled issue `Daily failed builds` — the
 //! one channel this digest keeps (AGENTS.md: unlike the watchdog's
@@ -30,9 +34,7 @@ use std::time::Duration;
 use askama::Template;
 use clap::{Args, Subcommand};
 use futures_util::{StreamExt as _, TryStreamExt as _};
-use stow_types::api::{CI_TARGET_TRIPLES, task_id_segment};
-use stow_types::records::parse_run_title;
-use stow_types::runs::{RunFailure, RunJobsPage, classify_failure};
+use stow_types::runs::{LegFailure, LegOutcome, RunFailure, RunJobRow};
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
 use time::OffsetDateTime;
@@ -48,19 +50,19 @@ use crate::watchdog;
 const DIGEST_ISSUE_TITLE: &str = "Daily failed builds";
 /// The digest's default look-back: the 24 hours before `--until`.
 const DEFAULT_WINDOW: time::Duration = time::Duration::hours(24);
-/// How long before it completes a `build-crate.yml` run can have been
-/// created: GitHub keeps a queued job up to 24 hours, and the build and
-/// publish jobs then run at most 120 + 60 minutes. The window selects
+/// How long before it completes a `build-batch.yml` run can have been
+/// created: GitHub keeps a queued job up to 24 hours, and the batch's
+/// legs then run inside it. The window selects
 /// runs by completion, so its listing reaches this far further back.
 const RUN_LIFETIME: time::Duration = time::Duration::hours(27);
 /// Run inspections in flight at once — each is one jobs read plus one
 /// log read, so the GitHub fan-out stays at this stated bound (the same
 /// 8 `github::runs_in_range` uses for its subdivision reads).
 const INSPECT_CONCURRENCY: usize = 8;
-/// A jobs page can be read mid-settle — `classify_failure` answers
-/// `None`. A completed run's rows land within seconds, so this many
-/// repolls this far apart cover it; a page still unsettled then is a
-/// GitHub defect worth failing on.
+/// A jobs page can be read mid-settle — `classify_legs` answers
+/// `Unsettled` for the leg still writing. A completed run's rows land
+/// within seconds, so this many repolls this far apart cover it; a
+/// page still unsettled then is a GitHub defect worth failing on.
 const SETTLE_ATTEMPTS: u32 = 3;
 const SETTLE_POLL: Duration = Duration::from_secs(20);
 
@@ -72,7 +74,7 @@ pub struct BuildsArgs {
 
 #[derive(Subcommand)]
 pub enum BuildsCommand {
-    /// Digest the window's failed build-crate runs into one comment on
+    /// Digest the window's failed build-batch legs into one comment on
     /// the `Daily failed builds` incident issue.
     Digest(DigestArgs),
 }
@@ -103,12 +105,11 @@ pub async fn run(token: &str, args: BuildsArgs, output: Output) -> stow_types::e
 
 // ===== Collecting the failures =====
 
-/// A run listing row — the fields the digest reads: the id for the jobs
-/// path, the title for `<rustc>-<task_id>`, the URL for the comment.
+/// A run listing row — the fields the digest reads: the id for the
+/// jobs path and the URL for the comment.
 #[derive(Debug, serde::Deserialize)]
 struct DigestRun {
     id: u64,
-    display_title: String,
     html_url: String,
     /// When the run last changed — for a completed run, when it completed.
     #[serde(with = "time::serde::rfc3339")]
@@ -121,7 +122,7 @@ impl github::RunRow for DigestRun {
     }
 }
 
-/// Every `build-crate.yml` run that completed `failure` inside
+/// Every `build-batch.yml` run that completed `failure` inside
 /// `(since, until]`. GitHub filters runs by creation time, and a run can
 /// complete up to [`RUN_LIFETIME`] after it was created, so the listing
 /// starts that much earlier and the completion time selects — a run
@@ -157,75 +158,24 @@ fn completed_in(
         .collect()
 }
 
-/// What a `<rustc>-<task_id>` task id carries — the grouping keys the
-/// digest needs. Written by `TaskNodeIdentity::task_id` as
-/// `<crate>-<version>-<features hash>-<target>-<rustc>-d<dep hash>`,
-/// `-host` for host-side nodes, every `-` inside a segment spelled `_`.
-#[derive(Debug)]
-struct TaskId {
-    crate_name: String,
-    version: String,
-    target: String,
-    host_side: bool,
-}
-
-/// Parse a canonical task id back into its grouping fields. The four
-/// tail segments are fixed-shape (`-d<64 hex>`, rustc, target, `<64
-/// hex>`) so they split unambiguously; the remaining head is
-/// `<crate>-<version>` where a crate name's dashes make the boundary
-/// ambiguous only to a left-to-right reader — the rightmost `-` ahead
-/// of a semver tail leads the version, because a prerelease's dashes
-/// fall inside it and no crate segment parses as semver. The target
-/// segment is [`task_id_segment`]-spelled; a triple can itself carry
-/// `_` (`x86_64`), so it decodes by matching the fleet's
-/// [`CI_TARGET_TRIPLES`] rather than reversing the spelling. `None` is
-/// not a canonical task id: the run is not one ours could have made.
-fn parse_task_id(task_id: &str) -> Option<TaskId> {
-    let (body, host_side) = task_id
-        .strip_suffix("-host")
-        .map_or((task_id, false), |body| (body, true));
-    let is_digest = |s: &str| s.len() == 64 && s.bytes().all(|byte| byte.is_ascii_hexdigit());
-    let (body, dependency) = body.rsplit_once('-')?;
-    if !dependency.starts_with('d') || !is_digest(&dependency[1..]) {
-        return None;
-    }
-    let (body, _rustc) = body.rsplit_once('-')?;
-    let (body, target) = body.rsplit_once('-')?;
-    let (head, features) = body.rsplit_once('-')?;
-    if !is_digest(features) {
-        return None;
-    }
-    let target = CI_TARGET_TRIPLES
-        .iter()
-        .find(|triple| task_id_segment(triple) == target)?;
-    for (index, _) in head.match_indices('-').rev() {
-        let version = &head[index + 1..];
-        if semver::Version::parse(version).is_ok() {
-            let crate_name = &head[..index];
-            return (!crate_name.is_empty()).then(|| TaskId {
-                crate_name: crate_name.to_owned(),
-                version: version.to_owned(),
-                target: (*target).to_owned(),
-                host_side,
-            });
-        }
-    }
-    None
-}
-
-/// One classified failure — a row of the digest and one JSON entry.
+/// One classified leg failure — a row of the digest and one JSON
+/// entry.
 #[derive(Debug, serde::Serialize)]
 struct FailureEntry {
     class: FailureKind,
     crate_name: String,
     version: String,
     target: String,
-    host_side: bool,
-    /// The failed job's name — `"-"` when no job failed
-    /// (`startup_failure`).
+    /// The leg's task hash — `blake3(task_id)`'s first 16 hex, from the
+    /// job-name suffix.
+    task_hash: String,
+    /// The failed job's name — `"leg <i> / build #<i> …"` /
+    /// `"leg <i> / publish #<i> …"`, or `"leg <i>"` for an invariant
+    /// failure that names no job.
     job: String,
     /// The failed step's name — `None` when the runner was lost before
-    /// a step could fail.
+    /// a step could fail; a `Concluded` leg carries its job's
+    /// conclusion (`timed_out`, …) and an `Invariant` leg its message.
     #[serde(skip_serializing_if = "Option::is_none")]
     step: Option<String>,
     /// The failed job log's first error line — `None` when the log was
@@ -256,20 +206,20 @@ impl FailureKind {
     }
 }
 
-/// Poll one run's jobs page until `classify_failure` answers — a page
-/// read mid-settle answers `None` and is repolled at [`SETTLE_POLL`]
-/// rather than misread; a page still unsettled after
+/// Poll one run's jobs page until every leg settles — a page read
+/// mid-settle answers `Unsettled` legs and is repolled at
+/// [`SETTLE_POLL`] rather than misread; a page still unsettled after
 /// [`SETTLE_ATTEMPTS`] is a GitHub defect and fails.
 async fn classify_run(
     token: &str,
     run_id: u64,
-) -> stow_types::error::Result<(RunJobsPage, RunFailure)> {
-    let path = format!("actions/runs/{run_id}/jobs?per_page=100");
+) -> stow_types::error::Result<(Vec<RunJobRow>, Vec<runs::PageLeg>)> {
     let mut attempts = SETTLE_ATTEMPTS;
     loop {
-        let page: RunJobsPage = github::get(token, &path, Backoff::new()).await?;
-        if let Some(class) = classify_failure(&page.jobs, OffsetDateTime::now_utc())? {
-            return Ok((page, class));
+        let jobs = runs::fetch_run_jobs(token, run_id).await?;
+        let legs = runs::classify_page(&jobs, "failure", OffsetDateTime::now_utc())?;
+        if legs.iter().all(|leg| leg.outcome != LegOutcome::Unsettled) {
+            return Ok((jobs, legs));
         }
         attempts -= 1;
         if attempts == 0 {
@@ -299,52 +249,116 @@ async fn first_error_line(token: &str, job_id: u64) -> Option<String> {
     }
 }
 
-/// Reduce one failed run to its digest entry: title → crate, version,
-/// target; jobs page → class, job and step; the failed job's log → the
-/// first error line.
-async fn inspect_run(token: &str, run: &DigestRun) -> stow_types::error::Result<FailureEntry> {
-    let (_rustc, task_id) = parse_run_title(&run.display_title).ok_or_else(|| {
-        stow_error!(
-            "run {} title {:?} is not `<rustc>-<task_id>`",
-            run.id,
-            run.display_title
-        )
-    })?;
-    let task = parse_task_id(task_id).ok_or_else(|| {
-        stow_error!(
-            "run {} task id {task_id:?} is not a canonical task id",
-            run.id
-        )
-    })?;
-    let (page, class) = classify_run(token, run.id).await?;
-    let (kind, job_name, step) = match class {
-        RunFailure::Verdict { job, step, .. } => (FailureKind::Verdict, job, Some(step)),
-        RunFailure::Infrastructure { job, step, .. } => (FailureKind::Infrastructure, job, step),
-    };
-    let error_line = match page.jobs.iter().find(|job| job.name == job_name) {
-        Some(job) => first_error_line(token, job.id).await,
-        None => None,
-    };
-    Ok(FailureEntry {
-        class: kind,
-        crate_name: task.crate_name,
-        version: task.version,
-        target: task.target,
-        host_side: task.host_side,
-        job: job_name,
-        step,
-        error_line,
-        run_url: run.html_url.clone(),
-    })
+/// The `(class, job, step)` a failed leg reports — a `VERDICT_STEPS`
+/// step is the crate's verdict and everything else is infrastructure;
+/// a `Concluded` leg's step slot carries the job's conclusion and an
+/// `Invariant` leg's carries its message, since neither names a failed
+/// step.
+fn failure_fields(
+    leg: &runs::PageLeg,
+    failure: &LegFailure,
+) -> (FailureKind, String, Option<String>, String) {
+    match failure {
+        LegFailure::Run(RunFailure::Verdict {
+            job,
+            step,
+            html_url,
+        }) => (
+            FailureKind::Verdict,
+            job.clone(),
+            Some(step.clone()),
+            html_url.clone(),
+        ),
+        LegFailure::Run(RunFailure::Infrastructure {
+            job,
+            step,
+            html_url,
+        }) => (
+            FailureKind::Infrastructure,
+            job.clone(),
+            step.clone(),
+            html_url.clone(),
+        ),
+        LegFailure::Concluded {
+            job,
+            conclusion,
+            html_url,
+        } => (
+            FailureKind::Infrastructure,
+            job.clone(),
+            Some(conclusion.clone()),
+            html_url.clone(),
+        ),
+        LegFailure::Invariant(message) => (
+            FailureKind::Infrastructure,
+            format!("leg {}", leg.leg),
+            Some(message.clone()),
+            String::new(),
+        ),
+    }
+}
+
+/// Reduce one failed batch run to its digest entries: the attempt's
+/// jobs page → one entry per failed leg, keyed by the label in its
+/// `build` job's name and its task hash.
+async fn inspect_run(token: &str, run: &DigestRun) -> stow_types::error::Result<Vec<FailureEntry>> {
+    let (jobs, legs) = classify_run(token, run.id).await?;
+    let mut entries = Vec::new();
+    for leg in &legs {
+        let LegOutcome::Failed(failure) = &leg.outcome else {
+            continue;
+        };
+        if !runs::leg_attempted(failure) {
+            continue;
+        }
+        // The leg's build job is the label source; a leg without one
+        // (a publish-only invariant) groups under `-`.
+        let label = match runs::leg_build_job(&jobs, leg.leg) {
+            Some(job) => Some(runs::leg_label(&job.name).ok_or_else(|| {
+                stow_error!(
+                    "run {} leg {}: build job {:?} has no readable label",
+                    run.id,
+                    leg.leg,
+                    job.name
+                )
+            })?),
+            None => None,
+        };
+        let (kind, job_name, step, job_url) = failure_fields(leg, failure);
+        let error_line = match jobs.iter().find(|job| job.name == job_name) {
+            Some(job) => first_error_line(token, job.id).await,
+            None => None,
+        };
+        entries.push(FailureEntry {
+            class: kind,
+            crate_name: label
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |label| label.crate_name.clone()),
+            version: label
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), |label| label.version.clone()),
+            target: label.map_or_else(|| "-".to_owned(), |label| label.target),
+            task_hash: leg.hash.to_string(),
+            job: job_name,
+            step,
+            error_line,
+            run_url: if job_url.is_empty() {
+                run.html_url.clone()
+            } else {
+                job_url
+            },
+        });
+    }
+    Ok(entries)
 }
 
 // ===== Rendering =====
 
-/// A `name | runs` count row of the digest's two summary tables.
+/// A `name | legs` count row of the digest's two summary tables.
 #[derive(Debug, serde::Serialize)]
 struct CountRow {
     name: String,
-    runs: usize,
+    legs: usize,
 }
 
 /// One crate's failures inside a class.
@@ -359,7 +373,7 @@ struct CrateGroup {
 #[derive(Debug, serde::Serialize)]
 struct ClassGroup {
     label: &'static str,
-    runs: usize,
+    legs: usize,
     crates: Vec<CrateGroup>,
 }
 
@@ -386,12 +400,7 @@ fn group_failures(entries: Vec<FailureEntry>) -> (Vec<CountRow>, Vec<CountRow>, 
             let crates = crates
                 .into_iter()
                 .map(|((crate_name, version), mut failures)| {
-                    failures.sort_by(|a, b| {
-                        a.target
-                            .cmp(&b.target)
-                            .then(a.host_side.cmp(&b.host_side))
-                            .then(a.job.cmp(&b.job))
-                    });
+                    failures.sort_by(|a, b| a.target.cmp(&b.target).then(a.job.cmp(&b.job)));
                     CrateGroup {
                         crate_name,
                         version,
@@ -401,21 +410,21 @@ fn group_failures(entries: Vec<FailureEntry>) -> (Vec<CountRow>, Vec<CountRow>, 
                 .collect();
             ClassGroup {
                 label: class.label(),
-                runs: class_counts[&class],
+                legs: class_counts[&class],
                 crates,
             }
         })
         .collect();
     let class_counts = class_counts
         .into_iter()
-        .map(|(class, runs)| CountRow {
+        .map(|(class, legs)| CountRow {
             name: class.label().to_owned(),
-            runs,
+            legs,
         })
         .collect();
     let target_counts = target_counts
         .into_iter()
-        .map(|(name, runs)| CountRow { name, runs })
+        .map(|(name, legs)| CountRow { name, legs })
         .collect();
     (class_counts, target_counts, groups)
 }
@@ -426,7 +435,8 @@ fn group_failures(entries: Vec<FailureEntry>) -> (Vec<CountRow>, Vec<CountRow>, 
 struct DigestTemplate<'a> {
     since: &'a str,
     until: &'a str,
-    total: usize,
+    failed_legs: usize,
+    failed_runs: usize,
     class_counts: &'a [CountRow],
     target_counts: &'a [CountRow],
     groups: &'a [ClassGroup],
@@ -526,6 +536,7 @@ struct DigestReport {
     since: String,
     until: String,
     failed_runs: usize,
+    failed_legs: usize,
     class_counts: Vec<CountRow>,
     target_counts: Vec<CountRow>,
     groups: Vec<ClassGroup>,
@@ -551,15 +562,20 @@ async fn digest(token: &str, args: DigestArgs, output: Output) -> stow_types::er
     // Independent runs inspect concurrently under the stated bound —
     // serial jobs+log reads would make a dense wave's digest take
     // minutes it does not need to.
-    let entries = futures_util::stream::iter(failed_runs.iter().map(|run| inspect_run(token, run)))
-        .buffered(INSPECT_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
+    let entries: Vec<FailureEntry> =
+        futures_util::stream::iter(failed_runs.iter().map(|run| inspect_run(token, run)))
+            .buffered(INSPECT_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect();
     let (class_counts, target_counts, groups) = group_failures(entries);
     let comment = DigestTemplate {
         since: &since_text,
         until: &until_text,
-        total: failed_runs.len(),
+        failed_legs: groups.iter().map(|group| group.legs).sum(),
+        failed_runs: failed_runs.len(),
         class_counts: &class_counts,
         target_counts: &target_counts,
         groups: &groups,
@@ -579,10 +595,8 @@ async fn digest(token: &str, args: DigestArgs, output: Output) -> stow_types::er
                 None
             }
         };
-        match plan_delivery(
-            failed_runs.len(),
-            open_issue.as_ref().map(|issue| issue.number),
-        ) {
+        let failed_legs = groups.iter().map(|group| group.legs).sum();
+        match plan_delivery(failed_legs, open_issue.as_ref().map(|issue| issue.number)) {
             Delivery::Comment => {
                 if let Err(error) = post_digest(token, &comment, open_issue, &mut actions).await {
                     failures.push(error);
@@ -611,6 +625,7 @@ async fn digest(token: &str, args: DigestArgs, output: Output) -> stow_types::er
         since: since_text,
         until: until_text,
         failed_runs: failed_runs.len(),
+        failed_legs: groups.iter().map(|group| group.legs).sum(),
         class_counts,
         target_counts,
         groups,
@@ -641,92 +656,76 @@ async fn digest(token: &str, args: DigestArgs, output: Output) -> stow_types::er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use stow_types::api::TaskHash;
 
-    /// The real titles a wave stamps: `1.99.0-<task_id>`.
+    /// The `failure_fields` mapping per `LegFailure` shape: a verdict
+    /// step is the crate's, a `timed_out` conclusion is
+    /// infrastructure, and an invariant names its leg.
     #[test]
-    fn task_id_parses_crate_version_target() {
-        let title = "1.99.0-gix-hash-0.27.0-ddd99a14d9fad9015908827b4edb6623350306075bbd2c2e5e600164d88b9618-aarch64_pc_windows_msvc-1.99.0-d378731025cfb98afa085f4362b1073bfd51298580ac931cc730d70f247998838";
-        let (_rustc, task_id) = parse_run_title(title).expect("title");
-        let task = parse_task_id(task_id).expect("task id");
-        assert_eq!(task.crate_name, "gix-hash");
-        assert_eq!(task.version, "0.27.0");
-        assert_eq!(task.target, "aarch64-pc-windows-msvc");
-        assert!(!task.host_side);
-    }
-
-    /// A host-side node carries the `-host` suffix after the dependency
-    /// digest (run 38977101174's title).
-    #[test]
-    fn task_id_parses_the_host_suffix() {
-        let title = "1.99.0-pest-2.9.4-b6a51989e7bc432a09ddf68698dd30718ef7d6986033e980ac4b118103106865-x86_64_unknown_linux_gnu-1.99.0-de864c6f3bff846e16a4dc2b8967662e27da4387268008fa6eb8d7216d25938d7-host";
-        let (_rustc, task_id) = parse_run_title(title).expect("title");
-        let task = parse_task_id(task_id).expect("task id");
-        assert_eq!(task.crate_name, "pest");
-        assert_eq!(task.version, "2.9.4");
-        assert_eq!(task.target, "x86_64-unknown-linux-gnu");
-        assert!(task.host_side);
-    }
-
-    /// The version boundary is the rightmost `-` ahead of a semver
-    /// tail: a prerelease's own dash stays inside the version, and a
-    /// crate named like a version keeps its dashes.
-    #[test]
-    fn task_id_version_boundary_prefers_the_rightmost_semver_tail() {
-        let digest = "a".repeat(64);
-        let parsed = |name_version: &str| {
-            parse_task_id(&format!(
-                "{name_version}-{digest}-x86_64_unknown_linux_gnu-1.99.0-d{digest}"
-            ))
-            .map(|task| (task.crate_name, task.version))
+    fn failure_fields_map_every_leg_failure_shape() {
+        let leg_of = |failure: LegFailure| runs::PageLeg {
+            leg: 2,
+            hash: TaskHash::of("task-a"),
+            outcome: LegOutcome::Failed(failure),
         };
-        assert_eq!(
-            parsed("serde-1.0.0-rc.1"),
-            Some(("serde".to_owned(), "1.0.0-rc.1".to_owned()))
-        );
-        assert_eq!(
-            parsed("aws-lc-sys-0.46.0"),
-            Some(("aws-lc-sys".to_owned(), "0.46.0".to_owned()))
-        );
-        assert_eq!(
-            parsed("foo-1.0.0-2.0.0"),
-            Some(("foo-1.0.0".to_owned(), "2.0.0".to_owned()))
-        );
+        let fields_of = |leg: &runs::PageLeg| match &leg.outcome {
+            LegOutcome::Failed(failure) => failure_fields(leg, failure),
+            _ => unreachable!(),
+        };
+        let (kind, _job, step, _url) = fields_of(&leg_of(LegFailure::Run(RunFailure::Verdict {
+            job: "leg 2 / build #2 serde 1.0.0 (x86_64-unknown-linux-gnu) aaaa1111bbbb2222"
+                .to_owned(),
+            step: "Run the untrusted build stage".to_owned(),
+            html_url: String::new(),
+        })));
+        assert_eq!(kind, FailureKind::Verdict);
+        assert_eq!(step.as_deref(), Some("Run the untrusted build stage"));
+        let (kind, _job, step, _url) = fields_of(&leg_of(LegFailure::Concluded {
+            job: "leg 2 / publish #2 aaaa1111bbbb2222".to_owned(),
+            conclusion: "timed_out".to_owned(),
+            html_url: String::new(),
+        }));
+        assert_eq!(kind, FailureKind::Infrastructure);
+        assert_eq!(step.as_deref(), Some("timed_out"));
+        let (kind, job, _step, _url) = fields_of(&leg_of(LegFailure::Invariant(
+            "leg 2 has no jobs".to_owned(),
+        )));
+        assert_eq!(kind, FailureKind::Infrastructure);
+        assert_eq!(job, "leg 2");
     }
 
-    /// A title that is not `<rustc>-<task_id>` — a workflow name never
-    /// rendered, a hand edit — parses nothing. `parse_run_title` is the
-    /// shallow `<x>-<y>` split; the canonical task-id parse is what
-    /// rejects the tail.
+    /// A `cancelled`/`skipped` leg is `fail-fast` collateral — never a
+    /// digest entry; `timed_out` is a failure worth reporting.
     #[test]
-    fn a_non_task_title_parses_nothing() {
-        assert!(parse_run_title("manual dispatch").is_none());
-        let (_, task_id) = parse_run_title("build-crate").expect("splits at the dash");
-        assert!(parse_task_id(task_id).is_none());
-    }
-
-    /// The target segment cannot be decoded by reversing the `-`→`_`
-    /// spelling — a triple can carry `_` itself (`x86_64`). Every fleet
-    /// triple encodes through `task_id_segment` and decodes by matching.
-    #[test]
-    fn every_ci_target_decodes() {
-        let digest = "a".repeat(64);
-        for target in CI_TARGET_TRIPLES {
-            let task_id = format!(
-                "serde-1.0.0-{digest}-{}-1.99.0-d{digest}",
-                task_id_segment(target)
-            );
-            assert_eq!(parse_task_id(&task_id).expect(target).target, *target);
-        }
+    fn collateral_leg_conclusions_are_not_failures() {
+        let attempted = |conclusion: &str| {
+            runs::leg_attempted(&LegFailure::Concluded {
+                job: "j".to_owned(),
+                conclusion: conclusion.to_owned(),
+                html_url: String::new(),
+            })
+        };
+        assert!(!attempted("cancelled"));
+        assert!(!attempted("skipped"));
+        assert!(attempted("timed_out"));
+        assert!(runs::leg_attempted(&LegFailure::Run(
+            RunFailure::Infrastructure {
+                job: "j".to_owned(),
+                step: None,
+                html_url: String::new(),
+            }
+        )));
     }
 
     fn entry(class: FailureKind, crate_name: &str, version: &str, target: &str) -> FailureEntry {
+        let hash = TaskHash::of(&format!("{crate_name}-{version}-task"));
         FailureEntry {
             class,
             crate_name: crate_name.to_owned(),
             version: version.to_owned(),
             target: target.to_owned(),
-            host_side: false,
-            job: format!("build {crate_name} {version} ({target})"),
+            task_hash: hash.to_string(),
+            job: format!("leg 0 / build #0 {crate_name} {version} ({target}) {hash}"),
             step: Some("Run the untrusted build stage".to_owned()),
             error_line: Some("error: linking with `ld.mold` failed".to_owned()),
             run_url: format!("https://github.com/water-rs/stow/actions/runs/{crate_name}"),
@@ -761,9 +760,9 @@ mod tests {
         let (class_counts, target_counts, groups) = group_failures(entries);
         assert_eq!(class_counts.len(), 2);
         assert_eq!(class_counts[0].name, "verdict");
-        assert_eq!(class_counts[0].runs, 2);
+        assert_eq!(class_counts[0].legs, 2);
         assert_eq!(class_counts[1].name, "infrastructure");
-        assert_eq!(class_counts[1].runs, 1);
+        assert_eq!(class_counts[1].legs, 1);
         assert_eq!(target_counts.len(), 3);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].label, "verdict");
@@ -800,7 +799,8 @@ mod tests {
         let comment = DigestTemplate {
             since: "2026-10-15T13:00:00Z",
             until: "2026-10-16T13:00:00Z",
-            total: 3,
+            failed_legs: 3,
+            failed_runs: 2,
             class_counts: &class_counts,
             target_counts: &target_counts,
             groups: &groups,
@@ -810,6 +810,7 @@ mod tests {
         let verdict = comment.find("verdict").expect("class named");
         let infrastructure = comment.find("infrastructure").expect("class named");
         assert!(verdict < infrastructure, "verdict leads");
+        assert!(comment.contains("**3 failed leg(s) across 2 failed `build-batch.yml` run(s)**"));
         assert!(comment.contains("| verdict | 2 |"));
         assert!(comment.contains("| `aarch64-apple-darwin` | 1 |"));
         assert!(comment.contains("**serde 1.0.0**"));
@@ -837,7 +838,6 @@ mod tests {
         let since = until - DEFAULT_WINDOW;
         let run = |id, updated_at: &str| DigestRun {
             id,
-            display_title: String::new(),
             html_url: String::new(),
             updated_at: OffsetDateTime::parse(updated_at, &Rfc3339).expect("updated_at"),
         };

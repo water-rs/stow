@@ -12,14 +12,17 @@ use stow_types::transient::{
 };
 use zenwave::{Client, ResponseExt};
 
-/// The repository every request below addresses — `build-crate.yml` runs
-/// and the Actions cache live here.
+/// The repository every request below addresses — the build workflows'
+/// runs and the Actions cache live here.
 pub const REPO: &str = "water-rs/stow";
 
 pub const API_BASE: &str = "https://api.github.com";
 pub const USER_AGENT: &str = "stow-admin";
-/// Workflow file whose runs `runs failures` inspects.
-pub const BUILD_WORKFLOW: &str = "build-crate.yml";
+/// Workflow file whose runs `runs failures`, `builds digest` and the
+/// watchdog's pipeline signals inspect — the batch workflow, whose
+/// runs carry every leg (stow#833). Spelled once in `stow_types` with
+/// the identity the scheduler dispatches to and certificates assert.
+pub use stow_types::trusted_builder::BATCH_WORKFLOW_FILE as BUILD_WORKFLOW;
 
 /// `GET` one API path under `/repos/{REPO}/` and decode the JSON body.
 /// The response body rides zenwave errors, so a rejection carries

@@ -1,24 +1,24 @@
 <!-- stow-builds-digest -->
-**{{ total }} failed `build-crate.yml` run(s)** — {{ since }} → {{ until }} UTC
+**{{ failed_legs }} failed leg(s) across {{ failed_runs }} failed `build-batch.yml` run(s)** — {{ since }} → {{ until }} UTC
 
-| class | runs |
+| class | legs |
 | --- | --- |
 {% for row in class_counts -%}
-| {{ row.name }} | {{ row.runs }} |
+| {{ row.name }} | {{ row.legs }} |
 {% endfor %}
 
-| target | runs |
+| target | legs |
 | --- | --- |
 {% for row in target_counts -%}
-| `{{ row.name }}` | {{ row.runs }} |
+| `{{ row.name }}` | {{ row.legs }} |
 {% endfor %}
 {% for group in groups %}
-## {{ group.label }} — {{ group.runs }} run(s)
+## {{ group.label }} — {{ group.legs }} leg(s)
 
 {% for krate in group.crates -%}
 - **{{ krate.crate_name }} {{ krate.version }}**
 {% for failure in krate.failures %}
-  - `{{ failure.target }}`{% if failure.host_side %} (host side){% endif %} — `{{ failure.job }}`{% if let Some(step) = failure.step %} / `{{ step }}`{% endif %} — [run]({{ failure.run_url }})
+  - `{{ failure.target }}` — `{{ failure.job }}`{% if let Some(step) = failure.step %} / `{{ step }}`{% endif %} — [run]({{ failure.run_url }})
     {%- if let Some(line) = failure.error_line %}
     first error: `{{ line }}`
     {%- endif %}

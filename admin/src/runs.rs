@@ -1,12 +1,21 @@
 //! `stow-admin runs failures --since <duration>` — fetch failed
-//! `build-crate.yml` runs from GitHub Actions, pull each failed job's
-//! log, classify the failure, and group by class.
+//! `build-batch.yml` runs from GitHub Actions, classify every leg of
+//! each run's jobs page, pull each failed leg's job log, classify the
+//! failure, and group by class.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
-use stow_types::runs::RunJobsPage;
+use stow_types::api::TaskHash;
+use stow_types::runs::{
+    LegFailure, LegJobKind, LegJobName, LegOutcome, RunFailure, RunJobRow, RunJobsPage,
+    classify_legs,
+};
+use stow_types::stow_error;
 use stow_types::transient::Backoff;
+use time::OffsetDateTime;
+use zenwave::ResponseExt as _;
 
 use crate::github::{self, BUILD_WORKFLOW};
 use crate::render::{self, Output, Table};
@@ -19,8 +28,8 @@ pub struct RunsArgs {
 
 #[derive(Subcommand)]
 pub enum RunsCommand {
-    /// List failed build-crate runs in the window, grouped by the failure
-    /// class their job logs show.
+    /// List failed build-batch legs in the window, grouped by the
+    /// failure class their job logs show.
     Failures(FailuresArgs),
 }
 
@@ -247,13 +256,214 @@ pub fn first_error_line(log: &str) -> Option<String> {
         .map(|line| line.trim().to_owned())
 }
 
-// ===== Step classification =====
+// ===== Leg classification =====
 //
 // `VERDICT_STEPS`, `STEP_SETTLE_WINDOW`, `RunFailure`,
-// `classify_failure` and the jobs-page row types moved to
-// `stow_types::runs` (stow#833) — the edge's batch resolver runs the
-// same classifier. `classify_log` and its `FailureClass` stay here:
-// they read job logs, which only `runs failures` and `watchdog` pull.
+// `classify_failure`, the jobs-page row types and the per-leg
+// classifier (`classify_legs`, `LegJobName`, `LegOutcome`,
+// `LegFailure`) live in `stow_types::runs` — the edge's batch resolver
+// runs the same contract. `classify_log` and its `FailureClass` stay
+// here: they read job logs, which only `runs failures`, `builds
+// digest` and `watchdog` pull.
+
+/// One leg of a `build-batch.yml` run's jobs page and its outcome.
+#[derive(Debug)]
+pub struct PageLeg {
+    /// The leg index — the `#N` in `leg N / build #N …`.
+    pub leg: u32,
+    /// The leg's [`TaskHash`] from its job-name suffix.
+    pub hash: TaskHash,
+    /// The leg's classified outcome.
+    pub outcome: LegOutcome,
+}
+
+/// Classify every leg present on a `build-batch.yml` run's jobs page —
+/// the shared classifier driven by the page itself (stow#833).
+///
+/// The admin readers hold no batch manifest, so each leg's expected
+/// [`TaskHash`] is read out of its own job names: the hash cross-check
+/// still fires when one leg's jobs disagree, a leg index repeating a
+/// job kind still fails as a duplicate, and a non-leg job name is a
+/// schema surprise the caller fails on. Legs come back in index
+/// order. A leg with no job rows never ran — under `fail-fast` a
+/// run's tail legs can be cancelled before scheduling — and produces
+/// no entry: it is neither a completed leg nor a failed one.
+/// `Unsettled` outcomes are the caller's signal to repoll.
+///
+/// `run_conclusion` is the run's reported conclusion — the
+/// `startup_failure`-with-no-jobs case the classifier treats as every
+/// leg's lost runner.
+pub fn classify_page(
+    jobs: &[RunJobRow],
+    run_conclusion: &str,
+    now: OffsetDateTime,
+) -> stow_types::error::Result<Vec<PageLeg>> {
+    let mut legs: BTreeMap<u32, TaskHash> = BTreeMap::new();
+    for job in jobs {
+        let Some(parsed) = LegJobName::parse(&job.name) else {
+            return Err(stow_error!(
+                "batch run jobs page names a non-leg job {:?}",
+                job.name
+            ));
+        };
+        // The first job's hash stands as the leg's expected hash; a
+        // second job disagreeing fails the leg's hash check inside
+        // `classify_legs`.
+        legs.entry(parsed.leg).or_insert(parsed.hash);
+    }
+    let Some(&last) = legs.keys().next_back() else {
+        return Ok(Vec::new());
+    };
+    // Entries for leg indexes absent from the page are never read —
+    // `classify_leg` consults `expected[leg]` only for the hash check,
+    // which runs only when the leg has jobs — so any valid hash fills
+    // them.
+    let placeholder: TaskHash = "0000000000000000".parse().expect("16 zero hex");
+    let expected: Vec<TaskHash> = (0..=last)
+        .map(|leg| {
+            legs.get(&leg)
+                .cloned()
+                .unwrap_or_else(|| placeholder.clone())
+        })
+        .collect();
+    let outcomes = classify_legs(&expected, run_conclusion, jobs, now)?;
+    Ok(outcomes
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, outcome)| {
+            let leg = u32::try_from(index).expect("leg index fits u32");
+            legs.get(&leg).map(|hash| PageLeg {
+                leg,
+                hash: hash.clone(),
+                outcome,
+            })
+        })
+        .collect())
+}
+
+/// Whether a failed leg was actually attempted — a leg whose jobs
+/// were `cancelled` or `skipped` is `fail-fast` collateral or an
+/// operator's cancel, never a failed build the reports count.
+pub fn leg_attempted(failure: &LegFailure) -> bool {
+    !matches!(failure, LegFailure::Concluded { conclusion, .. } if matches!(conclusion.as_str(), "cancelled" | "skipped"))
+}
+
+/// What a leg's `build` job name carries — the digest's grouping keys
+/// and the watchdog's target evidence. `build-batch.yml` writes it as
+/// `build #<leg> <crate> <version> (<target>) <hash>` under the
+/// `leg <leg> / ` caller prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegLabel {
+    /// Crate name as known to crates.io.
+    pub crate_name: String,
+    /// Exact crate version.
+    pub version: String,
+    /// Compilation target triple — carried verbatim in the job name.
+    pub target: String,
+}
+
+/// Parse a leg `build` job's name back into its label.
+///
+/// [`LegJobName::parse`] has already vetted the
+/// `build #<leg> … <16 hex>` frame; what remains between the leg
+/// index and the hash is `<crate> <version> (<target>)`, where the
+/// version must be semver — neither a crate name nor a target can
+/// carry a space, so the splits are unambiguous. `None` on a name
+/// that is not a leg `build` job's or whose label does not match —
+/// the callers fail fast on it: the run is ours, so an unreadable
+/// label is a schema surprise.
+pub fn leg_label(job_name: &str) -> Option<LegLabel> {
+    let parsed = LegJobName::parse(job_name)?;
+    if parsed.kind != LegJobKind::Build {
+        return None;
+    }
+    let segment = job_name.rsplit_once(" / ").map_or(job_name, |(_, s)| s);
+    let label = segment
+        .strip_prefix(&format!("build #{} ", parsed.leg))?
+        .strip_suffix(&format!(" {}", parsed.hash))?;
+    let (name_version, target) = label.rsplit_once(" (")?;
+    let target = target.strip_suffix(')')?;
+    let (crate_name, version) = name_version.split_once(' ')?;
+    if crate_name.is_empty() || semver::Version::parse(version).is_err() || target.is_empty() {
+        return None;
+    }
+    Some(LegLabel {
+        crate_name: crate_name.to_owned(),
+        version: version.to_owned(),
+        target: target.to_owned(),
+    })
+}
+
+/// The leg's `build` job row on the page — its name is the label
+/// source and its id the log path for legs that need it.
+pub fn leg_build_job(jobs: &[RunJobRow], leg: u32) -> Option<&RunJobRow> {
+    jobs.iter().find(|job| {
+        LegJobName::parse(&job.name)
+            .is_some_and(|name| name.leg == leg && name.kind == LegJobKind::Build)
+    })
+}
+
+/// Every job row of a run's latest attempt — the whole list, not one
+/// page (stow#833).
+///
+/// A batch carries 2 × `STOW_BATCH_MAX_TASKS` jobs and that bound is
+/// configurable, so a single `per_page=100` read silently truncates a
+/// large batch; the pager follows the RFC 8288 `Link` header's
+/// `rel="next"` (`stow_types::runs::link_next`, the same parse the
+/// edge's `attempt_jobs` runs) until GitHub names no next page.
+/// `runs failures`, `builds digest` and the watchdog all read their
+/// jobs through here — the one pager, nowhere duplicated.
+pub async fn fetch_run_jobs(token: &str, run_id: u64) -> stow_types::error::Result<Vec<RunJobRow>> {
+    fetch_jobs_pages(
+        Some(token),
+        &format!(
+            "{}/repos/{}/actions/runs/{run_id}/jobs?per_page=100",
+            github::API_BASE,
+            github::REPO
+        ),
+    )
+    .await
+}
+
+/// The pager loop behind [`fetch_run_jobs`] over absolute URLs —
+/// split so a test can point the first page at a loopback server.
+/// `Authorization` rides only when `token` is `Some` (the same
+/// convention `github::send_get` holds for loopback reads).
+async fn fetch_jobs_pages(
+    token: Option<&str>,
+    first_url: &str,
+) -> stow_types::error::Result<Vec<RunJobRow>> {
+    let mut jobs = Vec::new();
+    let mut url = first_url.to_owned();
+    loop {
+        let response = github::send_get(
+            token,
+            &url,
+            Some("application/vnd.github+json"),
+            None,
+            Backoff::new(),
+        )
+        .await
+        .map_err(|error| stow_error!("GET {url}: {error}"))?;
+        let next = response
+            .headers()
+            .get("link")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|header| stow_types::runs::link_next(Some(header)))
+            .map(str::to_owned);
+        let mut page: RunJobsPage = response
+            .error_for_status()
+            .await
+            .map_err(|error| stow_error!("GET {url}: {error}"))?
+            .into_json()
+            .await
+            .map_err(|error| stow_error!("read {url}: {error}"))?;
+        jobs.append(&mut page.jobs);
+        let Some(next) = next else { break };
+        url = next;
+    }
+    Ok(jobs)
+}
 
 // ===== GitHub REST shapes =====
 
@@ -283,7 +493,7 @@ struct FailureExample {
 #[derive(Debug, serde::Serialize)]
 struct FailureGroup {
     class: FailureClass,
-    runs: usize,
+    legs: usize,
     examples: Vec<FailureExample>,
 }
 
@@ -293,6 +503,7 @@ struct FailuresReport {
     workflow: &'static str,
     since_seconds: u64,
     failed_runs: usize,
+    failed_legs: usize,
     groups: Vec<FailureGroup>,
 }
 
@@ -302,10 +513,12 @@ pub async fn run(token: &str, args: RunsArgs, output: Output) -> stow_types::err
     }
 }
 
-/// Every failed run of the workflow in the closed window `[now-since,
-/// now]` — range enumeration reads the whole window past GitHub's
-/// 1000-row listing cap, so a dense failure wave no longer drops its
-/// tail (stow#555).
+/// Every failed run of the batch workflow in the closed window
+/// `[now-since, now]` — range enumeration reads the whole window past
+/// GitHub's 1000-row listing cap, so a dense failure wave no longer
+/// drops its tail (stow#555). One failed leg fails its whole run, so
+/// the listing is of runs *carrying* failures — the legs inside are
+/// what classify.
 async fn fetch_failed_runs(
     token: &str,
     since: std::time::Duration,
@@ -323,40 +536,57 @@ async fn fetch_failed_runs(
     .await
 }
 
-/// Fetch each failed job's log and group the classified failures.
+/// Classify each failed run's legs on its attempt's jobs page, then
+/// fetch each failed leg's failed-job log and group the classified
+/// failures.
 async fn classify_runs(
     token: &str,
     runs: &[WorkflowRun],
 ) -> stow_types::error::Result<Vec<FailureGroup>> {
-    let mut groups: std::collections::BTreeMap<FailureClass, Vec<FailureExample>> =
-        std::collections::BTreeMap::new();
+    let mut groups: BTreeMap<FailureClass, Vec<FailureExample>> = BTreeMap::new();
     for run in runs {
-        let jobs: RunJobsPage = github::get(
-            token,
-            &format!("actions/runs/{}/jobs?per_page=100", run.id),
-            Backoff::new(),
-        )
-        .await?;
-        for job in &jobs.jobs {
-            if job.conclusion.as_deref() != Some("failure") {
+        let jobs = fetch_run_jobs(token, run.id).await?;
+        for leg in classify_page(&jobs, "failure", OffsetDateTime::now_utc())? {
+            let LegOutcome::Failed(failure) = &leg.outcome else {
+                continue;
+            };
+            if !leg_attempted(failure) {
                 continue;
             }
-            let log_url = format!(
-                "https://api.github.com/repos/{}/actions/jobs/{}/logs",
-                github::REPO,
-                job.id
-            );
-            let log = match github::get_text(token, &log_url, Backoff::new()).await {
-                Ok(log) => log,
-                Err(error) => {
-                    tracing::warn!(job_id = job.id, %error, "job log unavailable; skipping");
-                    continue;
+            let (job_name, log_job) = match failure {
+                LegFailure::Run(
+                    RunFailure::Verdict { job, .. } | RunFailure::Infrastructure { job, .. },
+                )
+                | LegFailure::Concluded { job, .. } => {
+                    (job.clone(), jobs.iter().find(|row| row.name == *job))
+                }
+                LegFailure::Invariant(_) => (format!("leg {}", leg.leg), None),
+            };
+            let (class, evidence) = match (failure, log_job) {
+                // An invariant failure is its own evidence — the
+                // message names the mismatch; there is no log to read.
+                (LegFailure::Invariant(message), _) => {
+                    (FailureClass::Unknown, Some(message.clone()))
+                }
+                (_, None) => (FailureClass::Unknown, None),
+                (_, Some(job)) => {
+                    let log_url = format!(
+                        "https://api.github.com/repos/{}/actions/jobs/{}/logs",
+                        github::REPO,
+                        job.id
+                    );
+                    match github::get_text(token, &log_url, Backoff::new()).await {
+                        Ok(log) => classify_log(&log),
+                        Err(error) => {
+                            tracing::warn!(job_id = job.id, %error, "job log unavailable; skipping");
+                            continue;
+                        }
+                    }
                 }
             };
-            let (class, evidence) = classify_log(&log);
             groups.entry(class).or_default().push(FailureExample {
                 run_url: run.html_url.clone(),
-                job: job.name.clone(),
+                job: job_name,
                 evidence,
             });
         }
@@ -365,7 +595,7 @@ async fn classify_runs(
         .into_iter()
         .map(|(class, examples)| FailureGroup {
             class,
-            runs: examples.len(),
+            legs: examples.len(),
             examples,
         })
         .collect())
@@ -378,28 +608,31 @@ async fn failures(
 ) -> stow_types::error::Result<()> {
     let runs = fetch_failed_runs(token, args.since).await?;
     let groups = classify_runs(token, &runs).await?;
+    let failed_legs = groups.iter().map(|group| group.legs).sum();
 
     let report = FailuresReport {
         workflow: BUILD_WORKFLOW,
         since_seconds: args.since.as_secs(),
         failed_runs: runs.len(),
+        failed_legs,
         groups,
     };
     render::emit(output, &report, |report| {
         if report.groups.is_empty() {
             return format!(
-                "no failed {} runs in the last {}",
+                "no failed {} legs in the last {}",
                 report.workflow,
                 render::age(report.since_seconds)
             );
         }
         let mut out = format!(
-            "{} failed {} run(s) in the last {}\n",
+            "{} failed leg(s) across {} failed {} run(s) in the last {}\n",
+            report.failed_legs,
             report.failed_runs,
             report.workflow,
             render::age(report.since_seconds)
         );
-        let mut table = Table::new(&["class", "runs", "example"]);
+        let mut table = Table::new(&["class", "legs", "example"]);
         for group in &report.groups {
             let example = group
                 .examples
@@ -407,7 +640,7 @@ async fn failures(
                 .map_or("-", |example| example.run_url.as_str());
             table.push([
                 group.class.as_str().to_owned(),
-                group.runs.to_string(),
+                group.legs.to_string(),
                 example.to_owned(),
             ]);
         }
@@ -432,7 +665,12 @@ async fn failures(
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureClass, classify_log, log_line_body};
+    use stow_types::runs::RunStepRow;
+
+    use super::{
+        FailureClass, LegFailure, LegOutcome, RunFailure, RunJobRow, TaskHash, classify_log,
+        classify_page, leg_attempted, leg_label, log_line_body,
+    };
 
     /// The jobs-log API stamps every line with an RFC 3339 timestamp, so a
     /// fixture without one tests a format that never arrives. This is the
@@ -582,5 +820,204 @@ mod tests {
     fn first_error_line_wins() {
         let log = "##[error]error: toolchain '1.91.1' does not support target 'x'\nerror: failed to download `y`\n";
         assert_eq!(classify_log(log).0, FailureClass::ToolchainTargetMissing);
+    }
+
+    // ----- Batch legs (stow#833) -----
+
+    fn at(unix: i64) -> time::OffsetDateTime {
+        time::OffsetDateTime::from_unix_timestamp(unix).expect("timestamp")
+    }
+
+    /// One job row of a `build-batch.yml` run's page — settled
+    /// (`completed`) unless the fixture says otherwise.
+    fn job_row(name: String, conclusion: Option<&str>, steps: Vec<RunStepRow>) -> RunJobRow {
+        RunJobRow {
+            id: 0,
+            name,
+            status: "completed".to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+            started_at: Some(at(50)),
+            completed_at: Some(at(100)),
+            run_attempt: 1,
+            html_url: String::new(),
+            steps,
+        }
+    }
+
+    /// Leg `i`'s build job name as `build-batch.yml` writes it —
+    /// `leg i / build #i <crate> <version> (<target>) <hash>`.
+    fn build_name(leg: u32, task_id: &str) -> (TaskHash, String) {
+        let hash = TaskHash::of(task_id);
+        let name =
+            format!("leg {leg} / build #{leg} serde 1.0.0 (x86_64-unknown-linux-gnu) {hash}");
+        (hash, name)
+    }
+
+    /// Leg `i`'s publish job name — `leg i / publish #i <hash>`.
+    fn publish_name(leg: u32, task_id: &str) -> String {
+        format!("leg {leg} / publish #{leg} {}", TaskHash::of(task_id))
+    }
+
+    /// The build job name's label round-trips: crate, version and the
+    /// verbatim target, with or without the `leg N / ` caller prefix.
+    #[test]
+    fn leg_label_reads_crate_version_target() {
+        let hash = TaskHash::of("some-task-id");
+        for name in [
+            format!("leg 7 / build #7 gix-hash 0.27.0 (aarch64-pc-windows-msvc) {hash}"),
+            format!("build #7 gix-hash 0.27.0 (aarch64-pc-windows-msvc) {hash}"),
+        ] {
+            let label = leg_label(&name).expect("label");
+            assert_eq!(label.crate_name, "gix-hash");
+            assert_eq!(label.version, "0.27.0");
+            assert_eq!(label.target, "aarch64-pc-windows-msvc");
+        }
+    }
+
+    /// A publish job's name carries no label; anything off the
+    /// `<crate> <version> (<target>)` shape — a missing version, a
+    /// non-semver one, a missing target — parses nothing.
+    #[test]
+    fn leg_label_rejects_non_build_and_malformed_names() {
+        let hash = TaskHash::of("some-task-id");
+        for name in [
+            format!("leg 3 / publish #3 {hash}"),
+            format!("build #3 serde (x86_64-unknown-linux-gnu) {hash}"),
+            format!("build #3 serde not-semver (x86_64-unknown-linux-gnu) {hash}"),
+            format!("build #3 serde 1.0.0 x86_64-unknown-linux-gnu {hash}"),
+            "build-crate".to_owned(),
+        ] {
+            assert_eq!(leg_label(&name), None, "{name}");
+        }
+    }
+
+    /// A failed run's page classifies per leg: the verdict leg is a
+    /// failed leg; the cancelled collateral leg is not attempted; the
+    /// successful leg is neither.
+    #[test]
+    fn classify_page_reports_each_leg_on_its_own_merits() {
+        let (hash0, build0) = build_name(0, "task-a");
+        let (_hash1, build1) = build_name(1, "task-b");
+        let (_hash2, build2) = build_name(2, "task-c");
+        let jobs = vec![
+            job_row(build0, Some("success"), vec![]),
+            job_row(publish_name(0, "task-a"), Some("success"), vec![]),
+            job_row(
+                build1,
+                Some("failure"),
+                vec![RunStepRow {
+                    name: "Run the untrusted build stage".to_owned(),
+                    status: "completed".to_owned(),
+                    conclusion: Some("failure".to_owned()),
+                }],
+            ),
+            job_row(publish_name(1, "task-b"), Some("skipped"), vec![]),
+            job_row(build2, Some("cancelled"), vec![]),
+            job_row(publish_name(2, "task-c"), Some("cancelled"), vec![]),
+        ];
+        let legs = classify_page(&jobs, "failure", at(1_000)).expect("classified");
+        assert_eq!(legs.len(), 3);
+        assert_eq!(legs[0].hash, hash0);
+        assert!(matches!(legs[0].outcome, LegOutcome::Succeeded { .. }));
+        let LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { .. })) = &legs[1].outcome
+        else {
+            panic!("leg 1 is the crate's verdict: {:?}", legs[1].outcome);
+        };
+        let LegOutcome::Failed(failure) = &legs[2].outcome else {
+            panic!("leg 2 concluded cancelled: {:?}", legs[2].outcome);
+        };
+        let LegFailure::Concluded { conclusion, .. } = failure else {
+            panic!("leg 2 concluded cancelled: {failure:?}");
+        };
+        assert_eq!(conclusion, "cancelled");
+        assert!(!leg_attempted(failure));
+    }
+
+    /// The page is the manifest: a leg whose jobs disagree on the
+    /// hash is that leg's invariant failure even with no batch to
+    /// check against.
+    #[test]
+    fn classify_page_still_catches_a_hash_mismatch() {
+        let (_hash, build) = build_name(0, "task-a");
+        let jobs = vec![
+            job_row(build, Some("success"), vec![]),
+            job_row(publish_name(0, "task-b"), Some("success"), vec![]),
+        ];
+        let legs = classify_page(&jobs, "success", at(1_000)).expect("classified");
+        let LegOutcome::Failed(LegFailure::Invariant(message)) = &legs[0].outcome else {
+            panic!(
+                "a disagreeing hash is the leg's invariant: {:?}",
+                legs[0].outcome
+            );
+        };
+        assert!(message.contains("hash"));
+    }
+
+    /// A job name that is not a leg job fails the whole read — the
+    /// run is ours, so an unreadable name is a schema surprise, never
+    /// a leg to skip.
+    #[test]
+    fn classify_page_fails_on_a_non_leg_job() {
+        let job = job_row("build-crate".to_owned(), Some("failure"), vec![]);
+        assert!(classify_page(&[job], "failure", at(1_000)).is_err());
+    }
+
+    /// The jobs pager follows `Link: <…>; rel="next"`: a batch's jobs
+    /// can outrun one `per_page=100` page, and both pages' rows must
+    /// land in the answer. `test_server`'s steps cannot emit a `Link`
+    /// header, so the fixture speaks HTTP/1.1 itself — a read of the
+    /// request head, then the scripted response, connection closed.
+    #[tokio::test]
+    async fn fetch_jobs_pages_follows_link_next() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback binds");
+        let addr = listener.local_addr().expect("bound");
+        let base = format!("http://{addr}");
+        let job = |id: u64| {
+            format!(
+                "{{\"id\":{id},\"name\":\"job {id}\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":null,\"completed_at\":null,\"run_attempt\":1,\"html_url\":\"\",\"steps\":[]}}"
+            )
+        };
+        let respond = |link: Option<String>, id: u64| {
+            let body = format!("{{\"jobs\":[{}]}}", job(id));
+            let link = link.map_or(String::new(), |url| {
+                format!("link: <{url}>; rel=\"next\"\r\n")
+            });
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{link}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let responses = [respond(Some(format!("{base}/page2")), 1), respond(None, 2)];
+        let server = tokio::spawn(async move {
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buffer = vec![0_u8; 4096];
+                let mut head = Vec::new();
+                loop {
+                    let read = socket.read(&mut buffer).await.expect("read");
+                    head.extend_from_slice(&buffer[..read]);
+                    if head.windows(4).any(|w| w == b"\r\n\r\n") || read == 0 {
+                        break;
+                    }
+                }
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write response");
+            }
+        });
+        let jobs = super::fetch_jobs_pages(None, &format!("{base}/page1"))
+            .await
+            .expect("two pages of jobs");
+        server.await.expect("server");
+        assert_eq!(
+            jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
     }
 }
