@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 
-use stow_types::api::{EnqueueRequest, EnqueueSource};
+use stow_types::api::{BuildTaskPayload, EnqueueRequest, EnqueueSource};
 use stow_types::identity::FeaturesJson;
 
 use super::{
@@ -80,19 +80,72 @@ const fn settings() -> SchedulerSettings {
     }
 }
 
+/// A claimed leg as the claim assertions read it: the generation its
+/// claim minted, and the leg's identity as the batch's encoded payload
+/// carries it (`Deref` to the [`BuildTaskPayload`]).
+#[derive(Clone, Debug)]
+struct ClaimedLeg {
+    generation_id: String,
+    payload: BuildTaskPayload,
+}
+
+impl std::ops::Deref for ClaimedLeg {
+    type Target = BuildTaskPayload;
+
+    fn deref(&self) -> &BuildTaskPayload {
+        &self.payload
+    }
+}
+
+impl ClaimedLeg {
+    /// The claim's `(task_id, generation_id)` fence key, as the
+    /// dispatch-failure backoff takes it.
+    fn queued(&self) -> super::QueuedTask {
+        super::QueuedTask {
+            task_id: self.payload.task_id.clone(),
+            generation_id: self.generation_id.clone(),
+        }
+    }
+}
+
+/// Every leg of `batches` in the batches' close order, each paired with
+/// its identity decoded from the batch's encoded `BuildBatchPayload` —
+/// production keeps no more of a claimed row than its fence key.
+fn claimed_legs(
+    batches: &[crate::scheduler::batching::FormedBatch],
+) -> Vec<(super::QueuedTask, BuildTaskPayload)> {
+    batches
+        .iter()
+        .flat_map(|batch| {
+            let encoded: stow_types::api::BuildBatchPayload =
+                serde_json::from_str(&batch.encoded).expect("decode encoded batch");
+            batch
+                .tasks
+                .iter()
+                .enumerate()
+                .map(|(leg, task)| (task.clone(), encoded.task(leg).expect("decode batch leg")))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// `claim_dispatchable_tasks` flattened to the pre-batch
-/// `Vec<QueuedTask>` shape the claim assertions were written
-/// against — legs in the batches' close order.
+/// claimed-row shape the claim assertions were written against —
+/// legs in the batches' close order.
 async fn claim_flat(
     db: &DurableDb,
     settings: &SchedulerSettings,
     coverage: &impl CoverageOracle,
-) -> Result<Vec<super::QueuedTask>, QueueError> {
-    Ok(super::claim_dispatchable_tasks(db, settings, coverage)
-        .await?
-        .into_iter()
-        .flat_map(|batch| batch.tasks)
-        .collect())
+) -> Result<Vec<ClaimedLeg>, QueueError> {
+    Ok(
+        claimed_legs(&super::claim_dispatchable_tasks(db, settings, coverage).await?)
+            .into_iter()
+            .map(|(task, payload)| ClaimedLeg {
+                generation_id: task.generation_id,
+                payload,
+            })
+            .collect(),
+    )
 }
 
 const fn paused_settings() -> SchedulerSettings {
@@ -5335,15 +5388,9 @@ async fn response_loss_reclaim_drops_unbound_event_before_new_claim() {
     )
     .await
     .expect("store response-loss event");
-    super::mark_dispatch_failed(
-        &db,
-        &settings(),
-        &id,
-        &claimed.generation_id,
-        "response lost",
-    )
-    .await
-    .expect("reclaim response-loss generation");
+    super::back_off_dispatch_legs(&db, &settings(), &[claimed.queued()], "response lost")
+        .await
+        .expect("reclaim response-loss generation");
     assert_eq!(pending_completion_count(&db).await, 0);
     db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
             .bind(id.clone())
@@ -5388,15 +5435,9 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
     )
     .await
     .expect("cancel A");
-    super::mark_dispatch_failed(
-        &db,
-        &settings(),
-        &id,
-        &first.generation_id,
-        "late A failure",
-    )
-    .await
-    .expect("fence late A failure after cancel");
+    super::back_off_dispatch_legs(&db, &settings(), &[first.queued()], "late A failure")
+        .await
+        .expect("fence late A failure after cancel");
     assert_eq!(row_column(&db, "fenced", "status").await, "failed");
 
     super::apply_mutation(
@@ -5427,15 +5468,9 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
         .await
         .expect("bind B");
 
-    super::mark_dispatch_failed(
-        &db,
-        &settings(),
-        &id,
-        &first.generation_id,
-        "late A failure",
-    )
-    .await
-    .expect("fence late A failure after retry");
+    super::back_off_dispatch_legs(&db, &settings(), &[first.queued()], "late A failure")
+        .await
+        .expect("fence late A failure after retry");
     assert_eq!(row_column(&db, "fenced", "status").await, "dispatched");
     assert_eq!(row_column(&db, "fenced", "github_run_id").await, "run-b");
     assert_eq!(pending_completion_count(&db).await, 1);
@@ -5574,7 +5609,7 @@ async fn late_failure_cannot_match_purged_recreated_generation() {
         second.generation_id
     );
 
-    super::mark_dispatch_failed(&db, &settings(), &id, &first.generation_id, "late A")
+    super::back_off_dispatch_legs(&db, &settings(), &[first.queued()], "late A")
         .await
         .expect("fence old failure");
     assert_eq!(row_column(&db, "recreated", "status").await, "dispatched");
@@ -5582,6 +5617,40 @@ async fn late_failure_cannot_match_purged_recreated_generation() {
         row_column(&db, "recreated", "generation_id").await,
         second.generation_id
     );
+}
+
+/// The dispatch-failure backoff: `min(2^min(attempts, 6), cap)` minutes.
+const fn reference_backoff_minutes(attempts: u32) -> u32 {
+    let doubled = 1u32 << if attempts < 6 { attempts } else { 6 };
+    if doubled < super::MAX_DISPATCH_BACKOFF_MINUTES {
+        doubled
+    } else {
+        super::MAX_DISPATCH_BACKOFF_MINUTES
+    }
+}
+
+/// The SQL backoff expression the batch backoff writes equals the
+/// documented `min(2^min(attempts, 6), cap)` for every attempt count
+/// across the exponent clamp and the cap.
+#[tokio::test]
+async fn backoff_minutes_sql_matches_the_documented_curve() {
+    let db = memory_db().await.expect("memory db");
+    let expression = super::backoff_minutes_sql("dispatch_attempts");
+    for attempts in 0..=10u32 {
+        let minutes = db
+            .query(&format!(
+                "SELECT {expression} FROM (SELECT ? AS dispatch_attempts)"
+            ))
+            .bind(i64::from(attempts))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("evaluate backoff expression");
+        assert_eq!(
+            minutes,
+            i64::from(reference_backoff_minutes(attempts)),
+            "attempts {attempts}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5595,7 +5664,7 @@ async fn binding_clears_orphan_pending_run_before_normal_completion() {
         .await
         .expect("claim A")[0]
         .clone();
-    super::mark_dispatch_failed(&db, &settings(), &id, &first.generation_id, "response lost")
+    super::back_off_dispatch_legs(&db, &settings(), &[first.queued()], "response lost")
         .await
         .expect("reclaim A");
     db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
@@ -5663,7 +5732,7 @@ async fn persisted_bound_pending_event_recovers_after_restart() {
 
 /// Bind a claimed row's generation to `github_run_id` the way the
 /// retired per-task dispatch did - setup for the `complete_run` and
-/// `mark_dispatch_failed` fences, which still read `queue.github_run_id`
+/// `back_off_dispatch_legs` fences, which still read `queue.github_run_id`
 /// until the per-task completion route goes. Production binds one run
 /// per batch ([`super::bind_batch_run`]) and never writes this column.
 async fn bind_dispatch_run(
@@ -5868,7 +5937,7 @@ async fn bind_leg(db: &DurableDb, task_id: &str, batch_id: &str, batch_leg: i64)
 
 /// Enqueue every name and claim the lot — `settings()`'s ten slots
 /// take them all once `first_requested_at` clears the age gate.
-async fn claim_tasks(db: &DurableDb, names: &[&str]) -> Vec<super::QueuedTask> {
+async fn claim_tasks(db: &DurableDb, names: &[&str]) -> Vec<ClaimedLeg> {
     let requests: Vec<EnqueueRequest> = names.iter().map(|name| request(name, &[])).collect();
     enqueue(db, &requests).await.expect("enqueue legs");
     for name in names {
@@ -5879,9 +5948,9 @@ async fn claim_tasks(db: &DurableDb, names: &[&str]) -> Vec<super::QueuedTask> {
         .expect("claim legs")
 }
 
-/// The claim's `QueuedTask` for one crate — claim order follows the
-/// dispatch key, so tests bind legs by name, never position.
-fn claimed_task<'a>(claimed: &'a [super::QueuedTask], crate_name: &str) -> &'a super::QueuedTask {
+/// The claimed leg for one crate — claim order follows the dispatch
+/// key, so tests bind legs by name, never position.
+fn claimed_task<'a>(claimed: &'a [ClaimedLeg], crate_name: &str) -> &'a ClaimedLeg {
     claimed
         .iter()
         .find(|task| task.crate_name == crate_name)
@@ -8479,7 +8548,7 @@ async fn reentry_fixture() -> (DurableDb, String) {
 /// Every nonpending→pending re-entry reprices through the shared
 /// refresh: a row whose key was written before a cost move must
 /// leave the transition carrying the new cost's rank — on the
-/// operator `Retry` and on `mark_dispatch_failed` here, on the
+/// operator `Retry` and on `back_off_dispatch_legs` here, on the
 /// stale-lease recovery and the incomplete-shape requeue in the
 /// sibling test — while rows that did not transition keep their
 /// keys byte-for-byte.
@@ -8503,7 +8572,7 @@ async fn retry_and_dispatch_failure_reprice_against_moved_cost() {
     assert_eq!(status_of(&db, "retried").await, "pending");
     assert_eq!(prefix_of(&db, "retried").await, priced());
 
-    // mark_dispatch_failed: dispatched (run unbound) → pending.
+    // back_off_dispatch_legs: dispatched (run unbound) → pending.
     db.query(
         "UPDATE queue SET status = 'dispatched', generation_id = 'gen-fd' \
              WHERE crate_name = 'failed-dispatch'",
@@ -8511,11 +8580,13 @@ async fn retry_and_dispatch_failure_reprice_against_moved_cost() {
     .execute()
     .await
     .expect("mark dispatched");
-    super::mark_dispatch_failed(
+    super::back_off_dispatch_legs(
         &db,
         &settings(),
-        &task_id_on("failed-dispatch", TARGET),
-        "gen-fd",
+        &[super::QueuedTask {
+            task_id: task_id_on("failed-dispatch", TARGET),
+            generation_id: "gen-fd".to_owned(),
+        }],
         "workflow_dispatch failed",
     )
     .await
@@ -9218,25 +9289,7 @@ async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
         }
         // The payload path: subgraph + the task's own identity re-derive
         // the claimed task id.
-        let payload = stow_types::api::BuildTaskPayload {
-            task_id: task.task_id.clone(),
-            attempt: task.attempt,
-            crate_name: task.crate_name.parse().expect("crate name"),
-            version: stow_types::identity::CrateVersion::new(
-                task.version.parse().expect("version"),
-            ),
-            features_json: FeaturesJson::from_sorted(
-                serde_json::from_str::<Vec<String>>(&task.features_json).expect("features"),
-            )
-            .expect("canonical features"),
-            target: task.target.parse().expect("target"),
-            rustc_version: task.rustc_version.parse().expect("rustc"),
-            preserve_lockfile: false,
-            host_side: task.host_side,
-            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-            dependency_subgraph: task.dependency_subgraph.clone(),
-        };
-        let graph = payload.verified_dependency_graph().expect("verify");
+        let graph = task.payload.verified_dependency_graph().expect("verify");
         assert_eq!(
             graph.task_id(0),
             Some(task.task_id.as_str()),
@@ -9724,7 +9777,7 @@ async fn the_head_row_always_goes_out_batched() {
         .await
         .expect("claim");
     assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].tasks[0].crate_name, "head");
+    assert_eq!(claimed_legs(&batches)[0].1.crate_name, "head");
     assert_eq!(batches[0].parallelism, 1);
 }
 
@@ -9763,10 +9816,10 @@ async fn legs_order_longest_first_in_a_batch() {
         .await
         .expect("claim");
     assert_eq!(batches.len(), 1);
-    let order: Vec<&str> = batches[0]
-        .tasks
+    let legs = claimed_legs(&batches);
+    let order: Vec<&str> = legs
         .iter()
-        .map(|task| task.crate_name.as_str())
+        .map(|(_, payload)| payload.crate_name.as_str())
         .collect();
     assert_eq!(order, ["slow", "mid", "fast", "unmeasured"]);
 }
@@ -9789,7 +9842,7 @@ async fn a_dependent_is_never_batched_with_its_dependency() {
         .expect("claim");
     assert_eq!(batches.len(), 1);
     assert_eq!(batches[0].tasks.len(), 1);
-    assert_eq!(batches[0].tasks[0].crate_name, "dep");
+    assert_eq!(claimed_legs(&batches)[0].1.crate_name, "dep");
     assert_parent_status(
         &db,
         stow_types::api::QueueTaskStatus::Pending,
@@ -9914,7 +9967,7 @@ async fn a_failed_batch_dispatch_backs_off_every_leg_and_deletes_the_row() {
     .await
     .expect("persist the failed dispatch");
 
-    for task in &batch.tasks {
+    for (task, payload) in claimed_legs(std::slice::from_ref(&batch)) {
         let leg = db
             .query(
                 "SELECT status, error_msg, dispatch_attempts, \
@@ -9925,10 +9978,14 @@ async fn a_failed_batch_dispatch_backs_off_every_leg_and_deletes_the_row() {
             .fetch_one::<LegState>()
             .await
             .expect("read leg");
-        assert_eq!(leg.status, "pending", "{} requeues", task.crate_name);
+        assert_eq!(leg.status, "pending", "{} requeues", payload.crate_name);
         assert_eq!(leg.error_msg.as_deref(), Some("GitHub API error: 502"));
         assert_eq!(leg.dispatch_attempts, 1);
-        assert_eq!(leg.backed_off, 1, "{} waits out a backoff", task.crate_name);
+        assert_eq!(
+            leg.backed_off, 1,
+            "{} waits out a backoff",
+            payload.crate_name
+        );
     }
     assert!(
         build_batch(&db, batch.batch_id.as_str()).await.is_none(),
@@ -10146,8 +10203,8 @@ async fn a_batch_that_lost_a_leg_is_dropped_and_its_won_legs_restored() {
 
     assert_eq!(batches.len(), 1, "the head's batch is dropped");
     assert_eq!(batches[0].tasks.len(), 1);
-    let survivor = &batches[0].tasks[0];
-    assert_ne!(survivor.crate_name, raced);
+    let (survivor, survivor_payload) = claimed_legs(&batches).remove(0);
+    assert_ne!(survivor_payload.crate_name.as_str(), raced);
 
     let after = stamped_rows(&db).await;
     for (was, now) in before.iter().zip(&after) {
@@ -10161,7 +10218,7 @@ async fn a_batch_that_lost_a_leg_is_dropped_and_its_won_legs_restored() {
                 (now.status.as_str(), now.generation_id.as_str()),
                 ("dispatched", "racer")
             );
-        } else if name == survivor.crate_name {
+        } else if survivor_payload.crate_name.as_str() == name {
             assert_eq!(now.status, "dispatched");
             assert_eq!(now.generation_id, survivor.generation_id);
             assert_eq!(now.batch_id.as_deref(), Some(batches[0].batch_id.as_str()));

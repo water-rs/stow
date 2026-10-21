@@ -53,40 +53,14 @@ pub trait CoverageOracle: Sync {
     ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send;
 }
 
-/// One claimed queue row, ready to dispatch to a build runner.
-#[derive(Debug, Clone)]
+/// One claimed queue row: the identity a batch leg is fenced and
+/// backed off by.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct QueuedTask {
     pub task_id: String,
     /// Unique claim identity minted at dispatch claim time. It changes on
     /// every new claim, including after purge and recreation.
     pub generation_id: String,
-    /// The row's enqueue epoch at claim time. The `workflow_run` event
-    /// names no attempt — `complete_run` resolves the row's live one —
-    /// so a late report for a superseded attempt cannot overwrite the
-    /// live one.
-    pub attempt: u32,
-    pub crate_name: String,
-    pub version: String,
-    pub features_json: String,
-    pub target: String,
-    pub rustc_version: String,
-    /// Whether the task builds the crate as a host-side unit — passed
-    /// through to `BuildTaskPayload` so the CI builder shapes the
-    /// wrapper package's dependency as the unit's consumers compile it.
-    pub host_side: bool,
-    /// The task's explicit-spelling flag (stow#736) — passed through to
-    /// `BuildTaskPayload` so a target-side task at the runner's host
-    /// triple builds and publishes both invocation spellings.
-    pub explicit_spelling: stow_types::public_cache::ExplicitSpelling,
-    pub preserve_lockfile: bool,
-    /// The task's dependency subgraph at claim time, rebuilt from its
-    /// `queue_dependencies` rows (stow#588). Dispatch carries it to
-    /// `BuildTaskPayload.dependency_subgraph` so the generated wrapper
-    /// package pins the dep closure. The table stores direct-dep edges
-    /// only — a dep's own children are not recoverable here, so each
-    /// subgraph node lands as a leaf; the scheduler's storage rework is
-    /// owned by a follow-up task.
-    pub dependency_subgraph: stow_types::api::TaskSubgraph,
 }
 
 /// One admitted queue row before its claim: a [`QueuedTask`] without
@@ -114,16 +88,6 @@ impl PendingLeg {
         QueuedTask {
             task_id: self.task_id,
             generation_id,
-            attempt: self.attempt,
-            crate_name: self.crate_name,
-            version: self.version,
-            features_json: self.features_json,
-            target: self.target,
-            rustc_version: self.rustc_version,
-            host_side: self.host_side,
-            explicit_spelling: self.explicit_spelling,
-            preserve_lockfile: self.preserve_lockfile,
-            dependency_subgraph: self.dependency_subgraph,
         }
     }
 }
@@ -1654,7 +1618,8 @@ async fn complete(
     // see the old row, so `attempt` is the cycle position that failed.
     let retry = format!("attempt < {MAX_BUILD_ATTEMPTS}");
     let next_not_before = format!(
-        "datetime('now', '+' || MIN(1 << MIN(attempt, 6), {MAX_DISPATCH_BACKOFF_MINUTES}) || ' minutes')"
+        "datetime('now', '+' || {} || ' minutes')",
+        backoff_minutes_sql("attempt")
     );
     let statement = if report.success {
         "UPDATE queue \
@@ -2387,7 +2352,7 @@ pub async fn bind_batch_run(
 
 /// A batch whose dispatch failed — the POST, the network, an unreadable
 /// response or the token mint (stow#833 §4.2): every leg backs off
-/// through [`mark_dispatch_failed`] and the batch row is deleted,
+/// through [`back_off_dispatch_legs`] and the batch row is deleted,
 /// which releases its runner slots. Any run the failure left behind is
 /// an orphan whose completion finds no batch row.
 async fn fail_batch_dispatch(
@@ -2396,9 +2361,7 @@ async fn fail_batch_dispatch(
     batch: &FormedBatch,
     error: &str,
 ) -> Result<(), QueueError> {
-    for task in &batch.tasks {
-        mark_dispatch_failed(db, settings, &task.task_id, &task.generation_id, error).await?;
-    }
+    back_off_dispatch_legs(db, settings, &batch.tasks, error).await?;
     db.query("DELETE FROM build_batches WHERE batch_id = ?")
         .bind(batch.batch_id.as_str().to_owned())
         .execute()
@@ -5751,111 +5714,99 @@ async fn select_dispatchable_page(
         .map_err(|error| QueueError::Sql(format!("select dispatchable tasks: {error}")))
 }
 
-pub async fn mark_dispatch_failed(
+/// The dispatch-failure backoff in minutes as a SQL expression of
+/// `attempts_column`: `min(2^min(attempts, 6), MAX_DISPATCH_BACKOFF_MINUTES)`,
+/// so a persistent failure (GitHub outage, bad token) never spins the
+/// alarm in a zero-delay retry loop.
+fn backoff_minutes_sql(attempts_column: &str) -> String {
+    format!("MIN(1 << MIN({attempts_column}, 6), {MAX_DISPATCH_BACKOFF_MINUTES})")
+}
+
+/// Back off every leg of a batch whose dispatch failed, in one
+/// statement. Each leg whose `(task_id, generation_id)` still names a
+/// `dispatched`/`running` row with no bound run re-enters `pending`
+/// behind the backoff of its own `dispatch_attempts` (incremented at
+/// claim time); a late external-I/O failure for a superseded or
+/// already-bound generation matches nothing and must not overwrite the
+/// live row.
+///
+/// The row re-enters `pending`: `unpublished_deps`/`deps_met` stay live
+/// on every status, so the recompute is a cheap count-derived
+/// re-derivation — and `blocked`, maintained for pending rows only, may
+/// have gone stale while it was in-flight. `wake_at` is the later of
+/// the age gate and the backoff this statement writes (the SET operand
+/// is spelled out again — SET terms see the old row); the human lane
+/// ignores the age gate.
+pub async fn back_off_dispatch_legs(
     db: &DurableDb,
     settings: &SchedulerSettings,
-    task_id: &str,
-    generation_id: &str,
+    legs: &[QueuedTask],
     error: &str,
 ) -> Result<(), QueueError> {
-    // Exponential backoff keyed on dispatch_attempts (incremented at claim
-    // time): a persistent dispatch failure (GitHub outage, bad token) must
-    // not spin the alarm in a zero-delay retry loop.
-    let Some(dispatch_attempts) = db
-        .query(
-            "SELECT dispatch_attempts FROM queue \
-             WHERE task_id = ? AND generation_id = ? \
-               AND status IN ('dispatched', 'running') AND github_run_id IS NULL",
-        )
-        .bind(task_id.to_owned())
-        .bind(generation_id.to_owned())
-        .fetch_scalar_optional::<u32>()
-        .await
-        .map_err(|db_error| format!("load dispatch attempts for {task_id}: {db_error}"))?
-    else {
-        // A late external-I/O failure for a superseded or already-bound
-        // generation must not overwrite the live row.
+    if legs.is_empty() {
         return Ok(());
-    };
-    let backoff_minutes = dispatch_backoff_minutes(dispatch_attempts);
-    // The row re-enters `pending`: `unpublished_deps`/`deps_met` stay
-    // live on every status, so the recompute is a cheap count-derived
-    // re-derivation — and `blocked`, maintained for pending rows only,
-    // may have gone stale while it was in-flight. `wake_at` is the
-    // later of the age gate and the backoff this statement writes (the
-    // SET operand is spelled out again — SET terms see the old row);
-    // the human lane ignores the age gate.
-    let next_not_before = "datetime('now', ?)";
+    }
+    let next_not_before = format!(
+        "datetime('now', '+' || {} || ' minutes')",
+        backoff_minutes_sql("dispatch_attempts")
+    );
     let updated = db
         .query(&format!(
             "UPDATE queue \
-         SET status = 'pending', error_msg = ?, \
-             not_before = {next_not_before}, \
-             deps_met = {deps_met}, blocked = {blocked}, \
-             wake_at = {wake}, \
-             updated_at = datetime('now') \
-         WHERE task_id = ? AND generation_id = ? \
-           AND status IN ('dispatched', 'running') AND github_run_id IS NULL \
-         RETURNING task_id",
+             SET status = 'pending', error_msg = ?, \
+                 not_before = {next_not_before}, \
+                 deps_met = {deps_met}, blocked = {blocked}, \
+                 wake_at = {wake}, \
+                 updated_at = datetime('now') \
+             FROM (SELECT value ->> 'task_id' AS task_id, \
+                          value ->> 'generation_id' AS generation_id \
+                   FROM json_each(?)) AS e \
+             WHERE queue.task_id = e.task_id AND queue.generation_id = e.generation_id \
+               AND queue.status IN ('dispatched', 'running') \
+               AND queue.github_run_id IS NULL \
+             RETURNING queue.task_id",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
             wake = wake_at_sql(
-                "lane",
-                "first_requested_at",
-                next_not_before,
+                "queue.lane",
+                "queue.first_requested_at",
+                &next_not_before,
                 settings.dispatch_min_age_minutes,
             ),
         ))
         .bind(error.to_owned())
-        .bind(format!("+{backoff_minutes} minutes"))
-        .bind(format!("+{backoff_minutes} minutes"))
-        .bind(format!("+{backoff_minutes} minutes"))
-        .bind(task_id.to_owned())
-        .bind(generation_id.to_owned())
+        .bind(enqueue_json(legs)?)
         .fetch_scalars::<String>()
         .await
-        .map_err(|db_error| {
-            format!("mark dispatch failed for {task_id} generation {generation_id}: {db_error}")
-        })?;
+        .map_err(|db_error| format!("back off {} dispatch legs: {db_error}", legs.len()))?;
 
     if !updated.is_empty() {
-        discard_pending_completions(db, task_id, generation_id).await?;
-        // The row re-entered `pending` carrying the rank written
+        discard_pending_completions(db, &updated).await?;
+        // The rows re-entered `pending` carrying the rank written
         // before the last cost move; refresh it through the shared
-        // abstraction, scoped to the row that transitioned.
+        // abstraction, scoped to the rows that transitioned.
         refresh_dispatch_keys(db, &updated).await?;
     }
 
     Ok(())
 }
 
+/// Drop the early completion reports stored for rows that just
+/// re-entered `pending`: the run they named belongs to the generation
+/// the row left.
 async fn discard_pending_completions(
     db: &DurableDb,
-    task_id: &str,
-    generation_id: &str,
+    task_ids: &[String],
 ) -> Result<(), QueueError> {
     db.query(
         "DELETE FROM pending_run_completions \
-         WHERE task_id = ? AND EXISTS ( \
-             SELECT 1 FROM queue \
-             WHERE task_id = ? AND generation_id = ? AND status = 'pending' \
-         )",
+         WHERE task_id IN (SELECT value FROM json_each(?))",
     )
-    .bind(task_id.to_owned())
-    .bind(task_id.to_owned())
-    .bind(generation_id.to_owned())
+    .bind(enqueue_json(task_ids)?)
     .execute()
     .await
-    .map_err(|error| {
-        format!("discard pending completions for {task_id} generation {generation_id}: {error}")
-    })?;
+    .map_err(|error| format!("discard pending completions: {error}"))?;
     Ok(())
-}
-
-fn dispatch_backoff_minutes(attempts: u32) -> u32 {
-    2u32.checked_pow(attempts.min(6))
-        .unwrap_or(MAX_DISPATCH_BACKOFF_MINUTES)
-        .min(MAX_DISPATCH_BACKOFF_MINUTES)
 }
 
 /// Seconds of validity that must remain on the cached GitHub App
