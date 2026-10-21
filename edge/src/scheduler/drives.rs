@@ -1526,7 +1526,7 @@ pub const DRIVES: &[Drive] = &[
         // same queue code against the empty-catalog oracle — the host
         // gate checks statements and counters only.
         // The claimed tasks' subgraph rebuild (stow#588) is priced in
-        // the same pass: `load_claimed_subgraphs` pays one bounded
+        // the same pass: `load_admitted_subgraphs` pays one bounded
         // `task_id IN (…)` read per shared BFS level — at most
         // `SUBGRAPH_WALK_MAX_LEVELS` (64) statements and `O(Σ reachable
         // nodes)` rows read, bounded by the dispatched tasks' own
@@ -2013,7 +2013,11 @@ async fn dispatch_pass_drive(
             let claimed = queue::claim_dispatchable_tasks(db, &pass_settings, &NoCoverage)
                 .await
                 .map_err(|error| error.to_string())?;
-            let task_ids: Vec<String> = claimed.iter().map(|task| task.task_id.clone()).collect();
+            let task_ids: Vec<String> = claimed
+                .iter()
+                .flat_map(|batch| batch.tasks.iter())
+                .map(|task| task.task_id.clone())
+                .collect();
             ctx.record_claimed(task_ids.clone());
             task_ids
         }
@@ -2076,6 +2080,7 @@ async fn focused_claim_pass(
                 .await
                 .map_err(|error| error.to_string())?
                 .iter()
+                .flat_map(|batch| batch.tasks.iter())
                 .map(|task| task.task_id.clone())
                 .collect::<Vec<String>>()
         }
@@ -2086,6 +2091,7 @@ async fn focused_claim_pass(
                 .await
                 .map_err(|error| error.to_string())?
                 .iter()
+                .flat_map(|batch| batch.tasks.iter())
                 .map(|task| task.task_id.clone())
                 .collect::<Vec<String>>()
         }

@@ -4,14 +4,17 @@ use std::num::{NonZero, NonZeroU32};
 
 use skyzen_services::durable::{Alarm, DbValue, DurableDb};
 use stow_types::api::{
-    AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
-    QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerResetReport,
-    SchedulerStatus, TaskHash, TaskLane, runner_family,
+    AdminInFlight, AdminStatus, AdminTargetStats, BatchId, BuildTaskPayload, EnqueueRequest,
+    EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
+    RunnerFamily, SchedulerResetReport, SchedulerStatus, TaskHash, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::runs::{LegFailure, LegOutcome, RunFailure, RunJobRow};
 
 use crate::errors::QueueError;
+use crate::scheduler::batching::{
+    BatchCandidate, BatchKey, FormedBatch, PlannedBatch, SlotAdmission, SlotPlan, form_batches,
+};
 
 /// The semantic identity of a crates.io task, as the artifact catalog
 /// keys it: the identity a published closure member registers under.
@@ -84,6 +87,45 @@ pub struct QueuedTask {
     /// subgraph node lands as a leaf; the scheduler's storage rework is
     /// owned by a follow-up task.
     pub dependency_subgraph: stow_types::api::TaskSubgraph,
+}
+
+/// One admitted queue row before its claim: a [`QueuedTask`] without
+/// the `generation_id` the claim mints. Formation works on these, so a
+/// row nothing claimed never carries an identity it does not own.
+#[derive(Debug, Clone)]
+pub struct PendingLeg {
+    pub task_id: String,
+    pub attempt: u32,
+    pub crate_name: String,
+    pub version: String,
+    pub features_json: String,
+    pub target: String,
+    pub rustc_version: String,
+    pub host_side: bool,
+    pub explicit_spelling: stow_types::public_cache::ExplicitSpelling,
+    pub preserve_lockfile: bool,
+    pub dependency_subgraph: stow_types::api::TaskSubgraph,
+}
+
+impl PendingLeg {
+    /// The claimed row, under the `generation_id` its claim minted.
+    #[must_use]
+    pub fn claimed(self, generation_id: String) -> QueuedTask {
+        QueuedTask {
+            task_id: self.task_id,
+            generation_id,
+            attempt: self.attempt,
+            crate_name: self.crate_name,
+            version: self.version,
+            features_json: self.features_json,
+            target: self.target,
+            rustc_version: self.rustc_version,
+            host_side: self.host_side,
+            explicit_spelling: self.explicit_spelling,
+            preserve_lockfile: self.preserve_lockfile,
+            dependency_subgraph: self.dependency_subgraph,
+        }
+    }
 }
 
 /// Decode a stored `explicit_spelling` integer — the queue and
@@ -2764,26 +2806,13 @@ pub fn batch_resolutions(
 pub async fn resolve_batch(
     db: &DurableDb,
     settings: &SchedulerSettings,
-    batch_id: &str,
+    batch: &ReadyBatch,
     resolutions: &[LegResolution],
     window_minutes: u32,
 ) -> Result<bool, QueueError> {
-    // The batch row is the run binding's home: `done_run_id` (equal to
-    // `github_run_id` for every batch `ready_batches` surfaces) is the
-    // run the legs' outcomes name.
-    let run_id = db
-        .query("SELECT done_run_id FROM build_batches WHERE batch_id = ?")
-        .bind(batch_id.to_owned())
-        .fetch_optional::<BatchRunIdRow>()
-        .await
-        .map_err(|error| format!("load batch {batch_id} run id: {error}"))?
-        .and_then(|row| row.done_run_id);
-    let legs = batch_legs(db, &[batch_id.to_owned()])
-        .await?
-        .remove(batch_id)
-        .unwrap_or_default();
+    let batch_id = batch.batch_id.as_str();
     let mut any_failure = false;
-    for leg in legs {
+    for leg in &batch.legs {
         let resolution = resolutions
             .get(usize::try_from(leg.batch_leg).expect("u32 fits usize on every stow target"))
             .ok_or_else(|| {
@@ -2799,12 +2828,12 @@ pub async fn resolve_batch(
             LegResolution::Failed { error } => (false, Some(error.clone()), None),
         };
         let report = BuildCompleteReport {
-            task_id: leg.task_id,
-            generation_id: leg.generation_id,
+            task_id: leg.task_id.clone(),
+            generation_id: leg.generation_id.clone(),
             attempt: leg.attempt,
             success,
             error,
-            github_run_id: run_id.clone(),
+            github_run_id: Some(batch.run_id.clone()),
             finished_at: None,
             sample_ms,
         };
@@ -2821,11 +2850,6 @@ pub async fn resolve_batch(
         .await
         .map_err(|error| format!("delete resolved batch {batch_id}: {error}"))?;
     Ok(any_failure)
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct BatchRunIdRow {
-    done_run_id: Option<String>,
 }
 
 /// Push a batch's resolution out to `until_ms`: any leg still
@@ -3726,8 +3750,8 @@ const fn dispatch_family_label(family: RunnerFamily) -> &'static str {
 }
 
 /// `AND <column> IN ('<family>', …)` — "every family except the
-/// saturated one" rendered as equality over `RunnerFamily::ALL` minus
-/// `full_family`, derived from the type so a new family can never drift
+/// saturated ones" rendered as equality over `RunnerFamily::ALL` minus
+/// `saturated`, derived from the type so a new family can never drift
 /// from the exclusion, and never `!=` or `NOT IN`. On `idx_queue_wake`
 /// the family column is the last equality column before the `wake_at`
 /// range, where an inequality cannot bound the range — SQLite falls
@@ -3735,19 +3759,19 @@ const fn dispatch_family_label(family: RunnerFamily) -> &'static str {
 /// future-wake misses cost N reads on every alarm pass and every
 /// deliver. The IN list expands into one seek per surviving family, so
 /// each probe reads only the families that can dispatch (stow#588).
-/// `None` — no family saturated — renders no filter at all.
-fn dispatch_family_in_sql(column: &str, full_family: Option<RunnerFamily>) -> String {
-    let Some(full) = full_family else {
+/// An empty `saturated` renders no filter at all.
+fn dispatch_family_in_sql(column: &str, saturated: &[RunnerFamily]) -> String {
+    if saturated.is_empty() {
         return String::new();
-    };
+    }
     let families = RunnerFamily::ALL
         .iter()
-        .filter(|family| **family != full)
+        .filter(|family| !saturated.contains(family))
         .map(|family| format!("'{}'", dispatch_family_label(*family)))
         .collect::<Vec<_>>();
     if families.is_empty() {
-        // A one-family runner set whose only family is saturated: no
-        // row can dispatch — a literal false keeps the probe's shape.
+        // Every family saturated: no row can dispatch — a literal
+        // false keeps the probe's shape.
         return "AND 0".to_owned();
     }
     format!("AND {column} IN ({})", families.join(", "))
@@ -4657,41 +4681,11 @@ fn blocked_by_sql() -> String {
         .to_owned()
 }
 
-async fn claim_dispatchable_row(
-    db: &DurableDb,
-    row: TaskRow,
-) -> Result<Option<QueuedTask>, QueueError> {
-    let claimed_generation = db
-        .query(
-            // `claimed_at` is the immutable claim instant of the
-            // generation just minted — the one timestamp no in-flight
-            // writer may rewrite, so the completion samples a real
-            // claim-to-completion duration even after re-requests
-            // bumped `updated_at` (stow#524).
-            "UPDATE queue \
-             SET status = 'dispatched', generation_id = lower(hex(randomblob(16))), \
-                 dispatch_attempts = dispatch_attempts + 1, \
-                 github_run_id = NULL, claimed_at = datetime('now'), \
-                 updated_at = datetime('now') \
-             WHERE task_id = ? AND status = 'pending' \
-             RETURNING generation_id",
-        )
-        .bind(row.task_id.clone())
-        .fetch_optional::<ClaimGenerationRow>()
-        .await
-        .map_err(|error| format!("claim task {}: {error}", row.task_id))?;
-
-    let Some(claimed_generation) = claimed_generation else {
-        tracing::warn!(
-            task_id = %row.task_id,
-            "skipping task claim — already claimed by concurrent dispatch"
-        );
-        return Ok(None);
-    };
-
-    Ok(Some(QueuedTask {
+/// A page row as the pre-claim leg formation works on — the subgraph
+/// loads later.
+fn pending_leg(row: TaskRow) -> PendingLeg {
+    PendingLeg {
         task_id: row.task_id,
-        generation_id: claimed_generation.generation_id,
         attempt: row.attempt,
         crate_name: row.crate_name,
         version: row.version,
@@ -4705,14 +4699,439 @@ async fn claim_dispatchable_row(
             root_deps: Vec::new(),
             nodes: Vec::new(),
         },
-    }))
+    }
 }
 
+/// What a pending row's page record says beside the [`PendingLeg`]
+/// itself — its batch uniformity key, the leg-ordering cost, and the
+/// pre-claim row state an [`unclaim_rows`] restore writes back.
+struct ClaimSide {
+    /// `(rustc_version, family, lane)` — the batch key (§1.1).
+    key: BatchKey,
+    /// `crate_build_stats.median_ms` — `None` while unmeasured, which
+    /// sorts a leg last like it sorts the rank.
+    median_ms: Option<i64>,
+    /// The row's pre-claim `generation_id` — restored if the row's
+    /// batch is dropped after a lost race.
+    generation_id: String,
+    /// The row's pre-claim `claimed_at` — restored with it.
+    claimed_at: Option<String>,
+}
+
+/// One page row's `ClaimSide`: the runner family and lane decode from
+/// columns an enqueue wrote, so a value they cannot parse is corrupt
+/// state, never a skippable row.
+fn claim_side(row: &TaskRow) -> Result<ClaimSide, QueueError> {
+    let family = runner_family(&row.target).ok_or_else(|| {
+        QueueError::Invariant(format!(
+            "pending task {} targets `{}`, which maps to no runner family",
+            row.task_id, row.target
+        ))
+    })?;
+    let lane = TaskLane::parse(&row.lane).ok_or_else(|| {
+        QueueError::Invariant(format!(
+            "pending task {} carries lane {:?}",
+            row.task_id, row.lane
+        ))
+    })?;
+    let median_ms = row
+        .median_ms
+        .as_deref()
+        .map(|median| crate::scheduler::rank::checked_cost(median).map(NonZero::get))
+        .transpose()?;
+    let rustc_version = WireRustcVersion::parse(&row.rustc_version).map_err(|error| {
+        QueueError::Invariant(format!(
+            "pending task {} rustc_version {:?}: {error}",
+            row.task_id, row.rustc_version
+        ))
+    })?;
+    Ok(ClaimSide {
+        key: BatchKey {
+            rustc_version,
+            family,
+            lane,
+        },
+        median_ms,
+        generation_id: row.generation_id.clone(),
+        claimed_at: row.claimed_at.clone(),
+    })
+}
+
+/// The `BuildTaskPayload` one pending row encodes as a batch leg —
+/// the same fields the per-task dispatch serializes today. A stored
+/// column that fails to parse is corrupt state: the row came in
+/// through enqueue, which validates every field.
+fn task_payload(task: &PendingLeg) -> Result<BuildTaskPayload, QueueError> {
+    fn invalid(task_id: &str, error: impl std::fmt::Display) -> QueueError {
+        QueueError::Invariant(format!("pending task {task_id}: {error}"))
+    }
+    Ok(BuildTaskPayload {
+        task_id: task.task_id.clone(),
+        attempt: task.attempt,
+        crate_name: CrateName::parse(&task.crate_name)
+            .map_err(|error| invalid(&task.task_id, error))?,
+        version: CrateVersion::new(
+            semver::Version::parse(&task.version).map_err(|error| invalid(&task.task_id, error))?,
+        ),
+        features_json: FeaturesJson::from_sorted(
+            serde_json::from_str(&task.features_json)
+                .map_err(|error| invalid(&task.task_id, error))?,
+        )
+        .map_err(|error| invalid(&task.task_id, error))?,
+        target: TargetTriple::parse(&task.target).map_err(|error| invalid(&task.task_id, error))?,
+        rustc_version: WireRustcVersion::parse(&task.rustc_version)
+            .map_err(|error| invalid(&task.task_id, error))?,
+        preserve_lockfile: task.preserve_lockfile,
+        host_side: task.host_side,
+        explicit_spelling: task.explicit_spelling,
+        dependency_subgraph: task.dependency_subgraph.clone(),
+    })
+}
+
+/// One row of the [`unclaim_rows`] restore set — the pre-claim
+/// identity stamps the claim overwrote.
+#[derive(serde::Serialize)]
+struct UnclaimedRow {
+    task_id: String,
+    generation_id: String,
+    claimed_at: Option<String>,
+}
+
+impl UnclaimedRow {
+    /// The restore entry for `task_id` from its page-read `side`.
+    fn of(task_id: &str, sides: &std::collections::HashMap<String, ClaimSide>) -> Self {
+        let side = sides.get(task_id).expect("a claimed row has its side");
+        Self {
+            task_id: task_id.to_owned(),
+            generation_id: side.generation_id.clone(),
+            claimed_at: side.claimed_at.clone(),
+        }
+    }
+}
+
+/// Undo the claim and the batch binding on rows this pass won inside a
+/// batch it then dropped: status, `generation_id` and `claimed_at`
+/// restore to the pre-claim values the page read, `batch_id` and
+/// `batch_leg` clear, and `dispatch_attempts` steps back — a dropped
+/// leg burned no attempt. One `json_each` update for the whole set; an
+/// empty set issues none, so only a lost race writes here.
+async fn unclaim_rows(db: &DurableDb, rows: &[UnclaimedRow]) -> Result<(), QueueError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    db.query(
+        "UPDATE queue \
+         SET status = 'pending', generation_id = e.generation_id, \
+             claimed_at = e.claimed_at, \
+             dispatch_attempts = dispatch_attempts - 1, \
+             batch_id = NULL, batch_leg = NULL, \
+             updated_at = datetime('now') \
+         FROM (SELECT value ->> 'task_id' AS task_id, \
+                      value ->> 'generation_id' AS generation_id, \
+                      value ->> 'claimed_at' AS claimed_at \
+               FROM json_each(?)) AS e \
+         WHERE queue.task_id = e.task_id \
+           AND queue.status = 'dispatched' AND queue.github_run_id IS NULL",
+    )
+    .bind(enqueue_json(rows)?)
+    .execute()
+    .await
+    .map_err(|error| format!("restore dropped batch legs: {error}"))?;
+    Ok(())
+}
+
+/// One leg of the single claim-and-bind statement: the row it claims,
+/// the generation it mints, and the batch slot it takes.
+#[derive(serde::Serialize)]
+struct LegClaim {
+    task_id: String,
+    generation_id: String,
+    batch_id: String,
+    /// The leg's index in `tasks`, the matrix order `form_batches`
+    /// sorted.
+    leg: i64,
+}
+
+/// One formed batch's `build_batches` row in the `json_each` set.
+#[derive(serde::Serialize)]
+struct FormedBatchRow {
+    batch_id: String,
+    rustc_version: String,
+    dispatch_family: String,
+    lane: String,
+    parallelism: i64,
+    legs: i64,
+}
+
+/// Mint `count` ids in one statement — one `randomblob` row per id,
+/// bounded by the claim itself (at most `CLAIM_PAGE_ROWS ×
+/// CLAIM_MAX_PAGES` legs plus their batches), never a query per id.
+async fn mint_ids(db: &DurableDb, count: usize) -> Result<Vec<String>, QueueError> {
+    let ids = db
+        .query("SELECT lower(hex(randomblob(16))) FROM json_each(?)")
+        .bind(enqueue_json(&vec![0_u8; count])?)
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("mint {count} ids: {error}"))?;
+    if ids.len() != count {
+        return Err(QueueError::Invariant(format!(
+            "minted {} ids for a request of {count}",
+            ids.len()
+        )));
+    }
+    Ok(ids)
+}
+
+/// Mint every id the formation needs in one statement — a batch id per
+/// batch, then a `generation_id` per leg — and seal each planned batch
+/// with its own.
+async fn seal_batches(
+    db: &DurableDb,
+    planned: Vec<PlannedBatch>,
+    candidates: &[BatchCandidate],
+) -> Result<Vec<FormedBatch>, QueueError> {
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let legs: usize = planned.iter().map(|batch| batch.legs.len()).sum();
+    let mut ids = mint_ids(db, planned.len() + legs).await?.into_iter();
+    let batch_ids = ids
+        .by_ref()
+        .take(planned.len())
+        .map(|id| {
+            id.parse::<BatchId>()
+                .map_err(|error| QueueError::Invariant(format!("minted batch id {id:?}: {error}")))
+        })
+        .collect::<Result<Vec<BatchId>, QueueError>>()?;
+    planned
+        .into_iter()
+        .zip(batch_ids)
+        .map(|(batch, batch_id)| batch.seal(batch_id, candidates, &mut ids))
+        .collect()
+}
+
+/// Claim and bind every leg of every sealed batch in ONE statement:
+/// status, the minted `generation_id`, the attempt, the batch id and
+/// the leg index land together, so each queue row is written once. The
+/// `status = 'pending'` predicate is the race fence — the coverage
+/// lookup that preceded it is a D1 await, so a concurrent pass can
+/// claim a row in between — and the returned set is the legs this
+/// pass won.
+async fn claim_and_bind(
+    db: &DurableDb,
+    batches: &[FormedBatch],
+) -> Result<std::collections::HashSet<String>, QueueError> {
+    if batches.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let claims: Vec<LegClaim> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch.tasks.iter().enumerate().map(|(leg, task)| LegClaim {
+                task_id: task.task_id.clone(),
+                generation_id: task.generation_id.clone(),
+                batch_id: batch.batch_id.as_str().to_owned(),
+                leg: i64::try_from(leg).expect("a leg index is bounded by batch_max_tasks"),
+            })
+        })
+        .collect();
+    let won = db
+        .query(
+            // `claimed_at` is the immutable claim instant of the
+            // generation just minted — the one timestamp no in-flight
+            // writer may rewrite, so the completion samples a real
+            // claim-to-completion duration even after re-requests
+            // bumped `updated_at` (stow#524).
+            "UPDATE queue \
+             SET status = 'dispatched', generation_id = e.generation_id, \
+                 dispatch_attempts = dispatch_attempts + 1, \
+                 github_run_id = NULL, \
+                 batch_id = e.batch_id, batch_leg = e.leg, \
+                 claimed_at = datetime('now'), \
+                 updated_at = datetime('now') \
+             FROM (SELECT value ->> 'task_id' AS task_id, \
+                          value ->> 'generation_id' AS generation_id, \
+                          value ->> 'batch_id' AS batch_id, \
+                          CAST(value ->> 'leg' AS INTEGER) AS leg \
+                   FROM json_each(?)) AS e \
+             WHERE queue.task_id = e.task_id AND queue.status = 'pending' \
+             RETURNING queue.task_id",
+        )
+        .bind(enqueue_json(&claims)?)
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("claim {} legs: {error}", claims.len()))?;
+    Ok(won.into_iter().collect())
+}
+
+/// Drop every batch that lost a leg to a concurrent pass: its won legs
+/// go back to `pending` with the pre-claim stamps, it is warned once,
+/// and it never gets a `build_batches` row. Returns the surviving
+/// batches. Writes only when a race happened.
+async fn drop_raced_batches(
+    db: &DurableDb,
+    sealed: Vec<FormedBatch>,
+    won: &std::collections::HashSet<String>,
+    sides: &std::collections::HashMap<String, ClaimSide>,
+) -> Result<Vec<FormedBatch>, QueueError> {
+    let (kept, dropped): (Vec<FormedBatch>, Vec<FormedBatch>) = sealed
+        .into_iter()
+        .partition(|batch| batch.tasks.iter().all(|task| won.contains(&task.task_id)));
+    let mut restore = Vec::new();
+    for batch in &dropped {
+        tracing::warn!(
+            batch_id = %batch.batch_id,
+            "dropping batch — a leg was claimed by a concurrent dispatch"
+        );
+        restore.extend(
+            batch
+                .tasks
+                .iter()
+                .filter(|task| won.contains(&task.task_id))
+                .map(|task| UnclaimedRow::of(&task.task_id, sides)),
+        );
+    }
+    unclaim_rows(db, &restore).await?;
+    Ok(kept)
+}
+
+/// Insert the surviving batches' `build_batches` rows, carrying each
+/// batch's `parallelism` slots, in one `json_each` statement; an empty
+/// set writes none. The legs are bound before their row exists — a
+/// bound leg without its row is harmless, while a legless row would
+/// look releasable to a racing pass.
+async fn insert_batch_rows(
+    db: &DurableDb,
+    batches: &[FormedBatch],
+    stale_dispatch_minutes: u32,
+) -> Result<(), QueueError> {
+    if batches.is_empty() {
+        return Ok(());
+    }
+    let rows = batches
+        .iter()
+        .map(|batch| {
+            Ok(FormedBatchRow {
+                batch_id: batch.batch_id.as_str().to_owned(),
+                rustc_version: batch.rustc_version.as_str().to_owned(),
+                dispatch_family: dispatch_family_label(batch.family).to_owned(),
+                lane: batch.lane.as_str().to_owned(),
+                parallelism: i64::from(batch.parallelism),
+                legs: i64::try_from(batch.tasks.len())
+                    .map_err(|_| QueueError::Invariant("batch leg count exceeds i64".to_owned()))?,
+            })
+        })
+        .collect::<Result<Vec<FormedBatchRow>, QueueError>>()?;
+    db.query(
+        "INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              claimed_at, lease_at) \
+         SELECT e ->> 'batch_id', e ->> 'rustc_version', e ->> 'dispatch_family', \
+                e ->> 'lane', CAST(e ->> 'parallelism' AS INTEGER), \
+                CAST(e ->> 'legs' AS INTEGER), \
+                datetime('now'), datetime('now', ?) \
+         FROM (SELECT value AS e FROM json_each(?))",
+    )
+    .bind(format!("+{stale_dispatch_minutes} minutes"))
+    .bind(enqueue_json(&rows)?)
+    .execute()
+    .await
+    .map_err(|error| format!("insert formed batches: {error}"))?;
+    Ok(())
+}
+
+/// What the page walk hands the formation stage: the rows
+/// [`SlotPlan::admit`] admitted, in page order, each with its
+/// [`ClaimSide`], and how many candidate rows the pages selected.
+/// Every row is still `pending` — the walk claims nothing.
+struct ClaimWalk {
+    admitted: Vec<(TaskRow, ClaimSide)>,
+    selected: usize,
+}
+
+/// The `dispatch_key` page walk of [`claim_dispatchable_tasks`]:
+/// page, retire and admit interleaved — a pass reads rows in
+/// proportion to the rows it can still admit, never to the frontier
+/// depth. `plan.remaining()` sizes each page and `family_saturated`
+/// keeps a spent family's backlog out of it. The walk only decides
+/// which rows may go out; it writes nothing for them, so a row that
+/// formation then leaves unbatched costs no write at all.
+async fn claim_page_walk(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    coverage: &impl CoverageOracle,
+    plan: &mut SlotPlan,
+) -> Result<ClaimWalk, QueueError> {
+    let mut walk = ClaimWalk {
+        admitted: Vec::new(),
+        selected: 0,
+    };
+    let mut after = String::new();
+    for _ in 0..CLAIM_MAX_PAGES {
+        if plan.remaining() == 0 {
+            break;
+        }
+        // About two candidates per open slot: covered retirements
+        // rarely force a second page, and the page cap keeps a deep
+        // frontier on the next alarm tick.
+        let page_rows = CLAIM_PAGE_ROWS.min(i64::from(plan.remaining()) * 2);
+        let saturated: Vec<RunnerFamily> = RunnerFamily::ALL
+            .into_iter()
+            .filter(|family| plan.family_saturated(*family))
+            .collect();
+        let page = select_dispatchable_page(db, settings, &saturated, &after, page_rows).await?;
+        walk.selected += page.len();
+        let full_page =
+            page.len() == usize::try_from(page_rows).expect("claim page rows fits usize");
+        if let Some(last) = page.last() {
+            after.clone_from(&last.dispatch_key);
+        }
+        // `admit` commits the count rule at once; a `Denied` row stays
+        // pending — and so does every worse-ranked row of its key. A
+        // racing pass can still win an admitted row before the claim
+        // statement; that statement's `status = 'pending'` fence
+        // catches it.
+        for row in retire_covered_rows(db, page, coverage).await? {
+            if plan.remaining() == 0 {
+                break;
+            }
+            let side = claim_side(&row)?;
+            if matches!(plan.admit(&side.key)?, SlotAdmission::Denied) {
+                continue;
+            }
+            walk.admitted.push((row, side));
+        }
+        if !full_page {
+            break;
+        }
+    }
+    Ok(walk)
+}
+
+/// Claim pending rows into `build-batch.yml` dispatches (stow#833
+/// §1.2). The walk keeps its shape — stale/lease recovery, the freeze
+/// and pause gates, the capacity read, the `dispatch_key` page walk
+/// with `retire_covered_rows` retiring each page's covered rows — but
+/// a row is *admitted* only while [`SlotPlan::admit`] admits it, and
+/// capacity counts runner slots (`build_batches.parallelism` sums), not
+/// rows.
+///
+/// Admission claims nothing. The admitted rows' subgraphs load once,
+/// [`form_batches`] packs them on a fresh plan over the same budget —
+/// the walk's plan is spent deciding *whether* to take a row, and
+/// replaying the same decisions on a fresh plan can only differ where
+/// an encoder refusal it never saw loosens them (the equivalence is
+/// host-tested in `batching`) — and one statement mints every batch
+/// and generation id. A second statement then claims and binds every
+/// formed leg at once, so a row is written exactly once and a row
+/// formation leaves unbatched is not written at all; a batch that lost
+/// a leg to a concurrent pass is dropped whole, and the surviving
+/// batches get their `build_batches` rows in a third.
 pub async fn claim_dispatchable_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
     coverage: &impl CoverageOracle,
-) -> Result<Vec<QueuedTask>, QueueError> {
+) -> Result<Vec<FormedBatch>, QueueError> {
     // Stale recovery runs ahead of the pause check: a paused scheduler
     // owes its in-flight builds the same lease-expiry reclaim.
     recover_stale_active_tasks(db, settings).await?;
@@ -4732,82 +5151,73 @@ pub async fn claim_dispatchable_tasks(
     // dependent's edge is decidable only at the report that publishes
     // them — an alarm pass precedes that data and cannot know.
     let active = count_active_by_family(db).await?;
-    let mut total_slots = limit.get().saturating_sub(active.total);
-    let mut macos_slots = settings
+    let shared_free = limit.get().saturating_sub(active.total);
+    let macos_free = settings
         .max_concurrent_macos_jobs
         .saturating_sub(active.of(RunnerFamily::MacOs));
     tracing::info!(
         running = active.total,
-        available = total_slots,
-        macos_available = macos_slots,
+        available = shared_free,
+        macos_available = macos_free,
         ?settings,
         "scheduler claim_dispatchable_tasks capacity"
     );
-    if total_slots == 0 {
+    if shared_free == 0 {
+        return Ok(Vec::new());
+    }
+    let fresh_plan = || {
+        SlotPlan::new(
+            shared_free,
+            std::collections::HashMap::from([(RunnerFamily::MacOs, macos_free)]),
+            settings.batch_parallelism,
+            settings.batch_max_tasks,
+        )
+    };
+
+    let walk = claim_page_walk(db, settings, coverage, &mut fresh_plan()).await?;
+    tracing::info!(
+        selected = walk.selected,
+        "scheduler claim_dispatchable_tasks selected rows"
+    );
+    let mut legs = Vec::with_capacity(walk.admitted.len());
+    let mut sides = std::collections::HashMap::with_capacity(walk.admitted.len());
+    for (row, side) in walk.admitted {
+        sides.insert(row.task_id.clone(), side);
+        legs.push(pending_leg(row));
+    }
+    load_admitted_subgraphs(db, &mut legs).await?;
+    if legs.is_empty() {
         return Ok(Vec::new());
     }
 
-    // A family with zero free slots is excluded in the claim query
-    // itself: its backlog would otherwise spend the page budget while
-    // claimable rows of other families sit past the frontier.
-    let full_family = (macos_slots == 0).then_some(RunnerFamily::MacOs);
-    // Page, retire and claim interleaved: a pass reads rows in
-    // proportion to the slots it fills, never to the frontier depth —
-    // a page sized to the open slots goes to the coverage oracle as one
-    // lookup, and the next page is read only while slots remain and the
-    // last page came back full.
-    let mut claimed = Vec::new();
-    let mut selected = 0usize;
-    let mut after = String::new();
-    for _ in 0..CLAIM_MAX_PAGES {
-        if total_slots == 0 {
-            break;
-        }
-        // About two candidates per open slot: covered retirements
-        // rarely force a second page, and the page cap keeps a deep
-        // frontier on the next alarm tick.
-        let page_rows = CLAIM_PAGE_ROWS.min(i64::from(total_slots) * 2);
-        let page = select_dispatchable_page(db, settings, full_family, &after, page_rows).await?;
-        selected += page.len();
-        let full_page =
-            page.len() == usize::try_from(page_rows).expect("claim page rows fits usize");
-        if let Some(last) = page.last() {
-            after.clone_from(&last.dispatch_key);
-        }
-        for row in retire_covered_rows(db, page, coverage).await? {
-            if total_slots == 0 {
-                break;
-            }
-            // Enqueue only admits CI targets, so a pending row whose target
-            // maps to no runner family means the queue state is corrupt.
-            let family = runner_family(&row.target).ok_or_else(|| {
-                QueueError::Invariant(format!(
-                    "pending task {} targets `{}`, which maps to no runner family",
-                    row.task_id, row.target
-                ))
-            })?;
-            if family == RunnerFamily::MacOs && macos_slots == 0 {
-                continue;
-            }
-            let Some(task) = claim_dispatchable_row(db, row).await? else {
-                continue;
-            };
-            total_slots -= 1;
-            if family == RunnerFamily::MacOs {
-                macos_slots -= 1;
-            }
-
-            claimed.push(task);
-        }
-        if !full_page {
-            break;
-        }
+    let mut candidates = Vec::with_capacity(legs.len());
+    for task in legs {
+        let side = &sides[&task.task_id];
+        candidates.push(BatchCandidate {
+            payload: task_payload(&task)?,
+            lane: side.key.lane,
+            family: side.key.family,
+            median_ms: side.median_ms,
+            task,
+        });
     }
-    tracing::info!(selected, "scheduler claim_dispatchable_tasks selected rows");
-
-    load_claimed_subgraphs(db, &mut claimed).await?;
-
-    Ok(claimed)
+    let formation = form_batches(&candidates, &mut fresh_plan())?;
+    tracing::info!(
+        batches = formation.batches.len(),
+        unbatched = formation.unbatched.len(),
+        rejected = formation.rejected.len(),
+        "scheduler claim_dispatchable_tasks formed batches"
+    );
+    let sealed = seal_batches(db, formation.batches, &candidates).await?;
+    let won = claim_and_bind(db, &sealed).await?;
+    let batches = drop_raced_batches(db, sealed, &won, &sides).await?;
+    insert_batch_rows(db, &batches, settings.stale_dispatch_minutes).await?;
+    // Rows the encoder refused are still `pending`, which
+    // `fail_claimed_task` allows; unbatched rows are not written.
+    for &(index, ref error) in &formation.rejected {
+        fail_claimed_task(db, &candidates[index].task.task_id, error).await?;
+    }
+    Ok(batches)
 }
 
 /// One `task_nodes` row as the dispatch walk reads it.
@@ -4848,7 +5258,7 @@ const SUBGRAPH_WALK_LEVEL_ROWS: usize = 512;
 /// payload whose `verified_dependency_graph` would hold, so it fails
 /// dispatch with the missing task id named — never a leaf substitute —
 /// and the rest of the batch still dispatches.
-/// Per-task walk state for [`load_claimed_subgraphs`]: the ordered
+/// Per-task walk state for [`load_admitted_subgraphs`]: the ordered
 /// list of discovered dependency node ids (the future `nodes` array —
 /// the root itself is implicit in the wire), the set for dedup, the
 /// level frontier, and the root node's own children (the future
@@ -4860,9 +5270,9 @@ struct SubgraphWalk {
     root_children: Vec<String>,
 }
 
-async fn load_claimed_subgraphs(
+async fn load_admitted_subgraphs(
     db: &DurableDb,
-    claimed: &mut Vec<QueuedTask>,
+    claimed: &mut Vec<PendingLeg>,
 ) -> Result<(), QueueError> {
     if claimed.is_empty() {
         return Ok(());
@@ -4914,7 +5324,7 @@ async fn load_claimed_subgraphs(
     Ok(())
 }
 
-/// The walk half of [`load_claimed_subgraphs`]: level-0 roots in one
+/// The walk half of [`load_admitted_subgraphs`]: level-0 roots in one
 /// `IN` query, then the union-of-frontiers expansion bounded per level,
 /// returning every task's `SubgraphWalk` (None where the walk broke),
 /// the fetched row set, and the (claimed index, missing id) pairs.
@@ -5208,22 +5618,31 @@ pub(super) const CLAIM_MAX_PAGES: usize = 8;
 /// priority — then FIFO by `first_requested_at` with creation and id
 /// tie breakers), so neither is evaluated per row.
 ///
-/// `full_family` names a runner family with zero free slots — its rows
+/// `saturated` names runner families with no free slot — their rows
 /// are excluded in SQL, the same predicate the wake probes build: a
 /// saturated family's backlog must not spend the page budget while
 /// other families have claimable rows past the frontier. One page of at
 /// most `page_rows` rows resumes the keyset walk from `after` (the last
 /// `dispatch_key` the previous page read): the caller sizes the page to
-/// its open slots and pages again only while that page came back full,
-/// because a family that fills mid-pass is still skipped in Rust and
-/// the walk must see past it.
+/// the rows the plan can still admit and pages again only while that
+/// page came back full, because a family that fills mid-pass is still
+/// skipped in Rust and the walk must see past it.
 /// The production page selection — WHERE terms, family exclusion,
 /// ORDER BY and LIMIT — shared by the paged claim walk and the
 /// floor probe's bounded frontier so the two can't drift (stow#525).
-fn dispatchable_page_sql(columns: &str, full_family: Option<RunnerFamily>) -> String {
-    let family_filter = dispatch_family_in_sql("q.dispatch_family", full_family);
+fn dispatchable_page_sql(columns: &str, join_stats: bool, saturated: &[RunnerFamily]) -> String {
+    let family_filter = dispatch_family_in_sql("q.dispatch_family", saturated);
+    // The claim walk needs `median_ms` — the leg-ordering cost —
+    // from the keyed stats join; the frontier probe reads ids only
+    // and does not pay it.
+    let stats = if join_stats {
+        "LEFT JOIN crate_build_stats s \
+         ON s.crate_name = q.crate_name AND s.target = q.target"
+    } else {
+        ""
+    };
     format!(
-        "SELECT {columns} FROM queue q \
+        "SELECT {columns} FROM queue q {stats} \
          WHERE q.status = 'pending' AND q.deps_met = 1 \
            AND q.dispatch_eligible = 1 \
            AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
@@ -5237,7 +5656,7 @@ fn dispatchable_page_sql(columns: &str, full_family: Option<RunnerFamily>) -> St
 
 /// The bounded eligible frontier one claim pass can touch — the first
 /// `CLAIM_PAGE_ROWS * CLAIM_MAX_PAGES` rows of the production page
-/// selection under the live `full_family` — for the floor probe's
+/// selection under the live family exclusion — for the floor probe's
 /// pre-image snapshot (stow#525). The paged walk reads contiguous
 /// keyset slices of exactly this ordered set, so the bound covers
 /// every row the pass can open.
@@ -5249,8 +5668,12 @@ pub(super) async fn select_dispatchable_frontier(
     let macos_slots = settings
         .max_concurrent_macos_jobs
         .saturating_sub(active.of(RunnerFamily::MacOs));
-    let full_family = (macos_slots == 0).then_some(RunnerFamily::MacOs);
-    db.query(&dispatchable_page_sql("q.task_id", full_family))
+    let saturated: &[RunnerFamily] = if macos_slots == 0 {
+        &[RunnerFamily::MacOs]
+    } else {
+        &[]
+    };
+    db.query(&dispatchable_page_sql("q.task_id", false, saturated))
         .bind(dispatch_cutoff_modifier(settings.dispatch_min_age_minutes))
         .bind(String::new())
         .bind(CLAIM_PAGE_ROWS * i64::try_from(CLAIM_MAX_PAGES).unwrap_or(i64::MAX))
@@ -5262,13 +5685,16 @@ pub(super) async fn select_dispatchable_frontier(
 async fn select_dispatchable_page(
     db: &DurableDb,
     settings: &SchedulerSettings,
-    full_family: Option<RunnerFamily>,
+    saturated: &[RunnerFamily],
     after: &str,
     page_rows: i64,
 ) -> Result<Vec<TaskRow>, QueueError> {
     let sql = dispatchable_page_sql(
-        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.explicit_spelling, q.preserve_lockfile, q.dependency_identity, q.dispatch_attempts, q.dispatch_key",
-        full_family,
+        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.explicit_spelling, q.preserve_lockfile, q.dependency_identity, q.dispatch_attempts, q.dispatch_key, \
+         q.lane, q.generation_id, q.claimed_at, \
+         CAST(s.median_ms AS TEXT) AS median_ms",
+        true,
+        saturated,
     );
     let cutoff = dispatch_cutoff_modifier(settings.dispatch_min_age_minutes);
     // The keyset cursor: every real key starts with an inverted-value
@@ -6434,7 +6860,11 @@ pub async fn next_alarm(
         capacity,
         earliest_pending_eligible_ms: earliest_pending_eligible_ms(
             db,
-            macos_saturated.then_some(RunnerFamily::MacOs),
+            if macos_saturated {
+                &[RunnerFamily::MacOs]
+            } else {
+                &[]
+            },
             now_ms,
         )
         .await?,
@@ -6458,12 +6888,12 @@ pub async fn next_alarm(
 /// eligible set, the persisted lane-aware wake instant. May be in the
 /// past (already eligible).
 ///
-/// `full_family` names a capped runner family whose slots are all taken;
-/// its pending rows are excluded so an eligibility the scheduler could
-/// not act on cannot wake the alarm at `now`.
+/// `saturated` names capped runner families whose slots are all taken;
+/// their pending rows are excluded so an eligibility the scheduler
+/// could not act on cannot wake the alarm at `now`.
 async fn earliest_pending_eligible_ms(
     db: &DurableDb,
-    full_family: Option<RunnerFamily>,
+    saturated: &[RunnerFamily],
     now_ms: i64,
 ) -> Result<Option<i64>, QueueError> {
     // Two probes over `idx_queue_wake (status, deps_met,
@@ -6482,7 +6912,7 @@ async fn earliest_pending_eligible_ms(
     // one seek per family and each `wake_at` range stays bounded
     // (stow#588). `!=` would leave the range unbounded: every eligible
     // pending row read, on every alarm pass and every deliver.
-    let family_filter = dispatch_family_in_sql("dispatch_family", full_family);
+    let family_filter = dispatch_family_in_sql("dispatch_family", saturated);
     // The plan is a pure function of `now_ms`; bind the rendered clock
     // rather than calling wall-clock `datetime('now')` inside the probes.
     let now = db
@@ -7569,6 +7999,20 @@ async fn recover_stale_active_tasks(
         // last cost move; re-price exactly the transitioned ids.
         refresh_dispatch_keys(db, &recovered).await?;
     }
+    // A batch whose legs all left flight — recovered above, or
+    // resolved individually — holds no slots: its `parallelism` must
+    // stop counting against the family's pools.
+    db.query(
+        "DELETE FROM build_batches \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM queue \
+             WHERE queue.batch_id = build_batches.batch_id \
+               AND queue.status IN ('dispatched', 'running') \
+         )",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("release legless batches: {error}"))?;
     Ok(())
 }
 
@@ -7663,42 +8107,49 @@ async fn requeue_incomplete_shape_deps(
     Ok(())
 }
 
-/// Active (dispatched/running) queue rows counted by runner family: one
-/// `GROUP BY target` pass, with the target→family mapping applied in Rust
-/// because the map lives in `stow_types::api::runner_family`, not SQL.
+/// In-flight runner slots counted by family — the `parallelism` sums
+/// of the live `build_batches` rows, not leg counts (stow#833 §1.2):
+/// one row read per in-flight batch, at most about ⌈slots/k⌉ plus
+/// the human lane's.
 struct ActiveByFamily {
     total: u32,
     by_family: std::collections::HashMap<RunnerFamily, u32>,
 }
 
 impl ActiveByFamily {
-    /// Active rows building on `family`'s runner pool.
+    /// Active slots building on `family`'s runner pool.
     fn of(&self, family: RunnerFamily) -> u32 {
         self.by_family.get(&family).copied().unwrap_or(0)
     }
 }
 
+/// The `dispatch_family` label a stored row carries, inverted through
+/// [`dispatch_family_label`] so the two can never drift apart.
+fn family_of_label(label: &str) -> Option<RunnerFamily> {
+    RunnerFamily::ALL
+        .into_iter()
+        .find(|family| dispatch_family_label(*family) == label)
+}
+
 async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueError> {
     let rows = db
         .query(
-            "SELECT target, count(*) AS count FROM queue \
-             WHERE status IN ('dispatched', 'running') GROUP BY target",
+            "SELECT dispatch_family, SUM(parallelism) AS count FROM build_batches \
+             GROUP BY dispatch_family",
         )
-        .fetch_all::<TargetCountRow>()
+        .fetch_all::<FamilyCountRow>()
         .await
-        .map_err(|error| format!("count active tasks by target: {error}"))?;
+        .map_err(|error| format!("count active batch slots by family: {error}"))?;
     let mut by_family = std::collections::HashMap::new();
     let mut total = 0_u32;
     for row in rows {
-        // Enqueue only admits CI targets, so an active row whose target
-        // maps to no runner family means the queue state is corrupt.
-        let family = runner_family(&row.target).ok_or_else(|| {
+        let family = family_of_label(&row.dispatch_family).ok_or_else(|| {
             QueueError::Invariant(format!(
-                "active task targets `{}`, which maps to no runner family",
-                row.target
+                "build_batches dispatch_family {:?} maps to no runner family",
+                row.dispatch_family
             ))
         })?;
-        let count = u64_to_u32(row.count, "active task count")?;
+        let count = u64_to_u32(row.count, "active slot count")?;
         *by_family.entry(family).or_insert(0) += count;
         total += count;
     }
@@ -7751,11 +8202,10 @@ struct TaskRow {
     preserve_lockfile: i64,
     dependency_identity: String,
     dispatch_key: String,
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct ClaimGenerationRow {
+    lane: String,
     generation_id: String,
+    claimed_at: Option<String>,
+    median_ms: Option<String>,
 }
 
 /// One queue row as needed to build a [`RequestStatus`].
@@ -7802,10 +8252,10 @@ struct BoundPendingCompletionRow {
     run: String,
 }
 
-/// One `GROUP BY target` count over active rows.
+/// One `GROUP BY dispatch_family` slot sum over `build_batches`.
 #[derive(Debug, skyzen::FromRow)]
-struct TargetCountRow {
-    target: String,
+struct FamilyCountRow {
+    dispatch_family: String,
     count: u64,
 }
 

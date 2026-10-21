@@ -1333,9 +1333,12 @@ pub(super) async fn dispatch_pass(
         freeze: &freeze,
     };
     resolve_ready_batches(&scope, &credential_source).await?;
-    let tasks = queue::claim_dispatchable_tasks(db, settings, coverage)
+    let tasks: Vec<queue::QueuedTask> = queue::claim_dispatchable_tasks(db, settings, coverage)
         .await
-        .map_err(to_error)?;
+        .map_err(to_error)?
+        .into_iter()
+        .flat_map(|batch| batch.tasks)
+        .collect();
     tracing::info!(
         claimed = tasks.len(),
         "scheduler dispatch_pending selected tasks"
@@ -1531,15 +1534,9 @@ async fn resolve_batch_set(
                 .map_err(to_error)?;
             continue;
         };
-        if queue::resolve_batch(
-            db,
-            settings,
-            &batch.batch_id,
-            &resolutions,
-            freeze.window_minutes,
-        )
-        .await
-        .map_err(to_error)?
+        if queue::resolve_batch(db, settings, batch, &resolutions, freeze.window_minutes)
+            .await
+            .map_err(to_error)?
         {
             evaluate_dispatch_freeze(env, db, freeze).await?;
         }

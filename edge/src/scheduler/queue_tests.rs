@@ -73,9 +73,26 @@ const fn settings() -> SchedulerSettings {
         max_queue_pending: 2_000,
         human_daily_task_budget: 2_000,
         min_dispatch_value: 0,
-        batch_parallelism: 5,
-        batch_max_tasks: 40,
+        // A batch of one is exactly the pre-batch claim: the existing
+        // assertions keep their one-slot-per-row expectations.
+        batch_parallelism: 1,
+        batch_max_tasks: 1,
     }
+}
+
+/// `claim_dispatchable_tasks` flattened to the pre-batch
+/// `Vec<QueuedTask>` shape the claim assertions were written
+/// against — legs in the batches' close order.
+async fn claim_flat(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    coverage: &impl CoverageOracle,
+) -> Result<Vec<super::QueuedTask>, QueueError> {
+    Ok(super::claim_dispatchable_tasks(db, settings, coverage)
+        .await?
+        .into_iter()
+        .flat_map(|batch| batch.tasks)
+        .collect())
 }
 
 const fn paused_settings() -> SchedulerSettings {
@@ -298,6 +315,34 @@ async fn mark_active(db: &DurableDb, crate_name: &str, target: &str, status: &st
     .execute()
     .await
     .expect("mark task active");
+    // In-flight is a batch holding slots, not a bare queue row: the
+    // `parallelism = 1`, one-leg batch is the per-task shape the
+    // fixture stands in for, and the leg binding makes the pair
+    // consistent. The batch id is the task id's first 32 hex.
+    let task_id = task_id_on(crate_name, target);
+    let batch_id = &task_id[..32];
+    let family = match stow_types::api::runner_family(target).expect("fixture family") {
+        stow_types::api::RunnerFamily::Linux => "linux",
+        stow_types::api::RunnerFamily::MacOs => "macos",
+        stow_types::api::RunnerFamily::Windows => "windows",
+    };
+    db.query(
+        "INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              claimed_at, lease_at) \
+         VALUES (?, ?, ?, 'miss', 1, 1, ?, ?) \
+         ON CONFLICT(batch_id) DO UPDATE SET \
+             claimed_at = excluded.claimed_at, lease_at = excluded.lease_at",
+    )
+    .bind(batch_id.to_owned())
+    .bind(RUSTC)
+    .bind(family)
+    .bind(ROW_TS)
+    .bind(ROW_TS)
+    .execute()
+    .await
+    .expect("seed in-flight batch row");
+    bind_leg(db, &task_id, batch_id, 0).await;
 }
 
 /// `enqueue` always stamps `first_requested_at = datetime('now')`; tests
@@ -488,7 +533,7 @@ async fn submit_while_paused_enqueues_but_claims_nothing() {
         .expect("enqueue while paused");
     assert_eq!(inserted, 1);
 
-    let claimed = super::claim_dispatchable_tasks(&db, &paused_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &paused_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert!(claimed.is_empty());
@@ -506,7 +551,7 @@ async fn paused_claim_still_recovers_stale_in_flight_row() {
         .expect("enqueue");
     mark_active(&db, "busy", TARGET, "dispatched").await;
 
-    let claimed = super::claim_dispatchable_tasks(&db, &paused_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &paused_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert!(claimed.is_empty());
@@ -607,7 +652,7 @@ async fn repeated_requests_do_not_overtake_older_pending_tasks() {
             .expect("re-request spam");
     }
 
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -628,7 +673,7 @@ async fn higher_priority_value_claims_before_older_first_seen() {
         .expect("enqueue popular");
     set_first_requested_at(&db, "old", PAST_TS).await;
 
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -652,7 +697,7 @@ async fn equal_value_claims_in_first_seen_order() {
         dispatch_min_age_minutes: 0,
         ..settings()
     };
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+    let claimed = claim_flat(&db, &settings, &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 2);
@@ -705,7 +750,7 @@ async fn value_bands_preserve_lane_then_family_precedence() {
         dispatch_min_age_minutes: 0,
         ..settings()
     };
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+    let claimed = claim_flat(&db, &settings, &NoCoverage)
         .await
         .expect("claim");
     let order = claimed
@@ -780,7 +825,7 @@ async fn value_extremes_stay_within_i64_and_order() {
             task_id: &task_id_on("max", WINDOWS_TARGET),
         },)
     );
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed[0].crate_name, "max");
@@ -794,7 +839,7 @@ struct KeyOrder {
 /// The claimed rows' crate names, sorted — floor tests compare
 /// sets where the persisted order is separately covered.
 async fn claimed_names(db: &DurableDb, settings: &SchedulerSettings) -> Vec<String> {
-    let mut names: Vec<String> = super::claim_dispatchable_tasks(db, settings, &NoCoverage)
+    let mut names: Vec<String> = claim_flat(db, settings, &NoCoverage)
         .await
         .expect("claim")
         .iter()
@@ -906,7 +951,7 @@ async fn floor_never_blocks_the_human_lane() {
     .await
     .expect("enqueue");
 
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     let names = claimed
@@ -965,9 +1010,7 @@ async fn floor_preserves_the_tie_order() {
         dispatch_min_age_minutes: 0,
         ..settings()
     };
-    let claimed = super::claim_dispatchable_tasks(&db, &page, &NoCoverage)
-        .await
-        .expect("claim");
+    let claimed = claim_flat(&db, &page, &NoCoverage).await.expect("claim");
     let names = claimed
         .iter()
         .map(|task| task.crate_name.as_str().to_owned())
@@ -1004,7 +1047,7 @@ async fn under_floor_rows_never_arm_the_alarm() {
         .expect("next_alarm floored");
     assert_eq!(plan, AlarmPlan::Delete);
     assert!(
-        super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+        claim_flat(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim")
             .is_empty()
@@ -2632,7 +2675,7 @@ async fn demand_orders_exactly_above_the_js_safe_integer() {
     assert_eq!(more - less, 1, "adjacent deltas stay adjacent");
     assert!(less > js_safe.cast_signed(), "values are above 2^53");
 
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed[0].crate_name, "more");
@@ -2709,7 +2752,7 @@ async fn macos_cap_skips_macos_rows_but_claims_other_families() {
         dispatch_min_age_minutes: 0,
         ..settings()
     };
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+    let claimed = claim_flat(&db, &settings, &NoCoverage)
         .await
         .expect("claim");
 
@@ -2747,7 +2790,7 @@ async fn windows_tasks_claim_before_linux_within_a_lane() {
         dispatch_min_age_minutes: 0,
         ..settings()
     };
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+    let claimed = claim_flat(&db, &settings, &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 2);
@@ -2813,7 +2856,7 @@ async fn human_lane_still_claims_first_regardless_of_family() {
         dispatch_min_age_minutes: 0,
         ..settings()
     };
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+    let claimed = claim_flat(&db, &settings, &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 2);
@@ -3048,7 +3091,7 @@ async fn failed_build_retries_behind_its_backoff() {
         .expect("enqueue");
     set_first_requested_at(&db, "flaky", PAST_TS).await;
 
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -3091,7 +3134,7 @@ async fn failed_build_retries_behind_its_backoff() {
     enqueue(&db, &[request("flaky", &[])])
         .await
         .expect("re-request");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert!(claimed.is_empty());
@@ -3110,7 +3153,7 @@ async fn failed_build_at_the_attempt_cap_parks_failed() {
         .expect("enqueue");
     set_first_requested_at(&db, "flaky", PAST_TS).await;
 
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -3144,7 +3187,7 @@ async fn failed_build_at_the_attempt_cap_parks_failed() {
         .await
         .expect("re-request");
     assert_eq!(row_column(&db, "flaky", "status").await, "failed");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert!(claimed.is_empty());
@@ -3164,7 +3207,7 @@ async fn human_rerequest_resurrects_completed_and_claims() {
         .expect("enqueue");
     set_first_requested_at(&db, "stale-glibc", PAST_TS).await;
 
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -3191,7 +3234,7 @@ async fn human_rerequest_resurrects_completed_and_claims() {
         .await
         .expect("miss re-request");
     assert!(
-        super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+        claim_flat(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim")
             .is_empty()
@@ -3207,7 +3250,7 @@ async fn human_rerequest_resurrects_completed_and_claims() {
     super::enqueue_trusted(&db, &[human], &claim_settings())
         .await
         .expect("human re-request");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -3300,7 +3343,7 @@ async fn a_preheat_re_request_does_not_rebuild_a_completed_task() {
     enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     let id = claimed[0].task_id.clone();
@@ -3333,7 +3376,7 @@ async fn a_preheat_re_request_does_not_rebuild_a_completed_task() {
     assert_eq!(row.status, "completed");
     assert_eq!(row.attempt, 1);
     assert!(
-        super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+        claim_flat(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim")
             .is_empty(),
@@ -3352,7 +3395,7 @@ async fn a_preheat_re_request_retries_a_failed_task() {
     enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     let id = claimed[0].task_id.clone();
@@ -3415,9 +3458,7 @@ async fn claim_retires_tasks_the_catalog_already_covers() {
         ..settings()
     };
 
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &oracle)
-        .await
-        .expect("claim");
+    let claimed = claim_flat(&db, &settings, &oracle).await.expect("claim");
     let mut claimed_names = claimed
         .iter()
         .map(|task| task.crate_name.as_str())
@@ -3482,9 +3523,7 @@ async fn coverage_retirement_requires_the_same_dependency_context() {
         ..settings()
     };
 
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &oracle)
-        .await
-        .expect("claim");
+    let claimed = claim_flat(&db, &settings, &oracle).await.expect("claim");
 
     assert!(
         claimed
@@ -3509,7 +3548,7 @@ async fn human_task_dispatches_before_older_miss_task() {
         .expect("enqueue human");
     set_first_requested_at(&db, "missed", PAST_TS).await;
 
-    let claimed = super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 2);
@@ -3533,7 +3572,7 @@ async fn human_task_bypasses_dispatch_min_age() {
         dispatch_min_age_minutes: 60,
         ..settings()
     };
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+    let claimed = claim_flat(&db, &settings, &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -3683,7 +3722,7 @@ async fn human_lane_position_ties_break_on_task_id() {
     assert_eq!(zed.human_lane_position, Some(2));
 
     // The position must equal true dispatch order.
-    let claimed = super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 2);
@@ -3767,7 +3806,7 @@ async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
         .await
         .expect("enqueue");
     let id = task_id_on("alpha", TARGET);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -3834,7 +3873,7 @@ async fn stale_report_for_a_superseded_attempt_leaves_the_live_row_untouched() {
     enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -3853,7 +3892,7 @@ async fn stale_report_for_a_superseded_attempt_leaves_the_live_row_untouched() {
     enqueue(&db, &[human_request("alpha")])
         .await
         .expect("re-request");
-    let reclaimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let reclaimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("re-claim");
     assert_eq!(reclaimed.len(), 1);
@@ -3909,7 +3948,7 @@ async fn duplicate_report_for_the_current_attempt_conflicts() {
     enqueue(&db, &[request("alpha", &[])])
         .await
         .expect("enqueue");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     let id = claimed[0].task_id.clone();
@@ -4021,7 +4060,7 @@ async fn dependent_waits_for_a_completed_dependency_until_it_is_published() {
     enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim dep");
     assert_eq!(claimed.len(), 1);
@@ -4042,7 +4081,7 @@ async fn dependent_waits_for_a_completed_dependency_until_it_is_published() {
     enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim parent");
     assert!(
@@ -4052,7 +4091,7 @@ async fn dependent_waits_for_a_completed_dependency_until_it_is_published() {
     assert_eq!(row_column(&db, "parent", "status").await, "pending");
 
     publish(&db, "dep").await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim parent after publish");
     assert_eq!(claimed.len(), 1);
@@ -4069,7 +4108,7 @@ async fn dependent_waits_while_a_failed_dependency_retries() {
     enqueue(&db, &[request("dep", &[])])
         .await
         .expect("enqueue dep");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim dep");
     super::complete(
@@ -4093,7 +4132,7 @@ async fn dependent_waits_while_a_failed_dependency_retries() {
         .await
         .expect("enqueue parent");
     assert_eq!(row_column(&db, "dep", "status").await, "pending");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert!(
@@ -4117,7 +4156,7 @@ async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
     enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim dep");
     assert_eq!(claimed.len(), 1);
@@ -4144,7 +4183,7 @@ async fn dependent_settles_blocked_behind_a_terminally_failed_dependency() {
     .await
     .expect("fail dep");
     assert_eq!(row_column(&db, "dep", "status").await, "failed");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim after terminal failure");
     assert!(
@@ -4336,7 +4375,7 @@ async fn a_slice_delta_flips_the_matched_edges_and_moves_the_counter() {
         vec![("first-dep".to_owned(), 1), ("second-dep".to_owned(), 1),]
     );
     assert_eq!(gate_counters(&db, "parent").await, (0, 1));
-    let claimed = super::claim_dispatchable_tasks(
+    let claimed = claim_flat(
         &db,
         &SchedulerSettings {
             dispatch: Dispatch::from_max_concurrent_jobs(8),
@@ -4385,7 +4424,7 @@ async fn a_slice_delta_retire_flips_the_edges_back_and_increments_the_counter() 
         "a retire flips the matched edge back to unmet"
     );
     assert_eq!(gate_counters(&db, "parent").await, (1, 0));
-    let claimed = super::claim_dispatchable_tasks(
+    let claimed = claim_flat(
         &db,
         &SchedulerSettings {
             dispatch: Dispatch::from_max_concurrent_jobs(8),
@@ -4449,7 +4488,7 @@ async fn net_zero_slice_flips_refresh_blocked_and_replays_preserve_counters() {
     )
     .await
     .expect("enqueue parent");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim failed dependency");
     assert_eq!(claimed.len(), 1);
@@ -4540,7 +4579,7 @@ async fn fatal_blocker_clears_and_reappears_across_net_counter_flips() {
     .expect("enqueue parent");
     mark_active(&db, "dep-a", TARGET, "completed").await;
     mark_active(&db, "dep-b", TARGET, "completed").await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim fatal dependency");
     assert_eq!(claimed.len(), 1);
@@ -4656,7 +4695,7 @@ async fn dependent_is_not_blocked_by_a_failed_dependency_the_slice_already_serve
         .expect("parent row");
     assert_eq!(parent.status, stow_types::api::QueueTaskStatus::Pending);
     assert_eq!(parent.blocked_by, None);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim parent");
     assert_eq!(claimed.len(), 1);
@@ -4675,7 +4714,7 @@ async fn dependent_releases_when_the_dependency_later_succeeds_and_is_published(
     enqueue(&db, &[request("parent", &[dependency("dep")])])
         .await
         .expect("enqueue parent");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim dep");
     assert_eq!(claimed.len(), 1);
@@ -4697,7 +4736,7 @@ async fn dependent_releases_when_the_dependency_later_succeeds_and_is_published(
     )
     .await
     .expect("retry terminal dependency");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim dep retry");
     assert_eq!(claimed.len(), 1);
@@ -4715,7 +4754,7 @@ async fn dependent_releases_when_the_dependency_later_succeeds_and_is_published(
     )
     .await
     .expect("complete dep retry");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim before publish");
     assert!(claimed.is_empty(), "completed is still not servable");
@@ -4727,7 +4766,7 @@ async fn dependent_releases_when_the_dependency_later_succeeds_and_is_published(
         "publishing the only unmet edge reaches the counter-zero fast path"
     );
     assert_eq!(super::status(&db).await.expect("status").blocked, 0);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim parent after publish");
     assert_eq!(claimed.len(), 1);
@@ -4750,7 +4789,7 @@ async fn republishing_a_slice_replaces_its_membership() {
     // A later report without "dep" shrinks the slice: the edge's
     // record must track the latest publish, never the union.
     publish(&db, "other").await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim after shrink");
     assert_eq!(claimed.len(), 1);
@@ -4791,7 +4830,7 @@ async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
         ],
     )
     .await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim with only the native shape");
     assert!(
@@ -4809,7 +4848,7 @@ async fn cross_dependent_releases_on_the_target_shape_of_a_host_dep() {
         ],
     )
     .await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim with the target shape");
     assert_eq!(claimed.len(), 1);
@@ -4838,7 +4877,7 @@ async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
         ],
     )
     .await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim with only the target shape");
     assert!(
@@ -4856,7 +4895,7 @@ async fn native_dependent_needs_the_native_shape_of_a_host_dep() {
         ],
     )
     .await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim with the native shape");
     assert_eq!(claimed.len(), 1);
@@ -4886,7 +4925,7 @@ async fn a_host_side_dependent_needs_both_shapes_of_a_host_dep() {
         ],
     )
     .await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim with one shape");
     assert!(
@@ -4906,7 +4945,7 @@ async fn a_host_side_dependent_needs_both_shapes_of_a_host_dep() {
         ],
     )
     .await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim with both shapes");
     assert_eq!(claimed.len(), 1);
@@ -4945,7 +4984,7 @@ async fn a_larger_slice_reports_whole() {
     enqueue(&db, &[request("parent", &[dependency(&last)])])
         .await
         .expect("enqueue parent");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim parent");
     assert_eq!(claimed.len(), 1);
@@ -5004,7 +5043,7 @@ async fn a_crashed_reports_orphans_cannot_leak_into_the_next_report() {
     enqueue(&db, &[request("fresh-dep", &[dependency("dep")])])
         .await
         .expect("enqueue fresh dependent");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim after republish");
     assert_eq!(claimed.len(), 1);
@@ -5167,7 +5206,7 @@ async fn delayed_old_run_cannot_complete_new_bound_generation() {
         .await
         .expect("enqueue");
     let id = task_id_on("flaky", TARGET);
-    let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let first = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim A")[0]
         .clone();
@@ -5187,7 +5226,7 @@ async fn delayed_old_run_cannot_complete_new_bound_generation() {
             .execute()
             .await
             .expect("open retry");
-    let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let second = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim B")[0]
         .clone();
@@ -5221,7 +5260,7 @@ async fn early_completion_is_acknowledged_then_applied_after_exact_binding() {
         .await
         .expect("enqueue");
     let id = task_id_on("early", TARGET);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim")[0]
         .clone();
@@ -5252,7 +5291,7 @@ async fn duplicate_early_delivery_is_idempotent_and_replay_conflicts_after_apply
         .await
         .expect("enqueue");
     let id = task_id_on("replay", TARGET);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim")[0]
         .clone();
@@ -5284,7 +5323,7 @@ async fn response_loss_reclaim_drops_unbound_event_before_new_claim() {
         .await
         .expect("enqueue");
     let id = task_id_on("lost", TARGET);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim")[0]
         .clone();
@@ -5311,7 +5350,7 @@ async fn response_loss_reclaim_drops_unbound_event_before_new_claim() {
             .execute()
             .await
             .expect("open replacement dispatch");
-    let replacement = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let replacement = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim replacement")[0]
         .clone();
@@ -5337,7 +5376,7 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
         .await
         .expect("enqueue");
     let id = task_id_on("fenced", TARGET);
-    let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let first = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim A")[0]
         .clone();
@@ -5368,7 +5407,7 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
     )
     .await
     .expect("retry for B");
-    let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let second = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim B")[0]
         .clone();
@@ -5415,7 +5454,7 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
         .await
         .expect("enqueue A");
     let id = task_id_on("purged", TARGET);
-    let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let first = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim A")[0]
         .clone();
@@ -5453,7 +5492,7 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
     enqueue(&db, &[request("purged", &[])])
         .await
         .expect("enqueue B");
-    let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let second = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim B")[0]
         .clone();
@@ -5497,7 +5536,7 @@ async fn late_failure_cannot_match_purged_recreated_generation() {
         .await
         .expect("enqueue A");
     let id = task_id_on("recreated", TARGET);
-    let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let first = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim A")[0]
         .clone();
@@ -5525,7 +5564,7 @@ async fn late_failure_cannot_match_purged_recreated_generation() {
     enqueue(&db, &[request("recreated", &[])])
         .await
         .expect("enqueue B");
-    let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let second = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim B")[0]
         .clone();
@@ -5552,7 +5591,7 @@ async fn binding_clears_orphan_pending_run_before_normal_completion() {
         .await
         .expect("enqueue");
     let id = task_id_on("orphan", TARGET);
-    let first = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let first = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim A")[0]
         .clone();
@@ -5564,7 +5603,7 @@ async fn binding_clears_orphan_pending_run_before_normal_completion() {
             .execute()
             .await
             .expect("open B");
-    let second = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let second = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim B")[0]
         .clone();
@@ -5600,7 +5639,7 @@ async fn persisted_bound_pending_event_recovers_after_restart() {
         .await
         .expect("enqueue");
     let id = task_id_on("restart", TARGET);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim")[0]
         .clone();
@@ -5797,7 +5836,7 @@ async fn claim_tasks(db: &DurableDb, names: &[&str]) -> Vec<super::QueuedTask> {
     for name in names {
         set_first_requested_at(db, name, PAST_TS).await;
     }
-    super::claim_dispatchable_tasks(db, &settings(), &NoCoverage)
+    claim_flat(db, &settings(), &NoCoverage)
         .await
         .expect("claim legs")
 }
@@ -5822,6 +5861,11 @@ async fn ready_batches_surfaces_only_bound_due_batches() {
     let ready = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let unbound = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let deferred = "cccccccccccccccccccccccccccccccc";
+    // Claim before seeding: the pass's stale recovery deletes a
+    // `build_batches` row with no in-flight leg, so seeded rows must
+    // land after it — and after they land, `bind_leg` supplies the
+    // legs the next sweep looks for.
+    let claimed = claim_tasks(&db, &["legged-a", "legged-b"]).await;
     seed_ready_batch(&db, ready, "4242", "success", PAST_TS).await;
     // A completion held ahead of the binding — `done_run_id` set,
     // `github_run_id` NULL — is not resolvable.
@@ -5832,7 +5876,6 @@ async fn ready_batches_surfaces_only_bound_due_batches() {
     // Bound and done, but deferred past `now`.
     seed_ready_batch(&db, deferred, "5555", "success", "2099-01-01 00:00:00").await;
 
-    let claimed = claim_tasks(&db, &["legged-a", "legged-b"]).await;
     bind_leg(&db, &claimed_task(&claimed, "legged-a").task_id, ready, 1).await;
     bind_leg(&db, &claimed_task(&claimed, "legged-b").task_id, ready, 0).await;
 
@@ -5868,15 +5911,22 @@ async fn ready_batches_surfaces_only_bound_due_batches() {
 async fn a_resolved_batch_applies_each_leg_and_releases_its_row() {
     let db = memory_db().await.expect("memory db");
     let batch_id = "dddddddddddddddddddddddddddddddd";
-    seed_ready_batch(&db, batch_id, "7777", "failure", PAST_TS).await;
     let claimed = claim_tasks(&db, &["leg-ok", "leg-bad"]).await;
+    seed_ready_batch(&db, batch_id, "7777", "failure", PAST_TS).await;
     bind_leg(&db, &claimed_task(&claimed, "leg-ok").task_id, batch_id, 0).await;
     bind_leg(&db, &claimed_task(&claimed, "leg-bad").task_id, batch_id, 1).await;
 
+    let ready = super::ready_batches(&db, ROW_TS_MS)
+        .await
+        .expect("ready batches");
+    let batch = ready
+        .iter()
+        .find(|batch| batch.batch_id == batch_id)
+        .expect("the seeded batch is ready");
     let any_failure = super::resolve_batch(
         &db,
         &settings(),
-        batch_id,
+        batch,
         &[
             super::LegResolution::Succeeded {
                 duration_ms: 123_456,
@@ -5927,8 +5977,8 @@ async fn a_resolved_batch_applies_each_leg_and_releases_its_row() {
 async fn a_stale_leg_is_ignored_by_the_generation_fence() {
     let db = memory_db().await.expect("memory db");
     let batch_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    seed_ready_batch(&db, batch_id, "8888", "failure", PAST_TS).await;
     let claimed = claim_tasks(&db, &["live-leg", "dead-leg"]).await;
+    seed_ready_batch(&db, batch_id, "8888", "failure", PAST_TS).await;
     bind_leg(
         &db,
         &claimed_task(&claimed, "live-leg").task_id,
@@ -5951,10 +6001,17 @@ async fn a_stale_leg_is_ignored_by_the_generation_fence() {
         .await
         .expect("cancel the leg's row");
 
+    let ready = super::ready_batches(&db, ROW_TS_MS)
+        .await
+        .expect("ready batches");
+    let batch = ready
+        .iter()
+        .find(|batch| batch.batch_id == batch_id)
+        .expect("the seeded batch is ready");
     let any_failure = super::resolve_batch(
         &db,
         &settings(),
-        batch_id,
+        batch,
         &[
             super::LegResolution::Succeeded {
                 duration_ms: 60_000,
@@ -5990,8 +6047,8 @@ async fn a_stale_leg_is_ignored_by_the_generation_fence() {
 async fn a_batch_leg_samples_its_runner_time() {
     let db = memory_db().await.expect("memory db");
     let batch_id = "ffffffffffffffffffffffffffffffff";
-    seed_ready_batch(&db, batch_id, "9999", "success", PAST_TS).await;
     let claimed = claim_tasks(&db, &["timed-leg"]).await;
+    seed_ready_batch(&db, batch_id, "9999", "success", PAST_TS).await;
     let leg = claimed_task(&claimed, "timed-leg");
     bind_leg(&db, &leg.task_id, batch_id, 0).await;
     // Push the claim stamp far into the past: a claim-to-completion
@@ -6003,10 +6060,17 @@ async fn a_batch_leg_samples_its_runner_time() {
         .await
         .expect("age the claim stamp");
 
+    let ready = super::ready_batches(&db, ROW_TS_MS)
+        .await
+        .expect("ready batches");
+    let batch = ready
+        .iter()
+        .find(|batch| batch.batch_id == batch_id)
+        .expect("the seeded batch is ready");
     let any_failure = super::resolve_batch(
         &db,
         &settings(),
-        batch_id,
+        batch,
         &[super::LegResolution::Succeeded {
             duration_ms: 123_456,
         }],
@@ -6392,7 +6456,7 @@ async fn a_downloads_resubmit_writes_only_pending_rows() {
         .await
         .expect("enqueue inflight");
     assert_eq!(
-        super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+        claim_flat(&db, &wide_claim_settings(), &NoCoverage)
             .await
             .expect("claim inflight")
             .len(),
@@ -6481,7 +6545,7 @@ async fn a_downloads_resubmit_writes_only_pending_rows() {
 
     // The pending set's claim order repriced to the new counts:
     // `popular` claims ahead of the strictly-older `older`.
-    let claimed = super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &wide_claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 2);
@@ -7097,7 +7161,7 @@ async fn a_saturated_macos_backlog_does_not_starve_other_families() {
         dispatch_min_age_minutes: 0,
         ..settings()
     };
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+    let claimed = claim_flat(&db, &settings, &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed.len(), 1);
@@ -7132,9 +7196,7 @@ async fn a_small_slot_pass_reads_one_page_not_the_frontier() {
         ..settings()
     };
     let base = log.lock().expect("log").len();
-    let claimed = super::claim_dispatchable_tasks(&db, &settings, &oracle)
-        .await
-        .expect("claim");
+    let claimed = claim_flat(&db, &settings, &oracle).await.expect("claim");
     assert_eq!(claimed.len(), 3);
 
     let page_reads = log
@@ -7176,7 +7238,7 @@ async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
 
     // stow#785 regression: the pass cannot requeue before any report —
     // "completed with an unmet edge" is undecidable at claim time.
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert!(claimed.is_empty(), "the parent stays gated");
@@ -7213,7 +7275,7 @@ async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
         .execute()
         .await
         .expect("clear dep backoff");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim requeued dep");
     assert_eq!(claimed.len(), 1);
@@ -7250,13 +7312,13 @@ async fn completed_dependency_with_uncovered_shapes_is_requeued_once() {
         "completed",
         "the latch blocks a second re-queue"
     );
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim after second completion");
     assert!(claimed.is_empty(), "the parent waits for coverage");
 
     publish(&db, "dep").await;
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim parent");
     assert_eq!(claimed.len(), 1);
@@ -7450,7 +7512,7 @@ async fn seed_outcomes(
     super::enqueue_trusted(db, &requests, &wide_claim_settings())
         .await
         .expect("seed enqueue");
-    let claimed = super::claim_dispatchable_tasks(db, &wide_claim_settings(), &NoCoverage)
+    let claimed = claim_flat(db, &wide_claim_settings(), &NoCoverage)
         .await
         .expect("seed claim");
     assert_eq!(claimed.len(), count);
@@ -7520,7 +7582,7 @@ async fn freeze_gates_dispatch_but_not_enqueue_and_clear_resumes() {
     // Dispatch is not: the claim gate answers empty no matter what
     // is pending.
     assert!(
-        super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+        claim_flat(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim while frozen")
             .is_empty()
@@ -7531,7 +7593,7 @@ async fn freeze_gates_dispatch_but_not_enqueue_and_clear_resumes() {
     assert_eq!(plan, AlarmPlan::Delete);
 
     super::delete_freeze(&db).await.expect("clear");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim after clear");
     assert_eq!(claimed.len(), 1, "the freeze-queued miss dispatches");
@@ -7685,7 +7747,7 @@ async fn a_completion_reads_a_constant_row_count_as_the_window_fills() {
         enqueue(&db, &[request("measured", &[])])
             .await
             .expect("enqueue");
-        let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+        let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
             .await
             .expect("claim");
         let base = log.lock().expect("log").len();
@@ -8083,7 +8145,7 @@ async fn request_outcome_refuses_a_stale_attempt() {
 /// function produces a past claim stamp, and the pin must be exact
 /// for a deterministic duration assertion.
 async fn complete_success_at_minutes(db: &DurableDb, task_id: &str, run: &str, minutes_ago: u32) {
-    let claimed = super::claim_dispatchable_tasks(db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim")[0]
         .clone();
@@ -8148,7 +8210,7 @@ async fn build_duration_samples_the_immutable_claim_instant() {
         .await
         .expect("enqueue");
     let id = task_id_on("durable", TARGET);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim")[0]
         .clone();
@@ -8208,7 +8270,7 @@ async fn deferred_completion_measures_duration_at_received_at() {
         .await
         .expect("enqueue");
     let id = task_id_on("deferred", TARGET);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim")[0]
         .clone();
@@ -8544,7 +8606,7 @@ async fn stale_duplicate_and_failed_reports_never_sample() {
         .await
         .expect("enqueue");
     let id = task_id_on("fenced", TARGET);
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim")[0]
         .clone();
@@ -8589,7 +8651,7 @@ async fn stale_duplicate_and_failed_reports_never_sample() {
         .await
         .expect("enqueue");
     let fail_id = task_id_on("failonly", TARGET);
-    let failed_claim = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let failed_claim = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim")[0]
         .clone();
@@ -8635,7 +8697,7 @@ async fn cheaper_expected_build_claims_first_inside_a_band() {
         ..request("cheap", &[])
     };
     enqueue(&db, &[expensive, cheap]).await.expect("enqueue");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed[0].crate_name, "cheap", "cost-divided rank");
@@ -8663,7 +8725,7 @@ async fn cheaper_expected_build_claims_first_inside_a_band() {
     super::enqueue_trusted(&db, &[human, miss], &settings())
         .await
         .expect("enqueue");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(
@@ -8698,7 +8760,7 @@ async fn equal_scores_keep_fifo_order() {
     super::refresh_dispatch_keys(&db, &[task_id_on("fifo-first", TARGET)])
         .await
         .expect("refresh aged key");
-    let claimed = super::claim_dispatchable_tasks(&db, &claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert_eq!(claimed[0].crate_name, "fifo-first");
@@ -9108,7 +9170,7 @@ async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
     .await
     .expect("publish dep slice");
 
-    let claimed = super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &wide_claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     let mut verified = Vec::new();
@@ -9197,7 +9259,7 @@ async fn dispatch_fails_on_a_missing_node_naming_it() {
         .await
         .expect("drop node row");
 
-    let claimed = super::claim_dispatchable_tasks(&db, &wide_claim_settings(), &NoCoverage)
+    let claimed = claim_flat(&db, &wide_claim_settings(), &NoCoverage)
         .await
         .expect("claim");
     let owner_id = owner.task_id().expect("owner task id");
@@ -9333,7 +9395,7 @@ async fn first_requested_at_never_exceeds_updated_at() {
             .expect("invariant audit")
     };
     assert_eq!(audit().await, 0, "after submit");
-    for claimed in super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
+    for claimed in claim_flat(&db, &settings(), &NoCoverage)
         .await
         .expect("claim")
     {
@@ -9431,7 +9493,7 @@ async fn per_event_costs_track_the_event_not_stored_history() {
         seed_blocked_fixture(&db, owners, completed).await;
         log.lock().expect("log").clear();
 
-        let claimed = super::claim_dispatchable_tasks(&db, &settings(), &NoCoverage)
+        let claimed = claim_flat(&db, &settings(), &NoCoverage)
             .await
             .expect("claim");
         assert!(claimed.is_empty());
@@ -9493,5 +9555,461 @@ async fn per_event_costs_track_the_event_not_stored_history() {
     assert!(
         !stow_types::do_budgets::grew(report_min as f64, report_max as f64),
         "report reads grew with stored rows: {report_reads:?}"
+    );
+}
+// ===== Batched claim pass (stow#833 §1.2) =====
+
+/// Settings with real `k`/`B` — a miss batch holds `k = 3` slots and
+/// closes at `B = 4` legs.
+const fn batched_settings() -> SchedulerSettings {
+    SchedulerSettings {
+        dispatch_min_age_minutes: 0,
+        batch_parallelism: 3,
+        batch_max_tasks: 4,
+        ..settings()
+    }
+}
+
+/// §1.2: capacity is slots, not rows — the batches a pass forms hold
+/// Σ `parallelism` ≤ `STOW_MAX_CONCURRENT_JOBS`, and a row past the
+/// pool stays pending.
+#[tokio::test]
+async fn batches_claim_by_slots_not_rows() {
+    let db = memory_db().await.expect("memory db");
+    // 17 same-key miss rows, 10 slots, k=3, B=4: four full batches —
+    // 3+3+3+1 slots — and the 17th row is denied a fresh batch.
+    let requests: Vec<EnqueueRequest> = (0..17).map(|i| request(&format!("t{i}"), &[])).collect();
+    enqueue(&db, &requests).await.expect("enqueue");
+
+    let settings = SchedulerSettings {
+        dispatch: Dispatch::from_max_concurrent_jobs(10),
+        ..batched_settings()
+    };
+    let batches = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(batches.len(), 4);
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.tasks.len())
+            .collect::<Vec<_>>(),
+        vec![4, 4, 4, 4]
+    );
+    let slots: u32 = batches.iter().map(|batch| batch.parallelism).sum();
+    assert_eq!(
+        slots, 10,
+        "Σ parallelism is the slot total, not the leg count"
+    );
+    assert_eq!(
+        super::status(&db).await.expect("status").pending,
+        1,
+        "the row past the pool stays pending"
+    );
+
+    // And the next pass claims nothing — the slots are all held.
+    let again = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+        .await
+        .expect("claim again");
+    assert!(again.is_empty(), "in-flight parallelism counts as slots");
+}
+
+/// §1.2/§1.3: the macOS family's own cap bounds its batches inside
+/// the shared pool — a macOS batch never reserves past the cap's
+/// remainder.
+#[tokio::test]
+async fn the_macos_cap_bounds_macos_batches() {
+    let db = memory_db().await.expect("memory db");
+    let requests: Vec<EnqueueRequest> = (0..5)
+        .map(|i| request_on(&format!("m{i}"), MACOS_TARGET, &[]))
+        .collect();
+    enqueue(&db, &requests).await.expect("enqueue");
+
+    // macOS cap 3 against k=3, B=4: one batch of four legs on three
+    // slots, and the fifth row is denied — its family is spent.
+    let settings = SchedulerSettings {
+        max_concurrent_macos_jobs: 3,
+        ..batched_settings()
+    };
+    let batches = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].tasks.len(), 4);
+    assert_eq!(
+        batches[0].parallelism, 3,
+        "the cap bounds the batch's slots"
+    );
+    assert_eq!(super::status(&db).await.expect("status").pending, 1);
+}
+
+/// §1.1/§1.5: human and miss rows of one `(rustc, family)` never
+/// share a batch — the lane is part of the key.
+#[tokio::test]
+async fn human_and_miss_rows_form_separate_batches() {
+    let db = memory_db().await.expect("memory db");
+    enqueue(
+        &db,
+        &[
+            request("miss-a", &[]),
+            request("miss-b", &[]),
+            human_request("human-c"),
+        ],
+    )
+    .await
+    .expect("enqueue");
+
+    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(batches.len(), 2);
+    // The human row outranks the misses and opens its batch first;
+    // every human leg runs at once (parallelism = legs).
+    assert_eq!(batches[0].lane, stow_types::api::TaskLane::Human);
+    assert_eq!(batches[0].tasks.len(), 1);
+    assert_eq!(batches[0].parallelism, 1);
+    assert_eq!(batches[1].lane, stow_types::api::TaskLane::Miss);
+    assert_eq!(batches[1].tasks.len(), 2);
+    assert_eq!(batches[1].parallelism, 2);
+}
+
+/// §1.2: the head row always goes out — a lone claimable row opens
+/// its key's batch.
+#[tokio::test]
+async fn the_head_row_always_goes_out_batched() {
+    let db = memory_db().await.expect("memory db");
+    enqueue(&db, &[request("head", &[])])
+        .await
+        .expect("enqueue");
+
+    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].tasks[0].crate_name, "head");
+    assert_eq!(batches[0].parallelism, 1);
+}
+
+/// §1.2: legs order longest-first by `crate_build_stats.median_ms` —
+/// GitHub starts matrix legs in order as slots free, so the longest
+/// legs start first. An unmeasured pair sorts last, as it does for
+/// the rank.
+#[tokio::test]
+async fn legs_order_longest_first_in_a_batch() {
+    let db = memory_db().await.expect("memory db");
+    enqueue(
+        &db,
+        &[
+            request("fast", &[]),
+            request("slow", &[]),
+            request("mid", &[]),
+            request("unmeasured", &[]),
+        ],
+    )
+    .await
+    .expect("enqueue");
+    for (name, median) in [("fast", "100"), ("mid", "400"), ("slow", "900")] {
+        db.query(
+            "INSERT INTO crate_build_stats (crate_name, target, builds, median_ms) \
+             VALUES (?, ?, 1, ?)",
+        )
+        .bind(name)
+        .bind(TARGET)
+        .bind(median)
+        .execute()
+        .await
+        .expect("seed build stats");
+    }
+
+    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(batches.len(), 1);
+    let order: Vec<&str> = batches[0]
+        .tasks
+        .iter()
+        .map(|task| task.crate_name.as_str())
+        .collect();
+    assert_eq!(order, ["slow", "mid", "fast", "unmeasured"]);
+}
+
+/// §1.2: a row whose dependency is not in its published slice is
+/// never batched — `deps_met` gates the page itself, even when the
+/// dependency is claimed in the same pass's frontier.
+#[tokio::test]
+async fn a_dependent_is_never_batched_with_its_dependency() {
+    let db = memory_db().await.expect("memory db");
+    enqueue(&db, &[request("dep", &[])])
+        .await
+        .expect("enqueue dep");
+    enqueue(&db, &[request("parent", &[dependency("dep")])])
+        .await
+        .expect("enqueue dependent");
+
+    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].tasks.len(), 1);
+    assert_eq!(batches[0].tasks[0].crate_name, "dep");
+    assert_parent_status(
+        &db,
+        stow_types::api::QueueTaskStatus::Pending,
+        &[dependency("dep")],
+    )
+    .await;
+}
+
+/// A formed batch persists its `build_batches` row — slots, lane,
+/// family, rustc — and binds its legs' `batch_id`/`batch_leg` in
+/// matrix order.
+#[tokio::test]
+async fn a_formed_batch_writes_its_row_and_leg_bindings() {
+    #[derive(skyzen::FromRow)]
+    struct BatchRow {
+        rustc_version: String,
+        dispatch_family: String,
+        lane: String,
+        parallelism: i64,
+        legs: i64,
+        github_run_id: Option<String>,
+        claimed_at: String,
+        lease_at: String,
+    }
+    #[derive(skyzen::FromRow)]
+    struct LegRow {
+        task_id: String,
+        batch_leg: i64,
+    }
+
+    let db = memory_db().await.expect("memory db");
+    let requests: Vec<EnqueueRequest> = (0..3).map(|i| request(&format!("l{i}"), &[])).collect();
+    enqueue(&db, &requests).await.expect("enqueue");
+
+    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(batches.len(), 1);
+    let batch = &batches[0];
+    let batch_id = batch.batch_id.as_str();
+
+    let row = db
+        .query(
+            "SELECT rustc_version, dispatch_family, lane, parallelism, legs, \
+                    github_run_id, claimed_at, lease_at \
+             FROM build_batches WHERE batch_id = ?",
+        )
+        .bind(batch_id)
+        .fetch_optional::<BatchRow>()
+        .await
+        .expect("read batch row")
+        .expect("the batch row exists");
+    assert_eq!(row.rustc_version, RUSTC);
+    assert_eq!(row.dispatch_family, "linux");
+    assert_eq!(row.lane, "miss");
+    assert_eq!(row.parallelism, 3);
+    assert_eq!(row.legs, 3);
+    assert!(
+        row.github_run_id.is_none(),
+        "the dispatch response binds it later"
+    );
+    // The lease is claimed_at + stale_dispatch_minutes.
+    let lease = db
+        .query("SELECT lease_at = datetime(claimed_at, '+60 minutes') FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id)
+        .fetch_scalar::<i64>()
+        .await
+        .expect("lease check");
+    assert_eq!(lease, 1);
+
+    // Every leg carries its batch binding in matrix order.
+    let legs = db
+        .query("SELECT task_id, batch_leg FROM queue WHERE batch_id = ? ORDER BY batch_leg")
+        .bind(batch_id)
+        .fetch_all::<LegRow>()
+        .await
+        .expect("read leg bindings");
+    assert_eq!(legs.len(), 3);
+    for (index, leg) in legs.iter().enumerate() {
+        assert_eq!(leg.batch_leg, i64::try_from(index).expect("leg index"));
+        assert_eq!(leg.task_id, batch.tasks[index].task_id);
+    }
+}
+
+/// One queue row's claim-visible columns, for before/after
+/// comparison.
+#[derive(Debug, PartialEq, Eq, skyzen::FromRow)]
+struct StampedRow {
+    task_id: String,
+    status: String,
+    generation_id: String,
+    claimed_at: Option<String>,
+    dispatch_attempts: i64,
+    updated_at: String,
+    batch_id: Option<String>,
+    batch_leg: Option<i64>,
+}
+
+async fn stamped_rows(db: &DurableDb) -> Vec<StampedRow> {
+    db.query(
+        "SELECT task_id, status, generation_id, claimed_at, dispatch_attempts, updated_at, \
+                batch_id, batch_leg \
+         FROM queue ORDER BY task_id",
+    )
+    .fetch_all::<StampedRow>()
+    .await
+    .expect("read rows")
+}
+
+/// A row a pass does not batch is never written: no claim and no
+/// restore touches it, so its `generation_id`, `claimed_at`,
+/// `dispatch_attempts` and `updated_at` all keep their values.
+#[tokio::test]
+async fn an_unbatched_row_is_never_written() {
+    let db = memory_db().await.expect("memory db");
+    let requests: Vec<EnqueueRequest> = (0..3).map(|i| request(&format!("u{i}"), &[])).collect();
+    enqueue(&db, &requests).await.expect("enqueue");
+    // A past `updated_at` makes any write to a row visible: a touched
+    // row would carry `datetime('now')`.
+    db.query("UPDATE queue SET updated_at = ?")
+        .bind(PAST_TS.to_owned())
+        .execute()
+        .await
+        .expect("age rows");
+    let before = stamped_rows(&db).await;
+
+    // One slot: one row claims, the other two stay out of every batch.
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+
+    let after = stamped_rows(&db).await;
+    let mut untouched = 0;
+    for (was, now) in before.iter().zip(&after) {
+        if was.task_id == claimed[0].task_id {
+            assert_eq!(now.status, "dispatched");
+            continue;
+        }
+        assert_eq!(was, now, "an unbatched row is not written");
+        untouched += 1;
+    }
+    assert_eq!(untouched, 2);
+}
+
+/// An artifact catalog that, on its first question, flips the head
+/// row out of `pending` the way a concurrent pass's claim does — the
+/// coverage lookup is the D1 await between a pass's page read and its
+/// claim, so this is the race window itself, with no test seam in the
+/// claim code.
+struct RacingCoverage<'a> {
+    db: &'a DurableDb,
+    raced: std::sync::Mutex<Option<String>>,
+}
+
+impl CoverageOracle for RacingCoverage<'_> {
+    fn covered(
+        &self,
+        identities: &[SemanticTaskIdentity],
+    ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send {
+        let head = identities
+            .first()
+            .map(|identity| identity.crate_name.clone());
+        async move {
+            let first = {
+                let mut raced = self.raced.lock().expect("raced head");
+                let first = raced.is_none().then_some(head).flatten();
+                raced.clone_from(&first);
+                first
+            };
+            if let Some(head) = first {
+                self.db
+                    .query(
+                        "UPDATE queue \
+                         SET status = 'dispatched', generation_id = 'racer', \
+                             dispatch_attempts = dispatch_attempts + 1 \
+                         WHERE crate_name = ?",
+                    )
+                    .bind(head)
+                    .execute()
+                    .await
+                    .map_err(|error| QueueError::Sql(error.to_string()))?;
+            }
+            Ok(BTreeSet::new())
+        }
+    }
+}
+
+/// A batch that loses a leg to a concurrent pass is dropped whole: its
+/// won legs return to `pending` with their pre-claim stamps and no
+/// batch binding, it gets no `build_batches` row, and the pass's other
+/// batches are unaffected.
+#[tokio::test]
+async fn a_batch_that_lost_a_leg_is_dropped_and_its_won_legs_restored() {
+    let db = memory_db().await.expect("memory db");
+    let requests: Vec<EnqueueRequest> = (0..3).map(|i| request(&format!("r{i}"), &[])).collect();
+    enqueue(&db, &requests).await.expect("enqueue");
+    let before = stamped_rows(&db).await;
+    // Two legs per batch: the head and the second row share a batch,
+    // the third opens its own.
+    let settings = SchedulerSettings {
+        batch_max_tasks: 2,
+        ..batched_settings()
+    };
+    let coverage = RacingCoverage {
+        db: &db,
+        raced: std::sync::Mutex::new(None),
+    };
+
+    let batches = super::claim_dispatchable_tasks(&db, &settings, &coverage)
+        .await
+        .expect("claim");
+    let raced = coverage
+        .raced
+        .lock()
+        .expect("raced head")
+        .clone()
+        .expect("the race ran");
+
+    assert_eq!(batches.len(), 1, "the head's batch is dropped");
+    assert_eq!(batches[0].tasks.len(), 1);
+    let survivor = &batches[0].tasks[0];
+    assert_ne!(survivor.crate_name, raced);
+
+    let after = stamped_rows(&db).await;
+    for (was, now) in before.iter().zip(&after) {
+        let name = requests
+            .iter()
+            .find(|request| request.task_id().expect("task id").as_str() == was.task_id)
+            .map(|request| request.crate_name.to_string())
+            .expect("row from a request");
+        if name == raced {
+            assert_eq!(
+                (now.status.as_str(), now.generation_id.as_str()),
+                ("dispatched", "racer")
+            );
+        } else if name == survivor.crate_name {
+            assert_eq!(now.status, "dispatched");
+            assert_eq!(now.generation_id, survivor.generation_id);
+            assert_eq!(now.batch_id.as_deref(), Some(batches[0].batch_id.as_str()));
+            assert_eq!(now.batch_leg, Some(0));
+        } else {
+            // The dropped batch's won leg: claim undone, nothing bound.
+            assert_eq!(now.status, "pending");
+            assert_eq!(now.generation_id, was.generation_id);
+            assert_eq!(now.claimed_at, was.claimed_at);
+            assert_eq!(now.dispatch_attempts, was.dispatch_attempts);
+            assert_eq!((now.batch_id.as_deref(), now.batch_leg), (None, None));
+        }
+    }
+    let batch_rows = db
+        .query("SELECT batch_id FROM build_batches")
+        .fetch_scalars::<String>()
+        .await
+        .expect("read batch rows");
+    assert_eq!(
+        batch_rows,
+        [batches[0].batch_id.as_str().to_owned()],
+        "only the surviving batch is written"
     );
 }
