@@ -473,11 +473,12 @@ start_lanes() {
     log "started the $phase lanes (pid $LANES_PID), log: $LOG_DIR/lanes-$phase.log"
 }
 
-# Runs the local CI has seen: in flight, and successfully completed.
+# The local CI's batch runs: runs still in flight, and legs that
+# succeeded — successes count per task, which is the leg.
 local_ci_counts() {
     curl -fsS --max-time 30 "${LOCAL_CI_URL}/tasks" | jq -r '
         .tasks as $tasks
-        | "\([$tasks[] | select(.status != "completed")] | length) \([$tasks[] | select(.conclusion == "success")] | length)"'
+        | "\([$tasks[] | select(.status != "completed")] | length) \([$tasks[].legs[] | select(.conclusion == "success")] | length)"'
 }
 
 ROUND=0

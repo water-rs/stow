@@ -715,46 +715,52 @@ fn order_check(observed: &WaveObservations) -> Check {
         .collect();
     let mut violations = Vec::new();
     for run in &observed.runs {
-        let Some((_, task_id)) = crate::records::parse_run_title(&run.display_title) else {
-            continue;
-        };
-        let Some(node) = observed.nodes.get(task_id) else {
-            continue;
-        };
+        // `available` turns on the run's dispatch time alone, so it is
+        // computed once per run rather than once per leg.
         let available: BTreeSet<&String> = rounds
             .iter()
             .filter(|round| round.before_report.taken_at_ms <= run.dispatched_at_ms)
             .flat_map(|round| &round.published)
             .collect();
-        let missing: Vec<&String> = node
-            .dependencies
-            .iter()
-            .filter(|dep| !available.contains(dep))
-            .collect();
-        if !missing.is_empty() {
-            violations.push(format!(
-                "{task_id} dispatched at {} before {} of its dependencies were published (first: {})",
-                run.dispatched_at_ms,
-                missing.len(),
-                missing[0]
-            ));
-        }
-        if run
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains(FOREIGN_UNIT_MARKER))
-        {
-            violations.push(format!(
-                "{task_id} compiled a dependency itself: {}",
-                run.error.as_deref().unwrap_or_default()
-            ));
+        for leg in &run.legs {
+            let task_id = leg.task_id.as_str();
+            let Some(node) = observed.nodes.get(task_id) else {
+                continue;
+            };
+            let missing: Vec<&String> = node
+                .dependencies
+                .iter()
+                .filter(|dep| !available.contains(dep))
+                .collect();
+            if !missing.is_empty() {
+                violations.push(format!(
+                    "{task_id} dispatched at {} before {} of its dependencies were published (first: {})",
+                    run.dispatched_at_ms,
+                    missing.len(),
+                    missing[0]
+                ));
+            }
+            if let Some(error) = leg
+                .error
+                .as_deref()
+                .filter(|error| error.contains(FOREIGN_UNIT_MARKER))
+            {
+                violations.push(format!("{task_id} compiled a dependency itself: {error}"));
+            }
         }
     }
     check(
         "No node dispatched before its dependencies were published",
         violations.is_empty(),
         if violations.is_empty() {
-            format!("{} runs checked", observed.runs.len())
+            format!(
+                "{} legs checked",
+                observed
+                    .runs
+                    .iter()
+                    .map(|run| run.legs.len())
+                    .sum::<usize>()
+            )
         } else {
             summarise(&violations)
         },
@@ -767,14 +773,19 @@ fn published_check(observed: &WaveObservations) -> Check {
         .keys()
         .filter(|task_id| !observed.covered.contains(*task_id))
         .map(|task_id| {
+            // Two sources: the leg's own error when the leg produced
+            // one, else the run-level error — it holds only failures no
+            // leg owns (the dispatch, a webhook delivery), so it applies
+            // to every leg the run carried.
             let last_error = observed
                 .runs
                 .iter()
-                .filter(|run| {
-                    crate::records::parse_run_title(&run.display_title)
-                        .is_some_and(|(_, id)| id == task_id)
+                .filter_map(|run| {
+                    run.legs
+                        .iter()
+                        .find(|leg| leg.task_id == *task_id)
+                        .and_then(|leg| leg.error.as_deref().or(run.error.as_deref()))
                 })
-                .filter_map(|run| run.error.as_deref())
                 .next_back();
             last_error.map_or_else(
                 || format!("{task_id}: never published"),
@@ -932,7 +943,7 @@ mod tests {
         ProductionTask, Round, WaveObservations, analyse, count_production, ledger_delta,
     };
     use crate::api::{SchedulerLedger, SchedulerLedgerOp};
-    use crate::local_ci::LocalCiRun;
+    use crate::local_ci::{LocalCiLeg, LocalCiRun};
 
     /// A ledger whose four kinds each ran `events` times at `rate` rows
     /// read and one written per event, plus `completion_extra` reads on
@@ -968,15 +979,23 @@ mod tests {
     fn run(task_id: &str, dispatched_at_ms: u64) -> LocalCiRun {
         LocalCiRun {
             workflow_run_id: dispatched_at_ms,
-            display_title: format!("1.99.1-{task_id}"),
+            // A real batch run's title — `<rustc>-b<32 lowercase hex>`.
+            display_title: format!("1.99.1-b{task_id:0>32}"),
             status: "completed".to_owned(),
             conclusion: Some("success".to_owned()),
             html_url: String::new(),
-            path: ".github/workflows/build-crate.yml".to_owned(),
+            path: ".github/workflows/build-batch.yml".to_owned(),
             dispatched_at_ms,
             completed_at_ms: Some(dispatched_at_ms + 1),
             error: None,
             delivery_errors: Vec::new(),
+            legs: vec![LocalCiLeg {
+                leg: 0,
+                task_id: task_id.to_owned(),
+                status: "completed".to_owned(),
+                conclusion: Some("success".to_owned()),
+                error: None,
+            }],
         }
     }
 
@@ -1100,6 +1119,51 @@ mod tests {
             failed(&report),
             ["No node dispatched before its dependencies were published"]
         );
+    }
+
+    #[test]
+    fn a_foreign_unit_failure_names_only_its_own_leg() {
+        let mut observed = chain(0);
+        // One run, two failed legs: only a's carries the foreign-unit
+        // marker, while its message names leg 1 — attribution reads the
+        // leg's own error, never the run's joined summary.
+        let mut run = run("b", 95);
+        run.conclusion = Some("failure".to_owned());
+        run.legs = vec![
+            LocalCiLeg {
+                leg: 0,
+                task_id: "a".to_owned(),
+                status: "completed".to_owned(),
+                conclusion: Some("failure".to_owned()),
+                error: Some(
+                    "leg 0 build: Error: unit of leg 1 is not the task's own crate".to_owned(),
+                ),
+            },
+            LocalCiLeg {
+                leg: 1,
+                task_id: "b".to_owned(),
+                status: "completed".to_owned(),
+                conclusion: Some("failure".to_owned()),
+                error: Some("leg 1 build: Error: rustc failed".to_owned()),
+            },
+        ];
+        run.error = Some(format!(
+            "2 of 2 legs failed; {}",
+            run.legs[0].error.as_deref().expect("leg error")
+        ));
+        observed.runs[1] = run;
+        let report = analyse(&observed).expect("analyse");
+        let order = report
+            .checks
+            .iter()
+            .find(|check| check.name == "No node dispatched before its dependencies were published")
+            .expect("the order check ran");
+        assert!(!order.passed, "{order:?}");
+        assert!(
+            order.detail.contains("a compiled a dependency itself"),
+            "{order:?}"
+        );
+        assert!(!order.detail.contains("b compiled"), "{order:?}");
     }
 
     #[test]

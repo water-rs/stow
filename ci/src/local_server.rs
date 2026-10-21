@@ -3,9 +3,12 @@
 //! Activated via `stow-build serve`. Implements `POST /dispatch` so a
 //! locally-running edge worker can dispatch `build-batch` runs (a
 //! `BuildBatchPayload`) and `resolve-request` runs (a `RequestDispatch`)
-//! for end-to-end tests without touching real GitHub Actions — and
-//! `GET /tasks`, the run-state list `stow-admin preheat manual` polls in
-//! its `--dispatch-url` mode.
+//! for end-to-end tests without touching real GitHub Actions — the
+//! GitHub-shaped run endpoints the edge's `LocalCiBuildRuns` drives on
+//! the same loopback base (`GET/POST …/actions/runs/{id}` plus the
+//! attempt-jobs listing and `…/cancel`), and `GET /tasks`, the
+//! run-state list `stow-admin preheat manual` polls in its
+//! `--dispatch-url` mode.
 //!
 //! A batch run mirrors the production shape exactly: one run id for the
 //! batch, an event file carrying the dispatch input, and per leg a build
@@ -20,7 +23,7 @@
 //! workspace. async-net provides a futures-compatible TCP listener so we
 //! avoid the tokio-IO / futures-IO bridging dance.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -32,11 +35,12 @@ use futures_lite::stream;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use skyzen::Server;
-use skyzen::routing::{CreateRouteNode, Route, Router};
+use skyzen::extract::Query;
+use skyzen::routing::{CreateRouteNode, Params, Route, Router};
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
 use stow_types::api::{BatchTask, BuildBatchPayload, RequestDispatch};
-use stow_types::local_ci::LocalCiRun;
+use stow_types::local_ci::{LocalCiLeg, LocalCiRun};
 use stow_types::runs::VERDICT_STEPS;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
@@ -62,6 +66,10 @@ pub struct LocalServerState {
     /// Every batch run's job rows by run id — the rows GitHub's jobs
     /// API serves for the run.
     jobs: Arc<Mutex<BTreeMap<u64, Vec<RecordedJob>>>>,
+    /// Run ids a `POST …/cancel` has landed — queued legs check it
+    /// before starting and the run's conclusion reads it once the
+    /// running legs settle.
+    cancels: Arc<Mutex<BTreeSet<u64>>>,
     /// The local equivalent of GitHub assigning a fresh id to every
     /// workflow dispatch and every job.
     next_id: Arc<AtomicU64>,
@@ -101,6 +109,7 @@ impl LocalServerState {
             mock_registry_root,
             runs: Arc::new(Mutex::new(BTreeMap::new())),
             jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            cancels: Arc::new(Mutex::new(BTreeSet::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             runners: Arc::new(Semaphore::new(
                 std::thread::available_parallelism()
@@ -145,6 +154,7 @@ impl LocalServerState {
                 completed_at_ms: None,
                 error: None,
                 delivery_errors: Vec::new(),
+                legs: Vec::new(),
             });
         status.clone_into(&mut entry.status);
         entry.conclusion = conclusion.map(str::to_owned);
@@ -163,6 +173,74 @@ impl LocalServerState {
             .get_mut(&workflow_run_id.to_string())
         {
             run.error = Some(error.to_owned());
+        }
+    }
+
+    /// Whether a run record exists for `run_id` — the GitHub-shaped
+    /// run endpoints' 404 test.
+    fn run_exists(&self, run_id: u64) -> bool {
+        self.runs
+            .lock()
+            .expect("runs mutex poisoned")
+            .contains_key(&run_id.to_string())
+    }
+
+    /// Whether a `POST …/cancel` landed for `run_id`.
+    fn cancel_requested(&self, run_id: u64) -> bool {
+        self.cancels
+            .lock()
+            .expect("cancels mutex poisoned")
+            .contains(&run_id)
+    }
+
+    /// Seed a batch run's legs as `queued` — GitHub queues the whole
+    /// matrix at dispatch; `run_leg` flips each leg to `in_progress`
+    /// then `completed` as its jobs settle.
+    fn seed_legs(&self, workflow_run_id: u64, batch: &BuildBatchPayload) {
+        if let Some(run) = self
+            .runs
+            .lock()
+            .expect("runs mutex poisoned")
+            .get_mut(&workflow_run_id.to_string())
+        {
+            run.legs = batch
+                .tasks
+                .iter()
+                .map(|task| LocalCiLeg {
+                    leg: task.leg,
+                    task_id: task.task_id.clone(),
+                    status: "queued".to_owned(),
+                    conclusion: None,
+                    error: None,
+                })
+                .collect();
+        }
+    }
+
+    /// Flip leg `leg` of run `run_id` to `status`/`conclusion` — the
+    /// per-leg row `GET /tasks` serves. A failure settles with its
+    /// `error` recorded on the leg itself, so a reader never parses
+    /// which leg failed back out of the run's joined summary.
+    fn set_leg(
+        &self,
+        run_id: u64,
+        leg: u32,
+        status: &'static str,
+        conclusion: Option<&'static str>,
+        error: Option<&str>,
+    ) {
+        if let Some(entry) = self
+            .runs
+            .lock()
+            .expect("runs mutex poisoned")
+            .get_mut(&run_id.to_string())
+            .and_then(|run| run.legs.iter_mut().find(|entry| entry.leg == leg))
+        {
+            status.clone_into(&mut entry.status);
+            entry.conclusion = conclusion.map(str::to_owned);
+            if let Some(error) = error {
+                entry.error = Some(error.to_owned());
+            }
         }
     }
 
@@ -241,9 +319,10 @@ impl LocalServerState {
         drop(jobs);
     }
 
-    /// Record a job that never ran because its `if:` was false — a
-    /// completed `skipped` row with no steps.
-    fn skip_job(&self, run_id: u64, name: String) {
+    /// Record a job that never ran — a completed row with no steps,
+    /// the conclusion naming why: `skipped` when its `if:` was false,
+    /// `cancelled` when the run's cancel beat a runner to it.
+    fn close_unstarted_job(&self, run_id: u64, name: String, conclusion: &'static str) {
         let job_id = self.allocate_id();
         let now = time::OffsetDateTime::now_utc();
         self.jobs
@@ -255,13 +334,19 @@ impl LocalServerState {
                 id: job_id,
                 name,
                 status: "completed",
-                conclusion: Some("skipped"),
+                conclusion: Some(conclusion),
                 started_at: Some(now),
                 completed_at: Some(now),
                 run_attempt: RUN_ATTEMPT,
                 html_url: format!("http://{}/tasks/{run_id}/job/{job_id}", self.listen),
                 steps: Vec::new(),
             });
+    }
+
+    /// Record a job that never ran because its `if:` was false — a
+    /// completed `skipped` row with no steps.
+    fn skip_job(&self, run_id: u64, name: String) {
+        self.close_unstarted_job(run_id, name, "skipped");
     }
 }
 
@@ -367,14 +452,25 @@ pub async fn serve(
 }
 
 fn build_router(state: LocalServerState) -> Router {
-    Route::new(("/dispatch".post(dispatch), "/tasks".at(list_tasks)))
-        .with(State(state))
-        .build()
+    Route::new((
+        "/dispatch".post(dispatch),
+        "/tasks".at(list_tasks),
+        // The GitHub Actions control plane the edge's
+        // `LocalCiBuildRuns` drives on the loopback base — the same
+        // paths and shapes api.github.com serves, for run ids this
+        // mock allocated.
+        "/repos/{owner}/{repo}/actions/runs/{id}".at(get_run),
+        "/repos/{owner}/{repo}/actions/runs/{id}/attempts/{attempt}/jobs".at(get_attempt_jobs),
+        "/repos/{owner}/{repo}/actions/runs/{id}/cancel".post(cancel_run),
+    ))
+    .with(State(state))
+    .build()
 }
 
 /// `GET /tasks` — the run list `stow-admin preheat manual` polls when it
 /// drives the local runner, answering the same shape the GitHub runs API
-/// does (`status`/`conclusion`/`display_title` semantics).
+/// does (`status`/`conclusion`/`display_title` semantics), each build
+/// run's legs folded in.
 async fn list_tasks(State(state): State<LocalServerState>) -> Response {
     let tasks = state
         .runs
@@ -387,6 +483,200 @@ async fn list_tasks(State(state): State<LocalServerState>) -> Response {
         &stow_types::local_ci::LocalCiTasks { tasks },
         StatusCode::OK,
     )
+}
+
+/// GitHub's not-found envelope — `{"message": "Not Found"}` at 404, the
+/// answer an unknown run id gets on every run endpoint.
+fn not_found() -> Response {
+    json_response(
+        &serde_json::json!({ "message": "Not Found" }),
+        StatusCode::NOT_FOUND,
+    )
+}
+
+/// The `{id}` path parameter the run endpoints share — a missing or
+/// non-numeric id is a 404, like a run GitHub never heard of.
+fn run_id_param(params: &Params) -> Option<u64> {
+    params.get("id").ok()?.parse().ok()
+}
+
+/// The workflow's `name:` as GitHub serves it on a run object — the
+/// file stem of the run's `path`.
+fn workflow_name(path: &str) -> &str {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    file.strip_suffix(".yml").unwrap_or(file)
+}
+
+/// `GET /repos/{o}/{r}/actions/runs/{id}` — the run record in GitHub's
+/// shape: the `status`/`conclusion`/`run_attempt`/`html_url` the
+/// edge's lease check decodes, plus the name and title a reader
+/// expects of a real run object.
+async fn get_run(State(state): State<LocalServerState>, params: Params) -> Response {
+    let Some(run_id) = run_id_param(&params) else {
+        return not_found();
+    };
+    run_response(&state, run_id)
+}
+
+/// `GET …/runs/{id}`'s body for a run the mock holds — 404 otherwise.
+fn run_response(state: &LocalServerState, run_id: u64) -> Response {
+    let Some(run) = state
+        .runs
+        .lock()
+        .expect("runs mutex poisoned")
+        .get(&run_id.to_string())
+        .cloned()
+    else {
+        return not_found();
+    };
+    json_response(
+        &serde_json::json!({
+            "id": run.workflow_run_id,
+            "name": workflow_name(&run.path),
+            "display_title": run.display_title,
+            "status": run.status,
+            "conclusion": run.conclusion,
+            "run_attempt": RUN_ATTEMPT,
+            "html_url": run.html_url,
+            "path": run.path,
+            "event": "workflow_dispatch",
+            "head_branch": stow_types::trusted_builder::BRANCH,
+        }),
+        StatusCode::OK,
+    )
+}
+
+/// `per_page`/`page` of the attempt-jobs listing — GitHub defaults a
+/// jobs page to 30 rows.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+struct JobsQuery {
+    /// Rows per page — GitHub's default 30, capped at 100.
+    per_page: Option<u32>,
+    /// 1-based page index — GitHub's default 1.
+    page: Option<u32>,
+}
+
+/// `GET …/runs/{id}/attempts/{n}/jobs` — the run's recorded job rows
+/// in GitHub's `{"total_count", "jobs"}` envelope, paged at the
+/// request's `per_page` (default 30) with the `Link` header GitHub
+/// emits while a page follows, so the edge's pager walks real pages.
+async fn get_attempt_jobs(
+    State(state): State<LocalServerState>,
+    params: Params,
+    Query(query): Query<JobsQuery>,
+) -> Response {
+    let Some(run_id) = run_id_param(&params) else {
+        return not_found();
+    };
+    let Some(attempt) = params
+        .get("attempt")
+        .ok()
+        .and_then(|attempt| attempt.parse::<u32>().ok())
+    else {
+        return not_found();
+    };
+    attempt_jobs_response(&state, run_id, attempt, &query)
+}
+
+/// `GET …/attempts/{n}/jobs`'s page — 404 on a run the mock does not
+/// hold or an attempt it never ran (every mock run is attempt 1).
+fn attempt_jobs_response(
+    state: &LocalServerState,
+    run_id: u64,
+    attempt: u32,
+    query: &JobsQuery,
+) -> Response {
+    if attempt != RUN_ATTEMPT || !state.run_exists(run_id) {
+        return not_found();
+    }
+    let jobs = state
+        .jobs
+        .lock()
+        .expect("jobs mutex poisoned")
+        .get(&run_id)
+        .cloned()
+        .unwrap_or_default();
+    attempt_jobs_page(state, run_id, attempt, &jobs, query)
+}
+
+/// One page of a run's attempt jobs: `jobs` sliced at `query`'s
+/// `page`/`per_page`, plus the GitHub `Link` header — `next`/`last`
+/// while a page follows, `first`/`prev` once off the first page —
+/// whose URLs stay on this server's own origin so the edge's scoped
+/// pager follows them.
+fn attempt_jobs_page(
+    state: &LocalServerState,
+    run_id: u64,
+    attempt: u32,
+    jobs: &[RecordedJob],
+    query: &JobsQuery,
+) -> Response {
+    let per_page = usize::try_from(query.per_page.unwrap_or(30).clamp(1, 100))
+        .expect("a clamped page size fits usize");
+    let page = usize::try_from(query.page.unwrap_or(1).max(1)).expect("a nonzero page fits usize");
+    let start = (page - 1).saturating_mul(per_page);
+    let mut response = json_response(
+        &serde_json::json!({
+            "total_count": jobs.len(),
+            "jobs": jobs.iter().skip(start).take(per_page).collect::<Vec<_>>(),
+        }),
+        StatusCode::OK,
+    );
+    let page_url = |page: usize| {
+        format!(
+            "http://{}/repos/{}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page={per_page}&page={page}",
+            state.listen,
+            stow_types::trusted_builder::REPOSITORY,
+        )
+    };
+    let mut links = Vec::new();
+    if start + per_page < jobs.len() {
+        links.push(format!("<{}>; rel=\"next\"", page_url(page + 1)));
+        links.push(format!(
+            "<{}>; rel=\"last\"",
+            page_url(jobs.len().div_ceil(per_page))
+        ));
+    }
+    if page > 1 {
+        links.push(format!("<{}>; rel=\"first\"", page_url(1)));
+        links.push(format!("<{}>; rel=\"prev\"", page_url(page - 1)));
+    }
+    if !links.is_empty() {
+        response.headers_mut().insert(
+            "link",
+            skyzen::header::HeaderValue::from_str(&links.join(", "))
+                .expect("link header values are visible ASCII"),
+        );
+    }
+    response
+}
+
+/// `POST …/runs/{id}/cancel` — GitHub's 202. Legs still queued stop
+/// where they are; running legs settle, then `drive_batch` reports the
+/// run `completed`/`cancelled` through the usual `workflow_run`
+/// webhook.
+async fn cancel_run(State(state): State<LocalServerState>, params: Params) -> Response {
+    let Some(run_id) = run_id_param(&params) else {
+        return not_found();
+    };
+    cancel_response(&state, run_id)
+}
+
+/// `POST …/cancel`'s answer: record the run's cancel when the mock
+/// holds it — 202 as GitHub answers — 404 when it does not.
+fn cancel_response(state: &LocalServerState, run_id: u64) -> Response {
+    let mut response = Response::new(Body::from(Vec::new()));
+    *response.status_mut() = if state.run_exists(run_id) {
+        state
+            .cancels
+            .lock()
+            .expect("cancels mutex poisoned")
+            .insert(run_id);
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::NOT_FOUND
+    };
+    response
 }
 
 /// `POST /dispatch` — the scheduler's one local fan-out: `build-batch`
@@ -446,6 +736,7 @@ fn dispatch_batch(state: LocalServerState, batch: BuildBatchPayload) -> Response
         "in_progress",
         None,
     );
+    state.seed_legs(workflow_run_id, &batch);
     let response = dispatch_response(&run);
     tokio::spawn(drive_batch(state, batch, workflow_run_id));
     json_response(&response, StatusCode::ACCEPTED)
@@ -456,7 +747,10 @@ fn dispatch_batch(state: LocalServerState, batch: BuildBatchPayload) -> Response
 /// in `GET /tasks`, so a caller that sees no batch run in progress
 /// knows no callback is still in flight (scripts/traffic-cost.sh).
 async fn drive_batch(state: LocalServerState, batch: BuildBatchPayload, workflow_run_id: u64) {
-    let failure = match run_legs(&state, &batch, workflow_run_id).await {
+    // `failure` is the run's conclusion cause; `run_error` is only the
+    // failure no leg owns — each failed leg carries its own error on
+    // its `LocalCiLeg`, so the joined summary never lands on the run.
+    let (failure, run_error) = match run_legs(&state, &batch, workflow_run_id).await {
         Ok((root, failures)) => {
             let failure = failures.first().map(|first| {
                 format!(
@@ -474,17 +768,26 @@ async fn drive_batch(state: LocalServerState, batch: BuildBatchPayload, workflow
                     tracing::error!(%error, root = %root.display(), "remove the landed run's directory");
                 }
             }
-            failure
+            (failure, None)
         }
-        Err(error) => Some(format!("local CI dispatch failed: {error}")),
+        Err(error) => {
+            let error = format!("local CI dispatch failed: {error}");
+            (Some(error.clone()), Some(error))
+        }
     };
-    let conclusion = if failure.is_some() {
+    // A cancel the run collected while its legs ran outranks their
+    // own conclusions, exactly as GitHub reports `cancelled`.
+    let conclusion = if state.cancel_requested(workflow_run_id) {
+        "cancelled"
+    } else if failure.is_some() {
         "failure"
     } else {
         "success"
     };
     if let Some(error) = &failure {
         tracing::error!(batch_id = %batch.batch_id, %error, "local CI batch run failed");
+    }
+    if let Some(error) = &run_error {
         state.record_error(workflow_run_id, error);
     }
     let report = batch_workflow_run(
@@ -700,7 +1003,19 @@ async fn run_legs(
         match handle.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => failures.push(error),
-            Err(error) => failures.push(format!("leg {leg} task failed: {error}")),
+            Err(error) => {
+                // The leg's task died before it could settle its own
+                // entry: settle it here, with the error it never wrote.
+                let error = format!("leg {leg} task failed: {error}");
+                state.set_leg(
+                    workflow_run_id,
+                    batch.tasks[leg].leg,
+                    "completed",
+                    Some("failure"),
+                    Some(&error),
+                );
+                failures.push(error);
+            }
         }
     }
     Ok((root, failures))
@@ -720,6 +1035,23 @@ async fn run_leg(run: Arc<BatchRun>, leg: usize) -> Result<(), String> {
     let workflow_run_id = run.workflow_run_id;
     let task = &run.batch.tasks[leg];
 
+    if state.cancel_requested(workflow_run_id) {
+        // A queued matrix job whose run was cancelled never gets a
+        // runner: its row reads `cancelled`, and the publish `if:`
+        // gate skips exactly as a failed build's does.
+        state.close_unstarted_job(workflow_run_id, build_job_name(task), "cancelled");
+        state.skip_job(workflow_run_id, publish_job_name(task));
+        state.set_leg(
+            workflow_run_id,
+            task.leg,
+            "completed",
+            Some("cancelled"),
+            None,
+        );
+        return Ok(());
+    }
+    state.set_leg(workflow_run_id, task.leg, "in_progress", None, None);
+
     let build_job = state.begin_job(workflow_run_id, build_job_name(task), BUILD_JOB_STEPS);
     let layout = match build_stage(&run, leg).await {
         Ok(layout) => {
@@ -733,6 +1065,7 @@ async fn run_leg(run: Arc<BatchRun>, leg: usize) -> Result<(), String> {
             layout
         }
         Err(error) => {
+            let error = format!("leg {leg} build: {error}");
             state.finish_job(
                 workflow_run_id,
                 build_job,
@@ -740,7 +1073,14 @@ async fn run_leg(run: Arc<BatchRun>, leg: usize) -> Result<(), String> {
                 &["failure", "success"],
             );
             state.skip_job(workflow_run_id, publish_job_name(task));
-            return Err(format!("leg {leg} build: {error}"));
+            state.set_leg(
+                workflow_run_id,
+                task.leg,
+                "completed",
+                Some("failure"),
+                Some(&error),
+            );
+            return Err(error);
         }
     };
 
@@ -748,11 +1088,26 @@ async fn run_leg(run: Arc<BatchRun>, leg: usize) -> Result<(), String> {
     match publish_stage(&run, leg, &layout).await {
         Ok(()) => {
             state.finish_job(workflow_run_id, publish_job, "success", &["success"]);
+            state.set_leg(
+                workflow_run_id,
+                task.leg,
+                "completed",
+                Some("success"),
+                None,
+            );
             Ok(())
         }
         Err(error) => {
+            let error = format!("leg {leg} publish: {error}");
             state.finish_job(workflow_run_id, publish_job, "failure", &["failure"]);
-            Err(format!("leg {leg} publish: {error}"))
+            state.set_leg(
+                workflow_run_id,
+                task.leg,
+                "completed",
+                Some("failure"),
+                Some(&error),
+            );
+            Err(error)
         }
     }
 }
@@ -1117,9 +1472,12 @@ mod tests {
     use tokio::sync::Semaphore;
 
     use super::{
-        BUILD_JOB_STEPS, BatchRun, LocalServerState, PUBLISH_JOB_STEPS, WorkflowRunReport,
-        build_job_name, dispatch_response, publish_job_name, run_leg,
+        BUILD_JOB_STEPS, BatchRun, JobsQuery, LocalServerState, PUBLISH_JOB_STEPS, RUN_ATTEMPT,
+        RecordedJob, WorkflowRunReport, attempt_jobs_page, attempt_jobs_response, build_job_name,
+        cancel_response, dispatch_response, publish_job_name, run_leg, run_response,
     };
+
+    use skyzen::StatusCode;
 
     fn state() -> LocalServerState {
         LocalServerState::new(String::new(), String::new(), String::new(), String::new())
@@ -1299,6 +1657,199 @@ mod tests {
             .collect();
         assert_eq!(steps, VERDICT_STEPS);
         drop(jobs);
+    }
+
+    /// A recorded job row for the paging tests — the page decoder
+    /// reads only the envelope and the rows.
+    fn recorded_job(id: u64) -> RecordedJob {
+        RecordedJob {
+            id,
+            name: format!("job {id}"),
+            status: "completed",
+            conclusion: Some("success"),
+            started_at: None,
+            completed_at: None,
+            run_attempt: RUN_ATTEMPT,
+            html_url: String::new(),
+            steps: Vec::new(),
+        }
+    }
+
+    /// A jobs page response's row count and raw `Link` header.
+    async fn page_parts(response: skyzen::Response) -> (usize, Option<String>) {
+        let link = response
+            .headers()
+            .get("link")
+            .map(|value| value.to_str().expect("link is ASCII").to_owned());
+        let body: serde_json::Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .into_bytes()
+                .await
+                .expect("page body reads"),
+        )
+        .expect("jobs page is JSON");
+        (body["jobs"].as_array().expect("jobs array").len(), link)
+    }
+
+    /// A 40-leg batch's 80 jobs page at the request's `per_page` — the
+    /// default 30 gives three pages and `Link`'s `rel="next"` keeps
+    /// walking on the mock's own origin until the last.
+    #[tokio::test]
+    async fn attempt_jobs_pages_at_the_requested_size() {
+        let mut state = state();
+        state.listen = "127.0.0.1:28124".parse().unwrap();
+        let run_id = state.allocate_id();
+        let jobs: Vec<RecordedJob> = (0..80).map(recorded_job).collect();
+
+        // The default page is GitHub's 30; `next` stays on the mock's
+        // own origin so the edge's scoped pager follows it.
+        let (len, link) = page_parts(attempt_jobs_page(
+            &state,
+            run_id,
+            RUN_ATTEMPT,
+            &jobs,
+            &JobsQuery {
+                per_page: None,
+                page: None,
+            },
+        ))
+        .await;
+        assert_eq!(len, 30);
+        let next = stow_types::runs::link_next(link.as_deref()).expect("page 1 has next");
+        assert!(
+            next.starts_with(&format!("http://{}/", state.listen)),
+            "{next} stays on the mock's origin"
+        );
+        assert!(next.contains("page=2"), "{next}");
+
+        // A middle page links both ways: `next`/`last` onward,
+        // `first`/`prev` back.
+        let (len, link) = page_parts(attempt_jobs_page(
+            &state,
+            run_id,
+            RUN_ATTEMPT,
+            &jobs,
+            &JobsQuery {
+                per_page: Some(30),
+                page: Some(2),
+            },
+        ))
+        .await;
+        assert_eq!(len, 30);
+        let link = link.expect("page 2 links");
+        assert!(
+            stow_types::runs::link_next(Some(&link))
+                .expect("page 2 has next")
+                .contains("page=3")
+        );
+        assert!(link.contains("rel=\"last\""));
+        assert!(link.contains("rel=\"first\""));
+        assert!(link.contains("rel=\"prev\""));
+
+        // The last page ends the walk — no `next`.
+        let (len, link) = page_parts(attempt_jobs_page(
+            &state,
+            run_id,
+            RUN_ATTEMPT,
+            &jobs,
+            &JobsQuery {
+                per_page: Some(30),
+                page: Some(3),
+            },
+        ))
+        .await;
+        assert_eq!(len, 20);
+        assert!(stow_types::runs::link_next(link.as_deref()).is_none());
+
+        // `per_page=100` — the edge's own request — lands all 80 jobs
+        // of a 40-leg batch on one page.
+        let (len, link) = page_parts(attempt_jobs_page(
+            &state,
+            run_id,
+            RUN_ATTEMPT,
+            &jobs,
+            &JobsQuery {
+                per_page: Some(100),
+                page: Some(1),
+            },
+        ))
+        .await;
+        assert_eq!(len, 80);
+        assert!(link.is_none());
+    }
+
+    /// A run the mock never held — or an attempt it never ran — is
+    /// GitHub's 404 on every run endpoint.
+    #[test]
+    fn run_endpoints_404_unknown_runs_and_attempts() {
+        let state = state();
+        let run_id = state.allocate_id();
+        state.mark_run(
+            run_id,
+            "build-batch.yml",
+            "1.99.0-b0123",
+            "in_progress",
+            None,
+        );
+        assert_eq!(run_response(&state, run_id).status(), StatusCode::OK);
+        assert_eq!(
+            run_response(&state, state.allocate_id()).status(),
+            StatusCode::NOT_FOUND
+        );
+        let query = |page| JobsQuery {
+            per_page: None,
+            page,
+        };
+        assert_eq!(
+            attempt_jobs_response(&state, state.allocate_id(), RUN_ATTEMPT, &query(None)).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            attempt_jobs_response(&state, run_id, RUN_ATTEMPT + 1, &query(None)).status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            cancel_response(&state, run_id).status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            cancel_response(&state, state.allocate_id()).status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// A queued leg of a cancelled run records the GitHub shape — its
+    /// build `cancelled`, its publish `skipped`, the leg
+    /// `completed`/`cancelled` — and never spawns its stages.
+    #[tokio::test]
+    async fn a_cancelled_run_stops_legs_that_never_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state();
+        let run = batch_run(&state, &dir.path().join("stow-build"), true);
+        state.mark_run(
+            run.workflow_run_id,
+            "build-batch.yml",
+            "1.99.0-b0123",
+            "in_progress",
+            None,
+        );
+        state.seed_legs(run.workflow_run_id, &run.batch);
+        assert_eq!(
+            cancel_response(&state, run.workflow_run_id).status(),
+            StatusCode::ACCEPTED
+        );
+        run_leg(Arc::clone(&run), 0).await.unwrap();
+        let jobs = state.jobs.lock().unwrap();
+        let conclusions: Vec<_> = jobs[&run.workflow_run_id]
+            .iter()
+            .map(|job| job.conclusion)
+            .collect();
+        drop(jobs);
+        assert_eq!(conclusions, [Some("cancelled"), Some("skipped")]);
+        let leg = state.runs.lock().unwrap()[&run.workflow_run_id.to_string()].legs[0].clone();
+        assert_eq!(leg.status, "completed");
+        assert_eq!(leg.conclusion.as_deref(), Some("cancelled"));
     }
 
     /// A build stage that exits non-zero fails the `Run the untrusted

@@ -41,11 +41,39 @@ pub struct LocalCiRun {
     pub dispatched_at_ms: u64,
     /// When the run reached `completed`, Unix milliseconds.
     pub completed_at_ms: Option<u64>,
-    /// Why a failed run failed — the stage's own final error, so a
-    /// harness can name the cause without reading the server log.
+    /// A failure no single leg owns — the dispatch itself or a
+    /// `workflow_run` delivery — so a harness can name the cause
+    /// without reading the server log. It applies to every leg of the
+    /// run; a leg's own build or publish error rides
+    /// [`LocalCiLeg::error`] instead.
     pub error: Option<String>,
     /// Every `workflow_run` delivery attempt the edge refused, in order,
     /// including attempts a later retry recovered from: a delivery the
     /// edge answered with an error happened even when the run landed.
     pub delivery_errors: Vec<String>,
+    /// A build run's matrix legs (stow#833) — one per task the batch
+    /// carries, in batch order. A `resolve-request` run has none: it
+    /// fans nothing out.
+    pub legs: Vec<LocalCiLeg>,
+}
+
+/// One leg of a batched build run — the per-task row `GET /tasks`
+/// folds to a task state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalCiLeg {
+    /// The leg's index into the batch's `tasks` —
+    /// [`crate::api::BatchTask::leg`].
+    pub leg: u32,
+    /// The scheduler task id the leg builds —
+    /// [`crate::api::BatchTask::task_id`].
+    pub task_id: String,
+    /// `queued`, `in_progress`, or `completed` — the GitHub Actions
+    /// `status` field's spelling, per leg.
+    pub status: String,
+    /// `success`, `failure` or `cancelled` once `status` is
+    /// `completed`; `null` before, exactly like the API.
+    pub conclusion: Option<String>,
+    /// That leg's build or publish error — `None` for a leg that
+    /// succeeded or has not finished.
+    pub error: Option<String>,
 }

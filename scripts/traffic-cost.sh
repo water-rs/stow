@@ -205,7 +205,7 @@ http_listening() {
 # callback, so nothing a previous step dispatched is still landing.
 builds_drained() {
     curl -sf --max-time 5 "http://${LOCAL_CI_ADDR}/tasks" | jq -e '
-        [.tasks[] | select(.path == ".github/workflows/build-crate.yml")
+        [.tasks[] | select(.path == ".github/workflows/build-batch.yml")
                   | select(.status != "completed")] | length == 0' >/dev/null
 }
 

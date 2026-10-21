@@ -289,11 +289,11 @@ enum Dispatch {
     },
 }
 
-/// One run's state as the driver reads it — task-id keyed, so the
-/// GitHub `workflow_runs` rows (`display_title`) and the local server's
-/// `LocalCiRun` list fold onto the same record. Both title shapes parse
-/// through `parse_run_title`: a run whose title is not `<rustc>-<task_id>`
-/// is not one this wave could have dispatched.
+/// One task's run state as the driver reads it — task-id keyed, so the
+/// GitHub `workflow_runs` rows (`display_title`, parsed through
+/// `parse_run_title`) and the local server's per-leg `LocalCiRun` rows
+/// fold onto the same record. A run this wave could not have dispatched
+/// never produces one.
 #[derive(Debug, Clone)]
 struct RunState {
     task_id: String,
@@ -2444,9 +2444,9 @@ fn bound_run_state(
     }))
 }
 
-/// The local CI server's `/tasks` rows folded to run states — the same
-/// contract the mock always had: title-parsed, this wave's rustc, open
-/// tasks only.
+/// The local CI server's `/tasks` rows folded to run states — one
+/// `RunState` per leg of each batch run, the same contract the mock
+/// always had: this wave's rustc, open tasks only.
 async fn local_run_states(
     base: &str,
     open: &BTreeSet<String>,
@@ -2459,19 +2459,25 @@ async fn local_run_states(
         crate::github::get_url_json(&url, None, Backoff::new()).await?;
     Ok(tasks
         .tasks
-        .into_iter()
-        .filter_map(|run| {
-            let (rustc, task_id) = parse_run_title(&run.display_title)?;
-            (rustc == rustc_version.as_str() && open.contains(task_id)).then(|| RunState {
-                task_id: task_id.to_owned(),
-                workflow_run_id: run.workflow_run_id,
-                status: run.status,
-                conclusion: run.conclusion,
-                url: run.html_url,
-                head_sha: String::new(),
-                run_attempt: 1,
-                created_at: None,
-            })
+        .iter()
+        .filter(|run| {
+            stow_types::records::parse_batch_run_title(&run.display_title)
+                .is_some_and(|(rustc, _)| rustc == rustc_version.as_str())
+        })
+        .flat_map(|run| {
+            run.legs
+                .iter()
+                .filter(|leg| open.contains(&leg.task_id))
+                .map(move |leg| RunState {
+                    task_id: leg.task_id.clone(),
+                    workflow_run_id: run.workflow_run_id,
+                    status: leg.status.clone(),
+                    conclusion: leg.conclusion.clone(),
+                    url: run.html_url.clone(),
+                    head_sha: String::new(),
+                    run_attempt: 1,
+                    created_at: None,
+                })
         })
         .collect())
 }
@@ -3496,7 +3502,7 @@ mod tests {
             crate::test_server::Step::Respond {
                 status: 200,
                 retry_after: None,
-                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7","path":".github/workflows/build-crate.yml","dispatched_at_ms":0,"completed_at_ms":0,"error":null,"delivery_errors":[]}]}"#,
+                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-b0123456789abcdef0123456789abcdef","status":"completed","conclusion":"success","html_url":"http://localhost/run/7","path":".github/workflows/build-batch.yml","dispatched_at_ms":0,"completed_at_ms":0,"error":null,"delivery_errors":[],"legs":[{"leg":0,"task_id":"taskabc","status":"completed","conclusion":"success"}]}]}"#,
             },
         ])
         .await;
@@ -3847,8 +3853,8 @@ mod tests {
     /// The in-test local CI server `Dispatch::Local` drives: it
     /// records every `/dispatch` it is scripted to take, answers the
     /// scripted 500s — one after recording the task, one without —
-    /// and serves the recorded runs on `GET /tasks`, the same shape
-    /// `stow-build serve` speaks.
+    /// and serves the recorded runs on `GET /tasks` as one-leg batch
+    /// runs, the same shape `stow-build serve` speaks.
     struct MockCi {
         url: String,
         state: std::sync::Arc<std::sync::Mutex<MockCiState>>,
@@ -3868,6 +3874,47 @@ mod tests {
         unrecorded: BTreeSet<String>,
         next_id: u64,
         rustc: String,
+    }
+
+    /// `GET /tasks` of the mock CI: every recorded dispatch as a
+    /// completed one-leg batch run, the same shape `stow-build serve`
+    /// speaks.
+    async fn mock_tasks(
+        axum::extract::State(state): axum::extract::State<
+            std::sync::Arc<std::sync::Mutex<MockCiState>>,
+        >,
+    ) -> axum::Json<serde_json::Value> {
+        let tasks: Vec<serde_json::Value> = {
+            let state = state.lock().expect("mock state");
+            state
+                .recorded
+                .iter()
+                .map(|(task_id, run_id)| {
+                    serde_json::json!({
+                        "workflow_run_id": run_id,
+                        "display_title": format!("{}-b{run_id:032x}", state.rustc),
+                        "path": format!(
+                            ".github/workflows/{}",
+                            stow_types::trusted_builder::BATCH_WORKFLOW_FILE
+                        ),
+                        "status": "completed",
+                        "conclusion": "success",
+                        "html_url": format!("http://localhost/run/{run_id}"),
+                        "dispatched_at_ms": 0,
+                        "completed_at_ms": 0,
+                        "error": null,
+                        "delivery_errors": [],
+                        "legs": [{
+                            "leg": 0,
+                            "task_id": task_id,
+                            "status": "completed",
+                            "conclusion": "success",
+                        }],
+                    })
+                })
+                .collect()
+        };
+        axum::Json(serde_json::json!({ "tasks": tasks }))
     }
 
     impl MockCi {
@@ -3924,40 +3971,7 @@ mod tests {
                         },
                     ),
                 )
-                .route(
-                    "/tasks",
-                    axum::routing::get(
-                        |axum::extract::State(state): axum::extract::State<
-                            std::sync::Arc<std::sync::Mutex<MockCiState>>,
-                        >| async move {
-                            let tasks: Vec<serde_json::Value> = {
-                                let state = state.lock().expect("mock state");
-                                state
-                                    .recorded
-                                    .iter()
-                                    .map(|(task_id, run_id)| {
-                                        serde_json::json!({
-                                            "workflow_run_id": run_id,
-                                            "display_title": format!("{}-{task_id}", state.rustc),
-                                            "path": format!(
-                                                ".github/workflows/{}",
-                                                stow_types::trusted_builder::WORKFLOW_FILE
-                                            ),
-                                            "status": "completed",
-                                            "conclusion": "success",
-                                            "html_url": format!("http://localhost/run/{run_id}"),
-                                            "dispatched_at_ms": 0,
-                                            "completed_at_ms": 0,
-                                            "error": null,
-                                            "delivery_errors": [],
-                                        })
-                                    })
-                                    .collect()
-                            };
-                            axum::Json(serde_json::json!({ "tasks": tasks })).into_response()
-                        },
-                    ),
-                )
+                .route("/tasks", axum::routing::get(mock_tasks))
                 .with_state(shared);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
