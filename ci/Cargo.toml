@@ -55,6 +55,8 @@ heel = { version = "0.5", default-features = false }
 utoipa.workspace = true
 executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread", "sync"] }
+# Run-record timestamps, serialized as GitHub spells them.
+time = { version = "0.3", default-features = false, features = ["std", "serde-well-known"] }
 async-net = "2"
 # The machine check on every object the plan stage packs — objects and
 # archive members only, never image parsing (`read` covers COFF, ELF,

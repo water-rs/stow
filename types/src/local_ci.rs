@@ -19,9 +19,9 @@ pub struct LocalCiTasks {
 pub struct LocalCiRun {
     /// Numeric GitHub-compatible run identity, stable for this dispatch.
     pub workflow_run_id: u64,
-    /// The run's name — `<rustc>-<task_id>` for a build
-    /// ([`crate::records::run_title`]), the same shape `build-crate.yml`'s
-    /// `run-name` stamps on the real API.
+    /// The run's name — `<rustc>-b<batch_id>` for a build batch
+    /// ([`crate::records::batch_run_title`]), the same shape
+    /// `build-batch.yml`'s `run-name` stamps on the real API.
     pub display_title: String,
     /// `queued`, `in_progress`, or `completed` — the GitHub Actions
     /// `status` field's spelling.
