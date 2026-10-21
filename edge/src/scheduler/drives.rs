@@ -56,8 +56,9 @@ pub enum PriorAlarm {
 /// `error_msg`, `deps_met`, `blocked`, `wake_at`),
 /// `requeue_incomplete_shape_deps` (`status`, `attempt`, `error_msg`,
 /// `deps_met`, `blocked`, `not_before`, `wake_at`,
-/// `shape_requeue`), and `apply_key_updates` (`value`, `dispatch_key`,
-/// `dispatch_eligible`) on the transitioned ids (stow#525).
+/// `shape_requeue`), `apply_key_updates` (`value`, `dispatch_key`,
+/// `dispatch_eligible`) on the transitioned ids (stow#525), and the
+/// claim's batch binding (`batch_id`, `batch_leg`; stow#833).
 #[derive(Debug, Clone, skyzen::FromRow)]
 pub struct RestoreQueueRow {
     task_id: String,
@@ -81,6 +82,8 @@ pub struct RestoreQueueRow {
     claimed_at: Option<String>,
     updated_at: Option<String>,
     shape_requeue: i64,
+    batch_id: Option<String>,
+    batch_leg: Option<i64>,
 }
 
 /// The `RestoreQueueRow` column list, kept beside the struct so the
@@ -88,7 +91,8 @@ pub struct RestoreQueueRow {
 const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, \
      deps_met, blocked, not_before, wake_at, CAST(value AS TEXT) AS value, dispatch_key, \
      dispatch_eligible, \
-     generation_id, dispatch_attempts, github_run_id, claimed_at, updated_at, shape_requeue";
+     generation_id, dispatch_attempts, github_run_id, claimed_at, updated_at, shape_requeue, \
+     batch_id, batch_leg";
 
 /// What a drive may reach besides the metered queue `DurableDb`.
 ///
@@ -1143,8 +1147,10 @@ pub const DRIVES: &[Drive] = &[
                     .map(|_| ())
             })
         },
-        cleanup: Some(|db, _shape, _settings, ctx| {
-            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(
+                async move { restore_claim_surface(db, shape, &ctx.take_restore_rows()).await },
+            )
         }),
     },
     Drive {
@@ -1203,8 +1209,10 @@ pub const DRIVES: &[Drive] = &[
                     .map(|_| ())
             })
         },
-        cleanup: Some(|db, _shape, _settings, ctx| {
-            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(
+                async move { restore_claim_surface(db, shape, &ctx.take_restore_rows()).await },
+            )
         }),
     },
     Drive {
@@ -1417,7 +1425,7 @@ pub const DRIVES: &[Drive] = &[
                 Ok(())
             })
         },
-        cleanup: Some(|db, _shape, settings, ctx| {
+        cleanup: Some(|db, shape, settings, ctx| {
             Box::pin(async move {
                 let mut errors: Vec<String> = Vec::new();
                 // Leak check FIRST, on the live post-pass flags: every
@@ -1448,7 +1456,7 @@ pub const DRIVES: &[Drive] = &[
                         Err(error) => errors.push(format!("leak check: {error}")),
                     }
                 }
-                if let Err(error) = restore_snapshot_rows(db, &snapshot).await {
+                if let Err(error) = restore_claim_surface(db, shape, &snapshot).await {
                     errors.push(error);
                 }
                 // Restore the fixture's floor through the same
@@ -1489,7 +1497,13 @@ pub const DRIVES: &[Drive] = &[
                     .map(|_| ())
             })
         },
-        cleanup: None,
+        // The pass's claimed queue rows stay claimed — the re-arm
+        // restores exactly that recorded set — but the batch rows its
+        // claim inserted are not part of that record: they go now, so
+        // no later drive reads their slots.
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { restore_batches(db, shape).await })
+        }),
     },
     Drive {
         // The same pass with dispatch paused: the claim returns early,
@@ -2131,7 +2145,7 @@ async fn restore_snapshot_rows(db: &DurableDb, snapshot: &[RestoreQueueRow]) -> 
                      dispatch_key = ?, dispatch_eligible = ?, \
                      generation_id = ?, dispatch_attempts = ?, \
                      github_run_id = ?, claimed_at = ?, updated_at = ?, \
-                     shape_requeue = ? \
+                     shape_requeue = ?, batch_id = ?, batch_leg = ? \
                  WHERE task_id = ?",
             )
             .bind(row.status.clone())
@@ -2150,6 +2164,8 @@ async fn restore_snapshot_rows(db: &DurableDb, snapshot: &[RestoreQueueRow]) -> 
             .bind(row.claimed_at.clone())
             .bind(row.updated_at.clone())
             .bind(row.shape_requeue)
+            .bind(row.batch_id.clone())
+            .bind(row.batch_leg)
             .bind(row.task_id.clone())
             .execute()
             .await
@@ -2166,6 +2182,33 @@ async fn restore_snapshot_rows(db: &DurableDb, snapshot: &[RestoreQueueRow]) -> 
     } else {
         Err(errors.join("; "))
     }
+}
+
+/// A claiming drive's whole cleanup: the snapshotted queue rows back to
+/// their preimage and `build_batches` back to the fixture's own
+/// one-slot rows, so the batch rows the claim created never reach the
+/// next drive's capacity read. Both halves run whatever the other
+/// returns.
+async fn restore_claim_surface(
+    db: &DurableDb,
+    shape: FixtureShape,
+    snapshot: &[RestoreQueueRow],
+) -> Result<(), String> {
+    let rows = restore_snapshot_rows(db, snapshot).await;
+    let batches = restore_batches(db, shape).await;
+    match (rows, batches) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(rows), Err(batches)) => Err(format!("{rows}; {batches}")),
+    }
+}
+
+/// [`super::fixture::restore_batch_rows`] with the drive cleanup's
+/// error type.
+async fn restore_batches(db: &DurableDb, shape: FixtureShape) -> Result<(), String> {
+    super::fixture::restore_batch_rows(db, shape)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// Slice rows a delta report moves — retired from the live set plus the

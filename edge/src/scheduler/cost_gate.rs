@@ -291,8 +291,11 @@ const BUDGETS: &[RouteBudget] = &[
     // legitimate bound: the report body names every row).
     // The whole route (stow#785): the report — with its commit-time
     // shape repair — plus the `dispatch_pending` claiming tail and
-    // wake re-plan. The 10k host gate measured 37 statements, 106
-    // reads, 101 writes.
+    // wake re-plan. The 10k host gate measured 21 statements, 216
+    // reads, 151 writes. The tail's pass claims at most free slots /
+    // `STOW_BATCH_PARALLELISM` × `STOW_BATCH_MAX_TASKS` legs; the
+    // thirty one-slot in-flight batches leave 15 of the 45 slots, and
+    // the pass fills them with 15 human legs.
     RouteBudget {
         name: "POST /index/published (full)",
         statements: 90,
@@ -306,7 +309,8 @@ const BUDGETS: &[RouteBudget] = &[
     // slice or the graph (stow#521) — plus the same dispatch tail as
     // the full drive and the report-time shape repair, which can
     // requeue the deps the retire just uncovered. The 10k host gate
-    // measured 39 statements, 171 reads, 84 writes.
+    // measured 24 statements, 301 reads, 217 writes, the tail's claim
+    // bounded as the full drive's is.
     RouteBudget {
         name: "POST /index/published (delta)",
         statements: 110,
@@ -864,6 +868,7 @@ async fn run_one_drive(
 ) -> Result<(), String> {
     let mut keep = 0;
     let mut base = 0;
+    let batches_before = batch_surface(db).await;
     let outcome =
         drives::drive_lifecycle(
             drive,
@@ -906,6 +911,18 @@ async fn run_one_drive(
         Some(Err(error)) => Err(format!("{} cleanup failed: {error}", drive.name)),
         _ => Ok(()),
     };
+    // A drive that claims leaves `build_batches` as it found it: the
+    // slots its claim took must not reach the next drive's capacity
+    // read.
+    let end = log.lock().expect("statement log").len();
+    let batches_after = batch_surface(db).await;
+    log.lock().expect("statement log").truncate(end);
+    if batches_before != batches_after {
+        return Err(format!(
+            "{} left build_batches changed: before {batches_before:?}, after {batches_after:?}",
+            drive.name
+        ));
+    }
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => {
             let statements = log.lock().expect("statement log")[base..].to_vec();
@@ -920,6 +937,19 @@ async fn run_one_drive(
             drive.name
         )),
     }
+}
+
+/// Every `build_batches` row's identity and slot facts, sorted — the
+/// stamps (`claimed_at`, `lease_at`) are clock readings and left out.
+async fn batch_surface(db: &DurableDb) -> Vec<String> {
+    db.query(
+        "SELECT batch_id || '|' || rustc_version || '|' || dispatch_family || '|' || lane \
+                || '|' || parallelism || '|' || legs || '|' || COALESCE(github_run_id, '') \
+         FROM build_batches ORDER BY batch_id",
+    )
+    .fetch_scalars::<String>()
+    .await
+    .expect("read build_batches")
 }
 
 /// Every entry of [`drives::DRIVES`] holds its budget on the 10k gate
@@ -1143,6 +1173,7 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
         .await
         .expect("re-arm (baseline)");
+    let seeded_batches = batch_surface(&db).await;
     // The fixture seeds `attempt_outcome_buckets` to sized bulk, so the
     // target's `outcomes` sum is the seed's plus each pass's own
     // transition — the delta is what counts once per completion.
@@ -1178,6 +1209,11 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
         .await
         .expect("re-arm fixture");
     assert_rearm_gate_truth(&db, shape, &claimed).await;
+    assert_eq!(
+        batch_surface(&db).await,
+        seeded_batches,
+        "re-arm returns build_batches to the fixture's in-flight batches"
+    );
 
     for (n, status, _) in untouched {
         let id = format!("{n:064x}");

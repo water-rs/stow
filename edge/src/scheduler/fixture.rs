@@ -12,8 +12,10 @@
 //! Shape, in queue-order `n`:
 //! * `n <= pending_end` are `pending` — about 60% of the queue;
 //! * the next ~35% are `completed`, ~2.5% `failed`, and exactly thirty
-//!   `dispatched`/`running` rows — fewer than the default 45-slot
-//!   dispatch limit so the alarm's claim walk actually runs;
+//!   `dispatched`/`running` rows — each a one-slot batch leg with its
+//!   own `build_batches` row, so the thirty hold thirty runner slots,
+//!   fewer than the default 45-slot dispatch limit and the alarm's
+//!   claim walk actually runs;
 //! * the human lane inside the pending range is the pin window alone —
 //!   the claimable pending span is the planted window, and every other
 //!   pending row parks `dispatch_eligible = 0` below the admission
@@ -375,7 +377,99 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "claimed_at",
     "dispatch_eligible",
     "demand",
+    "batch_id",
+    "batch_leg",
 ];
+
+/// The seed's `rustc_version` expression over `n`.
+const RUSTC_CASE_SQL: &str = "CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END";
+
+/// The in-flight rows' `batch_id` expression over `n`: the low 32 hex
+/// digits of the row's `%064x` task id — the high half is zero at any
+/// fixture size, so the low half is what tells two rows apart — and
+/// NULL outside the in-flight range.
+fn in_flight_batch_id_sql(failed_end: u32, in_flight_end: u32) -> String {
+    format!(
+        "CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
+              THEN substr(printf('%064x', n), 33) ELSE NULL END"
+    )
+}
+
+/// The in-flight rows' `batch_id, batch_leg` seed columns: each row is
+/// leg 0 of its own batch.
+fn in_flight_batch_binding_sql(failed_end: u32, in_flight_end: u32) -> String {
+    format!(
+        "{}, CASE WHEN n > {failed_end} AND n <= {in_flight_end} THEN 0 ELSE NULL END",
+        in_flight_batch_id_sql(failed_end, in_flight_end)
+    )
+}
+
+/// The statement that gives every in-flight queue row among `seq_source`
+/// its one-slot `build_batches` row, so in-flight work holds dispatch
+/// slots the way a claimed leg does: `parallelism = 1`, `legs = 1`, the
+/// row's own family, rustc and lane, a bound `github_run_id`, and the
+/// in-flight rows' heartbeat shape — claimed at the same instant the
+/// queue row models, leased a day ahead so the lease check never
+/// reaches them however long a drive runs. An upsert by batch id, so a
+/// replay or a restore rewrites a row a drive moved.
+fn in_flight_batches_upsert_sql(shape: FixtureShape, seq_source: &str) -> String {
+    let pending_end = shape.pending_end();
+    let failed_end = shape.failed_end();
+    let in_flight_end = failed_end + FixtureShape::IN_FLIGHT_ROWS;
+    let human_end = FixtureShape::HUMAN_LANE_ROWS;
+    let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
+    let family =
+        crate::scheduler::queue::dispatch_family_sql(&format!("({})", target_case_sql("n")));
+    let lane = fixture_lane_case_sql(pending_end, human_pin, human_end);
+    let batch_id = in_flight_batch_id_sql(failed_end, in_flight_end);
+    format!(
+        "WITH RECURSIVE seq(n) AS ({seq_source}) \
+         INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              github_run_id, claimed_at, lease_at) \
+         SELECT {batch_id}, {RUSTC_CASE_SQL}, {family}, {lane}, 1, 1, 'run-' || n, \
+                datetime('now', '-30 minutes'), datetime('now', '+1 day') \
+         FROM seq WHERE n > {failed_end} AND n <= {in_flight_end} \
+         ON CONFLICT(batch_id) DO UPDATE SET \
+             rustc_version = excluded.rustc_version, \
+             dispatch_family = excluded.dispatch_family, lane = excluded.lane, \
+             parallelism = excluded.parallelism, legs = excluded.legs, \
+             github_run_id = excluded.github_run_id, done_run_id = NULL, \
+             done_attempt = NULL, conclusion = NULL, done_at = NULL, \
+             resolve_after = NULL, claimed_at = excluded.claimed_at, \
+             lease_at = excluded.lease_at"
+    )
+}
+
+/// Restore `build_batches` to exactly the fixture's own rows: delete
+/// every batch a claim created and rewrite the in-flight rows' one-slot
+/// batches. A drive whose run claims calls this from its cleanup, so a
+/// batch row a claim inserted — or a fixture row its legless-batch
+/// release dropped — never reaches the next drive's capacity read. The
+/// table holds at most the dispatch slot cap of rows, so both
+/// statements are bounded by the dispatch cap, never by the queue.
+pub async fn restore_batch_rows(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+    let failed_end = shape.failed_end();
+    let in_flight_end = failed_end + FixtureShape::IN_FLIGHT_ROWS;
+    db.query(&format!(
+        "WITH RECURSIVE seq(n) AS ({seq}) \
+         DELETE FROM build_batches \
+         WHERE batch_id NOT IN (SELECT {batch_id} FROM seq)",
+        seq = seq_sql(failed_end, in_flight_end),
+        batch_id = in_flight_batch_id_sql(failed_end, in_flight_end),
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("delete claim-created batches: {error}"))?;
+    db.query(&in_flight_batches_upsert_sql(
+        shape,
+        &seq_sql(failed_end, in_flight_end),
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("restore in-flight batches: {error}"))?;
+    Ok(())
+}
 
 /// The seed's `lane` expression over `n`.
 ///
@@ -522,7 +616,7 @@ fn queue_seed_insert_sql(
                 '1.' || (n / 20000) || '.' || (n % 500), \
                 '[]', \
                 {target_case}, \
-                CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
+                {RUSTC_CASE_SQL}, \
                 n % 5000, 1, n % 7, \
                 CASE WHEN n <= {pending_end} THEN 'pending' \
                      WHEN n <= {completed_end} THEN 'completed' \
@@ -544,7 +638,7 @@ fn queue_seed_insert_sql(
                 0, 0, {wake}, {family}, {value}, {key}, \
                 CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
                      THEN datetime('now', '-30 minutes') ELSE NULL END, \
-                {eligible}, 0 \
+                {eligible}, 0, {batch_binding} \
          FROM seq \
          {conflict}",
         columns = QUEUE_SEED_COLUMNS.join(", "),
@@ -561,8 +655,7 @@ fn queue_seed_insert_sql(
             "(n % 7)",
             "0",
         ),
-        key = key,
-        eligible = eligible,
+        batch_binding = in_flight_batch_binding_sql(failed_end, in_flight_end),
     )
 }
 
@@ -613,6 +706,12 @@ pub async fn seed_queue_chunk(
     .execute()
     .await
     .map_err(|error| format!("seed queue rows: {error}"))?;
+    // The in-flight rows hold dispatch slots: each gets its one-slot
+    // batch in the chunk that seeds it.
+    db.query(&in_flight_batches_upsert_sql(shape, &seq_sql(lo, hi)))
+        .execute()
+        .await
+        .map_err(|error| format!("seed in-flight batches: {error}"))?;
     Ok(())
 }
 
@@ -663,6 +762,19 @@ pub async fn restore_queue_rows(
         .execute()
         .await
         .map_err(|error| format!("restore seeded queue rows: {error}"))?;
+    // A restored in-flight row is a held slot again: its batch row is
+    // rewritten with it.
+    db.query(&in_flight_batches_upsert_sql(
+        shape,
+        "SELECT CAST(value AS INTEGER) FROM json_each(?)",
+    ))
+    .bind(
+        serde_json::to_string(ns)
+            .map_err(|error| QueueError::Sql(format!("encode restore row ids: {error}")))?,
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("restore in-flight batches: {error}"))?;
     Ok(())
 }
 
@@ -1185,6 +1297,9 @@ pub async fn rearm(
     // in `settings` under [`PROBE_CLAIMED_KEY`] so the set survives
     // between `POST /budget` calls.
     let claimed_ns = restore_claimed_rows(db, shape, min_age_minutes).await?;
+    // The hot pass's batch rows die with its claims; the in-flight
+    // rows' one-slot batches return whole.
+    restore_batch_rows(db, shape).await?;
     rearm_feed_window(db, shape).await?;
     // Row 101's seeded edge set: the resync's delta sync rewrote it.
     db.query("DELETE FROM queue_dependencies WHERE task_id = printf('%064x', ?)")
@@ -2591,6 +2706,107 @@ mod tests {
         );
     }
 
+    /// A coverage oracle that covers nothing — the cold-cache shape.
+    struct NothingCovered;
+
+    impl crate::scheduler::queue::CoverageOracle for NothingCovered {
+        fn covered(
+            &self,
+            _identities: &[crate::scheduler::queue::SemanticTaskIdentity],
+        ) -> impl std::future::Future<
+            Output = Result<
+                std::collections::BTreeSet<crate::scheduler::queue::SemanticTaskIdentity>,
+                QueueError,
+            >,
+        > + Send {
+            std::future::ready(Ok(std::collections::BTreeSet::new()))
+        }
+    }
+
+    /// The in-flight rows hold dispatch slots, and the planted window
+    /// outlasts one full batched pass on the slots they leave free:
+    /// a pass claims at most `free / k` batches of `B` legs, the
+    /// claimable planted rows exceed that, and a real pass over the
+    /// seeded fixture takes every slot it can from planted rows alone
+    /// — so the claim never reaches a row an earlier drive left
+    /// claimable, at any fixture size (the window is a constant).
+    #[tokio::test]
+    async fn planted_window_exceeds_one_full_batched_pass() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        seed_production_shape(&db, &GATE, settings.dispatch_min_age_minutes)
+            .await
+            .expect("seed");
+        let crate::scheduler::queue::Dispatch::Limited(limit) = settings.dispatch else {
+            panic!("default dispatch is limited");
+        };
+
+        let held: i64 = db
+            .query("SELECT SUM(parallelism) FROM build_batches")
+            .fetch_scalar()
+            .await
+            .expect("held slots");
+        let in_flight: i64 = db
+            .query("SELECT COUNT(*) FROM queue WHERE status IN ('dispatched', 'running')")
+            .fetch_scalar()
+            .await
+            .expect("in-flight rows");
+        assert_eq!(
+            (held, in_flight),
+            (
+                i64::from(FixtureShape::IN_FLIGHT_ROWS),
+                i64::from(FixtureShape::IN_FLIGHT_ROWS)
+            ),
+            "every in-flight row holds exactly one slot"
+        );
+        let unbound: i64 = db
+            .query(
+                "SELECT COUNT(*) FROM queue WHERE status IN ('dispatched', 'running') \
+                 AND (batch_id IS NULL OR batch_leg != 0 \
+                      OR batch_id NOT IN (SELECT batch_id FROM build_batches))",
+            )
+            .fetch_scalar()
+            .await
+            .expect("unbound in-flight rows");
+        assert_eq!(unbound, 0, "every in-flight row is leg 0 of its own batch");
+
+        let free = limit.get() - FixtureShape::IN_FLIGHT_ROWS;
+        let most_legs = free / settings.batch_parallelism * settings.batch_max_tasks;
+        let claimable: u32 = db
+            .query(
+                "SELECT COUNT(*) FROM queue WHERE status = 'pending' \
+                 AND dispatch_eligible = 1 AND deps_met = 1 AND blocked = 0 \
+                 AND not_before <= datetime('now')",
+            )
+            .fetch_scalar()
+            .await
+            .expect("claimable planted rows");
+        assert!(
+            claimable > most_legs,
+            "{claimable} claimable planted rows must exceed the {most_legs} legs one pass \
+             can claim on {free} free slots"
+        );
+
+        let claimed =
+            crate::scheduler::queue::claim_dispatchable_tasks(&db, &settings, &NothingCovered)
+                .await
+                .expect("claim");
+        let slots: u32 = claimed.iter().map(|batch| batch.parallelism).sum();
+        assert_eq!(slots, free, "the pass fills every free slot");
+        let window = (FixtureShape::HUMAN_LANE_ROWS - FixtureShape::HUMAN_PROBE_ROWS + 1)
+            ..=(FixtureShape::HUMAN_LANE_ROWS + FixtureShape::DISPATCH_ELIGIBLE_ROWS);
+        for task in claimed.iter().flat_map(|batch| &batch.tasks) {
+            let n = u32::try_from(
+                u64::from_str_radix(&task.task_id, 16).expect("fixture task ids are hex"),
+            )
+            .expect("fixture row number fits u32");
+            assert!(
+                window.contains(&n),
+                "claimed row {n} lies outside the planted window {window:?}"
+            );
+        }
+    }
+
     /// No fixture node may have a fan-in that grows with queue size:
     /// the dependents a purge or dep expansion walks are bounded by the
     /// shape's own constants, not by stored bulk (stow#588 — the first
@@ -2615,8 +2831,9 @@ mod tests {
                 .fetch_one::<FanIn>()
                 .await
                 .expect("fan-in");
-            // The pinned leaf takes the human-lane pin plus the
-            // DISPATCH_ELIGIBLE_ROWS window — under a hundred edges.
+            // The pinned pool takes the human-lane pin plus the
+            // DISPATCH_ELIGIBLE_ROWS window — under two hundred edges
+            // spread over 64 leaves.
             // Spread picks distribute the rest so no other dep node
             // comes near; the bound is comfortably above both because
             // the exact max is a spread detail the size check does not

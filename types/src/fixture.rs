@@ -32,8 +32,11 @@ impl FixtureShape {
     };
     /// The in-flight set — `dispatched`/`running` rows — capped so the
     /// dispatch limit still leaves slots for the claim pass to fill.
-    /// Held constant across fixture sizes: the alarm's claim is bounded
-    /// by this plus the dispatch cap, not by the queue.
+    /// Each row is a one-slot batch leg (the seed writes its
+    /// `build_batches` row too), so the set holds exactly this many
+    /// runner slots. Held constant across fixture sizes: the alarm's
+    /// claim is bounded by this plus the dispatch cap, not by the
+    /// queue.
     pub const IN_FLIGHT_ROWS: u32 = 30;
     /// Pending rows on the human lane — held constant so a lane-position
     /// probe reads the same depth at every fixture size.
@@ -57,7 +60,17 @@ impl FixtureShape {
     /// make the claimed set's dependency closure — and the dependents a
     /// purge or a dep expansion walks — a function of stored bulk
     /// instead of the claim's own bound (stow#588).
-    pub const DISPATCH_ELIGIBLE_ROWS: u32 = 64;
+    ///
+    /// Sized so one batched pass cannot drain it: the window plus the
+    /// human pins, minus the parked `n % 20 = 1` rows, exceeds the most
+    /// legs a pass can claim on the slots the in-flight rows leave free
+    /// (`(free slots / STOW_BATCH_PARALLELISM) × STOW_BATCH_MAX_TASKS`).
+    /// A window a pass can empty would let the claim reach rows an
+    /// earlier drive left claimable, and the walk would then move with
+    /// the drives' order instead of the fixture's shape. The edge's
+    /// `planted_window_exceeds_one_full_batched_pass` test holds the
+    /// bound against the scheduler's defaults.
+    pub const DISPATCH_ELIGIBLE_ROWS: u32 = 128;
 
     /// Rows `1..=pending_end` are `pending` — 60% of the queue.
     #[must_use]
