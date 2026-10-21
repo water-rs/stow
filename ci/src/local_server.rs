@@ -32,6 +32,7 @@ use std::sync::{Arc, Mutex};
 use async_net::TcpListener;
 use executor_core::tokio::TokioGlobal;
 use futures_lite::stream;
+use futures_util::StreamExt as _;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use skyzen::Server;
@@ -40,7 +41,10 @@ use skyzen::routing::{CreateRouteNode, Params, Route, Router};
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
 use stow_types::api::{BatchTask, BuildBatchPayload, RequestDispatch, TaskHash};
-use stow_types::local_ci::{LocalCiLeg, LocalCiRun, LocalCiSeededRun, LocalCiSeededRuns};
+use stow_types::local_ci::{
+    LocalCiLeg, LocalCiRun, LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRunIds,
+    LocalCiSeededRuns,
+};
 use stow_types::runs::VERDICT_STEPS;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
@@ -349,54 +353,108 @@ impl LocalServerState {
         self.close_unstarted_job(run_id, name, "skipped");
     }
 
-    /// Record `seeded` as finished `build-batch.yml` runs whose every
-    /// leg succeeded — runs that existed upstream before this server
-    /// took a dispatch. Each run's id must sit above every id the
-    /// server has allocated, and the allocator moves past the highest,
-    /// so no later dispatch or job can take one: GitHub never hands out
-    /// a run id twice.
-    fn record_seeded_runs(&self, seeded: &LocalCiSeededRuns) -> Result<(), String> {
-        let mut ids: Vec<u64> = seeded.runs.iter().map(|run| run.workflow_run_id).collect();
-        ids.sort_unstable();
-        let (Some(&lowest), Some(&highest)) = (ids.first(), ids.last()) else {
+    /// The id each of `seeded`'s runs is recorded under, in request
+    /// order. A named id must sit above every id the server has
+    /// allocated, and the allocator moves past the highest, so no later
+    /// dispatch or job can take one: GitHub never hands out a run id
+    /// twice. An unnamed run takes the allocator's next id, as a
+    /// dispatch does. Refused before anything is assigned: an empty
+    /// request, a run with no leg, or a named id that repeats.
+    fn seeded_run_ids(&self, seeded: &LocalCiSeededRuns) -> Result<Vec<u64>, String> {
+        if seeded.runs.is_empty() {
             return Err("no runs to seed".to_owned());
-        };
-        if let Some([twice, _]) = ids.array_windows().find(|[a, b]| a == b) {
-            return Err(format!("run id {twice} is seeded twice"));
         }
         if let Some(run) = seeded.runs.iter().find(|run| run.legs.is_empty()) {
-            return Err(format!("run {} seeds no leg", run.workflow_run_id));
+            return Err(format!("run of batch {} seeds no leg", run.batch_id));
         }
-        let next = highest
-            .checked_add(1)
-            .ok_or_else(|| format!("run id {highest} leaves no id to allocate after it"))?;
-        let previous = self.next_id.fetch_max(next, Ordering::Relaxed);
-        if previous > lowest {
-            return Err(format!(
-                "run id {lowest} is not above the ids this server already allocated \
-                 (next was {previous})"
-            ));
+        let mut named: Vec<u64> = seeded
+            .runs
+            .iter()
+            .filter_map(|run| run.workflow_run_id)
+            .collect();
+        named.sort_unstable();
+        if let Some([twice, _]) = named.array_windows().find(|[a, b]| a == b) {
+            return Err(format!("run id {twice} is seeded twice"));
         }
-        for run in &seeded.runs {
-            self.record_seeded_run(run);
+        if let (Some(&lowest), Some(&highest)) = (named.first(), named.last()) {
+            let next = highest
+                .checked_add(1)
+                .ok_or_else(|| format!("run id {highest} leaves no id to allocate after it"))?;
+            let previous = self.next_id.fetch_max(next, Ordering::Relaxed);
+            if previous > lowest {
+                return Err(format!(
+                    "run id {lowest} is not above the ids this server already allocated \
+                     (next was {previous})"
+                ));
+            }
         }
-        Ok(())
+        Ok(seeded
+            .runs
+            .iter()
+            .map(|run| run.workflow_run_id.unwrap_or_else(|| self.allocate_id()))
+            .collect())
     }
 
-    /// One seeded run: its run record with every leg `completed`/
-    /// `success`, and per leg the `build` and `publish` job rows a
-    /// successful leg leaves — the same rows [`run_leg`] writes.
-    fn record_seeded_run(&self, seeded: &LocalCiSeededRun) {
-        let run_id = seeded.workflow_run_id;
+    /// Publish every succeeded leg's records artifact for `seeded`, each
+    /// run under its id in `ids`, before any run is recorded — a reader
+    /// never sees a finished success whose records are missing. The
+    /// artifact carries the empty set, as a stubbed dispatched leg's
+    /// does. The pushes run concurrently, at most one per core, the
+    /// bound the runner pool holds dispatched legs to. `exe` is the
+    /// `stow-build` binary the mock registry binary sits beside.
+    async fn publish_seeded_records(
+        &self,
+        seeded: &LocalCiSeededRuns,
+        ids: &[u64],
+        exe: &Path,
+    ) -> stow_types::error::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let records_path = dir.path().join("records.json");
+        async_fs::write(&records_path, "[]").await?;
+        let pushes: Vec<_> = seeded
+            .runs
+            .iter()
+            .zip(ids)
+            .filter(|(run, _)| run.conclusion == LocalCiSeededConclusion::Success)
+            .flat_map(|(run, &run_id)| run.legs.iter().map(move |task_id| (run, run_id, task_id)))
+            .map(|(run, run_id, task_id)| {
+                push_records(
+                    self,
+                    task_id,
+                    run.rustc_version.as_str(),
+                    run_id,
+                    &records_path,
+                    exe,
+                )
+            })
+            .collect();
+        let bound = std::thread::available_parallelism()?.get();
+        let results: Vec<stow_types::error::Result<()>> = futures_util::stream::iter(pushes)
+            .buffer_unordered(bound)
+            .collect()
+            .await;
+        results.into_iter().collect()
+    }
+
+    /// One seeded run under `run_id`: its run record with every leg
+    /// `completed` at the run's conclusion, and per leg the `build` and
+    /// `publish` job rows such a leg leaves — the same rows [`run_leg`]
+    /// writes for a leg that succeeded, or that failed its build.
+    fn record_seeded_run(&self, seeded: &LocalCiSeededRun, run_id: u64) {
         let now = unix_millis();
+        let conclusion = match seeded.conclusion {
+            LocalCiSeededConclusion::Success => "success",
+            LocalCiSeededConclusion::Failure => "failure",
+        };
         let legs = (0..)
             .zip(&seeded.legs)
             .map(|(leg, task_id)| LocalCiLeg {
                 leg,
                 task_id: task_id.clone(),
                 status: "completed".to_owned(),
-                conclusion: Some("success".to_owned()),
-                error: None,
+                conclusion: Some(conclusion.to_owned()),
+                error: (seeded.conclusion == LocalCiSeededConclusion::Failure)
+                    .then(|| format!("leg {leg} build: seeded as failed")),
             })
             .collect::<Vec<_>>();
         self.runs.lock().expect("runs mutex poisoned").insert(
@@ -408,7 +466,7 @@ impl LocalServerState {
                     &seeded.batch_id,
                 ),
                 status: "completed".to_owned(),
-                conclusion: Some("success".to_owned()),
+                conclusion: Some(conclusion.to_owned()),
                 html_url: format!("http://{}/tasks/{run_id}", self.listen),
                 path: format!(
                     ".github/workflows/{}",
@@ -428,10 +486,18 @@ impl LocalServerState {
                 leg_build_job_name(leg, task_id, &hash),
                 BUILD_JOB_STEPS,
             );
-            self.finish_job(run_id, build, "success", &["success", "success"]);
-            let publish =
-                self.begin_job(run_id, leg_publish_job_name(leg, &hash), PUBLISH_JOB_STEPS);
-            self.finish_job(run_id, publish, "success", &["success"]);
+            match seeded.conclusion {
+                LocalCiSeededConclusion::Success => {
+                    self.finish_job(run_id, build, "success", &["success", "success"]);
+                    let publish =
+                        self.begin_job(run_id, leg_publish_job_name(leg, &hash), PUBLISH_JOB_STEPS);
+                    self.finish_job(run_id, publish, "success", &["success"]);
+                }
+                LocalCiSeededConclusion::Failure => {
+                    self.finish_job(run_id, build, "failure", &["failure", "success"]);
+                    self.skip_job(run_id, leg_publish_job_name(leg, &hash));
+                }
+            }
         }
     }
 }
@@ -775,21 +841,34 @@ fn cancel_response(state: &LocalServerState, run_id: u64) -> Response {
     response
 }
 
-/// `POST /seeded-runs` — record runs that exist upstream before the
-/// harness starts ([`LocalCiSeededRuns`]): 201 once every run is
-/// recorded, 409 when an id collides with one this server allocated or
-/// the request names a run twice or a run with no leg.
+/// `POST /seeded-runs` — record runs that exist upstream without a
+/// dispatch through this server ([`LocalCiSeededRuns`]): 201 with each
+/// run's id ([`LocalCiSeededRunIds`]) once every succeeded leg's records
+/// artifact is published and every run is recorded; 409 when a named id
+/// collides with one this server allocated, the request names a run
+/// twice or a run with no leg; 500 when a records push fails.
 async fn seed_runs(
     State(state): State<LocalServerState>,
     Json(seeded): Json<LocalCiSeededRuns>,
 ) -> Response {
-    match state.record_seeded_runs(&seeded) {
-        Ok(()) => json_response(
-            &serde_json::json!({ "recorded": seeded.runs.len() }),
-            StatusCode::CREATED,
-        ),
-        Err(error) => json_response(&bad_request(&error), StatusCode::CONFLICT),
+    let ids = match state.seeded_run_ids(&seeded) {
+        Ok(ids) => ids,
+        Err(error) => return json_response(&bad_request(&error), StatusCode::CONFLICT),
+    };
+    let published = match std::env::current_exe() {
+        Ok(exe) => state.publish_seeded_records(&seeded, &ids, &exe).await,
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = published {
+        return json_response(
+            &bad_request(&format!("publish seeded records: {error}")),
+            StatusCode::INTERNAL_SERVER_ERROR,
+        );
     }
+    for (run, &run_id) in seeded.runs.iter().zip(&ids) {
+        state.record_seeded_run(run, run_id);
+    }
+    json_response(&LocalCiSeededRunIds { runs: ids }, StatusCode::CREATED)
 }
 
 /// `POST /dispatch` — the scheduler's one local fan-out: `build-batch`
@@ -1589,6 +1668,7 @@ mod tests {
         RecordedJob, WorkflowRunReport, attempt_jobs_page, attempt_jobs_response, build_job_name,
         cancel_response, dispatch_response, publish_job_name, run_leg, run_response,
     };
+    use stow_types::local_ci::{LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRuns};
 
     use skyzen::StatusCode;
 
@@ -2005,14 +2085,50 @@ mod tests {
         }
     }
 
-    fn seeded(run_id: u64, task_id: &str) -> stow_types::local_ci::LocalCiSeededRun {
+    fn seeded(
+        run_id: Option<u64>,
+        task_id: &str,
+        conclusion: LocalCiSeededConclusion,
+    ) -> stow_types::local_ci::LocalCiSeededRun {
         stow_types::local_ci::LocalCiSeededRun {
             workflow_run_id: run_id,
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.86.0".to_owned())
                 .unwrap(),
             batch_id: task_id[32..].parse().unwrap(),
             legs: vec![task_id.to_owned()],
+            conclusion,
         }
+    }
+
+    /// Assign and record `runs` the way the route does, records aside.
+    fn record(state: &LocalServerState, runs: Vec<LocalCiSeededRun>) -> Vec<u64> {
+        let seeded = LocalCiSeededRuns { runs };
+        let ids = state.seeded_run_ids(&seeded).unwrap();
+        for (run, &run_id) in seeded.runs.iter().zip(&ids) {
+            state.record_seeded_run(run, run_id);
+        }
+        ids
+    }
+
+    /// The recorded jobs of seeded run `run_id`, classified for its one
+    /// leg under the run's recorded conclusion.
+    fn seeded_outcome(state: &LocalServerState, run_id: u64, task_id: &str) -> LegOutcome {
+        let conclusion = state.runs.lock().unwrap()[&run_id.to_string()]
+            .conclusion
+            .clone()
+            .unwrap();
+        let jobs: Vec<RunJobRow> = serde_json::from_value::<stow_types::runs::RunJobsPage>(
+            serde_json::json!({ "jobs": state.jobs.lock().unwrap()[&run_id] }),
+        )
+        .unwrap()
+        .jobs;
+        let hash = TaskHash::of(task_id);
+        assert!(jobs.iter().all(|job| {
+            LegJobName::parse(&job.name).is_some_and(|name| name.leg == 0 && name.hash == hash)
+        }));
+        classify_legs(&[hash], &conclusion, &jobs, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .remove(0)
     }
 
     /// A seeded run reads back as a finished `build-batch.yml` run
@@ -2022,12 +2138,8 @@ mod tests {
     fn a_seeded_run_serves_a_successful_batch_jobs_page() {
         let state = state();
         let task_id = format!("{:064x}", 97_502_u64);
-        let run = seeded(97_502, &task_id);
-        state
-            .record_seeded_runs(&stow_types::local_ci::LocalCiSeededRuns {
-                runs: vec![run.clone()],
-            })
-            .unwrap();
+        let run = seeded(Some(97_502), &task_id, LocalCiSeededConclusion::Success);
+        assert_eq!(record(&state, vec![run.clone()]), [97_502]);
 
         let recorded = state.runs.lock().unwrap()["97502"].clone();
         assert_eq!(
@@ -2036,41 +2148,125 @@ mod tests {
         );
         assert_eq!(recorded.path, ".github/workflows/build-batch.yml");
         assert_eq!(recorded.conclusion.as_deref(), Some("success"));
-
-        let jobs: Vec<RunJobRow> = serde_json::from_value::<stow_types::runs::RunJobsPage>(
-            serde_json::json!({ "jobs": state.jobs.lock().unwrap()[&97_502] }),
-        )
-        .unwrap()
-        .jobs;
-        let hash = TaskHash::of(&task_id);
-        assert!(jobs.iter().all(|job| {
-            LegJobName::parse(&job.name).is_some_and(|name| name.leg == 0 && name.hash == hash)
-        }));
-        let outcome = classify_legs(&[hash], "success", &jobs, time::OffsetDateTime::now_utc())
-            .unwrap()
-            .remove(0);
-        assert!(matches!(outcome, LegOutcome::Succeeded { .. }));
+        assert!(matches!(
+            seeded_outcome(&state, 97_502, &task_id),
+            LegOutcome::Succeeded { .. }
+        ));
         assert!(state.allocate_id() > 97_502);
     }
 
+    /// A run seeded as failed settles at once as a verdict failure of
+    /// its build — the step rows are complete, so no settle window
+    /// defers it — and its publish job is skipped.
+    #[test]
+    fn a_seeded_failed_run_serves_a_settled_verdict_failure() {
+        let state = state();
+        let task_id = format!("{:064x}", 41_u64);
+        let [run_id] = record(
+            &state,
+            vec![seeded(None, &task_id, LocalCiSeededConclusion::Failure)],
+        )[..] else {
+            panic!("one run seeded");
+        };
+        assert_eq!(
+            state.runs.lock().unwrap()[&run_id.to_string()]
+                .conclusion
+                .as_deref(),
+            Some("failure")
+        );
+        match seeded_outcome(&state, run_id, &task_id) {
+            LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { step, .. })) => {
+                assert_eq!(step, VERDICT_STEPS[0]);
+            }
+            other => panic!("expected a build verdict, got {other:?}"),
+        }
+        assert!(
+            state.jobs.lock().unwrap()[&run_id]
+                .iter()
+                .any(|job| job.conclusion == Some("skipped"))
+        );
+    }
+
+    /// An unnamed run takes an id the allocator hands out after every
+    /// named one, and a later dispatch's id lands above it.
+    #[test]
+    fn an_unnamed_seeded_run_is_allocated_above_the_named_ones() {
+        let state = state();
+        let named = format!("{:064x}", 900_u64);
+        let unnamed = format!("{:064x}", 901_u64);
+        let ids = record(
+            &state,
+            vec![
+                seeded(None, &unnamed, LocalCiSeededConclusion::Success),
+                seeded(Some(900), &named, LocalCiSeededConclusion::Success),
+            ],
+        );
+        assert_eq!(ids[1], 900);
+        assert!(ids[0] > 900, "{ids:?}");
+        assert!(state.allocate_id() > ids[0]);
+    }
+
+    /// Only a succeeded run's legs publish records: the failed run's
+    /// leg pushes nothing, so the mock registry binary is never run for
+    /// it — a registry that refuses every push fails only the success.
+    #[tokio::test]
+    async fn only_succeeded_legs_publish_records() {
+        let dir = tempfile::tempdir().unwrap();
+        script(&dir.path().join("stow-mock-registry"), 1);
+        let exe = dir.path().join("stow-build");
+        let state = state();
+        let task_id = format!("{:064x}", 77_u64);
+        let failed = LocalCiSeededRuns {
+            runs: vec![seeded(None, &task_id, LocalCiSeededConclusion::Failure)],
+        };
+        let ids = state.seeded_run_ids(&failed).unwrap();
+        state
+            .publish_seeded_records(&failed, &ids, &exe)
+            .await
+            .unwrap();
+        let succeeded = LocalCiSeededRuns {
+            runs: vec![seeded(None, &task_id, LocalCiSeededConclusion::Success)],
+        };
+        let ids = state.seeded_run_ids(&succeeded).unwrap();
+        assert!(
+            state
+                .publish_seeded_records(&succeeded, &ids, &exe)
+                .await
+                .is_err()
+        );
+    }
+
     /// A seeded id at or below one the server already allocated, a
-    /// repeated id and an empty request are refused before anything
-    /// is recorded.
+    /// repeated id, a legless run and an empty request are refused
+    /// before anything is recorded.
     #[test]
     fn seeding_refuses_ids_the_server_could_reuse() {
         let state = state();
         let task_id = format!("{:064x}", 7_u64);
+        let success = LocalCiSeededConclusion::Success;
         let allocated = state.allocate_id();
-        let clash = stow_types::local_ci::LocalCiSeededRuns {
-            runs: vec![seeded(allocated, &task_id)],
+        let clash = LocalCiSeededRuns {
+            runs: vec![seeded(Some(allocated), &task_id, success)],
         };
-        assert!(state.record_seeded_runs(&clash).is_err());
-        let twice = stow_types::local_ci::LocalCiSeededRuns {
-            runs: vec![seeded(50, &task_id), seeded(50, &task_id)],
+        assert!(state.seeded_run_ids(&clash).is_err());
+        let twice = LocalCiSeededRuns {
+            runs: vec![
+                seeded(Some(50), &task_id, success),
+                seeded(Some(50), &task_id, success),
+            ],
         };
-        assert!(state.record_seeded_runs(&twice).is_err());
-        let empty = stow_types::local_ci::LocalCiSeededRuns { runs: Vec::new() };
-        assert!(state.record_seeded_runs(&empty).is_err());
+        assert!(state.seeded_run_ids(&twice).is_err());
+        let mut legless = seeded(None, &task_id, success);
+        legless.legs.clear();
+        assert!(
+            state
+                .seeded_run_ids(&LocalCiSeededRuns {
+                    runs: vec![legless]
+                })
+                .is_err()
+        );
+        let empty = LocalCiSeededRuns { runs: Vec::new() };
+        assert!(state.seeded_run_ids(&empty).is_err());
         assert!(state.runs.lock().unwrap().is_empty());
     }
 }

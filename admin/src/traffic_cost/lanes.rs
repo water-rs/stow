@@ -8,15 +8,19 @@
 //! The public lanes need no credential; `--scheduler` adds the trusted
 //! lanes on the operator bearer, `--webhook-secret` adds the
 //! `workflow_run` callback lane — a `build-batch.yml` run's `completed`
-//! delivery for a seeded in-flight batch — signed under the mock's
-//! `STOW_GITHUB_WEBHOOK_SECRET`, and `--pow-secret` adds the untrusted
+//! delivery for a seeded in-flight batch, re-armed on the operator
+//! bearer outside its counted events so each delivery is a first one —
+//! signed under the mock's `STOW_GITHUB_WEBHOOK_SECRET`, and
+//! `--pow-secret` adds the untrusted
 //! miss lanes — real `POST /api/v1/admissions` calls, and `POST
 //! /api/v1/enqueue` redemptions on tickets minted under the mock's
 //! `STOW_POW_CHALLENGE_SECRET`. Alarm passes are never fired directly —
 //! the submits, mutations and completions the lanes drive arm the
 //! dispatch alarm, which is exactly how production earns them.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Args;
@@ -25,7 +29,7 @@ use sha2::Sha256;
 use stow_types::admission::{DEFAULT_POW_MIN_BITS, difficulty, issue_challenge};
 use stow_types::api::{
     AdmissionRequest, DependencyGraphEntry, EnqueueRequest, EnqueueSource, EnqueueTicket,
-    QueueSelector, ResolvedDependencyGraphEntry,
+    QueueSelector, ResolvedDependencyGraphEntry, SchedulerRearmReport, SchedulerRearmRequest,
 };
 use stow_types::fixture::{
     FixtureShape, InFlightBatch, REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED, task_hex_id,
@@ -122,8 +126,9 @@ pub enum Fire {
     /// a rotating pool of real crates.
     TrustedSubmit { rustc: String },
     /// HMAC-signed `POST /api/v1/github/workflow_run` reporting a
-    /// seeded in-flight batch's `build-batch.yml` run `completed`.
-    WorkflowRun { secret: String, queue_rows: u64 },
+    /// seeded in-flight batch's `build-batch.yml` run `completed` — each
+    /// event the first delivery for an armed batch.
+    WorkflowRun(CallbackLane),
     /// `POST /api/v1/admissions` — one miss entry whose resolved graph
     /// rides in the body, so the lane pays the real mint path without
     /// a crates.io hop.
@@ -135,6 +140,124 @@ pub enum Fire {
         min_bits: u32,
         rustc: String,
     },
+}
+
+/// The callback lane's supply of first deliveries.
+///
+/// Production's per-event cost is a batch's *first* `completed`
+/// delivery: the completion write, the alarm arm, then one alarm pass
+/// that resolves the batch and deletes its row. A second delivery for
+/// the same batch is a cheaper duplicate, and one after the resolution a
+/// cheaper 404, so a lane that cycled the fixture's
+/// [`FixtureShape::IN_FLIGHT_ROWS`] bound batches would price the cheap
+/// paths once it went round. The lane instead delivers only armed
+/// batches — bound, with no completion recorded — and refills from the
+/// probe's `POST /api/v1/admin/scheduler/budget/rearm`, which re-arms
+/// the batches its earlier deliveries resolved. The refill is harness
+/// work: it runs before an event is timed or profiled, never inside one.
+#[derive(Debug)]
+pub struct CallbackLane {
+    secret: String,
+    queue_rows: u32,
+    /// Armed, undelivered in-flight indexes `k`, in delivery order.
+    armed: Mutex<VecDeque<u32>>,
+}
+
+impl CallbackLane {
+    /// A lane over the `queue_rows` fixture, nothing armed yet.
+    ///
+    /// # Errors
+    /// `queue_rows` does not fit the fixture's `u32` row space.
+    fn new(secret: String, queue_rows: u64) -> Result<Self, String> {
+        Ok(Self {
+            secret,
+            queue_rows: u32::try_from(queue_rows).map_err(|_| {
+                format!("--queue-rows {queue_rows} exceeds the fixture's row space")
+            })?,
+            armed: Mutex::new(VecDeque::new()),
+        })
+    }
+
+    /// Deliver exactly `armed` next — the edge's whole armed set, which
+    /// already holds every batch this lane has queued and not delivered.
+    fn replace(&self, armed: impl IntoIterator<Item = u32>) {
+        *self.armed.lock().expect("armed batches") = armed.into_iter().collect();
+    }
+
+    /// Armed batches not yet delivered.
+    fn len(&self) -> usize {
+        self.armed.lock().expect("armed batches").len()
+    }
+
+    /// The next armed batch to deliver.
+    ///
+    /// # Errors
+    /// Nothing is armed — the caller fired without [`Fire::ready`].
+    fn take(&self) -> Result<InFlightBatch, String> {
+        let k = self
+            .armed
+            .lock()
+            .expect("armed batches")
+            .pop_front()
+            .ok_or_else(|| "the callback lane fired with no armed batch".to_owned())?;
+        Ok(shape(u64::from(self.queue_rows)).in_flight_batch(k))
+    }
+
+    /// Re-arm until at least `needed` batches are armed. A delivered
+    /// batch is re-armable once the alarm pass its delivery armed has
+    /// resolved it, which is the delivery's own aftermath and takes no
+    /// longer than a request; the wait is bounded by
+    /// [`REQUEST_TIMEOUT`], past which the lane fails rather than
+    /// deliver a duplicate.
+    async fn ready(&self, edge: &Edge, needed: usize) -> Result<(), String> {
+        if needed > FixtureShape::IN_FLIGHT_ROWS as usize {
+            return Err(format!(
+                "the callback lane needs {needed} armed batches at once, but the fixture holds \
+                 {} in flight",
+                FixtureShape::IN_FLIGHT_ROWS
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        while self.len() < needed {
+            let report: SchedulerRearmReport = edge
+                .post_json(
+                    "/api/v1/admin/scheduler/budget/rearm",
+                    &SchedulerRearmRequest {
+                        queue_rows: self.queue_rows,
+                    },
+                )
+                .await
+                .map_err(|error| format!("re-arm the fixture's in-flight batches: {error}"))?;
+            self.replace(report.armed);
+            if self.len() >= needed {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "{} of the {needed} batches the callback lane needs are armed after \
+                     {REQUEST_TIMEOUT:?} — the rest were never resolved after their delivery",
+                    self.len()
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Ok(())
+    }
+}
+
+impl Fire {
+    /// Make the next `needed` events fireable, outside any timed or
+    /// profiled window — the callback lane's re-arm; every other lane
+    /// needs nothing.
+    ///
+    /// # Errors
+    /// The re-arm failed or could not arm `needed` batches in time.
+    pub async fn ready(&self, edge: &Edge, needed: usize) -> Result<(), String> {
+        match self {
+            Self::WorkflowRun(lane) => lane.ready(edge, needed).await,
+            _ => Ok(()),
+        }
+    }
 }
 
 /// One lane: what to fire, at what peak rate, and which statuses are
@@ -166,14 +289,6 @@ fn shape(queue_rows: u64) -> FixtureShape {
     FixtureShape {
         queue_rows: u32::try_from(queue_rows).unwrap_or(u32::MAX),
     }
-}
-
-/// The k-th in-flight fixture batch — every `dispatched` and `running`
-/// row is leg 0 of its own bound batch, so the lane cycles all of them.
-fn in_flight_batch(k: u64, queue_rows: u64) -> InFlightBatch {
-    let index = u32::try_from(k % u64::from(FixtureShape::IN_FLIGHT_ROWS))
-        .expect("an index below IN_FLIGHT_ROWS fits u32");
-    shape(queue_rows).in_flight_batch(index)
 }
 
 /// The k-th failed row's task id — `completed_end < n <= failed_end`.
@@ -497,15 +612,11 @@ async fn plan(
             body: serde_json::to_value(vec![submit_task(rustc, counter)?])
                 .map_err(|error| error.to_string())?,
         }),
-        Fire::WorkflowRun { secret, queue_rows } => {
-            // The fixture holds IN_FLIGHT_ROWS bound batches and nothing
-            // re-arms one, so only each batch's first delivery is
-            // production's first-delivery path: the record write and
-            // the alarm arm. A later delivery for the same batch is a
-            // redelivery — no write while the batch awaits its alarm,
-            // a logged 404 once the alarm resolved it.
-            let body = workflow_run_body(&in_flight_batch(counter, *queue_rows));
-            let signature = sign_body(secret, body.as_bytes());
+        Fire::WorkflowRun(lane) => {
+            // An armed batch, so the delivery is production's first
+            // delivery: the record write and the alarm arm.
+            let body = workflow_run_body(&lane.take()?);
+            let signature = sign_body(&lane.secret, body.as_bytes());
             Ok(Plan::PostBytes {
                 url: format!("{base}/api/v1/github/workflow-run"),
                 headers: vec![
@@ -706,10 +817,7 @@ pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<V
         lanes.push(Lane {
             name: "workflow-callback",
             eps: eps(EventKind::BuildCallback),
-            fire: Fire::WorkflowRun {
-                secret: secret.clone(),
-                queue_rows: args.queue_rows,
-            },
+            fire: Fire::WorkflowRun(CallbackLane::new(secret.clone(), args.queue_rows)?),
             expected: ok2xx,
         });
     }
@@ -768,7 +876,7 @@ mod tests {
 
     use stow_types::fixture::FixtureShape;
 
-    use super::{LaneArgs, build_lanes, in_flight_batch, workflow_run_body};
+    use super::{CallbackLane, LaneArgs, build_lanes, workflow_run_body};
 
     /// The full lane set and the Worker CPU budget table name the same
     /// lanes: a lane without a budget would be measured and never gated,
@@ -802,17 +910,25 @@ mod tests {
         assert_eq!(lanes, budgets);
     }
 
-    /// The lane's deliveries walk every in-flight fixture batch once
-    /// per cycle, each a `build-batch.yml` `completed` whose title
-    /// decodes to that batch and whose run id is the one it is bound to.
+    /// The lane delivers exactly the batches armed, in arming order,
+    /// each once: a `build-batch.yml` `completed` whose title decodes to
+    /// that batch and whose run id is the one it is bound to. With
+    /// nothing armed it refuses to fire instead of repeating a batch.
     #[test]
-    fn the_callback_lane_completes_each_bound_batch_under_its_run() {
+    fn the_callback_lane_completes_each_armed_batch_once_under_its_run() {
         let rows = 100_000;
-        let cycle = u64::from(FixtureShape::IN_FLIGHT_ROWS);
+        let lane = CallbackLane::new("secret".to_owned(), rows).unwrap();
+        lane.replace((0..FixtureShape::IN_FLIGHT_ROWS).rev());
         let mut seen = std::collections::BTreeSet::new();
-        for counter in 0..cycle {
-            let batch = in_flight_batch(counter, rows);
-            assert_eq!(batch, in_flight_batch(counter + cycle, rows));
+        for k in (0..FixtureShape::IN_FLIGHT_ROWS).rev() {
+            let batch = lane.take().unwrap();
+            assert_eq!(
+                batch,
+                FixtureShape {
+                    queue_rows: u32::try_from(rows).unwrap()
+                }
+                .in_flight_batch(k)
+            );
             let body: serde_json::Value = serde_json::from_str(&workflow_run_body(&batch)).unwrap();
             let run = &body["workflow_run"];
             let title = run["display_title"].as_str().unwrap();
@@ -831,5 +947,6 @@ mod tests {
             assert_eq!(body["action"], "completed");
             assert!(seen.insert(batch.batch_id.to_string()));
         }
+        assert!(lane.take().is_err());
     }
 }

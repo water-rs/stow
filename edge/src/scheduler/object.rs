@@ -197,6 +197,7 @@ impl DurableObject for Scheduler {
             // carry; production requests hit the guard and 404.
             "/budget".post(scheduler_budget),
             "/budget/seed".post(scheduler_budget_seed),
+            "/budget/rearm".post(scheduler_budget_rearm),
             "/budget/ledger".at(scheduler_budget_ledger),
             // Trusted demand batches — #522's demand input; reached
             // from `POST /api/v1/admin/scheduler/demand`.
@@ -264,6 +265,47 @@ async fn scheduler_budget_seed(
             .await
             .map_err(to_error)?,
     ))
+}
+
+/// `POST /budget/rearm` — re-arm the seeded fixture's in-flight batches
+/// the callback lane's deliveries resolved and answer every armed one
+/// (stow#833). Same guard as the seed endpoint; a request naming another fixture size than the seeded
+/// one is a 409, since its batch and run ids would not be the store's.
+/// Reached from `POST /api/v1/admin/scheduler/budget/rearm`.
+async fn scheduler_budget_rearm(
+    env: WasmEnv,
+    db: DurableDb,
+    Json(request): Json<stow_types::api::SchedulerRearmRequest>,
+) -> Result<Json<stow_types::api::SchedulerRearmReport>> {
+    if !budget_probe_enabled(&env) {
+        return Err(
+            Error::msg("scheduler budget probe is not enabled on this deploy")
+                .set_status(StatusCode::NOT_FOUND),
+        );
+    }
+    let cursor = fixture::read_seed_cursor(&db)
+        .await
+        .map_err(to_error)?
+        .ok_or_else(|| {
+            Error::msg("no fixture was seeded — nothing to re-arm").set_status(StatusCode::CONFLICT)
+        })?;
+    let seeded = fixture::seed_cursor_shape(&cursor).map_err(to_error)?;
+    if seeded != request.queue_rows {
+        return Err(Error::msg(format!(
+            "re-arm names a {}-row fixture, but the store was seeded at {seeded} rows",
+            request.queue_rows
+        ))
+        .set_status(StatusCode::CONFLICT));
+    }
+    let settings = scheduler_settings(&env)?;
+    let armed = fixture::rearm_in_flight(
+        &db,
+        fixture::FixtureShape { queue_rows: seeded },
+        settings.dispatch_min_age_minutes,
+    )
+    .await
+    .map_err(to_error)?;
+    Ok(Json(stow_types::api::SchedulerRearmReport { armed }))
 }
 
 /// `POST /budget` — replay every drive under the metering backend and
@@ -1243,6 +1285,22 @@ fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
             }),
         },
     )
+}
+
+/// The local CI a mock stack dispatches to — where the budget probe's
+/// batch-resolution drives seed the run their batch concluded as.
+///
+/// # Errors
+/// The deploy names no `STOW_LOCAL_CI_URL`: the probe runs only on mock
+/// stacks, and every one of them carries it.
+pub(super) fn local_ci_runs(env: &WasmEnv) -> Result<dispatch::LocalCiBuildRuns> {
+    match credential_source(env)? {
+        CredentialSource::LocalCi(url) => Ok(dispatch::LocalCiBuildRuns::new(&url)),
+        CredentialSource::GitHub(_) => Err(Error::msg(
+            "the budget probe's batch drives seed their runs on the local CI, \
+             but the deploy names no STOW_LOCAL_CI_URL",
+        )),
+    }
 }
 
 /// The claim-plus-fan-out half of a dispatch pass, shared with the

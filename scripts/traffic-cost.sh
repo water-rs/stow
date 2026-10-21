@@ -411,26 +411,13 @@ budget_pass "small" --queue-rows "$SMALL" --reset
 # `completed` delivery does, and the alarm resolves the batch from both —
 # without them every completion would defer against a 404 jobs page
 # until its ceiling. So the local CI records each bound run as a finished
-# success, and each leg's records artifact lands under the run's
+# success and publishes each leg's records artifact under the run's
 # per-build tag `records-<rustc>-<hash>-<run id>-1`, at the batch's own
 # rustc. `traffic-cost fixture-runs` owns the shape math.
 admin --json traffic-cost fixture-runs --queue-rows "$SMALL" \
     >"$WORK_DIR/fixture-runs.json" 2>"$LOG_DIR/fixture-runs.log" \
     || die "traffic-cost fixture-runs failed — see $LOG_DIR/fixture-runs.log"
-printf '[]' >"$WORK_DIR/fixture-records.json"
-while read -r run_id rustc task_id; do
-    "$BIN/stow-mock-registry" push-records \
-        --records "$WORK_DIR/fixture-records.json" \
-        --task-id "$task_id" \
-        --rustc-version "$rustc" \
-        --run-id "$run_id" --run-attempt 1 \
-        --registry-root "$WORK_DIR/mock-registry" \
-        --private-key "$WORK_DIR/keys/private.pem" \
-        >>"$LOG_DIR/mock-registry-cli.log" 2>&1 \
-        || die "records artifact for $task_id failed — see $LOG_DIR/mock-registry-cli.log"
-done < <(jq -r '.runs[] | .workflow_run_id as $run | .rustc_version as $rustc
-    | .legs[] | "\($run) \($rustc) \(.)"' "$WORK_DIR/fixture-runs.json")
-curl -sf --max-time 10 -X POST -H 'Content-Type: application/json' \
+curl -sf --max-time 60 -X POST -H 'Content-Type: application/json' \
     --data-binary @"$WORK_DIR/fixture-runs.json" \
     "http://${LOCAL_CI_ADDR}/seeded-runs" >>"$LOG_DIR/fixture-runs.log" \
     || die "local CI refused the fixture's runs — see $LOG_DIR/local-ci.log"

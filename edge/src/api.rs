@@ -476,6 +476,22 @@ pub async fn admin_scheduler_budget(
     ))
 }
 
+/// `POST /api/v1/admin/scheduler/budget/rearm`
+///
+/// Re-arm the seeded fixture's in-flight batches the traffic-cost
+/// callback lane's deliveries resolved and answer every armed one, so
+/// each delivery it fires is a first delivery (stow#833). Same deploy-var
+/// guard as the seed route.
+pub async fn admin_scheduler_budget_rearm(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::SchedulerRearmRequest>,
+) -> Result<Json<stow_types::api::SchedulerRearmReport>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::rearm_budget_fixture(&scheduler, &request).await?,
+    ))
+}
+
 /// `GET /api/v1/admin/scheduler/budget/ledger`
 ///
 /// The scheduler Durable Object's billed `rowsRead`/`rowsWritten` per

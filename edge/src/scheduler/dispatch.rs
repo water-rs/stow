@@ -129,6 +129,26 @@ impl LocalCiBuildRuns {
             url: url.trim_end_matches('/').to_owned(),
         }
     }
+
+    /// `POST {base}/seeded-runs` — have the mock record finished runs
+    /// that no dispatch through it created, publishing each succeeded
+    /// leg's records artifact first, and answer each run's id. The
+    /// budget probe's batch-resolution drives seed the run their claimed
+    /// batch concluded as here, so the resolution reads the jobs page
+    /// and records production's run leaves (stow#833).
+    #[cfg(target_arch = "wasm32")]
+    pub async fn seed_runs(
+        &self,
+        seeded: &stow_types::local_ci::LocalCiSeededRuns,
+        pool: &OutboundPool,
+    ) -> Result<stow_types::local_ci::LocalCiSeededRunIds, DispatchError> {
+        let payload = serde_json::to_value(seeded)
+            .map_err(|error| DispatchError::Response(error.to_string()))?;
+        let request = self.api_request(worker::Method::Post, "seeded-runs", Some(&payload))?;
+        let body = body_text(send(&request, pool).await?).await?;
+        serde_json::from_str(&body)
+            .map_err(|error| DispatchError::Response(format!("{error}: {body}")))
+    }
 }
 
 /// The workflow and payload sent through either dispatch transport.

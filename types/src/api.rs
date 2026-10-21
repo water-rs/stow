@@ -2553,6 +2553,30 @@ pub struct SchedulerBudgetReport {
     pub over_budget: bool,
 }
 
+/// Body of `POST /api/v1/admin/scheduler/budget/rearm`.
+///
+/// The traffic-cost callback lane's refill: re-arm the seeded fixture's
+/// in-flight batches its deliveries resolved, so every delivery it fires
+/// is a first delivery. Only deploys that set `STOW_SCHEDULER_BUDGET`
+/// answer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerRearmRequest {
+    /// Queue rows of the fixture the caller derives its batches from —
+    /// refused unless it is the size the store was last seeded at, so
+    /// the caller's batch ids and run ids are the store's.
+    pub queue_rows: u32,
+}
+
+/// What `POST /api/v1/admin/scheduler/budget/rearm` answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerRearmReport {
+    /// Every armed in-flight index `k` after the re-arm, ascending —
+    /// each batch is `crate::fixture::FixtureShape::in_flight_batch(k)`,
+    /// bound to its own run with no completion recorded. The whole set,
+    /// not the call's increment: a caller replaces what it holds with it.
+    pub armed: Vec<u32>,
+}
+
 /// What `GET /api/v1/admin/scheduler/budget/ledger` returns.
 ///
 /// The scheduler Durable Object's billed `rowsRead`/`rowsWritten` booked
@@ -2570,7 +2594,8 @@ pub struct SchedulerLedger {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerLedgerOp {
     /// The operation: `<METHOD> <route>` for a request (a request id
-    /// segment collapses to `{id}`), or
+    /// segment collapses to `{id}`, and a batch's completion to
+    /// [`crate::do_budgets::LEDGER_OP_BATCH_COMPLETE`]), or
     /// [`crate::do_budgets::LEDGER_OP_ALARM`] for an alarm pass.
     pub op: String,
     /// How many times the operation ran.

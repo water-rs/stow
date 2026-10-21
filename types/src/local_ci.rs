@@ -78,33 +78,62 @@ pub struct LocalCiLeg {
     pub error: Option<String>,
 }
 
-/// `POST /seeded-runs`: `build-batch.yml` runs that already exist
-/// upstream when the harness starts.
+/// `POST /seeded-runs`: `build-batch.yml` runs that exist upstream
+/// without a dispatch through the server.
 ///
-/// These are the scheduler fixture's bound in-flight batches
-/// (`crate::fixture::FixtureShape::in_flight_batch`), dispatched before
-/// the store was seeded rather than through `/dispatch`. The server
-/// records each as a finished run whose every
-/// leg succeeded, so its run object and attempt-jobs page answer as
-/// GitHub's would once the run completed; the caller delivers the
-/// run's `workflow_run` completion and publishes each leg's records
-/// artifact itself.
+/// Two callers seed them. The traffic-cost harness seeds the scheduler
+/// fixture's bound in-flight batches
+/// (`crate::fixture::FixtureShape::in_flight_batch`), each under the run
+/// id the fixture already bound. The budget probe's batch-resolution
+/// drives seed the run a drive's claimed batch ran as, under an id the
+/// server allocates, and bind the batch to it. Either way the server
+/// records each run as finished, so its run object and attempt-jobs
+/// page answer as GitHub's would once the run completed, and it
+/// publishes every succeeded leg's records artifact under the run's tag
+/// before it records the run, as the run's publish jobs would have. The
+/// caller delivers the run's `workflow_run` completion itself.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LocalCiSeededRuns {
-    /// The runs to record, each under its own id.
+    /// The runs to record.
     pub runs: Vec<LocalCiSeededRun>,
 }
 
 /// One run [`LocalCiSeededRuns`] records.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LocalCiSeededRun {
-    /// The run id the batch is bound to — unique among every run the
-    /// server holds or will allocate.
-    pub workflow_run_id: u64,
-    /// The batch's rustc — the run title's lead.
+    /// The run's id. `Some` names a run bound before the server
+    /// started, unique among every run the server holds or will
+    /// allocate; `None` has the server allocate it, as GitHub assigns a
+    /// dispatch's.
+    pub workflow_run_id: Option<u64>,
+    /// The batch's rustc — the run title's lead and the records tag's
+    /// namespace.
     pub rustc_version: crate::identity::WireRustcVersion,
     /// The batch the run carries — the run title's `b<batch_id>`.
     pub batch_id: crate::api::BatchId,
     /// Each leg's task id, in leg order.
     pub legs: Vec<String>,
+    /// How every leg of the run ended.
+    pub conclusion: LocalCiSeededConclusion,
+}
+
+/// The one outcome every leg of a [`LocalCiSeededRun`] shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalCiSeededConclusion {
+    /// Every leg's build and publish jobs succeeded and its records
+    /// artifact is published; the run concluded `success`.
+    Success,
+    /// Every leg's build job failed at its first verdict step and its
+    /// publish job was skipped, so no leg published records; the run
+    /// concluded `failure`.
+    Failure,
+}
+
+/// `POST /seeded-runs`' answer: each seeded run's id, in request order,
+/// so a caller that let the server allocate learns the id it binds.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct LocalCiSeededRunIds {
+    /// The run ids, one per requested run.
+    pub runs: Vec<u64>,
 }

@@ -857,6 +857,112 @@ pub async fn restore_queue_rows(
     Ok(())
 }
 
+/// Re-arm the fixture's in-flight batches whose batch row is gone —
+/// the traffic-cost callback lane's deliveries resolved them — and
+/// answer which batches are armed, so every delivery the lane fires is
+/// a first delivery (stow#833).
+///
+/// A resolved batch's leg row returns to seeded truth at a fresh
+/// generation and its one-slot batch row is rewritten bound to the
+/// fixture's own run, with no completion recorded
+/// ([`restore_queue_rows`]). That run is one the local CI already
+/// serves: the harness seeded it, its jobs page and its leg's records
+/// artifact once, and a finished run's page and records never change
+/// upstream, so a re-armed batch resolves exactly as its first delivery
+/// did. A batch whose row is present is left alone, and so is a leg row
+/// a claim put in flight under another batch. The batch ids, run ids
+/// and leg task ids come from [`FixtureShape::in_flight_batch`], the
+/// shape the lane delivers against.
+///
+/// Returns every armed in-flight index `k`, ascending: a batch bound to
+/// its fixture run with no completion recorded — the freshly seeded
+/// ones, those an earlier call re-armed and the lane has not delivered,
+/// and those this call re-armed. A batch delivered and awaiting its
+/// alarm is not armed. The answer is the whole set, not this call's
+/// increment, so a caller replaces its queue with it and never holds a
+/// batch twice. Bounded by the in-flight group
+/// ([`FixtureShape::IN_FLIGHT_ROWS`]): two keyed reads and one restore
+/// over at most that many rows, never the queue.
+pub async fn rearm_in_flight(
+    db: &DurableDb,
+    shape: FixtureShape,
+    min_age_minutes: u32,
+) -> Result<Vec<u32>, QueueError> {
+    let batches: Vec<(u32, stow_types::fixture::InFlightBatch)> = (0..FixtureShape::IN_FLIGHT_ROWS)
+        .map(|k| (k, shape.in_flight_batch(k)))
+        .collect();
+    let encode = |ids: Vec<String>| {
+        serde_json::to_string(&ids)
+            .map_err(|error| QueueError::Sql(format!("encode in-flight ids: {error}")))
+    };
+    let present: std::collections::BTreeMap<String, HeldBatchRow> = db
+        .query(
+            "SELECT batch_id, github_run_id, done_run_id FROM build_batches \
+             WHERE batch_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(encode(
+            batches
+                .iter()
+                .map(|(_, batch)| batch.batch_id.to_string())
+                .collect(),
+        )?)
+        .fetch_all::<HeldBatchRow>()
+        .await
+        .map_err(|error| format!("read in-flight batch rows: {error}"))?
+        .into_iter()
+        .map(|row| (row.batch_id.clone(), row))
+        .collect();
+    let in_flight: std::collections::BTreeSet<String> = db
+        .query(
+            "SELECT task_id FROM queue \
+             WHERE task_id IN (SELECT value FROM json_each(?)) \
+               AND status IN ('dispatched', 'running')",
+        )
+        .bind(encode(
+            batches
+                .iter()
+                .map(|(_, batch)| batch.task_id.clone())
+                .collect(),
+        )?)
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("read in-flight leg rows: {error}"))?
+        .into_iter()
+        .collect();
+    let mut armed = Vec::with_capacity(batches.len());
+    let mut rearmed = Vec::new();
+    for (k, batch) in &batches {
+        match present.get(&batch.batch_id.to_string()) {
+            Some(row) => {
+                if row.done_run_id.is_none()
+                    && row.github_run_id.as_deref() == Some(batch.run_id.to_string().as_str())
+                {
+                    armed.push(*k);
+                }
+            }
+            None if !in_flight.contains(&batch.task_id) => {
+                armed.push(*k);
+                rearmed.push(shape.in_flight_row(*k));
+            }
+            None => {}
+        }
+    }
+    restore_queue_rows(db, shape, min_age_minutes, &rearmed).await?;
+    Ok(armed)
+}
+
+/// A fixture batch row's run binding, for [`rearm_in_flight`].
+#[derive(Debug, skyzen::FromRow)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the fields are build_batches' column names, which FromRow maps by name"
+)]
+struct HeldBatchRow {
+    batch_id: String,
+    github_run_id: Option<String>,
+    done_run_id: Option<String>,
+}
+
 /// Seed the `phase`'s dependency edges for owner rows `(lo, hi]` — the
 /// dep's identity is the same formula the `queue` seed applied at the
 /// dep's own `n`.
@@ -1265,9 +1371,11 @@ async fn rearm_feed_window(db: &DurableDb, shape: FixtureShape) -> Result<(), Qu
 ///   `enqueued` one.
 /// - Mutated seeded rows: retry's failed pair, cancel's pair,
 ///   promote's miss-lane row, purge's deleted pair, the resync's row
-///   101 and the running and dispatched rows are re-written through the seed's
-///   own column formulas ([`restore_queue_rows`]) — a row a probe moved
-///   or deleted returns to seeded truth.
+///   101 and the whole in-flight group (the drives' running and
+///   dispatched rows, and every leg the callback lane's deliveries
+///   resolved) are re-written through the seed's own column formulas
+///   ([`restore_queue_rows`]) — a row a probe or the lane moved or
+///   deleted returns to seeded truth.
 /// - Claimed rows: the pass records the ids its own claim moved out
 ///   of `pending` into probe control state
 ///   ([`record_probe_claimed`]); the re-arm restores exactly those
@@ -1341,9 +1449,14 @@ pub async fn rearm(
         shape.failed_row(1),
         shape.completed_row(0),
         shape.completed_row(1),
-        shape.running_row(),
-        shape.dispatched_row(0),
     ];
+    // The whole in-flight group: the drives move the running and
+    // dispatched rows, and the traffic-cost callback lane's deliveries
+    // resolve any of them (stow#833). Each returns as a bound in-flight
+    // leg, so the batch rows `restore_batch_rows` rewrites below are
+    // held by a leg in flight — never orphans the next pass's stale-batch
+    // sweep would pay to delete.
+    restored.extend((0..FixtureShape::IN_FLIGHT_ROWS).map(|k| shape.in_flight_row(k)));
     // The delta report's retire band: its dispatch tail's shape
     // requeue can flip those completed deps back to `pending` (the
     // repair the corrected `shape_requeue` seed finally lets the
@@ -2973,5 +3086,222 @@ mod tests {
                 row.widest
             );
         }
+    }
+
+    /// One in-flight queue row's batch binding, as the drift test reads
+    /// it back.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, skyzen::FromRow)]
+    struct InFlightLegRow {
+        task_id: String,
+        rustc_version: String,
+        batch_id: Option<String>,
+        batch_leg: Option<i64>,
+    }
+
+    /// A seeded queue row's rustc, as the drift test reads it.
+    #[derive(Debug, skyzen::FromRow)]
+    struct SeededRustcRow {
+        task_id: String,
+        rustc_version: String,
+    }
+
+    /// One `build_batches` row's identity, as the drift test reads it.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, skyzen::FromRow)]
+    struct BatchIdentityRow {
+        batch_id: String,
+        rustc_version: String,
+        github_run_id: Option<String>,
+    }
+
+    /// The edge seed and `stow_types::fixture` describe one fixture: the
+    /// traffic-cost harness derives the in-flight batches it delivers,
+    /// the runs it seeds upstream and the records tags it publishes from
+    /// [`FixtureShape::in_flight_batch`] and `seeded_rustc`, while the
+    /// seed writes them through `RUSTC_CASE_SQL`, the batch-id SQL and
+    /// `CAST(n AS TEXT)`. Seeded and read back, the two must agree row
+    /// for row — a drift would have the lane deliver completions for
+    /// batches the store does not hold, under runs nobody bound.
+    #[tokio::test]
+    async fn seeded_in_flight_batches_match_the_shared_fixture_shape() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        seed_production_shape(&db, &GATE, settings.dispatch_min_age_minutes)
+            .await
+            .expect("seed");
+        let expected: Vec<_> = (0..FixtureShape::IN_FLIGHT_ROWS)
+            .map(|k| GATE.in_flight_batch(k))
+            .collect();
+
+        let mut batches = db
+            .query("SELECT batch_id, rustc_version, github_run_id FROM build_batches")
+            .fetch_all::<BatchIdentityRow>()
+            .await
+            .expect("batch rows");
+        batches.sort();
+        let mut want: Vec<_> = expected
+            .iter()
+            .map(|batch| BatchIdentityRow {
+                batch_id: batch.batch_id.to_string(),
+                rustc_version: batch.rustc_version.to_owned(),
+                github_run_id: Some(batch.run_id.to_string()),
+            })
+            .collect();
+        want.sort();
+        assert_eq!(batches, want, "build_batches rows against in_flight_batch");
+
+        let mut legs = db
+            .query(
+                "SELECT task_id, rustc_version, batch_id, batch_leg FROM queue \
+                 WHERE status IN ('dispatched', 'running')",
+            )
+            .fetch_all::<InFlightLegRow>()
+            .await
+            .expect("in-flight rows");
+        legs.sort();
+        let mut want: Vec<_> = expected
+            .iter()
+            .map(|batch| InFlightLegRow {
+                task_id: batch.task_id.clone(),
+                rustc_version: batch.rustc_version.to_owned(),
+                batch_id: Some(batch.batch_id.to_string()),
+                batch_leg: Some(0),
+            })
+            .collect();
+        want.sort();
+        assert_eq!(legs, want, "in-flight queue rows against in_flight_batch");
+
+        // `seeded_rustc` is the rustc of every seeded row, not only the
+        // in-flight ones: the harness names rustc namespaces from it.
+        let rows = db
+            .query("SELECT task_id, rustc_version FROM queue WHERE task_id NOT LIKE '%-%'")
+            .fetch_all::<SeededRustcRow>()
+            .await
+            .expect("seeded rows");
+        assert_eq!(
+            rows.len(),
+            GATE.queue_rows as usize,
+            "every seeded row read"
+        );
+        for SeededRustcRow {
+            task_id,
+            rustc_version: rustc,
+        } in rows
+        {
+            let n = u64::from_str_radix(&task_id, 16).expect("a seeded task id is %064x");
+            assert_eq!(
+                stow_types::fixture::task_hex_id(n),
+                task_id,
+                "task id of row {n}"
+            );
+            assert_eq!(
+                rustc,
+                stow_types::fixture::seeded_rustc(n),
+                "rustc of row {n}"
+            );
+        }
+    }
+
+    /// The callback lane's refill answers every armed batch and re-arms
+    /// exactly the resolved ones: a fresh fixture is all armed and
+    /// rewrites nothing; a delivered batch awaiting its alarm drops out;
+    /// a resolved batch comes back bound to its own run with its leg in
+    /// flight; a resolved batch whose leg a claim put in flight elsewhere
+    /// stays out, its leg untouched.
+    #[tokio::test]
+    async fn rearm_answers_the_armed_set_and_restores_only_resolved_batches() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        let min_age = settings.dispatch_min_age_minutes;
+        seed_production_shape(&db, &GATE, min_age)
+            .await
+            .expect("seed");
+        let all: Vec<u32> = (0..FixtureShape::IN_FLIGHT_ROWS).collect();
+        assert_eq!(
+            rearm_in_flight(&db, GATE, min_age).await.expect("rearm"),
+            all,
+            "a fresh fixture is all armed"
+        );
+
+        let [delivered, resolved, stolen] = [0, 1, 2].map(|k| GATE.in_flight_batch(k));
+        crate::scheduler::queue::record_batch_completion(
+            &db,
+            &delivered.batch_id.to_string(),
+            &stow_types::api::BatchRunComplete {
+                run_id: delivered.run_id,
+                run_attempt: 1,
+                conclusion: "success".to_owned(),
+                html_url: format!("https://github.invalid/runs/{}", delivered.run_id),
+            },
+        )
+        .await
+        .expect("record the delivery");
+        for (batch, leg_batch) in [(&resolved, None), (&stolen, Some("elsewhere"))] {
+            db.query("DELETE FROM build_batches WHERE batch_id = ?")
+                .bind(batch.batch_id.to_string())
+                .execute()
+                .await
+                .expect("resolve the batch");
+            let status = if leg_batch.is_some() {
+                "running"
+            } else {
+                "completed"
+            };
+            db.query("UPDATE queue SET status = ?, batch_id = ?, batch_leg = 0 WHERE task_id = ?")
+                .bind(status.to_owned())
+                .bind(leg_batch.map(str::to_owned))
+                .bind(batch.task_id.clone())
+                .execute()
+                .await
+                .expect("settle the leg");
+        }
+
+        let armed = rearm_in_flight(&db, GATE, min_age).await.expect("rearm");
+        let want: Vec<u32> = all.iter().copied().filter(|&k| k != 0 && k != 2).collect();
+        assert_eq!(armed, want, "delivered and stolen batches are not armed");
+
+        let row = db
+            .query("SELECT batch_id, rustc_version, github_run_id FROM build_batches WHERE batch_id = ?")
+            .bind(resolved.batch_id.to_string())
+            .fetch_optional::<BatchIdentityRow>()
+            .await
+            .expect("re-armed batch row")
+            .expect("the resolved batch is bound again");
+        assert_eq!(row.github_run_id, Some(resolved.run_id.to_string()));
+        let leg = db
+            .query(
+                "SELECT task_id, rustc_version, batch_id, batch_leg FROM queue \
+                 WHERE task_id = ? AND status IN ('dispatched', 'running')",
+            )
+            .bind(resolved.task_id.clone())
+            .fetch_optional::<InFlightLegRow>()
+            .await
+            .expect("re-armed leg")
+            .expect("the resolved leg is in flight again");
+        assert_eq!(leg.batch_id, Some(resolved.batch_id.to_string()));
+
+        let stolen_leg: Option<String> = db
+            .query("SELECT batch_id FROM queue WHERE task_id = ?")
+            .bind(stolen.task_id.clone())
+            .fetch_scalar()
+            .await
+            .expect("stolen leg");
+        assert_eq!(
+            stolen_leg.as_deref(),
+            Some("elsewhere"),
+            "a claimed leg is left alone"
+        );
+        let stolen_rows = count_rows_where(&db, &stolen.batch_id.to_string()).await;
+        assert_eq!(
+            stolen_rows, 0,
+            "no batch row is rewritten under a claimed leg"
+        );
+    }
+
+    async fn count_rows_where(db: &DurableDb, batch_id: &str) -> i64 {
+        db.query("SELECT COUNT(*) FROM build_batches WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
+            .fetch_scalar()
+            .await
+            .expect("count batch rows")
     }
 }

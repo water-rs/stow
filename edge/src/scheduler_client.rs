@@ -19,6 +19,7 @@ const SCHEDULER_RESET_URL: &str = "https://scheduler.internal/reset";
 const SCHEDULER_BUDGET_SEED_URL: &str = "https://scheduler.internal/budget/seed";
 const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
 const SCHEDULER_BUDGET_LEDGER_URL: &str = "https://scheduler.internal/budget/ledger";
+const SCHEDULER_BUDGET_REARM_URL: &str = "https://scheduler.internal/budget/rearm";
 const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
 
 pub async fn send_enqueue(
@@ -220,6 +221,17 @@ pub async fn scheduler_budget(
     request: &stow_types::api::SchedulerBudgetRequest,
 ) -> Result<stow_types::api::SchedulerBudgetReport, SchedulerClientError> {
     post_json(namespace, SCHEDULER_BUDGET_URL, request).await
+}
+
+/// `POST /budget/rearm` — re-arm the seeded fixture's resolved
+/// in-flight batches for the traffic-cost callback lane and answer every
+/// armed one (stow#833). The
+/// DO answers only on deploys carrying `STOW_SCHEDULER_BUDGET=1`.
+pub async fn rearm_budget_fixture(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::SchedulerRearmRequest,
+) -> Result<stow_types::api::SchedulerRearmReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_BUDGET_REARM_URL, request).await
 }
 
 /// `GET /budget/ledger` — the probe deploy's per-operation billed rows

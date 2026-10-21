@@ -162,9 +162,9 @@ pub struct DriveContext {
     /// restores exactly the pre-drive state instead of leaving a
     /// probe arm behind.
     prior_alarm: std::sync::Arc<std::sync::Mutex<PriorAlarm>>,
-    /// The batch a batch drive's setup bound — the id its run and its
-    /// cleanup address.
-    batch: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The batch a batch drive's setup bound and the run it bound it
+    /// to — what its run and its cleanup address.
+    batch: std::sync::Arc<std::sync::Mutex<Option<BoundBatch>>>,
     /// The floor setting and flags a floor drive's setup found, so its
     /// cleanup puts back exactly what the operator floor path rewrote.
     prior_floor: std::sync::Arc<std::sync::Mutex<Option<PriorFloor>>>,
@@ -265,12 +265,12 @@ impl DriveContext {
     }
 
     /// Record the batch a batch drive's setup bound.
-    fn set_batch(&self, batch_id: String) {
-        *self.batch.lock().expect("drive batch") = Some(batch_id);
+    fn set_batch(&self, bound: BoundBatch) {
+        *self.batch.lock().expect("drive batch") = Some(bound);
     }
 
     /// The batch the drive's setup bound.
-    fn batch_id(&self) -> Result<String, String> {
+    fn bound_batch(&self) -> Result<BoundBatch, String> {
         self.batch
             .lock()
             .expect("drive batch")
@@ -293,7 +293,7 @@ impl DriveContext {
     }
 
     /// Take the bound batch for the cleanup.
-    fn take_batch(&self) -> Option<String> {
+    fn take_batch(&self) -> Option<BoundBatch> {
         self.batch.lock().expect("drive batch").take()
     }
 
@@ -1809,10 +1809,12 @@ pub const DRIVES: &[Drive] = &[
         // succeeded: `ready_batches`, the classification and then
         // every leg through `complete`'s fence with its build sample.
         // On wasm the real `resolve_ready_batches`, whose outbound
-        // reads go to the local mock CI and registry; on host the
-        // jobs page is synthetic and the registry check answers
-        // present. Rows are bounded by `STOW_BATCH_MAX_TASKS` legs ×
-        // a constant per leg.
+        // reads go to the local mock CI and registry — the setup seeds
+        // the batch's run there, its jobs page and every leg's records
+        // artifact, outside the measured window ([`upstream_run`]); on
+        // host the jobs page is synthetic and the registry check
+        // answers present. Rows are bounded by `STOW_BATCH_MAX_TASKS`
+        // legs × a constant per leg.
         name: "alarm pass (batch resolution)",
         setup: Some(seed_completed_success_batch),
         run: |db, _shape, settings, ctx| {
@@ -1827,7 +1829,9 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         // The same resolution when every leg failed: each leg re-queues
         // behind its backoff with its evidence row, the heavier of the
-        // two per-leg writes.
+        // two per-leg writes. On wasm the seeded run's legs fail their
+        // build at a verdict step and publish nothing, so the batch
+        // resolves as failed rather than deferring.
         name: "alarm pass (batch resolution, failure)",
         setup: Some(seed_completed_failure_batch),
         run: |db, _shape, settings, ctx| {
@@ -2700,9 +2704,20 @@ async fn restore_batches(db: &DurableDb, shape: FixtureShape) -> Result<(), Stri
 
 type DriveFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
-/// The run every batch drive binds its batch to. Numeric, as the lease
-/// check and the resolution pass parse a bound run id.
+/// The run a batch drive binds its batch to when nothing reads the run
+/// upstream: the completion-route and lease drives, and on host the
+/// resolution drives too, whose outbound reads are synthetic there. On
+/// wasm a resolution drive binds the run the local CI recorded for its
+/// batch instead ([`upstream_run`]). Numeric, as the lease check and the
+/// resolution pass parse a bound run id.
 pub const BATCH_DRIVE_RUN_ID: u64 = 9_000_000_001;
+
+/// A batch drive's bound batch: the claimed batch and its run.
+#[derive(Debug, Clone)]
+struct BoundBatch {
+    batch_id: String,
+    run_id: u64,
+}
 
 /// What the batch's run concluded — the conclusion its completion
 /// carries and the jobs page the host resolution classifies.
@@ -2732,28 +2747,26 @@ enum BatchEnd {
     Leased,
 }
 
-fn batch_completion(outcome: BatchOutcome) -> stow_types::api::BatchRunComplete {
+fn batch_completion(run_id: u64, outcome: BatchOutcome) -> stow_types::api::BatchRunComplete {
     stow_types::api::BatchRunComplete {
-        run_id: BATCH_DRIVE_RUN_ID,
+        run_id,
         run_attempt: 1,
         conclusion: outcome.conclusion().to_owned(),
-        html_url: stow_types::runs::run_url(&BATCH_DRIVE_RUN_ID.to_string()),
+        html_url: stow_types::runs::run_url(&run_id.to_string()),
     }
 }
 
-/// Claim one full batch from the planted window and bind it to
-/// [`BATCH_DRIVE_RUN_ID`] — a bound in-flight batch of
+/// Claim one full batch from the planted window — a batch of
 /// `STOW_BATCH_MAX_TASKS` legs, the bound every batch drive names.
 ///
 /// The claim runs with room for exactly one batch beside the fixture's
-/// in-flight slots. The rows it moves, and the pending rows of the legs'
-/// `(crate, target)` pairs that a build sample's cost refresh can
-/// re-key, restore from the snapshot the cleanup takes.
-async fn bind_cost_batch(
+/// in-flight slots. The rows it moves restore from the snapshot the
+/// cleanup takes.
+async fn claim_cost_batch(
     db: &DurableDb,
     settings: &SchedulerSettings,
     ctx: &DriveContext,
-) -> Result<String, String> {
+) -> Result<super::batching::FormedBatch, String> {
     if queue::freeze_enabled(db)
         .await
         .map_err(|error| error.to_string())?
@@ -2783,8 +2796,20 @@ async fn bind_cost_batch(
             settings.batch_max_tasks
         ));
     }
+    Ok(batch)
+}
+
+/// Bind the claimed `batch` to `run_id` — a bound in-flight batch. The
+/// pending rows of the legs' `(crate, target)` pairs that a build
+/// sample's cost refresh can re-key join the cleanup's snapshot.
+async fn bind_cost_batch(
+    db: &DurableDb,
+    ctx: &DriveContext,
+    batch: &super::batching::FormedBatch,
+    run_id: u64,
+) -> Result<String, String> {
     let batch_id = batch.batch_id.as_str().to_owned();
-    let bound = queue::bind_batch_run(db, &batch_id, &BATCH_DRIVE_RUN_ID.to_string())
+    let bound = queue::bind_batch_run(db, &batch_id, &run_id.to_string())
         .await
         .map_err(|error| error.to_string())?;
     if !bound {
@@ -2804,8 +2829,21 @@ async fn bind_cost_batch(
         .await
         .map_err(|error| error.to_string())?;
     ctx.extend_restore_rows(restore_rows_for(db, &siblings).await?);
-    ctx.set_batch(batch_id.clone());
+    ctx.set_batch(BoundBatch {
+        batch_id: batch_id.clone(),
+        run_id,
+    });
     Ok(batch_id)
+}
+
+/// A claimed batch bound to [`BATCH_DRIVE_RUN_ID`].
+async fn claim_bound_batch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+) -> Result<String, String> {
+    let batch = claim_cost_batch(db, settings, ctx).await?;
+    bind_cost_batch(db, ctx, &batch, BATCH_DRIVE_RUN_ID).await
 }
 
 fn seed_bound_batch<'a>(
@@ -2814,18 +2852,87 @@ fn seed_bound_batch<'a>(
     settings: &'a SchedulerSettings,
     ctx: &'a DriveContext,
 ) -> DriveFuture<'a> {
-    Box::pin(async move { bind_cost_batch(db, settings, ctx).await.map(|_| ()) })
+    Box::pin(async move { claim_bound_batch(db, settings, ctx).await.map(|_| ()) })
 }
 
-/// A bound batch whose run's `completed` delivery is already recorded.
+/// The run the claimed `batch` concluded as at `outcome`, existing
+/// upstream before its completion is recorded, as production's run
+/// does.
+///
+/// On wasm the local CI records it under an id it allocates: every
+/// leg's build and publish jobs at `outcome`, and for a success each
+/// leg's records artifact under the run's tag. The resolution then
+/// reads the jobs page and records the production path reads, and a
+/// failed run resolves as failed instead of deferring. On host the
+/// resolution's outbound reads are synthetic, so the run is
+/// [`BATCH_DRIVE_RUN_ID`].
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(
+        clippy::unused_async,
+        reason = "only the wasm build seeds the run at the local CI; the host build's resolution reads are synthetic"
+    )
+)]
+async fn upstream_run(
+    ctx: &DriveContext,
+    batch: &super::batching::FormedBatch,
+    outcome: BatchOutcome,
+) -> Result<u64, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use stow_types::local_ci::{LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRuns};
+        let env = ctx
+            .env
+            .as_ref()
+            .ok_or_else(|| "batch resolution drive needs a Worker env".to_owned())?;
+        let local_ci = super::object::local_ci_runs(env).map_err(|error| error.to_string())?;
+        let seeded = LocalCiSeededRuns {
+            runs: vec![LocalCiSeededRun {
+                workflow_run_id: None,
+                rustc_version: batch.rustc_version.clone(),
+                batch_id: batch.batch_id.clone(),
+                legs: batch
+                    .tasks
+                    .iter()
+                    .map(|task| task.task_id.clone())
+                    .collect(),
+                conclusion: match outcome {
+                    BatchOutcome::Success => LocalCiSeededConclusion::Success,
+                    BatchOutcome::Failure => LocalCiSeededConclusion::Failure,
+                },
+            }],
+        };
+        let ids = local_ci
+            .seed_runs(&seeded, &crate::fetch_guard::OutboundPool::new())
+            .await
+            .map_err(|error| format!("seed batch {}'s run: {error}", batch.batch_id))?;
+        match ids.runs[..] {
+            [run_id] => Ok(run_id),
+            _ => Err(format!(
+                "the local CI answered {} run ids for one seeded run",
+                ids.runs.len()
+            )),
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (ctx, batch, outcome);
+        Ok(BATCH_DRIVE_RUN_ID)
+    }
+}
+
+/// A bound batch whose run concluded upstream at `outcome` and whose
+/// `completed` delivery is already recorded.
 async fn bind_completed_batch(
     db: &DurableDb,
     settings: &SchedulerSettings,
     ctx: &DriveContext,
     outcome: BatchOutcome,
 ) -> Result<(), String> {
-    let batch_id = bind_cost_batch(db, settings, ctx).await?;
-    queue::record_batch_completion(db, &batch_id, &batch_completion(outcome))
+    let batch = claim_cost_batch(db, settings, ctx).await?;
+    let run_id = upstream_run(ctx, &batch, outcome).await?;
+    let batch_id = bind_cost_batch(db, ctx, &batch, run_id).await?;
+    queue::record_batch_completion(db, &batch_id, &batch_completion(run_id, outcome))
         .await
         .map_err(|error| error.to_string())
 }
@@ -2856,7 +2963,7 @@ fn seed_expired_batch<'a>(
     ctx: &'a DriveContext,
 ) -> DriveFuture<'a> {
     Box::pin(async move {
-        let batch_id = bind_cost_batch(db, settings, ctx).await?;
+        let batch_id = claim_bound_batch(db, settings, ctx).await?;
         db.query(
             "UPDATE build_batches SET lease_at = datetime('now', '-1 minutes') \
              WHERE batch_id = ?",
@@ -2877,9 +2984,14 @@ async fn complete_batch_route(
     ctx: &DriveContext,
     outcome: BatchOutcome,
 ) -> Result<(), String> {
-    queue::record_batch_completion(db, &ctx.batch_id()?, &batch_completion(outcome))
-        .await
-        .map_err(|error| error.to_string())?;
+    let bound = ctx.bound_batch()?;
+    queue::record_batch_completion(
+        db,
+        &bound.batch_id,
+        &batch_completion(bound.run_id, outcome),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     plan_wake(db, settings).await
 }
 
@@ -2971,7 +3083,7 @@ fn synthetic_jobs_page(
         run_attempt: 1,
         html_url: format!(
             "{}/job/{leg}",
-            stow_types::runs::run_url(&BATCH_DRIVE_RUN_ID.to_string())
+            stow_types::runs::run_url(&batch.run_id.to_string())
         ),
         steps,
     };
@@ -3060,10 +3172,11 @@ async fn finish_batch_drive(
     let mut errors: Vec<String> = Vec::new();
     let snapshot = ctx.take_restore_rows();
     match ctx.take_batch() {
-        Some(batch_id) => {
-            if let Err(error) = verify_batch_end(db, &batch_id, end).await {
+        Some(bound) => {
+            if let Err(error) = verify_batch_end(db, &bound, end).await {
                 errors.push(error);
             }
+            let batch_id = bound.batch_id;
             // The legs still carry their batch binding here, so the
             // samples and stats they filed are addressable through it.
             for statement in [
@@ -3110,7 +3223,8 @@ async fn finish_batch_drive(
 /// The unmetered check that a batch drive's run did its work: a no-op
 /// completion or an unapplied resolution would otherwise price as a
 /// cheap success.
-async fn verify_batch_end(db: &DurableDb, batch_id: &str, end: BatchEnd) -> Result<(), String> {
+async fn verify_batch_end(db: &DurableDb, bound: &BoundBatch, end: BatchEnd) -> Result<(), String> {
+    let batch_id = bound.batch_id.as_str();
     let count = |sql: &'static str, binds: Vec<String>| async move {
         let mut query = db.query(sql);
         for bind in binds {
@@ -3125,7 +3239,7 @@ async fn verify_batch_end(db: &DurableDb, batch_id: &str, end: BatchEnd) -> Resu
         BatchEnd::Completed => {
             let recorded = count(
                 "SELECT COUNT(*) FROM build_batches WHERE batch_id = ? AND done_run_id = ?",
-                vec![batch_id.to_owned(), BATCH_DRIVE_RUN_ID.to_string()],
+                vec![batch_id.to_owned(), bound.run_id.to_string()],
             )
             .await?;
             (recorded == 1)

@@ -1244,9 +1244,8 @@ async fn assert_rearm_gate_truth(db: &DurableDb, shape: fixture::FixtureShape, c
         shape.failed_row(1),
         shape.completed_row(0),
         shape.completed_row(1),
-        shape.running_row(),
-        shape.dispatched_row(0),
     ];
+    touched.extend((0..fixture::FixtureShape::IN_FLIGHT_ROWS).map(|k| shape.in_flight_row(k)));
     touched.extend(claimed.iter().filter_map(|id| {
         u64::from_str_radix(id, 16)
             .ok()
