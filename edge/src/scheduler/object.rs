@@ -1263,8 +1263,7 @@ pub(super) async fn dispatch_pass(
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
     let credential_source = credential_source(env)?;
-    // §3.2: completed batches resolve before claiming — a resolved
-    // batch's freed slots fill this same pass.
+    // The bindings and handles every step of the pass shares.
     let scope = PassScope {
         env,
         db,
@@ -1272,6 +1271,11 @@ pub(super) async fn dispatch_pass(
         github_repo: &github_repo,
         freeze: &freeze,
     };
+    // §4.3: expired leases settle first, so a completion the lease check
+    // recovers resolves in this same pass.
+    check_batch_leases(&scope, &credential_source).await?;
+    // §3.2: completed batches resolve before claiming — a resolved
+    // batch's freed slots fill this same pass.
     resolve_ready_batches(&scope, &credential_source).await?;
     let batches = queue::claim_dispatchable_tasks(db, settings, coverage)
         .await
@@ -1338,6 +1342,11 @@ pub(super) async fn dispatch_pass(
 /// the 30 s §3.2 grants the page to finish writing.
 const BATCH_RESOLVE_DEFER_MS: i64 = 30_000;
 
+/// How long the lease check leaves a batch whose run lookup, cancel or
+/// token mint failed before the next pass asks again — without it the
+/// alarm would re-arm at `now` for as long as GitHub is failing.
+const LEASE_RETRY_MS: i64 = BATCH_RESOLVE_DEFER_MS;
+
 /// The GHCR config the batch resolution's records check reads — the
 /// same binding the Worker's webhook builds for the per-task path
 /// (entry.rs).
@@ -1357,6 +1366,235 @@ struct PassScope<'a> {
     settings: &'a SchedulerSettings,
     github_repo: &'a str,
     freeze: &'a FreezeSettings,
+}
+
+/// §4.3: settle every batch whose lease expired — before resolving
+/// and claiming, so a recorded completion resolves and a requeued leg
+/// is claimable in this same pass. It runs whether or not dispatch is
+/// paused: a paused scheduler still owes its in-flight builds the
+/// lease check.
+///
+/// An unbound batch (the dispatch response was lost) has no run to ask
+/// about and requeues its legs without any HTTP. The bound ones are
+/// looked up concurrently ([`check_bound_leases`]); the credential
+/// resolves only when one expired, like the other arms'.
+async fn check_batch_leases(
+    scope: &PassScope<'_>,
+    credential_source: &CredentialSource,
+) -> Result<()> {
+    let PassScope { db, settings, .. } = *scope;
+    let now_ms = now_ms();
+    let mut bound = Vec::new();
+    for batch in queue::expired_batches(db, now_ms).await.map_err(to_error)? {
+        match batch.run_id {
+            None => {
+                tracing::warn!(
+                    batch_id = %batch.batch_id,
+                    "batch lease expired unbound — requeueing its legs"
+                );
+                queue::requeue_unbound_batch(db, settings, &batch.batch_id)
+                    .await
+                    .map_err(to_error)?;
+            }
+            Some(run_id) => bound.push((batch, run_id)),
+        }
+    }
+    if bound.is_empty() {
+        return Ok(());
+    }
+    match credential_source {
+        CredentialSource::LocalCi(url) => {
+            check_bound_leases(scope, &dispatch::LocalCiBuildRuns::new(url), bound, now_ms).await
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(db, config).await {
+                Ok(token) => {
+                    check_bound_leases(scope, &dispatch::GitHubBuildRuns::new(token), bound, now_ms)
+                        .await
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        batches = bound.len(),
+                        "installation token mint failed — leaving expired batches for the next pass"
+                    );
+                    for (batch, _) in &bound {
+                        queue::set_batch_lease(db, &batch.batch_id, now_ms + LEASE_RETRY_MS)
+                            .await
+                            .map_err(to_error)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// What the lease check decided for one bound, expired batch.
+enum LeaseVerdict {
+    /// The run completed — record it as the webhook would have.
+    Completed(stow_types::api::BatchRunComplete),
+    /// The run is still going inside its ceiling.
+    Extend,
+    /// The run outlived its ceiling — cancel it, then fail the batch.
+    Cancel,
+    /// The lookup failed — the next pass asks again.
+    Retry,
+}
+
+/// One bound expired set's lease check. The run lookups, then the
+/// cancels of the runs past their ceiling, each run concurrently under
+/// the invocation's outbound bound; the queue writes apply
+/// sequentially afterward (`&DurableDb` is not `Send`, so it never
+/// enters a concurrent future).
+async fn check_bound_leases(
+    scope: &PassScope<'_>,
+    backend: &impl dispatch::BuildRuns,
+    bound: Vec<(queue::ExpiredBatch, u64)>,
+    now_ms: i64,
+) -> Result<()> {
+    let github_repo = scope.github_repo;
+    let pool = crate::fetch_guard::OutboundPool::new();
+    // Collected before streaming, like the dispatch fan-out's.
+    let lookups: Vec<_> = bound
+        .iter()
+        .map(|&(_, run_id)| backend.run_status(github_repo, run_id, &pool))
+        .collect();
+    let statuses = stream::iter(lookups)
+        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    let mut verdicts = Vec::with_capacity(bound.len());
+    for ((batch, run_id), status) in bound.iter().zip(statuses) {
+        verdicts.push(lease_verdict(batch, *run_id, status)?);
+    }
+    let cancels: Vec<_> = bound
+        .iter()
+        .zip(&verdicts)
+        .filter(|(_, verdict)| matches!(verdict, LeaseVerdict::Cancel))
+        .map(|(&(_, run_id), _)| backend.cancel_run(github_repo, run_id, &pool))
+        .collect();
+    let mut cancels = stream::iter(cancels)
+        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter();
+    for ((batch, run_id), verdict) in bound.iter().zip(verdicts) {
+        let cancelled = matches!(verdict, LeaseVerdict::Cancel).then(|| {
+            cancels
+                .next()
+                .expect("one cancel was issued per past-ceiling verdict")
+        });
+        apply_lease_verdict(scope, batch, *run_id, verdict, cancelled, now_ms).await?;
+    }
+    Ok(())
+}
+
+/// What the lease check decides for one bound, expired batch from its
+/// run's state.
+///
+/// # Errors
+/// A `completed` run with no conclusion is corrupt GitHub state.
+fn lease_verdict(
+    batch: &queue::ExpiredBatch,
+    run_id: u64,
+    status: std::result::Result<stow_types::runs::RunStatus, dispatch::DispatchError>,
+) -> Result<LeaseVerdict> {
+    Ok(match status {
+        Err(error) => {
+            tracing::error!(
+                batch_id = %batch.batch_id,
+                run_id,
+                %error,
+                "run status lookup failed — leaving the batch for the next pass"
+            );
+            LeaseVerdict::Retry
+        }
+        Ok(status) if status.status == "completed" => {
+            let conclusion = status.conclusion.ok_or_else(|| {
+                Error::msg(format!(
+                    "run {run_id} of batch {} is completed with no conclusion",
+                    batch.batch_id
+                ))
+            })?;
+            LeaseVerdict::Completed(stow_types::api::BatchRunComplete {
+                run_id,
+                run_attempt: status.run_attempt,
+                conclusion,
+                html_url: status.html_url,
+            })
+        }
+        Ok(_) if batch.past_ceiling => LeaseVerdict::Cancel,
+        Ok(_) => LeaseVerdict::Extend,
+    })
+}
+
+/// Apply one batch's verdict to the queue. `cancelled` is the cancel
+/// call's outcome for a [`LeaseVerdict::Cancel`] verdict, `None` for
+/// every other.
+async fn apply_lease_verdict(
+    scope: &PassScope<'_>,
+    batch: &queue::ExpiredBatch,
+    run_id: u64,
+    verdict: LeaseVerdict,
+    cancelled: Option<std::result::Result<(), dispatch::DispatchError>>,
+    now_ms: i64,
+) -> Result<()> {
+    let PassScope { db, settings, .. } = *scope;
+    let batch_id = batch.batch_id.as_str();
+    match verdict {
+        LeaseVerdict::Completed(report) => {
+            tracing::info!(
+                batch_id,
+                run_id,
+                conclusion = %report.conclusion,
+                "expired lease found its run completed — recording the lost delivery"
+            );
+            match queue::record_batch_completion(db, batch_id, &report).await {
+                Ok(()) => {}
+                // The row left between the lookup and the write; the run
+                // it named resolves nothing.
+                Err(QueueError::UnknownBatch(_)) => {
+                    tracing::warn!(batch_id, "batch gone before its completion was recorded");
+                }
+                Err(error) => return Err(to_error(error)),
+            }
+        }
+        LeaseVerdict::Extend => {
+            queue::extend_batch_lease(db, settings, batch_id, now_ms)
+                .await
+                .map_err(to_error)?;
+        }
+        LeaseVerdict::Cancel => match cancelled.expect("a cancel verdict carries its cancel") {
+            Ok(()) => {
+                tracing::error!(
+                    batch_id,
+                    run_id,
+                    "run exceeded its ceiling — cancelled, failing its legs"
+                );
+                queue::fail_batch_past_ceiling(db, batch_id)
+                    .await
+                    .map_err(to_error)?;
+            }
+            Err(error) => {
+                tracing::error!(
+                    batch_id,
+                    run_id,
+                    %error,
+                    "cancelling a run past its ceiling failed — leaving the batch for the next pass"
+                );
+                queue::set_batch_lease(db, batch_id, now_ms + LEASE_RETRY_MS)
+                    .await
+                    .map_err(to_error)?;
+            }
+        },
+        LeaseVerdict::Retry => {
+            queue::set_batch_lease(db, batch_id, now_ms + LEASE_RETRY_MS)
+                .await
+                .map_err(to_error)?;
+        }
+    }
+    Ok(())
 }
 
 /// §3.2: resolve every batch whose `completed` delivery is bound and

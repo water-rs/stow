@@ -383,7 +383,7 @@ async fn mark_active(db: &DurableDb, crate_name: &str, target: &str, status: &st
         "INSERT INTO build_batches \
              (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
               claimed_at, lease_at) \
-         VALUES (?, ?, ?, 'miss', 1, 1, ?, ?) \
+         VALUES (?, ?, ?, 'miss', 1, 1, ?, datetime(?, ?)) \
          ON CONFLICT(batch_id) DO UPDATE SET \
              claimed_at = excluded.claimed_at, lease_at = excluded.lease_at",
     )
@@ -392,6 +392,7 @@ async fn mark_active(db: &DurableDb, crate_name: &str, target: &str, status: &st
     .bind(family)
     .bind(ROW_TS)
     .bind(ROW_TS)
+    .bind(format!("+{STALE_DISPATCH_MINUTES} minutes"))
     .execute()
     .await
     .expect("seed in-flight batch row");
@@ -593,28 +594,257 @@ async fn submit_while_paused_enqueues_but_claims_nothing() {
     assert_eq!(super::status(&db).await.expect("status").pending, 1);
 }
 
-/// An in-flight row past its lease is still reclaimed to `pending`
-/// while paused: the claim pass recovers stale work before the pause
-/// check turns it away.
+/// An expired unbound batch requeues its legs while paused: the
+/// lease check runs ahead of the claim's pause check, so a paused
+/// scheduler still gets its in-flight builds back.
 #[tokio::test]
-async fn paused_claim_still_recovers_stale_in_flight_row() {
+async fn paused_lease_check_still_requeues_an_unbound_batch() {
     let db = memory_db().await.expect("memory db");
     super::enqueue(&db, &[request("busy", &[])], &paused_settings())
         .await
         .expect("enqueue");
     mark_active(&db, "busy", TARGET, "dispatched").await;
 
+    let expired = super::expired_batches(&db, ROW_TS_MS + stale_ms())
+        .await
+        .expect("expired batches");
+    assert_eq!(expired.len(), 1);
+    super::requeue_unbound_batch(&db, &paused_settings(), &expired[0].batch_id)
+        .await
+        .expect("requeue");
     let claimed = claim_flat(&db, &paused_settings(), &NoCoverage)
         .await
         .expect("claim");
     assert!(claimed.is_empty());
-    let status = db
-        .query("SELECT status FROM queue WHERE task_id = ?")
-        .bind(task_id_on("busy", TARGET))
+    assert_eq!(status_of(&db, "busy").await, "pending");
+}
+
+/// A two-leg, one-slot batch in flight since `ROW_TS` (so two rounds,
+/// a 420-minute ceiling), its lease expiring at `ROW_TS + stale`.
+/// `run_id` binds it the way the dispatch response would; `None`
+/// leaves it unbound.
+async fn two_leg_batch(db: &DurableDb, run_id: Option<&str>) -> String {
+    enqueue(db, &[request("leg-a", &[]), request("leg-b", &[])])
+        .await
+        .expect("enqueue legs");
+    mark_active(db, "leg-a", TARGET, "dispatched").await;
+    mark_active(db, "leg-b", TARGET, "dispatched").await;
+    let task_a = task_id_on("leg-a", TARGET);
+    let task_b = task_id_on("leg-b", TARGET);
+    let (batch_id, other) = (task_a[..32].to_owned(), &task_b[..32]);
+    bind_leg(db, &task_b, &batch_id, 1).await;
+    db.query("DELETE FROM build_batches WHERE batch_id = ?")
+        .bind(other.to_owned())
+        .execute()
+        .await
+        .expect("drop the second fixture batch");
+    db.query("UPDATE build_batches SET legs = 2, github_run_id = ? WHERE batch_id = ?")
+        .bind(run_id)
+        .bind(batch_id.clone())
+        .execute()
+        .await
+        .expect("shape the fixture batch");
+    batch_id
+}
+
+async fn queue_error(db: &DurableDb, name: &str) -> String {
+    db.query("SELECT error_msg FROM queue WHERE crate_name = ?")
+        .bind(name.to_owned())
         .fetch_scalar::<String>()
         .await
-        .expect("status");
-    assert_eq!(status, "pending");
+        .expect("error_msg")
+}
+
+async fn batch_lease_ms(db: &DurableDb, batch_id: &str) -> Option<i64> {
+    db.query(
+        "SELECT CAST(strftime('%s', lease_at) AS INTEGER) * 1000 \
+         FROM build_batches WHERE batch_id = ?",
+    )
+    .bind(batch_id.to_owned())
+    .fetch_scalar_optional::<i64>()
+    .await
+    .expect("read lease")
+}
+
+async fn active_slots(db: &DurableDb) -> u32 {
+    super::count_active_by_family(db)
+        .await
+        .expect("count slots")
+        .total
+}
+
+/// §4.3: an expired unbound batch has no run to ask about — both legs
+/// requeue in one statement and the row delete frees the batch's slots.
+#[tokio::test]
+async fn an_expired_unbound_batch_requeues_its_legs_and_frees_its_slots() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = two_leg_batch(&db, None).await;
+    assert_eq!(active_slots(&db).await, 1);
+
+    let expired = super::expired_batches(&db, ROW_TS_MS + stale_ms())
+        .await
+        .expect("expired batches");
+    assert_eq!(
+        expired,
+        vec![super::ExpiredBatch {
+            batch_id: batch_id.clone(),
+            run_id: None,
+            past_ceiling: false,
+        }]
+    );
+    super::requeue_unbound_batch(&db, &settings(), &batch_id)
+        .await
+        .expect("requeue");
+
+    assert_eq!(status_of(&db, "leg-a").await, "pending");
+    assert_eq!(status_of(&db, "leg-b").await, "pending");
+    assert!(build_batch(&db, &batch_id).await.is_none());
+    assert_eq!(active_slots(&db).await, 0);
+}
+
+/// §4.3: a batch whose lease has not run out is not listed, so the
+/// lease check cannot touch it; at the lease instant it is.
+#[tokio::test]
+async fn a_batch_inside_its_lease_is_not_expired() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = two_leg_batch(&db, Some("4242")).await;
+
+    let inside = super::expired_batches(&db, ROW_TS_MS + stale_ms() - 1)
+        .await
+        .expect("inside the lease");
+    assert!(inside.is_empty(), "{inside:?}");
+    let expired = super::expired_batches(&db, ROW_TS_MS + stale_ms())
+        .await
+        .expect("at the lease");
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].batch_id, batch_id);
+    assert_eq!(expired[0].run_id, Some(4242));
+    assert_eq!(status_of(&db, "leg-a").await, "dispatched");
+    assert_eq!(active_slots(&db).await, 1);
+}
+
+/// §4.3: a bound batch whose run completed is recorded as the webhook
+/// would — it leaves the lease check for the resolution pass, and its
+/// legs stay in flight rather than being redispatched.
+#[tokio::test]
+async fn a_completed_run_is_recorded_without_redispatch() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = two_leg_batch(&db, Some("4242")).await;
+    let now_ms = ROW_TS_MS + stale_ms();
+
+    super::record_batch_completion(&db, &batch_id, &batch_run_complete(4242, 1, "success"))
+        .await
+        .expect("record the lost delivery");
+
+    assert!(
+        super::expired_batches(&db, now_ms)
+            .await
+            .expect("expired batches")
+            .is_empty(),
+        "a recorded completion belongs to the resolution pass"
+    );
+    // `resolve_after` is the recording instant (wall clock), so the
+    // resolution pass looks from well after it.
+    let resolution_ms = now_ms + 3650 * 86_400_000;
+    let ready = super::ready_batches(&db, resolution_ms)
+        .await
+        .expect("ready");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].batch_id, batch_id);
+    assert_eq!(ready[0].run_id, "4242");
+    assert_eq!(ready[0].legs.len(), 2);
+    let cheap = SchedulerSettings {
+        dispatch_min_age_minutes: 0,
+        ..settings()
+    };
+    assert!(
+        claim_flat(&db, &cheap, &NoCoverage)
+            .await
+            .expect("claim")
+            .is_empty()
+    );
+    assert_eq!(status_of(&db, "leg-a").await, "dispatched");
+    assert_eq!(status_of(&db, "leg-b").await, "dispatched");
+    assert_eq!(active_slots(&db).await, 1);
+}
+
+/// §4.3: a run still going inside its ceiling keeps its legs and its
+/// slots; only the lease moves, and the alarm re-arms on the new one.
+#[tokio::test]
+async fn an_in_progress_run_has_its_lease_extended() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = two_leg_batch(&db, Some("4242")).await;
+    let now_ms = ROW_TS_MS + stale_ms();
+
+    super::extend_batch_lease(&db, &settings(), &batch_id, now_ms)
+        .await
+        .expect("extend");
+
+    assert_eq!(
+        batch_lease_ms(&db, &batch_id).await,
+        Some(now_ms + stale_ms())
+    );
+    let expired = super::expired_batches(&db, now_ms)
+        .await
+        .expect("expired batches");
+    assert!(expired.is_empty(), "{expired:?}");
+    assert_eq!(status_of(&db, "leg-a").await, "dispatched");
+    assert_eq!(active_slots(&db).await, 1);
+    let plan = next_alarm(&db, now_ms, &settings())
+        .await
+        .expect("next_alarm");
+    assert_eq!(plan, AlarmPlan::At(now_ms + stale_ms()));
+}
+
+/// §4.3: the ceiling is `claimed_at + ⌈legs / parallelism⌉ × 180 min + 60 min`
+/// — here two rounds, 420 minutes. A batch past it has its in-flight legs
+/// failed in one statement with the ceiling error and its row released.
+#[tokio::test]
+async fn a_run_past_its_ceiling_fails_its_legs() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = two_leg_batch(&db, Some("4242")).await;
+    let minute = 60_000;
+
+    let inside = super::expired_batches(&db, ROW_TS_MS + 419 * minute)
+        .await
+        .expect("inside the ceiling");
+    assert!(!inside[0].past_ceiling);
+    let past = super::expired_batches(&db, ROW_TS_MS + 420 * minute)
+        .await
+        .expect("past the ceiling");
+    assert!(past[0].past_ceiling);
+
+    super::fail_batch_past_ceiling(&db, &batch_id)
+        .await
+        .expect("fail the batch");
+
+    for name in ["leg-a", "leg-b"] {
+        assert_eq!(status_of(&db, name).await, "failed");
+        assert_eq!(
+            queue_error(&db, name).await,
+            "infrastructure: run exceeded its ceiling"
+        );
+    }
+    assert!(build_batch(&db, &batch_id).await.is_none());
+    assert_eq!(active_slots(&db).await, 0);
+}
+
+/// A completion recorded while the cancel was in flight is the
+/// resolution pass's: the ceiling failure leaves the legs and the row.
+#[tokio::test]
+async fn a_recorded_completion_wins_over_the_ceiling_failure() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = two_leg_batch(&db, Some("4242")).await;
+    super::record_batch_completion(&db, &batch_id, &batch_run_complete(4242, 1, "cancelled"))
+        .await
+        .expect("record");
+
+    super::fail_batch_past_ceiling(&db, &batch_id)
+        .await
+        .expect("fail the batch");
+
+    assert_eq!(status_of(&db, "leg-a").await, "dispatched");
+    assert!(build_batch(&db, &batch_id).await.is_some());
 }
 
 #[tokio::test]
@@ -5662,9 +5892,36 @@ async fn seed_ready_batch(
     .expect("seed ready build_batches row");
 }
 
-/// Bind a claimed row to a batch leg — the claim pass does not write
-/// `batch_id`/`batch_leg` yet (the wiring is a later stage of
-/// stow#833), so tests seed the columns directly.
+/// A batch whose completion is recorded against its bound run wakes
+/// the alarm at its `resolve_after`, never at its past lease — a
+/// deferred resolution must not re-arm the alarm at `now` every pass —
+/// while an unrecorded batch still wakes at its lease.
+#[tokio::test]
+async fn a_recorded_batch_wakes_at_its_resolution_not_its_lease() {
+    let db = memory_db().await.expect("memory db");
+    seed_ready_batch(
+        &db,
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "8888",
+        "success",
+        "2099-01-01 00:00:00",
+    )
+    .await;
+    assert_eq!(
+        super::earliest_batch_wake_ms(&db).await.expect("wake"),
+        Some(4_070_908_800_000),
+        "a deferred recorded batch wakes at its resolve_after"
+    );
+    seed_build_batch(&db, "ffffffffffffffffffffffffffffffff", Some("9999")).await;
+    assert_eq!(
+        super::earliest_batch_wake_ms(&db).await.expect("wake"),
+        Some(ROW_TS_MS),
+        "an unrecorded batch wakes at its lease"
+    );
+}
+
+/// Bind a claimed row to a batch leg directly — tests that seed their
+/// own `build_batches` rows attach legs to them without a claim.
 async fn bind_leg(db: &DurableDb, task_id: &str, batch_id: &str, batch_leg: i64) {
     db.query("UPDATE queue SET batch_id = ?, batch_leg = ? WHERE task_id = ?")
         .bind(batch_id.to_owned())
@@ -8209,17 +8466,10 @@ async fn stale_recovery_and_shape_requeue_reprice_against_moved_cost() {
     let (db, stale_prefix) = reentry_fixture().await;
     let priced = repriced_prefix;
 
-    // Stale-lease recovery: running, past the stale window → pending.
-    db.query(
-        "UPDATE queue SET status = 'running', updated_at = datetime('now', '-2 days'), \
-             claimed_at = datetime('now', '-2 days'), \
-             first_requested_at = MIN(first_requested_at, datetime('now', '-2 days')) \
-             WHERE crate_name = 'stale'",
-    )
-    .execute()
-    .await
-    .expect("mark stale");
-    super::recover_stale_active_tasks(&db, &settings())
+    // Unbound-batch lease expiry: running, past the lease → pending.
+    mark_active(&db, "stale", TARGET, "running").await;
+    let task_id = task_id_on("stale", TARGET);
+    super::requeue_unbound_batch(&db, &settings(), &task_id[..32])
         .await
         .expect("recover stale");
     assert_eq!(status_of(&db, "stale").await, "pending");

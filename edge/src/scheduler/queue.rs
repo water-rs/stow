@@ -4811,9 +4811,9 @@ pub async fn claim_dispatchable_tasks(
     settings: &SchedulerSettings,
     coverage: &impl CoverageOracle,
 ) -> Result<Vec<FormedBatch>, QueueError> {
-    // Stale recovery runs ahead of the pause check: a paused scheduler
-    // owes its in-flight builds the same lease-expiry reclaim.
-    recover_stale_active_tasks(db, settings).await?;
+    // The lease check ran ahead of this claim (`object.rs`); what is
+    // left is releasing the slots of batches with no leg in flight.
+    release_legless_batches(db).await?;
     // The dispatch freeze is the gate, and it lives here — the enqueue
     // side of the queue never consults it, so misses keep arriving and
     // stay pending for the first pass after a human lifts the freeze.
@@ -6413,7 +6413,7 @@ pub enum DispatchCapacity {
     /// `active_total < limit` — a dispatch slot is free.
     Available,
     /// Every slot is taken: at least one dispatched/running row exists,
-    /// so `earliest_active_lease_expiry_ms` must be `Some`.
+    /// so `earliest_batch_wake_ms` must be `Some`.
     Exhausted,
 }
 
@@ -6431,20 +6431,20 @@ pub struct AlarmInputs {
     /// Earliest moment any unblocked pending row in a family with a free
     /// dispatch slot becomes dispatchable.
     pub earliest_pending_eligible_ms: Option<i64>,
-    /// Earliest `claimed_at + stale_dispatch_minutes` over dispatched/running
-    /// rows — when the oldest in-flight build becomes recoverable. Must be
+    /// Earliest moment an in-flight batch needs a pass — its lease
+    /// expiry, or its `resolve_after` once its completion is recorded
+    /// (see [`earliest_batch_wake_ms`]). Must be
     /// `Some` whenever `capacity` is `Exhausted`; `next_alarm` enforces
     /// this before delegating.
-    pub earliest_active_lease_expiry_ms: Option<i64>,
+    pub earliest_batch_wake_ms: Option<i64>,
 }
 
 /// Pure alarm decision; see [`AlarmInputs`] for the meaning of each field.
 ///
 /// A wake-up is needed not only for pending rows becoming eligible but also
-/// for stale recovery: `recover_stale_active_tasks` only runs inside
-/// `claim_dispatchable_tasks`, so an in-flight build whose completion
-/// webhook never arrives would never be reclaimed unless the alarm fires at
-/// its lease expiry.
+/// for the lease check: it only runs inside the dispatch pass, so an in-flight
+/// batch whose completion webhook never arrives would never be settled unless
+/// the alarm fires at its lease expiry.
 pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
     match (inputs.capacity, inputs.earliest_pending_eligible_ms) {
         // A free slot plus an eligible row: wake when it can be claimed.
@@ -6454,18 +6454,16 @@ pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
         // Every slot is taken, so the earliest wake-up that can make
         // progress is the oldest lease expiring — never `now`, which would
         // spin the Durable Object in a zero-delay alarm loop.
-        (DispatchCapacity::Exhausted, Some(_)) => {
-            inputs.earliest_active_lease_expiry_ms.map_or_else(
-                || unreachable!("exhausted dispatch capacity implies an active queue row"),
-                |lease_ms| AlarmPlan::At(lease_ms.max(inputs.now_ms)),
-            )
-        }
+        (DispatchCapacity::Exhausted, Some(_)) => inputs.earliest_batch_wake_ms.map_or_else(
+            || unreachable!("exhausted dispatch capacity implies an active queue row"),
+            |lease_ms| AlarmPlan::At(lease_ms.max(inputs.now_ms)),
+        ),
         // Paused, or no dispatchable row: the only wake that can still
         // make progress is stale recovery on an in-flight build — pending
         // rows blocked on an active dependency unblock when it completes
         // or goes stale too. Nothing in flight means nothing to wake for.
         (_, _) => inputs
-            .earliest_active_lease_expiry_ms
+            .earliest_batch_wake_ms
             .map_or(AlarmPlan::Delete, |lease_ms| {
                 AlarmPlan::At(lease_ms.max(inputs.now_ms))
             }),
@@ -6508,13 +6506,13 @@ pub async fn next_alarm(
             now_ms,
         )
         .await?,
-        earliest_active_lease_expiry_ms: earliest_active_lease_expiry_ms(db, settings).await?,
+        earliest_batch_wake_ms: earliest_batch_wake_ms(db).await?,
     };
     // Exhausted capacity means at least one dispatched/running row exists, so
     // a missing lease expiry contradicts the count just read — fail loudly
     // rather than letting plan_alarm pick a wake-up.
     if matches!(inputs.capacity, DispatchCapacity::Exhausted)
-        && inputs.earliest_active_lease_expiry_ms.is_none()
+        && inputs.earliest_batch_wake_ms.is_none()
     {
         return Err(QueueError::Invariant(
             "dispatch capacity exhausted but no dispatched/running rows".to_owned(),
@@ -6600,22 +6598,26 @@ async fn earliest_pending_eligible_ms(
         .transpose()
 }
 
-/// Earliest epoch-ms at which an in-flight (dispatched/running) row's lease
-/// goes stale: `claimed_at + stale_dispatch_minutes`, minimized. May be in
-/// the past (already recoverable). The lease clocks the claim, not the
-/// last transition — a re-request bumping `updated_at` on a live row must
-/// not postpone its recovery (stow#786).
-async fn earliest_active_lease_expiry_ms(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-) -> Result<Option<i64>, QueueError> {
+/// Earliest epoch-ms at which an in-flight batch needs a pass. A batch
+/// whose completion is recorded against its bound run belongs to the
+/// resolution pass and wakes at its `resolve_after`; every other batch
+/// wakes at its `lease_at` for the lease check — the same split
+/// [`expired_batches`] makes, so a recorded batch whose resolution is
+/// deferred never holds the alarm at its past lease. May be in the
+/// past (already due). The lease clocks the claim, not the last
+/// transition (stow#786), and is pushed forward only by the lease
+/// check finding the run still going. Two `MIN` probes over
+/// `build_batches`, whose rows are bounded by the dispatch slot cap.
+async fn earliest_batch_wake_ms(db: &DurableDb) -> Result<Option<i64>, QueueError> {
     let lease_epoch = db
         .query(
-            "SELECT CAST(strftime('%s', MIN(datetime(claimed_at, ?))) AS INTEGER) AS lease_epoch \
-             FROM queue \
-             WHERE status IN ('dispatched', 'running')",
+            "SELECT CAST(strftime('%s', MIN(wake)) AS INTEGER) AS lease_epoch FROM ( \
+                 SELECT MIN(lease_at) AS wake FROM build_batches \
+                 WHERE done_run_id IS NULL OR github_run_id IS NULL \
+                 UNION ALL \
+                 SELECT MIN(resolve_after) FROM build_batches \
+                 WHERE done_run_id IS NOT NULL AND github_run_id IS NOT NULL)",
         )
-        .bind(format!("+{} minutes", settings.stale_dispatch_minutes))
         .fetch_scalar::<Option<i64>>()
         .await
         .map_err(|error| format!("load earliest active lease expiry: {error}"))?;
@@ -7592,23 +7594,124 @@ pub(super) async fn apply_dispatch_floor(
     Ok(())
 }
 
-async fn recover_stale_active_tasks(
+/// The longest one build-batch round may run: the build job's
+/// 120-minute timeout plus the publish job's 60.
+const BATCH_ROUND_CEILING_MINUTES: i64 = 180;
+
+/// A runner-queue allowance on top of a batch's rounds — the run can
+/// never legitimately outlast its rounds plus this.
+const BATCH_CEILING_ALLOWANCE_MINUTES: i64 = 60;
+
+/// The most expired batches one lease pass reads. The in-flight batch
+/// set is already bounded by the family slot caps over
+/// `STOW_BATCH_PARALLELISM`, so this only caps a pass's run lookups; a
+/// batch left over keeps its past `lease_at` and the alarm re-arms at
+/// once.
+const EXPIRED_BATCH_LIMIT: i64 = 32;
+
+/// The failure a leg of a batch past its ceiling records.
+const CEILING_EXCEEDED_ERROR: &str = "infrastructure: run exceeded its ceiling";
+
+/// A `build_batches` row whose lease has run out, with the facts the
+/// lease check decides on (stow#833 §4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredBatch {
+    /// `build_batches.batch_id`.
+    pub batch_id: String,
+    /// The run the dispatch response bound, `None` when that response
+    /// was lost — an unbound batch has no run to ask about.
+    pub run_id: Option<u64>,
+    /// Whether `now` is past the batch's hard ceiling,
+    /// `claimed_at + ⌈legs / parallelism⌉ × 180 min + 60 min`.
+    pub past_ceiling: bool,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct ExpiredBatchRow {
+    batch_id: String,
+    github_run_id: Option<String>,
+    legs: u32,
+    parallelism: u32,
+    claimed_epoch: i64,
+}
+
+/// The batches whose lease has expired — `lease_at <= now`, earliest
+/// first, at most [`EXPIRED_BATCH_LIMIT`]. A batch whose completion is
+/// recorded against its bound run is the resolution pass's, not the
+/// lease check's, and stays out.
+///
+/// # Errors
+/// [`QueueError::Invariant`] when a row's run id is not numeric or its
+/// `parallelism` is zero — corrupt state.
+pub async fn expired_batches(db: &DurableDb, now_ms: i64) -> Result<Vec<ExpiredBatch>, QueueError> {
+    let rows = db
+        .query(
+            "SELECT batch_id, github_run_id, legs, parallelism, \
+                    CAST(strftime('%s', claimed_at) AS INTEGER) AS claimed_epoch \
+             FROM build_batches \
+             WHERE lease_at <= datetime(CAST(? AS INTEGER) / 1000, 'unixepoch') \
+               AND (done_run_id IS NULL OR github_run_id IS NULL) \
+             ORDER BY lease_at, batch_id \
+             LIMIT ?",
+        )
+        .bind(now_ms)
+        .bind(EXPIRED_BATCH_LIMIT)
+        .fetch_all::<ExpiredBatchRow>()
+        .await
+        .map_err(|error| format!("list expired batches: {error}"))?;
+    rows.into_iter()
+        .map(|row| {
+            if row.parallelism == 0 {
+                return Err(QueueError::Invariant(format!(
+                    "batch {} has zero parallelism",
+                    row.batch_id
+                )));
+            }
+            let rounds = i64::from(row.legs.div_ceil(row.parallelism));
+            let ceiling_ms = (row.claimed_epoch
+                + (rounds * BATCH_ROUND_CEILING_MINUTES + BATCH_CEILING_ALLOWANCE_MINUTES) * 60)
+                * 1000;
+            let run_id = row
+                .github_run_id
+                .map(|run| {
+                    run.parse::<u64>().map_err(|error| {
+                        QueueError::Invariant(format!(
+                            "batch {} is bound to run {run:?}: {error}",
+                            row.batch_id
+                        ))
+                    })
+                })
+                .transpose()?;
+            Ok(ExpiredBatch {
+                batch_id: row.batch_id,
+                run_id,
+                past_ceiling: now_ms >= ceiling_ms,
+            })
+        })
+        .collect()
+}
+
+/// Requeue an unbound expired batch's legs and release its row — the
+/// dispatch response was lost, so there is no run to ask about.
+///
+/// Legs re-enter `pending`: `deps_met` re-derives from the live
+/// counter, and `blocked` — maintained for pending rows only — may be
+/// stale on an in-flight row; both recompute in the same statement.
+/// `not_before` is untouched, so `wake_at` re-derives from the live
+/// columns. One statement for the legs, then the row delete that frees
+/// the batch's slots.
+pub async fn requeue_unbound_batch(
     db: &DurableDb,
     settings: &SchedulerSettings,
+    batch_id: &str,
 ) -> Result<(), QueueError> {
-    // Rows re-enter `pending`: `deps_met` re-derives from the live
-    // counter, and `blocked` — maintained for pending rows only — may
-    // be stale on a stale in-flight row; both recompute in the same
-    // statement. `not_before` is untouched, so `wake_at` re-derives
-    // from the live columns.
     let recovered = db
         .query(&format!(
             "UPDATE queue \
              SET status = 'pending', error_msg = '', deps_met = {deps_met}, \
                  blocked = {blocked}, wake_at = {wake}, \
                  updated_at = datetime('now') \
-             WHERE status IN ('dispatched', 'running') \
-               AND claimed_at <= datetime('now', ?) \
+             WHERE batch_id = ? AND status IN ('dispatched', 'running') \
              RETURNING task_id",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
@@ -7619,18 +7722,107 @@ async fn recover_stale_active_tasks(
                 settings.dispatch_min_age_minutes,
             ),
         ))
-        .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
+        .bind(batch_id.to_owned())
         .fetch_scalars::<String>()
         .await
-        .map_err(|error| format!("recover stale active tasks: {error}"))?;
+        .map_err(|error| format!("requeue legs of unbound batch {batch_id}: {error}"))?;
     if !recovered.is_empty() {
         // Re-entered `pending` rows carry the rank written before the
         // last cost move; re-price exactly the transitioned ids.
         refresh_dispatch_keys(db, &recovered).await?;
     }
-    // A batch whose legs all left flight — recovered above, or
-    // resolved individually — holds no slots: its `parallelism` must
-    // stop counting against the family's pools.
+    db.query("DELETE FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("delete requeued batch {batch_id}: {error}"))?;
+    Ok(())
+}
+
+/// Push a bound batch's lease out by `stale_dispatch_minutes` from
+/// `now_ms` — its run is still going. A completion recorded since the
+/// lookup is the resolution pass's and is left alone.
+pub async fn extend_batch_lease(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch_id: &str,
+    now_ms: i64,
+) -> Result<(), QueueError> {
+    set_batch_lease(
+        db,
+        batch_id,
+        now_ms + i64::from(settings.stale_dispatch_minutes) * 60_000,
+    )
+    .await
+}
+
+/// Move a batch's `lease_at` to `lease_ms` — the lease check's single
+/// write for a batch it leaves alive, either extended after a live
+/// run or deferred a moment after a failed lookup so the alarm does not
+/// re-arm at `now`. A completion recorded since the lookup is the
+/// resolution pass's and is left alone.
+pub async fn set_batch_lease(
+    db: &DurableDb,
+    batch_id: &str,
+    lease_ms: i64,
+) -> Result<(), QueueError> {
+    db.query(
+        "UPDATE build_batches \
+         SET lease_at = datetime(CAST(? AS INTEGER) / 1000, 'unixepoch') \
+         WHERE batch_id = ? AND done_run_id IS NULL",
+    )
+    .bind(lease_ms)
+    .bind(batch_id.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("set lease of batch {batch_id}: {error}"))?;
+    Ok(())
+}
+
+/// Fail a batch whose run outlived its ceiling: the legs still in
+/// flight fail in one statement and the row is released. A completion
+/// recorded since the lookup wins — the legs and the row are left to
+/// the resolution pass.
+pub async fn fail_batch_past_ceiling(db: &DurableDb, batch_id: &str) -> Result<(), QueueError> {
+    let failed = db
+        .query(
+            "UPDATE queue \
+             SET status = 'failed', error_msg = ?, updated_at = datetime('now') \
+             WHERE batch_id = ? AND status IN ('dispatched', 'running') \
+               AND EXISTS (SELECT 1 FROM build_batches \
+                           WHERE batch_id = ? AND done_run_id IS NULL) \
+             RETURNING task_id",
+        )
+        .bind(CEILING_EXCEEDED_ERROR.to_owned())
+        .bind(batch_id.to_owned())
+        .bind(batch_id.to_owned())
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("fail legs of batch {batch_id}: {error}"))?;
+    if !failed.is_empty() {
+        // A dep that just failed is the one outside-the-row event that
+        // flips a pending dependent's `blocked` flag.
+        refresh_dependents(
+            db,
+            "SELECT value AS task_id FROM json_each(?)",
+            &[DbValue::Text(enqueue_json(&failed)?)],
+        )
+        .await?;
+    }
+    db.query("DELETE FROM build_batches WHERE batch_id = ? AND done_run_id IS NULL")
+        .bind(batch_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("delete failed batch {batch_id}: {error}"))?;
+    Ok(())
+}
+
+/// A batch whose legs all left flight — resolved individually or
+/// failed — holds no slots: its `parallelism` must stop counting
+/// against the family's pools. Stale in-flight rows are not requeued
+/// here: the lease check ([`expired_batches`]) decides each expired
+/// batch from its run's own state.
+async fn release_legless_batches(db: &DurableDb) -> Result<(), QueueError> {
     db.query(
         "DELETE FROM build_batches \
          WHERE NOT EXISTS ( \
@@ -7891,7 +8083,7 @@ mod tests {
             now_ms: NOW_MS,
             capacity: DispatchCapacity::Available,
             earliest_pending_eligible_ms: None,
-            earliest_active_lease_expiry_ms: None,
+            earliest_batch_wake_ms: None,
         }
     }
 
@@ -7986,7 +8178,7 @@ mod tests {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Exhausted,
             earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
-            earliest_active_lease_expiry_ms: Some(NOW_MS + 300_000),
+            earliest_batch_wake_ms: Some(NOW_MS + 300_000),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 300_000));
@@ -7997,7 +8189,7 @@ mod tests {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Exhausted,
             earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
-            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            earliest_batch_wake_ms: Some(NOW_MS - 1),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
@@ -8022,7 +8214,7 @@ mod tests {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Paused,
             earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
-            earliest_active_lease_expiry_ms: Some(NOW_MS + 300_000),
+            earliest_batch_wake_ms: Some(NOW_MS + 300_000),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 300_000));
@@ -8032,7 +8224,7 @@ mod tests {
     fn paused_clamps_past_lease_expiry_to_now() {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Paused,
-            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            earliest_batch_wake_ms: Some(NOW_MS - 1),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
@@ -8044,7 +8236,7 @@ mod tests {
         // still has to fire so a build whose completion webhook was lost
         // gets reclaimed once its lease goes stale.
         let inputs = AlarmInputs {
-            earliest_active_lease_expiry_ms: Some(NOW_MS + 120_000),
+            earliest_batch_wake_ms: Some(NOW_MS + 120_000),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 120_000));
@@ -8053,7 +8245,7 @@ mod tests {
     #[test]
     fn clamps_past_lease_expiry_to_now_without_pending_rows() {
         let inputs = AlarmInputs {
-            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            earliest_batch_wake_ms: Some(NOW_MS - 1),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
@@ -8077,7 +8269,7 @@ mod tests {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Exhausted,
             earliest_pending_eligible_ms: Some(NOW_MS),
-            earliest_active_lease_expiry_ms: None,
+            earliest_batch_wake_ms: None,
             ..inputs()
         };
         let _ = plan_alarm(&inputs);

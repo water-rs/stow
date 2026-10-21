@@ -52,7 +52,7 @@ pub enum PriorAlarm {
 /// the union of every column the pass's writers touch:
 /// `claim_dispatchable_row` (`status`, `generation_id`, `dispatch_attempts`,
 /// `github_run_id`, `claimed_at`, `updated_at`), `retire_covered_rows`
-/// (`status`, `error_msg`), `recover_stale_active_tasks` (`status`,
+/// (`status`, `error_msg`), `requeue_unbound_batch` (`status`,
 /// `error_msg`, `deps_met`, `blocked`, `wake_at`),
 /// `requeue_incomplete_shape_deps` (`status`, `attempt`, `error_msg`,
 /// `deps_met`, `blocked`, `not_before`, `wake_at`,
