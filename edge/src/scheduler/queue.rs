@@ -4608,7 +4608,9 @@ impl UnclaimedRow {
 /// restore to the pre-claim values the page read, `batch_id` and
 /// `batch_leg` clear, and `dispatch_attempts` steps back — a dropped
 /// leg burned no attempt. One `json_each` update for the whole set; an
-/// empty set issues none, so only a lost race writes here.
+/// empty set issues none, so only a lost race writes here. The
+/// subquery's `LIMIT -1` makes the `json_each` side drive a primary-key
+/// seek instead of walking the `dispatched` status group.
 async fn unclaim_rows(db: &DurableDb, rows: &[UnclaimedRow]) -> Result<(), QueueError> {
     if rows.is_empty() {
         return Ok(());
@@ -4623,7 +4625,7 @@ async fn unclaim_rows(db: &DurableDb, rows: &[UnclaimedRow]) -> Result<(), Queue
          FROM (SELECT value ->> 'task_id' AS task_id, \
                       value ->> 'generation_id' AS generation_id, \
                       value ->> 'claimed_at' AS claimed_at \
-               FROM json_each(?)) AS e \
+               FROM json_each(?) LIMIT -1) AS e \
          WHERE queue.task_id = e.task_id \
            AND queue.status = 'dispatched' AND queue.github_run_id IS NULL",
     )
@@ -4735,7 +4737,9 @@ async fn claim_and_bind(
             // generation just minted — the one timestamp no in-flight
             // writer may rewrite, so the completion samples a real
             // claim-to-completion duration even after re-requests
-            // bumped `updated_at` (stow#524).
+            // bumped `updated_at` (stow#524). The subquery's `LIMIT -1`
+            // makes the `json_each` side drive a primary-key seek
+            // instead of walking the `pending` status group.
             "UPDATE queue \
              SET status = 'dispatched', generation_id = e.generation_id, \
                  dispatch_attempts = dispatch_attempts + 1, \
@@ -4747,7 +4751,7 @@ async fn claim_and_bind(
                           value ->> 'generation_id' AS generation_id, \
                           value ->> 'batch_id' AS batch_id, \
                           CAST(value ->> 'leg' AS INTEGER) AS leg \
-                   FROM json_each(?)) AS e \
+                   FROM json_each(?) LIMIT -1) AS e \
              WHERE queue.task_id = e.task_id AND queue.status = 'pending' \
              RETURNING queue.task_id",
         )
@@ -5527,7 +5531,9 @@ fn backoff_minutes_sql(attempts_column: &str) -> String {
 /// have gone stale while it was in-flight. `wake_at` is the later of
 /// the age gate and the backoff this statement writes (the SET operand
 /// is spelled out again — SET terms see the old row); the human lane
-/// ignores the age gate.
+/// ignores the age gate. The subquery's `LIMIT -1` makes the `json_each`
+/// side drive a primary-key seek instead of walking the
+/// `dispatched`/`running` status groups.
 pub async fn back_off_dispatch_legs(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -5551,7 +5557,7 @@ pub async fn back_off_dispatch_legs(
                  updated_at = datetime('now') \
              FROM (SELECT value ->> 'task_id' AS task_id, \
                           value ->> 'generation_id' AS generation_id \
-                   FROM json_each(?)) AS e \
+                   FROM json_each(?) LIMIT -1) AS e \
              WHERE queue.task_id = e.task_id AND queue.generation_id = e.generation_id \
                AND queue.status IN ('dispatched', 'running') \
                AND queue.github_run_id IS NULL \

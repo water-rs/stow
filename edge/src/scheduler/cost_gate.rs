@@ -27,6 +27,7 @@
 //! may never be raised to pass a regression.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use skyzen::FromRow;
@@ -1679,4 +1680,117 @@ async fn wake_probes_seek_each_remaining_familys_wake_range() {
             statement.sql
         );
     }
+}
+
+/// A coverage oracle that, on its first question, flips the head
+/// candidate out of `pending` the way a concurrent pass's claim does —
+/// the coverage lookup is the await between a pass's page read and its
+/// claim, so the dropped-batch restore runs with no test seam in the
+/// claim code.
+struct RacingCoverage<'a> {
+    db: &'a DurableDb,
+    raced: AtomicBool,
+}
+
+impl queue::CoverageOracle for RacingCoverage<'_> {
+    fn covered(
+        &self,
+        identities: &[queue::SemanticTaskIdentity],
+    ) -> impl std::future::Future<
+        Output = Result<BTreeSet<queue::SemanticTaskIdentity>, crate::errors::QueueError>,
+    > + Send {
+        let first = !self.raced.swap(true, Ordering::Relaxed);
+        let head = identities.first().cloned();
+        async move {
+            if let (true, Some(head)) = (first, head) {
+                self.db
+                    .query(
+                        "UPDATE queue \
+                         SET status = 'dispatched', generation_id = 'racer' \
+                         WHERE crate_name = ? AND version = ? AND features_json = ? \
+                           AND target = ? AND rustc_version = ?",
+                    )
+                    .bind(head.crate_name)
+                    .bind(head.version)
+                    .bind(head.features_json)
+                    .bind(head.target)
+                    .bind(head.rustc_version)
+                    .execute()
+                    .await
+                    .map_err(|error| crate::errors::QueueError::Sql(error.to_string()))?;
+            }
+            Ok(BTreeSet::new())
+        }
+    }
+}
+
+/// The batched claim, the dropped-batch restore and the dispatch
+/// back-off each update `queue` from a `json_each` payload filtered on a
+/// status. Without the subquery's `LIMIT -1` SQLite flattens the
+/// payload into the join and, with no planner statistics, drives it from
+/// `idx_queue_status_first (status=?)` — every row of that status times
+/// every payload element, 104k reads in a release-gate preheat. This
+/// replays each of the three under `EXPLAIN QUERY PLAN` and requires the
+/// payload to drive a primary-key seek instead.
+#[tokio::test]
+async fn payload_driven_queue_updates_seek_the_primary_key() {
+    const SEEK: &str = "SEARCH queue USING INDEX sqlite_autoindex_queue_1 (task_id=?)";
+    const STATUS_WALK: &str = "idx_queue_status_first";
+
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let settings = SchedulerSettings::default();
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
+
+    let base = log.lock().expect("log").len();
+    let coverage = RacingCoverage {
+        db: &db,
+        raced: AtomicBool::new(false),
+    };
+    let batches = queue::claim_dispatchable_tasks(&db, &settings, &coverage)
+        .await
+        .expect("claim");
+    assert!(
+        !batches.is_empty(),
+        "the pass must keep a batch for the back-off to fail"
+    );
+    let legs: Vec<queue::QueuedTask> = batches
+        .iter()
+        .flat_map(|batch| batch.tasks.iter().cloned())
+        .collect();
+    queue::back_off_dispatch_legs(&db, &settings, &legs, "plan probe")
+        .await
+        .expect("back off");
+    let statements = log.lock().expect("log")[base..].to_vec();
+
+    let mut claim = false;
+    let mut unclaim = false;
+    let mut back_off = false;
+    for statement in &statements {
+        let sql = statement.sql.as_str();
+        if !(sql.starts_with("UPDATE queue") && sql.contains("json_each")) {
+            continue;
+        }
+        let which = if sql.contains("SET status = 'dispatched', generation_id = e.generation_id") {
+            &mut claim
+        } else if sql.contains("SET status = 'pending', generation_id = e.generation_id") {
+            &mut unclaim
+        } else if sql.contains("SET status = 'pending', error_msg = ?") {
+            &mut back_off
+        } else {
+            continue;
+        };
+        *which = true;
+        let detail = explain_details(&db, statement).await.join("\n");
+        assert!(
+            detail.contains(SEEK) && !detail.contains(STATUS_WALK),
+            "payload-driven queue update lost its primary-key seek:\n{sql}\nplan:\n{detail}"
+        );
+    }
+    assert!(
+        claim && unclaim && back_off,
+        "the pass must run the claim ({claim}), the dropped-batch restore ({unclaim}) \
+         and the back-off ({back_off})"
+    );
 }

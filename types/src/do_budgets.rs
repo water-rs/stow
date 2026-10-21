@@ -450,6 +450,89 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_written: 700,
         wall_ms: 3_000,
     },
+    // The six batch drives below (stow#833) are provisional: each
+    // number is the host measurement quoted on its `BUDGETS` row plus
+    // 25%, rounded up, until the workerd lane reports and replaces it.
+    // The bound each names is the batch's leg count
+    // (`STOW_BATCH_MAX_TASKS`), never the queue.
+    DriveBudget {
+        // Provisional, from the host measurement (7 statements, 7 reads,
+        // 1 write) until the workerd lane reports (stow#833). The
+        // completion `UPDATE` is one keyed `build_batches` write plus
+        // the six statements of the `schedule_alarm` re-plan, flat in
+        // the batch's leg count. Wall copied from the single-row
+        // `POST /requests/{id}/run-update (in_progress)` route.
+        name: "POST /batches/{batch_id}/complete (success)",
+        statements: 9,
+        rows_read: 9,
+        rows_written: 2,
+        wall_ms: 150,
+    },
+    DriveBudget {
+        // Provisional, from the host measurement (7 statements, 7 reads,
+        // 1 write, identical to the success delivery) until the workerd
+        // lane reports (stow#833). The conclusion is carried verbatim,
+        // so the bound is the same single keyed write. Wall copied from
+        // the single-row `POST /requests/{id}/run-update (in_progress)`
+        // route.
+        name: "POST /batches/{batch_id}/complete (failure)",
+        statements: 9,
+        rows_read: 9,
+        rows_written: 2,
+        wall_ms: 150,
+    },
+    DriveBudget {
+        // Provisional, from the host measurement (442 statements, 272
+        // reads, 392 writes) until the workerd lane reports (stow#833).
+        // Bounded by `STOW_BATCH_MAX_TASKS` = 40 legs, about 11
+        // statements a leg (the fenced completion, its counter and
+        // window expiry, the build sample's insert, cap delete, stats
+        // read and write, and the keyed dispatch-key refresh), plus the
+        // batch row's delete. Wall copied from `"alarm pass"`.
+        name: "alarm pass (batch resolution)",
+        statements: 553,
+        rows_read: 340,
+        rows_written: 490,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
+        // Provisional, from the host measurement (14 statements, 8
+        // reads, 11 writes) until the workerd lane reports (stow#833).
+        // The same resolution over a one-leg batch: the fixed batch-row
+        // part plus one leg's completion and build sample, the price of
+        // one build's callback. Wall copied from `"alarm pass"`.
+        name: "alarm pass (batch resolution, one leg)",
+        statements: 18,
+        rows_read: 10,
+        rows_written: 14,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
+        // Provisional, from the host measurement (283 statements, 121
+        // reads, 201 writes) until the workerd lane reports (stow#833).
+        // Bounded by `STOW_BATCH_MAX_TASKS` = 40 failed legs, about 7
+        // statements a leg (the retry `UPDATE`, its refreshes and the
+        // outcome counter and evidence rows), with no build sample.
+        // Wall copied from `"alarm pass"`.
+        name: "alarm pass (batch resolution, failure)",
+        statements: 354,
+        rows_read: 152,
+        rows_written: 252,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
+        // Provisional, from the host measurement (2 statements, 1 read,
+        // 1 write) until the workerd lane reports (stow#833). One
+        // expired bound batch with a live run: the expired-batch read
+        // (`EXPIRED_BATCH_LIMIT` rows at most, the in-flight set being
+        // bounded by the slot caps) and the keyed lease extension. Wall
+        // copied from `"alarm pass"`.
+        name: "alarm pass (lease check)",
+        statements: 3,
+        rows_read: 2,
+        rows_written: 2,
+        wall_ms: 3_000,
+    },
     // The demand-feed caps below are native-calibrated (stow#523):
     // measured workerd billed rows on the fixture's fixed 384-task
     // delivery event, plus stated headroom where a shared planner
