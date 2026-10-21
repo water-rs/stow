@@ -73,18 +73,22 @@ impl FixtureShape {
     /// the most legs a pass can claim on the slots the in-flight rows
     /// leave free (`(free slots / STOW_BATCH_PARALLELISM) ×
     /// STOW_BATCH_MAX_TASKS` = 3 × 40 = 120 on the defaults), and
-    /// (b) feed that bound, not just exceed it: the first three batch
-    /// keys the claim's `dispatch_key` order opens — `(1.85.0,
-    /// windows)`, `(1.85.0, linux)`, `(1.86.0, linux)` — must each hold
-    /// at least 40 claimable rows, so the pass fills three miss
-    /// batches at 40 legs apiece. At 192 the fixture's `n % 9` family
-    /// and `n % 3` rustc spreads give those keys 40, 41 and 41
-    /// claimable rows. A window a pass can empty would let the claim
-    /// reach rows an earlier drive left claimable, and the walk would
-    /// then move with the drives' order instead of the fixture's
-    /// shape. The edge's `planted_window_exceeds_one_full_batched_pass`
-    /// test holds the bound against the scheduler's defaults.
-    pub const DISPATCH_ELIGIBLE_ROWS: u32 = 192;
+    /// (b) feed that bound, not just exceed it. The floored pass
+    /// admits only miss rows whose value clears `VALUE_BAND` — within
+    /// production's `priority + demand <= PRIORITY_MAX` rule that is
+    /// the Windows family alone — so the window must hold more than
+    /// one full pass of Windows rows (`n % 9 ∈ {6,7}`), not merely of
+    /// rows overall. At 640 the family spread gives the window about
+    /// 142 Windows rows, of which the `n % 20 = 1` park leaves ~135
+    /// claimable — every one ahead of every bulk Windows row on the
+    /// window's stored demand — so a pass's three 40-leg miss batches
+    /// fill from the window alone at any size. A window a pass can
+    /// empty would let the claim reach rows an earlier drive left
+    /// claimable, and the walk would then move with the drives' order
+    /// instead of the fixture's shape. The edge's
+    /// `planted_window_exceeds_one_full_batched_pass` test holds the
+    /// bound against the scheduler's defaults.
+    pub const DISPATCH_ELIGIBLE_ROWS: u32 = 640;
 
     /// Rows `1..=pending_end` are `pending` — 60% of the queue.
     #[must_use]

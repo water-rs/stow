@@ -22,7 +22,14 @@
 //!   moving their `pending`, unblocked probe state, and every other
 //!   pending row parks `dispatch_eligible = 0` below the admission
 //!   floor (a below-floor stored flag is only a stable state for a
-//!   miss-lane row — humans are exempt under every floor), ~5% of
+//!   miss-lane row — humans are exempt under every floor). The window
+//!   carries a stored demand so its Windows rows price above every
+//!   bulk Windows row — under a `VALUE_BAND` floor a miss row clears
+//!   the admission only through the Windows band, so the floored
+//!   claimable set is the window's Windows span, and without the
+//!   demand arm it ties bulk Windows rows on value and the
+//!   `first_requested_at` order lets the bulk in first (stow#833).
+//!   ~5% of
 //!   non-pending rows carry a future
 //!   `not_before`, `first_requested_at` spreads over the trailing two
 //!   days, and exactly
@@ -55,6 +62,15 @@ use crate::errors::QueueError;
 /// seeds `PRODUCTION` and the 1M shape `STOW_TRAFFIC_SIZES` carries.
 #[cfg(test)]
 pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
+
+/// The stored `demand` every window row carries — the demand fold's
+/// own unit of accumulated work. Production bounds `priority + demand
+/// <= PRIORITY_MAX`, so a window row (priority `n % 7 <= 6`) stays
+/// inside the band a real fold could write; the term still prices the
+/// window's Windows rows at `VALUE_BAND + priority + 1000`, ahead of
+/// every bulk Windows row (`VALUE_BAND + priority <= VALUE_BAND + 6`)
+/// in `dispatch_key` order whatever the bulk row's age (stow#833).
+const WINDOW_DEMAND: i64 = 1_000;
 
 /// Rows one crate name covers — the fixture's pinned per-name bound.
 /// `'crate' || (n / CRATE_NAME_ROWS)` bounds every name to at most
@@ -482,7 +498,10 @@ pub async fn restore_batch_rows(db: &DurableDb, shape: FixtureShape) -> Result<(
 /// a below-floor stored flag is only a stable state for a miss row.
 /// The pins stay eligible under every floor but the seed parks them
 /// behind a future `not_before`, so the first rows the claim walks at
-/// any floor are the planted window's one-band family — humans order
+/// any floor are the planted window's — the window's stored demand
+/// prices its Windows rows above every bulk Windows row, so a floored
+/// pass's claimable set is the window's Windows span alone — while
+/// humans order
 /// ahead of every miss row in `dispatch_key`, and a claimable pin
 /// would fill the pass with one-slot human legs instead of the miss
 /// batches the gate prices (stow#833). Rows outside the pending range
@@ -543,6 +562,16 @@ fn queue_seed_insert_sql(
     // the index excludes by equality. The bulk edge distribution stays
     // dev's: the demand walk and the probes' scans see the same mixed
     // met/unmet rows every other drive's budget was measured on.
+    // The window rows carry stored `WINDOW_DEMAND`: the floor-claim
+    // drive's `apply_dispatch_floor` recomputes `dispatch_eligible`
+    // from `value`, where only the window's Windows rows clear a
+    // `VALUE_BAND` floor — the demand arm lifts them to
+    // `VALUE_BAND + n % 7 + WINDOW_DEMAND`, ahead of every bulk
+    // Windows row the floor also admits (`VALUE_BAND + n % 7` ties
+    // resolve by `first_requested_at`, and the bulk rows are older).
+    // Without it the floored claim seats bulk Windows rows, whose
+    // edges follow the size-dependent bulk formula and move the node
+    // walk with the fixture size (stow#833).
     // Inside the window the ~5% `n % 20 = 1` pin still applies, as
     // before — and the human-lane pin window parks the same way: a
     // claimable pin would rank first and fill the pass with one-slot
@@ -583,20 +612,29 @@ fn queue_seed_insert_sql(
               ELSE datetime({updated_at}, '-' || (60 + n % 4320) || ' minutes') END"
     );
     let task_id = "printf('%064x', n)";
-    let bands_expr = format!(
-        "(CASE WHEN ({lane_case}) = 'human' THEN 2 ELSE 0 END) + \
-         (CASE WHEN ({family}) = 'windows' THEN 1 ELSE 0 END)",
-        family = crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
-    );
+    let bands_expr = bands_case_sql(lane_case, &target_case);
+    // Every window row carries `WINDOW_DEMAND` of accumulated demand —
+    // the production formula's own term, so `value`, the
+    // `dispatch_eligible` recompute and `dispatch_key` all derive it
+    // through `value_sql`. Inside the priority band it lifts the
+    // window's Windows rows to `VALUE_BAND + n % 7 + WINDOW_DEMAND`,
+    // ahead of every bulk Windows row, so a floored pass claims the
+    // window's Windows rows before any bulk row (stow#833). Window
+    // non-Windows rows stay at band 0, below the floor, as production
+    // would price them.
+    let demand = &window_demand_sql(human_end, eligible_end);
     let key = format!(
         "({prefix}) || '|' || ({first_at}) || '|' || ({first_at}) || '|' || ({task_id})",
-        prefix = rank_prefix_case_sql(&bands_expr),
+        prefix = rank_prefix_case_sql(&bands_expr, &format!("({demand})")),
     );
     // Non-window pending rows park `dispatch_eligible = 0` — the stored
     // production state a row below the admission floor carries — so the
     // claim page's `dispatch_eligible = 1` index equality excludes them
     // before the walk instead of reading past them per row. Window rows
-    // carry the recomputed flag the production formula gives.
+    // carry the recomputed flag the production formula gives — under a
+    // `VALUE_BAND` floor only the window's Windows rows stay eligible,
+    // the production-shaped outcome a miss row earns through the
+    // family band alone.
     let eligible = format!(
         "CASE WHEN n <= {pending_end} AND (n <= {human_pin} OR n > {eligible_end}) \
               THEN 0 ELSE ({}) END",
@@ -606,7 +644,7 @@ fn queue_seed_insert_sql(
                 &format!("({lane_case})"),
                 &crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
                 "(n % 7)",
-                "0",
+                &format!("({demand})"),
             ),
         ),
     );
@@ -647,7 +685,7 @@ fn queue_seed_insert_sql(
                 0, 0, {wake}, {family}, {value}, {key}, \
                 CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
                      THEN datetime('now', '-30 minutes') ELSE NULL END, \
-                {eligible}, 0, {batch_binding} \
+                {eligible}, {demand}, {batch_binding} \
          FROM seq \
          {conflict}",
         columns = QUEUE_SEED_COLUMNS.join(", "),
@@ -662,7 +700,7 @@ fn queue_seed_insert_sql(
             &format!("({lane_case})"),
             &crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
             "(n % 7)",
-            "0",
+            &format!("({demand})"),
         ),
         batch_binding = in_flight_batch_binding_sql(failed_end, in_flight_end),
     )
@@ -670,28 +708,60 @@ fn queue_seed_insert_sql(
 
 /// The `dispatch_key` rank prefix for the seed's small constant
 /// operand set — lane/family bands (0–3) crossed with the `n % 7`
-/// priority — each arm carrying the shared Rust abstraction's fixed
-/// prefix at the unmeasured cost 1, so a fixture row's key is
-/// byte-identical to what a writer derives for the same operands. The
-/// ranking formula itself never appears in SQL; the CASE only
-/// selects among the precomputed prefixes, and an operand outside the
-/// covered set yields NULL — a loud seed failure, not a silent key.
-fn rank_prefix_case_sql(bands_expr: &str) -> String {
+/// priority and the window's demand arm (0 or [`WINDOW_DEMAND`]) — each
+/// arm carrying the shared Rust abstraction's fixed prefix at the
+/// unmeasured cost 1, so a fixture row's key is byte-identical to
+/// what a writer derives for the same operands. The ranking formula
+/// itself never appears in SQL; the CASE only selects among the
+/// precomputed prefixes, and an operand outside the covered set
+/// yields NULL — a loud seed failure, not a silent key.
+fn rank_prefix_case_sql(bands_expr: &str, demand_expr: &str) -> String {
     use std::fmt::Write as _;
-    let mut case = format!("CASE ({bands_expr}) * 7 + (n % 7)");
+    let value_band = crate::scheduler::queue::VALUE_BAND;
+    let mut case =
+        format!("CASE ({demand_expr}) / {WINDOW_DEMAND} * 28 + ({bands_expr}) * 7 + (n % 7)");
     for band in 0_i64..4 {
-        for priority in 0_i64..7 {
-            let lane = if band >= 2 { "human" } else { "miss" };
-            let value = band * crate::scheduler::queue::VALUE_BAND + priority;
-            let prefix = crate::scheduler::rank::rank_prefix(
-                lane,
-                value,
-                crate::scheduler::rank::UNMEASURED_COST,
-            );
-            let _ = write!(case, " WHEN {} THEN '{prefix}'", band * 7 + priority);
+        for demand_band in 0_i64..2 {
+            for priority in 0_i64..7 {
+                let lane = if band >= 2 { "human" } else { "miss" };
+                let value = band * value_band + demand_band * WINDOW_DEMAND + priority;
+                let prefix = crate::scheduler::rank::rank_prefix(
+                    lane,
+                    value,
+                    crate::scheduler::rank::UNMEASURED_COST,
+                );
+                let _ = write!(
+                    case,
+                    " WHEN {} THEN '{prefix}'",
+                    demand_band * 28 + band * 7 + priority
+                );
+            }
         }
     }
     format!("{case} END")
+}
+
+/// The seed's lane/family band operand — `(human ? 2 : 0) +
+/// (windows ? 1 : 0)` over `n` — the expression `dispatch_key`'s
+/// prefix CASE reads.
+fn bands_case_sql(lane_case: &str, target_case: &str) -> String {
+    format!(
+        "(CASE WHEN ({lane_case}) = 'human' THEN 2 ELSE 0 END) + \
+         (CASE WHEN ({family}) = 'windows' THEN 1 ELSE 0 END)",
+        family = crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
+    )
+}
+
+/// The seed's stored `demand` arm: every window row carries
+/// [`WINDOW_DEMAND`] — a production-valid demand (the fold keeps
+/// `priority + demand <= PRIORITY_MAX`, and window priority is
+/// `n % 7 <= 6`) that prices the window's Windows rows above every
+/// bulk Windows row in `dispatch_key` order. Bulk rows keep 0.
+fn window_demand_sql(human_end: u32, eligible_end: u32) -> String {
+    format!(
+        "CASE WHEN n > {human_end} AND n <= {eligible_end} \
+              THEN {WINDOW_DEMAND} ELSE 0 END"
+    )
 }
 
 /// Seed `queue` rows `(lo, hi]`.
@@ -2821,6 +2891,49 @@ mod tests {
                 "claimed row {n} lies outside the planted window {window:?}"
             );
         }
+    }
+
+    /// The floor-claim drive's pass stays in the planted window too:
+    /// applying the admission floor recomputes `dispatch_eligible` from
+    /// each row's value, so a bulk row the seed parked but valued at or
+    /// above the floor would turn claimable — and its edges follow the
+    /// size-dependent bulk formula, so the claimed set's node-store
+    /// walk would change with the fixture size (stow#833).
+    #[tokio::test]
+    async fn floored_claim_stays_inside_the_planted_window() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        seed_production_shape(&db, &GATE, settings.dispatch_min_age_minutes)
+            .await
+            .expect("seed");
+        let floored = crate::scheduler::queue::SchedulerSettings {
+            min_dispatch_value: crate::scheduler::queue::VALUE_BAND,
+            ..settings
+        };
+        crate::scheduler::queue::apply_dispatch_floor(&db, &floored)
+            .await
+            .expect("apply floor");
+        let claimed =
+            crate::scheduler::queue::claim_dispatchable_tasks(&db, &floored, &NothingCovered)
+                .await
+                .expect("claim");
+        let window = (FixtureShape::HUMAN_LANE_ROWS + 1)
+            ..=(FixtureShape::HUMAN_LANE_ROWS + FixtureShape::DISPATCH_ELIGIBLE_ROWS);
+        let outside: Vec<u32> = claimed
+            .iter()
+            .flat_map(|batch| &batch.tasks)
+            .map(|task| {
+                u32::try_from(
+                    u64::from_str_radix(&task.task_id, 16).expect("fixture task ids are hex"),
+                )
+                .expect("fixture row number fits u32")
+            })
+            .filter(|n| !window.contains(n))
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "the floored pass claimed rows outside the planted window {window:?}: {outside:?}"
+        );
     }
 
     /// No fixture node may have a fan-in that grows with queue size:
