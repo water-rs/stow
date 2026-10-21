@@ -12,7 +12,10 @@
 //!   — user traffic from those reports and the CPU report, plus the
 //!   preheat waves and daily resubmits the Preheat cost report measures
 //!   (stow#775). The release gate runs it in its own job, once all
-//!   three tests' reports exist.
+//!   three tests' reports exist;
+//! - `fixture-runs` prints the runs the fixture's in-flight batches are
+//!   bound to, which the harness records in the local CI before the
+//!   callback lane completes them.
 
 use std::path::Path;
 
@@ -24,6 +27,7 @@ use crate::Edge;
 use crate::render::Output;
 
 mod cpu;
+mod fixture_runs;
 mod lanes;
 mod peak;
 mod preheat;
@@ -53,6 +57,9 @@ enum TrafficCostCommand {
     /// Project the month — user traffic plus the preheat waves and
     /// resubmits — against half of each product's allowance.
     Project(project::ProjectArgs),
+    /// Print the `build-batch.yml` runs the fixture's in-flight batches
+    /// are bound to, for the local CI's `POST /seeded-runs`.
+    FixtureRuns(fixture_runs::FixtureRunsArgs),
 }
 
 /// Dispatch one `traffic-cost` subcommand.
@@ -62,6 +69,7 @@ pub async fn run(args: TrafficCostArgs, output: Output) -> stow_types::error::Re
         TrafficCostCommand::Peak(args) => peak::run(&Edge::connect().await?, &args, output).await,
         TrafficCostCommand::Verdict(args) => verdict::run(&args, output).await,
         TrafficCostCommand::Project(args) => project::run(&args, output).await,
+        TrafficCostCommand::FixtureRuns(args) => fixture_runs::run(&args, output),
     }
 }
 

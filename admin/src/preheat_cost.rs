@@ -467,6 +467,11 @@ fn render_production(wave: &ProductionWave) -> String {
     )
 }
 
+/// An achieved `b̄` cell — `-` for a phase that dispatched no batch.
+pub fn legs_per_batch(value: Option<f64>) -> String {
+    value.map_or_else(|| "-".to_owned(), |value| format!("{value:.2}"))
+}
+
 fn render_report(report: &PreheatCostReport) -> String {
     let mut phases = Table::new(&[
         "phase",
@@ -474,7 +479,9 @@ fn render_report(report: &PreheatCostReport) -> String {
         "budget",
         "rows written",
         "budget",
-        "runs",
+        "batches",
+        "legs",
+        "legs/batch",
         "wall s",
     ]);
     for (name, phase) in [("wave", &report.wave), ("resubmit", &report.resubmit)] {
@@ -484,14 +491,17 @@ fn render_report(report: &PreheatCostReport) -> String {
             format!("{:.0}", phase.budget_rows_read),
             phase.rows_written.to_string(),
             format!("{:.0}", phase.budget_rows_written),
-            phase.dispatched_runs.to_string(),
+            phase.batches.to_string(),
+            phase.legs.to_string(),
+            legs_per_batch(phase.legs_per_batch),
             (phase.wall_ms / 1000).to_string(),
         ]);
     }
     let mut layers = Table::new(&[
         "layer",
         "published",
-        "runs",
+        "batches",
+        "legs",
         "kind",
         "events",
         "read/event",
@@ -505,7 +515,8 @@ fn render_report(report: &PreheatCostReport) -> String {
             layers.push([
                 layer.layer.to_string(),
                 layer.published.to_string(),
-                layer.dispatched_runs.to_string(),
+                layer.batches.to_string(),
+                layer.legs.to_string(),
                 format!("{:?}", kind.kind),
                 kind.events.to_string(),
                 format!("{read:.1}"),

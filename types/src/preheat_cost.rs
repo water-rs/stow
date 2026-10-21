@@ -21,7 +21,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{SchedulerLedger, SchedulerLedgerOp};
-use crate::do_budgets::{DO_BUDGETS, LEDGER_OP_ALARM, PREHEAT_BUDGET, grew};
+use crate::do_budgets::{
+    DO_BUDGETS, LEDGER_OP_ALARM, LEDGER_OP_BATCH_COMPLETE, PREHEAT_BUDGET, grew,
+};
 use crate::local_ci::LocalCiRun;
 
 /// The event kinds a wave is made of, each one scheduler operation.
@@ -32,7 +34,8 @@ pub enum EventKind {
     Submit,
     /// The alarm's dispatch pass.
     Dispatch,
-    /// A batch run's `workflow_run` completion.
+    /// A batch run's `workflow_run` completion — one per
+    /// `build-batch.yml` run, however many legs it carried.
     Completion,
     /// An `index-publish` slice report, which also dispatches the
     /// dependents it releases.
@@ -54,7 +57,7 @@ impl EventKind {
         match self {
             Self::Submit => "POST /tasks/submit/trusted",
             Self::Dispatch => LEDGER_OP_ALARM,
-            Self::Completion => "POST /batches/{batch_id}/complete",
+            Self::Completion => LEDGER_OP_BATCH_COMPLETE,
             Self::SliceReport => "POST /index/published",
         }
     }
@@ -313,8 +316,14 @@ pub struct PhaseCost {
     pub budget_rows_read: f64,
     /// The budget's `rowsWritten` for this phase at this node count.
     pub budget_rows_written: f64,
-    /// Runs the local CI was dispatched during the phase.
-    pub dispatched_runs: u64,
+    /// `build-batch.yml` runs the local CI was dispatched during the
+    /// phase — the completions the phase must have paid.
+    pub batches: u64,
+    /// Legs across those runs — the builds the phase dispatched.
+    pub legs: u64,
+    /// `legs / batches`, the achieved `b̄` every per-batch cost is
+    /// spread over; `None` when the phase dispatched no batch.
+    pub legs_per_batch: Option<f64>,
     /// Wall milliseconds from the phase's first to its last ledger read.
     pub wall_ms: u64,
 }
@@ -338,8 +347,10 @@ pub struct LayerCost {
     pub layer: usize,
     /// Task ids the layer's round first published.
     pub published: u64,
-    /// Runs dispatched during the layer.
-    pub dispatched_runs: u64,
+    /// `build-batch.yml` runs dispatched during the layer.
+    pub batches: u64,
+    /// Legs across those runs.
+    pub legs: u64,
     /// Per event kind.
     pub kinds: Vec<KindCost>,
 }
@@ -462,10 +473,29 @@ fn kind(costs: &[KindCost], kind: EventKind) -> &KindCost {
         .expect("kind_costs yields every EventKind")
 }
 
-fn runs_between(runs: &[LocalCiRun], from_ms: u64, to_ms: u64) -> u64 {
+/// The `build-batch.yml` runs dispatched in `(from_ms, to_ms]`, and
+/// the legs they carried. Other workflows the local CI ran (a request's
+/// resolve) are not builds.
+fn batches_between(runs: &[LocalCiRun], from_ms: u64, to_ms: u64) -> (u64, u64) {
+    let path = format!(
+        ".github/workflows/{}",
+        crate::trusted_builder::BATCH_WORKFLOW_FILE
+    );
     runs.iter()
-        .filter(|run| run.dispatched_at_ms > from_ms && run.dispatched_at_ms <= to_ms)
-        .count() as u64
+        .filter(|run| {
+            run.path == path && run.dispatched_at_ms > from_ms && run.dispatched_at_ms <= to_ms
+        })
+        .fold((0, 0), |(batches, legs), run| {
+            (batches + 1, legs + run.legs.len() as u64)
+        })
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "leg and batch counts stay far below f64's exact-integer range"
+)]
+fn per_batch(legs: u64, batches: u64) -> Option<f64> {
+    (batches > 0).then(|| legs as f64 / batches as f64)
 }
 
 fn phase_cost(
@@ -483,6 +513,7 @@ fn phase_cost(
         .filter(|op| !EventKind::ALL.iter().any(|kind| kind.ledger_op() == op.op))
         .map(|op| (*op).clone())
         .collect();
+    let (batches, legs) = batches_between(runs, phase.start.taken_at_ms, phase.end.taken_at_ms);
     Ok(PhaseCost {
         kinds: kind_costs(&ops),
         other_ops,
@@ -490,7 +521,9 @@ fn phase_cost(
         rows_written: counted.iter().map(|op| op.rows_written).sum(),
         budget_rows_read: budget.0,
         budget_rows_written: budget.1,
-        dispatched_runs: runs_between(runs, phase.start.taken_at_ms, phase.end.taken_at_ms),
+        batches,
+        legs,
+        legs_per_batch: per_batch(legs, batches),
         wall_ms: phase
             .end
             .taken_at_ms
@@ -503,10 +536,12 @@ fn layers(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::Resul
     let mut out = Vec::with_capacity(phase.rounds.len());
     for (index, round) in phase.rounds.iter().enumerate() {
         let ops = ledger_delta(&previous.ledger, &round.end.ledger)?;
+        let (batches, legs) = batches_between(runs, previous.taken_at_ms, round.end.taken_at_ms);
         out.push(LayerCost {
             layer: index + 1,
             published: round.published.len() as u64,
-            dispatched_runs: runs_between(runs, previous.taken_at_ms, round.end.taken_at_ms),
+            batches,
+            legs,
             kinds: kind_costs(&ops),
         });
         previous = &round.end;
@@ -557,6 +592,24 @@ fn totals_check(name: &str, cost: &PhaseCost) -> Check {
         format!(
             "rowsRead {} of {:.0}, rowsWritten {} of {:.0}",
             cost.rows_read, cost.budget_rows_read, cost.rows_written, cost.budget_rows_written
+        ),
+    )
+}
+
+/// Every batch run a phase dispatched completes through exactly one
+/// `POST /batches/{batch_id}/complete`, and nothing else books one —
+/// the count the projection prices completions at. Fewer means a
+/// completion never reached the scheduler or was booked under another
+/// ledger key; more means a run's completion was paid twice.
+fn completions_check(name: &str, cost: &PhaseCost) -> Check {
+    let completions = kind(&cost.kinds, EventKind::Completion).events;
+    check(
+        name,
+        completions == cost.batches,
+        format!(
+            "{completions} completions booked under `{}`, {} batch runs dispatched",
+            EventKind::Completion.ledger_op(),
+            cost.batches
         ),
     )
 }
@@ -902,12 +955,14 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
         totals_check("Resubmit total within the preheat budget", &resubmit),
         check(
             "Resubmit rebuilt nothing",
-            resubmit.dispatched_runs == 0,
+            resubmit.legs == 0,
             format!(
-                "{} runs dispatched by the resubmit",
-                resubmit.dispatched_runs
+                "{} legs in {} batch runs dispatched by the resubmit",
+                resubmit.legs, resubmit.batches
             ),
         ),
+        completions_check("Wave completions equal its batch runs", &wave),
+        completions_check("Resubmit completions equal its batch runs", &resubmit),
         check(
             "Wave ran in at least three layers",
             layers.len() >= 3,
@@ -945,18 +1000,19 @@ mod tests {
     use crate::api::{SchedulerLedger, SchedulerLedgerOp};
     use crate::local_ci::{LocalCiLeg, LocalCiRun};
 
-    /// A ledger whose four kinds each ran `events` times at `rate` rows
-    /// read and one written per event, plus `completion_extra` reads on
+    /// A ledger whose kinds each ran `events` times — completions
+    /// `completions` times, one per batch run — at `rate` rows read and
+    /// one written per event, plus `completion_extra` reads on
     /// completions.
-    fn ledger(events: u64, rate: u64, completion_extra: u64) -> SchedulerLedger {
+    fn ledger(events: u64, completions: u64, rate: u64, completion_extra: u64) -> SchedulerLedger {
         SchedulerLedger {
             ops: EventKind::ALL
                 .iter()
                 .map(|kind| {
-                    let extra = if *kind == EventKind::Completion {
-                        completion_extra
+                    let (events, extra) = if *kind == EventKind::Completion {
+                        (completions, completion_extra)
                     } else {
-                        0
+                        (events, 0)
                     };
                     SchedulerLedgerOp {
                         op: kind.ledger_op().to_owned(),
@@ -999,9 +1055,10 @@ mod tests {
         }
     }
 
-    /// A three-layer chain a → b → c: each layer runs 10 events per kind
-    /// at 20 rows each; `completion_growth` adds that many reads to each
-    /// later layer's completions in total.
+    /// A three-layer chain a → b → c, one one-leg batch run per node:
+    /// each layer runs 10 events per kind and one completion at 20 rows
+    /// each; `completion_growth` adds that many reads to each later
+    /// layer's completion in total.
     fn chain(completion_growth: u64) -> WaveObservations {
         let nodes = BTreeMap::from([
             (
@@ -1029,10 +1086,15 @@ mod tests {
         let start = snapshot(0, SchedulerLedger::default());
         let rounds: Vec<Round> = (1..=3u64)
             .map(|layer| Round {
-                before_report: snapshot(layer * 100 - 10, ledger(layer * 10, 20, 0)),
+                before_report: snapshot(layer * 100 - 10, ledger(layer * 10, layer - 1, 20, 0)),
                 end: snapshot(
                     layer * 100,
-                    ledger(layer * 10, 20, completion_growth * (layer - 1) * layer / 2),
+                    ledger(
+                        layer * 10,
+                        layer,
+                        20,
+                        completion_growth * (layer - 1) * layer / 2,
+                    ),
                 ),
                 published: BTreeSet::from([
                     ["a", "b", "c"][usize::try_from(layer - 1).unwrap()].to_owned()
@@ -1047,7 +1109,7 @@ mod tests {
             inserted_edges: 2,
             submit_failures: vec![],
             before: start.clone(),
-            after: snapshot(5, ledger(1, 20, 0)),
+            after: snapshot(5, ledger(1, 0, 20, 0)),
         };
         WaveObservations {
             rustc_version: "1.99.1".to_owned(),
@@ -1189,7 +1251,7 @@ mod tests {
 
     #[test]
     fn a_ledger_that_went_backwards_is_refused() {
-        assert!(ledger_delta(&ledger(10, 20, 0), &ledger(5, 20, 0)).is_err());
+        assert!(ledger_delta(&ledger(10, 1, 20, 0), &ledger(5, 1, 20, 0)).is_err());
     }
 
     #[test]
@@ -1231,7 +1293,67 @@ mod tests {
     #[test]
     fn a_phase_bills_every_counted_operation_as_a_request() {
         let report = analyse(&chain(0)).expect("analyse");
-        // Four kinds, each 30 events over the three layers.
-        assert_eq!(report.wave.requests(), 4 * 30);
+        // Three kinds at 30 events each over the three layers, and one
+        // completion per batch run.
+        assert_eq!(report.wave.requests(), 3 * 30 + 3);
+    }
+
+    #[test]
+    fn a_phase_reports_its_achieved_legs_per_batch() {
+        let mut observed = chain(0);
+        // b's run carries a second leg; a resolve run is no batch.
+        observed.runs[1].legs.push(LocalCiLeg {
+            leg: 1,
+            task_id: "a".to_owned(),
+            status: "completed".to_owned(),
+            conclusion: Some("success".to_owned()),
+            error: None,
+        });
+        let mut resolve = run("x", 96);
+        resolve.path = ".github/workflows/resolve-request.yml".to_owned();
+        resolve.legs.clear();
+        observed.runs.push(resolve);
+        let report = analyse(&observed).expect("analyse");
+        assert_eq!((report.wave.batches, report.wave.legs), (3, 4));
+        assert_eq!(report.wave.legs_per_batch, Some(4.0 / 3.0));
+        assert_eq!(report.resubmit.legs_per_batch, None);
+        let layers: Vec<(u64, u64)> = report
+            .layers
+            .iter()
+            .map(|layer| (layer.batches, layer.legs))
+            .collect();
+        assert_eq!(layers, [(2, 3), (1, 1), (0, 0)]);
+        assert!(failed(&report).is_empty(), "{:?}", report.checks);
+    }
+
+    #[test]
+    fn a_completion_count_off_the_batch_runs_fails() {
+        // A fourth batch run whose completion never booked.
+        let mut observed = chain(0);
+        observed.runs.push(run("c", 196));
+        let report = analyse(&observed).expect("analyse");
+        assert_eq!(failed(&report), ["Wave completions equal its batch runs"]);
+
+        // Completions booked under each batch's own path, as a ledger
+        // that does not collapse the batch id books them.
+        let mut observed = chain(0);
+        for round in &mut observed.wave.rounds {
+            for snapshot in [&mut round.before_report, &mut round.end] {
+                for op in &mut snapshot.ledger.ops {
+                    if op.op == EventKind::Completion.ledger_op() {
+                        op.op = format!("POST /batches/{:032x}/complete", 7);
+                    }
+                }
+            }
+        }
+        observed.wave.end = observed.wave.rounds.last().unwrap().end.clone();
+        observed.resubmit.start = observed.wave.end.clone();
+        observed.resubmit.end.ledger = observed.wave.end.ledger.clone();
+        let report = analyse(&observed).expect("analyse");
+        assert!(
+            failed(&report).contains(&"Wave completions equal its batch runs"),
+            "{:?}",
+            report.checks
+        );
     }
 }

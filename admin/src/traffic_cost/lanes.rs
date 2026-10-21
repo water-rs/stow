@@ -7,7 +7,8 @@
 //!
 //! The public lanes need no credential; `--scheduler` adds the trusted
 //! lanes on the operator bearer, `--webhook-secret` adds the
-//! `workflow_run` callback lane signed under the mock's
+//! `workflow_run` callback lane — a `build-batch.yml` run's `completed`
+//! delivery for a seeded in-flight batch — signed under the mock's
 //! `STOW_GITHUB_WEBHOOK_SECRET`, and `--pow-secret` adds the untrusted
 //! miss lanes — real `POST /api/v1/admissions` calls, and `POST
 //! /api/v1/enqueue` redemptions on tickets minted under the mock's
@@ -27,11 +28,13 @@ use stow_types::api::{
     QueueSelector, ResolvedDependencyGraphEntry,
 };
 use stow_types::fixture::{
-    FixtureShape, REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED, task_hex_id,
+    FixtureShape, InFlightBatch, REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED, task_hex_id,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::launch_model::{EventKind, LaunchModel};
 use stow_types::pow::enqueue_pow_zero_bits;
+use stow_types::records::batch_run_title;
+use stow_types::runs::run_url;
 
 use zenwave::Client;
 
@@ -118,13 +121,9 @@ pub enum Fire {
     /// `POST /api/v1/scheduler/tasks/submit` — one synthetic task over
     /// a rotating pool of real crates.
     TrustedSubmit { rustc: String },
-    /// HMAC-signed `POST /api/v1/github/workflow_run` completing a
-    /// seeded dispatched row.
-    WorkflowRun {
-        secret: String,
-        rustc: String,
-        queue_rows: u64,
-    },
+    /// HMAC-signed `POST /api/v1/github/workflow_run` reporting a
+    /// seeded in-flight batch's `build-batch.yml` run `completed`.
+    WorkflowRun { secret: String, queue_rows: u64 },
     /// `POST /api/v1/admissions` — one miss entry whose resolved graph
     /// rides in the body, so the lane pays the real mint path without
     /// a crates.io hop.
@@ -169,12 +168,12 @@ fn shape(queue_rows: u64) -> FixtureShape {
     }
 }
 
-/// The k-th dispatched row's task id — the fixture's in-flight range,
-/// even `n` only.
-fn dispatched_task_id(k: u64, queue_rows: u64) -> String {
-    let shape = shape(queue_rows);
-    let index = u32::try_from(k % u64::from(FixtureShape::IN_FLIGHT_ROWS / 2)).unwrap_or_default();
-    task_hex_id(u64::from(shape.dispatched_row(index)))
+/// The k-th in-flight fixture batch — every `dispatched` and `running`
+/// row is leg 0 of its own bound batch, so the lane cycles all of them.
+fn in_flight_batch(k: u64, queue_rows: u64) -> InFlightBatch {
+    let index = u32::try_from(k % u64::from(FixtureShape::IN_FLIGHT_ROWS))
+        .expect("an index below IN_FLIGHT_ROWS fits u32");
+    shape(queue_rows).in_flight_batch(index)
 }
 
 /// The k-th failed row's task id — `completed_end < n <= failed_end`.
@@ -214,29 +213,33 @@ fn sign_body(secret: &str, body: &[u8]) -> String {
     format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
 }
 
-/// The signed `workflow_run` delivery for one seeded dispatched task —
-/// the pinned fields `authorized_run` checks: the trusted repo, the
-/// build workflow's path, `main`, `workflow_dispatch`, and a
-/// `<rustc>-<task_id>` title. The `id`/`run_attempt` pair names the
-/// build whose records tag the edge looks up, so it is the fixture
-/// row's own index — the value `traffic-cost.sh` pushes each dispatched
-/// row's records artifact under.
-fn workflow_run_body(task_id: &str, rustc: &str, run_id: u64) -> String {
+/// The signed `completed` delivery GitHub sends when `batch`'s
+/// `build-batch.yml` run finishes — the pinned fields `authorized_run`
+/// checks (the trusted repo, the batch workflow's path, `main`,
+/// `workflow_dispatch`) and the `<rustc>-b<batch_id>` title the
+/// webhook decodes into the completion route's batch. The `id` is the
+/// run the fixture bound the batch to: the scheduler records the
+/// completion only for that run, and the alarm then reads that run's
+/// jobs page from the local CI (`traffic-cost fixture-runs`) and each
+/// leg's records artifact under `records-<rustc>-<hash>-<id>-1`, both
+/// of which `traffic-cost.sh` publishes before the lanes start.
+fn workflow_run_body(batch: &InFlightBatch) -> String {
+    let run_id = batch.run_id;
     serde_json::json!({
         "action": "completed",
         "repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
         "workflow_run": {
-            "display_title": format!("{rustc}-{task_id}"),
+            "display_title": batch_run_title(batch.rustc_version, &batch.batch_id),
             "event": "workflow_dispatch",
             "head_branch": stow_types::trusted_builder::BRANCH,
             "path": format!(
                 ".github/workflows/{}",
-                stow_types::trusted_builder::WORKFLOW_FILE
+                stow_types::trusted_builder::BATCH_WORKFLOW_FILE
             ),
             "conclusion": "success",
             "id": run_id,
             "run_attempt": 1,
-            "html_url": null,
+            "html_url": run_url(&run_id.to_string()),
             "head_repository": {
                 "full_name": stow_types::trusted_builder::REPOSITORY
             },
@@ -494,18 +497,14 @@ async fn plan(
             body: serde_json::to_value(vec![submit_task(rustc, counter)?])
                 .map_err(|error| error.to_string())?,
         }),
-        Fire::WorkflowRun {
-            secret,
-            rustc,
-            queue_rows,
-        } => {
-            // The run id is the fixture row's own index, not the lane
-            // counter: `traffic-cost.sh` pushes each dispatched row's
-            // records artifact under run id k, and the records tag's
-            // per-build suffix is what the edge's existence check
-            // resolves the delivery to.
-            let k = counter % u64::from(FixtureShape::IN_FLIGHT_ROWS / 2);
-            let body = workflow_run_body(&dispatched_task_id(k, *queue_rows), rustc, k);
+        Fire::WorkflowRun { secret, queue_rows } => {
+            // The fixture holds IN_FLIGHT_ROWS bound batches and nothing
+            // re-arms one, so only each batch's first delivery is
+            // production's first-delivery path: the record write and
+            // the alarm arm. A later delivery for the same batch is a
+            // redelivery — no write while the batch awaits its alarm,
+            // a logged 404 once the alarm resolved it.
+            let body = workflow_run_body(&in_flight_batch(counter, *queue_rows));
             let signature = sign_body(secret, body.as_bytes());
             Ok(Plan::PostBytes {
                 url: format!("{base}/api/v1/github/workflow-run"),
@@ -709,7 +708,6 @@ pub fn build_lanes(args: &LaneArgs, model: &LaunchModel, scale: f64) -> Result<V
             eps: eps(EventKind::BuildCallback),
             fire: Fire::WorkflowRun {
                 secret: secret.clone(),
-                rustc: args.rustc.clone(),
                 queue_rows: args.queue_rows,
             },
             expected: ok2xx,
@@ -768,7 +766,9 @@ mod tests {
     use stow_types::do_budgets::WORKER_CPU_BUDGETS;
     use stow_types::launch_model::LaunchModel;
 
-    use super::{LaneArgs, build_lanes};
+    use stow_types::fixture::FixtureShape;
+
+    use super::{LaneArgs, build_lanes, in_flight_batch, workflow_run_body};
 
     /// The full lane set and the Worker CPU budget table name the same
     /// lanes: a lane without a budget would be measured and never gated,
@@ -800,5 +800,36 @@ mod tests {
         lanes.sort_unstable();
         budgets.sort_unstable();
         assert_eq!(lanes, budgets);
+    }
+
+    /// The lane's deliveries walk every in-flight fixture batch once
+    /// per cycle, each a `build-batch.yml` `completed` whose title
+    /// decodes to that batch and whose run id is the one it is bound to.
+    #[test]
+    fn the_callback_lane_completes_each_bound_batch_under_its_run() {
+        let rows = 100_000;
+        let cycle = u64::from(FixtureShape::IN_FLIGHT_ROWS);
+        let mut seen = std::collections::BTreeSet::new();
+        for counter in 0..cycle {
+            let batch = in_flight_batch(counter, rows);
+            assert_eq!(batch, in_flight_batch(counter + cycle, rows));
+            let body: serde_json::Value = serde_json::from_str(&workflow_run_body(&batch)).unwrap();
+            let run = &body["workflow_run"];
+            let title = run["display_title"].as_str().unwrap();
+            assert_eq!(
+                stow_types::records::parse_batch_run_title(title),
+                Some((batch.rustc_version, batch.batch_id.clone()))
+            );
+            assert_eq!(
+                run["path"],
+                format!(
+                    ".github/workflows/{}",
+                    stow_types::trusted_builder::BATCH_WORKFLOW_FILE
+                )
+            );
+            assert_eq!(run["id"], batch.run_id);
+            assert_eq!(body["action"], "completed");
+            assert!(seen.insert(batch.batch_id.to_string()));
+        }
     }
 }

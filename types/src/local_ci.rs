@@ -77,3 +77,34 @@ pub struct LocalCiLeg {
     /// succeeded or has not finished.
     pub error: Option<String>,
 }
+
+/// `POST /seeded-runs`: `build-batch.yml` runs that already exist
+/// upstream when the harness starts.
+///
+/// These are the scheduler fixture's bound in-flight batches
+/// (`crate::fixture::FixtureShape::in_flight_batch`), dispatched before
+/// the store was seeded rather than through `/dispatch`. The server
+/// records each as a finished run whose every
+/// leg succeeded, so its run object and attempt-jobs page answer as
+/// GitHub's would once the run completed; the caller delivers the
+/// run's `workflow_run` completion and publishes each leg's records
+/// artifact itself.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct LocalCiSeededRuns {
+    /// The runs to record, each under its own id.
+    pub runs: Vec<LocalCiSeededRun>,
+}
+
+/// One run [`LocalCiSeededRuns`] records.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct LocalCiSeededRun {
+    /// The run id the batch is bound to — unique among every run the
+    /// server holds or will allocate.
+    pub workflow_run_id: u64,
+    /// The batch's rustc — the run title's lead.
+    pub rustc_version: crate::identity::WireRustcVersion,
+    /// The batch the run carries — the run title's `b<batch_id>`.
+    pub batch_id: crate::api::BatchId,
+    /// Each leg's task id, in leg order.
+    pub legs: Vec<String>,
+}

@@ -21,6 +21,13 @@ pub const DO_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
 /// scheduler route as `<METHOD> <path>`.
 pub const LEDGER_OP_ALARM: &str = "alarm";
 
+/// The probe ledger's key for a batch run's completion.
+///
+/// It is the scheduler route `POST /batches/{batch_id}/complete` with
+/// the batch id collapsed, so every batch's completion lands on one row
+/// the way a request record's id does.
+pub const LEDGER_OP_BATCH_COMPLETE: &str = "POST /batches/{batch_id}/complete";
+
 /// The scheduler cost one preheat wave and one daily resubmit may spend
 /// — the `Preheat cost` lane's (stow#773) totals gate.
 ///
@@ -680,9 +687,10 @@ pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
         cpu_ms: 15.0,
     },
     WorkerCpuBudget {
-        // The signed `workflow_run` callback: HMAC check, the records
-        // artifact's cosign verification, and the completion.
-        // Run 39009034210: 3.185 ms.
+        // The signed `workflow_run` callback: HMAC check, the batch
+        // run's title decode and the forward to the scheduler. Run
+        // 39009034210 measured 3.185 ms on the per-task path, which
+        // also verified the records artifact's cosign signature.
         lane: "workflow-callback",
         cpu_ms: 10.0,
     },
