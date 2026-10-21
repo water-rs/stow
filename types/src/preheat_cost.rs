@@ -32,7 +32,7 @@ pub enum EventKind {
     Submit,
     /// The alarm's dispatch pass.
     Dispatch,
-    /// A build's `workflow_run` completion.
+    /// A batch run's `workflow_run` completion.
     Completion,
     /// An `index-publish` slice report, which also dispatches the
     /// dependents it releases.
@@ -54,22 +54,21 @@ impl EventKind {
         match self {
             Self::Submit => "POST /tasks/submit/trusted",
             Self::Dispatch => LEDGER_OP_ALARM,
-            Self::Completion => "POST /tasks/complete-run",
+            Self::Completion => "POST /batches/{batch_id}/complete",
             Self::SliceReport => "POST /index/published",
         }
     }
 
     /// The stow#433 drive whose budget one event of this kind must fit,
-    /// for the kinds whose event has a fixed size: one completion is one
-    /// task, one alarm pass claims at most the dispatch cap. A submit
-    /// batch and a slice report scale with what they carry, so their
-    /// fixture drives do not bound a wave's events.
+    /// for the kinds whose event has a fixed size: one alarm pass claims
+    /// at most the dispatch cap. A submit batch, a batch completion and a
+    /// slice report scale with what they carry, so their fixture drives
+    /// do not bound a wave's events.
     #[must_use]
     pub const fn drive(self) -> Option<&'static str> {
         match self {
-            Self::Completion => Some("POST /tasks/complete-run"),
             Self::Dispatch => Some("alarm pass"),
-            Self::Submit | Self::SliceReport => None,
+            Self::Submit | Self::Completion | Self::SliceReport => None,
         }
     }
 }

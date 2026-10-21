@@ -719,23 +719,6 @@ CREATE TABLE IF NOT EXISTS attempt_outcomes_v2 (
 CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_v2_finished
 ON attempt_outcomes_v2 (finished_at);
 
--- A verified workflow completion can beat the scheduler's write of the
--- `workflow_dispatch` response. Keep that event by the run identity until
--- the exact response binds the same run to the claimed generation. Rows are
--- bounded by in-flight dispatches and are deleted when the binding applies
--- or the unbound generation is abandoned.
-CREATE TABLE IF NOT EXISTS pending_run_completions (
-    github_run_id TEXT PRIMARY KEY,
-    task_id TEXT NOT NULL,
-    success INTEGER NOT NULL CHECK (success IN (0, 1)),
-    error TEXT,
-    received_at TEXT NOT NULL DEFAULT (datetime('now'))
-);
-
-CREATE INDEX IF NOT EXISTS idx_pending_run_completions_task
-ON pending_run_completions (task_id);
-
-
 -- The dispatch-freeze transition log the watchdog (#450) turns into the
 -- `incident` issue record: one append-only row per engage/clear so a
 -- recorder that missed a transition still sees it. `trigger` is the

@@ -1,18 +1,13 @@
 //! `POST /api/v1/github/workflow-run` — GitHub's `workflow_run` webhook.
 //!
 //! Completion reaches the scheduler here instead of from CI (stow#455):
-//! `build-crate.yml` sets `run-name` to `<rustc>-<task_id>`, GitHub
+//! `build-batch.yml` sets `run-name` to `<rustc>-b<batch_id>`, GitHub
 //! delivers the run's `completed` event signed `sha256=<HMAC-SHA256>` with
 //! `X-Hub-Signature-256` over the raw body under the
 //! `STOW_GITHUB_WEBHOOK_SECRET` binding, and this route parses
-//! `display_title` back into its rustc and task id. A `success`
-//! conclusion is only forwarded once the run's
-//! `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifact exists
-//! in GHCR — the tag names the run that published it, so a completed run
-//! is matched to the artifact that run pushed and to no other
-//! (stow#655). The registry is
-//! the record store, so the record must be where the claim says it is
-//! before the queue marks the work done.
+//! `display_title` back into its rustc and batch id and forwards the
+//! run's identity to the scheduler, which resolves each leg from the
+//! signed records artifacts.
 //!
 //! The route carries no caller-credential gate: the HMAC signature is the
 //! authentication. Shed control lives in the zone WAF maintenance rules
@@ -20,18 +15,17 @@
 //! scheduler-lane paths, so a partial reopen keeps draining completions,
 //! and the `anonymous` scope carves `/api/v1/github` out alongside the
 //! trusted prefixes for the same reason. Only `all` blocks the route —
-//! the whole site is down then, and GitHub redelivers what the outage
-//! delayed.
+//! the whole site is down then, and a delivery sent during the outage is
+//! lost: GitHub never redelivers on its own, and the lease check repairs
+//! the batch a lost completion belonged to.
 
 use std::future::Future;
 
 #[cfg(target_arch = "wasm32")]
-use crate::api::{GhcrConfig, OkResponse};
+use crate::api::OkResponse;
 use crate::errors::{GetArtifactError, SchedulerClientError};
 #[cfg(target_arch = "wasm32")]
-use crate::fetch_guard::OutboundPool;
-#[cfg(target_arch = "wasm32")]
-use crate::{ghcr, scheduler_client};
+use crate::scheduler_client;
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use skyzen::Request;
@@ -43,10 +37,8 @@ use skyzen::utils::State;
 use skyzen_cloudflare::CfDurableNamespace;
 #[cfg(target_arch = "wasm32")]
 use skyzen_cloudflare::worker::send::IntoSendFuture as _;
-#[cfg(target_arch = "wasm32")]
-use stow_types::api::WorkflowRunComplete;
 use stow_types::api::{BatchId, BatchRunComplete};
-use stow_types::records::{parse_batch_run_title, parse_run_title};
+use stow_types::records::parse_batch_run_title;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -137,23 +129,19 @@ impl Extractor for VerifiedDelivery {
 /// full run document; the rest is ignored.
 #[derive(Debug, serde::Deserialize)]
 struct WorkflowRunFields {
-    /// `run-name` — the `<rustc>-<task_id>` title `build-crate.yml` stamps.
+    /// `run-name` — the title the trusted workflow stamps.
     display_title: String,
     /// What dispatched the run — must be `workflow_dispatch`.
     event: String,
     head_branch: String,
     path: String,
-    /// Read only by the wasm handler's completion record and the batch
-    /// forward's report.
+    /// Read by the batch forward's report and the request run update.
     conclusion: Option<String>,
     id: u64,
     /// `run_attempt` — GitHub's attempt number for the run, a positive
-    /// integer. Read by the wasm handler's records check, which builds
-    /// the run's `BuildRun` from it and `id`, and by the batch
-    /// forward's report.
+    /// integer. Read by the batch forward's report.
     run_attempt: std::num::NonZeroU32,
-    /// Read only by the wasm handler's completion record and the batch
-    /// forward's report.
+    /// Read by the batch forward's report and the request run update.
     html_url: Option<String>,
     /// The repo the head commit lives in — a fork's run names its fork.
     head_repository: RepoRef,
@@ -183,7 +171,7 @@ struct ActionOnly {
 /// action. `None` covers everything this hook does not consume —
 /// non-`workflow_run` events (`ping`) answer 200 so GitHub's delivery
 /// log stays clean; the action is returned for the caller to gate per
-/// workflow (a build run is consumed on `completed`, a resolve run on
+/// workflow (a batch run is consumed on `completed`, a resolve run on
 /// `in_progress` and `completed`). `Err` is a 400: the signature was
 /// fine but the payload is not the shape GitHub documented.
 fn decode_delivery(
@@ -195,7 +183,7 @@ fn decode_delivery(
     let ActionOnly { action } = serde_json::from_slice(&delivery.body).map_err(|error| {
         GetArtifactError::BadRequestWithMessage(format!("malformed workflow_run payload: {error}"))
     })?;
-    // The two lifecycle actions any trusted workflow consumes: a build
+    // The two lifecycle actions any trusted workflow consumes: a batch
     // run reports on `completed`, a resolve run on `in_progress` and
     // `completed`. `requested`/`queued`/`waiting` deliveries carry the
     // run but nothing to apply — answer 200 without parsing further.
@@ -212,14 +200,6 @@ fn decode_delivery(
 /// workflow stamps its own shape.
 #[derive(Debug)]
 enum RunSubject<'a> {
-    /// `build-crate.yml`'s `<rustc>-<task_id>` — a build task's
-    /// completion report.
-    Task {
-        /// The rustc the task targeted.
-        rustc_version: &'a str,
-        /// The task id the run reported on.
-        task_id: &'a str,
-    },
     /// `build-batch.yml`'s `<rustc>-b<batch_id>` — a batch run's
     /// completion report (stow#833).
     Batch {
@@ -241,7 +221,7 @@ enum RunSubject<'a> {
 /// The authority boundary a run event must sit inside — a fork or a
 /// feature-branch run's signature still verifies, so the run's own
 /// fields are what make it ours: a trusted workflow's file
-/// (`build-crate.yml` or `resolve-request.yml`), on `main`, dispatched
+/// (`build-batch.yml` or `resolve-request.yml`), on `main`, dispatched
 /// by `workflow_dispatch`, in the trusted repository (its head repo
 /// equal to the event repo, so a fork's delivery cannot pose as
 /// upstream's).
@@ -262,18 +242,6 @@ fn authorized_run(
         return Ok(None);
     }
     let subject = match run.path.strip_prefix(".github/workflows/") {
-        Some(stow_types::trusted_builder::WORKFLOW_FILE) => {
-            let Some((rustc_version, task_id)) = parse_run_title(&run.display_title) else {
-                return Err(GetArtifactError::BadRequestWithMessage(format!(
-                    "run {}'s display_title {:?} is not <rustc>-<task_id>",
-                    run.id, run.display_title
-                )));
-            };
-            RunSubject::Task {
-                rustc_version,
-                task_id,
-            }
-        }
         Some(stow_types::trusted_builder::BATCH_WORKFLOW_FILE) => {
             let Some((rustc_version, batch_id)) = parse_batch_run_title(&run.display_title) else {
                 return Err(GetArtifactError::BadRequestWithMessage(format!(
@@ -326,17 +294,16 @@ fn verify_signature(secret: &str, signature: &str, body: &[u8]) -> Result<(), Ge
 ///
 /// Everything this hook does not consume answers 200 — a `ping`, a
 /// `requested` action, a resolve run's non-lifecycle action, and a run
-/// outside the authority boundary are deliveries, not failures, and
-/// GitHub retries non-2xx. Consumed events always answer 200 too: a
-/// retried delivery changes nothing about an already-completed task or
-/// settled request record, so the scheduler's 404/409 answers are
-/// logged, not propagated. Only a malformed payload (400), a bad
-/// signature (401), and an upstream failure (500, worth a GitHub
-/// retry) leave the 2xx path.
+/// outside the authority boundary are deliveries, not failures. Consumed
+/// events always answer 200 too: the scheduler's 404/409 answers mean the
+/// event names nothing live, so they are logged, not propagated. Only a
+/// malformed payload (400), a bad signature (401), and an upstream failure
+/// (500) leave the 2xx path. GitHub never redelivers a failed delivery on
+/// its own, so a 500 loses the event; for a batch completion the lease
+/// check repairs the loss.
 #[cfg(target_arch = "wasm32")]
 pub async fn github_workflow_run(
     delivery: VerifiedDelivery,
-    State(ghcr): State<GhcrConfig>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
     let Some((action, event)) = decode_delivery(&delivery)? else {
@@ -348,12 +315,6 @@ pub async fn github_workflow_run(
         return Ok(Json(OkResponse { ok: true }));
     };
     match subject {
-        RunSubject::Task {
-            rustc_version,
-            task_id,
-        } if action == "completed" => {
-            complete_build_task(&ghcr, &scheduler, run, rustc_version, task_id).await?;
-        }
         RunSubject::Batch {
             rustc_version,
             batch_id,
@@ -366,11 +327,10 @@ pub async fn github_workflow_run(
         } if action == "in_progress" || action == "completed" => {
             update_request_run(&scheduler, run, &action, attempt, request_id).await?;
         }
-        // A build run's `requested`/`in_progress`, a batch run's
-        // `requested`/`in_progress` and a resolve run's
-        // `requested`/`waiting`: the task's and batch's lifecycle
-        // starts at `completed` and the request's record is `accepted`
-        // at dispatch — neither event carries anything to apply. The
+        // A batch run's `requested`/`in_progress` and a resolve run's
+        // `requested`/`waiting`: the batch's lifecycle starts at
+        // `completed` and the request's record is `accepted` at
+        // dispatch — neither event carries anything to apply. The
         // batch arm in particular touches nothing but the DO forward:
         // its leg resolution runs in the alarm pass (stow#833 §3.2).
         _ => {}
@@ -408,8 +368,8 @@ impl BatchCompletionForward for CfDurableNamespace {
 /// verbatim to `POST /batches/{batch_id}/complete`; the object records
 /// it on the batch row and the alarm pass resolves each leg
 /// (stow#833 §3.2). An unknown batch is an orphan run from an
-/// abandoned dispatch — the object's 404 is logged like today's
-/// unknown-task case, never an error back to GitHub.
+/// abandoned dispatch — the object's 404 is logged, never an error back
+/// to GitHub.
 async fn forward_batch_completion(
     forward: &impl BatchCompletionForward,
     run: &WorkflowRunFields,
@@ -443,86 +403,6 @@ async fn forward_batch_completion(
         Err(other) => {
             return Err(GetArtifactError::from(other)).inspect_err(|error| {
                 tracing::error!(%batch_id, %error, "forward batch completion");
-            });
-        }
-    }
-    Ok(())
-}
-
-/// `build-crate.yml` `completed` — verify the records artifact and
-/// report the task's conclusion to the scheduler.
-#[cfg(target_arch = "wasm32")]
-async fn complete_build_task(
-    ghcr: &GhcrConfig,
-    scheduler: &CfDurableNamespace,
-    run: &WorkflowRunFields,
-    rustc_version: &str,
-    task_id: &str,
-) -> Result<(), GetArtifactError> {
-    let mut success = run.conclusion.as_deref() == Some("success");
-    let mut error = None;
-    if success {
-        let build = stow_types::records::BuildRun {
-            run_id: run.id,
-            run_attempt: run.run_attempt.get(),
-        };
-        match ghcr::records_artifact_exists(
-            ghcr,
-            rustc_version,
-            task_id,
-            build,
-            &OutboundPool::new(),
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                success = false;
-                error = Some(stow_types::records::missing_records_error(task_id));
-                tracing::error!(task_id, "successful run produced no records artifact");
-            }
-            Err(fetch_error) => {
-                // A registry hiccup is transient: answer 500 so GitHub's
-                // redelivery retries the completion instead of dropping it.
-                tracing::warn!(task_id, %fetch_error, "records artifact check failed");
-                return Err(GetArtifactError::InternalWithMessage(format!(
-                    "verify records artifact for {task_id}: {fetch_error}"
-                )));
-            }
-        }
-    } else {
-        error = Some(format!(
-            "workflow run concluded `{}`{}",
-            run.conclusion.as_deref().unwrap_or("<none>"),
-            run.html_url
-                .as_deref()
-                .map(|url| format!(" ({url})"))
-                .unwrap_or_default()
-        ));
-    }
-
-    let completion = WorkflowRunComplete {
-        task_id: task_id.to_owned(),
-        success,
-        error,
-        github_run_id: Some(run.id.to_string()),
-    };
-    match scheduler_client::send_run_complete(scheduler, &completion).await {
-        Ok(()) => {
-            tracing::info!(task_id, success, "workflow_run completion applied");
-        }
-        // The queue's 404/409 mean the task is not live for this event —
-        // consumed, never an error back to GitHub.
-        Err(crate::errors::SchedulerClientError::Http {
-            status: 404 | 409,
-            body,
-            ..
-        }) => {
-            tracing::warn!(task_id, %body, "workflow_run completion did not match a live task");
-        }
-        Err(other) => {
-            return Err(GetArtifactError::from(other)).inspect_err(|error| {
-                tracing::error!(task_id, %error, "forward workflow_run completion");
             });
         }
     }
@@ -725,6 +605,10 @@ mod tests {
             completed_event(|event| {
                 event["workflow_run"]["head_branch"] = serde_json::json!("dev");
             }),
+            // `build-crate.yml` is a reusable workflow the batch calls,
+            // never dispatched itself: a run of it is outside the
+            // boundary however well pinned.
+            completed_event(|_| {}),
         ];
         for body in cases {
             let delivery = verified("workflow_run", &body)
@@ -737,34 +621,8 @@ mod tests {
         }
     }
 
-    /// The happy path pins everything, splits the title into
-    /// `(rustc, task_id)`, and the run id arrives as `u64`.
-    #[tokio::test]
-    async fn a_dispatched_main_build_run_is_authorized() {
-        let body = completed_event(|_| {});
-        let delivery = verified("workflow_run", &body)
-            .await
-            .expect("signed delivery verifies");
-        let (_action, event) = decode_delivery(&delivery)
-            .expect("decodes")
-            .expect("completed action");
-        let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
-        let RunSubject::Task {
-            rustc_version,
-            task_id,
-        } = subject
-        else {
-            panic!("build-crate.yml decodes a task subject");
-        };
-        assert_eq!(rustc_version, "1.99.0");
-        assert_eq!(task_id, "serde-1.0.0-abc123");
-        assert_eq!(run.id, 987_654_321_u64);
-        assert_eq!(run.run_attempt.get(), 1);
-    }
-
-    /// `run_attempt` is required and positive — the records tag is
-    /// per-build, so a delivery that cannot name its run's build is
-    /// malformed like any other missing field.
+    /// `run_attempt` is required and positive — a delivery that cannot
+    /// name its run's attempt is malformed like any other missing field.
     #[tokio::test]
     async fn a_run_without_a_valid_attempt_is_a_400() {
         for body in [
@@ -843,12 +701,12 @@ mod tests {
         assert!(matches!(error, GetArtifactError::BadRequestWithMessage(_)));
     }
 
-    /// A pinned run whose title is not `<rustc>-<task_id>` is a 400 —
-    /// the workflow stamps run-name itself, so a shapeless title means
-    /// the dispatch was hand-edited.
+    /// A pinned batch run whose title is not `<rustc>-b<batch_id>` is a
+    /// 400 — the workflow stamps run-name itself, so a shapeless title
+    /// means the dispatch was hand-edited.
     #[tokio::test]
     async fn an_authorized_run_with_a_shapeless_title_is_a_400() {
-        let body = completed_event(|event| {
+        let body = batch_completed_event(|event| {
             event["workflow_run"]["display_title"] = serde_json::json!("nodashintitle");
         });
         let delivery = verified("workflow_run", &body)
@@ -1023,8 +881,9 @@ mod tests {
     }
 
     /// A DO 404 — an unknown batch, the orphan of an abandoned
-    /// dispatch — is consumed like today's unknown-run case: logged,
-    /// still 200 to GitHub. A 5xx does propagate, worth a redelivery.
+    /// dispatch — is consumed: logged, still 200 to GitHub. A 5xx does
+    /// propagate as a 500; GitHub never redelivers it, so the lease
+    /// check repairs the loss.
     #[tokio::test]
     async fn a_batch_completion_404_is_consumed_but_a_5xx_is_not() {
         let body = batch_completed_event(|_| {});
@@ -1055,7 +914,7 @@ mod tests {
         };
         let error = forward_batch_completion(&failing, run, rustc_version, &batch_id)
             .await
-            .expect_err("a DO failure propagates for a GitHub retry");
+            .expect_err("a DO failure propagates as a 500");
         assert!(matches!(error, GetArtifactError::InternalWithMessage(_)));
     }
 }

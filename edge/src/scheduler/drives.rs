@@ -603,57 +603,6 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
-        // The fixture's in-flight rows carry a bound `github_run_id`
-        // (`run-{n}`) as a claimed generation does — the report must
-        // name it or the run-binding gate rejects it.
-        name: "POST /tasks/complete-run",
-        setup: None,
-        run: |db, shape, settings, _ctx| {
-            Box::pin(async move {
-                queue::complete_run(
-                    db,
-                    settings,
-                    &stow_types::api::WorkflowRunComplete {
-                        task_id: hex_id(u64::from(shape.running_row())),
-                        success: true,
-                        error: None,
-                        github_run_id: Some(format!("run-{}", shape.running_row())),
-                    },
-                    crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            })
-        },
-        cleanup: None,
-    },
-    Drive {
-        // The failure arm: the row re-queues `pending` behind its
-        // backoff (`attempt` under the cap), so this prices the
-        // heavier of the two failure writes — the cap arm only parks
-        // the row `failed`.
-        name: "POST /tasks/complete-run (failure)",
-        setup: None,
-        run: |db, shape, settings, _ctx| {
-            Box::pin(async move {
-                queue::complete_run(
-                    db,
-                    settings,
-                    &stow_types::api::WorkflowRunComplete {
-                        task_id: hex_id(u64::from(shape.dispatched_row(0))),
-                        success: false,
-                        error: Some("build failed".to_owned()),
-                        github_run_id: Some(format!("run-{}", shape.dispatched_row(0))),
-                    },
-                    crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            })
-        },
-        cleanup: None,
-    },
-    Drive {
         name: "POST /tasks/retry",
         setup: None,
         run: |db, shape, settings, _ctx| {

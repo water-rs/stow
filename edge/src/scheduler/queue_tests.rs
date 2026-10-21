@@ -3157,7 +3157,6 @@ async fn failed_build_retries_behind_its_backoff() {
             attempt: claimed[0].attempt,
             success: false,
             error: Some("boom".to_owned()),
-            finished_at: None,
             sample_ms: None,
             github_run_id: None,
         },
@@ -3273,7 +3272,6 @@ async fn human_rerequest_resurrects_completed_and_claims() {
             attempt: claimed[0].attempt,
             success: true,
             error: None,
-            finished_at: None,
             sample_ms: None,
             github_run_id: None,
         },
@@ -3874,7 +3872,6 @@ async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
             attempt: claimed[0].attempt,
             success: true,
             error: None,
-            finished_at: None,
             sample_ms: None,
             github_run_id: None,
         },
@@ -3901,7 +3898,6 @@ async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
             attempt: 1,
             success: true,
             error: None,
-            finished_at: None,
             sample_ms: None,
             github_run_id: None,
         },
@@ -5115,23 +5111,46 @@ fn report(
         attempt,
         success,
         error: None,
-        finished_at: None,
         sample_ms: None,
         github_run_id: None,
     }
 }
 
-fn report_with_run(
+/// Complete a claimed row's live generation through [`super::complete`]
+/// the way a batch leg's resolution does — `sample_ms` is the leg's
+/// runner time, `None` for a failure.
+async fn complete_live(
+    db: &DurableDb,
     task_id: &str,
     success: bool,
-    github_run_id: &str,
-) -> stow_types::api::WorkflowRunComplete {
-    stow_types::api::WorkflowRunComplete {
-        task_id: task_id.to_owned(),
-        success,
-        error: (!success).then(|| "build failed".to_owned()),
-        github_run_id: Some(github_run_id.to_owned()),
+    sample_ms: Option<i64>,
+) -> Result<(), QueueError> {
+    #[derive(skyzen::FromRow)]
+    struct LiveGeneration {
+        generation_id: String,
+        attempt: u32,
     }
+    let live = db
+        .query("SELECT generation_id, attempt FROM queue WHERE task_id = ?")
+        .bind(task_id.to_owned())
+        .fetch_one::<LiveGeneration>()
+        .await
+        .expect("live generation");
+    super::complete(
+        db,
+        &settings(),
+        &super::BuildCompleteReport {
+            task_id: task_id.to_owned(),
+            generation_id: live.generation_id,
+            attempt: live.attempt,
+            success,
+            error: (!success).then(|| "build failed".to_owned()),
+            github_run_id: None,
+            sample_ms,
+        },
+        TEST_WINDOW_MINUTES,
+    )
+    .await
 }
 
 #[derive(skyzen::FromRow)]
@@ -5168,7 +5187,6 @@ async fn seed_failed_retry_cycle(db: &DurableDb, id: &str, cycle: &str) {
                 success: false,
                 error: Some(format!("cycle-{cycle}-{attempt}")),
                 github_run_id: Some(format!("run-{cycle}-{attempt}")),
-                finished_at: None,
                 sample_ms: None,
             },
             TEST_WINDOW_MINUTES,
@@ -5253,170 +5271,6 @@ async fn two_retry_cycles_keep_distinct_failure_evidence() {
 }
 
 #[tokio::test]
-async fn delayed_old_run_cannot_complete_new_bound_generation() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("flaky", &[])])
-        .await
-        .expect("enqueue");
-    let id = task_id_on("flaky", TARGET);
-    let first = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim A")[0]
-        .clone();
-    bind_dispatch_run(&db, &id, &first.generation_id, "run-a")
-        .await
-        .expect("bind A");
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, false, "run-a"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("complete A");
-    db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
-            .bind(id.clone())
-            .execute()
-            .await
-            .expect("open retry");
-    let second = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim B")[0]
-        .clone();
-    bind_dispatch_run(&db, &id, &second.generation_id, "run-b")
-        .await
-        .expect("bind B");
-    let stale = super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, false, "run-a"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect_err("old A must conflict with B");
-    assert!(matches!(stale, QueueError::StaleCompletion { .. }));
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, true, "run-b"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("complete B");
-    assert_eq!(row_column(&db, "flaky", "status").await, "completed");
-}
-
-#[tokio::test]
-async fn early_completion_is_acknowledged_then_applied_after_exact_binding() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("early", &[])])
-        .await
-        .expect("enqueue");
-    let id = task_id_on("early", TARGET);
-    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim")[0]
-        .clone();
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, false, "run-early"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("early report is durably acknowledged");
-    assert_eq!(row_column(&db, "early", "status").await, "dispatched");
-    assert_eq!(pending_completion_count(&db).await, 1);
-    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-early")
-        .await
-        .expect("bind exact run");
-    super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
-        .await
-        .expect("apply pending exact run");
-    assert_eq!(row_column(&db, "early", "status").await, "pending");
-    assert_eq!(pending_completion_count(&db).await, 0);
-}
-
-#[tokio::test]
-async fn duplicate_early_delivery_is_idempotent_and_replay_conflicts_after_apply() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("replay", &[])])
-        .await
-        .expect("enqueue");
-    let id = task_id_on("replay", TARGET);
-    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim")[0]
-        .clone();
-    let event = report_with_run(&id, true, "run-replay");
-    super::complete_run(&db, &settings(), &event, TEST_WINDOW_MINUTES)
-        .await
-        .expect("first early delivery");
-    super::complete_run(&db, &settings(), &event, TEST_WINDOW_MINUTES)
-        .await
-        .expect("duplicate early delivery");
-    assert_eq!(pending_completion_count(&db).await, 1);
-    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-replay")
-        .await
-        .expect("bind replay run");
-    super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
-        .await
-        .expect("apply replay run");
-    let replay = super::complete_run(&db, &settings(), &event, TEST_WINDOW_MINUTES)
-        .await
-        .expect_err("replayed applied delivery conflicts");
-    assert!(matches!(replay, QueueError::StaleCompletion { .. }));
-    assert_eq!(pending_completion_count(&db).await, 0);
-}
-
-#[tokio::test]
-async fn response_loss_reclaim_drops_unbound_event_before_new_claim() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("lost", &[])])
-        .await
-        .expect("enqueue");
-    let id = task_id_on("lost", TARGET);
-    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim")[0]
-        .clone();
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, false, "run-lost"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("store response-loss event");
-    super::back_off_dispatch_legs(&db, &settings(), &[claimed.queued()], "response lost")
-        .await
-        .expect("reclaim response-loss generation");
-    assert_eq!(pending_completion_count(&db).await, 0);
-    db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
-            .bind(id.clone())
-            .execute()
-            .await
-            .expect("open replacement dispatch");
-    let replacement = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim replacement")[0]
-        .clone();
-    assert_eq!(replacement.attempt, claimed.attempt);
-    bind_dispatch_run(&db, &id, &replacement.generation_id, "run-new")
-        .await
-        .expect("bind replacement");
-    let stale = super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, false, "run-lost"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect_err("orphaned response-loss run is stale");
-    assert!(matches!(stale, QueueError::StaleCompletion { .. }));
-}
-
-#[tokio::test]
 async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation() {
     let db = memory_db().await.expect("memory db");
     enqueue(&db, &[request("fenced", &[])])
@@ -5455,15 +5309,6 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
     assert_eq!(second.attempt, 1);
     assert_ne!(second.generation_id, first.generation_id);
 
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, true, "run-b"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("persist early B completion");
-    assert_eq!(pending_completion_count(&db).await, 1);
     bind_dispatch_run(&db, &id, &second.generation_id, "run-b")
         .await
         .expect("bind B");
@@ -5473,13 +5318,6 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
         .expect("fence late A failure after retry");
     assert_eq!(row_column(&db, "fenced", "status").await, "dispatched");
     assert_eq!(row_column(&db, "fenced", "github_run_id").await, "run-b");
-    assert_eq!(pending_completion_count(&db).await, 1);
-
-    super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
-        .await
-        .expect("apply B completion");
-    assert_eq!(row_column(&db, "fenced", "status").await, "completed");
-    assert_eq!(pending_completion_count(&db).await, 0);
 }
 
 #[tokio::test]
@@ -5507,7 +5345,6 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
             attempt: 4,
             success: false,
             error: Some("cycle A".to_owned()),
-            finished_at: None,
             sample_ms: None,
             github_run_id: Some("run-a".to_owned()),
         },
@@ -5540,7 +5377,6 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
             attempt: second.attempt,
             success: false,
             error: Some("cycle B".to_owned()),
-            finished_at: None,
             sample_ms: None,
             github_run_id: Some("run-b".to_owned()),
         },
@@ -5653,88 +5489,11 @@ async fn backoff_minutes_sql_matches_the_documented_curve() {
     }
 }
 
-#[tokio::test]
-async fn binding_clears_orphan_pending_run_before_normal_completion() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("orphan", &[])])
-        .await
-        .expect("enqueue");
-    let id = task_id_on("orphan", TARGET);
-    let first = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim A")[0]
-        .clone();
-    super::back_off_dispatch_legs(&db, &settings(), &[first.queued()], "response lost")
-        .await
-        .expect("reclaim A");
-    db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00', wake_at = '1970-01-01 00:00:00' WHERE task_id = ?")
-            .bind(id.clone())
-            .execute()
-            .await
-            .expect("open B");
-    let second = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim B")[0]
-        .clone();
-    assert_eq!(second.attempt, first.attempt);
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, false, "run-x"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("persist orphan X");
-    assert_eq!(pending_completion_count(&db).await, 1);
-    bind_dispatch_run(&db, &id, &second.generation_id, "run-y")
-        .await
-        .expect("bind Y");
-    assert_eq!(pending_completion_count(&db).await, 0);
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, true, "run-y"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("complete Y");
-    assert_eq!(row_column(&db, "orphan", "status").await, "completed");
-}
-
-#[tokio::test]
-async fn persisted_bound_pending_event_recovers_after_restart() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("restart", &[])])
-        .await
-        .expect("enqueue");
-    let id = task_id_on("restart", TARGET);
-    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim")[0]
-        .clone();
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, false, "run-restart"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("persist pending event");
-    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-restart")
-        .await
-        .expect("persist binding");
-    super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
-        .await
-        .expect("restart recovery");
-    assert_eq!(row_column(&db, "restart", "status").await, "pending");
-    assert_eq!(pending_completion_count(&db).await, 0);
-}
-
 /// Bind a claimed row's generation to `github_run_id` the way the
-/// retired per-task dispatch did - setup for the `complete_run` and
-/// `back_off_dispatch_legs` fences, which still read `queue.github_run_id`
-/// until the per-task completion route goes. Production binds one run
-/// per batch ([`super::bind_batch_run`]) and never writes this column.
+/// retired per-task dispatch did — setup for the
+/// `back_off_dispatch_legs` fence, which still reads
+/// `queue.github_run_id`. Production binds one run per batch
+/// ([`super::bind_batch_run`]) and never writes this column.
 async fn bind_dispatch_run(
     db: &DurableDb,
     task_id: &str,
@@ -5753,26 +5512,7 @@ async fn bind_dispatch_run(
         .execute()
         .await
         .map_err(|error| format!("bind dispatch run for {task_id}: {error}"))?;
-    if result.rows_written == 0 {
-        return Ok(false);
-    }
-    db.query(
-        "DELETE FROM pending_run_completions \
-         WHERE task_id = ? AND github_run_id != ?",
-    )
-    .bind(task_id.to_owned())
-    .bind(github_run_id.to_owned())
-    .execute()
-    .await
-    .map_err(|error| format!("discard superseded pending completions for {task_id}: {error}"))?;
-    Ok(true)
-}
-
-async fn pending_completion_count(db: &DurableDb) -> i64 {
-    db.query("SELECT count(*) FROM pending_run_completions")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("pending completion count")
+    Ok(result.rows_written > 0)
 }
 
 /// A `build_batches` row the way the claim pass inserts it — bound to
@@ -7867,7 +7607,6 @@ async fn a_completion_reads_a_constant_row_count_as_the_window_fills() {
                 attempt: claimed[0].attempt,
                 success: false,
                 error: Some("boom".to_owned()),
-                finished_at: None,
                 sample_ms: None,
                 github_run_id: Some("run-live".to_owned()),
             },
@@ -7914,7 +7653,6 @@ async fn outcome_bucket_stays_aligned_under_the_do_binding() {
             attempt: 1,
             success: true,
             error: None,
-            finished_at: None,
             sample_ms: None,
             github_run_id: None,
         },
@@ -8245,34 +7983,15 @@ async fn request_outcome_refuses_a_stale_attempt() {
 
 // ---- stow#524: expected build cost ----
 
-/// Claim, pin the claim instant `minutes_ago` back, bind a run and
-/// complete it successfully — one honest sample of the path a real
-/// build takes. `claimed_at` is pinned by raw UPDATE for the same
-/// reason `mark_active` writes `updated_at` directly: no public
-/// function produces a past claim stamp, and the pin must be exact
-/// for a deterministic duration assertion.
-async fn complete_success_at_minutes(db: &DurableDb, task_id: &str, run: &str, minutes_ago: u32) {
-    let claimed = claim_flat(db, &claim_settings(), &NoCoverage)
+/// Claim a row and complete it successfully with a runner time of
+/// `minutes` — one honest sample of the path a batch leg takes.
+async fn complete_success_at_minutes(db: &DurableDb, task_id: &str, minutes: u32) {
+    claim_flat(db, &claim_settings(), &NoCoverage)
         .await
-        .expect("claim")[0]
-        .clone();
-    db.query("UPDATE queue SET claimed_at = datetime('now', ?) WHERE task_id = ?")
-        .bind(format!("-{minutes_ago} minutes"))
-        .bind(task_id.to_owned())
-        .execute()
+        .expect("claim");
+    complete_live(db, task_id, true, Some(i64::from(minutes) * 60_000))
         .await
-        .expect("pin claim instant");
-    bind_dispatch_run(db, task_id, &claimed.generation_id, run)
-        .await
-        .expect("bind run");
-    super::complete_run(
-        db,
-        &settings(),
-        &report_with_run(task_id, true, run),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("complete");
+        .expect("complete");
 }
 
 #[derive(skyzen::FromRow)]
@@ -8307,117 +8026,6 @@ async fn sample_count(db: &DurableDb, crate_name: &str) -> i64 {
         .expect("sample count")
 }
 
-/// The in-flight re-request writer rewrites `updated_at` even on an
-/// active task — a resubmitted build's duration must still measure
-/// from the claim's immutable `claimed_at`, not the mutable stamp.
-#[tokio::test]
-async fn build_duration_samples_the_immutable_claim_instant() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("durable", &[])])
-        .await
-        .expect("enqueue");
-    let id = task_id_on("durable", TARGET);
-    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim")[0]
-        .clone();
-    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-1")
-        .await
-        .expect("bind");
-    // Pin the claim instant BEFORE the resubmission so a writer
-    // that clobbered `claimed_at` would be caught rather than
-    // masked: the pin must survive the in-flight writer verbatim.
-    db.query("UPDATE queue SET claimed_at = datetime('now', '-1 hour') WHERE task_id = ?")
-        .bind(id.clone())
-        .execute()
-        .await
-        .expect("pin claim instant");
-    let pinned = row_column(&db, "durable", "claimed_at").await;
-    // The resubmission: `apply_batched_updates` rewrites
-    // `updated_at` on the in-flight row.
-    enqueue(&db, &[request("durable", &[])])
-        .await
-        .expect("in-flight resubmission");
-    let claimed_at = row_column(&db, "durable", "claimed_at").await;
-    let updated_at = row_column(&db, "durable", "updated_at").await;
-    assert_eq!(claimed_at, pinned, "the resubmit rewrote claimed_at");
-    assert_ne!(claimed_at, updated_at, "the resubmit moved updated_at");
-
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, true, "run-1"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("complete");
-
-    let duration = db
-        .query("SELECT duration_ms FROM crate_build_samples WHERE crate_name = 'durable'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("duration sample");
-    assert!(
-        (3_500_000..=3_700_000).contains(&duration),
-        "claim-to-completion ~1h, not resubmit-to-completion ~0: {duration}"
-    );
-    let stats = build_stats(&db, "durable").await.expect("stats row exists");
-    assert_eq!(stats.builds, 1);
-    assert_eq!(stats.median_ms, duration);
-}
-
-/// A deferred completion — the webhook landed while the row's
-/// `github_run_id` was still `NULL`, so it parked in
-/// `pending_run_completions` — measures claim-to-`received_at`, the
-/// instant the run actually finished, not the later binding moment.
-#[tokio::test]
-async fn deferred_completion_measures_duration_at_received_at() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("deferred", &[])])
-        .await
-        .expect("enqueue");
-    let id = task_id_on("deferred", TARGET);
-    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim")[0]
-        .clone();
-    db.query("UPDATE queue SET claimed_at = datetime('now', '-1 hour') WHERE task_id = ?")
-        .bind(id.clone())
-        .execute()
-        .await
-        .expect("pin claim instant");
-    // The report arrives with no run bound yet — it parks, stamping
-    // `received_at` at arrival.
-    assert!(
-        super::persist_pending_completion(&db, &report_with_run(&id, true, "run-def"))
-            .await
-            .expect("park completion")
-    );
-    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-def")
-        .await
-        .expect("bind run");
-    super::apply_pending_completion_for_binding(
-        &db,
-        &settings(),
-        &id,
-        &claimed.generation_id,
-        "run-def",
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("apply bound completion");
-
-    let duration = db
-        .query("SELECT duration_ms FROM crate_build_samples WHERE crate_name = 'deferred'")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("duration sample");
-    assert!(
-        (3_500_000..=3_700_000).contains(&duration),
-        "claim-to-received_at ~1h: {duration}"
-    );
-}
-
 /// A measured span is nonnegative by construction; a report carrying
 /// a negative duration must fail the sample insert through the
 /// column's `CHECK (duration_ms >= 0)` — the span is never clamped
@@ -8439,7 +8047,6 @@ async fn backward_completion_span_fails_without_polluting_stats() {
         success: true,
         error: None,
         github_run_id: Some("run-skew".to_owned()),
-        finished_at: Some(ROW_TS.to_owned()),
         sample_ms: None,
     };
     // A skewed clock measured a negative span.
@@ -8674,7 +8281,7 @@ async fn build_stats_median_is_a_real_median_over_a_bounded_window() {
         request.version = version.parse().expect("semver");
         let id = request.task_id().expect("request task id");
         enqueue(&db, &[request]).await.expect("enqueue");
-        complete_success_at_minutes(&db, &id, &format!("run-{version}"), minutes_ago).await;
+        complete_success_at_minutes(&db, &id, minutes_ago).await;
     }
     let stats = build_stats(&db, "median").await.expect("stats row");
     assert_eq!(stats.builds, 3);
@@ -8692,7 +8299,7 @@ async fn build_stats_median_is_a_real_median_over_a_bounded_window() {
         request.version = version.parse().expect("semver");
         let id = request.task_id().expect("request task id");
         enqueue(&db, &[request]).await.expect("enqueue");
-        complete_success_at_minutes(&db, &id, &format!("run-b{round}"), 3).await;
+        complete_success_at_minutes(&db, &id, 3).await;
     }
     assert_eq!(
         sample_count(&db, "median").await,
@@ -8715,31 +8322,17 @@ async fn stale_duplicate_and_failed_reports_never_sample() {
         .await
         .expect("enqueue");
     let id = task_id_on("fenced", TARGET);
-    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
+    claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
-        .expect("claim")[0]
-        .clone();
-    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-f")
+        .expect("claim");
+    complete_live(&db, &id, true, Some(60_000))
         .await
-        .expect("bind");
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, true, "run-f"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("complete");
+        .expect("complete");
     assert_eq!(sample_count(&db, "fenced").await, 1);
 
-    let replay = super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&id, true, "run-f"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect_err("replayed completion conflicts");
+    let replay = complete_live(&db, &id, true, Some(60_000))
+        .await
+        .expect_err("replayed completion conflicts");
     assert!(matches!(replay, QueueError::StaleCompletion { .. }));
     let ghost = super::complete(
         &db,
@@ -8760,21 +8353,12 @@ async fn stale_duplicate_and_failed_reports_never_sample() {
         .await
         .expect("enqueue");
     let fail_id = task_id_on("failonly", TARGET);
-    let failed_claim = claim_flat(&db, &claim_settings(), &NoCoverage)
+    claim_flat(&db, &claim_settings(), &NoCoverage)
         .await
-        .expect("claim")[0]
-        .clone();
-    bind_dispatch_run(&db, &fail_id, &failed_claim.generation_id, "run-x")
+        .expect("claim");
+    complete_live(&db, &fail_id, false, None)
         .await
-        .expect("bind");
-    super::complete_run(
-        &db,
-        &settings(),
-        &report_with_run(&fail_id, false, "run-x"),
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("failure completes");
+        .expect("failure completes");
     assert_eq!(
         sample_count(&db, "failonly").await,
         0,
@@ -8970,7 +8554,6 @@ async fn refreshed_scores_price_their_own_crate_target() {
             success: true,
             error: None,
             github_run_id: None,
-            finished_at: None,
             sample_ms: None,
         },
         "cheap",
@@ -9491,18 +9074,9 @@ async fn first_requested_at_never_exceeds_updated_at() {
         .expect("claim")
     {
         assert_eq!(audit().await, 0, "after claim");
-        bind_dispatch_run(&db, &claimed.task_id, &claimed.generation_id, "run-1")
+        complete_live(&db, &claimed.task_id, true, Some(60_000))
             .await
-            .expect("bind");
-        assert_eq!(audit().await, 0, "after bind");
-        super::complete_run(
-            &db,
-            &settings(),
-            &report_with_run(&claimed.task_id, true, "run-1"),
-            TEST_WINDOW_MINUTES,
-        )
-        .await
-        .expect("complete");
+            .expect("complete");
         assert_eq!(audit().await, 0, "after complete");
     }
     // The resubmit writer (`apply_batched_updates`) bumps `updated_at`

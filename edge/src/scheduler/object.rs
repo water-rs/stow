@@ -172,10 +172,6 @@ impl DurableObject for Scheduler {
                 "/promote".post(queue_promote),
                 "/purge".post(queue_purge),
             )),
-            // The GitHub `workflow_run` webhook's completion channel —
-            // carries task id + outcome and no attempt, which
-            // `queue::complete_run` resolves against the live row.
-            "/tasks/complete-run".post(complete_run),
             // The batched run's completion channel (stow#833 §3.2):
             // the report lands on the `build_batches` row verbatim and
             // the alarm pass resolves each leg from it.
@@ -563,53 +559,6 @@ async fn refuse_if_frozen(db: &DurableDb) -> Result<()> {
         return Err(Error::msg(reason).set_status(StatusCode::SERVICE_UNAVAILABLE));
     }
     Ok(())
-}
-
-/// `POST /tasks/complete-run` — the edge's webhook route forwards GitHub's
-/// `workflow_run` event here; the report carries the task id and outcome
-/// but no attempt, which `complete_run` resolves against the live row.
-///
-/// A completion for a task the queue never held answers 404, not 500 —
-/// the report references nothing real. A row whose live attempt or
-/// status no longer matches what the event describes answers 409 — the
-/// row moved on, and the webhook logs both rather than propagating them:
-/// a retried delivery changes nothing about a row that already moved.
-async fn complete_run(
-    env: WasmEnv,
-    db: DurableDb,
-    alarm: Alarm,
-    Json(report): Json<stow_types::api::WorkflowRunComplete>,
-) -> Result<Json<OkResponse>> {
-    let freeze = freeze_settings(&env)?;
-    queue::complete_run(
-        &db,
-        &scheduler_settings(&env)?,
-        &report,
-        freeze.window_minutes,
-    )
-    .await
-    .map_err(|error| {
-        let status = match &error {
-            crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-            crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        to_error(error).set_status(status)
-    })?;
-    // A failed attempt may have closed the window's trip condition —
-    // evaluate while this request still holds the outcome row's write
-    // context. The freeze then eats the dispatch the alarm was about
-    // to run.
-    if !report.success {
-        evaluate_dispatch_freeze(&env, &db, &freeze).await?;
-    }
-    // Same handoff as submit: the run's report is acknowledged as soon
-    // as the queue row lands, and the alarm's dispatch pass — not this
-    // request — runs claim plus the GitHub fan-out. The completion may
-    // leave nothing dispatchable (a failure with an empty queue, a
-    // finished backlog): `schedule_alarm` arms no wake then (stow#444).
-    schedule_alarm(&env, &db, &alarm).await?;
-    Ok(Json(OkResponse { ok: true }))
 }
 
 /// `POST /batches/{batch_id}/complete` — the edge's webhook forwards a
@@ -1310,16 +1259,6 @@ pub(super) async fn dispatch_pass(
 ) -> Result<Vec<String>> {
     let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
     let freeze = freeze_settings(env)?;
-    // The breaker is evaluated only when this reconcile applied a
-    // failure — the completion route already evaluates on every failed
-    // report, so a pass that applied nothing owes the window read only
-    // to failures it landed itself (stow#816).
-    if queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
-        .await
-        .map_err(to_error)?
-    {
-        evaluate_dispatch_freeze(env, db, &freeze).await?;
-    }
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.

@@ -1073,7 +1073,7 @@ async fn rearm_feed_window(db: &DurableDb, shape: FixtureShape) -> Result<(), Qu
 ///   `enqueued` one.
 /// - Mutated seeded rows: retry's failed pair, cancel's pair,
 ///   promote's miss-lane row, purge's deleted pair, the resync's row
-///   101 and the complete-run target are re-written through the seed's
+///   101 and the running and dispatched rows are re-written through the seed's
 ///   own column formulas ([`restore_queue_rows`]) — a row a probe moved
 ///   or deleted returns to seeded truth.
 /// - Claimed rows: the pass records the ids its own claim moved out

@@ -1399,29 +1399,6 @@ pub(crate) fn task_id_prefix(
     )
 }
 
-/// Completion the edge's `POST /api/v1/github/workflow-run` handler sends
-/// the scheduler Durable Object for a finished `build-crate.yml` run.
-///
-/// The webhook answer carries no `attempt`, so the object resolves the
-/// row's live attempt at apply time.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct WorkflowRunComplete {
-    /// The run's `display_title` — `build-crate.yml` sets `run-name` to
-    /// the task id, so this string IS `BuildTaskPayload::task_id`.
-    pub task_id: String,
-    /// The run's `conclusion` mapped onto success: only a run that
-    /// finished green *and* whose run's records artifact exists in GHCR
-    /// counts as a completed build.
-    pub success: bool,
-    /// Failure description when `success` is false — the conclusion and,
-    /// on a missing records artifact, which tag the edge looked for.
-    pub error: Option<String>,
-    /// The GitHub Actions run id, stamped onto the queue row so
-    /// `stow-admin status` surfaces the run URL.
-    #[serde(default)]
-    pub github_run_id: Option<String>,
-}
-
 /// Completion the edge's `POST /api/v1/github/workflow-run` handler
 /// forwards to the scheduler Durable Object's
 /// `POST /batches/{batch_id}/complete` for a finished `build-batch.yml`

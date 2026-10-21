@@ -8,7 +8,6 @@ const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
 const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
 const SCHEDULER_SUBMIT_IDS_URL: &str = "https://scheduler.internal/tasks/submit/ids";
-const SCHEDULER_RUN_COMPLETE_URL: &str = "https://scheduler.internal/tasks/complete-run";
 const SCHEDULER_BATCHES_URL: &str = "https://scheduler.internal/batches";
 const SCHEDULER_REQUESTS_URL: &str = "https://scheduler.internal/requests";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
@@ -59,16 +58,6 @@ pub async fn send_task_ids(
     request: &stow_types::api::SubmitTaskIdsRequest,
 ) -> Result<stow_types::api::SubmitTaskIdsResponse, SchedulerClientError> {
     post_json(namespace, SCHEDULER_SUBMIT_IDS_URL, request).await
-}
-
-/// The GitHub `workflow_run` webhook's completion channel (stow#455):
-/// the event names the task and its conclusion, never an attempt — the
-/// object resolves the live attempt.
-pub async fn send_run_complete(
-    namespace: &CfDurableNamespace,
-    report: &stow_types::api::WorkflowRunComplete,
-) -> Result<(), SchedulerClientError> {
-    send_json(namespace, SCHEDULER_RUN_COMPLETE_URL, report).await
 }
 
 /// The `workflow_run` webhook's completion channel for a

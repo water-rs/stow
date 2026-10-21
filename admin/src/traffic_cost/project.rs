@@ -363,7 +363,7 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::BuildCallback,
         route: "POST /api/v1/github/workflow-run",
-        drives: &[("POST /tasks/complete-run", 1.0)],
+        drives: &[],
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,

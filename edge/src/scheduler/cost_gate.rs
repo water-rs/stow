@@ -152,26 +152,6 @@ const BUDGETS: &[RouteBudget] = &[
     // Mutation routes — one keyed statement each against a bounded
     // selector.
     RouteBudget {
-        // The success arm also prices the build-cost bookkeeping
-        // (stow#524): one generation-keyed sample insert, the
-        // newest-BUILD_SAMPLE_WINDOW cap delete, the window's
-        // ≤-window read, the stats upsert and — only when the median
-        // moved — a keyed refresh over exactly the same-(crate, target)
-        // pending rows.
-        name: "POST /tasks/complete-run",
-        statements: 14,
-        rows_read: 120,
-        rows_written: 60,
-        scan_allowlist: &[],
-    },
-    RouteBudget {
-        name: "POST /tasks/complete-run (failure)",
-        statements: 9,
-        rows_read: 80,
-        rows_written: 20,
-        scan_allowlist: &[],
-    },
-    RouteBudget {
         // Measured 4/4/8 once the host backend counts `RETURNING`
         // writes (stow#796): the two retried rows, their status-count
         // trigger rows and the keyed follow-up writes.

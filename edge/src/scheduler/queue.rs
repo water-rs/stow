@@ -1557,11 +1557,7 @@ fn plan_enqueue(
     Ok(plan)
 }
 
-/// A queue row's completion as [`complete`] applies it — reduced to the
-/// fields the `workflow_run` completion path fills; the old CI
-/// `POST /api/v1/scheduler/complete` wire type carried the same name.
-/// `complete_run` resolves `attempt` from the live row and fills the
-/// rest from the webhook event.
+/// One batch leg's completion as [`complete`] applies it.
 #[derive(Debug)]
 struct BuildCompleteReport {
     task_id: String,
@@ -1570,18 +1566,10 @@ struct BuildCompleteReport {
     success: bool,
     error: Option<String>,
     github_run_id: Option<String>,
-    /// The instant the run finished — `None` for a live report
-    /// (completion is now); a completion applied later through
-    /// `pending_run_completions` carries its stored `received_at`, so
-    /// the duration sample measures claim-to-completion, not
-    /// claim-to-deferred-application (stow#524).
-    finished_at: Option<String>,
-    /// The build-cost sample's explicit duration — `None` measures
-    /// claim-to-completion from `finished_at` and the row's
-    /// `claimed_at` (the per-task path); `Some` is a batch leg's
-    /// runner time, measured on GitHub's clock across the leg's own
-    /// two jobs (stow#833 §4.1 — `claimed_at` stays only for the
-    /// lease).
+    /// The build-cost sample's duration: a batch leg's runner time,
+    /// measured on GitHub's clock across the leg's own two jobs
+    /// (stow#833 §4.1 — `claimed_at` stays only for the lease). `None`
+    /// for a failed leg.
     sample_ms: Option<i64>,
 }
 
@@ -1589,7 +1577,6 @@ struct BuildCompleteReport {
 struct CompletedTargetRow {
     target: String,
     crate_name: String,
-    claimed_at: Option<String>,
     status: String,
 }
 
@@ -1627,7 +1614,7 @@ async fn complete(
              updated_at = datetime('now') \
          WHERE task_id = ? AND generation_id = ? \
            AND status IN ('dispatched', 'running') \
-         RETURNING target, crate_name, claimed_at, status"
+         RETURNING target, crate_name, status"
             .to_owned()
     } else {
         format!(
@@ -1643,7 +1630,7 @@ async fn complete(
                  updated_at = datetime('now') \
              WHERE task_id = ? AND generation_id = ? \
                AND status IN ('dispatched', 'running') \
-             RETURNING target, crate_name, claimed_at, status",
+             RETURNING target, crate_name, status",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
             wake = wake_at_sql(
@@ -1705,52 +1692,20 @@ async fn complete(
     .await?;
     // A success is the build cost's only honest measurement, and the
     // generation fence above is what keeps a late or duplicate report
-    // out of the sample window. The duration is the report's explicit
-    // sample when it carries one (a batch leg's runner time); the
-    // per-task path measures claim-to-completion — and only when the
-    // generation minted a real `claimed_at` stamp to measure from.
-    if report.success {
-        let duration_ms = match report.sample_ms {
-            Some(duration_ms) => Some(duration_ms),
-            None => match completed.claimed_at.as_deref() {
-                Some(claimed_at) => Some(
-                    claim_to_completion_ms(db, report.finished_at.as_deref(), claimed_at).await?,
-                ),
-                None => None,
-            },
-        };
-        if let Some(duration_ms) = duration_ms {
-            record_build_sample(
-                db,
-                report,
-                &completed.crate_name,
-                &completed.target,
-                duration_ms,
-            )
-            .await?;
-        }
+    // out of the sample window.
+    if report.success
+        && let Some(duration_ms) = report.sample_ms
+    {
+        record_build_sample(
+            db,
+            report,
+            &completed.crate_name,
+            &completed.target,
+            duration_ms,
+        )
+        .await?;
     }
     Ok(())
-}
-
-/// The per-task path's build sample duration — `finished_at` −
-/// `claimed_at` in whole milliseconds, computed in SQL where the
-/// `datetime()` text lives. A live report's `finished_at` is `None`,
-/// which lands `datetime('now')` under the `COALESCE` (stow#524).
-async fn claim_to_completion_ms(
-    db: &DurableDb,
-    finished_at: Option<&str>,
-    claimed_at: &str,
-) -> Result<i64, QueueError> {
-    db.query(
-        "SELECT CAST((julianday(COALESCE(?, datetime('now'))) \
-                     - julianday(?)) * 86400000.0 AS INTEGER)",
-    )
-    .bind(finished_at.map(str::to_owned))
-    .bind(claimed_at.to_owned())
-    .fetch_scalar::<i64>()
-    .await
-    .map_err(|error| format!("measure claim-to-completion duration: {error}").into())
 }
 
 /// Diagnose why a completion report matched no row: unknown task id,
@@ -2041,284 +1996,6 @@ fn failure_class(report: &BuildCompleteReport) -> Option<String> {
                 |line| line.chars().take(MAX_PREFIX_CHARS).collect::<String>(),
             ),
     )
-}
-
-/// Apply a GitHub `workflow_run` completion — the webhook's wire report,
-/// which names the task and its outcome but no scheduler attempt number.
-///
-/// The webhook carries the platform run id, not the scheduler attempt; the
-/// bound generation resolves the exact in-flight claim and fences stale
-/// events before the records check can settle it.
-///
-/// # Errors
-///
-/// [`QueueError::UnknownTask`] when no queue row carries the task id;
-/// [`QueueError::StaleCompletion`] when the live row's attempt or status
-/// has moved past what the event describes, or when an in-flight row is
-/// bound to a different run than the one reporting;
-/// A completion that beats its dispatch response is persisted and
-/// acknowledged; the exact response binding later applies it.
-pub async fn complete_run(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-    report: &stow_types::api::WorkflowRunComplete,
-    window_minutes: u32,
-) -> Result<(), QueueError> {
-    let mut row = load_run_binding(db, &report.task_id).await?;
-    let Some(mut row) = row.take() else {
-        return Err(QueueError::UnknownTask(report.task_id.clone()));
-    };
-    // An in-flight row answers only to the run its generation bound at
-    // dispatch: the claim cleared `github_run_id` and the
-    // `workflow_dispatch` response's `workflow_run_id` wrote it. A
-    // report naming a different run belongs to a stale generation —
-    // timed automatic retries make that path real: run A fails, retry B
-    // is claimed and bound, and A's delayed duplicate would otherwise
-    // apply to B. A row on a terminal or pending state takes no binding
-    // check — `complete`'s own generation/status predicate is the fence
-    // there.
-    if matches!(row.status.as_str(), "dispatched" | "running") {
-        match row.github_run_id.as_deref() {
-            Some(bound) if report.github_run_id.as_deref() == Some(bound) => {}
-            Some(bound) => {
-                tracing::warn!(
-                    task_id = %report.task_id,
-                    bound_run = %bound,
-                    reported_run = ?report.github_run_id,
-                    "rejected completion report from a run the generation is not bound to"
-                );
-                return Err(QueueError::StaleCompletion {
-                    task_id: report.task_id.clone(),
-                    attempt: row.attempt,
-                    row_attempt: row.attempt,
-                    row_status: row.status,
-                });
-            }
-            None => {
-                // GitHub does not redeliver a webhook merely because the
-                // receiver answered 500. Persist the verified event while
-                // the native dispatch response is still in flight. The
-                // response binds by this exact run id; an old run with the
-                // same title can therefore never apply to this generation.
-                if persist_pending_completion(db, report).await? {
-                    return Ok(());
-                }
-
-                // The binding may have landed between the first read and
-                // the guarded insert. Re-read the identity and apply only
-                // when it is now the exact run that sent this event.
-                row = load_run_binding(db, &report.task_id)
-                    .await?
-                    .ok_or_else(|| QueueError::UnknownTask(report.task_id.clone()))?;
-                match row.github_run_id.as_deref() {
-                    Some(bound) if report.github_run_id.as_deref() == Some(bound) => {}
-                    Some(_) | None => {
-                        return Err(QueueError::StaleCompletion {
-                            task_id: report.task_id.clone(),
-                            attempt: row.attempt,
-                            row_attempt: row.attempt,
-                            row_status: row.status,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    complete(
-        db,
-        settings,
-        &BuildCompleteReport {
-            task_id: report.task_id.clone(),
-            generation_id: row.generation_id.clone(),
-            attempt: row.attempt,
-            success: report.success,
-            error: report.error.clone(),
-            github_run_id: report.github_run_id.clone(),
-            finished_at: None,
-            sample_ms: None,
-        },
-        window_minutes,
-    )
-    .await
-}
-
-async fn load_run_binding(
-    db: &DurableDb,
-    task_id: &str,
-) -> Result<Option<RunBindingRow>, QueueError> {
-    db.query("SELECT generation_id, attempt, status, github_run_id FROM queue WHERE task_id = ?")
-        .bind(task_id.to_owned())
-        .fetch_optional::<RunBindingRow>()
-        .await
-        .map_err(|error| format!("load task {task_id} for run completion: {error}").into())
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct RunBindingRow {
-    generation_id: String,
-    attempt: u32,
-    status: String,
-    github_run_id: Option<String>,
-}
-
-/// Store a verified completion that arrived before the dispatch response
-/// bound its run id. The guarded INSERT is the race fence: it writes only
-/// while the task is still in the same unbound in-flight state.
-async fn persist_pending_completion(
-    db: &DurableDb,
-    report: &stow_types::api::WorkflowRunComplete,
-) -> Result<bool, QueueError> {
-    let Some(github_run_id) = report.github_run_id.as_deref() else {
-        return Ok(false);
-    };
-    let inserted = db
-        .query(
-            "INSERT INTO pending_run_completions \
-                 (github_run_id, task_id, success, error) \
-             SELECT ?, task_id, ?, ? FROM queue \
-             WHERE task_id = ? AND status IN ('dispatched', 'running') \
-               AND github_run_id IS NULL \
-             ON CONFLICT(github_run_id) DO NOTHING",
-        )
-        .bind(github_run_id.to_owned())
-        .bind(i64::from(report.success))
-        .bind(report.error.clone())
-        .bind(report.task_id.clone())
-        .execute()
-        .await
-        .map_err(|error| format!("persist pending completion for {github_run_id}: {error}"))?;
-    if inserted.rows_written > 0 {
-        return Ok(true);
-    }
-
-    let existing = db
-        .query(
-            "SELECT github_run_id, task_id, success, error, received_at \
-             FROM pending_run_completions WHERE github_run_id = ?",
-        )
-        .bind(github_run_id.to_owned())
-        .fetch_optional::<PendingCompletionRow>()
-        .await
-        .map_err(|error| format!("load pending completion for {github_run_id}: {error}"))?;
-    match existing {
-        None => Ok(false),
-        Some(existing)
-            if existing.task_id == report.task_id
-                && existing.success == i64::from(report.success)
-                && existing.error == report.error =>
-        {
-            Ok(true)
-        }
-        Some(existing) => Err(QueueError::Invariant(format!(
-            "run {github_run_id} was already pending for task {}",
-            existing.task_id
-        ))),
-    }
-}
-
-/// Apply one exact pending event after its run id has been bound. The event
-/// stays durable until `complete` succeeds; a stale row consumes it without
-/// allowing it to affect a later generation. Returns whether a failure
-/// outcome was recorded — the caller's breaker-evaluation gate (stow#816):
-/// the completion route already evaluates on every failure report, so a
-/// pass owes the check only for failures it applied itself.
-async fn apply_pending_completion_for_binding(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-    task_id: &str,
-    generation_id: &str,
-    github_run_id: &str,
-    window_minutes: u32,
-) -> Result<bool, QueueError> {
-    db.query(
-        "DELETE FROM pending_run_completions \
-         WHERE task_id = ? AND github_run_id != ?",
-    )
-    .bind(task_id.to_owned())
-    .bind(github_run_id.to_owned())
-    .execute()
-    .await
-    .map_err(|error| format!("discard stale pending completions for {task_id}: {error}"))?;
-
-    let pending = db
-        .query(
-            "SELECT github_run_id, task_id, success, error, received_at \
-             FROM pending_run_completions \
-             WHERE task_id = ? AND github_run_id = ?",
-        )
-        .bind(task_id.to_owned())
-        .bind(github_run_id.to_owned())
-        .fetch_optional::<PendingCompletionRow>()
-        .await
-        .map_err(|error| format!("load bound pending completion for {task_id}: {error}"))?;
-    let Some(pending) = pending else {
-        return Ok(false);
-    };
-    let report = BuildCompleteReport {
-        task_id: pending.task_id,
-        generation_id: generation_id.to_owned(),
-        attempt: db
-            .query("SELECT attempt FROM queue WHERE task_id = ? AND generation_id = ?")
-            .bind(task_id.to_owned())
-            .bind(generation_id.to_owned())
-            .fetch_scalar::<u32>()
-            .await
-            .map_err(|error| format!("load bound attempt for {task_id}: {error}"))?,
-        success: pending.success != 0,
-        error: pending.error,
-        github_run_id: Some(pending.github_run_id.clone()),
-        finished_at: Some(pending.received_at),
-        sample_ms: None,
-    };
-    // A stale or unknown event is consumed without an outcome — only
-    // a `complete` that landed counts toward the caller's gate.
-    let applied = match complete(db, settings, &report, window_minutes).await {
-        Ok(()) => true,
-        Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => false,
-        Err(error) => return Err(error),
-    };
-    db.query("DELETE FROM pending_run_completions WHERE github_run_id = ?")
-        .bind(pending.github_run_id)
-        .execute()
-        .await
-        .map_err(|error| format!("consume pending completion for {task_id}: {error}"))?;
-    Ok(applied && !report.success)
-}
-
-/// Recover pending events after a DO restart. The join is driven by the
-/// currently bound in-flight rows, so it reads only identities that can
-/// still apply and never scans historical workflow runs. Returns whether
-/// any applied event recorded a failure outcome.
-pub async fn reconcile_pending_completions(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-    window_minutes: u32,
-) -> Result<bool, QueueError> {
-    let rows = db
-        .query(
-            "SELECT q.task_id, q.generation_id, q.github_run_id \
-             FROM queue q \
-             JOIN pending_run_completions p \
-               ON p.task_id = q.task_id AND p.github_run_id = q.github_run_id \
-             WHERE q.status IN ('dispatched', 'running') \
-               AND q.github_run_id IS NOT NULL",
-        )
-        .fetch_all::<BoundPendingCompletionRow>()
-        .await
-        .map_err(|error| format!("list bound pending completions: {error}"))?;
-    let mut failure_applied = false;
-    for row in rows {
-        failure_applied |= apply_pending_completion_for_binding(
-            db,
-            settings,
-            &row.task,
-            &row.generation,
-            &row.run,
-            window_minutes,
-        )
-        .await?;
-    }
-    Ok(failure_applied)
 }
 
 /// Bind the run a `build-batch.yml` dispatch response returned to its
@@ -2837,7 +2514,6 @@ pub async fn resolve_batch(
             success,
             error,
             github_run_id: Some(batch.run_id.clone()),
-            finished_at: None,
             sample_ms,
         };
         let applied = match complete(db, settings, &report, window_minutes).await {
@@ -5781,31 +5457,12 @@ pub async fn back_off_dispatch_legs(
         .map_err(|db_error| format!("back off {} dispatch legs: {db_error}", legs.len()))?;
 
     if !updated.is_empty() {
-        discard_pending_completions(db, &updated).await?;
         // The rows re-entered `pending` carrying the rank written
         // before the last cost move; refresh it through the shared
         // abstraction, scoped to the rows that transitioned.
         refresh_dispatch_keys(db, &updated).await?;
     }
 
-    Ok(())
-}
-
-/// Drop the early completion reports stored for rows that just
-/// re-entered `pending`: the run they named belongs to the generation
-/// the row left.
-async fn discard_pending_completions(
-    db: &DurableDb,
-    task_ids: &[String],
-) -> Result<(), QueueError> {
-    db.query(
-        "DELETE FROM pending_run_completions \
-         WHERE task_id IN (SELECT value FROM json_each(?))",
-    )
-    .bind(enqueue_json(task_ids)?)
-    .execute()
-    .await
-    .map_err(|error| format!("discard pending completions: {error}"))?;
     Ok(())
 }
 
@@ -6506,14 +6163,6 @@ pub async fn apply_mutation(
         // every keyed batch.
         for ids in mutated.chunks(ENQUEUE_JSON_BATCH_ROWS) {
             let ids = enqueue_json(ids)?;
-            db.query(
-                "DELETE FROM pending_run_completions \
-                 WHERE task_id IN (SELECT value FROM json_each(?))",
-            )
-            .bind(ids.clone())
-            .execute()
-            .await
-            .map_err(|error| format!("discard pending completions after mutation: {error}"))?;
             refresh_dependents(
                 db,
                 "SELECT value AS task_id FROM json_each(?)",
@@ -7947,17 +7596,6 @@ async fn recover_stale_active_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) -> Result<(), QueueError> {
-    db.query(
-        "DELETE FROM pending_run_completions WHERE task_id IN ( \
-             SELECT task_id FROM queue \
-             WHERE status IN ('dispatched', 'running') \
-               AND updated_at <= datetime('now', ?) \
-         )",
-    )
-    .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
-    .execute()
-    .await
-    .map_err(|error| format!("discard stale pending completions: {error}"))?;
     // Rows re-enter `pending`: `deps_met` re-derives from the live
     // counter, and `blocked` — maintained for pending rows only — may
     // be stale on a stale in-flight row; both recompute in the same
@@ -8222,25 +7860,6 @@ struct RequestStatusRow {
 struct AttemptStatusRow {
     attempt: u32,
     status: String,
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct PendingCompletionRow {
-    github_run_id: String,
-    task_id: String,
-    success: i64,
-    error: Option<String>,
-    received_at: String,
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct BoundPendingCompletionRow {
-    #[row(rename = "task_id")]
-    task: String,
-    #[row(rename = "generation_id")]
-    generation: String,
-    #[row(rename = "github_run_id")]
-    run: String,
 }
 
 /// One `GROUP BY dispatch_family` slot sum over `build_batches`.

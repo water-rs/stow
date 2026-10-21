@@ -487,7 +487,7 @@ async fn run_dispatched_task(
     // the budget probe and the launch load run measure, and a real cargo
     // build per dispatch is orders of magnitude heavier than either can
     // afford. The run still completes through the same signed
-    // `workflow_run` webhook, so `complete_run` lands and `GET /tasks`
+    // `workflow_run` webhook, so the completion lands and `GET /tasks`
     // reports a finished run — the dispatch shape is unchanged, only the
     // post-dispatch build work is stubbed. The webhook verifies the
     // task's records artifact before applying a success, so the stub
