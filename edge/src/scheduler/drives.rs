@@ -795,7 +795,12 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
-        cleanup: None,
+        // The outcome's trusted enqueue lands the report's root task as
+        // a human-lane `pending` row; left behind it would be claimable
+        // by the next pass drive.
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &[request_root_task(shape)]).await })
+        }),
     },
     Drive {
         // `completed` on the now-`enqueued` record — the single
@@ -875,7 +880,9 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &submit_accept_batch(shape)).await })
+        }),
     },
     Drive {
         name: "POST /admin/enqueue (trusted)",
@@ -911,7 +918,9 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &submit_batch(shape)).await })
+        }),
     },
     Drive {
         // `POST /tasks/submit/ids` — the missed lane's promote-by-id
@@ -924,8 +933,8 @@ pub const DRIVES: &[Drive] = &[
         name: "POST /admin/enqueue (submit-ids)",
         setup: Some(|db, shape, settings, _ctx| {
             Box::pin(async move {
-                // Guarantee the node store holds the batch's subgraphs —
-                // the count is whatever an earlier drive left behind.
+                // Land the batch's rows and node-store subgraphs: the
+                // route promotes ids the node store already holds.
                 queue::enqueue_trusted(db, &submit_batch(shape), settings)
                     .await
                     .map(|_| ())
@@ -959,11 +968,22 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &submit_batch(shape)).await })
+        }),
     },
     Drive {
         name: "POST /admin/enqueue (resubmit)",
-        setup: None,
+        setup: Some(|db, shape, settings, _ctx| {
+            Box::pin(async move {
+                // The run resubmits rows that already exist, so the
+                // batch lands here — no earlier drive leaves it behind.
+                queue::enqueue_trusted(db, &submit_batch(shape), settings)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        }),
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 // The same batch again lands nothing — the count must
@@ -978,7 +998,9 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &submit_batch(shape)).await })
+        }),
     },
     Drive {
         name: "POST /demand",
@@ -1220,8 +1242,9 @@ pub const DRIVES: &[Drive] = &[
         // the setup stamps `min_dispatch_value` at one band through the
         // operator floor path — unmetered, setup is not the event —
         // so the persisted flags put the under-floor miss bulk outside
-        // the eligible index span while the human lane and the one-band
-        // windows family stay ready. The metered pass then pays the
+        // the eligible index span while the one-band windows family
+        // stays ready (the human pins stay eligible but their parked
+        // `not_before` refuses them — stow#833). The metered pass then pays the
         // real production queries: the planner's freeze/settings/
         // lease/family probes and the claim walk over the eligible
         // span only. The pass claims ready rows — non-empty proves the
@@ -2331,6 +2354,57 @@ fn submit_batch_named(
     vec![resync, fresh, human]
 }
 
+/// Delete what a drive's enqueue landed — each request's task row and
+/// dependency edges, and every node of its resolved subgraph from the
+/// node store (the dependency nodes carry derived ids no fixture row
+/// shares) — so the next drive finds the queue as the fixture seeded
+/// it. Three statements over the requests' own ids, whatever the queue
+/// holds; the slot and status counters ride the queue triggers.
+async fn remove_submitted(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<(), String> {
+    let mut task_ids = Vec::with_capacity(requests.len());
+    let mut node_ids = Vec::new();
+    for request in requests {
+        task_ids.push(
+            request
+                .task_id()
+                .map_err(|error| format!("drive task id: {error}"))?,
+        );
+        let graph = request
+            .resolved_dependency_graph()
+            .map_err(|error| format!("drive subgraph: {error}"))?;
+        node_ids.extend(
+            (0..graph.nodes().len())
+                .filter_map(|index| graph.task_id(index))
+                .map(str::to_owned),
+        );
+    }
+    let encode = |ids: &[String]| {
+        serde_json::to_string(ids).map_err(|error| format!("encode drive task ids: {error}"))
+    };
+    let (task_ids, node_ids) = (encode(&task_ids)?, encode(&node_ids)?);
+    for (statement, ids) in [
+        (
+            "DELETE FROM queue_dependencies WHERE task_id IN (SELECT value FROM json_each(?))",
+            &task_ids,
+        ),
+        (
+            "DELETE FROM queue WHERE task_id IN (SELECT value FROM json_each(?))",
+            &task_ids,
+        ),
+        (
+            "DELETE FROM task_nodes WHERE task_id IN (SELECT value FROM json_each(?))",
+            &node_ids,
+        ),
+    ] {
+        db.query(statement)
+            .bind(ids.clone())
+            .execute()
+            .await
+            .map_err(|error| format!("remove submitted tasks: {error}"))?;
+    }
+    Ok(())
+}
+
 /// The request record the drives admit and settle — a `req-drive`
 /// id `rearm_fixture` deletes between runs, so every probe measures the
 /// fresh-admission path rather than a dedup hit.
@@ -2380,23 +2454,8 @@ async fn admit_request_drive(
 /// `HumanRequest` batch whose root is its own fresh task plus a root
 /// that names an existing completed row (the `was_queued` arm).
 fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport {
-    let crate_name = "costgate-request-root";
-    let version = "1.0.0";
+    let root_task = request_root_task(shape);
     let target = stow_types::api::CI_TARGET_TRIPLES[0];
-    let rustc = "1.86.0";
-    let root_task = EnqueueRequest {
-        crate_name: crate_name.parse().expect("request crate"),
-        version: version.parse().expect("request version"),
-        features_json: FeaturesJson::default(),
-        target: target.parse().expect("request target"),
-        rustc_version: rustc.parse().expect("request rustc"),
-        downloads: 1,
-        source: EnqueueSource::HumanRequest,
-        dependency_subgraph: subgraph_of(&[dep_request(shape.dep_row(2))]),
-        preserve_lockfile: false,
-        host_side: false,
-        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-    };
     let root_id = root_task.task_id().expect("derived root task id");
     stow_types::api::RequestOutcomeReport {
         attempt: 1,
@@ -2420,6 +2479,27 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
                 },
             ],
         },
+    }
+}
+
+/// The outcome report's own task: a fresh one-dep `HumanRequest` root.
+fn request_root_task(shape: FixtureShape) -> EnqueueRequest {
+    let crate_name = "costgate-request-root";
+    let version = "1.0.0";
+    let target = stow_types::api::CI_TARGET_TRIPLES[0];
+    let rustc = "1.86.0";
+    EnqueueRequest {
+        crate_name: crate_name.parse().expect("request crate"),
+        version: version.parse().expect("request version"),
+        features_json: FeaturesJson::default(),
+        target: target.parse().expect("request target"),
+        rustc_version: rustc.parse().expect("request rustc"),
+        downloads: 1,
+        source: EnqueueSource::HumanRequest,
+        dependency_subgraph: subgraph_of(&[dep_request(shape.dep_row(2))]),
+        preserve_lockfile: false,
+        host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     }
 }
 
@@ -3052,7 +3132,8 @@ async fn validate_feed_event_closures(db: &DurableDb, ids: &[String]) -> Result<
 }
 
 /// Delete only the event subgraph's own records — the roots' 512
-/// edges, then the 384 queue rows — every probe keyed by the explicit
+/// edges, the 384 queue rows, then their 384 node-store rows — every
+/// probe keyed by the explicit
 /// typed id list (`json_each` feeds the `task_id` primary keys; no
 /// prefix match or table walk). The queue's status counters live on
 /// triggers over these deletes, so they stay consistent; nothing
@@ -3075,13 +3156,20 @@ async fn clear_feed_event_subgraph(db: &DurableDb) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     db.query("DELETE FROM queue WHERE task_id IN (SELECT value FROM json_each(?))")
-        .bind(ids_json)
+        .bind(ids_json.clone())
         .execute()
         .await
         .map_err(|error| format!("clear event rows: {error}"))?;
     let rows = queue::changes(db)
         .await
         .map_err(|error| error.to_string())?;
+    // The enqueue also landed the subgraph's node-store rows, under
+    // the same ids.
+    db.query("DELETE FROM task_nodes WHERE task_id IN (SELECT value FROM json_each(?))")
+        .bind(ids_json)
+        .execute()
+        .await
+        .map_err(|error| format!("clear event nodes: {error}"))?;
     let (want_edges, want_rows) = (2 * u64::from(FEED_EVENT_ROOTS), u64::from(FEED_EVENT_NODES));
     if (edges != 0 || rows != 0) && (edges != want_edges || rows != want_rows) {
         return Err(format!(

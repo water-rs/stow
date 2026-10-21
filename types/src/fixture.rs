@@ -45,7 +45,12 @@ impl FixtureShape {
     /// row, so they are unblocked at every fixture size — a lane-status
     /// drive can name a fixed id whose lane-position probe always runs
     /// instead of silently skipping when a size-dependent edge set
-    /// flips `blocked`.
+    /// flips `blocked`. The seed also parks them behind a future
+    /// `not_before`: they stay `pending`, unblocked and
+    /// `dispatch_eligible = 1`, but the claim's page predicate refuses
+    /// them — a human pin would rank first and fill the pass with
+    /// one-slot legs, hiding the miss-batch claim the gate exists to
+    /// price (stow#833).
     pub const HUMAN_PROBE_ROWS: u32 = 16;
     /// Rows `updated_at` inside the last 24 h — held constant: an
     /// `/admin/status` outcome count is legitimately bounded by 24 h
@@ -61,16 +66,25 @@ impl FixtureShape {
     /// purge or a dep expansion walks — a function of stored bulk
     /// instead of the claim's own bound (stow#588).
     ///
-    /// Sized so one batched pass cannot drain it: the window plus the
-    /// human pins, minus the parked `n % 20 = 1` rows, exceeds the most
-    /// legs a pass can claim on the slots the in-flight rows leave free
-    /// (`(free slots / STOW_BATCH_PARALLELISM) × STOW_BATCH_MAX_TASKS`).
-    /// A window a pass can empty would let the claim reach rows an
-    /// earlier drive left claimable, and the walk would then move with
-    /// the drives' order instead of the fixture's shape. The edge's
-    /// `planted_window_exceeds_one_full_batched_pass` test holds the
-    /// bound against the scheduler's defaults.
-    pub const DISPATCH_ELIGIBLE_ROWS: u32 = 128;
+    /// Sized so one batched pass cannot drain it and so the pass can
+    /// reach its own bound: the claimable population is the window
+    /// minus its parked `n % 20 = 1` rows — the human pins are parked
+    /// behind `not_before` and no longer count — which must (a) exceed
+    /// the most legs a pass can claim on the slots the in-flight rows
+    /// leave free (`(free slots / STOW_BATCH_PARALLELISM) ×
+    /// STOW_BATCH_MAX_TASKS` = 3 × 40 = 120 on the defaults), and
+    /// (b) feed that bound, not just exceed it: the first three batch
+    /// keys the claim's `dispatch_key` order opens — `(1.85.0,
+    /// windows)`, `(1.85.0, linux)`, `(1.86.0, linux)` — must each hold
+    /// at least 40 claimable rows, so the pass fills three miss
+    /// batches at 40 legs apiece. At 192 the fixture's `n % 9` family
+    /// and `n % 3` rustc spreads give those keys 40, 41 and 41
+    /// claimable rows. A window a pass can empty would let the claim
+    /// reach rows an earlier drive left claimable, and the walk would
+    /// then move with the drives' order instead of the fixture's
+    /// shape. The edge's `planted_window_exceeds_one_full_batched_pass`
+    /// test holds the bound against the scheduler's defaults.
+    pub const DISPATCH_ELIGIBLE_ROWS: u32 = 192;
 
     /// Rows `1..=pending_end` are `pending` — 60% of the queue.
     #[must_use]

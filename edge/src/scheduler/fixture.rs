@@ -17,7 +17,9 @@
 //!   fewer than the default 45-slot dispatch limit and the alarm's
 //!   claim walk actually runs;
 //! * the human lane inside the pending range is the pin window alone —
-//!   the claimable pending span is the planted window, and every other
+//!   the claimable pending span is the planted window, the pins parked
+//!   behind a future `not_before` so the claim refuses them without
+//!   moving their `pending`, unblocked probe state, and every other
 //!   pending row parks `dispatch_eligible = 0` below the admission
 //!   floor (a below-floor stored flag is only a stable state for a
 //!   miss-lane row — humans are exempt under every floor), ~5% of
@@ -478,11 +480,12 @@ pub async fn restore_batch_rows(db: &DurableDb, shape: FixtureShape) -> Result<(
 /// because the lane exemption (`lane = 'human' OR value >= floor`)
 /// recomputes a human row to eligible under EVERY admission floor —
 /// a below-floor stored flag is only a stable state for a miss row.
-/// Keeping the parked bulk miss-lane also keeps the pin window the
-/// first rows the claim walks at any floor: humans order ahead of
-/// every miss row in `dispatch_key`, so the claimed set is the pin
-/// — and its pooled closure — even after a floor change flips some
-/// parked rows back to eligible. Rows outside the pending range
+/// The pins stay eligible under every floor but the seed parks them
+/// behind a future `not_before`, so the first rows the claim walks at
+/// any floor are the planted window's one-band family — humans order
+/// ahead of every miss row in `dispatch_key`, and a claimable pin
+/// would fill the pass with one-slot human legs instead of the miss
+/// batches the gate prices (stow#833). Rows outside the pending range
 /// keep the upstream lane split (their lane never prices a claim).
 fn fixture_lane_case_sql(pending_end: u32, human_pin: u32, human_end: u32) -> String {
     format!(
@@ -526,23 +529,29 @@ fn queue_seed_insert_sql(
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
     let lane_case = &fixture_lane_case_sql(pending_end, human_pin, human_end);
     let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
-    // The claimable set is exactly the planted window (the human-lane
-    // pin + `DISPATCH_ELIGIBLE_ROWS`) at every size (stow#588): a
-    // pending row outside it is parked `dispatch_eligible = 0` — the
-    // below-the-admission-floor state production persists — so
-    // `idx_queue_claim`'s `dispatch_eligible = 1` equality drops it
-    // from the claim's walk range before the `dispatch_key` ordering
-    // reads a row. A future `not_before` parks a row inside the walk
-    // range instead — the claim examines it and refuses it, stow#597's
-    // read-past — and gating by unmet deps turns the queue into chains
-    // the demand walk follows. `dispatch_eligible = 0` is the only
-    // unclaimable state the index excludes by equality. The bulk edge
-    // distribution stays dev's: the demand walk and the probes' scans
-    // see the same mixed met/unmet rows every other drive's budget was
-    // measured on. Inside the window the ~5% `n % 20 = 1` pin still
-    // applies, as before.
+    // The claimable set is exactly the planted window (the
+    // `DISPATCH_ELIGIBLE_ROWS` span minus its parked rows) at every
+    // size (stow#588): a pending row outside the span is parked
+    // `dispatch_eligible = 0` — the below-the-admission-floor state
+    // production persists — so `idx_queue_claim`'s
+    // `dispatch_eligible = 1` equality drops it from the claim's walk
+    // range before the `dispatch_key` ordering reads a row. A future
+    // `not_before` parks a row inside the walk range instead — the
+    // claim examines it and refuses it, stow#597's read-past — and
+    // gating by unmet deps turns the queue into chains the demand walk
+    // follows. `dispatch_eligible = 0` is the only unclaimable state
+    // the index excludes by equality. The bulk edge distribution stays
+    // dev's: the demand walk and the probes' scans see the same mixed
+    // met/unmet rows every other drive's budget was measured on.
+    // Inside the window the ~5% `n % 20 = 1` pin still applies, as
+    // before — and the human-lane pin window parks the same way: a
+    // claimable pin would rank first and fill the pass with one-slot
+    // human legs, hiding the miss-batch claim the gate prices
+    // (stow#833), while the lane-position probes only need the pins
+    // `pending` and unblocked.
     let not_before = &format!(
-        "CASE WHEN (n <= {failed_end} OR n > {in_flight_end}) AND n % 20 = 1 \
+        "CASE WHEN (n <= {failed_end} OR n > {in_flight_end}) \
+                  AND (n % 20 = 1 OR (n > {human_pin} AND n <= {human_end})) \
               THEN datetime('now', '+30 minutes') \
               ELSE '1970-01-01 00:00:00' END"
     );
@@ -807,14 +816,15 @@ pub async fn seed_edges_chunk(
     // (stow#588): the claim's `deps_met = 1` gate admits only rows
     // whose every edge is met — met means the dep row is published —
     // so claimable rows' children point at the completed range. The
-    // rows the claim can pick — the human-lane pin and the
-    // `DISPATCH_ELIGIBLE_ROWS` window the fixture plants just above
-    // it — all point at that pool. The claimable population is then
-    // fixed at every fixture size — pool dependents are exactly the
-    // planted window — and the claimed set's node-store closure is
-    // `{claimed, their pool nodes}`: depth 2, identical at every
-    // fixture size, the way the in-flight count and the slice delta
-    // are already pinned.
+    // human-lane pin and the `DISPATCH_ELIGIBLE_ROWS` window the
+    // fixture plants just above it share that pool — the pins' edges
+    // keep them unblocked for the lane probes even though their parked
+    // `not_before` takes them out of the claimable set. The claimable
+    // population is then fixed at every fixture size — pool dependents
+    // are exactly the planted span — and the claimed set's node-store
+    // closure is `{claimed, their pool nodes}`: depth 2, identical at
+    // every fixture size, the way the in-flight count and the slice
+    // delta are already pinned.
     //
     // Every other edge spreads over the WHOLE queue — origin/dev's
     // distribution: mixed met/unmet, the bulk shape the demand walk
@@ -2726,10 +2736,13 @@ mod tests {
     /// The in-flight rows hold dispatch slots, and the planted window
     /// outlasts one full batched pass on the slots they leave free:
     /// a pass claims at most `free / k` batches of `B` legs, the
-    /// claimable planted rows exceed that, and a real pass over the
-    /// seeded fixture takes every slot it can from planted rows alone
-    /// — so the claim never reaches a row an earlier drive left
-    /// claimable, at any fixture size (the window is a constant).
+    /// claimable planted rows exceed that — the human pins sit ahead
+    /// of the window in claim order but their parked `not_before`
+    /// refuses them, so the claimable population is the window alone —
+    /// and a real pass over the seeded fixture takes every slot it can
+    /// from planted rows alone — so the claim never reaches a row an
+    /// earlier drive left claimable, at any fixture size (the window
+    /// is a constant).
     #[tokio::test]
     async fn planted_window_exceeds_one_full_batched_pass() {
         let db = memory_db().await.expect("memory db");
@@ -2793,7 +2806,10 @@ mod tests {
                 .expect("claim");
         let slots: u32 = claimed.iter().map(|batch| batch.parallelism).sum();
         assert_eq!(slots, free, "the pass fills every free slot");
-        let window = (FixtureShape::HUMAN_LANE_ROWS - FixtureShape::HUMAN_PROBE_ROWS + 1)
+        // The parked pins refuse the claim, so the claimed set is the
+        // `DISPATCH_ELIGIBLE_ROWS` span alone — a pin reaching the
+        // claim would mean the `not_before` park regressed.
+        let window = (FixtureShape::HUMAN_LANE_ROWS + 1)
             ..=(FixtureShape::HUMAN_LANE_ROWS + FixtureShape::DISPATCH_ELIGIBLE_ROWS);
         for task in claimed.iter().flat_map(|batch| &batch.tasks) {
             let n = u32::try_from(

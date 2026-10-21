@@ -291,16 +291,19 @@ const BUDGETS: &[RouteBudget] = &[
     // legitimate bound: the report body names every row).
     // The whole route (stow#785): the report — with its commit-time
     // shape repair — plus the `dispatch_pending` claiming tail and
-    // wake re-plan. The 10k host gate measured 21 statements, 216
-    // reads, 151 writes. The tail's pass claims at most free slots /
+    // wake re-plan. The 10k host gate measured 22 statements, 492
+    // reads, 350 writes. The tail's pass claims at most free slots /
     // `STOW_BATCH_PARALLELISM` × `STOW_BATCH_MAX_TASKS` legs; the
     // thirty one-slot in-flight batches leave 15 of the 45 slots, and
-    // the pass fills them with 15 human legs.
+    // the pass fills 12 of them with miss batches (the third batch
+    // stops at 2 legs): 82 claimed legs, 3 writes each (the
+    // `UPDATE queue` claim, 246 of the 350) plus the 100 slice rows
+    // the report names. Writes budgeted at the measurement plus 20%.
     RouteBudget {
         name: "POST /index/published (full)",
         statements: 90,
         rows_read: 600,
-        rows_written: 300,
+        rows_written: 420,
         scan_allowlist: &[],
     },
     // A report whose membership moved by DELTA_ROWS: the gate writes
@@ -309,24 +312,32 @@ const BUDGETS: &[RouteBudget] = &[
     // slice or the graph (stow#521) — plus the same dispatch tail as
     // the full drive and the report-time shape repair, which can
     // requeue the deps the retire just uncovered. The 10k host gate
-    // measured 24 statements, 301 reads, 217 writes, the tail's claim
-    // bounded as the full drive's is.
+    // measured 25 statements, 577 reads, 416 writes, the tail's claim
+    // bounded as the full drive's is: 82 claimed legs, 3 writes each.
+    // Writes budgeted at the measurement plus 20%.
     RouteBudget {
         name: "POST /index/published (delta)",
         statements: 110,
         rows_read: 600,
-        rows_written: 300,
+        rows_written: 500,
         scan_allowlist: &[],
     },
     // The alarm's dispatch pass on a warm queue: the claim pages at
     // `2 × open slots` candidate rows and claims them, so the pass's
     // read is bounded by the dispatch cap plus the fixed probes,
-    // never by the frontier or the queue.
+    // never by the frontier or the queue. The pass fills the 15 free
+    // slots with 3 miss batches of 40 legs (claimed legs ≤ free slots /
+    // `STOW_BATCH_PARALLELISM` × `STOW_BATCH_MAX_TASKS`) — 120 legs.
+    // The 10k host gate measured 15 statements, 774 reads, 363 writes:
+    // the claim page reads 256 candidates, the node-store walk 264, the
+    // batch-id draw 123, and the `UPDATE queue` claim writes 3 per
+    // leg (360 of the 363). Reads and writes budgeted at the
+    // measurement plus 20%.
     RouteBudget {
         name: "alarm pass",
         statements: 90,
-        rows_read: 400,
-        rows_written: 150,
+        rows_read: 930,
+        rows_written: 440,
         scan_allowlist: &[],
     },
     RouteBudget {
@@ -342,11 +353,15 @@ const BUDGETS: &[RouteBudget] = &[
         // One real dispatch pass over the floored queue — the same
         // claim/plan surface as the hot pass, priced separately so
         // the gate sees planner and claim cost under a positive
-        // persisted floor (stow#525).
+        // persisted floor (stow#525). It claims the same 120 legs in 3
+        // miss batches (claimed legs ≤ free slots /
+        // `STOW_BATCH_PARALLELISM` × `STOW_BATCH_MAX_TASKS`) and
+        // measured the hot pass's 15 statements, 774 reads, 363 writes,
+        // budgeted at the measurement plus 20%.
         name: "alarm pass (floor claim)",
         statements: 90,
-        rows_read: 500,
-        rows_written: 150,
+        rows_read: 930,
+        rows_written: 440,
         scan_allowlist: &[],
     },
     // Every demand-feed cap below is PROVISIONAL: host-measured on the
@@ -869,6 +884,7 @@ async fn run_one_drive(
     let mut keep = 0;
     let mut base = 0;
     let batches_before = batch_surface(db).await;
+    let queue_before = queue_surface(db).await;
     let outcome =
         drives::drive_lifecycle(
             drive,
@@ -916,12 +932,19 @@ async fn run_one_drive(
     // read.
     let end = log.lock().expect("statement log").len();
     let batches_after = batch_surface(db).await;
+    let queue_after = queue_surface(db).await;
     log.lock().expect("statement log").truncate(end);
     if batches_before != batches_after {
         return Err(format!(
             "{} left build_batches changed: before {batches_before:?}, after {batches_after:?}",
             drive.name
         ));
+    }
+    // A drive that inserts leaves the queue as it found it: a pending
+    // row it added is claimable by the next pass drive, and its edges
+    // and nodes widen every later walk.
+    if let Some(left) = queue_before.left_behind(&queue_after) {
+        return Err(format!("{} left queue rows added: {left}", drive.name));
     }
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => {
@@ -936,6 +959,58 @@ async fn run_one_drive(
             "{} failed: {run_error}; cleanup also failed: {cleanup_error}",
             drive.name
         )),
+    }
+}
+
+/// What an inserting drive can leave in the queue: the task ids, plus
+/// the derived-id (`-`-bearing, never a fixture hex id) edge and node
+/// rows its enqueue writes.
+struct QueueSurface {
+    task_ids: std::collections::BTreeSet<String>,
+    derived_edges: i64,
+    derived_nodes: i64,
+}
+
+impl QueueSurface {
+    /// A description of what `after` holds beyond `self`, `None` when
+    /// the drive added nothing.
+    fn left_behind(&self, after: &Self) -> Option<String> {
+        let added: Vec<&String> = after.task_ids.difference(&self.task_ids).collect();
+        (!added.is_empty()
+            || after.derived_edges != self.derived_edges
+            || after.derived_nodes != self.derived_nodes)
+            .then(|| {
+                format!(
+                    "task ids {added:?}, derived edges {} -> {}, derived nodes {} -> {}",
+                    self.derived_edges,
+                    after.derived_edges,
+                    self.derived_nodes,
+                    after.derived_nodes
+                )
+            })
+    }
+}
+
+/// The queue's [`QueueSurface`], read unmetered.
+async fn queue_surface(db: &DurableDb) -> QueueSurface {
+    QueueSurface {
+        task_ids: db
+            .query("SELECT task_id FROM queue")
+            .fetch_scalars::<String>()
+            .await
+            .expect("read queue ids")
+            .into_iter()
+            .collect(),
+        derived_edges: db
+            .query("SELECT COUNT(*) FROM queue_dependencies WHERE task_id LIKE '%-%'")
+            .fetch_scalar()
+            .await
+            .expect("count derived edges"),
+        derived_nodes: db
+            .query("SELECT COUNT(*) FROM task_nodes WHERE task_id LIKE '%-%'")
+            .fetch_scalar()
+            .await
+            .expect("count derived nodes"),
     }
 }
 
@@ -1347,10 +1422,13 @@ async fn explain_details(db: &DurableDb, statement: &LoggedStatement) -> Vec<Str
         .collect()
 }
 
-/// The seeded claimable span is the planted window — the human-lane
-/// pin plus `DISPATCH_ELIGIBLE_ROWS`; every pending row outside it is
-/// parked below the admission floor, so the claim's equality seek can
-/// only ever examine this many rows.
+/// The seeded `dispatch_eligible = 1` span is the human-lane pin plus
+/// `DISPATCH_ELIGIBLE_ROWS`; every pending row outside it is parked
+/// below the admission floor, so the claim's equality seek can only
+/// ever examine this many rows. The pins stay inside the span — the
+/// lane exemption keeps them eligible under every floor — but their
+/// parked `not_before` makes the page predicate refuse them, so the
+/// claimable population is the window alone (stow#833).
 async fn assert_seeded_claimable_span_is_the_window(db: &DurableDb) {
     let eligible: u64 = db
         .query(
