@@ -9,6 +9,7 @@ const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
 const SCHEDULER_SUBMIT_IDS_URL: &str = "https://scheduler.internal/tasks/submit/ids";
 const SCHEDULER_RUN_COMPLETE_URL: &str = "https://scheduler.internal/tasks/complete-run";
+const SCHEDULER_BATCHES_URL: &str = "https://scheduler.internal/batches";
 const SCHEDULER_REQUESTS_URL: &str = "https://scheduler.internal/requests";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
@@ -68,6 +69,24 @@ pub async fn send_run_complete(
     report: &stow_types::api::WorkflowRunComplete,
 ) -> Result<(), SchedulerClientError> {
     send_json(namespace, SCHEDULER_RUN_COMPLETE_URL, report).await
+}
+
+/// The `workflow_run` webhook's completion channel for a
+/// `build-batch.yml` run (stow#833 §3.2): `POST
+/// /batches/{batch_id}/complete` carries the run's identity verbatim —
+/// one forward per batch — and the object's alarm pass resolves the
+/// legs from it.
+pub async fn send_batch_complete(
+    namespace: &CfDurableNamespace,
+    batch_id: &stow_types::api::BatchId,
+    report: &stow_types::api::BatchRunComplete,
+) -> Result<(), SchedulerClientError> {
+    send_json(
+        namespace,
+        &format!("{SCHEDULER_BATCHES_URL}/{batch_id}/complete"),
+        report,
+    )
+    .await
 }
 
 pub async fn get_status(

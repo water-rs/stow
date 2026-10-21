@@ -2329,6 +2329,59 @@ pub async fn bind_dispatch_run(
     Ok(true)
 }
 
+/// Record a `build-batch.yml` run's `workflow_run` `completed`
+/// delivery on its `build_batches` row — `POST
+/// /batches/{batch_id}/complete`'s whole write (stow#833 §3.2).
+///
+/// The report lands verbatim — `done_run_id`, `done_attempt`,
+/// `conclusion`, `done_at` — and the row is marked resolvable now
+/// (`resolve_after = now`) for the alarm's resolution pass. The write
+/// lands whether or not the dispatch response has bound
+/// `github_run_id` yet (§4.2's early-webhook case: resolution later
+/// requires `done_run_id = github_run_id`, so the batch row itself
+/// holds the early completion), and the `done_run_id IS NULL` guard
+/// makes a duplicate delivery a no-op: it touches nothing and still
+/// answers Ok.
+///
+/// # Errors
+/// [`QueueError::UnknownBatch`] when no `build_batches` row carries
+/// the id — an orphan run from an abandoned dispatch.
+pub async fn record_batch_completion(
+    db: &DurableDb,
+    batch_id: &str,
+    report: &stow_types::api::BatchRunComplete,
+) -> Result<(), QueueError> {
+    let written = db
+        .query(
+            "UPDATE build_batches \
+             SET done_run_id = ?, done_attempt = ?, conclusion = ?, \
+                 done_at = datetime('now'), resolve_after = datetime('now') \
+             WHERE batch_id = ? AND done_run_id IS NULL",
+        )
+        .bind(report.run_id.to_string())
+        .bind(i64::from(report.run_attempt))
+        .bind(report.conclusion.clone())
+        .bind(batch_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("record batch completion for {batch_id}: {error}"))?;
+    if written.rows_written > 0 {
+        return Ok(());
+    }
+    // Nothing wrote: either a duplicate delivery — `done_run_id` was
+    // already set — or no such batch row. Only the second is an error.
+    let exists = db
+        .query("SELECT COUNT(*) FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("probe batch {batch_id}: {error}"))?;
+    if exists == 0 {
+        return Err(QueueError::UnknownBatch(batch_id.to_owned()));
+    }
+    Ok(())
+}
+
 pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
     // The counts are trigger-maintained (schema.sql's
     // `queue_counts_on_*`): this read is the handful of (status, lane)

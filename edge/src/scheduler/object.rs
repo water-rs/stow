@@ -175,6 +175,10 @@ impl DurableObject for Scheduler {
             // carries task id + outcome and no attempt, which
             // `queue::complete_run` resolves against the live row.
             "/tasks/complete-run".post(complete_run),
+            // The batched run's completion channel (stow#833 §3.2):
+            // the report lands on the `build_batches` row verbatim and
+            // the alarm pass resolves each leg from it.
+            "/batches/{batch_id}/complete".post(complete_batch),
             // The human request lane (stow#428): admit deduplicates on
             // the request id and dispatches `resolve-request.yml`;
             // `outcome` is the resolve job's report channel and
@@ -605,6 +609,43 @@ async fn complete_run(
     // finished backlog): `schedule_alarm` arms no wake then (stow#444).
     schedule_alarm(&env, &db, &alarm).await?;
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// `POST /batches/{batch_id}/complete` — the edge's webhook forwards a
+/// `build-batch.yml` run's `completed` delivery here (stow#833 §3.2).
+/// The write lands even while `github_run_id` is still NULL — an early
+/// webhook that beat the dispatch response — and a duplicate delivery
+/// is a no-op 2xx. A batch the store does not hold answers 404: the
+/// run named nothing real, so the webhook logs the orphan rather than
+/// retrying it.
+async fn complete_batch(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    params: Params,
+    Json(report): Json<stow_types::api::BatchRunComplete>,
+) -> Result<Json<OkResponse>> {
+    queue::record_batch_completion(&db, batch_id_param(&params)?, &report)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                QueueError::UnknownBatch(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    // A recorded completion is resolution work for the alarm — arm the
+    // pass the row's `resolve_after` points at.
+    schedule_alarm(&env, &db, &alarm).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// The `{batch_id}` path parameter — verbatim; a completion naming an
+/// id the store does not hold is the route's 404.
+fn batch_id_param(params: &Params) -> Result<&str> {
+    params
+        .get("batch_id")
+        .map_err(|_| Error::msg("batch id is required").set_status(StatusCode::BAD_REQUEST))
 }
 
 async fn status(db: DurableDb) -> Result<Json<stow_types::api::SchedulerStatus>> {

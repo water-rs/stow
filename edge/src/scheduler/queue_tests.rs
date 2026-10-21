@@ -5621,6 +5621,123 @@ async fn pending_completion_count(db: &DurableDb) -> i64 {
         .expect("pending completion count")
 }
 
+/// A `build_batches` row the way the claim pass inserts it — bound to
+/// its run once the dispatch response landed (`github_run_id` set),
+/// still unbound while that response is in flight (stow#833).
+async fn seed_build_batch(db: &DurableDb, batch_id: &str, github_run_id: Option<&str>) {
+    db.query(
+        "INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              github_run_id, claimed_at, lease_at) \
+         VALUES (?, ?, 'linux', 'miss', 5, 2, ?, ?, ?)",
+    )
+    .bind(batch_id.to_owned())
+    .bind(RUSTC)
+    .bind(github_run_id)
+    .bind(ROW_TS)
+    .bind(ROW_TS)
+    .execute()
+    .await
+    .expect("seed build_batches row");
+}
+
+/// The `BatchRunComplete` the webhook forwards — run identity
+/// verbatim, the conclusion GitHub reported.
+fn batch_run_complete(
+    run_id: u64,
+    run_attempt: u32,
+    conclusion: &str,
+) -> stow_types::api::BatchRunComplete {
+    stow_types::api::BatchRunComplete {
+        run_id,
+        run_attempt,
+        conclusion: conclusion.to_owned(),
+        html_url: format!("https://github.com/water-rs/stow/actions/runs/{run_id}"),
+    }
+}
+
+#[derive(skyzen::FromRow)]
+struct BuildBatchRow {
+    github_run_id: Option<String>,
+    done_run_id: Option<String>,
+    done_attempt: Option<i64>,
+    conclusion: Option<String>,
+    done_at: Option<String>,
+    resolve_after: Option<String>,
+}
+
+async fn build_batch(db: &DurableDb, batch_id: &str) -> Option<BuildBatchRow> {
+    db.query(
+        "SELECT github_run_id, done_run_id, done_attempt, conclusion, done_at, resolve_after \
+         FROM build_batches WHERE batch_id = ?",
+    )
+    .bind(batch_id.to_owned())
+    .fetch_optional::<BuildBatchRow>()
+    .await
+    .expect("read build_batches row")
+}
+
+/// §3.2: a completion naming a batch the store never held is
+/// `UnknownBatch` — the route's 404, which the webhook logs as an
+/// orphan run from an abandoned dispatch.
+#[tokio::test]
+async fn a_batch_completion_for_an_unknown_batch_is_rejected() {
+    let db = memory_db().await.expect("memory db");
+    let error = super::record_batch_completion(
+        &db,
+        "0123456789abcdef0123456789abcdef",
+        &batch_run_complete(4242, 1, "success"),
+    )
+    .await
+    .expect_err("an unknown batch is refused");
+    assert!(matches!(error, QueueError::UnknownBatch(_)), "{error}");
+}
+
+/// §3.2: the first delivery writes the `done_*` fields and marks the
+/// row resolvable now; a duplicate delivery is guarded by
+/// `done_run_id IS NULL` — it changes nothing and still answers Ok.
+#[tokio::test]
+async fn a_batch_completion_writes_the_row_and_a_duplicate_is_a_noop() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = "0123456789abcdef0123456789abcdef";
+    seed_build_batch(&db, batch_id, Some("4242")).await;
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 1, "failure"))
+        .await
+        .expect("first delivery applies");
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert_eq!(row.done_run_id.as_deref(), Some("4242"));
+    assert_eq!(row.done_attempt, Some(1));
+    assert_eq!(row.conclusion.as_deref(), Some("failure"));
+    assert!(row.done_at.is_some() && row.resolve_after.is_some());
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 3, "success"))
+        .await
+        .expect("a duplicate delivery is a no-op");
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert_eq!(row.done_run_id.as_deref(), Some("4242"));
+    assert_eq!(row.done_attempt, Some(1));
+    assert_eq!(row.conclusion.as_deref(), Some("failure"));
+}
+
+/// §4.2: a `completed` webhook that beats the dispatch response's
+/// binding is held on the batch row itself — `github_run_id` still
+/// NULL, the `done_*` fields written — for the alarm's resolution to
+/// apply once the run is bound.
+#[tokio::test]
+async fn an_early_batch_completion_is_held_before_the_binding() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = "fedcba9876543210fedcba9876543210";
+    seed_build_batch(&db, batch_id, None).await;
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "success"))
+        .await
+        .expect("an early completion is held");
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert!(row.github_run_id.is_none(), "the binding is still open");
+    assert_eq!(row.done_run_id.as_deref(), Some("9001"));
+    assert_eq!(row.done_attempt, Some(1));
+    assert_eq!(row.conclusion.as_deref(), Some("success"));
+    assert!(row.resolve_after.is_some());
+}
+
 /// A `pending` count at or above `max_queue_pending` turns miss-lane
 /// submits away; human-lane and trusted submits still get in.
 #[tokio::test]

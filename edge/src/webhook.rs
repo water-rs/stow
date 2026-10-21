@@ -23,6 +23,8 @@
 //! the whole site is down then, and GitHub redelivers what the outage
 //! delayed.
 
+use std::future::Future;
+
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use skyzen::Request;
@@ -34,11 +36,12 @@ use skyzen::utils::State;
 use skyzen_cloudflare::CfDurableNamespace;
 #[cfg(target_arch = "wasm32")]
 use skyzen_cloudflare::worker::send::IntoSendFuture as _;
+use stow_types::api::{BatchId, BatchRunComplete};
 #[cfg(target_arch = "wasm32")]
 use stow_types::api::WorkflowRunComplete;
 #[cfg(target_arch = "wasm32")]
 use stow_types::identity::WireRustcVersion;
-use stow_types::records::parse_run_title;
+use stow_types::records::{parse_batch_run_title, parse_run_title};
 #[cfg(target_arch = "wasm32")]
 use stow_types::records::{RECORDS_ARTIFACT_TYPE, RECORDS_TASK_ID_ANNOTATION, records_tag};
 #[cfg(target_arch = "wasm32")]
@@ -46,7 +49,7 @@ use stow_types::registry::cache_repository;
 
 #[cfg(target_arch = "wasm32")]
 use crate::api::{GhcrConfig, OkResponse};
-use crate::errors::GetArtifactError;
+use crate::errors::{GetArtifactError, SchedulerClientError};
 #[cfg(target_arch = "wasm32")]
 use crate::fetch_guard::OutboundPool;
 #[cfg(target_arch = "wasm32")]
@@ -147,17 +150,17 @@ struct WorkflowRunFields {
     event: String,
     head_branch: String,
     path: String,
-    /// Read only by the wasm handler's completion record.
-    #[allow(dead_code)]
+    /// Read only by the wasm handler's completion record and the batch
+    /// forward's report.
     conclusion: Option<String>,
     id: u64,
     /// `run_attempt` — GitHub's attempt number for the run, a positive
-    /// integer. Read only by the wasm handler's records check, which
-    /// builds the run's `BuildRun` from it and `id`.
-    #[allow(dead_code)]
+    /// integer. Read by the wasm handler's records check, which builds
+    /// the run's `BuildRun` from it and `id`, and by the batch
+    /// forward's report.
     run_attempt: std::num::NonZeroU32,
-    /// Read only by the wasm handler's completion record.
-    #[allow(dead_code)]
+    /// Read only by the wasm handler's completion record and the batch
+    /// forward's report.
     html_url: Option<String>,
     /// The repo the head commit lives in — a fork's run names its fork.
     head_repository: RepoRef,
@@ -224,6 +227,14 @@ enum RunSubject<'a> {
         /// The task id the run reported on.
         task_id: &'a str,
     },
+    /// `build-batch.yml`'s `<rustc>-b<batch_id>` — a batch run's
+    /// completion report (stow#833).
+    Batch {
+        /// The rustc the batch's legs built under.
+        rustc_version: &'a str,
+        /// The batch the run reported on.
+        batch_id: BatchId,
+    },
     /// `resolve-request.yml`'s `resolve-a<attempt>-<request_id>` — the
     /// human request record's lifecycle signal (stow#428).
     Request {
@@ -268,6 +279,19 @@ fn authorized_run(
             RunSubject::Task {
                 rustc_version,
                 task_id,
+            }
+        }
+        Some(stow_types::trusted_builder::BATCH_WORKFLOW_FILE) => {
+            let Some((rustc_version, batch_id)) = parse_batch_run_title(&run.display_title)
+            else {
+                return Err(GetArtifactError::BadRequestWithMessage(format!(
+                    "run {}'s display_title {:?} is not <rustc>-b<batch_id>",
+                    run.id, run.display_title
+                )));
+            };
+            RunSubject::Batch {
+                rustc_version,
+                batch_id,
             }
         }
         Some(stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE) => {
@@ -338,19 +362,99 @@ pub async fn github_workflow_run(
         } if action == "completed" => {
             complete_build_task(&ghcr, &scheduler, run, rustc_version, task_id).await?;
         }
+        RunSubject::Batch {
+            rustc_version,
+            batch_id,
+        } if action == "completed" => {
+            forward_batch_completion(&scheduler, run, rustc_version, &batch_id).await?;
+        }
         RunSubject::Request {
             attempt,
             request_id,
         } if action == "in_progress" || action == "completed" => {
             update_request_run(&scheduler, run, &action, attempt, request_id).await?;
         }
-        // A build run's `requested`/`in_progress` and a resolve run's
-        // `requested`/`waiting`: the task's lifecycle starts at
-        // `completed` and the request's record is `accepted` at
-        // dispatch — neither event carries anything to apply.
+        // A build run's `requested`/`in_progress`, a batch run's
+        // `requested`/`in_progress` and a resolve run's
+        // `requested`/`waiting`: the task's and batch's lifecycle
+        // starts at `completed` and the request's record is `accepted`
+        // at dispatch — neither event carries anything to apply. The
+        // batch arm in particular touches nothing but the DO forward:
+        // its leg resolution runs in the alarm pass (stow#833 §3.2).
         _ => {}
     }
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// The one outbound channel a `build-batch.yml` `completed` delivery
+/// uses: the forward to the object's `POST /batches/{batch_id}/
+/// complete`. `CfDurableNamespace` carries it on wasm; tests stub it
+/// to count what the handler sends. Keeping it a trait is what makes
+/// "the batch arm issues no GitHub or GHCR call" host-testable — the
+/// handler holds no channel but this one.
+trait BatchCompletionForward: Sync {
+    /// Forward `report` to `POST /batches/{batch_id}/complete`.
+    fn send_batch_complete<'a>(
+        &'a self,
+        batch_id: &'a BatchId,
+        report: &'a BatchRunComplete,
+    ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a;
+}
+
+#[cfg(target_arch = "wasm32")]
+impl BatchCompletionForward for CfDurableNamespace {
+    fn send_batch_complete<'a>(
+        &'a self,
+        batch_id: &'a BatchId,
+        report: &'a BatchRunComplete,
+    ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a {
+        scheduler_client::send_batch_complete(self, batch_id, report).into_send()
+    }
+}
+
+/// `build-batch.yml` `completed` — forward the run's identity
+/// verbatim to `POST /batches/{batch_id}/complete`; the object records
+/// it on the batch row and the alarm pass resolves each leg
+/// (stow#833 §3.2). An unknown batch is an orphan run from an
+/// abandoned dispatch — the object's 404 is logged like today's
+/// unknown-task case, never an error back to GitHub.
+async fn forward_batch_completion(
+    forward: &impl BatchCompletionForward,
+    run: &WorkflowRunFields,
+    rustc_version: &str,
+    batch_id: &BatchId,
+) -> Result<(), GetArtifactError> {
+    let completion = BatchRunComplete {
+        run_id: run.id,
+        run_attempt: run.run_attempt.get(),
+        conclusion: run.conclusion.clone().unwrap_or_default(),
+        html_url: run.html_url.clone().unwrap_or_default(),
+    };
+    match forward.send_batch_complete(batch_id, &completion).await {
+        Ok(()) => {
+            tracing::info!(
+                %batch_id,
+                run_id = run.id,
+                rustc_version,
+                "batch run completion forwarded"
+            );
+        }
+        Err(SchedulerClientError::Http {
+            status: 404, body, ..
+        }) => {
+            tracing::warn!(
+                %batch_id,
+                %body,
+                "batch completion named no live batch"
+            );
+        }
+        Err(other) => {
+            return Err(GetArtifactError::from(other)).inspect_err(|error| {
+                tracing::error!(%batch_id, %error, "forward batch completion");
+            });
+        }
+    }
+    Ok(())
 }
 
 /// `build-crate.yml` `completed` — verify the records artifact and
@@ -826,5 +930,192 @@ mod tests {
             .expect("signed delivery verifies");
         let error = decode_delivery(&delivery).expect_err("malformed payload rejects");
         assert!(matches!(error, GetArtifactError::BadRequestWithMessage(_)));
+    }
+
+    /// The batch workflow's file and title stamp, applied to a
+    /// `completed` delivery.
+    fn batch_completed_event(over: impl Fn(&mut serde_json::Value)) -> Vec<u8> {
+        completed_event(|event| {
+            event["workflow_run"]["path"] = serde_json::json!(format!(
+                ".github/workflows/{}",
+                stow_types::trusted_builder::BATCH_WORKFLOW_FILE
+            ));
+            event["workflow_run"]["display_title"] = serde_json::json!(
+                stow_types::records::batch_run_title(
+                    "1.99.0",
+                    &"0123456789abcdef0123456789abcdef"
+                        .parse::<BatchId>()
+                        .expect("batch id")
+                )
+            );
+            over(event);
+        })
+    }
+
+    /// A `build-batch.yml` run decodes `<rustc>-b<batch_id>` into the
+    /// batch subject — inside the same authority boundary a build run
+    /// sits in (stow#833 §3.2).
+    #[tokio::test]
+    async fn a_batch_run_decodes_its_batch_subject() {
+        let body = batch_completed_event(|_| {});
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let (_action, event) = decode_delivery(&delivery)
+            .expect("decodes")
+            .expect("completed action");
+        let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+        let RunSubject::Batch {
+            rustc_version,
+            batch_id,
+        } = subject
+        else {
+            panic!("build-batch.yml decodes a batch subject");
+        };
+        assert_eq!(rustc_version, "1.99.0");
+        assert_eq!(
+            batch_id,
+            "0123456789abcdef0123456789abcdef".parse().expect("batch id")
+        );
+        assert_eq!(run.id, 987_654_321_u64);
+    }
+
+    /// A `build-batch.yml` run outside the authority boundary —
+    /// another branch, another event, another repo — is refused like
+    /// any other run's delivery.
+    #[tokio::test]
+    async fn a_batch_run_outside_the_authority_boundary_is_ignored() {
+        let cases = [
+            batch_completed_event(|event| {
+                event["workflow_run"]["head_branch"] = serde_json::json!("dev");
+            }),
+            batch_completed_event(|event| {
+                event["workflow_run"]["event"] = serde_json::json!("pull_request");
+            }),
+            batch_completed_event(|event| {
+                event["repository"]["full_name"] = serde_json::json!("attacker/fork");
+            }),
+            batch_completed_event(|event| {
+                event["workflow_run"]["head_repository"]["full_name"] =
+                    serde_json::json!("attacker/fork");
+            }),
+        ];
+        for body in cases {
+            let delivery = verified("workflow_run", &body)
+                .await
+                .expect("signed delivery verifies");
+            let (_action, event) = decode_delivery(&delivery)
+                .expect("decodes")
+                .expect("completed action");
+            assert!(authorized_run(&event).expect("checks").is_none());
+        }
+    }
+
+    /// The batch forward's test double: records the calls —
+    /// `send_batch_complete` is the batch arm's only outbound channel,
+    /// so this log is the whole of what the handler can do out.
+    #[derive(Default)]
+    struct CountingForward {
+        calls: std::sync::Mutex<Vec<(BatchId, BatchRunComplete)>>,
+        /// Scripted status — when `Some`, the stub answers
+        /// `SchedulerClientError::Http` with it.
+        status: Option<u16>,
+    }
+
+    impl BatchCompletionForward for CountingForward {
+        fn send_batch_complete<'a>(
+            &'a self,
+            batch_id: &'a BatchId,
+            report: &'a BatchRunComplete,
+        ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push((batch_id.clone(), report.clone()));
+            std::future::ready(self.status.map_or(Ok(()), |status| {
+                Err(SchedulerClientError::Http {
+                    url: format!("https://scheduler.internal/batches/{batch_id}/complete"),
+                    status,
+                    body: "{\"error\":\"unknown batch\"}".to_owned(),
+                })
+            }))
+        }
+    }
+
+    /// The batch arm's `completed` handler issues exactly one outbound
+    /// call — the `POST /batches/{batch_id}/complete` forward carrying
+    /// the run's identity verbatim; it holds no GitHub or GHCR channel
+    /// at all (stow#833 §3.2).
+    #[tokio::test]
+    async fn a_batch_completion_makes_one_do_forward_and_nothing_else() {
+        let body = batch_completed_event(|event| {
+            event["workflow_run"]["conclusion"] = serde_json::json!("failure");
+        });
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let (_action, event) = decode_delivery(&delivery)
+            .expect("decodes")
+            .expect("completed action");
+        let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+        let RunSubject::Batch {
+            rustc_version,
+            batch_id,
+        } = subject
+        else {
+            panic!("build-batch.yml decodes a batch subject");
+        };
+        let forward = CountingForward::default();
+        forward_batch_completion(&forward, run, rustc_version, &batch_id)
+            .await
+            .expect("forwarded");
+        let calls = forward.calls.lock().expect("calls").clone();
+        assert_eq!(calls.len(), 1, "the batch arm issues only the DO forward");
+        let (called_id, report) = &calls[0];
+        assert_eq!(*called_id, batch_id);
+        assert_eq!(report.run_id, 987_654_321);
+        assert_eq!(report.run_attempt, 1);
+        assert_eq!(report.conclusion, "failure");
+        assert_eq!(
+            report.html_url,
+            "https://github.com/water-rs/stow/actions/runs/987654321"
+        );
+    }
+
+    /// A DO 404 — an unknown batch, the orphan of an abandoned
+    /// dispatch — is consumed like today's unknown-run case: logged,
+    /// still 200 to GitHub. A 5xx does propagate, worth a redelivery.
+    #[tokio::test]
+    async fn a_batch_completion_404_is_consumed_but_a_5xx_is_not() {
+        let body = batch_completed_event(|_| {});
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let (_action, event) = decode_delivery(&delivery)
+            .expect("decodes")
+            .expect("completed action");
+        let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+        let RunSubject::Batch {
+            rustc_version,
+            batch_id,
+        } = subject
+        else {
+            panic!("build-batch.yml decodes a batch subject");
+        };
+        let unknown = CountingForward {
+            status: Some(404),
+            ..CountingForward::default()
+        };
+        forward_batch_completion(&unknown, run, rustc_version, &batch_id)
+            .await
+            .expect("an unknown batch is consumed, not propagated");
+        let failing = CountingForward {
+            status: Some(500),
+            ..CountingForward::default()
+        };
+        let error = forward_batch_completion(&failing, run, rustc_version, &batch_id)
+            .await
+            .expect_err("a DO failure propagates for a GitHub retry");
+        assert!(matches!(error, GetArtifactError::InternalWithMessage(_)));
     }
 }
