@@ -48,6 +48,21 @@ pub enum PriorAlarm {
     Armed(i64),
 }
 
+/// What the operator floor path (`queue::apply_dispatch_floor`) writes:
+/// the stored `min_dispatch_value` setting (`None` when no row exists)
+/// and the `dispatch_eligible` flag of every row the rewrite changes.
+#[derive(Debug)]
+struct PriorFloor {
+    stored: Option<String>,
+    flags: Vec<PriorFlag>,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct PriorFlag {
+    task_id: String,
+    dispatch_eligible: i64,
+}
+
 /// The queue fields a focused claim probe must put back exactly —
 /// the union of every column the pass's writers touch:
 /// `claim_dispatchable_row` (`status`, `generation_id`, `dispatch_attempts`,
@@ -141,6 +156,12 @@ pub struct DriveContext {
     /// The batch a batch drive's setup bound — the id its run and its
     /// cleanup address.
     batch: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The floor setting and flags a floor drive's setup found, so its
+    /// cleanup puts back exactly what the operator floor path rewrote.
+    prior_floor: std::sync::Arc<std::sync::Mutex<Option<PriorFloor>>>,
+    /// Set when a drive snapshots queue state for its cleanup to put
+    /// back exactly — the gate then holds that drive to the promise.
+    restores_queue: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DriveContext {
@@ -160,6 +181,8 @@ impl DriveContext {
             restore_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
             batch: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            prior_floor: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            restores_queue: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -179,6 +202,8 @@ impl DriveContext {
             restore_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
             batch: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            prior_floor: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            restores_queue: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -203,12 +228,14 @@ impl DriveContext {
 
     /// Record the pre-claim field set the setup snapshot read.
     fn set_restore_rows(&self, rows: Vec<RestoreQueueRow>) {
+        self.promise_queue_restore();
         *self.restore_rows.lock().expect("restore snapshot") = rows;
     }
 
     /// Add rows to the recorded field set — the rows a batch drive's
     /// run writes beyond the claim's own frontier.
     fn extend_restore_rows(&self, rows: Vec<RestoreQueueRow>) {
+        self.promise_queue_restore();
         self.restore_rows
             .lock()
             .expect("restore snapshot")
@@ -247,6 +274,35 @@ impl DriveContext {
             .expect("drive batch")
             .clone()
             .ok_or_else(|| "the drive's setup bound no batch".to_owned())
+    }
+
+    fn promise_queue_restore(&self) {
+        self.restores_queue
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the drive that just ran snapshotted queue state for an
+    /// exact restore; reading it clears it for the next drive. Only the
+    /// host gate holds drives to the promise.
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub fn take_restores_queue(&self) -> bool {
+        self.restores_queue
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Record the floor state a floor drive's setup found.
+    fn set_prior_floor(&self, prior: PriorFloor) {
+        self.promise_queue_restore();
+        *self.prior_floor.lock().expect("prior floor") = Some(prior);
+    }
+
+    /// Take the recorded floor state for the cleanup's restore.
+    fn take_prior_floor(&self) -> Result<PriorFloor, String> {
+        self.prior_floor
+            .lock()
+            .expect("prior floor")
+            .take()
+            .ok_or_else(|| "the drive's setup recorded no floor state".to_owned())
     }
 
     /// Take the bound batch for the cleanup.
@@ -1295,16 +1351,16 @@ pub const DRIVES: &[Drive] = &[
                 // The floor application's DML half — the same stored-
                 // floor read, conditional backfill and stamp the
                 // operator reset runs — no index DDL, which belongs
-                // to the reset route alone.
-                queue::apply_dispatch_floor(
-                    db,
-                    &queue::SchedulerSettings {
-                        min_dispatch_value: queue::VALUE_BAND,
-                        ..*settings
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+                // to the reset route alone. What it rewrites is
+                // snapshotted first, for the cleanup to put back.
+                let floored = queue::SchedulerSettings {
+                    min_dispatch_value: queue::VALUE_BAND,
+                    ..*settings
+                };
+                ctx.set_prior_floor(snapshot_floor(db, &floored).await?);
+                queue::apply_dispatch_floor(db, &floored)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 // The fixture must hold BOTH under-floor directions —
                 // ready-now rows the floor defers, and rows whose own
                 // wake is already deferred — or the probe proves
@@ -1481,7 +1537,7 @@ pub const DRIVES: &[Drive] = &[
                 Ok(())
             })
         },
-        cleanup: Some(|db, shape, settings, ctx| {
+        cleanup: Some(|db, shape, _settings, ctx| {
             Box::pin(async move {
                 let mut errors: Vec<String> = Vec::new();
                 // Leak check FIRST, on the live post-pass flags: every
@@ -1515,11 +1571,17 @@ pub const DRIVES: &[Drive] = &[
                 if let Err(error) = restore_claim_surface(db, shape, &snapshot).await {
                     errors.push(error);
                 }
-                // Restore the fixture's floor through the same
-                // operator path — flags and stamp consistent again —
-                // then surface every collected error.
-                if let Err(error) = queue::apply_dispatch_floor(db, settings).await {
-                    errors.push(format!("floor restore: {error}"));
+                // Put back the floor setting and every flag the floor
+                // path rewrote — from the setup's snapshot, not a
+                // recompute: the fixture parks rows the floor formula
+                // would not — then surface every collected error.
+                match ctx.take_prior_floor() {
+                    Ok(prior) => {
+                        if let Err(error) = restore_floor(db, prior).await {
+                            errors.push(format!("floor restore: {error}"));
+                        }
+                    }
+                    Err(error) => errors.push(error),
                 }
                 if errors.is_empty() {
                     Ok(())
@@ -1590,7 +1652,7 @@ pub const DRIVES: &[Drive] = &[
         // the run's completion and the wake re-plan the route's
         // `schedule_alarm` runs. The write is keyed by the batch id —
         // the leg count never enters it.
-        name: "POST /batches/{id}/complete (success)",
+        name: "POST /batches/{batch_id}/complete (success)",
         setup: Some(seed_bound_batch),
         run: |db, _shape, settings, ctx| {
             Box::pin(
@@ -1604,7 +1666,7 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         // The same route for a failed run: the conclusion is carried
         // verbatim, so the cost is the success delivery's.
-        name: "POST /batches/{id}/complete (failure)",
+        name: "POST /batches/{batch_id}/complete (failure)",
         setup: Some(seed_bound_batch),
         run: |db, _shape, settings, ctx| {
             Box::pin(
@@ -2354,6 +2416,74 @@ async fn restore_claim_surface(
     }
 }
 
+/// The state `queue::apply_dispatch_floor(db, floored)` is about to
+/// change: the stored floor setting and the flag of each row whose flag
+/// differs from the floored formula.
+async fn snapshot_floor(db: &DurableDb, floored: &SchedulerSettings) -> Result<PriorFloor, String> {
+    let eligible = queue::dispatch_eligible_at_floor_sql(
+        "lane",
+        "value",
+        &floored.min_dispatch_value.to_string(),
+    );
+    let stored = db
+        .query("SELECT value FROM settings WHERE key = 'min_dispatch_value'")
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| error.to_string())?;
+    let flags = db
+        .query(&format!(
+            "SELECT task_id, dispatch_eligible FROM queue WHERE dispatch_eligible != {eligible}"
+        ))
+        .fetch_all::<PriorFlag>()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(PriorFloor { stored, flags })
+}
+
+/// Write [`snapshot_floor`]'s state back: the setting row (or its
+/// absence) and each recorded row's flag.
+async fn restore_floor(db: &DurableDb, prior: PriorFloor) -> Result<(), String> {
+    match prior.stored {
+        Some(value) => db
+            .query(
+                "INSERT INTO settings (key, value) VALUES ('min_dispatch_value', ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(value)
+            .execute()
+            .await
+            .map(|_| ()),
+        None => db
+            .query("DELETE FROM settings WHERE key = 'min_dispatch_value'")
+            .execute()
+            .await
+            .map(|_| ()),
+    }
+    .map_err(|error| format!("floor setting: {error}"))?;
+    let mut by_flag: std::collections::BTreeMap<i64, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for row in prior.flags {
+        by_flag
+            .entry(row.dispatch_eligible)
+            .or_default()
+            .push(row.task_id);
+    }
+    for (flag, ids) in by_flag {
+        for chunk in ids.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
+            db.query(
+                "UPDATE queue SET dispatch_eligible = ? \
+                 WHERE task_id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(flag)
+            .bind(queue::enqueue_json(chunk).map_err(|e| e.to_string())?)
+            .execute()
+            .await
+            .map_err(|error| format!("floor flags: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// [`super::fixture::restore_batch_rows`] with the drive cleanup's
 /// error type.
 async fn restore_batches(db: &DurableDb, shape: FixtureShape) -> Result<(), String> {
@@ -2535,7 +2665,7 @@ fn seed_expired_batch<'a>(
     })
 }
 
-/// `POST /batches/{id}/complete`: the queue write the route performs,
+/// `POST /batches/{batch_id}/complete`: the queue write the route performs,
 /// then the wake re-plan its `schedule_alarm` runs.
 async fn complete_batch_route(
     db: &DurableDb,

@@ -3380,10 +3380,11 @@ const DEFAULT_MIN_DISPATCH_VALUE: i64 = 0;
 /// being assigned ([`value_sql`]), never the stale column.
 ///
 /// The admission expression with an explicit floor operand — the shape
-/// the settings-row formula shares, used only by
+/// the settings-row formula shares, used by
 /// [`apply_dispatch_floor`]'s pass, which must evaluate against the
-/// configured value before the row recording it exists.
-fn dispatch_eligible_at_floor_sql(lane: &str, value: &str, floor: &str) -> String {
+/// configured value before the row recording it exists, and by the cost
+/// gate's floor snapshot.
+pub(super) fn dispatch_eligible_at_floor_sql(lane: &str, value: &str, floor: &str) -> String {
     format!("CASE WHEN ({lane}) = 'human' OR ({value}) >= ({floor}) THEN 1 ELSE 0 END")
 }
 

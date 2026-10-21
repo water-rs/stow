@@ -642,7 +642,7 @@ pub struct BatchTask {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct BuildBatchPayload {
     /// The [`BatchId`] the scheduler minted at claim — it names the run
-    /// (`<rustc>-b<batch_id>`) and the `POST /batches/{id}/complete`
+    /// (`<rustc>-b<batch_id>`) and the `POST /batches/{batch_id}/complete`
     /// route.
     pub batch_id: BatchId,
     /// The one rustc every leg builds under — a batch never mixes rustc

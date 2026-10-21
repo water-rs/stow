@@ -361,7 +361,7 @@ const BUDGETS: &[RouteBudget] = &[
         // Measured 7 statements, 7 reads, 1 write: the completion
         // `UPDATE` (1 statement, 1 write) and the six statements of
         // the `schedule_alarm` re-plan.
-        name: "POST /batches/{id}/complete (success)",
+        name: "POST /batches/{batch_id}/complete (success)",
         statements: 8,
         rows_read: 8,
         rows_written: 1,
@@ -370,7 +370,7 @@ const BUDGETS: &[RouteBudget] = &[
     RouteBudget {
         // The conclusion is carried verbatim: the success delivery's
         // measurement, 7/7/1.
-        name: "POST /batches/{id}/complete (failure)",
+        name: "POST /batches/{batch_id}/complete (failure)",
         statements: 8,
         rows_read: 8,
         rows_written: 1,
@@ -1006,11 +1006,12 @@ async fn run_one_drive(
             drive.name
         ));
     }
-    // A drive that inserts leaves the queue as it found it: a pending
-    // row it added is claimable by the next pass drive, and its edges
-    // and nodes widen every later walk.
-    if let Some(left) = queue_before.left_behind(&queue_after) {
-        return Err(format!("{} left queue rows added: {left}", drive.name));
+    // A drive leaves the queue as it found it: a pending row it added
+    // is claimable by the next pass drive, its edges and nodes widen
+    // every later walk, and a flag it flipped changes what the claim
+    // walk can open.
+    if let Some(left) = queue_before.left_behind(&queue_after, ctx.take_restores_queue()) {
+        return Err(format!("{} left the queue changed: {left}", drive.name));
     }
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => {
@@ -1028,26 +1029,37 @@ async fn run_one_drive(
     }
 }
 
-/// What an inserting drive can leave in the queue: the task ids, plus
-/// the derived-id (`-`-bearing, never a fixture hex id) edge and node
-/// rows its enqueue writes.
+/// What a drive can leave in the queue: the task ids, plus the
+/// derived-id (`-`-bearing, never a fixture hex id) edge and node rows
+/// its enqueue writes, and how many pending rows are unparked
+/// (`dispatch_eligible = 1`) — a drive that moves the floor and does
+/// not put the flags back changes every later pass's claim walk.
 struct QueueSurface {
     task_ids: std::collections::BTreeSet<String>,
+    eligible_pending: i64,
     derived_edges: i64,
     derived_nodes: i64,
 }
 
 impl QueueSurface {
-    /// A description of what `after` holds beyond `self`, `None` when
-    /// the drive added nothing.
-    fn left_behind(&self, after: &Self) -> Option<String> {
+    /// A description of how `after` differs from `self`, `None` when
+    /// the drive left the surface as it found it. `restores_flags` is
+    /// true for a drive that snapshotted queue state for its cleanup,
+    /// which promises the rows back as found; the route drives that
+    /// take no snapshot change pending rows on purpose (a retry, a
+    /// promotion, a demand fold).
+    fn left_behind(&self, after: &Self, restores_flags: bool) -> Option<String> {
         let added: Vec<&String> = after.task_ids.difference(&self.task_ids).collect();
         (!added.is_empty()
+            || (restores_flags && after.eligible_pending != self.eligible_pending)
             || after.derived_edges != self.derived_edges
             || after.derived_nodes != self.derived_nodes)
             .then(|| {
                 format!(
-                    "task ids {added:?}, derived edges {} -> {}, derived nodes {} -> {}",
+                    "task ids added {added:?}, eligible pending rows {} -> {}, \
+                     derived edges {} -> {}, derived nodes {} -> {}",
+                    self.eligible_pending,
+                    after.eligible_pending,
                     self.derived_edges,
                     after.derived_edges,
                     self.derived_nodes,
@@ -1067,6 +1079,11 @@ async fn queue_surface(db: &DurableDb) -> QueueSurface {
             .expect("read queue ids")
             .into_iter()
             .collect(),
+        eligible_pending: db
+            .query("SELECT COUNT(*) FROM queue WHERE status = 'pending' AND dispatch_eligible = 1")
+            .fetch_scalar()
+            .await
+            .expect("count eligible pending rows"),
         derived_edges: db
             .query("SELECT COUNT(*) FROM queue_dependencies WHERE task_id LIKE '%-%'")
             .fetch_scalar()
@@ -1381,12 +1398,21 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
             "unclaimed {status} row at n={n} survived the re-arm"
         );
     }
+    // The retry drive turns the two seeded failed rows pending, so a
+    // claim can take them; the re-arm returns them to their seeded
+    // `failed`, every other claimed row to `pending`.
+    let seeded_failed = [shape.failed_row(0), shape.failed_row(1)].map(|n| format!("{n:064x}"));
     for id in &claimed {
         if u64::from_str_radix(id, 16).is_ok() {
+            let expected = if seeded_failed.contains(id) {
+                "failed"
+            } else {
+                "pending"
+            };
             assert_eq!(
                 status_of(&db, id).await,
-                "pending",
-                "claimed row {id} returned to pending"
+                expected,
+                "claimed row {id} returned to its seeded status"
             );
         }
     }
