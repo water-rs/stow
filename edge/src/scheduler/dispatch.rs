@@ -16,9 +16,9 @@ use skyzen_cloudflare::{CfFetch, worker};
 
 #[cfg(target_arch = "wasm32")]
 use crate::cf_http;
+use crate::fetch_guard::OutboundPool;
 #[cfg(target_arch = "wasm32")]
 use crate::fetch_guard::{FetchedResponse, GuardedResponse};
-use crate::fetch_guard::OutboundPool;
 use crate::github_app::InstallationToken;
 use crate::scheduler::queue::QueuedTask;
 
@@ -652,10 +652,7 @@ mod tests {
             workflow_dispatch_path("water-rs/stow", "build-batch.yml"),
             "repos/water-rs/stow/actions/workflows/build-batch.yml/dispatches"
         );
-        assert_eq!(
-            run_path("o/r", 42),
-            "repos/o/r/actions/runs/42"
-        );
+        assert_eq!(run_path("o/r", 42), "repos/o/r/actions/runs/42");
         assert_eq!(
             attempt_jobs_path("o/r", 42, 3),
             "repos/o/r/actions/runs/42/attempts/3/jobs?per_page=100"
@@ -684,18 +681,16 @@ mod tests {
             "https://api.github.com/repos/o/r"
         );
         for url in [
-            "https://evil.example/repos/o/r",   // another host
-            "http://api.github.com/repos/o/r",  // scheme mismatch
-            "https://api.github.com.evil/x",    // prefix lookalike
+            "https://evil.example/repos/o/r",  // another host
+            "http://api.github.com/repos/o/r", // scheme mismatch
+            "https://api.github.com.evil/x",   // prefix lookalike
             "https://api.github.com2/x",
         ] {
             let error = scoped_url("https://api.github.com", url).expect_err("refused");
             assert!(error.to_string().contains(url), "{error} names {url}");
         }
         // The local base scopes to its own origin, port included.
-        assert!(
-            scoped_url("http://127.0.0.1:8787", "http://127.0.0.1:8787/repos/o/r").is_ok()
-        );
+        assert!(scoped_url("http://127.0.0.1:8787", "http://127.0.0.1:8787/repos/o/r").is_ok());
         for url in [
             "http://127.0.0.1:87870/repos", // a port that shares the prefix
             "https://127.0.0.1:8787/repos", // scheme mismatch

@@ -6,9 +6,10 @@ use skyzen_services::durable::{Alarm, DbValue, DurableDb};
 use stow_types::api::{
     AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
     QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerResetReport,
-    SchedulerStatus, TaskLane, runner_family,
+    SchedulerStatus, TaskHash, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
+use stow_types::runs::{LegFailure, LegOutcome, RunFailure, RunJobRow};
 
 use crate::errors::QueueError;
 
@@ -1569,6 +1570,13 @@ struct BuildCompleteReport {
     /// the duration sample measures claim-to-completion, not
     /// claim-to-deferred-application (stow#524).
     finished_at: Option<String>,
+    /// The build-cost sample's explicit duration — `None` measures
+    /// claim-to-completion from `finished_at` and the row's
+    /// `claimed_at` (the per-task path); `Some` is a batch leg's
+    /// runner time, measured on GitHub's clock across the leg's own
+    /// two jobs (stow#833 §4.1 — `claimed_at` stays only for the
+    /// lease).
+    sample_ms: Option<i64>,
 }
 
 #[derive(Debug, skyzen::FromRow)]
@@ -1690,18 +1698,52 @@ async fn complete(
     .await?;
     // A success is the build cost's only honest measurement, and the
     // generation fence above is what keeps a late or duplicate report
-    // out of the sample window.
+    // out of the sample window. The duration is the report's explicit
+    // sample when it carries one (a batch leg's runner time); the
+    // per-task path measures claim-to-completion — and only when the
+    // generation minted a real `claimed_at` stamp to measure from.
     if report.success {
-        record_build_sample(
-            db,
-            report,
-            &completed.crate_name,
-            &completed.target,
-            completed.claimed_at.as_deref(),
-        )
-        .await?;
+        let duration_ms = match report.sample_ms {
+            Some(duration_ms) => Some(duration_ms),
+            None => match completed.claimed_at.as_deref() {
+                Some(claimed_at) => Some(
+                    claim_to_completion_ms(db, report.finished_at.as_deref(), claimed_at).await?,
+                ),
+                None => None,
+            },
+        };
+        if let Some(duration_ms) = duration_ms {
+            record_build_sample(
+                db,
+                report,
+                &completed.crate_name,
+                &completed.target,
+                duration_ms,
+            )
+            .await?;
+        }
     }
     Ok(())
+}
+
+/// The per-task path's build sample duration — `finished_at` −
+/// `claimed_at` in whole milliseconds, computed in SQL where the
+/// `datetime()` text lives. A live report's `finished_at` is `None`,
+/// which lands `datetime('now')` under the `COALESCE` (stow#524).
+async fn claim_to_completion_ms(
+    db: &DurableDb,
+    finished_at: Option<&str>,
+    claimed_at: &str,
+) -> Result<i64, QueueError> {
+    db.query(
+        "SELECT CAST((julianday(COALESCE(?, datetime('now'))) \
+                     - julianday(?)) * 86400000.0 AS INTEGER)",
+    )
+    .bind(finished_at.map(str::to_owned))
+    .bind(claimed_at.to_owned())
+    .fetch_scalar::<i64>()
+    .await
+    .map_err(|error| format!("measure claim-to-completion duration: {error}").into())
 }
 
 /// Diagnose why a completion report matched no row: unknown task id,
@@ -1753,36 +1795,28 @@ async fn reject_stale_completion(
 /// only when the median actually moved — is a keyed probe touching
 /// the pending rows of exactly this (`crate_name`, `target`).
 ///
-/// `claimed_at` `NULL` means the row predates the column or its
-/// completion applied to a generation minted before the stamp existed
-/// — there is no real claim instant to measure from, so no sample is
-/// taken at all. `report.finished_at` is the run's real completion
-/// instant (the pending-completion path's `received_at`), falling
-/// back to now for a live report.
+/// `duration_ms` is the caller's measurement: claim-to-completion for
+/// the per-task path, the leg's runner time for a batch leg
+/// (stow#833 §4.1) — the sample is the cost operand the rank reads,
+/// so it must measure the build itself.
 async fn record_build_sample(
     db: &DurableDb,
     report: &BuildCompleteReport,
     crate_name: &str,
     target: &str,
-    claimed_at: Option<&str>,
+    duration_ms: i64,
 ) -> Result<(), QueueError> {
-    let Some(claimed_at) = claimed_at else {
-        return Ok(());
-    };
     let inserted = db
         .query(
             "INSERT INTO crate_build_samples \
              (crate_name, target, generation_id, duration_ms) \
-             VALUES (?, ?, ?, \
-                     CAST((julianday(COALESCE(?, datetime('now'))) \
-                           - julianday(?)) * 86400000.0 AS INTEGER)) \
+             VALUES (?, ?, ?, ?) \
              ON CONFLICT DO NOTHING",
         )
         .bind(crate_name.to_owned())
         .bind(target.to_owned())
         .bind(report.generation_id.clone())
-        .bind(report.finished_at.clone())
-        .bind(claimed_at.to_owned())
+        .bind(duration_ms)
         .execute()
         .await
         .map_err(|error| format!("record build sample: {error}"))?;
@@ -2094,6 +2128,7 @@ pub async fn complete_run(
             error: report.error.clone(),
             github_run_id: report.github_run_id.clone(),
             finished_at: None,
+            sample_ms: None,
         },
         window_minutes,
     )
@@ -2226,6 +2261,7 @@ async fn apply_pending_completion_for_binding(
         error: pending.error,
         github_run_id: Some(pending.github_run_id.clone()),
         finished_at: Some(pending.received_at),
+        sample_ms: None,
     };
     // A stale or unknown event is consumed without an outcome — only
     // a `complete` that landed counts toward the caller's gate.
@@ -2379,6 +2415,435 @@ pub async fn record_batch_completion(
     if exists == 0 {
         return Err(QueueError::UnknownBatch(batch_id.to_owned()));
     }
+    Ok(())
+}
+
+/// A `build_batches` row ready for the alarm's resolution pass, with
+/// the queue rows bound to it (stow#833 §3.2).
+#[derive(Debug)]
+pub struct ReadyBatch {
+    /// `build_batches.batch_id`.
+    pub batch_id: String,
+    /// The run the batch is bound to and its completion named —
+    /// `done_run_id = github_run_id` guards the same id twice.
+    pub run_id: String,
+    /// The run attempt the completion named — the jobs page is read
+    /// pinned to it.
+    pub done_attempt: u32,
+    /// The batch key's rustc — the records tag namespace each
+    /// leg's artifact check reads.
+    pub rustc_version: String,
+    /// The run's reported conclusion (`success`, `failure`,
+    /// `startup_failure`, …) — the leg classifier's run-level input.
+    pub conclusion: String,
+    /// The batch's legs — queue rows carrying its `batch_id`, ordered
+    /// by `batch_leg`, the leg index in the dispatched payload's
+    /// `tasks` list.
+    pub legs: Vec<ReadyBatchLeg>,
+}
+
+/// One leg row of a [`ReadyBatch`] — the generation `resolve_batch`
+/// applies the leg's outcome under.
+#[derive(Debug)]
+pub struct ReadyBatchLeg {
+    /// The leg's queue task.
+    pub task_id: String,
+    /// The generation the claim minted for this leg — the completion
+    /// fence's operand.
+    pub generation_id: String,
+    /// The queue attempt the dispatch carried.
+    pub attempt: u32,
+    /// The leg's index in the batch's `tasks` list — its position in
+    /// `classify_legs`' outcome order, which `resolve_batch`'s
+    /// `resolutions` indexing follows.
+    pub batch_leg: u32,
+}
+
+/// The `build_batches` columns [`ready_batches`] selects.
+#[derive(Debug, skyzen::FromRow)]
+struct ReadyBatchRow {
+    batch_id: String,
+    rustc_version: String,
+    done_run_id: String,
+    done_attempt: u32,
+    conclusion: String,
+}
+
+/// A queue row as a batch's leg walk reads it.
+#[derive(Debug, skyzen::FromRow)]
+struct BatchLegRow {
+    batch_id: String,
+    task_id: String,
+    generation_id: String,
+    attempt: u32,
+    batch_leg: Option<i64>,
+}
+
+/// The batches whose `completed` delivery is bound and due —
+/// `done_run_id = github_run_id` (an early completion before the
+/// dispatch response's binding waits) and `resolve_after <= now` (a
+/// deferred jobs page inside its settle window waits) — each carrying
+/// its legs in `batch_leg` order.
+///
+/// `now_ms` is the caller's epoch-ms clock, rendered to the
+/// `datetime()` text `resolve_after` stores by the predicate itself.
+///
+/// The read is bounded by the batches in flight, not by queue size:
+/// at most the scheduler's family slot caps over
+/// `STOW_BATCH_PARALLELISM` — ⌈45/k⌉ miss batches plus the human
+/// lane's — rows, each holding at most `STOW_BATCH_MAX_TASKS` legs.
+/// The alarm's resolution drive names this as its stated bound
+/// (stow#833 §3.2).
+pub async fn ready_batches(db: &DurableDb, now_ms: i64) -> Result<Vec<ReadyBatch>, QueueError> {
+    let batches = db
+        .query(
+            "SELECT batch_id, rustc_version, done_run_id, done_attempt, conclusion \
+             FROM build_batches \
+             WHERE done_run_id = github_run_id \
+               AND resolve_after <= datetime(CAST(? AS INTEGER) / 1000, 'unixepoch') \
+             ORDER BY batch_id",
+        )
+        .bind(now_ms)
+        .fetch_all::<ReadyBatchRow>()
+        .await
+        .map_err(|error| format!("list resolvable batches: {error}"))?;
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One keyed read for every ready batch's legs — `idx_queue_batch`
+    // serves each batch's `batch_leg` walk, never a queue scan.
+    let ids: Vec<String> = batches.iter().map(|batch| batch.batch_id.clone()).collect();
+    let mut legs = batch_legs(db, &ids).await?;
+    Ok(batches
+        .into_iter()
+        .map(|batch| ReadyBatch {
+            legs: legs.remove(&batch.batch_id).unwrap_or_default(),
+            batch_id: batch.batch_id,
+            rustc_version: batch.rustc_version,
+            run_id: batch.done_run_id,
+            done_attempt: batch.done_attempt,
+            conclusion: batch.conclusion,
+        })
+        .collect())
+}
+
+/// The leg rows of the named batches, grouped by `batch_id` in
+/// `batch_leg` order — one `json_each`-bound read no matter how many
+/// batches the pass holds.
+async fn batch_legs(
+    db: &DurableDb,
+    batch_ids: &[String],
+) -> Result<BTreeMap<String, Vec<ReadyBatchLeg>>, QueueError> {
+    let rows = db
+        .query(
+            "SELECT batch_id, task_id, generation_id, attempt, batch_leg \
+             FROM queue \
+             WHERE batch_id IN (SELECT value FROM json_each(?)) \
+             ORDER BY batch_id, batch_leg",
+        )
+        .bind(enqueue_json(batch_ids)?)
+        .fetch_all::<BatchLegRow>()
+        .await
+        .map_err(|error| format!("load batch legs: {error}"))?;
+    let mut legs: BTreeMap<String, Vec<ReadyBatchLeg>> = BTreeMap::new();
+    for row in rows {
+        legs.entry(row.batch_id.clone())
+            .or_default()
+            .push(ready_leg(&row)?);
+    }
+    Ok(legs)
+}
+
+/// Decode one stored leg row — a queue row carrying `batch_id` always
+/// carries its `batch_leg` index with it, so a `NULL` or unreadable
+/// index is corrupt state, not a leg to skip.
+fn ready_leg(row: &BatchLegRow) -> Result<ReadyBatchLeg, QueueError> {
+    let batch_leg = row
+        .batch_leg
+        .and_then(|leg| u32::try_from(leg).ok())
+        .ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "task {} is bound to batch {} with batch_leg {:?}",
+                row.task_id, row.batch_id, row.batch_leg
+            ))
+        })?;
+    Ok(ReadyBatchLeg {
+        task_id: row.task_id.clone(),
+        generation_id: row.generation_id.clone(),
+        attempt: row.attempt,
+        batch_leg,
+    })
+}
+
+/// One settled leg's resolution — what [`resolve_batch`] applies to
+/// the leg's queue row (stow#833 §4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegResolution {
+    /// The leg's jobs succeeded and its signed records artifact is in
+    /// GHCR. The build-cost sample is the leg's runner time — its
+    /// build job's `started_at` to its publish job's `completed_at`,
+    /// in whole milliseconds — never claim-to-completion across the
+    /// batch's rounds.
+    Succeeded {
+        /// The leg's runner time in milliseconds.
+        duration_ms: i64,
+    },
+    /// The leg failed — `error` is the §4.1 text the queue row's
+    /// `error_msg`, the outcome evidence's `failure_class` and the
+    /// breaker's trip report all read.
+    Failed {
+        /// The §4.1 error text.
+        error: String,
+    },
+}
+
+/// Map one classified leg to its queue resolution (stow#833 §4.1).
+///
+/// `None` is "no answer yet" — a leg job still running, or a failed
+/// job's step rows inside their settle window: the caller defers the
+/// batch with [`defer_batch`] rather than resolving it.
+///
+/// `records_present` is the GHCR check's answer for a [`LegOutcome::
+/// Succeeded`] leg — a success without its signed records artifact
+/// resolves as the records-absent failure (stow#655). `task_id`
+/// names the leg's task in that text and `run_url` is the run's
+/// Actions URL — the only pointer a `startup_failure` run, which
+/// holds no jobs at all, can carry for its legs. Both are ignored
+/// otherwise: every other row of the table reads off the failure the
+/// classifier carried.
+#[must_use]
+pub fn leg_resolution(
+    outcome: &LegOutcome,
+    records_present: bool,
+    task_id: &str,
+    run_url: &str,
+) -> Option<LegResolution> {
+    match outcome {
+        LegOutcome::Unsettled => None,
+        LegOutcome::Succeeded {
+            started_at,
+            completed_at,
+            ..
+        } if records_present => Some(LegResolution::Succeeded {
+            duration_ms: i64::try_from((*completed_at - *started_at).whole_milliseconds())
+                .expect("a leg's runner time fits i64"),
+        }),
+        LegOutcome::Succeeded { .. } => Some(LegResolution::Failed {
+            error: stow_types::records::missing_records_error(task_id),
+        }),
+        LegOutcome::Failed(failure) => Some(LegResolution::Failed {
+            error: match failure {
+                LegFailure::Run(RunFailure::Verdict {
+                    job,
+                    step,
+                    html_url,
+                }) => format!("verdict: {job} / {step} ({html_url})"),
+                // `job: "-"` is the classifier's documented mark of a
+                // run no job ever failed — `startup_failure` — so the
+                // run itself is the pointer.
+                LegFailure::Run(RunFailure::Infrastructure { job, .. }) if job == "-" => {
+                    format!("infrastructure: startup_failure ({run_url})")
+                }
+                LegFailure::Run(RunFailure::Infrastructure {
+                    job,
+                    step,
+                    html_url,
+                }) => {
+                    format!(
+                        "infrastructure: {job} / {} ({html_url})",
+                        step.as_deref().unwrap_or("-")
+                    )
+                }
+                LegFailure::Concluded {
+                    job,
+                    conclusion,
+                    html_url,
+                } => format!("{conclusion}: {job} ({html_url})"),
+                LegFailure::Invariant(message) => format!("invariant: {message}"),
+            },
+        }),
+    }
+}
+
+/// Every expected leg's outcome for a ready batch, indexed by leg
+/// number — `classify_legs` over the legs' task hashes (stow#833
+/// §4.1). A leg index with no queue row still occupies its slot: its
+/// placeholder hash mismatches whatever the page carries for it,
+/// which is exactly that phantom leg's invariant failure.
+///
+/// A structural `classify_legs` error — an unreadable job name, a
+/// leg index past the batch — becomes every leg's
+/// [`LegFailure::Invariant`]: the run is ours, so an undecodable
+/// page fails the batch once, never retries it forever.
+#[must_use]
+pub fn leg_outcomes(
+    batch: &ReadyBatch,
+    jobs: &[RunJobRow],
+    now: time::OffsetDateTime,
+) -> Vec<LegOutcome> {
+    let leg_count = batch
+        .legs
+        .iter()
+        .map(|leg| leg.batch_leg)
+        .max()
+        .map_or(0, |max| {
+            usize::try_from(max + 1).expect("leg index + 1 fits usize")
+        });
+    let mut expected = vec![TaskHash::of(""); leg_count];
+    for leg in &batch.legs {
+        expected[usize::try_from(leg.batch_leg).expect("u32 leg index fits usize")] =
+            TaskHash::of(&leg.task_id);
+    }
+    match stow_types::runs::classify_legs(&expected, &batch.conclusion, jobs, now) {
+        Ok(outcomes) => outcomes,
+        Err(error) => vec![LegOutcome::Failed(LegFailure::Invariant(error.to_string())); leg_count],
+    }
+}
+
+/// Each leg's settled resolution for a ready batch, indexed by leg
+/// number — `None` where the leg's outcome is still unsettled, which
+/// defers the whole batch (stow#833 §3.2).
+///
+/// `records_present(leg)` answers the GHCR check for a `Succeeded`
+/// leg's records artifact; it is consulted only on successes.
+#[must_use]
+pub fn batch_resolutions(
+    batch: &ReadyBatch,
+    jobs: &[RunJobRow],
+    records_present: impl Fn(u32) -> bool,
+    now: time::OffsetDateTime,
+) -> Vec<Option<LegResolution>> {
+    let outcomes = leg_outcomes(batch, jobs, now);
+    let run_url = stow_types::runs::run_url(&batch.run_id);
+    let task_ids: BTreeMap<u32, &str> = batch
+        .legs
+        .iter()
+        .map(|leg| (leg.batch_leg, leg.task_id.as_str()))
+        .collect();
+    outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| {
+            let leg_index = u32::try_from(index).expect("leg index fits u32");
+            leg_resolution(
+                outcome,
+                records_present(leg_index),
+                task_ids.get(&leg_index).copied().unwrap_or(""),
+                &run_url,
+            )
+        })
+        .collect()
+}
+
+/// Apply a resolved batch's legs to their queue rows and release the
+/// batch's slots (stow#833 §3.2, §4.1).
+///
+/// Every leg goes through [`complete`]'s own contract under the
+/// batch's run id — the generation fence, the under-`MAX_BUILD_
+/// ATTEMPTS` retry/backoff write and the outcome evidence — with the
+/// leg's `generation_id`/`attempt` read live from its queue row, and
+/// its build sample carrying the resolution's runner-time
+/// `duration_ms` rather than claim-to-completion. A leg whose row
+/// moved on — cancelled, requeued, claimed into another generation —
+/// is refused by that fence and ignored, never an error (§4.2's
+/// "binding misses" case). Deleting the `build_batches` row last is
+/// what releases the batch's `parallelism` slots.
+///
+/// `resolutions[i]` is leg `i`'s settled outcome — the order
+/// `classify_legs` answers in. Every leg is settled: an unsettled leg
+/// is the caller's [`defer_batch`] case, not this function's.
+///
+/// Returns whether any *applied* leg failed, so the caller evaluates
+/// the freeze breaker once per batch — a fenced-off leg applied
+/// nothing, so its outcome counts for nothing either.
+///
+/// # Errors
+/// [`QueueError::Invariant`] when a leg row's `batch_leg` is unreadable
+/// or names a leg `resolutions` does not cover — corrupt state, never
+/// a skippable leg.
+pub async fn resolve_batch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch_id: &str,
+    resolutions: &[LegResolution],
+    window_minutes: u32,
+) -> Result<bool, QueueError> {
+    // The batch row is the run binding's home: `done_run_id` (equal to
+    // `github_run_id` for every batch `ready_batches` surfaces) is the
+    // run the legs' outcomes name.
+    let run_id = db
+        .query("SELECT done_run_id FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .fetch_optional::<BatchRunIdRow>()
+        .await
+        .map_err(|error| format!("load batch {batch_id} run id: {error}"))?
+        .and_then(|row| row.done_run_id);
+    let legs = batch_legs(db, &[batch_id.to_owned()])
+        .await?
+        .remove(batch_id)
+        .unwrap_or_default();
+    let mut any_failure = false;
+    for leg in legs {
+        let resolution = resolutions
+            .get(usize::try_from(leg.batch_leg).expect("u32 fits usize on every stow target"))
+            .ok_or_else(|| {
+                QueueError::Invariant(format!(
+                    "batch {batch_id} resolved {} legs but task {} names leg {}",
+                    resolutions.len(),
+                    leg.task_id,
+                    leg.batch_leg
+                ))
+            })?;
+        let (success, error, sample_ms) = match resolution {
+            LegResolution::Succeeded { duration_ms } => (true, None, Some(*duration_ms)),
+            LegResolution::Failed { error } => (false, Some(error.clone()), None),
+        };
+        let report = BuildCompleteReport {
+            task_id: leg.task_id,
+            generation_id: leg.generation_id,
+            attempt: leg.attempt,
+            success,
+            error,
+            github_run_id: run_id.clone(),
+            finished_at: None,
+            sample_ms,
+        };
+        let applied = match complete(db, settings, &report, window_minutes).await {
+            Ok(()) => true,
+            Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => false,
+            Err(error) => return Err(error),
+        };
+        any_failure |= applied && !report.success;
+    }
+    db.query("DELETE FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("delete resolved batch {batch_id}: {error}"))?;
+    Ok(any_failure)
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct BatchRunIdRow {
+    done_run_id: Option<String>,
+}
+
+/// Push a batch's resolution out to `until_ms`: any leg still
+/// unsettled — a job not yet `completed`, or a failed job's step rows
+/// inside their settle window — keeps the batch open for the next
+/// pass (stow#833 §3.2's 30 s deferral, capped by the caller at the
+/// settle window).
+pub async fn defer_batch(db: &DurableDb, batch_id: &str, until_ms: i64) -> Result<(), QueueError> {
+    db.query(
+        "UPDATE build_batches \
+         SET resolve_after = datetime(CAST(? AS INTEGER) / 1000, 'unixepoch') \
+         WHERE batch_id = ?",
+    )
+    .bind(until_ms)
+    .bind(batch_id.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("defer batch {batch_id}: {error}"))?;
     Ok(())
 }
 

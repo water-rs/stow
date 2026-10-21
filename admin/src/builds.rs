@@ -318,8 +318,8 @@ async fn inspect_run(token: &str, run: &DigestRun) -> stow_types::error::Result<
     })?;
     let (page, class) = classify_run(token, run.id).await?;
     let (kind, job_name, step) = match class {
-        RunFailure::Verdict { job, step } => (FailureKind::Verdict, job, Some(step)),
-        RunFailure::Infrastructure { job, step } => (FailureKind::Infrastructure, job, step),
+        RunFailure::Verdict { job, step, .. } => (FailureKind::Verdict, job, Some(step)),
+        RunFailure::Infrastructure { job, step, .. } => (FailureKind::Infrastructure, job, step),
     };
     let error_line = match page.jobs.iter().find(|job| job.name == job_name) {
         Some(job) => first_error_line(token, job.id).await,

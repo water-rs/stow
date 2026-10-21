@@ -2152,7 +2152,7 @@ impl Dispatch {
         let Some(class) = classify_failure(&page.jobs, time::OffsetDateTime::now_utc())? else {
             return Ok(Classified::Unsettled);
         };
-        let RunFailure::Infrastructure { job, step } = class else {
+        let RunFailure::Infrastructure { job, step, .. } = class else {
             return Ok(Classified::Verdict);
         };
         match crate::github::post_empty(

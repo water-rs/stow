@@ -841,8 +841,7 @@ pub(super) async fn admit_request_pass(
             }
         }
     };
-    if let Err(error) = outcome
-    {
+    if let Err(error) = outcome {
         queue::fail_request_dispatch(db, &admission.request_id, attempt, &error.to_string())
             .await
             .map_err(to_error)?;
@@ -1324,6 +1323,16 @@ pub(super) async fn dispatch_pass(
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
     let credential_source = credential_source(env)?;
+    // §3.2: completed batches resolve before claiming — a resolved
+    // batch's freed slots fill this same pass.
+    let scope = PassScope {
+        env,
+        db,
+        settings,
+        github_repo: &github_repo,
+        freeze: &freeze,
+    };
+    resolve_ready_batches(&scope, &credential_source).await?;
     let tasks = queue::claim_dispatchable_tasks(db, settings, coverage)
         .await
         .map_err(to_error)?;
@@ -1397,6 +1406,275 @@ pub(super) async fn dispatch_pass(
     }
 
     Ok(task_ids)
+}
+
+/// How long a batch whose jobs page cannot have settled yet — or one
+/// whose GitHub/GHCR read failed transiently — defers its resolution:
+/// the 30 s §3.2 grants the page to finish writing.
+const BATCH_RESOLVE_DEFER_MS: i64 = 30_000;
+
+/// The GHCR config the batch resolution's records check reads — the
+/// same binding the Worker's webhook builds for the per-task path
+/// (entry.rs).
+fn ghcr_config(env: &WasmEnv) -> crate::api::GhcrConfig {
+    crate::api::GhcrConfig {
+        base_url: read_optional_string_binding(env, crate::entry::GHCR_BASE_URL_BINDING)
+            .unwrap_or_else(|| crate::ghcr::default_base_url().to_owned()),
+        tokens: crate::registry_auth::RegistryTokens::default(),
+    }
+}
+
+/// What one alarm pass's batch resolution reads from its caller —
+/// the bindings and handles every step of the pass shares.
+struct PassScope<'a> {
+    env: &'a WasmEnv,
+    db: &'a DurableDb,
+    settings: &'a SchedulerSettings,
+    github_repo: &'a str,
+    freeze: &'a FreezeSettings,
+}
+
+/// §3.2: resolve every batch whose `completed` delivery is bound and
+/// due — before claiming, so a freed slot fills this same pass. The
+/// backend resolves once, like the dispatch arm's: a token-mint
+/// failure defers every ready batch rather than burning it.
+async fn resolve_ready_batches(
+    scope: &PassScope<'_>,
+    credential_source: &CredentialSource,
+) -> Result<()> {
+    let PassScope { env, db, .. } = *scope;
+    let now_ms = now_ms();
+    let ready = queue::ready_batches(db, now_ms).await.map_err(to_error)?;
+    if ready.is_empty() {
+        return Ok(());
+    }
+    let ghcr = ghcr_config(env);
+    match credential_source {
+        CredentialSource::LocalCi(url) => {
+            resolve_batch_set(
+                scope,
+                &dispatch::LocalCiBuildRuns::new(url),
+                &ghcr,
+                ready,
+                now_ms,
+            )
+            .await
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(db, config).await {
+                Ok(token) => {
+                    resolve_batch_set(
+                        scope,
+                        &dispatch::GitHubBuildRuns::new(token),
+                        &ghcr,
+                        ready,
+                        now_ms,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        batches = ready.len(),
+                        "installation token mint failed — deferring batch resolution"
+                    );
+                    for batch in ready {
+                        queue::defer_batch(db, &batch.batch_id, now_ms + BATCH_RESOLVE_DEFER_MS)
+                            .await
+                            .map_err(to_error)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// One ready-batch set's resolution fan-out — the outbound reads
+/// (jobs page, then a manifest read per successful leg) run
+/// concurrently under the invocation's outbound bound, the same bound
+/// the dispatch fan-out runs under. The queue writes apply
+/// sequentially afterward: `&DurableDb` is not `Send`, so it never
+/// enters a concurrent future.
+async fn resolve_batch_set(
+    scope: &PassScope<'_>,
+    backend: &impl dispatch::BuildRuns,
+    ghcr: &crate::api::GhcrConfig,
+    ready: Vec<queue::ReadyBatch>,
+    now_ms: i64,
+) -> Result<()> {
+    let PassScope {
+        env,
+        db,
+        settings,
+        github_repo,
+        freeze,
+    } = *scope;
+    let pool = crate::fetch_guard::OutboundPool::new();
+    let now = time::OffsetDateTime::from_unix_timestamp(now_ms / 1000)
+        .map_err(|error| Error::msg(format!("alarm clock out of range: {error}")))?;
+    // Collected before streaming: a closure inside the stream's type
+    // borrows each batch under a higher-ranked lifetime, and the alarm
+    // future then cannot prove itself `Send`.
+    let probes: Vec<_> = ready
+        .iter()
+        .map(|batch| probe_batch(backend, ghcr, github_repo, batch, &pool, now))
+        .collect();
+    let probes = stream::iter(probes)
+        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    for (batch, probe) in ready.iter().zip(probes) {
+        let Some(resolutions) = probe else {
+            queue::defer_batch(db, &batch.batch_id, now_ms + BATCH_RESOLVE_DEFER_MS)
+                .await
+                .map_err(to_error)?;
+            continue;
+        };
+        if queue::resolve_batch(
+            db,
+            settings,
+            &batch.batch_id,
+            &resolutions,
+            freeze.window_minutes,
+        )
+        .await
+        .map_err(to_error)?
+        {
+            evaluate_dispatch_freeze(env, db, freeze).await?;
+        }
+    }
+    Ok(())
+}
+
+/// One batch's outbound reads resolved into per-leg resolutions —
+/// `None` while any leg is unsettled or a read failed transiently
+/// (the caller defers the batch 30 s, §3.2). Concurrent-safe: it
+/// touches nothing but the outbound pool.
+async fn probe_batch(
+    backend: &impl dispatch::BuildRuns,
+    ghcr: &crate::api::GhcrConfig,
+    github_repo: &str,
+    batch: &queue::ReadyBatch,
+    pool: &crate::fetch_guard::OutboundPool,
+    now: time::OffsetDateTime,
+) -> Option<Vec<queue::LegResolution>> {
+    let run_id = match batch.run_id.parse::<u64>() {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            tracing::error!(batch_id = %batch.batch_id, run_id = %batch.run_id, %error, "batch run id is not numeric — deferring");
+            return None;
+        }
+    };
+    let jobs = match backend
+        .attempt_jobs(github_repo, run_id, batch.done_attempt, pool)
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            tracing::warn!(batch_id = %batch.batch_id, run_id, %error, "batch jobs page read failed — deferring");
+            return None;
+        }
+    };
+    let outcomes = queue::leg_outcomes(batch, &jobs, now);
+    // One GHCR manifest read per successful leg, concurrently under
+    // the same outbound bound — the tag pins the publish job's
+    // `run_attempt` (§3.1).
+    let checks: Vec<_> = batch
+        .legs
+        .iter()
+        .map(|leg| {
+            let outcome = &outcomes[index_to_usize(leg.batch_leg)];
+            leg_records_present(ghcr, batch, leg, outcome, run_id, pool)
+        })
+        .collect();
+    let checks = stream::iter(checks)
+        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    let mut confirmed = std::collections::BTreeSet::new();
+    for check in checks {
+        match check {
+            Ok(Some(leg_index)) => {
+                confirmed.insert(leg_index);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(batch_id = %batch.batch_id, run_id, %error, "batch records check failed — deferring");
+                return None;
+            }
+        }
+    }
+    let resolutions = queue::batch_resolutions(batch, &jobs, |leg| confirmed.contains(&leg), now);
+    if !batch
+        .legs
+        .iter()
+        .all(|leg| resolutions[index_to_usize(leg.batch_leg)].is_some())
+    {
+        tracing::debug!(batch_id = %batch.batch_id, "batch legs still settling — deferring");
+        return None;
+    }
+    Some(
+        resolutions
+            .into_iter()
+            .enumerate()
+            .map(|(index, resolution)| {
+                resolution.unwrap_or_else(|| queue::LegResolution::Failed {
+                    error: format!("invariant: leg {index} has no queue row"),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// One leg's records-artifact check — a GHCR manifest read on a
+/// `Succeeded` leg only, absent for every other outcome. The tag
+/// pins the publish job's `run_attempt` (§3.1).
+async fn leg_records_present(
+    ghcr: &crate::api::GhcrConfig,
+    batch: &queue::ReadyBatch,
+    leg: &queue::ReadyBatchLeg,
+    outcome: &stow_types::runs::LegOutcome,
+    run_id: u64,
+    pool: &crate::fetch_guard::OutboundPool,
+) -> std::result::Result<Option<u32>, crate::ghcr::FetchError> {
+    use skyzen_cloudflare::worker::send::IntoSendFuture as _;
+    let present = match outcome {
+        stow_types::runs::LegOutcome::Succeeded {
+            publish_attempt, ..
+        } => {
+            crate::ghcr::records_artifact_exists(
+                ghcr,
+                &batch.rustc_version,
+                &leg.task_id,
+                stow_types::records::BuildRun {
+                    run_id,
+                    run_attempt: *publish_attempt,
+                },
+                pool,
+            )
+            .into_send()
+            .await?
+        }
+        _ => false,
+    };
+    std::result::Result::Ok(present.then_some(leg.batch_leg))
+}
+
+/// A leg index as a slice index — `u32` fits `usize` on every stow
+/// target.
+fn index_to_usize(leg: u32) -> usize {
+    usize::try_from(leg).expect("u32 leg index fits usize")
+}
+
+/// The wall clock a pass reads — `Date::now()` returns whole
+/// milliseconds well below 2^53, so the value is exactly
+/// representable and always fits i64.
+fn now_ms() -> i64 {
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        js_sys::Date::now() as i64
+    }
 }
 
 /// The per-task `workflow_dispatch` fan-out over one resolved backend —
@@ -1505,11 +1783,7 @@ async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<
 /// The instant and settings every alarm plan is decided under — read
 /// once per pass so a route's plan and its arm see one clock.
 fn alarm_inputs(env: &WasmEnv) -> Result<(i64, SchedulerSettings)> {
-    // `Date::now()` returns whole milliseconds well below 2^53; the value is
-    // exactly representable and always fits i64.
-    #[allow(clippy::cast_possible_truncation)]
-    let now_ms = js_sys::Date::now() as i64;
-    Ok((now_ms, scheduler_settings(env)?))
+    Ok((now_ms(), scheduler_settings(env)?))
 }
 
 fn read_string_binding(env: &WasmEnv, binding_name: &str) -> Result<String> {

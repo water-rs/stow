@@ -25,6 +25,13 @@
 
 use std::future::Future;
 
+#[cfg(target_arch = "wasm32")]
+use crate::api::{GhcrConfig, OkResponse};
+use crate::errors::{GetArtifactError, SchedulerClientError};
+#[cfg(target_arch = "wasm32")]
+use crate::fetch_guard::OutboundPool;
+#[cfg(target_arch = "wasm32")]
+use crate::{ghcr, scheduler_client};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use skyzen::Request;
@@ -36,24 +43,10 @@ use skyzen::utils::State;
 use skyzen_cloudflare::CfDurableNamespace;
 #[cfg(target_arch = "wasm32")]
 use skyzen_cloudflare::worker::send::IntoSendFuture as _;
-use stow_types::api::{BatchId, BatchRunComplete};
 #[cfg(target_arch = "wasm32")]
 use stow_types::api::WorkflowRunComplete;
-#[cfg(target_arch = "wasm32")]
-use stow_types::identity::WireRustcVersion;
+use stow_types::api::{BatchId, BatchRunComplete};
 use stow_types::records::{parse_batch_run_title, parse_run_title};
-#[cfg(target_arch = "wasm32")]
-use stow_types::records::{RECORDS_ARTIFACT_TYPE, RECORDS_TASK_ID_ANNOTATION, records_tag};
-#[cfg(target_arch = "wasm32")]
-use stow_types::registry::cache_repository;
-
-#[cfg(target_arch = "wasm32")]
-use crate::api::{GhcrConfig, OkResponse};
-use crate::errors::{GetArtifactError, SchedulerClientError};
-#[cfg(target_arch = "wasm32")]
-use crate::fetch_guard::OutboundPool;
-#[cfg(target_arch = "wasm32")]
-use crate::{ghcr, scheduler_client};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -282,8 +275,7 @@ fn authorized_run(
             }
         }
         Some(stow_types::trusted_builder::BATCH_WORKFLOW_FILE) => {
-            let Some((rustc_version, batch_id)) = parse_batch_run_title(&run.display_title)
-            else {
+            let Some((rustc_version, batch_id)) = parse_batch_run_title(&run.display_title) else {
                 return Err(GetArtifactError::BadRequestWithMessage(format!(
                     "run {}'s display_title {:?} is not <rustc>-b<batch_id>",
                     run.id, run.display_title
@@ -474,13 +466,19 @@ async fn complete_build_task(
             run_id: run.id,
             run_attempt: run.run_attempt.get(),
         };
-        match records_artifact_exists(ghcr, rustc_version, task_id, build).await {
+        match ghcr::records_artifact_exists(
+            ghcr,
+            rustc_version,
+            task_id,
+            build,
+            &OutboundPool::new(),
+        )
+        .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 success = false;
-                error = Some(format!(
-                    "GitHub reports success but the records artifact for task {task_id} is not in GHCR"
-                ));
+                error = Some(stow_types::records::missing_records_error(task_id));
                 tracing::error!(task_id, "successful run produced no records artifact");
             }
             Err(fetch_error) => {
@@ -578,65 +576,6 @@ async fn update_request_run(
         }
     }
     Ok(())
-}
-
-/// Whether GHCR holds the records artifact this `build` of the task
-/// published — the tag names the run, so the check matches the artifact
-/// this run pushed and no other build's. The manifest's artifact type
-/// and task-id annotation must both match, so a tag pointing at anything
-/// else does not satisfy the check.
-#[cfg(target_arch = "wasm32")]
-async fn records_artifact_exists(
-    config: &GhcrConfig,
-    rustc_version: &str,
-    task_id: &str,
-    build: stow_types::records::BuildRun,
-) -> Result<bool, ghcr::FetchError> {
-    let rustc = WireRustcVersion::parse(rustc_version).map_err(|error| {
-        ghcr::FetchError::InvalidRequest(format!(
-            "malformed records rustc {rustc_version}: {error}"
-        ))
-    })?;
-    let tag = records_tag(rustc_version, task_id, build);
-    let repository = cache_repository(&rustc);
-    let response = ghcr::open_manifest(
-        &config.base_url,
-        repository.path(),
-        &tag,
-        &config.tokens,
-        &OutboundPool::new(),
-    )
-    .await;
-    let mut manifest = match response {
-        Ok(response) => response,
-        Err(ghcr::FetchError::NotFound) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let body =
-        manifest.text().into_send().await.map_err(|error| {
-            ghcr::FetchError::Network(format!("read records manifest: {error}"))
-        })?;
-    let manifest: serde_json::Value = serde_json::from_str(&body)
-        .map_err(|error| ghcr::FetchError::Network(format!("parse records manifest: {error}")))?;
-    let artifact_type_matches = manifest
-        .get("artifactType")
-        .and_then(|value| value.as_str())
-        == Some(RECORDS_ARTIFACT_TYPE);
-    let task_id_matches = manifest
-        .get("annotations")
-        .and_then(|annotations| annotations.get(RECORDS_TASK_ID_ANNOTATION))
-        .and_then(|value| value.as_str())
-        == Some(task_id);
-    if !(artifact_type_matches && task_id_matches) {
-        tracing::warn!(
-            task_id = %task_id,
-            artifact_type_matches,
-            task_id_matches,
-            "records tag exists but manifest shape does not match"
-        );
-        return Ok(false);
-    }
-    Ok(true)
 }
 
 #[cfg(test)]
@@ -940,14 +879,13 @@ mod tests {
                 ".github/workflows/{}",
                 stow_types::trusted_builder::BATCH_WORKFLOW_FILE
             ));
-            event["workflow_run"]["display_title"] = serde_json::json!(
-                stow_types::records::batch_run_title(
+            event["workflow_run"]["display_title"] =
+                serde_json::json!(stow_types::records::batch_run_title(
                     "1.99.0",
                     &"0123456789abcdef0123456789abcdef"
                         .parse::<BatchId>()
                         .expect("batch id")
-                )
-            );
+                ));
             over(event);
         })
     }
@@ -975,7 +913,9 @@ mod tests {
         assert_eq!(rustc_version, "1.99.0");
         assert_eq!(
             batch_id,
-            "0123456789abcdef0123456789abcdef".parse().expect("batch id")
+            "0123456789abcdef0123456789abcdef"
+                .parse()
+                .expect("batch id")
         );
         assert_eq!(run.id, 987_654_321_u64);
     }

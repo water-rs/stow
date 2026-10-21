@@ -3062,6 +3062,7 @@ async fn failed_build_retries_behind_its_backoff() {
             success: false,
             error: Some("boom".to_owned()),
             finished_at: None,
+            sample_ms: None,
             github_run_id: None,
         },
         TEST_WINDOW_MINUTES,
@@ -3177,6 +3178,7 @@ async fn human_rerequest_resurrects_completed_and_claims() {
             success: true,
             error: None,
             finished_at: None,
+            sample_ms: None,
             github_run_id: None,
         },
         TEST_WINDOW_MINUTES,
@@ -3781,6 +3783,7 @@ async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
             success: true,
             error: None,
             finished_at: None,
+            sample_ms: None,
             github_run_id: None,
         },
         TEST_WINDOW_MINUTES,
@@ -3807,6 +3810,7 @@ async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
             success: true,
             error: None,
             finished_at: None,
+            sample_ms: None,
             github_run_id: None,
         },
         TEST_WINDOW_MINUTES,
@@ -5020,6 +5024,7 @@ fn report(
         success,
         error: None,
         finished_at: None,
+        sample_ms: None,
         github_run_id: None,
     }
 }
@@ -5072,6 +5077,7 @@ async fn seed_failed_retry_cycle(db: &DurableDb, id: &str, cycle: &str) {
                 error: Some(format!("cycle-{cycle}-{attempt}")),
                 github_run_id: Some(format!("run-{cycle}-{attempt}")),
                 finished_at: None,
+                sample_ms: None,
             },
             TEST_WINDOW_MINUTES,
         )
@@ -5428,6 +5434,7 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
             success: false,
             error: Some("cycle A".to_owned()),
             finished_at: None,
+            sample_ms: None,
             github_run_id: Some("run-a".to_owned()),
         },
         TEST_WINDOW_MINUTES,
@@ -5460,6 +5467,7 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
             success: false,
             error: Some("cycle B".to_owned()),
             finished_at: None,
+            sample_ms: None,
             github_run_id: Some("run-b".to_owned()),
         },
         TEST_WINDOW_MINUTES,
@@ -5736,6 +5744,421 @@ async fn an_early_batch_completion_is_held_before_the_binding() {
     assert_eq!(row.done_attempt, Some(1));
     assert_eq!(row.conclusion.as_deref(), Some("success"));
     assert!(row.resolve_after.is_some());
+}
+
+/// A bound, completed batch — `github_run_id` set and the `done_*`
+/// fields written — with `resolve_after` where the caller wants it.
+async fn seed_ready_batch(
+    db: &DurableDb,
+    batch_id: &str,
+    run_id: &str,
+    conclusion: &str,
+    resolve_after: &str,
+) {
+    db.query(
+        "INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              github_run_id, done_run_id, done_attempt, conclusion, done_at, \
+              resolve_after, claimed_at, lease_at) \
+         VALUES (?, ?, 'linux', 'miss', 5, 2, ?, ?, 1, ?, ?, ?, ?, ?)",
+    )
+    .bind(batch_id.to_owned())
+    .bind(RUSTC)
+    .bind(run_id.to_owned())
+    .bind(run_id.to_owned())
+    .bind(conclusion.to_owned())
+    .bind(ROW_TS)
+    .bind(resolve_after.to_owned())
+    .bind(ROW_TS)
+    .bind(ROW_TS)
+    .execute()
+    .await
+    .expect("seed ready build_batches row");
+}
+
+/// Bind a claimed row to a batch leg — the claim pass does not write
+/// `batch_id`/`batch_leg` yet (the wiring is a later stage of
+/// stow#833), so tests seed the columns directly.
+async fn bind_leg(db: &DurableDb, task_id: &str, batch_id: &str, batch_leg: i64) {
+    db.query("UPDATE queue SET batch_id = ?, batch_leg = ? WHERE task_id = ?")
+        .bind(batch_id.to_owned())
+        .bind(batch_leg)
+        .bind(task_id.to_owned())
+        .execute()
+        .await
+        .expect("bind leg");
+}
+
+/// Enqueue every name and claim the lot — `settings()`'s ten slots
+/// take them all once `first_requested_at` clears the age gate.
+async fn claim_tasks(db: &DurableDb, names: &[&str]) -> Vec<super::QueuedTask> {
+    let requests: Vec<EnqueueRequest> = names.iter().map(|name| request(name, &[])).collect();
+    enqueue(db, &requests).await.expect("enqueue legs");
+    for name in names {
+        set_first_requested_at(db, name, PAST_TS).await;
+    }
+    super::claim_dispatchable_tasks(db, &settings(), &NoCoverage)
+        .await
+        .expect("claim legs")
+}
+
+/// The claim's `QueuedTask` for one crate — claim order follows the
+/// dispatch key, so tests bind legs by name, never position.
+fn claimed_task<'a>(claimed: &'a [super::QueuedTask], crate_name: &str) -> &'a super::QueuedTask {
+    claimed
+        .iter()
+        .find(|task| task.crate_name == crate_name)
+        .expect("task was claimed")
+}
+
+/// §3.2: `ready_batches` surfaces a batch once its completion is
+/// bound to the dispatched run and due — an early completion still
+/// waiting on the dispatch response's binding and a batch deferred
+/// past `now` stay out — and legs come back in `batch_leg` wire
+/// order, not claim order.
+#[tokio::test]
+async fn ready_batches_surfaces_only_bound_due_batches() {
+    let db = memory_db().await.expect("memory db");
+    let ready = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let unbound = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let deferred = "cccccccccccccccccccccccccccccccc";
+    seed_ready_batch(&db, ready, "4242", "success", PAST_TS).await;
+    // A completion held ahead of the binding — `done_run_id` set,
+    // `github_run_id` NULL — is not resolvable.
+    seed_build_batch(&db, unbound, None).await;
+    super::record_batch_completion(&db, unbound, &batch_run_complete(9001, 1, "success"))
+        .await
+        .expect("held completion");
+    // Bound and done, but deferred past `now`.
+    seed_ready_batch(&db, deferred, "5555", "success", "2099-01-01 00:00:00").await;
+
+    let claimed = claim_tasks(&db, &["legged-a", "legged-b"]).await;
+    bind_leg(&db, &claimed_task(&claimed, "legged-a").task_id, ready, 1).await;
+    bind_leg(&db, &claimed_task(&claimed, "legged-b").task_id, ready, 0).await;
+
+    let batches = super::ready_batches(&db, ROW_TS_MS)
+        .await
+        .expect("ready batches");
+    assert_eq!(batches.len(), 1, "only the bound due batch resolves");
+    let batch = &batches[0];
+    assert_eq!(batch.batch_id, ready);
+    assert_eq!(batch.run_id, "4242");
+    assert_eq!(batch.done_attempt, 1);
+    assert_eq!(batch.conclusion, "success");
+    let legs = &batch.legs;
+    assert_eq!(legs.len(), 2);
+    let (b, a) = (
+        claimed_task(&claimed, "legged-b"),
+        claimed_task(&claimed, "legged-a"),
+    );
+    assert_eq!(legs[0].batch_leg, 0);
+    assert_eq!(legs[0].task_id, b.task_id);
+    assert_eq!(legs[0].generation_id, b.generation_id);
+    assert_eq!(legs[0].attempt, b.attempt);
+    assert_eq!(legs[1].batch_leg, 1);
+    assert_eq!(legs[1].task_id, a.task_id);
+}
+
+/// §3.2/§4.1: every settled leg applies through `complete`'s own
+/// contract — a success lands `completed` with the batch's run id,
+/// a failure under `MAX_BUILD_ATTEMPTS` requeues behind backoff with
+/// `attempt` bumped and its error evidence recorded — and resolving
+/// deletes the batch row, which is what releases its slots.
+#[tokio::test]
+async fn a_resolved_batch_applies_each_leg_and_releases_its_row() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = "dddddddddddddddddddddddddddddddd";
+    seed_ready_batch(&db, batch_id, "7777", "failure", PAST_TS).await;
+    let claimed = claim_tasks(&db, &["leg-ok", "leg-bad"]).await;
+    bind_leg(&db, &claimed_task(&claimed, "leg-ok").task_id, batch_id, 0).await;
+    bind_leg(&db, &claimed_task(&claimed, "leg-bad").task_id, batch_id, 1).await;
+
+    let any_failure = super::resolve_batch(
+        &db,
+        &settings(),
+        batch_id,
+        &[
+            super::LegResolution::Succeeded {
+                duration_ms: 123_456,
+            },
+            super::LegResolution::Failed {
+                error: "verdict: leg 1 / Run the untrusted build stage (u)".to_owned(),
+            },
+        ],
+        TEST_WINDOW_MINUTES,
+    )
+    .await
+    .expect("resolve");
+    assert!(any_failure, "one failed leg reports failure");
+
+    assert_eq!(row_column(&db, "leg-ok", "status").await, "completed");
+    assert_eq!(row_column(&db, "leg-ok", "github_run_id").await, "7777");
+    assert_eq!(row_column(&db, "leg-bad", "status").await, "pending");
+    assert_eq!(
+        row_column(&db, "leg-bad", "CAST(attempt AS TEXT)").await,
+        "2"
+    );
+    assert_eq!(
+        row_column(&db, "leg-bad", "error_msg").await,
+        "verdict: leg 1 / Run the untrusted build stage (u)"
+    );
+    // The breaker's evidence carries the failure's class — its first line.
+    assert_eq!(
+        db.query("SELECT failure_class FROM attempt_outcomes_v2")
+            .fetch_scalar::<String>()
+            .await
+            .expect("outcome evidence"),
+        "verdict: leg 1 / Run the untrusted build stage (u)"
+    );
+    // The batch row is gone — the only release of its slots.
+    assert!(
+        build_batch(&db, batch_id).await.is_none(),
+        "resolving deletes the batch row"
+    );
+}
+
+/// §4.2: a leg whose queue row moved on — here cancelled back to
+/// `pending` while still bound to the batch — is refused by
+/// `complete`'s generation/status fence and ignored, never an error:
+/// the batch resolves on its other legs and its row still deletes. A
+/// fenced-off failure counts for nothing toward the caller's
+/// once-per-batch breaker gate.
+#[tokio::test]
+async fn a_stale_leg_is_ignored_by_the_generation_fence() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    seed_ready_batch(&db, batch_id, "8888", "failure", PAST_TS).await;
+    let claimed = claim_tasks(&db, &["live-leg", "dead-leg"]).await;
+    bind_leg(
+        &db,
+        &claimed_task(&claimed, "live-leg").task_id,
+        batch_id,
+        0,
+    )
+    .await;
+    bind_leg(
+        &db,
+        &claimed_task(&claimed, "dead-leg").task_id,
+        batch_id,
+        1,
+    )
+    .await;
+    // The row is cancelled between the jobs-page read and the apply:
+    // still bound to the batch, no longer in flight.
+    db.query("UPDATE queue SET status = 'pending' WHERE task_id = ?")
+        .bind(claimed_task(&claimed, "dead-leg").task_id.clone())
+        .execute()
+        .await
+        .expect("cancel the leg's row");
+
+    let any_failure = super::resolve_batch(
+        &db,
+        &settings(),
+        batch_id,
+        &[
+            super::LegResolution::Succeeded {
+                duration_ms: 60_000,
+            },
+            super::LegResolution::Failed {
+                error: "infrastructure: leg 1 / - (u)".to_owned(),
+            },
+        ],
+        TEST_WINDOW_MINUTES,
+    )
+    .await
+    .expect("resolve");
+    assert!(!any_failure, "a fenced-off leg applied nothing");
+    assert_eq!(row_column(&db, "live-leg", "status").await, "completed");
+    assert_eq!(
+        db.query(
+            "SELECT COALESCE(error_msg, '<untouched>') FROM queue WHERE crate_name = 'dead-leg'"
+        )
+        .fetch_scalar::<String>()
+        .await
+        .expect("dead leg row"),
+        "<untouched>",
+        "the stale leg's row is untouched"
+    );
+    assert!(build_batch(&db, batch_id).await.is_none());
+}
+
+/// §4.1: a batch leg's build sample is its runner time — the leg's
+/// own two jobs, measured on GitHub's clock — never
+/// claim-to-completion across the batch's rounds; `claimed_at` stays
+/// only for the lease.
+#[tokio::test]
+async fn a_batch_leg_samples_its_runner_time() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = "ffffffffffffffffffffffffffffffff";
+    seed_ready_batch(&db, batch_id, "9999", "success", PAST_TS).await;
+    let claimed = claim_tasks(&db, &["timed-leg"]).await;
+    let leg = claimed_task(&claimed, "timed-leg");
+    bind_leg(&db, &leg.task_id, batch_id, 0).await;
+    // Push the claim stamp far into the past: a claim-to-completion
+    // sample would land years, so an exact runner-time value proves
+    // which duration was measured.
+    db.query("UPDATE queue SET claimed_at = '2020-01-01 00:00:00' WHERE task_id = ?")
+        .bind(leg.task_id.clone())
+        .execute()
+        .await
+        .expect("age the claim stamp");
+
+    let any_failure = super::resolve_batch(
+        &db,
+        &settings(),
+        batch_id,
+        &[super::LegResolution::Succeeded {
+            duration_ms: 123_456,
+        }],
+        TEST_WINDOW_MINUTES,
+    )
+    .await
+    .expect("resolve");
+    assert!(!any_failure);
+    assert_eq!(
+        db.query("SELECT duration_ms FROM crate_build_samples WHERE crate_name = 'timed-leg'")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("sample"),
+        123_456,
+        "the sample is the leg's runner time"
+    );
+}
+
+/// §3.2: an unsettled leg defers the whole batch — `defer_batch`
+/// pushes `resolve_after`, and `ready_batches` leaves the batch alone
+/// until it is due again.
+#[tokio::test]
+async fn defer_batch_pushes_resolution_out() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = "12121212121212121212121212121212";
+    seed_ready_batch(&db, batch_id, "3131", "failure", PAST_TS).await;
+    super::defer_batch(&db, batch_id, ROW_TS_MS + 30_000)
+        .await
+        .expect("defer");
+    assert!(
+        super::ready_batches(&db, ROW_TS_MS)
+            .await
+            .expect("ready batches")
+            .is_empty(),
+        "a deferred batch is not ready"
+    );
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert_eq!(
+        row.resolve_after.as_deref(),
+        Some("2026-01-01 00:00:30"),
+        "resolve_after moved thirty seconds out"
+    );
+    assert!(
+        super::ready_batches(&db, ROW_TS_MS + 30_000)
+            .await
+            .expect("ready batches")
+            .iter()
+            .any(|batch| batch.batch_id == batch_id),
+        "the batch is ready once due"
+    );
+}
+
+/// §4.1's whole table: every `LegOutcome` shape maps to its queue
+/// resolution — runner-time success, the records-absent failure
+/// (the webhook's own wording), the three `RunFailure` texts,
+/// `Concluded`, `Invariant`, `startup_failure` — and `Unsettled`
+/// maps to no resolution at all.
+#[test]
+fn the_leg_resolution_maps_every_outcome_row() {
+    use stow_types::runs::{LegFailure, LegOutcome, RunFailure};
+    use time::OffsetDateTime;
+
+    let succeeded = LegOutcome::Succeeded {
+        started_at: OffsetDateTime::from_unix_timestamp(999_900).expect("ts"),
+        completed_at: OffsetDateTime::from_unix_timestamp(1_000_000).expect("ts"),
+        publish_attempt: 1,
+    };
+    assert_eq!(
+        super::leg_resolution(&succeeded, true, "task-abc", "run-url"),
+        Some(super::LegResolution::Succeeded {
+            duration_ms: 100_000
+        }),
+        "a confirmed success samples its runner time"
+    );
+    assert_eq!(
+        super::leg_resolution(&succeeded, false, "task-abc", "run-url"),
+        Some(super::LegResolution::Failed {
+            error:
+                "GitHub reports success but the records artifact for task task-abc is not in GHCR"
+                    .to_owned()
+        }),
+        "records absent is the webhook's own wording"
+    );
+
+    let url = "https://github.com/water-rs/stow/actions/runs/1/job/7";
+    let cases: [(LegOutcome, &str); 6] = [
+        (
+            LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict {
+                job: "leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h".to_owned(),
+                step: "Run the untrusted build stage".to_owned(),
+                html_url: url.to_owned(),
+            })),
+            "verdict: leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h / Run the untrusted build stage (https://github.com/water-rs/stow/actions/runs/1/job/7)",
+        ),
+        (
+            LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure {
+                job: "leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h".to_owned(),
+                step: Some("Set up the runner".to_owned()),
+                html_url: url.to_owned(),
+            })),
+            "infrastructure: leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h / Set up the runner (https://github.com/water-rs/stow/actions/runs/1/job/7)",
+        ),
+        (
+            LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure {
+                job: "leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h".to_owned(),
+                step: None,
+                html_url: url.to_owned(),
+            })),
+            "infrastructure: leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h / - (https://github.com/water-rs/stow/actions/runs/1/job/7)",
+        ),
+        (
+            LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure {
+                job: "-".to_owned(),
+                step: None,
+                html_url: String::new(),
+            })),
+            "infrastructure: startup_failure (https://github.com/water-rs/stow/actions/runs/9)",
+        ),
+        (
+            LegOutcome::Failed(LegFailure::Concluded {
+                job: "leg 1 / publish #1 h".to_owned(),
+                conclusion: "cancelled".to_owned(),
+                html_url: url.to_owned(),
+            }),
+            "cancelled: leg 1 / publish #1 h (https://github.com/water-rs/stow/actions/runs/1/job/7)",
+        ),
+        (
+            LegOutcome::Failed(LegFailure::Invariant(
+                "leg 0 has no jobs on the page".to_owned(),
+            )),
+            "invariant: leg 0 has no jobs on the page",
+        ),
+    ];
+    for (outcome, expected) in cases {
+        assert_eq!(
+            super::leg_resolution(
+                &outcome,
+                true,
+                "task",
+                "https://github.com/water-rs/stow/actions/runs/9"
+            ),
+            Some(super::LegResolution::Failed {
+                error: expected.to_owned()
+            }),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(
+        super::leg_resolution(&LegOutcome::Unsettled, false, "task", "run-url"),
+        None,
+        "unsettled is no resolution yet"
+    );
 }
 
 /// A `pending` count at or above `max_queue_pending` turns miss-lane
@@ -7276,6 +7699,7 @@ async fn a_completion_reads_a_constant_row_count_as_the_window_fills() {
                 success: false,
                 error: Some("boom".to_owned()),
                 finished_at: None,
+                sample_ms: None,
                 github_run_id: Some("run-live".to_owned()),
             },
             TEST_WINDOW_MINUTES,
@@ -7322,6 +7746,7 @@ async fn outcome_bucket_stays_aligned_under_the_do_binding() {
             success: true,
             error: None,
             finished_at: None,
+            sample_ms: None,
             github_run_id: None,
         },
         "gen-aligned",
@@ -7824,11 +8249,10 @@ async fn deferred_completion_measures_duration_at_received_at() {
     );
 }
 
-/// A measured claim-to-completion span is nonnegative by
-/// construction; a report whose finish precedes its claim (skewed
-/// `finished_at`, a future `claimed_at`) must fail the sample
-/// insert through the column's `CHECK (duration_ms >= 0)` — the
-/// span is never clamped into a bogus zero. The failed statement
+/// A measured span is nonnegative by construction; a report carrying
+/// a negative duration must fail the sample insert through the
+/// column's `CHECK (duration_ms >= 0)` — the span is never clamped
+/// into a bogus zero. The failed statement
 /// must leave no trace: no sample, no stats row, no median and no
 /// key refresh off it. A legitimately zero-length span (sub-ms
 /// build) still records and floors its median to the 1ms unit.
@@ -7847,12 +8271,12 @@ async fn backward_completion_span_fails_without_polluting_stats() {
         error: None,
         github_run_id: Some("run-skew".to_owned()),
         finished_at: Some(ROW_TS.to_owned()),
+        sample_ms: None,
     };
-    // Claim stamped after the reported finish — a negative span.
-    let error =
-        super::record_build_sample(&db, &report, "skewed", TARGET, Some("2099-01-01 00:00:00"))
-            .await
-            .expect_err("negative measured span fails");
+    // A skewed clock measured a negative span.
+    let error = super::record_build_sample(&db, &report, "skewed", TARGET, -1)
+        .await
+        .expect_err("negative measured span fails");
     assert!(
         error.to_string().contains("record build sample"),
         "statement error, not a silent write: {error}"
@@ -7869,11 +8293,7 @@ async fn backward_completion_span_fails_without_polluting_stats() {
 
     // The legitimate zero-length span records and floors to the
     // 1ms unit at the stats write.
-    let same = super::BuildCompleteReport {
-        finished_at: Some(ROW_TS.to_owned()),
-        ..report
-    };
-    super::record_build_sample(&db, &same, "skewed", TARGET, Some(ROW_TS))
+    super::record_build_sample(&db, &report, "skewed", TARGET, 0)
         .await
         .expect("zero-length span records");
     let median = db
@@ -8380,10 +8800,11 @@ async fn refreshed_scores_price_their_own_crate_target() {
             error: None,
             github_run_id: None,
             finished_at: None,
+            sample_ms: None,
         },
         "cheap",
         TARGET,
-        Some("2025-01-01 00:00:00"),
+        90_000,
     )
     .await
     .expect("cost move sample");

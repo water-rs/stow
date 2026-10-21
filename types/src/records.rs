@@ -217,6 +217,17 @@ pub fn is_records_tag(tag: &str) -> bool {
     tag.starts_with(RECORDS_TAG_PREFIX)
 }
 
+/// The failure a `success`-concluded build earns when its records
+/// artifact is not in GHCR.
+///
+/// The claim is not the record, so a task is done only once the
+/// artifact exists (stow#655). The webhook's per-task path and a
+/// batch leg's resolution report the wording verbatim (stow#833 §4.1).
+#[must_use]
+pub fn missing_records_error(task_id: &str) -> String {
+    format!("GitHub reports success but the records artifact for task {task_id} is not in GHCR")
+}
+
 /// One record as one index row. A record always carries its pushed
 /// bundle's digest — the publish writes it — so every record maps.
 #[must_use]

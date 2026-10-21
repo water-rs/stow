@@ -9,9 +9,7 @@
 
 use std::collections::HashMap;
 
-use stow_types::api::{
-    BatchEncoder, BatchFit, BatchId, BuildTaskPayload, RunnerFamily, TaskLane,
-};
+use stow_types::api::{BatchEncoder, BatchFit, BatchId, BuildTaskPayload, RunnerFamily, TaskLane};
 use stow_types::identity::WireRustcVersion;
 
 use crate::errors::QueueError;
@@ -146,8 +144,7 @@ pub fn form_batches(
     batch_max_tasks: u32,
     batch_ids: &mut impl Iterator<Item = BatchId>,
 ) -> Result<BatchFormation, QueueError> {
-    let max_legs =
-        usize::try_from(batch_max_tasks).expect("u32 fits usize on every stow target");
+    let max_legs = usize::try_from(batch_max_tasks).expect("u32 fits usize on every stow target");
     let mut free: HashMap<RunnerFamily, u32> = free_slots.clone();
     let mut open: Vec<OpenBatch> = Vec::new();
     let mut batches = Vec::new();
@@ -222,11 +219,7 @@ pub fn form_batches(
                             continue 'assign;
                         }
                         Ok(BatchFit::Fits) => {
-                            batches.push(close(
-                                open.swap_remove(position),
-                                candidates,
-                                &mut free,
-                            )?);
+                            batches.push(close(open.swap_remove(position), candidates, &mut free)?);
                         }
                         // An empty batch's push can only err — `Full`
                         // is unreachable by `push`'s contract.
@@ -294,9 +287,12 @@ fn open_batch(
             "batch id supply exhausted mid-formation".to_owned(),
         ));
     };
-    let mut encoder =
-        BatchEncoder::new(batch_id.clone(), candidate.payload.rustc_version.clone(), bound)
-            .map_err(|error| QueueError::Invariant(error.to_string()))?;
+    let mut encoder = BatchEncoder::new(
+        batch_id.clone(),
+        candidate.payload.rustc_version.clone(),
+        bound,
+    )
+    .map_err(|error| QueueError::Invariant(error.to_string()))?;
     match encoder.push(&candidate.payload) {
         Ok(BatchFit::Fits) => {}
         // An empty batch's push can only err — `Full` is unreachable
@@ -393,10 +389,10 @@ mod tests {
         BatchCandidate, BatchId, BuildTaskPayload, QueuedTask, RunnerFamily, TaskLane,
         WireRustcVersion, form_batches,
     };
+    use std::collections::HashMap;
     use stow_types::api::TaskSubgraph;
     use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple};
     use stow_types::public_cache::ExplicitSpelling;
-    use std::collections::HashMap;
 
     /// A minimal dep-free payload; `size` pads `task_id` for
     /// capacity tests.
@@ -454,7 +450,14 @@ mod tests {
     }
 
     fn linux(name: &str, median_ms: Option<i64>) -> BatchCandidate {
-        candidate(name, TaskLane::Miss, RunnerFamily::Linux, median_ms, 0, "1.91.0")
+        candidate(
+            name,
+            TaskLane::Miss,
+            RunnerFamily::Linux,
+            median_ms,
+            0,
+            "1.91.0",
+        )
     }
 
     /// A deterministic id supply: `0000…0001`, `0000…0002`, …
@@ -514,7 +517,14 @@ mod tests {
         // `b` fits an empty batch (task_id ~64.5k) but not after `a`'s
         // ~2.5k of framing and leg; `c` then joins `b`'s batch.
         let candidates = vec![
-            candidate("a", TaskLane::Miss, RunnerFamily::Linux, Some(1), 2_000, "1.91.0"),
+            candidate(
+                "a",
+                TaskLane::Miss,
+                RunnerFamily::Linux,
+                Some(1),
+                2_000,
+                "1.91.0",
+            ),
             candidate(
                 "b",
                 TaskLane::Miss,
@@ -555,9 +565,23 @@ mod tests {
     #[test]
     fn a_batch_opens_only_with_a_free_family_slot() {
         let candidates = vec![
-            candidate("l1", TaskLane::Miss, RunnerFamily::Linux, Some(1), 0, "1.90.0"),
+            candidate(
+                "l1",
+                TaskLane::Miss,
+                RunnerFamily::Linux,
+                Some(1),
+                0,
+                "1.90.0",
+            ),
             linux("l2", Some(1)),
-            candidate("m1", TaskLane::Miss, RunnerFamily::MacOs, Some(1), 0, "1.91.0"),
+            candidate(
+                "m1",
+                TaskLane::Miss,
+                RunnerFamily::MacOs,
+                Some(1),
+                0,
+                "1.91.0",
+            ),
         ];
         let formation = form_batches(
             &candidates,
@@ -581,7 +605,14 @@ mod tests {
     fn human_and_miss_never_share_a_batch() {
         let candidates = vec![
             linux("miss", Some(1)),
-            candidate("human", TaskLane::Human, RunnerFamily::Linux, Some(1), 0, "1.91.0"),
+            candidate(
+                "human",
+                TaskLane::Human,
+                RunnerFamily::Linux,
+                Some(1),
+                0,
+                "1.91.0",
+            ),
         ];
         let formation = form_batches(
             &candidates,
@@ -679,9 +710,30 @@ mod tests {
     #[test]
     fn human_parallelism_is_min_legs_free() {
         let candidates = vec![
-            candidate("h1", TaskLane::Human, RunnerFamily::Linux, Some(1), 0, "1.91.0"),
-            candidate("h2", TaskLane::Human, RunnerFamily::Linux, Some(1), 0, "1.91.0"),
-            candidate("h3", TaskLane::Human, RunnerFamily::Linux, Some(1), 0, "1.91.0"),
+            candidate(
+                "h1",
+                TaskLane::Human,
+                RunnerFamily::Linux,
+                Some(1),
+                0,
+                "1.91.0",
+            ),
+            candidate(
+                "h2",
+                TaskLane::Human,
+                RunnerFamily::Linux,
+                Some(1),
+                0,
+                "1.91.0",
+            ),
+            candidate(
+                "h3",
+                TaskLane::Human,
+                RunnerFamily::Linux,
+                Some(1),
+                0,
+                "1.91.0",
+            ),
         ];
         let formation = form_batches(
             &candidates,
@@ -704,8 +756,22 @@ mod tests {
     fn the_batch_key_is_rustc_family_lane() {
         let candidates = vec![
             linux("a", Some(1)),
-            candidate("b", TaskLane::Miss, RunnerFamily::Linux, Some(1), 0, "1.90.0"),
-            candidate("c", TaskLane::Miss, RunnerFamily::MacOs, Some(1), 0, "1.91.0"),
+            candidate(
+                "b",
+                TaskLane::Miss,
+                RunnerFamily::Linux,
+                Some(1),
+                0,
+                "1.90.0",
+            ),
+            candidate(
+                "c",
+                TaskLane::Miss,
+                RunnerFamily::MacOs,
+                Some(1),
+                0,
+                "1.91.0",
+            ),
         ];
         let formation = form_batches(
             &candidates,
@@ -752,10 +818,7 @@ mod tests {
     /// `tasks` reports them — leg `i` in the wire is `tasks[i]`.
     #[test]
     fn the_wire_order_matches_the_leg_list() {
-        let candidates = vec![
-            linux("fast", Some(100)),
-            linux("slow", Some(900)),
-        ];
+        let candidates = vec![linux("fast", Some(100)), linux("slow", Some(900))];
         let formation = form_batches(
             &candidates,
             &free(&[(RunnerFamily::Linux, 9)]),

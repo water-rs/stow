@@ -65,6 +65,8 @@ pub enum RunFailure {
         job: String,
         /// The failed `VERDICT_STEPS` step's name.
         step: String,
+        /// The failed job's Actions URL.
+        html_url: String,
     },
     /// Runner infrastructure failed, not the crate.
     Infrastructure {
@@ -75,6 +77,9 @@ pub enum RunFailure {
         /// Its first failed step — `None` when the runner was lost
         /// before any step ran (a cancelled setup, a dropped runner).
         step: Option<String>,
+        /// The failed job's Actions URL — empty when `job` is `"-"`:
+        /// a run with no job at all has no job URL to carry.
+        html_url: String,
     },
 }
 
@@ -127,6 +132,7 @@ pub fn classify_failure(
         return Ok(Some(RunFailure::Infrastructure {
             job: "-".to_owned(),
             step: None,
+            html_url: String::new(),
         }));
     };
     if let Some(step) = job.steps.iter().find(|step| !row_completed(&step.status)) {
@@ -142,6 +148,7 @@ pub fn classify_failure(
         return Ok(Some(RunFailure::Infrastructure {
             job: job.name.clone(),
             step: Some(step.name.clone()),
+            html_url: job.html_url.clone(),
         }));
     }
     let Some(step) = job
@@ -152,17 +159,20 @@ pub fn classify_failure(
         return Ok(Some(RunFailure::Infrastructure {
             job: job.name.clone(),
             step: None,
+            html_url: job.html_url.clone(),
         }));
     };
     if VERDICT_STEPS.contains(&step.name.as_str()) {
         Ok(Some(RunFailure::Verdict {
             job: job.name.clone(),
             step: step.name.clone(),
+            html_url: job.html_url.clone(),
         }))
     } else {
         Ok(Some(RunFailure::Infrastructure {
             job: job.name.clone(),
             step: Some(step.name.clone()),
+            html_url: job.html_url.clone(),
         }))
     }
 }
@@ -247,6 +257,19 @@ pub struct RunStatus {
     pub run_attempt: u32,
     /// The run's Actions URL — the leg failure's pointer back to it.
     pub html_url: String,
+}
+
+/// A run's Actions URL on the trusted repository.
+///
+/// The pointer a leg failure carries back to its run when the jobs
+/// page holds no job to ask (a `startup_failure` run has no jobs).
+/// GitHub's `html_url` for a run is exactly this shape.
+#[must_use]
+pub fn run_url(run_id: &str) -> String {
+    format!(
+        "https://github.com/{}/actions/runs/{run_id}",
+        crate::trusted_builder::REPOSITORY
+    )
 }
 
 /// The `rel="next"` target of an RFC 8288 `Link` header — the
@@ -433,6 +456,7 @@ pub fn classify_legs(
                 LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure {
                     job: "-".to_owned(),
                     step: None,
+                    html_url: String::new(),
                 }))
             })
             .collect());
@@ -643,7 +667,7 @@ mod tests {
             Some(1_000_000),
             &[(TOOLCHAIN_STEP, "completed", Some("failure"))],
         )];
-        let Ok(Some(RunFailure::Infrastructure { job, step })) =
+        let Ok(Some(RunFailure::Infrastructure { job, step, .. })) =
             classify_failure(&jobs, at(1_000_100))
         else {
             panic!("a toolchain-install failure is infrastructure");
@@ -750,7 +774,7 @@ mod tests {
                 ],
             ),
         ];
-        let Ok(Some(RunFailure::Infrastructure { job, step })) =
+        let Ok(Some(RunFailure::Infrastructure { job, step, .. })) =
             classify_failure(&jobs, at(1_000_000))
         else {
             panic!("a lost runner is infrastructure");
@@ -984,14 +1008,20 @@ mod tests {
         );
         let outcomes =
             classify_legs(&[leg_hash(0)], "failure", &jobs, at(1_000)).expect("classified");
-        assert!(
-            matches!(
-                outcomes[0],
-                LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { .. }))
-            ),
-            "{:?}",
-            outcomes[0]
-        );
+        let LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict {
+            job,
+            step,
+            html_url,
+        })) = &outcomes[0]
+        else {
+            panic!(
+                "a verdict-step failure is the crate's verdict, got {:?}",
+                outcomes[0]
+            );
+        };
+        assert_eq!(job, &jobs[0].name);
+        assert_eq!(step, "Run the untrusted build stage");
+        assert_eq!(html_url, &jobs[0].html_url);
     }
 
     /// §4.1: a failure outside `VERDICT_STEPS` is infrastructure.
@@ -1096,10 +1126,12 @@ mod tests {
                 LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure {
                     job: "-".to_owned(),
                     step: None,
+                    html_url: String::new(),
                 })),
                 LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure {
                     job: "-".to_owned(),
                     step: None,
+                    html_url: String::new(),
                 })),
             ]
         );
@@ -1178,8 +1210,7 @@ mod tests {
              <https://api.github.com/x?page=9>; rel=\"last\""
         );
         assert_eq!(super::link_next(Some(&middle)), Some(next));
-        let last =
-            "<https://api.github.com/x?page=1>; rel=\"prev\", <https://api.github.com/x>; rel=\"first\"";
+        let last = "<https://api.github.com/x?page=1>; rel=\"prev\", <https://api.github.com/x>; rel=\"first\"";
         assert_eq!(super::link_next(Some(last)), None);
         assert_eq!(super::link_next(None), None);
         assert_eq!(super::link_next(Some("")), None);
