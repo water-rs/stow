@@ -44,10 +44,10 @@ pub const REPOSITORY: &str = repository!();
 pub const WORKFLOW_FILE: &str = workflow_file!();
 /// The `name:` the trusted workflow declares.
 ///
-/// GitHub shows it as a run's `display_title` until it has rendered the
-/// workflow's `run-name`, so a reader that meets it is looking at a run
-/// whose title is not known yet, not at another workflow's run
-/// (stow#704).
+/// `build-crate.yml` is `workflow_call`-only, so GitHub never lists a
+/// run under this name; the constant pins the file's `name:` line. The
+/// "title not rendered yet" case a reader can meet is a batch run's —
+/// see [`BATCH_WORKFLOW_NAME`].
 pub const WORKFLOW_NAME: &str = "build-crate";
 /// Workflow file that carries a batch of build tasks (stow#833).
 ///
@@ -57,9 +57,10 @@ pub const WORKFLOW_NAME: &str = "build-crate";
 pub const BATCH_WORKFLOW_FILE: &str = batch_workflow_file!();
 /// The `name:` the batch workflow declares.
 ///
-/// Same "title not rendered yet" rule as [`WORKFLOW_NAME`] (stow#704):
-/// until GitHub renders the run's `run-name` a batch run's
-/// `display_title` is this name, not another workflow's.
+/// GitHub shows it as a run's `display_title` until it has rendered the
+/// workflow's `run-name`, so a reader that meets it is looking at a run
+/// whose title is not known yet, not at another workflow's run
+/// (stow#704).
 pub const BATCH_WORKFLOW_NAME: &str = "build-batch";
 /// Branch the trusted workflow runs from. `workflow_dispatch` takes the bare
 /// branch name; the certificate subject carries the full ref.

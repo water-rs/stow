@@ -901,13 +901,13 @@ fn index_publish_cron() -> serde_yml::Value {
 #[test]
 fn index_publish_declarations() {
     let wf = index_publish_cron();
-    // Fires on a completed build-crate run, on the backstop schedule,
+    // Fires on a completed build-batch run, on the backstop schedule,
     // and manually.
     assert_eq!(
         at(&wf, "on.workflow_run.workflows")
             .and_then(|s| s.as_sequence())
             .map(|s| s.iter().map(scalar).collect::<Vec<_>>()),
-        Some(vec!["build-crate".to_owned()])
+        Some(vec!["build-batch".to_owned()])
     );
     assert_eq!(
         at(&wf, "on.workflow_run.types")
@@ -995,7 +995,7 @@ fn index_publish_completion_forwards_title_rustc() {
     assert_eq!(
         fields.get("rustc_version").map(String::as_str),
         Some("1.98.1"),
-        "the `<rustc>-<task_id>` run title's rustc prefix"
+        "the `<rustc>-b<batch_id>` run title's rustc prefix"
     );
     assert_eq!(fields.len(), 2, "{fields:?}");
     // Nothing probed the URL — `gh` was the only outbound tool.
@@ -1031,9 +1031,9 @@ fn index_publish_schedule_and_manual_carry_no_rustc() {
 
 #[test]
 fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
-    // `${RUN_TITLE%%-*}` trims at the FIRST dash — a task id that is
-    // itself dashed (`1.99.0-beta-…` never occurs, but any suffix at
-    // all) must not bleed into the forwarded rustc.
+    // `${RUN_TITLE%%-*}` trims at the FIRST dash — the `<rustc>-b<batch_id>`
+    // title's hex suffix never dashes, but any suffix at all must not
+    // bleed into the forwarded rustc.
     let scn = Scenario::new();
     let runner = index_runner(&scn, "workflow_run", Some("1.99.0-task-9f8e7d-extra"));
     assert_eq!(
@@ -1045,6 +1045,179 @@ fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
     assert_eq!(
         fields.get("rustc_version").map(String::as_str),
         Some("1.99.0")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// build-batch.yml / build-crate.yml (stow#833)
+// ---------------------------------------------------------------------------
+
+/// `build-batch.yml` is the one dispatched caller: a `fail-fast: false`
+/// matrix whose legs each call the signer workflow — the caller holds
+/// no token of its own, and the jobs-page names `leg <i>` carries are
+/// the leg binding `stow_types::runs::LegJobName` parses.
+#[test]
+fn build_batch_declarations() {
+    let wf = load_workflow("build-batch.yml");
+    assert_eq!(
+        at(&wf, "on.workflow_dispatch.inputs.batch.required")
+            .map(scalar)
+            .as_deref(),
+        Some("true")
+    );
+    // The caller declares no permissions: the workflow's token is an
+    // empty set and every grant lives on the leg call.
+    assert_eq!(
+        at(&wf, "permissions")
+            .and_then(serde_yml::Value::as_mapping)
+            .map(serde_yml::Mapping::is_empty),
+        Some(true),
+        "build-batch.yml must declare `permissions: {{}}`"
+    );
+    assert_eq!(
+        at(&wf, "jobs.leg.name").map(scalar).as_deref(),
+        Some("leg ${{ matrix.task.i }}")
+    );
+    // One failed leg must not cancel the others.
+    assert_eq!(
+        at(&wf, "jobs.leg.strategy.fail-fast"),
+        Some(&serde_yml::Value::Bool(false))
+    );
+    // The caller job's grants are the union the called jobs narrow.
+    assert_eq!(
+        at(&wf, "jobs.leg.permissions.contents")
+            .map(scalar)
+            .as_deref(),
+        Some("read")
+    );
+    assert_eq!(
+        at(&wf, "jobs.leg.permissions.packages")
+            .map(scalar)
+            .as_deref(),
+        Some("write")
+    );
+    assert_eq!(
+        at(&wf, "jobs.leg.permissions.id-token")
+            .map(scalar)
+            .as_deref(),
+        Some("write")
+    );
+    assert_eq!(
+        at(&wf, "jobs.leg.uses").map(scalar).as_deref(),
+        Some("./.github/workflows/build-crate.yml")
+    );
+}
+
+/// `build-crate.yml` is `workflow_call`-only — nothing can dispatch a
+/// lone crate build — and keeps its two trust levels, the per-leg job
+/// names the jobs-page parser binds on, and per-leg artifact names
+/// (artifact names are scoped to the run, so every leg needs its own).
+#[test]
+fn build_crate_declarations() {
+    let wf = load_workflow("build-crate.yml");
+    let triggers: Vec<String> = field(&wf, "on")
+        .and_then(serde_yml::Value::as_mapping)
+        .expect("on mapping")
+        .keys()
+        .map(scalar)
+        .collect();
+    assert_eq!(
+        triggers,
+        ["workflow_call"],
+        "build-crate.yml is callable only: {triggers:?}"
+    );
+
+    assert_eq!(
+        at(&wf, "jobs.build.name").map(scalar).as_deref(),
+        Some(
+            "build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}"
+        )
+    );
+    assert_eq!(
+        at(&wf, "jobs.publish.name").map(scalar).as_deref(),
+        Some("publish #${{ inputs.leg }} ${{ inputs.task_hash }}")
+    );
+
+    // Two trust levels: the untrusted build reads, the trusted publish
+    // writes packages and mints the OIDC token cosign signs under.
+    assert_eq!(
+        at(&wf, "jobs.build.permissions.contents")
+            .map(scalar)
+            .as_deref(),
+        Some("read")
+    );
+    assert_eq!(
+        at(&wf, "jobs.build.permissions.packages")
+            .map(scalar)
+            .as_deref(),
+        Some("read")
+    );
+    assert_eq!(
+        at(&wf, "jobs.publish.permissions.contents")
+            .map(scalar)
+            .as_deref(),
+        Some("read")
+    );
+    assert_eq!(
+        at(&wf, "jobs.publish.permissions.packages")
+            .map(scalar)
+            .as_deref(),
+        Some("write")
+    );
+    assert_eq!(
+        at(&wf, "jobs.publish.permissions.id-token")
+            .map(scalar)
+            .as_deref(),
+        Some("write")
+    );
+    assert_eq!(
+        at(&wf, "jobs.publish.needs").map(scalar).as_deref(),
+        Some("build")
+    );
+    assert_eq!(
+        at(&wf, "jobs.publish.if").map(scalar).as_deref(),
+        Some("needs.build.result == 'success'")
+    );
+
+    // Per-leg artifact names on both sides of the handoff.
+    let build_steps = job_steps(&wf, "build");
+    let uploads: Vec<&str> = build_steps
+        .iter()
+        .filter(|s| {
+            s.uses
+                .as_deref()
+                .is_some_and(|u| u.starts_with("actions/upload-artifact"))
+        })
+        .filter_map(|s| s.with.get("name").map(String::as_str))
+        .collect();
+    assert_eq!(
+        uploads,
+        [
+            "build-output-${{ inputs.leg }}",
+            "build-network-audit-${{ inputs.leg }}"
+        ]
+    );
+    let publish_steps = job_steps(&wf, "publish");
+    let download = publish_steps
+        .iter()
+        .find(|s| {
+            s.uses
+                .as_deref()
+                .is_some_and(|u| u.starts_with("actions/download-artifact"))
+        })
+        .expect("download-artifact step");
+    assert_eq!(
+        download.with.get("name").map(String::as_str),
+        Some("build-output-${{ inputs.leg }}")
+    );
+
+    // The task reaches stow-build from the dispatch event file, never
+    // an env var: `STOW_BUILD_TASK_JSON` must not appear anywhere.
+    let text = std::fs::read_to_string(support::workflows_dir().join("build-crate.yml"))
+        .expect("read build-crate.yml");
+    assert!(
+        !text.contains("STOW_BUILD_TASK_JSON"),
+        "build-crate.yml still passes the task through STOW_BUILD_TASK_JSON"
     );
 }
 
