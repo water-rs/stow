@@ -22,6 +22,7 @@ use crate::db;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
+use crate::scheduler::dispatch::BuildRuns as _;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{budget, fixture};
@@ -38,6 +39,8 @@ const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
 const STOW_MIN_DISPATCH_VALUE_BINDING: &str = "STOW_MIN_DISPATCH_VALUE";
+const STOW_BATCH_PARALLELISM_BINDING: &str = "STOW_BATCH_PARALLELISM";
+const STOW_BATCH_MAX_TASKS_BINDING: &str = "STOW_BATCH_MAX_TASKS";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -88,6 +91,10 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
         .unwrap_or(defaults.human_daily_task_budget),
         min_dispatch_value: read_optional_i64_binding(env, STOW_MIN_DISPATCH_VALUE_BINDING)?
             .unwrap_or(defaults.min_dispatch_value),
+        batch_parallelism: read_optional_u32_binding(env, STOW_BATCH_PARALLELISM_BINDING)?
+            .unwrap_or(defaults.batch_parallelism),
+        batch_max_tasks: read_optional_u32_binding(env, STOW_BATCH_MAX_TASKS_BINDING)?
+            .unwrap_or(defaults.batch_max_tasks),
     })
 }
 
@@ -762,30 +769,38 @@ pub(super) async fn admit_request_pass(
         max_closure: admission.max_closure,
         dispatched_at,
     };
-    // The same credential arm as `dispatch_pass`: the cached installation
+    // The same backend arm as `dispatch_pass`: the cached installation
     // token — minted inline on expiry — or the mock stack's local-CI URL.
-    let credential = match credential_source {
-        CredentialSource::LocalCi(url) => dispatch::DispatchCredential::LocalCi(url),
-        CredentialSource::GitHub(config) => match github_app::installation_token(db, &config).await
-        {
-            Ok(token) => dispatch::DispatchCredential::GitHub(token),
-            Err(error) => {
-                let error = dispatch::DispatchError::TokenMint(error.to_string());
-                queue::fail_request_dispatch(
-                    db,
-                    &admission.request_id,
-                    attempt,
-                    &error.to_string(),
-                )
-                .await
-                .map_err(to_error)?;
-                return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
-            }
-        },
-    };
     let pool = crate::fetch_guard::OutboundPool::new();
-    if let Err(error) =
-        dispatch::trigger_resolve(&dispatch_payload, &credential, &github_repo, &pool).await
+    let outcome = match credential_source {
+        CredentialSource::LocalCi(url) => {
+            dispatch::LocalCiBuildRuns::new(&url)
+                .trigger_resolve(&dispatch_payload, &github_repo, &pool)
+                .await
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(db, &config).await {
+                Ok(token) => {
+                    dispatch::GitHubBuildRuns::new(token)
+                        .trigger_resolve(&dispatch_payload, &github_repo, &pool)
+                        .await
+                }
+                Err(error) => {
+                    let error = dispatch::DispatchError::TokenMint(error.to_string());
+                    queue::fail_request_dispatch(
+                        db,
+                        &admission.request_id,
+                        attempt,
+                        &error.to_string(),
+                    )
+                    .await
+                    .map_err(to_error)?;
+                    return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
+                }
+            }
+        }
+    };
+    if let Err(error) = outcome
     {
         queue::fail_request_dispatch(db, &admission.request_id, attempt, &error.to_string())
             .await
@@ -1280,20 +1295,36 @@ pub(super) async fn dispatch_pass(
     }
     let task_ids: Vec<String> = tasks.iter().map(|task| task.task_id.clone()).collect();
 
-    // The credential resolves once per pass, only when tasks exist: the
+    // The backend resolves once per pass, only when tasks exist: the
     // local-CI branch carries no Authorization; the GitHub branch reuses
     // the installation token cached in DO storage while more than five
     // minutes of validity remain and otherwise mints a fresh one. A
     // failed mint is a dispatch failure for every claimed task — the same
     // backoff a failed POST would get.
-    let credential = match credential_source {
+    match credential_source {
         CredentialSource::LocalCi(url) => {
             tracing::info!(url = %url, "dispatching via local-CI endpoint");
-            dispatch::DispatchCredential::LocalCi(url)
+            dispatch_fan_out(
+                db,
+                settings,
+                &dispatch::LocalCiBuildRuns::new(&url),
+                tasks,
+                &github_repo,
+            )
+            .await?;
         }
         CredentialSource::GitHub(config) => {
             match github_app::installation_token(db, &config).await {
-                Ok(token) => dispatch::DispatchCredential::GitHub(token),
+                Ok(token) => {
+                    dispatch_fan_out(
+                        db,
+                        settings,
+                        &dispatch::GitHubBuildRuns::new(token),
+                        tasks,
+                        &github_repo,
+                    )
+                    .await?;
+                }
                 Err(error) => {
                     let error = dispatch::DispatchError::TokenMint(error.to_string());
                     for task in &tasks {
@@ -1312,39 +1343,6 @@ pub(super) async fn dispatch_pass(
                 }
             }
         }
-    };
-
-    // The fan-out runs concurrently, bounded twice at the invocation's
-    // outbound ceiling: the stream's `buffer_unordered` admits at most
-    // `MAX_OUTBOUND_INFLIGHT` (4) `workflow_dispatch` calls at once, and
-    // the pool slot `trigger_workflow` waits on enforces the same bound
-    // before any request posts.
-    let pool = crate::fetch_guard::OutboundPool::new();
-    let mut results = stream::iter(tasks.into_iter().enumerate())
-        .map(|(index, task)| {
-            // Each future owns its task and shares the credential,
-            // repo and pool by reference — copied per call so
-            // `async move` moves nothing out of the map closure.
-            let (credential, github_repo, pool) = (&credential, github_repo.as_str(), &pool);
-            async move {
-                let task_id = task.task_id.clone();
-                let generation_id = task.generation_id.clone();
-                (
-                    index,
-                    task_id,
-                    generation_id,
-                    dispatch::trigger_build(&task, credential, github_repo, pool).await,
-                )
-            }
-        })
-        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-        .collect::<Vec<_>>()
-        .await;
-    // A failed dispatch still marks exactly its own task, in the claim
-    // order the sequential loop wrote.
-    results.sort_unstable_by_key(|(index, _, _, _)| *index);
-    for (_, task_id, generation_id, result) in results {
-        persist_dispatch_outcome(db, settings, &task_id, &generation_id, result).await?;
     }
 
     // A completion may have been persisted while this pass was waiting for
@@ -1358,6 +1356,50 @@ pub(super) async fn dispatch_pass(
     }
 
     Ok(task_ids)
+}
+
+/// The per-task `workflow_dispatch` fan-out over one resolved backend —
+/// the pool-bounded concurrent POSTs and the ordered outcome apply.
+async fn dispatch_fan_out(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    backend: &impl dispatch::BuildRuns,
+    tasks: Vec<queue::QueuedTask>,
+    github_repo: &str,
+) -> Result<()> {
+    // The fan-out runs concurrently, bounded twice at the invocation's
+    // outbound ceiling: the stream's `buffer_unordered` admits at most
+    // `MAX_OUTBOUND_INFLIGHT` (4) `workflow_dispatch` calls at once, and
+    // the pool slot `trigger_build` waits on enforces the same bound
+    // before any request posts.
+    let pool = crate::fetch_guard::OutboundPool::new();
+    let mut results = stream::iter(tasks.into_iter().enumerate())
+        .map(|(index, task)| {
+            // Each future owns its task and shares the backend,
+            // repo and pool by reference — copied per call so
+            // `async move` moves nothing out of the map closure.
+            let (backend, github_repo, pool) = (backend, github_repo, &pool);
+            async move {
+                let task_id = task.task_id.clone();
+                let generation_id = task.generation_id.clone();
+                (
+                    index,
+                    task_id,
+                    generation_id,
+                    backend.trigger_build(&task, github_repo, pool).await,
+                )
+            }
+        })
+        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    // A failed dispatch still marks exactly its own task, in the claim
+    // order the sequential loop wrote.
+    results.sort_unstable_by_key(|(index, _, _, _)| *index);
+    for (_, task_id, generation_id, result) in results {
+        persist_dispatch_outcome(db, settings, &task_id, &generation_id, result).await?;
+    }
+    Ok(())
 }
 
 async fn persist_dispatch_outcome(

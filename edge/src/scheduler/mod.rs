@@ -1,8 +1,10 @@
 //! Durable Object build scheduler.
 //!
 //! `queue` holds the backend-abstracted queue state machine and compiles on
-//! every target so its logic is host-testable; `dispatch` and `object` are the
-//! Cloudflare-bound dispatch and Durable Object glue.
+//! every target so its logic is host-testable; `dispatch` keeps the same
+//! split inside itself — the `BuildRuns` contract and every pure helper
+//! host-test while the `CfFetch` plumbing stays `wasm32`-only — and
+//! `object` is the Durable Object glue.
 
 /// The hourly demand feed's durable hour/page state machine —
 /// backend-abstracted like `queue` so it host-tests on every target.
@@ -35,9 +37,12 @@ mod cost_gate;
 #[cfg(any(test, target_arch = "wasm32"))]
 pub mod do_budgets;
 
+/// §1.2 batch formation — the pure packer the batched claim pass
+/// drives (stow#833).
+pub mod batching;
+
 #[cfg(target_arch = "wasm32")]
 pub mod budget;
-#[cfg(target_arch = "wasm32")]
 pub mod dispatch;
 #[cfg(target_arch = "wasm32")]
 pub mod object;

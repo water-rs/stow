@@ -108,6 +108,12 @@ const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
 // the row while CI runs, so the stale-recovery cutoff must comfortably
 // exceed the slowest expected build or long builds get double-dispatched.
 const DEFAULT_STALE_DISPATCH_MINUTES: u32 = 60;
+// Batch shape (stow#833 §1.3): `k` — the `max-parallel` runner slots
+// one `build-batch.yml` matrix holds — and `B` — its leg bound, eight
+// rounds at the default. `B` stays far under GitHub's 256-job matrix
+// limit and its tasks pack under the workflow_dispatch input cap.
+const DEFAULT_BATCH_PARALLELISM: u32 = 5;
+const DEFAULT_BATCH_MAX_TASKS: u32 = 40;
 // Exponential dispatch-failure backoff cap.
 const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 
@@ -167,7 +173,8 @@ impl Dispatch {
 /// Durable Object glue (`STOW_MAX_CONCURRENT_JOBS`,
 /// `STOW_MAX_CONCURRENT_MACOS_JOBS`, `STOW_DISPATCH_MIN_AGE_MINUTES`,
 /// `STOW_STALE_DISPATCH_MINUTES`, `STOW_MAX_QUEUE_PENDING`,
-/// `STOW_HUMAN_DAILY_TASK_BUDGET`, `STOW_MIN_DISPATCH_VALUE`).
+/// `STOW_HUMAN_DAILY_TASK_BUDGET`, `STOW_MIN_DISPATCH_VALUE`,
+/// `STOW_BATCH_PARALLELISM`, `STOW_BATCH_MAX_TASKS`).
 ///
 /// Defaults match production; the local mock lowers `dispatch` via `vars`
 /// because miniflare's workerd OOMs under parallel complete
@@ -199,6 +206,12 @@ pub struct SchedulerSettings {
     /// effect only through that pass: the queue's writers and probes
     /// read the persisted answer, never this field.
     pub min_dispatch_value: i64,
+    /// `k` — the `max-parallel` runner slots one `build-batch.yml`
+    /// matrix holds (stow#833 §1.3); the sum over in-flight batches is
+    /// what the family caps bound.
+    pub batch_parallelism: u32,
+    /// `B` — the leg bound at which a batch closes (stow#833 §1.3).
+    pub batch_max_tasks: u32,
 }
 
 impl Default for SchedulerSettings {
@@ -211,6 +224,8 @@ impl Default for SchedulerSettings {
             max_queue_pending: DEFAULT_MAX_QUEUE_PENDING,
             human_daily_task_budget: DEFAULT_HUMAN_DAILY_TASK_BUDGET,
             min_dispatch_value: DEFAULT_MIN_DISPATCH_VALUE,
+            batch_parallelism: DEFAULT_BATCH_PARALLELISM,
+            batch_max_tasks: DEFAULT_BATCH_MAX_TASKS,
         }
     }
 }

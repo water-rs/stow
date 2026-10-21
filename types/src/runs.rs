@@ -227,6 +227,47 @@ pub struct RunStepRow {
     pub conclusion: Option<String>,
 }
 
+/// `GET actions/runs/{id}` — the run's coarse state the lease check
+/// reads (stow#833 §4.3).
+///
+/// `completed` resolves the batch as if its webhook had arrived;
+/// `queued`/`in_progress` extends the lease; `run_attempt` pins the
+/// jobs page to the attempt the scheduler dispatched.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RunStatus {
+    /// `queued`/`in_progress`/`completed`/`waiting` as GitHub serves
+    /// it.
+    pub status: String,
+    /// `success`/`failure`/`cancelled`/`startup_failure`/… — `None`
+    /// while the run is not `completed`.
+    #[serde(default)]
+    pub conclusion: Option<String>,
+    /// The run's current attempt — the `attempts/{n}/jobs` page the
+    /// leg classifier reads.
+    pub run_attempt: u32,
+    /// The run's Actions URL — the leg failure's pointer back to it.
+    pub html_url: String,
+}
+
+/// The `rel="next"` target of an RFC 8288 `Link` header — the
+/// attempt-jobs pager's continuation (stow#833).
+///
+/// Each `<url>; rel="…"` link-param is comma-separated; GitHub serves
+/// `next`/`last` while a page follows and `prev`/`first` alone on the
+/// last page, so `None` — an absent header or no `next` link — ends
+/// the walk.
+#[must_use]
+pub fn link_next(header: Option<&str>) -> Option<&str> {
+    header?.split(',').find_map(|link| {
+        let (url, params) = link.trim().strip_prefix('<')?.split_once('>')?;
+        params
+            .split(';')
+            .map(str::trim)
+            .any(|param| param.eq_ignore_ascii_case("rel=\"next\""))
+            .then(|| url.trim())
+    })
+}
+
 // ===== Leg classification (stow#833) =====
 
 /// Which of a `build-batch.yml` leg's two `build-crate.yml` jobs a
@@ -328,11 +369,14 @@ pub enum LegOutcome {
     /// marking the task done.
     Succeeded {
         /// The build job's `started_at` — the leg's runner time opens
-        /// here.
-        started_at: Option<time::OffsetDateTime>,
+        /// here. A successful leg whose build job lacks it is an
+        /// [`LegFailure::Invariant`], never a success with a missing
+        /// duration edge.
+        started_at: time::OffsetDateTime,
         /// The publish job's `completed_at` — the leg's runner time
-        /// ends here.
-        completed_at: Option<time::OffsetDateTime>,
+        /// ends here. Missing, the leg is an [`LegFailure::Invariant`]
+        /// like a build job without `started_at`.
+        completed_at: time::OffsetDateTime,
         /// The publish job's `run_attempt` — the attempt whose records
         /// tag the caller checks.
         publish_attempt: u32,
@@ -499,11 +543,23 @@ fn classify_leg(
         // The build leg succeeded; its publish row has not landed yet.
         (Some(_), None) if culprit.is_none() => LegOutcome::Unsettled,
         (Some(_), None) => concluded(build.expect("build leg present")),
-        (Some(build), Some(publish)) if culprit.is_none() => LegOutcome::Succeeded {
-            started_at: build.started_at,
-            completed_at: publish.completed_at,
-            publish_attempt: publish.run_attempt,
-        },
+        (Some(build), Some(publish)) if culprit.is_none() => {
+            match (build.started_at, publish.completed_at) {
+                (Some(started_at), Some(completed_at)) => LegOutcome::Succeeded {
+                    started_at,
+                    completed_at,
+                    publish_attempt: publish.run_attempt,
+                },
+                (None, _) => LegOutcome::Failed(LegFailure::Invariant(format!(
+                    "leg {leg}'s build job {:?} completed `success` with no started_at",
+                    build.name
+                ))),
+                (_, None) => LegOutcome::Failed(LegFailure::Invariant(format!(
+                    "leg {leg}'s publish job {:?} completed `success` with no completed_at",
+                    publish.name
+                ))),
+            }
+        }
         (Some(_), Some(_)) => concluded(culprit.expect("a non-success job exists")),
     })
 }
@@ -876,11 +932,37 @@ mod tests {
         assert_eq!(
             outcomes,
             [LegOutcome::Succeeded {
-                started_at: Some(at(50)),
-                completed_at: Some(at(100)),
+                started_at: at(50),
+                completed_at: at(100),
                 publish_attempt: 1,
             }]
         );
+    }
+
+    /// A successful leg's duration edges come from real timestamps: a
+    /// build job reporting `success` with no `started_at`, or a
+    /// publish job with no `completed_at`, is that leg's invariant
+    /// failure — the message names the job — never a success with a
+    /// fabricated duration.
+    #[test]
+    fn a_settled_leg_missing_timestamps_is_an_invariant() {
+        for (job, field) in [
+            (LegJobKind::Build, "started_at"),
+            (LegJobKind::Publish, "completed_at"),
+        ] {
+            let mut jobs = settled_leg(0).to_vec();
+            match job {
+                LegJobKind::Build => jobs[0].started_at = None,
+                LegJobKind::Publish => jobs[1].completed_at = None,
+            }
+            let outcomes =
+                classify_legs(&[leg_hash(0)], "success", &jobs, at(1_000)).expect("classified");
+            let LegOutcome::Failed(LegFailure::Invariant(message)) = &outcomes[0] else {
+                panic!("a missing {field} is the leg's invariant failure");
+            };
+            assert!(message.contains(&jobs[usize::from(job == LegJobKind::Publish)].name));
+            assert!(message.contains(field));
+        }
     }
 
     /// §4.1: a failed `VERDICT_STEPS` step on the leg's own jobs is the
@@ -1081,5 +1163,50 @@ mod tests {
             &[],
         ));
         assert!(classify_legs(&[leg_hash(0)], "failure", &jobs, at(1_000)).is_err());
+    }
+
+    /// The pager's three page shapes: a middle page links `next` (the
+    /// walk continues at that URL verbatim), the last page links only
+    /// `prev`/`first` (None ends it), and an absent header ends it
+    /// before either is read.
+    #[test]
+    fn link_next_follows_only_rel_next() {
+        let next =
+            "https://api.github.com/repos/o/r/actions/runs/1/attempts/2/jobs?per_page=100&page=2";
+        let middle = format!(
+            "<{next}>; rel=\"next\", \
+             <https://api.github.com/x?page=9>; rel=\"last\""
+        );
+        assert_eq!(super::link_next(Some(&middle)), Some(next));
+        let last =
+            "<https://api.github.com/x?page=1>; rel=\"prev\", <https://api.github.com/x>; rel=\"first\"";
+        assert_eq!(super::link_next(Some(last)), None);
+        assert_eq!(super::link_next(None), None);
+        assert_eq!(super::link_next(Some("")), None);
+        // A `next` that is not the first link-param still resolves.
+        let reordered =
+            format!("<https://api.github.com/x?page=9>; rel=\"last\", <{next}>; rel=\"next\"");
+        assert_eq!(super::link_next(Some(&reordered)), Some(next));
+    }
+
+    /// The run-status wire shape decodes the fields the lease check
+    /// reads; a body missing one fails at the boundary.
+    #[test]
+    fn run_status_decodes_the_lease_fields() {
+        let status: super::RunStatus = serde_json::from_str(
+            r#"{"status":"completed","conclusion":"success","run_attempt":2,
+               "html_url":"https://github.com/water-rs/stow/actions/runs/1",
+               "extra":"ignored"}"#,
+        )
+        .expect("run status decodes");
+        assert_eq!(status.status, "completed");
+        assert_eq!(status.conclusion.as_deref(), Some("success"));
+        assert_eq!(status.run_attempt, 2);
+        for body in [
+            r#"{"conclusion":"success","run_attempt":2,"html_url":"u"}"#,
+            r#"{"status":"completed","run_attempt":"2","html_url":"u"}"#,
+        ] {
+            assert!(serde_json::from_str::<super::RunStatus>(body).is_err());
+        }
     }
 }
