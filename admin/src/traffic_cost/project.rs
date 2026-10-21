@@ -363,7 +363,17 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::BuildCallback,
         route: "POST /api/v1/github/workflow-run",
-        drives: &[],
+        // A `build-batch.yml` run of b̄ legs costs its completion route
+        // C and its resolution's fixed part F once, and each leg's part
+        // L once per leg, so a build pays (C + F)/b̄ + L. One route and
+        // one one-leg resolution per build charge C + F + L, which is at
+        // least that for every b̄ ≥ 1 — no batch size is assumed. The
+        // pass floor the resolution runs inside is `AlarmPass`'s, one
+        // per build against production's one per batch.
+        drives: &[
+            ("POST /batches/{batch_id}/complete (success)", 1.0),
+            ("alarm pass (batch resolution, one leg)", 1.0),
+        ],
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,

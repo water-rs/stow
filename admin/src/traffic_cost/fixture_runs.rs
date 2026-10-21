@@ -14,7 +14,9 @@
 use clap::Args;
 use stow_types::fixture::FixtureShape;
 use stow_types::identity::WireRustcVersion;
-use stow_types::local_ci::{LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRuns};
+use stow_types::local_ci::{
+    LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRuns, LocalCiSeededStatus,
+};
 use stow_types::stow_error;
 
 use crate::render::{Output, Table, emit};
@@ -39,7 +41,9 @@ fn seeded_runs(shape: FixtureShape) -> stow_types::error::Result<LocalCiSeededRu
                     .map_err(|error| stow_error!("fixture rustc: {error}"))?,
                 batch_id: batch.batch_id,
                 legs: vec![batch.task_id],
-                conclusion: LocalCiSeededConclusion::Success,
+                status: LocalCiSeededStatus::Completed {
+                    conclusion: LocalCiSeededConclusion::Success,
+                },
             })
         })
         .collect::<stow_types::error::Result<_>>()?;
@@ -83,8 +87,10 @@ mod tests {
             let batch = shape.in_flight_batch(k);
             assert_eq!(run.workflow_run_id, Some(batch.run_id));
             assert_eq!(
-                run.conclusion,
-                stow_types::local_ci::LocalCiSeededConclusion::Success
+                run.status,
+                stow_types::local_ci::LocalCiSeededStatus::Completed {
+                    conclusion: stow_types::local_ci::LocalCiSeededConclusion::Success
+                }
             );
             assert_eq!(run.batch_id, batch.batch_id);
             assert_eq!(run.rustc_version.as_str(), batch.rustc_version);

@@ -1770,10 +1770,10 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     // The batch drives (stow#833). Each setup claims one real batch of
-    // `STOW_BATCH_MAX_TASKS` legs from the planted window and binds it
-    // to a run, so the drive prices the rows a bound in-flight batch
-    // costs — the per-event bound every one of them names is that leg
-    // count, never the queue.
+    // `STOW_BATCH_MAX_TASKS` legs from the planted window — the one-leg
+    // resolution's, one leg — and binds it to a run, so the drive
+    // prices the rows a bound in-flight batch costs — the per-event
+    // bound every one of them names is that leg count, never the queue.
     Drive {
         // The webhook's forward: one `UPDATE build_batches` stamping
         // the run's completion and the wake re-plan the route's
@@ -1827,6 +1827,25 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
+        // The same resolution over a batch of one leg — the claim closes
+        // it at one leg, as `STOW_BATCH_MAX_TASKS = 1` would — so the
+        // row is the resolution's fixed part plus one leg's: the batch
+        // row read and delete, and that leg's `complete` and build
+        // sample. The `workflow_run` callback prices one of these per
+        // build, which covers what production pays per build at any
+        // batch size; the 40-leg drive above stays the per-event bound.
+        name: "alarm pass (batch resolution, one leg)",
+        setup: Some(seed_completed_one_leg_batch),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                resolve_completed_batch(db, settings, ctx, BatchOutcome::Success).await
+            })
+        },
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move { finish_batch_drive(db, shape, ctx, BatchEnd::Resolved).await })
+        }),
+    },
+    Drive {
         // The same resolution when every leg failed: each leg re-queues
         // behind its backoff with its evidence row, the heavier of the
         // two per-leg writes. On wasm the seeded run's legs fail their
@@ -1847,15 +1866,17 @@ pub const DRIVES: &[Drive] = &[
         // The lease check over one expired bound batch whose run is
         // still going: the expired-batch read and the lease extension.
         // On wasm the real lease pass, which asks the local mock CI for
-        // the run's state. The read is bounded by `EXPIRED_BATCH_LIMIT`
-        // and the family slot caps; the write is one keyed statement.
+        // the run's state — the setup seeds the batch's run there as
+        // running, and the cleanup cancels it ([`finish_lease_drive`]).
+        // The read is bounded by `EXPIRED_BATCH_LIMIT` and the family
+        // slot caps; the write is one keyed statement.
         name: "alarm pass (lease check)",
         setup: Some(seed_expired_batch),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move { check_expired_lease(db, settings, ctx).await })
         },
-        cleanup: Some(|db, shape, _settings, ctx| {
-            Box::pin(async move { finish_batch_drive(db, shape, ctx, BatchEnd::Leased).await })
+        cleanup: Some(|db, shape, settings, ctx| {
+            Box::pin(async move { finish_lease_drive(db, shape, settings, ctx).await })
         }),
     },
     Drive {
@@ -2705,11 +2726,11 @@ async fn restore_batches(db: &DurableDb, shape: FixtureShape) -> Result<(), Stri
 type DriveFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 /// The run a batch drive binds its batch to when nothing reads the run
-/// upstream: the completion-route and lease drives, and on host the
-/// resolution drives too, whose outbound reads are synthetic there. On
-/// wasm a resolution drive binds the run the local CI recorded for its
-/// batch instead ([`upstream_run`]). Numeric, as the lease check and the
-/// resolution pass parse a bound run id.
+/// upstream: the completion-route drives, and on host the resolution
+/// and lease drives too, whose outbound reads are synthetic there. On
+/// wasm a resolution or lease drive binds the run the local CI recorded
+/// for its batch instead ([`upstream_run`]). Numeric, as the lease check
+/// and the resolution pass parse a bound run id.
 pub const BATCH_DRIVE_RUN_ID: u64 = 9_000_000_001;
 
 /// A batch drive's bound batch: the claimed batch and its run.
@@ -2734,6 +2755,17 @@ impl BatchOutcome {
             Self::Failure => "failure",
         }
     }
+
+    /// The finished run upstream that concluded at this outcome.
+    const fn upstream(self) -> stow_types::local_ci::LocalCiSeededStatus {
+        use stow_types::local_ci::{LocalCiSeededConclusion, LocalCiSeededStatus};
+        LocalCiSeededStatus::Completed {
+            conclusion: match self {
+                Self::Success => LocalCiSeededConclusion::Success,
+                Self::Failure => LocalCiSeededConclusion::Failure,
+            },
+        }
+    }
 }
 
 /// The state a batch drive's run must have left its batch in.
@@ -2743,8 +2775,13 @@ enum BatchEnd {
     Completed,
     /// Every leg left flight and the batch row is released.
     Resolved,
-    /// The lease runs past now again.
-    Leased,
+    /// The lease was extended by `lease_minutes`
+    /// (`STOW_STALE_DISPATCH_MINUTES`): it runs more than half that span
+    /// past now. The lease check's retry deferral after an unreadable
+    /// run moves it only `LEASE_RETRY_MS` (30 s), which no lease of a
+    /// minute or more reaches half of — so a drive whose lookup failed
+    /// does not pass as an extension.
+    Extended { lease_minutes: u32 },
 }
 
 fn batch_completion(run_id: u64, outcome: BatchOutcome) -> stow_types::api::BatchRunComplete {
@@ -2756,16 +2793,37 @@ fn batch_completion(run_id: u64, outcome: BatchOutcome) -> stow_types::api::Batc
     }
 }
 
-/// Claim one full batch from the planted window — a batch of
-/// `STOW_BATCH_MAX_TASKS` legs, the bound every batch drive names.
+/// How many legs a batch drive's claim closes its batch at.
+#[derive(Debug, Clone, Copy)]
+enum BatchLegs {
+    /// `STOW_BATCH_MAX_TASKS` — a full batch, the per-event bound every
+    /// batch drive's row budget names.
+    Full,
+    /// One leg — the smallest batch a run carries, whose resolution is
+    /// the fixed cost plus one leg's (the callback's price).
+    One,
+}
+
+impl BatchLegs {
+    const fn count(self, settings: &SchedulerSettings) -> u32 {
+        match self {
+            Self::Full => settings.batch_max_tasks,
+            Self::One => 1,
+        }
+    }
+}
+
+/// Claim one batch of `legs` from the planted window.
 ///
 /// The claim runs with room for exactly one batch beside the fixture's
-/// in-flight slots. The rows it moves restore from the snapshot the
-/// cleanup takes.
+/// in-flight slots, closing it at `legs` — the production claim under
+/// `STOW_BATCH_MAX_TASKS = legs`. The rows it moves restore from the
+/// snapshot the cleanup takes.
 async fn claim_cost_batch(
     db: &DurableDb,
     settings: &SchedulerSettings,
     ctx: &DriveContext,
+    legs: BatchLegs,
 ) -> Result<super::batching::FormedBatch, String> {
     if queue::freeze_enabled(db)
         .await
@@ -2775,10 +2833,12 @@ async fn claim_cost_batch(
     }
     snapshot_claim_surface(db, settings, ctx, &[]).await?;
     let room = FixtureShape::IN_FLIGHT_ROWS + settings.batch_parallelism;
+    let expected = legs.count(settings);
     let one_batch = SchedulerSettings {
         dispatch: queue::Dispatch::Limited(
             std::num::NonZeroU32::new(room).expect("the fixture holds in-flight slots"),
         ),
+        batch_max_tasks: expected,
         ..*settings
     };
     let mut batches = claim_pass(db, &one_batch, ctx, "batch drive claim").await?;
@@ -2789,11 +2849,10 @@ async fn claim_cost_batch(
         ));
     }
     let batch = batches.remove(0);
-    let legs = batch.tasks.len();
-    if u32::try_from(legs) != Ok(settings.batch_max_tasks) {
+    let claimed = batch.tasks.len();
+    if u32::try_from(claimed) != Ok(expected) {
         return Err(format!(
-            "the claimed batch holds {legs} legs, expected STOW_BATCH_MAX_TASKS = {}",
-            settings.batch_max_tasks
+            "the claimed batch holds {claimed} legs, expected {expected} ({legs:?})"
         ));
     }
     Ok(batch)
@@ -2836,13 +2895,13 @@ async fn bind_cost_batch(
     Ok(batch_id)
 }
 
-/// A claimed batch bound to [`BATCH_DRIVE_RUN_ID`].
+/// A claimed full batch bound to [`BATCH_DRIVE_RUN_ID`].
 async fn claim_bound_batch(
     db: &DurableDb,
     settings: &SchedulerSettings,
     ctx: &DriveContext,
 ) -> Result<String, String> {
-    let batch = claim_cost_batch(db, settings, ctx).await?;
+    let batch = claim_cost_batch(db, settings, ctx, BatchLegs::Full).await?;
     bind_cost_batch(db, ctx, &batch, BATCH_DRIVE_RUN_ID).await
 }
 
@@ -2855,36 +2914,35 @@ fn seed_bound_batch<'a>(
     Box::pin(async move { claim_bound_batch(db, settings, ctx).await.map(|_| ()) })
 }
 
-/// The run the claimed `batch` concluded as at `outcome`, existing
-/// upstream before its completion is recorded, as production's run
-/// does.
+/// The run the claimed `batch` is upstream at `status` — running, or
+/// concluded before its completion is recorded, as production's run is.
 ///
 /// On wasm the local CI records it under an id it allocates: every
-/// leg's build and publish jobs at `outcome`, and for a success each
-/// leg's records artifact under the run's tag. The resolution then
-/// reads the jobs page and records the production path reads, and a
-/// failed run resolves as failed instead of deferring. On host the
-/// resolution's outbound reads are synthetic, so the run is
-/// [`BATCH_DRIVE_RUN_ID`].
+/// leg's jobs at `status`, and for a success each leg's records
+/// artifact under the run's tag. A batch drive's outbound reads then
+/// answer what production's do — the lease check finds the run still
+/// going, the resolution reads the jobs page and records a finished run
+/// leaves, and a failed run resolves as failed instead of deferring. On
+/// host those reads are synthetic, so the run is [`BATCH_DRIVE_RUN_ID`].
 #[cfg_attr(
     not(target_arch = "wasm32"),
     expect(
         clippy::unused_async,
-        reason = "only the wasm build seeds the run at the local CI; the host build's resolution reads are synthetic"
+        reason = "only the wasm build seeds the run at the local CI; the host build's outbound reads are synthetic"
     )
 )]
 async fn upstream_run(
     ctx: &DriveContext,
     batch: &super::batching::FormedBatch,
-    outcome: BatchOutcome,
+    status: stow_types::local_ci::LocalCiSeededStatus,
 ) -> Result<u64, String> {
     #[cfg(target_arch = "wasm32")]
     {
-        use stow_types::local_ci::{LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRuns};
+        use stow_types::local_ci::{LocalCiSeededRun, LocalCiSeededRuns};
         let env = ctx
             .env
             .as_ref()
-            .ok_or_else(|| "batch resolution drive needs a Worker env".to_owned())?;
+            .ok_or_else(|| "a batch drive's upstream run needs a Worker env".to_owned())?;
         let local_ci = super::object::local_ci_runs(env).map_err(|error| error.to_string())?;
         let seeded = LocalCiSeededRuns {
             runs: vec![LocalCiSeededRun {
@@ -2896,10 +2954,7 @@ async fn upstream_run(
                     .iter()
                     .map(|task| task.task_id.clone())
                     .collect(),
-                conclusion: match outcome {
-                    BatchOutcome::Success => LocalCiSeededConclusion::Success,
-                    BatchOutcome::Failure => LocalCiSeededConclusion::Failure,
-                },
+                status,
             }],
         };
         let ids = local_ci
@@ -2916,21 +2971,22 @@ async fn upstream_run(
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = (ctx, batch, outcome);
+        let _ = (ctx, batch, status);
         Ok(BATCH_DRIVE_RUN_ID)
     }
 }
 
-/// A bound batch whose run concluded upstream at `outcome` and whose
-/// `completed` delivery is already recorded.
+/// A bound batch of `legs` whose run concluded upstream at `outcome`
+/// and whose `completed` delivery is already recorded.
 async fn bind_completed_batch(
     db: &DurableDb,
     settings: &SchedulerSettings,
     ctx: &DriveContext,
     outcome: BatchOutcome,
+    legs: BatchLegs,
 ) -> Result<(), String> {
-    let batch = claim_cost_batch(db, settings, ctx).await?;
-    let run_id = upstream_run(ctx, &batch, outcome).await?;
+    let batch = claim_cost_batch(db, settings, ctx, legs).await?;
+    let run_id = upstream_run(ctx, &batch, outcome.upstream()).await?;
     let batch_id = bind_cost_batch(db, ctx, &batch, run_id).await?;
     queue::record_batch_completion(db, &batch_id, &batch_completion(run_id, outcome))
         .await
@@ -2943,7 +2999,20 @@ fn seed_completed_success_batch<'a>(
     settings: &'a SchedulerSettings,
     ctx: &'a DriveContext,
 ) -> DriveFuture<'a> {
-    Box::pin(async move { bind_completed_batch(db, settings, ctx, BatchOutcome::Success).await })
+    Box::pin(async move {
+        bind_completed_batch(db, settings, ctx, BatchOutcome::Success, BatchLegs::Full).await
+    })
+}
+
+fn seed_completed_one_leg_batch<'a>(
+    db: &'a DurableDb,
+    _shape: FixtureShape,
+    settings: &'a SchedulerSettings,
+    ctx: &'a DriveContext,
+) -> DriveFuture<'a> {
+    Box::pin(async move {
+        bind_completed_batch(db, settings, ctx, BatchOutcome::Success, BatchLegs::One).await
+    })
 }
 
 fn seed_completed_failure_batch<'a>(
@@ -2952,10 +3021,13 @@ fn seed_completed_failure_batch<'a>(
     settings: &'a SchedulerSettings,
     ctx: &'a DriveContext,
 ) -> DriveFuture<'a> {
-    Box::pin(async move { bind_completed_batch(db, settings, ctx, BatchOutcome::Failure).await })
+    Box::pin(async move {
+        bind_completed_batch(db, settings, ctx, BatchOutcome::Failure, BatchLegs::Full).await
+    })
 }
 
-/// A bound batch whose lease ran out a minute ago.
+/// A full bound batch whose run is still going upstream and whose
+/// lease ran out a minute ago.
 fn seed_expired_batch<'a>(
     db: &'a DurableDb,
     _shape: FixtureShape,
@@ -2963,7 +3035,14 @@ fn seed_expired_batch<'a>(
     ctx: &'a DriveContext,
 ) -> DriveFuture<'a> {
     Box::pin(async move {
-        let batch_id = claim_bound_batch(db, settings, ctx).await?;
+        let batch = claim_cost_batch(db, settings, ctx, BatchLegs::Full).await?;
+        let run_id = upstream_run(
+            ctx,
+            &batch,
+            stow_types::local_ci::LocalCiSeededStatus::InProgress,
+        )
+        .await?;
+        let batch_id = bind_cost_batch(db, ctx, &batch, run_id).await?;
         db.query(
             "UPDATE build_batches SET lease_at = datetime('now', '-1 minutes') \
              WHERE batch_id = ?",
@@ -3119,7 +3198,8 @@ fn synthetic_jobs_page(
 }
 
 /// The alarm pass's lease check over the one expired bound batch, whose
-/// run is still going: on wasm the real lease pass; on host the
+/// run is still going: on wasm the real lease pass, whose run lookup
+/// reads the running run the setup seeded at the local CI; on host the
 /// expired-batch read and the extension that verdict applies.
 async fn check_expired_lease(
     db: &DurableDb,
@@ -3138,7 +3218,7 @@ async fn check_expired_lease(
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = ctx;
+        let bound = ctx.bound_batch()?;
         let now_ms = clock_ms();
         let expired = queue::expired_batches(db, now_ms)
             .await
@@ -3146,7 +3226,7 @@ async fn check_expired_lease(
         let [batch] = expired.as_slice() else {
             return Err(format!("{} batches expired, expected one", expired.len()));
         };
-        if batch.run_id != Some(BATCH_DRIVE_RUN_ID) || batch.past_ceiling {
+        if batch.run_id != Some(bound.run_id) || batch.past_ceiling {
             return Err(format!(
                 "the expired batch is not a live bound run: {batch:?}"
             ));
@@ -3220,6 +3300,67 @@ async fn finish_batch_drive(
     }
 }
 
+/// The lease drive's whole cleanup. The run its setup left going
+/// upstream ends first, then the batch drive's own cleanup runs, each
+/// whatever the other returns.
+async fn finish_lease_drive(
+    db: &DurableDb,
+    shape: FixtureShape,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+) -> Result<(), String> {
+    let ended = end_running_run(ctx).await;
+    let finished = finish_batch_drive(
+        db,
+        shape,
+        ctx,
+        BatchEnd::Extended {
+            lease_minutes: settings.stale_dispatch_minutes,
+        },
+    )
+    .await;
+    let errors: Vec<String> = [ended.err(), finished.err()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// End the run the lease drive's setup left going upstream. On wasm
+/// its cancel — the production backend's `cancel_run` — completes the
+/// seeded run on the local CI, which nothing else would: a run left in
+/// progress there holds the harness's build drain open. On host the
+/// run exists nowhere.
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(
+        clippy::unused_async,
+        reason = "only the wasm build seeded a run at the local CI to end"
+    )
+)]
+async fn end_running_run(ctx: &DriveContext) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let bound = ctx.bound_batch()?;
+        let env = ctx
+            .env
+            .as_ref()
+            .ok_or_else(|| "lease check drive needs a Worker env".to_owned())?;
+        super::object::cancel_local_ci_run(env, bound.run_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = ctx;
+        Ok(())
+    }
+}
+
 /// The unmetered check that a batch drive's run did its work: a no-op
 /// completion or an unapplied resolution would otherwise price as a
 /// cheap success.
@@ -3265,16 +3406,21 @@ async fn verify_batch_end(db: &DurableDb, bound: &BoundBatch, end: BatchEnd) -> 
                 )
             })
         }
-        BatchEnd::Leased => {
-            let live = count(
+        BatchEnd::Extended { lease_minutes } => {
+            let half_lease_seconds = u64::from(lease_minutes) * 30;
+            let extended = count(
                 "SELECT COUNT(*) FROM build_batches \
-                 WHERE batch_id = ? AND lease_at > datetime('now')",
-                vec![batch_id.to_owned()],
+                 WHERE batch_id = ? \
+                   AND lease_at > datetime('now', '+' || ? || ' seconds')",
+                vec![batch_id.to_owned(), half_lease_seconds.to_string()],
             )
             .await?;
-            (live == 1)
-                .then_some(())
-                .ok_or_else(|| format!("batch {batch_id}'s lease was not extended"))
+            (extended == 1).then_some(()).ok_or_else(|| {
+                format!(
+                    "batch {batch_id}'s lease was not extended by {lease_minutes} minutes — \
+                     the lease check did not find its run still going"
+                )
+            })
         }
     }
 }

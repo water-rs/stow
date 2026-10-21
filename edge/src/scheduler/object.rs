@@ -1303,6 +1303,24 @@ pub(super) fn local_ci_runs(env: &WasmEnv) -> Result<dispatch::LocalCiBuildRuns>
     }
 }
 
+/// Cancel `run_id` on the local CI through the backend's own
+/// `cancel_run`, under the deploy's `GITHUB_REPO` — how the budget
+/// probe's lease-check drive ends the running run its setup seeded.
+///
+/// # Errors
+/// The deploy names no local CI or no repository, or the cancel failed.
+pub(super) async fn cancel_local_ci_run(env: &WasmEnv, run_id: u64) -> Result<()> {
+    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+    local_ci_runs(env)?
+        .cancel_run(
+            &github_repo,
+            run_id,
+            &crate::fetch_guard::OutboundPool::new(),
+        )
+        .await
+        .map_err(|error| Error::msg(format!("cancel local CI run {run_id}: {error}")))
+}
+
 /// The claim-plus-fan-out half of a dispatch pass, shared with the
 /// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
 /// `wall_ms` covers the concurrent `dispatch_batch` fan-out and the

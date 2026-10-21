@@ -85,13 +85,16 @@ pub struct LocalCiLeg {
 /// fixture's bound in-flight batches
 /// (`crate::fixture::FixtureShape::in_flight_batch`), each under the run
 /// id the fixture already bound. The budget probe's batch-resolution
-/// drives seed the run a drive's claimed batch ran as, under an id the
-/// server allocates, and bind the batch to it. Either way the server
-/// records each run as finished, so its run object and attempt-jobs
-/// page answer as GitHub's would once the run completed, and it
-/// publishes every succeeded leg's records artifact under the run's tag
-/// before it records the run, as the run's publish jobs would have. The
-/// caller delivers the run's `workflow_run` completion itself.
+/// drives seed the run a drive's claimed batch ran as, and the
+/// lease-check drive the run its batch is still running as, each under
+/// an id the server allocates, and bind the batch to it. The server
+/// records each run in the [`LocalCiSeededStatus`] it names, so its run
+/// object and attempt-jobs page answer as GitHub's would at that point,
+/// and it publishes every succeeded leg's records artifact under the
+/// run's tag before it records the run, as the run's publish jobs would
+/// have. Nothing drives a seeded run afterwards: a running one stays
+/// running until a `POST …/runs/{id}/cancel` ends it, and the caller
+/// delivers any `workflow_run` completion itself.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LocalCiSeededRuns {
     /// The runs to record.
@@ -113,11 +116,32 @@ pub struct LocalCiSeededRun {
     pub batch_id: crate::api::BatchId,
     /// Each leg's task id, in leg order.
     pub legs: Vec<String>,
-    /// How every leg of the run ended.
-    pub conclusion: LocalCiSeededConclusion,
+    /// Where the run stands — GitHub's `status` and, once `completed`,
+    /// its `conclusion`, both at the run's top level as the API spells
+    /// them.
+    #[serde(flatten)]
+    pub status: LocalCiSeededStatus,
 }
 
-/// The one outcome every leg of a [`LocalCiSeededRun`] shares.
+/// Where a [`LocalCiSeededRun`] stands, the state every one of its legs
+/// shares — GitHub's `status`, with the `conclusion` only a `completed`
+/// run carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LocalCiSeededStatus {
+    /// Every leg's build job is running and its publish job has not
+    /// started, so nothing is published and the run's `conclusion` is
+    /// `null`. A `POST …/runs/{id}/cancel` completes it as `cancelled`.
+    InProgress,
+    /// The run finished, every leg at `conclusion`.
+    Completed {
+        /// How every leg of the run ended.
+        conclusion: LocalCiSeededConclusion,
+    },
+}
+
+/// The one outcome every leg of a completed [`LocalCiSeededRun`]
+/// shares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalCiSeededConclusion {
@@ -136,4 +160,47 @@ pub enum LocalCiSeededConclusion {
 pub struct LocalCiSeededRunIds {
     /// The run ids, one per requested run.
     pub runs: Vec<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededStatus};
+
+    /// A seeded run's state is spelled at the run's top level as GitHub
+    /// spells a run object's — `status`, plus `conclusion` once
+    /// `completed` — and reads back as the state it was written as.
+    #[test]
+    fn a_seeded_run_spells_its_state_as_a_github_run_does() {
+        let task_id = format!("{:064x}", 5_u64);
+        for (status, expected) in [
+            (
+                LocalCiSeededStatus::InProgress,
+                serde_json::json!({ "status": "in_progress" }),
+            ),
+            (
+                LocalCiSeededStatus::Completed {
+                    conclusion: LocalCiSeededConclusion::Failure,
+                },
+                serde_json::json!({ "status": "completed", "conclusion": "failure" }),
+            ),
+        ] {
+            let run = LocalCiSeededRun {
+                workflow_run_id: None,
+                rustc_version: crate::identity::WireRustcVersion::parse("1.86.0".to_owned())
+                    .unwrap(),
+                batch_id: task_id[32..].parse().unwrap(),
+                legs: vec![task_id.clone()],
+                status,
+            };
+            let value = serde_json::to_value(&run).unwrap();
+            for (key, spelled) in expected.as_object().unwrap() {
+                assert_eq!(&value[key], spelled, "{key} of {value}");
+            }
+            if status == LocalCiSeededStatus::InProgress {
+                assert!(value.get("conclusion").is_none(), "{value}");
+            }
+            let read: LocalCiSeededRun = serde_json::from_value(value).unwrap();
+            assert_eq!(read.status, status);
+        }
+    }
 }

@@ -352,8 +352,9 @@ const BUDGETS: &[RouteBudget] = &[
         scan_allowlist: &[],
     },
     // The batch drives (stow#833). Each setup claims one full batch of
-    // `STOW_BATCH_MAX_TASKS` = 40 legs from the planted window and binds
-    // it to a run; the batch's leg count is the per-event bound every
+    // `STOW_BATCH_MAX_TASKS` = 40 legs from the planted window — the
+    // one-leg resolution's, one leg — and binds it to a run; the
+    // batch's leg count is the per-event bound every
     // row below names, and none of them reads or writes in proportion to
     // the queue. Budgeted at the 10k host measurement plus 25%, rounded
     // down; the 20k fixture measured within it. The route's write is one
@@ -393,6 +394,18 @@ const BUDGETS: &[RouteBudget] = &[
         statements: 550,
         rows_read: 340,
         rows_written: 490,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // The same resolution over a batch of one leg: the fixed part
+        // (`ready_batches`' batch row and the batch row's delete) plus
+        // one leg's `complete` and build sample. The callback's price
+        // per build. Measured 14 statements, 8 reads, 11 writes, the
+        // same on the 20k fixture.
+        name: "alarm pass (batch resolution, one leg)",
+        statements: 17,
+        rows_read: 10,
+        rows_written: 13,
         scan_allowlist: &[],
     },
     RouteBudget {
@@ -1357,16 +1370,17 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     let legs = i64::from(settings.batch_max_tasks);
     run_drives(&db, shape, &settings, &ctx, &log).await;
 
-    // The two resolution drives each land one full batch of `legs`
-    // legs: the successful batch counts `legs` outcomes, the failed one
-    // `legs` outcomes and `legs` failures. A landed leg writes no raw
+    // The two full resolution drives each land one batch of `legs`
+    // legs and the one-leg drive a batch of one: the successful batches
+    // count `legs + 1` outcomes, the failed one `legs` outcomes and
+    // `legs` failures. A landed leg writes no raw
     // `attempt_outcomes_v2` row on success — the bucket count is its
     // evidence — and one row per leg on failure, each on the generation
     // the claim minted. (Each drive's own cleanup already proved its
     // batch reached its end state.)
     assert_eq!(
         outcome_totals(&db).await,
-        (seeded_outcomes + 2 * legs, seeded_failures + legs),
+        (seeded_outcomes + 2 * legs + 1, seeded_failures + legs),
         "the first pass's leg transitions counted once"
     );
     let per_pass_evidence = usize::try_from(legs).expect("leg count fits usize");
@@ -1410,7 +1424,10 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     // generations: the evidence of both passes is distinct throughout.
     assert_eq!(
         outcome_totals(&db).await,
-        (seeded_outcomes + 4 * legs, seeded_failures + 2 * legs),
+        (
+            seeded_outcomes + 2 * (2 * legs + 1),
+            seeded_failures + 2 * legs
+        ),
         "the second pass's leg transitions counted once more"
     );
     assert_failure_evidence(&db, 2 * per_pass_evidence).await;
