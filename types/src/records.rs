@@ -26,30 +26,6 @@ pub const RECORDS_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.records.config
 /// readers never parse the tag for it.
 pub const RECORDS_TASK_ID_ANNOTATION: &str = "dev.stow.records.task-id";
 
-/// The `run-name` `build-crate.yml` stamps on its run — the full
-/// `<rustc>-<task_id>`, unhashed.
-///
-/// `WireRustcVersion` is numeric (`1.99.0`) and never contains `-`, so
-/// the title splits at the first `-`: the rustc version selects which
-/// records an export pass considers, the task id identifies the run.
-#[must_use]
-pub fn run_title(rustc_version: &str, task_id: &str) -> String {
-    debug_assert!(
-        !rustc_version.is_empty() && !rustc_version.contains('-'),
-        "rustc version {rustc_version:?} cannot lead a run title"
-    );
-    format!("{rustc_version}-{task_id}")
-}
-
-/// The `(rustc_version, task_id)` a run title names — the inverse of
-/// [`run_title`]. `None` when the title is not `<rustc>-<task_id>`: the
-/// run is not one ours could have made, or its name was hand-edited.
-#[must_use]
-pub fn parse_run_title(title: &str) -> Option<(&str, &str)> {
-    let (rustc_version, task_id) = title.split_once('-')?;
-    (!rustc_version.is_empty() && !task_id.is_empty()).then_some((rustc_version, task_id))
-}
-
 /// The `run-name` `build-batch.yml` stamps on its run (stow#833).
 ///
 /// The full `<rustc>-b<batch_id>`. `batch_id` is the 32-lowercase-hex
@@ -256,19 +232,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_title_round_trips() {
-        assert_eq!(run_title("1.99.0", "abc123"), "1.99.0-abc123");
-        assert_eq!(parse_run_title("1.99.0-abc123"), Some(("1.99.0", "abc123")));
-        assert_eq!(
-            parse_run_title("1.99.0-a-task-id-with-dashes"),
-            Some(("1.99.0", "a-task-id-with-dashes"))
-        );
-        assert_eq!(parse_run_title("nodash"), None);
-        assert_eq!(parse_run_title("-missingrustc"), None);
-        assert_eq!(parse_run_title("1.99.0-"), None);
-    }
-
-    #[test]
     fn batch_run_title_round_trips() {
         let batch_id: BatchId = "0123456789abcdef0123456789abcdef"
             .parse()
@@ -309,11 +272,8 @@ mod tests {
         ] {
             assert_eq!(parse_batch_run_title(title), None, "{title}");
         }
-        // `run_title` output never parses as a batch title.
-        assert_eq!(
-            parse_batch_run_title(&run_title("1.99.0", "some-task-id")),
-            None
-        );
+        // A title without the `b<batch_id>` half never parses.
+        assert_eq!(parse_batch_run_title("1.99.0-some-task-id"), None);
     }
 
     const BUILD: BuildRun = BuildRun {
@@ -423,10 +383,6 @@ mod tests {
             parse_records_tag(&tag).map(|parsed| parsed.rustc_version),
             Some("1.99.0")
         );
-        // The webhook path: parse the run title, hash the task id.
-        let title = run_title("1.99.0", &task_id);
-        let (title_rustc, title_task_id) = parse_run_title(&title).expect("run title");
-        assert_eq!(records_tag(title_rustc, title_task_id, BUILD), tag);
     }
 
     #[test]

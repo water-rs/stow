@@ -468,6 +468,24 @@ impl BuildTaskPayload {
 
 // ----- Batched build dispatch (stow#833) -----
 
+/// `k` — the default `max-parallel` runner slots one `build-batch.yml`
+/// matrix holds (stow#833 §1.3).
+///
+/// The sum over in-flight batches is what the runner-family caps
+/// bound; at the defaults nine batches can be in flight — three macOS
+/// (15 of 16 slots) and six Linux/Windows. The scheduler's
+/// `STOW_BATCH_PARALLELISM` binding and `preheat manual
+/// --batch-parallelism` default to it, so the value exists once.
+pub const DEFAULT_BATCH_PARALLELISM: u32 = 5;
+
+/// `B` — the leg bound at which a batch closes (stow#833 §1.3).
+///
+/// Eight `k`-slot rounds at the default, far under GitHub's 256-job
+/// matrix limit, and its tasks pack under [`DISPATCH_INPUT_LIMIT`].
+/// The scheduler's `STOW_BATCH_MAX_TASKS` binding and `preheat manual
+/// --batch-max-tasks` default to it.
+pub const DEFAULT_BATCH_MAX_TASKS: u32 = 40;
+
 /// `value` is exactly `len` lowercase ASCII hex digits.
 fn is_lower_hex(value: &str, len: usize) -> bool {
     value.len() == len

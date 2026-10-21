@@ -4,9 +4,10 @@ use std::num::{NonZero, NonZeroU32};
 
 use skyzen_services::durable::{Alarm, DbValue, DurableDb};
 use stow_types::api::{
-    AdminInFlight, AdminStatus, AdminTargetStats, BatchId, BuildTaskPayload, EnqueueRequest,
-    EnqueueSource, PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus,
-    RunnerFamily, SchedulerResetReport, SchedulerStatus, TaskHash, TaskLane, runner_family,
+    AdminInFlight, AdminStatus, AdminTargetStats, BatchId, BuildTaskPayload,
+    DEFAULT_BATCH_MAX_TASKS, DEFAULT_BATCH_PARALLELISM, EnqueueRequest, EnqueueSource,
+    PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily,
+    SchedulerResetReport, SchedulerStatus, TaskHash, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::runs::{LegFailure, LegOutcome, RunFailure, RunJobRow};
@@ -118,9 +119,9 @@ const DEFAULT_STALE_DISPATCH_MINUTES: u32 = 60;
 // Batch shape (stow#833 §1.3): `k` — the `max-parallel` runner slots
 // one `build-batch.yml` matrix holds — and `B` — its leg bound, eight
 // rounds at the default. `B` stays far under GitHub's 256-job matrix
-// limit and its tasks pack under the workflow_dispatch input cap.
-const DEFAULT_BATCH_PARALLELISM: u32 = 5;
-const DEFAULT_BATCH_MAX_TASKS: u32 = 40;
+// limit and its tasks pack under the workflow_dispatch input cap. The
+// defaults live in `stow_types::api` so `preheat manual` reads the
+// same values the bindings fall back to.
 // Exponential dispatch-failure backoff cap.
 const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 
