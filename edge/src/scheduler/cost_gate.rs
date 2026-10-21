@@ -291,19 +291,20 @@ const BUDGETS: &[RouteBudget] = &[
     // legitimate bound: the report body names every row).
     // The whole route (stow#785): the report — with its commit-time
     // shape repair — plus the `dispatch_pending` claiming tail and
-    // wake re-plan. The 10k host gate measured 22 statements, 492
-    // reads, 350 writes. The tail's pass claims at most free slots /
-    // `STOW_BATCH_PARALLELISM` × `STOW_BATCH_MAX_TASKS` legs; the
-    // thirty one-slot in-flight batches leave 15 of the 45 slots, and
-    // the pass fills 12 of them with miss batches (the third batch
-    // stops at 2 legs): 82 claimed legs, 3 writes each (the
-    // `UPDATE queue` claim, 246 of the 350) plus the 100 slice rows
-    // the report names. Writes budgeted at the measurement plus 20%.
+    // wake re-plan. The 10k host gate measured 22 statements, 612
+    // reads, 464 writes. The tail's pass claims at most free slots /
+    // `STOW_BATCH_PARALLELISM` × `STOW_BATCH_MAX_TASKS` legs — the
+    // dispatch cap bounds it, not the event: the thirty one-slot
+    // in-flight batches leave 15 of the 45 slots, filled with 3 miss
+    // batches of 40 legs: 120 claimed legs, 3 writes each (the
+    // `UPDATE queue` claim, 360 of the 464) plus the 100 slice rows
+    // the report names. Reads and writes budgeted at the measurement
+    // plus 20%.
     RouteBudget {
         name: "POST /index/published (full)",
         statements: 90,
-        rows_read: 600,
-        rows_written: 420,
+        rows_read: 735,
+        rows_written: 560,
         scan_allowlist: &[],
     },
     // A report whose membership moved by DELTA_ROWS: the gate writes
@@ -312,14 +313,15 @@ const BUDGETS: &[RouteBudget] = &[
     // slice or the graph (stow#521) — plus the same dispatch tail as
     // the full drive and the report-time shape repair, which can
     // requeue the deps the retire just uncovered. The 10k host gate
-    // measured 25 statements, 577 reads, 416 writes, the tail's claim
-    // bounded as the full drive's is: 82 claimed legs, 3 writes each.
-    // Writes budgeted at the measurement plus 20%.
+    // measured 25 statements, 697 reads, 530 writes, the tail's claim
+    // bounded by the dispatch cap as the full drive's is: 120 claimed
+    // legs, 3 writes each. Reads and writes budgeted at the
+    // measurement plus 20%.
     RouteBudget {
         name: "POST /index/published (delta)",
         statements: 110,
-        rows_read: 600,
-        rows_written: 500,
+        rows_read: 840,
+        rows_written: 640,
         scan_allowlist: &[],
     },
     // The alarm's dispatch pass on a warm queue: the claim pages at
@@ -1009,8 +1011,9 @@ async fn run_one_drive(
     // A drive leaves the queue as it found it: a pending row it added
     // is claimable by the next pass drive, its edges and nodes widen
     // every later walk, and a flag it flipped changes what the claim
-    // walk can open.
-    if let Some(left) = queue_before.left_behind(&queue_after, ctx.take_restores_queue()) {
+    // walk can open. No exemptions — a drive that moves pending rows
+    // restores them in its own cleanup, so a changed count is a leak.
+    if let Some(left) = queue_before.left_behind(&queue_after) {
         return Err(format!("{} left the queue changed: {left}", drive.name));
     }
     match (run_result, cleanup_result) {
@@ -1043,15 +1046,13 @@ struct QueueSurface {
 
 impl QueueSurface {
     /// A description of how `after` differs from `self`, `None` when
-    /// the drive left the surface as it found it. `restores_flags` is
-    /// true for a drive that snapshotted queue state for its cleanup,
-    /// which promises the rows back as found; the route drives that
-    /// take no snapshot change pending rows on purpose (a retry, a
-    /// promotion, a demand fold).
-    fn left_behind(&self, after: &Self, restores_flags: bool) -> Option<String> {
+    /// the drive left the surface as it found it — every drive is held
+    /// to it. A route that moves pending rows restores them in its own
+    /// cleanup, so a changed eligible-pending count is always a leak.
+    fn left_behind(&self, after: &Self) -> Option<String> {
         let added: Vec<&String> = after.task_ids.difference(&self.task_ids).collect();
         (!added.is_empty()
-            || (restores_flags && after.eligible_pending != self.eligible_pending)
+            || after.eligible_pending != self.eligible_pending
             || after.derived_edges != self.derived_edges
             || after.derived_nodes != self.derived_nodes)
             .then(|| {
@@ -1202,10 +1203,9 @@ async fn assert_failure_evidence(db: &DurableDb, expected: usize) {
 
 /// What a pass's batch drives must leave behind besides their recorded
 /// evidence: no build sample or stat the resolved legs filed, and no
-/// queue row bound to a batch the fixture does not hold — apart from
-/// the `claimed` legs of the hot pass, which stay claimed until the
-/// re-arm restores them.
-async fn assert_batch_drives_cleaned_up(db: &DurableDb, claimed: &[String]) {
+/// queue row bound to a batch the fixture does not hold: every claiming
+/// drive restores its legs, so a bound orphan is a failed restore.
+async fn assert_batch_drives_cleaned_up(db: &DurableDb) {
     for table in ["crate_build_samples", "crate_build_stats"] {
         let rows = db
             .query(&format!("SELECT COUNT(*) FROM {table}"))
@@ -1217,10 +1217,8 @@ async fn assert_batch_drives_cleaned_up(db: &DurableDb, claimed: &[String]) {
     let orphaned = db
         .query(
             "SELECT COUNT(*) FROM queue WHERE batch_id IS NOT NULL \
-             AND batch_id NOT IN (SELECT batch_id FROM build_batches) \
-             AND task_id NOT IN (SELECT value FROM json_each(?))",
+             AND batch_id NOT IN (SELECT batch_id FROM build_batches)",
         )
-        .bind(serde_json::to_string(claimed).expect("encode claimed ids"))
         .fetch_scalar::<i64>()
         .await
         .expect("orphaned legs");
@@ -1376,7 +1374,7 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     assert_failure_evidence(&db, per_pass_evidence).await;
     let claimed = ctx.claimed_ids();
     assert!(!claimed.is_empty(), "the gate pass claims rows");
-    assert_batch_drives_cleaned_up(&db, &claimed).await;
+    assert_batch_drives_cleaned_up(&db).await;
     fixture::record_probe_claimed(&db, &claimed)
         .await
         .expect("record claims");
@@ -1398,21 +1396,12 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
             "unclaimed {status} row at n={n} survived the re-arm"
         );
     }
-    // The retry drive turns the two seeded failed rows pending, so a
-    // claim can take them; the re-arm returns them to their seeded
-    // `failed`, every other claimed row to `pending`.
-    let seeded_failed = [shape.failed_row(0), shape.failed_row(1)].map(|n| format!("{n:064x}"));
     for id in &claimed {
         if u64::from_str_radix(id, 16).is_ok() {
-            let expected = if seeded_failed.contains(id) {
-                "failed"
-            } else {
-                "pending"
-            };
             assert_eq!(
                 status_of(&db, id).await,
-                expected,
-                "claimed row {id} returned to its seeded status"
+                "pending",
+                "claimed row {id} returned to pending"
             );
         }
     }
@@ -1426,7 +1415,7 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
         "the second pass's leg transitions counted once more"
     );
     assert_failure_evidence(&db, 2 * per_pass_evidence).await;
-    assert_batch_drives_cleaned_up(&db, &ctx.claimed_ids()).await;
+    assert_batch_drives_cleaned_up(&db).await;
 }
 
 /// A drive that fails mid-pass must still see its cleanup run — the

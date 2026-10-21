@@ -63,8 +63,8 @@ struct PriorFlag {
     dispatch_eligible: i64,
 }
 
-/// The queue fields a focused claim probe must put back exactly —
-/// the union of every column the pass's writers touch:
+/// The queue fields a drive's cleanup must put back exactly — the
+/// union of every column the drives' writers touch:
 /// `claim_dispatchable_row` (`status`, `generation_id`, `dispatch_attempts`,
 /// `github_run_id`, `claimed_at`, `updated_at`), `retire_covered_rows`
 /// (`status`, `error_msg`), `requeue_unbound_batch` (`status`,
@@ -72,8 +72,11 @@ struct PriorFlag {
 /// `requeue_incomplete_shape_deps` (`status`, `attempt`, `error_msg`,
 /// `deps_met`, `blocked`, `not_before`, `wake_at`,
 /// `shape_requeue`), `apply_key_updates` (`value`, `dispatch_key`,
-/// `dispatch_eligible`) on the transitioned ids (stow#525), and the
-/// claim's batch binding (`batch_id`, `batch_leg`; stow#833).
+/// `dispatch_eligible`) on the transitioned ids (stow#525), the
+/// claim's batch binding (`batch_id`, `batch_leg`; stow#833), the
+/// promote mutation's `lane` move, the retry/cancel verbs' status and
+/// wake columns plus their dependents' `blocked` refresh, and the
+/// demand fold's `demand` accumulation (stow#522).
 #[derive(Debug, Clone, skyzen::FromRow)]
 pub struct RestoreQueueRow {
     task_id: String,
@@ -89,7 +92,13 @@ pub struct RestoreQueueRow {
     /// through the `CAST AS TEXT` contract `RANK_SOURCE_SELECT` uses
     /// (stow#524).
     value: String,
+    /// `demand` shares `value`'s TEXT contract — an accumulated demand
+    /// can leave the JS safe integer range the same way.
+    demand: String,
     dispatch_key: String,
+    /// The lane the row was parked on — the promote mutation moves a
+    /// `miss` row to `human`.
+    lane: String,
     dispatch_eligible: i64,
     generation_id: String,
     dispatch_attempts: i64,
@@ -104,8 +113,8 @@ pub struct RestoreQueueRow {
 /// The `RestoreQueueRow` column list, kept beside the struct so the
 /// snapshot queries and the restore UPDATE can't drift apart.
 const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, \
-     deps_met, blocked, not_before, wake_at, CAST(value AS TEXT) AS value, dispatch_key, \
-     dispatch_eligible, \
+     deps_met, blocked, not_before, wake_at, CAST(value AS TEXT) AS value, \
+     CAST(demand AS TEXT) AS demand, dispatch_key, lane, dispatch_eligible, \
      generation_id, dispatch_attempts, github_run_id, claimed_at, updated_at, shape_requeue, \
      batch_id, batch_leg";
 
@@ -159,9 +168,6 @@ pub struct DriveContext {
     /// The floor setting and flags a floor drive's setup found, so its
     /// cleanup puts back exactly what the operator floor path rewrote.
     prior_floor: std::sync::Arc<std::sync::Mutex<Option<PriorFloor>>>,
-    /// Set when a drive snapshots queue state for its cleanup to put
-    /// back exactly — the gate then holds that drive to the promise.
-    restores_queue: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DriveContext {
@@ -182,7 +188,6 @@ impl DriveContext {
             prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
             batch: std::sync::Arc::new(std::sync::Mutex::new(None)),
             prior_floor: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            restores_queue: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -203,7 +208,6 @@ impl DriveContext {
             prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
             batch: std::sync::Arc::new(std::sync::Mutex::new(None)),
             prior_floor: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            restores_queue: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -228,14 +232,12 @@ impl DriveContext {
 
     /// Record the pre-claim field set the setup snapshot read.
     fn set_restore_rows(&self, rows: Vec<RestoreQueueRow>) {
-        self.promise_queue_restore();
         *self.restore_rows.lock().expect("restore snapshot") = rows;
     }
 
     /// Add rows to the recorded field set — the rows a batch drive's
     /// run writes beyond the claim's own frontier.
     fn extend_restore_rows(&self, rows: Vec<RestoreQueueRow>) {
-        self.promise_queue_restore();
         self.restore_rows
             .lock()
             .expect("restore snapshot")
@@ -276,23 +278,8 @@ impl DriveContext {
             .ok_or_else(|| "the drive's setup bound no batch".to_owned())
     }
 
-    fn promise_queue_restore(&self) {
-        self.restores_queue
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Whether the drive that just ran snapshotted queue state for an
-    /// exact restore; reading it clears it for the next drive. Only the
-    /// host gate holds drives to the promise.
-    #[cfg(all(test, not(target_arch = "wasm32")))]
-    pub fn take_restores_queue(&self) -> bool {
-        self.restores_queue
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Record the floor state a floor drive's setup found.
     fn set_prior_floor(&self, prior: PriorFloor) {
-        self.promise_queue_restore();
         *self.prior_floor.lock().expect("prior floor") = Some(prior);
     }
 
@@ -696,8 +683,25 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
+        // The retried rows re-enter `pending` — status, the wake and
+        // attempt columns, the re-priced dispatch pair — and the verb's
+        // follow-up refresh re-evaluates their dependents' `blocked`.
+        // The setup snapshots that whole write set so the cleanup
+        // returns the queue exactly as seeded.
         name: "POST /tasks/retry",
-        setup: None,
+        setup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move {
+                snapshot_mutation_rows(
+                    db,
+                    ctx,
+                    &[
+                        hex_id(u64::from(shape.failed_row(0))),
+                        hex_id(u64::from(shape.failed_row(1))),
+                    ],
+                )
+                .await
+            })
+        }),
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -724,11 +728,28 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
+        // The cancelled rows leave `pending` for `failed` and their
+        // dependents wake-block in the same request — the same
+        // snapshot/restore contract the retry drive holds.
         name: "POST /tasks/cancel",
-        setup: None,
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                snapshot_mutation_rows(
+                    db,
+                    ctx,
+                    &[
+                        hex_id(u64::from(FixtureShape::pending_row(701))),
+                        hex_id(u64::from(FixtureShape::pending_row(702))),
+                    ],
+                )
+                .await
+            })
+        }),
         run: |db, _shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -752,11 +773,25 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
+        // The promote writes only the matched row: the lane move, the
+        // `not_before` wake and the human-priced `(value, dispatch_key,
+        // dispatch_eligible)` pair — no dependents refresh. Snapshot it
+        // for the cleanup's exact restore.
         name: "POST /tasks/promote",
-        setup: None,
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.set_restore_rows(
+                    restore_rows_for(db, &[hex_id(u64::from(FixtureShape::pending_row(4703)))])
+                        .await?,
+                );
+                Ok(())
+            })
+        }),
         run: |db, _shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -781,11 +816,35 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
+        // The delete takes the rows themselves — a snapshot cannot
+        // write a vanished row back, so the cleanup re-seeds them
+        // through the fixture's own restore — while the dependents'
+        // `blocked` refresh is column work the snapshot covers.
         name: "POST /tasks/purge",
-        setup: None,
+        setup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.set_restore_rows(
+                    restore_rows_for(
+                        db,
+                        &dependents_of(
+                            db,
+                            &[
+                                hex_id(u64::from(shape.completed_row(0))),
+                                hex_id(u64::from(shape.completed_row(1))),
+                            ],
+                        )
+                        .await?,
+                    )
+                    .await?,
+                );
+                Ok(())
+            })
+        }),
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -809,7 +868,29 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, settings, ctx| {
+            Box::pin(async move {
+                let mut errors: Vec<String> = Vec::new();
+                if let Err(error) = super::fixture::restore_queue_rows(
+                    db,
+                    shape,
+                    settings.dispatch_min_age_minutes,
+                    &[shape.completed_row(0), shape.completed_row(1)],
+                )
+                .await
+                {
+                    errors.push(error.to_string());
+                }
+                if let Err(error) = restore_snapshot_rows(db, &ctx.take_restore_rows()).await {
+                    errors.push(error);
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
+            })
+        }),
     },
     Drive {
         // A settled `enqueued` record: the row read, the stored-roots
@@ -1093,7 +1174,7 @@ pub const DRIVES: &[Drive] = &[
     },
     Drive {
         name: "POST /demand",
-        setup: Some(|_db, _shape, _settings, ctx| {
+        setup: Some(|db, _shape, _settings, ctx| {
             Box::pin(async move {
                 // Capture the alarm state before the drive arms its
                 // probe timestamps — the cleanup restores exactly this
@@ -1105,8 +1186,27 @@ pub const DRIVES: &[Drive] = &[
                     let prior = alarm.get_alarm().await.map_err(|error| error.to_string())?;
                     ctx.set_prior_alarm(prior);
                 }
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = ctx;
+                // The fold's write set is exactly the entry's unbuilt
+                // closure — row 101 and the unmet-edge rows behind it —
+                // the same set the run's `demand_event_rows` computes.
+                // Snapshot it here so the cleanup returns `demand`,
+                // `value`, `dispatch_key` and `dispatch_eligible` as
+                // seeded.
+                let n = 101_u32;
+                let (crate_name, version) = crate_identity(n);
+                let touched = queue::demand_closure_tasks(
+                    db,
+                    &[
+                        crate_name,
+                        version,
+                        FeaturesJson::default().raw(),
+                        dep_target(n).to_owned(),
+                        "1.86.0".to_owned(),
+                    ],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                ctx.set_restore_rows(restore_rows_for(db, &touched).await?);
                 Ok(())
             })
         }),
@@ -1196,8 +1296,24 @@ pub const DRIVES: &[Drive] = &[
                 Ok(())
             })
         },
-        cleanup: Some(|_db, _shape, _settings, ctx| {
+        cleanup: Some(|db, _shape, _settings, ctx| {
             Box::pin(async move {
+                let mut errors: Vec<String> = Vec::new();
+                // The folded rows back to their snapshot preimage, and
+                // the accepted batch record — plus any staged remainder
+                // a mid-run failure left — removed: the fixture holds
+                // no demand ledger rows.
+                if let Err(error) = restore_snapshot_rows(db, &ctx.take_restore_rows()).await {
+                    errors.push(error);
+                }
+                for statement in [
+                    "DELETE FROM demand_contributions WHERE batch_id = 'costgate-demand'",
+                    "DELETE FROM demand_batches WHERE batch_id = 'costgate-demand'",
+                ] {
+                    if let Err(error) = db.query(statement).execute().await {
+                        errors.push(format!("remove demand batch record: {error}"));
+                    }
+                }
                 // Put the pre-drive alarm state back: re-arm the
                 // captured timestamp, or delete the probe's arm when
                 // nothing was set — a real armed alarm must not leak
@@ -1206,17 +1322,23 @@ pub const DRIVES: &[Drive] = &[
                 if let Some(alarm) = ctx.alarm.as_ref() {
                     match ctx.take_prior_alarm() {
                         PriorAlarm::Armed(ms) => {
-                            alarm.set_alarm(ms).await.map_err(|e| e.to_string())?;
+                            if let Err(error) = alarm.set_alarm(ms).await {
+                                errors.push(error.to_string());
+                            }
                         }
                         PriorAlarm::Unarmed => {
-                            alarm.delete_alarm().await.map_err(|e| e.to_string())?;
+                            if let Err(error) = alarm.delete_alarm().await {
+                                errors.push(error.to_string());
+                            }
                         }
                         PriorAlarm::NotCaptured => {}
                     }
                 }
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = ctx;
-                Ok(())
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
             })
         }),
     },
@@ -1607,7 +1729,9 @@ pub const DRIVES: &[Drive] = &[
         // nodes)` rows read, bounded by the dispatched tasks' own
         // subgraphs, never the queue bulk.
         name: "alarm pass",
-        setup: None,
+        setup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move { snapshot_claim_surface(db, settings, ctx, &[]).await })
+        }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
                 dispatch_pass_drive(db, settings, ctx, false)
@@ -1615,12 +1739,15 @@ pub const DRIVES: &[Drive] = &[
                     .map(|_| ())
             })
         },
-        // The pass's claimed queue rows stay claimed — the re-arm
-        // restores exactly that recorded set — but the batch rows its
-        // claim inserted are not part of that record: they go now, so
-        // no later drive reads their slots.
-        cleanup: Some(|db, shape, _settings, _ctx| {
-            Box::pin(async move { restore_batches(db, shape).await })
+        // The claimed ids stay in `claimed_tasks` — the launch gate's
+        // marginal divisor and the re-arm's restore set — but the rows
+        // themselves go back from the setup snapshot now, so no later
+        // drive measures the pass's claimed frontier instead of the
+        // fixture's. The claim's batch rows go with them.
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(
+                async move { restore_claim_surface(db, shape, &ctx.take_restore_rows()).await },
+            )
         }),
     },
     Drive {
@@ -1930,8 +2057,14 @@ pub const DRIVES: &[Drive] = &[
         // bound. The unmetered cleanup deletes exactly the
         // subgraph's own primary keys.
         name: "POST /scheduler/demand-feed/deliver (page apply)",
-        setup: Some(|db, _shape, settings, _ctx| {
+        setup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move {
+                // The run's page apply folds demand into queue rows —
+                // snapshot the closure of every entry the hour's pages
+                // carry before any delivery. The event subgraph's own
+                // rows only land later in this setup, so the cleanup's
+                // primary-key delete — never the snapshot — owns them.
+                snapshot_feed_delivery_rows(db, ctx, &[(0, &[256, 4], feed_event_entries)]).await?;
                 seed_feed_event_subgraph(db, settings).await?;
                 seed_feed_hour_sized(db, 0, &[256, 4], feed_event_entries).await
             })
@@ -1944,8 +2077,19 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
-        cleanup: Some(|db, _shape, _settings, _ctx| {
-            Box::pin(async move { clear_feed_event_subgraph(db).await })
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                // The snapshotted fixture rows back first — the delete
+                // below removes event rows by primary key, and a
+                // restore ordered after it would report them vanished.
+                let restored = restore_snapshot_rows(db, &ctx.take_restore_rows()).await;
+                let cleared = clear_feed_event_subgraph(db).await;
+                match (restored, cleared) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Err(restored), Err(cleared)) => Err(format!("{restored}; {cleared}")),
+                }
+            })
         }),
     },
     Drive {
@@ -1954,8 +2098,21 @@ pub const DRIVES: &[Drive] = &[
         // probe, then the contiguous-watermark guarded transition to
         // `delivered`, priced separately from a mid-hour apply.
         name: "POST /scheduler/demand-feed/deliver (terminal)",
-        setup: Some(|db, _shape, settings, _ctx| {
+        setup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move {
+                // T00's remaining page and every staged T01 page fold
+                // demand into fixture queue rows — snapshot the
+                // closures their pages' entries reach before the first
+                // delivery.
+                snapshot_feed_delivery_rows(
+                    db,
+                    ctx,
+                    &[
+                        (0, &[4; FEED_DRIVE_PAGES as usize], feed_drive_entries),
+                        (1, &[4; FEED_DRIVE_PAGES as usize], feed_drive_entries),
+                    ],
+                )
+                .await?;
                 // Contiguity: T01's transition needs the watermark at
                 // T00, so the predecessor delivers fully in unmetered
                 // setup — then T01 stages and every page applies,
@@ -1978,7 +2135,11 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            // The feed ledger chain stays — only the queue rows the
+            // folds moved return to their snapshot preimage.
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
         // A delivery replay on an already-delivered hour: the header
@@ -1986,8 +2147,17 @@ pub const DRIVES: &[Drive] = &[
         // re-plan — the bounded cost a lost-ack re-fire owes, with
         // zero ledger writes.
         name: "POST /scheduler/demand-feed/deliver (replay)",
-        setup: Some(|db, _shape, settings, _ctx| {
+        setup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move {
+                // The full delivery below folds T02's pages into
+                // fixture queue rows — snapshot their entries'
+                // closures before the first delivery.
+                snapshot_feed_delivery_rows(
+                    db,
+                    ctx,
+                    &[(2, &[4; FEED_DRIVE_PAGES as usize], feed_drive_entries)],
+                )
+                .await?;
                 seed_feed_hour(db, 2, FEED_DRIVE_PAGES).await?;
                 deliver_feed_hour_fully(db, 2, settings).await
             })
@@ -2000,7 +2170,9 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
         // One bounded retire chunk with a full 256 obsolete pages
@@ -2304,6 +2476,35 @@ async fn restore_rows_for(db: &DurableDb, ids: &[String]) -> Result<Vec<RestoreQ
     Ok(rows)
 }
 
+/// Snapshot the queue rows a `POST /tasks/*` mutation's run can
+/// rewrite — the selector's own ids plus every dependent whose
+/// `blocked` flag the verb's follow-up refresh re-evaluates — into the
+/// drive context's restore list, so the cleanup returns the queue
+/// exactly as seeded.
+async fn snapshot_mutation_rows(
+    db: &DurableDb,
+    ctx: &DriveContext,
+    ids: &[String],
+) -> Result<(), String> {
+    let mut rows = restore_rows_for(db, ids).await?;
+    rows.extend(restore_rows_for(db, &dependents_of(db, ids).await?).await?);
+    ctx.set_restore_rows(rows);
+    Ok(())
+}
+
+/// Every task that owns an edge onto one of `ids` — the dependents a
+/// mutation's `refresh_dependents` re-evaluates `blocked` on.
+async fn dependents_of(db: &DurableDb, ids: &[String]) -> Result<Vec<String>, String> {
+    db.query(
+        "SELECT task_id FROM queue_dependencies \
+         WHERE depends_on_task_id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
+    .fetch_scalars::<String>()
+    .await
+    .map_err(|error| error.to_string())
+}
+
 /// Snapshot every queue row a claiming pass can move into the drive
 /// context's restore list — the eligible frontier (`claim`/`retire`
 /// writers), plus any `extra_ids` a probe knows its own earlier half
@@ -2355,7 +2556,8 @@ async fn restore_snapshot_rows(db: &DurableDb, snapshot: &[RestoreQueueRow]) -> 
                 "UPDATE queue SET status = ?, attempt = ?, error_msg = ?, \
                      deps_met = ?, blocked = ?, \
                      not_before = ?, wake_at = ?, value = CAST(? AS INTEGER), \
-                     dispatch_key = ?, dispatch_eligible = ?, \
+                     demand = CAST(? AS INTEGER), \
+                     dispatch_key = ?, lane = ?, dispatch_eligible = ?, \
                      generation_id = ?, dispatch_attempts = ?, \
                      github_run_id = ?, claimed_at = ?, updated_at = ?, \
                      shape_requeue = ?, batch_id = ?, batch_leg = ? \
@@ -2369,7 +2571,9 @@ async fn restore_snapshot_rows(db: &DurableDb, snapshot: &[RestoreQueueRow]) -> 
             .bind(row.not_before.clone())
             .bind(row.wake_at.clone())
             .bind(row.value.clone())
+            .bind(row.demand.clone())
             .bind(row.dispatch_key.clone())
+            .bind(row.lane.clone())
             .bind(row.dispatch_eligible)
             .bind(row.generation_id.clone())
             .bind(row.dispatch_attempts)
@@ -3504,6 +3708,73 @@ async fn deliver_feed_hour_fully(
             return Ok(());
         }
     }
+}
+
+/// Snapshot into the drive context's restore list every queue row a
+/// drive's feed deliveries can fold — the unbuilt closure, which is
+/// the `demand_pass` fold's exact write set, of every entry the
+/// delivered hours' pages carry. The live staged payloads cover pages
+/// a chain sibling already landed; the `counts`/`entries` spec covers
+/// the pages this drive's own setup stages for an absent hour — the
+/// union names the same entries either way. Taken before the first
+/// delivery so the cleanup writes `demand`, `value`, `dispatch_key`
+/// and `dispatch_eligible` back as found (stow#833); the feed ledger
+/// itself stays — the drives chain on its watermark.
+async fn snapshot_feed_delivery_rows(
+    db: &DurableDb,
+    ctx: &DriveContext,
+    hours: &[(u32, &[u32], FeedPageEntries)],
+) -> Result<(), String> {
+    let mut touched = std::collections::BTreeSet::new();
+    for &(idx, counts, entries) in hours {
+        let hour = feed_drive_hour(idx);
+        for payload in db
+            .query("SELECT payload FROM demand_feed_pages WHERE hour = ?")
+            .bind(hour.as_str())
+            .fetch_scalars::<String>()
+            .await
+            .map_err(|error| format!("read staged pages of {hour}: {error}"))?
+        {
+            let staged: Vec<stow_types::api::SchedulerDemandEntry> = serde_json::from_str(&payload)
+                .map_err(|error| {
+                    format!("staged page payload of {hour} does not decode: {error}")
+                })?;
+            for entry in &staged {
+                feed_entry_closure(db, &mut touched, entry).await?;
+            }
+        }
+        for (page_no, count) in counts.iter().enumerate() {
+            for entry in entries(u32::try_from(page_no).expect("page index"), *count)? {
+                feed_entry_closure(db, &mut touched, &entry).await?;
+            }
+        }
+    }
+    let ids: Vec<String> = touched.into_iter().collect();
+    ctx.set_restore_rows(restore_rows_for(db, &ids).await?);
+    Ok(())
+}
+
+/// Union one page entry's unbuilt closure — the task set a delivery's
+/// `demand_pass` can write for it — into `touched`.
+async fn feed_entry_closure(
+    db: &DurableDb,
+    touched: &mut std::collections::BTreeSet<String>,
+    entry: &stow_types::api::SchedulerDemandEntry,
+) -> Result<(), String> {
+    let closure = queue::demand_closure_tasks(
+        db,
+        &[
+            entry.crate_name.as_str().to_owned(),
+            entry.version.to_string(),
+            entry.features_json.raw(),
+            entry.target.as_str().to_owned(),
+            entry.rustc_version.as_str().to_owned(),
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    touched.extend(closure);
+    Ok(())
 }
 
 /// The page-apply drive's own event graph (stow#523): the stored
