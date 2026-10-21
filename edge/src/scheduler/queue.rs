@@ -2356,55 +2356,95 @@ pub async fn reconcile_pending_completions(
     Ok(failure_applied)
 }
 
-/// Bind the run a `workflow_dispatch` response returned to the claimed
-/// row's generation. The claim cleared `github_run_id`, so the write is
-/// gated on the generation the dispatch was made for: a row that has
-/// since moved on (cancelled, failed over) takes no binding, and the
-/// orphan run's own report is rejected as stale when it lands.
+/// Bind the run a `build-batch.yml` dispatch response returned to its
+/// `build_batches` row — one bind per batch, however many legs it
+/// carries (stow#833 §4.2). The claim left `github_run_id` NULL, and
+/// the `IS NULL` guard makes the bind write-once: a rebind never
+/// overwrites the run a completion is matched against
+/// (`done_run_id = github_run_id`). A `completed` delivery that beat
+/// this bind is already on the row, so it becomes resolvable the
+/// moment the bind lands.
 ///
-/// The id is also what #526's reconciliation compares against — the
-/// persisted binding is the source of truth for which run a generation
-/// dispatched, where name-matching alone cannot tell two generations
-/// of `<rustc>-<task_id>` apart.
-///
-/// Returns `true` when the binding landed. `false` means the row no
-/// longer sits in the bound generation's claim — the caller logs and
-/// moves on.
-pub async fn bind_dispatch_run(
+/// Returns `true` when the binding landed. `false` means the row is
+/// gone or already bound — the caller logs and moves on.
+pub async fn bind_batch_run(
     db: &DurableDb,
-    task_id: &str,
-    generation_id: &str,
+    batch_id: &str,
     github_run_id: &str,
 ) -> Result<bool, QueueError> {
     let result = db
         .query(
-            "UPDATE queue SET github_run_id = ? \
-             WHERE task_id = ? AND generation_id = ? \
-                 AND status IN ('dispatched', 'running') AND github_run_id IS NULL",
+            "UPDATE build_batches SET github_run_id = ? \
+             WHERE batch_id = ? AND github_run_id IS NULL",
         )
         .bind(github_run_id.to_owned())
-        .bind(task_id.to_owned())
-        .bind(generation_id.to_owned())
+        .bind(batch_id.to_owned())
         .execute()
         .await
-        .map_err(|error| format!("bind dispatch run for {task_id}: {error}"))?;
-    if result.rows_written == 0 {
-        return Ok(false);
+        .map_err(|error| format!("bind dispatch run for batch {batch_id}: {error}"))?;
+    Ok(result.rows_written > 0)
+}
+
+/// A batch whose dispatch failed — the POST, the network, an unreadable
+/// response or the token mint (stow#833 §4.2): every leg backs off
+/// through [`mark_dispatch_failed`] and the batch row is deleted,
+/// which releases its runner slots. Any run the failure left behind is
+/// an orphan whose completion finds no batch row.
+async fn fail_batch_dispatch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch: &FormedBatch,
+    error: &str,
+) -> Result<(), QueueError> {
+    for task in &batch.tasks {
+        mark_dispatch_failed(db, settings, &task.task_id, &task.generation_id, error).await?;
     }
-    // A completion from an orphaned run can arrive while this generation is
-    // claimed but still unbound. Once the native response binds Y, every
-    // pending event for the task except Y belongs to an older or ambiguous
-    // generation and must be consumed here, even when Y had no early event.
-    db.query(
-        "DELETE FROM pending_run_completions \
-         WHERE task_id = ? AND github_run_id != ?",
-    )
-    .bind(task_id.to_owned())
-    .bind(github_run_id.to_owned())
-    .execute()
-    .await
-    .map_err(|error| format!("discard superseded pending completions for {task_id}: {error}"))?;
-    Ok(true)
+    db.query("DELETE FROM build_batches WHERE batch_id = ?")
+        .bind(batch.batch_id.as_str().to_owned())
+        .execute()
+        .await
+        .map_err(|db_error| {
+            format!(
+                "delete failed-dispatch batch {}: {db_error}",
+                batch.batch_id
+            )
+        })?;
+    Ok(())
+}
+
+/// Persist one batch's dispatch outcome: a returned run id binds the
+/// batch row once ([`bind_batch_run`]); a dispatch error — or a bind
+/// that could not be written — backs off every leg and deletes the
+/// row ([`fail_batch_dispatch`]).
+pub async fn persist_batch_dispatch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch: &FormedBatch,
+    outcome: Result<u64, String>,
+) -> Result<(), QueueError> {
+    match outcome {
+        Ok(run_id) => {
+            match bind_batch_run(db, batch.batch_id.as_str(), &run_id.to_string()).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        batch_id = %batch.batch_id,
+                        run_id,
+                        "dispatch run binding skipped — the batch row is gone or already bound"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(batch_id = %batch.batch_id, %error, "failed to bind batch dispatch run");
+                    fail_batch_dispatch(db, settings, batch, &error.to_string()).await?;
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(batch_id = %batch.batch_id, %error, "failed to dispatch build batch");
+            fail_batch_dispatch(db, settings, batch, &error).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Record a `build-batch.yml` run's `workflow_run` `completed`

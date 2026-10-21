@@ -5210,7 +5210,7 @@ async fn delayed_old_run_cannot_complete_new_bound_generation() {
         .await
         .expect("claim A")[0]
         .clone();
-    super::bind_dispatch_run(&db, &id, &first.generation_id, "run-a")
+    bind_dispatch_run(&db, &id, &first.generation_id, "run-a")
         .await
         .expect("bind A");
     super::complete_run(
@@ -5230,7 +5230,7 @@ async fn delayed_old_run_cannot_complete_new_bound_generation() {
         .await
         .expect("claim B")[0]
         .clone();
-    super::bind_dispatch_run(&db, &id, &second.generation_id, "run-b")
+    bind_dispatch_run(&db, &id, &second.generation_id, "run-b")
         .await
         .expect("bind B");
     let stale = super::complete_run(
@@ -5274,7 +5274,7 @@ async fn early_completion_is_acknowledged_then_applied_after_exact_binding() {
     .expect("early report is durably acknowledged");
     assert_eq!(row_column(&db, "early", "status").await, "dispatched");
     assert_eq!(pending_completion_count(&db).await, 1);
-    super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-early")
+    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-early")
         .await
         .expect("bind exact run");
     super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
@@ -5303,7 +5303,7 @@ async fn duplicate_early_delivery_is_idempotent_and_replay_conflicts_after_apply
         .await
         .expect("duplicate early delivery");
     assert_eq!(pending_completion_count(&db).await, 1);
-    super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-replay")
+    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-replay")
         .await
         .expect("bind replay run");
     super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
@@ -5355,7 +5355,7 @@ async fn response_loss_reclaim_drops_unbound_event_before_new_claim() {
         .expect("claim replacement")[0]
         .clone();
     assert_eq!(replacement.attempt, claimed.attempt);
-    super::bind_dispatch_run(&db, &id, &replacement.generation_id, "run-new")
+    bind_dispatch_run(&db, &id, &replacement.generation_id, "run-new")
         .await
         .expect("bind replacement");
     let stale = super::complete_run(
@@ -5423,7 +5423,7 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
     .await
     .expect("persist early B completion");
     assert_eq!(pending_completion_count(&db).await, 1);
-    super::bind_dispatch_run(&db, &id, &second.generation_id, "run-b")
+    bind_dispatch_run(&db, &id, &second.generation_id, "run-b")
         .await
         .expect("bind B");
 
@@ -5617,7 +5617,7 @@ async fn binding_clears_orphan_pending_run_before_normal_completion() {
     .await
     .expect("persist orphan X");
     assert_eq!(pending_completion_count(&db).await, 1);
-    super::bind_dispatch_run(&db, &id, &second.generation_id, "run-y")
+    bind_dispatch_run(&db, &id, &second.generation_id, "run-y")
         .await
         .expect("bind Y");
     assert_eq!(pending_completion_count(&db).await, 0);
@@ -5651,7 +5651,7 @@ async fn persisted_bound_pending_event_recovers_after_restart() {
     )
     .await
     .expect("persist pending event");
-    super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-restart")
+    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-restart")
         .await
         .expect("persist binding");
     super::reconcile_pending_completions(&db, &settings(), TEST_WINDOW_MINUTES)
@@ -5659,6 +5659,44 @@ async fn persisted_bound_pending_event_recovers_after_restart() {
         .expect("restart recovery");
     assert_eq!(row_column(&db, "restart", "status").await, "pending");
     assert_eq!(pending_completion_count(&db).await, 0);
+}
+
+/// Bind a claimed row's generation to `github_run_id` the way the
+/// retired per-task dispatch did - setup for the `complete_run` and
+/// `mark_dispatch_failed` fences, which still read `queue.github_run_id`
+/// until the per-task completion route goes. Production binds one run
+/// per batch ([`super::bind_batch_run`]) and never writes this column.
+async fn bind_dispatch_run(
+    db: &DurableDb,
+    task_id: &str,
+    generation_id: &str,
+    github_run_id: &str,
+) -> Result<bool, QueueError> {
+    let result = db
+        .query(
+            "UPDATE queue SET github_run_id = ? \
+             WHERE task_id = ? AND generation_id = ? \
+                 AND status IN ('dispatched', 'running') AND github_run_id IS NULL",
+        )
+        .bind(github_run_id.to_owned())
+        .bind(task_id.to_owned())
+        .bind(generation_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("bind dispatch run for {task_id}: {error}"))?;
+    if result.rows_written == 0 {
+        return Ok(false);
+    }
+    db.query(
+        "DELETE FROM pending_run_completions \
+         WHERE task_id = ? AND github_run_id != ?",
+    )
+    .bind(task_id.to_owned())
+    .bind(github_run_id.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("discard superseded pending completions for {task_id}: {error}"))?;
+    Ok(true)
 }
 
 async fn pending_completion_count(db: &DurableDb) -> i64 {
@@ -8155,7 +8193,7 @@ async fn complete_success_at_minutes(db: &DurableDb, task_id: &str, run: &str, m
         .execute()
         .await
         .expect("pin claim instant");
-    super::bind_dispatch_run(db, task_id, &claimed.generation_id, run)
+    bind_dispatch_run(db, task_id, &claimed.generation_id, run)
         .await
         .expect("bind run");
     super::complete_run(
@@ -8214,7 +8252,7 @@ async fn build_duration_samples_the_immutable_claim_instant() {
         .await
         .expect("claim")[0]
         .clone();
-    super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-1")
+    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-1")
         .await
         .expect("bind");
     // Pin the claim instant BEFORE the resubmission so a writer
@@ -8286,7 +8324,7 @@ async fn deferred_completion_measures_duration_at_received_at() {
             .await
             .expect("park completion")
     );
-    super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-def")
+    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-def")
         .await
         .expect("bind run");
     super::apply_pending_completion_for_binding(
@@ -8610,7 +8648,7 @@ async fn stale_duplicate_and_failed_reports_never_sample() {
         .await
         .expect("claim")[0]
         .clone();
-    super::bind_dispatch_run(&db, &id, &claimed.generation_id, "run-f")
+    bind_dispatch_run(&db, &id, &claimed.generation_id, "run-f")
         .await
         .expect("bind");
     super::complete_run(
@@ -8655,7 +8693,7 @@ async fn stale_duplicate_and_failed_reports_never_sample() {
         .await
         .expect("claim")[0]
         .clone();
-    super::bind_dispatch_run(&db, &fail_id, &failed_claim.generation_id, "run-x")
+    bind_dispatch_run(&db, &fail_id, &failed_claim.generation_id, "run-x")
         .await
         .expect("bind");
     super::complete_run(
@@ -9400,7 +9438,7 @@ async fn first_requested_at_never_exceeds_updated_at() {
         .expect("claim")
     {
         assert_eq!(audit().await, 0, "after claim");
-        super::bind_dispatch_run(&db, &claimed.task_id, &claimed.generation_id, "run-1")
+        bind_dispatch_run(&db, &claimed.task_id, &claimed.generation_id, "run-1")
             .await
             .expect("bind");
         assert_eq!(audit().await, 0, "after bind");
@@ -9834,6 +9872,141 @@ async fn a_formed_batch_writes_its_row_and_leg_bindings() {
         assert_eq!(leg.batch_leg, i64::try_from(index).expect("leg index"));
         assert_eq!(leg.task_id, batch.tasks[index].task_id);
     }
+}
+
+/// Claim three same-key rows into one batch - the batch a dispatch
+/// outcome then persists against.
+async fn claim_one_batch(db: &DurableDb) -> super::FormedBatch {
+    let requests: Vec<EnqueueRequest> = (0..3).map(|i| request(&format!("d{i}"), &[])).collect();
+    enqueue(db, &requests).await.expect("enqueue");
+    let mut batches = super::claim_dispatchable_tasks(db, &batched_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    assert_eq!(batches.len(), 1, "one key, one batch");
+    let batch = batches.remove(0);
+    assert_eq!(batch.tasks.len(), 3);
+    batch
+}
+
+/// A failed dispatch - POST, network, unreadable response or token
+/// mint - backs off every leg of the batch and deletes the batch row,
+/// which releases its slots (stow#833 section 4.2).
+#[tokio::test]
+async fn a_failed_batch_dispatch_backs_off_every_leg_and_deletes_the_row() {
+    #[derive(skyzen::FromRow)]
+    struct LegState {
+        status: String,
+        error_msg: Option<String>,
+        dispatch_attempts: i64,
+        backed_off: i64,
+    }
+
+    let db = memory_db().await.expect("memory db");
+    let batch = claim_one_batch(&db).await;
+    assert!(build_batch(&db, batch.batch_id.as_str()).await.is_some());
+
+    super::persist_batch_dispatch(
+        &db,
+        &batched_settings(),
+        &batch,
+        Err("GitHub API error: 502".to_owned()),
+    )
+    .await
+    .expect("persist the failed dispatch");
+
+    for task in &batch.tasks {
+        let leg = db
+            .query(
+                "SELECT status, error_msg, dispatch_attempts, \
+                        not_before > datetime('now') AS backed_off \
+                 FROM queue WHERE task_id = ?",
+            )
+            .bind(task.task_id.clone())
+            .fetch_one::<LegState>()
+            .await
+            .expect("read leg");
+        assert_eq!(leg.status, "pending", "{} requeues", task.crate_name);
+        assert_eq!(leg.error_msg.as_deref(), Some("GitHub API error: 502"));
+        assert_eq!(leg.dispatch_attempts, 1);
+        assert_eq!(leg.backed_off, 1, "{} waits out a backoff", task.crate_name);
+    }
+    assert!(
+        build_batch(&db, batch.batch_id.as_str()).await.is_none(),
+        "the failed batch's row is deleted"
+    );
+}
+
+/// A successful dispatch binds the run once, on the batch row - no leg
+/// row takes a run id, and a second bind cannot overwrite the first
+/// (stow#833 section 4.2).
+#[tokio::test]
+async fn a_successful_batch_dispatch_binds_the_batch_once() {
+    let db = memory_db().await.expect("memory db");
+    let batch = claim_one_batch(&db).await;
+    let batch_id = batch.batch_id.as_str();
+
+    super::persist_batch_dispatch(&db, &batched_settings(), &batch, Ok(4242))
+        .await
+        .expect("persist the dispatch");
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert_eq!(row.github_run_id.as_deref(), Some("4242"));
+    let bound_legs = db
+        .query("SELECT count(*) FROM queue WHERE github_run_id IS NOT NULL")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("count bound legs");
+    assert_eq!(bound_legs, 0, "one bind per batch, not per task");
+    let dispatched = db
+        .query("SELECT count(*) FROM queue WHERE batch_id = ? AND status = 'dispatched'")
+        .bind(batch_id.to_owned())
+        .fetch_scalar::<i64>()
+        .await
+        .expect("count dispatched legs");
+    assert_eq!(dispatched, 3, "the legs stay in flight");
+
+    assert!(
+        !super::bind_batch_run(&db, batch_id, "9999")
+            .await
+            .expect("rebind"),
+        "a bound batch takes no second binding"
+    );
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert_eq!(row.github_run_id.as_deref(), Some("4242"));
+}
+
+/// A `completed` delivery recorded before the dispatch response bound
+/// the run is not resolvable while the binding is open, and is due the
+/// moment the bind lands (stow#833 section 4.2).
+#[tokio::test]
+async fn an_early_completion_resolves_once_the_dispatch_binds_the_batch() {
+    // Past every `resolve_after` the test writes.
+    const LATER_MS: i64 = 4_102_444_800_000;
+
+    let db = memory_db().await.expect("memory db");
+    let batch = claim_one_batch(&db).await;
+    let batch_id = batch.batch_id.as_str();
+
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 1, "success"))
+        .await
+        .expect("the early completion is held");
+    assert!(
+        super::ready_batches(&db, LATER_MS)
+            .await
+            .expect("ready batches")
+            .is_empty(),
+        "an unbound batch does not resolve"
+    );
+
+    super::persist_batch_dispatch(&db, &batched_settings(), &batch, Ok(4242))
+        .await
+        .expect("persist the dispatch");
+    let ready = super::ready_batches(&db, LATER_MS)
+        .await
+        .expect("ready batches");
+    assert_eq!(ready.len(), 1, "the bind makes the held completion due");
+    assert_eq!(ready[0].batch_id, batch_id);
+    assert_eq!(ready[0].run_id, "4242");
+    assert_eq!(ready[0].legs.len(), 3);
 }
 
 /// One queue row's claim-visible columns, for before/after

@@ -96,7 +96,7 @@ const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, \
 /// Worker env and the catalog D1 handle wrapped in the counted backend,
 /// so the pass drive runs the real dispatch path — binding resolution,
 /// the paged claim with its per-page coverage lookup, and the
-/// `MAX_OUTBOUND_INFLIGHT`-bounded `trigger_build` fan-out — and the
+/// `MAX_OUTBOUND_INFLIGHT`-bounded `dispatch_batch` fan-out — and the
 /// report can price the coverage lookup's D1 rows against what the
 /// pass claimed.
 pub struct DriveContext {
@@ -1521,7 +1521,7 @@ pub const DRIVES: &[Drive] = &[
         // `dispatch_pass` (`object.rs`): binding resolution, the claim
         // paged at `2 × open slots` rows with its per-page catalog
         // coverage lookup, and the `MAX_OUTBOUND_INFLIGHT`-bounded
-        // `trigger_build` fan-out — the HTTP wall the launch gate's
+        // `dispatch_batch` fan-out — the HTTP wall the launch gate's
         // peak-wall bound exists to measure. On host the claim runs the
         // same queue code against the empty-catalog oracle — the host
         // gate checks statements and counters only.
@@ -2040,7 +2040,7 @@ async fn dispatch_pass_drive(
 /// paged eligible walk with its coverage oracle — then `next_alarm`
 /// over the post-claim queue. A focused floor probe prices what an
 /// alarm wake pays to plan and claim under the floor; running the
-/// pass's `trigger_build` fan-out instead would dispatch unrecorded
+/// pass's `dispatch_batch` fan-out instead would dispatch unrecorded
 /// workflows and contaminate the run/outcome/median state later
 /// drives measure (stow#525). The rows it moves restore from the
 /// drive's unmetered `restore_rows` snapshot — the claim ids never

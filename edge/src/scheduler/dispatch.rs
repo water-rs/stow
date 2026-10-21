@@ -20,7 +20,6 @@ use crate::fetch_guard::OutboundPool;
 #[cfg(target_arch = "wasm32")]
 use crate::fetch_guard::{FetchedResponse, GuardedResponse};
 use crate::github_app::InstallationToken;
-use crate::scheduler::queue::QueuedTask;
 
 /// `per_page` for the attempt-jobs page — at the `B = 40` leg bound a
 /// batch's 80 jobs fit one page; deeper batches still page by `Link`.
@@ -29,9 +28,9 @@ const JOBS_PAGE_SIZE: u32 = 100;
 /// The run identity a successful `workflow_dispatch` returns — GitHub's
 /// `return_run_details` response (`workflow_run_id`, `run_url`,
 /// `html_url`); the local-CI mock answers the same fields. The build
-/// lane binds `workflow_run_id` to the claimed rows' generation so a
-/// `workflow_run` completion applies only to the run that generation
-/// dispatched.
+/// lane binds `workflow_run_id` once to the dispatched batch's
+/// `build_batches` row, so a `workflow_run` completion resolves only
+/// the run that batch dispatched.
 pub struct DispatchedRun {
     /// The Actions run id GitHub assigned the dispatched run.
     pub workflow_run_id: u64,
@@ -53,21 +52,10 @@ pub struct DispatchedRun {
 pub trait BuildRuns: Sync {
     /// `workflow_dispatch` of `build-batch.yml` with `encoded` — the
     /// [`stow_types::api::BatchEncoder`] output — as the `batch`
-    /// input; resolves to the run's bound identity the way
-    /// [`Self::trigger_build`] binds it.
+    /// input; resolves to the run identity the batch row binds.
     fn dispatch_batch<'a>(
         &'a self,
         encoded: &'a str,
-        repo: &'a str,
-        pool: &'a OutboundPool,
-    ) -> impl Future<Output = Result<DispatchedRun, DispatchError>> + Send + 'a;
-
-    /// `workflow_dispatch` of `build-crate.yml` for one claimed task —
-    /// the per-task path kept working until the batched claim replaces
-    /// it (stow#833).
-    fn trigger_build<'a>(
-        &'a self,
-        task: &'a QueuedTask,
         repo: &'a str,
         pool: &'a OutboundPool,
     ) -> impl Future<Output = Result<DispatchedRun, DispatchError>> + Send + 'a;
@@ -150,24 +138,6 @@ struct WorkflowDispatch<'a> {
     input_name: &'a str,
     input: &'a serde_json::Value,
     return_run_details: bool,
-}
-
-/// The JSON `BuildTaskPayload` one claimed row dispatches as — the
-/// same per-task input `build-crate.yml` reads today.
-fn task_dispatch_input(task: &QueuedTask) -> serde_json::Value {
-    serde_json::json!({
-        "task_id": task.task_id,
-        "attempt": task.attempt,
-        "crate_name": task.crate_name,
-        "version": task.version,
-        "features_json": task.features_json,
-        "target": task.target,
-        "rustc_version": task.rustc_version,
-        "host_side": task.host_side,
-        "explicit_spelling": task.explicit_spelling,
-        "preserve_lockfile": task.preserve_lockfile,
-        "dependency_subgraph": task.dependency_subgraph,
-    })
 }
 
 /// `repos/{repo}/actions/workflows/{file}/dispatches` — GitHub's
@@ -461,48 +431,10 @@ impl<R: BuildRunsBackend> BuildRuns for R {
             tracing::info!(
                 run_id = run.workflow_run_id,
                 run_url = %run.run_url,
+                html_url = %run.html_url,
                 "dispatched build batch"
             );
         })
-    }
-
-    async fn trigger_build(
-        &self,
-        task: &QueuedTask,
-        repo: &str,
-        pool: &OutboundPool,
-    ) -> Result<DispatchedRun, DispatchError> {
-        let payload = task_dispatch_input(task);
-        let response = post_workflow_dispatch(
-            self,
-            &WorkflowDispatch {
-                workflow_file: stow_types::trusted_builder::WORKFLOW_FILE,
-                event_type: "build-crate",
-                input_name: "task",
-                input: &payload,
-                return_run_details: true,
-            },
-            repo,
-            pool,
-        )
-        .await?;
-        let body = body_text(response).await?;
-        decode_build_run_details(&body)
-            .inspect(|run| {
-                tracing::info!(
-                    run_id = run.workflow_run_id,
-                    run_url = %run.run_url,
-                    html_url = %run.html_url,
-                    task_id = %task.task_id,
-                    crate_name = %task.crate_name,
-                    target = %task.target,
-                    rustc_version = %task.rustc_version,
-                    "dispatched build"
-                );
-            })
-            .inspect_err(|error| {
-                tracing::error!(task_id = %task.task_id, %error, "GH Actions dispatch failed");
-            })
     }
 
     async fn trigger_resolve(

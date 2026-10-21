@@ -264,7 +264,7 @@ non-yanked release when the body omits it) and the current stable rustc,
 then hands the request to the scheduler's `POST /requests` — the
 request record (`requests` table) is born `accepted` and dispatched
 there to `resolve-request.yml` on `main` through the same GitHub App
-`workflow_dispatch` arm `trigger_build` uses for `build-crate.yml`.
+`workflow_dispatch` arm `dispatch_batch` uses for `build-batch.yml`.
 `resolve-request.yml` runs `stow-admin request resolve`: `stow-resolver`
 expands the crate's dependency closure over crates.io metadata — normal
 and build edges, optional-dependency feature activation, `cfg(...)`

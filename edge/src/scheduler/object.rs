@@ -22,6 +22,7 @@ use crate::db;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
+use crate::scheduler::batching::FormedBatch;
 use crate::scheduler::dispatch::BuildRuns as _;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
@@ -1297,7 +1298,7 @@ fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
 
 /// The claim-plus-fan-out half of a dispatch pass, shared with the
 /// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
-/// `wall_ms` covers the concurrent `trigger_build` fan-out and the
+/// `wall_ms` covers the concurrent `dispatch_batch` fan-out and the
 /// counted-D1 coverage lookups a real wake pays. Returns the claimed
 /// task ids — the probe's claim record and the launch gate's claim
 /// count both derive from the pass's own set.
@@ -1333,35 +1334,36 @@ pub(super) async fn dispatch_pass(
         freeze: &freeze,
     };
     resolve_ready_batches(&scope, &credential_source).await?;
-    let tasks: Vec<queue::QueuedTask> = queue::claim_dispatchable_tasks(db, settings, coverage)
+    let batches = queue::claim_dispatchable_tasks(db, settings, coverage)
         .await
-        .map_err(to_error)?
-        .into_iter()
-        .flat_map(|batch| batch.tasks)
+        .map_err(to_error)?;
+    let task_ids: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| batch.tasks.iter().map(|task| task.task_id.clone()))
         .collect();
     tracing::info!(
-        claimed = tasks.len(),
-        "scheduler dispatch_pending selected tasks"
+        batches = batches.len(),
+        claimed = task_ids.len(),
+        "scheduler dispatch_pending selected batches"
     );
-    if tasks.is_empty() {
+    if batches.is_empty() {
         return Ok(Vec::new());
     }
-    let task_ids: Vec<String> = tasks.iter().map(|task| task.task_id.clone()).collect();
 
-    // The backend resolves once per pass, only when tasks exist: the
+    // The backend resolves once per pass, only when batches exist: the
     // local-CI branch carries no Authorization; the GitHub branch reuses
     // the installation token cached in DO storage while more than five
     // minutes of validity remain and otherwise mints a fresh one. A
-    // failed mint is a dispatch failure for every claimed task — the same
-    // backoff a failed POST would get.
+    // failed mint is a dispatch failure for every claimed batch — the
+    // same backoff a failed POST would get.
     match credential_source {
         CredentialSource::LocalCi(url) => {
             tracing::info!(url = %url, "dispatching via local-CI endpoint");
-            dispatch_fan_out(
+            dispatch_batches(
                 db,
                 settings,
                 &dispatch::LocalCiBuildRuns::new(&url),
-                tasks,
+                batches,
                 &github_repo,
             )
             .await?;
@@ -1369,45 +1371,26 @@ pub(super) async fn dispatch_pass(
         CredentialSource::GitHub(config) => {
             match github_app::installation_token(db, &config).await {
                 Ok(token) => {
-                    dispatch_fan_out(
+                    dispatch_batches(
                         db,
                         settings,
                         &dispatch::GitHubBuildRuns::new(token),
-                        tasks,
+                        batches,
                         &github_repo,
                     )
                     .await?;
                 }
                 Err(error) => {
                     let error = dispatch::DispatchError::TokenMint(error.to_string());
-                    for task in &tasks {
-                        queue::mark_dispatch_failed(
-                            db,
-                            settings,
-                            &task.task_id,
-                            &task.generation_id,
-                            &error.to_string(),
-                        )
-                        .await
-                        .map_err(to_error)?;
-                        tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
+                    for batch in &batches {
+                        queue::persist_batch_dispatch(db, settings, batch, Err(error.to_string()))
+                            .await
+                            .map_err(to_error)?;
                     }
-                    return Ok(task_ids);
                 }
             }
         }
     }
-
-    // A completion may have been persisted while this pass was waiting for
-    // the dispatch response. Consume it now that all returned identities are
-    // bound; the same join also makes this path restart-safe.
-    if queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
-        .await
-        .map_err(to_error)?
-    {
-        evaluate_dispatch_freeze(env, db, &freeze).await?;
-    }
-
     Ok(task_ids)
 }
 
@@ -1674,93 +1657,43 @@ fn now_ms() -> i64 {
     }
 }
 
-/// The per-task `workflow_dispatch` fan-out over one resolved backend —
-/// the pool-bounded concurrent POSTs and the ordered outcome apply.
-async fn dispatch_fan_out(
+/// The `build-batch.yml` dispatch fan-out over one resolved backend —
+/// one `workflow_dispatch` per formed batch, concurrently, then the
+/// ordered outcome apply (stow#833 §4.2).
+///
+/// The POSTs run under the invocation's outbound bound: the stream's
+/// `buffered` admits at most `MAX_OUTBOUND_INFLIGHT` (4) at once, and
+/// the pool slot `dispatch_batch` waits on enforces the same bound
+/// before any request posts. `buffered` — not `buffer_unordered` —
+/// yields results in the batches' own order, so each outcome stays
+/// matched to its batch. The queue writes then apply sequentially:
+/// `&DurableDb` is not `Send`, so it never enters a concurrent future.
+async fn dispatch_batches(
     db: &DurableDb,
     settings: &SchedulerSettings,
     backend: &impl dispatch::BuildRuns,
-    tasks: Vec<queue::QueuedTask>,
+    batches: Vec<FormedBatch>,
     github_repo: &str,
 ) -> Result<()> {
-    // The fan-out runs concurrently, bounded twice at the invocation's
-    // outbound ceiling: the stream's `buffer_unordered` admits at most
-    // `MAX_OUTBOUND_INFLIGHT` (4) `workflow_dispatch` calls at once, and
-    // the pool slot `trigger_build` waits on enforces the same bound
-    // before any request posts.
     let pool = crate::fetch_guard::OutboundPool::new();
-    let mut results = stream::iter(tasks.into_iter().enumerate())
-        .map(|(index, task)| {
-            // Each future owns its task and shares the backend,
-            // repo and pool by reference — copied per call so
-            // `async move` moves nothing out of the map closure.
-            let (backend, github_repo, pool) = (backend, github_repo, &pool);
-            async move {
-                let task_id = task.task_id.clone();
-                let generation_id = task.generation_id.clone();
-                (
-                    index,
-                    task_id,
-                    generation_id,
-                    backend.trigger_build(&task, github_repo, pool).await,
-                )
-            }
-        })
-        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+    // Collected before streaming: a closure inside the stream's type
+    // borrows each batch under a higher-ranked lifetime, and the alarm
+    // future then cannot prove itself `Send`.
+    let dispatches: Vec<_> = batches
+        .iter()
+        .map(|batch| backend.dispatch_batch(&batch.encoded, github_repo, &pool))
+        .collect();
+    let outcomes = stream::iter(dispatches)
+        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
         .collect::<Vec<_>>()
         .await;
-    // A failed dispatch still marks exactly its own task, in the claim
-    // order the sequential loop wrote.
-    results.sort_unstable_by_key(|(index, _, _, _)| *index);
-    for (_, task_id, generation_id, result) in results {
-        persist_dispatch_outcome(db, settings, &task_id, &generation_id, result).await?;
-    }
-    Ok(())
-}
-
-async fn persist_dispatch_outcome(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-    task_id: &str,
-    generation_id: &str,
-    outcome: std::result::Result<dispatch::DispatchedRun, dispatch::DispatchError>,
-) -> Result<()> {
-    match outcome {
-        Ok(run) => match queue::bind_dispatch_run(
-            db,
-            task_id,
-            generation_id,
-            &run.workflow_run_id.to_string(),
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!(
-                    task_id = %task_id,
-                    run_id = run.workflow_run_id,
-                    "dispatch run binding skipped — the claimed generation moved on"
-                );
-            }
-            Err(error) => {
-                queue::mark_dispatch_failed(
-                    db,
-                    settings,
-                    task_id,
-                    generation_id,
-                    &error.to_string(),
-                )
-                .await
-                .map_err(to_error)?;
-                tracing::error!(task_id = %task_id, %error, "failed to bind dispatch run");
-            }
-        },
-        Err(error) => {
-            queue::mark_dispatch_failed(db, settings, task_id, generation_id, &error.to_string())
-                .await
-                .map_err(to_error)?;
-            tracing::error!(task_id = %task_id, error = %error, "failed to dispatch build");
-        }
+    for (batch, outcome) in batches.iter().zip(outcomes) {
+        let outcome = outcome
+            .map(|run| run.workflow_run_id)
+            .map_err(|error| error.to_string());
+        queue::persist_batch_dispatch(db, settings, batch, outcome)
+            .await
+            .map_err(to_error)?;
     }
     Ok(())
 }
