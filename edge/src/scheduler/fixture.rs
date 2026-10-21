@@ -445,7 +445,7 @@ fn in_flight_batches_upsert_sql(shape: FixtureShape, seq_source: &str) -> String
          INSERT INTO build_batches \
              (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
               github_run_id, claimed_at, lease_at) \
-         SELECT {batch_id}, {RUSTC_CASE_SQL}, {family}, {lane}, 1, 1, 'run-' || n, \
+         SELECT {batch_id}, {RUSTC_CASE_SQL}, {family}, {lane}, 1, 1, CAST(n AS TEXT), \
                 datetime('now', '-30 minutes'), datetime('now', '+1 day') \
          FROM seq WHERE n > {failed_end} AND n <= {in_flight_end} \
          ON CONFLICT(batch_id) DO UPDATE SET \

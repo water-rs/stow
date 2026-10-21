@@ -1330,12 +1330,15 @@ pub(super) async fn dispatch_pass(
 
 /// How long a batch whose jobs page cannot have settled yet — or one
 /// whose GitHub/GHCR read failed transiently — defers its resolution:
-/// the 30 s §3.2 grants the page to finish writing.
+/// the 30 s §3.2 grants the page to finish writing. The deferral ends
+/// at the batch's ceiling, where the batch fails instead
+/// ([`queue::defer_unresolved_batch`]).
 const BATCH_RESOLVE_DEFER_MS: i64 = 30_000;
 
 /// How long the lease check leaves a batch whose run lookup, cancel or
 /// token mint failed before the next pass asks again — without it the
-/// alarm would re-arm at `now` for as long as GitHub is failing.
+/// alarm would re-arm at `now` for as long as GitHub is failing. A
+/// batch at its ceiling is failed instead ([`queue::retry_unreadable_batch`]).
 const LEASE_RETRY_MS: i64 = BATCH_RESOLVE_DEFER_MS;
 
 /// The GHCR config the batch resolution's records check reads — the
@@ -1469,7 +1472,7 @@ async fn check_batch_leases(
                         "installation token mint failed — leaving expired batches for the next pass"
                     );
                     for (batch, _) in &bound {
-                        queue::set_batch_lease(db, &batch.batch_id, now_ms + LEASE_RETRY_MS)
+                        queue::retry_unreadable_batch(db, batch, now_ms, LEASE_RETRY_MS)
                             .await
                             .map_err(to_error)?;
                     }
@@ -1622,7 +1625,7 @@ async fn apply_lease_verdict(
                     run_id,
                     "run exceeded its ceiling — cancelled, failing its legs"
                 );
-                queue::fail_batch_past_ceiling(db, batch_id)
+                queue::fail_batch_past_ceiling(db, batch_id, queue::CeilingFailure::RunOutlived)
                     .await
                     .map_err(to_error)?;
             }
@@ -1631,15 +1634,15 @@ async fn apply_lease_verdict(
                     batch_id,
                     run_id,
                     %error,
-                    "cancelling a run past its ceiling failed — leaving the batch for the next pass"
+                    "cancelling a run past its ceiling failed"
                 );
-                queue::set_batch_lease(db, batch_id, now_ms + LEASE_RETRY_MS)
+                queue::retry_unreadable_batch(db, batch, now_ms, LEASE_RETRY_MS)
                     .await
                     .map_err(to_error)?;
             }
         },
         LeaseVerdict::Retry => {
-            queue::set_batch_lease(db, batch_id, now_ms + LEASE_RETRY_MS)
+            queue::retry_unreadable_batch(db, batch, now_ms, LEASE_RETRY_MS)
                 .await
                 .map_err(to_error)?;
         }
@@ -1691,8 +1694,8 @@ async fn resolve_ready_batches(
                         batches = ready.len(),
                         "installation token mint failed — deferring batch resolution"
                     );
-                    for batch in ready {
-                        queue::defer_batch(db, &batch.batch_id, now_ms + BATCH_RESOLVE_DEFER_MS)
+                    for batch in &ready {
+                        queue::defer_unresolved_batch(db, batch, now_ms, BATCH_RESOLVE_DEFER_MS)
                             .await
                             .map_err(to_error)?;
                     }
@@ -1739,7 +1742,7 @@ async fn resolve_batch_set(
         .await;
     for (batch, probe) in ready.iter().zip(probes) {
         let Some(resolutions) = probe else {
-            queue::defer_batch(db, &batch.batch_id, now_ms + BATCH_RESOLVE_DEFER_MS)
+            queue::defer_unresolved_batch(db, batch, now_ms, BATCH_RESOLVE_DEFER_MS)
                 .await
                 .map_err(to_error)?;
             continue;
@@ -1756,7 +1759,8 @@ async fn resolve_batch_set(
 
 /// One batch's outbound reads resolved into per-leg resolutions —
 /// `None` while any leg is unsettled or a read failed transiently
-/// (the caller defers the batch 30 s, §3.2). Concurrent-safe: it
+/// (the caller defers the batch 30 s inside its ceiling and fails it at
+/// the ceiling, §3.2). Concurrent-safe: it
 /// touches nothing but the outbound pool.
 async fn probe_batch(
     backend: &impl dispatch::BuildRuns,
@@ -1766,13 +1770,7 @@ async fn probe_batch(
     pool: &crate::fetch_guard::OutboundPool,
     now: time::OffsetDateTime,
 ) -> Option<Vec<queue::LegResolution>> {
-    let run_id = match batch.run_id.parse::<u64>() {
-        Ok(run_id) => run_id,
-        Err(error) => {
-            tracing::error!(batch_id = %batch.batch_id, run_id = %batch.run_id, %error, "batch run id is not numeric — deferring");
-            return None;
-        }
-    };
+    let run_id = batch.run_id;
     let jobs = match backend
         .attempt_jobs(github_repo, run_id, batch.done_attempt, pool)
         .await

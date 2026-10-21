@@ -2006,10 +2006,17 @@ fn failure_class(report: &BuildCompleteReport) -> Option<String> {
 /// overwrites the run a completion is matched against
 /// (`done_run_id = github_run_id`). A `completed` delivery that beat
 /// this bind is already on the row, so it becomes resolvable the
-/// moment the bind lands.
+/// moment the bind lands — provided it names this run: the bind lands
+/// only when `done_run_id` is NULL or equal to `github_run_id`, so a
+/// row never holds two different runs.
 ///
 /// Returns `true` when the binding landed. `false` means the row is
 /// gone or already bound — the caller logs and moves on.
+///
+/// # Errors
+/// [`QueueError::Invariant`] when an early completion from a different
+/// run is already on the row: the bind would leave a batch no pass can
+/// consume, so the caller fails the dispatch instead.
 pub async fn bind_batch_run(
     db: &DurableDb,
     batch_id: &str,
@@ -2018,14 +2025,34 @@ pub async fn bind_batch_run(
     let result = db
         .query(
             "UPDATE build_batches SET github_run_id = ? \
-             WHERE batch_id = ? AND github_run_id IS NULL",
+             WHERE batch_id = ? AND github_run_id IS NULL \
+               AND (done_run_id IS NULL OR done_run_id = ?)",
         )
         .bind(github_run_id.to_owned())
         .bind(batch_id.to_owned())
+        .bind(github_run_id.to_owned())
         .execute()
         .await
         .map_err(|error| format!("bind dispatch run for batch {batch_id}: {error}"))?;
-    Ok(result.rows_written > 0)
+    if result.rows_written > 0 {
+        return Ok(true);
+    }
+    // Nothing wrote: the row is gone, already bound, or holds an early
+    // completion from another run. Only the last is an error.
+    let held = db
+        .query("SELECT done_run_id FROM build_batches WHERE batch_id = ? AND github_run_id IS NULL")
+        .bind(batch_id.to_owned())
+        .fetch_scalar_optional::<Option<String>>()
+        .await
+        .map_err(|error| format!("probe batch {batch_id}: {error}"))?
+        .flatten();
+    match held {
+        Some(done_run_id) if done_run_id != github_run_id => Err(QueueError::Invariant(format!(
+            "batch {batch_id} was dispatched as run {github_run_id} but already holds a \
+                 completion from run {done_run_id}"
+        ))),
+        _ => Ok(false),
+    }
 }
 
 /// A batch whose dispatch failed — the POST, the network, an unreadable
@@ -2098,47 +2125,67 @@ pub async fn persist_batch_dispatch(
 /// lands whether or not the dispatch response has bound
 /// `github_run_id` yet (§4.2's early-webhook case: resolution later
 /// requires `done_run_id = github_run_id`, so the batch row itself
-/// holds the early completion), and the `done_run_id IS NULL` guard
-/// makes a duplicate delivery a no-op: it touches nothing and still
-/// answers Ok.
+/// holds the early completion), but only for the run the row is bound
+/// to: `github_run_id IS NULL OR github_run_id = <run>`. The
+/// `done_run_id IS NULL` guard makes a duplicate delivery of the same
+/// run a no-op: it touches nothing and still answers Ok.
 ///
 /// # Errors
 /// [`QueueError::UnknownBatch`] when no `build_batches` row carries
 /// the id — an orphan run from an abandoned dispatch.
+/// [`QueueError::Invariant`] when the delivered run is not the one the
+/// row is bound to or already recorded: a row naming two runs is in
+/// neither the resolution pass's nor the lease check's set.
 pub async fn record_batch_completion(
     db: &DurableDb,
     batch_id: &str,
     report: &stow_types::api::BatchRunComplete,
 ) -> Result<(), QueueError> {
+    let run_id = report.run_id.to_string();
     let written = db
         .query(
             "UPDATE build_batches \
              SET done_run_id = ?, done_attempt = ?, conclusion = ?, \
                  done_at = datetime('now'), resolve_after = datetime('now') \
-             WHERE batch_id = ? AND done_run_id IS NULL",
+             WHERE batch_id = ? AND done_run_id IS NULL \
+               AND (github_run_id IS NULL OR github_run_id = ?)",
         )
-        .bind(report.run_id.to_string())
+        .bind(run_id.clone())
         .bind(i64::from(report.run_attempt))
         .bind(report.conclusion.clone())
         .bind(batch_id.to_owned())
+        .bind(run_id.clone())
         .execute()
         .await
         .map_err(|error| format!("record batch completion for {batch_id}: {error}"))?;
     if written.rows_written > 0 {
         return Ok(());
     }
-    // Nothing wrote: either a duplicate delivery — `done_run_id` was
-    // already set — or no such batch row. Only the second is an error.
-    let exists = db
-        .query("SELECT COUNT(*) FROM build_batches WHERE batch_id = ?")
+    // Nothing wrote: a duplicate delivery, a run the row is not bound
+    // to, or no such batch row.
+    let held = db
+        .query("SELECT github_run_id, done_run_id FROM build_batches WHERE batch_id = ?")
         .bind(batch_id.to_owned())
-        .fetch_scalar::<i64>()
+        .fetch_optional::<HeldRunsRow>()
         .await
-        .map_err(|error| format!("probe batch {batch_id}: {error}"))?;
-    if exists == 0 {
-        return Err(QueueError::UnknownBatch(batch_id.to_owned()));
+        .map_err(|error| format!("probe batch {batch_id}: {error}"))?
+        .ok_or_else(|| QueueError::UnknownBatch(batch_id.to_owned()))?;
+    if held.done_run_id.as_deref() == Some(run_id.as_str()) {
+        return Ok(());
     }
-    Ok(())
+    Err(QueueError::Invariant(format!(
+        "batch {batch_id} is bound to run {} and recorded run {} but a completion named run {run_id}",
+        held.github_run_id.as_deref().unwrap_or("-"),
+        held.done_run_id.as_deref().unwrap_or("-"),
+    )))
+}
+
+/// The run ids a `build_batches` row holds, for
+/// [`record_batch_completion`]'s mismatch probe.
+#[derive(Debug, skyzen::FromRow)]
+struct HeldRunsRow {
+    github_run_id: Option<String>,
+    done_run_id: Option<String>,
 }
 
 /// A `build_batches` row ready for the alarm's resolution pass, with
@@ -2149,7 +2196,7 @@ pub struct ReadyBatch {
     pub batch_id: String,
     /// The run the batch is bound to and its completion named —
     /// `done_run_id = github_run_id` guards the same id twice.
-    pub run_id: String,
+    pub run_id: u64,
     /// The run attempt the completion named — the jobs page is read
     /// pinned to it.
     pub done_attempt: u32,
@@ -2163,6 +2210,10 @@ pub struct ReadyBatch {
     /// by `batch_leg`, the leg index in the dispatched payload's
     /// `tasks` list.
     pub legs: Vec<ReadyBatchLeg>,
+    /// The batch's absolute deadline in epoch milliseconds
+    /// ([`batch_ceiling_ms`]): a resolution that still has no answer at
+    /// this instant fails the batch ([`defer_unresolved_batch`]).
+    pub ceiling_ms: i64,
 }
 
 /// One leg row of a [`ReadyBatch`] — the generation `resolve_batch`
@@ -2190,6 +2241,9 @@ struct ReadyBatchRow {
     done_run_id: String,
     done_attempt: u32,
     conclusion: String,
+    legs: u32,
+    parallelism: u32,
+    claimed_epoch: i64,
 }
 
 /// A queue row as a batch's leg walk reads it.
@@ -2217,10 +2271,16 @@ struct BatchLegRow {
 /// lane's — rows, each holding at most `STOW_BATCH_MAX_TASKS` legs.
 /// The alarm's resolution drive names this as its stated bound
 /// (stow#833 §3.2).
+///
+/// # Errors
+/// [`QueueError::Invariant`] when a row's run id is not numeric or its
+/// `parallelism` is zero — corrupt state.
 pub async fn ready_batches(db: &DurableDb, now_ms: i64) -> Result<Vec<ReadyBatch>, QueueError> {
     let batches = db
         .query(
-            "SELECT batch_id, rustc_version, done_run_id, done_attempt, conclusion \
+            "SELECT batch_id, rustc_version, done_run_id, done_attempt, conclusion, \
+                    legs, parallelism, \
+                    CAST(strftime('%s', claimed_at) AS INTEGER) AS claimed_epoch \
              FROM build_batches \
              WHERE done_run_id = github_run_id \
                AND resolve_after <= datetime(CAST(? AS INTEGER) / 1000, 'unixepoch') \
@@ -2237,17 +2297,32 @@ pub async fn ready_batches(db: &DurableDb, now_ms: i64) -> Result<Vec<ReadyBatch
     // serves each batch's `batch_leg` walk, never a queue scan.
     let ids: Vec<String> = batches.iter().map(|batch| batch.batch_id.clone()).collect();
     let mut legs = batch_legs(db, &ids).await?;
-    Ok(batches
+    batches
         .into_iter()
-        .map(|batch| ReadyBatch {
-            legs: legs.remove(&batch.batch_id).unwrap_or_default(),
-            batch_id: batch.batch_id,
-            rustc_version: batch.rustc_version,
-            run_id: batch.done_run_id,
-            done_attempt: batch.done_attempt,
-            conclusion: batch.conclusion,
+        .map(|batch| {
+            let run_id = batch.done_run_id.parse::<u64>().map_err(|error| {
+                QueueError::Invariant(format!(
+                    "batch {} is bound to run {:?}: {error}",
+                    batch.batch_id, batch.done_run_id
+                ))
+            })?;
+            let ceiling_ms = batch_ceiling_ms(
+                &batch.batch_id,
+                batch.claimed_epoch,
+                batch.legs,
+                batch.parallelism,
+            )?;
+            Ok(ReadyBatch {
+                legs: legs.remove(&batch.batch_id).unwrap_or_default(),
+                batch_id: batch.batch_id,
+                rustc_version: batch.rustc_version,
+                run_id,
+                done_attempt: batch.done_attempt,
+                conclusion: batch.conclusion,
+                ceiling_ms,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// The leg rows of the named batches, grouped by `batch_id` in
@@ -2437,7 +2512,7 @@ pub fn batch_resolutions(
     now: time::OffsetDateTime,
 ) -> Vec<Option<LegResolution>> {
     let outcomes = leg_outcomes(batch, jobs, now);
-    let run_url = stow_types::runs::run_url(&batch.run_id);
+    let run_url = stow_types::runs::run_url(&batch.run_id.to_string());
     let task_ids: BTreeMap<u32, &str> = batch
         .legs
         .iter()
@@ -2514,7 +2589,7 @@ pub async fn resolve_batch(
             attempt: leg.attempt,
             success,
             error,
-            github_run_id: Some(batch.run_id.clone()),
+            github_run_id: Some(batch.run_id.to_string()),
             sample_ms,
         };
         let applied = match complete(db, settings, &report, window_minutes).await {
@@ -2535,8 +2610,11 @@ pub async fn resolve_batch(
 /// Push a batch's resolution out to `until_ms`: any leg still
 /// unsettled — a job not yet `completed`, or a failed job's step rows
 /// inside their settle window — keeps the batch open for the next
-/// pass (stow#833 §3.2's 30 s deferral, capped by the caller at the
-/// settle window).
+/// pass (stow#833 §3.2's 30 s deferral).
+///
+/// The push itself has no bound; the deadline is the batch's ceiling,
+/// which [`defer_unresolved_batch`] applies — the pass defers a ready
+/// batch only through it.
 pub async fn defer_batch(db: &DurableDb, batch_id: &str, until_ms: i64) -> Result<(), QueueError> {
     db.query(
         "UPDATE build_batches \
@@ -2549,6 +2627,41 @@ pub async fn defer_batch(db: &DurableDb, batch_id: &str, until_ms: i64) -> Resul
     .await
     .map_err(|error| format!("defer batch {batch_id}: {error}"))?;
     Ok(())
+}
+
+/// What became of a batch a pass could not settle this time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchRetry {
+    /// The batch is inside its ceiling: its next look moved out.
+    Deferred,
+    /// The batch reached its ceiling still unreadable or unsettled: its
+    /// in-flight legs failed and the row is released.
+    Failed,
+}
+
+/// A ready batch the resolution pass has no answer for — a jobs page
+/// read error, a records check error, legs still settling, a token
+/// mint failure. Inside the batch's ceiling its resolution moves out to
+/// `now_ms + defer_ms`; at or past it the batch fails
+/// ([`fail_batch_past_ceiling`]) so the row never holds its slots or the
+/// alarm beyond its deadline.
+pub async fn defer_unresolved_batch(
+    db: &DurableDb,
+    batch: &ReadyBatch,
+    now_ms: i64,
+    defer_ms: i64,
+) -> Result<BatchRetry, QueueError> {
+    if now_ms >= batch.ceiling_ms {
+        tracing::error!(
+            batch_id = %batch.batch_id,
+            run_id = batch.run_id,
+            "batch results unreadable or unsettled past its ceiling — failing its legs"
+        );
+        fail_batch_past_ceiling(db, &batch.batch_id, CeilingFailure::ResolutionStalled).await?;
+        return Ok(BatchRetry::Failed);
+    }
+    defer_batch(db, &batch.batch_id, now_ms + defer_ms).await?;
+    Ok(BatchRetry::Deferred)
 }
 
 pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
@@ -7611,8 +7724,68 @@ const BATCH_CEILING_ALLOWANCE_MINUTES: i64 = 60;
 /// once.
 const EXPIRED_BATCH_LIMIT: i64 = 32;
 
-/// The failure a leg of a batch past its ceiling records.
-const CEILING_EXCEEDED_ERROR: &str = "infrastructure: run exceeded its ceiling";
+/// Why a batch past its ceiling fails — the error its in-flight legs
+/// record, and whether a completion recorded since the caller's lookup
+/// wins over the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingFailure {
+    /// The lease check found the run still going past the ceiling and
+    /// cancelled it.
+    RunOutlived,
+    /// The lease check could not learn the run's state — the lookup, the
+    /// cancel or the token mint kept failing — until the ceiling.
+    RunUnreadable,
+    /// The resolution pass could not read or settle the completed run's
+    /// results until the ceiling.
+    ResolutionStalled,
+}
+
+impl CeilingFailure {
+    /// The `error_msg` the failed legs record.
+    const fn error(self) -> &'static str {
+        match self {
+            Self::RunOutlived => "infrastructure: run exceeded its ceiling",
+            Self::RunUnreadable => "infrastructure: run state unreadable past its ceiling",
+            Self::ResolutionStalled => {
+                "infrastructure: run results unreadable or unsettled past its ceiling"
+            }
+        }
+    }
+
+    /// Whether a completion recorded since the caller's lookup wins: the
+    /// lease check's batches are the ones without a recorded completion,
+    /// and one that landed meanwhile is the resolution pass's. The
+    /// resolution pass's own batches always carry one.
+    const fn recorded_completion_wins(self) -> bool {
+        match self {
+            Self::RunOutlived | Self::RunUnreadable => true,
+            Self::ResolutionStalled => false,
+        }
+    }
+}
+
+/// A batch's absolute deadline in epoch milliseconds:
+/// `claimed_at + ⌈legs / parallelism⌉ × 180 min + 60 min`. Both passes
+/// read it — the lease check cancels a run past it, the resolution pass
+/// stops deferring at it.
+///
+/// # Errors
+/// [`QueueError::Invariant`] when `parallelism` is zero.
+fn batch_ceiling_ms(
+    batch_id: &str,
+    claimed_epoch: i64,
+    legs: u32,
+    parallelism: u32,
+) -> Result<i64, QueueError> {
+    if parallelism == 0 {
+        return Err(QueueError::Invariant(format!(
+            "batch {batch_id} has zero parallelism"
+        )));
+    }
+    let rounds = i64::from(legs.div_ceil(parallelism));
+    let ceiling_minutes = rounds * BATCH_ROUND_CEILING_MINUTES + BATCH_CEILING_ALLOWANCE_MINUTES;
+    Ok((claimed_epoch + ceiling_minutes * 60) * 1000)
+}
 
 /// A `build_batches` row whose lease has run out, with the facts the
 /// lease check decides on (stow#833 §4.3).
@@ -7663,16 +7836,8 @@ pub async fn expired_batches(db: &DurableDb, now_ms: i64) -> Result<Vec<ExpiredB
         .map_err(|error| format!("list expired batches: {error}"))?;
     rows.into_iter()
         .map(|row| {
-            if row.parallelism == 0 {
-                return Err(QueueError::Invariant(format!(
-                    "batch {} has zero parallelism",
-                    row.batch_id
-                )));
-            }
-            let rounds = i64::from(row.legs.div_ceil(row.parallelism));
-            let ceiling_ms = (row.claimed_epoch
-                + (rounds * BATCH_ROUND_CEILING_MINUTES + BATCH_CEILING_ALLOWANCE_MINUTES) * 60)
-                * 1000;
+            let ceiling_ms =
+                batch_ceiling_ms(&row.batch_id, row.claimed_epoch, row.legs, row.parallelism)?;
             let run_id = row
                 .github_run_id
                 .map(|run| {
@@ -7781,22 +7946,29 @@ pub async fn set_batch_lease(
     Ok(())
 }
 
-/// Fail a batch whose run outlived its ceiling: the legs still in
-/// flight fail in one statement and the row is released. A completion
-/// recorded since the lookup wins — the legs and the row are left to
-/// the resolution pass.
-pub async fn fail_batch_past_ceiling(db: &DurableDb, batch_id: &str) -> Result<(), QueueError> {
+/// Fail a batch that reached its ceiling: the legs still in flight fail
+/// in one statement with `cause`'s error and the row is released. For a
+/// cause where [`CeilingFailure::recorded_completion_wins`], a
+/// completion recorded since the lookup wins — the legs and the row are
+/// left to the resolution pass.
+pub async fn fail_batch_past_ceiling(
+    db: &DurableDb,
+    batch_id: &str,
+    cause: CeilingFailure,
+) -> Result<(), QueueError> {
+    let guarded = i64::from(cause.recorded_completion_wins());
     let failed = db
         .query(
             "UPDATE queue \
              SET status = 'failed', error_msg = ?, updated_at = datetime('now') \
              WHERE batch_id = ? AND status IN ('dispatched', 'running') \
-               AND EXISTS (SELECT 1 FROM build_batches \
-                           WHERE batch_id = ? AND done_run_id IS NULL) \
+               AND (? = 0 OR EXISTS (SELECT 1 FROM build_batches \
+                                     WHERE batch_id = ? AND done_run_id IS NULL)) \
              RETURNING task_id",
         )
-        .bind(CEILING_EXCEEDED_ERROR.to_owned())
+        .bind(cause.error().to_owned())
         .bind(batch_id.to_owned())
+        .bind(guarded)
         .bind(batch_id.to_owned())
         .fetch_scalars::<String>()
         .await
@@ -7811,12 +7983,38 @@ pub async fn fail_batch_past_ceiling(db: &DurableDb, batch_id: &str) -> Result<(
         )
         .await?;
     }
-    db.query("DELETE FROM build_batches WHERE batch_id = ? AND done_run_id IS NULL")
+    db.query("DELETE FROM build_batches WHERE batch_id = ? AND (? = 0 OR done_run_id IS NULL)")
         .bind(batch_id.to_owned())
+        .bind(guarded)
         .execute()
         .await
         .map_err(|error| format!("delete failed batch {batch_id}: {error}"))?;
     Ok(())
+}
+
+/// A lease check that could not learn or settle a bound batch's run —
+/// the lookup, the cancel or the token mint failed. Inside the batch's
+/// ceiling the lease moves `retry_ms` out and the next pass asks again;
+/// at the ceiling the batch fails ([`fail_batch_past_ceiling`]), so a
+/// run GitHub never answers for cannot hold its slots or the alarm
+/// forever.
+pub async fn retry_unreadable_batch(
+    db: &DurableDb,
+    batch: &ExpiredBatch,
+    now_ms: i64,
+    retry_ms: i64,
+) -> Result<BatchRetry, QueueError> {
+    if batch.past_ceiling {
+        tracing::error!(
+            batch_id = %batch.batch_id,
+            run_id = ?batch.run_id,
+            "run state unreadable at the batch's ceiling — failing its legs"
+        );
+        fail_batch_past_ceiling(db, &batch.batch_id, CeilingFailure::RunUnreadable).await?;
+        return Ok(BatchRetry::Failed);
+    }
+    set_batch_lease(db, &batch.batch_id, now_ms + retry_ms).await?;
+    Ok(BatchRetry::Deferred)
 }
 
 /// A batch whose legs all left flight — resolved individually or

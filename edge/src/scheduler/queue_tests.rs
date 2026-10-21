@@ -751,7 +751,7 @@ async fn a_completed_run_is_recorded_without_redispatch() {
         .expect("ready");
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].batch_id, batch_id);
-    assert_eq!(ready[0].run_id, "4242");
+    assert_eq!(ready[0].run_id, 4242);
     assert_eq!(ready[0].legs.len(), 2);
     let cheap = SchedulerSettings {
         dispatch_min_age_minutes: 0,
@@ -814,7 +814,7 @@ async fn a_run_past_its_ceiling_fails_its_legs() {
         .expect("past the ceiling");
     assert!(past[0].past_ceiling);
 
-    super::fail_batch_past_ceiling(&db, &batch_id)
+    super::fail_batch_past_ceiling(&db, &batch_id, super::CeilingFailure::RunOutlived)
         .await
         .expect("fail the batch");
 
@@ -839,7 +839,7 @@ async fn a_recorded_completion_wins_over_the_ceiling_failure() {
         .await
         .expect("record");
 
-    super::fail_batch_past_ceiling(&db, &batch_id)
+    super::fail_batch_past_ceiling(&db, &batch_id, super::CeilingFailure::RunOutlived)
         .await
         .expect("fail the batch");
 
@@ -5989,7 +5989,7 @@ async fn ready_batches_surfaces_only_bound_due_batches() {
     assert_eq!(batches.len(), 1, "only the bound due batch resolves");
     let batch = &batches[0];
     assert_eq!(batch.batch_id, ready);
-    assert_eq!(batch.run_id, "4242");
+    assert_eq!(batch.run_id, 4242);
     assert_eq!(batch.done_attempt, 1);
     assert_eq!(batch.conclusion, "success");
     let legs = &batch.legs;
@@ -6224,6 +6224,323 @@ async fn defer_batch_pushes_resolution_out() {
             .iter()
             .any(|batch| batch.batch_id == batch_id),
         "the batch is ready once due"
+    );
+}
+
+/// Every `build_batches` row is in some pass's set: a resolvable row
+/// (`done_run_id = github_run_id`) is the resolution pass's, every
+/// other one the lease check's (`done_run_id IS NULL OR github_run_id
+/// IS NULL`). A row both skip would hold its slots and wake the alarm
+/// at its `resolve_after` forever.
+async fn assert_no_orphan_batches(db: &DurableDb) {
+    let orphans = db
+        .query(
+            "SELECT batch_id FROM build_batches \
+             WHERE done_run_id IS NOT NULL AND github_run_id IS NOT NULL \
+               AND done_run_id != github_run_id",
+        )
+        .fetch_scalars::<String>()
+        .await
+        .expect("list orphan batches");
+    assert!(orphans.is_empty(), "batches no pass consumes: {orphans:?}");
+}
+
+/// A bound, completed batch with its two legs attached — the batch a
+/// resolution pass gets and cannot answer. Claimed at `ROW_TS` with two
+/// legs over five slots: one round, a 240-minute ceiling.
+async fn seed_stuck_batch(db: &DurableDb, batch_id: &str) {
+    let claimed = claim_tasks(db, &["stuck-a", "stuck-b"]).await;
+    seed_ready_batch(db, batch_id, "4242", "success", PAST_TS).await;
+    bind_leg(db, &claimed_task(&claimed, "stuck-a").task_id, batch_id, 0).await;
+    bind_leg(db, &claimed_task(&claimed, "stuck-b").task_id, batch_id, 1).await;
+    // The claim formed batch rows of its own for these legs; the seeded
+    // row replaces them.
+    db.query("DELETE FROM build_batches WHERE batch_id != ?")
+        .bind(batch_id.to_owned())
+        .execute()
+        .await
+        .expect("drop the claim's own batch rows");
+}
+
+const STUCK_BATCH: &str = "34343434343434343434343434343434";
+const CEILING_MS: i64 = ROW_TS_MS + 240 * 60_000;
+
+/// Stow#833: a resolution with no answer at its ceiling fails the legs
+/// still in flight, refreshes their dependents and deletes the row,
+/// instead of deferring forever.
+#[tokio::test]
+async fn an_unresolved_batch_past_its_ceiling_fails_its_legs_and_leaves_flight() {
+    let db = memory_db().await.expect("memory db");
+    seed_stuck_batch(&db, STUCK_BATCH).await;
+    enqueue(&db, &[request("parent", &[dependency("stuck-a")])])
+        .await
+        .expect("enqueue dependent");
+    assert_eq!(
+        row_column(&db, "parent", "CAST(blocked AS TEXT)").await,
+        "0"
+    );
+
+    let ready = super::ready_batches(&db, ROW_TS_MS)
+        .await
+        .expect("ready batches");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].ceiling_ms, CEILING_MS);
+    let outcome = super::defer_unresolved_batch(&db, &ready[0], CEILING_MS, 30_000)
+        .await
+        .expect("fail the stalled batch");
+
+    assert_eq!(outcome, super::BatchRetry::Failed);
+    for name in ["stuck-a", "stuck-b"] {
+        assert_eq!(row_column(&db, name, "status").await, "failed");
+        assert_eq!(
+            row_column(&db, name, "error_msg").await,
+            "infrastructure: run results unreadable or unsettled past its ceiling"
+        );
+    }
+    assert_eq!(
+        row_column(&db, "parent", "CAST(blocked AS TEXT)").await,
+        "1"
+    );
+    assert!(build_batch(&db, STUCK_BATCH).await.is_none());
+    assert_eq!(active_slots(&db).await, 0);
+    assert_no_orphan_batches(&db).await;
+}
+
+/// Inside the ceiling the same unanswered batch defers 30 s and keeps
+/// its legs and its slots.
+#[tokio::test]
+async fn an_unresolved_batch_before_its_ceiling_defers() {
+    let db = memory_db().await.expect("memory db");
+    seed_stuck_batch(&db, STUCK_BATCH).await;
+    let now_ms = CEILING_MS - 1;
+
+    let ready = super::ready_batches(&db, now_ms)
+        .await
+        .expect("ready batches");
+    let outcome = super::defer_unresolved_batch(&db, &ready[0], now_ms, 30_000)
+        .await
+        .expect("defer");
+
+    assert_eq!(outcome, super::BatchRetry::Deferred);
+    assert_eq!(row_column(&db, "stuck-a", "status").await, "dispatched");
+    assert_eq!(active_slots(&db).await, 5);
+    assert!(
+        super::ready_batches(&db, now_ms)
+            .await
+            .expect("ready batches")
+            .is_empty()
+    );
+    assert_eq!(
+        super::ready_batches(&db, now_ms + 30_000)
+            .await
+            .expect("ready batches")
+            .len(),
+        1
+    );
+    assert_no_orphan_batches(&db).await;
+}
+
+/// The lease check's retry arm (a failed run lookup, cancel or token
+/// mint) fails a batch that reached its ceiling, and keeps moving the
+/// lease of one inside it.
+#[tokio::test]
+async fn a_lease_retry_past_the_ceiling_fails_the_batch() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = two_leg_batch(&db, Some("4242")).await;
+    let minute = 60_000;
+
+    let inside = super::expired_batches(&db, ROW_TS_MS + 419 * minute)
+        .await
+        .expect("inside the ceiling");
+    let retried = super::retry_unreadable_batch(&db, &inside[0], ROW_TS_MS + 419 * minute, 30_000)
+        .await
+        .expect("retry inside the ceiling");
+    assert_eq!(retried, super::BatchRetry::Deferred);
+    assert_eq!(
+        batch_lease_ms(&db, &batch_id).await,
+        Some(ROW_TS_MS + 419 * minute + 30_000)
+    );
+    assert_eq!(status_of(&db, "leg-a").await, "dispatched");
+
+    let past = super::expired_batches(&db, ROW_TS_MS + 420 * minute)
+        .await
+        .expect("past the ceiling");
+    let retried = super::retry_unreadable_batch(&db, &past[0], ROW_TS_MS + 420 * minute, 30_000)
+        .await
+        .expect("retry past the ceiling");
+    assert_eq!(retried, super::BatchRetry::Failed);
+    for name in ["leg-a", "leg-b"] {
+        assert_eq!(status_of(&db, name).await, "failed");
+        assert_eq!(
+            queue_error(&db, name).await,
+            "infrastructure: run state unreadable past its ceiling"
+        );
+    }
+    assert!(build_batch(&db, &batch_id).await.is_none());
+    assert_eq!(active_slots(&db).await, 0);
+    assert_no_orphan_batches(&db).await;
+}
+
+/// A completion recorded between the failed lookup and the ceiling
+/// failure wins: the legs and the row are the resolution pass's.
+#[tokio::test]
+async fn a_recorded_completion_wins_over_an_unreadable_ceiling_failure() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = two_leg_batch(&db, Some("4242")).await;
+    let past = super::expired_batches(&db, ROW_TS_MS + 420 * 60_000)
+        .await
+        .expect("past the ceiling");
+    super::record_batch_completion(&db, &batch_id, &batch_run_complete(4242, 1, "success"))
+        .await
+        .expect("record");
+
+    super::retry_unreadable_batch(&db, &past[0], ROW_TS_MS + 420 * 60_000, 30_000)
+        .await
+        .expect("retry");
+
+    assert_eq!(status_of(&db, "leg-a").await, "dispatched");
+    assert!(build_batch(&db, &batch_id).await.is_some());
+    assert_no_orphan_batches(&db).await;
+}
+
+/// A completion naming a run other than the one the row is bound to
+/// writes nothing and is an `Invariant` naming the batch and both runs
+/// — it would otherwise leave a row neither pass consumes.
+#[tokio::test]
+async fn a_completion_naming_another_run_than_the_bound_one_is_an_invariant() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = "56565656565656565656565656565656";
+    seed_build_batch(&db, batch_id, Some("4242")).await;
+
+    let error =
+        super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "success"))
+            .await
+            .expect_err("a foreign run is refused");
+
+    let QueueError::Invariant(message) = &error else {
+        panic!("expected an invariant, got {error}");
+    };
+    for named in [batch_id, "4242", "9001"] {
+        assert!(message.contains(named), "{message}");
+    }
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert!(row.done_run_id.is_none(), "nothing was written");
+    assert_no_orphan_batches(&db).await;
+
+    // A second run after the bound one's completion is refused too.
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 1, "success"))
+        .await
+        .expect("the bound run's completion lands");
+    let error =
+        super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "failure"))
+            .await
+            .expect_err("a second run is refused");
+    assert!(matches!(error, QueueError::Invariant(_)), "{error}");
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert_eq!(row.done_run_id.as_deref(), Some("4242"));
+    assert_eq!(row.conclusion.as_deref(), Some("success"));
+    assert_no_orphan_batches(&db).await;
+}
+
+/// A duplicate delivery of the recorded run answers Ok and writes
+/// nothing — not even a later attempt's `done_at`.
+#[tokio::test]
+async fn a_duplicate_completion_of_the_same_run_writes_nothing() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = "78787878787878787878787878787878";
+    seed_build_batch(&db, batch_id, Some("4242")).await;
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 1, "failure"))
+        .await
+        .expect("first delivery");
+    db.query("UPDATE build_batches SET done_at = '2000-01-01 00:00:00' WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .execute()
+        .await
+        .expect("mark the recorded row");
+
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 2, "success"))
+        .await
+        .expect("a duplicate is Ok");
+
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert_eq!(row.done_at.as_deref(), Some("2000-01-01 00:00:00"));
+    assert_eq!(row.done_attempt, Some(1));
+    assert_eq!(row.conclusion.as_deref(), Some("failure"));
+    assert_no_orphan_batches(&db).await;
+}
+
+/// Binding a dispatch response's run against an early completion from
+/// another run is an `Invariant` and writes nothing; the matching run
+/// still binds.
+#[tokio::test]
+async fn binding_a_run_over_another_runs_early_completion_is_an_invariant() {
+    let db = memory_db().await.expect("memory db");
+    let batch_id = "90909090909090909090909090909090";
+    seed_build_batch(&db, batch_id, None).await;
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "success"))
+        .await
+        .expect("the early completion is held");
+
+    let error = super::bind_batch_run(&db, batch_id, "4242")
+        .await
+        .expect_err("a different run cannot bind");
+
+    let QueueError::Invariant(message) = &error else {
+        panic!("expected an invariant, got {error}");
+    };
+    for named in [batch_id, "4242", "9001"] {
+        assert!(message.contains(named), "{message}");
+    }
+    let row = build_batch(&db, batch_id).await.expect("batch row");
+    assert!(row.github_run_id.is_none(), "the bind wrote nothing");
+    assert_no_orphan_batches(&db).await;
+
+    assert!(
+        super::bind_batch_run(&db, batch_id, "9001")
+            .await
+            .expect("the completing run binds"),
+    );
+    assert_no_orphan_batches(&db).await;
+}
+
+/// The dispatch outcome that binds over a foreign early completion
+/// fails the dispatch: the legs back off and the row is released,
+/// rather than a row neither pass consumes.
+#[tokio::test]
+async fn a_dispatch_bound_over_a_foreign_completion_releases_the_batch() {
+    let db = memory_db().await.expect("memory db");
+    let batch = claim_one_batch(&db).await;
+    let batch_id = batch.batch_id.as_str();
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "success"))
+        .await
+        .expect("the early completion is held");
+
+    super::persist_batch_dispatch(&db, &batched_settings(), &batch, Ok(4242))
+        .await
+        .expect("persist the dispatch");
+
+    assert!(build_batch(&db, batch_id).await.is_none());
+    assert_eq!(active_slots(&db).await, 0);
+    assert_no_orphan_batches(&db).await;
+}
+
+/// A stored run id that is not numeric is corrupt state: the resolution
+/// read refuses it by name instead of deferring the batch forever.
+#[tokio::test]
+async fn a_ready_batch_with_a_non_numeric_run_id_is_an_invariant() {
+    let db = memory_db().await.expect("memory db");
+    seed_ready_batch(&db, STUCK_BATCH, "run-1", "success", PAST_TS).await;
+
+    let error = super::ready_batches(&db, ROW_TS_MS)
+        .await
+        .expect_err("a non-numeric run id is corrupt");
+
+    let QueueError::Invariant(message) = &error else {
+        panic!("expected an invariant, got {error}");
+    };
+    assert!(
+        message.contains(STUCK_BATCH) && message.contains("run-1"),
+        "{message}"
     );
 }
 
@@ -9886,7 +10203,7 @@ async fn an_early_completion_resolves_once_the_dispatch_binds_the_batch() {
         .expect("ready batches");
     assert_eq!(ready.len(), 1, "the bind makes the held completion due");
     assert_eq!(ready[0].batch_id, batch_id);
-    assert_eq!(ready[0].run_id, "4242");
+    assert_eq!(ready[0].run_id, 4242);
     assert_eq!(ready[0].legs.len(), 3);
 }
 
