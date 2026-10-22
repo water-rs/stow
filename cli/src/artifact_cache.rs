@@ -12,7 +12,7 @@ use stow_types::bundle::{
     STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE, SigstoreSignature,
 };
 use stow_types::error::Context;
-use stow_types::identity::{DependencyCMetadataJson, DependencyCompileKeyIdentity};
+use stow_types::identity::{CrateName, DependencyCompileKeyIdentity};
 use stow_types::platform::Profile;
 use stow_types::public_cache::{
     StableRegistryArtifactIdentity, normalized_cache_profile, stable_c_metadata_for_compile_key,
@@ -95,8 +95,36 @@ pub struct LocalBuildArtifact {
     pub identity: StableRegistryArtifactIdentity,
     /// Canonical features JSON as fed into the compile key.
     pub features_json: String,
-    /// Canonical dependency `c_metadata` identities JSON.
-    pub dependency_c_metadata_json: String,
+    /// The unit's `--extern` deps resolved against `materialized_outputs`,
+    /// each carrying the instance digest it was compiled against.
+    pub dependencies: ResolvedDependencies,
+    /// The outputs the compile produced, each with the sha256 the
+    /// post-compile resolution hashed once — the local store records them
+    /// verbatim instead of re-hashing the staged copy.
+    pub outputs: Vec<LocalBuildOutput>,
+}
+
+impl LocalBuildArtifact {
+    /// The instance digest of this compile — the same
+    /// [`outputs_instance_digest`] a cache entry's recorded outputs answer
+    /// with, so a dependent's binding compares like for like.
+    pub fn instance(&self) -> String {
+        outputs_instance_digest(self.outputs.iter().map(|output| output.sha256.as_str()))
+    }
+}
+
+/// One digest identifying exactly which bytes a unit instance is: blake3
+/// under `stow.unit-instance.v1` over the unit's output files' sha256s —
+/// the set `artifact_cache_outputs` records for an entry — sorted, so the
+/// output ordering of a bundle manifest never perturbs it.
+pub fn outputs_instance_digest<'a>(sha256s: impl IntoIterator<Item = &'a str>) -> String {
+    let mut sha256s: Vec<&str> = sha256s.into_iter().collect();
+    sha256s.sort_unstable();
+    let mut hasher = blake3::Hasher::new_derive_key("stow.unit-instance.v1");
+    for sha256 in &sha256s {
+        hasher.update(sha256.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 /// One locally-compiled registry unit as one build's rustc invocations
@@ -173,6 +201,10 @@ pub struct CachedArtifactBundle {
     pub features_json: String,
     pub dependency_c_metadata_json: String,
     pub dependency_compile_keys_json: String,
+    /// `[{crate_name, compile_key, instance}]` — the dependency instances a
+    /// local entry was compiled against; `'[]'` on remote entries, whose
+    /// binding is the published instance by construction (stow#836).
+    pub dependency_instances_json: String,
     /// Compile time the publisher recorded for this artifact — `0` for
     /// locally produced entries, which carry no measurement.
     pub compile_millis: u64,
@@ -196,6 +228,13 @@ pub struct CachedArtifactBundle {
 impl CachedArtifactBundle {
     pub fn output_source_path(&self, file: &ArtifactBundleFile) -> PathBuf {
         self.entry_dir.join(bundle_file_path(&file.file_name))
+    }
+
+    /// The instance digest of this entry's recorded outputs — the value a
+    /// dependent's `dependency_instances_json` binding and the externs'
+    /// `materialized_outputs` rows compare against (stow#836).
+    pub fn instance(&self) -> String {
+        outputs_instance_digest(self.outputs.iter().map(|output| output.sha256.as_str()))
     }
 }
 
@@ -299,6 +338,7 @@ pub async fn load_cached_bundle(
         features_json: entry.features_json,
         dependency_c_metadata_json: entry.dependency_c_metadata_json,
         dependency_compile_keys_json: entry.dependency_compile_keys_json,
+        dependency_instances_json: entry.dependency_instances_json,
         compile_millis: db_int(entry.compile_millis, "artifact cache entry compile_millis")?,
         size_bytes: db_int(entry.size_bytes, "artifact cache entry size_bytes")?,
         profile: shape.profile,
@@ -455,6 +495,10 @@ pub fn load_bundle_entry_dir(
         features_json: manifest.config.features_json.raw(),
         dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.raw(),
         dependency_compile_keys_json: manifest.config.dependency_compile_keys_json,
+        // A manifest carries no binding; a consume-store entry is
+        // remote-provenance, so its binding is the published instance by
+        // construction.
+        dependency_instances_json: "[]".to_owned(),
         compile_millis: manifest.config.compile_millis,
         size_bytes: directory_size(entry_dir)?,
         profile: manifest.config.profile,
@@ -743,6 +787,9 @@ fn cached_bundle_for_entry(
         features_json: bundle.manifest.config.features_json.raw(),
         dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
         dependency_compile_keys_json: bundle.manifest.config.dependency_compile_keys_json.clone(),
+        // A remote entry's binding is the published instance by
+        // construction; the column records '[]'.
+        dependency_instances_json: "[]".to_owned(),
         compile_millis: bundle.manifest.config.compile_millis,
         size_bytes,
         profile: bundle.manifest.config.profile.clone(),
@@ -780,12 +827,10 @@ pub async fn store_local_build_outputs(
     build: &LocalBuildArtifact,
     host: &str,
 ) -> stow_types::error::Result<bool> {
-    let stable_parsed = parsed_with_stable_identity(parsed, &build.identity);
-    let outputs = local_build_output_specs(parsed, &stable_parsed, host)?;
-    if outputs.is_empty() {
+    if build.outputs.is_empty() {
         return Ok(false);
     }
-    for output in &outputs {
+    for output in &build.outputs {
         if !output.source.exists() {
             tracing::debug!(
                 crate_name = %parsed.crate_name,
@@ -836,12 +881,19 @@ pub async fn store_local_build_outputs(
         remove_orphaned_entry_dir(entry_dir.clone()).await?;
     }
 
+    let Some(binding) =
+        bind_dependency_instances(&connection, parsed, build, host, &version_dir).await?
+    else {
+        return Ok(false);
+    };
+
     let staging_dir = config
         .artifact_cache_staging_dir(&build.rustc_version)
         .await?;
     let written = tokio::task::spawn_blocking({
         let staging_dir = staging_dir.clone();
         let entry_dir = entry_dir.clone();
+        let outputs = build.outputs.clone();
         move || write_local_build_entry_blocking(staging_dir.path(), &entry_dir, &outputs)
     })
     .await
@@ -854,6 +906,7 @@ pub async fn store_local_build_outputs(
         &cache_key,
         &entry_relative_dir,
         &written,
+        &binding,
     )
     .await?;
     drop(write_lease);
@@ -871,9 +924,98 @@ pub async fn store_local_build_outputs(
     Ok(true)
 }
 
+/// The dependency binding a stored local entry records — the compile keys
+/// and the instances of its direct dependencies' cache entries.
+struct DependencyBinding {
+    compile_keys_json: String,
+    instances_json: String,
+}
+
+/// Bind a local build to the exact dependency instances it compiled
+/// against, or `None` when the cache does not hold them: rustc binds a
+/// dependent to its deps by SVH, so an artifact whose recorded instances the
+/// cache does not hold could only ever be served into a broken pair
+/// (E0460/E0463, stow#836). First-writer-wins per unit lets concurrent cold
+/// builds split a dep set across different instances; the store refuses
+/// the mismatched half rather than admit it.
+async fn bind_dependency_instances(
+    connection: &sqlx::SqlitePool,
+    parsed: &ParsedRustcArgs,
+    build: &LocalBuildArtifact,
+    host: &str,
+    version_dir: &Path,
+) -> stow_types::error::Result<Option<DependencyBinding>> {
+    let dep_entries = load_dependency_entry_instances(connection, build, host).await?;
+    let mut dependency_compile_keys = Vec::with_capacity(build.dependencies.externs.len());
+    let mut dependency_instances = Vec::with_capacity(build.dependencies.externs.len());
+    for extern_dep in &build.dependencies.externs {
+        match dep_entries.get(extern_dep.c_metadata.as_str()) {
+            Some(dep_entry) if !version_dir.join(&dep_entry.relative_dir).exists() => {
+                tracing::debug!(
+                    crate_name = %parsed.crate_name,
+                    dependency = %extern_dep.crate_name,
+                    compiled_against = %extern_dep.instance,
+                    "skipping local artifact cache store: dependency entry has a row but no files"
+                );
+                return Ok(None);
+            }
+            Some(dep_entry) if dep_entry.instance == extern_dep.instance => {
+                dependency_compile_keys.push(DependencyCompileKeyIdentity {
+                    crate_name: CrateName::parse(extern_dep.crate_name.as_str()).map_err(
+                        |error| {
+                            stow_types::stow_error!(
+                                "extern crate name `{}` is not a registry crate name: {error}",
+                                extern_dep.crate_name
+                            )
+                        },
+                    )?,
+                    compile_key: dep_entry.compile_key.clone(),
+                });
+                dependency_instances.push(DependencyInstanceIdentity {
+                    crate_name: extern_dep.crate_name.clone(),
+                    compile_key: dep_entry.compile_key.clone(),
+                    instance: extern_dep.instance.clone(),
+                });
+            }
+            Some(dep_entry) => {
+                tracing::debug!(
+                    crate_name = %parsed.crate_name,
+                    dependency = %extern_dep.crate_name,
+                    compiled_against = %extern_dep.instance,
+                    entry_instance = %dep_entry.instance,
+                    "skipping local artifact cache store: dependency instance differs from the cached one"
+                );
+                return Ok(None);
+            }
+            None => {
+                tracing::debug!(
+                    crate_name = %parsed.crate_name,
+                    dependency = %extern_dep.crate_name,
+                    compiled_against = %extern_dep.instance,
+                    "skipping local artifact cache store: no cache entry for dependency"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    let dependency_compile_keys_json = serde_json::to_string(
+        &DependencyCompileKeyIdentity::canonicalize_list(dependency_compile_keys),
+    )
+    .wrap_err("serialize dependency compile keys")?;
+    let dependency_instances_json = serde_json::to_string(
+        &DependencyInstanceIdentity::canonicalize_list(dependency_instances),
+    )
+    .wrap_err("serialize dependency instances")?;
+    Ok(Some(DependencyBinding {
+        compile_keys_json: dependency_compile_keys_json,
+        instances_json: dependency_instances_json,
+    }))
+}
+
 /// Persist the `artifact_cache_entries` row for a freshly staged local entry:
-/// local provenance, no signatures, no verified marker, and dependency
-/// compile keys resolved against the entries that produced the deps.
+/// local provenance, no signatures, no verified marker, and the dependency
+/// binding — compile keys and instances — the refusal check just verified
+/// against the entries that produced the deps.
 async fn record_local_entry_metadata(
     connection: &sqlx::SqlitePool,
     parsed: &ParsedRustcArgs,
@@ -881,14 +1023,8 @@ async fn record_local_entry_metadata(
     cache_key: &str,
     entry_relative_dir: &Path,
     written: &LocalEntryWrite,
+    binding: &DependencyBinding,
 ) -> stow_types::error::Result<()> {
-    let dependency_compile_keys_json = resolve_dependency_compile_keys_json(
-        connection,
-        &build.rustc_version,
-        &build.target,
-        &build.dependency_c_metadata_json,
-    )
-    .await?;
     let profile = normalized_cache_profile(parsed)?;
     let kind = crate::parsed_artifact_kind(parsed)?;
     let crate_types = crate::parsed_crate_types(parsed)?;
@@ -909,8 +1045,9 @@ async fn record_local_entry_metadata(
             crate_version: build.identity.version.clone(),
             c_metadata: build.identity.c_metadata.as_str(),
             features_json: build.features_json.clone(),
-            dependency_c_metadata_json: build.dependency_c_metadata_json.clone(),
-            dependency_compile_keys_json: &dependency_compile_keys_json,
+            dependency_c_metadata_json: build.dependencies.c_metadata_json.clone(),
+            dependency_compile_keys_json: &binding.compile_keys_json,
+            dependency_instances_json: &binding.instances_json,
             compile_millis: 0,
             target: &build.target,
             profile: &profile,
@@ -937,6 +1074,8 @@ pub async fn record_materialized_bundle_outputs(
     let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
     let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
     let dependency_identity = stable_c_metadata.as_str();
+    let instance =
+        outputs_instance_digest(bundle.outputs.iter().map(|output| output.sha256.as_str()));
     let stable_identity = StableRegistryArtifactIdentity {
         compile_key: bundle.compile_key.clone(),
         c_metadata: stable_c_metadata.clone(),
@@ -952,6 +1091,7 @@ pub async fn record_materialized_bundle_outputs(
             &connection,
             &output_path,
             dependency_identity,
+            &instance,
             updated_at_ms,
         )
         .await?;
@@ -961,6 +1101,7 @@ pub async fn record_materialized_bundle_outputs(
                 &connection,
                 &original_path,
                 dependency_identity,
+                &instance,
                 updated_at_ms,
             )
             .await?;
@@ -972,12 +1113,42 @@ pub async fn record_materialized_bundle_outputs(
                 &connection,
                 &stable_output_path,
                 dependency_identity,
+                &instance,
                 updated_at_ms,
             )
             .await?;
         }
     }
 
+    Ok(())
+}
+
+/// Record `materialized_outputs` rows for a closure dependency's
+/// original-named outputs — the files
+/// `inject::materialize_original_outputs` writes into the served unit's
+/// out dir. The closure walk is the one materialization that used to
+/// leave no rows behind; a later dependent resolving an `--extern` at one
+/// of these paths needs the instance the bytes carry (stow#836).
+pub async fn record_materialized_closure_outputs(
+    config: &StowConfig,
+    out_dir: &Path,
+    bundle: &CachedArtifactBundle,
+) -> stow_types::error::Result<()> {
+    let connection = config.state_db_pool().await?;
+    let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
+    let instance =
+        outputs_instance_digest(bundle.outputs.iter().map(|output| output.sha256.as_str()));
+    for file in &bundle.outputs {
+        let original_path = crate::inject::original_output_path(out_dir, file)?;
+        record_materialized_output(
+            &connection,
+            &original_path,
+            bundle.c_metadata.as_str(),
+            &instance,
+            updated_at_ms,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -1013,13 +1184,14 @@ pub fn materialized_output_paths(
 pub async fn record_materialized_local_build_outputs(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
-    identity: &StableRegistryArtifactIdentity,
+    build: &LocalBuildArtifact,
     host: &str,
 ) -> stow_types::error::Result<()> {
     let connection = config.state_db_pool().await?;
     let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
-    let dependency_identity = identity.c_metadata.as_str();
-    let stable_parsed = parsed_with_stable_identity(parsed, identity);
+    let dependency_identity = build.identity.c_metadata.as_str();
+    let instance = build.instance();
+    let stable_parsed = parsed_with_stable_identity(parsed, &build.identity);
 
     // The stable-named invocation is the same unit under another file
     // name, so it names the same outputs: a shape present under one name
@@ -1036,7 +1208,14 @@ pub async fn record_materialized_local_build_outputs(
         ));
     }
     for path in cargo_named.iter().chain(&stable_named) {
-        record_materialized_output(&connection, path, dependency_identity, updated_at_ms).await?;
+        record_materialized_output(
+            &connection,
+            path,
+            dependency_identity,
+            &instance,
+            updated_at_ms,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1144,13 +1323,40 @@ pub fn extern_output_paths(
 /// found (stow#618).
 pub enum DependencyCMetadataResolution {
     /// Every extern resolved; the serialized dependency-identity JSON the
-    /// compile key and the miss journal consume.
-    Resolved(String),
+    /// compile key and the miss journal consume, plus each extern's
+    /// recorded instance digest.
+    Resolved(ResolvedDependencies),
     /// The first extern path — in `extern_output_paths` order — with no
     /// recorded row. The dependency's bookkeeping genuinely never landed:
     /// a path or git dependency, or a dependency whose own store was
     /// skipped.
     Unrecorded(String),
+}
+
+/// A unit's `--extern` set resolved against `materialized_outputs` — the
+/// identity JSON the compile key consumes and, alongside it, the exact
+/// dependency instances the compile ran against (stow#836).
+#[derive(Debug)]
+pub struct ResolvedDependencies {
+    /// `[{crate_name, c_metadata}]` in canonical order — the
+    /// `dependency_c_metadata_json` the compile key and the miss journal
+    /// consume.
+    pub c_metadata_json: String,
+    /// Each extern's crate, stable identity and recorded instance digest,
+    /// in `c_metadata_json` order.
+    pub externs: Vec<MaterializedDependency>,
+}
+
+/// One resolved `--extern`: which stable identity the extern path belongs
+/// to, and which exact instance of it the compile ran against.
+#[derive(Debug, Clone)]
+pub struct MaterializedDependency {
+    /// The crate name as the `--extern` spelled it.
+    pub crate_name: String,
+    /// The dependency's stable `c_metadata`.
+    pub c_metadata: String,
+    /// [`outputs_instance_digest`] of the bytes the extern path carried.
+    pub instance: String,
 }
 
 pub async fn resolve_dependency_c_metadata_json(
@@ -1160,7 +1366,12 @@ pub async fn resolve_dependency_c_metadata_json(
     let connection = config.state_db_pool().await?;
     let identities = extern_output_paths(parsed)?;
     if identities.is_empty() {
-        return Ok(DependencyCMetadataResolution::Resolved("[]".to_owned()));
+        return Ok(DependencyCMetadataResolution::Resolved(
+            ResolvedDependencies {
+                c_metadata_json: "[]".to_owned(),
+                externs: Vec::new(),
+            },
+        ));
     }
 
     // One round trip for the whole extern set — this runs inside every
@@ -1171,28 +1382,40 @@ pub async fn resolve_dependency_c_metadata_json(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT output_path, c_metadata FROM materialized_outputs \
+        "SELECT output_path, c_metadata, instance FROM materialized_outputs \
          WHERE output_path IN ({placeholders})"
     );
-    let mut rows = sqlx::query_as::<_, (String, String)>(sqlx::AssertSqlSafe(sql));
+    let mut rows = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(sql));
     for output_path in identities.iter().map(|(_, output_path)| output_path) {
         rows = rows.bind(output_path);
     }
     let rows = rows.fetch_all(&connection).await?;
-    let metadata_by_path: BTreeMap<String, String> = rows.into_iter().collect();
+    let metadata_by_path: BTreeMap<String, (String, String)> = rows
+        .into_iter()
+        .map(|(path, c_metadata, instance)| (path, (c_metadata, instance)))
+        .collect();
     let mut resolved = Vec::with_capacity(identities.len());
+    let mut externs = Vec::with_capacity(identities.len());
     for (crate_name, output_path) in identities {
-        let Some(c_metadata) = metadata_by_path.get(&output_path) else {
+        let Some((c_metadata, instance)) = metadata_by_path.get(&output_path) else {
             return Ok(DependencyCMetadataResolution::Unrecorded(output_path));
         };
         resolved.push(DependencyCMetadataIdentity {
+            crate_name: crate_name.clone(),
+            c_metadata: c_metadata.clone(),
+        });
+        externs.push(MaterializedDependency {
             crate_name,
             c_metadata: c_metadata.clone(),
+            instance: instance.clone(),
         });
     }
 
     Ok(DependencyCMetadataResolution::Resolved(
-        serde_json::to_string(&resolved)?,
+        ResolvedDependencies {
+            c_metadata_json: serde_json::to_string(&resolved)?,
+            externs,
+        },
     ))
 }
 
@@ -1200,17 +1423,20 @@ async fn record_materialized_output(
     connection: &sqlx::SqlitePool,
     path: &Path,
     c_metadata: &str,
+    instance: &str,
     updated_at_ms: i64,
 ) -> stow_types::error::Result<()> {
     sqlx::query(
-        "INSERT INTO materialized_outputs (output_path, c_metadata, updated_at_ms) \
-         VALUES (?, ?, ?) \
+        "INSERT INTO materialized_outputs (output_path, c_metadata, instance, updated_at_ms) \
+         VALUES (?, ?, ?, ?) \
          ON CONFLICT(output_path) DO UPDATE SET \
              c_metadata = excluded.c_metadata, \
+             instance = excluded.instance, \
              updated_at_ms = excluded.updated_at_ms",
     )
     .bind(path_to_string(path)?)
     .bind(c_metadata)
+    .bind(instance)
     .bind(updated_at_ms)
     .execute(connection)
     .await?;
@@ -1224,6 +1450,23 @@ pub async fn remove_cached_bundle(
     let version_dir = config.artifact_cache_version_dir(request.rustc_version);
     let cache_key = cache_key(request);
     let rustc_version = request.rustc_version.to_owned();
+    let connection = config.state_db_pool().await?;
+    remove_cached_bundle_locked(&connection, &version_dir, &rustc_version, &cache_key).await
+}
+
+/// Remove the entry a loaded bundle was read from — the same removal path
+/// as [`remove_cached_bundle`], addressed by the bundle's own `cache_key`
+/// for a serve path that holds the bundle rather than the request that
+/// found it (stow#836). The bundle is consumed: its shared lease goes
+/// before the removal takes the entry's exclusive lock.
+pub async fn remove_loaded_bundle_entry(
+    config: &StowConfig,
+    bundle: CachedArtifactBundle,
+) -> stow_types::error::Result<()> {
+    let rustc_version = bundle.rustc_version.clone();
+    let cache_key = bundle.cache_key.clone();
+    drop(bundle);
+    let version_dir = config.artifact_cache_version_dir(&rustc_version);
     let connection = config.state_db_pool().await?;
     remove_cached_bundle_locked(&connection, &version_dir, &rustc_version, &cache_key).await
 }
@@ -1422,13 +1665,16 @@ fn write_bundle_entry_blocking(
 }
 
 /// One rustc output file captured into a local cache entry.
-struct LocalBuildOutput {
+#[derive(Debug, Clone)]
+pub struct LocalBuildOutput {
     /// Where the passthrough build wrote the artifact.
     source: PathBuf,
     /// The file name inside the entry's `files/` dir — the stable-name form
     /// a remote bundle would have carried.
     file_name: String,
     media_type: &'static str,
+    /// SHA-256 of the source's bytes, hashed once at compile finish.
+    sha256: String,
 }
 
 /// The files a local store captured into the staged entry, plus its size.
@@ -1440,7 +1686,7 @@ struct LocalEntryWrite {
 /// The artifacts a successful rustc invocation produced, paired with the
 /// stable-name file names they carry inside the cache entry. The dep-info
 /// file is not an output: like remote bundles it is synthesized on restore.
-fn local_build_output_specs(
+pub fn local_build_output_specs(
     parsed: &ParsedRustcArgs,
     stable_parsed: &ParsedRustcArgs,
     host: &str,
@@ -1461,6 +1707,7 @@ fn local_build_output_specs(
                 )
             })?)?,
             media_type: STOW_RLIB_MEDIA_TYPE,
+            sha256: String::new(),
         });
     }
     if parsed.emit.contains("metadata") {
@@ -1478,6 +1725,7 @@ fn local_build_output_specs(
                 )
             })?)?,
             media_type: STOW_RMETA_MEDIA_TYPE,
+            sha256: String::new(),
         });
     }
     if parsed.emit.contains("link") && parsed.produces_dynamic_library() {
@@ -1508,9 +1756,34 @@ fn local_build_output_specs(
                 ArtifactKind::ProcMacro => STOW_PROC_MACRO_MEDIA_TYPE,
                 ArtifactKind::Rlib | ArtifactKind::Dylib => STOW_DYLIB_MEDIA_TYPE,
             },
+            sha256: String::new(),
         });
     }
     Ok(outputs)
+}
+
+/// Hash each output's source bytes — once per compile, so the local store
+/// records per-file digests without reading the staged copy again.
+pub async fn hash_local_build_outputs(
+    mut outputs: Vec<LocalBuildOutput>,
+) -> stow_types::error::Result<Vec<LocalBuildOutput>> {
+    tokio::task::spawn_blocking(move || {
+        hash_local_build_outputs_sync(&mut outputs)?;
+        Ok(outputs)
+    })
+    .await
+    .wrap_err("join local build output hashing task")?
+}
+
+/// The blocking half of [`hash_local_build_outputs`] — tests call it
+/// directly off the runtime.
+pub fn hash_local_build_outputs_sync(
+    outputs: &mut [LocalBuildOutput],
+) -> stow_types::error::Result<()> {
+    for output in outputs {
+        output.sha256 = sha256_file_bytes(&output.source)?.0;
+    }
+    Ok(())
 }
 
 /// Stage a locally-built entry under a temp name in the process's staging
@@ -1557,14 +1830,17 @@ fn write_local_build_entry_blocking(
                 output.source.display()
             )
         })?;
-        // Hash the staged bytes, not the source: the recorded digest must
-        // describe what the entry actually holds.
-        let (sha256, len) = sha256_file_bytes(&dest)?;
+        // The compile hashed the source bytes once; the staged copy is a
+        // clone of exactly those bytes, so the digest it recorded is what
+        // the entry holds.
+        let len = std::fs::metadata(&dest)
+            .wrap_err_with(|| format!("stat staged cache file {}", dest.display()))?
+            .len();
         size_bytes = size_bytes.saturating_add(len);
         written_outputs.push(ArtifactBundleFile {
             file_name: output.file_name.clone(),
             media_type: output.media_type.to_owned(),
-            sha256,
+            sha256: output.sha256.clone(),
         });
     }
 
@@ -1583,48 +1859,117 @@ fn write_local_build_entry_blocking(
     })
 }
 
-/// Resolve `dependency_c_metadata_json` identities to the compile keys of
-/// the cache entries that produced them, so a later hit can materialize a
-/// dependency's original-named outputs through the closure path.
-///
-/// Dependencies without a cache entry — built locally but never stored —
-/// are omitted rather than listed: a locally-produced artifact is never
-/// uploaded, so recording its key would only set up a doomed remote fetch on
-/// every hit. The dep's own outputs already sit in the shared `deps` dir.
-async fn resolve_dependency_compile_keys_json(
+/// One entry in `dependency_instances_json`: which instance of a direct
+/// dependency a stored artifact was compiled against — the
+/// [`outputs_instance_digest`] of the dep entry's recorded outputs at
+/// store time. A served hit is sound only while the dep's current entry
+/// still carries that instance (stow#836).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct DependencyInstanceIdentity {
+    /// Crate name as known to crates.io.
+    pub crate_name: String,
+    /// Blake3 compile key of the dependency's cache entry.
+    pub compile_key: String,
+    /// Instance digest of the dependency's cache entry when the store
+    /// verified the binding.
+    pub instance: String,
+}
+
+impl DependencyInstanceIdentity {
+    /// Sort and deduplicate a list of identities into canonical order —
+    /// the same order [`DependencyCompileKeyIdentity::canonicalize_list`]
+    /// gives the parallel column.
+    pub fn canonicalize_list(mut identities: Vec<Self>) -> Vec<Self> {
+        identities.sort();
+        identities.dedup();
+        identities
+    }
+}
+
+/// A dependency's current cache entry reduced to what the store's instance
+/// check reads.
+struct DependencyEntryInstance {
+    compile_key: String,
+    relative_dir: String,
+    instance: String,
+}
+
+/// The current cache entries for a local build's direct dependencies in one
+/// batched primary-key query — the `c_metadata → (compile_key, entry dir,
+/// instance)` map the store's refusal check reads. A dep's entry sits under
+/// the dependent's own target or, for a host-side dep such as a proc-macro
+/// of a `--target` build, under the host triple; the stable `c_metadata`
+/// already carries the target, so one dep naming entries under both is a
+/// corrupt cache and fails.
+async fn load_dependency_entry_instances(
     connection: &sqlx::SqlitePool,
-    rustc_version: &str,
-    target: &str,
-    dependency_c_metadata_json: &str,
-) -> stow_types::error::Result<String> {
-    let dependencies =
-        serde_json::from_str::<Vec<stow_types::identity::DependencyCMetadataIdentity>>(
-            dependency_c_metadata_json,
-        )
-        .wrap_err("parse dependency c_metadata identities")?;
-    let dependencies = DependencyCMetadataJson::canonicalize(dependencies).map_err(|error| {
-        stow_types::stow_error!("invalid dependency c_metadata identities: {error}")
-    })?;
-    let mut resolved = Vec::with_capacity(dependencies.entries().len());
-    for dependency in dependencies.entries() {
-        let compile_key = sqlx::query_scalar::<_, String>(
-            "SELECT compile_key FROM artifact_cache_entries \
-             WHERE rustc_version = ? AND target = ? AND c_metadata = ?",
-        )
-        .bind(rustc_version)
-        .bind(target)
-        .bind(dependency.c_metadata.as_str())
-        .fetch_optional(connection)
-        .await?;
-        if let Some(compile_key) = compile_key {
-            resolved.push(DependencyCompileKeyIdentity {
-                crate_name: dependency.crate_name.clone(),
-                compile_key,
-            });
+    build: &LocalBuildArtifact,
+    host: &str,
+) -> stow_types::error::Result<BTreeMap<String, DependencyEntryInstance>> {
+    if build.dependencies.externs.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let targets: BTreeSet<&str> = [build.target.as_str(), host].into_iter().collect();
+    let cache_keys: Vec<String> = build
+        .dependencies
+        .externs
+        .iter()
+        .flat_map(|extern_dep| {
+            targets
+                .iter()
+                .map(|target| artifact_cache_key(target, extern_dep.c_metadata.as_str()))
+        })
+        .collect();
+    let placeholders = cache_keys
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT e.c_metadata, e.cache_key, e.compile_key, e.relative_dir, o.sha256 \
+         FROM artifact_cache_entries e \
+         LEFT JOIN artifact_cache_outputs o \
+             ON o.rustc_version = e.rustc_version AND o.cache_key = e.cache_key \
+         WHERE e.rustc_version = ? AND e.cache_key IN ({placeholders}) \
+         ORDER BY e.cache_key, o.ordinal"
+    );
+    let mut query = sqlx::query_as::<_, (String, String, String, String, Option<String>)>(
+        sqlx::AssertSqlSafe(sql),
+    )
+    .bind(&build.rustc_version);
+    for cache_key in &cache_keys {
+        query = query.bind(cache_key);
+    }
+    let rows = query.fetch_all(connection).await?;
+    let mut entries: BTreeMap<String, (String, String, String, Vec<String>)> = BTreeMap::new();
+    for (c_metadata, cache_key, compile_key, relative_dir, sha256) in rows {
+        let entry = entries
+            .entry(c_metadata.clone())
+            .or_insert_with(|| (cache_key.clone(), compile_key, relative_dir, Vec::new()));
+        if entry.0 != cache_key {
+            return Err(stow_types::stow_error!(
+                "dependency c_metadata {c_metadata} has cache entries under both {} and {cache_key}",
+                entry.0
+            ));
+        }
+        if let Some(sha256) = sha256 {
+            entry.3.push(sha256);
         }
     }
-    serde_json::to_string(&DependencyCompileKeyIdentity::canonicalize_list(resolved))
-        .wrap_err("serialize dependency compile keys")
+    Ok(entries
+        .into_iter()
+        .map(|(c_metadata, (_, compile_key, relative_dir, sha256s))| {
+            let instance = outputs_instance_digest(sha256s.iter().map(String::as_str));
+            (
+                c_metadata,
+                DependencyEntryInstance {
+                    compile_key,
+                    relative_dir,
+                    instance,
+                },
+            )
+        })
+        .collect())
 }
 
 fn output_file_name(path: &Path) -> stow_types::error::Result<String> {
@@ -2228,6 +2573,7 @@ struct ArtifactCacheEntryRow {
     features_json: String,
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: String,
+    dependency_instances_json: String,
     compile_millis: i64,
     size_bytes: i64,
     profile_json: String,
@@ -2281,7 +2627,7 @@ async fn load_artifact_cache_entry(
 ) -> stow_types::error::Result<Option<ArtifactCacheEntryRow>> {
     sqlx::query_as::<_, ArtifactCacheEntryRow>(
         "SELECT relative_dir, last_accessed_ms, oci_reference, oci_digest, \
-                compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, \
+                compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, \
                 compile_millis, size_bytes, \
                 profile_json, emit_json, kind_json, crate_types_json, \
                 verified_marker_version, verified_marker_policy, provenance \
@@ -2419,6 +2765,7 @@ struct CacheEntryMetadata<'a> {
     features_json: String,
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: &'a str,
+    dependency_instances_json: &'a str,
     /// Publisher-recorded compile time; `0` for locally produced entries.
     compile_millis: u64,
     target: &'a str,
@@ -2444,6 +2791,7 @@ impl<'a> CacheEntryMetadata<'a> {
             features_json: bundle.manifest.config.features_json.raw(),
             dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
             dependency_compile_keys_json: &bundle.manifest.config.dependency_compile_keys_json,
+            dependency_instances_json: "[]",
             compile_millis: bundle.manifest.config.compile_millis,
             target: bundle.manifest.config.target.as_str(),
             profile: &bundle.manifest.config.profile,
@@ -2506,8 +2854,8 @@ async fn insert_artifact_cache_entry(
 ) -> stow_types::error::Result<()> {
     sqlx::query(
         "INSERT OR REPLACE INTO artifact_cache_entries \
-         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
     )
     .bind(rustc_version)
     .bind(cache_key)
@@ -2526,6 +2874,7 @@ async fn insert_artifact_cache_entry(
     .bind(&metadata.features_json)
     .bind(&metadata.dependency_c_metadata_json)
     .bind(metadata.dependency_compile_keys_json)
+    .bind(metadata.dependency_instances_json)
     .bind(db_int::<_, i64>(
         metadata.compile_millis,
         "artifact cache entry compile_millis",
@@ -3106,7 +3455,7 @@ pub mod tests {
             b"staged-rmeta-bytes",
         )
         .expect("write rmeta");
-        let build = local_build_artifact(stable_c_metadata);
+        let build = local_build_artifact(&parsed, stable_c_metadata);
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -3515,6 +3864,7 @@ pub mod tests {
             features_json: "[]".to_owned(),
             dependency_c_metadata_json: "[]".to_owned(),
             dependency_compile_keys_json: "[]".to_owned(),
+            dependency_instances_json: "[]".to_owned(),
             compile_millis: 0,
             size_bytes: 0,
             profile: stow_types::platform::Profile {
@@ -3597,13 +3947,7 @@ pub mod tests {
             super::record_materialized_local_build_outputs(
                 &config,
                 &dependency,
-                &StableRegistryArtifactIdentity {
-                    compile_key: "colorchoice-compile-key".to_owned(),
-                    c_metadata: "stable-colorchoice".to_owned(),
-                    extra_filename: "-stable-colorchoice".to_owned(),
-                    crate_name: "colorchoice".to_owned(),
-                    version: "1.0.0".to_owned(),
-                },
+                &local_build_artifact(&dependency, "stable-colorchoice"),
                 "aarch64-apple-darwin",
             )
             .await
@@ -3623,7 +3967,7 @@ pub mod tests {
                 panic!("the dependency's bookkeeping resolved");
             };
             assert_eq!(
-                resolved,
+                resolved.c_metadata_json,
                 r#"[{"crate_name":"colorchoice","c_metadata":"stable-colorchoice"}]"#
             );
         });
@@ -3674,7 +4018,7 @@ pub mod tests {
                 panic!("the dependency's bookkeeping resolved");
             };
             assert_eq!(
-                resolved,
+                resolved.c_metadata_json,
                 r#"[{"crate_name":"colorchoice","c_metadata":"0123456789abcdef"}]"#
             );
         });
@@ -3698,7 +4042,7 @@ pub mod tests {
         let rmeta_source = parsed.output_rmeta_path().expect("rmeta output path");
         std::fs::write(&rlib_source, b"local-rlib-bytes").expect("write rlib");
         std::fs::write(&rmeta_source, b"local-rmeta-bytes").expect("write rmeta");
-        let build = local_build_artifact(stable_c_metadata);
+        let build = local_build_artifact(&parsed, stable_c_metadata);
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -3774,7 +4118,7 @@ pub mod tests {
         let parsed = local_build_parsed("demo", "cargo-meta-2", out_dir, &["link"]);
         // A failed or partial build leaves outputs absent: rustc exited
         // non-zero, or wrote only some of them. Nothing may be stored.
-        let build = local_build_artifact("aaaabbbbccccdddd");
+        let build = local_build_artifact(&parsed, "aaaabbbbccccdddd");
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -3814,7 +4158,7 @@ pub mod tests {
             b"first-build",
         )
         .expect("write rlib");
-        let build = local_build_artifact(stable_c_metadata);
+        let build = local_build_artifact(&parsed, stable_c_metadata);
 
         run_async(async {
             prepare_local_cache(&config, "1.91.1")
@@ -3835,6 +4179,581 @@ pub mod tests {
         });
     }
 
+    /// Record a dependency's materialized outputs the way the wrapper does
+    /// after its compile, then offer it to the store.
+    async fn store_dependency(
+        config: &StowConfig,
+        parsed: &ParsedRustcArgs,
+        build: &super::LocalBuildArtifact,
+    ) -> bool {
+        super::record_materialized_local_build_outputs(
+            config,
+            parsed,
+            build,
+            "aarch64-apple-darwin",
+        )
+        .await
+        .expect("record dependency outputs");
+        super::store_local_build_outputs(config, parsed, build, "aarch64-apple-darwin")
+            .await
+            .expect("store dependency")
+    }
+
+    /// Resolve a dependent's externs through the materialized outputs, as
+    /// the wrapper's finish path does, and offer it to the store under
+    /// `target` with the host the tests run on.
+    async fn store_dependent(
+        config: &StowConfig,
+        parsed: &ParsedRustcArgs,
+        stable_c_metadata: &str,
+        target: &str,
+    ) -> (bool, super::LocalBuildArtifact) {
+        let super::DependencyCMetadataResolution::Resolved(dependencies) =
+            super::resolve_dependency_c_metadata_json(config, parsed)
+                .await
+                .expect("resolve dependent externs")
+        else {
+            panic!("the dependent's externs resolve")
+        };
+        let mut build = local_build_artifact(parsed, stable_c_metadata);
+        build.target = target.to_owned();
+        build.dependencies = dependencies;
+        let stored =
+            super::store_local_build_outputs(config, parsed, &build, "aarch64-apple-darwin")
+                .await
+                .expect("store dependent");
+        (stored, build)
+    }
+
+    /// A `toml` unit in `out_dir` linking `serde_core` through `dep_rmeta`,
+    /// with its rlib and rmeta written.
+    fn toml_dependent(out_dir: &Path, dep_rmeta: PathBuf) -> ParsedRustcArgs {
+        let mut parsed = parsed_rustc_args(
+            "toml",
+            "cargo-meta-toml",
+            out_dir.to_path_buf(),
+            vec![ParsedExternCrate {
+                crate_name: "serde_core".to_owned(),
+                path: dep_rmeta,
+            }],
+            vec!["lib".to_owned()],
+        );
+        parsed.emit = ["metadata", "link"]
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect();
+        std::fs::write(parsed.output_rlib_path().expect("toml rlib"), b"toml-rlib")
+            .expect("write toml rlib");
+        std::fs::write(
+            parsed.output_rmeta_path().expect("toml rmeta"),
+            b"toml-rmeta",
+        )
+        .expect("write toml rmeta");
+        parsed
+    }
+
+    /// stow#836: two concurrent cold builds compile the same unit to
+    /// different bytes (different target dirs, different `OUT_DIR` in the
+    /// SVH). First-writer-wins keeps the dep's entry to build A; build B's
+    /// dependent, compiled against the other instance, must be refused —
+    /// storing it would bind a dependent to bytes the cache does not
+    /// hold, and every later build served the pair fails E0460/E0463.
+    /// Build A's dependent, compiled against the stored instance, stores
+    /// and records that instance.
+    #[test]
+    fn a_dependent_compiled_against_another_builds_dependency_is_not_stored() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let first_dir = tempdir.path().join("a/deps");
+        let second_dir = tempdir.path().join("b/deps");
+        let dependents_dir = tempdir.path().join("consumer/deps");
+        for dir in [&first_dir, &second_dir, &dependents_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        // One stable identity, two instances: the dep's bytes differ
+        // between target dirs while its identity does not.
+        let dep_stable = "5edec0de5edec0de";
+        let stored_dep =
+            local_build_parsed("serde_core", "cargo-meta-dep", first_dir, &["metadata"]);
+        std::fs::write(stored_dep.output_rmeta_path().expect("rmeta"), b"svh-a").expect("write");
+        let losing_dep =
+            local_build_parsed("serde_core", "cargo-meta-dep", second_dir, &["metadata"]);
+        std::fs::write(losing_dep.output_rmeta_path().expect("rmeta"), b"svh-b").expect("write");
+        let stored_dep_build = local_build_artifact(&stored_dep, dep_stable);
+        let losing_dep_build = local_build_artifact(&losing_dep, dep_stable);
+        assert_ne!(
+            stored_dep_build.instance(),
+            losing_dep_build.instance(),
+            "different bytes must produce different instances"
+        );
+
+        let toml_stable = "70a170a170a170a1";
+        let refused = toml_dependent(
+            &dependents_dir,
+            losing_dep.output_rmeta_path().expect("rmeta"),
+        );
+        let admitted = toml_dependent(
+            &dependents_dir,
+            stored_dep.output_rmeta_path().expect("rmeta"),
+        );
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(
+                store_dependency(&config, &stored_dep, &stored_dep_build).await,
+                "build a's dep stores first"
+            );
+            assert!(
+                !store_dependency(&config, &losing_dep, &losing_dep_build).await,
+                "first-writer-wins keeps build a's dep"
+            );
+
+            let (stored, _) =
+                store_dependent(&config, &refused, toml_stable, "aarch64-apple-darwin").await;
+            assert!(
+                !stored,
+                "a dependent bound to an instance the cache does not hold must not store"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &fetch_request(toml_stable))
+                    .await
+                    .expect("load toml bundle")
+                    .is_none(),
+                "no entry may exist for the refused dependent"
+            );
+
+            let (stored, _) =
+                store_dependent(&config, &admitted, toml_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "a dependent bound to the stored instance stores");
+            let instances = stored_dependency_instances(
+                &config,
+                &super::artifact_cache_key("aarch64-apple-darwin", toml_stable),
+            )
+            .await;
+            assert_eq!(instances.len(), 1);
+            assert_eq!(instances[0].crate_name, "serde_core");
+            assert_eq!(
+                instances[0].compile_key, stored_dep_build.identity.compile_key,
+                "the row binds to build a's dep entry"
+            );
+            assert_eq!(
+                instances[0].instance,
+                stored_dep_build.instance(),
+                "the row records the instance the dependent compiled against"
+            );
+        });
+    }
+
+    /// A `--target` build's dependent links host-side deps (proc-macros)
+    /// whose entries sit under the host triple, not the dependent's
+    /// target; the binding finds them there and the dependent stores.
+    #[test]
+    fn a_cross_target_dependent_binds_a_host_side_dependency() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let host_dir = tempdir.path().join("host/deps");
+        let target_dir = tempdir.path().join("x86_64-unknown-linux-gnu/deps");
+        for dir in [&host_dir, &target_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+        let dep = local_build_parsed("serde_core", "cargo-meta-dep", host_dir, &["metadata"]);
+        std::fs::write(dep.output_rmeta_path().expect("rmeta"), b"host-side").expect("write");
+        let dep_build = local_build_artifact(&dep, "5edec0de5edec0de");
+        let mut dependent = toml_dependent(&target_dir, dep.output_rmeta_path().expect("rmeta"));
+        dependent.target = Some("x86_64-unknown-linux-gnu".to_owned());
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &dep, &dep_build).await);
+            let (stored, _) = store_dependent(
+                &config,
+                &dependent,
+                "70a170a170a170a1",
+                "x86_64-unknown-linux-gnu",
+            )
+            .await;
+            assert!(
+                stored,
+                "the host-side dep's entry binds the cross dependent"
+            );
+            let instances = stored_dependency_instances(
+                &config,
+                &super::artifact_cache_key("x86_64-unknown-linux-gnu", "70a170a170a170a1"),
+            )
+            .await;
+            assert_eq!(instances.len(), 1);
+            assert_eq!(instances[0].instance, dep_build.instance());
+        });
+    }
+
+    async fn stored_dependency_instances(
+        config: &StowConfig,
+        cache_key: &str,
+    ) -> Vec<super::DependencyInstanceIdentity> {
+        let pool = connect(&config.cache_dir).await.expect("connect state db");
+        let instances_json: String = sqlx::query_scalar(
+            "SELECT dependency_instances_json FROM artifact_cache_entries \
+             WHERE rustc_version = '1.91.1' AND cache_key = ?",
+        )
+        .bind(cache_key)
+        .fetch_one(&pool)
+        .await
+        .expect("read dependency instances");
+        serde_json::from_str(&instances_json).expect("parse dependency instances")
+    }
+
+    /// Serve the cached entry under `stable_c_metadata` into `parsed`'s
+    /// out dir the way the serve path does: write its files, then record
+    /// their `materialized_outputs` rows with the entry's instance.
+    async fn materialize_served(
+        config: &StowConfig,
+        parsed: &ParsedRustcArgs,
+        stable_c_metadata: &str,
+    ) {
+        let bundle = super::load_cached_bundle(config, &fetch_request(stable_c_metadata))
+            .await
+            .expect("load served bundle")
+            .expect("served entry present");
+        crate::inject::write_artifacts(
+            parsed,
+            &bundle,
+            "aarch64-apple-darwin",
+            crate::inject::OutputDirWriters::StowOnly,
+        )
+        .await
+        .expect("materialize served bundle");
+        super::record_materialized_bundle_outputs(config, parsed, &bundle, "aarch64-apple-darwin")
+            .await
+            .expect("record served outputs");
+    }
+
+    /// stow#836: dep-A's entry is evicted and dep-B re-stored under the
+    /// same identity — same compile key, different instance. The dependent
+    /// bound to dep-A's instance is stale: serving it misses, and its
+    /// entry is evicted so a later local compile can store a consistent
+    /// replacement.
+    #[test]
+    fn a_closure_entry_bound_to_an_evicted_dependency_is_not_served() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let first_dir = tempdir.path().join("a/deps");
+        let second_dir = tempdir.path().join("b/deps");
+        let third_dir = tempdir.path().join("c/deps");
+        let dependent_dir = tempdir.path().join("a-dependent/deps");
+        for dir in [&first_dir, &second_dir, &third_dir, &dependent_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let evicted_dep =
+            local_build_parsed("serde_core", "cargo-meta-dep", first_dir, &["metadata"]);
+        std::fs::write(evicted_dep.output_rmeta_path().expect("rmeta"), b"svh-a").expect("write");
+        let refilled_dep =
+            local_build_parsed("serde_core", "cargo-meta-dep", second_dir, &["metadata"]);
+        std::fs::write(refilled_dep.output_rmeta_path().expect("rmeta"), b"svh-b").expect("write");
+        let evicted_dep_build = local_build_artifact(&evicted_dep, dep_stable);
+        let refilled_dep_build = local_build_artifact(&refilled_dep, dep_stable);
+        assert_ne!(
+            evicted_dep_build.instance(),
+            refilled_dep_build.instance(),
+            "different bytes must produce different instances"
+        );
+
+        let toml_stable = "70a170a170a170a1";
+        let dependent = toml_dependent(
+            &dependent_dir,
+            evicted_dep.output_rmeta_path().expect("rmeta"),
+        );
+
+        // The serving build is served dep-B: its files land in the third
+        // out dir the way the serve path writes them, and the rows it
+        // records carry dep-B's instance.
+        let refilled_dep_served = local_build_parsed(
+            "serde_core",
+            "cargo-meta-dep",
+            third_dir.clone(),
+            &["metadata"],
+        );
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &evicted_dep, &evicted_dep_build).await);
+            let (stored, _) =
+                store_dependent(&config, &dependent, toml_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "the dependent binds to dep-a's instance");
+
+            // Dep-A's entry is evicted; another build's dep-B fills the key.
+            super::remove_cached_bundle(&config, &fetch_request(dep_stable))
+                .await
+                .expect("evict dep-a entry");
+            assert!(store_dependency(&config, &refilled_dep, &refilled_dep_build).await);
+
+            materialize_served(&config, &refilled_dep_served, dep_stable).await;
+
+            let dependent_third = toml_dependent(
+                &third_dir,
+                refilled_dep_served.output_rmeta_path().expect("rmeta"),
+            );
+            let request = fetch_request(toml_stable);
+            let bundle = super::load_cached_bundle(&config, &request)
+                .await
+                .expect("load dependent bundle")
+                .expect("dependent entry present");
+            let served = crate::prune_materialized_aliases_for_cached_closure(
+                &config,
+                &dependent_third,
+                &request,
+                bundle,
+            )
+            .await
+            .expect("closure binding check");
+            assert!(
+                served.is_none(),
+                "a dependent bound to an evicted instance must miss"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("reload dependent")
+                    .is_none(),
+                "the stale dependent entry is evicted"
+            );
+        });
+    }
+
+    /// `toml_edit` in `out_dir`, compiled against the `toml` rmeta at
+    /// `toml_rmeta` — a dependent one level above `toml_dependent`.
+    fn toml_edit_dependent(out_dir: &Path, toml_rmeta: PathBuf) -> ParsedRustcArgs {
+        let mut parsed = parsed_rustc_args(
+            "toml_edit",
+            "cargo-meta-top",
+            out_dir.to_path_buf(),
+            vec![ParsedExternCrate {
+                crate_name: "toml".to_owned(),
+                path: toml_rmeta,
+            }],
+            vec!["lib".to_owned()],
+        );
+        parsed.emit = ["metadata", "link"]
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect();
+        parsed
+    }
+
+    /// stow#836: the stale entry need not be the one served. `toml` binds
+    /// to dep-A, `toml_edit` binds to `toml`; dep-A is evicted and dep-B
+    /// fills its key. Serving `toml_edit` — whose own binding to `toml`
+    /// still holds — misses, and the stale `toml` deeper in the closure is
+    /// the entry evicted.
+    #[test]
+    fn a_stale_entry_deeper_in_the_closure_is_evicted() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let first_dir = tempdir.path().join("a/deps");
+        let second_dir = tempdir.path().join("b/deps");
+        let serving_dir = tempdir.path().join("c/deps");
+        for dir in [&first_dir, &second_dir, &serving_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let evicted_dep = local_build_parsed(
+            "serde_core",
+            "cargo-meta-dep",
+            first_dir.clone(),
+            &["metadata"],
+        );
+        std::fs::write(evicted_dep.output_rmeta_path().expect("rmeta"), b"svh-a").expect("write");
+        let refilled_dep =
+            local_build_parsed("serde_core", "cargo-meta-dep", second_dir, &["metadata"]);
+        std::fs::write(refilled_dep.output_rmeta_path().expect("rmeta"), b"svh-b").expect("write");
+        let evicted_dep_build = local_build_artifact(&evicted_dep, dep_stable);
+        let refilled_dep_build = local_build_artifact(&refilled_dep, dep_stable);
+
+        let toml_stable = "70a170a170a170a1";
+        let toml = toml_dependent(&first_dir, evicted_dep.output_rmeta_path().expect("rmeta"));
+        let top_stable = "70e170e170e170e1";
+        let top_first = toml_edit_dependent(&first_dir, toml.output_rmeta_path().expect("rmeta"));
+        std::fs::write(top_first.output_rlib_path().expect("rlib"), b"top-rlib").expect("write");
+        std::fs::write(top_first.output_rmeta_path().expect("rmeta"), b"top-rmeta").expect("write");
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &evicted_dep, &evicted_dep_build).await);
+            let (stored, toml_build) =
+                store_dependent(&config, &toml, toml_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "toml binds to dep-a");
+            super::record_materialized_local_build_outputs(
+                &config,
+                &toml,
+                &toml_build,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record toml outputs");
+            let (stored, _) =
+                store_dependent(&config, &top_first, top_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "toml_edit binds to toml");
+
+            super::remove_cached_bundle(&config, &fetch_request(dep_stable))
+                .await
+                .expect("evict dep-a entry");
+            assert!(store_dependency(&config, &refilled_dep, &refilled_dep_build).await);
+
+            // The serving build is served `toml` itself, unchanged — the
+            // extern `toml_edit` checks against still carries the bound
+            // instance; only `toml`'s own binding is stale.
+            let toml_served = toml_dependent(
+                &serving_dir,
+                refilled_dep.output_rmeta_path().expect("rmeta"),
+            );
+            materialize_served(&config, &toml_served, toml_stable).await;
+
+            let top_serving = toml_edit_dependent(
+                &serving_dir,
+                toml_served.output_rmeta_path().expect("rmeta"),
+            );
+            let request = fetch_request(top_stable);
+            let bundle = super::load_cached_bundle(&config, &request)
+                .await
+                .expect("load toml_edit bundle")
+                .expect("toml_edit entry present");
+            let served = crate::prune_materialized_aliases_for_cached_closure(
+                &config,
+                &top_serving,
+                &request,
+                bundle,
+            )
+            .await
+            .expect("closure binding check");
+            assert!(
+                served.is_none(),
+                "a closure holding a stale entry must miss"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &fetch_request(toml_stable))
+                    .await
+                    .expect("reload toml")
+                    .is_none(),
+                "the stale toml entry deeper in the closure is evicted"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("reload toml_edit")
+                    .is_some(),
+                "toml_edit's own binding still holds; it stays cached"
+            );
+        });
+    }
+
+    /// stow#836: a remote dependent was compiled against the published dep
+    /// instance; a dep whose cache entry is local-provenance can never
+    /// satisfy it. The serve misses and the local dep entry is evicted, so
+    /// the next build downloads the published dep and the remote pair
+    /// serves; the remote dependent stays cached.
+    #[test]
+    fn a_remote_dependent_over_a_local_dependency_evicts_the_local_dependency() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let dep_dir = tempdir.path().join("dep/deps");
+        let out_dir = tempdir.path().join("served/deps");
+        for dir in [&dep_dir, &out_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let dep = local_build_parsed("serde_core", "cargo-meta-dep", dep_dir, &["metadata"]);
+        std::fs::write(dep.output_rmeta_path().expect("rmeta"), b"local-dep").expect("write");
+        let dep_build = local_build_artifact(&dep, dep_stable);
+
+        // A remote dependent bound to the dep's compile key — the binding
+        // a published artifact carries.
+        let remote_meta = "70a170a170a170a1";
+        let mut remote = sample_bundle(remote_meta, "libtoml-70a170a170a170a1.rmeta");
+        remote.manifest.config.dependency_compile_keys_json =
+            serde_json::to_string(&[stow_types::identity::DependencyCompileKeyIdentity {
+                crate_name: stow_types::identity::CrateName::parse("serde_core")
+                    .expect("crate name"),
+                compile_key: dep_build.identity.compile_key.clone(),
+            }])
+            .expect("serialize dependency compile keys");
+
+        // The build serving the remote dependent compiled the dep locally:
+        // its extern carries the local instance.
+        let local_dep_in_out = local_build_parsed(
+            "serde_core",
+            "cargo-meta-dep",
+            out_dir.clone(),
+            &["metadata"],
+        );
+        std::fs::write(
+            local_dep_in_out.output_rmeta_path().expect("rmeta"),
+            b"local-dep",
+        )
+        .expect("write local dep rmeta");
+        let dependent = toml_dependent(
+            &out_dir,
+            local_dep_in_out.output_rmeta_path().expect("rmeta"),
+        );
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &dep, &dep_build).await);
+            let stored =
+                super::store_downloaded_bundle(&config, &fetch_request(remote_meta), &remote)
+                    .await
+                    .expect("store remote dependent");
+            assert_eq!(stored.provenance, super::ArtifactProvenance::Remote);
+
+            super::record_materialized_local_build_outputs(
+                &config,
+                &local_dep_in_out,
+                &dep_build,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record local dep outputs");
+
+            let request = fetch_request(remote_meta);
+            let served = crate::prune_materialized_aliases_for_cached_closure(
+                &config, &dependent, &request, stored,
+            )
+            .await
+            .expect("closure binding check");
+            assert!(
+                served.is_none(),
+                "a remote dependent over a local dependency must miss"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("reload remote dependent")
+                    .is_some(),
+                "the remote dependent stays cached"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &fetch_request(dep_stable))
+                    .await
+                    .expect("reload dep")
+                    .is_none(),
+                "the local dep entry the remote dependent sits on is evicted"
+            );
+        });
+    }
+
     #[test]
     fn remote_download_does_not_displace_local_entry() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -3849,7 +4768,7 @@ pub mod tests {
             b"locally-built",
         )
         .expect("write rlib");
-        let build = local_build_artifact(stable_c_metadata);
+        let build = local_build_artifact(&parsed, stable_c_metadata);
         let request = fetch_request(stable_c_metadata);
         let bundle = sample_bundle(stable_c_metadata, "libdemo-1122334455667788.rlib");
 
@@ -3899,7 +4818,7 @@ pub mod tests {
             b"evict-me",
         )
         .expect("write rlib");
-        let local_build = local_build_artifact(local_meta);
+        let local_build = local_build_artifact(&local_parsed, local_meta);
         let local_key = super::artifact_cache_key("aarch64-apple-darwin", local_meta);
         let remote_request = fetch_request("bbbb");
         let remote_bundle = sample_bundle("bbbb", "libdemo-bbbb.rmeta");
@@ -3989,7 +4908,7 @@ pub mod tests {
             b"newer-local",
         )
         .expect("write rlib");
-        let local_build = local_build_artifact(local_meta);
+        let local_build = local_build_artifact(&local_parsed, local_meta);
         let local_key = super::artifact_cache_key("aarch64-apple-darwin", local_meta);
 
         run_async(async {
@@ -4233,21 +5152,44 @@ pub mod tests {
         parsed
     }
 
-    fn local_build_artifact(stable_c_metadata: &str) -> super::LocalBuildArtifact {
+    fn local_build_artifact(
+        parsed: &ParsedRustcArgs,
+        stable_c_metadata: &str,
+    ) -> super::LocalBuildArtifact {
+        let identity = StableRegistryArtifactIdentity {
+            // Real compile keys are hex; the stable c_metadata is the
+            // first 16 hex digits of the key.
+            compile_key: format!("{stable_c_metadata}{stable_c_metadata}"),
+            c_metadata: stable_c_metadata.to_owned(),
+            extra_filename: format!("-{stable_c_metadata}"),
+            crate_name: parsed.crate_name.clone(),
+            version: "1.0.0".to_owned(),
+        };
+        // The fixture mirrors the resolve path's hashing, except it
+        // tolerates a missing source — the skips-missing-output test
+        // needs an artifact whose outputs rustc never wrote, which the
+        // real resolve path can never produce.
+        let stable_parsed = crate::inject::parsed_with_stable_identity(parsed, &identity);
+        let mut outputs =
+            super::local_build_output_specs(parsed, &stable_parsed, "aarch64-apple-darwin")
+                .expect("local build output specs");
+        for output in &mut outputs {
+            if output.source.exists() {
+                output.sha256 = super::sha256_file_bytes(&output.source)
+                    .expect("hash fixture output")
+                    .0;
+            }
+        }
         super::LocalBuildArtifact {
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
-            identity: StableRegistryArtifactIdentity {
-                // Real compile keys are hex; the stable c_metadata is the
-                // first 16 hex digits of the key.
-                compile_key: format!("{stable_c_metadata}{stable_c_metadata}"),
-                c_metadata: stable_c_metadata.to_owned(),
-                extra_filename: format!("-{stable_c_metadata}"),
-                crate_name: "demo".to_owned(),
-                version: "1.0.0".to_owned(),
-            },
+            identity,
             features_json: "[]".to_owned(),
-            dependency_c_metadata_json: "[]".to_owned(),
+            dependencies: super::ResolvedDependencies {
+                c_metadata_json: "[]".to_owned(),
+                externs: Vec::new(),
+            },
+            outputs,
         }
     }
 
@@ -4323,6 +5265,7 @@ pub mod tests {
                 .config
                 .dependency_compile_keys_json
                 .clone(),
+            dependency_instances_json: "[]".to_owned(),
             compile_millis: artifact_bundle.manifest.config.compile_millis,
             size_bytes: 0,
             profile: artifact_bundle.manifest.config.profile.clone(),

@@ -18,6 +18,12 @@ CREATE TABLE artifact_cache_entries (
     features_json TEXT NOT NULL DEFAULT '',
     dependency_c_metadata_json TEXT NOT NULL DEFAULT '[]',
     dependency_compile_keys_json TEXT NOT NULL DEFAULT '[]',
+    -- `[{crate_name, compile_key, instance}]`: the instance digest each
+    -- direct dependency was compiled against — the digest over the dep
+    -- entry's own output sha256s. Written by local stores; remote rows
+    -- carry '[]' (a remote binding is the published instance by
+    -- construction).
+    dependency_instances_json TEXT NOT NULL DEFAULT '[]',
     compile_millis INTEGER NOT NULL DEFAULT 0,
     target TEXT NOT NULL DEFAULT '',
     profile_json TEXT NOT NULL DEFAULT '{}',
@@ -109,6 +115,9 @@ CREATE TABLE crate_stats (
 CREATE TABLE materialized_outputs (
     output_path TEXT PRIMARY KEY,
     c_metadata TEXT NOT NULL,
+    -- `outputs_instance_digest` of the artifact instance at this path —
+    -- which exact bytes a dependent's `--extern` resolves to.
+    instance TEXT NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
 
