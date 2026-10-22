@@ -52,6 +52,8 @@ use crate::render::{self, Output};
 
 /// The build-crate runs poll cadence.
 const RUN_POLL_SECONDS: u64 = 30;
+/// The layer progress line's cadence — every second poll tick.
+const LAYER_PROGRESS_SECONDS: u64 = 60;
 /// The published-slice poll cadence after an index-publish dispatch.
 const INDEX_POLL_SECONDS: u64 = 60;
 /// How long a layer's index publish may take before the driver fails —
@@ -615,6 +617,10 @@ async fn drive_layers(
         drive_layer(
             drive.dispatch,
             layer,
+            LayerPosition {
+                index,
+                of: layers.len(),
+            },
             nodes,
             &mut report.reruns,
             &mut drive.policy,
@@ -2026,6 +2032,109 @@ async fn classify_and_fold(
     Ok(())
 }
 
+/// One tick's partition of a layer for the progress line: `done`,
+/// `failed`, `skipped`, `dispatched` and `remaining` sum to `total`,
+/// and `running_batches` breaks out the dispatched legs whose bound
+/// run GitHub still reports `in_progress` — batch-granular, so it
+/// never reads as legs building.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct LayerProgress {
+    total: usize,
+    done: usize,
+    failed: usize,
+    skipped: usize,
+    dispatched: usize,
+    running_batches: usize,
+    remaining: usize,
+}
+
+/// Partition `layer`'s nodes into the progress counts — pure: the wave
+/// state the driver already holds answers every count, and `open` is
+/// never consulted since its unresolved-unblocked subset is exactly
+/// `remaining` plus the in-flight part of `dispatched`. A settled leg
+/// keeps `dispatched` set (the folds never clear it), so the
+/// `dispatched` arm must re-test `done`/`failed`, and `skipped` stands
+/// apart because blocked nodes are dropped before dispatch. The
+/// partition is structural — each node lands in one bucket — and the
+/// `debug_assert!` keeps the invariant stated.
+fn layer_progress(
+    layer: &[String],
+    nodes: &BTreeMap<String, NodeRun>,
+    batches: &HashMap<BatchId, BoundRun>,
+) -> LayerProgress {
+    let running: BTreeSet<u64> = batches
+        .values()
+        .filter(|batch| {
+            batch
+                .latest
+                .as_ref()
+                .is_some_and(|state| state.status == "in_progress")
+        })
+        .filter_map(|batch| batch.workflow_run_id)
+        .collect();
+    let mut progress = LayerProgress {
+        total: layer.len(),
+        ..LayerProgress::default()
+    };
+    for id in layer {
+        let node = nodes.get(id).expect("layer node");
+        if node.done {
+            progress.done += 1;
+        } else if node.failed {
+            progress.failed += 1;
+        } else if node.blocked_by.is_some() {
+            progress.skipped += 1;
+        } else if node.dispatched {
+            progress.dispatched += 1;
+            if node
+                .workflow_run_id
+                .is_some_and(|run_id| running.contains(&run_id))
+            {
+                progress.running_batches += 1;
+            }
+        } else {
+            progress.remaining += 1;
+        }
+    }
+    debug_assert!(
+        progress.done
+            + progress.failed
+            + progress.skipped
+            + progress.dispatched
+            + progress.remaining
+            == progress.total,
+        "the progress counts partition the layer"
+    );
+    progress
+}
+
+/// A layer's position among the wave's layers — `index` is 0-based
+/// (the lines log `index + 1`), `of` the layer count; the same pair
+/// `drive_layers` logs on its `layer` line.
+#[derive(Clone, Copy)]
+struct LayerPosition {
+    index: usize,
+    of: usize,
+}
+
+/// Emit the layer progress line on the driver's diagnostic stream —
+/// `position` places the layer exactly as `drive_layers`' own `layer`
+/// line does.
+fn log_layer_progress(position: LayerPosition, progress: &LayerProgress) {
+    tracing::info!(
+        layer = position.index + 1,
+        of = position.of,
+        total = progress.total,
+        done = progress.done,
+        failed = progress.failed,
+        skipped = progress.skipped,
+        dispatched = progress.dispatched,
+        running_batches = progress.running_batches,
+        remaining = progress.remaining,
+        "layer progress"
+    );
+}
+
 /// Drive one layer to completion: adopt once — every run in the closed
 /// `[adopt_since, now]` window whose title names an open node — dispatch
 /// the rest bounded by `in_flight`, then poll only the run ids the wave
@@ -2039,10 +2148,12 @@ async fn classify_and_fold(
 /// with no run found returns to unsent for a fresh dispatch. Every
 /// write — dispatch or rerun — shares `gate`: an answer that settled
 /// nothing pauses sends for the backoff's wait while polling and
-/// resolution run on.
+/// resolution run on. `position` is the layer's place among the
+/// wave's layers, for the per-minute `layer progress` line.
 async fn drive_layer(
     dispatch: &Dispatch,
     layer: &[String],
+    position: LayerPosition,
     nodes: &mut BTreeMap<String, NodeRun>,
     reruns: &mut Vec<RerunRecord>,
     policy: &mut BatchPolicy<'_>,
@@ -2084,6 +2195,7 @@ async fn drive_layer(
         &main_head,
     )
     .await?;
+    let mut last_progress = tokio::time::Instant::now();
     loop {
         // `main`'s head is read once per poll — usually a free 304 —
         // and every row's staleness is judged against it.
@@ -2099,7 +2211,13 @@ async fn drive_layer(
         }
         dispatch_open(dispatch, &mut wave, policy).await?;
         if wave.open.is_empty() {
+            // The final line — the last state is never a tick stale.
+            log_layer_progress(position, &layer_progress(layer, wave.nodes, wave.batches));
             return Ok(());
+        }
+        if last_progress.elapsed() >= std::time::Duration::from_secs(LAYER_PROGRESS_SECONDS) {
+            log_layer_progress(position, &layer_progress(layer, wave.nodes, wave.batches));
+            last_progress = tokio::time::Instant::now();
         }
         let overdue: Vec<String> = wave
             .batches
@@ -4553,6 +4671,104 @@ mod tests {
         assert!(dispatch_overdue(&batches[&batch]));
     }
 
+    /// The progress counts partition the layer: done, failed, blocked,
+    /// unresolved-dispatch, queued-run and in-progress-run nodes each
+    /// land in their own count — `running_batches` names only the legs
+    /// riding a bound run GitHub still reports in progress — and the
+    /// buckets sum to the layer. The settled nodes keep `dispatched`
+    /// set, exactly as the folds leave them, so the `dispatched`
+    /// count's `!done && !failed` guard is exercised.
+    #[test]
+    fn the_layer_progress_counts_partition_the_layer() {
+        const T: &str = "x86_64-unknown-linux-gnu";
+        let (mut nodes, _) = build_graph(vec![
+            request("done", T, false, &[]),
+            request("failed", T, false, &[]),
+            request("blocked", T, false, &[]),
+            request("unresolved", T, false, &[]),
+            request("queued", T, false, &[]),
+            request("running", T, false, &[]),
+            request("waiting", T, false, &[]),
+        ])
+        .expect("valid graph");
+        let ids: BTreeMap<&str, String> = [
+            "done",
+            "failed",
+            "blocked",
+            "unresolved",
+            "queued",
+            "running",
+            "waiting",
+        ]
+        .into_iter()
+        .map(|name| {
+            (
+                name,
+                node_task_id(request_by_name(name, &nodes)).expect("task id"),
+            )
+        })
+        .collect();
+        let layer: Vec<String> = nodes.keys().cloned().collect();
+        // A settled node keeps `dispatched` and its run binding — the
+        // folds only flip `done`/`failed` and drop it from `open`.
+        {
+            let node = nodes.get_mut(&ids["done"]).expect("done node");
+            node.done = true;
+            node.dispatched = true;
+            node.workflow_run_id = Some(40);
+        }
+        {
+            let node = nodes.get_mut(&ids["failed"]).expect("failed node");
+            node.failed = true;
+            node.dispatched = true;
+            node.workflow_run_id = Some(41);
+        }
+        nodes
+            .get_mut(&ids["blocked"])
+            .expect("blocked node")
+            .blocked_by = Some(ids["failed"].clone());
+        let mut batches = HashMap::new();
+        unresolved_batch(
+            &mut batches,
+            &mut nodes,
+            batch_id_for(9),
+            std::slice::from_ref(&ids["unresolved"]),
+            at(1_000_000),
+        );
+        for (name, run_id, status) in [("queued", 50, "queued"), ("running", 51, "in_progress")] {
+            {
+                let node = nodes.get_mut(&ids[name]).expect("bound node");
+                node.dispatched = true;
+                node.workflow_run_id = Some(run_id);
+            }
+            let mut batch = bound_batch(std::slice::from_ref(&ids[name]), run_id);
+            batch.latest = Some(run_state_with_id(run_id, status, None, true));
+            batches.insert(batch_id_for(run_id), batch);
+        }
+        let progress = layer_progress(&layer, &nodes, &batches);
+        assert_eq!(
+            progress,
+            LayerProgress {
+                total: 7,
+                done: 1,
+                failed: 1,
+                skipped: 1,
+                dispatched: 3,
+                running_batches: 1,
+                remaining: 1,
+            }
+        );
+        assert_eq!(
+            progress.done
+                + progress.failed
+                + progress.skipped
+                + progress.dispatched
+                + progress.remaining,
+            progress.total,
+            "the counts partition the layer"
+        );
+    }
+
     /// stow#647 section D at batch scope: a rerun asked on attempt N
     /// is accepted once the run shows a later attempt — the record the
     /// confirmed path would have pushed lands, and the new row folds
@@ -5076,6 +5292,7 @@ mod tests {
             let drive = drive_layer(
                 &dispatch,
                 &layer,
+                LayerPosition { index: 0, of: 1 },
                 &mut nodes,
                 &mut reruns,
                 &mut policy,
@@ -5165,7 +5382,7 @@ mod tests {
         let mut reruns = Vec::new();
         {
             let drive = async {
-                for layer in &layers {
+                for (index, layer) in layers.iter().enumerate() {
                     if layer.is_empty() {
                         continue;
                     }
@@ -5173,6 +5390,10 @@ mod tests {
                     drive_layer(
                         &dispatch,
                         layer,
+                        LayerPosition {
+                            index,
+                            of: layers.len(),
+                        },
                         &mut nodes,
                         &mut reruns,
                         &mut policy,
