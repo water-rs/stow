@@ -20,6 +20,9 @@ STOW_LOCAL_CI_URL = "http://127.0.0.1:28124"
 STOW_GITHUB_API_URL = "http://127.0.0.1:28123"
 STOW_DISPATCH_MIN_AGE_MINUTES = "0"
 STOW_MAX_CONCURRENT_JOBS = "3"
+# The mock's human-lane reserve a manual wave leaves free (stow#854) —
+# one slot inside the 3-job pool.
+STOW_HUMAN_RESERVED_JOBS = "1"
 # Batches hold at most the mock's 3-job pool at once; B keeps the
 # production default so the reduced wave still packs legs (stow#833).
 STOW_BATCH_PARALLELISM = "3"

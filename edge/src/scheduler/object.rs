@@ -42,6 +42,8 @@ const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET
 const STOW_MIN_DISPATCH_VALUE_BINDING: &str = "STOW_MIN_DISPATCH_VALUE";
 const STOW_BATCH_PARALLELISM_BINDING: &str = "STOW_BATCH_PARALLELISM";
 const STOW_BATCH_MAX_TASKS_BINDING: &str = "STOW_BATCH_MAX_TASKS";
+const STOW_HUMAN_RESERVED_JOBS_BINDING: &str = "STOW_HUMAN_RESERVED_JOBS";
+const STOW_HUMAN_RESERVED_MACOS_JOBS_BINDING: &str = "STOW_HUMAN_RESERVED_MACOS_JOBS";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -96,7 +98,12 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
             .unwrap_or(defaults.batch_parallelism),
         batch_max_tasks: read_optional_u32_binding(env, STOW_BATCH_MAX_TASKS_BINDING)?
             .unwrap_or(defaults.batch_max_tasks),
-        human_reserve: defaults.human_reserve,
+        human_reserve: queue::HumanReserve {
+            shared: read_optional_u32_binding(env, STOW_HUMAN_RESERVED_JOBS_BINDING)?
+                .unwrap_or(defaults.human_reserve.shared),
+            macos: read_optional_u32_binding(env, STOW_HUMAN_RESERVED_MACOS_JOBS_BINDING)?
+                .unwrap_or(defaults.human_reserve.macos),
+        },
     })
 }
 
@@ -177,6 +184,14 @@ impl DurableObject for Scheduler {
             // the report lands on the `build_batches` row verbatim and
             // the alarm pass resolves each leg from it.
             "/batches/{batch_id}/complete".post(complete_batch),
+            // A coordinated `preheat manual` wave's trusted pair
+            // (stow#854 §3.1): registration before the
+            // `workflow_dispatch`, the send's outcome after. Nested to
+            // stay under the router's route-tuple arity.
+            "/manual-batches".route((
+                "".post(register_manual_batch),
+                "/dispatch".post(record_manual_batch_dispatch),
+            )),
             // The human request lane (stow#428): admit deduplicates on
             // the request id and dispatches `resolve-request.yml`;
             // `outcome` is the resolve job's report channel and
@@ -631,6 +646,76 @@ async fn complete_batch(
     // pass the row's `resolve_after` points at.
     schedule_alarm(&env, &db, &alarm).await?;
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// `POST /manual-batches` — register one `build-batch.yml` batch
+/// `preheat manual` is about to dispatch (stow#854 §3.2). The batch's
+/// legs are claimed `dispatched` under the driver-minted id and the
+/// granted slots land in `build_batches`, so no lane claims or
+/// re-enqueues them while the wave builds — and `expired_batches`'s
+/// lease still covers the wave that dies between register and report.
+/// Reached from `POST /api/v1/admin/scheduler/manual-batches`.
+async fn register_manual_batch(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(registration): Json<stow_types::api::ManualBatchRegistration>,
+) -> Result<Json<stow_types::api::ManualBatchRegistered>> {
+    let settings = scheduler_settings(&env)?;
+    // The register route refuses while frozen — the wave it would
+    // commit could not settle while `next_alarm` deletes the alarm —
+    // and the refusal here carries the trigger's summary rather than
+    // the queue function's bare `Frozen`.
+    refuse_if_frozen(&db).await?;
+    let registered = queue::register_manual_batch(&db, &settings, &registration)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                QueueError::InvalidManualBatch(_) => StatusCode::BAD_REQUEST,
+                QueueError::ManualBatchConflict(_) => StatusCode::CONFLICT,
+                QueueError::ManualRegistrationRefused(
+                    crate::errors::ManualRegistrationRefused::ReserveExceedsCap { .. },
+                ) => StatusCode::INTERNAL_SERVER_ERROR,
+                QueueError::ManualRegistrationRefused(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    // A registered batch's lease and resolution are the alarm's
+    // bookkeeping; a `ShareFull` answer wrote nothing to arm.
+    if matches!(
+        registered,
+        stow_types::api::ManualBatchRegistered::Registered { .. }
+    ) {
+        schedule_alarm(&env, &db, &alarm).await?;
+    }
+    Ok(Json(registered))
+}
+
+/// `POST /manual-batches/dispatch` — the driver's report of what its
+/// `workflow_dispatch` came back with (stow#854 §3.3): `Dispatched`
+/// binds the run id so the webhook's completion can resolve the batch,
+/// `NotDispatched` releases the claim back to `pending`. Never refuses
+/// while frozen — the run already exists, and a release is cleanup.
+async fn record_manual_batch_dispatch(
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(dispatch): Json<stow_types::api::ManualBatchDispatch>,
+) -> Result<Json<stow_types::api::ManualDispatchRecorded>> {
+    let recorded = queue::record_manual_dispatch(&db, &scheduler_settings(&env)?, &dispatch)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                QueueError::ManualBatchConflict(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    // `Bound` arms the lease/resolution bookkeeping; `Released` just
+    // requeued legs the next pass may claim.
+    schedule_alarm(&env, &db, &alarm).await?;
+    Ok(Json(recorded))
 }
 
 /// The `{batch_id}` path parameter — verbatim; a completion naming an

@@ -2244,10 +2244,6 @@ struct HeldRunsRow {
 /// (stow#854 §3.2 step 0, §4.4). Pure — the share is computed from the
 /// same `count_active_by_family` the claim pass runs, so a registration
 /// needs no schema or provenance to stay inside the reserve.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 fn manual_share(
     limit: NonZeroU32,
     settings: &SchedulerSettings,
@@ -2268,10 +2264,6 @@ fn manual_share(
 /// The slice of a [`ManualShare`] a batch on `family` may draw on: the
 /// pool for Linux and Windows, and — a macOS leg needs a pool slot and
 /// a macOS slot — the smaller of both for macOS.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 fn manual_family_share(share: ManualShare, family: RunnerFamily) -> u32 {
     match family {
         RunnerFamily::MacOs => share.shared.min(share.macos),
@@ -2281,10 +2273,6 @@ fn manual_family_share(share: ManualShare, family: RunnerFamily) -> u32 {
 
 /// One leg's queue row as the registration's claim probe reads it.
 #[derive(Debug, skyzen::FromRow)]
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 struct ManualLegProbeRow {
     task_id: String,
     status: String,
@@ -2324,10 +2312,6 @@ struct ManualLegProbeRow {
 /// [`QueueError::Invariant`] when the claim probe finds a row
 /// `enqueue_inner` just wrote missing, or the claim writes fewer legs
 /// than planned — impossible inside the tick.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 pub async fn register_manual_batch(
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -2421,10 +2405,6 @@ pub async fn register_manual_batch(
 /// id. A leg `enqueue_inner` would skip is unreachable — the family
 /// check already refused it (the `CI_TARGET_TRIPLES` partition
 /// invariant).
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 fn validate_manual_legs(
     registration: &ManualBatchRegistration,
     settings: &SchedulerSettings,
@@ -2490,10 +2470,6 @@ fn validate_manual_legs(
 /// lives here, not in `scheduler_settings`: that function runs on every
 /// scheduler route, and a knob only manual registration reads must not
 /// take the lanes down.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 const fn manual_reserve_within_caps(
     settings: &SchedulerSettings,
     limit: NonZeroU32,
@@ -2525,10 +2501,6 @@ const fn manual_reserve_within_caps(
 /// claimable/refused in request order. A `failed` row claims as an
 /// operator retry (`attempt` restarts at 1); everything else the probe
 /// cannot name is `Invariant` — `enqueue_inner` just wrote each row.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 async fn probe_manual_legs(
     db: &DurableDb,
     task_ids: &[String],
@@ -2604,10 +2576,6 @@ async fn probe_manual_legs(
 /// match the plan inside one input-gate tick), then
 /// `refresh_dependents` for the legs leaving `failed`, as in the
 /// `retry` verb.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 async fn claim_manual_legs(
     db: &DurableDb,
     batch_id: &str,
@@ -2676,10 +2644,6 @@ async fn claim_manual_legs(
 /// `parallelism` already the granted `min`. `DO NOTHING RETURNING`
 /// turns the primary-key conflict — a driver never reuses a batch id —
 /// into the route's 409 without error-string matching.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 async fn insert_manual_batch_row(
     db: &DurableDb,
     registration: &ManualBatchRegistration,
@@ -2728,10 +2692,6 @@ async fn insert_manual_batch_row(
 /// the row: a `Dispatched` naming a run other than the bound one, or a
 /// `NotDispatched` against a row that carries a run or a completion.
 /// [`QueueError::Invariant`] from the underlying probes.
-#[cfg_attr(
-    target_arch = "wasm32",
-    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
-)]
 pub async fn record_manual_dispatch(
     db: &DurableDb,
     settings: &SchedulerSettings,

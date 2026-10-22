@@ -16,6 +16,12 @@ STOW_DISPATCH_MIN_AGE_MINUTES = "5"
 # 4 macOS runners free.
 STOW_MAX_CONCURRENT_JOBS = "45"
 STOW_MAX_CONCURRENT_MACOS_JOBS = "16"
+# Runner slots a coordinated `preheat manual` wave always leaves free
+# for the human request lane (stow#854): one per runner family inside
+# the pool, one inside the macOS cap — a human request's all-family
+# frontier can start however large the wave.
+STOW_HUMAN_RESERVED_JOBS = "3"
+STOW_HUMAN_RESERVED_MACOS_JOBS = "1"
 # Batch shape (stow#833): each build-batch.yml matrix holds k runner
 # slots (max-parallel) and up to B legs — eight rounds at the defaults.
 STOW_BATCH_PARALLELISM = "5"

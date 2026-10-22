@@ -202,6 +202,13 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
                     "/ledger".at(api::admin_scheduler_budget_ledger),
                 )),
                 "/scheduler/demand".post(api::admin_scheduler_demand),
+                // The coordinated `preheat manual` wave's pair
+                // (stow#854): register before the send, report the
+                // send's outcome after.
+                "/scheduler/manual-batches".route((
+                    "".post(api::admin_manual_batch_register),
+                    "/dispatch".post(api::admin_manual_batch_dispatch),
+                )),
                 "/scheduler/demand-feed".route((
                     "/query".post(api::admin_scheduler_demand_feed_query),
                     "/begin".post(api::admin_scheduler_demand_feed_begin),

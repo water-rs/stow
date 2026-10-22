@@ -260,6 +260,9 @@ const SCHEDULER_DEMAND_FEED_COMPLETE_URL: &str = "https://scheduler.internal/dem
 const SCHEDULER_DEMAND_FEED_CLEANUP_URL: &str = "https://scheduler.internal/demand-feed/cleanup";
 const SCHEDULER_DEMAND_FEED_DELIVER_URL: &str = "https://scheduler.internal/demand-feed/deliver";
 const SCHEDULER_DEMAND_FEED_STATUS_URL: &str = "https://scheduler.internal/demand-feed/status";
+const SCHEDULER_MANUAL_BATCHES_URL: &str = "https://scheduler.internal/manual-batches";
+const SCHEDULER_MANUAL_BATCH_DISPATCH_URL: &str =
+    "https://scheduler.internal/manual-batches/dispatch";
 
 /// `POST /demand-feed/begin` — open or rotate the hour's staging
 /// attempt (stow#523); a resume answers a fresh generation.
@@ -435,4 +438,24 @@ async fn fetch(
         });
     }
     Ok(response)
+}
+/// `POST /manual-batches` — register one `build-batch.yml` batch a
+/// coordinated `preheat manual` wave is about to dispatch (stow#854
+/// §3.1–3.2); the answer carries the granted `max-parallel`, the
+/// claimed and refused legs, and the remaining share.
+pub async fn send_manual_batch_register(
+    namespace: &CfDurableNamespace,
+    registration: &stow_types::api::ManualBatchRegistration,
+) -> Result<stow_types::api::ManualBatchRegistered, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_MANUAL_BATCHES_URL, registration).await
+}
+
+/// `POST /manual-batches/dispatch` — report what the batch's
+/// `workflow_dispatch` came back with: `Dispatched` binds the run id,
+/// `NotDispatched` releases the claim (stow#854 §3.3).
+pub async fn send_manual_batch_dispatch(
+    namespace: &CfDurableNamespace,
+    dispatch: &stow_types::api::ManualBatchDispatch,
+) -> Result<stow_types::api::ManualDispatchRecorded, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_MANUAL_BATCH_DISPATCH_URL, dispatch).await
 }

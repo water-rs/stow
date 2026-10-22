@@ -697,6 +697,62 @@ pub async fn admin_queue_purge(
     Ok(Json(queue_mutation(&scheduler, "purge", &selector).await?))
 }
 
+/// The scheduler's 400 names the refusal and its 409 the conflicting
+/// live state — both forward with the scheduler's own message (the
+/// `queue_mutation` pattern), so `preheat manual`'s error names it
+/// (stow#854 §3.4).
+fn manual_batch_error(error: crate::errors::SchedulerClientError) -> GetArtifactError {
+    match error {
+        crate::errors::SchedulerClientError::Http {
+            status: 400, body, ..
+        } => GetArtifactError::BadRequestWithMessage(
+            crate::errors::scheduler_error_message(&body).to_owned(),
+        ),
+        crate::errors::SchedulerClientError::Http {
+            status: 409, body, ..
+        } => GetArtifactError::SchedulerConflict(
+            crate::errors::scheduler_error_message(&body).to_owned(),
+        ),
+        other => other.into(),
+    }
+}
+
+/// `POST /api/v1/admin/scheduler/manual-batches`
+///
+/// Register one `build-batch.yml` batch a coordinated `preheat manual`
+/// wave is about to dispatch (stow#854): the scheduler claims its legs
+/// and charges the granted slots, so the lanes never rebuild what the
+/// wave is building. The answer is `Registered` with the granted
+/// `max-parallel`, claimed and refused legs and the remaining share —
+/// or `ShareFull` while the wave's reserved-out share is occupied.
+pub async fn admin_manual_batch_register(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(registration): Json<stow_types::api::ManualBatchRegistration>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::ManualBatchRegistered>, GetArtifactError> {
+    scheduler_client::send_manual_batch_register(&scheduler, &registration)
+        .await
+        .map(Json)
+        .map_err(manual_batch_error)
+}
+
+/// `POST /api/v1/admin/scheduler/manual-batches/dispatch`
+///
+/// Report what the wave's `workflow_dispatch` for a registered batch
+/// came back with — `Dispatched` binds the run id so the completion
+/// webhook resolves it, `NotDispatched` releases the claim
+/// (stow#854 §3.3).
+pub async fn admin_manual_batch_dispatch(
+    SchedulerCaller(_caller): SchedulerCaller,
+    Json(dispatch): Json<stow_types::api::ManualBatchDispatch>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::ManualDispatchRecorded>, GetArtifactError> {
+    scheduler_client::send_manual_batch_dispatch(&scheduler, &dispatch)
+        .await
+        .map(Json)
+        .map_err(manual_batch_error)
+}
+
 /// Query for `GET /api/v1/admin/coverage/{crate_name}`.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 pub struct CoverageQuery {
