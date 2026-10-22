@@ -2332,7 +2332,7 @@ pub async fn register_manual_batch(
             ManualRegistrationRefused::Paused,
         ));
     };
-    manual_reserve_within_caps(settings, limit)?;
+    manual_reserve_within_caps(settings, limit, family)?;
 
     // Step 0 — the share, before anything is written: the same
     // `GROUP BY dispatch_family` occupancy the claim pass reads.
@@ -2341,6 +2341,22 @@ pub async fn register_manual_batch(
     let family_share = manual_family_share(share, family);
     if family_share == 0 {
         return Ok(ManualBatchRegistered::ShareFull { share });
+    }
+
+    // The driver never reuses a batch id — a live row under it is the
+    // route's 409, probed before any write because the store has no
+    // transactions and everything after this point commits. The
+    // INSERT's `ON CONFLICT` stays as the `Invariant` backstop.
+    let exists = db
+        .query("SELECT 1 FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .fetch_scalar_optional::<i64>()
+        .await
+        .map_err(|error| format!("probe manual batch id {batch_id}: {error}"))?;
+    if exists.is_some() {
+        return Err(QueueError::ManualBatchConflict(format!(
+            "batch id {batch_id} is already a live batch"
+        )));
     }
 
     // Step 1 — insert absent rows `pending` and apply the existing
@@ -2464,15 +2480,20 @@ fn validate_manual_legs(
     ))
 }
 
-/// A human reserve at or above its cap leaves a manual wave no slot in
-/// any state — a misconfiguration the route fails (the wave's 500)
-/// rather than a `ShareFull` it could never leave (§3.2). The check
-/// lives here, not in `scheduler_settings`: that function runs on every
-/// scheduler route, and a knob only manual registration reads must not
-/// take the lanes down.
+/// A human reserve at or above the cap it narrows leaves a manual wave
+/// no slot in any state — a misconfiguration the route fails (the
+/// wave's 500) rather than a `ShareFull` it could never leave (§3.2).
+/// The macOS arm is family-scoped: it binds only a macOS batch, and
+/// only when the cap is set at all — `STOW_MAX_CONCURRENT_MACOS_JOBS =
+/// 0` is the operator's pause of the family (a macOS batch then
+/// saturates to `ShareFull`), not a bad reserve. The check lives here,
+/// not in `scheduler_settings`: that function runs on every scheduler
+/// route, and a knob only manual registration reads must not take the
+/// lanes down.
 const fn manual_reserve_within_caps(
     settings: &SchedulerSettings,
     limit: NonZeroU32,
+    family: RunnerFamily,
 ) -> Result<(), QueueError> {
     if settings.human_reserve.shared >= limit.get() {
         return Err(QueueError::ManualRegistrationRefused(
@@ -2484,7 +2505,10 @@ const fn manual_reserve_within_caps(
             },
         ));
     }
-    if settings.human_reserve.macos >= settings.max_concurrent_macos_jobs {
+    if matches!(family, RunnerFamily::MacOs)
+        && settings.max_concurrent_macos_jobs > 0
+        && settings.human_reserve.macos >= settings.max_concurrent_macos_jobs
+    {
         return Err(QueueError::ManualRegistrationRefused(
             ManualRegistrationRefused::ReserveExceedsCap {
                 binding: "STOW_HUMAN_RESERVED_MACOS_JOBS",
@@ -2672,8 +2696,11 @@ async fn insert_manual_batch_row(
         .await
         .map_err(|error| format!("insert manual batch {batch_id}: {error}"))?;
     if inserted.is_none() {
-        return Err(QueueError::ManualBatchConflict(format!(
-            "batch id {batch_id} is already a live batch"
+        // `register_manual_batch` probed the id before any write, and
+        // one input-gate tick runs between it and this statement — a
+        // conflict here is impossible.
+        return Err(QueueError::Invariant(format!(
+            "manual batch {batch_id} insert collided after its probe passed"
         )));
     }
     Ok(())
@@ -5486,6 +5513,54 @@ async fn claim_page_walk(
     Ok(walk)
 }
 
+/// The pool's occupancy and free slots as one `count_active_by_family`
+/// read sees them — the counts a claim pass forms against. The pass
+/// reads this twice: once before the walk admits rows, and again after
+/// the walk's last outbound await (`coverage.covered`), because
+/// `register_manual_batch` is a second `build_batches` writer that can
+/// commit inside that window — a registration that lands mid-walk is
+/// charged under its own read and must not be charged again under a
+/// stale one (stow#854 F1). From `load_admitted_subgraphs` to
+/// `insert_batch_rows` only `DurableDb` work runs, so the second read
+/// holds to the insert.
+#[derive(Debug, Clone, Copy)]
+struct FreeCapacity {
+    /// `SUM(parallelism)` over every in-flight batch.
+    active: u32,
+    /// `STOW_MAX_CONCURRENT_JOBS − active`, saturating.
+    shared_free: u32,
+    /// `STOW_MAX_CONCURRENT_MACOS_JOBS − macOS active`, saturating.
+    macos_free: u32,
+}
+
+impl FreeCapacity {
+    /// A `SlotPlan` built on these counts — the formation's capacity.
+    fn plan(&self, settings: &SchedulerSettings) -> SlotPlan {
+        SlotPlan::new(
+            self.shared_free,
+            std::collections::HashMap::from([(RunnerFamily::MacOs, self.macos_free)]),
+            settings.batch_parallelism,
+            settings.batch_max_tasks,
+        )
+    }
+}
+
+/// One `count_active_by_family` read as a [`FreeCapacity`].
+async fn free_capacity(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    limit: NonZeroU32,
+) -> Result<FreeCapacity, QueueError> {
+    let active = count_active_by_family(db).await?;
+    Ok(FreeCapacity {
+        active: active.total,
+        shared_free: limit.get().saturating_sub(active.total),
+        macos_free: settings
+            .max_concurrent_macos_jobs
+            .saturating_sub(active.of(RunnerFamily::MacOs)),
+    })
+}
+
 /// Claim pending rows into `build-batch.yml` dispatches (stow#833
 /// §1.2). The walk keeps its shape — stale/lease recovery, the freeze
 /// and pause gates, the capacity read, the `dispatch_key` page walk
@@ -5495,11 +5570,12 @@ async fn claim_page_walk(
 /// rows.
 ///
 /// Admission claims nothing. The admitted rows' subgraphs load once,
-/// [`form_batches`] packs them on a fresh plan over the same budget —
-/// the walk's plan is spent deciding *whether* to take a row, and
-/// replaying the same decisions on a fresh plan can only differ where
-/// an encoder refusal it never saw loosens them (the equivalence is
-/// host-tested in `batching`) — and one statement mints every batch
+/// [`form_batches`] packs them on a fresh plan over occupancy re-read
+/// after the walk ([`FreeCapacity`]) — the walk's plan is spent
+/// deciding *whether* to take a row, and replaying the same decisions
+/// on a fresh plan can only differ where an encoder refusal it never
+/// saw loosens them (the equivalence is host-tested in `batching`) or
+/// a manual registration took slots mid-walk — and one statement mints every batch
 /// and generation id. A second statement then claims and binds every
 /// formed leg at once, so a row is written exactly once and a row
 /// formation leaves unbatched is not written at all; a batch that lost
@@ -5528,35 +5604,29 @@ pub async fn claim_dispatchable_tasks(
     // (stow#785): whether a completed dep's published rows cover a
     // dependent's edge is decidable only at the report that publishes
     // them — an alarm pass precedes that data and cannot know.
-    let active = count_active_by_family(db).await?;
-    let shared_free = limit.get().saturating_sub(active.total);
-    let macos_free = settings
-        .max_concurrent_macos_jobs
-        .saturating_sub(active.of(RunnerFamily::MacOs));
+    let capacity = free_capacity(db, settings, limit).await?;
     tracing::info!(
-        running = active.total,
-        available = shared_free,
-        macos_available = macos_free,
+        running = capacity.active,
+        available = capacity.shared_free,
+        macos_available = capacity.macos_free,
         ?settings,
         "scheduler claim_dispatchable_tasks capacity"
     );
-    if shared_free == 0 {
+    if capacity.shared_free == 0 {
         return Ok(Vec::new());
     }
-    let fresh_plan = || {
-        SlotPlan::new(
-            shared_free,
-            std::collections::HashMap::from([(RunnerFamily::MacOs, macos_free)]),
-            settings.batch_parallelism,
-            settings.batch_max_tasks,
-        )
-    };
 
-    let walk = claim_page_walk(db, settings, coverage, &mut fresh_plan()).await?;
+    let walk = claim_page_walk(db, settings, coverage, &mut capacity.plan(settings)).await?;
     tracing::info!(
         selected = walk.selected,
         "scheduler claim_dispatchable_tasks selected rows"
     );
+    // Re-read occupancy after the walk's last outbound await: a manual
+    // registration may have committed inside it (stow#854 F1).
+    let capacity = free_capacity(db, settings, limit).await?;
+    if capacity.shared_free == 0 {
+        return Ok(Vec::new());
+    }
     let mut legs = Vec::with_capacity(walk.admitted.len());
     let mut sides = std::collections::HashMap::with_capacity(walk.admitted.len());
     for (row, side) in walk.admitted {
@@ -5579,7 +5649,7 @@ pub async fn claim_dispatchable_tasks(
             task,
         });
     }
-    let formation = form_batches(&candidates, &mut fresh_plan())?;
+    let formation = form_batches(&candidates, &mut capacity.plan(settings))?;
     tracing::info!(
         batches = formation.batches.len(),
         unbatched = formation.unbatched.len(),

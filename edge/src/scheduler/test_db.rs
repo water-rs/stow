@@ -15,7 +15,7 @@ use crate::scheduler::queue::{self, SchedulerSettings};
 
 /// `DurableDbBackend` backed by a `sqlx` `SQLite` pool.
 #[derive(Debug, Clone)]
-struct SqliteBackend {
+pub struct SqliteBackend {
     pool: sqlx::SqlitePool,
     /// Whether DDL and PRAGMA statements pass [`check_do_statements`].
     /// Schema work is operations work — only the reset path may issue
@@ -55,6 +55,20 @@ pub async fn memory_db() -> Result<DurableDb, QueueError> {
     queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
     backend.close_ddl_permit();
     Ok(db)
+}
+
+/// A queue database plus a second live handle into the same pool — for
+/// the claim-interleave test whose `CoverageOracle` must write inside
+/// `covered()`'s outbound-await window (stow#854 F1): the oracle holds
+/// the backend (Send + Sync via the pool) and builds a `DurableDb` per
+/// call.
+pub async fn memory_db_and_backend() -> Result<(DurableDb, SqliteBackend), QueueError> {
+    let backend = memory_backend().await?;
+    let db = DurableDb::new(backend.clone());
+    queue::reset(&db).await?;
+    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    backend.close_ddl_permit();
+    Ok((db, backend))
 }
 
 /// Open a fresh in-memory queue database with NO schema applied and the
