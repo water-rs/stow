@@ -96,6 +96,7 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
             .unwrap_or(defaults.batch_parallelism),
         batch_max_tasks: read_optional_u32_binding(env, STOW_BATCH_MAX_TASKS_BINDING)?
             .unwrap_or(defaults.batch_max_tasks),
+        human_reserve: defaults.human_reserve,
     })
 }
 

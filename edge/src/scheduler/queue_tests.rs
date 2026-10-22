@@ -1,11 +1,16 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 
-use stow_types::api::{BuildTaskPayload, EnqueueRequest, EnqueueSource};
+use stow_types::api::{
+    BuildTaskPayload, EnqueueRequest, EnqueueSource, LegRefusal, ManualBatchDispatch,
+    ManualBatchRegistered, ManualBatchRegistration, ManualDispatchOutcome, ManualDispatchRecorded,
+    ManualShare, TaskLane,
+};
 use stow_types::identity::FeaturesJson;
 
 use super::{
-    AlarmPlan, CoverageOracle, Dispatch, SchedulerSettings, SemanticTaskIdentity, next_alarm,
+    AlarmPlan, CoverageOracle, Dispatch, HumanReserve, SchedulerSettings, SemanticTaskIdentity,
+    next_alarm,
 };
 use crate::errors::QueueError;
 use crate::scheduler::test_db::{
@@ -77,6 +82,7 @@ const fn settings() -> SchedulerSettings {
         // assertions keep their one-slot-per-row expectations.
         batch_parallelism: 1,
         batch_max_tasks: 1,
+        human_reserve: HumanReserve::DEFAULT,
     }
 }
 
@@ -7096,6 +7102,18 @@ async fn row_column(db: &DurableDb, crate_name: &str, column: &str) -> String {
     .expect("row column")
 }
 
+/// An INTEGER queue column — `attempt`, `blocked`, `batch_leg`.
+async fn row_int(db: &DurableDb, crate_name: &str, column: &str) -> i64 {
+    db.query(&format!(
+        "SELECT {column} FROM queue WHERE crate_name = ? AND target = ?"
+    ))
+    .bind(crate_name.to_owned())
+    .bind(TARGET)
+    .fetch_scalar::<i64>()
+    .await
+    .expect("row column")
+}
+
 /// Whether a queue row exists at all — purge assertions.
 async fn row_exists(db: &DurableDb, crate_name: &str) -> bool {
     db.query("SELECT count(*) FROM queue WHERE crate_name = ? AND target = ?")
@@ -10382,5 +10400,1334 @@ async fn a_batch_that_lost_a_leg_is_dropped_and_its_won_legs_restored() {
         batch_rows,
         [batches[0].batch_id.as_str().to_owned()],
         "only the surviving batch is written"
+    );
+}
+// ------------------------------------------------------------------
+// stow#854 — `preheat manual` batch registration (§3.2–3.3, §4.4)
+// ------------------------------------------------------------------
+
+/// One `ManualBatchRegistration` as the driver sends it: a minted batch
+/// id, the wave's rustc, the `max-parallel` it would dispatch, and the
+/// legs in matrix order.
+fn manual_registration(
+    batch_id: &str,
+    parallelism: u32,
+    legs: Vec<EnqueueRequest>,
+) -> ManualBatchRegistration {
+    ManualBatchRegistration {
+        batch_id: batch_id.parse().expect("batch id"),
+        rustc_version: RUSTC.parse().expect("rustc"),
+        parallelism: std::num::NonZeroU32::new(parallelism).expect("nonzero parallelism"),
+        legs,
+    }
+}
+
+/// The register route's settings shape: a real leg bound (the shared
+/// `settings()` keeps `batch_max_tasks: 1`) and the default reserve.
+const fn manual_settings() -> SchedulerSettings {
+    SchedulerSettings {
+        batch_max_tasks: 40,
+        ..settings()
+    }
+}
+
+/// `dispatch` is `stow_types::api::ManualDispatchOutcome` sugar for the
+/// dispatch-outcome route's body.
+fn manual_dispatch(batch_id: &str, outcome: ManualDispatchOutcome) -> ManualBatchDispatch {
+    ManualBatchDispatch {
+        batch_id: batch_id.parse().expect("batch id"),
+        outcome,
+    }
+}
+
+/// Seed `slots` of in-flight parallelism on `family` as one
+/// `build_batches` row. The share reads `SUM(parallelism)` only, and
+/// `register_manual_batch` never runs `release_legless_batches`, so a
+/// legless row charges the pool exactly like a live one.
+async fn seed_occupied_slots(db: &DurableDb, batch_id: &str, family: &str, slots: u32) {
+    db.query(
+        "INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              claimed_at, lease_at) \
+         VALUES (?, ?, ?, 'miss', ?, 1, ?, datetime(?, '+60 minutes'))",
+    )
+    .bind(batch_id.to_owned())
+    .bind(RUSTC)
+    .bind(family.to_owned())
+    .bind(i64::from(slots))
+    .bind(ROW_TS)
+    .bind(ROW_TS)
+    .execute()
+    .await
+    .expect("seed occupancy");
+}
+
+/// `lane` a seeded occupancy row under the human lane's label.
+async fn seed_occupied_lane_slots(
+    db: &DurableDb,
+    batch_id: &str,
+    family: &str,
+    lane: &str,
+    slots: u32,
+) {
+    db.query(
+        "INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              claimed_at, lease_at) \
+         VALUES (?, ?, ?, ?, ?, 1, ?, datetime(?, '+60 minutes'))",
+    )
+    .bind(batch_id.to_owned())
+    .bind(RUSTC)
+    .bind(family.to_owned())
+    .bind(lane.to_owned())
+    .bind(i64::from(slots))
+    .bind(ROW_TS)
+    .bind(ROW_TS)
+    .execute()
+    .await
+    .expect("seed occupancy");
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis(),
+    )
+    .expect("epoch millis")
+}
+
+/// Seed `linux`/`macos` occupancy, count it and answer the share — the
+/// `manual_share` unit test's probe through the real read rather than
+/// a constructed `ActiveByFamily` (a queue.rs detail).
+async fn manual_share_seeded(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    linux: u32,
+    macos: u32,
+) -> ManualShare {
+    db.query("DELETE FROM build_batches")
+        .execute()
+        .await
+        .expect("reset occupancy");
+    seed_occupied_lane_slots(
+        db,
+        "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0",
+        "linux",
+        "miss",
+        linux,
+    )
+    .await;
+    seed_occupied_lane_slots(
+        db,
+        "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1",
+        "macos",
+        "miss",
+        macos,
+    )
+    .await;
+    let active = super::count_active_by_family(db).await.expect("active");
+    let Dispatch::Limited(limit) = settings.dispatch else {
+        panic!("test settings are limited")
+    };
+    super::manual_share(limit, settings, &active)
+}
+
+/// A one-leg registration under `batch_id` — the dispatch-outcome
+/// test's setup.
+async fn manual_register_one(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch_id: &str,
+    name: &str,
+) {
+    super::register_manual_batch(
+        db,
+        settings,
+        &manual_registration(batch_id, 1, vec![request(name, &[])]),
+    )
+    .await
+    .expect("register");
+}
+
+/// `record_manual_dispatch` taking the batch id and outcome loose.
+async fn manual_record(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch_id: &str,
+    outcome: ManualDispatchOutcome,
+) -> Result<ManualDispatchRecorded, QueueError> {
+    super::record_manual_dispatch(db, settings, &manual_dispatch(batch_id, outcome)).await
+}
+
+/// The `Registered` arm's fields, or a test failure naming the other.
+fn registered(
+    answer: ManualBatchRegistered,
+) -> (
+    u32,
+    Vec<stow_types::api::ClaimedLeg>,
+    Vec<stow_types::api::RefusedLeg>,
+    ManualShare,
+) {
+    match answer {
+        ManualBatchRegistered::Registered {
+            parallelism,
+            claimed,
+            refused,
+            share,
+        } => (parallelism, claimed, refused, share),
+        ManualBatchRegistered::ShareFull { share } => {
+            panic!("expected Registered, got ShareFull {share:?}")
+        }
+    }
+}
+
+/// §4.4: `manual_share` subtracts the reserve before occupancy, each
+/// saturating independently of the other.
+#[tokio::test]
+async fn manual_share_subtracts_the_reserve_then_occupancy() {
+    let db = memory_db().await.expect("memory db");
+    let settings = SchedulerSettings {
+        dispatch: Dispatch::from_max_concurrent_jobs(45),
+        max_concurrent_macos_jobs: 16,
+        ..manual_settings()
+    };
+    let Dispatch::Limited(limit) = settings.dispatch else {
+        panic!("test settings are limited")
+    };
+    assert_eq!(
+        manual_share_seeded(&db, &settings, 30, 10).await,
+        ManualShare {
+            shared: 2,
+            macos: 5
+        },
+        "limit 45 less reserve 3 less 40 active; macOS 16 less 1 less 10"
+    );
+    // Occupancy at the caps saturates to zero rather than underflowing.
+    assert_eq!(
+        manual_share_seeded(&db, &settings, 45, 16).await,
+        ManualShare {
+            shared: 0,
+            macos: 0
+        }
+    );
+    // And on an empty store the whole `cap − reserve` is what's left.
+    let empty = memory_db().await.expect("fresh memory db");
+    let active = super::count_active_by_family(&empty).await.expect("active");
+    assert_eq!(
+        super::manual_share(limit, &settings, &active),
+        ManualShare {
+            shared: 42,
+            macos: 15
+        }
+    );
+    // `reserve ≥ cap` saturates to zero — the route's 500 check catches
+    // the misconfiguration before the share is ever computed.
+    let zero = SchedulerSettings {
+        human_reserve: HumanReserve {
+            shared: 45,
+            macos: 16,
+        },
+        ..settings
+    };
+    assert_eq!(
+        super::manual_share(limit, &zero, &active),
+        ManualShare {
+            shared: 0,
+            macos: 0
+        }
+    );
+}
+
+/// §3.2 step 0: a registration is granted at most the share the caps
+/// leave after the human reserve — and that grant lands in the same
+/// `count_active_by_family` occupancy the lanes read.
+#[tokio::test]
+async fn a_manual_registration_is_granted_only_the_free_share() {
+    let db = memory_db().await.expect("memory db");
+    let settings = SchedulerSettings {
+        dispatch: Dispatch::from_max_concurrent_jobs(45),
+        ..manual_settings()
+    };
+    // 40 of 45 pool slots occupied → a 5-slot request is granted 2.
+    seed_occupied_slots(&db, "d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0", "linux", 40).await;
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "aa01aa01aa01aa01aa01aa01aa01aa01",
+            5,
+            vec![request("wave-a", &[]), request("wave-b", &[])],
+        ),
+    )
+    .await
+    .expect("register");
+    let (parallelism, claimed, refused, share) = registered(answer);
+    assert_eq!(parallelism, 2, "min(request 5, claimed 2, share 2)");
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(refused, Vec::new());
+    assert_eq!(share.shared, 0, "the grant charged the whole free share");
+    assert_eq!(active_slots(&db).await, 42, "the row's parallelism counts");
+}
+
+/// §3.2 step 0: at `L − R` occupied the answer is `ShareFull` and
+/// nothing was written — no rows, no enqueue, no batch.
+#[tokio::test]
+async fn a_manual_registration_past_the_share_writes_nothing() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let settings = SchedulerSettings {
+        dispatch: Dispatch::from_max_concurrent_jobs(45),
+        ..manual_settings()
+    };
+    seed_occupied_slots(&db, "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1", "linux", 42).await;
+    log.lock().expect("log").clear();
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "aa02aa02aa02aa02aa02aa02aa02aa02",
+            5,
+            vec![request("wave-a", &[]), request("wave-b", &[])],
+        ),
+    )
+    .await
+    .expect("register");
+    let share = match answer {
+        ManualBatchRegistered::ShareFull { share } => share,
+        ManualBatchRegistered::Registered { .. } => {
+            panic!("expected ShareFull, got {answer:?}")
+        }
+    };
+    assert_eq!(share.shared, 0);
+    let written: u64 = log
+        .lock()
+        .expect("log")
+        .iter()
+        .map(|s| s.rows_written)
+        .sum();
+    assert_eq!(written, 0, "ShareFull writes nothing");
+    assert!(!row_exists(&db, "wave-a").await);
+    assert!(!row_exists(&db, "wave-b").await);
+}
+
+/// §4.4: the macOS reserve binds a macOS batch even with pool slots
+/// free, while a Linux batch in the same occupancy is granted — a
+/// macOS leg needs a pool slot AND a macOS slot.
+#[tokio::test]
+async fn the_macos_reserve_binds_only_macos_manual_batches() {
+    let db = memory_db().await.expect("memory db");
+    let settings = SchedulerSettings {
+        dispatch: Dispatch::from_max_concurrent_jobs(45),
+        max_concurrent_macos_jobs: 16,
+        ..manual_settings()
+    };
+    // macOS cap 16 less reserve 1 fully occupied; pool slots free.
+    seed_occupied_slots(&db, "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2", "macos", 15).await;
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "aa03aa03aa03aa03aa03aa03aa03aa03",
+            2,
+            vec![request_on("wave-mac", MACOS_TARGET, &[])],
+        ),
+    )
+    .await
+    .expect("register macOS");
+    assert!(matches!(
+        answer,
+        ManualBatchRegistered::ShareFull {
+            share: ManualShare {
+                shared: 27,
+                macos: 0
+            }
+        }
+    ));
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "aa04aa04aa04aa04aa04aa04aa04aa04",
+            2,
+            vec![request_on("wave-linux", TARGET, &[])],
+        ),
+    )
+    .await
+    .expect("register linux");
+    let (parallelism, claimed, ..) = registered(answer);
+    assert_eq!(parallelism, 1, "the single claimed leg bounds the grant");
+    assert_eq!(claimed.len(), 1);
+}
+
+/// §4.4: `count_active_by_family` sums every live `build_batches` row,
+/// so the human lane's own in-flight slots count toward the occupancy
+/// the wave's share is computed against.
+#[tokio::test]
+async fn human_lane_batches_count_toward_occupancy() {
+    let db = memory_db().await.expect("memory db");
+    let settings = SchedulerSettings {
+        dispatch: Dispatch::from_max_concurrent_jobs(45),
+        ..manual_settings()
+    };
+    seed_occupied_lane_slots(
+        &db,
+        "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+        "linux",
+        "human",
+        40,
+    )
+    .await;
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "aa05aa05aa05aa05aa05aa05aa05aa05",
+            5,
+            vec![request("wave-a", &[])],
+        ),
+    )
+    .await
+    .expect("register");
+    let (parallelism, _, _, share) = registered(answer);
+    assert_eq!(parallelism, 1, "min(request 5, claimed 1, share 2)");
+    assert_eq!(share.shared, 1);
+}
+
+/// §3.2: the pause, and a reserve at or above its cap, refuse before
+/// anything is written — both are `ManualRegistrationRefused` so the
+/// route maps 503/500 from the type.
+#[tokio::test]
+async fn a_paused_or_misconfigured_scheduler_refuses_registration() {
+    let db = memory_db().await.expect("memory db");
+    let legs = vec![request("wave-a", &[])];
+    let error = super::register_manual_batch(
+        &db,
+        &paused_settings(),
+        &manual_registration("aa06aa06aa06aa06aa06aa06aa06aa06", 1, legs.clone()),
+    )
+    .await
+    .expect_err("paused registration refuses");
+    assert!(
+        matches!(
+            error,
+            QueueError::ManualRegistrationRefused(crate::errors::ManualRegistrationRefused::Paused)
+        ),
+        "{error}"
+    );
+    for (reserve, name) in [
+        (
+            HumanReserve {
+                shared: 45,
+                macos: 1,
+            },
+            "shared reserve at the pool cap",
+        ),
+        (
+            HumanReserve {
+                shared: 3,
+                macos: 16,
+            },
+            "macOS reserve at the macOS cap",
+        ),
+    ] {
+        let settings = SchedulerSettings {
+            dispatch: Dispatch::from_max_concurrent_jobs(45),
+            max_concurrent_macos_jobs: 16,
+            human_reserve: reserve,
+            ..manual_settings()
+        };
+        let error = super::register_manual_batch(
+            &db,
+            &settings,
+            &manual_registration(
+                "aa07aa07aa07aa07aa07aa07aa07aa07",
+                1,
+                vec![request("wave-b", &[])],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                QueueError::ManualRegistrationRefused(
+                    crate::errors::ManualRegistrationRefused::ReserveExceedsCap { .. }
+                )
+            ),
+            "{name}: {error}"
+        );
+    }
+}
+
+/// §4.4's guarantee: however large the registered wave, the reserve it
+/// leaves is reachable — human-lane enqueues claim into a batch on each
+/// family the moment the request lands.
+#[tokio::test]
+async fn the_wave_cannot_eat_the_human_reserve() {
+    let db = memory_db().await.expect("memory db");
+    let settings = SchedulerSettings {
+        dispatch: Dispatch::from_max_concurrent_jobs(6),
+        human_reserve: HumanReserve {
+            shared: 3,
+            macos: 1,
+        },
+        ..manual_settings()
+    };
+    // The wave registers 3 slots — every slot the reserve leaves.
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "aa08aa08aa08aa08aa08aa08aa08aa08",
+            3,
+            vec![
+                request("wave-1", &[]),
+                request("wave-2", &[]),
+                request("wave-3", &[]),
+            ],
+        ),
+    )
+    .await
+    .expect("register wave");
+    let (parallelism, claimed, ..) = registered(answer);
+    assert_eq!(parallelism, 3);
+    assert_eq!(claimed.len(), 3);
+    // Its next registration finds the share closed.
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "aa09aa09aa09aa09aa09aa09aa09aa09",
+            1,
+            vec![request("wave-4", &[])],
+        ),
+    )
+    .await
+    .expect("second registration");
+    assert!(
+        matches!(answer, ManualBatchRegistered::ShareFull { .. }),
+        "{answer:?}"
+    );
+    // A human request per family claims immediately into its own lane.
+    let mut humans = Vec::new();
+    for (name, target) in [
+        ("ask-linux", TARGET),
+        ("ask-mac", MACOS_TARGET),
+        ("ask-win", WINDOWS_TARGET),
+    ] {
+        let mut human = request_on(name, target, &[]);
+        human.source = EnqueueSource::HumanRequest;
+        humans.push(human);
+    }
+    enqueue(&db, &humans).await.expect("human enqueue");
+    let batches = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+        .await
+        .expect("claim");
+    let mut families: Vec<String> = batches
+        .iter()
+        .filter(|batch| batch.lane == TaskLane::Human)
+        .map(|batch| {
+            match batch.family {
+                stow_types::api::RunnerFamily::Linux => "linux",
+                stow_types::api::RunnerFamily::MacOs => "macos",
+                stow_types::api::RunnerFamily::Windows => "windows",
+            }
+            .to_owned()
+        })
+        .collect();
+    families.sort();
+    assert_eq!(
+        families,
+        ["linux", "macos", "windows"],
+        "each family's human frontier formed a batch beside the wave"
+    );
+}
+
+/// §3.2: absent legs are inserted `pending` then claimed `dispatched`
+/// under the driver's batch id — `batch_leg` in request order — and the
+/// `build_batches` row charges `min(request, claimed)` slots with the
+/// lease `stale_dispatch_minutes` out.
+#[tokio::test]
+async fn registration_claims_absent_and_pending_legs_in_order() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    // `wave-old` is already queued `pending`; the rest are absent.
+    enqueue(&db, &[request("wave-old", &[])])
+        .await
+        .expect("enqueue");
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "bb01bb01bb01bb01bb01bb01bb01bb01",
+            7,
+            vec![
+                request("wave-old", &[]),
+                request("wave-new", &[]),
+                request("wave-last", &[]),
+            ],
+        ),
+    )
+    .await
+    .expect("register");
+    let (parallelism, claimed, refused, _) = registered(answer);
+    assert_eq!(parallelism, 3, "min(request 7, claimed 3, share 40)");
+    assert_eq!(refused, Vec::new());
+    let order: Vec<(&str, u32)> = claimed
+        .iter()
+        .map(|leg| (leg.task_id.as_str(), leg.leg))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (task_id_on("wave-old", TARGET).as_str(), 0),
+            (task_id_on("wave-new", TARGET).as_str(), 1),
+            (task_id_on("wave-last", TARGET).as_str(), 2),
+        ],
+        "claimed legs are re-indexed 0.. in request order"
+    );
+    for name in ["wave-old", "wave-new", "wave-last"] {
+        assert_eq!(status_of(&db, name).await, "dispatched", "{name}");
+    }
+    assert_eq!(
+        row_column(&db, "wave-old", "batch_id").await,
+        "bb01bb01bb01bb01bb01bb01bb01bb01"
+    );
+    assert_eq!(row_int(&db, "wave-new", "batch_leg").await, 1);
+    // The row: lane 'miss', legs 3, lease = claimed + stale.
+    let lease_secs = db
+        .query(
+            "SELECT CAST(strftime('%s', lease_at) AS INTEGER) \
+                  - CAST(strftime('%s', claimed_at) AS INTEGER) \
+             FROM build_batches WHERE batch_id = ?",
+        )
+        .bind("bb01bb01bb01bb01bb01bb01bb01bb01")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("lease delta");
+    assert_eq!(lease_secs, i64::from(STALE_DISPATCH_MINUTES) * 60);
+    let legs_held = db
+        .query("SELECT legs FROM build_batches WHERE batch_id = ?")
+        .bind("bb01bb01bb01bb01bb01bb01bb01bb01")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("batch row legs");
+    let parallelism_held = db
+        .query("SELECT parallelism FROM build_batches WHERE batch_id = ?")
+        .bind("bb01bb01bb01bb01bb01bb01bb01bb01")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("batch row parallelism");
+    assert_eq!((legs_held, parallelism_held), (3, 3));
+}
+
+/// §3.2: a `failed` leg claims as an operator retry — `attempt` back to
+/// 1, the error cleared — and leaving `failed` refreshes its
+/// dependents' `blocked`, exactly like the `retry` verb.
+#[tokio::test]
+async fn registration_claims_a_failed_leg_as_an_operator_retry() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    enqueue(
+        &db,
+        &[request("dep", &[]), request("child", &[dependency("dep")])],
+    )
+    .await
+    .expect("enqueue");
+    // Fail `dep` through the operator verb so `child` goes `blocked`.
+    super::apply_mutation(
+        &db,
+        &settings,
+        super::QueueMutation::Cancel,
+        &super::QueueSelector {
+            task_ids: vec![task_id_on("dep", TARGET)],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("fail the dep");
+    assert_eq!(status_of(&db, "dep").await, "failed");
+    assert_eq!(row_int(&db, "child", "blocked").await, 1);
+
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "bb02bb02bb02bb02bb02bb02bb02bb02",
+            2,
+            vec![request("dep", &[])],
+        ),
+    )
+    .await
+    .expect("register");
+    let (_, claimed, refused, _) = registered(answer);
+    assert_eq!(refused, Vec::new());
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].attempt, 1, "a claimed `failed` leg restarts");
+    assert_eq!(status_of(&db, "dep").await, "dispatched");
+    assert_eq!(row_int(&db, "dep", "attempt").await, 1);
+    assert_eq!(row_column(&db, "dep", "error_msg").await, "");
+    assert_eq!(
+        row_int(&db, "child", "blocked").await,
+        0,
+        "leaving `failed` unblocks the dependent"
+    );
+}
+
+/// §3.2: an in-flight row refuses `InFlight` naming its batch, a
+/// `completed` row refuses `Completed`, and a `pending` row inside its
+/// failure backoff refuses `BackingOff` with its `not_before`.
+#[tokio::test]
+async fn registration_refuses_in_flight_completed_and_backing_off() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    // `busy` is in flight under a live registration; `done` completed;
+    // `slow` is pending inside a backoff window.
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "bb03bb03bb03bb03bb03bb03bb03bb03",
+            2,
+            vec![request("busy", &[])],
+        ),
+    )
+    .await
+    .expect("first registration claims busy");
+    registered(answer);
+    enqueue(&db, &[request("done", &[]), request("slow", &[])])
+        .await
+        .expect("enqueue");
+    db.query("UPDATE queue SET status = 'completed' WHERE task_id = ?")
+        .bind(task_id_on("done", TARGET))
+        .execute()
+        .await
+        .expect("complete done");
+    db.query("UPDATE queue SET not_before = '2999-01-01 00:00:00' WHERE task_id = ?")
+        .bind(task_id_on("slow", TARGET))
+        .execute()
+        .await
+        .expect("back off slow");
+
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "bb04bb04bb04bb04bb04bb04bb04bb04",
+            4,
+            vec![
+                request("busy", &[]),
+                request("done", &[]),
+                request("slow", &[]),
+                request("fresh", &[]),
+            ],
+        ),
+    )
+    .await
+    .expect("register");
+    let (_, claimed, refused, _) = registered(answer);
+    assert_eq!(claimed.len(), 1, "only the fresh leg claims");
+    assert_eq!(claimed[0].task_id, task_id_on("fresh", TARGET));
+    let reasons: Vec<LegRefusal> = refused.into_iter().map(|leg| leg.reason).collect();
+    assert_eq!(
+        reasons,
+        [
+            LegRefusal::InFlight {
+                batch_id: Some(
+                    "bb03bb03bb03bb03bb03bb03bb03bb03"
+                        .parse()
+                        .expect("batch id")
+                )
+            },
+            LegRefusal::Completed,
+            LegRefusal::BackingOff {
+                until: "2999-01-01 00:00:00".to_owned()
+            },
+        ],
+        "refusals arrive in request order"
+    );
+}
+
+/// §3.2 + §1.1's flag gap: a `KeysApart` request resurrects a
+/// `completed` `KeysAsNative` row through `enqueue_inner`, and the
+/// claim takes it — the published native-only shapes cannot serve the
+/// explicit-spelling consumers (stow#736).
+#[tokio::test]
+async fn registration_claims_a_flag_gap_completed_leg() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    enqueue(&db, &[request("gap", &[])]).await.expect("enqueue");
+    db.query("UPDATE queue SET status = 'completed' WHERE task_id = ?")
+        .bind(task_id_on("gap", TARGET))
+        .execute()
+        .await
+        .expect("complete gap");
+    let mut leg = request("gap", &[]);
+    leg.explicit_spelling = stow_types::public_cache::ExplicitSpelling::KeysApart;
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration("bb05bb05bb05bb05bb05bb05bb05bb05", 1, vec![leg]),
+    )
+    .await
+    .expect("register");
+    let (_, claimed, refused, _) = registered(answer);
+    assert_eq!(refused, Vec::new());
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(status_of(&db, "gap").await, "dispatched");
+}
+
+/// §3.2: every leg refused answers `Registered { parallelism: 0 }` —
+/// no `build_batches` row exists for the batch then.
+#[tokio::test]
+async fn an_all_refused_registration_writes_no_batch_row() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "bb06bb06bb06bb06bb06bb06bb06bb06",
+            1,
+            vec![request("held", &[])],
+        ),
+    )
+    .await
+    .expect("first registration claims held");
+    registered(answer);
+    // The second registration's only leg is in flight under the first.
+    let answer = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "bb07bb07bb07bb07bb07bb07bb07bb07",
+            1,
+            vec![request("held", &[])],
+        ),
+    )
+    .await
+    .expect("second registration");
+    let (parallelism, claimed, refused, _) = registered(answer);
+    assert_eq!(parallelism, 0);
+    assert_eq!(claimed, Vec::new());
+    assert_eq!(refused.len(), 1);
+    assert!(
+        build_batch(&db, "bb07bb07bb07bb07bb07bb07bb07bb07")
+            .await
+            .is_none(),
+        "an all-refused registration writes no batch row"
+    );
+    // And the first batch's row is untouched by the refusal.
+    assert!(
+        build_batch(&db, "bb06bb06bb06bb06bb06bb06bb06bb06")
+            .await
+            .is_some()
+    );
+}
+
+/// §3.2's 400s: validation refuses before anything is written — an
+/// empty leg list, over-`batch_max_tasks`, a leg at another rustc, a
+/// leg on another runner family, a non-CI target, a duplicate leg.
+#[tokio::test]
+async fn invalid_manual_batches_fail_fast() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    let two = SchedulerSettings {
+        batch_max_tasks: 2,
+        ..manual_settings()
+    };
+    let mut other_rustc = request("leg", &[]);
+    other_rustc.rustc_version = "1.86.0".parse().expect("rustc");
+    let cases: Vec<(SchedulerSettings, ManualBatchRegistration, &str)> = vec![
+        (
+            settings,
+            manual_registration("cc01cc01cc01cc01cc01cc01cc01cc01", 1, vec![]),
+            "empty legs",
+        ),
+        (
+            two,
+            manual_registration(
+                "cc02cc02cc02cc02cc02cc02cc02cc02",
+                3,
+                vec![request("a", &[]), request("b", &[]), request("c", &[])],
+            ),
+            "over batch_max_tasks",
+        ),
+        (
+            settings,
+            manual_registration("cc03cc03cc03cc03cc03cc03cc03cc03", 1, vec![other_rustc]),
+            "mixed rustc",
+        ),
+        (
+            settings,
+            manual_registration(
+                "cc04cc04cc04cc04cc04cc04cc04cc04",
+                2,
+                vec![request("lin", &[]), request_on("mac", MACOS_TARGET, &[])],
+            ),
+            "mixed family",
+        ),
+        (
+            settings,
+            manual_registration(
+                "cc05cc05cc05cc05cc05cc05cc05cc05",
+                1,
+                vec![request_on("musl", "aarch64-unknown-linux-musl", &[])],
+            ),
+            "non-CI target",
+        ),
+        (
+            settings,
+            manual_registration(
+                "cc06cc06cc06cc06cc06cc06cc06cc06",
+                2,
+                vec![request("dup", &[]), request("dup", &[])],
+            ),
+            "duplicate leg",
+        ),
+    ];
+    for (settings, registration, name) in cases {
+        let error = super::register_manual_batch(&db, &settings, &registration)
+            .await
+            .expect_err(name);
+        assert!(
+            matches!(error, QueueError::InvalidManualBatch(_)),
+            "{name}: {error}"
+        );
+    }
+    assert_eq!(
+        super::status(&db).await.expect("status").pending,
+        0,
+        "a refused registration leaves no rows"
+    );
+}
+
+/// §3.2 step 6: the driver never reuses a batch id — a second
+/// registration under a live id is the route's 409.
+#[tokio::test]
+async fn a_reused_batch_id_conflicts() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "dd01dd01dd01dd01dd01dd01dd01dd01",
+            1,
+            vec![request("one", &[])],
+        ),
+    )
+    .await
+    .expect("first registration");
+    let error = super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            "dd01dd01dd01dd01dd01dd01dd01dd01",
+            1,
+            vec![request("two", &[])],
+        ),
+    )
+    .await
+    .expect_err("reused id conflicts");
+    assert!(
+        matches!(error, QueueError::ManualBatchConflict(_)),
+        "{error}"
+    );
+}
+
+/// §1.2 (a): once registered, the legs' rows are `dispatched` — a lane
+/// enqueue, a trusted enqueue and a submit-by-id of the same ids all
+/// write nothing, and the claim cannot form a batch containing them.
+#[tokio::test]
+async fn a_registered_batch_is_invisible_to_the_lanes() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let settings = manual_settings();
+    let legs = vec![request("wave-a", &[]), request("wave-b", &[])];
+    super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration("dd02dd02dd02dd02dd02dd02dd02dd02", 2, legs.clone()),
+    )
+    .await
+    .expect("register");
+    log.lock().expect("log").clear();
+
+    super::enqueue(&db, &legs, &settings)
+        .await
+        .expect("enqueue");
+    super::enqueue_trusted(&db, &legs, &settings)
+        .await
+        .expect("enqueue trusted");
+    let outcome = super::submit_task_ids(
+        &db,
+        &legs
+            .iter()
+            .map(|leg| stow_types::api::SubmitTaskIdEntry {
+                task_id: leg.task_id().expect("task id"),
+                downloads: 0,
+            })
+            .collect::<Vec<_>>(),
+        &settings,
+    )
+    .await
+    .expect("submit by id");
+    assert_eq!(outcome.unknown, Vec::<String>::new());
+    let batches = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
+        .await
+        .expect("claim");
+    assert!(batches.is_empty(), "no pending row exists to claim");
+
+    let written: u64 = log
+        .lock()
+        .expect("log")
+        .iter()
+        .map(|s| s.rows_written)
+        .sum();
+    assert_eq!(written, 0, "the lanes write nothing beside the wave");
+}
+
+/// §1.2 (b): the webhook settles a registered batch exactly like a
+/// scheduler batch — an early completion held on the unbound row, the
+/// dispatch report's bind making it resolvable, `resolve_batch`
+/// completing every leg and releasing the row.
+#[tokio::test]
+async fn a_registered_batch_settles_through_the_normal_path() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    let batch_id = "dd03dd03dd03dd03dd03dd03dd03dd03";
+    super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(
+            batch_id,
+            2,
+            vec![request("leg-a", &[]), request("leg-b", &[])],
+        ),
+    )
+    .await
+    .expect("register");
+    // The completion beats the dispatch report — held on the row.
+    super::record_batch_completion(&db, batch_id, &batch_run_complete(7777, 1, "success"))
+        .await
+        .expect("early completion is held");
+    let recorded = super::record_manual_dispatch(
+        &db,
+        &settings,
+        &manual_dispatch(batch_id, ManualDispatchOutcome::Dispatched { run_id: 7777 }),
+    )
+    .await
+    .expect("bind");
+    assert_eq!(recorded, ManualDispatchRecorded::Bound);
+
+    let ready = super::ready_batches(&db, now_ms())
+        .await
+        .expect("ready batches");
+    let batch = ready
+        .iter()
+        .find(|batch| batch.batch_id == batch_id)
+        .expect("the registered batch is resolvable");
+    let any_failure = super::resolve_batch(
+        &db,
+        &settings,
+        batch,
+        &[
+            super::LegResolution::Succeeded {
+                duration_ms: 60_000,
+            },
+            super::LegResolution::Succeeded {
+                duration_ms: 90_000,
+            },
+        ],
+        TEST_WINDOW_MINUTES,
+    )
+    .await
+    .expect("resolve");
+    assert!(!any_failure);
+    assert_eq!(status_of(&db, "leg-a").await, "completed");
+    assert_eq!(status_of(&db, "leg-b").await, "completed");
+    assert!(
+        build_batch(&db, batch_id).await.is_none(),
+        "resolution releases the row"
+    );
+}
+
+/// §1.2 (c): a bound registered batch is a lease object like any other
+/// — past `lease_at` it is `expired_batches`' with its run id, and a
+/// live run's `extend_batch_lease` keeps the legs in flight. Unbound —
+/// the driver died between send and bind — the lease requeues it.
+#[tokio::test]
+async fn a_registered_batch_lives_under_the_lease() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    let bound = "dd04dd04dd04dd04dd04dd04dd04dd04";
+    super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(bound, 1, vec![request("bound-leg", &[])]),
+    )
+    .await
+    .expect("register bound batch");
+    let recorded = super::record_manual_dispatch(
+        &db,
+        &settings,
+        &manual_dispatch(bound, ManualDispatchOutcome::Dispatched { run_id: 4242 }),
+    )
+    .await
+    .expect("bind");
+    assert_eq!(recorded, ManualDispatchRecorded::Bound);
+
+    let past_lease = now_ms() + stale_ms() + 60_000;
+    let expired = super::expired_batches(&db, past_lease)
+        .await
+        .expect("expired batches");
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].batch_id, bound);
+    assert_eq!(expired[0].run_id, Some(4242));
+    // A live run's lease extends; the legs stay in flight.
+    super::extend_batch_lease(&db, &settings, bound, past_lease)
+        .await
+        .expect("extend lease");
+    assert_eq!(status_of(&db, "bound-leg").await, "dispatched");
+    assert!(build_batch(&db, bound).await.is_some());
+    assert!(
+        super::expired_batches(&db, past_lease)
+            .await
+            .expect("expired again")
+            .is_empty(),
+        "the extended lease is past the probe instant"
+    );
+
+    // Unbound — no run to ask about: the lease requeues the legs.
+    let unbound = "dd05dd05dd05dd05dd05dd05dd05dd05";
+    super::register_manual_batch(
+        &db,
+        &settings,
+        &manual_registration(unbound, 1, vec![request("lost-leg", &[])]),
+    )
+    .await
+    .expect("register unbound batch");
+    let expired = super::expired_batches(&db, past_lease)
+        .await
+        .expect("expired batches");
+    let found = expired
+        .iter()
+        .find(|batch| batch.batch_id == unbound)
+        .expect("unbound batch expires at its lease");
+    assert_eq!(found.run_id, None);
+    super::requeue_unbound_batch(&db, &settings, unbound)
+        .await
+        .expect("requeue");
+    assert_eq!(status_of(&db, "lost-leg").await, "pending");
+    assert!(build_batch(&db, unbound).await.is_none());
+}
+
+/// §1.2 (d): a failed leg goes back to `pending` under the queue's own
+/// backoff — attempt 2, `not_before ≈ now + 2 min` — and at
+/// `MAX_BUILD_ATTEMPTS` it is `failed` with dependents `blocked`.
+/// Each retry round is the wave's next registration (§4.3: the row
+/// owns the retry).
+#[tokio::test]
+async fn a_failed_manual_leg_retries_with_queue_backoff() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+    // `child` depends on the leg and stays pending throughout — its
+    // `blocked` flag is the assertion's read of the cap.
+    enqueue(&db, &[request("child", &[dependency("dep")])])
+        .await
+        .expect("enqueue child");
+    let leg = || vec![request("dep", &[])];
+    for attempt in 1..=4_u32 {
+        let batch_id = format!("ee{attempt:02x}{}", "ee".repeat(14));
+        super::register_manual_batch(&db, &settings, &manual_registration(&batch_id, 1, leg()))
+            .await
+            .unwrap_or_else(|error| panic!("register attempt {attempt}: {error}"));
+        let recorded = super::record_manual_dispatch(
+            &db,
+            &settings,
+            &manual_dispatch(
+                &batch_id,
+                ManualDispatchOutcome::Dispatched {
+                    run_id: 9000 + u64::from(attempt),
+                },
+            ),
+        )
+        .await
+        .expect("bind");
+        assert_eq!(recorded, ManualDispatchRecorded::Bound);
+        super::record_batch_completion(
+            &db,
+            &batch_id,
+            &batch_run_complete(9000 + u64::from(attempt), 1, "failure"),
+        )
+        .await
+        .expect("record completion");
+        let ready = super::ready_batches(&db, now_ms())
+            .await
+            .expect("ready batches");
+        let batch = ready
+            .iter()
+            .find(|batch| batch.batch_id == batch_id)
+            .expect("ready");
+        super::resolve_batch(
+            &db,
+            &settings,
+            batch,
+            &[super::LegResolution::Failed {
+                error: "infrastructure: leg 0 / - (u)".to_owned(),
+            }],
+            TEST_WINDOW_MINUTES,
+        )
+        .await
+        .expect("resolve");
+        if attempt == 1 {
+            assert_eq!(status_of(&db, "dep").await, "pending");
+            assert_eq!(row_int(&db, "dep", "attempt").await, 2);
+            // 2^1 minutes of backoff gate the retry.
+            let gated = db
+                .query(
+                    "SELECT CASE WHEN not_before > datetime('now') \
+                         AND not_before <= datetime('now', '+3 minutes') \
+                         THEN 1 ELSE 0 END AS gated \
+                     FROM queue WHERE task_id = ?",
+                )
+                .bind(task_id_on("dep", TARGET))
+                .fetch_scalar::<i64>()
+                .await
+                .expect("backoff gate");
+            assert_eq!(gated, 1, "the failed leg backs off ≈ 2 minutes");
+            // Lift the backoff so the next registration claims it.
+            db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00' WHERE task_id = ?")
+                .bind(task_id_on("dep", TARGET))
+                .execute()
+                .await
+                .expect("lift backoff");
+        } else if attempt < 4 {
+            assert_eq!(status_of(&db, "dep").await, "pending");
+            db.query("UPDATE queue SET not_before = '1970-01-01 00:00:00' WHERE task_id = ?")
+                .bind(task_id_on("dep", TARGET))
+                .execute()
+                .await
+                .expect("lift backoff");
+        }
+    }
+    assert_eq!(status_of(&db, "dep").await, "failed");
+    assert_eq!(
+        row_int(&db, "child", "blocked").await,
+        1,
+        "the capped failure blocks the dependent"
+    );
+}
+
+/// §3.3: the dispatch report's whole table — `Bound` on the first
+/// `Dispatched`, `AlreadyBound` on its repeat, `Unknown` where no row
+/// exists, a 409 where the row is bound to another run; `Released` on
+/// `NotDispatched`, 409 on `NotDispatched` against a bound row or an
+/// early-completion row.
+#[tokio::test]
+async fn record_manual_dispatch_binds_releases_and_conflicts() {
+    let db = memory_db().await.expect("memory db");
+    let settings = manual_settings();
+
+    let bound = "ee10ee10ee10ee10ee10ee10ee10ee10";
+    manual_register_one(&db, &settings, bound, "one").await;
+    assert_eq!(
+        manual_record(
+            &db,
+            &settings,
+            bound,
+            ManualDispatchOutcome::Dispatched { run_id: 111 }
+        )
+        .await
+        .expect("bind"),
+        ManualDispatchRecorded::Bound
+    );
+    assert_eq!(
+        manual_record(
+            &db,
+            &settings,
+            bound,
+            ManualDispatchOutcome::Dispatched { run_id: 111 }
+        )
+        .await
+        .expect("rebind is idempotent"),
+        ManualDispatchRecorded::AlreadyBound
+    );
+    let error = manual_record(
+        &db,
+        &settings,
+        bound,
+        ManualDispatchOutcome::Dispatched { run_id: 222 },
+    )
+    .await
+    .expect_err("another run conflicts");
+    assert!(
+        matches!(error, QueueError::ManualBatchConflict(_)),
+        "{error}"
+    );
+    // `NotDispatched` against the bound row conflicts too — a run is on it.
+    let error = manual_record(&db, &settings, bound, ManualDispatchOutcome::NotDispatched)
+        .await
+        .expect_err("not-dispatched on a bound row conflicts");
+    assert!(
+        matches!(error, QueueError::ManualBatchConflict(_)),
+        "{error}"
+    );
+
+    // No such batch at all → `Unknown` under either outcome.
+    assert_eq!(
+        manual_record(
+            &db,
+            &settings,
+            "ee11ee11ee11ee11ee11ee11ee11ee11",
+            ManualDispatchOutcome::Dispatched { run_id: 1 }
+        )
+        .await
+        .expect("unknown"),
+        ManualDispatchRecorded::Unknown
+    );
+    assert_eq!(
+        manual_record(
+            &db,
+            &settings,
+            "ee11ee11ee11ee11ee11ee11ee11ee11",
+            ManualDispatchOutcome::NotDispatched
+        )
+        .await
+        .expect("unknown"),
+        ManualDispatchRecorded::Unknown
+    );
+
+    // `NotDispatched` requeues the legs and deletes the row.
+    let released = "ee12ee12ee12ee12ee12ee12ee12ee12";
+    manual_register_one(&db, &settings, released, "two").await;
+    assert_eq!(
+        manual_record(
+            &db,
+            &settings,
+            released,
+            ManualDispatchOutcome::NotDispatched
+        )
+        .await
+        .expect("release"),
+        ManualDispatchRecorded::Released
+    );
+    assert_eq!(status_of(&db, "two").await, "pending");
+    assert!(build_batch(&db, released).await.is_none());
+
+    // `NotDispatched` where an early completion already landed → 409:
+    // the driver says nothing was sent, but a run is on the row.
+    let early = "ee13ee13ee13ee13ee13ee13ee13ee13";
+    manual_register_one(&db, &settings, early, "three").await;
+    super::record_batch_completion(&db, early, &batch_run_complete(333, 1, "failure"))
+        .await
+        .expect("early completion");
+    let error = manual_record(&db, &settings, early, ManualDispatchOutcome::NotDispatched)
+        .await
+        .expect_err("not-dispatched on a completed row conflicts");
+    assert!(
+        matches!(error, QueueError::ManualBatchConflict(_)),
+        "{error}"
     );
 }

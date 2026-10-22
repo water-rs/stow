@@ -4,15 +4,17 @@ use std::num::{NonZero, NonZeroU32};
 
 use skyzen_services::durable::{Alarm, DbValue, DurableDb};
 use stow_types::api::{
-    AdminInFlight, AdminStatus, AdminTargetStats, BatchId, BuildTaskPayload,
-    DEFAULT_BATCH_MAX_TASKS, DEFAULT_BATCH_PARALLELISM, EnqueueRequest, EnqueueSource,
-    PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily,
-    SchedulerResetReport, SchedulerStatus, TaskHash, TaskLane, runner_family,
+    AdminInFlight, AdminStatus, AdminTargetStats, BatchId, BuildTaskPayload, ClaimedLeg,
+    DEFAULT_BATCH_MAX_TASKS, DEFAULT_BATCH_PARALLELISM, EnqueueRequest, EnqueueSource, LegRefusal,
+    ManualBatchDispatch, ManualBatchRegistered, ManualBatchRegistration, ManualDispatchOutcome,
+    ManualDispatchRecorded, ManualShare, PublishedSliceRow, QueueSelector, QueueTask,
+    QueueTaskStatus, RefusedLeg, RequestStatus, RunnerFamily, SchedulerResetReport,
+    SchedulerStatus, TaskHash, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::runs::{LegFailure, LegOutcome, RunFailure, RunJobRow};
 
-use crate::errors::QueueError;
+use crate::errors::{ManualRegistrationRefused, QueueError};
 use crate::scheduler::batching::{
     BatchCandidate, BatchKey, FormedBatch, PlannedBatch, SlotAdmission, SlotPlan, form_batches,
 };
@@ -110,6 +112,19 @@ pub const fn spelling_of(stored: i64) -> stow_types::public_cache::ExplicitSpell
 // while leaving 4 macOS runners free.
 const DEFAULT_MAX_CONCURRENT_JOBS: NonZeroU32 = NonZeroU32::new(45).unwrap();
 const DEFAULT_MAX_CONCURRENT_MACOS_JOBS: u32 = 16;
+/// Default for `STOW_HUMAN_RESERVED_JOBS` — the pool slots a
+/// coordinated `preheat manual` wave always leaves free for the human
+/// request lane (stow#854 §4.4). One slot per runner family is the
+/// smallest reserve a human request's all-family frontier can start
+/// under, however large the wave.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "the runner-family count fits u32"
+)]
+const DEFAULT_HUMAN_RESERVED_JOBS: u32 = RunnerFamily::ALL.len() as u32;
+/// Default for `STOW_HUMAN_RESERVED_MACOS_JOBS` — the same reserve
+/// inside the macOS cap, which binds separately from the pool.
+const DEFAULT_HUMAN_RESERVED_MACOS_JOBS: u32 = 1;
 const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
 // A single crate build on GitHub-hosted runners (toolchain install + compile
 // + sign + push) can legitimately take tens of minutes and nothing updates
@@ -177,12 +192,42 @@ impl Dispatch {
     }
 }
 
+/// The runner slots a coordinated `preheat manual` wave always leaves
+/// free for the human request lane (stow#854 §4.4). The register
+/// route's grant keeps total occupancy at or below each cap minus its
+/// reserve, so a human request's frontier can start on every family
+/// however large the wave. The scheduler's own lane claims are not
+/// bound by it — the reserve constrains the wave only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HumanReserve {
+    /// Slots held back inside `STOW_MAX_CONCURRENT_JOBS`.
+    pub shared: u32,
+    /// Slots held back inside `STOW_MAX_CONCURRENT_MACOS_JOBS`.
+    pub macos: u32,
+}
+
+impl HumanReserve {
+    /// The production defaults — `STOW_HUMAN_RESERVED_JOBS` /
+    /// `STOW_HUMAN_RESERVED_MACOS_JOBS` unset.
+    pub const DEFAULT: Self = Self {
+        shared: DEFAULT_HUMAN_RESERVED_JOBS,
+        macos: DEFAULT_HUMAN_RESERVED_MACOS_JOBS,
+    };
+}
+
+impl Default for HumanReserve {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 /// Runtime-tunable scheduler knobs, read from Worker env bindings by the
 /// Durable Object glue (`STOW_MAX_CONCURRENT_JOBS`,
 /// `STOW_MAX_CONCURRENT_MACOS_JOBS`, `STOW_DISPATCH_MIN_AGE_MINUTES`,
 /// `STOW_STALE_DISPATCH_MINUTES`, `STOW_MAX_QUEUE_PENDING`,
 /// `STOW_HUMAN_DAILY_TASK_BUDGET`, `STOW_MIN_DISPATCH_VALUE`,
-/// `STOW_BATCH_PARALLELISM`, `STOW_BATCH_MAX_TASKS`).
+/// `STOW_BATCH_PARALLELISM`, `STOW_BATCH_MAX_TASKS`,
+/// `STOW_HUMAN_RESERVED_JOBS`, `STOW_HUMAN_RESERVED_MACOS_JOBS`).
 ///
 /// Defaults match production; the local mock lowers `dispatch` via `vars`
 /// because miniflare's workerd OOMs under parallel complete
@@ -220,6 +265,11 @@ pub struct SchedulerSettings {
     pub batch_parallelism: u32,
     /// `B` — the leg bound at which a batch closes (stow#833 §1.3).
     pub batch_max_tasks: u32,
+    /// The human-lane reserve a manual wave's registrations must leave
+    /// free (`STOW_HUMAN_RESERVED_JOBS`,
+    /// `STOW_HUMAN_RESERVED_MACOS_JOBS`; stow#854 §4.4). Only the
+    /// manual-batch register route reads it.
+    pub human_reserve: HumanReserve,
 }
 
 impl Default for SchedulerSettings {
@@ -234,6 +284,7 @@ impl Default for SchedulerSettings {
             min_dispatch_value: DEFAULT_MIN_DISPATCH_VALUE,
             batch_parallelism: DEFAULT_BATCH_PARALLELISM,
             batch_max_tasks: DEFAULT_BATCH_MAX_TASKS,
+            human_reserve: HumanReserve::DEFAULT,
         }
     }
 }
@@ -2186,6 +2237,571 @@ pub async fn record_batch_completion(
 struct HeldRunsRow {
     github_run_id: Option<String>,
     done_run_id: Option<String>,
+}
+
+/// The runner slots a manual wave may still take: the pool and the
+/// macOS cap, each less its human-lane reserve and everything in flight
+/// (stow#854 §3.2 step 0, §4.4). Pure — the share is computed from the
+/// same `count_active_by_family` the claim pass runs, so a registration
+/// needs no schema or provenance to stay inside the reserve.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+fn manual_share(
+    limit: NonZeroU32,
+    settings: &SchedulerSettings,
+    active: &ActiveByFamily,
+) -> ManualShare {
+    ManualShare {
+        shared: limit
+            .get()
+            .saturating_sub(settings.human_reserve.shared)
+            .saturating_sub(active.total),
+        macos: settings
+            .max_concurrent_macos_jobs
+            .saturating_sub(settings.human_reserve.macos)
+            .saturating_sub(active.of(RunnerFamily::MacOs)),
+    }
+}
+
+/// The slice of a [`ManualShare`] a batch on `family` may draw on: the
+/// pool for Linux and Windows, and — a macOS leg needs a pool slot and
+/// a macOS slot — the smaller of both for macOS.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+fn manual_family_share(share: ManualShare, family: RunnerFamily) -> u32 {
+    match family {
+        RunnerFamily::MacOs => share.shared.min(share.macos),
+        RunnerFamily::Linux | RunnerFamily::Windows => share.shared,
+    }
+}
+
+/// One leg's queue row as the registration's claim probe reads it.
+#[derive(Debug, skyzen::FromRow)]
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+struct ManualLegProbeRow {
+    task_id: String,
+    status: String,
+    attempt: u32,
+    batch_id: Option<String>,
+    not_before: String,
+    backing_off: i64,
+}
+
+/// `POST /manual-batches` — register one `build-batch.yml` batch
+/// `preheat manual` is about to dispatch (stow#854 §3.2). The legs'
+/// queue rows are claimed into `dispatched` under the driver's own
+/// batch id — minted before the send, never here — and one
+/// `build_batches` row charges the granted slots. From this call's
+/// return onward a lane enqueue writes nothing for the legs and the
+/// alarm cannot claim them; the driver then sends the
+/// `workflow_dispatch` and reports its outcome to
+/// [`record_manual_dispatch`].
+///
+/// Every statement is a `DurableDb` call with no outbound await, so the
+/// whole registration commits in one input-gate tick — the same
+/// atomicity `enqueue_inner` relies on, so no claim pass can interleave
+/// between the share read and the batch row that charges it.
+///
+/// The batch's runner family is derived from the legs' targets, never
+/// sent. The dispatch-min-age, `deps_met` and `dispatch_eligible` gates
+/// are deliberately not applied: the wave's own index-rooted layering
+/// is its dependency gate (§4.2).
+///
+/// # Errors
+/// [`QueueError::InvalidManualBatch`] on a malformed batch (mixed rustc
+/// or family, a non-CI target, a duplicate or out-of-bounds leg list) —
+/// nothing is written. [`QueueError::ManualRegistrationRefused`] while
+/// the scheduler is frozen, paused, or carries a reserve at or above
+/// its cap — nothing is written. [`QueueError::ManualBatchConflict`] on
+/// a batch id that is already a live `build_batches` row.
+/// [`QueueError::Invariant`] when the claim probe finds a row
+/// `enqueue_inner` just wrote missing, or the claim writes fewer legs
+/// than planned — impossible inside the tick.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+pub async fn register_manual_batch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    registration: &ManualBatchRegistration,
+) -> Result<ManualBatchRegistered, QueueError> {
+    let batch_id = registration.batch_id.as_str();
+    // Validation — a refused registration writes nothing.
+    let (family, task_ids) = validate_manual_legs(registration, settings)?;
+
+    // The scheduler's own postures refuse before anything is written.
+    if freeze_enabled(db).await? {
+        return Err(QueueError::ManualRegistrationRefused(
+            ManualRegistrationRefused::Frozen,
+        ));
+    }
+    let Dispatch::Limited(limit) = settings.dispatch else {
+        return Err(QueueError::ManualRegistrationRefused(
+            ManualRegistrationRefused::Paused,
+        ));
+    };
+    manual_reserve_within_caps(settings, limit)?;
+
+    // Step 0 — the share, before anything is written: the same
+    // `GROUP BY dispatch_family` occupancy the claim pass reads.
+    let active = count_active_by_family(db).await?;
+    let share = manual_share(limit, settings, &active);
+    let family_share = manual_family_share(share, family);
+    if family_share == 0 {
+        return Ok(ManualBatchRegistered::ShareFull { share });
+    }
+
+    // Step 1 — insert absent rows `pending` and apply the existing
+    // re-request rules (a `KeysApart` flag gap resurrects a `completed`
+    // row); a no-op for everything else.
+    enqueue_inner(db, &registration.legs, settings, false).await?;
+
+    // Step 2 — the claim probe, one read per leg by primary key.
+    let (claimable, refused) = probe_manual_legs(db, &task_ids).await?;
+    // Nothing claimable means no statements at all: `parallelism: 0`
+    // carries no `build_batches` row.
+    if claimable.is_empty() {
+        return Ok(ManualBatchRegistered::Registered {
+            parallelism: 0,
+            claimed: Vec::new(),
+            refused,
+            share,
+        });
+    }
+    // Steps 3–5 — mint, claim, and refresh the dependents of legs
+    // claimed out of `failed`.
+    claim_manual_legs(db, batch_id, &claimable).await?;
+
+    // Step 6 — the batch row. `parallelism` is the granted
+    // `max-parallel`: request, claimed legs and the family's share,
+    // whichever binds.
+    let granted = registration
+        .parallelism
+        .get()
+        .min(u32::try_from(claimable.len()).expect("legs fit u32"))
+        .min(family_share);
+    insert_manual_batch_row(db, registration, settings, family, granted, claimable.len()).await?;
+    let claimed: Vec<ClaimedLeg> = claimable
+        .into_iter()
+        .enumerate()
+        .map(|(leg, (task_id, _, attempt))| ClaimedLeg {
+            task_id,
+            leg: u32::try_from(leg).expect("a leg index is bounded by batch_max_tasks"),
+            attempt,
+        })
+        .collect();
+    // The answer's share is step 0's less this grant — the macOS slot
+    // only when the batch actually draws on that cap.
+    let share = ManualShare {
+        shared: share.shared.saturating_sub(granted),
+        macos: if family == RunnerFamily::MacOs {
+            share.macos.saturating_sub(granted)
+        } else {
+            share.macos
+        },
+    };
+    Ok(ManualBatchRegistered::Registered {
+        parallelism: granted,
+        claimed,
+        refused,
+        share,
+    })
+}
+
+/// `register_manual_batch`'s validation, before anything is written:
+/// the leg list's bounds and uniformity, and each leg's derived task
+/// id. A leg `enqueue_inner` would skip is unreachable — the family
+/// check already refused it (the `CI_TARGET_TRIPLES` partition
+/// invariant).
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+fn validate_manual_legs(
+    registration: &ManualBatchRegistration,
+    settings: &SchedulerSettings,
+) -> Result<(RunnerFamily, Vec<String>), QueueError> {
+    let legs = registration.legs.as_slice();
+    if legs.is_empty() {
+        return Err(QueueError::InvalidManualBatch(
+            "a manual batch names no legs".to_owned(),
+        ));
+    }
+    if legs.len() as u64 > u64::from(settings.batch_max_tasks) {
+        return Err(QueueError::InvalidManualBatch(format!(
+            "manual batch of {} legs exceeds STOW_BATCH_MAX_TASKS {}",
+            legs.len(),
+            settings.batch_max_tasks
+        )));
+    }
+    let mut family: Option<RunnerFamily> = None;
+    let mut task_ids: Vec<String> = Vec::with_capacity(legs.len());
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for leg in legs {
+        if leg.rustc_version != registration.rustc_version {
+            return Err(QueueError::InvalidManualBatch(format!(
+                "leg {} builds under rustc {} but the batch is {}",
+                leg.crate_name, leg.rustc_version, registration.rustc_version
+            )));
+        }
+        let leg_family = runner_family(leg.target.as_str()).ok_or_else(|| {
+            QueueError::InvalidManualBatch(format!(
+                "leg {} targets {}, which no CI runner builds",
+                leg.crate_name, leg.target
+            ))
+        })?;
+        match family {
+            None => family = Some(leg_family),
+            Some(batch_family) if batch_family != leg_family => {
+                return Err(QueueError::InvalidManualBatch(format!(
+                    "leg {} targets {} — a batch never mixes runner families",
+                    leg.crate_name, leg.target
+                )));
+            }
+            Some(_) => {}
+        }
+        let task_id = leg
+            .task_id()
+            .map_err(|error| QueueError::InvalidManualBatch(error.to_string()))?;
+        if !seen.insert(task_id.clone()) {
+            return Err(QueueError::InvalidManualBatch(format!(
+                "duplicate leg {task_id}"
+            )));
+        }
+        task_ids.push(task_id);
+    }
+    Ok((
+        family.expect("non-empty legs carry a runner family"),
+        task_ids,
+    ))
+}
+
+/// A human reserve at or above its cap leaves a manual wave no slot in
+/// any state — a misconfiguration the route fails (the wave's 500)
+/// rather than a `ShareFull` it could never leave (§3.2). The check
+/// lives here, not in `scheduler_settings`: that function runs on every
+/// scheduler route, and a knob only manual registration reads must not
+/// take the lanes down.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+const fn manual_reserve_within_caps(
+    settings: &SchedulerSettings,
+    limit: NonZeroU32,
+) -> Result<(), QueueError> {
+    if settings.human_reserve.shared >= limit.get() {
+        return Err(QueueError::ManualRegistrationRefused(
+            ManualRegistrationRefused::ReserveExceedsCap {
+                binding: "STOW_HUMAN_RESERVED_JOBS",
+                reserve: settings.human_reserve.shared,
+                cap_binding: "STOW_MAX_CONCURRENT_JOBS",
+                cap: limit.get(),
+            },
+        ));
+    }
+    if settings.human_reserve.macos >= settings.max_concurrent_macos_jobs {
+        return Err(QueueError::ManualRegistrationRefused(
+            ManualRegistrationRefused::ReserveExceedsCap {
+                binding: "STOW_HUMAN_RESERVED_MACOS_JOBS",
+                reserve: settings.human_reserve.macos,
+                cap_binding: "STOW_MAX_CONCURRENT_MACOS_JOBS",
+                cap: settings.max_concurrent_macos_jobs,
+            },
+        ));
+    }
+    Ok(())
+}
+
+/// §3.2 step 2 — the claim probe, one keyed read per leg, partitioned
+/// claimable/refused in request order. A `failed` row claims as an
+/// operator retry (`attempt` restarts at 1); everything else the probe
+/// cannot name is `Invariant` — `enqueue_inner` just wrote each row.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+async fn probe_manual_legs(
+    db: &DurableDb,
+    task_ids: &[String],
+) -> Result<(Vec<(String, bool, u32)>, Vec<RefusedLeg>), QueueError> {
+    let probes = db
+        .query(
+            "SELECT q.task_id, q.status, q.attempt, q.batch_id, q.not_before, \
+                    q.not_before > datetime('now') AS backing_off \
+             FROM (SELECT value AS task_id FROM json_each(?) LIMIT -1) AS e \
+             JOIN queue q ON q.task_id = e.task_id",
+        )
+        .bind(enqueue_json(task_ids)?)
+        .fetch_all::<ManualLegProbeRow>()
+        .await
+        .map_err(|error| format!("probe manual batch legs: {error}"))?;
+    let probes: BTreeMap<String, ManualLegProbeRow> = probes
+        .into_iter()
+        .map(|row| (row.task_id.clone(), row))
+        .collect();
+    // `(task_id, was_failed, attempt)` per claimable leg, in request
+    // order.
+    let mut claimable: Vec<(String, bool, u32)> = Vec::new();
+    let mut refused: Vec<RefusedLeg> = Vec::new();
+    for task_id in task_ids {
+        let probe = probes.get(task_id).ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "registered leg {task_id} has no queue row after its enqueue"
+            ))
+        })?;
+        match probe.status.as_str() {
+            "failed" => claimable.push((task_id.clone(), true, 1)),
+            "pending" if probe.backing_off == 0 => {
+                claimable.push((task_id.clone(), false, probe.attempt));
+            }
+            "pending" => refused.push(RefusedLeg {
+                task_id: task_id.clone(),
+                reason: LegRefusal::BackingOff {
+                    until: probe.not_before.clone(),
+                },
+            }),
+            "dispatched" | "running" => refused.push(RefusedLeg {
+                task_id: task_id.clone(),
+                reason: LegRefusal::InFlight {
+                    batch_id: probe
+                        .batch_id
+                        .as_deref()
+                        .map(str::parse::<BatchId>)
+                        .transpose()
+                        .map_err(|error| {
+                            QueueError::Invariant(format!(
+                                "queue row {task_id} carries an unparsable batch id: {error}"
+                            ))
+                        })?,
+                },
+            }),
+            "completed" => refused.push(RefusedLeg {
+                task_id: task_id.clone(),
+                reason: LegRefusal::Completed,
+            }),
+            status => {
+                return Err(QueueError::Invariant(format!(
+                    "queue row {task_id} holds an unknown status {status:?}"
+                )));
+            }
+        }
+    }
+    Ok((claimable, refused))
+}
+
+/// §3.2 steps 3–5 — one `generation_id` per leg, the single claim
+/// statement fenced the way `claim_and_bind`'s is (only `failed` and
+/// un-backed-off `pending` rows move, and the `RETURNING` count must
+/// match the plan inside one input-gate tick), then
+/// `refresh_dependents` for the legs leaving `failed`, as in the
+/// `retry` verb.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+async fn claim_manual_legs(
+    db: &DurableDb,
+    batch_id: &str,
+    claimable: &[(String, bool, u32)],
+) -> Result<(), QueueError> {
+    let generation_ids = mint_ids(db, claimable.len()).await?;
+    let claims: Vec<LegClaim> = claimable
+        .iter()
+        .zip(generation_ids)
+        .enumerate()
+        .map(|(leg, ((task_id, _, _), generation_id))| LegClaim {
+            task_id: task_id.clone(),
+            generation_id,
+            batch_id: batch_id.to_owned(),
+            leg: i64::try_from(leg).expect("a leg index is bounded by batch_max_tasks"),
+        })
+        .collect();
+    let won = db
+        .query(
+            "UPDATE queue \
+             SET status = 'dispatched', generation_id = e.generation_id, \
+                 attempt = CASE WHEN queue.status = 'failed' THEN 1 ELSE queue.attempt END, \
+                 error_msg = CASE WHEN queue.status = 'failed' THEN '' ELSE queue.error_msg END, \
+                 dispatch_attempts = dispatch_attempts + 1, github_run_id = NULL, \
+                 batch_id = e.batch_id, batch_leg = e.leg, \
+                 claimed_at = datetime('now'), updated_at = datetime('now') \
+             FROM (SELECT value ->> 'task_id' AS task_id, \
+                          value ->> 'generation_id' AS generation_id, \
+                          value ->> 'batch_id' AS batch_id, \
+                          CAST(value ->> 'leg' AS INTEGER) AS leg \
+                   FROM json_each(?) LIMIT -1) AS e \
+             WHERE queue.task_id = e.task_id \
+               AND (queue.status = 'failed' \
+                    OR (queue.status = 'pending' \
+                        AND queue.not_before <= datetime('now'))) \
+             RETURNING queue.task_id",
+        )
+        .bind(enqueue_json(&claims)?)
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("claim {} manual legs: {error}", claims.len()))?;
+    if won.len() != claimable.len() {
+        return Err(QueueError::Invariant(format!(
+            "manual batch {batch_id} planned {} legs but claimed {}",
+            claimable.len(),
+            won.len()
+        )));
+    }
+    let retried: Vec<String> = claimable
+        .iter()
+        .filter(|(_, was_failed, _)| *was_failed)
+        .map(|(task_id, _, _)| task_id.clone())
+        .collect();
+    if !retried.is_empty() {
+        refresh_dependents(
+            db,
+            "SELECT value AS task_id FROM json_each(?)",
+            &[DbValue::Text(enqueue_json(&retried)?)],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// §3.2 step 6 — the batch row, the `insert_batch_rows` shape with
+/// `parallelism` already the granted `min`. `DO NOTHING RETURNING`
+/// turns the primary-key conflict — a driver never reuses a batch id —
+/// into the route's 409 without error-string matching.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+async fn insert_manual_batch_row(
+    db: &DurableDb,
+    registration: &ManualBatchRegistration,
+    settings: &SchedulerSettings,
+    family: RunnerFamily,
+    parallelism: u32,
+    legs: usize,
+) -> Result<(), QueueError> {
+    let batch_id = registration.batch_id.as_str();
+    let inserted = db
+        .query(
+            "INSERT INTO build_batches \
+                 (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+                  claimed_at, lease_at) \
+             VALUES (?, ?, ?, 'miss', ?, ?, datetime('now'), datetime('now', ?)) \
+             ON CONFLICT(batch_id) DO NOTHING \
+             RETURNING batch_id",
+        )
+        .bind(batch_id.to_owned())
+        .bind(registration.rustc_version.as_str().to_owned())
+        .bind(dispatch_family_label(family).to_owned())
+        .bind(i64::from(parallelism))
+        .bind(i64::try_from(legs).expect("legs fit i64"))
+        .bind(format!("+{} minutes", settings.stale_dispatch_minutes))
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| format!("insert manual batch {batch_id}: {error}"))?;
+    if inserted.is_none() {
+        return Err(QueueError::ManualBatchConflict(format!(
+            "batch id {batch_id} is already a live batch"
+        )));
+    }
+    Ok(())
+}
+
+/// `POST /manual-batches/dispatch` — record what the driver's
+/// `workflow_dispatch` came back with (stow#854 §3.3). `Dispatched`
+/// binds the run id to the batch row — the same [`bind_batch_run`] the
+/// scheduler's own dispatch runs — so the webhook's completion can
+/// resolve it. `NotDispatched` releases the claim: the legs return to
+/// `pending` and the batch row is deleted. This route never refuses
+/// while frozen — the run already exists, and a release is cleanup.
+///
+/// # Errors
+/// [`QueueError::ManualBatchConflict`] when the report disagrees with
+/// the row: a `Dispatched` naming a run other than the bound one, or a
+/// `NotDispatched` against a row that carries a run or a completion.
+/// [`QueueError::Invariant`] from the underlying probes.
+#[cfg_attr(
+    target_arch = "wasm32",
+    expect(dead_code, reason = "S3 wires the manual-batch routes — staged code")
+)]
+pub async fn record_manual_dispatch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    dispatch: &ManualBatchDispatch,
+) -> Result<ManualDispatchRecorded, QueueError> {
+    let batch_id = dispatch.batch_id.as_str();
+    match dispatch.outcome {
+        ManualDispatchOutcome::Dispatched { run_id } => {
+            let run = run_id.to_string();
+            match bind_batch_run(db, batch_id, &run).await {
+                Ok(true) => Ok(ManualDispatchRecorded::Bound),
+                Ok(false) => {
+                    let held = db
+                        .query(
+                            "SELECT github_run_id, done_run_id FROM build_batches \
+                             WHERE batch_id = ?",
+                        )
+                        .bind(batch_id.to_owned())
+                        .fetch_optional::<HeldRunsRow>()
+                        .await
+                        .map_err(|error| format!("probe batch {batch_id}: {error}"))?;
+                    match held {
+                        None => Ok(ManualDispatchRecorded::Unknown),
+                        Some(row) if row.github_run_id.as_deref() == Some(run.as_str()) => {
+                            Ok(ManualDispatchRecorded::AlreadyBound)
+                        }
+                        Some(row) => Err(QueueError::ManualBatchConflict(format!(
+                            "batch {batch_id} is bound to run {} but the driver \
+                             reports run {run}",
+                            row.github_run_id.as_deref().unwrap_or("-")
+                        ))),
+                    }
+                }
+                // An early completion from a different run is the
+                // bind's own conflict case (stow#833 §4.2).
+                Err(QueueError::Invariant(message)) => {
+                    Err(QueueError::ManualBatchConflict(message))
+                }
+                Err(error) => Err(error),
+            }
+        }
+        ManualDispatchOutcome::NotDispatched => {
+            let held = db
+                .query(
+                    "SELECT github_run_id, done_run_id FROM build_batches \
+                     WHERE batch_id = ?",
+                )
+                .bind(batch_id.to_owned())
+                .fetch_optional::<HeldRunsRow>()
+                .await
+                .map_err(|error| format!("probe batch {batch_id}: {error}"))?;
+            match held {
+                None => Ok(ManualDispatchRecorded::Unknown),
+                Some(row) if row.github_run_id.is_some() || row.done_run_id.is_some() => {
+                    Err(QueueError::ManualBatchConflict(format!(
+                        "batch {batch_id} holds run {} but the driver reports \
+                         nothing was sent",
+                        row.github_run_id
+                            .as_deref()
+                            .or(row.done_run_id.as_deref())
+                            .unwrap_or("-")
+                    )))
+                }
+                Some(_) => {
+                    requeue_unbound_batch(db, settings, batch_id).await?;
+                    Ok(ManualDispatchRecorded::Released)
+                }
+            }
+        }
+    }
 }
 
 /// A `build_batches` row ready for the alarm's resolution pass, with

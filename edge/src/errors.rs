@@ -220,6 +220,24 @@ pub enum QueueError {
     /// Handlers map this to `400 Bad Request`.
     #[error("queue purge requires filter.older_than_secs so live work cannot be swept")]
     PurgeRequiresAge,
+    /// A `POST /manual-batches` registration failed validation — a mixed
+    /// rustc or runner family, a non-CI target, a duplicate task id, or
+    /// a leg list outside `1..=STOW_BATCH_MAX_TASKS`. Handlers map this
+    /// to `400 Bad Request` (stow#854).
+    #[error("invalid manual batch: {0}")]
+    InvalidManualBatch(String),
+    /// A manual batch named a `build_batches` row that disagrees with
+    /// it — a reused batch id, or a dispatch report against a row bound
+    /// to (or completed by) another run. Handlers map this to
+    /// `409 Conflict` (stow#854).
+    #[error("manual batch conflict: {0}")]
+    ManualBatchConflict(String),
+    /// The scheduler's own posture refuses a manual registration — the
+    /// pause, the freeze, or a human-lane reserve at or above its cap.
+    /// Handlers map `Paused`/`Frozen` to `503 Service Unavailable` and
+    /// `ReserveExceedsCap` to `500 Internal Server Error` (stow#854).
+    #[error("{0}")]
+    ManualRegistrationRefused(ManualRegistrationRefused),
     /// Stored queue state contradicts an invariant (e.g. dispatch capacity
     /// reported exhausted while no dispatched/running row exists).
     #[error("queue invariant violated: {0}")]
@@ -231,6 +249,41 @@ pub enum QueueError {
         field: &'static str,
         /// Offending value.
         value: u64,
+    },
+}
+
+/// Why the scheduler refused a manual-batch registration — the payload
+/// of [`QueueError::ManualRegistrationRefused`], so the route maps the
+/// status from the type (stow#854).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ManualRegistrationRefused {
+    /// `STOW_MAX_CONCURRENT_JOBS` is `0` — the operator's deliberate
+    /// pause; a manual wave dispatching beside it would defeat it.
+    #[error("scheduler dispatch paused")]
+    Paused,
+    /// The dispatch freeze is engaged — while it holds, `next_alarm`
+    /// deletes the alarm, so a registered batch could not settle or be
+    /// lease-checked.
+    #[error("scheduler dispatch frozen")]
+    Frozen,
+    /// A human-lane reserve meets or exceeds the cap it narrows, so no
+    /// scheduler state leaves a manual wave a slot — a
+    /// misconfiguration, not congestion.
+    #[error(
+        "{binding} = {reserve} meets or exceeds {cap_binding} = {cap}: a manual wave can never hold a slot; fix the reserve binding"
+    )]
+    ReserveExceedsCap {
+        /// The reserve binding at fault (`STOW_HUMAN_RESERVED_JOBS` or
+        /// `STOW_HUMAN_RESERVED_MACOS_JOBS`).
+        binding: &'static str,
+        /// The reserve's configured value.
+        reserve: u32,
+        /// The cap binding the reserve narrows
+        /// (`STOW_MAX_CONCURRENT_JOBS` or
+        /// `STOW_MAX_CONCURRENT_MACOS_JOBS`).
+        cap_binding: &'static str,
+        /// The cap's value.
+        cap: u32,
     },
 }
 

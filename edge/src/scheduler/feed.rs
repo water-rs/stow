@@ -801,7 +801,7 @@ async fn retire_chunk(
 #[cfg(test)]
 mod tests {
     use super::{feed_begin, feed_cleanup, feed_complete, feed_deliver, feed_page, read_hour};
-    use crate::scheduler::queue::{Dispatch, SchedulerSettings};
+    use crate::scheduler::queue::{Dispatch, HumanReserve, SchedulerSettings};
     use crate::scheduler::test_db::{counting_memory_db, memory_db};
     use stow_types::api::{
         DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageRequest, EnqueueRequest,
@@ -833,6 +833,7 @@ mod tests {
             min_dispatch_value: 0,
             batch_parallelism: 5,
             batch_max_tasks: 40,
+            human_reserve: HumanReserve::DEFAULT,
         }
     }
 
