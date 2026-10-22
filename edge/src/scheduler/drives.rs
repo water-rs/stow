@@ -1488,8 +1488,8 @@ pub const DRIVES: &[Drive] = &[
                 // wake is already deferred — or the probe proves
                 // nothing about the eligible span's boundary. Ready =
                 // the page predicate's wake terms true; deferred =
-                // `not_before` still ahead (the fixture's +30min
-                // rows).
+                // `not_before` still ahead (the fixture's parked
+                // rows, a day ahead of the seed).
                 let ready = db
                     .query(
                         "SELECT COUNT(*) FROM queue \

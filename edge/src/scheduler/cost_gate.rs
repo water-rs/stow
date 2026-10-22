@@ -1445,6 +1445,98 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     assert_batch_drives_cleaned_up(&db).await;
 }
 
+/// The `release-gate.yml` traffic-cost `timeout-minutes` the fixture's
+/// park must outlive: the job reuses one seed for its post-peak-drive
+/// budget pass ~35 minutes in, so a `not_before` park stamped shorter
+/// than this bound frees every pin and `n % 20 = 1` row into the
+/// claim the pass prices — the `deferred=0` failure the `+30 minutes`
+/// park produced (stow#833).
+const TRAFFIC_COST_JOB_MINUTES: i64 = 110;
+
+/// stow#833: the drives must still hold on a fixture as old as the
+/// traffic-cost job can run. Host SQLite's `now` cannot advance, so
+/// the test moves every `now`-relative stamp the seed wrote back by
+/// [`TRAFFIC_COST_JOB_MINUTES`] — the instant the job's bound lands —
+/// then re-arms the way `budget::run` does (the restore set's stamps
+/// return to fresh `now`-relative values, as on the persisted fixture)
+/// and runs the full pass. The parked rows the restore does not name
+/// keep the aged values, so a park shorter than the job reads as
+/// claimable — and the human-lane pins are the witness, since a
+/// claimable pin ranks ahead of every miss row the pass prices.
+#[tokio::test]
+async fn after_pass_drives_hold_on_a_fixture_aged_past_the_harness_run() {
+    let settings = SchedulerSettings::default();
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
+    let shape = fixture::GATE;
+
+    let ago = format!("-{TRAFFIC_COST_JOB_MINUTES} minutes");
+    // Every `now`-relative stamp `queue_seed_insert_sql` writes: the
+    // `'1970-01-01 00:00:00'` `not_before` is a sentinel, not a stamp,
+    // and `claimed_at` is the seed columns' only nullable stamp. The
+    // in-flight batch upsert's `claimed_at`/`lease_at` are its only
+    // `now`-relative stamps (`done_at`/`resolve_after` stay NULL). The
+    // outcome buckets stay put: in the harness the peak drive's
+    // completions expire them as they age, so no run ever holds an
+    // aged-out backlog — shifting them past the trip window at once
+    // would price a one-off expiry burst no drive event produces.
+    for sql in [
+        "UPDATE queue SET not_before = datetime(not_before, ?) \
+         WHERE not_before != '1970-01-01 00:00:00'",
+        "UPDATE queue SET wake_at = datetime(wake_at, ?)",
+        "UPDATE queue SET first_requested_at = datetime(first_requested_at, ?)",
+        "UPDATE queue SET created_at = datetime(created_at, ?)",
+        "UPDATE queue SET updated_at = datetime(updated_at, ?)",
+        "UPDATE queue SET claimed_at = datetime(claimed_at, ?) \
+         WHERE claimed_at IS NOT NULL",
+    ] {
+        db.query(sql)
+            .bind(ago.clone())
+            .execute()
+            .await
+            .expect("age the fixture's queue stamps");
+    }
+    db.query(
+        "UPDATE build_batches \
+         SET claimed_at = datetime(claimed_at, ?), lease_at = datetime(lease_at, ?)",
+    )
+    .bind(ago.clone())
+    .bind(ago)
+    .execute()
+    .await
+    .expect("age the in-flight batches' stamps");
+
+    // `budget::run` re-arms before its metered pass.
+    fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
+        .await
+        .expect("re-arm fixture");
+    let ctx = drives::DriveContext::host();
+    run_drives(&db, shape, &settings, &ctx, &log).await;
+
+    // The pins the park exists for — `n` in
+    // `(HUMAN_LANE_ROWS - HUMAN_PROBE_ROWS, HUMAN_LANE_ROWS]` — stay
+    // parked: a lapsed `not_before` would read claimable here.
+    let first_pin =
+        fixture::FixtureShape::HUMAN_LANE_ROWS - fixture::FixtureShape::HUMAN_PROBE_ROWS + 1;
+    let unparked: u64 = db
+        .query(
+            "SELECT COUNT(*) FROM queue \
+             WHERE task_id >= printf('%064x', ?) AND task_id <= printf('%064x', ?) \
+               AND not_before <= datetime('now')",
+        )
+        .bind(i64::from(first_pin))
+        .bind(i64::from(fixture::FixtureShape::HUMAN_LANE_ROWS))
+        .fetch_scalar()
+        .await
+        .expect("count unparked pins");
+    assert_eq!(
+        unparked, 0,
+        "a human pin's `not_before` park lapsed inside the job bound"
+    );
+}
+
 /// A drive that fails mid-pass must still see its cleanup run — the
 /// isolation promise holds on the error path too — and when the
 /// cleanup itself also fails, the error names both failures.

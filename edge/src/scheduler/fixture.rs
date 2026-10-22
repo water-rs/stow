@@ -577,11 +577,14 @@ fn queue_seed_insert_sql(
     // claimable pin would rank first and fill the pass with one-slot
     // human legs, hiding the miss-batch claim the gate prices
     // (stow#833), while the lane-position probes only need the pins
-    // `pending` and unblocked.
+    // `pending` and unblocked. The park outlives the whole traffic-cost
+    // job, like the in-flight stamps below: the post-drive budget pass
+    // reuses this seed after the peak drive, and a park that expires
+    // first frees every pin and parked row into the claim it prices.
     let not_before = &format!(
         "CASE WHEN (n <= {failed_end} OR n > {in_flight_end}) \
                   AND (n % 20 = 1 OR (n > {human_pin} AND n <= {human_end})) \
-              THEN datetime('now', '+30 minutes') \
+              THEN datetime('now', '+1 day') \
               ELSE '1970-01-01 00:00:00' END"
     );
     let last_24h = FixtureShape::LAST_24H_ROWS;
