@@ -5,6 +5,7 @@
 //! identity newtypes from [`crate::identity`] carry the invariants.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::ToSchema;
@@ -1436,6 +1437,162 @@ pub struct BatchRunComplete {
     pub conclusion: String,
     /// The run's Actions URL — the record's pointer back to the run.
     pub html_url: String,
+}
+
+/// `POST /api/v1/admin/scheduler/manual-batches` — one `build-batch.yml`
+/// batch `preheat manual` is about to dispatch, in matrix order
+/// (stow#854).
+///
+/// The driver registers before it sends the `workflow_dispatch`, so from
+/// this request's return onward the legs' queue rows are `dispatched`
+/// under `batch_id` and no lane can claim them beside the wave.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ManualBatchRegistration {
+    /// The [`BatchId`] the driver minted for the batch — it names the
+    /// run (`<rustc>-b<batch_id>`).
+    pub batch_id: BatchId,
+    /// The one rustc every leg builds under — a batch never mixes rustc
+    /// versions.
+    pub rustc_version: WireRustcVersion,
+    /// The `max-parallel` the driver would send; the route stores
+    /// `min(parallelism, claimed legs, family share)` and answers it.
+    #[schema(value_type = u32)]
+    pub parallelism: NonZeroU32,
+    /// Each leg's full request — the route must be able to insert a node
+    /// no lane ever submitted. Task ids derive from these, as in every
+    /// submit.
+    pub legs: Vec<EnqueueRequest>,
+}
+
+/// The runner slots a manual wave may still take after this answer: the
+/// pool and the macOS cap, each less its human-lane reserve and
+/// everything in flight (stow#854 §4.4).
+///
+/// A snapshot — lanes claim concurrently, so the route's own computation
+/// at the next registration is the authority; the driver uses it only to
+/// size its next request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ManualShare {
+    /// Free pool slots the wave may still take
+    /// (`STOW_MAX_CONCURRENT_JOBS` less the human reserve and all
+    /// in-flight parallelism).
+    pub shared: u32,
+    /// Free macOS slots the wave may still take
+    /// (`STOW_MAX_CONCURRENT_MACOS_JOBS` less its reserve and in-flight
+    /// macOS parallelism). A macOS leg needs both.
+    pub macos: u32,
+}
+
+/// `POST /api/v1/admin/scheduler/manual-batches`'s answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ManualBatchRegistered {
+    /// The batch row exists and the listed legs are `dispatched` under
+    /// it; the driver re-encodes the claimed subset and sends.
+    Registered {
+        /// The granted `max-parallel`: `min(request, claimed legs, the
+        /// family's share)`. 0 only when every leg was refused — no
+        /// `build_batches` row exists then.
+        parallelism: u32,
+        /// Claimed legs, re-indexed 0.. in request order; the driver
+        /// re-encodes exactly these, in this order, with `attempt` from
+        /// here.
+        claimed: Vec<ClaimedLeg>,
+        /// Legs the claim refused, in request order.
+        refused: Vec<RefusedLeg>,
+        /// The share left after this grant.
+        share: ManualShare,
+    },
+    /// The batch's family has no slot left for a manual wave. Nothing
+    /// was written; no leg was enqueued or claimed.
+    ShareFull {
+        /// The share the wave has to wait on.
+        share: ManualShare,
+    },
+}
+
+/// One leg [`ManualBatchRegistered::Registered`] claimed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ClaimedLeg {
+    /// The leg's task id, derived from its [`EnqueueRequest`].
+    pub task_id: String,
+    /// The matrix index the driver re-encodes this leg at — 0.. over the
+    /// claimed legs in request order.
+    pub leg: u32,
+    /// The queue attempt the leg builds under — `1` for a leg claimed
+    /// out of `failed`, else the row's attempt.
+    pub attempt: u32,
+}
+
+/// One leg the registration refused, with the queue state that refused
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RefusedLeg {
+    /// The leg's task id, derived from its [`EnqueueRequest`].
+    pub task_id: String,
+    /// Why the claim refused it.
+    pub reason: LegRefusal,
+}
+
+/// The queue state a [`RefusedLeg`] was found in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LegRefusal {
+    /// `dispatched`/`running` under another batch — someone is building
+    /// it.
+    InFlight {
+        /// The batch building it, when the row carries one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_id: Option<BatchId>,
+    },
+    /// `completed` with no flag gap — built and published already.
+    Completed,
+    /// `pending` inside its failure backoff (`not_before > now`).
+    BackingOff {
+        /// ISO 8601 instant the backoff lifts — the row is claimable
+        /// from then on.
+        until: String,
+    },
+}
+
+/// `POST /api/v1/admin/scheduler/manual-batches/dispatch` — the
+/// `workflow_dispatch` outcome for a registered batch (stow#854).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ManualBatchDispatch {
+    /// The [`BatchId`] a `ManualBatchRegistration` already wrote.
+    pub batch_id: BatchId,
+    /// What the send came back with.
+    pub outcome: ManualDispatchOutcome,
+}
+
+/// One arm of a [`ManualBatchDispatch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ManualDispatchOutcome {
+    /// The dispatch returned a run id — bind it so the webhook's
+    /// completion can resolve the batch.
+    Dispatched {
+        /// The Actions workflow run id the dispatch response carried.
+        run_id: u64,
+    },
+    /// Nothing was sent (rate-limited or refused) — release the claim:
+    /// the legs go back to `pending` and the batch row is deleted.
+    NotDispatched,
+}
+
+/// `POST /api/v1/admin/scheduler/manual-batches/dispatch`'s answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualDispatchRecorded {
+    /// The batch row was unbound and now carries the run id.
+    Bound,
+    /// The row already carried this run id — a repeated `Dispatched`.
+    AlreadyBound,
+    /// The row was unbound, its legs are `pending` again and the row is
+    /// deleted.
+    Released,
+    /// No `build_batches` row carries the batch id.
+    Unknown,
 }
 
 /// A normalized dependency entry from a resolved Cargo dependency graph.
@@ -3548,10 +3705,11 @@ pub struct ArtifactPruneResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchEncoder, BatchFit, BatchTask, BuildBatchPayload, BuildTaskPayload, CI_TARGET_TRIPLES,
-        DEMAND_FEED_PAGE_MAX_BYTES, DEMAND_FEED_PAGE_MAX_ENTRIES, DISPATCH_INPUT_LIMIT,
-        DemandFeedHour, DemandFeedPageBuilder, RunnerFamily, SchedulerDemandEntry, TaskHash,
-        runner_family,
+        BatchEncoder, BatchFit, BatchId, BatchTask, BuildBatchPayload, BuildTaskPayload,
+        CI_TARGET_TRIPLES, ClaimedLeg, DEMAND_FEED_PAGE_MAX_BYTES, DEMAND_FEED_PAGE_MAX_ENTRIES,
+        DISPATCH_INPUT_LIMIT, DemandFeedHour, DemandFeedPageBuilder, LegRefusal,
+        ManualBatchRegistered, ManualBatchRegistration, ManualShare, RefusedLeg, RunnerFamily,
+        SchedulerDemandEntry, TaskHash, runner_family,
     };
     use crate::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
     use crate::public_cache::ExplicitSpelling;
@@ -4204,6 +4362,90 @@ mod tests {
             fat.oversize_dispatch_error(candidate).to_string()
         );
         assert_eq!(encoder.legs(), 0);
+    }
+
+    /// `ManualBatchRegistered` is the register route's whole answer:
+    /// both variants carry every field through the wire — the driver
+    /// re-encodes `claimed` verbatim and resizes its next request on
+    /// `share` (stow#854).
+    #[test]
+    fn manual_batch_registered_variants_round_trip() {
+        let batch_id: BatchId = "0123456789abcdef0123456789abcdef"
+            .parse()
+            .expect("batch id");
+        let share = ManualShare {
+            shared: 7,
+            macos: 2,
+        };
+        let registered = ManualBatchRegistered::Registered {
+            parallelism: 3,
+            claimed: vec![ClaimedLeg {
+                task_id: "walkdir-2.5.0-aaa-x86_64-unknown-linux-gnu-1.85.0".to_owned(),
+                leg: 0,
+                attempt: 1,
+            }],
+            refused: vec![
+                RefusedLeg {
+                    task_id: "in-flight".to_owned(),
+                    reason: LegRefusal::InFlight {
+                        batch_id: Some(batch_id),
+                    },
+                },
+                RefusedLeg {
+                    task_id: "done".to_owned(),
+                    reason: LegRefusal::Completed,
+                },
+                RefusedLeg {
+                    task_id: "backing-off".to_owned(),
+                    reason: LegRefusal::BackingOff {
+                        until: "2026-10-22T12:00:00Z".to_owned(),
+                    },
+                },
+            ],
+            share,
+        };
+        let share_full = ManualBatchRegistered::ShareFull { share };
+        for answer in [&registered, &share_full] {
+            let wire = serde_json::to_value(answer).expect("encode");
+            let decoded: ManualBatchRegistered = serde_json::from_value(wire).expect("decode");
+            assert_eq!(&decoded, answer);
+        }
+        assert_eq!(
+            serde_json::to_value(&registered).expect("encode")["kind"],
+            "registered"
+        );
+        assert_eq!(
+            serde_json::to_value(&share_full).expect("encode")["kind"],
+            "share_full"
+        );
+        // A `None` `batch_id` on `InFlight` is omitted, not null.
+        let in_flight =
+            serde_json::to_value(LegRefusal::InFlight { batch_id: None }).expect("encode");
+        assert_eq!(in_flight["kind"], "in_flight");
+        assert!(in_flight.get("batch_id").is_none());
+    }
+
+    /// `parallelism` is a `NonZeroU32`: a `0` is refused at decode,
+    /// before any route validation runs (stow#854).
+    #[test]
+    fn manual_batch_registration_refuses_zero_parallelism() {
+        let body = |parallelism| {
+            serde_json::json!({
+                "batch_id": "0123456789abcdef0123456789abcdef",
+                "rustc_version": "1.85.0",
+                "parallelism": parallelism,
+                "legs": [],
+            })
+        };
+        serde_json::from_value::<ManualBatchRegistration>(body(0))
+            .expect_err("parallelism 0 must not decode");
+        assert_eq!(
+            serde_json::from_value::<ManualBatchRegistration>(body(2))
+                .expect("parallelism 2 decodes")
+                .parallelism
+                .get(),
+            2
+        );
     }
 }
 /// Public aggregate usage statistics served by `GET /api/v1/stats`.
