@@ -201,6 +201,10 @@ pub struct CachedArtifactBundle {
     pub features_json: String,
     pub dependency_c_metadata_json: String,
     pub dependency_compile_keys_json: String,
+    /// `[{crate_name, compile_key, instance}]` — the dependency instances a
+    /// local entry was compiled against; `'[]'` on remote entries, whose
+    /// binding is the published instance by construction (stow#836).
+    pub dependency_instances_json: String,
     /// Compile time the publisher recorded for this artifact — `0` for
     /// locally produced entries, which carry no measurement.
     pub compile_millis: u64,
@@ -224,6 +228,13 @@ pub struct CachedArtifactBundle {
 impl CachedArtifactBundle {
     pub fn output_source_path(&self, file: &ArtifactBundleFile) -> PathBuf {
         self.entry_dir.join(bundle_file_path(&file.file_name))
+    }
+
+    /// The instance digest of this entry's recorded outputs — the value a
+    /// dependent's `dependency_instances_json` binding and the externs'
+    /// `materialized_outputs` rows compare against (stow#836).
+    pub fn instance(&self) -> String {
+        outputs_instance_digest(self.outputs.iter().map(|output| output.sha256.as_str()))
     }
 }
 
@@ -327,6 +338,7 @@ pub async fn load_cached_bundle(
         features_json: entry.features_json,
         dependency_c_metadata_json: entry.dependency_c_metadata_json,
         dependency_compile_keys_json: entry.dependency_compile_keys_json,
+        dependency_instances_json: entry.dependency_instances_json,
         compile_millis: db_int(entry.compile_millis, "artifact cache entry compile_millis")?,
         size_bytes: db_int(entry.size_bytes, "artifact cache entry size_bytes")?,
         profile: shape.profile,
@@ -483,6 +495,10 @@ pub fn load_bundle_entry_dir(
         features_json: manifest.config.features_json.raw(),
         dependency_c_metadata_json: manifest.config.dependency_c_metadata_json.raw(),
         dependency_compile_keys_json: manifest.config.dependency_compile_keys_json,
+        // A manifest carries no binding; a consume-store entry is
+        // remote-provenance, so its binding is the published instance by
+        // construction.
+        dependency_instances_json: "[]".to_owned(),
         compile_millis: manifest.config.compile_millis,
         size_bytes: directory_size(entry_dir)?,
         profile: manifest.config.profile,
@@ -771,6 +787,9 @@ fn cached_bundle_for_entry(
         features_json: bundle.manifest.config.features_json.raw(),
         dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
         dependency_compile_keys_json: bundle.manifest.config.dependency_compile_keys_json.clone(),
+        // A remote entry's binding is the published instance by
+        // construction; the column records '[]'.
+        dependency_instances_json: "[]".to_owned(),
         compile_millis: bundle.manifest.config.compile_millis,
         size_bytes,
         profile: bundle.manifest.config.profile.clone(),
@@ -1431,6 +1450,23 @@ pub async fn remove_cached_bundle(
     let version_dir = config.artifact_cache_version_dir(request.rustc_version);
     let cache_key = cache_key(request);
     let rustc_version = request.rustc_version.to_owned();
+    let connection = config.state_db_pool().await?;
+    remove_cached_bundle_locked(&connection, &version_dir, &rustc_version, &cache_key).await
+}
+
+/// Remove the entry a loaded bundle was read from — the same removal path
+/// as [`remove_cached_bundle`], addressed by the bundle's own `cache_key`
+/// for a serve path that holds the bundle rather than the request that
+/// found it (stow#836). The bundle is consumed: its shared lease goes
+/// before the removal takes the entry's exclusive lock.
+pub async fn remove_loaded_bundle_entry(
+    config: &StowConfig,
+    bundle: CachedArtifactBundle,
+) -> stow_types::error::Result<()> {
+    let rustc_version = bundle.rustc_version.clone();
+    let cache_key = bundle.cache_key.clone();
+    drop(bundle);
+    let version_dir = config.artifact_cache_version_dir(&rustc_version);
     let connection = config.state_db_pool().await?;
     remove_cached_bundle_locked(&connection, &version_dir, &rustc_version, &cache_key).await
 }
@@ -2537,6 +2573,7 @@ struct ArtifactCacheEntryRow {
     features_json: String,
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: String,
+    dependency_instances_json: String,
     compile_millis: i64,
     size_bytes: i64,
     profile_json: String,
@@ -2590,7 +2627,7 @@ async fn load_artifact_cache_entry(
 ) -> stow_types::error::Result<Option<ArtifactCacheEntryRow>> {
     sqlx::query_as::<_, ArtifactCacheEntryRow>(
         "SELECT relative_dir, last_accessed_ms, oci_reference, oci_digest, \
-                compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, \
+                compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, \
                 compile_millis, size_bytes, \
                 profile_json, emit_json, kind_json, crate_types_json, \
                 verified_marker_version, verified_marker_policy, provenance \
@@ -3827,6 +3864,7 @@ pub mod tests {
             features_json: "[]".to_owned(),
             dependency_c_metadata_json: "[]".to_owned(),
             dependency_compile_keys_json: "[]".to_owned(),
+            dependency_instances_json: "[]".to_owned(),
             compile_millis: 0,
             size_bytes: 0,
             profile: stow_types::platform::Profile {
@@ -4369,6 +4407,353 @@ pub mod tests {
         serde_json::from_str(&instances_json).expect("parse dependency instances")
     }
 
+    /// Serve the cached entry under `stable_c_metadata` into `parsed`'s
+    /// out dir the way the serve path does: write its files, then record
+    /// their `materialized_outputs` rows with the entry's instance.
+    async fn materialize_served(
+        config: &StowConfig,
+        parsed: &ParsedRustcArgs,
+        stable_c_metadata: &str,
+    ) {
+        let bundle = super::load_cached_bundle(config, &fetch_request(stable_c_metadata))
+            .await
+            .expect("load served bundle")
+            .expect("served entry present");
+        crate::inject::write_artifacts(
+            parsed,
+            &bundle,
+            "aarch64-apple-darwin",
+            crate::inject::OutputDirWriters::StowOnly,
+        )
+        .await
+        .expect("materialize served bundle");
+        super::record_materialized_bundle_outputs(config, parsed, &bundle, "aarch64-apple-darwin")
+            .await
+            .expect("record served outputs");
+    }
+
+    /// stow#836: dep-A's entry is evicted and dep-B re-stored under the
+    /// same identity — same compile key, different instance. The dependent
+    /// bound to dep-A's instance is stale: serving it misses, and its
+    /// entry is evicted so a later local compile can store a consistent
+    /// replacement.
+    #[test]
+    fn a_closure_entry_bound_to_an_evicted_dependency_is_not_served() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let first_dir = tempdir.path().join("a/deps");
+        let second_dir = tempdir.path().join("b/deps");
+        let third_dir = tempdir.path().join("c/deps");
+        let dependent_dir = tempdir.path().join("a-dependent/deps");
+        for dir in [&first_dir, &second_dir, &third_dir, &dependent_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let evicted_dep =
+            local_build_parsed("serde_core", "cargo-meta-dep", first_dir, &["metadata"]);
+        std::fs::write(evicted_dep.output_rmeta_path().expect("rmeta"), b"svh-a").expect("write");
+        let refilled_dep =
+            local_build_parsed("serde_core", "cargo-meta-dep", second_dir, &["metadata"]);
+        std::fs::write(refilled_dep.output_rmeta_path().expect("rmeta"), b"svh-b").expect("write");
+        let evicted_dep_build = local_build_artifact(&evicted_dep, dep_stable);
+        let refilled_dep_build = local_build_artifact(&refilled_dep, dep_stable);
+        assert_ne!(
+            evicted_dep_build.instance(),
+            refilled_dep_build.instance(),
+            "different bytes must produce different instances"
+        );
+
+        let toml_stable = "70a170a170a170a1";
+        let dependent = toml_dependent(
+            &dependent_dir,
+            evicted_dep.output_rmeta_path().expect("rmeta"),
+        );
+
+        // The serving build is served dep-B: its files land in the third
+        // out dir the way the serve path writes them, and the rows it
+        // records carry dep-B's instance.
+        let refilled_dep_served = local_build_parsed(
+            "serde_core",
+            "cargo-meta-dep",
+            third_dir.clone(),
+            &["metadata"],
+        );
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &evicted_dep, &evicted_dep_build).await);
+            let (stored, _) =
+                store_dependent(&config, &dependent, toml_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "the dependent binds to dep-a's instance");
+
+            // Dep-A's entry is evicted; another build's dep-B fills the key.
+            super::remove_cached_bundle(&config, &fetch_request(dep_stable))
+                .await
+                .expect("evict dep-a entry");
+            assert!(store_dependency(&config, &refilled_dep, &refilled_dep_build).await);
+
+            materialize_served(&config, &refilled_dep_served, dep_stable).await;
+
+            let dependent_third = toml_dependent(
+                &third_dir,
+                refilled_dep_served.output_rmeta_path().expect("rmeta"),
+            );
+            let request = fetch_request(toml_stable);
+            let bundle = super::load_cached_bundle(&config, &request)
+                .await
+                .expect("load dependent bundle")
+                .expect("dependent entry present");
+            let served = crate::prune_materialized_aliases_for_cached_closure(
+                &config,
+                &dependent_third,
+                &request,
+                bundle,
+            )
+            .await
+            .expect("closure binding check");
+            assert!(
+                served.is_none(),
+                "a dependent bound to an evicted instance must miss"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("reload dependent")
+                    .is_none(),
+                "the stale dependent entry is evicted"
+            );
+        });
+    }
+
+    /// `toml_edit` in `out_dir`, compiled against the `toml` rmeta at
+    /// `toml_rmeta` — a dependent one level above `toml_dependent`.
+    fn toml_edit_dependent(out_dir: &Path, toml_rmeta: PathBuf) -> ParsedRustcArgs {
+        let mut parsed = parsed_rustc_args(
+            "toml_edit",
+            "cargo-meta-top",
+            out_dir.to_path_buf(),
+            vec![ParsedExternCrate {
+                crate_name: "toml".to_owned(),
+                path: toml_rmeta,
+            }],
+            vec!["lib".to_owned()],
+        );
+        parsed.emit = ["metadata", "link"]
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect();
+        parsed
+    }
+
+    /// stow#836: the stale entry need not be the one served. `toml` binds
+    /// to dep-A, `toml_edit` binds to `toml`; dep-A is evicted and dep-B
+    /// fills its key. Serving `toml_edit` — whose own binding to `toml`
+    /// still holds — misses, and the stale `toml` deeper in the closure is
+    /// the entry evicted.
+    #[test]
+    fn a_stale_entry_deeper_in_the_closure_is_evicted() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let first_dir = tempdir.path().join("a/deps");
+        let second_dir = tempdir.path().join("b/deps");
+        let serving_dir = tempdir.path().join("c/deps");
+        for dir in [&first_dir, &second_dir, &serving_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let evicted_dep = local_build_parsed(
+            "serde_core",
+            "cargo-meta-dep",
+            first_dir.clone(),
+            &["metadata"],
+        );
+        std::fs::write(evicted_dep.output_rmeta_path().expect("rmeta"), b"svh-a").expect("write");
+        let refilled_dep =
+            local_build_parsed("serde_core", "cargo-meta-dep", second_dir, &["metadata"]);
+        std::fs::write(refilled_dep.output_rmeta_path().expect("rmeta"), b"svh-b").expect("write");
+        let evicted_dep_build = local_build_artifact(&evicted_dep, dep_stable);
+        let refilled_dep_build = local_build_artifact(&refilled_dep, dep_stable);
+
+        let toml_stable = "70a170a170a170a1";
+        let toml = toml_dependent(&first_dir, evicted_dep.output_rmeta_path().expect("rmeta"));
+        let top_stable = "70e170e170e170e1";
+        let top_first = toml_edit_dependent(&first_dir, toml.output_rmeta_path().expect("rmeta"));
+        std::fs::write(top_first.output_rlib_path().expect("rlib"), b"top-rlib").expect("write");
+        std::fs::write(top_first.output_rmeta_path().expect("rmeta"), b"top-rmeta").expect("write");
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &evicted_dep, &evicted_dep_build).await);
+            let (stored, toml_build) =
+                store_dependent(&config, &toml, toml_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "toml binds to dep-a");
+            super::record_materialized_local_build_outputs(
+                &config,
+                &toml,
+                &toml_build,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record toml outputs");
+            let (stored, _) =
+                store_dependent(&config, &top_first, top_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "toml_edit binds to toml");
+
+            super::remove_cached_bundle(&config, &fetch_request(dep_stable))
+                .await
+                .expect("evict dep-a entry");
+            assert!(store_dependency(&config, &refilled_dep, &refilled_dep_build).await);
+
+            // The serving build is served `toml` itself, unchanged — the
+            // extern `toml_edit` checks against still carries the bound
+            // instance; only `toml`'s own binding is stale.
+            let toml_served = toml_dependent(
+                &serving_dir,
+                refilled_dep.output_rmeta_path().expect("rmeta"),
+            );
+            materialize_served(&config, &toml_served, toml_stable).await;
+
+            let top_serving = toml_edit_dependent(
+                &serving_dir,
+                toml_served.output_rmeta_path().expect("rmeta"),
+            );
+            let request = fetch_request(top_stable);
+            let bundle = super::load_cached_bundle(&config, &request)
+                .await
+                .expect("load toml_edit bundle")
+                .expect("toml_edit entry present");
+            let served = crate::prune_materialized_aliases_for_cached_closure(
+                &config,
+                &top_serving,
+                &request,
+                bundle,
+            )
+            .await
+            .expect("closure binding check");
+            assert!(
+                served.is_none(),
+                "a closure holding a stale entry must miss"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &fetch_request(toml_stable))
+                    .await
+                    .expect("reload toml")
+                    .is_none(),
+                "the stale toml entry deeper in the closure is evicted"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("reload toml_edit")
+                    .is_some(),
+                "toml_edit's own binding still holds; it stays cached"
+            );
+        });
+    }
+
+    /// stow#836: a remote dependent was compiled against the published dep
+    /// instance; a dep whose cache entry is local-provenance can never
+    /// satisfy it. The serve misses and the local dep entry is evicted, so
+    /// the next build downloads the published dep and the remote pair
+    /// serves; the remote dependent stays cached.
+    #[test]
+    fn a_remote_dependent_over_a_local_dependency_evicts_the_local_dependency() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let dep_dir = tempdir.path().join("dep/deps");
+        let out_dir = tempdir.path().join("served/deps");
+        for dir in [&dep_dir, &out_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let dep = local_build_parsed("serde_core", "cargo-meta-dep", dep_dir, &["metadata"]);
+        std::fs::write(dep.output_rmeta_path().expect("rmeta"), b"local-dep").expect("write");
+        let dep_build = local_build_artifact(&dep, dep_stable);
+
+        // A remote dependent bound to the dep's compile key — the binding
+        // a published artifact carries.
+        let remote_meta = "70a170a170a170a1";
+        let mut remote = sample_bundle(remote_meta, "libtoml-70a170a170a170a1.rmeta");
+        remote.manifest.config.dependency_compile_keys_json =
+            serde_json::to_string(&[stow_types::identity::DependencyCompileKeyIdentity {
+                crate_name: stow_types::identity::CrateName::parse("serde_core")
+                    .expect("crate name"),
+                compile_key: dep_build.identity.compile_key.clone(),
+            }])
+            .expect("serialize dependency compile keys");
+
+        // The build serving the remote dependent compiled the dep locally:
+        // its extern carries the local instance.
+        let local_dep_in_out = local_build_parsed(
+            "serde_core",
+            "cargo-meta-dep",
+            out_dir.clone(),
+            &["metadata"],
+        );
+        std::fs::write(
+            local_dep_in_out.output_rmeta_path().expect("rmeta"),
+            b"local-dep",
+        )
+        .expect("write local dep rmeta");
+        let dependent = toml_dependent(
+            &out_dir,
+            local_dep_in_out.output_rmeta_path().expect("rmeta"),
+        );
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &dep, &dep_build).await);
+            let stored =
+                super::store_downloaded_bundle(&config, &fetch_request(remote_meta), &remote)
+                    .await
+                    .expect("store remote dependent");
+            assert_eq!(stored.provenance, super::ArtifactProvenance::Remote);
+
+            super::record_materialized_local_build_outputs(
+                &config,
+                &local_dep_in_out,
+                &dep_build,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record local dep outputs");
+
+            let request = fetch_request(remote_meta);
+            let served = crate::prune_materialized_aliases_for_cached_closure(
+                &config, &dependent, &request, stored,
+            )
+            .await
+            .expect("closure binding check");
+            assert!(
+                served.is_none(),
+                "a remote dependent over a local dependency must miss"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("reload remote dependent")
+                    .is_some(),
+                "the remote dependent stays cached"
+            );
+            assert!(
+                super::load_cached_bundle(&config, &fetch_request(dep_stable))
+                    .await
+                    .expect("reload dep")
+                    .is_none(),
+                "the local dep entry the remote dependent sits on is evicted"
+            );
+        });
+    }
+
     #[test]
     fn remote_download_does_not_displace_local_entry() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -4880,6 +5265,7 @@ pub mod tests {
                 .config
                 .dependency_compile_keys_json
                 .clone(),
+            dependency_instances_json: "[]".to_owned(),
             compile_millis: artifact_bundle.manifest.config.compile_millis,
             size_bytes: 0,
             profile: artifact_bundle.manifest.config.profile.clone(),

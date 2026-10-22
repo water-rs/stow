@@ -87,10 +87,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer as _};
 
 use crate::artifact_cache::{
-    DependencyCMetadataResolution, load_cached_bundle, load_cached_bundle_by_compile_key,
-    load_semantic_cached_bundle, prepare_local_cache, record_materialized_bundle_outputs,
-    record_materialized_local_build_outputs, remove_cached_bundle,
-    resolve_dependency_c_metadata_json,
+    DependencyCMetadataResolution, DependencyInstanceIdentity, load_cached_bundle,
+    load_cached_bundle_by_compile_key, load_semantic_cached_bundle, prepare_local_cache,
+    record_materialized_bundle_outputs, record_materialized_local_build_outputs,
+    remove_cached_bundle, remove_loaded_bundle_entry, resolve_dependency_c_metadata_json,
 };
 use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
@@ -3098,19 +3098,29 @@ async fn try_serve_loaded_local_cached_bundle(
         return None;
     }
 
-    if let Err(error) =
-        prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
+    let cached_bundle = match prune_materialized_aliases_for_cached_closure(
+        config,
+        parsed,
+        request,
+        cached_bundle,
+    )
+    .await
     {
-        tracing::debug!(
-            error = %error,
-            crate_name = %parsed.crate_name,
-            target = %request.target,
-            rustc_version = %request.rustc_version,
-            "failed to materialize dependency closure aliases for local stow artifact cache entry"
-        );
-        tally.failed = true;
-        return None;
-    }
+        Ok(Some(bundle)) => bundle,
+        // The binding no longer holds — a miss, not a path failure.
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                target = %request.target,
+                rustc_version = %request.rustc_version,
+                "failed to materialize dependency closure aliases for local stow artifact cache entry"
+            );
+            tally.failed = true;
+            return None;
+        }
+    };
 
     materialize_local_cached_bundle(config, parsed, request, cached_bundle, tally).await
 }
@@ -3221,14 +3231,38 @@ async fn finish_local_serve(
     Some(notifications)
 }
 
-async fn prune_materialized_aliases_for_cached_closure(
+/// Materialize the dependency closure of the cached bundle a serve path is
+/// about to hand rustc — and first verify every entry the serve would hand
+/// out is still bound to the exact dependency instances it was compiled
+/// against (stow#836).
+///
+/// `Ok(Some(bundle))` serves; `Ok(None)` is a binding that no longer
+/// holds — this invocation compiles — with every stale local entry already
+/// evicted so a later local compile can store a consistent replacement;
+/// `Err` is a failure of the cache path itself.
+pub(crate) async fn prune_materialized_aliases_for_cached_closure(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
-    cached_bundle: &artifact_cache::CachedArtifactBundle,
-) -> stow_types::error::Result<()> {
+    cached_bundle: artifact_cache::CachedArtifactBundle,
+) -> stow_types::error::Result<Option<artifact_cache::CachedArtifactBundle>> {
     let Some(out_dir) = parsed.out_dir.as_ref() else {
-        return Ok(());
+        return Ok(Some(cached_bundle));
+    };
+
+    // The instances this build's --extern files carry — what the served
+    // entry's binding is checked against. An unrecorded extern makes the
+    // binding unverifiable: a miss, never a serve.
+    let externs = match resolve_dependency_c_metadata_json(config, parsed).await? {
+        DependencyCMetadataResolution::Resolved(resolved) => resolved.externs,
+        DependencyCMetadataResolution::Unrecorded(extern_path) => {
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                extern_path,
+                "not serving stow artifact cache entry: an extern has no recorded instance"
+            );
+            return Ok(None);
+        }
     };
 
     let mut bundles_by_compile_key = BTreeMap::new();
@@ -3265,12 +3299,25 @@ async fn prune_materialized_aliases_for_cached_closure(
         bundles_by_compile_key.insert(dependency.compile_key, dependency_bundle);
     }
 
+    let binding =
+        check_served_closure_binding(parsed, &cached_bundle, &externs, &bundles_by_compile_key)?;
+    if binding.unbound || !binding.stale.is_empty() {
+        evict_closure_entries(
+            config,
+            cached_bundle,
+            bundles_by_compile_key,
+            &binding.stale,
+        )
+        .await;
+        return Ok(None);
+    }
+
     let mut keep_original_file_names = BTreeSet::new();
     let mut closure_compile_keys = BTreeSet::new();
     let mut closure_crates = BTreeSet::from([canonical_crate_name(&cached_bundle.crate_name)]);
     let mut closure_visited = BTreeSet::new();
     collect_dependency_closure_file_names(
-        cached_bundle,
+        &cached_bundle,
         &bundles_by_compile_key,
         &mut closure_visited,
         &mut keep_original_file_names,
@@ -3297,7 +3344,252 @@ async fn prune_materialized_aliases_for_cached_closure(
             .await?;
     }
 
-    Ok(())
+    Ok(Some(cached_bundle))
+}
+
+/// Evict the closure entries a binding check marked (stow#836). A loaded
+/// bundle holds its entry's shared lease, so each marked bundle is dropped
+/// before the removal takes the entry's exclusive lock; a removal that
+/// fails — the entry is in use by another process — is retried by a later
+/// invocation that finds the same binding.
+async fn evict_closure_entries(
+    config: &StowConfig,
+    cached_bundle: artifact_cache::CachedArtifactBundle,
+    mut bundles_by_compile_key: BTreeMap<String, artifact_cache::CachedArtifactBundle>,
+    stale: &[String],
+) {
+    let mut served = Some(cached_bundle);
+    for cache_key in stale {
+        let bundle = if served
+            .as_ref()
+            .is_some_and(|bundle| bundle.cache_key == *cache_key)
+        {
+            served.take().expect("the served bundle is evicted once")
+        } else if let Some(compile_key) = bundles_by_compile_key
+            .iter()
+            .find(|(_, bundle)| bundle.cache_key == *cache_key)
+            .map(|(compile_key, _)| compile_key.clone())
+        {
+            bundles_by_compile_key
+                .remove(&compile_key)
+                .expect("the found key is present")
+        } else {
+            continue;
+        };
+        if let Err(error) = remove_loaded_bundle_entry(config, bundle).await {
+            tracing::debug!(
+                error = %error,
+                cache_key = %cache_key,
+                "failed to evict stale stow artifact cache entry"
+            );
+        }
+    }
+}
+
+/// What comparing the served closure's bindings against the instances at
+/// hand found (stow#836). Either field alone makes the invocation a miss.
+struct ClosureBinding {
+    /// Cache keys of local entries to evict: entries bound to dependency
+    /// instances the cache no longer holds, and local dependency entries a
+    /// remote entry sits on. Evicting the first lets a later local compile
+    /// store a consistent replacement under the freed key; evicting the
+    /// second lets the next build download the published instance, so the
+    /// remote pair serves instead of missing for as long as the local
+    /// entry lives.
+    stale: Vec<String>,
+    /// The serve is impossible: a remote entry sitting on a
+    /// local-provenance dependency entry, or a served entry whose binding
+    /// does not match this build's `--extern` files.
+    unbound: bool,
+}
+
+/// The hard error a dep identity absent from the walked bundle map means —
+/// the walk loads every key it will be asked for.
+fn missing_closure_dep(dep: &DependencyCompileKeyIdentity) -> stow_types::error::Error {
+    stow_types::stow_error!(
+        "missing prefetched cached bundle for compile key {} ({})",
+        dep.compile_key,
+        dep.crate_name
+    )
+}
+
+/// Verify every entry a serve would hand rustc — the served unit's entry
+/// and each closure entry the walk loaded — is still bound to the exact
+/// dependency instances it was compiled against (stow#836):
+///
+/// - a local entry's `dependency_instances_json` must equal, per dep, the
+///   `instance()` of the dep's currently cached entry — a dep evicted and
+///   re-stored from another build leaves the entry stale;
+/// - a remote entry (binding `'[]'`) is bound to the published dep
+///   instance by construction, so each dep's entry must be
+///   remote-provenance — a local dep entry blocks the serve and is
+///   evicted, since the published instance supersedes it: kept, it would
+///   make the remote dependent miss on every build.
+///
+/// The served entry is additionally checked against this build's own
+/// `--extern` files: the instances `resolve_dependency_c_metadata_json`
+/// resolved are the only bytes this invocation can pair with it.
+fn check_served_closure_binding(
+    parsed: &rustc_args::ParsedRustcArgs,
+    cached_bundle: &artifact_cache::CachedArtifactBundle,
+    externs: &[artifact_cache::MaterializedDependency],
+    bundles_by_compile_key: &BTreeMap<String, artifact_cache::CachedArtifactBundle>,
+) -> stow_types::error::Result<ClosureBinding> {
+    let mut stale = Vec::new();
+    let mut unbound = false;
+    for entry in std::iter::once(cached_bundle).chain(bundles_by_compile_key.values()) {
+        let deps = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
+            &entry.dependency_compile_keys_json,
+        )?;
+        match entry.provenance {
+            artifact_cache::ArtifactProvenance::Local => {
+                let bound = serde_json::from_str::<Vec<DependencyInstanceIdentity>>(
+                    &entry.dependency_instances_json,
+                )?;
+                let bound_by_key: BTreeMap<&str, &str> = bound
+                    .iter()
+                    .map(|identity| (identity.compile_key.as_str(), identity.instance.as_str()))
+                    .collect();
+                // The binding names exactly the dep set the entry was
+                // compiled against; a gap or an extra is a stale row.
+                let mut entry_stale = bound_by_key.len() != deps.len();
+                for dep in &deps {
+                    if entry_stale {
+                        break;
+                    }
+                    let dep_bundle = bundles_by_compile_key
+                        .get(&dep.compile_key)
+                        .ok_or_else(|| missing_closure_dep(dep))?;
+                    let recorded = bound_by_key.get(dep.compile_key.as_str()).copied();
+                    let current = dep_bundle.instance();
+                    if recorded != Some(current.as_str()) {
+                        tracing::debug!(
+                            crate_name = %entry.crate_name,
+                            dependency = %dep.crate_name,
+                            bound_instance = recorded.unwrap_or("<unbound>"),
+                            entry_instance = %current,
+                            "cached entry is bound to a dependency instance the cache no longer holds; evicting"
+                        );
+                        entry_stale = true;
+                    }
+                }
+                if entry_stale {
+                    stale.push(entry.cache_key.clone());
+                }
+            }
+            artifact_cache::ArtifactProvenance::Remote => {
+                for dep in &deps {
+                    let dep_bundle = bundles_by_compile_key
+                        .get(&dep.compile_key)
+                        .ok_or_else(|| missing_closure_dep(dep))?;
+                    if dep_bundle.provenance != artifact_cache::ArtifactProvenance::Remote {
+                        tracing::debug!(
+                            crate_name = %entry.crate_name,
+                            dependency = %dep.crate_name,
+                            dep_instance = %dep_bundle.instance(),
+                            dep_provenance = dep_bundle.provenance.as_column(),
+                            "not serving remote cached entry: a dependency's cache entry is a local instance; evicting it"
+                        );
+                        stale.push(dep_bundle.cache_key.clone());
+                        unbound = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !served_binding_matches_externs(parsed, cached_bundle, externs, bundles_by_compile_key)? {
+        unbound = true;
+    }
+
+    Ok(ClosureBinding { stale, unbound })
+}
+
+/// Whether the served entry's binding matches the instances this build's
+/// `--extern` files carry (stow#836) — the dep entries can be consistent
+/// among themselves while the files cargo handed this invocation are
+/// another instance. The dep a build extern resolved to is identified by
+/// the dep entry's stable `c_metadata`: the crate name is not a join key —
+/// a rename or a `[lib] name` rewrites it.
+fn served_binding_matches_externs(
+    parsed: &rustc_args::ParsedRustcArgs,
+    cached_bundle: &artifact_cache::CachedArtifactBundle,
+    externs: &[artifact_cache::MaterializedDependency],
+    bundles_by_compile_key: &BTreeMap<String, artifact_cache::CachedArtifactBundle>,
+) -> stow_types::error::Result<bool> {
+    let mut matches = true;
+    let served_deps = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
+        &cached_bundle.dependency_compile_keys_json,
+    )?;
+    let mut served_dep_bundles = Vec::with_capacity(served_deps.len());
+    for dep in &served_deps {
+        served_dep_bundles.push(
+            bundles_by_compile_key
+                .get(&dep.compile_key)
+                .ok_or_else(|| missing_closure_dep(dep))?,
+        );
+    }
+    let served_bound: BTreeMap<String, String> = match cached_bundle.provenance {
+        artifact_cache::ArtifactProvenance::Local => {
+            serde_json::from_str::<Vec<DependencyInstanceIdentity>>(
+                &cached_bundle.dependency_instances_json,
+            )?
+            .into_iter()
+            .map(|identity| (identity.compile_key, identity.instance))
+            .collect()
+        }
+        artifact_cache::ArtifactProvenance::Remote => BTreeMap::new(),
+    };
+    for extern_dep in externs {
+        let Some(dep_bundle) = served_dep_bundles
+            .iter()
+            .find(|bundle| bundle.c_metadata == extern_dep.c_metadata)
+        else {
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                dependency = %extern_dep.crate_name,
+                c_metadata = %extern_dep.c_metadata,
+                "not serving cached entry: an extern is not a direct dependency of the entry"
+            );
+            matches = false;
+            continue;
+        };
+        match cached_bundle.provenance {
+            artifact_cache::ArtifactProvenance::Local => {
+                let bound_instance = served_bound
+                    .get(dep_bundle.compile_key.as_str())
+                    .map(String::as_str);
+                if bound_instance != Some(extern_dep.instance.as_str()) {
+                    tracing::debug!(
+                        crate_name = %parsed.crate_name,
+                        dependency = %extern_dep.crate_name,
+                        bound_instance = bound_instance.unwrap_or("<unbound>"),
+                        extern_instance = %extern_dep.instance,
+                        "not serving cached entry: it is bound to a different dependency instance than the extern carries"
+                    );
+                    matches = false;
+                }
+            }
+            artifact_cache::ArtifactProvenance::Remote => {
+                let entry_instance = dep_bundle.instance();
+                if dep_bundle.provenance != artifact_cache::ArtifactProvenance::Remote
+                    || entry_instance != extern_dep.instance
+                {
+                    tracing::debug!(
+                        crate_name = %parsed.crate_name,
+                        dependency = %extern_dep.crate_name,
+                        extern_instance = %extern_dep.instance,
+                        entry_instance = %entry_instance,
+                        dep_provenance = dep_bundle.provenance.as_column(),
+                        "not serving remote cached entry: a direct dependency's instance is not the published one"
+                    );
+                    matches = false;
+                }
+            }
+        }
+    }
+
+    Ok(matches)
 }
 
 async fn download_closure_dependency_bundle(
@@ -3584,28 +3876,38 @@ async fn try_serve_local_semantic_cached_bundle(
         tally.failed = true;
         return None;
     }
+    let cached_c_metadata = cached_bundle.c_metadata.clone();
     let request = FetchRequest {
         target: &semantic_request.target,
         rustc_version: &semantic_request.rustc_version,
-        c_metadata: &cached_bundle.c_metadata,
+        c_metadata: &cached_c_metadata,
     };
-    if let Err(error) =
-        prune_materialized_aliases_for_cached_closure(config, parsed, &request, &cached_bundle)
-            .await
+    let cached_bundle = match prune_materialized_aliases_for_cached_closure(
+        config,
+        parsed,
+        &request,
+        cached_bundle,
+    )
+    .await
     {
-        tracing::debug!(
-            error = %error,
-            crate_name = %parsed.crate_name,
-            semantic_crate_name = %semantic_request.crate_name,
-            semantic_version = %semantic_request.version,
-            target = %semantic_request.target,
-            rustc_version = %semantic_request.rustc_version,
-            cached_c_metadata = %cached_bundle.c_metadata,
-            "failed to materialize dependency closure aliases for local semantic stow artifact cache entry"
-        );
-        tally.failed = true;
-        return None;
-    }
+        Ok(Some(bundle)) => bundle,
+        // The binding no longer holds — a miss, not a path failure.
+        Ok(None) => return None,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                semantic_crate_name = %semantic_request.crate_name,
+                semantic_version = %semantic_request.version,
+                target = %semantic_request.target,
+                rustc_version = %semantic_request.rustc_version,
+                cached_c_metadata = %request.c_metadata,
+                "failed to materialize dependency closure aliases for local semantic stow artifact cache entry"
+            );
+            tally.failed = true;
+            return None;
+        }
+    };
 
     materialize_semantic_cached_bundle(config, parsed, semantic_request, cached_bundle, tally).await
 }
@@ -3758,28 +4060,35 @@ async fn try_serve_verified_downloaded_bundle(
         }
     };
 
-    if let Err(error) =
-        prune_materialized_aliases_for_cached_closure(config, parsed, request, &cached_bundle).await
-    {
-        tracing::debug!(
-            error = %error,
-            crate_name = %parsed.crate_name,
-            target = %request.target,
-            rustc_version = %request.rustc_version,
-            "failed to materialize dependency closure aliases for downloaded stow bundle"
-        );
-        drop(cached_bundle);
-        evict_cached_bundle(
-            config,
-            parsed,
-            request,
-            "failed to evict downloaded stow bundle with incomplete dependency closure aliases",
-        )
-        .await;
-        env.env_cache.record_circuit_failure(config).await;
-        tally.failed = true;
-        return None;
-    }
+    let cached_bundle =
+        match prune_materialized_aliases_for_cached_closure(config, parsed, request, cached_bundle)
+            .await
+        {
+            Ok(Some(bundle)) => bundle,
+            // The binding no longer holds — a miss, not a path failure: the
+            // freshly stored remote entry stays cached and the circuit
+            // records nothing (stow#836).
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    target = %request.target,
+                    rustc_version = %request.rustc_version,
+                    "failed to materialize dependency closure aliases for downloaded stow bundle"
+                );
+                evict_cached_bundle(
+                config,
+                parsed,
+                request,
+                "failed to evict downloaded stow bundle with incomplete dependency closure aliases",
+            )
+            .await;
+                env.env_cache.record_circuit_failure(config).await;
+                tally.failed = true;
+                return None;
+            }
+        };
 
     materialize_downloaded_bundle(env, parsed, request, cached_bundle, tally).await
 }
