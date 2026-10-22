@@ -66,7 +66,7 @@ struct JournalEntry {
 /// `None` when its extern identities did not parse — the unit is not
 /// observed and never mints a miss (stow#317).
 pub fn observed_unit(parsed: &ParsedRustcArgs, build: &LocalBuildArtifact) -> Option<ObservedUnit> {
-    let externs = match serde_json::from_str(&build.dependency_c_metadata_json) {
+    let externs = match serde_json::from_str(&build.dependencies.c_metadata_json) {
         Ok(externs) => externs,
         Err(error) => {
             tracing::warn!(

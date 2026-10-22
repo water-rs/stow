@@ -548,7 +548,7 @@ async fn finish_rustc_compile(
                         record_materialized_local_build_outputs(
                             &base.config,
                             parsed,
-                            &build.identity,
+                            &build,
                             &base.host_target,
                         )
                         .await,
@@ -2938,7 +2938,7 @@ async fn try_serve_local_prefetched_graph_bundle(
         resolved_unit_features_json(table, &crate_name, &version, parsed, target, rustc_version)?;
     let expected_dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await {
-            Ok(DependencyCMetadataResolution::Resolved(value)) => value,
+            Ok(DependencyCMetadataResolution::Resolved(resolved)) => resolved.c_metadata_json,
             Ok(DependencyCMetadataResolution::Unrecorded(..)) => return None,
             Err(error) => {
                 tracing::debug!(
@@ -3290,6 +3290,11 @@ async fn prune_materialized_aliases_for_cached_closure(
             inject::OutputDirWriters::StowOnly,
         )
         .await?;
+        // The closure materialization wrote dep outputs without a row
+        // before; a dependent compiled against these paths resolves its
+        // externs — and their instances — through them (stow#836).
+        artifact_cache::record_materialized_closure_outputs(config, out_dir, dependency_bundle)
+            .await?;
     }
 
     Ok(())
@@ -3926,7 +3931,7 @@ async fn build_semantic_fetch_request(
     };
     let dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await? {
-            DependencyCMetadataResolution::Resolved(value) => value,
+            DependencyCMetadataResolution::Resolved(resolved) => resolved.c_metadata_json,
             DependencyCMetadataResolution::Unrecorded(..) => return Ok(None),
         };
     let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
@@ -3980,7 +3985,7 @@ async fn build_stable_exact_identity(
     };
     let dependency_c_metadata_json =
         match resolve_dependency_c_metadata_json(config, parsed).await? {
-            DependencyCMetadataResolution::Resolved(value) => value,
+            DependencyCMetadataResolution::Resolved(resolved) => resolved.c_metadata_json,
             DependencyCMetadataResolution::Unrecorded(..) => {
                 trace_identity_inputs(
                     parsed,
@@ -4150,13 +4155,12 @@ async fn resolve_local_build_artifact(
         .clone()
         .unwrap_or_else(|| base.host_target.clone());
     let rustc_version = base.rustc_version.clone();
-    let dependency_c_metadata_json =
-        match resolve_dependency_c_metadata_json(config, parsed).await? {
-            DependencyCMetadataResolution::Resolved(value) => value,
-            DependencyCMetadataResolution::Unrecorded(extern_path) => {
-                return Ok(LocalBuildResolution::UnrecordedExtern { extern_path });
-            }
-        };
+    let dependencies = match resolve_dependency_c_metadata_json(config, parsed).await? {
+        DependencyCMetadataResolution::Resolved(dependencies) => dependencies,
+        DependencyCMetadataResolution::Unrecorded(extern_path) => {
+            return Ok(LocalBuildResolution::UnrecordedExtern { extern_path });
+        }
+    };
     let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
         return Ok(LocalBuildResolution::NotAnArtifactUnit);
     };
@@ -4169,7 +4173,7 @@ async fn resolve_local_build_artifact(
         &target,
         &rustc_version,
         &scan_features_json,
-        &dependency_c_metadata_json,
+        &dependencies.c_metadata_json,
     )?
     else {
         return Ok(LocalBuildResolution::NotAnArtifactUnit);
@@ -4195,13 +4199,21 @@ async fn resolve_local_build_artifact(
             )
         })
         .unwrap_or(scan_features_json);
+    // Hash the unit's outputs once here — the materialized-output rows
+    // record the instance digest, and the local store reuses the per-file
+    // sha256s instead of re-reading the staged copy (stow#836).
+    let stable_parsed = inject::parsed_with_stable_identity(parsed, &identity);
+    let outputs =
+        artifact_cache::local_build_output_specs(parsed, &stable_parsed, &base.host_target)?;
+    let outputs = artifact_cache::hash_local_build_outputs(outputs).await?;
     Ok(LocalBuildResolution::Resolved(Box::new(
         artifact_cache::LocalBuildArtifact {
             target,
             rustc_version,
             identity,
             features_json,
-            dependency_c_metadata_json,
+            dependencies,
+            outputs,
         },
     )))
 }
