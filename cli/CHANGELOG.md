@@ -7,6 +7,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/water-rs/stow/compare/stow-cli-v0.6.0...stow-cli-v0.7.0) - 2026-10-22
+
+### Added
+
+- *(cli)* grant the sandbox toolchain once through a stable identity ([#822](https://github.com/water-rs/stow/pull/822))
+- *(cli)* experimental heel sandbox around the user's cargo build ([#783](https://github.com/water-rs/stow/pull/783))
+- *(cli)* read cargo's unit graph instead of hand-walking cargo metadata ([#551](https://github.com/water-rs/stow/pull/551)) ([#566](https://github.com/water-rs/stow/pull/566))
+- *(edge)* serve cacheable GETs through Workers Cache; adopt native platform features ([#454](https://github.com/water-rs/stow/pull/454)) ([#498](https://github.com/water-rs/stow/pull/498))
+- [**breaking**] preheat the cache from GHCR, with records as the only record source ([#477](https://github.com/water-rs/stow/pull/477))
+- *(admin)* [**breaking**] resolve graphs natively with the cargo library in stow-admin ([#468](https://github.com/water-rs/stow/pull/468))
+
+### Fixed
+
+- *(deps)* take heel 0.5.1 from crates.io and drop the git patch ([#845](https://github.com/water-rs/stow/pull/845))
+- *(cli)* bind cached artifacts to the dependency instances they were compiled against ([#838](https://github.com/water-rs/stow/pull/838))
+- *(cli)* create the target directory before granting it to the sandbox ([#824](https://github.com/water-rs/stow/pull/824))
+- concurrent slice refreshes no longer make a build compile its closure ([#819](https://github.com/water-rs/stow/pull/819))
+- *(cli)* a cold project's serve map names index units from the lockfile ([#808](https://github.com/water-rs/stow/pull/808))
+- *(edge,cli)* coverage counts a node only under its own dependency context ([#801](https://github.com/water-rs/stow/pull/801))
+- *(cli)* a miss on a slice whose fetch is pending retries the fetched answer ([#799](https://github.com/water-rs/stow/pull/799))
+- *(cli)* hold denied units until the fetched slice commits their policy markers ([#794](https://github.com/water-rs/stow/pull/794))
+- split the public cache into one GHCR package per rustc version ([#763](https://github.com/water-rs/stow/pull/763))
+- move the cache to the stow-cache-2 package generation and drop registry gc (stow#758) ([#759](https://github.com/water-rs/stow/pull/759))
+- identities and shapes are required everywhere; index format 5; registry gc (stow#730) ([#753](https://github.com/water-rs/stow/pull/753))
+- target-side nodes whose --extern closure holds a proc-macro publish the explicit --target shape (stow#736) ([#752](https://github.com/water-rs/stow/pull/752))
+- *(cli)* key local-build markers by the artifact and count units sent local behind one ([#742](https://github.com/water-rs/stow/pull/742))
+- *(cli)* a cold-cache lookup waits for the build's slice fetch (stow#735) ([#739](https://github.com/water-rs/stow/pull/739))
+- *(cli)* time only the wait in the close-beside-a-read test (stow#728) ([#731](https://github.com/water-rs/stow/pull/731))
+- *(ci)* the builder's prefetch stages its candidates concurrently ([#720](https://github.com/water-rs/stow/pull/720))
+- *(cli)* wrapper shims live per cargo home and stow binary, and a wrapper refuses another build's supervisor ([#714](https://github.com/water-rs/stow/pull/714))
+- *(cli)* the close truncates a state-database WAL grown past its bound ([#710](https://github.com/water-rs/stow/pull/710))
+- *(cli)* the trust root loads beside the pulls that need it, not ahead of cargo ([#706](https://github.com/water-rs/stow/pull/706))
+- *(cli)* one counted outcome per rustc invocation ([#703](https://github.com/water-rs/stow/pull/703))
+- *(cli)* the trace file records stow's spans whatever RUST_LOG is ([#700](https://github.com/water-rs/stow/pull/700))
+- *(cli)* every stow process closes the state database before it exits ([#686](https://github.com/water-rs/stow/pull/686))
+- *(cli)* a stow command stops a drain's derivation before its own cargo starts ([#684](https://github.com/water-rs/stow/pull/684))
+- *(cli)* stop capturing, unpacking and loading build-script products ([#680](https://github.com/water-rs/stow/pull/680))
+- *(cli)* remove the symlink materialization mode ([#679](https://github.com/water-rs/stow/pull/679))
+- *(cli)* a drain drops a miss group whose project no longer hashes to its recorded key ([#677](https://github.com/water-rs/stow/pull/677))
+- *(cli)* no cargo build is assembled before the mold selection resolves ([#675](https://github.com/water-rs/stow/pull/675))
+- *(cli)* a failing build returns its exit status to its owners ([#668](https://github.com/water-rs/stow/pull/668))
+- *(cli)* take stow's own work out of the window before cargo's first unit ([#621](https://github.com/water-rs/stow/pull/621))
+- *(cli)* reclaim the staging a cut-off store leaves in the cache ([#662](https://github.com/water-rs/stow/pull/662))
+- *(cli)* drain every supervisor connection before the build exits ([#661](https://github.com/water-rs/stow/pull/661))
+- *(cli)* a build prints cargo's output and the summary line, nothing else ([#646](https://github.com/water-rs/stow/pull/646))
+- *(cli)* return when cargo does, and keep a build's scratch files in one directory it removes ([#654](https://github.com/water-rs/stow/pull/654))
+- *(cli)* store a flight's end when nobody is subscribed yet ([#643](https://github.com/water-rs/stow/pull/643))
+- *(cli)* leave cargo's records alone when a unit is served ([#639](https://github.com/water-rs/stow/pull/639))
+- *(cli)* recognise a never-cacheable unit before resolving its identity ([#636](https://github.com/water-rs/stow/pull/636))
+- *(cli)* carry build-sized tables in files, not environment strings ([#631](https://github.com/water-rs/stow/pull/631))
+- *(cli)* store every compiled unit before the build exits ([#628](https://github.com/water-rs/stow/pull/628))
+- *(cli)* keep the mold selection when setup runs again ([#629](https://github.com/water-rs/stow/pull/629))
+- *(cli)* serve locally stored units without a cached unit graph ([#626](https://github.com/water-rs/stow/pull/626))
+- *(cli)* look up and report a unit at its resolved cargo feature set ([#615](https://github.com/water-rs/stow/pull/615)) ([#622](https://github.com/water-rs/stow/pull/622))
+- carry resolved dependency identity through the cache graph ([#594](https://github.com/water-rs/stow/pull/594))
+- *(ci)* stage consumption from the build's own cargo unit graph ([#590](https://github.com/water-rs/stow/pull/590))
+- serve and publish crates whose [lib] name differs from the package name ([#583](https://github.com/water-rs/stow/pull/583))
+- *(admin,cli)* classify HTTP statuses zenwave returns as errors, starting with the watchdog incident label ([#569](https://github.com/water-rs/stow/pull/569))
+- *(cli)* take the rustc and mold probes off the pre-cargo critical path ([#515](https://github.com/water-rs/stow/pull/515))
+- *(cli)* retry transient failures when downloading mold ([#514](https://github.com/water-rs/stow/pull/514))
+- satisfy the lints Rust 1.99 adds ([#513](https://github.com/water-rs/stow/pull/513))
+- *(oci)* sign a manifest before its tag points at it ([#483](https://github.com/water-rs/stow/pull/483))
+- *(edge)* [**breaking**] drop the CI completion route and the probes of retired routes ([#479](https://github.com/water-rs/stow/pull/479))
+- *(cli)* carry the invocation's OUT_DIR across the supervisor socket ([#476](https://github.com/water-rs/stow/pull/476))
+- *(scheduler)* [**breaking**] bound every scheduler request and alarm pass to its event, gated by workerd's billed counters ([#472](https://github.com/water-rs/stow/pull/472))
+- *(ci)* [**breaking**] cut build-wave latency and the failures behind it ([#462](https://github.com/water-rs/stow/pull/462))
+- [**breaking**] a served unit is one its slice vouches for, and a dependency side the resolver never wrote is not trusted ([#374](https://github.com/water-rs/stow/pull/374))
+- [**breaking**] host-side units are nodes of their own, built at the keys consumers compute ([#368](https://github.com/water-rs/stow/pull/368))
+
+### Other
+
+- add the Preheat cost test to the release gate ([#825](https://github.com/water-rs/stow/pull/825))
+- *(cli)* order the facade and stub-census tests by release, not by sleeps ([#811](https://github.com/water-rs/stow/pull/811))
+- *(cli)* keep the serve tests' fresh slice fresh on slow runners ([#807](https://github.com/water-rs/stow/pull/807))
+- *(cli)* run every stow-cli test against its own homes ([#804](https://github.com/water-rs/stow/pull/804))
+- remove all migration code; a schema change is an operator reset ([#746](https://github.com/water-rs/stow/pull/746))
+- *(cli)* sample the never-slower gate's window from builds stopped at their first unit ([#671](https://github.com/water-rs/stow/pull/671))
+- *(cli)* assert the admission drain's bound in attempts, not seconds ([#672](https://github.com/water-rs/stow/pull/672))
+- *(cli)* persist a cache entry's metadata in one transaction ([#620](https://github.com/water-rs/stow/pull/620))
+- *(cli)* take the state DB open, rustc probes and Windows shim compare off cargo's critical path ([#518](https://github.com/water-rs/stow/pull/518))
+- *(cli)* decide serves from a once-per-build map, not a per-invocation round trip ([#509](https://github.com/water-rs/stow/pull/509))
+- *(deps)* bump sigstore from 0.13.0 to 0.14.0 ([#503](https://github.com/water-rs/stow/pull/503))
+- *(edge)* [**breaking**] serve bundles by digest without the D1 catalog lookup ([#467](https://github.com/water-rs/stow/pull/467))
+
 ## [0.6.0](https://github.com/water-rs/stow/compare/stow-cli-v0.5.0...stow-cli-v0.6.0) - 2026-09-24
 
 ### Added
