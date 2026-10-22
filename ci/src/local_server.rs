@@ -2170,8 +2170,7 @@ mod tests {
             }
             other => panic!("expected a build verdict, got {other:?}"),
         }
-        let jobs = state.jobs.lock().unwrap();
-        let publish = &jobs[&run.workflow_run_id][1];
+        let publish = state.jobs.lock().unwrap()[&run.workflow_run_id][1].clone();
         assert_eq!(publish.conclusion, Some("skipped"));
         assert_eq!(
             publish.name,
@@ -2388,10 +2387,10 @@ mod tests {
             }
             other => panic!("expected a build verdict, got {other:?}"),
         }
-        let jobs = state.jobs.lock().unwrap();
-        let skipped = jobs[&run_id]
+        let skipped = state.jobs.lock().unwrap()[&run_id]
             .iter()
             .find(|job| job.conclusion == Some("skipped"))
+            .cloned()
             .expect("the failed leg's publish is skipped");
         assert_eq!(
             skipped.name,
