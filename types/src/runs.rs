@@ -350,19 +350,17 @@ impl LegJobName {
     /// since the run is ours.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
-        let (caller, called) = name
-            .rsplit_once(" / ")
-            .map_or(("", name), |(caller, called)| (caller, called));
-        let (kind, rest) = called
+        let (prefix, segment) = name.rsplit_once(" / ").unwrap_or(("", name));
+        let (kind, rest) = segment
             .strip_prefix("build #")
             .map(|rest| (LegJobKind::Build, rest))
             .or_else(|| {
-                called
+                segment
                     .strip_prefix("publish #")
                     .map(|rest| (LegJobKind::Publish, rest))
             })?;
         if rest.contains("${{") {
-            let leg = caller.strip_prefix("leg ")?.parse().ok()?;
+            let leg = prefix.strip_prefix("leg ")?.parse().ok()?;
             return Some(Self {
                 kind,
                 leg,

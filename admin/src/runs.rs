@@ -679,7 +679,7 @@ async fn failures(
 
 #[cfg(test)]
 mod tests {
-    use stow_types::runs::RunStepRow;
+    use stow_types::runs::{LegJobName, RunStepRow};
 
     use super::{
         FailureClass, LegFailure, LegOutcome, RunFailure, RunJobRow, TaskHash, classify_log,
