@@ -52,7 +52,7 @@ jobs:
     name: Changed paths
     runs-on: ubuntu-latest
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      code: ${{ steps.filter.outputs.code == 'true' && steps.bump.outputs.only != 'true' }}
     steps:
       # The filter diffs against the previous tip (or the merge group's base)
       # with git, so it needs the repository checked out.
@@ -75,6 +75,18 @@ jobs:
               - '!**/*.md'
               - '!LICENSE*'
               - '!.gitignore'
+      # A release-plz bump changes workspace versions and changelogs and
+      # nothing else, so it cannot change what a compiler or a test observes
+      # beyond the version string. The script reads the diff rather than the
+      # branch name: code pushed onto a release branch runs every leg.
+      - name: Version-only diff
+        id: bump
+        if: github.event_name != 'schedule'
+        env:
+          BASE: ${{ github.event.merge_group.base_sha || github.event.before }}
+        run: |
+          only=$(python3 -I scripts/version-only.py "$BASE" "$GITHUB_SHA")
+          echo "only=$only" >> "$GITHUB_OUTPUT"
 
   test:
     needs: changes
