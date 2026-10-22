@@ -333,7 +333,7 @@ pub fn classify_page(
     let expected: Vec<TaskHash> = (0..=last)
         .map(|leg| {
             legs.get(&leg)
-                .and_then(|hash| hash.clone())
+                .and_then(Clone::clone)
                 .unwrap_or_else(|| placeholder.clone())
         })
         .collect();
