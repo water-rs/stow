@@ -83,12 +83,21 @@ pub enum RunFailure {
     },
 }
 
-/// A job or step row has settled once GitHub reports it `completed` —
-/// a run's own `completed` arrives while its job rows still read
-/// `queued`/`in_progress`/`waiting` and the failed job's steps the
-/// same, so every other value is a page still being written.
+/// A step row has settled once GitHub reports it `completed` — a
+/// run's own `completed` arrives while its step rows still read
+/// `queued`/`in_progress`/`waiting`, so every other value is a page
+/// still being written. Job rows settle wider — see [`job_settled`].
 fn row_completed(status: &str) -> bool {
     status == "completed"
+}
+
+/// A job row is settled once GitHub reports it `completed` — or the
+/// moment it carries a `conclusion`, which is only ever written on a
+/// finished job: a completed run's job row can still read
+/// `in_progress` with its `conclusion` already set (run 39842358378,
+/// stow#863), and the conclusion is the truer word.
+fn job_settled(job: &RunJobRow) -> bool {
+    job.conclusion.is_some() || row_completed(&job.status)
 }
 
 /// Classify a completed failed run by its jobs as of `now`.
@@ -105,7 +114,8 @@ fn row_completed(status: &str) -> bool {
 /// mid-settle shows the failed job without its failed step — the
 /// lost-runner shape — so a verdict would misclassify as
 /// infrastructure and earn a rerun GitHub then refuses (stow#765). A
-/// job still not `completed` defers unconditionally; a failed job
+/// job still not settled — neither `completed` nor carrying a
+/// `conclusion` (stow#863) — defers unconditionally; a failed job
 /// whose step rows are unsettled defers only inside
 /// [`STEP_SETTLE_WINDOW`] of its own `completed_at` — past the window
 /// the first unsettled step is where the runner was lost, and the
@@ -115,14 +125,14 @@ fn row_completed(status: &str) -> bool {
 /// just-completed job as a lost runner.
 ///
 /// # Errors
-/// A `completed` job row carrying no `completed_at` — a schema
+/// A settled job row carrying no `completed_at` — a schema
 /// surprise, so the classifier fails fast rather than guess at its
 /// age.
 pub fn classify_failure(
     jobs: &[RunJobRow],
     now: time::OffsetDateTime,
 ) -> crate::error::Result<Option<RunFailure>> {
-    if jobs.iter().any(|job| !row_completed(&job.status)) {
+    if jobs.iter().any(|job| !job_settled(job)) {
         return Ok(None);
     }
     let Some(job) = jobs
@@ -138,8 +148,10 @@ pub fn classify_failure(
     if let Some(step) = job.steps.iter().find(|step| !row_completed(&step.status)) {
         let Some(completed_at) = job.completed_at else {
             return Err(stow_error!(
-                "jobs page: completed job {:?} carries no completed_at",
-                job.name
+                "jobs page: settled job {:?} (status {:?}, conclusion {:?}) carries no completed_at",
+                job.name,
+                job.status,
+                job.conclusion.as_deref().unwrap_or("<none>")
             ));
         };
         if now - completed_at < STEP_SETTLE_WINDOW + GITHUB_CLOCK_ALLOWANCE {
@@ -201,9 +213,12 @@ pub struct RunJobRow {
     pub name: String,
     /// `queued`/`in_progress`/`completed`/`waiting`/`pending` as
     /// GitHub serves it — a run's `completed` arrives while its job
-    /// rows are still settling, so classification reads it.
+    /// rows are still settling, and a finished job's can lag its
+    /// `conclusion` (stow#863), so classification reads both.
     pub status: String,
-    /// `success`/`failure`/`skipped`/… — `None` while the job runs.
+    /// `success`/`failure`/`skipped`/… — `None` while the job runs;
+    /// only ever written on a finished job, so its presence settles
+    /// the row whatever `status` says.
     #[serde(default)]
     pub conclusion: Option<String>,
     /// GitHub's start time — null until the job begins. A leg's runner
@@ -439,8 +454,9 @@ pub enum LegOutcome {
     },
     /// The leg failed — [`LegFailure`] names the class.
     Failed(LegFailure),
-    /// No answer yet: a job is not `completed`, or a failed job's step
-    /// rows are still inside their settle window — the batch keeps its
+    /// No answer yet: a job is not settled — neither `completed` nor
+    /// carrying a `conclusion` — or a failed job's step rows are still
+    /// inside their settle window — the batch keeps its
     /// `resolve_after` and the next pass reads again.
     Unsettled,
 }
@@ -576,7 +592,7 @@ fn classify_leg(
             }),
         );
     }
-    if present.iter().any(|job| !row_completed(&job.status)) {
+    if present.iter().any(|job| !job_settled(job)) {
         return Ok(LegOutcome::Unsettled);
     }
     let concluded = |job: &RunJobRow| -> LegOutcome {
@@ -596,7 +612,7 @@ fn classify_leg(
             },
         )
     };
-    // Every present job completed and none failed — a success is the
+    // Every present job settled and none failed — a success is the
     // pair both reading `success`; anything else names the first
     // non-success job's conclusion.
     let culprit = [build, publish]
@@ -866,6 +882,29 @@ mod tests {
                 .expect("classified")
                 .is_none()
         );
+    }
+
+    /// stow#863: the observed shape on the failing job itself — a
+    /// `completed` run's job row can read `in_progress` with its
+    /// `conclusion` already written. A conclusion only ever lands on
+    /// a finished job, so it settles the row whatever `status` says.
+    #[test]
+    fn a_concluded_job_is_settled_whatever_its_status_says() {
+        let jobs = [job_row(
+            "build",
+            "in_progress",
+            Some("failure"),
+            Some(1_000_000),
+            &[(
+                "Run the untrusted build stage",
+                "completed",
+                Some("failure"),
+            )],
+        )];
+        assert!(matches!(
+            classify_failure(&jobs, at(1_000_100)),
+            Ok(Some(RunFailure::Verdict { .. }))
+        ));
     }
 
     // ----- Leg classification (stow#833) -----
@@ -1268,6 +1307,56 @@ mod tests {
         let outcomes =
             classify_legs(&[leg_hash(0)], "in_progress", &jobs, at(1_000)).expect("classified");
         assert_eq!(outcomes, [LegOutcome::Unsettled]);
+    }
+
+    /// stow#863: run 39842358378's page — a `completed` run's publish
+    /// row served `in_progress` with `conclusion: "success"` already
+    /// written. The conclusion settles the row: the leg succeeds on
+    /// the first read instead of deferring.
+    #[test]
+    fn a_leg_succeeds_on_a_concluded_job_whose_status_lags() {
+        let mut jobs = settled_leg(0);
+        jobs[1].status = "in_progress".to_owned();
+        let outcomes =
+            classify_legs(&[leg_hash(0)], "success", &jobs, at(1_000)).expect("classified");
+        assert_eq!(
+            outcomes,
+            [LegOutcome::Succeeded {
+                started_at: at(50),
+                completed_at: at(100),
+                publish_attempt: 1,
+            }]
+        );
+    }
+
+    /// stow#863: the same stale `status` on the failing job — an
+    /// `in_progress` build row carrying `conclusion: "failure"` is
+    /// settled by it and classifies its failed step, not a defer.
+    #[test]
+    fn a_leg_fails_on_a_concluded_job_whose_status_lags() {
+        let mut jobs = settled_leg(0).to_vec();
+        jobs[0] = leg_job(
+            LegJobKind::Build,
+            0,
+            &leg_hash(0),
+            "in_progress",
+            Some("failure"),
+            &[(
+                "Run the untrusted build stage",
+                "completed",
+                Some("failure"),
+            )],
+        );
+        let outcomes =
+            classify_legs(&[leg_hash(0)], "failure", &jobs, at(1_000)).expect("classified");
+        assert!(
+            matches!(
+                outcomes[0],
+                LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { .. }))
+            ),
+            "{:?}",
+            outcomes[0]
+        );
     }
 
     /// §4.1: a failed leg whose step rows are still inside the settle

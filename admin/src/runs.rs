@@ -961,6 +961,20 @@ mod tests {
         assert!(!leg_attempted(failure));
     }
 
+    /// stow#863: run 39842358378 — a `completed` run's job row served
+    /// `in_progress` with `conclusion: "success"` already written. The
+    /// conclusion settles the row whatever `status` says: the leg
+    /// reads `Succeeded` on the first read rather than repolling.
+    #[test]
+    fn classify_page_settles_a_leg_on_its_conclusion() {
+        let (_hash, build) = build_name(0, "task-a");
+        let mut publish = job_row(publish_name(0, "task-a"), Some("success"), vec![]);
+        publish.status = "in_progress".to_owned();
+        let jobs = vec![job_row(build, Some("success"), vec![]), publish];
+        let legs = classify_page(&jobs, "success", at(1_000)).expect("classified");
+        assert!(matches!(legs[0].outcome, LegOutcome::Succeeded { .. }));
+    }
+
     /// stow#839: the observed page — each leg's build fails at a
     /// verdict step and its skipped publish's name comes back
     /// unrendered — reads both legs as verdict failures; each leg's
