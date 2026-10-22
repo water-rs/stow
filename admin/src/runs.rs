@@ -417,8 +417,14 @@ pub fn leg_build_job(jobs: &[RunJobRow], leg: u32) -> Option<&RunJobRow> {
     })
 }
 
-/// Every job row of a run's latest attempt — the whole list, not one
-/// page (stow#833).
+/// Every job row of a run's attempt — the whole list, not one page
+/// (stow#833).
+///
+/// The attempt is pinned: the default `filter=latest` jobs view
+/// (`GET …/runs/{id}/jobs`) answers 502 on every request for a run
+/// whose failed legs were rerun, while the attempt-scoped view serves
+/// the same rows (stow#852). The preheat driver's `attempt_jobs` and
+/// the edge's `attempt_jobs_path` read the same path.
 ///
 /// A batch carries 2 × `STOW_BATCH_MAX_TASKS` jobs and that bound is
 /// configurable, so a single `per_page=100` read silently truncates a
@@ -427,16 +433,23 @@ pub fn leg_build_job(jobs: &[RunJobRow], leg: u32) -> Option<&RunJobRow> {
 /// edge's `attempt_jobs` runs) until GitHub names no next page.
 /// `runs failures`, `builds digest` and the watchdog all read their
 /// jobs through here — the one pager, nowhere duplicated.
-pub async fn fetch_run_jobs(token: &str, run_id: u64) -> stow_types::error::Result<Vec<RunJobRow>> {
-    fetch_jobs_pages(
-        Some(token),
-        &format!(
-            "{}/repos/{}/actions/runs/{run_id}/jobs?per_page=100",
-            github::API_BASE,
-            github::REPO
-        ),
+pub async fn fetch_run_jobs(
+    token: &str,
+    run_id: u64,
+    attempt: u32,
+) -> stow_types::error::Result<Vec<RunJobRow>> {
+    fetch_jobs_pages(Some(token), &run_jobs_url(run_id, attempt)).await
+}
+
+/// `GET …/runs/{run_id}/attempts/{attempt}/jobs?per_page=100` — the
+/// first page the pager opens; later pages ride the `Link` header's
+/// URLs verbatim.
+fn run_jobs_url(run_id: u64, attempt: u32) -> String {
+    format!(
+        "{}/repos/{}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+        github::API_BASE,
+        github::REPO
     )
-    .await
 }
 
 /// The pager loop behind [`fetch_run_jobs`] over absolute URLs —
@@ -485,6 +498,7 @@ async fn fetch_jobs_pages(
 struct WorkflowRun {
     id: u64,
     html_url: String,
+    run_attempt: u32,
 }
 
 impl github::RunRow for WorkflowRun {
@@ -559,7 +573,7 @@ async fn classify_runs(
 ) -> stow_types::error::Result<Vec<FailureGroup>> {
     let mut groups: BTreeMap<FailureClass, Vec<FailureExample>> = BTreeMap::new();
     for run in runs {
-        let jobs = fetch_run_jobs(token, run.id).await?;
+        let jobs = fetch_run_jobs(token, run.id, run.run_attempt).await?;
         for leg in classify_page(&jobs, "failure", OffsetDateTime::now_utc())? {
             let LegOutcome::Failed(failure) = &leg.outcome else {
                 continue;
@@ -1039,6 +1053,20 @@ mod tests {
     fn classify_page_fails_on_a_non_leg_job() {
         let job = job_row("build-crate".to_owned(), Some("failure"), vec![]);
         assert!(classify_page(&[job], "failure", at(1_000)).is_err());
+    }
+
+    /// The first page is the attempt-scoped view — the default
+    /// `filter=latest` jobs path 502s on rerun runs (stow#852).
+    #[test]
+    fn run_jobs_url_pins_the_attempt() {
+        assert_eq!(
+            super::run_jobs_url(42, 3),
+            format!(
+                "{}/repos/{}/actions/runs/42/attempts/3/jobs?per_page=100",
+                crate::github::API_BASE,
+                crate::github::REPO
+            )
+        );
     }
 
     /// The jobs pager follows `Link: <…>; rel="next"`: a batch's jobs
