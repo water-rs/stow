@@ -135,7 +135,7 @@ const MAX_BUILD_ATTEMPTS: u32 = 4;
 /// insertion. One completion's median recompute reads at most this
 /// many rows and the cap delete keeps no more, so the statistic
 /// never grows a historical scan (stow#524).
-const BUILD_SAMPLE_WINDOW: i64 = 32;
+pub(super) const BUILD_SAMPLE_WINDOW: i64 = 32;
 
 /// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
 /// miss-lane submits start being refused. The edge handler reads the same
@@ -2270,7 +2270,11 @@ struct BatchLegRow {
 /// `STOW_BATCH_PARALLELISM` — ⌈45/k⌉ miss batches plus the human
 /// lane's — rows, each holding at most `STOW_BATCH_MAX_TASKS` legs.
 /// The alarm's resolution drive names this as its stated bound
-/// (stow#833 §3.2).
+/// (stow#833 §3.2). No `ORDER BY`: no caller depends on batch order
+/// (legs arrive keyed by `batch_id`), and ordering by `batch_id`
+/// would steer the planner onto the primary key — a walk of every
+/// in-flight batch — instead of `idx_build_batches_resolve`'s bounded
+/// `resolve_after<?` range.
 ///
 /// # Errors
 /// [`QueueError::Invariant`] when a row's run id is not numeric or its
@@ -2283,8 +2287,7 @@ pub async fn ready_batches(db: &DurableDb, now_ms: i64) -> Result<Vec<ReadyBatch
                     CAST(strftime('%s', claimed_at) AS INTEGER) AS claimed_epoch \
              FROM build_batches \
              WHERE done_run_id = github_run_id \
-               AND resolve_after <= datetime(CAST(? AS INTEGER) / 1000, 'unixepoch') \
-             ORDER BY batch_id",
+               AND resolve_after <= datetime(CAST(? AS INTEGER) / 1000, 'unixepoch')",
         )
         .bind(now_ms)
         .fetch_all::<ReadyBatchRow>()
@@ -3546,18 +3549,19 @@ const fn dispatch_family_label(family: RunnerFamily) -> &'static str {
 /// `AND <column> IN ('<family>', …)` — "every family except the
 /// saturated ones" rendered as equality over `RunnerFamily::ALL` minus
 /// `saturated`, derived from the type so a new family can never drift
-/// from the exclusion, and never `!=` or `NOT IN`. On `idx_queue_wake`
-/// the family column is the last equality column before the `wake_at`
-/// range, where an inequality cannot bound the range — SQLite falls
+/// from the exclusion, and never `!=` or `NOT IN`. Both callers get the
+/// term unconditionally: on `idx_queue_wake` the family column is the
+/// last equality column before the `wake_at` range, where a missing
+/// term — like an inequality — cannot bound the range, so SQLite falls
 /// back to reading every eligible pending row, which made a burst of N
 /// future-wake misses cost N reads on every alarm pass and every
-/// deliver. The IN list expands into one seek per surviving family, so
-/// each probe reads only the families that can dispatch (stow#588).
-/// An empty `saturated` renders no filter at all.
+/// deliver (stow#833). The IN list expands into one seek per surviving
+/// family, so each probe reads only the families that can dispatch
+/// (stow#588) — an empty `saturated` renders `IN` over every family.
+/// The claim page's [`dispatchable_page_sql`] puts `dispatch_family`
+/// behind its `dispatch_key` range, where the extra `IN` is a residual
+/// term and the page's plan is unchanged.
 fn dispatch_family_in_sql(column: &str, saturated: &[RunnerFamily]) -> String {
-    if saturated.is_empty() {
-        return String::new();
-    }
     let families = RunnerFamily::ALL
         .iter()
         .filter(|family| !saturated.contains(family))
@@ -5838,8 +5842,8 @@ const TRIP_EXAMPLE_RUNS: i64 = 3;
 
 /// Sum the in-window outcome buckets per target and run the pure trip
 /// decision. The read is `attempt_outcome_buckets`, not the raw rows:
-/// the window is at most `window_minutes / 5` buckets per target
-/// (12 × 9 targets under the defaults) whatever the traffic, so the
+/// the window is at most `window_minutes / 5 + 1` buckets per target
+/// (13 × 9 targets under the defaults) whatever the traffic, so the
 /// cost of the check is constant in the number of completions it
 /// covers. The sample is the outcome tally, not the queue rows: a
 /// retried task flips back to `pending` and would otherwise erase its
@@ -5850,13 +5854,18 @@ pub async fn evaluate_freeze_trip(
     db: &DurableDb,
     settings: &crate::freeze::FreezeSettings,
 ) -> Result<Option<FreezeTripDraft>, QueueError> {
-    // The bucket SELECT returns the rows it scans — the host backend's
-    // `rows_read` then equals what the Durable Object bills.
+    // The bucket SELECT's range is bounded on both ends, so it returns
+    // the rows it scans — at most (`window_minutes` / 5 + 1) ×
+    // `CI_TARGET_TRIPLES` — and the host backend's `rows_read` equals
+    // what the Durable Object bills. No ORDER BY: the fold is a
+    // `BTreeMap`, and ordering would steer the planner onto the
+    // (target, bucket) primary key — a full scan — instead of
+    // `idx_attempt_outcome_buckets_bucket`'s bounded range (stow#833).
     let buckets = db
         .query(
             "SELECT target, outcomes, failures FROM attempt_outcome_buckets \
              WHERE bucket >= unixepoch('now') - CAST(? AS INTEGER) \
-             ORDER BY target, bucket",
+               AND bucket <= unixepoch('now')",
         )
         .bind(i64::from(settings.window_minutes) * 60)
         .fetch_all::<OutcomeBucketRow>()
@@ -5921,6 +5930,27 @@ pub async fn evaluate_freeze_trip(
         classes,
         example_run_ids,
     }))
+}
+
+/// The database half of the post-failure freeze check — the
+/// already-frozen short-circuit plus the window evaluation, so a
+/// failure drive pays exactly the reads the Durable Object's check
+/// runs. `None` covers both "a freeze already holds" (the cheap gate
+/// skips the window read) and "the window does not trip"; the caller
+/// applies an `Ok(Some(_))` draft through
+/// `freeze::apply_transition` — the record write and the one alert —
+/// which stays request-side with the alert sink.
+///
+/// # Errors
+/// [`QueueError::Sql`] when a read fails.
+pub async fn freeze_trip_draft(
+    db: &DurableDb,
+    settings: &crate::freeze::FreezeSettings,
+) -> Result<Option<FreezeTripDraft>, QueueError> {
+    if freeze_enabled(db).await? {
+        return Ok(None);
+    }
+    evaluate_freeze_trip(db, settings).await
 }
 
 /// One `attempt_outcome_buckets` row inside the trip window — the
@@ -6666,10 +6696,12 @@ async fn earliest_pending_eligible_ms(
     // `wake_at` range means under-floor rows are outside the index
     // span the probes walk — a queue of them arms nothing immediate
     // and contributes nothing to the deferred MIN's read set.
-    // The family exclusion renders as `dispatch_family IN (…)` — the
-    // remaining families as equality, so SQLite expands the list into
-    // one seek per family and each `wake_at` range stays bounded
-    // (stow#588). `!=` would leave the range unbounded: every eligible
+    // The family term renders as `dispatch_family IN (…)` —
+    // `RunnerFamily::ALL` minus the saturated families, all of them
+    // when none is — equality over the column ahead of `wake_at`, so
+    // SQLite expands the list into one seek per family and each
+    // `wake_at` range stays bounded (stow#588). A missing term
+    // (stow#833) or a `!=` leaves the range unbounded: every eligible
     // pending row read, on every alarm pass and every deliver.
     let family_filter = dispatch_family_in_sql("dispatch_family", saturated);
     // The plan is a pure function of `now_ms`; bind the rendered clock

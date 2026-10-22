@@ -388,24 +388,25 @@ const BUDGETS: &[RouteBudget] = &[
         // dispatch-key refresh over the leg's own `(crate, target)`
         // pending rows — about 11 statements a leg, each leg's median
         // moving because the fixture holds no earlier sample. Measured
-        // 442 statements, 272 reads, 392 writes (the fixture's
-        // `CRATE_NAME_ROWS` bounds the refresh's set). The batch row's
-        // delete is the last statement.
+        // 443 statements, 1530 reads, 436 writes — the seeded
+        // `BUILD_SAMPLE_WINDOW` rings price the cap delete and median
+        // recompute at production's steady state (stow#833). The batch
+        // row's delete is the last statement.
         name: "alarm pass (batch resolution)",
-        statements: 550,
-        rows_read: 340,
-        rows_written: 490,
+        statements: 553,
+        rows_read: 1_912,
+        rows_written: 545,
         scan_allowlist: &[],
     },
     RouteBudget {
         // The same resolution over a batch of one leg: the fixed part
         // (`ready_batches`' batch row and the batch row's delete) plus
-        // one leg's `complete` and build sample. The callback's price
-        // per build. Measured 14 statements, 8 reads, 11 writes, the
-        // same on the 20k fixture.
+        // one leg's `complete` and build sample — its ring reads at
+        // the `BUILD_SAMPLE_WINDOW` cap (stow#833). The callback's
+        // price per build. Measured 14 statements, 38 reads, 11 writes.
         name: "alarm pass (batch resolution, one leg)",
         statements: 17,
-        rows_read: 10,
+        rows_read: 47,
         rows_written: 13,
         scan_allowlist: &[],
     },
@@ -1220,9 +1221,18 @@ async fn assert_failure_evidence(db: &DurableDb, expected: usize) {
 /// queue row bound to a batch the fixture does not hold: every claiming
 /// drive restores its legs, so a bound orphan is a failed restore.
 async fn assert_batch_drives_cleaned_up(db: &DurableDb) {
-    for table in ["crate_build_samples", "crate_build_stats"] {
+    // The fixture's seeded rings stay — the drives' cleanups remove
+    // only their own generations — so a leftover drive sample is any
+    // row outside the ring ids; the stats table still starts empty.
+    for (table, predicate) in [
+        (
+            "crate_build_samples",
+            "WHERE generation_id NOT LIKE 'seed-ring-%'",
+        ),
+        ("crate_build_stats", ""),
+    ] {
         let rows = db
-            .query(&format!("SELECT COUNT(*) FROM {table}"))
+            .query(&format!("SELECT COUNT(*) FROM {table} {predicate}"))
             .fetch_scalar::<i64>()
             .await
             .expect("sample rows");
@@ -1555,26 +1565,52 @@ async fn assert_seeded_claimable_span_is_the_window(db: &DurableDb) {
 /// stow#588's sixth queue run priced each wake probe at ~16k reads on
 /// the 100k queue: `dispatch_family != 'macos'` could not bound
 /// `idx_queue_wake`'s trailing `wake_at` range, so every alarm pass and
-/// every deliver read the whole dispatch-eligible pending set. The
-/// exclusion is now equality — `dispatch_family IN (…)` over
-/// `RunnerFamily::ALL` minus the saturated family — which SQLite
-/// expands into one seek per remaining family: this seeds the gate
-/// fixture's production shape, checks the claimable span is the
-/// planted window (the bulk parks `dispatch_eligible = 0`, so the
-/// claim page's `dispatch_eligible=?` equality seeks into the window
-/// instead of reading past parked rows — stow#597's read-past), then
-/// plants a burst of eligible future-wake misses and asserts both
-/// probes' plans bind `dispatch_family=?` inside the `idx_queue_wake`
-/// seek — reads bounded by the family count, never the eligible set.
+/// every deliver read the whole dispatch-eligible pending set — and a
+/// dropped filter when nothing was saturated (stow#833) lost the bound
+/// the same way. The term is now unconditional equality —
+/// `dispatch_family IN (…)` over `RunnerFamily::ALL` minus the
+/// saturated families — which SQLite expands into one seek per
+/// surviving family: each arm seeds the gate fixture's production
+/// shape, checks the claimable span is the planted window (the bulk
+/// parks `dispatch_eligible = 0`, so the claim page's
+/// `dispatch_eligible=?` equality seeks into the window instead of
+/// reading past parked rows — stow#597's read-past), then plants a
+/// burst of eligible future-wake misses and asserts both probes' plans
+/// bind `dispatch_family=?` inside the `idx_queue_wake` seek — reads
+/// bounded by the family count, never the eligible set.
 #[tokio::test]
 async fn wake_probes_seek_each_remaining_familys_wake_range() {
+    // The live `full_family` a macOS backlog produces — the family
+    // the exclusion must remove from the probes' seeks.
+    check_wake_probe_seeks(
+        SchedulerSettings {
+            max_concurrent_macos_jobs: 0,
+            ..SchedulerSettings::default()
+        },
+        "'linux', 'windows'",
+        "macos-saturated",
+    )
+    .await;
+    // Nothing saturated: the fixture's one-slot in-flight batches
+    // leave macOS under its cap, so `saturated` is empty — the probes
+    // must still carry the family equality, rendered over
+    // `RunnerFamily::ALL` in its declared order, or the `wake_at`
+    // range loses its bound (stow#833).
+    check_wake_probe_seeks(
+        SchedulerSettings::default(),
+        "'linux', 'macos', 'windows'",
+        "unsaturated",
+    )
+    .await;
+}
+
+/// One arm of [`wake_probes_seek_each_remaining_familys_wake_range`]:
+/// seed the gate fixture under `settings`, defer every pending wake so
+/// both probes log, and assert each statement's plan and `IN` list —
+/// `expected_in` is the rendered operand list of
+/// `RunnerFamily::ALL` minus the families `settings` saturates.
+async fn check_wake_probe_seeks(settings: SchedulerSettings, expected_in: &str, label: &str) {
     let (db, log) = counting_memory_db().await.expect("counting db");
-    let settings = SchedulerSettings {
-        // The live `full_family` a macOS backlog produces — the family
-        // the exclusion must remove from the probes' seeks.
-        max_concurrent_macos_jobs: 0,
-        ..SchedulerSettings::default()
-    };
     fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
         .await
         .expect("seed fixture");
@@ -1617,56 +1653,53 @@ async fn wake_probes_seek_each_remaining_familys_wake_range() {
     let mut deferred_probe = false;
     let mut frontier = false;
     for statement in &statements {
-        if !statement.sql.contains("dispatch_family IN") {
-            continue;
-        }
-        let detail = explain_details(&db, statement).await.join("\n");
-        assert!(
-            !detail.contains("SCAN queue"),
-            "family-excluded statement scanned the queue:\n{}\nplan:\n{detail}",
-            statement.sql
-        );
+        let detail;
         if statement.sql.contains("wake_at <= ?") {
             ready_probe = true;
+            detail = explain_details(&db, statement).await.join("\n");
             assert!(
                 detail.contains("SEARCH queue USING")
                     && detail.contains("idx_queue_wake")
-                    && detail.contains("dispatch_family=?"),
-                "ready probe lost the family equality seek:\n{detail}"
+                    && detail.contains("dispatch_family=?")
+                    && detail.contains("wake_at<?"),
+                "{label}: ready probe lost the family equality seek:\n{detail}"
             );
         } else if statement.sql.contains("wake_at > ?") {
             deferred_probe = true;
+            detail = explain_details(&db, statement).await.join("\n");
             assert!(
                 detail.contains("SEARCH queue USING")
                     && detail.contains("idx_queue_wake")
-                    && detail.contains("dispatch_family=?"),
-                "deferred probe lost the family equality seek:\n{detail}"
+                    && detail.contains("dispatch_family=?")
+                    && detail.contains("wake_at>?"),
+                "{label}: deferred probe lost the family equality seek:\n{detail}"
             );
         } else if statement.sql.contains("q.dispatch_key > ?") {
             frontier = true;
+            detail = explain_details(&db, statement).await.join("\n");
             // The claim page's seek: `dispatch_eligible=?` equality
             // bounds the walk before the `dispatch_key` range — the
             // parked bulk is outside the index span, not read-past
-            // inside it (stow#597).
+            // inside it (stow#597). `dispatch_family` sits behind that
+            // range, so the extra `IN` is a residual term the plan
+            // does not show.
             assert!(
                 detail.contains("idx_queue_claim")
                     && detail.contains("dispatch_eligible=?")
                     && detail.contains("dispatch_key>?"),
-                "claim page lost the eligible equality seek:\n{detail}"
+                "{label}: claim page lost the eligible equality seek:\n{detail}"
             );
-        }
-    }
-    assert!(
-        ready_probe && deferred_probe && frontier,
-        "both wake probes and the frontier must carry the family exclusion"
-    );
-    // The exclusion names exactly the remaining families — the bound is
-    // the family count, derived from `RunnerFamily::ALL`, not a list
-    // that can drift from it.
-    for statement in &statements {
-        if !statement.sql.contains("dispatch_family IN") {
+        } else {
             continue;
         }
+        assert!(
+            !detail.contains("SCAN queue"),
+            "{label}: family-filtered statement scanned the queue:\n{}\nplan:\n{detail}",
+            statement.sql
+        );
+        // The term names exactly the surviving families — the bound is
+        // the family count, derived from `RunnerFamily::ALL`, not a
+        // list that can drift from it.
         let column = if statement.sql.contains("q.dispatch_family") {
             "q.dispatch_family"
         } else {
@@ -1675,11 +1708,18 @@ async fn wake_probes_seek_each_remaining_familys_wake_range() {
         assert!(
             statement
                 .sql
-                .contains(&format!("{column} IN ('linux', 'windows')")),
-            "exclusion must be RunnerFamily::ALL minus macos: {}",
+                .contains(&format!("{column} IN ({expected_in})")),
+            "{label}: the family term must be RunnerFamily::ALL minus the \
+             saturated families: {}",
             statement.sql
         );
     }
+    assert!(
+        ready_probe && deferred_probe && frontier,
+        "{label}: both wake probes and the frontier must carry the family \
+         term (ready={ready_probe}, deferred={deferred_probe}, \
+         frontier={frontier})"
+    );
 }
 
 /// A coverage oracle that, on its first question, flips the head
@@ -1793,4 +1833,110 @@ async fn payload_driven_queue_updates_seek_the_primary_key() {
         "the pass must run the claim ({claim}), the dropped-batch restore ({unclaim}) \
          and the back-off ({back_off})"
     );
+}
+
+/// The freeze-trip bucket read must stay a bounded index range: the
+/// dropped upper bound returned every future bucket the seed ever
+/// wrote, and the `ORDER BY target, bucket` steered the planner onto
+/// the `(target, bucket)` primary key — a full-table walk the host
+/// gate's scan rule would name `SCAN attempt_outcome_buckets` the
+/// moment the host failure drive ran the read (stow#833). The fixed
+/// statement is one `idx_attempt_outcome_buckets_bucket` range bounded
+/// on both ends, exactly the read the resolution failure arm now runs
+/// on host through `freeze_trip_draft`.
+#[tokio::test]
+async fn freeze_trip_bucket_read_is_a_bounded_index_range() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    queue::freeze_trip_draft(&db, &crate::freeze::FreezeSettings::default())
+        .await
+        .expect("freeze trip draft");
+    let statements = log.lock().expect("log").to_vec();
+
+    let mut read = false;
+    for statement in &statements {
+        if !statement.sql.contains("FROM attempt_outcome_buckets") {
+            continue;
+        }
+        read = true;
+        let detail = explain_details(&db, statement).await.join("\n");
+        assert!(
+            detail.contains(
+                "SEARCH attempt_outcome_buckets USING INDEX \
+                 idx_attempt_outcome_buckets_bucket (bucket>? AND bucket<?)"
+            ),
+            "freeze-trip bucket read lost its bounded index range:\n{}\nplan:\n{detail}",
+            statement.sql
+        );
+    }
+    assert!(read, "the trip check must read attempt_outcome_buckets");
+}
+
+/// The bounded range's read set on the seeded gate fixture: at most
+/// `(window / 5 + 1)` buckets per target — the window edge can
+/// straddle one extra bucket — over `CI_TARGET_TRIPLES`, never the
+/// stored bulk (stow#833). The fixture seeds its bucket rows at and
+/// ahead of the current bucket, so the old unbounded-above read
+/// returned all of them.
+#[tokio::test]
+async fn freeze_trip_bucket_read_stays_inside_the_window() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let settings = SchedulerSettings::default();
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
+
+    let freeze = crate::freeze::FreezeSettings::default();
+    let base = log.lock().expect("log").len();
+    queue::freeze_trip_draft(&db, &freeze)
+        .await
+        .expect("freeze trip draft");
+    let statements = log.lock().expect("log")[base..].to_vec();
+
+    let bound = u64::from(freeze.window_minutes / 5 + 1)
+        * u64::try_from(stow_types::api::CI_TARGET_TRIPLES.len()).expect("target count fits u64");
+    let mut read = false;
+    for statement in &statements {
+        if !statement.sql.contains("FROM attempt_outcome_buckets") {
+            continue;
+        }
+        read = true;
+        assert!(
+            statement.rows_read <= bound,
+            "the window read returned {} rows — the bound is \
+             (window/5 + 1) × CI_TARGET_TRIPLES = {bound}",
+            statement.rows_read
+        );
+    }
+    assert!(read, "the trip check must read attempt_outcome_buckets");
+}
+
+/// `ready_batches` must seek `idx_build_batches_resolve`: the
+/// `ORDER BY batch_id` it used to carry steered the planner onto
+/// `sqlite_autoindex_build_batches_1` — a walk of every in-flight
+/// batch for a read the resolvable set bounds (stow#833). No caller
+/// depends on batch order: legs arrive keyed by `batch_id` and each
+/// consumer finds its batch by name.
+#[tokio::test]
+async fn ready_batches_seeks_the_resolve_index() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    queue::ready_batches(&db, 0).await.expect("ready batches");
+    let statements = log.lock().expect("log").to_vec();
+
+    let mut read = false;
+    for statement in &statements {
+        if !statement.sql.contains("FROM build_batches") {
+            continue;
+        }
+        read = true;
+        let detail = explain_details(&db, statement).await.join("\n");
+        assert!(
+            detail.contains(
+                "SEARCH build_batches USING INDEX \
+                 idx_build_batches_resolve (resolve_after<?)"
+            ),
+            "ready_batches lost the resolve_after seek:\n{}\nplan:\n{detail}",
+            statement.sql
+        );
+    }
+    assert!(read, "the resolution pass must read build_batches");
 }

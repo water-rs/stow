@@ -3137,6 +3137,14 @@ async fn resolve_completed_batch(
                 outcome.conclusion()
             ));
         }
+        if any_failure {
+            // The failure arm's freeze check: the wasm path's
+            // `evaluate_dispatch_freeze` runs this same read before the
+            // alert side effects a host drive has no counterpart for.
+            queue::freeze_trip_draft(db, &crate::freeze::FreezeSettings::default())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 }

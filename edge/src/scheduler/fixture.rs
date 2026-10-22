@@ -1437,6 +1437,10 @@ pub async fn rearm(
             .await
             .map_err(|error| QueueError::Sql(format!("re-arm inserted rows: {error}")))?;
     }
+    // The seeded rings are the sample table's intended cost state —
+    // the wholesale delete above removes them with the learned rows,
+    // so re-plant them (stow#833).
+    seed_sample_rings(db).await?;
     // The mutation drives' exact targets. `pending_row`/`failed_row`
     // and friends are the same positional helpers the drives select
     // with, so the restore cannot drift from the selectors.
@@ -1687,6 +1691,9 @@ pub async fn seed_batch(
             }
             SeedPhase::OutcomeBuckets => {
                 seed_outcome_buckets_chunk(db, shape, n, hi).await?;
+                if hi >= phase.range_end(shape) {
+                    seed_sample_rings(db).await?;
+                }
             }
         }
     }
@@ -1871,6 +1878,43 @@ async fn seed_outcome_buckets_chunk(
     Ok(())
 }
 
+/// `BUILD_SAMPLE_WINDOW` sample rows for every `(crate_name, target)`
+/// key the planted dispatch window carries. A busy key's ring sits at
+/// the cap in production, and every resolved batch leg pays the cap
+/// delete and the median recompute over it — an empty table would let
+/// the resolution drives measure ~5-entry rings and under-price the
+/// steady state (stow#833). The keys derive from the same constants
+/// the window is planted from — `w` runs `(HUMAN_LANE_ROWS,
+/// HUMAN_LANE_ROWS + DISPATCH_ELIGIBLE_ROWS]` with
+/// `'crate' || (w / CRATE_NAME_ROWS)` and the row's target arm — so
+/// the ring count depends on the window alone, never `queue_rows`.
+/// `generation_id`s are deterministic ring ids no claim can mint, so
+/// `INSERT OR IGNORE` keeps a replayed completion arm a dedupe pass.
+async fn seed_sample_rings(db: &DurableDb) -> Result<(), QueueError> {
+    let human_end = FixtureShape::HUMAN_LANE_ROWS;
+    let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
+    let target_case = target_case_sql("w");
+    db.query(&format!(
+        "WITH RECURSIVE seq(n) AS ({}), \
+         window(w) AS (SELECT {human_end} + 1 UNION ALL \
+                       SELECT w + 1 FROM window WHERE w < {eligible_end}) \
+         INSERT OR IGNORE INTO crate_build_samples \
+             (crate_name, target, generation_id, duration_ms) \
+         SELECT 'crate' || (w / {CRATE_NAME_ROWS}), {target_case}, \
+                'seed-ring-' || printf('%016x', n), 45000 + n * 1400 \
+         FROM window CROSS JOIN seq",
+        seq_sql(
+            0,
+            u32::try_from(crate::scheduler::queue::BUILD_SAMPLE_WINDOW)
+                .expect("the sample window fits u32"),
+        ),
+    ))
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("seed sample rings: {error}")))?;
+    Ok(())
+}
+
 /// Seed the whole fixture on the host path — the same chunks the/// Seed the whole fixture on the host path — the same chunks the
 /// workerd probe writes, looped until the seed reports done.
 ///
@@ -1938,6 +1982,11 @@ const SEED_TABLES: &[&str] = &[
     // wipe and grow past the new shape's proportion (stow#816, same
     // defect class as the feed tables above).
     "attempt_outcome_buckets",
+    // The seeded sample rings are fixture state the same way: a
+    // learned sample from a previous seed's drives would otherwise
+    // survive into a ring that must sit at exactly
+    // `BUILD_SAMPLE_WINDOW` (stow#833).
+    "crate_build_samples",
 ];
 
 /// `POST /budget/seed` — load the fixture through the operator path,
@@ -2400,6 +2449,16 @@ mod tests {
         .execute()
         .await
         .expect("plant stale outcome bucket");
+        // The seeded sample rings are fixture state too — a row under
+        // a key the seed never writes stands in the same way (stow#833).
+        db.query(
+            "INSERT INTO crate_build_samples \
+             (crate_name, target, generation_id, duration_ms) \
+             VALUES ('stale-crate', 'stale-target', 'stale-gen', 1)",
+        )
+        .execute()
+        .await
+        .expect("plant stale sample row");
         run(true, 200).await;
 
         let small = FixtureShape { queue_rows: 200 };
@@ -2432,6 +2491,31 @@ mod tests {
             buckets,
             i64::from(outcome_bucket_rows(small)),
             "seeded outcome bulk — no stale rows"
+        );
+        assert_seeded_sample_rings(&db).await;
+    }
+
+    /// The window's `(crate_name, target)` keys: `w` runs
+    /// `(HUMAN_LANE_ROWS, HUMAN_LANE_ROWS + DISPATCH_ELIGIBLE_ROWS]`
+    /// and every 50-row crate block covers all `CI_TARGET_TRIPLES`
+    /// arms, so the ring count is the window's constant key count ×
+    /// `BUILD_SAMPLE_WINDOW` at every fixture size (stow#833).
+    async fn assert_seeded_sample_rings(db: &DurableDb) {
+        let human_end = i64::from(FixtureShape::HUMAN_LANE_ROWS);
+        let eligible_end = human_end + i64::from(FixtureShape::DISPATCH_ELIGIBLE_ROWS);
+        let keys = (eligible_end / i64::from(CRATE_NAME_ROWS)
+            - (human_end + 1) / i64::from(CRATE_NAME_ROWS)
+            + 1)
+            * i64::try_from(CI_TARGET_TRIPLES.len()).expect("target count fits i64");
+        let samples = db
+            .query("SELECT COUNT(*) FROM crate_build_samples")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count build samples");
+        assert_eq!(
+            samples,
+            keys * crate::scheduler::queue::BUILD_SAMPLE_WINDOW,
+            "seeded rings at the cap — no stale rows"
         );
     }
 

@@ -1024,20 +1024,19 @@ fn iso_now() -> String {
 }
 
 /// After a failed completion, decide whether the trailing window trips
-/// the freeze. `apply_transition` owns the one-alert-per-transition
-/// rule: a live freeze answers `Unchanged` without rewriting the
-/// record or resending the alert. Storage and query errors propagate
-/// (loud); the alert's outcome only ever lands on the record.
+/// the freeze. `freeze_trip_draft` owns the database half — the
+/// already-frozen gate plus the window read — which the host cost
+/// drive calls too, so both arms bill the same statements.
+/// `apply_transition` owns the one-alert-per-transition rule: a live
+/// freeze answers `Unchanged` without rewriting the record or
+/// resending the alert. Storage and query errors propagate (loud);
+/// the alert's outcome only ever lands on the record.
 async fn evaluate_dispatch_freeze(
     env: &WasmEnv,
     db: &DurableDb,
     settings: &FreezeSettings,
 ) -> Result<()> {
-    // Cheap gate first — skip the window query entirely when frozen.
-    if queue::freeze_enabled(db).await.map_err(to_error)? {
-        return Ok(());
-    }
-    let Some(draft) = queue::evaluate_freeze_trip(db, settings)
+    let Some(draft) = queue::freeze_trip_draft(db, settings)
         .await
         .map_err(to_error)?
     else {
