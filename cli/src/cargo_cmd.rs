@@ -6180,6 +6180,7 @@ mod tests {
                     features_json: String::new(),
                     dependency_c_metadata_json: "[]".to_owned(),
                     dependency_compile_keys_json: "[]".to_owned(),
+                    dependency_instances_json: "[]".to_owned(),
                     compile_millis: 0,
                     size_bytes: 0,
                     profile: cached_dependency_profile(),
