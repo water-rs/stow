@@ -4,15 +4,16 @@ name: Release gate
 # mock end-to-end, the traffic-cost and preheat-cost tests, the production
 # wave count, and the monthly projection over what those three measured.
 # They run three ways —
-# `workflow_dispatch` on any ref, nightly on dev's head (03:00 ET), and on
-# pull requests and merge groups into main, where the `main` ruleset
-# requires this workflow's `Release gate` check.
+# `workflow_dispatch` on any ref, nightly on dev's head (03:00 ET), and in
+# main's merge group, where the `main` ruleset requires this workflow's
+# `Release gate` check.
 #
-# The `merge_group` trigger carries no branch filter because dev's queue
-# fires it as well as main's: every leg below skips itself when the group's
-# base ref is not main (`github.event.merge_group.base_ref` is the group's
-# target branch), so a dev merge pays only the gate job's seconds while the
-# required check still reports.
+# A pull request into main and a dev merge group run only the gate job: the
+# required check still reports, and the legs run once, in main's merge
+# group, which tests the tree that lands. The `merge_group` trigger carries
+# no branch filter because dev's queue fires it as well as main's, so every
+# leg checks the group's base ref (`github.event.merge_group.base_ref` is
+# the group's target branch).
 on:
   workflow_dispatch:
   schedule:
@@ -41,12 +42,12 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
-  # Every leg skips itself in a dev merge group — see the header. On any
-  # other trigger it runs unconditionally: a release gate or a nightly tick
-  # has no "changed paths" to scope to, and the nightly exists to catch a
-  # drift no change drove.
+  # Every leg skips itself on a pull request and in a dev merge group — see
+  # the header. Otherwise it runs unconditionally: a release gate or a
+  # nightly tick has no "changed paths" to scope to, and the nightly exists
+  # to catch a drift no change drove.
   mock-e2e:
-    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Mock end-to-end
     runs-on: ubuntu-latest
     permissions:
@@ -121,7 +122,7 @@ jobs:
   # signal or 5xx under the drive. Its reports are what the `Monthly
   # projection` job prices the month from.
   traffic-cost:
-    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Traffic cost
     runs-on: ubuntu-latest
     timeout-minutes: 110
@@ -179,7 +180,7 @@ jobs:
   # production lanes outran this job's timeout beside the wave's builds,
   # so the `Production wave` job counts it.
   preheat-cost:
-    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Preheat cost
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -237,7 +238,7 @@ jobs:
   # minutes for the projects lane, which is why it has a job of its own
   # and a timeout of its own. It fails when a lane fails or plans nothing.
   production-wave:
-    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Production wave
     runs-on: ubuntu-latest
     # Measured 37 minutes (the projects lane dominates), plus half.
@@ -286,7 +287,7 @@ jobs:
   # project` prints the traffic, preheat and total beside the bound for
   # each product and fails when any total is over it.
   projection:
-    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     needs:
       - traffic-cost
       - preheat-cost
