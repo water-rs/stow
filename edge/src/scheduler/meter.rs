@@ -333,10 +333,21 @@ impl Meter {
 }
 
 /// The probe ledger's op name for one request: `<METHOD> <route>`, with
-/// a request-record id collapsed to `{id}` so every record's reads land
-/// on one row.
+/// a request-record id collapsed to `{id}` and a batch's completion
+/// collapsed to [`LEDGER_OP_BATCH_COMPLETE`], so every record's reads
+/// and every batch's completion land on one row each.
+///
+/// [`LEDGER_OP_BATCH_COMPLETE`]: stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE
 #[must_use]
 pub fn ledger_op(method: &str, path: &str) -> String {
+    if method == "POST"
+        && path
+            .strip_prefix("/batches/")
+            .and_then(|rest| rest.strip_suffix("/complete"))
+            .is_some_and(|batch_id| !batch_id.is_empty() && !batch_id.contains('/'))
+    {
+        return stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE.to_owned();
+    }
     let route = path.strip_prefix("/requests/").map_or_else(
         || path.to_owned(),
         |rest| {
@@ -522,6 +533,46 @@ mod tests {
     /// backend — the same `Meter::wrap` shape production installs.
     async fn metered() -> Result<(DurableDb, Meter), QueueError> {
         Ok(Meter::wrap(memory_db().await?))
+    }
+
+    /// Every request record books under one op per route.
+    #[test]
+    fn a_request_record_id_collapses_to_its_route() {
+        assert_eq!(
+            super::ledger_op("GET", "/requests/7f3a"),
+            "GET /requests/{id}"
+        );
+        assert_eq!(
+            super::ledger_op("POST", "/requests/7f3a/outcome"),
+            "POST /requests/{id}/outcome"
+        );
+        assert_eq!(super::ledger_op("POST", "/requests"), "POST /requests");
+    }
+
+    /// Every batch's completion books under the one op the Preheat cost
+    /// report reads as its `Completion` kind; nothing else under
+    /// `/batches/` collapses into it.
+    #[test]
+    fn a_batch_completion_collapses_to_the_shared_ledger_op() {
+        let completion = stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE;
+        assert_eq!(
+            super::ledger_op("POST", "/batches/00000000000000000000000000000001/complete"),
+            completion
+        );
+        assert_eq!(
+            super::ledger_op("POST", "/batches/a/complete"),
+            super::ledger_op("POST", "/batches/b/complete")
+        );
+        assert_eq!(
+            stow_types::preheat_cost::EventKind::Completion.ledger_op(),
+            completion
+        );
+        assert_ne!(super::ledger_op("GET", "/batches/a/complete"), completion);
+        assert_ne!(super::ledger_op("POST", "/batches//complete"), completion);
+        assert_ne!(
+            super::ledger_op("POST", "/batches/a/b/complete"),
+            completion
+        );
     }
 
     #[tokio::test]

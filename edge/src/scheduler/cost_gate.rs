@@ -27,6 +27,7 @@
 //! may never be raised to pass a regression.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use skyzen::FromRow;
@@ -151,26 +152,6 @@ const BUDGETS: &[RouteBudget] = &[
     },
     // Mutation routes — one keyed statement each against a bounded
     // selector.
-    RouteBudget {
-        // The success arm also prices the build-cost bookkeeping
-        // (stow#524): one generation-keyed sample insert, the
-        // newest-BUILD_SAMPLE_WINDOW cap delete, the window's
-        // ≤-window read, the stats upsert and — only when the median
-        // moved — a keyed refresh over exactly the same-(crate, target)
-        // pending rows.
-        name: "POST /tasks/complete-run",
-        statements: 14,
-        rows_read: 120,
-        rows_written: 60,
-        scan_allowlist: &[],
-    },
-    RouteBudget {
-        name: "POST /tasks/complete-run (failure)",
-        statements: 9,
-        rows_read: 80,
-        rows_written: 20,
-        scan_allowlist: &[],
-    },
     RouteBudget {
         // Measured 4/4/8 once the host backend counts `RETURNING`
         // writes (stow#796): the two retried rows, their status-count
@@ -311,13 +292,20 @@ const BUDGETS: &[RouteBudget] = &[
     // legitimate bound: the report body names every row).
     // The whole route (stow#785): the report — with its commit-time
     // shape repair — plus the `dispatch_pending` claiming tail and
-    // wake re-plan. The 10k host gate measured 37 statements, 106
-    // reads, 101 writes.
+    // wake re-plan. The 10k host gate measured 22 statements, 612
+    // reads, 464 writes. The tail's pass claims at most free slots /
+    // `STOW_BATCH_PARALLELISM` × `STOW_BATCH_MAX_TASKS` legs — the
+    // dispatch cap bounds it, not the event: the thirty one-slot
+    // in-flight batches leave 15 of the 45 slots, filled with 3 miss
+    // batches of 40 legs: 120 claimed legs, 3 writes each (the
+    // `UPDATE queue` claim, 360 of the 464) plus the 100 slice rows
+    // the report names. Reads and writes budgeted at the measurement
+    // plus 20%.
     RouteBudget {
         name: "POST /index/published (full)",
         statements: 90,
-        rows_read: 600,
-        rows_written: 300,
+        rows_read: 735,
+        rows_written: 560,
         scan_allowlist: &[],
     },
     // A report whose membership moved by DELTA_ROWS: the gate writes
@@ -326,23 +314,33 @@ const BUDGETS: &[RouteBudget] = &[
     // slice or the graph (stow#521) — plus the same dispatch tail as
     // the full drive and the report-time shape repair, which can
     // requeue the deps the retire just uncovered. The 10k host gate
-    // measured 39 statements, 171 reads, 84 writes.
+    // measured 25 statements, 697 reads, 530 writes, the tail's claim
+    // bounded by the dispatch cap as the full drive's is: 120 claimed
+    // legs, 3 writes each. Reads and writes budgeted at the
+    // measurement plus 20%.
     RouteBudget {
         name: "POST /index/published (delta)",
         statements: 110,
-        rows_read: 600,
-        rows_written: 300,
+        rows_read: 840,
+        rows_written: 640,
         scan_allowlist: &[],
     },
     // The alarm's dispatch pass on a warm queue: the claim pages at
     // `2 × open slots` candidate rows and claims them, so the pass's
     // read is bounded by the dispatch cap plus the fixed probes,
-    // never by the frontier or the queue.
+    // never by the frontier or the queue. The pass fills the 15 free
+    // slots with 3 miss batches of 40 legs (claimed legs ≤ free slots /
+    // `STOW_BATCH_PARALLELISM` × `STOW_BATCH_MAX_TASKS`) — 120 legs.
+    // The 10k host gate measured 15 statements, 774 reads, 363 writes:
+    // the claim page reads 256 candidates, the node-store walk 264, the
+    // batch-id draw 123, and the `UPDATE queue` claim writes 3 per
+    // leg (360 of the 363). Reads and writes budgeted at the
+    // measurement plus 20%.
     RouteBudget {
         name: "alarm pass",
         statements: 90,
-        rows_read: 400,
-        rows_written: 150,
+        rows_read: 930,
+        rows_written: 440,
         scan_allowlist: &[],
     },
     RouteBudget {
@@ -354,15 +352,99 @@ const BUDGETS: &[RouteBudget] = &[
         rows_written: 4,
         scan_allowlist: &[],
     },
+    // The batch drives (stow#833). Each setup claims one full batch of
+    // `STOW_BATCH_MAX_TASKS` = 40 legs from the planted window — the
+    // one-leg resolution's, one leg — and binds it to a run; the
+    // batch's leg count is the per-event bound every
+    // row below names, and none of them reads or writes in proportion to
+    // the queue. Budgeted at the 10k host measurement plus 25%, rounded
+    // down; the 20k fixture measured within it. The route's write is one
+    // keyed `UPDATE build_batches`, so it does not scale with the legs
+    // at all.
+    RouteBudget {
+        // Measured 7 statements, 7 reads, 1 write: the completion
+        // `UPDATE` (1 statement, 1 write) and the six statements of
+        // the `schedule_alarm` re-plan.
+        name: "POST /batches/{batch_id}/complete (success)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 1,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // The conclusion is carried verbatim: the success delivery's
+        // measurement, 7/7/1.
+        name: "POST /batches/{batch_id}/complete (failure)",
+        statements: 8,
+        rows_read: 8,
+        rows_written: 1,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // Bounded by `STOW_BATCH_MAX_TASKS` legs: `ready_batches` and
+        // its leg read once, then per leg `complete`'s fenced `UPDATE`,
+        // its outcome counter and window expiry, and the build sample's
+        // insert, cap delete, stats read and write, and the keyed
+        // dispatch-key refresh over the leg's own `(crate, target)`
+        // pending rows — about 11 statements a leg, each leg's median
+        // moving because the fixture holds no earlier sample. Measured
+        // 443 statements, 1530 reads, 436 writes — the seeded
+        // `BUILD_SAMPLE_WINDOW` rings price the cap delete and median
+        // recompute at production's steady state (stow#833). The batch
+        // row's delete is the last statement.
+        name: "alarm pass (batch resolution)",
+        statements: 553,
+        rows_read: 1_912,
+        rows_written: 545,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // The same resolution over a batch of one leg: the fixed part
+        // (`ready_batches`' batch row and the batch row's delete) plus
+        // one leg's `complete` and build sample — its ring reads at
+        // the `BUILD_SAMPLE_WINDOW` cap (stow#833). The callback's
+        // price per build. Measured 14 statements, 38 reads, 11 writes.
+        name: "alarm pass (batch resolution, one leg)",
+        statements: 17,
+        rows_read: 47,
+        rows_written: 13,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // The same 40 legs all failed: per leg the retry `UPDATE`, its
+        // follow-up refreshes and the outcome counter and evidence rows,
+        // with no build sample — about 7 statements a leg. Measured 283
+        // statements, 121 reads, 201 writes.
+        name: "alarm pass (batch resolution, failure)",
+        statements: 350,
+        rows_read: 150,
+        rows_written: 250,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // One expired bound batch with a live run: the expired-batch
+        // read (`EXPIRED_BATCH_LIMIT` rows at most, and the in-flight
+        // set is bounded by the slot caps) and the keyed lease
+        // extension. Measured 2 statements, 1 read, 1 write.
+        name: "alarm pass (lease check)",
+        statements: 2,
+        rows_read: 1,
+        rows_written: 1,
+        scan_allowlist: &[],
+    },
     RouteBudget {
         // One real dispatch pass over the floored queue — the same
         // claim/plan surface as the hot pass, priced separately so
         // the gate sees planner and claim cost under a positive
-        // persisted floor (stow#525).
+        // persisted floor (stow#525). It claims the same 120 legs in 3
+        // miss batches (claimed legs ≤ free slots /
+        // `STOW_BATCH_PARALLELISM` × `STOW_BATCH_MAX_TASKS`) and
+        // measured the hot pass's 15 statements, 774 reads, 363 writes,
+        // budgeted at the measurement plus 20%.
         name: "alarm pass (floor claim)",
         statements: 90,
-        rows_read: 500,
-        rows_written: 150,
+        rows_read: 930,
+        rows_written: 440,
         scan_allowlist: &[],
     },
     // Every demand-feed cap below is PROVISIONAL: host-measured on the
@@ -884,6 +966,8 @@ async fn run_one_drive(
 ) -> Result<(), String> {
     let mut keep = 0;
     let mut base = 0;
+    let batches_before = batch_surface(db).await;
+    let queue_before = queue_surface(db).await;
     let outcome =
         drives::drive_lifecycle(
             drive,
@@ -926,6 +1010,27 @@ async fn run_one_drive(
         Some(Err(error)) => Err(format!("{} cleanup failed: {error}", drive.name)),
         _ => Ok(()),
     };
+    // A drive that claims leaves `build_batches` as it found it: the
+    // slots its claim took must not reach the next drive's capacity
+    // read.
+    let end = log.lock().expect("statement log").len();
+    let batches_after = batch_surface(db).await;
+    let queue_after = queue_surface(db).await;
+    log.lock().expect("statement log").truncate(end);
+    if batches_before != batches_after {
+        return Err(format!(
+            "{} left build_batches changed: before {batches_before:?}, after {batches_after:?}",
+            drive.name
+        ));
+    }
+    // A drive leaves the queue as it found it: a pending row it added
+    // is claimable by the next pass drive, its edges and nodes widen
+    // every later walk, and a flag it flipped changes what the claim
+    // walk can open. No exemptions — a drive that moves pending rows
+    // restores them in its own cleanup, so a changed count is a leak.
+    if let Some(left) = queue_before.left_behind(&queue_after) {
+        return Err(format!("{} left the queue changed: {left}", drive.name));
+    }
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => {
             let statements = log.lock().expect("statement log")[base..].to_vec();
@@ -940,6 +1045,85 @@ async fn run_one_drive(
             drive.name
         )),
     }
+}
+
+/// What a drive can leave in the queue: the task ids, plus the
+/// derived-id (`-`-bearing, never a fixture hex id) edge and node rows
+/// its enqueue writes, and how many pending rows are unparked
+/// (`dispatch_eligible = 1`) — a drive that moves the floor and does
+/// not put the flags back changes every later pass's claim walk.
+struct QueueSurface {
+    task_ids: std::collections::BTreeSet<String>,
+    eligible_pending: i64,
+    derived_edges: i64,
+    derived_nodes: i64,
+}
+
+impl QueueSurface {
+    /// A description of how `after` differs from `self`, `None` when
+    /// the drive left the surface as it found it — every drive is held
+    /// to it. A route that moves pending rows restores them in its own
+    /// cleanup, so a changed eligible-pending count is always a leak.
+    fn left_behind(&self, after: &Self) -> Option<String> {
+        let added: Vec<&String> = after.task_ids.difference(&self.task_ids).collect();
+        (!added.is_empty()
+            || after.eligible_pending != self.eligible_pending
+            || after.derived_edges != self.derived_edges
+            || after.derived_nodes != self.derived_nodes)
+            .then(|| {
+                format!(
+                    "task ids added {added:?}, eligible pending rows {} -> {}, \
+                     derived edges {} -> {}, derived nodes {} -> {}",
+                    self.eligible_pending,
+                    after.eligible_pending,
+                    self.derived_edges,
+                    after.derived_edges,
+                    self.derived_nodes,
+                    after.derived_nodes
+                )
+            })
+    }
+}
+
+/// The queue's [`QueueSurface`], read unmetered.
+async fn queue_surface(db: &DurableDb) -> QueueSurface {
+    QueueSurface {
+        task_ids: db
+            .query("SELECT task_id FROM queue")
+            .fetch_scalars::<String>()
+            .await
+            .expect("read queue ids")
+            .into_iter()
+            .collect(),
+        eligible_pending: db
+            .query("SELECT COUNT(*) FROM queue WHERE status = 'pending' AND dispatch_eligible = 1")
+            .fetch_scalar()
+            .await
+            .expect("count eligible pending rows"),
+        derived_edges: db
+            .query("SELECT COUNT(*) FROM queue_dependencies WHERE task_id LIKE '%-%'")
+            .fetch_scalar()
+            .await
+            .expect("count derived edges"),
+        derived_nodes: db
+            .query("SELECT COUNT(*) FROM task_nodes WHERE task_id LIKE '%-%'")
+            .fetch_scalar()
+            .await
+            .expect("count derived nodes"),
+    }
+}
+
+/// Every `build_batches` row's identity and slot facts, sorted — the
+/// stamps (`claimed_at`, `lease_at`) are clock readings and left out.
+async fn batch_surface(db: &DurableDb) -> Vec<String> {
+    db.query(
+        "SELECT batch_id || '|' || rustc_version || '|' || dispatch_family || '|' || lane \
+                || '|' || parallelism || '|' || legs || '|' || COALESCE(github_run_id, '') \
+         FROM build_batches ORDER BY batch_id",
+    )
+    .fetch_scalars::<String>()
+    .await
+    .expect("read build_batches")
 }
 
 /// Every entry of [`drives::DRIVES`] holds its budget on the 10k gate
@@ -983,31 +1167,19 @@ async fn per_request_cost_gate() {
     );
 }
 
-#[derive(Debug, skyzen::FromRow)]
-struct RunningTarget {
-    attempt: i64,
-    github_run_id: Option<String>,
-    generation_id: String,
-}
-
-async fn running_target(db: &DurableDb, shape: fixture::FixtureShape) -> RunningTarget {
-    db.query("SELECT attempt, github_run_id, generation_id FROM queue WHERE task_id = printf('%064x', ?)")
-        .bind(i64::from(shape.running_row()))
-        .fetch_optional::<RunningTarget>()
+/// Σ `outcomes` and Σ `failures` over every attempt-outcome bucket.
+async fn outcome_totals(db: &DurableDb) -> (i64, i64) {
+    let outcomes = db
+        .query("SELECT COALESCE(SUM(outcomes), 0) FROM attempt_outcome_buckets")
+        .fetch_scalar::<i64>()
         .await
-        .expect("running target query")
-        .expect("running target row")
-}
-
-async fn running_outcomes(db: &DurableDb, shape: fixture::FixtureShape) -> i64 {
-    db.query(
-        "SELECT COALESCE(SUM(outcomes), 0) FROM attempt_outcome_buckets \
-         WHERE target = (SELECT target FROM queue WHERE task_id = printf('%064x', ?))",
-    )
-    .bind(i64::from(shape.running_row()))
-    .fetch_scalar::<i64>()
-    .await
-    .expect("running outcomes")
+        .expect("outcome total");
+    let failures = db
+        .query("SELECT COALESCE(SUM(failures), 0) FROM attempt_outcome_buckets")
+        .fetch_scalar::<i64>()
+        .await
+        .expect("failure total");
+    (outcomes, failures)
 }
 
 async fn status_of(db: &DurableDb, task_id: &str) -> String {
@@ -1018,14 +1190,20 @@ async fn status_of(db: &DurableDb, task_id: &str) -> String {
         .expect("status")
 }
 
-async fn assert_failure_evidence(db: &DurableDb, shape: fixture::FixtureShape, expected: usize) {
+/// The failure evidence the batch-resolution drives leave: one row per
+/// failed leg of each pass, every one on a generation of its own.
+async fn assert_failure_evidence(db: &DurableDb, expected: usize) {
     let generations = db
-        .query("SELECT generation_id FROM attempt_outcomes_v2 WHERE task_id = printf('%064x', ?) AND attempt = 1")
-        .bind(i64::from(shape.dispatched_row(0)))
+        .query("SELECT generation_id FROM attempt_outcomes_v2 WHERE github_run_id = ?")
+        .bind(drives::BATCH_DRIVE_RUN_ID.to_string())
         .fetch_scalars::<String>()
         .await
         .expect("failure generations");
-    assert_eq!(generations.len(), expected, "each pass records its failure");
+    assert_eq!(
+        generations.len(),
+        expected,
+        "each pass records its failures"
+    );
     assert_eq!(
         generations
             .iter()
@@ -1036,6 +1214,39 @@ async fn assert_failure_evidence(db: &DurableDb, shape: fixture::FixtureShape, e
     );
     assert!(generations.iter().all(|generation| generation.len() == 32
         && generation.bytes().all(|byte| byte.is_ascii_hexdigit())));
+}
+
+/// What a pass's batch drives must leave behind besides their recorded
+/// evidence: no build sample or stat the resolved legs filed, and no
+/// queue row bound to a batch the fixture does not hold: every claiming
+/// drive restores its legs, so a bound orphan is a failed restore.
+async fn assert_batch_drives_cleaned_up(db: &DurableDb) {
+    // The fixture's seeded rings stay — the drives' cleanups remove
+    // only their own generations — so a leftover drive sample is any
+    // row outside the ring ids; the stats table still starts empty.
+    for (table, predicate) in [
+        (
+            "crate_build_samples",
+            "WHERE generation_id NOT LIKE 'seed-ring-%'",
+        ),
+        ("crate_build_stats", ""),
+    ] {
+        let rows = db
+            .query(&format!("SELECT COUNT(*) FROM {table} {predicate}"))
+            .fetch_scalar::<i64>()
+            .await
+            .expect("sample rows");
+        assert_eq!(rows, 0, "{table} outlived the batch drives");
+    }
+    let orphaned = db
+        .query(
+            "SELECT COUNT(*) FROM queue WHERE batch_id IS NOT NULL \
+             AND batch_id NOT IN (SELECT batch_id FROM build_batches)",
+        )
+        .fetch_scalar::<i64>()
+        .await
+        .expect("orphaned legs");
+    assert_eq!(orphaned, 0, "a leg is still bound to a released batch");
 }
 
 /// The gate truth a re-arm must leave behind. Every stored edge flag
@@ -1057,9 +1268,8 @@ async fn assert_rearm_gate_truth(db: &DurableDb, shape: fixture::FixtureShape, c
         shape.failed_row(1),
         shape.completed_row(0),
         shape.completed_row(1),
-        shape.running_row(),
-        shape.dispatched_row(0),
     ];
+    touched.extend((0..fixture::FixtureShape::IN_FLIGHT_ROWS).map(|k| shape.in_flight_row(k)));
     touched.extend(claimed.iter().filter_map(|id| {
         u64::from_str_radix(id, 16)
             .ok()
@@ -1120,8 +1330,8 @@ async fn assert_rearm_gate_truth(db: &DurableDb, shape: fixture::FixtureShape, c
 /// fixture prove the restore covers the whole mutation class — and the
 /// probe's own control state carries it: claimed rows restore from the
 /// pass's recorded claim set (a non-pending row the pass never touched
-/// survives), and the running target's `attempt` steps forward so each
-/// pass's completion lands on a fresh epoch.
+/// survives), and each pass's batch drives claim fresh generations, so
+/// their failure evidence accumulates rather than colliding.
 #[tokio::test]
 async fn budget_probe_repeats_on_a_persisted_fixture() {
     every_drive_has_exactly_one_row_in_each_budget_table();
@@ -1163,34 +1373,32 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
         .await
         .expect("re-arm (baseline)");
+    let seeded_batches = batch_surface(&db).await;
     // The fixture seeds `attempt_outcome_buckets` to sized bulk, so the
-    // target's `outcomes` sum is the seed's plus each pass's own
-    // transition — the delta is what counts once per completion.
-    let seeded_outcomes = running_outcomes(&db, shape).await;
+    // totals are the seed's plus each pass's own transitions — the
+    // delta is what counts once per leg.
+    let (seeded_outcomes, seeded_failures) = outcome_totals(&db).await;
+    let legs = i64::from(settings.batch_max_tasks);
     run_drives(&db, shape, &settings, &ctx, &log).await;
 
-    // The complete drive lands `completed` + stamps the run id; the
-    // same pass's shape-requeue sweep then re-enters the row as
-    // `pending` at `attempt + 1` — the post-pass read is that state,
-    // which is also the state the re-arm restores from. A success
-    // never writes a raw `attempt_outcomes_v2` row: the per-target
-    // bucket's `outcomes` count is the completion's evidence, and it
-    // must increase exactly once per landed transition.
-    let first = running_target(&db, shape).await;
-    let run_id = format!("run-{}", shape.running_row());
+    // The two full resolution drives each land one batch of `legs`
+    // legs and the one-leg drive a batch of one: the successful batches
+    // count `legs + 1` outcomes, the failed one `legs` outcomes and
+    // `legs` failures. A landed leg writes no raw
+    // `attempt_outcomes_v2` row on success — the bucket count is its
+    // evidence — and one row per leg on failure, each on the generation
+    // the claim minted. (Each drive's own cleanup already proved its
+    // batch reached its end state.)
     assert_eq!(
-        first.github_run_id.as_deref(),
-        Some(run_id.as_str()),
-        "the pass's completion landed and stamped its run id"
+        outcome_totals(&db).await,
+        (seeded_outcomes + 2 * legs + 1, seeded_failures + legs),
+        "the first pass's leg transitions counted once"
     );
-    assert_eq!(
-        running_outcomes(&db, shape).await,
-        seeded_outcomes + 1,
-        "the first pass's completed transition counted once"
-    );
+    let per_pass_evidence = usize::try_from(legs).expect("leg count fits usize");
+    assert_failure_evidence(&db, per_pass_evidence).await;
     let claimed = ctx.claimed_ids();
-    assert_failure_evidence(&db, shape, 1).await;
     assert!(!claimed.is_empty(), "the gate pass claims rows");
+    assert_batch_drives_cleaned_up(&db).await;
     fixture::record_probe_claimed(&db, &claimed)
         .await
         .expect("record claims");
@@ -1198,6 +1406,11 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
         .await
         .expect("re-arm fixture");
     assert_rearm_gate_truth(&db, shape, &claimed).await;
+    assert_eq!(
+        batch_surface(&db).await,
+        seeded_batches,
+        "re-arm returns build_batches to the fixture's in-flight batches"
+    );
 
     for (n, status, _) in untouched {
         let id = format!("{n:064x}");
@@ -1218,24 +1431,109 @@ async fn budget_probe_repeats_on_a_persisted_fixture() {
     }
 
     run_drives(&db, shape, &settings, &ctx, &log).await;
-    let second = running_target(&db, shape).await;
-    assert_eq!(second.github_run_id.as_deref(), Some(run_id.as_str()));
-    assert_ne!(second.generation_id, first.generation_id);
-    assert_failure_evidence(&db, shape, 2).await;
-    // The second pass's own transition — counted once more, on a
-    // fresh generation. The re-arm also steps `attempt` past whatever
-    // the last pass left; the requeue's +1 rides on top, so strict
-    // increase is the form, not +1.
+    // The second pass's own transitions — counted once more, on fresh
+    // generations: the evidence of both passes is distinct throughout.
     assert_eq!(
-        running_outcomes(&db, shape).await,
-        seeded_outcomes + 2,
-        "the second pass's completed transition counted once more"
+        outcome_totals(&db).await,
+        (
+            seeded_outcomes + 2 * (2 * legs + 1),
+            seeded_failures + 2 * legs
+        ),
+        "the second pass's leg transitions counted once more"
     );
-    assert!(
-        second.attempt > first.attempt,
-        "each pass completes a fresh attempt epoch: {} then {}",
-        first.attempt,
-        second.attempt,
+    assert_failure_evidence(&db, 2 * per_pass_evidence).await;
+    assert_batch_drives_cleaned_up(&db).await;
+}
+
+/// The `release-gate.yml` traffic-cost `timeout-minutes` the fixture's
+/// park must outlive: the job reuses one seed for its post-peak-drive
+/// budget pass ~35 minutes in, so a `not_before` park stamped shorter
+/// than this bound frees every pin and `n % 20 = 1` row into the
+/// claim the pass prices — the `deferred=0` failure the `+30 minutes`
+/// park produced (stow#833).
+const TRAFFIC_COST_JOB_MINUTES: i64 = 110;
+
+/// stow#833: the drives must still hold on a fixture as old as the
+/// traffic-cost job can run. Host SQLite's `now` cannot advance, so
+/// the test moves every `now`-relative stamp the seed wrote back by
+/// [`TRAFFIC_COST_JOB_MINUTES`] — the instant the job's bound lands —
+/// then re-arms the way `budget::run` does (the restore set's stamps
+/// return to fresh `now`-relative values, as on the persisted fixture)
+/// and runs the full pass. The parked rows the restore does not name
+/// keep the aged values, so a park shorter than the job reads as
+/// claimable — and the human-lane pins are the witness, since a
+/// claimable pin ranks ahead of every miss row the pass prices.
+#[tokio::test]
+async fn after_pass_drives_hold_on_a_fixture_aged_past_the_harness_run() {
+    let settings = SchedulerSettings::default();
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
+    let shape = fixture::GATE;
+
+    let ago = format!("-{TRAFFIC_COST_JOB_MINUTES} minutes");
+    // Every `now`-relative stamp `queue_seed_insert_sql` writes: the
+    // `'1970-01-01 00:00:00'` `not_before` is a sentinel, not a stamp,
+    // and `claimed_at` is the seed columns' only nullable stamp. The
+    // in-flight batch upsert's `claimed_at`/`lease_at` are its only
+    // `now`-relative stamps (`done_at`/`resolve_after` stay NULL). The
+    // outcome buckets stay put: in the harness the peak drive's
+    // completions expire them as they age, so no run ever holds an
+    // aged-out backlog — shifting them past the trip window at once
+    // would price a one-off expiry burst no drive event produces.
+    for sql in [
+        "UPDATE queue SET not_before = datetime(not_before, ?) \
+         WHERE not_before != '1970-01-01 00:00:00'",
+        "UPDATE queue SET wake_at = datetime(wake_at, ?)",
+        "UPDATE queue SET first_requested_at = datetime(first_requested_at, ?)",
+        "UPDATE queue SET created_at = datetime(created_at, ?)",
+        "UPDATE queue SET updated_at = datetime(updated_at, ?)",
+        "UPDATE queue SET claimed_at = datetime(claimed_at, ?) \
+         WHERE claimed_at IS NOT NULL",
+    ] {
+        db.query(sql)
+            .bind(ago.clone())
+            .execute()
+            .await
+            .expect("age the fixture's queue stamps");
+    }
+    db.query(
+        "UPDATE build_batches \
+         SET claimed_at = datetime(claimed_at, ?), lease_at = datetime(lease_at, ?)",
+    )
+    .bind(ago.clone())
+    .bind(ago)
+    .execute()
+    .await
+    .expect("age the in-flight batches' stamps");
+
+    // `budget::run` re-arms before its metered pass.
+    fixture::rearm(&db, shape, settings.dispatch_min_age_minutes)
+        .await
+        .expect("re-arm fixture");
+    let ctx = drives::DriveContext::host();
+    run_drives(&db, shape, &settings, &ctx, &log).await;
+
+    // The pins the park exists for — `n` in
+    // `(HUMAN_LANE_ROWS - HUMAN_PROBE_ROWS, HUMAN_LANE_ROWS]` — stay
+    // parked: a lapsed `not_before` would read claimable here.
+    let first_pin =
+        fixture::FixtureShape::HUMAN_LANE_ROWS - fixture::FixtureShape::HUMAN_PROBE_ROWS + 1;
+    let unparked: u64 = db
+        .query(
+            "SELECT COUNT(*) FROM queue \
+             WHERE task_id >= printf('%064x', ?) AND task_id <= printf('%064x', ?) \
+               AND not_before <= datetime('now')",
+        )
+        .bind(i64::from(first_pin))
+        .bind(i64::from(fixture::FixtureShape::HUMAN_LANE_ROWS))
+        .fetch_scalar()
+        .await
+        .expect("count unparked pins");
+    assert_eq!(
+        unparked, 0,
+        "a human pin's `not_before` park lapsed inside the job bound"
     );
 }
 
@@ -1331,10 +1629,13 @@ async fn explain_details(db: &DurableDb, statement: &LoggedStatement) -> Vec<Str
         .collect()
 }
 
-/// The seeded claimable span is the planted window — the human-lane
-/// pin plus `DISPATCH_ELIGIBLE_ROWS`; every pending row outside it is
-/// parked below the admission floor, so the claim's equality seek can
-/// only ever examine this many rows.
+/// The seeded `dispatch_eligible = 1` span is the human-lane pin plus
+/// `DISPATCH_ELIGIBLE_ROWS`; every pending row outside it is parked
+/// below the admission floor, so the claim's equality seek can only
+/// ever examine this many rows. The pins stay inside the span — the
+/// lane exemption keeps them eligible under every floor — but their
+/// parked `not_before` makes the page predicate refuse them, so the
+/// claimable population is the window alone (stow#833).
 async fn assert_seeded_claimable_span_is_the_window(db: &DurableDb) {
     let eligible: u64 = db
         .query(
@@ -1356,26 +1657,52 @@ async fn assert_seeded_claimable_span_is_the_window(db: &DurableDb) {
 /// stow#588's sixth queue run priced each wake probe at ~16k reads on
 /// the 100k queue: `dispatch_family != 'macos'` could not bound
 /// `idx_queue_wake`'s trailing `wake_at` range, so every alarm pass and
-/// every deliver read the whole dispatch-eligible pending set. The
-/// exclusion is now equality — `dispatch_family IN (…)` over
-/// `RunnerFamily::ALL` minus the saturated family — which SQLite
-/// expands into one seek per remaining family: this seeds the gate
-/// fixture's production shape, checks the claimable span is the
-/// planted window (the bulk parks `dispatch_eligible = 0`, so the
-/// claim page's `dispatch_eligible=?` equality seeks into the window
-/// instead of reading past parked rows — stow#597's read-past), then
-/// plants a burst of eligible future-wake misses and asserts both
-/// probes' plans bind `dispatch_family=?` inside the `idx_queue_wake`
-/// seek — reads bounded by the family count, never the eligible set.
+/// every deliver read the whole dispatch-eligible pending set — and a
+/// dropped filter when nothing was saturated (stow#833) lost the bound
+/// the same way. The term is now unconditional equality —
+/// `dispatch_family IN (…)` over `RunnerFamily::ALL` minus the
+/// saturated families — which SQLite expands into one seek per
+/// surviving family: each arm seeds the gate fixture's production
+/// shape, checks the claimable span is the planted window (the bulk
+/// parks `dispatch_eligible = 0`, so the claim page's
+/// `dispatch_eligible=?` equality seeks into the window instead of
+/// reading past parked rows — stow#597's read-past), then plants a
+/// burst of eligible future-wake misses and asserts both probes' plans
+/// bind `dispatch_family=?` inside the `idx_queue_wake` seek — reads
+/// bounded by the family count, never the eligible set.
 #[tokio::test]
 async fn wake_probes_seek_each_remaining_familys_wake_range() {
+    // The live `full_family` a macOS backlog produces — the family
+    // the exclusion must remove from the probes' seeks.
+    check_wake_probe_seeks(
+        SchedulerSettings {
+            max_concurrent_macos_jobs: 0,
+            ..SchedulerSettings::default()
+        },
+        "'linux', 'windows'",
+        "macos-saturated",
+    )
+    .await;
+    // Nothing saturated: the fixture's one-slot in-flight batches
+    // leave macOS under its cap, so `saturated` is empty — the probes
+    // must still carry the family equality, rendered over
+    // `RunnerFamily::ALL` in its declared order, or the `wake_at`
+    // range loses its bound (stow#833).
+    check_wake_probe_seeks(
+        SchedulerSettings::default(),
+        "'linux', 'macos', 'windows'",
+        "unsaturated",
+    )
+    .await;
+}
+
+/// One arm of [`wake_probes_seek_each_remaining_familys_wake_range`]:
+/// seed the gate fixture under `settings`, defer every pending wake so
+/// both probes log, and assert each statement's plan and `IN` list —
+/// `expected_in` is the rendered operand list of
+/// `RunnerFamily::ALL` minus the families `settings` saturates.
+async fn check_wake_probe_seeks(settings: SchedulerSettings, expected_in: &str, label: &str) {
     let (db, log) = counting_memory_db().await.expect("counting db");
-    let settings = SchedulerSettings {
-        // The live `full_family` a macOS backlog produces — the family
-        // the exclusion must remove from the probes' seeks.
-        max_concurrent_macos_jobs: 0,
-        ..SchedulerSettings::default()
-    };
     fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
         .await
         .expect("seed fixture");
@@ -1418,56 +1745,53 @@ async fn wake_probes_seek_each_remaining_familys_wake_range() {
     let mut deferred_probe = false;
     let mut frontier = false;
     for statement in &statements {
-        if !statement.sql.contains("dispatch_family IN") {
-            continue;
-        }
-        let detail = explain_details(&db, statement).await.join("\n");
-        assert!(
-            !detail.contains("SCAN queue"),
-            "family-excluded statement scanned the queue:\n{}\nplan:\n{detail}",
-            statement.sql
-        );
+        let detail;
         if statement.sql.contains("wake_at <= ?") {
             ready_probe = true;
+            detail = explain_details(&db, statement).await.join("\n");
             assert!(
                 detail.contains("SEARCH queue USING")
                     && detail.contains("idx_queue_wake")
-                    && detail.contains("dispatch_family=?"),
-                "ready probe lost the family equality seek:\n{detail}"
+                    && detail.contains("dispatch_family=?")
+                    && detail.contains("wake_at<?"),
+                "{label}: ready probe lost the family equality seek:\n{detail}"
             );
         } else if statement.sql.contains("wake_at > ?") {
             deferred_probe = true;
+            detail = explain_details(&db, statement).await.join("\n");
             assert!(
                 detail.contains("SEARCH queue USING")
                     && detail.contains("idx_queue_wake")
-                    && detail.contains("dispatch_family=?"),
-                "deferred probe lost the family equality seek:\n{detail}"
+                    && detail.contains("dispatch_family=?")
+                    && detail.contains("wake_at>?"),
+                "{label}: deferred probe lost the family equality seek:\n{detail}"
             );
         } else if statement.sql.contains("q.dispatch_key > ?") {
             frontier = true;
+            detail = explain_details(&db, statement).await.join("\n");
             // The claim page's seek: `dispatch_eligible=?` equality
             // bounds the walk before the `dispatch_key` range — the
             // parked bulk is outside the index span, not read-past
-            // inside it (stow#597).
+            // inside it (stow#597). `dispatch_family` sits behind that
+            // range, so the extra `IN` is a residual term the plan
+            // does not show.
             assert!(
                 detail.contains("idx_queue_claim")
                     && detail.contains("dispatch_eligible=?")
                     && detail.contains("dispatch_key>?"),
-                "claim page lost the eligible equality seek:\n{detail}"
+                "{label}: claim page lost the eligible equality seek:\n{detail}"
             );
-        }
-    }
-    assert!(
-        ready_probe && deferred_probe && frontier,
-        "both wake probes and the frontier must carry the family exclusion"
-    );
-    // The exclusion names exactly the remaining families — the bound is
-    // the family count, derived from `RunnerFamily::ALL`, not a list
-    // that can drift from it.
-    for statement in &statements {
-        if !statement.sql.contains("dispatch_family IN") {
+        } else {
             continue;
         }
+        assert!(
+            !detail.contains("SCAN queue"),
+            "{label}: family-filtered statement scanned the queue:\n{}\nplan:\n{detail}",
+            statement.sql
+        );
+        // The term names exactly the surviving families — the bound is
+        // the family count, derived from `RunnerFamily::ALL`, not a
+        // list that can drift from it.
         let column = if statement.sql.contains("q.dispatch_family") {
             "q.dispatch_family"
         } else {
@@ -1476,9 +1800,235 @@ async fn wake_probes_seek_each_remaining_familys_wake_range() {
         assert!(
             statement
                 .sql
-                .contains(&format!("{column} IN ('linux', 'windows')")),
-            "exclusion must be RunnerFamily::ALL minus macos: {}",
+                .contains(&format!("{column} IN ({expected_in})")),
+            "{label}: the family term must be RunnerFamily::ALL minus the \
+             saturated families: {}",
             statement.sql
         );
     }
+    assert!(
+        ready_probe && deferred_probe && frontier,
+        "{label}: both wake probes and the frontier must carry the family \
+         term (ready={ready_probe}, deferred={deferred_probe}, \
+         frontier={frontier})"
+    );
+}
+
+/// A coverage oracle that, on its first question, flips the head
+/// candidate out of `pending` the way a concurrent pass's claim does —
+/// the coverage lookup is the await between a pass's page read and its
+/// claim, so the dropped-batch restore runs with no test seam in the
+/// claim code.
+struct RacingCoverage<'a> {
+    db: &'a DurableDb,
+    raced: AtomicBool,
+}
+
+impl queue::CoverageOracle for RacingCoverage<'_> {
+    fn covered(
+        &self,
+        identities: &[queue::SemanticTaskIdentity],
+    ) -> impl std::future::Future<
+        Output = Result<BTreeSet<queue::SemanticTaskIdentity>, crate::errors::QueueError>,
+    > + Send {
+        let first = !self.raced.swap(true, Ordering::Relaxed);
+        let head = identities.first().cloned();
+        async move {
+            if let (true, Some(head)) = (first, head) {
+                self.db
+                    .query(
+                        "UPDATE queue \
+                         SET status = 'dispatched', generation_id = 'racer' \
+                         WHERE crate_name = ? AND version = ? AND features_json = ? \
+                           AND target = ? AND rustc_version = ?",
+                    )
+                    .bind(head.crate_name)
+                    .bind(head.version)
+                    .bind(head.features_json)
+                    .bind(head.target)
+                    .bind(head.rustc_version)
+                    .execute()
+                    .await
+                    .map_err(|error| crate::errors::QueueError::Sql(error.to_string()))?;
+            }
+            Ok(BTreeSet::new())
+        }
+    }
+}
+
+/// The batched claim, the dropped-batch restore and the dispatch
+/// back-off each update `queue` from a `json_each` payload filtered on a
+/// status. Without the subquery's `LIMIT -1` SQLite flattens the
+/// payload into the join and, with no planner statistics, drives it from
+/// `idx_queue_status_first (status=?)` — every row of that status times
+/// every payload element, 104k reads in a release-gate preheat. This
+/// replays each of the three under `EXPLAIN QUERY PLAN` and requires the
+/// payload to drive a primary-key seek instead.
+#[tokio::test]
+async fn payload_driven_queue_updates_seek_the_primary_key() {
+    const SEEK: &str = "SEARCH queue USING INDEX sqlite_autoindex_queue_1 (task_id=?)";
+    const STATUS_WALK: &str = "idx_queue_status_first";
+
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let settings = SchedulerSettings::default();
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
+
+    let base = log.lock().expect("log").len();
+    let coverage = RacingCoverage {
+        db: &db,
+        raced: AtomicBool::new(false),
+    };
+    let batches = queue::claim_dispatchable_tasks(&db, &settings, &coverage)
+        .await
+        .expect("claim");
+    assert!(
+        !batches.is_empty(),
+        "the pass must keep a batch for the back-off to fail"
+    );
+    let legs: Vec<queue::QueuedTask> = batches
+        .iter()
+        .flat_map(|batch| batch.tasks.iter().cloned())
+        .collect();
+    queue::back_off_dispatch_legs(&db, &settings, &legs, "plan probe")
+        .await
+        .expect("back off");
+    let statements = log.lock().expect("log")[base..].to_vec();
+
+    let mut claim = false;
+    let mut unclaim = false;
+    let mut back_off = false;
+    for statement in &statements {
+        let sql = statement.sql.as_str();
+        if !(sql.starts_with("UPDATE queue") && sql.contains("json_each")) {
+            continue;
+        }
+        let which = if sql.contains("SET status = 'dispatched', generation_id = e.generation_id") {
+            &mut claim
+        } else if sql.contains("SET status = 'pending', generation_id = e.generation_id") {
+            &mut unclaim
+        } else if sql.contains("SET status = 'pending', error_msg = ?") {
+            &mut back_off
+        } else {
+            continue;
+        };
+        *which = true;
+        let detail = explain_details(&db, statement).await.join("\n");
+        assert!(
+            detail.contains(SEEK) && !detail.contains(STATUS_WALK),
+            "payload-driven queue update lost its primary-key seek:\n{sql}\nplan:\n{detail}"
+        );
+    }
+    assert!(
+        claim && unclaim && back_off,
+        "the pass must run the claim ({claim}), the dropped-batch restore ({unclaim}) \
+         and the back-off ({back_off})"
+    );
+}
+
+/// The freeze-trip bucket read must stay a bounded index range: the
+/// dropped upper bound returned every future bucket the seed ever
+/// wrote, and the `ORDER BY target, bucket` steered the planner onto
+/// the `(target, bucket)` primary key — a full-table walk the host
+/// gate's scan rule would name `SCAN attempt_outcome_buckets` the
+/// moment the host failure drive ran the read (stow#833). The fixed
+/// statement is one `idx_attempt_outcome_buckets_bucket` range bounded
+/// on both ends, exactly the read the resolution failure arm now runs
+/// on host through `freeze_trip_draft`.
+#[tokio::test]
+async fn freeze_trip_bucket_read_is_a_bounded_index_range() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    queue::freeze_trip_draft(&db, &crate::freeze::FreezeSettings::default())
+        .await
+        .expect("freeze trip draft");
+    let statements = log.lock().expect("log").to_vec();
+
+    let mut read = false;
+    for statement in &statements {
+        if !statement.sql.contains("FROM attempt_outcome_buckets") {
+            continue;
+        }
+        read = true;
+        let detail = explain_details(&db, statement).await.join("\n");
+        assert!(
+            detail.contains(
+                "SEARCH attempt_outcome_buckets USING INDEX \
+                 idx_attempt_outcome_buckets_bucket (bucket>? AND bucket<?)"
+            ),
+            "freeze-trip bucket read lost its bounded index range:\n{}\nplan:\n{detail}",
+            statement.sql
+        );
+    }
+    assert!(read, "the trip check must read attempt_outcome_buckets");
+}
+
+/// The bounded range's read set on the seeded gate fixture: at most
+/// `(window / 5 + 1)` buckets per target — the window edge can
+/// straddle one extra bucket — over `CI_TARGET_TRIPLES`, never the
+/// stored bulk (stow#833). The fixture seeds its bucket rows at and
+/// ahead of the current bucket, so the old unbounded-above read
+/// returned all of them.
+#[tokio::test]
+async fn freeze_trip_bucket_read_stays_inside_the_window() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    let settings = SchedulerSettings::default();
+    fixture::seed_production_shape(&db, &fixture::GATE, settings.dispatch_min_age_minutes)
+        .await
+        .expect("seed fixture");
+
+    let freeze = crate::freeze::FreezeSettings::default();
+    let base = log.lock().expect("log").len();
+    queue::freeze_trip_draft(&db, &freeze)
+        .await
+        .expect("freeze trip draft");
+    let statements = log.lock().expect("log")[base..].to_vec();
+
+    let bound = u64::from(freeze.window_minutes / 5 + 1)
+        * u64::try_from(stow_types::api::CI_TARGET_TRIPLES.len()).expect("target count fits u64");
+    let mut read = false;
+    for statement in &statements {
+        if !statement.sql.contains("FROM attempt_outcome_buckets") {
+            continue;
+        }
+        read = true;
+        assert!(
+            statement.rows_read <= bound,
+            "the window read returned {} rows — the bound is \
+             (window/5 + 1) × CI_TARGET_TRIPLES = {bound}",
+            statement.rows_read
+        );
+    }
+    assert!(read, "the trip check must read attempt_outcome_buckets");
+}
+
+/// `ready_batches` must seek `idx_build_batches_resolve`: the
+/// `ORDER BY batch_id` it used to carry steered the planner onto
+/// `sqlite_autoindex_build_batches_1` — a walk of every in-flight
+/// batch for a read the resolvable set bounds (stow#833). No caller
+/// depends on batch order: legs arrive keyed by `batch_id` and each
+/// consumer finds its batch by name.
+#[tokio::test]
+async fn ready_batches_seeks_the_resolve_index() {
+    let (db, log) = counting_memory_db().await.expect("counting db");
+    queue::ready_batches(&db, 0).await.expect("ready batches");
+    let statements = log.lock().expect("log").to_vec();
+
+    let mut read = false;
+    for statement in &statements {
+        if !statement.sql.contains("FROM build_batches") {
+            continue;
+        }
+        read = true;
+        let detail = explain_details(&db, statement).await.join("\n");
+        assert!(
+            detail.contains(
+                "SEARCH build_batches USING INDEX \
+                 idx_build_batches_resolve (resolve_after<?)"
+            ),
+            "ready_batches lost the resolve_after seek:\n{}\nplan:\n{detail}",
+            statement.sql
+        );
+    }
+    assert!(read, "the resolution pass must read build_batches");
 }

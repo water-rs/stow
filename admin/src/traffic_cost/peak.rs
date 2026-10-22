@@ -123,11 +123,23 @@ async fn run_paced(interval: Duration, duration: Duration, mut fire: impl AsyncF
     clippy::cast_sign_loss,
     reason = "request counts and percentile indices are tiny"
 )]
-async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
+async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> Result<LaneStats, String> {
     let mut client = zenwave::client();
     let mut stats = LaneStats::default();
+    // A lane the harness cannot make fireable stops firing and fails the
+    // pass: an event fired anyway would be a different path than the one
+    // the lane prices.
+    let mut unready = None;
     let interval = Duration::from_secs_f64(1.0 / lane.eps.max(1e-4));
     let fire = async |counter: u64| {
+        if unready.is_some() {
+            return;
+        }
+        // Harness work, before the event's clock starts.
+        if let Err(error) = lane.fire.ready(edge, 1).await {
+            unready = Some(error);
+            return;
+        }
         let fired = tokio::time::Instant::now();
         // A response the edge never sends cannot stall the run: the
         // deadline check happens between fires, so bound each one.
@@ -170,6 +182,9 @@ async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
         stats.requests += 1;
     };
     run_paced(interval, duration, fire).await;
+    if let Some(error) = unready {
+        return Err(format!("{}: {error}", lane.name));
+    }
     let mut sorted = std::mem::take(&mut stats.latencies_ms);
     sorted.sort_by(f64::total_cmp);
     let percentile = |p: f64| -> f64 {
@@ -183,7 +198,7 @@ async fn run_lane(lane: &Lane, edge: &Edge, duration: Duration) -> LaneStats {
     stats.p99_ms = percentile(0.99);
     stats.latencies_ms = sorted;
     stats.effective_eps = stats.requests as f64 / duration.as_secs_f64();
-    stats
+    Ok(stats)
 }
 
 /// `stow-admin traffic-cost peak` — fire the lanes, then emit the
@@ -200,7 +215,10 @@ pub async fn run(edge: &Edge, args: &PeakArgs, output: Output) -> stow_types::er
     let duration = Duration::from_secs(args.duration_secs);
     let results =
         futures_util::future::join_all(lanes.iter().map(|lane| run_lane(lane, edge, duration)))
-            .await;
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| stow_error!("{error}"))?;
 
     let mut lanes_map = BTreeMap::new();
     let mut breaches = Vec::new();

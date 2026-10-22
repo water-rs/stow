@@ -3,8 +3,8 @@
 //! Each run measures four signal groups — Cloudflare usage against the
 //! hourly share of the monthly included allowances, edge health (Worker
 //! invocation statuses, DO resource failures, `overloaded` events), the
-//! build pipeline (build-crate failure rate, dispatch retries, pending
-//! age, dispatch stalls), and the public endpoints — then acts on the
+//! build pipeline (build-batch failed-leg share, dispatch retries,
+//! pending age, dispatch stalls), and the public endpoints — then acts on the
 //! verdict: `Trip` breaches disable the dispatching workflows that read
 //! `active` — the exact set, recorded on the incident issue for `clear`
 //! to restore — and enable
@@ -22,8 +22,9 @@
 //! Costs (AGENTS.md "resources are spent deliberately"): one run is one
 //! GraphQL POST, one Analytics Engine SQL POST, ≤3 admin/endpoint calls,
 //! one GHCR verified pull for the bundle probe (tag list + index
-//! manifest + signature + blob), ≤ `1 + MAX_CLASSIFIED_RUNS*2` GitHub
-//! REST reads plus one per trip workflow when a trip runs, and, only
+//! manifest + signature + blob), ≤ `1 + completed-runs +
+//! MAX_CLASSIFIED_LEGS` GitHub REST reads (a run's legs live only on
+//! its jobs page) plus one per trip workflow when a trip runs, and, only
 //! while an incident is open, ≤8 REST mutations
 //! plus one email — idle runs issue no mutations at all.
 
@@ -32,11 +33,14 @@ use std::fmt::Write as _;
 
 use askama::Template;
 use clap::{Args, Subcommand};
+use futures_util::StreamExt as _;
 use stow_types::analytics::{self, Envelope};
 use stow_types::api::{AdminStatus, DispatchFreeze};
 use stow_types::identity::WireRustcVersion;
+use stow_types::runs::{LegFailure, LegOutcome, RunFailure, RunJobRow};
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
+use stow_types::trusted_builder::BATCH_WORKFLOW_FILE;
 
 use crate::maintenance::{self, MaintenanceScope};
 use time::OffsetDateTime;
@@ -276,9 +280,11 @@ const SIGNALS: &[Signal] = &[
         effect: Effect::Alert,
     },
     // ── build pipeline ──
+    // The leg is the unit (stow#833): one failed leg fails its whole
+    // batch run, so a per-run share would read near 100%.
     Signal {
         id: "pipeline.failure_rate",
-        label: "build-crate failure share of completed runs",
+        label: "build-batch failed-leg share of completed legs",
         window_secs: HOUR,
         min_sample: 20,
         threshold: 50.0,
@@ -287,7 +293,7 @@ const SIGNALS: &[Signal] = &[
     },
     Signal {
         id: "pipeline.retry_storm",
-        label: "build-crate runs at dispatch attempt ≥3",
+        label: "build-batch runs at dispatch attempt ≥3",
         window_secs: HOUR,
         min_sample: 0,
         threshold: 10.0,
@@ -348,7 +354,7 @@ fn signal(id: &str) -> &'static Signal {
 struct Reading {
     signal: &'static Signal,
     /// Denominator or count basis the verdict's `min_sample` reads —
-    /// total requests for a rate, completed runs for a failure rate, `1`
+    /// total requests for a rate, completed legs for the leg share, `1`
     /// for a point check, pending count for the dispatch stall.
     sample: u64,
     /// The measured value in the signal's unit.
@@ -432,26 +438,43 @@ const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
 const WORKER_SCRIPT_NAME: &str = "stow-edge";
 
 /// Bound on per-run GitHub log classification — each classified failed
-/// run costs one jobs call plus one log call, so a pathological failure
-/// storm is reported at the cap instead of burning the job's minutes.
-const MAX_CLASSIFIED_RUNS: usize = 25;
+/// leg costs one log call on top of its run's jobs read, so a
+/// pathological failure storm is reported at the cap instead of
+/// burning the job's minutes.
+const MAX_CLASSIFIED_LEGS: usize = 25;
+/// Independent jobs-page reads in flight at once — the same bound
+/// `github::runs_in_range` uses for its subdivision reads.
+const JOBS_READ_CONCURRENCY: usize = 8;
 /// Actions runner capacity, used by the dispatch-stall signal —
 /// AGENTS.md states 60 concurrent runners.
 const RUNNER_CAPACITY: usize = 60;
 
 /// Dispatching workflows a trip touches — everything that can start a
-/// build wave or move the index: `build-crate`, the index cron, and
-/// every preheat lane. A trip disables only the ones reading `active`
+/// build wave or move the index: `build-batch` (the workflow the
+/// scheduler dispatches to; `build-crate.yml` is `workflow_call`-only
+/// now, stow#833), the index cron, and every preheat lane. A trip
+/// disables only the ones reading `active`
 /// and records exactly that set on the incident issue; `clear` restores
 /// the record, nothing more (stow#744).
 const TRIP_WORKFLOWS: &[&str] = &[
-    "build-crate.yml",
+    BATCH_WORKFLOW_FILE,
     "index-publish-cron.yml",
     "preheat-admin.yml",
     "preheat-cron.yml",
     "preheat-missed.yml",
     "preheat-projects.yml",
 ];
+
+/// One failed leg inside a completed run — the `pipeline.failure_rate`
+/// numerator's unit (stow#833).
+struct FailedLeg {
+    /// Index into the completed-run list — the run carrying the leg.
+    run: usize,
+    /// The leg index in its batch.
+    leg: u32,
+    /// The leg's classified failure.
+    failure: LegFailure,
+}
 
 /// Runtime context every collector and actuation shares.
 struct Watcher<'a> {
@@ -600,8 +623,15 @@ impl Watcher<'_> {
 
     // ----- GitHub pipeline -----
 
-    /// build-crate completed runs over the hour → failure rate and
-    /// dispatch-retry signals, with per-target and per-class evidence.
+    /// build-batch completed runs over the hour → the failed-leg
+    /// share and dispatch-retry signals, with per-target and
+    /// per-class evidence.
+    ///
+    /// Legs live only on each run's jobs page — one read per
+    /// completed run, bounded-concurrent. A page that cannot be read
+    /// or whose leg classification fails is a failed read: the
+    /// collector returns `Err`, never an understated share.
+    #[allow(clippy::too_many_lines)]
     async fn pipeline_readings(&self) -> Result<Vec<Reading>, String> {
         let since = self
             .now
@@ -610,16 +640,56 @@ impl Watcher<'_> {
             ))
             .ok_or("window underflow")?;
         let runs = fetch_completed_runs(self.gh_token, since).await?;
-        let completed = u64::try_from(runs.len()).unwrap_or(u64::MAX);
-        let failed: Vec<&GhRun> = runs
-            .iter()
-            .filter(|run| run.conclusion.as_deref() == Some("failure"))
-            .collect();
+        // One jobs read per completed run, bounded-concurrent — a
+        // failed read or an unreadable page fails the reading rather
+        // than understating the leg share (a collector failure is an
+        // incident of its own).
+        let pages: Vec<Vec<RunJobRow>> =
+            futures_util::stream::iter(runs.iter().map(|run| async move {
+                runs::fetch_run_jobs(self.gh_token, run.id)
+                    .await
+                    .map_err(|error| format!("run {}: jobs fetch: {error}", run.id))
+            }))
+            .buffered(JOBS_READ_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()?;
+
+        // Fold every run's page into completed/failed legs — the leg
+        // is the unit: one failed leg fails its whole run.
+        let mut completed_legs = 0u64;
+        let mut failed_legs: Vec<FailedLeg> = Vec::new();
+        for (index, (run, jobs)) in runs.iter().zip(&pages).enumerate() {
+            let legs = runs::classify_page(
+                jobs,
+                run.conclusion.as_deref().unwrap_or_default(),
+                self.now,
+            )
+            .map_err(|error| format!("run {}: leg classification: {error}", run.id))?;
+            for leg in legs {
+                match leg.outcome {
+                    // A leg still settling is not a completed leg.
+                    LegOutcome::Unsettled => {}
+                    LegOutcome::Succeeded { .. } => completed_legs += 1,
+                    LegOutcome::Failed(failure) => {
+                        completed_legs += 1;
+                        if runs::leg_attempted(&failure) {
+                            failed_legs.push(FailedLeg {
+                                run: index,
+                                leg: leg.leg,
+                                failure,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         #[allow(clippy::cast_precision_loss)]
-        let failure_rate = if completed == 0 {
+        let failure_rate = if completed_legs == 0 {
             0.0
         } else {
-            failed.len() as f64 / completed as f64 * 100.0
+            failed_legs.len() as f64 / completed_legs as f64 * 100.0
         };
         let retrying: Vec<&GhRun> = runs
             .iter()
@@ -628,19 +698,23 @@ impl Watcher<'_> {
 
         let mut evidence_rate = Vec::new();
         let mut evidence_retry = Vec::new();
-        if !failed.is_empty() {
-            let (targets, classes) = self.classify_failed(&failed).await;
+        if !failed_legs.is_empty() {
+            let (targets, classes) = self.classify_failed(&failed_legs, &pages).await;
             if !targets.is_empty() {
                 evidence_rate.push(format!("targets: {}", targets.join(", ")));
             }
             if !classes.is_empty() {
                 evidence_rate.push(format!("classes: {}", classes.join(", ")));
             }
-            for run in failed.iter().take(5) {
-                evidence_rate.push(run.html_url.clone());
+            let mut run_urls: BTreeSet<&str> = BTreeSet::new();
+            for leg in &failed_legs {
+                run_urls.insert(runs[leg.run].html_url.as_str());
             }
-            if failed.len() > 5 {
-                evidence_rate.push(format!("+{} more failed runs", failed.len() - 5));
+            for url in run_urls.iter().take(5) {
+                evidence_rate.push((*url).to_owned());
+            }
+            if failed_legs.len() > 5 {
+                evidence_rate.push(format!("+{} more failed legs", failed_legs.len() - 5));
             }
         }
         for run in retrying.iter().take(5) {
@@ -659,67 +733,66 @@ impl Watcher<'_> {
         Ok(vec![
             Reading {
                 signal: signal("pipeline.failure_rate"),
-                sample: completed,
+                sample: completed_legs,
                 value: failure_rate,
                 evidence: evidence_rate,
             },
             Reading {
                 signal: signal("pipeline.retry_storm"),
-                sample: completed,
+                sample: u64::try_from(runs.len()).unwrap_or(u64::MAX),
                 value: retried,
                 evidence: evidence_retry,
             },
         ])
     }
 
-    /// For each failed run (≤ `MAX_CLASSIFIED_RUNS`), read job names for
-    /// the per-target view and fetch the job log for the failure class.
-    /// Log fetch failures degrade the evidence, never the signal.
-    async fn classify_failed(&self, failed: &[&GhRun]) -> (Vec<String>, Vec<String>) {
+    /// For each failed leg (≤ `MAX_CLASSIFIED_LEGS`), read its build
+    /// job's label for the per-target view and fetch the failed job's
+    /// log for the failure class. Log fetch failures degrade the
+    /// evidence, never the signal.
+    async fn classify_failed(
+        &self,
+        failed: &[FailedLeg],
+        pages: &[Vec<RunJobRow>],
+    ) -> (Vec<String>, Vec<String>) {
         let mut by_target: std::collections::BTreeMap<String, u32> =
             std::collections::BTreeMap::new();
         let mut by_class: std::collections::BTreeMap<&'static str, u32> =
             std::collections::BTreeMap::new();
-        for run in failed.iter().take(MAX_CLASSIFIED_RUNS) {
-            let jobs: GhJobsPage = match github::get(
-                self.gh_token,
-                &format!("actions/runs/{}/jobs?per_page=100", run.id),
-                Backoff::new(),
-            )
-            .await
+        for leg in failed.iter().take(MAX_CLASSIFIED_LEGS) {
+            let page = &pages[leg.run];
+            if let Some(target) = runs::leg_build_job(page, leg.leg)
+                .and_then(|job| runs::leg_label(&job.name))
+                .map(|label| label.target)
             {
-                Ok(page) => page,
+                *by_target.entry(target).or_default() += 1;
+            }
+            let job_name = match &leg.failure {
+                LegFailure::Invariant(_) => {
+                    *by_class.entry("invariant").or_default() += 1;
+                    continue;
+                }
+                LegFailure::Run(
+                    RunFailure::Verdict { job, .. } | RunFailure::Infrastructure { job, .. },
+                )
+                | LegFailure::Concluded { job, .. } => job.as_str(),
+            };
+            let Some(job) = page.iter().find(|job| job.name == job_name) else {
+                continue;
+            };
+            let log_url = format!(
+                "https://api.github.com/repos/{}/actions/jobs/{}/logs",
+                github::REPO,
+                job.id
+            );
+            let log = match github::get_text(self.gh_token, &log_url, Backoff::new()).await {
+                Ok(log) => log,
                 Err(error) => {
-                    tracing::warn!(run_id = run.id, %error, "jobs fetch failed; skipping");
+                    tracing::warn!(job_id = job.id, %error, "job log unavailable");
                     continue;
                 }
             };
-            for job in &jobs.jobs {
-                if job.conclusion.as_deref() != Some("failure") {
-                    continue;
-                }
-                if let Some(target) = job
-                    .name
-                    .rsplit('(')
-                    .next()
-                    .and_then(|tail| tail.strip_suffix(')'))
-                {
-                    *by_target.entry(target.to_owned()).or_default() += 1;
-                }
-                let log_url = format!(
-                    "https://api.github.com/repos/{}/actions/jobs/{}/logs",
-                    github::REPO,
-                    job.id
-                );
-                let log = match github::get_text(self.gh_token, &log_url, Backoff::new()).await {
-                    Ok(log) => log,
-                    Err(error) => {
-                        tracing::warn!(job_id = job.id, %error, "job log unavailable");
-                        continue;
-                    }
-                };
-                *by_class.entry(classify_one(&log)).or_default() += 1;
-            }
+            *by_class.entry(classify_one(&log)).or_default() += 1;
         }
         let targets = by_target
             .iter()
@@ -1378,20 +1451,6 @@ impl github::RunRow for GhRun {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct GhJobsPage {
-    #[serde(default)]
-    jobs: Vec<GhJob>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GhJob {
-    id: u64,
-    name: String,
-    #[serde(default)]
-    conclusion: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
 pub struct GhIssue {
     /// The issue number.
     pub number: u64,
@@ -1424,8 +1483,8 @@ struct GhComment {
     body: Option<String>,
 }
 
-/// Every `completed` build-crate run in the closed window `[since, now]`
-/// — both outcomes, since the failure rate needs the denominator: range
+/// Every `completed` build-batch run in the closed window `[since, now]`
+/// — both outcomes, since the leg share needs the denominator: range
 /// enumeration reads past GitHub's 1000-row listing cap so a dense wave
 /// cannot silently shrink the denominator (stow#555).
 async fn fetch_completed_runs(gh_token: &str, since: OffsetDateTime) -> Result<Vec<GhRun>, String> {
@@ -2971,8 +3030,8 @@ mod tests {
         assert!(!decision.incident);
     }
 
-    /// Minimum sample: 5 failed runs of 5 is 100% but below `min_sample`
-    /// 20 → skipped, no trip.
+    /// Minimum sample: 5 failed legs of 5 completed is 100% but below
+    /// `min_sample` 20 → skipped, no trip.
     #[test]
     fn failure_rate_respects_minimum_sample() {
         let readings = vec![reading("pipeline.failure_rate", 5, 100.0)];
@@ -3139,14 +3198,14 @@ mod tests {
             now: "2026-09-28T00:00:00Z",
             dry_run: false,
             breaches: &[breach],
-            actions: &["disabled build-crate.yml".to_owned()],
+            actions: &["disabled build-batch.yml".to_owned()],
             failures: &[],
             disabled: &disabled,
         }
         .render()
         .unwrap();
         assert!(body.contains("cf.d1.rows_written"));
-        assert!(body.contains("disabled build-crate.yml"));
+        assert!(body.contains("disabled build-batch.yml"));
     }
 
     /// Marker render + parse round-trip: the set the template writes is
@@ -3154,7 +3213,7 @@ mod tests {
     #[test]
     fn disabled_marker_round_trips() {
         let disabled =
-            BTreeSet::from(["build-crate.yml".to_owned(), "preheat-cron.yml".to_owned()]);
+            BTreeSet::from(["build-batch.yml".to_owned(), "preheat-cron.yml".to_owned()]);
         let body = IncidentTemplate {
             now: "2026-10-14T00:00:00Z",
             dry_run: false,
@@ -3166,7 +3225,7 @@ mod tests {
         .render()
         .unwrap();
         assert!(
-            body.contains("<!-- stow-watchdog:disabled build-crate.yml,preheat-cron.yml -->"),
+            body.contains("<!-- stow-watchdog:disabled build-batch.yml,preheat-cron.yml -->"),
             "unexpected body:\n{body}"
         );
         assert_eq!(parse_disabled_marker(42, &body), Ok(Some(disabled)));
@@ -3201,11 +3260,11 @@ mod tests {
             parse_disabled_marker(42, "<!-- stow-watchdog:disabled-else a.yml -->"),
             Ok(None)
         );
-        let error = parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-crate.yml, -->")
+        let error = parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-batch.yml, -->")
             .unwrap_err();
         assert!(error.contains("incident #42"), "unexpected error: {error}");
         let error =
-            parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-crate.yml").unwrap_err();
+            parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-batch.yml").unwrap_err();
         assert!(error.contains("incident #42"), "unexpected error: {error}");
         let error =
             parse_disabled_marker(42, "<!-- stow-watchdog:disabled not a file -->").unwrap_err();
@@ -3218,7 +3277,7 @@ mod tests {
     fn trip_selects_only_the_active() {
         let reads = vec![
             TripState {
-                workflow: "build-crate.yml",
+                workflow: "build-batch.yml",
                 state: Ok("active".to_owned()),
             },
             TripState {
@@ -3231,7 +3290,7 @@ mod tests {
             },
         ];
         let (set, failures) = select_trip_set(&reads);
-        assert_eq!(set, BTreeSet::from(["build-crate.yml".to_owned()]));
+        assert_eq!(set, BTreeSet::from(["build-batch.yml".to_owned()]));
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("index-publish-cron.yml"));
     }
@@ -3248,11 +3307,11 @@ mod tests {
             pull_request: None,
         };
         match clear_restore(Some(&issue(Some(
-            "<!-- stow-watchdog:disabled build-crate.yml,preheat-cron.yml -->",
+            "<!-- stow-watchdog:disabled build-batch.yml,preheat-cron.yml -->",
         )))) {
             RestoreSet::Set(set) => assert_eq!(
                 set,
-                BTreeSet::from(["build-crate.yml".to_owned(), "preheat-cron.yml".to_owned()])
+                BTreeSet::from(["build-batch.yml".to_owned(), "preheat-cron.yml".to_owned()])
             ),
             _ => panic!("a recorded set restores"),
         }
@@ -3273,13 +3332,13 @@ mod tests {
         ));
     }
 
-    /// The trip list stays exactly the dispatch lanes — `build-crate`
+    /// The trip list stays exactly the dispatch lanes — `build-batch`
     /// plus the five cron/preheat workflows — each a workflow file the
     /// API names by path.
     #[test]
     fn trip_workflows_are_the_dispatch_lanes() {
         assert_eq!(TRIP_WORKFLOWS.len(), 6);
-        assert!(TRIP_WORKFLOWS.contains(&"build-crate.yml"));
+        assert!(TRIP_WORKFLOWS.contains(&BATCH_WORKFLOW_FILE));
         assert!(TRIP_WORKFLOWS.iter().all(|name| {
             std::path::Path::new(name)
                 .extension()
@@ -3287,16 +3346,19 @@ mod tests {
         }));
     }
 
-    /// `pipeline_readings`'s classifier path — job names carry targets,
-    /// logs classify through `runs`'s table.
+    /// `pipeline_readings`'s evidence path — a leg's build job name
+    /// carries the target verbatim, logs classify through `runs`'s
+    /// table.
     #[test]
-    fn job_name_target_parses() {
-        let name = "build serde_json 1.0.149 (aarch64-apple-darwin)";
-        let target = name
-            .rsplit('(')
-            .next()
-            .and_then(|tail| tail.strip_suffix(')'));
-        assert_eq!(target, Some("aarch64-apple-darwin"));
+    fn leg_build_job_name_parses() {
+        let hash = stow_types::api::TaskHash::of("some-task");
+        let label = runs::leg_label(&format!(
+            "leg 3 / build #3 serde_json 1.0.149 (aarch64-apple-darwin) {hash}"
+        ))
+        .expect("leg label");
+        assert_eq!(label.target, "aarch64-apple-darwin");
+        assert_eq!(label.crate_name, "serde_json");
+        assert_eq!(label.version, "1.0.149");
     }
 
     // ===== `ensure_label` against a real client on a loopback =====

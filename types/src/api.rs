@@ -444,16 +444,609 @@ impl BuildTaskPayload {
         let encoded = serde_json::to_string(self)
             .map_err(|error| stow_error!("serialize build task payload: {error}"))?;
         if encoded.len() > DISPATCH_INPUT_LIMIT {
+            return Err(self.oversize_dispatch_error(encoded.len()));
+        }
+        Ok(encoded)
+    }
+
+    /// The error every dispatch producer raises when this task's
+    /// encoding cannot ride a `workflow_dispatch` input — shared by
+    /// [`Self::encode_dispatch_task`] and [`BatchEncoder::push`] so a
+    /// task refused on size is named identically on either path.
+    fn oversize_dispatch_error(&self, encoded_len: usize) -> crate::error::Error {
+        stow_error!(
+            "build task {} {} on {} encodes to {} characters across {} dependency nodes — over the {}-character workflow_dispatch input cap",
+            self.crate_name,
+            self.version,
+            self.target,
+            encoded_len,
+            self.dependency_subgraph.nodes.len(),
+            DISPATCH_INPUT_LIMIT,
+        )
+    }
+}
+
+// ----- Batched build dispatch (stow#833) -----
+
+/// `k` — the default `max-parallel` runner slots one `build-batch.yml`
+/// matrix holds (stow#833 §1.3).
+///
+/// The sum over in-flight batches is what the runner-family caps
+/// bound; at the defaults nine batches can be in flight — three macOS
+/// (15 of 16 slots) and six Linux/Windows. The scheduler's
+/// `STOW_BATCH_PARALLELISM` binding and `preheat manual
+/// --batch-parallelism` default to it, so the value exists once.
+pub const DEFAULT_BATCH_PARALLELISM: u32 = 5;
+
+/// `B` — the leg bound at which a batch closes (stow#833 §1.3).
+///
+/// Eight `k`-slot rounds at the default, far under GitHub's 256-job
+/// matrix limit, and its tasks pack under [`DISPATCH_INPUT_LIMIT`].
+/// The scheduler's `STOW_BATCH_MAX_TASKS` binding and `preheat manual
+/// --batch-max-tasks` default to it.
+pub const DEFAULT_BATCH_MAX_TASKS: u32 = 40;
+
+/// `value` is exactly `len` lowercase ASCII hex digits.
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A validated hex id on the batch wire: construction runs only through
+/// [`FromStr`](std::str::FromStr)/`TryFrom<String>`, and serde
+/// deserializes through the same check so a malformed wire value fails
+/// at the boundary.
+macro_rules! hex_newtype {
+    (
+        $(#[$meta:meta])*
+        $name:ident, $len:literal, $what:literal
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
+        #[serde(try_from = "String", into = "String")]
+        pub struct $name(String);
+
+        impl $name {
+            /// Borrow the hex string.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(&self.0)
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = crate::error::Error;
+
+            fn from_str(value: &str) -> crate::error::Result<Self> {
+                if is_lower_hex(value, $len) {
+                    Ok(Self(value.to_owned()))
+                } else {
+                    Err(stow_error!(
+                        concat!(
+                            "invalid ",
+                            $what,
+                            " `{0}`: must be exactly ",
+                            stringify!($len),
+                            " lowercase hex"
+                        ),
+                        value
+                    ))
+                }
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = crate::error::Error;
+
+            fn try_from(value: String) -> crate::error::Result<Self> {
+                value.parse()
+            }
+        }
+
+        impl From<$name> for String {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+    };
+}
+
+hex_newtype!(
+    /// The 32-lowercase-hex id the scheduler mints for a batch at
+    /// claim (`lower(hex(randomblob(16)))`, like `generation_id`)
+    /// (stow#833).
+    ///
+    /// The id names the run (`<rustc>-b<batch_id>`) and the
+    /// `POST /batches/{batch_id}/complete` route.
+    BatchId,
+    32,
+    "batch id"
+);
+
+hex_newtype!(
+    /// The first 16 hex of blake3(`task_id`) — a leg's job-name
+    /// binding (stow#833).
+    ///
+    /// The same digest the records tag carries, so a run's jobs map
+    /// back to legs by hash, not by position alone.
+    TaskHash,
+    16,
+    "task hash"
+);
+
+impl TaskHash {
+    /// The task hash `task_id` carries — `blake3(task_id)`'s first 16
+    /// hex, the value [`BatchTask::task_hash`] and the leg's job-name
+    /// suffix hold.
+    #[must_use]
+    pub fn of(task_id: &str) -> Self {
+        Self(blake3::hash(task_id.as_bytes()).to_hex()[..16].to_owned())
+    }
+}
+
+/// One leg of a [`BuildBatchPayload`] — the [`BuildTaskPayload`] fields
+/// minus the batch-level `rustc_version`, with the subgraph folded into
+/// the batch's shared node table.
+///
+/// `i`, `h` and `r` keep their short wire names: the payload rides one
+/// `workflow_dispatch` input and the [`DISPATCH_INPUT_LIMIT`] cap is
+/// shared. `i` is the leg's index in the batch's `tasks` list — the
+/// workflow's `--leg` selector and the `#N` in its job names — and `h`
+/// is the first 16 hex of blake3(`task_id`), the same digest the
+/// records tag carries, so a run's jobs map back to legs by hash, not
+/// by position alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BatchTask {
+    /// The leg's index into [`BuildBatchPayload::tasks`].
+    #[serde(rename = "i")]
+    pub leg: u32,
+    /// First 16 hex of blake3(`task_id`) — the job-name binding (stow#833).
+    #[serde(rename = "h")]
+    pub task_hash: TaskHash,
+    /// Opaque scheduler task identifier — [`BuildTaskPayload::task_id`].
+    pub task_id: String,
+    /// Which queue attempt this dispatch carries —
+    /// [`BuildTaskPayload::attempt`].
+    #[serde(default)]
+    pub attempt: u32,
+    /// Crate name as known to crates.io.
+    pub crate_name: CrateName,
+    /// Exact crate version to build.
+    pub version: CrateVersion,
+    /// Canonicalized features list (sorted, deduplicated).
+    pub features_json: FeaturesJson,
+    /// Compilation target triple. Legs of one batch mix targets freely —
+    /// `runs-on` and the toolchain are per leg.
+    pub target: TargetTriple,
+    /// Whether the leg builds the crate as a host-side unit —
+    /// [`BuildTaskPayload::host_side`].
+    #[serde(default)]
+    pub host_side: bool,
+    /// Whether the node keys differently under the explicit
+    /// `--target <host>` spelling — [`BuildTaskPayload::explicit_spelling`].
+    pub explicit_spelling: crate::public_cache::ExplicitSpelling,
+    /// Whether the runner keeps the bundled `Cargo.lock` —
+    /// [`BuildTaskPayload::preserve_lockfile`].
+    #[serde(default)]
+    pub preserve_lockfile: bool,
+    /// Indexes into [`BuildBatchPayload::nodes`] naming this task's
+    /// direct dependencies — [`TaskSubgraph::root_deps`] against the
+    /// shared table.
+    #[serde(rename = "r", default, skip_serializing_if = "Vec::is_empty")]
+    pub root_deps: Vec<u32>,
+}
+
+/// The `batch` `workflow_dispatch` input `build-batch.yml` reads
+/// (stow#833).
+///
+/// One run of up-to-`DISPATCH_INPUT_LIMIT` tasks that share
+/// `rustc_version`, runner family and lane, fanned out as a
+/// `fail-fast: false` matrix of `build-crate.yml` calls under
+/// `max-parallel: parallelism`.
+///
+/// The legs' dependency subgraphs share one node table: a wire node is
+/// only graph inputs — its target is derived from the task that reaches
+/// it (the [`TaskSubgraph`] doc) — so one table entry serves every leg
+/// that references it, whatever its target or side. Entries are
+/// deduplicated by full content, `d` included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BuildBatchPayload {
+    /// The [`BatchId`] the scheduler minted at claim — it names the run
+    /// (`<rustc>-b<batch_id>`) and the `POST /batches/{batch_id}/complete`
+    /// route.
+    pub batch_id: BatchId,
+    /// The one rustc every leg builds under — a batch never mixes rustc
+    /// versions.
+    pub rustc_version: WireRustcVersion,
+    /// The matrix's `max-parallel` — the runner slots this run holds.
+    pub parallelism: u32,
+    /// The legs, in matrix order; a leg's `i` is its index here.
+    pub tasks: Vec<BatchTask>,
+    /// The shared node table every leg's `r` and `d` indexes into.
+    pub nodes: Vec<SubgraphNode>,
+}
+
+impl BuildBatchPayload {
+    /// Leg `index`'s task as the standalone [`BuildTaskPayload`] the
+    /// per-task path would have carried: the closure reachable from the
+    /// leg's `r` through the shared [`Self::nodes`] table, reindexed
+    /// onto the leg's own node list.
+    ///
+    /// The rebuilt node order is the shared table's, so a leg whose
+    /// pushed subgraph already listed its nodes in first-intern order
+    /// reproduces it exactly; any other order reindexes to the same
+    /// resolved graph — [`BuildTaskPayload::verified_dependency_graph`]
+    /// and the publish closure check are order-insensitive.
+    ///
+    /// # Errors
+    /// `index` past `tasks`, or a `r`/`d` wire index past `nodes`.
+    pub fn task(&self, index: usize) -> crate::error::Result<BuildTaskPayload> {
+        let leg = self.tasks.get(index).ok_or_else(|| {
+            stow_error!(
+                "batch {} holds {} legs — leg {index} is out of range",
+                self.batch_id,
+                self.tasks.len()
+            )
+        })?;
+        let node = |wire: u32, from: &str| -> crate::error::Result<usize> {
+            let shared = usize::try_from(wire).map_err(|error| stow_error!("{error}"))?;
+            if shared >= self.nodes.len() {
+                return Err(stow_error!(
+                    "batch {} leg {index} {from} index {shared} names no node of the {}-entry shared table",
+                    self.batch_id,
+                    self.nodes.len()
+                ));
+            }
+            Ok(shared)
+        };
+        // The leg's dependency closure, as shared-table indexes.
+        let mut reachable = BTreeSet::new();
+        let mut frontier = leg
+            .root_deps
+            .iter()
+            .map(|&dep| node(dep, "r"))
+            .collect::<crate::error::Result<Vec<usize>>>()?;
+        while let Some(next) = frontier.pop() {
+            if reachable.insert(next) {
+                frontier.extend(
+                    self.nodes[next]
+                        .deps
+                        .iter()
+                        .map(|&dep| node(dep, "d"))
+                        .collect::<crate::error::Result<Vec<usize>>>()?,
+                );
+            }
+        }
+        // Shared index → the leg's wire rank — one lookup per edge, as
+        // in `TaskSubgraph::from_resolved`.
+        let wire_ranks: BTreeMap<usize, u32> = reachable
+            .iter()
+            .enumerate()
+            .map(|(rank, &shared)| {
+                u32::try_from(rank)
+                    .map(|rank| (shared, rank))
+                    .map_err(|_| stow_error!("batch leg {index} node rank {rank} does not fit u32"))
+            })
+            .collect::<crate::error::Result<BTreeMap<usize, u32>>>()?;
+        let wire_index = |shared: usize| -> u32 { wire_ranks[&shared] };
+        let root_deps = leg
+            .root_deps
+            .iter()
+            .map(|&dep| node(dep, "r").map(wire_index))
+            .collect::<crate::error::Result<Vec<u32>>>()?;
+        let nodes = reachable
+            .iter()
+            .map(|&index| {
+                let shared = &self.nodes[index];
+                Ok(SubgraphNode {
+                    crate_name: shared.crate_name.clone(),
+                    version: shared.version.clone(),
+                    features_json: shared.features_json.clone(),
+                    host_side: shared.host_side,
+                    keys_apart: shared.keys_apart,
+                    deps: shared
+                        .deps
+                        .iter()
+                        .map(|&dep| node(dep, "d").map(wire_index))
+                        .collect::<crate::error::Result<Vec<u32>>>()?,
+                })
+            })
+            .collect::<crate::error::Result<Vec<SubgraphNode>>>()?;
+        Ok(BuildTaskPayload {
+            task_id: leg.task_id.clone(),
+            attempt: leg.attempt,
+            crate_name: leg.crate_name.clone(),
+            version: leg.version.clone(),
+            features_json: leg.features_json.clone(),
+            target: leg.target.clone(),
+            rustc_version: self.rustc_version.clone(),
+            preserve_lockfile: leg.preserve_lockfile,
+            host_side: leg.host_side,
+            explicit_spelling: leg.explicit_spelling,
+            dependency_subgraph: TaskSubgraph { root_deps, nodes },
+        })
+    }
+
+    /// Serialize the batch for dispatch.
+    ///
+    /// # Errors
+    /// Serialization failure, or an encoded batch over
+    /// [`DISPATCH_INPUT_LIMIT`] — unreachable through
+    /// [`BatchEncoder`], which never lets a push take the encoding past
+    /// the cap; only a hand-built payload can trip it.
+    pub fn encode_dispatch_batch(&self) -> crate::error::Result<String> {
+        let encoded = serde_json::to_string(self)
+            .map_err(|error| stow_error!("serialize build batch payload: {error}"))?;
+        if encoded.len() > DISPATCH_INPUT_LIMIT {
             return Err(stow_error!(
-                "build task {} {} on {} encodes to {} characters across {} dependency nodes — over the {}-character workflow_dispatch input cap",
-                self.crate_name,
-                self.version,
-                self.target,
+                "build batch {} encodes to {} characters across {} legs — over the {}-character workflow_dispatch input cap",
+                self.batch_id,
                 encoded.len(),
-                self.dependency_subgraph.nodes.len(),
+                self.tasks.len(),
                 DISPATCH_INPUT_LIMIT,
             ));
         }
+        Ok(encoded)
+    }
+}
+
+/// Whether [`BatchEncoder::push`] accepted a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchFit {
+    /// The task joined the batch.
+    Fits,
+    /// Adding it would take the encoded batch past
+    /// [`DISPATCH_INPUT_LIMIT`] — close this batch and open another.
+    Full,
+}
+
+/// Packs `BuildTaskPayload`s into a [`BuildBatchPayload`] that stays
+/// under [`DISPATCH_INPUT_LIMIT`] — measured, never estimated.
+///
+/// The byte accounting is exact: the empty-payload framing is measured
+/// once at construction, and each push adds its leg's serialized length
+/// plus every *new* shared-table entry's, commas included — the same
+/// accounting [`DemandFeedPageBuilder`] runs. Node dedup is by full
+/// encoded content, so a `d` index list is part of the key.
+#[derive(Debug)]
+pub struct BatchEncoder {
+    payload: BuildBatchPayload,
+    /// Shared-table position by a node's own serialized bytes — the
+    /// dedup key doubles as the entry's measured length.
+    node_indexes: std::collections::HashMap<Vec<u8>, u32>,
+    /// Bytes the `tasks` array's contents occupy: elements and their
+    /// separating commas.
+    tasks_bytes: usize,
+    /// Same for the `nodes` array.
+    nodes_bytes: usize,
+    /// Serialized length of the payload with `tasks`/`nodes` empty —
+    /// the framing every element lands inside.
+    framing_bytes: usize,
+}
+
+/// A task-subgraph node's mark in [`BatchEncoder::intern`]'s DFS over
+/// one push — the three-color guard that catches a dep cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternState {
+    /// The DFS has not reached the node this push.
+    Unseen,
+    /// On the DFS stack — reaching it again closes a cycle.
+    Open,
+    /// Interned — `positions` holds its shared-table slot.
+    Interned,
+}
+
+impl BatchEncoder {
+    /// An encoder for `batch_id` at `parallelism` matrix slots, under
+    /// `rustc_version`.
+    ///
+    /// # Errors
+    /// The empty-payload framing fails to serialize.
+    pub fn new(
+        batch_id: BatchId,
+        rustc_version: WireRustcVersion,
+        parallelism: u32,
+    ) -> crate::error::Result<Self> {
+        let payload = BuildBatchPayload {
+            batch_id,
+            rustc_version,
+            parallelism,
+            tasks: Vec::new(),
+            nodes: Vec::new(),
+        };
+        let framing_bytes = serde_json::to_vec(&payload)
+            .map_err(|error| stow_error!("encode build batch framing: {error}"))?
+            .len();
+        Ok(Self {
+            payload,
+            node_indexes: std::collections::HashMap::new(),
+            tasks_bytes: 0,
+            nodes_bytes: 0,
+            framing_bytes,
+        })
+    }
+
+    /// The length the staged payload encodes to — framing, legs and the
+    /// shared table together.
+    #[must_use]
+    pub const fn encoded_len(&self) -> usize {
+        self.framing_bytes + self.tasks_bytes + self.nodes_bytes
+    }
+
+    /// Number of legs staged so far.
+    #[must_use]
+    pub const fn legs(&self) -> usize {
+        self.payload.tasks.len()
+    }
+
+    /// Intern the task-subgraph node at local index `local` into the
+    /// shared table, returning its position there — recursion interns
+    /// every dependency first so the node's `d` is already in shared
+    /// indexes when its content is deduplicated.
+    ///
+    /// `states` is the three-color DFS guard ([`InternState`]);
+    /// `positions` records each local index's shared position once
+    /// interned; `added` collects the serialized keys of nodes this
+    /// push appended, for byte accounting and rollback.
+    ///
+    /// # Errors
+    /// A `root_deps`/`d` index past the task's node list, a dependency
+    /// cycle, a shared-table position past `u32`, or a node that fails
+    /// to serialize.
+    fn intern(
+        &mut self,
+        task: &BuildTaskPayload,
+        local: usize,
+        states: &mut [InternState],
+        positions: &mut [u32],
+        added: &mut Vec<Vec<u8>>,
+    ) -> crate::error::Result<u32> {
+        let nodes = &task.dependency_subgraph.nodes;
+        if local >= nodes.len() {
+            return Err(stow_error!(
+                "batch task {} {} ({}) subgraph index {local} names no node of its {}-entry list",
+                task.crate_name,
+                task.version,
+                task.target,
+                nodes.len()
+            ));
+        }
+        match states[local] {
+            InternState::Interned => return Ok(positions[local]),
+            InternState::Open => {
+                return Err(stow_error!(
+                    "batch task {} {} ({}) subgraph closes a dependency cycle through node {local}",
+                    task.crate_name,
+                    task.version,
+                    task.target,
+                ));
+            }
+            InternState::Unseen => states[local] = InternState::Open,
+        }
+        let mut deps = Vec::with_capacity(nodes[local].deps.len());
+        for &dep in &nodes[local].deps {
+            let dep = usize::try_from(dep).map_err(|error| stow_error!("{error}"))?;
+            deps.push(self.intern(task, dep, states, positions, added)?);
+        }
+        let shared = SubgraphNode {
+            crate_name: nodes[local].crate_name.clone(),
+            version: nodes[local].version.clone(),
+            features_json: nodes[local].features_json.clone(),
+            host_side: nodes[local].host_side,
+            keys_apart: nodes[local].keys_apart,
+            deps,
+        };
+        let encoded = serde_json::to_vec(&shared)
+            .map_err(|error| stow_error!("encode build batch node: {error}"))?;
+        let position = if let Some(&position) = self.node_indexes.get(&encoded) {
+            position
+        } else {
+            let position = u32::try_from(self.payload.nodes.len())
+                .map_err(|_| stow_error!("build batch shared table overflows u32 positions"))?;
+            self.node_indexes.insert(encoded.clone(), position);
+            self.payload.nodes.push(shared);
+            added.push(encoded);
+            position
+        };
+        states[local] = InternState::Interned;
+        positions[local] = position;
+        Ok(position)
+    }
+
+    /// Add `task` as the next leg.
+    ///
+    /// The task's dependency closure is interned into the shared table
+    /// — entries already present merge by content — and the leg's `r`
+    /// records its root deps' shared positions. Returns
+    /// [`BatchFit::Full`] when the push would take the encoded batch
+    /// past [`DISPATCH_INPUT_LIMIT`]; the batch is then unchanged and
+    /// the task should open a fresh one.
+    ///
+    /// # Errors
+    /// A task that does not fit even an empty batch's framing — no
+    /// batch can carry it — refused with the same oversize error
+    /// [`BuildTaskPayload::encode_dispatch_task`] raises; or a
+    /// malformed subgraph (`r`/`d` out of range, a cycle).
+    pub fn push(&mut self, task: &BuildTaskPayload) -> crate::error::Result<BatchFit> {
+        let subgraph = &task.dependency_subgraph;
+        let mut states = vec![InternState::Unseen; subgraph.nodes.len()];
+        let mut positions = vec![0_u32; subgraph.nodes.len()];
+        let mut added = Vec::new();
+        let mut root_deps = Vec::with_capacity(subgraph.root_deps.len());
+        for &dep in &subgraph.root_deps {
+            let dep = usize::try_from(dep).map_err(|error| stow_error!("{error}"))?;
+            root_deps.push(self.intern(task, dep, &mut states, &mut positions, &mut added)?);
+        }
+        let leg = BatchTask {
+            leg: u32::try_from(self.payload.tasks.len()).map_err(|_| {
+                stow_error!(
+                    "build batch {} leg index overflows u32",
+                    self.payload.batch_id
+                )
+            })?,
+            task_hash: TaskHash::of(&task.task_id),
+            task_id: task.task_id.clone(),
+            attempt: task.attempt,
+            crate_name: task.crate_name.clone(),
+            version: task.version.clone(),
+            features_json: task.features_json.clone(),
+            target: task.target.clone(),
+            host_side: task.host_side,
+            explicit_spelling: task.explicit_spelling,
+            preserve_lockfile: task.preserve_lockfile,
+            root_deps,
+        };
+        let task_bytes = serde_json::to_vec(&leg)
+            .map_err(|error| stow_error!("encode build batch leg: {error}"))?
+            .len()
+            + usize::from(!self.payload.tasks.is_empty());
+        // Every appended node pays its separating comma — except the
+        // first entry into an empty table.
+        let nodes_delta = added.iter().map(Vec::len).sum::<usize>() + added.len()
+            - usize::from(added.len() == self.payload.nodes.len() && !added.is_empty());
+        let candidate = self.encoded_len() + task_bytes + nodes_delta;
+        if candidate > DISPATCH_INPUT_LIMIT {
+            // Roll back the staged nodes — the task leaves no trace.
+            let staged = self.payload.nodes.len() - added.len();
+            for key in added {
+                self.node_indexes.remove(&key);
+            }
+            self.payload.nodes.truncate(staged);
+            if self.payload.tasks.is_empty() {
+                // Even an empty batch's framing cannot carry the task
+                // — no batch can — refuse it with the per-task
+                // dispatch path's own oversize error.
+                return Err(task.oversize_dispatch_error(candidate));
+            }
+            return Ok(BatchFit::Full);
+        }
+        self.tasks_bytes += task_bytes;
+        self.nodes_bytes += nodes_delta;
+        self.payload.tasks.push(leg);
+        Ok(BatchFit::Fits)
+    }
+
+    /// Close the batch into its `workflow_dispatch` `batch` input.
+    ///
+    /// # Errors
+    /// The encoder holds no legs, or the payload fails to serialize.
+    pub fn finish(self) -> crate::error::Result<String> {
+        if self.payload.tasks.is_empty() {
+            return Err(stow_error!(
+                "build batch {} holds no legs — nothing to dispatch",
+                self.payload.batch_id
+            ));
+        }
+        let encoded = self.payload.encode_dispatch_batch()?;
+        debug_assert_eq!(encoded.len(), self.encoded_len());
         Ok(encoded)
     }
 }
@@ -824,27 +1417,25 @@ pub(crate) fn task_id_prefix(
     )
 }
 
-/// Completion the edge's `POST /api/v1/github/workflow-run` handler sends
-/// the scheduler Durable Object for a finished `build-crate.yml` run.
+/// Completion the edge's `POST /api/v1/github/workflow-run` handler
+/// forwards to the scheduler Durable Object's
+/// `POST /batches/{batch_id}/complete` for a finished `build-batch.yml`
+/// run (stow#833).
 ///
-/// The webhook answer carries no `attempt`, so the object resolves the
-/// row's live attempt at apply time.
+/// The webhook only records the delivery; resolution — mapping the
+/// run's jobs onto legs — runs in the object's alarm pass, which is why
+/// the report carries the run identity verbatim rather than a per-leg
+/// outcome.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct WorkflowRunComplete {
-    /// The run's `display_title` — `build-crate.yml` sets `run-name` to
-    /// the task id, so this string IS `BuildTaskPayload::task_id`.
-    pub task_id: String,
-    /// The run's `conclusion` mapped onto success: only a run that
-    /// finished green *and* whose run's records artifact exists in GHCR
-    /// counts as a completed build.
-    pub success: bool,
-    /// Failure description when `success` is false — the conclusion and,
-    /// on a missing records artifact, which tag the edge looked for.
-    pub error: Option<String>,
-    /// The GitHub Actions run id, stamped onto the queue row so
-    /// `stow-admin status` surfaces the run URL.
-    #[serde(default)]
-    pub github_run_id: Option<String>,
+pub struct BatchRunComplete {
+    /// The Actions workflow run id.
+    pub run_id: u64,
+    /// The run's attempt number — `1` on the first run.
+    pub run_attempt: u32,
+    /// The run's `conclusion` (`success`, `failure`, `cancelled`, …).
+    pub conclusion: String,
+    /// The run's Actions URL — the record's pointer back to the run.
+    pub html_url: String,
 }
 
 /// A normalized dependency entry from a resolved Cargo dependency graph.
@@ -1962,6 +2553,30 @@ pub struct SchedulerBudgetReport {
     pub over_budget: bool,
 }
 
+/// Body of `POST /api/v1/admin/scheduler/budget/rearm`.
+///
+/// The traffic-cost callback lane's refill: re-arm the seeded fixture's
+/// in-flight batches its deliveries resolved, so every delivery it fires
+/// is a first delivery. Only deploys that set `STOW_SCHEDULER_BUDGET`
+/// answer it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerRearmRequest {
+    /// Queue rows of the fixture the caller derives its batches from —
+    /// refused unless it is the size the store was last seeded at, so
+    /// the caller's batch ids and run ids are the store's.
+    pub queue_rows: u32,
+}
+
+/// What `POST /api/v1/admin/scheduler/budget/rearm` answers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerRearmReport {
+    /// Every armed in-flight index `k` after the re-arm, ascending —
+    /// each batch is `crate::fixture::FixtureShape::in_flight_batch(k)`,
+    /// bound to its own run with no completion recorded. The whole set,
+    /// not the call's increment: a caller replaces what it holds with it.
+    pub armed: Vec<u32>,
+}
+
 /// What `GET /api/v1/admin/scheduler/budget/ledger` returns.
 ///
 /// The scheduler Durable Object's billed `rowsRead`/`rowsWritten` booked
@@ -1979,7 +2594,8 @@ pub struct SchedulerLedger {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerLedgerOp {
     /// The operation: `<METHOD> <route>` for a request (a request id
-    /// segment collapses to `{id}`), or
+    /// segment collapses to `{id}`, and a batch's completion to
+    /// [`crate::do_budgets::LEDGER_OP_BATCH_COMPLETE`]), or
     /// [`crate::do_budgets::LEDGER_OP_ALARM`] for an alarm pass.
     pub op: String,
     /// How many times the operation ran.
@@ -2932,10 +3548,14 @@ pub struct ArtifactPruneResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        CI_TARGET_TRIPLES, DEMAND_FEED_PAGE_MAX_BYTES, DEMAND_FEED_PAGE_MAX_ENTRIES,
-        DemandFeedHour, DemandFeedPageBuilder, RunnerFamily, SchedulerDemandEntry, runner_family,
+        BatchEncoder, BatchFit, BatchTask, BuildBatchPayload, BuildTaskPayload, CI_TARGET_TRIPLES,
+        DEMAND_FEED_PAGE_MAX_BYTES, DEMAND_FEED_PAGE_MAX_ENTRIES, DISPATCH_INPUT_LIMIT,
+        DemandFeedHour, DemandFeedPageBuilder, RunnerFamily, SchedulerDemandEntry, TaskHash,
+        runner_family,
     };
-    use crate::identity::FeaturesJson;
+    use crate::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
+    use crate::public_cache::ExplicitSpelling;
+    use crate::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
 
     /// Every CI target must land in exactly one family, and the families'
     /// `targets()` lists together must be exactly `CI_TARGET_TRIPLES` —
@@ -3193,6 +3813,397 @@ mod tests {
             DemandFeedHour::latest_closed(3_599).map(|h| h.as_str().to_owned()),
             Some("1969-12-31T23".to_owned())
         );
+    }
+
+    // ----- Batched build dispatch (stow#833) -----
+
+    const BATCH_RUSTC: &str = "1.99.0";
+    const BATCH_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    /// A resolved node for a batch fixture: the crate at `target` under
+    /// `BATCH_RUSTC` with no features, depending on `dependencies`.
+    fn batch_node(
+        crate_name: &str,
+        version: &str,
+        target: &str,
+        host_side: bool,
+        dependencies: &[usize],
+    ) -> ResolvedTaskNode {
+        ResolvedTaskNode {
+            identity: TaskNodeIdentity {
+                crate_name: CrateName::parse(crate_name).expect("crate name"),
+                version: CrateVersion::new(semver::Version::parse(version).expect("version")),
+                features_json: FeaturesJson::default(),
+                target: TargetTriple::parse(target).expect("target"),
+                rustc_version: WireRustcVersion::parse(BATCH_RUSTC).expect("rustc"),
+                host_side,
+            },
+            explicit_spelling: ExplicitSpelling::KeysAsNative,
+            dependencies: dependencies.to_vec(),
+        }
+    }
+
+    /// The `BuildTaskPayload` the per-task path produces for the graph —
+    /// node 0 is the task's own node, the rest its dependency closure.
+    fn batch_payload(graph_nodes: Vec<ResolvedTaskNode>) -> BuildTaskPayload {
+        let graph = ResolvedTaskGraph::resolve(graph_nodes).expect("resolved graph");
+        let root = &graph.nodes()[0];
+        BuildTaskPayload {
+            task_id: graph.task_id(0).expect("root task id").to_owned(),
+            attempt: 1,
+            crate_name: root.identity.crate_name.clone(),
+            version: root.identity.version.clone(),
+            features_json: root.identity.features_json.clone(),
+            target: root.identity.target.clone(),
+            rustc_version: root.identity.rustc_version.clone(),
+            preserve_lockfile: false,
+            host_side: root.identity.host_side,
+            explicit_spelling: root.explicit_spelling,
+            dependency_subgraph: super::TaskSubgraph::from_resolved(&graph, 0)
+                .expect("task subgraph"),
+        }
+    }
+
+    /// The length the leg's `BatchTask` element serializes to — used to
+    /// place a task exactly on the [`DISPATCH_INPUT_LIMIT`] boundary.
+    fn batch_leg_len(task: &BuildTaskPayload, leg: u32, root_deps: Vec<u32>) -> usize {
+        let wire = BatchTask {
+            leg,
+            task_hash: TaskHash::of(&task.task_id),
+            task_id: task.task_id.clone(),
+            attempt: task.attempt,
+            crate_name: task.crate_name.clone(),
+            version: task.version.clone(),
+            features_json: task.features_json.clone(),
+            target: task.target.clone(),
+            host_side: task.host_side,
+            explicit_spelling: task.explicit_spelling,
+            preserve_lockfile: task.preserve_lockfile,
+            root_deps,
+        };
+        serde_json::to_vec(&wire).expect("measure leg").len()
+    }
+
+    /// A dep-free task — for size tests the `task_id` is a plausible
+    /// string, never verified.
+    fn dep_free_task(crate_name: &str, target: &str, features: Vec<String>) -> BuildTaskPayload {
+        BuildTaskPayload {
+            task_id: format!(
+                "{crate_name}-1.0.0-{}-x86_64_unknown-linux-gnu-1_99_0",
+                blake3::hash(crate_name.as_bytes()).to_hex()
+            ),
+            attempt: 1,
+            crate_name: CrateName::parse(crate_name).expect("crate name"),
+            version: CrateVersion::new(semver::Version::parse("1.0.0").expect("version")),
+            features_json: FeaturesJson::canonicalize(features).expect("features"),
+            target: TargetTriple::parse(target).expect("target"),
+            rustc_version: WireRustcVersion::parse(BATCH_RUSTC).expect("rustc"),
+            preserve_lockfile: false,
+            host_side: false,
+            explicit_spelling: ExplicitSpelling::KeysAsNative,
+            dependency_subgraph: super::TaskSubgraph::default(),
+        }
+    }
+
+    /// A dep-free task whose `BatchTask` element serializes to exactly
+    /// `elem_len` bytes — `features_json` carries the size with the
+    /// same accounting [`sized_entry`] runs: a name of `len` chars
+    /// contributes `len + 5` bytes (`\"name\"` plus a separating
+    /// comma), and a list of names costs `Σ(len + 5) - 1` over the
+    /// bare `"[]"`.
+    fn sized_task(crate_name: &str, target: &str, leg: u32, elem_len: usize) -> BuildTaskPayload {
+        let bare = dep_free_task(crate_name, target, Vec::new());
+        let bare_len = batch_leg_len(&bare, leg, Vec::new());
+        if elem_len == bare_len {
+            return bare;
+        }
+        assert!(
+            elem_len > bare_len + 4,
+            "target {elem_len} leaves no room for a name"
+        );
+        // The names together contribute `total = need + 1` in
+        // `Σ(len + 5)` units — the `- 1` is the absent trailing comma.
+        let total = elem_len - bare_len + 1;
+        let count = total / 133;
+        let rest = total - count * 133;
+        let mut features: Vec<String> = (0..count).map(|index| format!("f{index:0127}")).collect();
+        match rest {
+            0 => {}
+            // Shrink the last bulk name by `6 - rest` and add a
+            // one-char "z" name: `-(6 - rest) + 6 = rest`.
+            1..=5 => {
+                let last = features.pop().expect("a bulk name");
+                features.push(last[..last.len() - (6 - rest)].to_owned());
+                features.push("z".to_owned());
+            }
+            _ => features.push("z".repeat(rest - 5)),
+        }
+        let sized = dep_free_task(crate_name, target, features);
+        assert_eq!(
+            batch_leg_len(&sized, leg, Vec::new()),
+            elem_len,
+            "sized leg must land exactly"
+        );
+        sized
+    }
+
+    /// The five fixture tasks: `a` on `x86_64` depends on `mid → leaf`;
+    /// `b` on `wasm32` shares that whole wire subgraph (wire nodes carry
+    /// no target); `c` on `x86_64` adds its own `next → leaf`; `d` and
+    /// `e` are host-side apple-darwin tasks sharing the host dep `host`.
+    /// Every subgraph lists its nodes in first-intern order, so each
+    /// leg reconstructs byte-identically.
+    fn batch_fixture_tasks() -> Vec<BuildTaskPayload> {
+        vec![
+            batch_payload(vec![
+                batch_node("crate-a", "1.0.0", "x86_64-unknown-linux-gnu", false, &[2]),
+                batch_node("dep-leaf", "1.0.0", "x86_64-unknown-linux-gnu", false, &[]),
+                batch_node("dep-mid", "1.0.0", "x86_64-unknown-linux-gnu", false, &[1]),
+            ]),
+            batch_payload(vec![
+                batch_node("crate-b", "1.0.0", "wasm32-unknown-unknown", false, &[2]),
+                batch_node("dep-leaf", "1.0.0", "wasm32-unknown-unknown", false, &[]),
+                batch_node("dep-mid", "1.0.0", "wasm32-unknown-unknown", false, &[1]),
+            ]),
+            batch_payload(vec![
+                batch_node("crate-c", "1.0.0", "x86_64-unknown-linux-gnu", false, &[2]),
+                batch_node("dep-leaf", "1.0.0", "x86_64-unknown-linux-gnu", false, &[]),
+                batch_node("dep-next", "1.0.0", "x86_64-unknown-linux-gnu", false, &[1]),
+            ]),
+            batch_payload(vec![
+                batch_node("crate-d", "1.0.0", "aarch64-apple-darwin", true, &[1]),
+                batch_node("dep-host", "1.0.0", "aarch64-apple-darwin", true, &[]),
+            ]),
+            batch_payload(vec![
+                batch_node("crate-e", "1.0.0", "aarch64-apple-darwin", true, &[1]),
+                batch_node("dep-host", "1.0.0", "aarch64-apple-darwin", true, &[]),
+            ]),
+        ]
+    }
+
+    /// §7: every `task(i)` equals the `BuildTaskPayload` it was pushed
+    /// from and passes `verified_dependency_graph`.
+    #[test]
+    fn batch_task_round_trips_through_the_wire() {
+        let pushed = batch_fixture_tasks();
+        let mut encoder = BatchEncoder::new(
+            BATCH_ID.parse().expect("batch id"),
+            BATCH_RUSTC.parse().expect("rustc"),
+            5,
+        )
+        .expect("encoder");
+        for task in &pushed {
+            assert_eq!(encoder.push(task).expect("push"), BatchFit::Fits);
+        }
+        let wire = encoder.finish().expect("finish");
+        let batch: BuildBatchPayload = serde_json::from_str(&wire).expect("decode batch");
+        assert_eq!(batch.batch_id.as_str(), BATCH_ID);
+        assert_eq!(batch.tasks.len(), pushed.len());
+        for (index, pushed_task) in pushed.iter().enumerate() {
+            let leg = &batch.tasks[index];
+            assert_eq!(leg.leg, u32::try_from(index).expect("leg index"));
+            assert_eq!(leg.task_hash, TaskHash::of(&pushed_task.task_id));
+            let rebuilt = batch.task(index).expect("rebuild leg");
+            assert_eq!(&rebuilt, pushed_task);
+            rebuilt
+                .verified_dependency_graph()
+                .expect("rebuilt leg verifies");
+        }
+    }
+
+    /// A pushed subgraph whose `nodes` are not in first-intern order —
+    /// here reversed, every index remapped — still rebuilds a leg that
+    /// verifies to the pushed task's own resolved graph and keeps every
+    /// leg identity field: wire order is a serialization detail, never
+    /// identity.
+    #[test]
+    fn batch_task_round_trips_a_subgraph_in_another_order() {
+        let pushed = batch_fixture_tasks()
+            .into_iter()
+            .next()
+            .expect("fixture task");
+        let mut reordered = pushed.clone();
+        let wire_len =
+            u32::try_from(reordered.dependency_subgraph.nodes.len()).expect("wire len fits u32");
+        reordered.dependency_subgraph.nodes.reverse();
+        let remap = |index: &u32| wire_len - 1 - *index;
+        for node in &mut reordered.dependency_subgraph.nodes {
+            node.deps = node.deps.iter().map(remap).collect();
+        }
+        reordered.dependency_subgraph.root_deps = reordered
+            .dependency_subgraph
+            .root_deps
+            .iter()
+            .map(remap)
+            .collect();
+        // The reorder keeps the wire graph valid — `resolve` derives
+        // the same task id.
+        reordered
+            .verified_dependency_graph()
+            .expect("reordered subgraph verifies");
+
+        let mut encoder = BatchEncoder::new(
+            BATCH_ID.parse().expect("batch id"),
+            BATCH_RUSTC.parse().expect("rustc"),
+            5,
+        )
+        .expect("encoder");
+        assert_eq!(encoder.push(&reordered).expect("push"), BatchFit::Fits);
+        let batch: BuildBatchPayload =
+            serde_json::from_str(&encoder.finish().expect("finish")).expect("decode batch");
+        let rebuilt = batch.task(0).expect("rebuild leg");
+        assert_eq!(
+            rebuilt
+                .verified_dependency_graph()
+                .expect("rebuilt leg verifies"),
+            pushed
+                .verified_dependency_graph()
+                .expect("pushed task verifies"),
+            "a reordered wire subgraph resolves to a different graph"
+        );
+        assert_eq!(rebuilt.task_id, pushed.task_id);
+        assert_eq!(rebuilt.attempt, pushed.attempt);
+        assert_eq!(rebuilt.crate_name, pushed.crate_name);
+        assert_eq!(rebuilt.version, pushed.version);
+        assert_eq!(rebuilt.features_json, pushed.features_json);
+        assert_eq!(rebuilt.target, pushed.target);
+        assert_eq!(rebuilt.rustc_version, pushed.rustc_version);
+        assert_eq!(rebuilt.host_side, pushed.host_side);
+        assert_eq!(rebuilt.explicit_spelling, pushed.explicit_spelling);
+        assert_eq!(rebuilt.preserve_lockfile, pushed.preserve_lockfile);
+    }
+
+    /// The shared node table deduplicates by full content — legs on
+    /// different targets and sides merge on identical wire nodes, and
+    /// no leg's derived task id changes.
+    #[test]
+    fn batch_shared_table_dedups_across_targets_and_sides() {
+        let pushed = batch_fixture_tasks();
+        let mut encoder = BatchEncoder::new(
+            BATCH_ID.parse().expect("batch id"),
+            BATCH_RUSTC.parse().expect("rustc"),
+            5,
+        )
+        .expect("encoder");
+        for task in &pushed {
+            encoder.push(task).expect("push");
+        }
+        let batch: BuildBatchPayload =
+            serde_json::from_str(&encoder.finish().expect("finish")).expect("decode batch");
+        // leaf+mid+next on the target side, host on the host side: the
+        // wasm and second host legs added nothing of their own.
+        assert_eq!(batch.nodes.len(), 4);
+        for (index, pushed_task) in pushed.iter().enumerate() {
+            let rebuilt = batch.task(index).expect("rebuild leg");
+            let graph = rebuilt.verified_dependency_graph().expect("verifies");
+            assert_eq!(
+                graph.task_id(0).map(str::to_owned),
+                Some(pushed_task.task_id.clone()),
+                "leg {index} derives a different task id"
+            );
+            assert_eq!(
+                graph,
+                pushed_task
+                    .verified_dependency_graph()
+                    .expect("pushed verifies"),
+                "leg {index} resolves to a different graph"
+            );
+        }
+    }
+
+    /// Two wire nodes sharing `(n, v, f, h, x)` but differing in `d`
+    /// are different units and must not merge.
+    #[test]
+    fn batch_shared_table_keeps_same_identity_nodes_with_different_deps() {
+        let task = batch_payload(vec![
+            batch_node(
+                "crate-q",
+                "1.0.0",
+                "x86_64-unknown-linux-gnu",
+                false,
+                &[2, 4],
+            ),
+            batch_node("dep-a", "1.0.0", "x86_64-unknown-linux-gnu", false, &[]),
+            batch_node("dep-leaf", "1.0.0", "x86_64-unknown-linux-gnu", false, &[1]),
+            batch_node("dep-b", "1.0.0", "x86_64-unknown-linux-gnu", false, &[]),
+            batch_node("dep-leaf", "1.0.0", "x86_64-unknown-linux-gnu", false, &[3]),
+        ]);
+        let mut encoder = BatchEncoder::new(
+            BATCH_ID.parse().expect("batch id"),
+            BATCH_RUSTC.parse().expect("rustc"),
+            5,
+        )
+        .expect("encoder");
+        encoder.push(&task).expect("push");
+        let batch: BuildBatchPayload =
+            serde_json::from_str(&encoder.finish().expect("finish")).expect("decode batch");
+        assert_eq!(batch.nodes.len(), 4);
+        assert_eq!(batch.task(0).expect("rebuild"), task);
+    }
+
+    /// §7: packing stops exactly at `DISPATCH_INPUT_LIMIT` — a leg that
+    /// fills the batch to the byte stays in; the next returns `Full`
+    /// and leaves the batch untouched.
+    #[test]
+    fn batch_packing_stops_at_the_dispatch_input_limit() {
+        let mut encoder = BatchEncoder::new(
+            BATCH_ID.parse().expect("batch id"),
+            BATCH_RUSTC.parse().expect("rustc"),
+            5,
+        )
+        .expect("encoder");
+        let small = dep_free_task("crate-s", "x86_64-unknown-linux-gnu", Vec::new());
+        assert_eq!(encoder.push(&small).expect("push"), BatchFit::Fits);
+        // The next leg's delta is its element length plus the
+        // separating comma; size it so the encoding lands on the cap.
+        let fat = sized_task(
+            "crate-f",
+            "x86_64-unknown-linux-gnu",
+            1,
+            DISPATCH_INPUT_LIMIT - encoder.encoded_len() - 1,
+        );
+        assert_eq!(encoder.push(&fat).expect("push"), BatchFit::Fits);
+        assert_eq!(encoder.encoded_len(), DISPATCH_INPUT_LIMIT);
+        let tiny = dep_free_task("crate-t", "x86_64-unknown-linux-gnu", Vec::new());
+        assert_eq!(encoder.push(&tiny).expect("push"), BatchFit::Full);
+        assert_eq!(
+            encoder.encoded_len(),
+            DISPATCH_INPUT_LIMIT,
+            "a Full push leaves the batch untouched"
+        );
+        let wire = encoder.finish().expect("finish");
+        assert_eq!(wire.len(), DISPATCH_INPUT_LIMIT);
+        let batch: BuildBatchPayload = serde_json::from_str(&wire).expect("decode batch");
+        assert_eq!(batch.tasks.len(), 2);
+    }
+
+    /// §7: a task no batch can carry — its leg alone does not fit an
+    /// empty batch's framing — is refused with the same oversize error
+    /// `encode_dispatch_task` gives today, measured against the batch's
+    /// own encoding.
+    #[test]
+    fn batch_push_refuses_a_lone_oversize_task() {
+        let mut encoder = BatchEncoder::new(
+            BATCH_ID.parse().expect("batch id"),
+            BATCH_RUSTC.parse().expect("rustc"),
+            5,
+        )
+        .expect("encoder");
+        let fat = sized_task(
+            "crate-huge",
+            "x86_64-unknown-linux-gnu",
+            0,
+            DISPATCH_INPUT_LIMIT,
+        );
+        let refused = encoder.push(&fat).expect_err("oversize leg refused");
+        // The refusal is the per-task dispatch path's own oversize
+        // error, naming the batch-encoded length `push` measured.
+        let candidate = encoder.encoded_len() + batch_leg_len(&fat, 0, Vec::new());
+        assert_eq!(
+            refused.to_string(),
+            fat.oversize_dispatch_error(candidate).to_string()
+        );
+        assert_eq!(encoder.legs(), 0);
     }
 }
 /// Public aggregate usage statistics served by `GET /api/v1/stats`.

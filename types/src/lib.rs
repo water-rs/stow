@@ -31,6 +31,7 @@ pub mod preheat_cost;
 pub mod public_cache;
 pub mod records;
 pub mod registry;
+pub mod runs;
 pub mod rustc;
 pub mod task_graph;
 pub mod transient;

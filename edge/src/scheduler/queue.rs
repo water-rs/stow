@@ -4,13 +4,18 @@ use std::num::{NonZero, NonZeroU32};
 
 use skyzen_services::durable::{Alarm, DbValue, DurableDb};
 use stow_types::api::{
-    AdminInFlight, AdminStatus, AdminTargetStats, EnqueueRequest, EnqueueSource, PublishedSliceRow,
-    QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily, SchedulerResetReport,
-    SchedulerStatus, TaskLane, runner_family,
+    AdminInFlight, AdminStatus, AdminTargetStats, BatchId, BuildTaskPayload,
+    DEFAULT_BATCH_MAX_TASKS, DEFAULT_BATCH_PARALLELISM, EnqueueRequest, EnqueueSource,
+    PublishedSliceRow, QueueSelector, QueueTask, QueueTaskStatus, RequestStatus, RunnerFamily,
+    SchedulerResetReport, SchedulerStatus, TaskHash, TaskLane, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
+use stow_types::runs::{LegFailure, LegOutcome, RunFailure, RunJobRow};
 
 use crate::errors::QueueError;
+use crate::scheduler::batching::{
+    BatchCandidate, BatchKey, FormedBatch, PlannedBatch, SlotAdmission, SlotPlan, form_batches,
+};
 
 /// The semantic identity of a crates.io task, as the artifact catalog
 /// keys it: the identity a published closure member registers under.
@@ -49,40 +54,43 @@ pub trait CoverageOracle: Sync {
     ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send;
 }
 
-/// One claimed queue row, ready to dispatch to a build runner.
-#[derive(Debug, Clone)]
+/// One claimed queue row: the identity a batch leg is fenced and
+/// backed off by.
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct QueuedTask {
     pub task_id: String,
     /// Unique claim identity minted at dispatch claim time. It changes on
     /// every new claim, including after purge and recreation.
     pub generation_id: String,
-    /// The row's enqueue epoch at claim time. The `workflow_run` event
-    /// names no attempt — `complete_run` resolves the row's live one —
-    /// so a late report for a superseded attempt cannot overwrite the
-    /// live one.
+}
+
+/// One admitted queue row before its claim: a [`QueuedTask`] without
+/// the `generation_id` the claim mints. Formation works on these, so a
+/// row nothing claimed never carries an identity it does not own.
+#[derive(Debug, Clone)]
+pub struct PendingLeg {
+    pub task_id: String,
     pub attempt: u32,
     pub crate_name: String,
     pub version: String,
     pub features_json: String,
     pub target: String,
     pub rustc_version: String,
-    /// Whether the task builds the crate as a host-side unit — passed
-    /// through to `BuildTaskPayload` so the CI builder shapes the
-    /// wrapper package's dependency as the unit's consumers compile it.
     pub host_side: bool,
-    /// The task's explicit-spelling flag (stow#736) — passed through to
-    /// `BuildTaskPayload` so a target-side task at the runner's host
-    /// triple builds and publishes both invocation spellings.
     pub explicit_spelling: stow_types::public_cache::ExplicitSpelling,
     pub preserve_lockfile: bool,
-    /// The task's dependency subgraph at claim time, rebuilt from its
-    /// `queue_dependencies` rows (stow#588). Dispatch carries it to
-    /// `BuildTaskPayload.dependency_subgraph` so the generated wrapper
-    /// package pins the dep closure. The table stores direct-dep edges
-    /// only — a dep's own children are not recoverable here, so each
-    /// subgraph node lands as a leaf; the scheduler's storage rework is
-    /// owned by a follow-up task.
     pub dependency_subgraph: stow_types::api::TaskSubgraph,
+}
+
+impl PendingLeg {
+    /// The claimed row, under the `generation_id` its claim minted.
+    #[must_use]
+    pub fn claimed(self, generation_id: String) -> QueuedTask {
+        QueuedTask {
+            task_id: self.task_id,
+            generation_id,
+        }
+    }
 }
 
 /// Decode a stored `explicit_spelling` integer — the queue and
@@ -108,6 +116,12 @@ const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
 // the row while CI runs, so the stale-recovery cutoff must comfortably
 // exceed the slowest expected build or long builds get double-dispatched.
 const DEFAULT_STALE_DISPATCH_MINUTES: u32 = 60;
+// Batch shape (stow#833 §1.3): `k` — the `max-parallel` runner slots
+// one `build-batch.yml` matrix holds — and `B` — its leg bound, eight
+// rounds at the default. `B` stays far under GitHub's 256-job matrix
+// limit and its tasks pack under the workflow_dispatch input cap. The
+// defaults live in `stow_types::api` so `preheat manual` reads the
+// same values the bindings fall back to.
 // Exponential dispatch-failure backoff cap.
 const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 
@@ -121,7 +135,7 @@ const MAX_BUILD_ATTEMPTS: u32 = 4;
 /// insertion. One completion's median recompute reads at most this
 /// many rows and the cap delete keeps no more, so the statistic
 /// never grows a historical scan (stow#524).
-const BUILD_SAMPLE_WINDOW: i64 = 32;
+pub(super) const BUILD_SAMPLE_WINDOW: i64 = 32;
 
 /// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
 /// miss-lane submits start being refused. The edge handler reads the same
@@ -167,7 +181,8 @@ impl Dispatch {
 /// Durable Object glue (`STOW_MAX_CONCURRENT_JOBS`,
 /// `STOW_MAX_CONCURRENT_MACOS_JOBS`, `STOW_DISPATCH_MIN_AGE_MINUTES`,
 /// `STOW_STALE_DISPATCH_MINUTES`, `STOW_MAX_QUEUE_PENDING`,
-/// `STOW_HUMAN_DAILY_TASK_BUDGET`, `STOW_MIN_DISPATCH_VALUE`).
+/// `STOW_HUMAN_DAILY_TASK_BUDGET`, `STOW_MIN_DISPATCH_VALUE`,
+/// `STOW_BATCH_PARALLELISM`, `STOW_BATCH_MAX_TASKS`).
 ///
 /// Defaults match production; the local mock lowers `dispatch` via `vars`
 /// because miniflare's workerd OOMs under parallel complete
@@ -199,6 +214,12 @@ pub struct SchedulerSettings {
     /// effect only through that pass: the queue's writers and probes
     /// read the persisted answer, never this field.
     pub min_dispatch_value: i64,
+    /// `k` — the `max-parallel` runner slots one `build-batch.yml`
+    /// matrix holds (stow#833 §1.3); the sum over in-flight batches is
+    /// what the family caps bound.
+    pub batch_parallelism: u32,
+    /// `B` — the leg bound at which a batch closes (stow#833 §1.3).
+    pub batch_max_tasks: u32,
 }
 
 impl Default for SchedulerSettings {
@@ -211,6 +232,8 @@ impl Default for SchedulerSettings {
             max_queue_pending: DEFAULT_MAX_QUEUE_PENDING,
             human_daily_task_budget: DEFAULT_HUMAN_DAILY_TASK_BUDGET,
             min_dispatch_value: DEFAULT_MIN_DISPATCH_VALUE,
+            batch_parallelism: DEFAULT_BATCH_PARALLELISM,
+            batch_max_tasks: DEFAULT_BATCH_MAX_TASKS,
         }
     }
 }
@@ -1535,11 +1558,7 @@ fn plan_enqueue(
     Ok(plan)
 }
 
-/// A queue row's completion as [`complete`] applies it — reduced to the
-/// fields the `workflow_run` completion path fills; the old CI
-/// `POST /api/v1/scheduler/complete` wire type carried the same name.
-/// `complete_run` resolves `attempt` from the live row and fills the
-/// rest from the webhook event.
+/// One batch leg's completion as [`complete`] applies it.
 #[derive(Debug)]
 struct BuildCompleteReport {
     task_id: String,
@@ -1548,19 +1567,17 @@ struct BuildCompleteReport {
     success: bool,
     error: Option<String>,
     github_run_id: Option<String>,
-    /// The instant the run finished — `None` for a live report
-    /// (completion is now); a completion applied later through
-    /// `pending_run_completions` carries its stored `received_at`, so
-    /// the duration sample measures claim-to-completion, not
-    /// claim-to-deferred-application (stow#524).
-    finished_at: Option<String>,
+    /// The build-cost sample's duration: a batch leg's runner time,
+    /// measured on GitHub's clock across the leg's own two jobs
+    /// (stow#833 §4.1 — `claimed_at` stays only for the lease). `None`
+    /// for a failed leg.
+    sample_ms: Option<i64>,
 }
 
 #[derive(Debug, skyzen::FromRow)]
 struct CompletedTargetRow {
     target: String,
     crate_name: String,
-    claimed_at: Option<String>,
     status: String,
 }
 
@@ -1589,7 +1606,8 @@ async fn complete(
     // see the old row, so `attempt` is the cycle position that failed.
     let retry = format!("attempt < {MAX_BUILD_ATTEMPTS}");
     let next_not_before = format!(
-        "datetime('now', '+' || MIN(1 << MIN(attempt, 6), {MAX_DISPATCH_BACKOFF_MINUTES}) || ' minutes')"
+        "datetime('now', '+' || {} || ' minutes')",
+        backoff_minutes_sql("attempt")
     );
     let statement = if report.success {
         "UPDATE queue \
@@ -1597,7 +1615,7 @@ async fn complete(
              updated_at = datetime('now') \
          WHERE task_id = ? AND generation_id = ? \
            AND status IN ('dispatched', 'running') \
-         RETURNING target, crate_name, claimed_at, status"
+         RETURNING target, crate_name, status"
             .to_owned()
     } else {
         format!(
@@ -1613,7 +1631,7 @@ async fn complete(
                  updated_at = datetime('now') \
              WHERE task_id = ? AND generation_id = ? \
                AND status IN ('dispatched', 'running') \
-             RETURNING target, crate_name, claimed_at, status",
+             RETURNING target, crate_name, status",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
             wake = wake_at_sql(
@@ -1676,13 +1694,15 @@ async fn complete(
     // A success is the build cost's only honest measurement, and the
     // generation fence above is what keeps a late or duplicate report
     // out of the sample window.
-    if report.success {
+    if report.success
+        && let Some(duration_ms) = report.sample_ms
+    {
         record_build_sample(
             db,
             report,
             &completed.crate_name,
             &completed.target,
-            completed.claimed_at.as_deref(),
+            duration_ms,
         )
         .await?;
     }
@@ -1738,36 +1758,28 @@ async fn reject_stale_completion(
 /// only when the median actually moved — is a keyed probe touching
 /// the pending rows of exactly this (`crate_name`, `target`).
 ///
-/// `claimed_at` `NULL` means the row predates the column or its
-/// completion applied to a generation minted before the stamp existed
-/// — there is no real claim instant to measure from, so no sample is
-/// taken at all. `report.finished_at` is the run's real completion
-/// instant (the pending-completion path's `received_at`), falling
-/// back to now for a live report.
+/// `duration_ms` is the caller's measurement: claim-to-completion for
+/// the per-task path, the leg's runner time for a batch leg
+/// (stow#833 §4.1) — the sample is the cost operand the rank reads,
+/// so it must measure the build itself.
 async fn record_build_sample(
     db: &DurableDb,
     report: &BuildCompleteReport,
     crate_name: &str,
     target: &str,
-    claimed_at: Option<&str>,
+    duration_ms: i64,
 ) -> Result<(), QueueError> {
-    let Some(claimed_at) = claimed_at else {
-        return Ok(());
-    };
     let inserted = db
         .query(
             "INSERT INTO crate_build_samples \
              (crate_name, target, generation_id, duration_ms) \
-             VALUES (?, ?, ?, \
-                     CAST((julianday(COALESCE(?, datetime('now'))) \
-                           - julianday(?)) * 86400000.0 AS INTEGER)) \
+             VALUES (?, ?, ?, ?) \
              ON CONFLICT DO NOTHING",
         )
         .bind(crate_name.to_owned())
         .bind(target.to_owned())
         .bind(report.generation_id.clone())
-        .bind(report.finished_at.clone())
-        .bind(claimed_at.to_owned())
+        .bind(duration_ms)
         .execute()
         .await
         .map_err(|error| format!("record build sample: {error}"))?;
@@ -1987,331 +1999,672 @@ fn failure_class(report: &BuildCompleteReport) -> Option<String> {
     )
 }
 
-/// Apply a GitHub `workflow_run` completion — the webhook's wire report,
-/// which names the task and its outcome but no scheduler attempt number.
+/// Bind the run a `build-batch.yml` dispatch response returned to its
+/// `build_batches` row — one bind per batch, however many legs it
+/// carries (stow#833 §4.2). The claim left `github_run_id` NULL, and
+/// the `IS NULL` guard makes the bind write-once: a rebind never
+/// overwrites the run a completion is matched against
+/// (`done_run_id = github_run_id`). A `completed` delivery that beat
+/// this bind is already on the row, so it becomes resolvable the
+/// moment the bind lands — provided it names this run: the bind lands
+/// only when `done_run_id` is NULL or equal to `github_run_id`, so a
+/// row never holds two different runs.
 ///
-/// The webhook carries the platform run id, not the scheduler attempt; the
-/// bound generation resolves the exact in-flight claim and fences stale
-/// events before the records check can settle it.
+/// Returns `true` when the binding landed. `false` means the row is
+/// gone or already bound — the caller logs and moves on.
 ///
 /// # Errors
-///
-/// [`QueueError::UnknownTask`] when no queue row carries the task id;
-/// [`QueueError::StaleCompletion`] when the live row's attempt or status
-/// has moved past what the event describes, or when an in-flight row is
-/// bound to a different run than the one reporting;
-/// A completion that beats its dispatch response is persisted and
-/// acknowledged; the exact response binding later applies it.
-pub async fn complete_run(
+/// [`QueueError::Invariant`] when an early completion from a different
+/// run is already on the row: the bind would leave a batch no pass can
+/// consume, so the caller fails the dispatch instead.
+pub async fn bind_batch_run(
     db: &DurableDb,
-    settings: &SchedulerSettings,
-    report: &stow_types::api::WorkflowRunComplete,
-    window_minutes: u32,
-) -> Result<(), QueueError> {
-    let mut row = load_run_binding(db, &report.task_id).await?;
-    let Some(mut row) = row.take() else {
-        return Err(QueueError::UnknownTask(report.task_id.clone()));
-    };
-    // An in-flight row answers only to the run its generation bound at
-    // dispatch: the claim cleared `github_run_id` and the
-    // `workflow_dispatch` response's `workflow_run_id` wrote it. A
-    // report naming a different run belongs to a stale generation —
-    // timed automatic retries make that path real: run A fails, retry B
-    // is claimed and bound, and A's delayed duplicate would otherwise
-    // apply to B. A row on a terminal or pending state takes no binding
-    // check — `complete`'s own generation/status predicate is the fence
-    // there.
-    if matches!(row.status.as_str(), "dispatched" | "running") {
-        match row.github_run_id.as_deref() {
-            Some(bound) if report.github_run_id.as_deref() == Some(bound) => {}
-            Some(bound) => {
-                tracing::warn!(
-                    task_id = %report.task_id,
-                    bound_run = %bound,
-                    reported_run = ?report.github_run_id,
-                    "rejected completion report from a run the generation is not bound to"
-                );
-                return Err(QueueError::StaleCompletion {
-                    task_id: report.task_id.clone(),
-                    attempt: row.attempt,
-                    row_attempt: row.attempt,
-                    row_status: row.status,
-                });
-            }
-            None => {
-                // GitHub does not redeliver a webhook merely because the
-                // receiver answered 500. Persist the verified event while
-                // the native dispatch response is still in flight. The
-                // response binds by this exact run id; an old run with the
-                // same title can therefore never apply to this generation.
-                if persist_pending_completion(db, report).await? {
-                    return Ok(());
-                }
-
-                // The binding may have landed between the first read and
-                // the guarded insert. Re-read the identity and apply only
-                // when it is now the exact run that sent this event.
-                row = load_run_binding(db, &report.task_id)
-                    .await?
-                    .ok_or_else(|| QueueError::UnknownTask(report.task_id.clone()))?;
-                match row.github_run_id.as_deref() {
-                    Some(bound) if report.github_run_id.as_deref() == Some(bound) => {}
-                    Some(_) | None => {
-                        return Err(QueueError::StaleCompletion {
-                            task_id: report.task_id.clone(),
-                            attempt: row.attempt,
-                            row_attempt: row.attempt,
-                            row_status: row.status,
-                        });
-                    }
-                }
-            }
-        }
-    }
-    complete(
-        db,
-        settings,
-        &BuildCompleteReport {
-            task_id: report.task_id.clone(),
-            generation_id: row.generation_id.clone(),
-            attempt: row.attempt,
-            success: report.success,
-            error: report.error.clone(),
-            github_run_id: report.github_run_id.clone(),
-            finished_at: None,
-        },
-        window_minutes,
-    )
-    .await
-}
-
-async fn load_run_binding(
-    db: &DurableDb,
-    task_id: &str,
-) -> Result<Option<RunBindingRow>, QueueError> {
-    db.query("SELECT generation_id, attempt, status, github_run_id FROM queue WHERE task_id = ?")
-        .bind(task_id.to_owned())
-        .fetch_optional::<RunBindingRow>()
-        .await
-        .map_err(|error| format!("load task {task_id} for run completion: {error}").into())
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct RunBindingRow {
-    generation_id: String,
-    attempt: u32,
-    status: String,
-    github_run_id: Option<String>,
-}
-
-/// Store a verified completion that arrived before the dispatch response
-/// bound its run id. The guarded INSERT is the race fence: it writes only
-/// while the task is still in the same unbound in-flight state.
-async fn persist_pending_completion(
-    db: &DurableDb,
-    report: &stow_types::api::WorkflowRunComplete,
-) -> Result<bool, QueueError> {
-    let Some(github_run_id) = report.github_run_id.as_deref() else {
-        return Ok(false);
-    };
-    let inserted = db
-        .query(
-            "INSERT INTO pending_run_completions \
-                 (github_run_id, task_id, success, error) \
-             SELECT ?, task_id, ?, ? FROM queue \
-             WHERE task_id = ? AND status IN ('dispatched', 'running') \
-               AND github_run_id IS NULL \
-             ON CONFLICT(github_run_id) DO NOTHING",
-        )
-        .bind(github_run_id.to_owned())
-        .bind(i64::from(report.success))
-        .bind(report.error.clone())
-        .bind(report.task_id.clone())
-        .execute()
-        .await
-        .map_err(|error| format!("persist pending completion for {github_run_id}: {error}"))?;
-    if inserted.rows_written > 0 {
-        return Ok(true);
-    }
-
-    let existing = db
-        .query(
-            "SELECT github_run_id, task_id, success, error, received_at \
-             FROM pending_run_completions WHERE github_run_id = ?",
-        )
-        .bind(github_run_id.to_owned())
-        .fetch_optional::<PendingCompletionRow>()
-        .await
-        .map_err(|error| format!("load pending completion for {github_run_id}: {error}"))?;
-    match existing {
-        None => Ok(false),
-        Some(existing)
-            if existing.task_id == report.task_id
-                && existing.success == i64::from(report.success)
-                && existing.error == report.error =>
-        {
-            Ok(true)
-        }
-        Some(existing) => Err(QueueError::Invariant(format!(
-            "run {github_run_id} was already pending for task {}",
-            existing.task_id
-        ))),
-    }
-}
-
-/// Apply one exact pending event after its run id has been bound. The event
-/// stays durable until `complete` succeeds; a stale row consumes it without
-/// allowing it to affect a later generation. Returns whether a failure
-/// outcome was recorded — the caller's breaker-evaluation gate (stow#816):
-/// the completion route already evaluates on every failure report, so a
-/// pass owes the check only for failures it applied itself.
-async fn apply_pending_completion_for_binding(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-    task_id: &str,
-    generation_id: &str,
-    github_run_id: &str,
-    window_minutes: u32,
-) -> Result<bool, QueueError> {
-    db.query(
-        "DELETE FROM pending_run_completions \
-         WHERE task_id = ? AND github_run_id != ?",
-    )
-    .bind(task_id.to_owned())
-    .bind(github_run_id.to_owned())
-    .execute()
-    .await
-    .map_err(|error| format!("discard stale pending completions for {task_id}: {error}"))?;
-
-    let pending = db
-        .query(
-            "SELECT github_run_id, task_id, success, error, received_at \
-             FROM pending_run_completions \
-             WHERE task_id = ? AND github_run_id = ?",
-        )
-        .bind(task_id.to_owned())
-        .bind(github_run_id.to_owned())
-        .fetch_optional::<PendingCompletionRow>()
-        .await
-        .map_err(|error| format!("load bound pending completion for {task_id}: {error}"))?;
-    let Some(pending) = pending else {
-        return Ok(false);
-    };
-    let report = BuildCompleteReport {
-        task_id: pending.task_id,
-        generation_id: generation_id.to_owned(),
-        attempt: db
-            .query("SELECT attempt FROM queue WHERE task_id = ? AND generation_id = ?")
-            .bind(task_id.to_owned())
-            .bind(generation_id.to_owned())
-            .fetch_scalar::<u32>()
-            .await
-            .map_err(|error| format!("load bound attempt for {task_id}: {error}"))?,
-        success: pending.success != 0,
-        error: pending.error,
-        github_run_id: Some(pending.github_run_id.clone()),
-        finished_at: Some(pending.received_at),
-    };
-    // A stale or unknown event is consumed without an outcome — only
-    // a `complete` that landed counts toward the caller's gate.
-    let applied = match complete(db, settings, &report, window_minutes).await {
-        Ok(()) => true,
-        Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => false,
-        Err(error) => return Err(error),
-    };
-    db.query("DELETE FROM pending_run_completions WHERE github_run_id = ?")
-        .bind(pending.github_run_id)
-        .execute()
-        .await
-        .map_err(|error| format!("consume pending completion for {task_id}: {error}"))?;
-    Ok(applied && !report.success)
-}
-
-/// Recover pending events after a DO restart. The join is driven by the
-/// currently bound in-flight rows, so it reads only identities that can
-/// still apply and never scans historical workflow runs. Returns whether
-/// any applied event recorded a failure outcome.
-pub async fn reconcile_pending_completions(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-    window_minutes: u32,
-) -> Result<bool, QueueError> {
-    let rows = db
-        .query(
-            "SELECT q.task_id, q.generation_id, q.github_run_id \
-             FROM queue q \
-             JOIN pending_run_completions p \
-               ON p.task_id = q.task_id AND p.github_run_id = q.github_run_id \
-             WHERE q.status IN ('dispatched', 'running') \
-               AND q.github_run_id IS NOT NULL",
-        )
-        .fetch_all::<BoundPendingCompletionRow>()
-        .await
-        .map_err(|error| format!("list bound pending completions: {error}"))?;
-    let mut failure_applied = false;
-    for row in rows {
-        failure_applied |= apply_pending_completion_for_binding(
-            db,
-            settings,
-            &row.task,
-            &row.generation,
-            &row.run,
-            window_minutes,
-        )
-        .await?;
-    }
-    Ok(failure_applied)
-}
-
-/// Bind the run a `workflow_dispatch` response returned to the claimed
-/// row's generation. The claim cleared `github_run_id`, so the write is
-/// gated on the generation the dispatch was made for: a row that has
-/// since moved on (cancelled, failed over) takes no binding, and the
-/// orphan run's own report is rejected as stale when it lands.
-///
-/// The id is also what #526's reconciliation compares against — the
-/// persisted binding is the source of truth for which run a generation
-/// dispatched, where name-matching alone cannot tell two generations
-/// of `<rustc>-<task_id>` apart.
-///
-/// Returns `true` when the binding landed. `false` means the row no
-/// longer sits in the bound generation's claim — the caller logs and
-/// moves on.
-pub async fn bind_dispatch_run(
-    db: &DurableDb,
-    task_id: &str,
-    generation_id: &str,
+    batch_id: &str,
     github_run_id: &str,
 ) -> Result<bool, QueueError> {
     let result = db
         .query(
-            "UPDATE queue SET github_run_id = ? \
-             WHERE task_id = ? AND generation_id = ? \
-                 AND status IN ('dispatched', 'running') AND github_run_id IS NULL",
+            "UPDATE build_batches SET github_run_id = ? \
+             WHERE batch_id = ? AND github_run_id IS NULL \
+               AND (done_run_id IS NULL OR done_run_id = ?)",
         )
         .bind(github_run_id.to_owned())
-        .bind(task_id.to_owned())
-        .bind(generation_id.to_owned())
+        .bind(batch_id.to_owned())
+        .bind(github_run_id.to_owned())
         .execute()
         .await
-        .map_err(|error| format!("bind dispatch run for {task_id}: {error}"))?;
-    if result.rows_written == 0 {
-        return Ok(false);
+        .map_err(|error| format!("bind dispatch run for batch {batch_id}: {error}"))?;
+    if result.rows_written > 0 {
+        return Ok(true);
     }
-    // A completion from an orphaned run can arrive while this generation is
-    // claimed but still unbound. Once the native response binds Y, every
-    // pending event for the task except Y belongs to an older or ambiguous
-    // generation and must be consumed here, even when Y had no early event.
+    // Nothing wrote: the row is gone, already bound, or holds an early
+    // completion from another run. Only the last is an error.
+    let held = db
+        .query("SELECT done_run_id FROM build_batches WHERE batch_id = ? AND github_run_id IS NULL")
+        .bind(batch_id.to_owned())
+        .fetch_scalar_optional::<Option<String>>()
+        .await
+        .map_err(|error| format!("probe batch {batch_id}: {error}"))?
+        .flatten();
+    match held {
+        Some(done_run_id) if done_run_id != github_run_id => Err(QueueError::Invariant(format!(
+            "batch {batch_id} was dispatched as run {github_run_id} but already holds a \
+                 completion from run {done_run_id}"
+        ))),
+        _ => Ok(false),
+    }
+}
+
+/// A batch whose dispatch failed — the POST, the network, an unreadable
+/// response or the token mint (stow#833 §4.2): every leg backs off
+/// through [`back_off_dispatch_legs`] and the batch row is deleted,
+/// which releases its runner slots. Any run the failure left behind is
+/// an orphan whose completion finds no batch row.
+async fn fail_batch_dispatch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch: &FormedBatch,
+    error: &str,
+) -> Result<(), QueueError> {
+    back_off_dispatch_legs(db, settings, &batch.tasks, error).await?;
+    db.query("DELETE FROM build_batches WHERE batch_id = ?")
+        .bind(batch.batch_id.as_str().to_owned())
+        .execute()
+        .await
+        .map_err(|db_error| {
+            format!(
+                "delete failed-dispatch batch {}: {db_error}",
+                batch.batch_id
+            )
+        })?;
+    Ok(())
+}
+
+/// Persist one batch's dispatch outcome: a returned run id binds the
+/// batch row once ([`bind_batch_run`]); a dispatch error — or a bind
+/// that could not be written — backs off every leg and deletes the
+/// row ([`fail_batch_dispatch`]).
+pub async fn persist_batch_dispatch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch: &FormedBatch,
+    outcome: Result<u64, String>,
+) -> Result<(), QueueError> {
+    match outcome {
+        Ok(run_id) => {
+            match bind_batch_run(db, batch.batch_id.as_str(), &run_id.to_string()).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        batch_id = %batch.batch_id,
+                        run_id,
+                        "dispatch run binding skipped — the batch row is gone or already bound"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(batch_id = %batch.batch_id, %error, "failed to bind batch dispatch run");
+                    fail_batch_dispatch(db, settings, batch, &error.to_string()).await?;
+                }
+            }
+        }
+        Err(error) => {
+            tracing::error!(batch_id = %batch.batch_id, %error, "failed to dispatch build batch");
+            fail_batch_dispatch(db, settings, batch, &error).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Record a `build-batch.yml` run's `workflow_run` `completed`
+/// delivery on its `build_batches` row — `POST
+/// /batches/{batch_id}/complete`'s whole write (stow#833 §3.2).
+///
+/// The report lands verbatim — `done_run_id`, `done_attempt`,
+/// `conclusion`, `done_at` — and the row is marked resolvable now
+/// (`resolve_after = now`) for the alarm's resolution pass. The write
+/// lands whether or not the dispatch response has bound
+/// `github_run_id` yet (§4.2's early-webhook case: resolution later
+/// requires `done_run_id = github_run_id`, so the batch row itself
+/// holds the early completion), but only for the run the row is bound
+/// to: `github_run_id IS NULL OR github_run_id = <run>`. The
+/// `done_run_id IS NULL` guard makes a duplicate delivery of the same
+/// run a no-op: it touches nothing and still answers Ok.
+///
+/// # Errors
+/// [`QueueError::UnknownBatch`] when no `build_batches` row carries
+/// the id — an orphan run from an abandoned dispatch.
+/// [`QueueError::Invariant`] when the delivered run is not the one the
+/// row is bound to or already recorded: a row naming two runs is in
+/// neither the resolution pass's nor the lease check's set.
+pub async fn record_batch_completion(
+    db: &DurableDb,
+    batch_id: &str,
+    report: &stow_types::api::BatchRunComplete,
+) -> Result<(), QueueError> {
+    let run_id = report.run_id.to_string();
+    let written = db
+        .query(
+            "UPDATE build_batches \
+             SET done_run_id = ?, done_attempt = ?, conclusion = ?, \
+                 done_at = datetime('now'), resolve_after = datetime('now') \
+             WHERE batch_id = ? AND done_run_id IS NULL \
+               AND (github_run_id IS NULL OR github_run_id = ?)",
+        )
+        .bind(run_id.clone())
+        .bind(i64::from(report.run_attempt))
+        .bind(report.conclusion.clone())
+        .bind(batch_id.to_owned())
+        .bind(run_id.clone())
+        .execute()
+        .await
+        .map_err(|error| format!("record batch completion for {batch_id}: {error}"))?;
+    if written.rows_written > 0 {
+        return Ok(());
+    }
+    // Nothing wrote: a duplicate delivery, a run the row is not bound
+    // to, or no such batch row.
+    let held = db
+        .query("SELECT github_run_id, done_run_id FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .fetch_optional::<HeldRunsRow>()
+        .await
+        .map_err(|error| format!("probe batch {batch_id}: {error}"))?
+        .ok_or_else(|| QueueError::UnknownBatch(batch_id.to_owned()))?;
+    if held.done_run_id.as_deref() == Some(run_id.as_str()) {
+        return Ok(());
+    }
+    Err(QueueError::Invariant(format!(
+        "batch {batch_id} is bound to run {} and recorded run {} but a completion named run {run_id}",
+        held.github_run_id.as_deref().unwrap_or("-"),
+        held.done_run_id.as_deref().unwrap_or("-"),
+    )))
+}
+
+/// The run ids a `build_batches` row holds, for
+/// [`record_batch_completion`]'s mismatch probe.
+#[derive(Debug, skyzen::FromRow)]
+struct HeldRunsRow {
+    github_run_id: Option<String>,
+    done_run_id: Option<String>,
+}
+
+/// A `build_batches` row ready for the alarm's resolution pass, with
+/// the queue rows bound to it (stow#833 §3.2).
+#[derive(Debug)]
+pub struct ReadyBatch {
+    /// `build_batches.batch_id`.
+    pub batch_id: String,
+    /// The run the batch is bound to and its completion named —
+    /// `done_run_id = github_run_id` guards the same id twice.
+    pub run_id: u64,
+    /// The run attempt the completion named — the jobs page is read
+    /// pinned to it.
+    pub done_attempt: u32,
+    /// The batch key's rustc — the records tag namespace each
+    /// leg's artifact check reads.
+    pub rustc_version: String,
+    /// The run's reported conclusion (`success`, `failure`,
+    /// `startup_failure`, …) — the leg classifier's run-level input.
+    pub conclusion: String,
+    /// The batch's legs — queue rows carrying its `batch_id`, ordered
+    /// by `batch_leg`, the leg index in the dispatched payload's
+    /// `tasks` list.
+    pub legs: Vec<ReadyBatchLeg>,
+    /// The batch's absolute deadline in epoch milliseconds
+    /// ([`batch_ceiling_ms`]): a resolution that still has no answer at
+    /// this instant fails the batch ([`defer_unresolved_batch`]).
+    pub ceiling_ms: i64,
+}
+
+/// One leg row of a [`ReadyBatch`] — the generation `resolve_batch`
+/// applies the leg's outcome under.
+#[derive(Debug)]
+pub struct ReadyBatchLeg {
+    /// The leg's queue task.
+    pub task_id: String,
+    /// The generation the claim minted for this leg — the completion
+    /// fence's operand.
+    pub generation_id: String,
+    /// The queue attempt the dispatch carried.
+    pub attempt: u32,
+    /// The leg's index in the batch's `tasks` list — its position in
+    /// `classify_legs`' outcome order, which `resolve_batch`'s
+    /// `resolutions` indexing follows.
+    pub batch_leg: u32,
+}
+
+/// The `build_batches` columns [`ready_batches`] selects.
+#[derive(Debug, skyzen::FromRow)]
+struct ReadyBatchRow {
+    batch_id: String,
+    rustc_version: String,
+    done_run_id: String,
+    done_attempt: u32,
+    conclusion: String,
+    legs: u32,
+    parallelism: u32,
+    claimed_epoch: i64,
+}
+
+/// A queue row as a batch's leg walk reads it.
+#[derive(Debug, skyzen::FromRow)]
+struct BatchLegRow {
+    batch_id: String,
+    task_id: String,
+    generation_id: String,
+    attempt: u32,
+    batch_leg: Option<i64>,
+}
+
+/// The batches whose `completed` delivery is bound and due —
+/// `done_run_id = github_run_id` (an early completion before the
+/// dispatch response's binding waits) and `resolve_after <= now` (a
+/// deferred jobs page inside its settle window waits) — each carrying
+/// its legs in `batch_leg` order.
+///
+/// `now_ms` is the caller's epoch-ms clock, rendered to the
+/// `datetime()` text `resolve_after` stores by the predicate itself.
+///
+/// The read is bounded by the batches in flight, not by queue size:
+/// at most the scheduler's family slot caps over
+/// `STOW_BATCH_PARALLELISM` — ⌈45/k⌉ miss batches plus the human
+/// lane's — rows, each holding at most `STOW_BATCH_MAX_TASKS` legs.
+/// The alarm's resolution drive names this as its stated bound
+/// (stow#833 §3.2). No `ORDER BY`: no caller depends on batch order
+/// (legs arrive keyed by `batch_id`), and ordering by `batch_id`
+/// would steer the planner onto the primary key — a walk of every
+/// in-flight batch — instead of `idx_build_batches_resolve`'s bounded
+/// `resolve_after<?` range.
+///
+/// # Errors
+/// [`QueueError::Invariant`] when a row's run id is not numeric or its
+/// `parallelism` is zero — corrupt state.
+pub async fn ready_batches(db: &DurableDb, now_ms: i64) -> Result<Vec<ReadyBatch>, QueueError> {
+    let batches = db
+        .query(
+            "SELECT batch_id, rustc_version, done_run_id, done_attempt, conclusion, \
+                    legs, parallelism, \
+                    CAST(strftime('%s', claimed_at) AS INTEGER) AS claimed_epoch \
+             FROM build_batches \
+             WHERE done_run_id = github_run_id \
+               AND resolve_after <= datetime(CAST(? AS INTEGER) / 1000, 'unixepoch')",
+        )
+        .bind(now_ms)
+        .fetch_all::<ReadyBatchRow>()
+        .await
+        .map_err(|error| format!("list resolvable batches: {error}"))?;
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One keyed read for every ready batch's legs — `idx_queue_batch`
+    // serves each batch's `batch_leg` walk, never a queue scan.
+    let ids: Vec<String> = batches.iter().map(|batch| batch.batch_id.clone()).collect();
+    let mut legs = batch_legs(db, &ids).await?;
+    batches
+        .into_iter()
+        .map(|batch| {
+            let run_id = batch.done_run_id.parse::<u64>().map_err(|error| {
+                QueueError::Invariant(format!(
+                    "batch {} is bound to run {:?}: {error}",
+                    batch.batch_id, batch.done_run_id
+                ))
+            })?;
+            let ceiling_ms = batch_ceiling_ms(
+                &batch.batch_id,
+                batch.claimed_epoch,
+                batch.legs,
+                batch.parallelism,
+            )?;
+            Ok(ReadyBatch {
+                legs: legs.remove(&batch.batch_id).unwrap_or_default(),
+                batch_id: batch.batch_id,
+                rustc_version: batch.rustc_version,
+                run_id,
+                done_attempt: batch.done_attempt,
+                conclusion: batch.conclusion,
+                ceiling_ms,
+            })
+        })
+        .collect()
+}
+
+/// The leg rows of the named batches, grouped by `batch_id` in
+/// `batch_leg` order — one `json_each`-bound read no matter how many
+/// batches the pass holds.
+async fn batch_legs(
+    db: &DurableDb,
+    batch_ids: &[String],
+) -> Result<BTreeMap<String, Vec<ReadyBatchLeg>>, QueueError> {
+    let rows = db
+        .query(
+            "SELECT batch_id, task_id, generation_id, attempt, batch_leg \
+             FROM queue \
+             WHERE batch_id IN (SELECT value FROM json_each(?)) \
+             ORDER BY batch_id, batch_leg",
+        )
+        .bind(enqueue_json(batch_ids)?)
+        .fetch_all::<BatchLegRow>()
+        .await
+        .map_err(|error| format!("load batch legs: {error}"))?;
+    let mut legs: BTreeMap<String, Vec<ReadyBatchLeg>> = BTreeMap::new();
+    for row in rows {
+        legs.entry(row.batch_id.clone())
+            .or_default()
+            .push(ready_leg(&row)?);
+    }
+    Ok(legs)
+}
+
+/// Decode one stored leg row — a queue row carrying `batch_id` always
+/// carries its `batch_leg` index with it, so a `NULL` or unreadable
+/// index is corrupt state, not a leg to skip.
+fn ready_leg(row: &BatchLegRow) -> Result<ReadyBatchLeg, QueueError> {
+    let batch_leg = row
+        .batch_leg
+        .and_then(|leg| u32::try_from(leg).ok())
+        .ok_or_else(|| {
+            QueueError::Invariant(format!(
+                "task {} is bound to batch {} with batch_leg {:?}",
+                row.task_id, row.batch_id, row.batch_leg
+            ))
+        })?;
+    Ok(ReadyBatchLeg {
+        task_id: row.task_id.clone(),
+        generation_id: row.generation_id.clone(),
+        attempt: row.attempt,
+        batch_leg,
+    })
+}
+
+/// One settled leg's resolution — what [`resolve_batch`] applies to
+/// the leg's queue row (stow#833 §4.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegResolution {
+    /// The leg's jobs succeeded and its signed records artifact is in
+    /// GHCR. The build-cost sample is the leg's runner time — its
+    /// build job's `started_at` to its publish job's `completed_at`,
+    /// in whole milliseconds — never claim-to-completion across the
+    /// batch's rounds.
+    Succeeded {
+        /// The leg's runner time in milliseconds.
+        duration_ms: i64,
+    },
+    /// The leg failed — `error` is the §4.1 text the queue row's
+    /// `error_msg`, the outcome evidence's `failure_class` and the
+    /// breaker's trip report all read.
+    Failed {
+        /// The §4.1 error text.
+        error: String,
+    },
+}
+
+/// Map one classified leg to its queue resolution (stow#833 §4.1).
+///
+/// `None` is "no answer yet" — a leg job still running, or a failed
+/// job's step rows inside their settle window: the caller defers the
+/// batch with [`defer_batch`] rather than resolving it.
+///
+/// `records_present` is the GHCR check's answer for a [`LegOutcome::
+/// Succeeded`] leg — a success without its signed records artifact
+/// resolves as the records-absent failure (stow#655). `task_id`
+/// names the leg's task in that text and `run_url` is the run's
+/// Actions URL — the only pointer a `startup_failure` run, which
+/// holds no jobs at all, can carry for its legs. Both are ignored
+/// otherwise: every other row of the table reads off the failure the
+/// classifier carried.
+#[must_use]
+pub fn leg_resolution(
+    outcome: &LegOutcome,
+    records_present: bool,
+    task_id: &str,
+    run_url: &str,
+) -> Option<LegResolution> {
+    match outcome {
+        LegOutcome::Unsettled => None,
+        LegOutcome::Succeeded {
+            started_at,
+            completed_at,
+            ..
+        } if records_present => Some(LegResolution::Succeeded {
+            duration_ms: i64::try_from((*completed_at - *started_at).whole_milliseconds())
+                .expect("a leg's runner time fits i64"),
+        }),
+        LegOutcome::Succeeded { .. } => Some(LegResolution::Failed {
+            error: stow_types::records::missing_records_error(task_id),
+        }),
+        LegOutcome::Failed(failure) => Some(LegResolution::Failed {
+            error: match failure {
+                LegFailure::Run(RunFailure::Verdict {
+                    job,
+                    step,
+                    html_url,
+                }) => format!("verdict: {job} / {step} ({html_url})"),
+                // `job: "-"` is the classifier's documented mark of a
+                // run no job ever failed — `startup_failure` — so the
+                // run itself is the pointer.
+                LegFailure::Run(RunFailure::Infrastructure { job, .. }) if job == "-" => {
+                    format!("infrastructure: startup_failure ({run_url})")
+                }
+                LegFailure::Run(RunFailure::Infrastructure {
+                    job,
+                    step,
+                    html_url,
+                }) => {
+                    format!(
+                        "infrastructure: {job} / {} ({html_url})",
+                        step.as_deref().unwrap_or("-")
+                    )
+                }
+                LegFailure::Concluded {
+                    job,
+                    conclusion,
+                    html_url,
+                } => format!("{conclusion}: {job} ({html_url})"),
+                LegFailure::Invariant(message) => format!("invariant: {message}"),
+            },
+        }),
+    }
+}
+
+/// Every expected leg's outcome for a ready batch, indexed by leg
+/// number — `classify_legs` over the legs' task hashes (stow#833
+/// §4.1). A leg index with no queue row still occupies its slot: its
+/// placeholder hash mismatches whatever the page carries for it,
+/// which is exactly that phantom leg's invariant failure.
+///
+/// A structural `classify_legs` error — an unreadable job name, a
+/// leg index past the batch — becomes every leg's
+/// [`LegFailure::Invariant`]: the run is ours, so an undecodable
+/// page fails the batch once, never retries it forever.
+#[must_use]
+pub fn leg_outcomes(
+    batch: &ReadyBatch,
+    jobs: &[RunJobRow],
+    now: time::OffsetDateTime,
+) -> Vec<LegOutcome> {
+    let leg_count = batch
+        .legs
+        .iter()
+        .map(|leg| leg.batch_leg)
+        .max()
+        .map_or(0, |max| {
+            usize::try_from(max + 1).expect("leg index + 1 fits usize")
+        });
+    let mut expected = vec![TaskHash::of(""); leg_count];
+    for leg in &batch.legs {
+        expected[usize::try_from(leg.batch_leg).expect("u32 leg index fits usize")] =
+            TaskHash::of(&leg.task_id);
+    }
+    match stow_types::runs::classify_legs(&expected, &batch.conclusion, jobs, now) {
+        Ok(outcomes) => outcomes,
+        Err(error) => vec![LegOutcome::Failed(LegFailure::Invariant(error.to_string())); leg_count],
+    }
+}
+
+/// Each leg's settled resolution for a ready batch, indexed by leg
+/// number — `None` where the leg's outcome is still unsettled, which
+/// defers the whole batch (stow#833 §3.2).
+///
+/// `records_present(leg)` answers the GHCR check for a `Succeeded`
+/// leg's records artifact; it is consulted only on successes.
+#[must_use]
+pub fn batch_resolutions(
+    batch: &ReadyBatch,
+    jobs: &[RunJobRow],
+    records_present: impl Fn(u32) -> bool,
+    now: time::OffsetDateTime,
+) -> Vec<Option<LegResolution>> {
+    let outcomes = leg_outcomes(batch, jobs, now);
+    let run_url = stow_types::runs::run_url(&batch.run_id.to_string());
+    let task_ids: BTreeMap<u32, &str> = batch
+        .legs
+        .iter()
+        .map(|leg| (leg.batch_leg, leg.task_id.as_str()))
+        .collect();
+    outcomes
+        .iter()
+        .enumerate()
+        .map(|(index, outcome)| {
+            let leg_index = u32::try_from(index).expect("leg index fits u32");
+            leg_resolution(
+                outcome,
+                records_present(leg_index),
+                task_ids.get(&leg_index).copied().unwrap_or(""),
+                &run_url,
+            )
+        })
+        .collect()
+}
+
+/// Apply a resolved batch's legs to their queue rows and release the
+/// batch's slots (stow#833 §3.2, §4.1).
+///
+/// Every leg goes through [`complete`]'s own contract under the
+/// batch's run id — the generation fence, the under-`MAX_BUILD_
+/// ATTEMPTS` retry/backoff write and the outcome evidence — with the
+/// leg's `generation_id`/`attempt` read live from its queue row, and
+/// its build sample carrying the resolution's runner-time
+/// `duration_ms` rather than claim-to-completion. A leg whose row
+/// moved on — cancelled, requeued, claimed into another generation —
+/// is refused by that fence and ignored, never an error (§4.2's
+/// "binding misses" case). Deleting the `build_batches` row last is
+/// what releases the batch's `parallelism` slots.
+///
+/// `resolutions[i]` is leg `i`'s settled outcome — the order
+/// `classify_legs` answers in. Every leg is settled: an unsettled leg
+/// is the caller's [`defer_batch`] case, not this function's.
+///
+/// Returns whether any *applied* leg failed, so the caller evaluates
+/// the freeze breaker once per batch — a fenced-off leg applied
+/// nothing, so its outcome counts for nothing either.
+///
+/// # Errors
+/// [`QueueError::Invariant`] when a leg row's `batch_leg` is unreadable
+/// or names a leg `resolutions` does not cover — corrupt state, never
+/// a skippable leg.
+pub async fn resolve_batch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch: &ReadyBatch,
+    resolutions: &[LegResolution],
+    window_minutes: u32,
+) -> Result<bool, QueueError> {
+    let batch_id = batch.batch_id.as_str();
+    let mut any_failure = false;
+    for leg in &batch.legs {
+        let resolution = resolutions
+            .get(usize::try_from(leg.batch_leg).expect("u32 fits usize on every stow target"))
+            .ok_or_else(|| {
+                QueueError::Invariant(format!(
+                    "batch {batch_id} resolved {} legs but task {} names leg {}",
+                    resolutions.len(),
+                    leg.task_id,
+                    leg.batch_leg
+                ))
+            })?;
+        let (success, error, sample_ms) = match resolution {
+            LegResolution::Succeeded { duration_ms } => (true, None, Some(*duration_ms)),
+            LegResolution::Failed { error } => (false, Some(error.clone()), None),
+        };
+        let report = BuildCompleteReport {
+            task_id: leg.task_id.clone(),
+            generation_id: leg.generation_id.clone(),
+            attempt: leg.attempt,
+            success,
+            error,
+            github_run_id: Some(batch.run_id.to_string()),
+            sample_ms,
+        };
+        let applied = match complete(db, settings, &report, window_minutes).await {
+            Ok(()) => true,
+            Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => false,
+            Err(error) => return Err(error),
+        };
+        any_failure |= applied && !report.success;
+    }
+    db.query("DELETE FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("delete resolved batch {batch_id}: {error}"))?;
+    Ok(any_failure)
+}
+
+/// Push a batch's resolution out to `until_ms`: any leg still
+/// unsettled — a job not yet `completed`, or a failed job's step rows
+/// inside their settle window — keeps the batch open for the next
+/// pass (stow#833 §3.2's 30 s deferral).
+///
+/// The push itself has no bound; the deadline is the batch's ceiling,
+/// which [`defer_unresolved_batch`] applies — the pass defers a ready
+/// batch only through it.
+pub async fn defer_batch(db: &DurableDb, batch_id: &str, until_ms: i64) -> Result<(), QueueError> {
     db.query(
-        "DELETE FROM pending_run_completions \
-         WHERE task_id = ? AND github_run_id != ?",
+        "UPDATE build_batches \
+         SET resolve_after = datetime(CAST(? AS INTEGER) / 1000, 'unixepoch') \
+         WHERE batch_id = ?",
     )
-    .bind(task_id.to_owned())
-    .bind(github_run_id.to_owned())
+    .bind(until_ms)
+    .bind(batch_id.to_owned())
     .execute()
     .await
-    .map_err(|error| format!("discard superseded pending completions for {task_id}: {error}"))?;
-    Ok(true)
+    .map_err(|error| format!("defer batch {batch_id}: {error}"))?;
+    Ok(())
+}
+
+/// What became of a batch a pass could not settle this time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchRetry {
+    /// The batch is inside its ceiling: its next look moved out.
+    Deferred,
+    /// The batch reached its ceiling still unreadable or unsettled: its
+    /// in-flight legs failed and the row is released.
+    Failed,
+}
+
+/// A ready batch the resolution pass has no answer for — a jobs page
+/// read error, a records check error, legs still settling, a token
+/// mint failure. Inside the batch's ceiling its resolution moves out to
+/// `now_ms + defer_ms`; at or past it the batch fails
+/// ([`fail_batch_past_ceiling`]) so the row never holds its slots or the
+/// alarm beyond its deadline.
+pub async fn defer_unresolved_batch(
+    db: &DurableDb,
+    batch: &ReadyBatch,
+    now_ms: i64,
+    defer_ms: i64,
+) -> Result<BatchRetry, QueueError> {
+    if now_ms >= batch.ceiling_ms {
+        tracing::error!(
+            batch_id = %batch.batch_id,
+            run_id = batch.run_id,
+            "batch results unreadable or unsettled past its ceiling — failing its legs"
+        );
+        fail_batch_past_ceiling(db, &batch.batch_id, CeilingFailure::ResolutionStalled).await?;
+        return Ok(BatchRetry::Failed);
+    }
+    defer_batch(db, &batch.batch_id, now_ms + defer_ms).await?;
+    Ok(BatchRetry::Deferred)
 }
 
 pub async fn status(db: &DurableDb) -> Result<SchedulerStatus, QueueError> {
@@ -3144,10 +3497,11 @@ const DEFAULT_MIN_DISPATCH_VALUE: i64 = 0;
 /// being assigned ([`value_sql`]), never the stale column.
 ///
 /// The admission expression with an explicit floor operand — the shape
-/// the settings-row formula shares, used only by
+/// the settings-row formula shares, used by
 /// [`apply_dispatch_floor`]'s pass, which must evaluate against the
-/// configured value before the row recording it exists.
-fn dispatch_eligible_at_floor_sql(lane: &str, value: &str, floor: &str) -> String {
+/// configured value before the row recording it exists, and by the cost
+/// gate's floor snapshot.
+pub(super) fn dispatch_eligible_at_floor_sql(lane: &str, value: &str, floor: &str) -> String {
     format!("CASE WHEN ({lane}) = 'human' OR ({value}) >= ({floor}) THEN 1 ELSE 0 END")
 }
 
@@ -3193,28 +3547,29 @@ const fn dispatch_family_label(family: RunnerFamily) -> &'static str {
 }
 
 /// `AND <column> IN ('<family>', …)` — "every family except the
-/// saturated one" rendered as equality over `RunnerFamily::ALL` minus
-/// `full_family`, derived from the type so a new family can never drift
-/// from the exclusion, and never `!=` or `NOT IN`. On `idx_queue_wake`
-/// the family column is the last equality column before the `wake_at`
-/// range, where an inequality cannot bound the range — SQLite falls
+/// saturated ones" rendered as equality over `RunnerFamily::ALL` minus
+/// `saturated`, derived from the type so a new family can never drift
+/// from the exclusion, and never `!=` or `NOT IN`. Both callers get the
+/// term unconditionally: on `idx_queue_wake` the family column is the
+/// last equality column before the `wake_at` range, where a missing
+/// term — like an inequality — cannot bound the range, so SQLite falls
 /// back to reading every eligible pending row, which made a burst of N
 /// future-wake misses cost N reads on every alarm pass and every
-/// deliver. The IN list expands into one seek per surviving family, so
-/// each probe reads only the families that can dispatch (stow#588).
-/// `None` — no family saturated — renders no filter at all.
-fn dispatch_family_in_sql(column: &str, full_family: Option<RunnerFamily>) -> String {
-    let Some(full) = full_family else {
-        return String::new();
-    };
+/// deliver (stow#833). The IN list expands into one seek per surviving
+/// family, so each probe reads only the families that can dispatch
+/// (stow#588) — an empty `saturated` renders `IN` over every family.
+/// The claim page's [`dispatchable_page_sql`] puts `dispatch_family`
+/// behind its `dispatch_key` range, where the extra `IN` is a residual
+/// term and the page's plan is unchanged.
+fn dispatch_family_in_sql(column: &str, saturated: &[RunnerFamily]) -> String {
     let families = RunnerFamily::ALL
         .iter()
-        .filter(|family| **family != full)
+        .filter(|family| !saturated.contains(family))
         .map(|family| format!("'{}'", dispatch_family_label(*family)))
         .collect::<Vec<_>>();
     if families.is_empty() {
-        // A one-family runner set whose only family is saturated: no
-        // row can dispatch — a literal false keeps the probe's shape.
+        // Every family saturated: no row can dispatch — a literal
+        // false keeps the probe's shape.
         return "AND 0".to_owned();
     }
     format!("AND {column} IN ({})", families.join(", "))
@@ -4124,41 +4479,11 @@ fn blocked_by_sql() -> String {
         .to_owned()
 }
 
-async fn claim_dispatchable_row(
-    db: &DurableDb,
-    row: TaskRow,
-) -> Result<Option<QueuedTask>, QueueError> {
-    let claimed_generation = db
-        .query(
-            // `claimed_at` is the immutable claim instant of the
-            // generation just minted — the one timestamp no in-flight
-            // writer may rewrite, so the completion samples a real
-            // claim-to-completion duration even after re-requests
-            // bumped `updated_at` (stow#524).
-            "UPDATE queue \
-             SET status = 'dispatched', generation_id = lower(hex(randomblob(16))), \
-                 dispatch_attempts = dispatch_attempts + 1, \
-                 github_run_id = NULL, claimed_at = datetime('now'), \
-                 updated_at = datetime('now') \
-             WHERE task_id = ? AND status = 'pending' \
-             RETURNING generation_id",
-        )
-        .bind(row.task_id.clone())
-        .fetch_optional::<ClaimGenerationRow>()
-        .await
-        .map_err(|error| format!("claim task {}: {error}", row.task_id))?;
-
-    let Some(claimed_generation) = claimed_generation else {
-        tracing::warn!(
-            task_id = %row.task_id,
-            "skipping task claim — already claimed by concurrent dispatch"
-        );
-        return Ok(None);
-    };
-
-    Ok(Some(QueuedTask {
+/// A page row as the pre-claim leg formation works on — the subgraph
+/// loads later.
+fn pending_leg(row: TaskRow) -> PendingLeg {
+    PendingLeg {
         task_id: row.task_id,
-        generation_id: claimed_generation.generation_id,
         attempt: row.attempt,
         crate_name: row.crate_name,
         version: row.version,
@@ -4172,17 +4497,446 @@ async fn claim_dispatchable_row(
             root_deps: Vec::new(),
             nodes: Vec::new(),
         },
-    }))
+    }
 }
 
+/// What a pending row's page record says beside the [`PendingLeg`]
+/// itself — its batch uniformity key, the leg-ordering cost, and the
+/// pre-claim row state an [`unclaim_rows`] restore writes back.
+struct ClaimSide {
+    /// `(rustc_version, family, lane)` — the batch key (§1.1).
+    key: BatchKey,
+    /// `crate_build_stats.median_ms` — `None` while unmeasured, which
+    /// sorts a leg last like it sorts the rank.
+    median_ms: Option<i64>,
+    /// The row's pre-claim `generation_id` — restored if the row's
+    /// batch is dropped after a lost race.
+    generation_id: String,
+    /// The row's pre-claim `claimed_at` — restored with it.
+    claimed_at: Option<String>,
+}
+
+/// One page row's `ClaimSide`: the runner family and lane decode from
+/// columns an enqueue wrote, so a value they cannot parse is corrupt
+/// state, never a skippable row.
+fn claim_side(row: &TaskRow) -> Result<ClaimSide, QueueError> {
+    let family = runner_family(&row.target).ok_or_else(|| {
+        QueueError::Invariant(format!(
+            "pending task {} targets `{}`, which maps to no runner family",
+            row.task_id, row.target
+        ))
+    })?;
+    let lane = TaskLane::parse(&row.lane).ok_or_else(|| {
+        QueueError::Invariant(format!(
+            "pending task {} carries lane {:?}",
+            row.task_id, row.lane
+        ))
+    })?;
+    let median_ms = row
+        .median_ms
+        .as_deref()
+        .map(|median| crate::scheduler::rank::checked_cost(median).map(NonZero::get))
+        .transpose()?;
+    let rustc_version = WireRustcVersion::parse(&row.rustc_version).map_err(|error| {
+        QueueError::Invariant(format!(
+            "pending task {} rustc_version {:?}: {error}",
+            row.task_id, row.rustc_version
+        ))
+    })?;
+    Ok(ClaimSide {
+        key: BatchKey {
+            rustc_version,
+            family,
+            lane,
+        },
+        median_ms,
+        generation_id: row.generation_id.clone(),
+        claimed_at: row.claimed_at.clone(),
+    })
+}
+
+/// The `BuildTaskPayload` one pending row encodes as a batch leg —
+/// the same fields the per-task dispatch serializes today. A stored
+/// column that fails to parse is corrupt state: the row came in
+/// through enqueue, which validates every field.
+fn task_payload(task: &PendingLeg) -> Result<BuildTaskPayload, QueueError> {
+    fn invalid(task_id: &str, error: impl std::fmt::Display) -> QueueError {
+        QueueError::Invariant(format!("pending task {task_id}: {error}"))
+    }
+    Ok(BuildTaskPayload {
+        task_id: task.task_id.clone(),
+        attempt: task.attempt,
+        crate_name: CrateName::parse(&task.crate_name)
+            .map_err(|error| invalid(&task.task_id, error))?,
+        version: CrateVersion::new(
+            semver::Version::parse(&task.version).map_err(|error| invalid(&task.task_id, error))?,
+        ),
+        features_json: FeaturesJson::from_sorted(
+            serde_json::from_str(&task.features_json)
+                .map_err(|error| invalid(&task.task_id, error))?,
+        )
+        .map_err(|error| invalid(&task.task_id, error))?,
+        target: TargetTriple::parse(&task.target).map_err(|error| invalid(&task.task_id, error))?,
+        rustc_version: WireRustcVersion::parse(&task.rustc_version)
+            .map_err(|error| invalid(&task.task_id, error))?,
+        preserve_lockfile: task.preserve_lockfile,
+        host_side: task.host_side,
+        explicit_spelling: task.explicit_spelling,
+        dependency_subgraph: task.dependency_subgraph.clone(),
+    })
+}
+
+/// One row of the [`unclaim_rows`] restore set — the pre-claim
+/// identity stamps the claim overwrote.
+#[derive(serde::Serialize)]
+struct UnclaimedRow {
+    task_id: String,
+    generation_id: String,
+    claimed_at: Option<String>,
+}
+
+impl UnclaimedRow {
+    /// The restore entry for `task_id` from its page-read `side`.
+    fn of(task_id: &str, sides: &std::collections::HashMap<String, ClaimSide>) -> Self {
+        let side = sides.get(task_id).expect("a claimed row has its side");
+        Self {
+            task_id: task_id.to_owned(),
+            generation_id: side.generation_id.clone(),
+            claimed_at: side.claimed_at.clone(),
+        }
+    }
+}
+
+/// Undo the claim and the batch binding on rows this pass won inside a
+/// batch it then dropped: status, `generation_id` and `claimed_at`
+/// restore to the pre-claim values the page read, `batch_id` and
+/// `batch_leg` clear, and `dispatch_attempts` steps back — a dropped
+/// leg burned no attempt. One `json_each` update for the whole set; an
+/// empty set issues none, so only a lost race writes here. The
+/// subquery's `LIMIT -1` makes the `json_each` side drive a primary-key
+/// seek instead of walking the `dispatched` status group.
+async fn unclaim_rows(db: &DurableDb, rows: &[UnclaimedRow]) -> Result<(), QueueError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    db.query(
+        "UPDATE queue \
+         SET status = 'pending', generation_id = e.generation_id, \
+             claimed_at = e.claimed_at, \
+             dispatch_attempts = dispatch_attempts - 1, \
+             batch_id = NULL, batch_leg = NULL, \
+             updated_at = datetime('now') \
+         FROM (SELECT value ->> 'task_id' AS task_id, \
+                      value ->> 'generation_id' AS generation_id, \
+                      value ->> 'claimed_at' AS claimed_at \
+               FROM json_each(?) LIMIT -1) AS e \
+         WHERE queue.task_id = e.task_id \
+           AND queue.status = 'dispatched' AND queue.github_run_id IS NULL",
+    )
+    .bind(enqueue_json(rows)?)
+    .execute()
+    .await
+    .map_err(|error| format!("restore dropped batch legs: {error}"))?;
+    Ok(())
+}
+
+/// One leg of the single claim-and-bind statement: the row it claims,
+/// the generation it mints, and the batch slot it takes.
+#[derive(serde::Serialize)]
+struct LegClaim {
+    task_id: String,
+    generation_id: String,
+    batch_id: String,
+    /// The leg's index in `tasks`, the matrix order `form_batches`
+    /// sorted.
+    leg: i64,
+}
+
+/// One formed batch's `build_batches` row in the `json_each` set.
+#[derive(serde::Serialize)]
+struct FormedBatchRow {
+    batch_id: String,
+    rustc_version: String,
+    dispatch_family: String,
+    lane: String,
+    parallelism: i64,
+    legs: i64,
+}
+
+/// Mint `count` ids in one statement — one `randomblob` row per id,
+/// bounded by the claim itself (at most `CLAIM_PAGE_ROWS ×
+/// CLAIM_MAX_PAGES` legs plus their batches), never a query per id.
+async fn mint_ids(db: &DurableDb, count: usize) -> Result<Vec<String>, QueueError> {
+    let ids = db
+        .query("SELECT lower(hex(randomblob(16))) FROM json_each(?)")
+        .bind(enqueue_json(&vec![0_u8; count])?)
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("mint {count} ids: {error}"))?;
+    if ids.len() != count {
+        return Err(QueueError::Invariant(format!(
+            "minted {} ids for a request of {count}",
+            ids.len()
+        )));
+    }
+    Ok(ids)
+}
+
+/// Mint every id the formation needs in one statement — a batch id per
+/// batch, then a `generation_id` per leg — and seal each planned batch
+/// with its own.
+async fn seal_batches(
+    db: &DurableDb,
+    planned: Vec<PlannedBatch>,
+    candidates: &[BatchCandidate],
+) -> Result<Vec<FormedBatch>, QueueError> {
+    if planned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let legs: usize = planned.iter().map(|batch| batch.legs.len()).sum();
+    let mut ids = mint_ids(db, planned.len() + legs).await?.into_iter();
+    let batch_ids = ids
+        .by_ref()
+        .take(planned.len())
+        .map(|id| {
+            id.parse::<BatchId>()
+                .map_err(|error| QueueError::Invariant(format!("minted batch id {id:?}: {error}")))
+        })
+        .collect::<Result<Vec<BatchId>, QueueError>>()?;
+    planned
+        .into_iter()
+        .zip(batch_ids)
+        .map(|(batch, batch_id)| batch.seal(batch_id, candidates, &mut ids))
+        .collect()
+}
+
+/// Claim and bind every leg of every sealed batch in ONE statement:
+/// status, the minted `generation_id`, the attempt, the batch id and
+/// the leg index land together, so each queue row is written once. The
+/// `status = 'pending'` predicate is the race fence — the coverage
+/// lookup that preceded it is a D1 await, so a concurrent pass can
+/// claim a row in between — and the returned set is the legs this
+/// pass won.
+async fn claim_and_bind(
+    db: &DurableDb,
+    batches: &[FormedBatch],
+) -> Result<std::collections::HashSet<String>, QueueError> {
+    if batches.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let claims: Vec<LegClaim> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch.tasks.iter().enumerate().map(|(leg, task)| LegClaim {
+                task_id: task.task_id.clone(),
+                generation_id: task.generation_id.clone(),
+                batch_id: batch.batch_id.as_str().to_owned(),
+                leg: i64::try_from(leg).expect("a leg index is bounded by batch_max_tasks"),
+            })
+        })
+        .collect();
+    let won = db
+        .query(
+            // `claimed_at` is the immutable claim instant of the
+            // generation just minted — the one timestamp no in-flight
+            // writer may rewrite, so the completion samples a real
+            // claim-to-completion duration even after re-requests
+            // bumped `updated_at` (stow#524). The subquery's `LIMIT -1`
+            // makes the `json_each` side drive a primary-key seek
+            // instead of walking the `pending` status group.
+            "UPDATE queue \
+             SET status = 'dispatched', generation_id = e.generation_id, \
+                 dispatch_attempts = dispatch_attempts + 1, \
+                 github_run_id = NULL, \
+                 batch_id = e.batch_id, batch_leg = e.leg, \
+                 claimed_at = datetime('now'), \
+                 updated_at = datetime('now') \
+             FROM (SELECT value ->> 'task_id' AS task_id, \
+                          value ->> 'generation_id' AS generation_id, \
+                          value ->> 'batch_id' AS batch_id, \
+                          CAST(value ->> 'leg' AS INTEGER) AS leg \
+                   FROM json_each(?) LIMIT -1) AS e \
+             WHERE queue.task_id = e.task_id AND queue.status = 'pending' \
+             RETURNING queue.task_id",
+        )
+        .bind(enqueue_json(&claims)?)
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("claim {} legs: {error}", claims.len()))?;
+    Ok(won.into_iter().collect())
+}
+
+/// Drop every batch that lost a leg to a concurrent pass: its won legs
+/// go back to `pending` with the pre-claim stamps, it is warned once,
+/// and it never gets a `build_batches` row. Returns the surviving
+/// batches. Writes only when a race happened.
+async fn drop_raced_batches(
+    db: &DurableDb,
+    sealed: Vec<FormedBatch>,
+    won: &std::collections::HashSet<String>,
+    sides: &std::collections::HashMap<String, ClaimSide>,
+) -> Result<Vec<FormedBatch>, QueueError> {
+    let (kept, dropped): (Vec<FormedBatch>, Vec<FormedBatch>) = sealed
+        .into_iter()
+        .partition(|batch| batch.tasks.iter().all(|task| won.contains(&task.task_id)));
+    let mut restore = Vec::new();
+    for batch in &dropped {
+        tracing::warn!(
+            batch_id = %batch.batch_id,
+            "dropping batch — a leg was claimed by a concurrent dispatch"
+        );
+        restore.extend(
+            batch
+                .tasks
+                .iter()
+                .filter(|task| won.contains(&task.task_id))
+                .map(|task| UnclaimedRow::of(&task.task_id, sides)),
+        );
+    }
+    unclaim_rows(db, &restore).await?;
+    Ok(kept)
+}
+
+/// Insert the surviving batches' `build_batches` rows, carrying each
+/// batch's `parallelism` slots, in one `json_each` statement; an empty
+/// set writes none. The legs are bound before their row exists — a
+/// bound leg without its row is harmless, while a legless row would
+/// look releasable to a racing pass.
+async fn insert_batch_rows(
+    db: &DurableDb,
+    batches: &[FormedBatch],
+    stale_dispatch_minutes: u32,
+) -> Result<(), QueueError> {
+    if batches.is_empty() {
+        return Ok(());
+    }
+    let rows = batches
+        .iter()
+        .map(|batch| {
+            Ok(FormedBatchRow {
+                batch_id: batch.batch_id.as_str().to_owned(),
+                rustc_version: batch.rustc_version.as_str().to_owned(),
+                dispatch_family: dispatch_family_label(batch.family).to_owned(),
+                lane: batch.lane.as_str().to_owned(),
+                parallelism: i64::from(batch.parallelism),
+                legs: i64::try_from(batch.tasks.len())
+                    .map_err(|_| QueueError::Invariant("batch leg count exceeds i64".to_owned()))?,
+            })
+        })
+        .collect::<Result<Vec<FormedBatchRow>, QueueError>>()?;
+    db.query(
+        "INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              claimed_at, lease_at) \
+         SELECT e ->> 'batch_id', e ->> 'rustc_version', e ->> 'dispatch_family', \
+                e ->> 'lane', CAST(e ->> 'parallelism' AS INTEGER), \
+                CAST(e ->> 'legs' AS INTEGER), \
+                datetime('now'), datetime('now', ?) \
+         FROM (SELECT value AS e FROM json_each(?))",
+    )
+    .bind(format!("+{stale_dispatch_minutes} minutes"))
+    .bind(enqueue_json(&rows)?)
+    .execute()
+    .await
+    .map_err(|error| format!("insert formed batches: {error}"))?;
+    Ok(())
+}
+
+/// What the page walk hands the formation stage: the rows
+/// [`SlotPlan::admit`] admitted, in page order, each with its
+/// [`ClaimSide`], and how many candidate rows the pages selected.
+/// Every row is still `pending` — the walk claims nothing.
+struct ClaimWalk {
+    admitted: Vec<(TaskRow, ClaimSide)>,
+    selected: usize,
+}
+
+/// The `dispatch_key` page walk of [`claim_dispatchable_tasks`]:
+/// page, retire and admit interleaved — a pass reads rows in
+/// proportion to the rows it can still admit, never to the frontier
+/// depth. `plan.remaining()` sizes each page and `family_saturated`
+/// keeps a spent family's backlog out of it. The walk only decides
+/// which rows may go out; it writes nothing for them, so a row that
+/// formation then leaves unbatched costs no write at all.
+async fn claim_page_walk(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    coverage: &impl CoverageOracle,
+    plan: &mut SlotPlan,
+) -> Result<ClaimWalk, QueueError> {
+    let mut walk = ClaimWalk {
+        admitted: Vec::new(),
+        selected: 0,
+    };
+    let mut after = String::new();
+    for _ in 0..CLAIM_MAX_PAGES {
+        if plan.remaining() == 0 {
+            break;
+        }
+        // About two candidates per open slot: covered retirements
+        // rarely force a second page, and the page cap keeps a deep
+        // frontier on the next alarm tick.
+        let page_rows = CLAIM_PAGE_ROWS.min(i64::from(plan.remaining()) * 2);
+        let saturated: Vec<RunnerFamily> = RunnerFamily::ALL
+            .into_iter()
+            .filter(|family| plan.family_saturated(*family))
+            .collect();
+        let page = select_dispatchable_page(db, settings, &saturated, &after, page_rows).await?;
+        walk.selected += page.len();
+        let full_page =
+            page.len() == usize::try_from(page_rows).expect("claim page rows fits usize");
+        if let Some(last) = page.last() {
+            after.clone_from(&last.dispatch_key);
+        }
+        // `admit` commits the count rule at once; a `Denied` row stays
+        // pending — and so does every worse-ranked row of its key. A
+        // racing pass can still win an admitted row before the claim
+        // statement; that statement's `status = 'pending'` fence
+        // catches it.
+        for row in retire_covered_rows(db, page, coverage).await? {
+            if plan.remaining() == 0 {
+                break;
+            }
+            let side = claim_side(&row)?;
+            if matches!(plan.admit(&side.key)?, SlotAdmission::Denied) {
+                continue;
+            }
+            walk.admitted.push((row, side));
+        }
+        if !full_page {
+            break;
+        }
+    }
+    Ok(walk)
+}
+
+/// Claim pending rows into `build-batch.yml` dispatches (stow#833
+/// §1.2). The walk keeps its shape — stale/lease recovery, the freeze
+/// and pause gates, the capacity read, the `dispatch_key` page walk
+/// with `retire_covered_rows` retiring each page's covered rows — but
+/// a row is *admitted* only while [`SlotPlan::admit`] admits it, and
+/// capacity counts runner slots (`build_batches.parallelism` sums), not
+/// rows.
+///
+/// Admission claims nothing. The admitted rows' subgraphs load once,
+/// [`form_batches`] packs them on a fresh plan over the same budget —
+/// the walk's plan is spent deciding *whether* to take a row, and
+/// replaying the same decisions on a fresh plan can only differ where
+/// an encoder refusal it never saw loosens them (the equivalence is
+/// host-tested in `batching`) — and one statement mints every batch
+/// and generation id. A second statement then claims and binds every
+/// formed leg at once, so a row is written exactly once and a row
+/// formation leaves unbatched is not written at all; a batch that lost
+/// a leg to a concurrent pass is dropped whole, and the surviving
+/// batches get their `build_batches` rows in a third.
 pub async fn claim_dispatchable_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
     coverage: &impl CoverageOracle,
-) -> Result<Vec<QueuedTask>, QueueError> {
-    // Stale recovery runs ahead of the pause check: a paused scheduler
-    // owes its in-flight builds the same lease-expiry reclaim.
-    recover_stale_active_tasks(db, settings).await?;
+) -> Result<Vec<FormedBatch>, QueueError> {
+    // The lease check ran ahead of this claim (`object.rs`); what is
+    // left is releasing the slots of batches with no leg in flight.
+    release_legless_batches(db).await?;
     // The dispatch freeze is the gate, and it lives here — the enqueue
     // side of the queue never consults it, so misses keep arriving and
     // stay pending for the first pass after a human lifts the freeze.
@@ -4199,82 +4953,73 @@ pub async fn claim_dispatchable_tasks(
     // dependent's edge is decidable only at the report that publishes
     // them — an alarm pass precedes that data and cannot know.
     let active = count_active_by_family(db).await?;
-    let mut total_slots = limit.get().saturating_sub(active.total);
-    let mut macos_slots = settings
+    let shared_free = limit.get().saturating_sub(active.total);
+    let macos_free = settings
         .max_concurrent_macos_jobs
         .saturating_sub(active.of(RunnerFamily::MacOs));
     tracing::info!(
         running = active.total,
-        available = total_slots,
-        macos_available = macos_slots,
+        available = shared_free,
+        macos_available = macos_free,
         ?settings,
         "scheduler claim_dispatchable_tasks capacity"
     );
-    if total_slots == 0 {
+    if shared_free == 0 {
+        return Ok(Vec::new());
+    }
+    let fresh_plan = || {
+        SlotPlan::new(
+            shared_free,
+            std::collections::HashMap::from([(RunnerFamily::MacOs, macos_free)]),
+            settings.batch_parallelism,
+            settings.batch_max_tasks,
+        )
+    };
+
+    let walk = claim_page_walk(db, settings, coverage, &mut fresh_plan()).await?;
+    tracing::info!(
+        selected = walk.selected,
+        "scheduler claim_dispatchable_tasks selected rows"
+    );
+    let mut legs = Vec::with_capacity(walk.admitted.len());
+    let mut sides = std::collections::HashMap::with_capacity(walk.admitted.len());
+    for (row, side) in walk.admitted {
+        sides.insert(row.task_id.clone(), side);
+        legs.push(pending_leg(row));
+    }
+    load_admitted_subgraphs(db, &mut legs).await?;
+    if legs.is_empty() {
         return Ok(Vec::new());
     }
 
-    // A family with zero free slots is excluded in the claim query
-    // itself: its backlog would otherwise spend the page budget while
-    // claimable rows of other families sit past the frontier.
-    let full_family = (macos_slots == 0).then_some(RunnerFamily::MacOs);
-    // Page, retire and claim interleaved: a pass reads rows in
-    // proportion to the slots it fills, never to the frontier depth —
-    // a page sized to the open slots goes to the coverage oracle as one
-    // lookup, and the next page is read only while slots remain and the
-    // last page came back full.
-    let mut claimed = Vec::new();
-    let mut selected = 0usize;
-    let mut after = String::new();
-    for _ in 0..CLAIM_MAX_PAGES {
-        if total_slots == 0 {
-            break;
-        }
-        // About two candidates per open slot: covered retirements
-        // rarely force a second page, and the page cap keeps a deep
-        // frontier on the next alarm tick.
-        let page_rows = CLAIM_PAGE_ROWS.min(i64::from(total_slots) * 2);
-        let page = select_dispatchable_page(db, settings, full_family, &after, page_rows).await?;
-        selected += page.len();
-        let full_page =
-            page.len() == usize::try_from(page_rows).expect("claim page rows fits usize");
-        if let Some(last) = page.last() {
-            after.clone_from(&last.dispatch_key);
-        }
-        for row in retire_covered_rows(db, page, coverage).await? {
-            if total_slots == 0 {
-                break;
-            }
-            // Enqueue only admits CI targets, so a pending row whose target
-            // maps to no runner family means the queue state is corrupt.
-            let family = runner_family(&row.target).ok_or_else(|| {
-                QueueError::Invariant(format!(
-                    "pending task {} targets `{}`, which maps to no runner family",
-                    row.task_id, row.target
-                ))
-            })?;
-            if family == RunnerFamily::MacOs && macos_slots == 0 {
-                continue;
-            }
-            let Some(task) = claim_dispatchable_row(db, row).await? else {
-                continue;
-            };
-            total_slots -= 1;
-            if family == RunnerFamily::MacOs {
-                macos_slots -= 1;
-            }
-
-            claimed.push(task);
-        }
-        if !full_page {
-            break;
-        }
+    let mut candidates = Vec::with_capacity(legs.len());
+    for task in legs {
+        let side = &sides[&task.task_id];
+        candidates.push(BatchCandidate {
+            payload: task_payload(&task)?,
+            lane: side.key.lane,
+            family: side.key.family,
+            median_ms: side.median_ms,
+            task,
+        });
     }
-    tracing::info!(selected, "scheduler claim_dispatchable_tasks selected rows");
-
-    load_claimed_subgraphs(db, &mut claimed).await?;
-
-    Ok(claimed)
+    let formation = form_batches(&candidates, &mut fresh_plan())?;
+    tracing::info!(
+        batches = formation.batches.len(),
+        unbatched = formation.unbatched.len(),
+        rejected = formation.rejected.len(),
+        "scheduler claim_dispatchable_tasks formed batches"
+    );
+    let sealed = seal_batches(db, formation.batches, &candidates).await?;
+    let won = claim_and_bind(db, &sealed).await?;
+    let batches = drop_raced_batches(db, sealed, &won, &sides).await?;
+    insert_batch_rows(db, &batches, settings.stale_dispatch_minutes).await?;
+    // Rows the encoder refused are still `pending`, which
+    // `fail_claimed_task` allows; unbatched rows are not written.
+    for &(index, ref error) in &formation.rejected {
+        fail_claimed_task(db, &candidates[index].task.task_id, error).await?;
+    }
+    Ok(batches)
 }
 
 /// One `task_nodes` row as the dispatch walk reads it.
@@ -4315,7 +5060,7 @@ const SUBGRAPH_WALK_LEVEL_ROWS: usize = 512;
 /// payload whose `verified_dependency_graph` would hold, so it fails
 /// dispatch with the missing task id named — never a leaf substitute —
 /// and the rest of the batch still dispatches.
-/// Per-task walk state for [`load_claimed_subgraphs`]: the ordered
+/// Per-task walk state for [`load_admitted_subgraphs`]: the ordered
 /// list of discovered dependency node ids (the future `nodes` array —
 /// the root itself is implicit in the wire), the set for dedup, the
 /// level frontier, and the root node's own children (the future
@@ -4327,9 +5072,9 @@ struct SubgraphWalk {
     root_children: Vec<String>,
 }
 
-async fn load_claimed_subgraphs(
+async fn load_admitted_subgraphs(
     db: &DurableDb,
-    claimed: &mut Vec<QueuedTask>,
+    claimed: &mut Vec<PendingLeg>,
 ) -> Result<(), QueueError> {
     if claimed.is_empty() {
         return Ok(());
@@ -4381,7 +5126,7 @@ async fn load_claimed_subgraphs(
     Ok(())
 }
 
-/// The walk half of [`load_claimed_subgraphs`]: level-0 roots in one
+/// The walk half of [`load_admitted_subgraphs`]: level-0 roots in one
 /// `IN` query, then the union-of-frontiers expansion bounded per level,
 /// returning every task's `SubgraphWalk` (None where the walk broke),
 /// the fetched row set, and the (claimed index, missing id) pairs.
@@ -4675,22 +5420,31 @@ pub(super) const CLAIM_MAX_PAGES: usize = 8;
 /// priority — then FIFO by `first_requested_at` with creation and id
 /// tie breakers), so neither is evaluated per row.
 ///
-/// `full_family` names a runner family with zero free slots — its rows
+/// `saturated` names runner families with no free slot — their rows
 /// are excluded in SQL, the same predicate the wake probes build: a
 /// saturated family's backlog must not spend the page budget while
 /// other families have claimable rows past the frontier. One page of at
 /// most `page_rows` rows resumes the keyset walk from `after` (the last
 /// `dispatch_key` the previous page read): the caller sizes the page to
-/// its open slots and pages again only while that page came back full,
-/// because a family that fills mid-pass is still skipped in Rust and
-/// the walk must see past it.
+/// the rows the plan can still admit and pages again only while that
+/// page came back full, because a family that fills mid-pass is still
+/// skipped in Rust and the walk must see past it.
 /// The production page selection — WHERE terms, family exclusion,
 /// ORDER BY and LIMIT — shared by the paged claim walk and the
 /// floor probe's bounded frontier so the two can't drift (stow#525).
-fn dispatchable_page_sql(columns: &str, full_family: Option<RunnerFamily>) -> String {
-    let family_filter = dispatch_family_in_sql("q.dispatch_family", full_family);
+fn dispatchable_page_sql(columns: &str, join_stats: bool, saturated: &[RunnerFamily]) -> String {
+    let family_filter = dispatch_family_in_sql("q.dispatch_family", saturated);
+    // The claim walk needs `median_ms` — the leg-ordering cost —
+    // from the keyed stats join; the frontier probe reads ids only
+    // and does not pay it.
+    let stats = if join_stats {
+        "LEFT JOIN crate_build_stats s \
+         ON s.crate_name = q.crate_name AND s.target = q.target"
+    } else {
+        ""
+    };
     format!(
-        "SELECT {columns} FROM queue q \
+        "SELECT {columns} FROM queue q {stats} \
          WHERE q.status = 'pending' AND q.deps_met = 1 \
            AND q.dispatch_eligible = 1 \
            AND (q.lane = 'human' OR q.first_requested_at <= datetime('now', ?)) \
@@ -4704,7 +5458,7 @@ fn dispatchable_page_sql(columns: &str, full_family: Option<RunnerFamily>) -> St
 
 /// The bounded eligible frontier one claim pass can touch — the first
 /// `CLAIM_PAGE_ROWS * CLAIM_MAX_PAGES` rows of the production page
-/// selection under the live `full_family` — for the floor probe's
+/// selection under the live family exclusion — for the floor probe's
 /// pre-image snapshot (stow#525). The paged walk reads contiguous
 /// keyset slices of exactly this ordered set, so the bound covers
 /// every row the pass can open.
@@ -4716,8 +5470,12 @@ pub(super) async fn select_dispatchable_frontier(
     let macos_slots = settings
         .max_concurrent_macos_jobs
         .saturating_sub(active.of(RunnerFamily::MacOs));
-    let full_family = (macos_slots == 0).then_some(RunnerFamily::MacOs);
-    db.query(&dispatchable_page_sql("q.task_id", full_family))
+    let saturated: &[RunnerFamily] = if macos_slots == 0 {
+        &[RunnerFamily::MacOs]
+    } else {
+        &[]
+    };
+    db.query(&dispatchable_page_sql("q.task_id", false, saturated))
         .bind(dispatch_cutoff_modifier(settings.dispatch_min_age_minutes))
         .bind(String::new())
         .bind(CLAIM_PAGE_ROWS * i64::try_from(CLAIM_MAX_PAGES).unwrap_or(i64::MAX))
@@ -4729,13 +5487,16 @@ pub(super) async fn select_dispatchable_frontier(
 async fn select_dispatchable_page(
     db: &DurableDb,
     settings: &SchedulerSettings,
-    full_family: Option<RunnerFamily>,
+    saturated: &[RunnerFamily],
     after: &str,
     page_rows: i64,
 ) -> Result<Vec<TaskRow>, QueueError> {
     let sql = dispatchable_page_sql(
-        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.explicit_spelling, q.preserve_lockfile, q.dependency_identity, q.dispatch_attempts, q.dispatch_key",
-        full_family,
+        "q.task_id, q.attempt, q.crate_name, q.version, q.features_json, q.target, q.rustc_version, q.host_side, q.explicit_spelling, q.preserve_lockfile, q.dependency_identity, q.dispatch_attempts, q.dispatch_key, \
+         q.lane, q.generation_id, q.claimed_at, \
+         CAST(s.median_ms AS TEXT) AS median_ms",
+        true,
+        saturated,
     );
     let cutoff = dispatch_cutoff_modifier(settings.dispatch_min_age_minutes);
     // The keyset cursor: every real key starts with an inverted-value
@@ -4752,111 +5513,82 @@ async fn select_dispatchable_page(
         .map_err(|error| QueueError::Sql(format!("select dispatchable tasks: {error}")))
 }
 
-pub async fn mark_dispatch_failed(
+/// The dispatch-failure backoff in minutes as a SQL expression of
+/// `attempts_column`: `min(2^min(attempts, 6), MAX_DISPATCH_BACKOFF_MINUTES)`,
+/// so a persistent failure (GitHub outage, bad token) never spins the
+/// alarm in a zero-delay retry loop.
+fn backoff_minutes_sql(attempts_column: &str) -> String {
+    format!("MIN(1 << MIN({attempts_column}, 6), {MAX_DISPATCH_BACKOFF_MINUTES})")
+}
+
+/// Back off every leg of a batch whose dispatch failed, in one
+/// statement. Each leg whose `(task_id, generation_id)` still names a
+/// `dispatched`/`running` row with no bound run re-enters `pending`
+/// behind the backoff of its own `dispatch_attempts` (incremented at
+/// claim time); a late external-I/O failure for a superseded or
+/// already-bound generation matches nothing and must not overwrite the
+/// live row.
+///
+/// The row re-enters `pending`: `unpublished_deps`/`deps_met` stay live
+/// on every status, so the recompute is a cheap count-derived
+/// re-derivation — and `blocked`, maintained for pending rows only, may
+/// have gone stale while it was in-flight. `wake_at` is the later of
+/// the age gate and the backoff this statement writes (the SET operand
+/// is spelled out again — SET terms see the old row); the human lane
+/// ignores the age gate. The subquery's `LIMIT -1` makes the `json_each`
+/// side drive a primary-key seek instead of walking the
+/// `dispatched`/`running` status groups.
+pub async fn back_off_dispatch_legs(
     db: &DurableDb,
     settings: &SchedulerSettings,
-    task_id: &str,
-    generation_id: &str,
+    legs: &[QueuedTask],
     error: &str,
 ) -> Result<(), QueueError> {
-    // Exponential backoff keyed on dispatch_attempts (incremented at claim
-    // time): a persistent dispatch failure (GitHub outage, bad token) must
-    // not spin the alarm in a zero-delay retry loop.
-    let Some(dispatch_attempts) = db
-        .query(
-            "SELECT dispatch_attempts FROM queue \
-             WHERE task_id = ? AND generation_id = ? \
-               AND status IN ('dispatched', 'running') AND github_run_id IS NULL",
-        )
-        .bind(task_id.to_owned())
-        .bind(generation_id.to_owned())
-        .fetch_scalar_optional::<u32>()
-        .await
-        .map_err(|db_error| format!("load dispatch attempts for {task_id}: {db_error}"))?
-    else {
-        // A late external-I/O failure for a superseded or already-bound
-        // generation must not overwrite the live row.
+    if legs.is_empty() {
         return Ok(());
-    };
-    let backoff_minutes = dispatch_backoff_minutes(dispatch_attempts);
-    // The row re-enters `pending`: `unpublished_deps`/`deps_met` stay
-    // live on every status, so the recompute is a cheap count-derived
-    // re-derivation — and `blocked`, maintained for pending rows only,
-    // may have gone stale while it was in-flight. `wake_at` is the
-    // later of the age gate and the backoff this statement writes (the
-    // SET operand is spelled out again — SET terms see the old row);
-    // the human lane ignores the age gate.
-    let next_not_before = "datetime('now', ?)";
+    }
+    let next_not_before = format!(
+        "datetime('now', '+' || {} || ' minutes')",
+        backoff_minutes_sql("dispatch_attempts")
+    );
     let updated = db
         .query(&format!(
             "UPDATE queue \
-         SET status = 'pending', error_msg = ?, \
-             not_before = {next_not_before}, \
-             deps_met = {deps_met}, blocked = {blocked}, \
-             wake_at = {wake}, \
-             updated_at = datetime('now') \
-         WHERE task_id = ? AND generation_id = ? \
-           AND status IN ('dispatched', 'running') AND github_run_id IS NULL \
-         RETURNING task_id",
+             SET status = 'pending', error_msg = ?, \
+                 not_before = {next_not_before}, \
+                 deps_met = {deps_met}, blocked = {blocked}, \
+                 wake_at = {wake}, \
+                 updated_at = datetime('now') \
+             FROM (SELECT value ->> 'task_id' AS task_id, \
+                          value ->> 'generation_id' AS generation_id \
+                   FROM json_each(?) LIMIT -1) AS e \
+             WHERE queue.task_id = e.task_id AND queue.generation_id = e.generation_id \
+               AND queue.status IN ('dispatched', 'running') \
+               AND queue.github_run_id IS NULL \
+             RETURNING queue.task_id",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
             wake = wake_at_sql(
-                "lane",
-                "first_requested_at",
-                next_not_before,
+                "queue.lane",
+                "queue.first_requested_at",
+                &next_not_before,
                 settings.dispatch_min_age_minutes,
             ),
         ))
         .bind(error.to_owned())
-        .bind(format!("+{backoff_minutes} minutes"))
-        .bind(format!("+{backoff_minutes} minutes"))
-        .bind(format!("+{backoff_minutes} minutes"))
-        .bind(task_id.to_owned())
-        .bind(generation_id.to_owned())
+        .bind(enqueue_json(legs)?)
         .fetch_scalars::<String>()
         .await
-        .map_err(|db_error| {
-            format!("mark dispatch failed for {task_id} generation {generation_id}: {db_error}")
-        })?;
+        .map_err(|db_error| format!("back off {} dispatch legs: {db_error}", legs.len()))?;
 
     if !updated.is_empty() {
-        discard_pending_completions(db, task_id, generation_id).await?;
-        // The row re-entered `pending` carrying the rank written
+        // The rows re-entered `pending` carrying the rank written
         // before the last cost move; refresh it through the shared
-        // abstraction, scoped to the row that transitioned.
+        // abstraction, scoped to the rows that transitioned.
         refresh_dispatch_keys(db, &updated).await?;
     }
 
     Ok(())
-}
-
-async fn discard_pending_completions(
-    db: &DurableDb,
-    task_id: &str,
-    generation_id: &str,
-) -> Result<(), QueueError> {
-    db.query(
-        "DELETE FROM pending_run_completions \
-         WHERE task_id = ? AND EXISTS ( \
-             SELECT 1 FROM queue \
-             WHERE task_id = ? AND generation_id = ? AND status = 'pending' \
-         )",
-    )
-    .bind(task_id.to_owned())
-    .bind(task_id.to_owned())
-    .bind(generation_id.to_owned())
-    .execute()
-    .await
-    .map_err(|error| {
-        format!("discard pending completions for {task_id} generation {generation_id}: {error}")
-    })?;
-    Ok(())
-}
-
-fn dispatch_backoff_minutes(attempts: u32) -> u32 {
-    2u32.checked_pow(attempts.min(6))
-        .unwrap_or(MAX_DISPATCH_BACKOFF_MINUTES)
-        .min(MAX_DISPATCH_BACKOFF_MINUTES)
 }
 
 /// Seconds of validity that must remain on the cached GitHub App
@@ -5110,8 +5842,8 @@ const TRIP_EXAMPLE_RUNS: i64 = 3;
 
 /// Sum the in-window outcome buckets per target and run the pure trip
 /// decision. The read is `attempt_outcome_buckets`, not the raw rows:
-/// the window is at most `window_minutes / 5` buckets per target
-/// (12 × 9 targets under the defaults) whatever the traffic, so the
+/// the window is at most `window_minutes / 5 + 1` buckets per target
+/// (13 × 9 targets under the defaults) whatever the traffic, so the
 /// cost of the check is constant in the number of completions it
 /// covers. The sample is the outcome tally, not the queue rows: a
 /// retried task flips back to `pending` and would otherwise erase its
@@ -5122,13 +5854,18 @@ pub async fn evaluate_freeze_trip(
     db: &DurableDb,
     settings: &crate::freeze::FreezeSettings,
 ) -> Result<Option<FreezeTripDraft>, QueueError> {
-    // The bucket SELECT returns the rows it scans — the host backend's
-    // `rows_read` then equals what the Durable Object bills.
+    // The bucket SELECT's range is bounded on both ends, so it returns
+    // the rows it scans — at most (`window_minutes` / 5 + 1) ×
+    // `CI_TARGET_TRIPLES` — and the host backend's `rows_read` equals
+    // what the Durable Object bills. No ORDER BY: the fold is a
+    // `BTreeMap`, and ordering would steer the planner onto the
+    // (target, bucket) primary key — a full scan — instead of
+    // `idx_attempt_outcome_buckets_bucket`'s bounded range (stow#833).
     let buckets = db
         .query(
             "SELECT target, outcomes, failures FROM attempt_outcome_buckets \
              WHERE bucket >= unixepoch('now') - CAST(? AS INTEGER) \
-             ORDER BY target, bucket",
+               AND bucket <= unixepoch('now')",
         )
         .bind(i64::from(settings.window_minutes) * 60)
         .fetch_all::<OutcomeBucketRow>()
@@ -5193,6 +5930,27 @@ pub async fn evaluate_freeze_trip(
         classes,
         example_run_ids,
     }))
+}
+
+/// The database half of the post-failure freeze check — the
+/// already-frozen short-circuit plus the window evaluation, so a
+/// failure drive pays exactly the reads the Durable Object's check
+/// runs. `None` covers both "a freeze already holds" (the cheap gate
+/// skips the window read) and "the window does not trip"; the caller
+/// applies an `Ok(Some(_))` draft through
+/// `freeze::apply_transition` — the record write and the one alert —
+/// which stays request-side with the alert sink.
+///
+/// # Errors
+/// [`QueueError::Sql`] when a read fails.
+pub async fn freeze_trip_draft(
+    db: &DurableDb,
+    settings: &crate::freeze::FreezeSettings,
+) -> Result<Option<FreezeTripDraft>, QueueError> {
+    if freeze_enabled(db).await? {
+        return Ok(None);
+    }
+    evaluate_freeze_trip(db, settings).await
 }
 
 /// One `attempt_outcome_buckets` row inside the trip window — the
@@ -5556,14 +6314,6 @@ pub async fn apply_mutation(
         // every keyed batch.
         for ids in mutated.chunks(ENQUEUE_JSON_BATCH_ROWS) {
             let ids = enqueue_json(ids)?;
-            db.query(
-                "DELETE FROM pending_run_completions \
-                 WHERE task_id IN (SELECT value FROM json_each(?))",
-            )
-            .bind(ids.clone())
-            .execute()
-            .await
-            .map_err(|error| format!("discard pending completions after mutation: {error}"))?;
             refresh_dependents(
                 db,
                 "SELECT value AS task_id FROM json_each(?)",
@@ -5814,7 +6564,7 @@ pub enum DispatchCapacity {
     /// `active_total < limit` — a dispatch slot is free.
     Available,
     /// Every slot is taken: at least one dispatched/running row exists,
-    /// so `earliest_active_lease_expiry_ms` must be `Some`.
+    /// so `earliest_batch_wake_ms` must be `Some`.
     Exhausted,
 }
 
@@ -5832,20 +6582,20 @@ pub struct AlarmInputs {
     /// Earliest moment any unblocked pending row in a family with a free
     /// dispatch slot becomes dispatchable.
     pub earliest_pending_eligible_ms: Option<i64>,
-    /// Earliest `claimed_at + stale_dispatch_minutes` over dispatched/running
-    /// rows — when the oldest in-flight build becomes recoverable. Must be
+    /// Earliest moment an in-flight batch needs a pass — its lease
+    /// expiry, or its `resolve_after` once its completion is recorded
+    /// (see [`earliest_batch_wake_ms`]). Must be
     /// `Some` whenever `capacity` is `Exhausted`; `next_alarm` enforces
     /// this before delegating.
-    pub earliest_active_lease_expiry_ms: Option<i64>,
+    pub earliest_batch_wake_ms: Option<i64>,
 }
 
 /// Pure alarm decision; see [`AlarmInputs`] for the meaning of each field.
 ///
 /// A wake-up is needed not only for pending rows becoming eligible but also
-/// for stale recovery: `recover_stale_active_tasks` only runs inside
-/// `claim_dispatchable_tasks`, so an in-flight build whose completion
-/// webhook never arrives would never be reclaimed unless the alarm fires at
-/// its lease expiry.
+/// for the lease check: it only runs inside the dispatch pass, so an in-flight
+/// batch whose completion webhook never arrives would never be settled unless
+/// the alarm fires at its lease expiry.
 pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
     match (inputs.capacity, inputs.earliest_pending_eligible_ms) {
         // A free slot plus an eligible row: wake when it can be claimed.
@@ -5855,18 +6605,16 @@ pub fn plan_alarm(inputs: &AlarmInputs) -> AlarmPlan {
         // Every slot is taken, so the earliest wake-up that can make
         // progress is the oldest lease expiring — never `now`, which would
         // spin the Durable Object in a zero-delay alarm loop.
-        (DispatchCapacity::Exhausted, Some(_)) => {
-            inputs.earliest_active_lease_expiry_ms.map_or_else(
-                || unreachable!("exhausted dispatch capacity implies an active queue row"),
-                |lease_ms| AlarmPlan::At(lease_ms.max(inputs.now_ms)),
-            )
-        }
+        (DispatchCapacity::Exhausted, Some(_)) => inputs.earliest_batch_wake_ms.map_or_else(
+            || unreachable!("exhausted dispatch capacity implies an active queue row"),
+            |lease_ms| AlarmPlan::At(lease_ms.max(inputs.now_ms)),
+        ),
         // Paused, or no dispatchable row: the only wake that can still
         // make progress is stale recovery on an in-flight build — pending
         // rows blocked on an active dependency unblock when it completes
         // or goes stale too. Nothing in flight means nothing to wake for.
         (_, _) => inputs
-            .earliest_active_lease_expiry_ms
+            .earliest_batch_wake_ms
             .map_or(AlarmPlan::Delete, |lease_ms| {
                 AlarmPlan::At(lease_ms.max(inputs.now_ms))
             }),
@@ -5901,17 +6649,21 @@ pub async fn next_alarm(
         capacity,
         earliest_pending_eligible_ms: earliest_pending_eligible_ms(
             db,
-            macos_saturated.then_some(RunnerFamily::MacOs),
+            if macos_saturated {
+                &[RunnerFamily::MacOs]
+            } else {
+                &[]
+            },
             now_ms,
         )
         .await?,
-        earliest_active_lease_expiry_ms: earliest_active_lease_expiry_ms(db, settings).await?,
+        earliest_batch_wake_ms: earliest_batch_wake_ms(db).await?,
     };
     // Exhausted capacity means at least one dispatched/running row exists, so
     // a missing lease expiry contradicts the count just read — fail loudly
     // rather than letting plan_alarm pick a wake-up.
     if matches!(inputs.capacity, DispatchCapacity::Exhausted)
-        && inputs.earliest_active_lease_expiry_ms.is_none()
+        && inputs.earliest_batch_wake_ms.is_none()
     {
         return Err(QueueError::Invariant(
             "dispatch capacity exhausted but no dispatched/running rows".to_owned(),
@@ -5925,12 +6677,12 @@ pub async fn next_alarm(
 /// eligible set, the persisted lane-aware wake instant. May be in the
 /// past (already eligible).
 ///
-/// `full_family` names a capped runner family whose slots are all taken;
-/// its pending rows are excluded so an eligibility the scheduler could
-/// not act on cannot wake the alarm at `now`.
+/// `saturated` names capped runner families whose slots are all taken;
+/// their pending rows are excluded so an eligibility the scheduler
+/// could not act on cannot wake the alarm at `now`.
 async fn earliest_pending_eligible_ms(
     db: &DurableDb,
-    full_family: Option<RunnerFamily>,
+    saturated: &[RunnerFamily],
     now_ms: i64,
 ) -> Result<Option<i64>, QueueError> {
     // Two probes over `idx_queue_wake (status, deps_met,
@@ -5944,12 +6696,14 @@ async fn earliest_pending_eligible_ms(
     // `wake_at` range means under-floor rows are outside the index
     // span the probes walk — a queue of them arms nothing immediate
     // and contributes nothing to the deferred MIN's read set.
-    // The family exclusion renders as `dispatch_family IN (…)` — the
-    // remaining families as equality, so SQLite expands the list into
-    // one seek per family and each `wake_at` range stays bounded
-    // (stow#588). `!=` would leave the range unbounded: every eligible
+    // The family term renders as `dispatch_family IN (…)` —
+    // `RunnerFamily::ALL` minus the saturated families, all of them
+    // when none is — equality over the column ahead of `wake_at`, so
+    // SQLite expands the list into one seek per family and each
+    // `wake_at` range stays bounded (stow#588). A missing term
+    // (stow#833) or a `!=` leaves the range unbounded: every eligible
     // pending row read, on every alarm pass and every deliver.
-    let family_filter = dispatch_family_in_sql("dispatch_family", full_family);
+    let family_filter = dispatch_family_in_sql("dispatch_family", saturated);
     // The plan is a pure function of `now_ms`; bind the rendered clock
     // rather than calling wall-clock `datetime('now')` inside the probes.
     let now = db
@@ -5997,22 +6751,26 @@ async fn earliest_pending_eligible_ms(
         .transpose()
 }
 
-/// Earliest epoch-ms at which an in-flight (dispatched/running) row's lease
-/// goes stale: `claimed_at + stale_dispatch_minutes`, minimized. May be in
-/// the past (already recoverable). The lease clocks the claim, not the
-/// last transition — a re-request bumping `updated_at` on a live row must
-/// not postpone its recovery (stow#786).
-async fn earliest_active_lease_expiry_ms(
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-) -> Result<Option<i64>, QueueError> {
+/// Earliest epoch-ms at which an in-flight batch needs a pass. A batch
+/// whose completion is recorded against its bound run belongs to the
+/// resolution pass and wakes at its `resolve_after`; every other batch
+/// wakes at its `lease_at` for the lease check — the same split
+/// [`expired_batches`] makes, so a recorded batch whose resolution is
+/// deferred never holds the alarm at its past lease. May be in the
+/// past (already due). The lease clocks the claim, not the last
+/// transition (stow#786), and is pushed forward only by the lease
+/// check finding the run still going. Two `MIN` probes over
+/// `build_batches`, whose rows are bounded by the dispatch slot cap.
+async fn earliest_batch_wake_ms(db: &DurableDb) -> Result<Option<i64>, QueueError> {
     let lease_epoch = db
         .query(
-            "SELECT CAST(strftime('%s', MIN(datetime(claimed_at, ?))) AS INTEGER) AS lease_epoch \
-             FROM queue \
-             WHERE status IN ('dispatched', 'running')",
+            "SELECT CAST(strftime('%s', MIN(wake)) AS INTEGER) AS lease_epoch FROM ( \
+                 SELECT MIN(lease_at) AS wake FROM build_batches \
+                 WHERE done_run_id IS NULL OR github_run_id IS NULL \
+                 UNION ALL \
+                 SELECT MIN(resolve_after) FROM build_batches \
+                 WHERE done_run_id IS NOT NULL AND github_run_id IS NOT NULL)",
         )
-        .bind(format!("+{} minutes", settings.stale_dispatch_minutes))
         .fetch_scalar::<Option<i64>>()
         .await
         .map_err(|error| format!("load earliest active lease expiry: {error}"))?;
@@ -6989,34 +7747,176 @@ pub(super) async fn apply_dispatch_floor(
     Ok(())
 }
 
-async fn recover_stale_active_tasks(
+/// The longest one build-batch round may run: the build job's
+/// 120-minute timeout plus the publish job's 60.
+const BATCH_ROUND_CEILING_MINUTES: i64 = 180;
+
+/// A runner-queue allowance on top of a batch's rounds — the run can
+/// never legitimately outlast its rounds plus this.
+const BATCH_CEILING_ALLOWANCE_MINUTES: i64 = 60;
+
+/// The most expired batches one lease pass reads. The in-flight batch
+/// set is already bounded by the family slot caps over
+/// `STOW_BATCH_PARALLELISM`, so this only caps a pass's run lookups; a
+/// batch left over keeps its past `lease_at` and the alarm re-arms at
+/// once.
+const EXPIRED_BATCH_LIMIT: i64 = 32;
+
+/// Why a batch past its ceiling fails — the error its in-flight legs
+/// record, and whether a completion recorded since the caller's lookup
+/// wins over the failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingFailure {
+    /// The lease check found the run still going past the ceiling and
+    /// cancelled it.
+    RunOutlived,
+    /// The lease check could not learn the run's state — the lookup, the
+    /// cancel or the token mint kept failing — until the ceiling.
+    RunUnreadable,
+    /// The resolution pass could not read or settle the completed run's
+    /// results until the ceiling.
+    ResolutionStalled,
+}
+
+impl CeilingFailure {
+    /// The `error_msg` the failed legs record.
+    const fn error(self) -> &'static str {
+        match self {
+            Self::RunOutlived => "infrastructure: run exceeded its ceiling",
+            Self::RunUnreadable => "infrastructure: run state unreadable past its ceiling",
+            Self::ResolutionStalled => {
+                "infrastructure: run results unreadable or unsettled past its ceiling"
+            }
+        }
+    }
+
+    /// Whether a completion recorded since the caller's lookup wins: the
+    /// lease check's batches are the ones without a recorded completion,
+    /// and one that landed meanwhile is the resolution pass's. The
+    /// resolution pass's own batches always carry one.
+    const fn recorded_completion_wins(self) -> bool {
+        match self {
+            Self::RunOutlived | Self::RunUnreadable => true,
+            Self::ResolutionStalled => false,
+        }
+    }
+}
+
+/// A batch's absolute deadline in epoch milliseconds:
+/// `claimed_at + ⌈legs / parallelism⌉ × 180 min + 60 min`. Both passes
+/// read it — the lease check cancels a run past it, the resolution pass
+/// stops deferring at it.
+///
+/// # Errors
+/// [`QueueError::Invariant`] when `parallelism` is zero.
+fn batch_ceiling_ms(
+    batch_id: &str,
+    claimed_epoch: i64,
+    legs: u32,
+    parallelism: u32,
+) -> Result<i64, QueueError> {
+    if parallelism == 0 {
+        return Err(QueueError::Invariant(format!(
+            "batch {batch_id} has zero parallelism"
+        )));
+    }
+    let rounds = i64::from(legs.div_ceil(parallelism));
+    let ceiling_minutes = rounds * BATCH_ROUND_CEILING_MINUTES + BATCH_CEILING_ALLOWANCE_MINUTES;
+    Ok((claimed_epoch + ceiling_minutes * 60) * 1000)
+}
+
+/// A `build_batches` row whose lease has run out, with the facts the
+/// lease check decides on (stow#833 §4.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpiredBatch {
+    /// `build_batches.batch_id`.
+    pub batch_id: String,
+    /// The run the dispatch response bound, `None` when that response
+    /// was lost — an unbound batch has no run to ask about.
+    pub run_id: Option<u64>,
+    /// Whether `now` is past the batch's hard ceiling,
+    /// `claimed_at + ⌈legs / parallelism⌉ × 180 min + 60 min`.
+    pub past_ceiling: bool,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct ExpiredBatchRow {
+    batch_id: String,
+    github_run_id: Option<String>,
+    legs: u32,
+    parallelism: u32,
+    claimed_epoch: i64,
+}
+
+/// The batches whose lease has expired — `lease_at <= now`, earliest
+/// first, at most [`EXPIRED_BATCH_LIMIT`]. A batch whose completion is
+/// recorded against its bound run is the resolution pass's, not the
+/// lease check's, and stays out.
+///
+/// # Errors
+/// [`QueueError::Invariant`] when a row's run id is not numeric or its
+/// `parallelism` is zero — corrupt state.
+pub async fn expired_batches(db: &DurableDb, now_ms: i64) -> Result<Vec<ExpiredBatch>, QueueError> {
+    let rows = db
+        .query(
+            "SELECT batch_id, github_run_id, legs, parallelism, \
+                    CAST(strftime('%s', claimed_at) AS INTEGER) AS claimed_epoch \
+             FROM build_batches \
+             WHERE lease_at <= datetime(CAST(? AS INTEGER) / 1000, 'unixepoch') \
+               AND (done_run_id IS NULL OR github_run_id IS NULL) \
+             ORDER BY lease_at, batch_id \
+             LIMIT ?",
+        )
+        .bind(now_ms)
+        .bind(EXPIRED_BATCH_LIMIT)
+        .fetch_all::<ExpiredBatchRow>()
+        .await
+        .map_err(|error| format!("list expired batches: {error}"))?;
+    rows.into_iter()
+        .map(|row| {
+            let ceiling_ms =
+                batch_ceiling_ms(&row.batch_id, row.claimed_epoch, row.legs, row.parallelism)?;
+            let run_id = row
+                .github_run_id
+                .map(|run| {
+                    run.parse::<u64>().map_err(|error| {
+                        QueueError::Invariant(format!(
+                            "batch {} is bound to run {run:?}: {error}",
+                            row.batch_id
+                        ))
+                    })
+                })
+                .transpose()?;
+            Ok(ExpiredBatch {
+                batch_id: row.batch_id,
+                run_id,
+                past_ceiling: now_ms >= ceiling_ms,
+            })
+        })
+        .collect()
+}
+
+/// Requeue an unbound expired batch's legs and release its row — the
+/// dispatch response was lost, so there is no run to ask about.
+///
+/// Legs re-enter `pending`: `deps_met` re-derives from the live
+/// counter, and `blocked` — maintained for pending rows only — may be
+/// stale on an in-flight row; both recompute in the same statement.
+/// `not_before` is untouched, so `wake_at` re-derives from the live
+/// columns. One statement for the legs, then the row delete that frees
+/// the batch's slots.
+pub async fn requeue_unbound_batch(
     db: &DurableDb,
     settings: &SchedulerSettings,
+    batch_id: &str,
 ) -> Result<(), QueueError> {
-    db.query(
-        "DELETE FROM pending_run_completions WHERE task_id IN ( \
-             SELECT task_id FROM queue \
-             WHERE status IN ('dispatched', 'running') \
-               AND updated_at <= datetime('now', ?) \
-         )",
-    )
-    .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
-    .execute()
-    .await
-    .map_err(|error| format!("discard stale pending completions: {error}"))?;
-    // Rows re-enter `pending`: `deps_met` re-derives from the live
-    // counter, and `blocked` — maintained for pending rows only — may
-    // be stale on a stale in-flight row; both recompute in the same
-    // statement. `not_before` is untouched, so `wake_at` re-derives
-    // from the live columns.
     let recovered = db
         .query(&format!(
             "UPDATE queue \
              SET status = 'pending', error_msg = '', deps_met = {deps_met}, \
                  blocked = {blocked}, wake_at = {wake}, \
                  updated_at = datetime('now') \
-             WHERE status IN ('dispatched', 'running') \
-               AND claimed_at <= datetime('now', ?) \
+             WHERE batch_id = ? AND status IN ('dispatched', 'running') \
              RETURNING task_id",
             deps_met = deps_met_sql("queue.task_id"),
             blocked = blocked_sql("queue.task_id"),
@@ -7027,15 +7927,151 @@ async fn recover_stale_active_tasks(
                 settings.dispatch_min_age_minutes,
             ),
         ))
-        .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
+        .bind(batch_id.to_owned())
         .fetch_scalars::<String>()
         .await
-        .map_err(|error| format!("recover stale active tasks: {error}"))?;
+        .map_err(|error| format!("requeue legs of unbound batch {batch_id}: {error}"))?;
     if !recovered.is_empty() {
         // Re-entered `pending` rows carry the rank written before the
         // last cost move; re-price exactly the transitioned ids.
         refresh_dispatch_keys(db, &recovered).await?;
     }
+    db.query("DELETE FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("delete requeued batch {batch_id}: {error}"))?;
+    Ok(())
+}
+
+/// Push a bound batch's lease out by `stale_dispatch_minutes` from
+/// `now_ms` — its run is still going. A completion recorded since the
+/// lookup is the resolution pass's and is left alone.
+pub async fn extend_batch_lease(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch_id: &str,
+    now_ms: i64,
+) -> Result<(), QueueError> {
+    set_batch_lease(
+        db,
+        batch_id,
+        now_ms + i64::from(settings.stale_dispatch_minutes) * 60_000,
+    )
+    .await
+}
+
+/// Move a batch's `lease_at` to `lease_ms` — the lease check's single
+/// write for a batch it leaves alive, either extended after a live
+/// run or deferred a moment after a failed lookup so the alarm does not
+/// re-arm at `now`. A completion recorded since the lookup is the
+/// resolution pass's and is left alone.
+pub async fn set_batch_lease(
+    db: &DurableDb,
+    batch_id: &str,
+    lease_ms: i64,
+) -> Result<(), QueueError> {
+    db.query(
+        "UPDATE build_batches \
+         SET lease_at = datetime(CAST(? AS INTEGER) / 1000, 'unixepoch') \
+         WHERE batch_id = ? AND done_run_id IS NULL",
+    )
+    .bind(lease_ms)
+    .bind(batch_id.to_owned())
+    .execute()
+    .await
+    .map_err(|error| format!("set lease of batch {batch_id}: {error}"))?;
+    Ok(())
+}
+
+/// Fail a batch that reached its ceiling: the legs still in flight fail
+/// in one statement with `cause`'s error and the row is released. For a
+/// cause where [`CeilingFailure::recorded_completion_wins`], a
+/// completion recorded since the lookup wins — the legs and the row are
+/// left to the resolution pass.
+pub async fn fail_batch_past_ceiling(
+    db: &DurableDb,
+    batch_id: &str,
+    cause: CeilingFailure,
+) -> Result<(), QueueError> {
+    let guarded = i64::from(cause.recorded_completion_wins());
+    let failed = db
+        .query(
+            "UPDATE queue \
+             SET status = 'failed', error_msg = ?, updated_at = datetime('now') \
+             WHERE batch_id = ? AND status IN ('dispatched', 'running') \
+               AND (? = 0 OR EXISTS (SELECT 1 FROM build_batches \
+                                     WHERE batch_id = ? AND done_run_id IS NULL)) \
+             RETURNING task_id",
+        )
+        .bind(cause.error().to_owned())
+        .bind(batch_id.to_owned())
+        .bind(guarded)
+        .bind(batch_id.to_owned())
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("fail legs of batch {batch_id}: {error}"))?;
+    if !failed.is_empty() {
+        // A dep that just failed is the one outside-the-row event that
+        // flips a pending dependent's `blocked` flag.
+        refresh_dependents(
+            db,
+            "SELECT value AS task_id FROM json_each(?)",
+            &[DbValue::Text(enqueue_json(&failed)?)],
+        )
+        .await?;
+    }
+    db.query("DELETE FROM build_batches WHERE batch_id = ? AND (? = 0 OR done_run_id IS NULL)")
+        .bind(batch_id.to_owned())
+        .bind(guarded)
+        .execute()
+        .await
+        .map_err(|error| format!("delete failed batch {batch_id}: {error}"))?;
+    Ok(())
+}
+
+/// A lease check that could not learn or settle a bound batch's run —
+/// the lookup, the cancel or the token mint failed. Inside the batch's
+/// ceiling the lease moves `retry_ms` out and the next pass asks again;
+/// at the ceiling the batch fails ([`fail_batch_past_ceiling`]), so a
+/// run GitHub never answers for cannot hold its slots or the alarm
+/// forever.
+pub async fn retry_unreadable_batch(
+    db: &DurableDb,
+    batch: &ExpiredBatch,
+    now_ms: i64,
+    retry_ms: i64,
+) -> Result<BatchRetry, QueueError> {
+    if batch.past_ceiling {
+        tracing::error!(
+            batch_id = %batch.batch_id,
+            run_id = ?batch.run_id,
+            "run state unreadable at the batch's ceiling — failing its legs"
+        );
+        fail_batch_past_ceiling(db, &batch.batch_id, CeilingFailure::RunUnreadable).await?;
+        return Ok(BatchRetry::Failed);
+    }
+    set_batch_lease(db, &batch.batch_id, now_ms + retry_ms).await?;
+    Ok(BatchRetry::Deferred)
+}
+
+/// A batch whose legs all left flight — resolved individually or
+/// failed — holds no slots: its `parallelism` must stop counting
+/// against the family's pools. Stale in-flight rows are not requeued
+/// here: the lease check ([`expired_batches`]) decides each expired
+/// batch from its run's own state.
+async fn release_legless_batches(db: &DurableDb) -> Result<(), QueueError> {
+    db.query(
+        "DELETE FROM build_batches \
+         WHERE NOT EXISTS ( \
+             SELECT 1 FROM queue \
+             WHERE queue.batch_id = build_batches.batch_id \
+               AND queue.status IN ('dispatched', 'running') \
+         )",
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("release legless batches: {error}"))?;
     Ok(())
 }
 
@@ -7130,42 +8166,49 @@ async fn requeue_incomplete_shape_deps(
     Ok(())
 }
 
-/// Active (dispatched/running) queue rows counted by runner family: one
-/// `GROUP BY target` pass, with the target→family mapping applied in Rust
-/// because the map lives in `stow_types::api::runner_family`, not SQL.
+/// In-flight runner slots counted by family — the `parallelism` sums
+/// of the live `build_batches` rows, not leg counts (stow#833 §1.2):
+/// one row read per in-flight batch, at most about ⌈slots/k⌉ plus
+/// the human lane's.
 struct ActiveByFamily {
     total: u32,
     by_family: std::collections::HashMap<RunnerFamily, u32>,
 }
 
 impl ActiveByFamily {
-    /// Active rows building on `family`'s runner pool.
+    /// Active slots building on `family`'s runner pool.
     fn of(&self, family: RunnerFamily) -> u32 {
         self.by_family.get(&family).copied().unwrap_or(0)
     }
 }
 
+/// The `dispatch_family` label a stored row carries, inverted through
+/// [`dispatch_family_label`] so the two can never drift apart.
+fn family_of_label(label: &str) -> Option<RunnerFamily> {
+    RunnerFamily::ALL
+        .into_iter()
+        .find(|family| dispatch_family_label(*family) == label)
+}
+
 async fn count_active_by_family(db: &DurableDb) -> Result<ActiveByFamily, QueueError> {
     let rows = db
         .query(
-            "SELECT target, count(*) AS count FROM queue \
-             WHERE status IN ('dispatched', 'running') GROUP BY target",
+            "SELECT dispatch_family, SUM(parallelism) AS count FROM build_batches \
+             GROUP BY dispatch_family",
         )
-        .fetch_all::<TargetCountRow>()
+        .fetch_all::<FamilyCountRow>()
         .await
-        .map_err(|error| format!("count active tasks by target: {error}"))?;
+        .map_err(|error| format!("count active batch slots by family: {error}"))?;
     let mut by_family = std::collections::HashMap::new();
     let mut total = 0_u32;
     for row in rows {
-        // Enqueue only admits CI targets, so an active row whose target
-        // maps to no runner family means the queue state is corrupt.
-        let family = runner_family(&row.target).ok_or_else(|| {
+        let family = family_of_label(&row.dispatch_family).ok_or_else(|| {
             QueueError::Invariant(format!(
-                "active task targets `{}`, which maps to no runner family",
-                row.target
+                "build_batches dispatch_family {:?} maps to no runner family",
+                row.dispatch_family
             ))
         })?;
-        let count = u64_to_u32(row.count, "active task count")?;
+        let count = u64_to_u32(row.count, "active slot count")?;
         *by_family.entry(family).or_insert(0) += count;
         total += count;
     }
@@ -7218,11 +8261,10 @@ struct TaskRow {
     preserve_lockfile: i64,
     dependency_identity: String,
     dispatch_key: String,
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct ClaimGenerationRow {
+    lane: String,
     generation_id: String,
+    claimed_at: Option<String>,
+    median_ms: Option<String>,
 }
 
 /// One queue row as needed to build a [`RequestStatus`].
@@ -7250,29 +8292,10 @@ struct AttemptStatusRow {
     status: String,
 }
 
+/// One `GROUP BY dispatch_family` slot sum over `build_batches`.
 #[derive(Debug, skyzen::FromRow)]
-struct PendingCompletionRow {
-    github_run_id: String,
-    task_id: String,
-    success: i64,
-    error: Option<String>,
-    received_at: String,
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct BoundPendingCompletionRow {
-    #[row(rename = "task_id")]
-    task: String,
-    #[row(rename = "generation_id")]
-    generation: String,
-    #[row(rename = "github_run_id")]
-    run: String,
-}
-
-/// One `GROUP BY target` count over active rows.
-#[derive(Debug, skyzen::FromRow)]
-struct TargetCountRow {
-    target: String,
+struct FamilyCountRow {
+    dispatch_family: String,
     count: u64,
 }
 
@@ -7298,7 +8321,7 @@ mod tests {
             now_ms: NOW_MS,
             capacity: DispatchCapacity::Available,
             earliest_pending_eligible_ms: None,
-            earliest_active_lease_expiry_ms: None,
+            earliest_batch_wake_ms: None,
         }
     }
 
@@ -7393,7 +8416,7 @@ mod tests {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Exhausted,
             earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
-            earliest_active_lease_expiry_ms: Some(NOW_MS + 300_000),
+            earliest_batch_wake_ms: Some(NOW_MS + 300_000),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 300_000));
@@ -7404,7 +8427,7 @@ mod tests {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Exhausted,
             earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
-            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            earliest_batch_wake_ms: Some(NOW_MS - 1),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
@@ -7429,7 +8452,7 @@ mod tests {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Paused,
             earliest_pending_eligible_ms: Some(NOW_MS - 60_000),
-            earliest_active_lease_expiry_ms: Some(NOW_MS + 300_000),
+            earliest_batch_wake_ms: Some(NOW_MS + 300_000),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 300_000));
@@ -7439,7 +8462,7 @@ mod tests {
     fn paused_clamps_past_lease_expiry_to_now() {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Paused,
-            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            earliest_batch_wake_ms: Some(NOW_MS - 1),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
@@ -7451,7 +8474,7 @@ mod tests {
         // still has to fire so a build whose completion webhook was lost
         // gets reclaimed once its lease goes stale.
         let inputs = AlarmInputs {
-            earliest_active_lease_expiry_ms: Some(NOW_MS + 120_000),
+            earliest_batch_wake_ms: Some(NOW_MS + 120_000),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS + 120_000));
@@ -7460,7 +8483,7 @@ mod tests {
     #[test]
     fn clamps_past_lease_expiry_to_now_without_pending_rows() {
         let inputs = AlarmInputs {
-            earliest_active_lease_expiry_ms: Some(NOW_MS - 1),
+            earliest_batch_wake_ms: Some(NOW_MS - 1),
             ..inputs()
         };
         assert_eq!(plan_alarm(&inputs), AlarmPlan::At(NOW_MS));
@@ -7484,7 +8507,7 @@ mod tests {
         let inputs = AlarmInputs {
             capacity: DispatchCapacity::Exhausted,
             earliest_pending_eligible_ms: Some(NOW_MS),
-            earliest_active_lease_expiry_ms: None,
+            earliest_batch_wake_ms: None,
             ..inputs()
         };
         let _ = plan_alarm(&inputs);

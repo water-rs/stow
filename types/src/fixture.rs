@@ -32,8 +32,11 @@ impl FixtureShape {
     };
     /// The in-flight set — `dispatched`/`running` rows — capped so the
     /// dispatch limit still leaves slots for the claim pass to fill.
-    /// Held constant across fixture sizes: the alarm's claim is bounded
-    /// by this plus the dispatch cap, not by the queue.
+    /// Each row is a one-slot batch leg (the seed writes its
+    /// `build_batches` row too), so the set holds exactly this many
+    /// runner slots. Held constant across fixture sizes: the alarm's
+    /// claim is bounded by this plus the dispatch cap, not by the
+    /// queue.
     pub const IN_FLIGHT_ROWS: u32 = 30;
     /// Pending rows on the human lane — held constant so a lane-position
     /// probe reads the same depth at every fixture size.
@@ -42,7 +45,12 @@ impl FixtureShape {
     /// row, so they are unblocked at every fixture size — a lane-status
     /// drive can name a fixed id whose lane-position probe always runs
     /// instead of silently skipping when a size-dependent edge set
-    /// flips `blocked`.
+    /// flips `blocked`. The seed also parks them behind a future
+    /// `not_before`: they stay `pending`, unblocked and
+    /// `dispatch_eligible = 1`, but the claim's page predicate refuses
+    /// them — a human pin would rank first and fill the pass with
+    /// one-slot legs, hiding the miss-batch claim the gate exists to
+    /// price (stow#833).
     pub const HUMAN_PROBE_ROWS: u32 = 16;
     /// Rows `updated_at` inside the last 24 h — held constant: an
     /// `/admin/status` outcome count is legitimately bounded by 24 h
@@ -57,7 +65,30 @@ impl FixtureShape {
     /// make the claimed set's dependency closure — and the dependents a
     /// purge or a dep expansion walks — a function of stored bulk
     /// instead of the claim's own bound (stow#588).
-    pub const DISPATCH_ELIGIBLE_ROWS: u32 = 64;
+    ///
+    /// Sized so one batched pass cannot drain it and so the pass can
+    /// reach its own bound: the claimable population is the window
+    /// minus its parked `n % 20 = 1` rows — the human pins are parked
+    /// behind `not_before` and no longer count — which must (a) exceed
+    /// the most legs a pass can claim on the slots the in-flight rows
+    /// leave free (`(free slots / STOW_BATCH_PARALLELISM) ×
+    /// STOW_BATCH_MAX_TASKS` = 3 × 40 = 120 on the defaults), and
+    /// (b) feed that bound, not just exceed it. The floored pass
+    /// admits only miss rows whose value clears `VALUE_BAND` — within
+    /// production's `priority + demand <= PRIORITY_MAX` rule that is
+    /// the Windows family alone — so the window must hold more than
+    /// one full pass of Windows rows (`n % 9 ∈ {6,7}`), not merely of
+    /// rows overall. At 640 the family spread gives the window about
+    /// 142 Windows rows, of which the `n % 20 = 1` park leaves ~135
+    /// claimable — every one ahead of every bulk Windows row on the
+    /// window's stored demand — so a pass's three 40-leg miss batches
+    /// fill from the window alone at any size. A window a pass can
+    /// empty would let the claim reach rows an earlier drive left
+    /// claimable, and the walk would then move with the drives' order
+    /// instead of the fixture's shape. The edge's
+    /// `planted_window_exceeds_one_full_batched_pass` test holds the
+    /// bound against the scheduler's defaults.
+    pub const DISPATCH_ELIGIBLE_ROWS: u32 = 640;
 
     /// Rows `1..=pending_end` are `pending` — 60% of the queue.
     #[must_use]
@@ -109,8 +140,7 @@ impl FixtureShape {
     }
 
     /// A `dispatched` row id — the even `n` half of the in-flight
-    /// group, first to last. The webhook lane completes these; a
-    /// `running` row's run never finishes.
+    /// group, first to last.
     #[must_use]
     pub const fn dispatched_row(self, k: u32) -> u32 {
         let first = if self.failed_end().is_multiple_of(2) {
@@ -119,6 +149,30 @@ impl FixtureShape {
             1
         };
         self.failed_end() + first + (k % (Self::IN_FLIGHT_ROWS / 2)) * 2
+    }
+
+    /// The bound batch the `k`-th in-flight row is leg 0 of — `k`
+    /// indexes the in-flight group like [`Self::in_flight_row`]. The
+    /// seed gives every in-flight row its own one-leg `build_batches`
+    /// row (`in_flight_batches_upsert_sql` in the edge fixture): the
+    /// batch id is the low 32 hex of the row's task id, the bound run is
+    /// the row number, and the rustc is the row's own.
+    ///
+    /// # Panics
+    ///
+    /// Never: the low half of a `%064x` task id is 32 lowercase hex.
+    #[must_use]
+    pub fn in_flight_batch(self, k: u32) -> InFlightBatch {
+        let n = u64::from(self.in_flight_row(k));
+        let task_id = task_hex_id(n);
+        InFlightBatch {
+            run_id: n,
+            batch_id: task_id[32..]
+                .parse()
+                .expect("the low half of a %064x task id is 32 lowercase hex"),
+            rustc_version: seeded_rustc(n),
+            task_id,
+        }
     }
 
     /// A `completed` dep for the submit batch's `depends_on` — `k` picks
@@ -153,6 +207,29 @@ impl FixtureShape {
     }
 }
 
+/// One seeded in-flight batch: a bound, undelivered `build-batch.yml`
+/// run with a single leg — what a production batch looks like between
+/// its dispatch and its run's `completed` delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InFlightBatch {
+    /// The run the batch is bound to (`build_batches.github_run_id`).
+    pub run_id: u64,
+    /// The batch's id — the run title's `b<batch_id>` and the
+    /// completion route's path segment.
+    pub batch_id: crate::api::BatchId,
+    /// The batch's rustc — the run title's lead and the records tag's
+    /// namespace.
+    pub rustc_version: &'static str,
+    /// Leg 0's task id.
+    pub task_id: String,
+}
+
+/// A seeded row's rustc — the seed SQL's `RUSTC_CASE_SQL` over `n`.
+#[must_use]
+pub const fn seeded_rustc(n: u64) -> &'static str {
+    if n % 3 < 2 { "1.85.0" } else { "1.86.0" }
+}
+
 /// How the fixture's `n % len` target spread maps onto
 /// [`CI_TARGET_TRIPLES`].
 fn target_count() -> u32 {
@@ -176,3 +253,34 @@ pub const REQUEST_FIXTURE_ENQUEUED: &str = "req-fixture-enqueued";
 /// The `failed` fixture request record's id — a static read with no
 /// root re-probe.
 pub const REQUEST_FIXTURE_FAILED: &str = "req-fixture-failed";
+
+#[cfg(test)]
+mod tests {
+    use super::{FixtureShape, seeded_rustc};
+
+    /// Every in-flight row names its own batch under the run it is
+    /// bound to, and the k-th batch is the k-th in-flight row's.
+    #[test]
+    fn each_in_flight_row_is_its_own_bound_batch() {
+        let shape = FixtureShape::PRODUCTION;
+        let batches: Vec<_> = (0..FixtureShape::IN_FLIGHT_ROWS)
+            .map(|k| shape.in_flight_batch(k))
+            .collect();
+        for (k, batch) in (0..).zip(&batches) {
+            let n = u64::from(shape.in_flight_row(k));
+            assert_eq!(batch.run_id, n);
+            assert_eq!(batch.task_id, format!("{n:064x}"));
+            assert_eq!(batch.batch_id.to_string(), format!("{n:032x}"));
+            assert_eq!(batch.rustc_version, seeded_rustc(n));
+        }
+        let distinct: std::collections::BTreeSet<_> = batches
+            .iter()
+            .map(|batch| batch.batch_id.to_string())
+            .collect();
+        assert_eq!(distinct.len(), batches.len());
+        // Both rustc arms are in flight, so a lane that titled every
+        // run with one rustc would misname a third of them.
+        assert!(batches.iter().any(|batch| batch.rustc_version == "1.86.0"));
+        assert!(batches.iter().any(|batch| batch.rustc_version == "1.85.0"));
+    }
+}

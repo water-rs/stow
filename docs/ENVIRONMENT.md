@@ -89,11 +89,13 @@ target, and `index sync` POSTs exactly those new rows to the edge's
 publish of a new rustc and for disaster recovery.
 
 `stow-admin preheat manual --crates|--projects <file> --rustc-version <v>
-[--targets a,b] [--in-flight 45] [--edge-url <url>] [--dispatch-url
+[--targets a,b] [--in-flight 45] [--batch-parallelism 5]
+[--batch-max-tasks 40] [--edge-url <url>] [--dispatch-url
 <url>]` is the operator-driven wave of stow#455: it resolves the graph
 in-process for every CI target, layers it so each layer's deps sit in
-the published index, dispatches `build-crate.yml` through GitHub's
-`workflow_dispatch` API under the operator token, dispatches
+the published index, dispatches `build-batch.yml` — one run per packed
+batch, `--in-flight` bounding the runner slots in-flight batches hold —
+through GitHub's `workflow_dispatch` API under the operator token, dispatches
 `index-publish.yml` between layers, and resumes by re-reading the
 published index — no edge, no local state. A run that fails outside
 the build and publish steps — runner setup, toolchain install,
@@ -108,19 +110,21 @@ index publish) for `scripts/mock-e2e.sh`.
 
 ## stow-build (CI runner)
 
-The runner has three subcommands. `stow-build build --output-dir <dir>` is
-the untrusted stage (compiles the task crate, writes task, plan and blobs
-into `<dir>`); `stow-build publish --input-dir <dir>` is the trusted stage
-(validates `<dir>`, then pushes and signs the bundle plus the task's
+The runner has three subcommands. `stow-build build --leg <n> --output-dir <dir>` is
+the untrusted stage (compiles the leg's task crate, writes task, plan and blobs
+into `<dir>`); `stow-build publish --leg <n> --input-dir <dir>` is the trusted stage
+(validates `<dir>`, then pushes and signs the bundle plus the leg's
 records artifact into GHCR — GitHub's `workflow_run` webhook reports
 the run, so publish never calls the edge); `stow-build serve --listen
-<host:port>` is the dev-only local dispatch endpoint. Both stages read the task from
-`STOW_BUILD_TASK_JSON`, which the workflow fills from its
-`workflow_dispatch` input.
+<host:port>` is the dev-only local dispatch endpoint. Both stages read leg `n`
+of the batch from the dispatch event file `GITHUB_EVENT_PATH` names
+(`.inputs.batch`, a JSON `BuildBatchPayload`) — a called
+`build-crate.yml` job's event is the caller `build-batch.yml` run's
+`workflow_dispatch`.
 
 | Variable | Stage | Purpose |
 |---|---|---|
-| `STOW_BUILD_TASK_JSON` | build, publish | Inline JSON `BuildTaskPayload`. Required. |
+| `GITHUB_EVENT_PATH` | build, publish | Actions dispatch event file holding the batch (`inputs.batch`, a JSON `BuildBatchPayload`) `--leg` indexes. The runner injects it into every job. Required. |
 | `STOW_BUILD_WORKSPACE_ROOT` | build | Pre-existing path to build in instead of a tempdir. |
 | `STOW_BUILD_CARGO_SUBCOMMAND` | build | One of `build` / `check` / `test`. Default `build`. |
 | `STOW_BUILD_RUSTC_CAPTURE_DIR` | build (set by the runner for its rustc wrapper) | Per-rustc-invocation capture sink for output snapshots and identity sidecars. |
@@ -137,6 +141,7 @@ the run, so publish never calls the edge); `stow-build serve --listen
 | `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` for the edge OIDC token minted when a publish step calls a trusted edge route (`index publish` D1 sync); unused when the run only pushes GHCR artifacts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | serve (falls back to `gh auth token`) | Developer GitHub credential the edge's trusted endpoints accept outside Actions. |
 | `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign signing key and mock registry root the local dispatcher populates. Required. |
+| `STOW_LOCAL_CI_STUB` | serve | **Mock/test-only.** When set (any value), the local CI server short-circuits each leg's build and publish work — the dispatch POST the budget probe and the launch-load run measure stays real, while a stubbed run still pushes each leg's (empty) records artifact and completes through the same signed `workflow_run` webhook. |
 | `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), visible in CI logs here. |
 
 ## scripts/preheat-cost.sh
@@ -205,7 +210,7 @@ The release gate's `Traffic cost` job runs this script on the mock stack
 | `CF_ACCOUNT_ID` | _required_ (var) | Cloudflare account id the Analytics Engine SQL API is queried under for `GET /api/v1/stats`. |
 | `CF_ANALYTICS_TOKEN` | _required_ (secret) | API token with Analytics Engine read on the account — the `Authorization: Bearer` credential `GET /api/v1/stats` queries with. |
 | `SCHEDULER` | _required_ (Durable Object binding) | Build scheduler queue. |
-| `GITHUB_REPO` | `water-rs/stow` | Repo every trusted credential must resolve inside (OIDC `repository` claim and the push-permission check), and the repository the scheduler triggers `workflow_dispatch` of `build-crate.yml` on. |
+| `GITHUB_REPO` | `water-rs/stow` | Repo every trusted credential must resolve inside (OIDC `repository` claim and the push-permission check), and the repository the scheduler triggers `workflow_dispatch` of `build-batch.yml` on. |
 | `STOW_OIDC_AUDIENCE` | _required_ (var) | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests. |
 | `GHCR_BASE_URL` | `https://ghcr.io` | OCI registry root (`scheme://host[:port]`) the edge's bundle byte path pulls from — the request's rustc names the `water-rs/stow-cache-<rustc>` package appended under `/v2/`; a mock deploy points it at `stow-mock-registry serve`. |
 | `STOW_MAX_EXPANDED_TASKS` | `4096` | Cap on the size of an expanded transitive graph. |
@@ -214,9 +219,11 @@ The release gate's `Traffic cost` job runs this script on the mock stack
 | `STOW_STATS_SQL_URL` | unset | **Mock-only.** Overrides the Analytics Engine SQL API base URL the public stats routes post to (`/stats` and friends) — and the edge-side override the demand feed's `analytics_engine/sql` query posts through in the mock deploy. Loopback-pinned — the account's analytics token rides in the `Authorization` header, so a non-loopback URL would exfiltrate it; set only by `edge/Skyzen.mock.toml` (to `stow-mock-registry serve`'s stub) and pinned out of `edge/Skyzen.toml` by the same manifest test as `STOW_LOCAL_CI_URL`. |
 | `STOW_GITHUB_API_URL` | unset | **Mock-only.** Origin the trusted lanes' bearer check resolves its GitHub probes under — `GET /user`, `GET /{repo}.git/info/refs?service=git-receive-pack`, and the OIDC `/.well-known/jwks` all build on it, replacing `api.github.com`, `github.com` and `token.actions.githubusercontent.com` with a single mock origin. Required whenever `STOW_LOCAL_CI_URL` is set — a mock deploy that omits it fails worker startup rather than letting the check reach the real GitHub API — and loopback-pinned like `STOW_STATS_SQL_URL`, because the caller's credential rides in `Authorization`. The mock manifests point it at `stow-mock-registry serve`'s GitHub stub (same base as `GHCR_BASE_URL`); production never sets it. |
 | `STOW_DISPATCH_MIN_AGE_MINUTES` | `5` | Minimum age (minutes) a task must wait in `pending` before being dispatched, so misses can coalesce. Mock fixtures set `0`. |
-| `STOW_MAX_CONCURRENT_JOBS` | `45` | Maximum concurrently dispatched CI builds across all runner families. Sized against the org's 60-runner pool, leaving 15 runners for the repo's own CI. Mock fixtures set `3` because miniflare OOMs under parallel complete bursts. `"0"` pauses dispatch: submits keep queueing, nothing is claimed, and the alarm wakes only for stale recovery on builds already in flight — see `DEPLOYMENT.md`'s pause procedure. |
-| `STOW_MAX_CONCURRENT_MACOS_JOBS` | `16` | Maximum concurrently dispatched CI builds on macOS targets (`aarch64-apple-*`). The org has 20 macOS runners; the cap leaves 4 for the repo's own CI, and macOS rows past the cap stay pending until a slot frees. |
-| `STOW_STALE_DISPATCH_MINUTES` | `60` | Age after which a `dispatched` task with no completion is assumed lost and re-queued. Must exceed the slowest expected CI build or long builds get double-dispatched. |
+| `STOW_MAX_CONCURRENT_JOBS` | `45` | Maximum runner slots in-flight batches may hold at once — the sum of each `build-batch.yml` run's `parallelism` (`max-parallel`) — across all runner families. Sized against the org's 60-runner pool, leaving 15 runners for the repo's own CI. Mock fixtures set `3` because miniflare OOMs under parallel complete bursts. `"0"` pauses dispatch: submits keep queueing, nothing is claimed, and the alarm wakes only for stale recovery on builds already in flight — see `DEPLOYMENT.md`'s pause procedure. |
+| `STOW_MAX_CONCURRENT_MACOS_JOBS` | `16` | Maximum runner slots in-flight batches may hold on macOS targets (`aarch64-apple-*`). The org has 20 macOS runners; the cap leaves 4 for the repo's own CI, and macOS rows past the cap stay pending until a slot frees. |
+| `STOW_BATCH_PARALLELISM` | `5` | `k` — the `max-parallel` runner slots one `build-batch.yml` matrix holds (stow#833). A batch claims `min(k, legs, free family slots)` slots, so the sum over in-flight batches is what `STOW_MAX_CONCURRENT_JOBS`/the macOS cap bound. |
+| `STOW_BATCH_MAX_TASKS` | `40` | `B` — the leg count at which a `build-batch.yml` matrix closes (stow#833); tasks also close it early when the encoded `batch` dispatch input would pass 65,535 characters. |
+| `STOW_STALE_DISPATCH_MINUTES` | `60` | The lease on a claimed batch — `build_batches.lease_at = claimed_at + this`. At expiry the alarm's lease check reads the run: a completed run resolves the batch as if its webhook had arrived, a still-running one extends the lease by the same span, and an unbound batch (the dispatch answer was lost) requeues its legs. Past the batch's ceiling (`claimed_at + ⌈legs/parallelism⌉ × 180 min + 60 min`) the run is cancelled and its in-flight legs fail, so the ceiling — never the lease — is what ends a batch. |
 | `STOW_POW_CHALLENGE_SECRET` | _required_ (secret) | HMAC-SHA256 key for the enqueue-admission challenge minted on public cache misses and verified by `POST /api/v1/enqueue`. |
 | `STOW_POW_MIN_BITS` | `12` | Floor on enqueue proof-of-work difficulty: minted admissions and redeemed tickets never require fewer bits, even on an empty queue. |
 | `STOW_MAX_QUEUE_PENDING` | `2000` | Pending-task count at which the miss lane refuses `POST /api/v1/enqueue` with 429 and `Retry-After: 600`. Checked in the edge handler before forwarding and again inside the scheduler Durable Object; human-lane and RepoWriter-trusted submits are exempt. |

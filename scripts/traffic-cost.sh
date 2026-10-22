@@ -205,7 +205,7 @@ http_listening() {
 # callback, so nothing a previous step dispatched is still landing.
 builds_drained() {
     curl -sf --max-time 5 "http://${LOCAL_CI_ADDR}/tasks" | jq -e '
-        [.tasks[] | select(.path == ".github/workflows/build-crate.yml")
+        [.tasks[] | select(.path == ".github/workflows/build-batch.yml")
                   | select(.status != "completed")] | length == 0' >/dev/null
 }
 
@@ -404,32 +404,24 @@ budget_pass() {
 budget_pass "large" --queue-rows "$LARGE" --reset
 budget_pass "small" --queue-rows "$SMALL" --reset
 
-# The callback lane completes the fixture's `dispatched` rows — the even
-# half of the in-flight range, the ids `lanes.rs` cycles. In production a
-# run's records artifact reaches GHCR before its `workflow_run` event
-# does, so the edge's records check must find it here too; without these
-# the lane's completions land as failures. The tag is per-build —
-# `records-<rustc>-<hash>-<run id>-<attempt>` — so each push carries the
-# row's index k as the run id the lane's callback names.
-# Divide first: the same integer math as `FixtureShape::failed_end`.
-# shellcheck disable=SC2017
-FAILED_END=$((SMALL / 40 * 39))
-FIRST_DISPATCHED=2
-[ $((FAILED_END % 2)) -eq 0 ] || FIRST_DISPATCHED=1
-printf '[]' >"$WORK_DIR/dispatched-records.json"
-for k in $(seq 0 14); do
-    task_id="$(printf '%064x' $((FAILED_END + FIRST_DISPATCHED + k * 2)))"
-    "$BIN/stow-mock-registry" push-records \
-        --records "$WORK_DIR/dispatched-records.json" \
-        --task-id "$task_id" \
-        --rustc-version "$RUSTC_VERSION" \
-        --run-id "$k" --run-attempt 1 \
-        --registry-root "$WORK_DIR/mock-registry" \
-        --private-key "$WORK_DIR/keys/private.pem" \
-        >>"$LOG_DIR/mock-registry-cli.log" 2>&1 \
-        || die "records artifact for $task_id failed — see $LOG_DIR/mock-registry-cli.log"
-done
-echo "[traffic] published records artifacts for the 15 dispatched fixture rows"
+# The callback lane reports the fixture's in-flight batches `completed`:
+# each in-flight row is leg 0 of its own one-leg batch, bound to a
+# `build-batch.yml` run this local CI never dispatched. In production the
+# run's jobs page and each leg's records artifact exist before the
+# `completed` delivery does, and the alarm resolves the batch from both —
+# without them every completion would defer against a 404 jobs page
+# until its ceiling. So the local CI records each bound run as a finished
+# success and publishes each leg's records artifact under the run's
+# per-build tag `records-<rustc>-<hash>-<run id>-1`, at the batch's own
+# rustc. `traffic-cost fixture-runs` owns the shape math.
+admin --json traffic-cost fixture-runs --queue-rows "$SMALL" \
+    >"$WORK_DIR/fixture-runs.json" 2>"$LOG_DIR/fixture-runs.log" \
+    || die "traffic-cost fixture-runs failed — see $LOG_DIR/fixture-runs.log"
+curl -sf --max-time 60 -X POST -H 'Content-Type: application/json' \
+    --data-binary @"$WORK_DIR/fixture-runs.json" \
+    "http://${LOCAL_CI_ADDR}/seeded-runs" >>"$LOG_DIR/fixture-runs.log" \
+    || die "local CI refused the fixture's runs — see $LOG_DIR/local-ci.log"
+echo "[traffic] recorded $(jq '.runs | length' "$WORK_DIR/fixture-runs.json") in-flight fixture batch runs and their legs' records artifacts"
 
 LANE_ARGS=(
     --model "$REPO_ROOT/launch-model.toml"

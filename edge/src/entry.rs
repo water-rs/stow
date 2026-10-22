@@ -17,7 +17,7 @@ const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 const STOW_OIDC_AUDIENCE_BINDING: &str = "STOW_OIDC_AUDIENCE";
-const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
+pub const GHCR_BASE_URL_BINDING: &str = "GHCR_BASE_URL";
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
 const STOW_GITHUB_API_URL_BINDING: &str = "STOW_GITHUB_API_URL";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
@@ -198,6 +198,7 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
                 "/scheduler/budget".route((
                     "".post(api::admin_scheduler_budget),
                     "/seed".post(api::admin_scheduler_budget_seed),
+                    "/rearm".post(api::admin_scheduler_budget_rearm),
                     "/ledger".at(api::admin_scheduler_budget_ledger),
                 )),
                 "/scheduler/demand".post(api::admin_scheduler_demand),

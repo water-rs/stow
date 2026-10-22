@@ -162,8 +162,8 @@ struct EventCost {
 /// Per-event costs, from the route handlers in `edge/src/api.rs`. The
 /// DO drives are billed per call from the measured row; D1 and subrequest
 /// counts are the handler's statement/lookup shapes (an admission's
-/// miss drain is its 64-row batch; a callback's mirror write is the
-/// ~15 artifact rows a build reports).
+/// miss drain is its 64-row batch; a callback's one subrequest is its
+/// forward to the scheduler, and it touches no D1).
 const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::CliBytePathFetch,
@@ -363,14 +363,24 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::BuildCallback,
         route: "POST /api/v1/github/workflow-run",
-        drives: &[("POST /tasks/complete-run", 1.0)],
+        // A `build-batch.yml` run of b̄ legs costs its completion route
+        // C and its resolution's fixed part F once, and each leg's part
+        // L once per leg, so a build pays (C + F)/b̄ + L. One route and
+        // one one-leg resolution per build charge C + F + L, which is at
+        // least that for every b̄ ≥ 1 — no batch size is assumed. The
+        // pass floor the resolution runs inside is `AlarmPass`'s, one
+        // per build against production's one per batch.
+        drives: &[
+            ("POST /batches/{batch_id}/complete (success)", 1.0),
+            ("alarm pass (batch resolution, one leg)", 1.0),
+        ],
         do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("workflow-callback", 1.0)]),
-        subrequests: 4.0,
-        d1_rows_read: 2.0,
-        d1_rows_written: 15.0,
+        subrequests: 1.0,
+        d1_rows_read: 0.0,
+        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -1029,8 +1039,9 @@ fn project(
     })
 }
 
-/// Human rendering of the preheat share: its scale and the measured
-/// per-node costs it multiplies.
+/// Human rendering of the preheat share: its scale, the measured
+/// per-node costs it multiplies, and the legs per batch the measured
+/// phases achieved — the `b̄` the per-node completion cost rides on.
 fn render_preheat(preheat: &PreheatMonthly) -> String {
     use std::fmt::Write as _;
     let mut out = format!(
@@ -1041,13 +1052,25 @@ fn render_preheat(preheat: &PreheatMonthly) -> String {
         preheat.production_nodes,
         preheat.measured_nodes,
     );
-    let mut table = Table::new(&["per node", "DO requests", "rows read", "rows written"]);
-    for (label, cost) in [("wave", &preheat.wave), ("resubmit", &preheat.resubmit)] {
+    let mut table = Table::new(&[
+        "per node",
+        "DO requests",
+        "rows read",
+        "rows written",
+        "batches",
+        "legs/batch",
+    ]);
+    for (label, cost, batching) in [
+        ("wave", &preheat.wave, &preheat.wave_batching),
+        ("resubmit", &preheat.resubmit, &preheat.resubmit_batching),
+    ] {
         table.push([
             label.to_owned(),
             format!("{:.2}", cost.requests),
             format!("{:.2}", cost.rows_read),
             format!("{:.2}", cost.rows_written),
+            batching.batches.to_string(),
+            crate::preheat_cost::legs_per_batch(batching.legs_per_batch),
         ]);
     }
     let _ = write!(out, "{}", table.render());
@@ -1238,7 +1261,7 @@ mod tests {
     use stow_types::do_budgets::WORKER_CPU_BUDGETS;
 
     use super::{ProjectArgs, evaluate, project};
-    use crate::traffic_cost::preheat::{PerNode, PreheatMonthly};
+    use crate::traffic_cost::preheat::{Batching, PerNode, PreheatMonthly};
     use crate::traffic_cost::test_support::{fixture_cpu, fixture_report, model};
 
     /// A preheat share with no cost — the traffic-only baseline the
@@ -1257,6 +1280,14 @@ mod tests {
             resubmits_per_month: 1.0,
             wave,
             resubmit,
+            wave_batching: Batching {
+                batches: 0,
+                legs_per_batch: None,
+            },
+            resubmit_batching: Batching {
+                batches: 0,
+                legs_per_batch: None,
+            },
         }
     }
 

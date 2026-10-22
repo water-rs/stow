@@ -1,12 +1,7 @@
 name: build-crate
 
-# The webhook completion parses `display_title` back into the run's
-# rustc and task id (`stow_types::records::run_title`).
-run-name: ${{ fromJSON(inputs.task).rustc_version }}-${{ fromJSON(inputs.task).task_id }}
-
-# The scheduler (or `stow-admin preheat manual`) dispatches this workflow on
-# `main` with the whole task as one JSON input. Two jobs, two trust levels,
-# and no Cloudflare dependency at all (stow#455):
+# Every leg of a `build-batch.yml` run calls this file (stow#833). Two
+# jobs, two trust levels, and no Cloudflare dependency at all (stow#455):
 #
 #   build   — compiles third-party code. Read-only token, no secrets,
 #             no OIDC. Everything it produces is handed over as a workflow
@@ -20,28 +15,48 @@ run-name: ${{ fromJSON(inputs.task).rustc_version }}-${{ fromJSON(inputs.task).t
 #             `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag).
 #             GHCR is the only record store; the task talks to no edge route.
 #
-# Completion reaches the scheduler through GitHub itself: `run-name`
-# above stamps `<rustc>-<task_id>`, so the `workflow_run` `completed`
-# webhook the edge receives carries both in `display_title` — no
-# completion POST from a runner, no failure-report job.
+# The task never travels through this file's inputs: a called workflow's
+# `github.event` is the caller's `workflow_dispatch`, so `stow-build`
+# reads leg `--leg` of the batch from `$GITHUB_EVENT_PATH`
+# (`.inputs.batch`) — a Windows env var's 32,767-char cap would already
+# break a task carried by `env:` on a large subgraph.
+#
+# The job names carry the leg binding — `build #<leg> <label>
+# (<target>) <task hash>` and `publish #<leg> <task hash>` — the shape
+# `stow_types::runs::LegJobName` parses the run's jobs page back into
+# legs with.
 #
 # The certificate identity clients trust is this file on refs/heads/main
-# (stow_types::trusted_builder); dispatching any other ref produces artifacts
-# no client accepts.
+# (stow_types::trusted_builder): Fulcio's SAN for a reusable workflow is
+# the called workflow's `job_workflow_ref`, so batching changes nothing a
+# client verifies; dispatching any other ref produces artifacts no client
+# accepts.
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
-      task:
-        description: JSON-encoded BuildTaskPayload
+      leg:
+        description: The leg's index into the batch's tasks list
+        required: true
+        type: number
+      task_hash:
+        description: First 16 hex of blake3(task_id) — the leg's job-name binding
+        required: true
+        type: string
+      target:
+        description: The leg's compilation target triple
+        required: true
+        type: string
+      rustc_version:
+        description: The batch's pinned rustc version
+        required: true
+        type: string
+      label:
+        description: The leg's crate name and version, for the build job name
         required: true
         type: string
 
 permissions: {}
-
-concurrency:
-  group: build-crate-${{ fromJSON(inputs.task).task_id }}
-  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,8 +69,8 @@ env:
 # `env`, so the map is inline in both jobs.
 jobs:
   build:
-    name: build ${{ fromJSON(inputs.task).crate_name }} ${{ fromJSON(inputs.task).version }} (${{ fromJSON(inputs.task).target }})
-    runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-14","aarch64-apple-ios":"macos-14","aarch64-apple-ios-sim":"macos-14","aarch64-linux-android":"ubuntu-latest","x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-latest","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-latest"}')[fromJSON(inputs.task).target] }}
+    name: "build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}"
+    runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-14","aarch64-apple-ios":"macos-14","aarch64-apple-ios-sim":"macos-14","aarch64-linux-android":"ubuntu-latest","x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-latest","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-latest"}')[inputs.target] }}
     permissions:
       contents: read
       packages: read # pull the pinned stow toolchain from GHCR
@@ -69,8 +84,8 @@ jobs:
       # here would leave the pinned toolchain without the target's std.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: ${{ fromJSON(inputs.task).rustc_version }}
-          targets: ${{ fromJSON(inputs.task).target }}
+          toolchain: ${{ inputs.rustc_version }}
+          targets: ${{ inputs.target }}
       # The sandboxed phases inherit these CARGO_TARGET_*/CC_*/AR_* variables
       # through stow-build's toolchain passthrough; a variable that is not set
       # for the task's target is simply absent there too.
@@ -86,7 +101,7 @@ jobs:
       - name: Configure the cross toolchain
         shell: bash
         env:
-          TASK_TARGET: ${{ fromJSON(inputs.task).target }}
+          TASK_TARGET: ${{ inputs.target }}
         run: |
           set -euo pipefail
           target_key="$(echo "$TASK_TARGET" | tr 'a-z-' 'A-Z_')"
@@ -179,17 +194,15 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run the untrusted build stage
         shell: bash
-        env:
-          STOW_BUILD_TASK_JSON: ${{ inputs.task }}
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = "Linux" ]; then
             eval "$(ci/glibc-sysroot/env.sh "$HOME/stow-glibc-2.28")"
           fi
-          stow-build build --output-dir "${{ runner.temp }}/stow-build-output"
+          stow-build build --leg ${{ inputs.leg }} --output-dir "${{ runner.temp }}/stow-build-output"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: build-output
+          name: build-output-${{ inputs.leg }}
           path: ${{ runner.temp }}/stow-build-output
           if-no-files-found: error
           retention-days: 1
@@ -198,7 +211,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
-          name: build-network-audit
+          name: build-network-audit-${{ inputs.leg }}
           path: ${{ runner.temp }}/stow-build-output/network-audit.jsonl
           if-no-files-found: warn
           retention-days: 1
@@ -229,10 +242,10 @@ jobs:
           echo "highest glibc required by host-loaded outputs: ${highest:-none}"
 
   publish:
-    name: publish
+    name: "publish #${{ inputs.leg }} ${{ inputs.task_hash }}"
     needs: build
     if: needs.build.result == 'success'
-    runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-14","aarch64-apple-ios":"macos-14","aarch64-apple-ios-sim":"macos-14","aarch64-linux-android":"ubuntu-latest","x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-latest","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-latest"}')[fromJSON(inputs.task).target] }}
+    runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-14","aarch64-apple-ios":"macos-14","aarch64-apple-ios-sim":"macos-14","aarch64-linux-android":"ubuntu-latest","x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-latest","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-latest"}')[inputs.target] }}
     permissions:
       contents: read
       packages: write
@@ -255,14 +268,13 @@ jobs:
       # toolchain (ci/src/closure.rs) and refuses a rustc that is not the pin.
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
-          toolchain: ${{ fromJSON(inputs.task).rustc_version }}
+          toolchain: ${{ inputs.rustc_version }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: build-output
+          name: build-output-${{ inputs.leg }}
           path: ${{ runner.temp }}/stow-build-output
       - name: Run the trusted publish stage
-        run: stow-build publish --input-dir "${{ runner.temp }}/stow-build-output"
+        run: stow-build publish --leg ${{ inputs.leg }} --input-dir "${{ runner.temp }}/stow-build-output"
         env:
-          STOW_BUILD_TASK_JSON: ${{ inputs.task }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}

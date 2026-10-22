@@ -280,6 +280,18 @@ async fn fire_events(
     Ok(())
 }
 
+/// Make `count` events of `lane` fireable — harness work, so it runs
+/// before a round's profile starts, never inside one.
+async fn ready(lane: &Lane, edge: &Edge, count: u32) -> stow_types::error::Result<()> {
+    lane.fire
+        .ready(
+            edge,
+            usize::try_from(count).map_err(|_| stow_error!("{count} events per round"))?,
+        )
+        .await
+        .map_err(|error| stow_error!("{}: {error}", lane.name))
+}
+
 /// Measure one lane: warm it, then [`ROUNDS`] profiled rounds.
 async fn measure_lane(
     lane: &Lane,
@@ -298,9 +310,11 @@ async fn measure_lane(
         })?;
     let mut client = zenwave::client();
     let mut counter = 0u64;
+    ready(lane, edge, args.warmup_events).await?;
     fire_events(lane, edge, &mut client, &mut counter, args.warmup_events).await?;
     let mut rounds_cpu_ms = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
+        ready(lane, edge, args.events_per_round).await?;
         let cpu_ms = profiled(inspector, async || {
             fire_events(lane, edge, &mut client, &mut counter, args.events_per_round).await
         })
