@@ -45,7 +45,7 @@ use stow_types::local_ci::{
     LocalCiLeg, LocalCiRun, LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRunIds,
     LocalCiSeededRuns, LocalCiSeededStatus,
 };
-use stow_types::runs::VERDICT_STEPS;
+use stow_types::runs::{LegJobName, VERDICT_STEPS};
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
@@ -352,10 +352,11 @@ impl LocalServerState {
             });
     }
 
-    /// Record a job that never ran because its `if:` was false — a
-    /// completed `skipped` row with no steps.
-    fn skip_job(&self, run_id: u64, name: String) {
-        self.close_unstarted_job(run_id, name, "skipped");
+    /// Record the leg's publish job skipped — its `if:` gate failed —
+    /// as GitHub serves it: a completed `skipped` row with no steps,
+    /// under the unrendered `name:` template (stow#839).
+    fn skip_job(&self, run_id: u64, leg: u32) {
+        self.close_unstarted_job(run_id, LegJobName::skipped_publish(leg), "skipped");
     }
 
     /// The id each of `seeded`'s runs is recorded under, in request
@@ -518,7 +519,7 @@ impl LocalServerState {
                     conclusion: LocalCiSeededConclusion::Failure,
                 } => {
                     self.finish_job(run_id, build, "failure", &["failure", "success"]);
-                    self.skip_job(run_id, leg_publish_job_name(leg, &hash));
+                    self.skip_job(run_id, leg);
                 }
             }
         }
@@ -539,11 +540,11 @@ impl LocalServerState {
     /// a finished run whose jobs are not. No `workflow_run` delivery
     /// follows — a seeded run's caller delivers its own.
     fn cancel_undriven_run(&self, run_id: u64) {
-        let publish_jobs: Vec<String> = self.runs.lock().expect("runs mutex poisoned")
+        let publish_legs: Vec<u32> = self.runs.lock().expect("runs mutex poisoned")
             [&run_id.to_string()]
             .legs
             .iter()
-            .map(|leg| leg_publish_job_name(leg.leg, &TaskHash::of(&leg.task_id)))
+            .map(|leg| leg.leg)
             .collect();
         let now = time::OffsetDateTime::now_utc();
         let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
@@ -565,8 +566,8 @@ impl LocalServerState {
             }
         }
         drop(jobs);
-        for name in publish_jobs {
-            self.skip_job(run_id, name);
+        for leg in publish_legs {
+            self.skip_job(run_id, leg);
         }
         let mut runs = self.runs.lock().expect("runs mutex poisoned");
         let run = runs
@@ -1323,7 +1324,7 @@ async fn run_leg(run: Arc<BatchRun>, leg: usize) -> Result<(), String> {
         // runner: its row reads `cancelled`, and the publish `if:`
         // gate skips exactly as a failed build's does.
         state.close_unstarted_job(workflow_run_id, build_job_name(task), "cancelled");
-        state.skip_job(workflow_run_id, publish_job_name(task));
+        state.skip_job(workflow_run_id, task.leg);
         state.set_leg(
             workflow_run_id,
             task.leg,
@@ -1355,7 +1356,7 @@ async fn run_leg(run: Arc<BatchRun>, leg: usize) -> Result<(), String> {
                 "failure",
                 &["failure", "success"],
             );
-            state.skip_job(workflow_run_id, publish_job_name(task));
+            state.skip_job(workflow_run_id, task.leg);
             state.set_leg(
                 workflow_run_id,
                 task.leg,
@@ -1883,7 +1884,9 @@ mod tests {
             .map(|job| LegJobName::parse(&job.name).unwrap_or_else(|| panic!("{}", job.name)))
             .collect();
         let hash = run.batch.tasks[0].task_hash.clone();
-        assert!(names.iter().all(|name| name.leg == 0 && name.hash == hash));
+        assert!(names.iter().all(|name| {
+            name.leg == 0 && name.hash.as_ref().is_none_or(|found| *found == hash)
+        }));
         assert_eq!(names[0].kind, LegJobKind::Build);
         let expected: Vec<TaskHash> = vec![hash];
         let conclusion = if jobs
@@ -1919,6 +1922,12 @@ mod tests {
         assert_eq!(
             publish_job_name(leg),
             format!("leg 0 / publish #0 {}", leg.task_hash)
+        );
+        // A skipped job's `name:` stays unrendered — `build-crate.yml`'s
+        // template verbatim under the rendered caller prefix (stow#839).
+        assert_eq!(
+            LegJobName::skipped_publish(0),
+            "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}"
         );
     }
 
@@ -2143,7 +2152,8 @@ mod tests {
 
     /// A build stage that exits non-zero fails the `Run the untrusted
     /// build stage` step — the crate's verdict — and skips the publish
-    /// job.
+    /// job, whose name the page serves unrendered as GitHub does
+    /// (stow#839).
     #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_build_is_a_verdict_and_skips_publish() {
@@ -2160,8 +2170,12 @@ mod tests {
             }
             other => panic!("expected a build verdict, got {other:?}"),
         }
-        let jobs = state.jobs.lock().unwrap();
-        assert_eq!(jobs[&run.workflow_run_id][1].conclusion, Some("skipped"));
+        let publish = state.jobs.lock().unwrap()[&run.workflow_run_id][1].clone();
+        assert_eq!(publish.conclusion, Some("skipped"));
+        assert_eq!(
+            publish.name,
+            "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}"
+        );
     }
 
     /// A records push that fails fails the `Run the trusted publish
@@ -2318,7 +2332,9 @@ mod tests {
         .jobs;
         let hash = TaskHash::of(task_id);
         assert!(jobs.iter().all(|job| {
-            LegJobName::parse(&job.name).is_some_and(|name| name.leg == 0 && name.hash == hash)
+            LegJobName::parse(&job.name).is_some_and(|name| {
+                name.leg == 0 && name.hash.as_ref().is_none_or(|found| *found == hash)
+            })
         }));
         classify_legs(&[hash], &conclusion, &jobs, time::OffsetDateTime::now_utc())
             .unwrap()
@@ -2371,10 +2387,14 @@ mod tests {
             }
             other => panic!("expected a build verdict, got {other:?}"),
         }
-        assert!(
-            state.jobs.lock().unwrap()[&run_id]
-                .iter()
-                .any(|job| job.conclusion == Some("skipped"))
+        let skipped = state.jobs.lock().unwrap()[&run_id]
+            .iter()
+            .find(|job| job.conclusion == Some("skipped"))
+            .cloned()
+            .expect("the failed leg's publish is skipped");
+        assert_eq!(
+            skipped.name,
+            "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}"
         );
     }
 

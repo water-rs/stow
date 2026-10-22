@@ -3151,7 +3151,8 @@ async fn resolve_completed_batch(
 
 /// The jobs page of a finished `build-batch.yml` run: every leg's build
 /// and publish jobs under the names `LegJobName` parses. A failing leg
-/// fails its build job at a verdict step and skips its publish job.
+/// fails its build job at a verdict step and skips its publish job —
+/// which GitHub serves under the unrendered `name:` template (stow#839).
 #[cfg(not(target_arch = "wasm32"))]
 fn synthetic_jobs_page(
     batch: &queue::ReadyBatch,
@@ -3198,7 +3199,12 @@ fn synthetic_jobs_page(
                             conclusion: Some("failure".to_owned()),
                         }],
                     ),
-                    job(publish_name, "skipped", index, Vec::new()),
+                    job(
+                        stow_types::runs::LegJobName::skipped_publish(index),
+                        "skipped",
+                        index,
+                        Vec::new(),
+                    ),
                 ],
             }
         })

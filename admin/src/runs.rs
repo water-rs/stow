@@ -271,8 +271,12 @@ pub fn first_error_line(log: &str) -> Option<String> {
 pub struct PageLeg {
     /// The leg index — the `#N` in `leg N / build #N …`.
     pub leg: u32,
-    /// The leg's [`TaskHash`] from its job-name suffix.
-    pub hash: TaskHash,
+    /// The leg's [`TaskHash`] from its job-name suffix — `None` when
+    /// every job the leg has on the page is unrendered (skipped jobs
+    /// carry the `name:` template verbatim, stow#839): the leg still
+    /// classifies — skipped jobs conclude `skipped` — it just holds no
+    /// hash to report.
+    pub hash: Option<TaskHash>,
     /// The leg's classified outcome.
     pub outcome: LegOutcome,
 }
@@ -282,9 +286,13 @@ pub struct PageLeg {
 ///
 /// The admin readers hold no batch manifest, so each leg's expected
 /// [`TaskHash`] is read out of its own job names: the hash cross-check
-/// still fires when one leg's jobs disagree, a leg index repeating a
-/// job kind still fails as a duplicate, and a non-leg job name is a
-/// schema surprise the caller fails on. Legs come back in index
+/// still fires when one leg's rendered jobs disagree, a leg index
+/// repeating a job kind still fails as a duplicate, and a non-leg job
+/// name is a schema surprise the caller fails on. A skipped job's name
+/// is the workflow's `name:` template verbatim (stow#839) — it names
+/// its leg through the caller prefix but carries no hash, so the leg's
+/// expected hash is its first *rendered* job's; a leg whose jobs are
+/// all unrendered reports `hash: None`. Legs come back in index
 /// order. A leg with no job rows never ran — under `fail-fast` a
 /// run's tail legs can be cancelled before scheduling — and produces
 /// no entry: it is neither a completed leg nor a failed one.
@@ -298,7 +306,7 @@ pub fn classify_page(
     run_conclusion: &str,
     now: OffsetDateTime,
 ) -> stow_types::error::Result<Vec<PageLeg>> {
-    let mut legs: BTreeMap<u32, TaskHash> = BTreeMap::new();
+    let mut legs: BTreeMap<u32, Option<TaskHash>> = BTreeMap::new();
     for job in jobs {
         let Some(parsed) = LegJobName::parse(&job.name) else {
             return Err(stow_error!(
@@ -306,23 +314,26 @@ pub fn classify_page(
                 job.name
             ));
         };
-        // The first job's hash stands as the leg's expected hash; a
-        // second job disagreeing fails the leg's hash check inside
-        // `classify_legs`.
-        legs.entry(parsed.leg).or_insert(parsed.hash);
+        // The first rendered job's hash stands as the leg's expected
+        // hash; a second rendered job disagreeing fails the leg's hash
+        // check inside `classify_legs`.
+        let entry = legs.entry(parsed.leg).or_insert(None);
+        if entry.is_none() {
+            *entry = parsed.hash;
+        }
     }
     let Some(&last) = legs.keys().next_back() else {
         return Ok(Vec::new());
     };
-    // Entries for leg indexes absent from the page are never read —
-    // `classify_leg` consults `expected[leg]` only for the hash check,
-    // which runs only when the leg has jobs — so any valid hash fills
-    // them.
+    // Entries for leg indexes absent from the page — or whose jobs are
+    // all unrendered — are never read for their hash: `classify_leg`
+    // consults `expected[leg]` only when a rendered job name claims a
+    // hash, so any valid hash fills them.
     let placeholder: TaskHash = "0000000000000000".parse().expect("16 zero hex");
     let expected: Vec<TaskHash> = (0..=last)
         .map(|leg| {
             legs.get(&leg)
-                .cloned()
+                .and_then(Clone::clone)
                 .unwrap_or_else(|| placeholder.clone())
         })
         .collect();
@@ -377,10 +388,13 @@ pub fn leg_label(job_name: &str) -> Option<LegLabel> {
     if parsed.kind != LegJobKind::Build {
         return None;
     }
+    // An unrendered build name carries the label template, not a
+    // label — nothing readable to return.
+    let hash = parsed.hash.as_ref()?;
     let segment = job_name.rsplit_once(" / ").map_or(job_name, |(_, s)| s);
     let label = segment
         .strip_prefix(&format!("build #{} ", parsed.leg))?
-        .strip_suffix(&format!(" {}", parsed.hash))?;
+        .strip_suffix(&format!(" {hash}"))?;
     let (name_version, target) = label.rsplit_once(" (")?;
     let target = target.strip_suffix(')')?;
     let (crate_name, version) = name_version.split_once(' ')?;
@@ -665,7 +679,7 @@ async fn failures(
 
 #[cfg(test)]
 mod tests {
-    use stow_types::runs::RunStepRow;
+    use stow_types::runs::{LegJobName, RunStepRow};
 
     use super::{
         FailureClass, LegFailure, LegOutcome, RunFailure, RunJobRow, TaskHash, classify_log,
@@ -917,7 +931,7 @@ mod tests {
         ];
         let legs = classify_page(&jobs, "failure", at(1_000)).expect("classified");
         assert_eq!(legs.len(), 3);
-        assert_eq!(legs[0].hash, hash0);
+        assert_eq!(legs[0].hash.as_ref(), Some(&hash0));
         assert!(matches!(legs[0].outcome, LegOutcome::Succeeded { .. }));
         let LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { .. })) = &legs[1].outcome
         else {
@@ -931,6 +945,71 @@ mod tests {
         };
         assert_eq!(conclusion, "cancelled");
         assert!(!leg_attempted(failure));
+    }
+
+    /// stow#839: the observed page — each leg's build fails at a
+    /// verdict step and its skipped publish's name comes back
+    /// unrendered — reads both legs as verdict failures; each leg's
+    /// hash still comes from its rendered build job.
+    #[test]
+    fn classify_page_reads_skipped_jobs_unrendered_names() {
+        let (hash0, build0) = build_name(0, "task-a");
+        let (_hash1, build1) = build_name(1, "task-b");
+        let skipped_publish =
+            |leg: u32| job_row(LegJobName::skipped_publish(leg), Some("skipped"), vec![]);
+        let verdict_step = || RunStepRow {
+            name: "Run the untrusted build stage".to_owned(),
+            status: "completed".to_owned(),
+            conclusion: Some("failure".to_owned()),
+        };
+        let jobs = vec![
+            job_row(build0, Some("failure"), vec![verdict_step()]),
+            skipped_publish(0),
+            job_row(build1, Some("failure"), vec![verdict_step()]),
+            skipped_publish(1),
+        ];
+        let legs = classify_page(&jobs, "failure", at(1_000)).expect("classified");
+        assert_eq!(legs.len(), 2);
+        assert_eq!(legs[0].hash.as_ref(), Some(&hash0));
+        for leg in &legs {
+            assert!(
+                matches!(
+                    leg.outcome,
+                    LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { .. }))
+                ),
+                "{:?}",
+                leg.outcome
+            );
+        }
+    }
+
+    /// stow#839: a leg whose only jobs are unrendered — every job
+    /// skipped — has no rendered hash to derive; it reports
+    /// `hash: None` and classifies by conclusion, a defined outcome
+    /// rather than a panic.
+    #[test]
+    fn classify_page_reports_an_unrendered_only_leg_without_a_hash() {
+        let jobs = vec![
+            job_row(
+                "leg 0 / build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}".to_owned(),
+                Some("skipped"),
+                vec![],
+            ),
+            job_row(
+                "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}".to_owned(),
+                Some("skipped"),
+                vec![],
+            ),
+        ];
+        let legs = classify_page(&jobs, "failure", at(1_000)).expect("classified");
+        let [leg] = &legs[..] else {
+            panic!("one leg on the page: {legs:?}");
+        };
+        assert_eq!(leg.hash, None);
+        let LegOutcome::Failed(LegFailure::Concluded { conclusion, .. }) = &leg.outcome else {
+            panic!("an all-skipped leg concludes skipped: {:?}", leg.outcome);
+        };
+        assert_eq!(conclusion, "skipped");
     }
 
     /// The page is the manifest: a leg whose jobs disagree on the

@@ -338,7 +338,10 @@ async fn inspect_run(token: &str, run: &DigestRun) -> stow_types::error::Result<
                 .as_ref()
                 .map_or_else(|| "-".to_owned(), |label| label.version.clone()),
             target: label.map_or_else(|| "-".to_owned(), |label| label.target),
-            task_hash: leg.hash.to_string(),
+            task_hash: leg
+                .hash
+                .as_ref()
+                .map_or_else(|| "-".to_owned(), ToString::to_string),
             job: job_name,
             step,
             error_line,
@@ -665,7 +668,7 @@ mod tests {
     fn failure_fields_map_every_leg_failure_shape() {
         let leg_of = |failure: LegFailure| runs::PageLeg {
             leg: 2,
-            hash: TaskHash::of("task-a"),
+            hash: Some(TaskHash::of("task-a")),
             outcome: LegOutcome::Failed(failure),
         };
         let fields_of = |leg: &runs::PageLeg| match &leg.outcome {

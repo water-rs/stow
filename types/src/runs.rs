@@ -308,36 +308,65 @@ pub enum LegJobKind {
 pub struct LegJobName {
     /// Build or publish.
     pub kind: LegJobKind,
-    /// The leg's index in the batch's `tasks` list — the `#N`.
+    /// The leg's index in the batch's `tasks` list — the `#N` of a
+    /// rendered name, the caller prefix's `leg <i>` of an unrendered
+    /// one (the `${{ inputs.leg }}` it carries is that same index
+    /// unrendered).
     pub leg: u32,
     /// The leg's [`TaskHash`] — `blake3(task_id)`'s first 16 hex, the
     /// job-name binding that maps a run's jobs back to legs by hash,
-    /// not by position alone.
-    pub hash: TaskHash,
+    /// not by position alone. `None` when GitHub never rendered the
+    /// name: a skipped job's `name:` is `build-crate.yml`'s template
+    /// verbatim, `${{ inputs.task_hash }}` included (stow#839).
+    pub hash: Option<TaskHash>,
 }
 
 impl LegJobName {
+    /// The name GitHub serves for leg `leg`'s publish job when it is
+    /// skipped: it never renders a skipped job's `name:`, so the called
+    /// segment is `build-crate.yml`'s template verbatim under the
+    /// caller's rendered `leg <i>` prefix (stow#839). The local CI
+    /// server and the scheduler's synthetic pages emit it so the mock
+    /// lanes exercise the shape.
+    #[must_use]
+    pub fn skipped_publish(leg: u32) -> String {
+        format!("leg {leg} / publish #${{{{ inputs.leg }}}} ${{{{ inputs.task_hash }}}}")
+    }
+
     /// Parse a job name from a `build-batch.yml` run's jobs page.
     ///
     /// GitHub names a reusable-workflow matrix job
-    /// `"<caller job> / <called job>"`, so the caller's `leg <i>`
-    /// prefix is discarded at the last `" / "` (the whole name stands
-    /// when no separator is present). The segment then reads
-    /// `build #<N> <label> (<target>) <16 hex>` or
-    /// `publish #<N> <16 hex>`.
+    /// `"<caller job> / <called job>"`. The called segment of a job
+    /// that ran reads `build #<N> <label> (<target>) <16 hex>` or
+    /// `publish #<N> <16 hex>`; a *skipped* job's name is the workflow's
+    /// `name:` template verbatim — `build #${{ inputs.leg }} …` /
+    /// `publish #${{ inputs.leg }} ${{ inputs.task_hash }}` — under the
+    /// caller's rendered `leg <i>` prefix, which is where the leg index
+    /// comes from (stow#839). Only a skipped job may arrive unrendered;
+    /// the conclusion check is the caller's.
     ///
-    /// `None` when the segment matches neither shape — the caller
-    /// fails fast on it, since the run is ours.
+    /// `None` when the segment matches neither shape or an unrendered
+    /// name carries no `leg <i>` prefix — the caller fails fast on it,
+    /// since the run is ours.
     #[must_use]
     pub fn parse(name: &str) -> Option<Self> {
-        let name = name.rsplit_once(" / ").map_or(name, |(_, called)| called);
-        let (kind, rest) = name
+        let (prefix, segment) = name.rsplit_once(" / ").unwrap_or(("", name));
+        let (kind, rest) = segment
             .strip_prefix("build #")
             .map(|rest| (LegJobKind::Build, rest))
             .or_else(|| {
-                name.strip_prefix("publish #")
+                segment
+                    .strip_prefix("publish #")
                     .map(|rest| (LegJobKind::Publish, rest))
             })?;
+        if rest.contains("${{") {
+            let leg = prefix.strip_prefix("leg ")?.parse().ok()?;
+            return Some(Self {
+                kind,
+                leg,
+                hash: None,
+            });
+        }
         let (leg, label) = rest.split_once(' ')?;
         if leg.is_empty() || !leg.bytes().all(|byte| byte.is_ascii_digit()) {
             return None;
@@ -357,7 +386,11 @@ impl LegJobName {
                 hash.parse().ok()?
             }
         };
-        Some(Self { kind, leg, hash })
+        Some(Self {
+            kind,
+            leg,
+            hash: Some(hash),
+        })
     }
 }
 
@@ -440,9 +473,10 @@ struct LegJobs {
 ///
 /// # Errors
 /// A job name [`LegJobName::parse`] cannot read — the run is ours, so
-/// a job that is not a leg is a schema surprise — or a leg index past
-/// `expected.len()`: both are structural violations of the page, not
-/// one leg's outcome.
+/// a job that is not a leg is a schema surprise — an unrendered name
+/// on a job whose conclusion is not `skipped` (only a skipped job may
+/// arrive unrendered, stow#839), or a leg index past `expected.len()`:
+/// all are structural violations of the page, not one leg's outcome.
 pub fn classify_legs(
     expected: &[TaskHash],
     run_conclusion: &str,
@@ -469,6 +503,13 @@ pub fn classify_legs(
                 job.name
             ));
         };
+        if parsed.hash.is_none() && job.conclusion.as_deref() != Some("skipped") {
+            return Err(stow_error!(
+                "batch run jobs page names an unrendered job {:?} — only a skipped job's name is unrendered, and it concluded {:?}",
+                job.name,
+                job.conclusion.as_deref().unwrap_or("<none>")
+            ));
+        }
         let leg = usize::try_from(parsed.leg).map_err(|error| stow_error!("{error}"))?;
         let Some(entry) = legs.get_mut(leg) else {
             return Err(stow_error!(
@@ -477,8 +518,11 @@ pub fn classify_legs(
                 expected.len()
             ));
         };
-        if parsed.hash != expected[leg] && entry.hash_mismatch.is_none() {
-            entry.hash_mismatch = Some(parsed.hash);
+        if let Some(hash) = &parsed.hash
+            && *hash != expected[leg]
+            && entry.hash_mismatch.is_none()
+        {
+            entry.hash_mismatch = Some(hash.clone());
         }
         match parsed.kind {
             LegJobKind::Build => entry.build.push(index),
@@ -887,6 +931,19 @@ mod tests {
         ]
     }
 
+    /// Leg `i`'s publish job skipped as GitHub reports it — the
+    /// `name:` template unrendered under the rendered caller prefix
+    /// (stow#839).
+    fn skipped_publish_job(leg: u32) -> RunJobRow {
+        job_row(
+            &LegJobName::skipped_publish(leg),
+            "completed",
+            Some("skipped"),
+            Some(100),
+            &[],
+        )
+    }
+
     /// A leg reads as `build #N <label> (<target>) <hash>` /
     /// `publish #N <hash>` under the caller-job prefix — and the same
     /// segment alone, when GitHub drops the `"leg N / "` prefix.
@@ -900,7 +957,7 @@ mod tests {
             let parsed = LegJobName::parse(&name).expect("build name parses");
             assert_eq!(parsed.kind, LegJobKind::Build);
             assert_eq!(parsed.leg, 3);
-            assert_eq!(parsed.hash, hash);
+            assert_eq!(parsed.hash.as_ref(), Some(&hash));
         }
         for name in [
             leg_name(LegJobKind::Publish, 3, &hash),
@@ -909,7 +966,37 @@ mod tests {
             let parsed = LegJobName::parse(&name).expect("publish name parses");
             assert_eq!(parsed.kind, LegJobKind::Publish);
             assert_eq!(parsed.leg, 3);
-            assert_eq!(parsed.hash, hash);
+            assert_eq!(parsed.hash.as_ref(), Some(&hash));
+        }
+    }
+
+    /// stow#839: GitHub never renders a skipped job's `name:` — the
+    /// jobs page carries `build-crate.yml`'s template verbatim under
+    /// the rendered `leg <i>` caller prefix. The name parses to its
+    /// kind and the prefix's leg, with no hash. Without the `leg <i>`
+    /// prefix there is no leg to read.
+    #[test]
+    fn unrendered_leg_job_names_parse_their_kind_and_caller_leg() {
+        for (name, kind) in [
+            (
+                "leg 7 / build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}",
+                LegJobKind::Build,
+            ),
+            (
+                "leg 7 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}",
+                LegJobKind::Publish,
+            ),
+        ] {
+            let parsed = LegJobName::parse(name).expect("unrendered name parses");
+            assert_eq!(parsed.kind, kind, "{name}");
+            assert_eq!(parsed.leg, 7, "{name}");
+            assert_eq!(parsed.hash, None, "{name}");
+        }
+        for name in [
+            "publish #${{ inputs.leg }} ${{ inputs.task_hash }}",
+            "leg x / publish #${{ inputs.leg }} ${{ inputs.task_hash }}",
+        ] {
+            assert_eq!(LegJobName::parse(name), None, "{name}");
         }
     }
 
@@ -1065,6 +1152,97 @@ mod tests {
                 html_url: jobs[0].html_url.clone(),
             })
         );
+    }
+
+    /// stow#839: the observed page — each leg's build fails at a
+    /// verdict step and its skipped publish's name comes back
+    /// unrendered — classifies both legs as the build's failure rather
+    /// than failing the whole read as a non-leg job.
+    #[test]
+    fn a_failed_builds_skipped_publish_classifies_unrendered() {
+        let verdict = [(
+            "Run the untrusted build stage",
+            "completed",
+            Some("failure"),
+        )];
+        let jobs = vec![
+            leg_job(
+                LegJobKind::Build,
+                0,
+                &leg_hash(0),
+                "completed",
+                Some("failure"),
+                &verdict,
+            ),
+            skipped_publish_job(0),
+            leg_job(
+                LegJobKind::Build,
+                1,
+                &leg_hash(1),
+                "completed",
+                Some("failure"),
+                &verdict,
+            ),
+            skipped_publish_job(1),
+        ];
+        let outcomes = classify_legs(&[leg_hash(0), leg_hash(1)], "failure", &jobs, at(1_000))
+            .expect("classified");
+        for (index, outcome) in outcomes.iter().enumerate() {
+            let LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { job, .. })) = outcome
+            else {
+                panic!("leg {index} is its build's verdict failure: {outcome:?}");
+            };
+            assert!(job.contains(&format!("build #{index}")), "{job}");
+        }
+    }
+
+    /// stow#839: an unrendered name is the skipped-job shape only — a
+    /// job that ran or concluded otherwise under the template text is
+    /// a schema surprise, never a leg to guess at.
+    #[test]
+    fn an_unrendered_name_on_a_non_skipped_job_fails_the_read() {
+        for (status, conclusion) in [
+            ("completed", Some("success")),
+            ("completed", Some("failure")),
+            ("completed", Some("cancelled")),
+            ("in_progress", None),
+        ] {
+            let jobs = [job_row(
+                "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}",
+                status,
+                conclusion,
+                Some(100),
+                &[],
+            )];
+            assert!(
+                classify_legs(&[leg_hash(0)], "failure", &jobs, at(1_000)).is_err(),
+                "{status}/{conclusion:?}"
+            );
+        }
+    }
+
+    /// stow#839: a leg whose jobs are all unrendered — every job
+    /// skipped — classifies by conclusion like any all-skipped leg;
+    /// its expected hash comes from the batch, which is exactly what
+    /// `expected` carries.
+    #[test]
+    fn an_all_skipped_leg_classifies_by_conclusion_without_a_hash() {
+        let jobs = [
+            job_row(
+                "leg 0 / build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}",
+                "completed",
+                Some("skipped"),
+                Some(100),
+                &[],
+            ),
+            skipped_publish_job(0),
+        ];
+        let outcomes =
+            classify_legs(&[leg_hash(0)], "failure", &jobs, at(1_000)).expect("classified");
+        let LegOutcome::Failed(LegFailure::Concluded { conclusion, .. }) = &outcomes[0] else {
+            panic!("an all-skipped leg concludes skipped: {:?}", outcomes[0]);
+        };
+        assert_eq!(conclusion, "skipped");
     }
 
     /// §4.1: a job not yet `completed` defers the leg — the build can

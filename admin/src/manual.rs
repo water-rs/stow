@@ -2950,7 +2950,9 @@ async fn adopt_runs(
 /// A candidate GitHub run's leg map at adoption: every parseable job
 /// name lands its leg's 16-hex hash into `expected`, and a hash an
 /// undispatched open node claims maps the leg to its task id —
-/// adoption binds legs by hash, not by position. Gaps in `expected`
+/// adoption binds legs by hash, not by position. A skipped job's
+/// unrendered name (stow#839) carries no hash — it still claims its
+/// leg's slot in `expected` but binds nothing. Gaps in `expected`
 /// fill with a placeholder: a leg that never left the matrix's queue
 /// carries no called-job name until it runs.
 fn adopt_github_legs(
@@ -2969,10 +2971,13 @@ fn adopt_github_legs(
         if expected.len() <= leg {
             expected.resize(leg + 1, phantom.clone());
         }
+        let Some(hash) = parsed.hash else {
+            continue;
+        };
         if expected[leg] == phantom {
-            expected[leg] = parsed.hash.clone();
+            expected[leg] = hash.clone();
         }
-        if let Some(task_id) = open_hash.get(&parsed.hash)
+        if let Some(task_id) = open_hash.get(&hash)
             && !nodes.get(task_id).expect("open node").dispatched
         {
             legs.insert(parsed.leg, task_id.clone());
