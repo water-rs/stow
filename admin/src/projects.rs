@@ -99,6 +99,11 @@ pub struct SubmitArgs {
     /// their ordinary git tree.
     #[arg(long)]
     pub source_trees: Option<PathBuf>,
+    /// Resolve only the first N listed repositories — a reduced-scale
+    /// wave over the same reviewed list (the `Preheat cost` lane's
+    /// local runs). Absent submits every listed repository.
+    #[arg(long)]
+    pub limit: Option<usize>,
 }
 
 /// The schema of `preheat/projects.toml`: a reviewed list of
@@ -197,44 +202,44 @@ struct GenerateReport {
 }
 
 /// A listed repository `submit` could not resolve, with its reason.
-#[derive(Debug, serde::Serialize)]
-struct SkippedRepo {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SkippedRepo {
     /// The repository URL as the file carried it.
-    repo: String,
+    pub repo: String,
     /// Why resolution failed — fetch, manifest, or resolver.
-    reason: String,
+    pub reason: String,
 }
 
 /// One repository's contribution to the plan: its task count.
-#[derive(Debug, serde::Serialize)]
-struct RepoContribution {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct RepoContribution {
     /// The repository URL as the file carried it.
-    repo: String,
+    pub repo: String,
     /// How many enqueue requests its resolve graphs produced.
-    tasks: usize,
+    pub tasks: usize,
 }
 
 /// The plan `submit` previews and applies: every task every repository
 /// produced, plus per-repository outcomes.
-#[derive(Debug, serde::Serialize)]
-struct ProjectsPlan {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct ProjectsPlan {
     /// The repository list the plan was built from.
-    file: String,
+    pub file: String,
     /// Every enqueue request across every repository and target —
     /// deduplication is the scheduler's `task_id`, not a pass here.
-    tasks: Vec<EnqueueRequest>,
+    pub tasks: Vec<EnqueueRequest>,
     /// How many requests each listed repository produced.
-    per_repo: Vec<RepoContribution>,
+    pub per_repo: Vec<RepoContribution>,
     /// Repositories resolution failed on, with their reasons.
-    skipped: Vec<SkippedRepo>,
+    pub skipped: Vec<SkippedRepo>,
     /// Repositories that resolved but whose submit POST failed — a
     /// different fault than a resolve skip, reported separately.
     /// Always empty in a dry run, which submits nothing.
-    submit_failed: Vec<SkippedRepo>,
+    pub submit_failed: Vec<SkippedRepo>,
 }
 
 /// The aggregated answer of the chunked submits `apply` ran.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct SubmitOutcome {
     /// How many batches were posted to the scheduler.
     pub batches: usize,
@@ -301,8 +306,8 @@ pub async fn run(args: ProjectsArgs, output: Output) -> stow_types::error::Resul
             generate(&token, &args, output).await
         }
         ProjectsCommand::Submit(args) => {
-            let edge = crate::Edge::connect().await?;
-            tokio::task::spawn_blocking(move || submit(&edge, &args, output))
+            let edge = crate::Edge::connect_to_submit(args.yes).await?;
+            tokio::task::spawn_blocking(move || submit(edge.as_ref(), &args, output))
                 .await
                 .expect("projects submit panicked")
         }
@@ -401,7 +406,7 @@ async fn generate(
 /// the scheduler as soon as its resolve lands, so a token or network
 /// failure mid-lane costs the wave only the repositories it never
 /// reached, never the work it already did.
-fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::Result<()> {
+fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
     let targets: Vec<TargetTriple> = crate::preheat::ci_targets(args.targets.clone())?
@@ -411,7 +416,10 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
                 .map_err(|error| stow_error!("--targets `{raw}`: {error}"))
         })
         .collect::<stow_types::error::Result<_>>()?;
-    let repos = tokio::runtime::Handle::current().block_on(load_projects_file(&args.file))?;
+    let mut repos = tokio::runtime::Handle::current().block_on(load_projects_file(&args.file))?;
+    if let Some(limit) = args.limit {
+        repos.truncate(limit);
+    }
     // Declared source trees load once, before the pool: every row must
     // name a repository this input actually lists.
     let trees =
@@ -447,7 +455,10 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
         |_index, repo, result| match result {
             Ok(tasks) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
-                if args.yes && !tasks.is_empty() {
+                // `edge` is present exactly when the run submits.
+                if let Some(edge) = edge
+                    && !tasks.is_empty()
+                {
                     match tokio::runtime::Handle::current().block_on(submit_chunked(edge, &tasks)) {
                         Ok(chunk_outcome) => {
                             outcome.batches += chunk_outcome.batches;
@@ -480,9 +491,9 @@ fn submit(edge: &Edge, args: &SubmitArgs, output: Output) -> stow_types::error::
         },
     );
     let envelope = render::Planned {
-        dry_run: !args.yes,
+        dry_run: edge.is_none(),
         plan,
-        result: args.yes.then_some(outcome),
+        result: edge.map(|_| outcome),
     };
     render::emit(output, &envelope, render_projects_plan)
 }

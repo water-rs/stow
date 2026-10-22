@@ -9,6 +9,7 @@
 //! stdout writers are the final renderers in `render.rs`.
 
 mod artifacts;
+mod builds;
 mod cache;
 mod cloudflare;
 mod coverage;
@@ -17,12 +18,11 @@ mod demand_feed;
 mod deploy;
 mod github;
 mod index_cmd;
-mod launch_gate;
-mod launch_load;
 mod launch_model;
 mod maintenance;
 mod manual;
 mod preheat;
+mod preheat_cost;
 mod projects;
 mod queue;
 mod render;
@@ -34,6 +34,7 @@ mod scheduler;
 mod source_trees;
 #[cfg(test)]
 mod test_server;
+mod traffic_cost;
 mod watchdog;
 
 use std::fmt::Write as _;
@@ -101,6 +102,8 @@ enum Command {
     Preheat(preheat::PreheatArgs),
     /// Inspect GitHub Actions build runs.
     Runs(runs::RunsArgs),
+    /// The daily failed-build digest (stow#778).
+    Builds(builds::BuildsArgs),
     /// Inspect and prune the artifact catalog.
     Artifacts(artifacts::ArtifactsArgs),
     /// GitHub Actions cache usage and eviction.
@@ -120,14 +123,10 @@ enum Command {
     /// Regenerate the checked-in launch traffic model from production
     /// analytics (stow#452).
     LaunchModel(launch_model::LaunchModelArgs),
-    /// The launch-cost gate: project the measured scheduler-budget
-    /// report against the launch model and fail on an over-allowance
-    /// dimension (stow#452).
-    LaunchGate(launch_gate::LaunchGateArgs),
-    /// The stow#452 mock-stack load test: drive a running edge at the
-    /// launch model's peak rates and report per-lane p50/p99, error
-    /// and overload signals.
-    LaunchLoad(launch_load::LaunchLoadArgs),
+    /// The Traffic cost test's pieces: Worker CPU per lane, the
+    /// peak-concurrency drive, and the projection against the
+    /// allowance (`scripts/traffic-cost.sh`).
+    TrafficCost(traffic_cost::TrafficCostArgs),
     /// The human request lane's Actions leg: `request resolve` turns an
     /// admitted request's dispatch input into its outcome report.
     Request(request::RequestArgs),
@@ -233,6 +232,7 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         Command::Coverage(args) => coverage::run(&Edge::connect().await?, args, output).await,
         Command::Preheat(args) => preheat::run(args, output).await,
         Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
+        Command::Builds(args) => builds::run(&github_token().await?, args, output).await,
         Command::Artifacts(args) => artifacts::run(&Edge::connect().await?, args, output).await,
         Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
         Command::Maintenance(args) => maintenance::run(args, output).await,
@@ -242,8 +242,7 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         }
         Command::Index(args) => index_cmd::run(args).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
-        Command::LaunchGate(args) => launch_gate::run(&args, output).await,
-        Command::LaunchLoad(args) => launch_load::run(&Edge::connect().await?, &args, output).await,
+        Command::TrafficCost(args) => traffic_cost::run(args, output).await,
         Command::Request(args) => request::run(args, output).await,
         Command::Submit(args) => submit_command(&Edge::connect().await?, args, output).await,
         Command::Deploy(args) => deploy::run(args, output).await,
@@ -287,6 +286,17 @@ impl Edge {
                 .ok()
                 .filter(|value| !value.is_empty()),
         })
+    }
+
+    /// The edge for a lane whose plan needs none: connected only when
+    /// the lane will submit (`yes`), so a plan-only run needs neither
+    /// `STOW_EDGE_URL` nor a credential.
+    pub(crate) async fn connect_to_submit(yes: bool) -> stow_types::error::Result<Option<Self>> {
+        if yes {
+            Self::connect().await.map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     /// A connection pinned at a loopback base — the demand-feed tests
@@ -356,17 +366,26 @@ impl Edge {
 
     /// `POST` a JSON body to an edge path — the one transport every
     /// JSON/unit/stream caller shares: bearer + version header +
-    /// timeout + status guard. The caller owns the 2xx response's
-    /// decode, drain, or unbuffered stream.
-    async fn post_response<B: serde::Serialize + Sync>(
+    /// timeout. The nested result keeps the send's typed outcome
+    /// intact — the backend lifts a non-2xx into
+    /// `Err(zenwave::Error::Http)` — so a caller can match a refusal's
+    /// status itself; the outer `Err` covers build/auth failures.
+    async fn post_send<B: serde::Serialize + Sync>(
         &self,
         path: &str,
         body: &B,
         timeout: Duration,
-    ) -> stow_types::error::Result<zenwave::Response> {
+    ) -> stow_types::error::Result<std::result::Result<zenwave::Response, zenwave::Error>> {
         let url = format!("{}{path}", self.base);
         let bearer = self.bearer().await?;
-        let mut client = zenwave::client().timeout(timeout);
+        // The timeout middleware is stacked by hand — `Client::timeout`
+        // hides it behind `impl Client`'s associated `Error`, and the
+        // send's `MiddlewareError` must stay matchable for the typed
+        // outcome this function returns.
+        let mut client = zenwave::endpoint::WithMiddleware::new(
+            zenwave::client(),
+            zenwave::Timeout::new(timeout),
+        );
         let request = client
             .post(&url)
             .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
@@ -376,13 +395,46 @@ impl Edge {
             })
             .and_then(|request| request.json_body(body))
             .map_err(|error| stow_error!("POST {url}: {error}"))?;
-        let response = request
-            .await
-            .map_err(|error| stow_error!("POST {url}: {error}"))?;
-        response
+        // The timeout middleware wraps the endpoint's `zenwave::Error`
+        // in `MiddlewareError`; the send's outcome stays typed either
+        // way — the endpoint half verbatim, the timeout as
+        // `Error::Timeout`, the same variant zenwave maps it to.
+        Ok(request.await.map_err(|error| match error {
+            zenwave::middleware::MiddlewareError::Endpoint(error) => error,
+            zenwave::middleware::MiddlewareError::Middleware(error) => error.into(),
+        }))
+    }
+
+    /// [`post_send`](Self::post_send) plus the 2xx status guard most
+    /// callers want. The caller owns the 2xx response's decode, drain,
+    /// or unbuffered stream.
+    async fn post_response<B: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+        timeout: Duration,
+    ) -> stow_types::error::Result<zenwave::Response> {
+        let url = format!("{}{path}", self.base);
+        self.post_send(path, body, timeout)
+            .await?
+            .map_err(|error| stow_error!("POST {url}: {error}"))?
             .error_for_status()
             .await
             .map_err(|error| stow_error!("POST {url}: {error}"))
+    }
+
+    /// `POST` a JSON body and answer the send's own result — no status
+    /// guard, so `index report`'s 409 → full-report resync matches the
+    /// refusal's typed code instead of a flattened error. The outer
+    /// `Err` covers build/auth failures; an `Err` inside is the
+    /// backend's `zenwave::Error::Http` carrying the response's status
+    /// and body.
+    pub(crate) async fn post_unchecked<B: serde::Serialize + Sync>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> stow_types::error::Result<std::result::Result<zenwave::Response, zenwave::Error>> {
+        self.post_send(path, body, REQUEST_TIMEOUT).await
     }
 
     /// [`post_json`](Self::post_json) at an explicit bound — for the
@@ -594,7 +646,6 @@ async fn dispatch_freeze_switch(
     };
     render::mutation(
         output,
-        args.yes,
         plan,
         |envelope: &render::Planned<DispatchFreeze, DispatchFreeze>| {
             let mut out = "clear dispatch freeze\n".to_owned();
@@ -604,9 +655,9 @@ async fn dispatch_freeze_switch(
             let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |plan: &DispatchFreeze| {
+        args.yes.then_some(async move |plan: &DispatchFreeze| {
             edge.post_json("/api/v1/admin/dispatch-freeze", plan).await
-        },
+        }),
     )
     .await
 }
@@ -749,7 +800,6 @@ async fn submit_command(
     .map_err(|error| stow_error!("submit resolver task: {error}"))??;
     render::mutation(
         output,
-        args.yes,
         requests,
         |envelope: &render::Planned<Vec<EnqueueRequest>, SchedulerSubmitResponse>| {
             let mut out = format!("{} task(s)\n", envelope.plan.len());
@@ -774,7 +824,8 @@ async fn submit_command(
             let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |requests: &Vec<EnqueueRequest>| submit(edge, requests).await,
+        args.yes
+            .then_some(async move |requests: &Vec<EnqueueRequest>| submit(edge, requests).await),
     )
     .await
 }

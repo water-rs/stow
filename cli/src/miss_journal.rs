@@ -1011,6 +1011,7 @@ async fn rederive_memoized_graph(
                 stow_types::api::runner_family(consumer_target)
                     .map_or(consumer_target, |family| family.host_triple()),
                 &rustc,
+                None,
                 slot,
             )
             .await
@@ -1214,6 +1215,7 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
+            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 

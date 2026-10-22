@@ -500,7 +500,7 @@ pub async fn feed_complete(
                 (SELECT p.chain_hash FROM demand_feed_pages p \
                  WHERE p.hour = demand_feed_hours.hour \
                    AND p.generation = demand_feed_hours.generation \
-                   AND p.page_no = ? - 1) = ?)",
+                   AND p.page_no = CAST(? AS INTEGER) - 1) = ?)",
     )
     .bind(page_count)
     .bind(entry_count)
@@ -831,6 +831,8 @@ mod tests {
             max_queue_pending: 2_000,
             human_daily_task_budget: 2_000,
             min_dispatch_value: 0,
+            batch_parallelism: 5,
+            batch_max_tasks: 40,
         }
     }
 

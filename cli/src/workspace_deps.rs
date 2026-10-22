@@ -8,6 +8,7 @@ use glob::glob;
 use semver::Version;
 use serde::Deserialize;
 use stow_types::api::{ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry};
+use stow_types::env_name;
 use stow_types::error::Context;
 use stow_types::public_cache::UnitSide;
 
@@ -190,6 +191,7 @@ pub fn lockfile_registry_packages(
 /// format version this code does not understand, and when the graph's
 /// own consistency checks trip — see [`expanded_dependency_graph`].
 #[tracing::instrument(name = "stow.workspace_deps.unit_graph", skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_exact_dependency_graph(
     manifest_path: &Path,
     action: &str,
@@ -198,9 +200,10 @@ pub async fn resolve_exact_dependency_graph(
     current_dir: &Path,
     host_triple: &str,
     rustc_version: &stow_types::identity::WireRustcVersion,
+    cargo_home: Option<&Path>,
 ) -> stow_types::error::Result<ExpandedDependencyGraph> {
     let (mut unit_graph, subcommand) =
-        unit_graph_command(manifest_path, action, cargo_args, current_dir).await?;
+        unit_graph_command(manifest_path, action, cargo_args, current_dir, cargo_home).await?;
     let unit_graph_output = unit_graph
         .output()
         .await
@@ -218,14 +221,21 @@ pub async fn resolve_exact_dependency_graph(
 /// The command half of [`resolve_exact_dependency_graph`]: the `cargo
 /// <subcommand> --unit-graph` invocation, built but not yet spawned,
 /// and the subcommand name the failure's error text uses (stow#667).
+/// `cargo_home` pins `CARGO_HOME` on the child — and the global config
+/// the `[unstable]` gate reads — so a test answers from its own home
+/// rather than the developer's; `None` inherits the process's.
 async fn unit_graph_command(
     manifest_path: &Path,
     action: &str,
     cargo_args: &[OsString],
     current_dir: &Path,
+    cargo_home: Option<&Path>,
 ) -> stow_types::error::Result<(Command, &'static str)> {
     let subcommand = unit_graph_subcommand(action)?;
     let mut unit_graph = Command::new("cargo");
+    if let Some(home) = cargo_home {
+        unit_graph.env("CARGO_HOME", home);
+    }
     unit_graph
         .arg(subcommand)
         // Before the user's args: never lands behind a `--` terminator.
@@ -250,7 +260,7 @@ async fn unit_graph_command(
     // query fails loudly below — no fallback.
     if std::env::var_os("RUSTC_BOOTSTRAP").is_none() && cargo_channel_is_stable(current_dir).await?
     {
-        unstable_feature_gate(current_dir, cargo_args)?;
+        unstable_feature_gate(current_dir, cargo_args, cargo_home)?;
         for (key, value) in unit_graph_channel_env() {
             unit_graph.env(key, value);
         }
@@ -315,10 +325,11 @@ pub async fn resolve_exact_dependency_graph_stoppable(
     current_dir: &Path,
     host_triple: &str,
     rustc_version: &stow_types::identity::WireRustcVersion,
+    cargo_home: Option<&Path>,
     slot: &mut crate::derive_gate::DerivationSlot,
 ) -> stow_types::error::Result<Option<ExpandedDependencyGraph>> {
     let (mut unit_graph, subcommand) =
-        unit_graph_command(manifest_path, action, cargo_args, current_dir).await?;
+        unit_graph_command(manifest_path, action, cargo_args, current_dir, cargo_home).await?;
     unit_graph
         .stdout(async_process::Stdio::piped())
         .stderr(async_process::Stdio::piped());
@@ -474,14 +485,17 @@ fn unit_graph_channel_env() -> Vec<(&'static str, &'static str)> {
 fn unstable_feature_gate(
     current_dir: &Path,
     cargo_args: &[OsString],
+    cargo_home: Option<&Path>,
 ) -> stow_types::error::Result<()> {
     let mut enabled = Vec::<String>::new();
     for (key, _value) in std::env::vars() {
-        if let Some(name) = key.strip_prefix("CARGO_UNSTABLE_") {
+        if let Some(name) = env_name::strip_prefix(&key, "CARGO_UNSTABLE_") {
             enabled.push(format!("CARGO_UNSTABLE_{name}"));
         }
     }
-    for (source, document) in crate::mold::cargo_config_documents(current_dir, cargo_args) {
+    for (source, document) in
+        crate::mold::cargo_config_documents(current_dir, cargo_args, cargo_home)
+    {
         let Some(item) = document.get("unstable") else {
             continue;
         };
@@ -2784,6 +2798,7 @@ mod unit_graph_tests {
     };
     use stow_types::api::ResolvedDependencyGraphEntry;
 
+    #[cfg(unix)]
     const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
 
     fn write(root: &Path, relative: &str, contents: &str) {
@@ -2914,6 +2929,11 @@ mod unit_graph_tests {
                     .map(str::to_owned)
             })
             .or(spelled_target);
+        // A cargo home of the fixture's own: the `--unit-graph` child
+        // and the `[unstable]` gate's document walk would otherwise read
+        // the developer's `$CARGO_HOME/config.toml` (stow#800).
+        let cargo_home = root.join("cargo-home");
+        std::fs::create_dir_all(&cargo_home).expect("create cargo home");
         smol::block_on(resolve_exact_dependency_graph(
             &root.join("Cargo.toml"),
             action,
@@ -2922,6 +2942,7 @@ mod unit_graph_tests {
             root,
             "x86_64-unknown-linux-gnu",
             rustc_test(),
+            Some(&cargo_home),
         ))
         .expect("resolve exact dependency graph")
     }
@@ -3323,9 +3344,13 @@ mod unit_graph_tests {
             "shared",
             "[package]\nname = \"shared\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
         );
+        // The fixture's own cargo home — the developer's
+        // `$CARGO_HOME/config.toml` must not merge into this resolution
+        // (stow#800).
         std::process::Command::new("cargo")
             .args(["generate-lockfile", "--offline"])
             .current_dir(root)
+            .env("CARGO_HOME", root.join("cargo-home"))
             .output()
             .expect("generate lockfile");
 
@@ -3371,9 +3396,13 @@ mod unit_graph_tests {
             "anyhow",
             "[package]\nname = \"anyhow\"\nversion = \"1.0.0\"\nedition = \"2021\"\n",
         );
+        // The fixture's own cargo home — the developer's
+        // `$CARGO_HOME/config.toml` must not merge into this resolution
+        // (stow#800).
         std::process::Command::new("cargo")
             .args(["generate-lockfile", "--offline"])
             .current_dir(root)
+            .env("CARGO_HOME", root.join("cargo-home"))
             .output()
             .expect("generate lockfile");
 
@@ -3414,7 +3443,13 @@ mod unit_graph_tests {
             ".cargo/config.toml",
             "[unstable]\nunit-graph = true\n",
         );
-        let error = unstable_feature_gate(root, &[]).expect_err("unstable gate errors");
+        // The gate's document walk pins the fixture's own cargo home —
+        // a developer's `$CARGO_HOME/config.toml` must not merge in
+        // (stow#800).
+        let cargo_home = root.join("cargo-home");
+        std::fs::create_dir_all(&cargo_home).expect("create cargo home");
+        let error =
+            unstable_feature_gate(root, &[], Some(&cargo_home)).expect_err("unstable gate errors");
         assert!(
             error.to_string().contains("unstable.unit-graph"),
             "the setting names itself: {error}"

@@ -13,7 +13,12 @@ key pair, starts all three services, submits one `itoa` task through
 `stow-admin`, waits out the scheduler, exports and publishes the signed
 index slice, refreshes it into the CLI's local index, and `stow check`s a
 throwaway consumer crate in mock-key mode until the artifact is served
-from the cache. For the edge it runs `skyzen build` once and supervises
+from the cache. It then exercises the host-side node pipeline:
+`snafu-derive`'s proc-macro tree submits as host-side tasks gated on
+published slices, builds wave by wave with an export → publish → report →
+sync pass between layers, and serves a second consumer both natively and
+under `--target wasm32-unknown-unknown`. For the edge it runs
+`skyzen build` once and supervises
 `wrangler dev` itself, because `skyzen dev`'s file watcher rebuilds in
 a loop on Linux — inotify reports opens of the watched manifest and
 sources as changes, so every rebuild re-triggers itself. Everything
@@ -26,15 +31,123 @@ scripts/mock-e2e.sh
 ```
 
 The script prints its log directory at the end and dumps every log on
-failure. CI runs it on every PR and push (`mock-e2e` in
-`.github/workflows/test.yml`), which is what keeps the trusted build
-path — dispatch → build → publish → CLI cache hit — continuously
-tested on a clean runner.
+failure. CI runs it in the release gate (`mock-e2e` in
+`.github/workflows/release-gate.yml`) — on demand, nightly on `dev`,
+and on every pull request and merge group into `main` — which is what
+keeps the trusted build path — dispatch → build → publish → CLI cache
+hit — continuously tested on a clean runner.
+
+## Traffic cost
+
+`scripts/traffic-cost.sh` runs the same three services against the
+production-shaped scheduler fixture instead of a single crate, and
+answers whether launch user traffic fits the Cloudflare allowance
+without overloading the scheduler. In one stack start it:
+
+1. seeds the fixture at 1M and then 100k queue rows and runs every
+   scheduler drive (`edge/src/scheduler/drives.rs`) through the Durable
+   Object's budget probe, reading workerd's billed `rowsRead` and
+   `rowsWritten`;
+2. measures Worker CPU per traffic lane with the isolate's V8 CPU
+   profiler, reached through `wrangler dev --inspector-port`
+   (`stow-admin traffic-cost cpu`);
+3. drives every lane at the launch model's peak rate for thirty
+   minutes (`stow-admin traffic-cost peak`);
+4. runs the drives again on the loaded fixture;
+5. judges the run (`stow-admin traffic-cost verdict`): row budgets,
+   growth with stored rows, and peak serialized Durable Object wall.
+
+The monthly projection against half of each product's allowance is the
+release gate's separate `Monthly projection` job (`stow-admin
+traffic-cost project`): it prices user traffic from this run's
+`reports/budget-small.json`, `budget-after.json` and `worker-cpu.json`
+at the launch model's rates, then adds the preheat the Preheat cost job
+measured — see below.
+
+Between steps it waits until the dispatch stub reports no build run in
+progress, so a dispatch callback from one step never lands in the next
+step's measurement, and it stops the services in reverse start order.
+Every lane stays on the machine except the trusted endpoints' GitHub
+push-permission check. The tunables are listed in
+`docs/ENVIRONMENT.md`. CI runs it as the release gate's `Traffic cost`
+job and uploads `reports/` on every run.
+
+```sh
+GH_TOKEN=$(gh auth token) scripts/traffic-cost.sh
+```
 
 The rest of this doc is the manual recipe the script automates, with
 the topology and verification details behind it. Follow it when you
 want the services left running, a larger preheat than a single crate,
 or a real consumer project instead of the throwaway one.
+
+## Preheat cost
+
+`scripts/preheat-cost.sh` runs a whole preheat wave on the same three
+services and prices it in the rows the scheduler Durable Object is
+billed for (stow#773). The production lanes — `preheat top`, `preheat
+top-binaries`, `preheat projects submit` over `preheat/projects.toml`
+— submit the real resolved graph across every CI target while the
+wave runs; every dispatch is a real `stow-build build` and publish
+validation whose rustc invocations a mock compiler answers with empty
+outputs (`STOW_BUILD_MOCK_COMPILE`, compiled in only with the
+`mock-compile` feature) and answers as the host of the runner the
+task's target is dispatched to, so one machine builds every target's
+host-side nodes as its runner would; publish rounds release the graph layer by
+layer; then the same lists are resubmitted the way the daily cron
+does. The edge runs the budget-probe manifest at production's
+dispatch caps and cost multiplier, and its probe ledger (`stow-admin
+preheat cost ledger`) is read at every lane and round boundary.
+
+`stow-admin preheat cost report` turns the run into
+`preheat-cost-report.json` — per event kind (submit, alarm dispatch,
+completion, slice report) per layer, wave and resubmit totals, nodes
+per target, wall time — and fails when the wave or resubmit totals
+pass the preheat budget in `types/src/do_budgets.rs`, a per-event cost
+grows from the first layer to the last past the scheduler-budget
+tolerance, a node is dispatched before its dependencies are
+published, a submitted node never publishes, or the object answers
+`overloaded`. The full wave is CI-sized; locally, reduce it:
+
+```sh
+STOW_PREHEAT_COST_TARGETS="$(rustc -vV | sed -n 's/^host: //p')" \
+STOW_PREHEAT_COST_LIMIT=3 STOW_PREHEAT_COST_PROJECTS=2 \
+  scripts/preheat-cost.sh
+```
+
+`docs/ENVIRONMENT.md` lists every tunable.
+
+## Production wave
+
+The monthly projection needs the production wave's size, and counting
+it needs no mock stack. `scripts/production-wave.sh` runs the three
+production lanes — `preheat top`, `preheat top-binaries` and `preheat
+projects submit` — at `preheat-admin.yml`'s default limit and targets,
+concurrently and plan-only: without `--yes` a lane resolves and prints
+the tasks it would submit and never connects to an edge, so nothing is
+enqueued. `stow-admin preheat cost production` then counts the distinct
+task identities across the lanes into `production-wave.json`, and fails
+when a lane exited non-zero or planned nothing. It is the release
+gate's own `Production wave` job because production's resolve takes up
+to 100 minutes (the projects lane) and would otherwise compete with the
+Preheat cost job's wave for the runner.
+
+```sh
+scripts/production-wave.sh
+```
+
+## Monthly projection
+
+The release gate's `Monthly projection` job divides the Preheat cost
+report's wave and resubmit totals by the reduced wave's node count and
+multiplies by the production count: one wave per stable rustc release
+(`[cadence]` in `launch-model.toml`, counted from Rust's release
+history by `stow-admin launch-model export`) plus one resubmit per day,
+added to each product's traffic before comparing with half its
+allowance. `stow-admin traffic-cost project` takes the report as
+`--preheat` and the count as `--production`. Only the scheduler Durable
+Object's billed calls and rows are measured; the table marks every
+other dimension `n/m` and prices it from traffic alone.
 
 ## Prerequisites
 
@@ -61,7 +174,7 @@ Build the workspace binaries once:
 
 ```sh
 cd /path/to/stow
-cargo build -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
+cargo build --release -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
 ```
 
 ## Topology
@@ -93,7 +206,8 @@ never calls the edge — and reports completion through the same
 fixture's `STOW_GITHUB_WEBHOOK_SECRET`. `stow-admin index sync` then
 mirrors the verified records into D1 behind the developer's GitHub
 token (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`), which the edge
-checks against the owner's push access to `water-rs/stow`.
+checks for push access to `water-rs/stow` — against the mock registry's
+GitHub stub (`STOW_GITHUB_API_URL`), never the real API.
 The edge owns the only D1-write credential.
 
 ## Bring services up
@@ -104,7 +218,7 @@ Open three terminals (or use `tmux`/background processes).
 
 ```sh
 mkdir -p /tmp/stow-bench/mock-registry
-target/debug/stow-mock-registry serve --registry-root /tmp/stow-bench/mock-registry
+target/release/stow-mock-registry serve --registry-root /tmp/stow-bench/mock-registry
 ```
 
 Verify: `curl -i http://127.0.0.1:28123/v2/` returns `401 Unauthorized`
@@ -152,7 +266,7 @@ is enough — the scheduler routes are 500s until the schema exists):
 # Prints `scheduler store reset — <n> objects dropped` and stamps the
 # configured dispatch floor.
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-    target/debug/stow-admin scheduler reset --yes
+    target/release/stow-admin scheduler reset --yes
 ```
 
 Verify: `curl http://127.0.0.1:8788/api/v1/scheduler/status` returns
@@ -167,7 +281,7 @@ STOW_GITHUB_WEBHOOK_SECRET=mock-github-webhook-secret \
 STOW_MOCK_PUBLIC_KEY_PATH=/tmp/stow-bench/keys/public.pem \
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
-target/debug/stow-build serve --listen 127.0.0.1:28124
+target/release/stow-build serve --listen 127.0.0.1:28124
 ```
 
 Verify: the log prints `local CI server listening listen=127.0.0.1:28124`.
@@ -197,7 +311,7 @@ Two preheat shapes are useful:
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin preheat top \
+target/release/stow-admin preheat top \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
@@ -207,7 +321,7 @@ lane's, so tasks land on the latest semver-compatible versions):
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin preheat top-binaries \
+target/release/stow-admin preheat top-binaries \
   --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
@@ -236,12 +350,12 @@ registry (mock-key mode delegates the signed push to
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/debug/stow-admin index export \
+target/release/stow-admin index export \
   --target aarch64-apple-darwin --rustc-version 1.91.1 \
   --out /tmp/stow-bench/index.bin
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
-target/debug/stow-admin index publish \
+target/release/stow-admin index publish \
   --file /tmp/stow-bench/index.bin \
   --target aarch64-apple-darwin --rustc-version 1.91.1
 ```

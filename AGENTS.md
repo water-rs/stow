@@ -20,13 +20,13 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 - Every residual cost is the product: remove a cost before presenting it as a trade-off, and never narrow a feature to avoid one.
 - Fail fast on inconsistent identity or schema; no fallbacks.
 - The repository carries no migration or compatibility code. Each store has one schema and the code is written against it alone; a schema change is an operator reset of the store, refilled from the signed records or the next wave.
-- Request code and the alarm never create, alter or backfill anything. Their cost scales with the event, never with stored data; idle cost is zero; independent outbound calls run concurrently under a stated bound; no runner is held by waiting. Each scheduler route and the alarm has a drive in `edge/src/scheduler/drives.rs`, gated by `scripts/scheduler-budget.sh`, and a change on those paths states its cost.
+- Request code and the alarm never create, alter or backfill anything. Their cost scales with the event, never with stored data; idle cost is zero; independent outbound calls run concurrently under a stated bound; no runner is held by waiting. Each scheduler route and the alarm has a drive in `edge/src/scheduler/drives.rs`, gated by `scripts/traffic-cost.sh`, and a change on those paths states its cost.
 - Use a native Cloudflare or GitHub feature before building infrastructure, and name the ones checked when none fits.
 - On Linux, mold is the linker on both sides of the cache, with no fallback. Never state which linker a target uses by default.
 - A performance claim is measured on what the developer pays repeatedly, on a project large enough for the effect to exist, and is not generalized past what was measured.
 - A fix that names a defect class finds and lists every other instance in the same PR.
 - `CI_TARGET_TRIPLES` is never expanded for one project.
-- Every alert, breaker trip and watchdog report sends an email from `alerts@stow.waterui.dev` and keeps an `incident`-labelled issue; either channel failing never stops the other.
+- Every alert, breaker trip and watchdog report sends an email from `alerts@stow.waterui.dev` and keeps an `incident`-labelled issue; either channel failing never stops the other. Exception: the daily failed-build digest keeps only its `Daily failed builds` issue — no mail.
 
 ## Documents
 

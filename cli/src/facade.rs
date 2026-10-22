@@ -25,6 +25,7 @@ use stow_types::public_cache::{canonical_crate_name, detect_registry_crate_versi
 use stow_types::rustc::ParsedRustcArgs;
 
 use crate::rustc_args;
+use crate::supervisor::ipc::{IPC_METHOD, IpcCall, IpcCallBody, mint_connection_id};
 use crate::supervisor::protocol::{Answer, AwaitServeMap, Observed, Request};
 use crate::supervisor::{self, Endpoint};
 
@@ -38,7 +39,7 @@ const WILDCARD: &str = "*";
 /// The bound on a facade's wait for a pending serve map: long enough for
 /// the driver's fresh slice fetch to land, short enough that a stuck
 /// fetch cannot stall the build's unit queue past it (stow#347).
-const SERVE_MAP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const SERVE_MAP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The serve decision, distilled to what a facade can look up before its
 /// runtime exists: which `(crate, version)` pairs this build could serve,
@@ -58,11 +59,12 @@ pub struct ServeMap {
     pub host: Vec<(String, String)>,
     /// The map may still grow: the driver wrote it from its cached slices
     /// alone because the fresh index fetch could not finish before cargo
-    /// started (stow#347). A facade whose crate the map names but whose
-    /// unit it does not cover asks the supervisor — `AwaitServeMap` over
-    /// the build's existing transport — to hold it until the driver's
-    /// full analysis rewrites this file with `pending` cleared, rather
-    /// than compiling a unit the fetch may be about to cover.
+    /// started (stow#347). A facade serving a registry unit the map does
+    /// not cover asks the supervisor — `AwaitServeMap` over the build's
+    /// existing transport — to hold it until the driver's next write
+    /// clears the flag, rather than compiling a unit the fetch may be
+    /// about to cover (stow#788: "pending" means a fetch is in flight,
+    /// so the set of names it can add is not yet closed).
     #[serde(default)]
     pub pending: bool,
 }
@@ -115,20 +117,6 @@ impl ServeMap {
             entry_name == canonical_name && (entry_version == version || entry_version == WILDCARD)
         })
     }
-
-    /// Whether the build ever covered `name`: any version, either side.
-    /// A pending map's wait applies only to a crate this could still
-    /// gain coverage for — the local artifacts or a previous slice
-    /// already know it, so the fresh fetch plausibly adds the shape
-    /// this unit needs; a crate nobody covered waits on a lottery, and
-    /// stalling every first-wave unit on that measured about 0.8 s over
-    /// cargo's own noise (stow#347).
-    fn names(&self, canonical_name: &str) -> bool {
-        self.target
-            .iter()
-            .chain(&self.host)
-            .any(|(entry_name, _)| entry_name == canonical_name)
-    }
 }
 
 /// What the facade settled before the runtime starts.
@@ -156,7 +144,12 @@ pub enum FastPath {
 /// principle but not in fact fails the build rather than silently
 /// compiling without it.
 pub fn try_invocation() -> stow_types::error::Result<FastPath> {
-    let args = crate::process_args();
+    try_invocation_with(&crate::process_args())
+}
+
+/// [`try_invocation`] over a spelled argv — the process's own comes
+/// from `crate::process_args`; a test hands the facade's argv in.
+fn try_invocation_with(args: &[OsString]) -> stow_types::error::Result<FastPath> {
     if args.get(1).and_then(|arg| arg.to_str()) != Some("rustc") {
         return Ok(FastPath::Defer);
     }
@@ -198,13 +191,13 @@ pub fn try_invocation() -> stow_types::error::Result<FastPath> {
     if invocation_covers(&map) {
         return Ok(FastPath::Defer);
     }
-    // A pending map's "not covered" is provisional — but only for a
-    // crate the build already covers at some shape. A crate the local
-    // artifacts and the cached slices never covered waits on a
-    // lottery, and measured against cargo that stall is above noise, so
-    // the facade compiles and units arriving after the final write
-    // still defer on it (stow#347).
-    if map.pending && map.names(&canonical_crate_name(&crate_name)) {
+    // A pending map's "not covered" is provisional while the build's
+    // fetch is still in flight: this is a registry unit (the
+    // `detect_registry_crate_version` gate above), so the settled map
+    // may cover it — wait for the final write rather than compiling a
+    // unit the fetch is about to cover (stow#347, stow#788).
+    // Non-registry and local units never reach this point.
+    if map.pending {
         await_serve_map(&endpoint, &token)?;
         map = ServeMap::read(&map_path)?;
         if invocation_covers(&map) {
@@ -234,15 +227,32 @@ fn run_uncovered(
     // before the frame that could consult it. (stow's own identity is
     // insensitive to provenance; an artifact compiled against CI's copy of
     // a locally-built crate links against the wrong copy.)
-    write_observed(&mut wire, token, executable, wrapped_args, None)
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    send(
+        &mut wire,
+        &Request::Observed(Observed::new(
+            token.to_owned(),
+            executable,
+            wrapped_args,
+            None,
+        )),
+    )
+    .map_err(|error| stow_types::stow_error!("{error}"))?;
     let status = std::process::Command::new(executable)
         .args(wrapped_args)
         .status()
         .wrap_err("failed to spawn wrapped compiler")?;
     let success = status.success();
-    write_observed(&mut wire, token, executable, wrapped_args, Some(success))
-        .map_err(|error| stow_types::stow_error!("{error}"))?;
+    send(
+        &mut wire,
+        &Request::Observed(Observed::new(
+            token.to_owned(),
+            executable,
+            wrapped_args,
+            Some(success),
+        )),
+    )
+    .map_err(|error| stow_types::stow_error!("{error}"))?;
+    close_wire(&mut wire).map_err(|error| stow_types::stow_error!("{error}"))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -280,12 +290,9 @@ fn await_serve_map_within(
     let request = Request::AwaitServeMap(AwaitServeMap {
         token: token.to_owned(),
     });
-    write_request(&mut wire, &request).map_err(|error| {
-        stow_types::stow_error!(
-            "the serve-map wait could not ask the supervisor at {endpoint:?}: {error}"
-        )
-    })?;
-    match read_answer(&mut wire) {
+    let answer = send(&mut wire, &request);
+    let _ = close_wire(&mut wire);
+    match answer {
         Ok(Some(Answer::ServeMapReady)) => Ok(()),
         Ok(None) => Err(stow_types::stow_error!(
             "the supervisor at {endpoint:?} closed the serve-map wait unanswered"
@@ -348,12 +355,26 @@ impl ServeMapSignal {
         self.latch.complete();
     }
 
+    /// Whether the final write has landed — the at-once check for a
+    /// caller that waits only on a still-pending signal.
+    pub fn has_completed(&self) -> bool {
+        self.latch.has_completed()
+    }
+
     /// Wait for [`Self::complete`], whether the completion lands before
     /// or after the wait starts. A signal nobody completes resolves
     /// nothing — a dropped one drops the waiter's connection with it
     /// (stow#347), so the latch need not resolve on its own.
     pub async fn wait(&self) {
         self.latch.wait().await;
+    }
+
+    /// Resolve once `waits` waits have parked on the still-pending
+    /// signal — the test observation [`crate::Latch::parked`] carries
+    /// (stow#810).
+    #[cfg(test)]
+    pub(crate) async fn parked(&self, waits: usize) {
+        self.latch.parked(waits).await;
     }
 }
 
@@ -385,22 +406,31 @@ impl Drop for ServeMapWaiters {
 }
 
 /// The stream a facade opens to its supervisor — unix socket on unix,
-/// loopback TCP elsewhere: the transport the Windows build's facades
-/// already speak (stow#347).
+/// loopback TCP elsewhere, or heel's IPC socket when the build is
+/// sandboxed: the transports every platform speaks (stow#347, stow#779).
 enum FacadeStream {
     #[cfg(unix)]
     Unix(std::os::unix::net::UnixStream),
     Tcp(std::net::TcpStream),
+    /// A conversation on heel's IPC socket: the only outbound channel a
+    /// `deny network*` profile leaves a sandboxed process (stow#779).
+    Ipc {
+        client: heel::IpcClient,
+        connection: u64,
+    },
 }
 
 impl FacadeStream {
     /// Bound the wait's read: the `ServeMapReady` answer cannot stall a
-    /// unit queue past it.
+    /// unit queue past it. heel's `IpcClient` exposes no read deadline,
+    /// so the IPC transport relies on the supervisor's own lifetime —
+    /// its death closes the socket and fails the call.
     fn set_read_timeout(&self, duration: Option<std::time::Duration>) -> std::io::Result<()> {
         match self {
             #[cfg(unix)]
             Self::Unix(stream) => stream.set_read_timeout(duration),
             Self::Tcp(stream) => stream.set_read_timeout(duration),
+            Self::Ipc { .. } => Ok(()),
         }
     }
 }
@@ -411,6 +441,7 @@ impl Read for FacadeStream {
             #[cfg(unix)]
             Self::Unix(stream) => stream.read(buffer),
             Self::Tcp(stream) => stream.read(buffer),
+            Self::Ipc { .. } => unreachable!("the IPC transport answers through its own call"),
         }
     }
 }
@@ -421,6 +452,7 @@ impl Write for FacadeStream {
             #[cfg(unix)]
             Self::Unix(stream) => stream.write(buffer),
             Self::Tcp(stream) => stream.write(buffer),
+            Self::Ipc { .. } => unreachable!("the IPC transport writes through its own call"),
         }
     }
 
@@ -429,6 +461,7 @@ impl Write for FacadeStream {
             #[cfg(unix)]
             Self::Unix(stream) => stream.flush(),
             Self::Tcp(stream) => stream.flush(),
+            Self::Ipc { .. } => unreachable!("the IPC transport writes through its own call"),
         }
     }
 }
@@ -444,7 +477,58 @@ fn connect(endpoint: &Endpoint) -> std::io::Result<FacadeStream> {
         Endpoint::Loopback(port) => {
             std::net::TcpStream::connect(("127.0.0.1", *port)).map(FacadeStream::Tcp)
         }
+        Endpoint::Ipc(path) => heel::IpcClient::connect(path)
+            .map(|client| FacadeStream::Ipc {
+                client,
+                connection: mint_connection_id(),
+            })
+            .map_err(|error| {
+                std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    format!("connect to supervisor over heel IPC: {error}"),
+                )
+            }),
     }
+}
+
+/// Send one `Request` and collect its `Answer` — over the socket that is
+/// a frame write plus a frame read, over IPC one call; `Observed`, the
+/// protocol's one-way frame, carries `Ok(None)` on either.
+fn send(wire: &mut FacadeStream, request: &Request) -> Result<Option<Answer>, FrameError> {
+    if let FacadeStream::Ipc { client, connection } = wire {
+        return client
+            .call::<_, Option<Answer>>(
+                IPC_METHOD,
+                &IpcCall {
+                    connection: *connection,
+                    body: IpcCallBody::Request(request.clone()),
+                },
+            )
+            .map_err(|error| FrameError::Io(std::io::Error::other(error.to_string())));
+    }
+    write_request(wire, request).map_err(FrameError::Io)?;
+    match request {
+        Request::Observed(_) => Ok(None),
+        _ => read_answer(wire),
+    }
+}
+
+/// End the conversation: the IPC server drops the marks it held — the
+/// teardown a socket close performs — then the transport drops.
+fn close_wire(wire: &mut FacadeStream) -> std::io::Result<()> {
+    let FacadeStream::Ipc { client, connection } = wire else {
+        return Ok(());
+    };
+    client
+        .call::<_, Option<Answer>>(
+            IPC_METHOD,
+            &IpcCall {
+                connection: *connection,
+                body: IpcCallBody::Close,
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 /// One length-prefixed request frame: the same wire
@@ -471,6 +555,15 @@ enum FrameError {
     Malformed(String),
 }
 
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Malformed(message) => write!(f, "{message}"),
+        }
+    }
+}
+
 /// Read one answer frame, blocking. `Ok(None)` is a clean end of
 /// stream — the driver closed between frames — the same semantic the
 /// async `read_frame` gives the supervisor.
@@ -492,24 +585,6 @@ fn read_answer(wire: &mut FacadeStream) -> Result<Option<Answer>, FrameError> {
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(|error| FrameError::Malformed(format!("decode frame: {error}")))
-}
-
-/// One one-way `Observed` frame: mark or report, on the same wire
-/// `client::Connection` speaks.
-fn write_observed(
-    wire: &mut FacadeStream,
-    token: &str,
-    executable: &OsString,
-    wrapped_args: &[OsString],
-    success: Option<bool>,
-) -> std::io::Result<()> {
-    let request = Request::Observed(Observed::new(
-        token.to_owned(),
-        executable,
-        wrapped_args,
-        success,
-    ));
-    write_request(wire, &request)
 }
 
 #[cfg(test)]
@@ -600,12 +675,14 @@ mod tests {
         assert!(decoded.pending);
     }
 
-    /// Accept one `AwaitServeMap` frame on a loopback listener and
-    /// answer it with `answer` — after `hold`, so the test can see the
-    /// wait actually waited. Returns the port the facade connects to
-    /// and the frame the peer read.
+    /// Accept one `AwaitServeMap` frame on a loopback listener, run
+    /// `release`, then answer it with `answer` — the caller's word on
+    /// when the answer may leave, so the test orders its own act
+    /// against a signal rather than racing a fixed hold (stow#810).
+    /// Returns the port the facade connects to and the frame the peer
+    /// read.
     fn serve_one_await(
-        hold: std::time::Duration,
+        release: impl FnOnce() + Send + 'static,
         answer: &super::Answer,
     ) -> (u16, std::thread::JoinHandle<super::Request>) {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
@@ -618,7 +695,7 @@ mod tests {
             let mut body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
             peer.read_exact(&mut body).expect("read body");
             let request: super::Request = serde_json::from_slice(&body).expect("request frame");
-            std::thread::sleep(hold);
+            release();
             let encoded = serde_json::to_vec(&answer).expect("answer frame");
             peer.write_all(
                 &u32::try_from(encoded.len())
@@ -639,21 +716,31 @@ mod tests {
     /// unix socket's close (stow#347).
     #[test]
     fn the_wait_rides_the_loopback_transport() {
-        use std::time::{Duration, Instant};
+        use std::time::Instant;
 
-        let (port, server) =
-            serve_one_await(Duration::from_millis(80), &super::Answer::ServeMapReady);
+        // The peer stamps the instant it lets its answer go; a wait that
+        // returned before that stamp did not wait for the peer's word.
+        let (released_tx, released_rx) = std::sync::mpsc::channel::<Instant>();
+        let (port, server) = serve_one_await(
+            move || released_tx.send(Instant::now()).expect("stamp the release"),
+            &super::Answer::ServeMapReady,
+        );
         let started = Instant::now();
         super::await_serve_map(&Endpoint::Loopback(port), "the-token").expect("the wait");
-        let waited = started.elapsed();
+        let returned = Instant::now();
         let request = server.join().expect("server thread");
+        let released = released_rx.recv().expect("the peer's release stamp");
         assert_eq!(
             request,
             super::Request::AwaitServeMap(super::AwaitServeMap {
                 token: "the-token".to_owned()
             })
         );
-        assert!(waited >= Duration::from_millis(80), "{waited:?}");
+        assert!(
+            returned >= released,
+            "the wait returned before the peer answered"
+        );
+        let waited = returned.duration_since(started);
         assert!(waited < super::SERVE_MAP_WAIT_TIMEOUT, "{waited:?}");
     }
 
@@ -717,13 +804,14 @@ mod tests {
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
         let port = listener.local_addr().expect("local addr").port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (mut peer, _) = listener.accept().expect("accept the facade");
             let mut length_bytes = [0_u8; 4];
             peer.read_exact(&mut length_bytes).expect("read length");
             let mut body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
             peer.read_exact(&mut body).expect("read body");
-            std::thread::sleep(Duration::from_secs(2));
+            release_rx.recv().expect("the test's release");
         });
         let started = Instant::now();
         super::await_serve_map_within(
@@ -734,9 +822,10 @@ mod tests {
         .expect("the bounded timeout ends the wait quietly");
         let waited = started.elapsed();
         assert!(
-            waited >= Duration::from_millis(50) && waited < Duration::from_secs(2),
+            waited >= Duration::from_millis(50) && !server.is_finished(),
             "the wait ended on its own bound, not the peer's: {waited:?}"
         );
+        release_tx.send(()).expect("release the peer");
         server.join().expect("server thread");
     }
 
@@ -744,10 +833,8 @@ mod tests {
     /// a protocol bug the facade surfaces, not a release (stow#347).
     #[test]
     fn a_refused_wait_fails_loudly() {
-        use std::time::Duration;
-
         let (port, server) = serve_one_await(
-            Duration::ZERO,
+            || {},
             &super::Answer::Failed {
                 message: "supervisor token mismatch".to_owned(),
             },
@@ -772,5 +859,198 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), signal.wait())
             .await
             .expect("a waiter after completion returns at once");
+    }
+
+    /// The facade's fast path reads process env, and env is global to
+    /// the test process — one guard serializes every test that sets it,
+    /// for the same reason the lib tests hold theirs.
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        GUARD
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The argv cargo hands its wrapper for a registry crate unit:
+    /// `<wrapper> rustc <rustc> <unit args>` — `demo` 1.0.0 spelled
+    /// for a target, out of a registry src path.
+    fn registry_unit_argv(
+        out_dir: &std::path::Path,
+        registry_src: &std::path::Path,
+    ) -> Vec<std::ffi::OsString> {
+        let mut argv = vec![
+            std::ffi::OsString::from("stow"),
+            std::ffi::OsString::from("rustc"),
+            std::ffi::OsString::from("no-such-rustc"),
+            std::ffi::OsString::from("--crate-name"),
+            std::ffi::OsString::from("demo"),
+            std::ffi::OsString::from("--crate-type"),
+            std::ffi::OsString::from("lib"),
+            std::ffi::OsString::from("--emit"),
+            std::ffi::OsString::from("dep-info,metadata,link"),
+            std::ffi::OsString::from("--out-dir"),
+            out_dir.as_os_str().to_os_string(),
+            std::ffi::OsString::from("-C"),
+            std::ffi::OsString::from("metadata=demometa"),
+            std::ffi::OsString::from("-C"),
+            std::ffi::OsString::from("extra-filename=-demometa"),
+            std::ffi::OsString::from("--target"),
+            std::ffi::OsString::from("aarch64-apple-darwin"),
+        ];
+        argv.push(
+            registry_src
+                .join("index.crates.io-0123abcd/demo-1.0.0/src/lib.rs")
+                .into_os_string(),
+        );
+        argv
+    }
+
+    /// stow#788: a registry unit a pending map does not name waits for
+    /// the final write — the build's fetch may be about to cover it —
+    /// and re-reads the file before deciding. The settled write covers
+    /// the unit here, so the answer is the plan path, not a compile.
+    #[test]
+    fn a_pending_map_holds_an_unnamed_registry_unit() {
+        use std::time::Instant;
+
+        /// What the test hears first: the server's word that the wait
+        /// frame arrived, or the facade's own return.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Step {
+            Parked,
+            Returned,
+        }
+
+        let _guard = env_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let map_path = dir.path().join("serve-map.json");
+        let mut pending = map(&[], &[]);
+        pending.pending = true;
+        std::fs::write(&map_path, serde_json::to_vec(&pending).expect("map"))
+            .expect("write pending map");
+        // The server reports when the facade's wait frame has arrived —
+        // the facade read the pending map and parked — and answers only
+        // on the test's word: the settled map is on disk after the park
+        // and before the answer may leave, on any runner (stow#810). The
+        // facade reports its own return on the same channel, so a facade
+        // that answers without parking fails the test instead of
+        // hanging it.
+        let (step_tx, step_rx) = std::sync::mpsc::channel::<Step>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let server_step = step_tx.clone();
+        let (port, server) = serve_one_await(
+            move || {
+                server_step.send(Step::Parked).expect("report the park");
+                release_rx.recv().expect("the test's release");
+            },
+            &super::Answer::ServeMapReady,
+        );
+        let binary =
+            crate::supervisor::BinaryIdentity::of(&std::env::current_exe().expect("current exe"))
+                .expect("binary identity");
+        unsafe {
+            std::env::set_var(super::STOW_SERVE_MAP_FILE_ENV, &map_path);
+            std::env::set_var(crate::supervisor::ENDPOINT_ENV, format!("tcp:{port}"));
+            std::env::set_var(crate::supervisor::TOKEN_ENV, "the-token");
+            std::env::set_var(crate::supervisor::BINARY_ENV, binary.encode());
+            std::env::remove_var(crate::STOW_TRACE_WRAPPED_COMPILERS_ENV);
+            std::env::remove_var("STOW_IDENTITY_TRACE");
+        }
+        let args = registry_unit_argv(
+            &dir.path().join("deps"),
+            &dir.path().join("cargo_home/registry/src"),
+        );
+        let facade = std::thread::spawn(move || {
+            let outcome = super::try_invocation_with(&args);
+            let answered = Instant::now();
+            step_tx.send(Step::Returned).expect("report the return");
+            (answered, outcome)
+        });
+        assert_eq!(
+            step_rx.recv().expect("the first step"),
+            Step::Parked,
+            "an unnamed registry unit answered before it parked on the serve-map wait"
+        );
+        // The fetch's answer lands while the facade is parked: the
+        // settled map covers the unit, so the re-read defers it.
+        std::fs::write(
+            &map_path,
+            serde_json::to_vec(&map(&[("demo", "1.0.0")], &[])).expect("map"),
+        )
+        .expect("write settled map");
+        let released = Instant::now();
+        release_tx.send(()).expect("release the server's answer");
+        let (answered, outcome) = facade.join().expect("facade thread");
+        let outcome = outcome.expect("try_invocation");
+        server.join().expect("server thread");
+        unsafe {
+            std::env::remove_var(super::STOW_SERVE_MAP_FILE_ENV);
+            std::env::remove_var(crate::supervisor::ENDPOINT_ENV);
+            std::env::remove_var(crate::supervisor::TOKEN_ENV);
+            std::env::remove_var(crate::supervisor::BINARY_ENV);
+        }
+        assert!(
+            answered >= released,
+            "the facade's answer arrived before the test released it"
+        );
+        assert!(
+            matches!(outcome, super::FastPath::Defer),
+            "the settled map covers the unit, so it defers to the plan path"
+        );
+    }
+
+    /// A settled map's "uncovered" is final: the facade goes straight to
+    /// the uncovered path — the wait must not even connect. The endpoint
+    /// accepts but answers no `AwaitServeMap`, so any wait would fail the
+    /// time bound (stow#347).
+    #[test]
+    fn a_settled_map_never_waits() {
+        use std::time::{Duration, Instant};
+
+        let _guard = env_guard();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let map_path = dir.path().join("serve-map.json");
+        std::fs::write(&map_path, serde_json::to_vec(&map(&[], &[])).expect("map"))
+            .expect("write settled map");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
+        let port = listener.local_addr().expect("local addr").port();
+        std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accept the facade");
+            let mut sink = [0_u8; 4096];
+            while peer.read(&mut sink).is_ok_and(|read| read > 0) {}
+        });
+        let binary =
+            crate::supervisor::BinaryIdentity::of(&std::env::current_exe().expect("current exe"))
+                .expect("binary identity");
+        unsafe {
+            std::env::set_var(super::STOW_SERVE_MAP_FILE_ENV, &map_path);
+            std::env::set_var(crate::supervisor::ENDPOINT_ENV, format!("tcp:{port}"));
+            std::env::set_var(crate::supervisor::TOKEN_ENV, "the-token");
+            std::env::set_var(crate::supervisor::BINARY_ENV, binary.encode());
+            std::env::remove_var(crate::STOW_TRACE_WRAPPED_COMPILERS_ENV);
+            std::env::remove_var("STOW_IDENTITY_TRACE");
+        }
+        let args = registry_unit_argv(
+            &dir.path().join("deps"),
+            &dir.path().join("cargo_home/registry/src"),
+        );
+        let started = Instant::now();
+        let result = super::try_invocation_with(&args);
+        let elapsed = started.elapsed();
+        unsafe {
+            std::env::remove_var(super::STOW_SERVE_MAP_FILE_ENV);
+            std::env::remove_var(crate::supervisor::ENDPOINT_ENV);
+            std::env::remove_var(crate::supervisor::TOKEN_ENV);
+            std::env::remove_var(crate::supervisor::BINARY_ENV);
+        }
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a settled map must not wait: {elapsed:?}"
+        );
+        // `no-such-rustc` cannot spawn — the observed mark landed and
+        // the uncovered path ran: it reached the compile without the
+        // wait's hold.
+        assert!(result.is_err(), "the uncovered path ran rustc");
     }
 }

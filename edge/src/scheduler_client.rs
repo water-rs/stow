@@ -8,7 +8,7 @@ const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
 const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
 const SCHEDULER_SUBMIT_IDS_URL: &str = "https://scheduler.internal/tasks/submit/ids";
-const SCHEDULER_RUN_COMPLETE_URL: &str = "https://scheduler.internal/tasks/complete-run";
+const SCHEDULER_BATCHES_URL: &str = "https://scheduler.internal/batches";
 const SCHEDULER_REQUESTS_URL: &str = "https://scheduler.internal/requests";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
@@ -18,6 +18,8 @@ const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_RESET_URL: &str = "https://scheduler.internal/reset";
 const SCHEDULER_BUDGET_SEED_URL: &str = "https://scheduler.internal/budget/seed";
 const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
+const SCHEDULER_BUDGET_LEDGER_URL: &str = "https://scheduler.internal/budget/ledger";
+const SCHEDULER_BUDGET_REARM_URL: &str = "https://scheduler.internal/budget/rearm";
 const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
 
 pub async fn send_enqueue(
@@ -59,14 +61,22 @@ pub async fn send_task_ids(
     post_json(namespace, SCHEDULER_SUBMIT_IDS_URL, request).await
 }
 
-/// The GitHub `workflow_run` webhook's completion channel (stow#455):
-/// the event names the task and its conclusion, never an attempt — the
-/// object resolves the live attempt.
-pub async fn send_run_complete(
+/// The `workflow_run` webhook's completion channel for a
+/// `build-batch.yml` run (stow#833 §3.2): `POST
+/// /batches/{batch_id}/complete` carries the run's identity verbatim —
+/// one forward per batch — and the object's alarm pass resolves the
+/// legs from it.
+pub async fn send_batch_complete(
     namespace: &CfDurableNamespace,
-    report: &stow_types::api::WorkflowRunComplete,
+    batch_id: &stow_types::api::BatchId,
+    report: &stow_types::api::BatchRunComplete,
 ) -> Result<(), SchedulerClientError> {
-    send_json(namespace, SCHEDULER_RUN_COMPLETE_URL, report).await
+    send_json(
+        namespace,
+        &format!("{SCHEDULER_BATCHES_URL}/{batch_id}/complete"),
+        report,
+    )
+    .await
 }
 
 pub async fn get_status(
@@ -211,6 +221,25 @@ pub async fn scheduler_budget(
     request: &stow_types::api::SchedulerBudgetRequest,
 ) -> Result<stow_types::api::SchedulerBudgetReport, SchedulerClientError> {
     post_json(namespace, SCHEDULER_BUDGET_URL, request).await
+}
+
+/// `POST /budget/rearm` — re-arm the seeded fixture's resolved
+/// in-flight batches for the traffic-cost callback lane and answer every
+/// armed one (stow#833). The
+/// DO answers only on deploys carrying `STOW_SCHEDULER_BUDGET=1`.
+pub async fn rearm_budget_fixture(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::SchedulerRearmRequest,
+) -> Result<stow_types::api::SchedulerRearmReport, SchedulerClientError> {
+    post_json(namespace, SCHEDULER_BUDGET_REARM_URL, request).await
+}
+
+/// `GET /budget/ledger` — the probe deploy's per-operation billed rows
+/// (stow#773).
+pub async fn scheduler_ledger(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::SchedulerLedger, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_BUDGET_LEDGER_URL).await
 }
 
 /// `POST /demand` — apply one durable demand batch (stow#522 I7):

@@ -150,6 +150,75 @@ async fn memory_backend() -> Result<SqliteBackend, QueueError> {
     })
 }
 
+/// A `SqliteBackend` wrapper that binds every numeric parameter as
+/// REAL — the only numeric shape the Durable Object's SQL API knows.
+/// Workerd's `SqlStorage::BindingValue` is bytes | string | double, so
+/// a JS number — `DbValue::Integer` or `Boolean` alike — lands as a
+/// double and arithmetic on it is floating point. Tests that must see
+/// the arithmetic production actually runs route through it (stow#816).
+#[derive(Debug, Clone)]
+struct RealBindBackend {
+    inner: SqliteBackend,
+}
+
+/// `params` as the DO binds them: every number coerced to a double.
+fn real_bind_params(params: &[DbValue]) -> Vec<DbValue> {
+    params
+        .iter()
+        .map(|param| match param {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "the f64 conversion IS the Durable Object's binding"
+            )]
+            DbValue::Integer(value) => DbValue::Real(*value as f64),
+            DbValue::Boolean(value) => DbValue::Real(f64::from(u8::from(*value))),
+            value => value.clone(),
+        })
+        .collect()
+}
+
+impl DurableDbBackend for RealBindBackend {
+    async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
+        self.inner.query(query, &real_bind_params(params)).await
+    }
+
+    async fn execute(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> Result<DbExecResult, DurableDbError> {
+        self.inner.execute(query, &real_bind_params(params)).await
+    }
+
+    async fn database_size(&self) -> Result<u64, DurableDbError> {
+        self.inner.database_size().await
+    }
+
+    async fn sync(&self) -> Result<(), DurableDbError> {
+        self.inner.sync().await
+    }
+}
+
+/// Open a fresh in-memory queue database (schema applied) on a
+/// [`RealBindBackend`] — every statement sees parameters bound the way
+/// the Durable Object binds them, so a test exercises the arithmetic
+/// production actually runs instead of the host's integer binds.
+///
+/// # Errors
+///
+/// Returns `QueueError::Sql` if the pool cannot be opened or `reset`
+/// fails.
+pub async fn real_bind_db() -> Result<DurableDb, QueueError> {
+    let inner = memory_backend().await?;
+    let db = DurableDb::new(RealBindBackend {
+        inner: inner.clone(),
+    });
+    queue::reset(&db).await?;
+    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    inner.close_ddl_permit();
+    Ok(db)
+}
+
 /// A `SqliteBackend` wrapper that appends every statement and its wall
 /// time to a shared log before returning the real result.
 #[derive(Debug, Clone)]
@@ -427,10 +496,20 @@ fn check_do_statements(sql: &str, ddl_permitted: bool) -> Result<(), DurableDbEr
 impl DurableDbBackend for SqliteBackend {
     async fn query(&self, query: &str, params: &[DbValue]) -> Result<DbExecResult, DurableDbError> {
         check_do_statements(query, self.ddl_permitted.load(Ordering::Relaxed))?;
+        // `fetch_all` hands back rows but no `changes()` — yet a write
+        // issued through the read path (an `INSERT … RETURNING`, the
+        // budget upsert) writes all the same, and the Durable Object
+        // cursor bills it. Bracket the statement with `total_changes()`
+        // on one held connection so the reported `rows_written` is what
+        // the statement actually moved — the same count `execute`'s
+        // `rows_affected` already carries (stow#796).
+        let mut conn = self.pool.acquire().await.map_err(backend_error)?;
+        let before = total_changes(&mut conn).await?;
         let rows = bind_params(sqlx::query(sqlx::AssertSqlSafe(query)), params)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *conn)
             .await
             .map_err(backend_error)?;
+        let after = total_changes(&mut conn).await?;
         let rows = rows
             .iter()
             .map(row_to_json)
@@ -438,7 +517,7 @@ impl DurableDbBackend for SqliteBackend {
         Ok(DbExecResult {
             rows_read: u64::try_from(rows.len()).map_err(backend_error)?,
             rows,
-            rows_written: 0,
+            rows_written: u64::try_from(after.saturating_sub(before)).map_err(backend_error)?,
         })
     }
 
@@ -482,6 +561,15 @@ fn backend_error(error: impl std::fmt::Display) -> DurableDbError {
         message: error.to_string(),
         source: None,
     }
+}
+
+/// The connection-wide change counter — its delta across one
+/// statement is the write count `changes()` would report for it.
+async fn total_changes(conn: &mut sqlx::SqliteConnection) -> Result<i64, DurableDbError> {
+    sqlx::query_scalar("SELECT total_changes()")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(backend_error)
 }
 
 async fn pragma_i64(pool: &sqlx::SqlitePool, sql: &str) -> Result<u64, DurableDbError> {

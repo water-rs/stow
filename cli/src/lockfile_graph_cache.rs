@@ -20,6 +20,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use blake3::Hasher;
+use stow_types::env_name;
 use stow_types::error::Context;
 
 use crate::config::StowConfig;
@@ -173,30 +174,41 @@ pub fn key_of(project: &KeyInputs<'_>) -> stow_types::error::Result<String> {
     // `CARGO_BUILD_*` other than the three named stay out (stow#617).
     for (key, value) in project.env {
         let Some(key) = key.to_str() else { continue };
-        if matches!(
+        // The hashed name is one spelling per variable — the listed
+        // name for an exact match, the uppercase convention for a
+        // prefixed one — so the same variables key the same however the
+        // host spelled them (Windows stores `Path`, cargo reads `PATH`).
+        let listed = env_name::matching(
             key,
-            "RUSTFLAGS"
-                | "CARGO_ENCODED_RUSTFLAGS"
-                | "RUSTC"
-                | "CARGO_BUILD_TARGET"
-                | "CARGO_BUILD_RUSTFLAGS"
-                | "CARGO_BUILD_RUSTC"
-        ) || (key.starts_with("CARGO_TARGET_") && key != "CARGO_TARGET_DIR")
-            || key.starts_with("CARGO_RESOLVER_")
-            || key.starts_with("CARGO_PROFILE_")
-            || key.starts_with("CARGO_UNSTABLE_")
-        {
-            hasher.update(key.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(value.as_encoded_bytes());
-            hasher.update(&[0]);
-        }
+            &[
+                "RUSTFLAGS",
+                "CARGO_ENCODED_RUSTFLAGS",
+                "RUSTC",
+                "CARGO_BUILD_TARGET",
+                "CARGO_BUILD_RUSTFLAGS",
+                "CARGO_BUILD_RUSTC",
+            ],
+        )
+        .map(str::to_owned);
+        let prefixed = (env_name::starts_with(key, "CARGO_TARGET_")
+            && !env_name::eq(key, "CARGO_TARGET_DIR"))
+            || env_name::starts_with_any(
+                key,
+                &["CARGO_RESOLVER_", "CARGO_PROFILE_", "CARGO_UNSTABLE_"],
+            );
+        let Some(key) = listed.or_else(|| prefixed.then(|| env_name::canonical(key))) else {
+            continue;
+        };
+        hasher.update(key.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(value.as_encoded_bytes());
+        hasher.update(&[0]);
     }
     // Every config document cargo reads — files in merge order plus
     // each `--config` value — hashed as cargo sees them (source label
     // + parsed form).
     for (name, document) in
-        crate::mold::cargo_config_documents(project.current_dir, project.cargo_args)
+        crate::mold::cargo_config_documents(project.current_dir, project.cargo_args, None)
     {
         hasher.update(name.as_bytes());
         hasher.update(&[0]);
@@ -310,6 +322,7 @@ mod tests {
             metadata_args: MetadataArgs::default(),
             target: "x86_64-unknown-linux-gnu".to_owned(),
             target_given: false,
+            host_target: "x86_64-unknown-linux-gnu".to_owned(),
             rustc_version: "1.99.0".to_owned(),
             mold: MoldSelection::resolved(Vec::new()),
             env_base: None,
@@ -494,6 +507,7 @@ mod tests {
             &zed,
             "x86_64-unknown-linux-gnu",
             &stow_types::identity::WireRustcVersion::parse("1.91.1").unwrap(),
+            None,
         ))
         .expect("resolve zed");
         let json = serde_json::to_string(&graph).expect("encode");

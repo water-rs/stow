@@ -4,6 +4,7 @@ use std::ffi::OsString;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
+use super::ipc::{IPC_METHOD, IpcCall, IpcCallBody, mint_connection_id};
 use super::protocol::{
     Answer, ArtifactNotifications, Compiled, Plan, Request, read_frame, write_frame,
 };
@@ -26,10 +27,25 @@ pub struct Ticket {
     ticket: u64,
 }
 
+/// The transport a [`Connection`] speaks: the build's own socket, or a
+/// conversation tunneled through heel's IPC socket when the build runs
+/// sandboxed (stow#779).
+enum ConnectionInner {
+    /// A connected unix socket or loopback stream.
+    Stream(Stream),
+    /// A client of heel's IPC server plus this facade's conversation id.
+    /// The client leaves its slot while a call blocks on the worker
+    /// thread and is always put back, so a call never finds it gone.
+    Ipc {
+        client: Option<heel::IpcClient>,
+        connection: u64,
+    },
+}
+
 /// Connection to the supervisor, kept open across the plan and the report
 /// so the compile's outcome reaches the same conversation.
 pub struct Connection {
-    stream: Stream,
+    inner: ConnectionInner,
     token: String,
 }
 
@@ -43,8 +59,24 @@ impl Connection {
     /// and a build that quietly stops using the cache is the failure that
     /// hides.
     pub async fn open(endpoint: &Endpoint, token: String) -> Result<Self, String> {
+        if let Endpoint::Ipc(path) = endpoint {
+            let path = path.clone();
+            let client = smol::unblock(move || heel::IpcClient::connect(path))
+                .await
+                .map_err(|error| format!("connect to supervisor over heel IPC: {error}"))?;
+            return Ok(Self {
+                inner: ConnectionInner::Ipc {
+                    client: Some(client),
+                    connection: mint_connection_id(),
+                },
+                token,
+            });
+        }
         let stream = super::connect(endpoint).await?;
-        Ok(Self { stream, token })
+        Ok(Self {
+            inner: ConnectionInner::Stream(stream),
+            token,
+        })
     }
 
     /// Ask what to do with one rustc invocation.
@@ -101,21 +133,63 @@ impl Connection {
     ///
     /// # Errors
     ///
-    /// A stream that cannot be shut down.
+    /// A stream that cannot be shut down, or a close the IPC transport
+    /// could not deliver — the conversation's marks then stay until the
+    /// build ends instead of completing now.
     pub async fn close(mut self) -> Result<(), String> {
-        match &mut self.stream {
-            #[cfg(unix)]
-            Stream::Unix(stream) => stream.shutdown().await,
-            Stream::Loopback(stream) => stream.shutdown().await,
+        match &mut self.inner {
+            ConnectionInner::Stream(stream) => match stream {
+                #[cfg(unix)]
+                Stream::Unix(stream) => stream.shutdown().await,
+                Stream::Loopback(stream) => stream.shutdown().await,
+            }
+            .map_err(|error| format!("close the supervisor connection: {error}")),
+            ConnectionInner::Ipc { client, connection } => {
+                let Some(mut client) = client.take() else {
+                    return Ok(());
+                };
+                let call = IpcCall {
+                    connection: *connection,
+                    body: IpcCallBody::Close,
+                };
+                smol::unblock(move || {
+                    client
+                        .call::<_, Option<Answer>>(IPC_METHOD, &call)
+                        .map(|_| ())
+                        .map_err(|error| format!("close the supervisor IPC conversation: {error}"))
+                })
+                .await
+            }
         }
-        .map_err(|error| format!("close the supervisor connection: {error}"))
     }
 
     async fn exchange(&mut self, request: &Request) -> Result<Answer, String> {
-        match &mut self.stream {
-            #[cfg(unix)]
-            Stream::Unix(stream) => exchange_on(stream, request).await,
-            Stream::Loopback(stream) => exchange_on(stream, request).await,
+        match &mut self.inner {
+            ConnectionInner::Stream(stream) => match stream {
+                #[cfg(unix)]
+                Stream::Unix(stream) => exchange_on(stream, request).await,
+                Stream::Loopback(stream) => exchange_on(stream, request).await,
+            },
+            ConnectionInner::Ipc { client, connection } => {
+                let mut ipc = client
+                    .take()
+                    .expect("the IPC client is restored after every call");
+                let call = IpcCall {
+                    connection: *connection,
+                    body: IpcCallBody::Request(request.clone()),
+                };
+                let (ipc, answer) = smol::unblock(move || {
+                    let answer = ipc
+                        .call::<_, Option<Answer>>(IPC_METHOD, &call)
+                        .map_err(|error| format!("supervisor IPC call: {error}"));
+                    (ipc, answer)
+                })
+                .await;
+                *client = Some(ipc);
+                answer?.ok_or_else(|| {
+                    "supervisor IPC answered a two-way request with nothing".to_owned()
+                })
+            }
         }
     }
 }

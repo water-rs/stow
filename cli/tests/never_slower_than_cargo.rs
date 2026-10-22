@@ -12,11 +12,11 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 
-use stow_cli::protocol::{Answer, Request};
+use stow_cli::protocol::{Answer, Plan, Request};
 
 mod support;
 
-use support::hermetic_stow_env;
+use support::{hermetic_stow_env, sealed_home_env};
 
 /// An edge that answers the miss-admissions mint with an empty list and
 /// then fails every other call with a 500.
@@ -141,12 +141,13 @@ fn write_probe_crate(dir: &Path, cargo_home: &Path, dependencies: &str) {
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
     // The fetch must share the isolated CARGO_HOME the builds use.
-    let fetched = Command::new("cargo")
+    let mut fetch = Command::new("cargo");
+    fetch
         .arg("fetch")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run cargo fetch");
+        .env("CARGO_HOME", cargo_home);
+    sealed_home_env(&mut fetch, &dir.join("stow-home"));
+    let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
         "cargo fetch failed:\n{}",
@@ -210,7 +211,7 @@ fn stow_setup_in(dir: &Path, edge_url: &str, cache_dir: &Path, cargo_home: &Path
         .arg("setup")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    hermetic_stow_env(&mut setup, edge_url, cache_dir);
+    hermetic_stow_env(&mut setup, edge_url, cache_dir, &dir.join("stow-home"));
     let setup = setup.output().expect("run stow-cli setup");
     assert!(
         setup.status.success(),
@@ -255,7 +256,7 @@ fn stow_build(
         .arg("build")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    hermetic_stow_env(&mut command, edge_url, cache_dir);
+    hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));
     command
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target_dir)
@@ -556,7 +557,7 @@ fn cargo_build_in(
         .env("CARGO_HOME", cargo_home);
     // The wrapper shim is `stow-cli rustc` under cargo: same hermetic
     // environment as a driver invocation.
-    hermetic_stow_env(&mut command, edge_url, cache_dir);
+    hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));
     command
         .env("RUSTC_WRAPPER", wrapper)
         .env("CARGO_TARGET_DIR", target_dir)
@@ -681,6 +682,18 @@ struct StubSupervision {
     compiled: std::collections::BTreeMap<String, usize>,
     observed_marks: std::collections::BTreeMap<String, usize>,
     observed_reports: std::collections::BTreeMap<String, usize>,
+    /// Connections accepted but not yet drained to their close — the
+    /// count [`drain_stub`] waits out before the census is read.
+    open_connections: usize,
+}
+
+/// The stub's census and the notification its connection threads raise
+/// when the last open connection drains, so [`drain_stub`] waits on that
+/// event instead of sampling the count (stow#810).
+#[derive(Debug, Default)]
+struct StubSupervisor {
+    census: std::sync::Mutex<StubSupervision>,
+    drained: std::sync::Condvar,
 }
 
 /// The crate a supervisor frame compiled: `--crate-name`'s value in the
@@ -775,25 +788,98 @@ fn serve_stub_connection(
 /// A supervisor that answers every plan with `Compile` and every report
 /// with `Recorded`, while counting which frames each crate produced.
 /// Returns the loopback endpoint pieces and the shared count map.
-fn spawn_stub_supervisor() -> (String, std::sync::Arc<std::sync::Mutex<StubSupervision>>) {
+fn spawn_stub_supervisor() -> (String, std::sync::Arc<StubSupervisor>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub supervisor");
     let port = listener.local_addr().expect("local addr").port();
-    let counts = std::sync::Arc::new(std::sync::Mutex::new(StubSupervision::default()));
-    let accept_counts = std::sync::Arc::clone(&counts);
+    let stub = std::sync::Arc::new(StubSupervisor::default());
+    let accept_stub = std::sync::Arc::clone(&stub);
     std::thread::spawn(move || {
         let mut connections = Vec::new();
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
+            accept_stub
+                .census
+                .lock()
+                .expect("frame counts")
+                .open_connections += 1;
             connections.push(std::thread::spawn({
-                let counts = std::sync::Arc::clone(&accept_counts);
-                move || serve_stub_connection(stream, &counts)
+                let stub = std::sync::Arc::clone(&accept_stub);
+                move || {
+                    serve_stub_connection(stream, &stub.census);
+                    let mut census = stub.census.lock().expect("frame counts");
+                    census.open_connections -= 1;
+                    if census.open_connections == 0 {
+                        stub.drained.notify_all();
+                    }
+                }
             }));
         }
         for connection in connections {
             let _ = connection.join();
         }
     });
-    (format!("tcp:{port}"), counts)
+    (format!("tcp:{port}"), stub)
+}
+
+/// The census is final only once every connection thread has drained
+/// its stream to EOF, and a fixed beat after the build's exit guesses
+/// at that drain — the race stow#810 names. The probe's answer is the
+/// accept loop's word that it took every connection the build opened
+/// (accept is FIFO, so a handshake still queued at the build's exit is
+/// counted before the probe), and `open_connections == 0` after the
+/// probe's own close is the connection threads' word that every frame
+/// was counted — raised on `drained` by the thread that closes the last
+/// one.
+fn drain_stub(endpoint: &str, stub: &StubSupervisor) {
+    let port: u16 = endpoint
+        .strip_prefix("tcp:")
+        .expect("a tcp loopback endpoint")
+        .parse()
+        .expect("a loopback port");
+    let mut probe = std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+        .expect("connect the drain probe");
+    let request = Request::Plan(Plan::new(
+        "test-token".to_owned(),
+        std::ffi::OsStr::new("rustc"),
+        &[
+            std::ffi::OsString::from("--crate-name"),
+            std::ffi::OsString::from("drain_probe"),
+        ],
+    ));
+    let body = serde_json::to_vec(&request).expect("encode probe frame");
+    probe
+        .write_all(
+            &u32::try_from(body.len())
+                .expect("frame length")
+                .to_le_bytes(),
+        )
+        .and_then(|()| probe.write_all(&body))
+        .and_then(|()| probe.flush())
+        .expect("write probe frame");
+    let mut length = [0_u8; 4];
+    probe.read_exact(&mut length).expect("read answer length");
+    let mut body = vec![0_u8; u32::from_le_bytes(length) as usize];
+    probe.read_exact(&mut body).expect("read answer body");
+    let answer: Answer = serde_json::from_slice(&body).expect("decode probe answer");
+    assert!(
+        matches!(answer, Answer::Compile { .. }),
+        "the probe must be answered: {answer:?}"
+    );
+    drop(probe);
+    let (census, wait) = stub
+        .drained
+        .wait_timeout_while(
+            stub.census.lock().expect("frame counts"),
+            std::time::Duration::from_secs(30),
+            |census| census.open_connections != 0,
+        )
+        .expect("frame counts");
+    let undrained = wait.timed_out().then(|| format!("{census:?}"));
+    drop(census);
+    assert!(
+        undrained.is_none(),
+        "the stub's connections never drained: {undrained:?}"
+    );
 }
 
 /// What the stub exports as `STOW_SUPERVISOR_BINARY`: the identity of
@@ -828,7 +914,7 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
     let cargo_home = tempfile::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
-    let (endpoint, counts) = spawn_stub_supervisor();
+    let (endpoint, stub) = spawn_stub_supervisor();
     let supervisor_binary = supervisor_binary();
     let map_path = dir.path().join("serve-map.json");
     std::fs::write(&map_path, "{\"target\":[],\"host\":[]}").expect("write serve map");
@@ -861,9 +947,9 @@ fn an_all_miss_build_never_waits_on_the_supervisor() {
     // Connection threads finish the instant each facade closes its
     // stream; the build's exit guarantees all frames were sent, and the
     // lock sees them once the stub has drained them.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    drain_stub(&endpoint, &stub);
     let (cfg_if_plans, cfg_if_marks, cfg_if_reports, probe_plans, debug) = {
-        let counts = counts.lock().expect("frame counts");
+        let counts = stub.census.lock().expect("frame counts");
         let values = (
             counts.plans.get("cfg_if").copied().unwrap_or(0),
             counts.observed_marks.get("cfg_if").copied().unwrap_or(0),
@@ -902,7 +988,7 @@ fn a_covered_unit_still_takes_the_plan_path() {
     let cargo_home = tempfile::tempdir().expect("cargo home");
     write_crate(dir.path(), cargo_home.path());
     let wrapper = write_rustc_wrapper_shim(dir.path());
-    let (endpoint, counts) = spawn_stub_supervisor();
+    let (endpoint, stub) = spawn_stub_supervisor();
     let supervisor_binary = supervisor_binary();
     // `cfg-if` compiles unspelled — no `--target` on a native build — so
     // the host side carries it, at any version. Map entries are
@@ -932,9 +1018,9 @@ fn a_covered_unit_still_takes_the_plan_path() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    drain_stub(&endpoint, &stub);
     let (cfg_if_plans, cfg_if_observed, debug) = {
-        let counts = counts.lock().expect("frame counts");
+        let counts = stub.census.lock().expect("frame counts");
         let values = (
             counts.plans.get("cfg_if").copied().unwrap_or(0),
             counts.observed_marks.get("cfg_if").copied().unwrap_or(0)
@@ -1108,6 +1194,7 @@ fn write_empty_crate(dir: &Path) {
 /// gates compare stow against.
 fn cargo_baseline(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Command {
     let mut command = Command::new("cargo");
+    sealed_home_env(&mut command, &dir.join("stow-home"));
     command
         .arg("build")
         .current_dir(dir)
@@ -1138,7 +1225,7 @@ fn stow_candidate(
         .arg("build")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    hermetic_stow_env(&mut command, edge_url, cache_dir);
+    hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));
     command
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", target_dir)
@@ -1244,12 +1331,13 @@ fn write_multi_crate(dir: &Path, cargo_home: &Path) {
     std::fs::create_dir_all(dir.join("src")).expect("create src");
     std::fs::write(dir.join("src").join("main.rs"), "fn main() {}\n").expect("write main.rs");
     // Resolve now, so the build under test is not also a network test.
-    let fetched = Command::new("cargo")
+    let mut fetch = Command::new("cargo");
+    fetch
         .arg("fetch")
         .current_dir(dir)
-        .env("CARGO_HOME", cargo_home)
-        .output()
-        .expect("run cargo fetch");
+        .env("CARGO_HOME", cargo_home);
+    sealed_home_env(&mut fetch, &dir.join("stow-home"));
+    let fetched = fetch.output().expect("run cargo fetch");
     assert!(
         fetched.status.success(),
         "cargo fetch failed:\n{}",

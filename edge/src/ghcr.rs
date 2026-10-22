@@ -277,3 +277,64 @@ pub enum FetchError {
     #[error("GHCR returned unexpected HTTP status {0}")]
     UnexpectedStatus(u16),
 }
+
+/// Whether GHCR holds the records artifact this `build` of the task
+/// published — the tag names the run, so the check matches the artifact
+/// this run pushed and no other build's. The manifest's artifact type
+/// and task-id annotation must both match, so a tag pointing at anything
+/// else does not satisfy the check. Shared by the webhook's per-task
+/// path and the scheduler's batch-leg resolution (stow#833 §3.2).
+#[cfg(target_arch = "wasm32")]
+pub async fn records_artifact_exists(
+    config: &crate::api::GhcrConfig,
+    rustc_version: &str,
+    task_id: &str,
+    build: stow_types::records::BuildRun,
+    pool: &OutboundPool,
+) -> Result<bool, FetchError> {
+    use skyzen_cloudflare::worker::send::IntoSendFuture as _;
+    let rustc = stow_types::identity::WireRustcVersion::parse(rustc_version).map_err(|error| {
+        FetchError::InvalidRequest(format!("malformed records rustc {rustc_version}: {error}"))
+    })?;
+    let tag = stow_types::records::records_tag(rustc_version, task_id, build);
+    let repository = stow_types::registry::cache_repository(&rustc);
+    let response = open_manifest(
+        &config.base_url,
+        repository.path(),
+        &tag,
+        &config.tokens,
+        pool,
+    )
+    .await;
+    let manifest = match response {
+        Ok(response) => response,
+        Err(FetchError::NotFound) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let body = manifest
+        .text()
+        .into_send()
+        .await
+        .map_err(|error| FetchError::Network(format!("read records manifest: {error}")))?;
+    let manifest: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|error| FetchError::Network(format!("parse records manifest: {error}")))?;
+    let artifact_type_matches = manifest
+        .get("artifactType")
+        .and_then(|value| value.as_str())
+        == Some(stow_types::records::RECORDS_ARTIFACT_TYPE);
+    let task_id_matches = manifest
+        .get("annotations")
+        .and_then(|annotations| annotations.get(stow_types::records::RECORDS_TASK_ID_ANNOTATION))
+        .and_then(|value| value.as_str())
+        == Some(task_id);
+    if !(artifact_type_matches && task_id_matches) {
+        tracing::warn!(
+            task_id = %task_id,
+            artifact_type_matches,
+            task_id_matches,
+            "records tag exists but manifest shape does not match"
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}

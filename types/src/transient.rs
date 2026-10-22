@@ -143,13 +143,70 @@ pub fn retry_after_hint(headers: &http::HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+/// The margin a reset-derived wait carries past the named epoch — the
+/// clock that wrote `x-ratelimit-reset` and the clock reading it are
+/// never the same clock.
+const RESET_SKEW: Duration = Duration::from_secs(2);
+
+/// How an answer declared the request rate-limited, and the wait the
+/// answer named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimit {
+    /// The answer names its wait — `Retry-After` when it carries one,
+    /// otherwise `x-ratelimit-reset` minus `now`, floored at zero, plus
+    /// the skew margin. `reset` is the `x-ratelimit-reset` epoch the
+    /// answer carried, when it carried one.
+    Wait {
+        /// The wait to honor in full.
+        wait: Duration,
+        /// The reset epoch (seconds) the answer carried.
+        reset: Option<i64>,
+    },
+    /// Rate-limited, but the answer named no wait — a bare 429, or a
+    /// remaining-exhausted answer whose reset never arrived.
+    Unstated,
+}
+
+/// Whether `status` and `headers` are the server's rate limit — the
+/// shape GitHub documents.
+///
+/// A `429`; a `403` carrying `Retry-After` (the secondary-limit answer
+/// on writes); or a `403`/`429` whose `x-ratelimit-remaining` is `0`
+/// (the primary limit, whose `x-ratelimit-reset` epoch names the wait).
+/// The named wait is `Retry-After` when present, otherwise until the
+/// reset — a reset already past waits only the skew margin. `now` is
+/// the caller's wall clock in epoch seconds — injected so the
+/// classifier stays pure and this module compiles for `wasm32`.
+#[must_use]
+pub fn rate_limit(status: u16, headers: &http::HeaderMap, now: i64) -> Option<RateLimit> {
+    let retry_after = retry_after_hint(headers);
+    let exhausted = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "0");
+    if !(status == 429 || (status == 403 && (retry_after.is_some() || exhausted))) {
+        return None;
+    }
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<i64>().ok());
+    let wait = retry_after.or_else(|| {
+        reset.map(|at| {
+            Duration::from_secs(u64::try_from(at.saturating_sub(now).max(0)).unwrap_or(0))
+                + RESET_SKEW
+        })
+    });
+    Some(wait.map_or(RateLimit::Unstated, |wait| RateLimit::Wait { wait, reset }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::{
-        ATTEMPTS, Backoff, OUTAGE_BOUND, OUTAGE_DELAY_MAX, RETRY_AFTER_MAX, RETRY_DELAY,
-        is_transient_status,
+        ATTEMPTS, Backoff, OUTAGE_BOUND, OUTAGE_DELAY_MAX, RESET_SKEW, RETRY_AFTER_MAX,
+        RETRY_DELAY, RateLimit, is_transient_status, rate_limit,
     };
 
     #[test]
@@ -238,6 +295,122 @@ mod tests {
         assert_eq!(
             Backoff::outage().next_wait(Some(Duration::from_hours(1))),
             Some(RETRY_AFTER_MAX)
+        );
+    }
+
+    /// Header pairs as a `HeaderMap` — static names, string values.
+    fn headers(pairs: &[(&'static str, &str)]) -> http::HeaderMap {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                http::header::HeaderName::from_static(name),
+                http::HeaderValue::from_str(value).expect("header value"),
+            );
+        }
+        map
+    }
+
+    /// GitHub's documented rate-limit answers classify: a 429 outright,
+    /// a 403 carrying `Retry-After`, or a 403/429 whose
+    /// `x-ratelimit-remaining` is `0`. A plain 403 — with budget left or
+    /// no headers at all — is the answer, not the limit.
+    #[test]
+    fn rate_limit_recognizes_only_the_documented_shapes() {
+        for status in [200, 301, 400, 401, 404, 422, 500] {
+            assert_eq!(rate_limit(status, &headers(&[]), 1_000), None, "{status}");
+        }
+        assert_eq!(rate_limit(403, &headers(&[]), 1_000), None);
+        assert_eq!(
+            rate_limit(
+                403,
+                &headers(&[
+                    ("x-ratelimit-remaining", "57"),
+                    ("x-ratelimit-reset", "2000")
+                ]),
+                1_000
+            ),
+            None,
+            "budget remaining is not the primary limit"
+        );
+        assert_eq!(
+            rate_limit(
+                404,
+                &headers(&[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "2000")
+                ]),
+                1_000
+            ),
+            None,
+            "an exhausted budget does not limit a status outside the class"
+        );
+        assert_eq!(
+            rate_limit(429, &headers(&[]), 1_000),
+            Some(RateLimit::Unstated)
+        );
+        assert_eq!(
+            rate_limit(403, &headers(&[("x-ratelimit-remaining", "0")]), 1_000),
+            Some(RateLimit::Unstated),
+            "exhausted without a reset names no wait"
+        );
+    }
+
+    /// The named wait is `Retry-After` when present, otherwise the reset
+    /// epoch minus `now` plus the skew margin — a reset already past
+    /// waits only the margin.
+    #[test]
+    fn rate_limit_names_retry_after_else_the_reset() {
+        assert_eq!(
+            rate_limit(403, &headers(&[("retry-after", "7")]), 1_000),
+            Some(RateLimit::Wait {
+                wait: Duration::from_secs(7),
+                reset: None,
+            })
+        );
+        for status in [403, 429] {
+            assert_eq!(
+                rate_limit(
+                    status,
+                    &headers(&[
+                        ("x-ratelimit-remaining", "0"),
+                        ("x-ratelimit-reset", "1030")
+                    ]),
+                    1_000
+                ),
+                Some(RateLimit::Wait {
+                    wait: Duration::from_secs(30) + RESET_SKEW,
+                    reset: Some(1030),
+                }),
+                "{status}"
+            );
+        }
+        assert_eq!(
+            rate_limit(
+                429,
+                &headers(&[
+                    ("retry-after", "9"),
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "2000")
+                ]),
+                1_000
+            ),
+            Some(RateLimit::Wait {
+                wait: Duration::from_secs(9),
+                reset: Some(2000),
+            }),
+            "Retry-After wins over the reset"
+        );
+        assert_eq!(
+            rate_limit(
+                403,
+                &headers(&[("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", "900")]),
+                1_000
+            ),
+            Some(RateLimit::Wait {
+                wait: RESET_SKEW,
+                reset: Some(900),
+            }),
+            "a past reset floors at the margin"
         );
     }
 }

@@ -29,14 +29,10 @@ use skyzen_services::{DbExecResult, DbValue, QuerySource};
 
 use crate::errors::QueueError;
 
-/// DO `rowsRead` monthly allowance on Workers Paid — the meter's budget
-/// line for reads. <https://developers.cloudflare.com/durable-objects/platform/pricing/>
-/// lists 25 billion rows read/month included.
-pub const DO_ROWS_READ_MONTHLY: f64 = 25e9;
-/// DO `rowsWritten` monthly allowance on Workers Paid.
-/// <https://developers.cloudflare.com/durable-objects/platform/pricing/>
-/// lists 50 million rows written/month included.
-pub const DO_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
+/// The Workers Paid DO allowances the meter's daily budget lines divide
+/// — one table in `stow-types`, shared with the watchdog and the
+/// `Preheat cost` lane.
+pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY};
 
 /// `STOW_COST_BUDGET_MULTIPLIER`'s default — scales every daily
 /// budget, so a shared account can trip earlier by lowering it.
@@ -171,6 +167,10 @@ impl DurableDbBackend for MeteringBackend {
 pub struct Meter {
     inner: Arc<DurableDb>,
     pending: Arc<Pending>,
+    /// The `probe_meter` row this operation also books under — set only
+    /// on the budget-probe deploy (`STOW_SCHEDULER_BUDGET=1`), where the
+    /// `Preheat cost` lane reads cost per event kind.
+    ledger_op: Option<String>,
 }
 
 #[derive(skyzen::FromRow)]
@@ -190,7 +190,23 @@ impl Meter {
             inner: Arc::clone(&inner),
             pending: Arc::clone(&pending),
         });
-        (metered, Self { inner, pending })
+        (
+            metered,
+            Self {
+                inner,
+                pending,
+                ledger_op: None,
+            },
+        )
+    }
+
+    /// Also book this operation's counts under `op` in the probe ledger
+    /// (`probe_meter`) when it settles. Only the budget-probe deploy
+    /// asks for it.
+    #[must_use]
+    pub fn with_ledger_op(mut self, op: String) -> Self {
+        self.ledger_op = Some(op);
+        self
     }
 
     /// The unmetered handle — the meter row's own write and the freeze
@@ -209,6 +225,9 @@ impl Meter {
     /// write single-statement.
     pub async fn settle(&self) -> Result<Option<MeterTotals>, QueueError> {
         let (read, written) = self.pending.take();
+        if let Some(op) = &self.ledger_op {
+            book_ledger(&self.inner, op, read, written).await?;
+        }
         if read == 0 && written == 0 {
             return Ok(None);
         }
@@ -313,6 +332,91 @@ impl Meter {
     }
 }
 
+/// The probe ledger's op name for one request: `<METHOD> <route>`, with
+/// a request-record id collapsed to `{id}` and a batch's completion
+/// collapsed to [`LEDGER_OP_BATCH_COMPLETE`], so every record's reads
+/// and every batch's completion land on one row each.
+///
+/// [`LEDGER_OP_BATCH_COMPLETE`]: stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE
+#[must_use]
+pub fn ledger_op(method: &str, path: &str) -> String {
+    if method == "POST"
+        && path
+            .strip_prefix("/batches/")
+            .and_then(|rest| rest.strip_suffix("/complete"))
+            .is_some_and(|batch_id| !batch_id.is_empty() && !batch_id.contains('/'))
+    {
+        return stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE.to_owned();
+    }
+    let route = path.strip_prefix("/requests/").map_or_else(
+        || path.to_owned(),
+        |rest| {
+            rest.split_once('/').map_or_else(
+                || "/requests/{id}".to_owned(),
+                |(_, tail)| format!("/requests/{{id}}/{tail}"),
+            )
+        },
+    );
+    format!("{method} {route}")
+}
+
+/// Book one settled operation into `probe_meter` — one upsert through
+/// the unmetered handle, so the ledger's own write is never charged to
+/// the operation it records. An operation with no statements still
+/// counts as an event.
+async fn book_ledger(db: &DurableDb, op: &str, read: u64, written: u64) -> Result<(), QueueError> {
+    db.query(
+        "INSERT INTO probe_meter (op, events, rows_read, rows_written) VALUES (?, 1, ?, ?) \
+         ON CONFLICT(op) DO UPDATE SET \
+           events = probe_meter.events + 1, \
+           rows_read = probe_meter.rows_read + excluded.rows_read, \
+           rows_written = probe_meter.rows_written + excluded.rows_written",
+    )
+    .bind(op.to_owned())
+    .bind(
+        i64::try_from(read)
+            .map_err(|_| format!("probe ledger {op}: rowsRead {read} overflows i64"))?,
+    )
+    .bind(
+        i64::try_from(written)
+            .map_err(|_| format!("probe ledger {op}: rowsWritten {written} overflows i64"))?,
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("book probe ledger {op}: {error}"))?;
+    Ok(())
+}
+
+#[derive(skyzen::FromRow)]
+struct LedgerRow {
+    op: String,
+    events: u64,
+    rows_read: u64,
+    rows_written: u64,
+}
+
+/// Every `probe_meter` row — the `GET /budget/ledger` answer. Bounded by
+/// the number of distinct operations the object serves, never by the
+/// queue.
+pub async fn ledger(db: &DurableDb) -> Result<stow_types::api::SchedulerLedger, QueueError> {
+    let rows = db
+        .query("SELECT op, events, rows_read, rows_written FROM probe_meter ORDER BY op")
+        .fetch_all::<LedgerRow>()
+        .await
+        .map_err(|error| format!("read probe ledger: {error}"))?;
+    Ok(stow_types::api::SchedulerLedger {
+        ops: rows
+            .into_iter()
+            .map(|row| stow_types::api::SchedulerLedgerOp {
+                op: row.op,
+                events: row.events,
+                rows_read: row.rows_read,
+                rows_written: row.rows_written,
+            })
+            .collect(),
+    })
+}
+
 /// The fetch routes' metering middleware: swaps the request's
 /// `DurableDb` extension for the metered wrapper before the handler
 /// runs, then settles the operation's counts and — when the day
@@ -337,6 +441,14 @@ impl skyzen::middleware::Middleware for MeterGuard {
             .extensions()
             .get::<skyzen::runtime::wasm::WasmEnv>()
             .cloned();
+        let meter = if env
+            .as_ref()
+            .is_some_and(super::object::budget_probe_enabled)
+        {
+            meter.with_ledger_op(ledger_op(request.method().as_str(), request.uri().path()))
+        } else {
+            meter
+        };
         let multiplier = match &env {
             Some(env) => super::object::cost_budget_multiplier(env)?,
             None => DEFAULT_COST_BUDGET_MULTIPLIER,
@@ -421,6 +533,46 @@ mod tests {
     /// backend — the same `Meter::wrap` shape production installs.
     async fn metered() -> Result<(DurableDb, Meter), QueueError> {
         Ok(Meter::wrap(memory_db().await?))
+    }
+
+    /// Every request record books under one op per route.
+    #[test]
+    fn a_request_record_id_collapses_to_its_route() {
+        assert_eq!(
+            super::ledger_op("GET", "/requests/7f3a"),
+            "GET /requests/{id}"
+        );
+        assert_eq!(
+            super::ledger_op("POST", "/requests/7f3a/outcome"),
+            "POST /requests/{id}/outcome"
+        );
+        assert_eq!(super::ledger_op("POST", "/requests"), "POST /requests");
+    }
+
+    /// Every batch's completion books under the one op the Preheat cost
+    /// report reads as its `Completion` kind; nothing else under
+    /// `/batches/` collapses into it.
+    #[test]
+    fn a_batch_completion_collapses_to_the_shared_ledger_op() {
+        let completion = stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE;
+        assert_eq!(
+            super::ledger_op("POST", "/batches/00000000000000000000000000000001/complete"),
+            completion
+        );
+        assert_eq!(
+            super::ledger_op("POST", "/batches/a/complete"),
+            super::ledger_op("POST", "/batches/b/complete")
+        );
+        assert_eq!(
+            stow_types::preheat_cost::EventKind::Completion.ledger_op(),
+            completion
+        );
+        assert_ne!(super::ledger_op("GET", "/batches/a/complete"), completion);
+        assert_ne!(super::ledger_op("POST", "/batches//complete"), completion);
+        assert_ne!(
+            super::ledger_op("POST", "/batches/a/b/complete"),
+            completion
+        );
     }
 
     #[tokio::test]

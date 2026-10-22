@@ -1,7 +1,7 @@
 //! The scheduler route list both cost gates drive. The host-side gate
 //! (`cost_gate.rs`, `cargo test -p stow-edge`) runs this same list on a
 //! small fixture against `counting_memory_db` as a fast pre-check; the
-//! workerd harness (`budget.rs`, `scripts/scheduler-budget.sh`) runs it
+//! workerd harness (`budget.rs`, `scripts/traffic-cost.sh`) runs it
 //! on the 100k production fixture inside the Durable Object, where
 //! `CfDurableDb` reports the real `rowsRead`/`rowsWritten` Cloudflare
 //! bills. One drive list keeps the two harnesses honest: a route that
@@ -48,23 +48,41 @@ pub enum PriorAlarm {
     Armed(i64),
 }
 
-/// The queue fields a focused claim probe must put back exactly —
-/// the union of every column the pass's writers touch:
+/// What the operator floor path (`queue::apply_dispatch_floor`) writes:
+/// the stored `min_dispatch_value` setting (`None` when no row exists)
+/// and the `dispatch_eligible` flag of every row the rewrite changes.
+#[derive(Debug)]
+struct PriorFloor {
+    stored: Option<String>,
+    flags: Vec<PriorFlag>,
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct PriorFlag {
+    task_id: String,
+    dispatch_eligible: i64,
+}
+
+/// The queue fields a drive's cleanup must put back exactly — the
+/// union of every column the drives' writers touch:
 /// `claim_dispatchable_row` (`status`, `generation_id`, `dispatch_attempts`,
 /// `github_run_id`, `claimed_at`, `updated_at`), `retire_covered_rows`
-/// (`status`, `error_msg`), `recover_stale_active_tasks` (`status`,
+/// (`status`, `error_msg`), `requeue_unbound_batch` (`status`,
 /// `error_msg`, `deps_met`, `blocked`, `wake_at`),
 /// `requeue_incomplete_shape_deps` (`status`, `attempt`, `error_msg`,
-/// `request_count`, `deps_met`, `blocked`, `not_before`, `wake_at`,
-/// `shape_requeue`), and `apply_key_updates` (`value`, `dispatch_key`,
-/// `dispatch_eligible`) on the transitioned ids (stow#525).
+/// `deps_met`, `blocked`, `not_before`, `wake_at`,
+/// `shape_requeue`), `apply_key_updates` (`value`, `dispatch_key`,
+/// `dispatch_eligible`) on the transitioned ids (stow#525), the
+/// claim's batch binding (`batch_id`, `batch_leg`; stow#833), the
+/// promote mutation's `lane` move, the retry/cancel verbs' status and
+/// wake columns plus their dependents' `blocked` refresh, and the
+/// demand fold's `demand` accumulation (stow#522).
 #[derive(Debug, Clone, skyzen::FromRow)]
 pub struct RestoreQueueRow {
     task_id: String,
     status: String,
     attempt: i64,
     error_msg: Option<String>,
-    request_count: i64,
     deps_met: i64,
     blocked: i64,
     not_before: Option<String>,
@@ -74,7 +92,13 @@ pub struct RestoreQueueRow {
     /// through the `CAST AS TEXT` contract `RANK_SOURCE_SELECT` uses
     /// (stow#524).
     value: String,
+    /// `demand` shares `value`'s TEXT contract — an accumulated demand
+    /// can leave the JS safe integer range the same way.
+    demand: String,
     dispatch_key: String,
+    /// The lane the row was parked on — the promote mutation moves a
+    /// `miss` row to `human`.
+    lane: String,
     dispatch_eligible: i64,
     generation_id: String,
     dispatch_attempts: i64,
@@ -82,14 +106,17 @@ pub struct RestoreQueueRow {
     claimed_at: Option<String>,
     updated_at: Option<String>,
     shape_requeue: i64,
+    batch_id: Option<String>,
+    batch_leg: Option<i64>,
 }
 
 /// The `RestoreQueueRow` column list, kept beside the struct so the
 /// snapshot queries and the restore UPDATE can't drift apart.
-const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, request_count, \
-     deps_met, blocked, not_before, wake_at, CAST(value AS TEXT) AS value, dispatch_key, \
-     dispatch_eligible, \
-     generation_id, dispatch_attempts, github_run_id, claimed_at, updated_at, shape_requeue";
+const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, \
+     deps_met, blocked, not_before, wake_at, CAST(value AS TEXT) AS value, \
+     CAST(demand AS TEXT) AS demand, dispatch_key, lane, dispatch_eligible, \
+     generation_id, dispatch_attempts, github_run_id, claimed_at, updated_at, shape_requeue, \
+     batch_id, batch_leg";
 
 /// What a drive may reach besides the metered queue `DurableDb`.
 ///
@@ -97,7 +124,7 @@ const RESTORE_COLUMNS: &str = "task_id, status, attempt, error_msg, request_coun
 /// Worker env and the catalog D1 handle wrapped in the counted backend,
 /// so the pass drive runs the real dispatch path — binding resolution,
 /// the paged claim with its per-page coverage lookup, and the
-/// `MAX_OUTBOUND_INFLIGHT`-bounded `trigger_build` fan-out — and the
+/// `MAX_OUTBOUND_INFLIGHT`-bounded `dispatch_batch` fan-out — and the
 /// report can price the coverage lookup's D1 rows against what the
 /// pass claimed.
 pub struct DriveContext {
@@ -135,6 +162,12 @@ pub struct DriveContext {
     /// restores exactly the pre-drive state instead of leaving a
     /// probe arm behind.
     prior_alarm: std::sync::Arc<std::sync::Mutex<PriorAlarm>>,
+    /// The batch a batch drive's setup bound and the run it bound it
+    /// to — what its run and its cleanup address.
+    batch: std::sync::Arc<std::sync::Mutex<Option<BoundBatch>>>,
+    /// The floor setting and flags a floor drive's setup found, so its
+    /// cleanup puts back exactly what the operator floor path rewrote.
+    prior_floor: std::sync::Arc<std::sync::Mutex<Option<PriorFloor>>>,
 }
 
 impl DriveContext {
@@ -153,6 +186,8 @@ impl DriveContext {
             claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             restore_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
+            batch: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            prior_floor: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -171,6 +206,8 @@ impl DriveContext {
             claimed_tasks: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             restore_rows: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             prior_alarm: std::sync::Arc::new(std::sync::Mutex::new(PriorAlarm::NotCaptured)),
+            batch: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            prior_floor: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -198,6 +235,15 @@ impl DriveContext {
         *self.restore_rows.lock().expect("restore snapshot") = rows;
     }
 
+    /// Add rows to the recorded field set — the rows a batch drive's
+    /// run writes beyond the claim's own frontier.
+    fn extend_restore_rows(&self, rows: Vec<RestoreQueueRow>) {
+        self.restore_rows
+            .lock()
+            .expect("restore snapshot")
+            .extend(rows);
+    }
+
     /// Take the recorded pre-claim field set for the cleanup's exact
     /// restore.
     pub fn take_restore_rows(&self) -> Vec<RestoreQueueRow> {
@@ -216,6 +262,39 @@ impl DriveContext {
             &mut *self.prior_alarm.lock().expect("prior alarm"),
             PriorAlarm::NotCaptured,
         )
+    }
+
+    /// Record the batch a batch drive's setup bound.
+    fn set_batch(&self, bound: BoundBatch) {
+        *self.batch.lock().expect("drive batch") = Some(bound);
+    }
+
+    /// The batch the drive's setup bound.
+    fn bound_batch(&self) -> Result<BoundBatch, String> {
+        self.batch
+            .lock()
+            .expect("drive batch")
+            .clone()
+            .ok_or_else(|| "the drive's setup bound no batch".to_owned())
+    }
+
+    /// Record the floor state a floor drive's setup found.
+    fn set_prior_floor(&self, prior: PriorFloor) {
+        *self.prior_floor.lock().expect("prior floor") = Some(prior);
+    }
+
+    /// Take the recorded floor state for the cleanup's restore.
+    fn take_prior_floor(&self) -> Result<PriorFloor, String> {
+        self.prior_floor
+            .lock()
+            .expect("prior floor")
+            .take()
+            .ok_or_else(|| "the drive's setup recorded no floor state".to_owned())
+    }
+
+    /// Take the bound batch for the cleanup.
+    fn take_batch(&self) -> Option<BoundBatch> {
+        self.batch.lock().expect("drive batch").take()
     }
 
     /// Every task id the pass drives claimed so far, in claim order.
@@ -397,7 +476,7 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         // Bounded by held quantities: the outcomes walk is the last
         // 24 h of completions (`FixtureShape::LAST_24H_ROWS`, an
-        // `idx_queue_updated_at` range), and the in-flight section by
+        // `idx_queue_terminal_updated` range), and the in-flight section by
         // the dispatch cap (`FixtureShape::IN_FLIGHT_ROWS`) — neither
         // tracks the stored queue bulk.
         name: "GET /admin/status",
@@ -532,9 +611,11 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
-        // The age selector walks `idx_queue_updated_at` — the rows it
-        // reads are bounded by the page limit, and the 24 h window it
-        // lands in is held at `FixtureShape::LAST_24H_ROWS`.
+        // The age selector's exact term still ranges `updated_at`
+        // while the implied `first_requested_at` bound does the index
+        // walk — the rows it reads are bounded by the page limit, and
+        // the 24 h window it lands in is held at
+        // `FixtureShape::LAST_24H_ROWS`.
         name: "GET /tasks?older_than=86400",
         setup: None,
         run: |db, _shape, _settings, _ctx| {
@@ -602,59 +683,25 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
-        // The fixture's in-flight rows carry a bound `github_run_id`
-        // (`run-{n}`) as a claimed generation does — the report must
-        // name it or the run-binding gate rejects it.
-        name: "POST /tasks/complete-run",
-        setup: None,
-        run: |db, shape, settings, _ctx| {
-            Box::pin(async move {
-                queue::complete_run(
-                    db,
-                    settings,
-                    &stow_types::api::WorkflowRunComplete {
-                        task_id: hex_id(u64::from(shape.running_row())),
-                        success: true,
-                        error: None,
-                        github_run_id: Some(format!("run-{}", shape.running_row())),
-                    },
-                    crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            })
-        },
-        cleanup: None,
-    },
-    Drive {
-        // The failure arm: the row re-queues `pending` behind its
-        // backoff (`attempt` under the cap), so this prices the
-        // heavier of the two failure writes — the cap arm only parks
-        // the row `failed`.
-        name: "POST /tasks/complete-run (failure)",
-        setup: None,
-        run: |db, shape, settings, _ctx| {
-            Box::pin(async move {
-                queue::complete_run(
-                    db,
-                    settings,
-                    &stow_types::api::WorkflowRunComplete {
-                        task_id: hex_id(u64::from(shape.dispatched_row(0))),
-                        success: false,
-                        error: Some("build failed".to_owned()),
-                        github_run_id: Some(format!("run-{}", shape.dispatched_row(0))),
-                    },
-                    crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
-                )
-                .await
-                .map_err(|error| error.to_string())
-            })
-        },
-        cleanup: None,
-    },
-    Drive {
+        // The retried rows re-enter `pending` — status, the wake and
+        // attempt columns, the re-priced dispatch pair — and the verb's
+        // follow-up refresh re-evaluates their dependents' `blocked`.
+        // The setup snapshots that whole write set so the cleanup
+        // returns the queue exactly as seeded.
         name: "POST /tasks/retry",
-        setup: None,
+        setup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move {
+                snapshot_mutation_rows(
+                    db,
+                    ctx,
+                    &[
+                        hex_id(u64::from(shape.failed_row(0))),
+                        hex_id(u64::from(shape.failed_row(1))),
+                    ],
+                )
+                .await
+            })
+        }),
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -681,11 +728,28 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
+        // The cancelled rows leave `pending` for `failed` and their
+        // dependents wake-block in the same request — the same
+        // snapshot/restore contract the retry drive holds.
         name: "POST /tasks/cancel",
-        setup: None,
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                snapshot_mutation_rows(
+                    db,
+                    ctx,
+                    &[
+                        hex_id(u64::from(FixtureShape::pending_row(701))),
+                        hex_id(u64::from(FixtureShape::pending_row(702))),
+                    ],
+                )
+                .await
+            })
+        }),
         run: |db, _shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -709,11 +773,25 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
+        // The promote writes only the matched row: the lane move, the
+        // `not_before` wake and the human-priced `(value, dispatch_key,
+        // dispatch_eligible)` pair — no dependents refresh. Snapshot it
+        // for the cleanup's exact restore.
         name: "POST /tasks/promote",
-        setup: None,
+        setup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.set_restore_rows(
+                    restore_rows_for(db, &[hex_id(u64::from(FixtureShape::pending_row(4703)))])
+                        .await?,
+                );
+                Ok(())
+            })
+        }),
         run: |db, _shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -738,11 +816,35 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
+        // The delete takes the rows themselves — a snapshot cannot
+        // write a vanished row back, so the cleanup re-seeds them
+        // through the fixture's own restore — while the dependents'
+        // `blocked` refresh is column work the snapshot covers.
         name: "POST /tasks/purge",
-        setup: None,
+        setup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.set_restore_rows(
+                    restore_rows_for(
+                        db,
+                        &dependents_of(
+                            db,
+                            &[
+                                hex_id(u64::from(shape.completed_row(0))),
+                                hex_id(u64::from(shape.completed_row(1))),
+                            ],
+                        )
+                        .await?,
+                    )
+                    .await?,
+                );
+                Ok(())
+            })
+        }),
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 queue::apply_mutation(
@@ -766,7 +868,29 @@ pub const DRIVES: &[Drive] = &[
                 })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, settings, ctx| {
+            Box::pin(async move {
+                let mut errors: Vec<String> = Vec::new();
+                if let Err(error) = super::fixture::restore_queue_rows(
+                    db,
+                    shape,
+                    settings.dispatch_min_age_minutes,
+                    &[shape.completed_row(0), shape.completed_row(1)],
+                )
+                .await
+                {
+                    errors.push(error.to_string());
+                }
+                if let Err(error) = restore_snapshot_rows(db, &ctx.take_restore_rows()).await {
+                    errors.push(error);
+                }
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
+            })
+        }),
     },
     Drive {
         // A settled `enqueued` record: the row read, the stored-roots
@@ -841,7 +965,12 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
-        cleanup: None,
+        // The outcome's trusted enqueue lands the report's root task as
+        // a human-lane `pending` row; left behind it would be claimable
+        // by the next pass drive.
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &[request_root_task(shape)]).await })
+        }),
     },
     Drive {
         // `completed` on the now-`enqueued` record — the single
@@ -921,7 +1050,9 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &submit_accept_batch(shape)).await })
+        }),
     },
     Drive {
         name: "POST /admin/enqueue (trusted)",
@@ -957,7 +1088,9 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &submit_batch(shape)).await })
+        }),
     },
     Drive {
         // `POST /tasks/submit/ids` — the missed lane's promote-by-id
@@ -970,8 +1103,8 @@ pub const DRIVES: &[Drive] = &[
         name: "POST /admin/enqueue (submit-ids)",
         setup: Some(|db, shape, settings, _ctx| {
             Box::pin(async move {
-                // Guarantee the node store holds the batch's subgraphs —
-                // the count is whatever an earlier drive left behind.
+                // Land the batch's rows and node-store subgraphs: the
+                // route promotes ids the node store already holds.
                 queue::enqueue_trusted(db, &submit_batch(shape), settings)
                     .await
                     .map(|_| ())
@@ -1005,11 +1138,22 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &submit_batch(shape)).await })
+        }),
     },
     Drive {
         name: "POST /admin/enqueue (resubmit)",
-        setup: None,
+        setup: Some(|db, shape, settings, _ctx| {
+            Box::pin(async move {
+                // The run resubmits rows that already exist, so the
+                // batch lands here — no earlier drive leaves it behind.
+                queue::enqueue_trusted(db, &submit_batch(shape), settings)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        }),
         run: |db, shape, settings, _ctx| {
             Box::pin(async move {
                 // The same batch again lands nothing — the count must
@@ -1024,11 +1168,13 @@ pub const DRIVES: &[Drive] = &[
                     })
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, _ctx| {
+            Box::pin(async move { remove_submitted(db, &submit_batch(shape)).await })
+        }),
     },
     Drive {
         name: "POST /demand",
-        setup: Some(|_db, _shape, _settings, ctx| {
+        setup: Some(|db, _shape, _settings, ctx| {
             Box::pin(async move {
                 // Capture the alarm state before the drive arms its
                 // probe timestamps — the cleanup restores exactly this
@@ -1040,8 +1186,27 @@ pub const DRIVES: &[Drive] = &[
                     let prior = alarm.get_alarm().await.map_err(|error| error.to_string())?;
                     ctx.set_prior_alarm(prior);
                 }
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = ctx;
+                // The fold's write set is exactly the entry's unbuilt
+                // closure — row 101 and the unmet-edge rows behind it —
+                // the same set the run's `demand_event_rows` computes.
+                // Snapshot it here so the cleanup returns `demand`,
+                // `value`, `dispatch_key` and `dispatch_eligible` as
+                // seeded.
+                let n = 101_u32;
+                let (crate_name, version) = crate_identity(n);
+                let touched = queue::demand_closure_tasks(
+                    db,
+                    &[
+                        crate_name,
+                        version,
+                        FeaturesJson::default().raw(),
+                        dep_target(n).to_owned(),
+                        "1.86.0".to_owned(),
+                    ],
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                ctx.set_restore_rows(restore_rows_for(db, &touched).await?);
                 Ok(())
             })
         }),
@@ -1131,8 +1296,24 @@ pub const DRIVES: &[Drive] = &[
                 Ok(())
             })
         },
-        cleanup: Some(|_db, _shape, _settings, ctx| {
+        cleanup: Some(|db, _shape, _settings, ctx| {
             Box::pin(async move {
+                let mut errors: Vec<String> = Vec::new();
+                // The folded rows back to their snapshot preimage, and
+                // the accepted batch record — plus any staged remainder
+                // a mid-run failure left — removed: the fixture holds
+                // no demand ledger rows.
+                if let Err(error) = restore_snapshot_rows(db, &ctx.take_restore_rows()).await {
+                    errors.push(error);
+                }
+                for statement in [
+                    "DELETE FROM demand_contributions WHERE batch_id = 'costgate-demand'",
+                    "DELETE FROM demand_batches WHERE batch_id = 'costgate-demand'",
+                ] {
+                    if let Err(error) = db.query(statement).execute().await {
+                        errors.push(format!("remove demand batch record: {error}"));
+                    }
+                }
                 // Put the pre-drive alarm state back: re-arm the
                 // captured timestamp, or delete the probe's arm when
                 // nothing was set — a real armed alarm must not leak
@@ -1141,24 +1322,38 @@ pub const DRIVES: &[Drive] = &[
                 if let Some(alarm) = ctx.alarm.as_ref() {
                     match ctx.take_prior_alarm() {
                         PriorAlarm::Armed(ms) => {
-                            alarm.set_alarm(ms).await.map_err(|e| e.to_string())?;
+                            if let Err(error) = alarm.set_alarm(ms).await {
+                                errors.push(error.to_string());
+                            }
                         }
                         PriorAlarm::Unarmed => {
-                            alarm.delete_alarm().await.map_err(|e| e.to_string())?;
+                            if let Err(error) = alarm.delete_alarm().await {
+                                errors.push(error.to_string());
+                            }
                         }
                         PriorAlarm::NotCaptured => {}
                     }
                 }
-                #[cfg(not(target_arch = "wasm32"))]
-                let _ = ctx;
-                Ok(())
+                if errors.is_empty() {
+                    Ok(())
+                } else {
+                    Err(errors.join("; "))
+                }
             })
         }),
     },
     Drive {
+        // The route's whole event (stow#785): `record_published_slice`
+        // — with its report-time shape repair — plus the
+        // `dispatch_pending` tail `record_published_index` runs. The
+        // tail's claims restore from the unmetered setup snapshot so
+        // the alarm-pass drives still see the planted window. A
+        // focused probe: the claim ids never enter `claimed_tasks`.
         name: "POST /index/published (full)",
-        setup: None,
-        run: |db, _shape, _settings, _ctx| {
+        setup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move { snapshot_claim_surface(db, settings, ctx, &[]).await })
+        }),
+        run: |db, _shape, settings, ctx| {
             Box::pin(async move {
                 // A full report (`base_generation: None`) — the
                 // first-publish and resync path — on a dedicated slice
@@ -1168,23 +1363,48 @@ pub const DRIVES: &[Drive] = &[
                 // live-set fetch reads only that slice.
                 queue::record_published_slice(
                     db,
+                    settings,
                     stow_types::api::CI_TARGET_TRIPLES[8],
                     "9.9.9",
-                    None,
-                    None,
-                    &full_slice_report(),
-                    &[],
+                    &stow_types::api::PublishedSliceReport {
+                        base_generation: None,
+                        generation: None,
+                        added: full_slice_report(),
+                        retired: Vec::new(),
+                    },
                 )
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+                focused_claim_pass(db, settings, ctx, "published (full) tail")
+                    .await
+                    .map(|_| ())
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(
+                async move { restore_claim_surface(db, shape, &ctx.take_restore_rows()).await },
+            )
+        }),
     },
     Drive {
+        // Same whole-route shape as the full drive: the report's own
+        // commit requeues the completed deps the retire just left
+        // uncovered, and the `dispatch_pending` tail can then claim —
+        // the retire band's dep rows join the snapshot preemptively
+        // because the report creates those repair writes mid-run
+        // (stow#785).
         name: "POST /index/published (delta)",
-        setup: None,
-        run: |db, shape, _settings, _ctx| {
+        setup: Some(|db, shape, settings, ctx| {
+            Box::pin(async move {
+                let live = shape.slice_live_rows(0);
+                let first = shape.slice_first_row(0);
+                let band: Vec<String> = (0..DELTA_ROWS)
+                    .map(|i| format!("{:064x}", first + (live - 1 - i) * 9))
+                    .collect();
+                snapshot_claim_surface(db, settings, ctx, &band).await
+            })
+        }),
+        run: |db, shape, settings, ctx| {
             Box::pin(async move {
                 // A routine per-wave report: `added`/`retired` carry only
                 // what moved, `base_generation` is the live token, and
@@ -1203,20 +1423,39 @@ pub const DRIVES: &[Drive] = &[
                     .await
                     .map_err(|error| error.to_string())?;
                 let (added, retired) = delta_slice_report(shape);
-                queue::record_published_slice(db, target, rustc, base, None, &added, &retired)
+                queue::record_published_slice(
+                    db,
+                    settings,
+                    target,
+                    rustc,
+                    &stow_types::api::PublishedSliceReport {
+                        base_generation: base,
+                        generation: None,
+                        added,
+                        retired,
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                focused_claim_pass(db, settings, ctx, "published (delta) tail")
                     .await
-                    .map_err(|error| error.to_string())
+                    .map(|_| ())
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(
+                async move { restore_claim_surface(db, shape, &ctx.take_restore_rows()).await },
+            )
+        }),
     },
     Drive {
         // One real dispatch pass over a *floored* queue (stow#525):
         // the setup stamps `min_dispatch_value` at one band through the
         // operator floor path — unmetered, setup is not the event —
         // so the persisted flags put the under-floor miss bulk outside
-        // the eligible index span while the human lane and the one-band
-        // windows family stay ready. The metered pass then pays the
+        // the eligible index span while the one-band windows family
+        // stays ready (the human pins stay eligible but their parked
+        // `not_before` refuses them — stow#833). The metered pass then pays the
         // real production queries: the planner's freeze/settings/
         // lease/family probes and the claim walk over the eligible
         // span only. The pass claims ready rows — non-empty proves the
@@ -1234,23 +1473,23 @@ pub const DRIVES: &[Drive] = &[
                 // The floor application's DML half — the same stored-
                 // floor read, conditional backfill and stamp the
                 // operator reset runs — no index DDL, which belongs
-                // to the reset route alone.
-                queue::apply_dispatch_floor(
-                    db,
-                    &queue::SchedulerSettings {
-                        min_dispatch_value: queue::VALUE_BAND,
-                        ..*settings
-                    },
-                )
-                .await
-                .map_err(|error| error.to_string())?;
+                // to the reset route alone. What it rewrites is
+                // snapshotted first, for the cleanup to put back.
+                let floored = queue::SchedulerSettings {
+                    min_dispatch_value: queue::VALUE_BAND,
+                    ..*settings
+                };
+                ctx.set_prior_floor(snapshot_floor(db, &floored).await?);
+                queue::apply_dispatch_floor(db, &floored)
+                    .await
+                    .map_err(|error| error.to_string())?;
                 // The fixture must hold BOTH under-floor directions —
                 // ready-now rows the floor defers, and rows whose own
                 // wake is already deferred — or the probe proves
                 // nothing about the eligible span's boundary. Ready =
                 // the page predicate's wake terms true; deferred =
-                // `not_before` still ahead (the fixture's +30min
-                // rows).
+                // `not_before` still ahead (the fixture's parked
+                // rows, a day ahead of the seed).
                 let ready = db
                     .query(
                         "SELECT COUNT(*) FROM queue \
@@ -1289,9 +1528,7 @@ pub const DRIVES: &[Drive] = &[
                 //   production page selection under the live family
                 //   exclusion, the only rows the paged walk can open;
                 // - stale-lease recovery touches active rows past the
-                //   stale window;
-                // - shape requeue touches `completed` rows whose
-                //   dependents are still unmet.
+                //   stale window.
                 // The candidate sets are hard-capped so a fixture that
                 // outgrows the bound fails loudly instead of mutating
                 // rows the restore can't reach.
@@ -1304,19 +1541,7 @@ pub const DRIVES: &[Drive] = &[
                             .to_owned(),
                     );
                 }
-                let mut rows = Vec::new();
-                for ids in frontier_ids.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
-                    rows.extend(
-                        db.query(&format!(
-                            "SELECT {RESTORE_COLUMNS} FROM queue \
-                             WHERE task_id IN (SELECT value FROM json_each(?))"
-                        ))
-                        .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
-                        .fetch_all::<RestoreQueueRow>()
-                        .await
-                        .map_err(|error| error.to_string())?,
-                    );
-                }
+                let rows = restore_rows_for(db, &frontier_ids).await?;
                 // The snapshot must actually hold a banded value —
                 // above the JS safe integer the TEXT cast is the only
                 // lossless decode, so a fixture without one can't prove
@@ -1345,7 +1570,7 @@ pub const DRIVES: &[Drive] = &[
                     .query(
                         "SELECT COUNT(*) FROM queue \
                          WHERE status IN ('dispatched', 'running') \
-                           AND updated_at <= datetime('now', ?)",
+                           AND claimed_at <= datetime('now', ?)",
                     )
                     .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
                     .fetch_scalar::<u64>()
@@ -1357,29 +1582,6 @@ pub const DRIVES: &[Drive] = &[
                          the snapshot can't cover recovery or its capacity shift"
                     ));
                 }
-                // The shape-requeue writer is a real fixture case (the
-                // canonical seed has one): include its candidates in
-                // the snapshot, hard-capped so an oversized set fails
-                // loudly instead of mutating rows the restore can't
-                // reach.
-                let candidates = db
-                    .query(&format!(
-                        "SELECT {RESTORE_COLUMNS} FROM queue c \
-                         WHERE c.status = 'completed' AND c.shape_requeue = 0 \
-                           AND EXISTS ( \
-                               SELECT 1 FROM queue_dependencies d \
-                               WHERE d.depends_on_task_id = c.task_id \
-                                 AND d.dep_met = 0) LIMIT 256"
-                    ))
-                    .fetch_all::<RestoreQueueRow>()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                if candidates.len() == 256 {
-                    return Err("shape requeue candidate set reached the snapshot bound — \
-                         fixture contract broken"
-                        .to_owned());
-                }
-                rows.extend(candidates);
                 // Coverage precondition: `retire_covered_rows` is the
                 // pass's one writer the queue snapshot can't see — it
                 // consults the catalog oracle. Run the real
@@ -1397,6 +1599,7 @@ pub const DRIVES: &[Drive] = &[
                         target: String,
                         rustc_version: String,
                         host_side: i64,
+                        dependency_identity: String,
                     }
                     let d1 = ctx
                         .d1
@@ -1407,7 +1610,7 @@ pub const DRIVES: &[Drive] = &[
                         identities.extend(
                             db.query(
                                 "SELECT crate_name, version, features_json, target, \
-                                        rustc_version, host_side FROM queue \
+                                        rustc_version, host_side, dependency_identity FROM queue \
                                  WHERE task_id IN (SELECT value FROM json_each(?))",
                             )
                             .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
@@ -1422,6 +1625,7 @@ pub const DRIVES: &[Drive] = &[
                                 target: row.target,
                                 rustc_version: row.rustc_version,
                                 host_side: row.host_side != 0,
+                                dependency_identity: row.dependency_identity,
                                 explicit_spelling:
                                     stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                             }),
@@ -1455,16 +1659,16 @@ pub const DRIVES: &[Drive] = &[
                 Ok(())
             })
         },
-        cleanup: Some(|db, _shape, settings, ctx| {
+        cleanup: Some(|db, shape, _settings, ctx| {
             Box::pin(async move {
                 let mut errors: Vec<String> = Vec::new();
                 // Leak check FIRST, on the live post-pass flags: every
                 // row the pass left `dispatched` must carry
                 // `dispatch_eligible = 1`, or the eligible span
-                // admitted under-floor bulk. A shape-requeued
-                // under-floor row re-enters `pending` — legitimate,
-                // not a claim — so the predicate reads `dispatched`
-                // only. Done before the restore resets flags.
+                // admitted under-floor bulk. A stale-recovered row
+                // re-enters `pending` — legitimate, not a claim — so
+                // the predicate reads `dispatched` only. Done before
+                // the restore resets flags.
                 let snapshot = ctx.take_restore_rows();
                 let ids: Vec<String> = snapshot.iter().map(|row| row.task_id.clone()).collect();
                 for chunk in ids.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
@@ -1486,57 +1690,20 @@ pub const DRIVES: &[Drive] = &[
                         Err(error) => errors.push(format!("leak check: {error}")),
                     }
                 }
-                // Restore EVERY snapshot row unconditionally, full
-                // preimage — a row recovered to `pending` and reclaimed
-                // `dispatched` in one pass ends with its original
-                // status but a fresh generation/stamp, which a status
-                // diff would miss; only the whole mutable field set is
-                // exact (stow#525).
-                for row in &snapshot {
-                    match db
-                        .query(
-                            "UPDATE queue SET status = ?, attempt = ?, error_msg = ?, \
-                                 request_count = ?, deps_met = ?, blocked = ?, \
-                                 not_before = ?, wake_at = ?, value = CAST(? AS INTEGER), \
-                                 dispatch_key = ?, dispatch_eligible = ?, \
-                                 generation_id = ?, dispatch_attempts = ?, \
-                                 github_run_id = ?, claimed_at = ?, updated_at = ?, \
-                                 shape_requeue = ? \
-                             WHERE task_id = ?",
-                        )
-                        .bind(row.status.clone())
-                        .bind(row.attempt)
-                        .bind(row.error_msg.clone())
-                        .bind(row.request_count)
-                        .bind(row.deps_met)
-                        .bind(row.blocked)
-                        .bind(row.not_before.clone())
-                        .bind(row.wake_at.clone())
-                        .bind(row.value.clone())
-                        .bind(row.dispatch_key.clone())
-                        .bind(row.dispatch_eligible)
-                        .bind(row.generation_id.clone())
-                        .bind(row.dispatch_attempts)
-                        .bind(row.github_run_id.clone())
-                        .bind(row.claimed_at.clone())
-                        .bind(row.updated_at.clone())
-                        .bind(row.shape_requeue)
-                        .bind(row.task_id.clone())
-                        .execute()
-                        .await
-                    {
-                        Ok(result) if result.rows_written == 0 => {
-                            errors.push(format!("snapshot row {} vanished", row.task_id));
-                        }
-                        Ok(_) => {}
-                        Err(error) => errors.push(format!("restore {}: {error}", row.task_id)),
-                    }
+                if let Err(error) = restore_claim_surface(db, shape, &snapshot).await {
+                    errors.push(error);
                 }
-                // Restore the fixture's floor through the same
-                // operator path — flags and stamp consistent again —
-                // then surface every collected error.
-                if let Err(error) = queue::apply_dispatch_floor(db, settings).await {
-                    errors.push(format!("floor restore: {error}"));
+                // Put back the floor setting and every flag the floor
+                // path rewrote — from the setup's snapshot, not a
+                // recompute: the fixture parks rows the floor formula
+                // would not — then surface every collected error.
+                match ctx.take_prior_floor() {
+                    Ok(prior) => {
+                        if let Err(error) = restore_floor(db, prior).await {
+                            errors.push(format!("floor restore: {error}"));
+                        }
+                    }
+                    Err(error) => errors.push(error),
                 }
                 if errors.is_empty() {
                     Ok(())
@@ -1551,18 +1718,20 @@ pub const DRIVES: &[Drive] = &[
         // `dispatch_pass` (`object.rs`): binding resolution, the claim
         // paged at `2 × open slots` rows with its per-page catalog
         // coverage lookup, and the `MAX_OUTBOUND_INFLIGHT`-bounded
-        // `trigger_build` fan-out — the HTTP wall the launch gate's
+        // `dispatch_batch` fan-out — the HTTP wall the launch gate's
         // peak-wall bound exists to measure. On host the claim runs the
         // same queue code against the empty-catalog oracle — the host
         // gate checks statements and counters only.
         // The claimed tasks' subgraph rebuild (stow#588) is priced in
-        // the same pass: `load_claimed_subgraphs` pays one bounded
+        // the same pass: `load_admitted_subgraphs` pays one bounded
         // `task_id IN (…)` read per shared BFS level — at most
         // `SUBGRAPH_WALK_MAX_LEVELS` (64) statements and `O(Σ reachable
         // nodes)` rows read, bounded by the dispatched tasks' own
         // subgraphs, never the queue bulk.
         name: "alarm pass",
-        setup: None,
+        setup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move { snapshot_claim_surface(db, settings, ctx, &[]).await })
+        }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
                 dispatch_pass_drive(db, settings, ctx, false)
@@ -1570,7 +1739,16 @@ pub const DRIVES: &[Drive] = &[
                     .map(|_| ())
             })
         },
-        cleanup: None,
+        // The claimed ids stay in `claimed_tasks` — the launch gate's
+        // marginal divisor and the re-arm's restore set — but the rows
+        // themselves go back from the setup snapshot now, so no later
+        // drive measures the pass's claimed frontier instead of the
+        // fixture's. The claim's batch rows go with them.
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(
+                async move { restore_claim_surface(db, shape, &ctx.take_restore_rows()).await },
+            )
+        }),
     },
     Drive {
         // The same pass with dispatch paused: the claim returns early,
@@ -1590,6 +1768,116 @@ pub const DRIVES: &[Drive] = &[
             })
         },
         cleanup: None,
+    },
+    // The batch drives (stow#833). Each setup claims one real batch of
+    // `STOW_BATCH_MAX_TASKS` legs from the planted window — the one-leg
+    // resolution's, one leg — and binds it to a run, so the drive
+    // prices the rows a bound in-flight batch costs — the per-event
+    // bound every one of them names is that leg count, never the queue.
+    Drive {
+        // The webhook's forward: one `UPDATE build_batches` stamping
+        // the run's completion and the wake re-plan the route's
+        // `schedule_alarm` runs. The write is keyed by the batch id —
+        // the leg count never enters it.
+        name: "POST /batches/{batch_id}/complete (success)",
+        setup: Some(seed_bound_batch),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(
+                async move { complete_batch_route(db, settings, ctx, BatchOutcome::Success).await },
+            )
+        },
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move { finish_batch_drive(db, shape, ctx, BatchEnd::Completed).await })
+        }),
+    },
+    Drive {
+        // The same route for a failed run: the conclusion is carried
+        // verbatim, so the cost is the success delivery's.
+        name: "POST /batches/{batch_id}/complete (failure)",
+        setup: Some(seed_bound_batch),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(
+                async move { complete_batch_route(db, settings, ctx, BatchOutcome::Failure).await },
+            )
+        },
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move { finish_batch_drive(db, shape, ctx, BatchEnd::Completed).await })
+        }),
+    },
+    Drive {
+        // The alarm's resolution of one completed batch whose legs all
+        // succeeded: `ready_batches`, the classification and then
+        // every leg through `complete`'s fence with its build sample.
+        // On wasm the real `resolve_ready_batches`, whose outbound
+        // reads go to the local mock CI and registry — the setup seeds
+        // the batch's run there, its jobs page and every leg's records
+        // artifact, outside the measured window ([`upstream_run`]); on
+        // host the jobs page is synthetic and the registry check
+        // answers present. Rows are bounded by `STOW_BATCH_MAX_TASKS`
+        // legs × a constant per leg.
+        name: "alarm pass (batch resolution)",
+        setup: Some(seed_completed_success_batch),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                resolve_completed_batch(db, settings, ctx, BatchOutcome::Success).await
+            })
+        },
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move { finish_batch_drive(db, shape, ctx, BatchEnd::Resolved).await })
+        }),
+    },
+    Drive {
+        // The same resolution over a batch of one leg — the claim closes
+        // it at one leg, as `STOW_BATCH_MAX_TASKS = 1` would — so the
+        // row is the resolution's fixed part plus one leg's: the batch
+        // row read and delete, and that leg's `complete` and build
+        // sample. The `workflow_run` callback prices one of these per
+        // build, which covers what production pays per build at any
+        // batch size; the 40-leg drive above stays the per-event bound.
+        name: "alarm pass (batch resolution, one leg)",
+        setup: Some(seed_completed_one_leg_batch),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                resolve_completed_batch(db, settings, ctx, BatchOutcome::Success).await
+            })
+        },
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move { finish_batch_drive(db, shape, ctx, BatchEnd::Resolved).await })
+        }),
+    },
+    Drive {
+        // The same resolution when every leg failed: each leg re-queues
+        // behind its backoff with its evidence row, the heavier of the
+        // two per-leg writes. On wasm the seeded run's legs fail their
+        // build at a verdict step and publish nothing, so the batch
+        // resolves as failed rather than deferring.
+        name: "alarm pass (batch resolution, failure)",
+        setup: Some(seed_completed_failure_batch),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                resolve_completed_batch(db, settings, ctx, BatchOutcome::Failure).await
+            })
+        },
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move { finish_batch_drive(db, shape, ctx, BatchEnd::Resolved).await })
+        }),
+    },
+    Drive {
+        // The lease check over one expired bound batch whose run is
+        // still going: the expired-batch read and the lease extension.
+        // On wasm the real lease pass, which asks the local mock CI for
+        // the run's state — the setup seeds the batch's run there as
+        // running, and the cleanup cancels it ([`finish_lease_drive`]).
+        // The read is bounded by `EXPIRED_BATCH_LIMIT` and the family
+        // slot caps; the write is one keyed statement.
+        name: "alarm pass (lease check)",
+        setup: Some(seed_expired_batch),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move { check_expired_lease(db, settings, ctx).await })
+        },
+        cleanup: Some(|db, shape, settings, ctx| {
+            Box::pin(async move { finish_lease_drive(db, shape, settings, ctx).await })
+        }),
     },
     Drive {
         // The feed's resume-cursor read (stow#523): one watermark
@@ -1794,8 +2082,14 @@ pub const DRIVES: &[Drive] = &[
         // bound. The unmetered cleanup deletes exactly the
         // subgraph's own primary keys.
         name: "POST /scheduler/demand-feed/deliver (page apply)",
-        setup: Some(|db, _shape, settings, _ctx| {
+        setup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move {
+                // The run's page apply folds demand into queue rows —
+                // snapshot the closure of every entry the hour's pages
+                // carry before any delivery. The event subgraph's own
+                // rows only land later in this setup, so the cleanup's
+                // primary-key delete — never the snapshot — owns them.
+                snapshot_feed_delivery_rows(db, ctx, &[(0, &[256, 4], feed_event_entries)]).await?;
                 seed_feed_event_subgraph(db, settings).await?;
                 seed_feed_hour_sized(db, 0, &[256, 4], feed_event_entries).await
             })
@@ -1808,8 +2102,19 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
-        cleanup: Some(|db, _shape, _settings, _ctx| {
-            Box::pin(async move { clear_feed_event_subgraph(db).await })
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                // The snapshotted fixture rows back first — the delete
+                // below removes event rows by primary key, and a
+                // restore ordered after it would report them vanished.
+                let restored = restore_snapshot_rows(db, &ctx.take_restore_rows()).await;
+                let cleared = clear_feed_event_subgraph(db).await;
+                match (restored, cleared) {
+                    (Ok(()), Ok(())) => Ok(()),
+                    (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+                    (Err(restored), Err(cleared)) => Err(format!("{restored}; {cleared}")),
+                }
+            })
         }),
     },
     Drive {
@@ -1818,8 +2123,21 @@ pub const DRIVES: &[Drive] = &[
         // probe, then the contiguous-watermark guarded transition to
         // `delivered`, priced separately from a mid-hour apply.
         name: "POST /scheduler/demand-feed/deliver (terminal)",
-        setup: Some(|db, _shape, settings, _ctx| {
+        setup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move {
+                // T00's remaining page and every staged T01 page fold
+                // demand into fixture queue rows — snapshot the
+                // closures their pages' entries reach before the first
+                // delivery.
+                snapshot_feed_delivery_rows(
+                    db,
+                    ctx,
+                    &[
+                        (0, &[4; FEED_DRIVE_PAGES as usize], feed_drive_entries),
+                        (1, &[4; FEED_DRIVE_PAGES as usize], feed_drive_entries),
+                    ],
+                )
+                .await?;
                 // Contiguity: T01's transition needs the watermark at
                 // T00, so the predecessor delivers fully in unmetered
                 // setup — then T01 stages and every page applies,
@@ -1842,7 +2160,11 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            // The feed ledger chain stays — only the queue rows the
+            // folds moved return to their snapshot preimage.
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
         // A delivery replay on an already-delivered hour: the header
@@ -1850,8 +2172,17 @@ pub const DRIVES: &[Drive] = &[
         // re-plan — the bounded cost a lost-ack re-fire owes, with
         // zero ledger writes.
         name: "POST /scheduler/demand-feed/deliver (replay)",
-        setup: Some(|db, _shape, settings, _ctx| {
+        setup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move {
+                // The full delivery below folds T02's pages into
+                // fixture queue rows — snapshot their entries'
+                // closures before the first delivery.
+                snapshot_feed_delivery_rows(
+                    db,
+                    ctx,
+                    &[(2, &[4; FEED_DRIVE_PAGES as usize], feed_drive_entries)],
+                )
+                .await?;
                 seed_feed_hour(db, 2, FEED_DRIVE_PAGES).await?;
                 deliver_feed_hour_fully(db, 2, settings).await
             })
@@ -1864,7 +2195,9 @@ pub const DRIVES: &[Drive] = &[
                     .map_err(|error| error.to_string())
             })
         },
-        cleanup: None,
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move { restore_snapshot_rows(db, &ctx.take_restore_rows()).await })
+        }),
     },
     Drive {
         // One bounded retire chunk with a full 256 obsolete pages
@@ -2043,7 +2376,11 @@ async fn dispatch_pass_drive(
             let claimed = queue::claim_dispatchable_tasks(db, &pass_settings, &NoCoverage)
                 .await
                 .map_err(|error| error.to_string())?;
-            let task_ids: Vec<String> = claimed.iter().map(|task| task.task_id.clone()).collect();
+            let task_ids: Vec<String> = claimed
+                .iter()
+                .flat_map(|batch| batch.tasks.iter())
+                .map(|task| task.task_id.clone())
+                .collect();
             ctx.record_claimed(task_ids.clone());
             task_ids
         }
@@ -2062,11 +2399,11 @@ async fn dispatch_pass_drive(
 
 /// The planner + claim half of a dispatch pass, with no workflow
 /// fan-out: the real `claim_dispatchable_tasks` — stale-lease
-/// recovery, shape requeue, freeze probe, capacity reads and the
+/// recovery, freeze probe, capacity reads and the
 /// paged eligible walk with its coverage oracle — then `next_alarm`
 /// over the post-claim queue. A focused floor probe prices what an
 /// alarm wake pays to plan and claim under the floor; running the
-/// pass's `trigger_build` fan-out instead would dispatch unrecorded
+/// pass's `dispatch_batch` fan-out instead would dispatch unrecorded
 /// workflows and contaminate the run/outcome/median state later
 /// drives measure (stow#525). The rows it moves restore from the
 /// drive's unmetered `restore_rows` snapshot — the claim ids never
@@ -2075,39 +2412,65 @@ async fn dispatch_pass_drive(
 async fn floor_claim_probe(
     db: &DurableDb,
     settings: &SchedulerSettings,
-    #[allow(unused_variables)] ctx: &DriveContext,
+    ctx: &DriveContext,
 ) -> Result<Vec<String>, String> {
-    let task_ids = {
-        #[cfg(target_arch = "wasm32")]
-        {
-            let d1 = ctx
-                .d1
-                .as_ref()
-                .ok_or_else(|| "floor claim probe needs the counted D1".to_owned())?;
-            let coverage = super::object::CatalogCoverage { db: d1.clone() };
-            queue::claim_dispatchable_tasks(db, settings, &coverage)
-                .await
-                .map_err(|error| error.to_string())?
-                .iter()
-                .map(|task| task.task_id.clone())
-                .collect::<Vec<String>>()
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            queue::claim_dispatchable_tasks(db, settings, &NoCoverage)
-                .await
-                .map_err(|error| error.to_string())?
-                .iter()
-                .map(|task| task.task_id.clone())
-                .collect::<Vec<String>>()
-        }
-    };
-    // The drive's unmetered cleanup restores every touched row from
-    // the setup snapshot — the claim ids stay out of `claimed_tasks`
-    // (the launch gate's marginal divisor counts the hot pass only)
-    // and out of the probe restore list the drain walks.
-    // The real current time on wasm — the plan the pass would arm —
-    // and the deterministic clock the host gate always uses.
+    focused_claim_pass(db, settings, ctx, "floor claim probe").await
+}
+
+/// A claiming pass's queue layer without the workflow fan-out —
+/// [`claim_pass`], then `next_alarm` for the wake re-plan the route's
+/// `schedule_alarm` performs. Shared by the floor probe and the
+/// `/index/published` drives' `dispatch_pending` tail: focused probes
+/// never record into `claimed_tasks` — the launch gate's marginal
+/// divisor counts only the hot pass — their moves restore from the
+/// caller's snapshot.
+async fn focused_claim_pass(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+    probe: &str,
+) -> Result<Vec<String>, String> {
+    let task_ids = claim_pass(db, settings, ctx, probe)
+        .await?
+        .iter()
+        .flat_map(|batch| batch.tasks.iter())
+        .map(|task| task.task_id.clone())
+        .collect::<Vec<String>>();
+    plan_wake(db, settings).await?;
+    Ok(task_ids)
+}
+
+/// `claim_dispatchable_tasks` under the lane's coverage oracle — the
+/// counted-D1 `CatalogCoverage` on wasm, `NoCoverage` on host.
+async fn claim_pass(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    #[allow(unused_variables)] ctx: &DriveContext,
+    #[allow(unused_variables)] probe: &str,
+) -> Result<Vec<super::batching::FormedBatch>, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let d1 = ctx
+            .d1
+            .as_ref()
+            .ok_or_else(|| format!("{probe} needs the counted D1"))?;
+        let coverage = super::object::CatalogCoverage { db: d1.clone() };
+        queue::claim_dispatchable_tasks(db, settings, &coverage)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        queue::claim_dispatchable_tasks(db, settings, &NoCoverage)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// The wake re-plan a route's `schedule_alarm` runs after its write —
+/// the real current time on wasm, the deterministic clock the host
+/// gate always uses.
+async fn plan_wake(db: &DurableDb, settings: &SchedulerSettings) -> Result<(), String> {
     #[cfg(target_arch = "wasm32")]
     #[allow(clippy::cast_possible_truncation)]
     let now_ms = js_sys::Date::now() as i64;
@@ -2115,8 +2478,965 @@ async fn floor_claim_probe(
     let now_ms = 0_i64;
     queue::next_alarm(db, now_ms, settings)
         .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// `RESTORE_COLUMNS` for a task-id list — the preimage a focused
+/// probe's cleanup writes back, chunked under the JSON batch bound.
+async fn restore_rows_for(db: &DurableDb, ids: &[String]) -> Result<Vec<RestoreQueueRow>, String> {
+    let mut rows = Vec::new();
+    for chunk in ids.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
+        rows.extend(
+            db.query(&format!(
+                "SELECT {RESTORE_COLUMNS} FROM queue \
+                 WHERE task_id IN (SELECT value FROM json_each(?))"
+            ))
+            .bind(queue::enqueue_json(chunk).map_err(|e| e.to_string())?)
+            .fetch_all::<RestoreQueueRow>()
+            .await
+            .map_err(|error| error.to_string())?,
+        );
+    }
+    Ok(rows)
+}
+
+/// Snapshot the queue rows a `POST /tasks/*` mutation's run can
+/// rewrite — the selector's own ids plus every dependent whose
+/// `blocked` flag the verb's follow-up refresh re-evaluates — into the
+/// drive context's restore list, so the cleanup returns the queue
+/// exactly as seeded.
+async fn snapshot_mutation_rows(
+    db: &DurableDb,
+    ctx: &DriveContext,
+    ids: &[String],
+) -> Result<(), String> {
+    let mut rows = restore_rows_for(db, ids).await?;
+    rows.extend(restore_rows_for(db, &dependents_of(db, ids).await?).await?);
+    ctx.set_restore_rows(rows);
+    Ok(())
+}
+
+/// Every task that owns an edge onto one of `ids` — the dependents a
+/// mutation's `refresh_dependents` re-evaluates `blocked` on.
+async fn dependents_of(db: &DurableDb, ids: &[String]) -> Result<Vec<String>, String> {
+    db.query(
+        "SELECT task_id FROM queue_dependencies \
+         WHERE depends_on_task_id IN (SELECT value FROM json_each(?))",
+    )
+    .bind(queue::enqueue_json(ids).map_err(|e| e.to_string())?)
+    .fetch_scalars::<String>()
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Snapshot every queue row a claiming pass can move into the drive
+/// context's restore list — the eligible frontier (`claim`/`retire`
+/// writers), plus any `extra_ids` a probe knows its own earlier half
+/// creates mid-run (the delta report's retire band, whose completed
+/// deps the slice commit's shape repair can requeue — stow#785). The stale-lease precondition is
+/// the floor probe's: recovery runs before paging, so a stale
+/// in-flight row would escape the frontier snapshot.
+async fn snapshot_claim_surface(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+    extra_ids: &[String],
+) -> Result<(), String> {
+    let stale = db
+        .query(
+            "SELECT COUNT(*) FROM queue \
+             WHERE status IN ('dispatched', 'running') \
+               AND claimed_at <= datetime('now', ?)",
+        )
+        .bind(format!("-{} minutes", settings.stale_dispatch_minutes))
+        .fetch_scalar::<u64>()
+        .await
         .map_err(|error| error.to_string())?;
-    Ok(task_ids)
+    if stale > 0 {
+        return Err(format!(
+            "fixture holds {stale} stale-lease candidate(s) — \
+             the snapshot can't cover recovery or its capacity shift"
+        ));
+    }
+    let frontier_ids = queue::select_dispatchable_frontier(db, settings)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut rows = restore_rows_for(db, &frontier_ids).await?;
+    rows.extend(restore_rows_for(db, extra_ids).await?);
+    ctx.set_restore_rows(rows);
+    Ok(())
+}
+
+/// Write every snapshotted row's preimage back unconditionally — a
+/// row recovered to `pending` and reclaimed `dispatched` in one pass
+/// ends with its original status but a fresh generation, which a
+/// status diff would miss; only the whole mutable field set is exact
+/// (stow#525).
+async fn restore_snapshot_rows(db: &DurableDb, snapshot: &[RestoreQueueRow]) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    for row in snapshot {
+        match db
+            .query(
+                "UPDATE queue SET status = ?, attempt = ?, error_msg = ?, \
+                     deps_met = ?, blocked = ?, \
+                     not_before = ?, wake_at = ?, value = CAST(? AS INTEGER), \
+                     demand = CAST(? AS INTEGER), \
+                     dispatch_key = ?, lane = ?, dispatch_eligible = ?, \
+                     generation_id = ?, dispatch_attempts = ?, \
+                     github_run_id = ?, claimed_at = ?, updated_at = ?, \
+                     shape_requeue = ?, batch_id = ?, batch_leg = ? \
+                 WHERE task_id = ?",
+            )
+            .bind(row.status.clone())
+            .bind(row.attempt)
+            .bind(row.error_msg.clone())
+            .bind(row.deps_met)
+            .bind(row.blocked)
+            .bind(row.not_before.clone())
+            .bind(row.wake_at.clone())
+            .bind(row.value.clone())
+            .bind(row.demand.clone())
+            .bind(row.dispatch_key.clone())
+            .bind(row.lane.clone())
+            .bind(row.dispatch_eligible)
+            .bind(row.generation_id.clone())
+            .bind(row.dispatch_attempts)
+            .bind(row.github_run_id.clone())
+            .bind(row.claimed_at.clone())
+            .bind(row.updated_at.clone())
+            .bind(row.shape_requeue)
+            .bind(row.batch_id.clone())
+            .bind(row.batch_leg)
+            .bind(row.task_id.clone())
+            .execute()
+            .await
+        {
+            Ok(result) if result.rows_written == 0 => {
+                errors.push(format!("snapshot row {} vanished", row.task_id));
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(format!("restore {}: {error}", row.task_id)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// A claiming drive's whole cleanup: the snapshotted queue rows back to
+/// their preimage and `build_batches` back to the fixture's own
+/// one-slot rows, so the batch rows the claim created never reach the
+/// next drive's capacity read. Both halves run whatever the other
+/// returns.
+async fn restore_claim_surface(
+    db: &DurableDb,
+    shape: FixtureShape,
+    snapshot: &[RestoreQueueRow],
+) -> Result<(), String> {
+    let rows = restore_snapshot_rows(db, snapshot).await;
+    let batches = restore_batches(db, shape).await;
+    match (rows, batches) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(rows), Err(batches)) => Err(format!("{rows}; {batches}")),
+    }
+}
+
+/// The state `queue::apply_dispatch_floor(db, floored)` is about to
+/// change: the stored floor setting and the flag of each row whose flag
+/// differs from the floored formula.
+async fn snapshot_floor(db: &DurableDb, floored: &SchedulerSettings) -> Result<PriorFloor, String> {
+    let eligible = queue::dispatch_eligible_at_floor_sql(
+        "lane",
+        "value",
+        &floored.min_dispatch_value.to_string(),
+    );
+    let stored = db
+        .query("SELECT value FROM settings WHERE key = 'min_dispatch_value'")
+        .fetch_scalar_optional::<String>()
+        .await
+        .map_err(|error| error.to_string())?;
+    let flags = db
+        .query(&format!(
+            "SELECT task_id, dispatch_eligible FROM queue WHERE dispatch_eligible != {eligible}"
+        ))
+        .fetch_all::<PriorFlag>()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(PriorFloor { stored, flags })
+}
+
+/// Write [`snapshot_floor`]'s state back: the setting row (or its
+/// absence) and each recorded row's flag.
+async fn restore_floor(db: &DurableDb, prior: PriorFloor) -> Result<(), String> {
+    match prior.stored {
+        Some(value) => db
+            .query(
+                "INSERT INTO settings (key, value) VALUES ('min_dispatch_value', ?) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(value)
+            .execute()
+            .await
+            .map(|_| ()),
+        None => db
+            .query("DELETE FROM settings WHERE key = 'min_dispatch_value'")
+            .execute()
+            .await
+            .map(|_| ()),
+    }
+    .map_err(|error| format!("floor setting: {error}"))?;
+    let mut by_flag: std::collections::BTreeMap<i64, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for row in prior.flags {
+        by_flag
+            .entry(row.dispatch_eligible)
+            .or_default()
+            .push(row.task_id);
+    }
+    for (flag, ids) in by_flag {
+        for chunk in ids.chunks(queue::ENQUEUE_JSON_BATCH_ROWS) {
+            db.query(
+                "UPDATE queue SET dispatch_eligible = ? \
+                 WHERE task_id IN (SELECT value FROM json_each(?))",
+            )
+            .bind(flag)
+            .bind(queue::enqueue_json(chunk).map_err(|e| e.to_string())?)
+            .execute()
+            .await
+            .map_err(|error| format!("floor flags: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// [`super::fixture::restore_batch_rows`] with the drive cleanup's
+/// error type.
+async fn restore_batches(db: &DurableDb, shape: FixtureShape) -> Result<(), String> {
+    super::fixture::restore_batch_rows(db, shape)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+// ===== Batch drives (stow#833) =====
+
+type DriveFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// The run a batch drive binds its batch to when nothing reads the run
+/// upstream: the completion-route drives, and on host the resolution
+/// and lease drives too, whose outbound reads are synthetic there. On
+/// wasm a resolution or lease drive binds the run the local CI recorded
+/// for its batch instead ([`upstream_run`]). Numeric, as the lease check
+/// and the resolution pass parse a bound run id.
+pub const BATCH_DRIVE_RUN_ID: u64 = 9_000_000_001;
+
+/// A batch drive's bound batch: the claimed batch and its run.
+#[derive(Debug, Clone)]
+struct BoundBatch {
+    batch_id: String,
+    run_id: u64,
+}
+
+/// What the batch's run concluded — the conclusion its completion
+/// carries and the jobs page the host resolution classifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchOutcome {
+    Success,
+    Failure,
+}
+
+impl BatchOutcome {
+    const fn conclusion(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+
+    /// The finished run upstream that concluded at this outcome.
+    const fn upstream(self) -> stow_types::local_ci::LocalCiSeededStatus {
+        use stow_types::local_ci::{LocalCiSeededConclusion, LocalCiSeededStatus};
+        LocalCiSeededStatus::Completed {
+            conclusion: match self {
+                Self::Success => LocalCiSeededConclusion::Success,
+                Self::Failure => LocalCiSeededConclusion::Failure,
+            },
+        }
+    }
+}
+
+/// The state a batch drive's run must have left its batch in.
+#[derive(Debug, Clone, Copy)]
+enum BatchEnd {
+    /// The completion is recorded against the bound run.
+    Completed,
+    /// Every leg left flight and the batch row is released.
+    Resolved,
+    /// The lease was extended by `lease_minutes`
+    /// (`STOW_STALE_DISPATCH_MINUTES`): it runs more than half that span
+    /// past now. The lease check's retry deferral after an unreadable
+    /// run moves it only `LEASE_RETRY_MS` (30 s), which no lease of a
+    /// minute or more reaches half of — so a drive whose lookup failed
+    /// does not pass as an extension.
+    Extended { lease_minutes: u32 },
+}
+
+fn batch_completion(run_id: u64, outcome: BatchOutcome) -> stow_types::api::BatchRunComplete {
+    stow_types::api::BatchRunComplete {
+        run_id,
+        run_attempt: 1,
+        conclusion: outcome.conclusion().to_owned(),
+        html_url: stow_types::runs::run_url(&run_id.to_string()),
+    }
+}
+
+/// How many legs a batch drive's claim closes its batch at.
+#[derive(Debug, Clone, Copy)]
+enum BatchLegs {
+    /// `STOW_BATCH_MAX_TASKS` — a full batch, the per-event bound every
+    /// batch drive's row budget names.
+    Full,
+    /// One leg — the smallest batch a run carries, whose resolution is
+    /// the fixed cost plus one leg's (the callback's price).
+    One,
+}
+
+impl BatchLegs {
+    const fn count(self, settings: &SchedulerSettings) -> u32 {
+        match self {
+            Self::Full => settings.batch_max_tasks,
+            Self::One => 1,
+        }
+    }
+}
+
+/// Claim one batch of `legs` from the planted window.
+///
+/// The claim runs with room for exactly one batch beside the fixture's
+/// in-flight slots, closing it at `legs` — the production claim under
+/// `STOW_BATCH_MAX_TASKS = legs`. The rows it moves restore from the
+/// snapshot the cleanup takes.
+async fn claim_cost_batch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+    legs: BatchLegs,
+) -> Result<super::batching::FormedBatch, String> {
+    if queue::freeze_enabled(db)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        return Err("the fixture is frozen — a batch drive would claim nothing".to_owned());
+    }
+    snapshot_claim_surface(db, settings, ctx, &[]).await?;
+    let room = FixtureShape::IN_FLIGHT_ROWS + settings.batch_parallelism;
+    let expected = legs.count(settings);
+    let one_batch = SchedulerSettings {
+        dispatch: queue::Dispatch::Limited(
+            std::num::NonZeroU32::new(room).expect("the fixture holds in-flight slots"),
+        ),
+        batch_max_tasks: expected,
+        ..*settings
+    };
+    let mut batches = claim_pass(db, &one_batch, ctx, "batch drive claim").await?;
+    if batches.len() != 1 {
+        return Err(format!(
+            "the claim formed {} batches, expected exactly one",
+            batches.len()
+        ));
+    }
+    let batch = batches.remove(0);
+    let claimed = batch.tasks.len();
+    if u32::try_from(claimed) != Ok(expected) {
+        return Err(format!(
+            "the claimed batch holds {claimed} legs, expected {expected} ({legs:?})"
+        ));
+    }
+    Ok(batch)
+}
+
+/// Bind the claimed `batch` to `run_id` — a bound in-flight batch. The
+/// pending rows of the legs' `(crate, target)` pairs that a build
+/// sample's cost refresh can re-key join the cleanup's snapshot.
+async fn bind_cost_batch(
+    db: &DurableDb,
+    ctx: &DriveContext,
+    batch: &super::batching::FormedBatch,
+    run_id: u64,
+) -> Result<String, String> {
+    let batch_id = batch.batch_id.as_str().to_owned();
+    let bound = queue::bind_batch_run(db, &batch_id, &run_id.to_string())
+        .await
+        .map_err(|error| error.to_string())?;
+    if !bound {
+        return Err(format!("batch {batch_id} was already bound to a run"));
+    }
+    // A build sample's median move re-keys the pending rows of the
+    // leg's own `(crate, target)` — rows the claim never touched.
+    let siblings = db
+        .query(
+            "SELECT task_id FROM queue \
+             WHERE status = 'pending' \
+               AND (crate_name, target) IN \
+                   (SELECT crate_name, target FROM queue WHERE batch_id = ?)",
+        )
+        .bind(batch_id.clone())
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| error.to_string())?;
+    ctx.extend_restore_rows(restore_rows_for(db, &siblings).await?);
+    ctx.set_batch(BoundBatch {
+        batch_id: batch_id.clone(),
+        run_id,
+    });
+    Ok(batch_id)
+}
+
+/// A claimed full batch bound to [`BATCH_DRIVE_RUN_ID`].
+async fn claim_bound_batch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+) -> Result<String, String> {
+    let batch = claim_cost_batch(db, settings, ctx, BatchLegs::Full).await?;
+    bind_cost_batch(db, ctx, &batch, BATCH_DRIVE_RUN_ID).await
+}
+
+fn seed_bound_batch<'a>(
+    db: &'a DurableDb,
+    _shape: FixtureShape,
+    settings: &'a SchedulerSettings,
+    ctx: &'a DriveContext,
+) -> DriveFuture<'a> {
+    Box::pin(async move { claim_bound_batch(db, settings, ctx).await.map(|_| ()) })
+}
+
+/// The run the claimed `batch` is upstream at `status` — running, or
+/// concluded before its completion is recorded, as production's run is.
+///
+/// On wasm the local CI records it under an id it allocates: every
+/// leg's jobs at `status`, and for a success each leg's records
+/// artifact under the run's tag. A batch drive's outbound reads then
+/// answer what production's do — the lease check finds the run still
+/// going, the resolution reads the jobs page and records a finished run
+/// leaves, and a failed run resolves as failed instead of deferring. On
+/// host those reads are synthetic, so the run is [`BATCH_DRIVE_RUN_ID`].
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(
+        clippy::unused_async,
+        reason = "only the wasm build seeds the run at the local CI; the host build's outbound reads are synthetic"
+    )
+)]
+async fn upstream_run(
+    ctx: &DriveContext,
+    batch: &super::batching::FormedBatch,
+    status: stow_types::local_ci::LocalCiSeededStatus,
+) -> Result<u64, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use stow_types::local_ci::{LocalCiSeededRun, LocalCiSeededRuns};
+        let env = ctx
+            .env
+            .as_ref()
+            .ok_or_else(|| "a batch drive's upstream run needs a Worker env".to_owned())?;
+        let local_ci = super::object::local_ci_runs(env).map_err(|error| error.to_string())?;
+        let seeded = LocalCiSeededRuns {
+            runs: vec![LocalCiSeededRun {
+                workflow_run_id: None,
+                rustc_version: batch.rustc_version.clone(),
+                batch_id: batch.batch_id.clone(),
+                legs: batch
+                    .tasks
+                    .iter()
+                    .map(|task| task.task_id.clone())
+                    .collect(),
+                status,
+            }],
+        };
+        let ids = local_ci
+            .seed_runs(&seeded, &crate::fetch_guard::OutboundPool::new())
+            .await
+            .map_err(|error| format!("seed batch {}'s run: {error}", batch.batch_id))?;
+        match ids.runs[..] {
+            [run_id] => Ok(run_id),
+            _ => Err(format!(
+                "the local CI answered {} run ids for one seeded run",
+                ids.runs.len()
+            )),
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (ctx, batch, status);
+        Ok(BATCH_DRIVE_RUN_ID)
+    }
+}
+
+/// A bound batch of `legs` whose run concluded upstream at `outcome`
+/// and whose `completed` delivery is already recorded.
+async fn bind_completed_batch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+    outcome: BatchOutcome,
+    legs: BatchLegs,
+) -> Result<(), String> {
+    let batch = claim_cost_batch(db, settings, ctx, legs).await?;
+    let run_id = upstream_run(ctx, &batch, outcome.upstream()).await?;
+    let batch_id = bind_cost_batch(db, ctx, &batch, run_id).await?;
+    queue::record_batch_completion(db, &batch_id, &batch_completion(run_id, outcome))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn seed_completed_success_batch<'a>(
+    db: &'a DurableDb,
+    _shape: FixtureShape,
+    settings: &'a SchedulerSettings,
+    ctx: &'a DriveContext,
+) -> DriveFuture<'a> {
+    Box::pin(async move {
+        bind_completed_batch(db, settings, ctx, BatchOutcome::Success, BatchLegs::Full).await
+    })
+}
+
+fn seed_completed_one_leg_batch<'a>(
+    db: &'a DurableDb,
+    _shape: FixtureShape,
+    settings: &'a SchedulerSettings,
+    ctx: &'a DriveContext,
+) -> DriveFuture<'a> {
+    Box::pin(async move {
+        bind_completed_batch(db, settings, ctx, BatchOutcome::Success, BatchLegs::One).await
+    })
+}
+
+fn seed_completed_failure_batch<'a>(
+    db: &'a DurableDb,
+    _shape: FixtureShape,
+    settings: &'a SchedulerSettings,
+    ctx: &'a DriveContext,
+) -> DriveFuture<'a> {
+    Box::pin(async move {
+        bind_completed_batch(db, settings, ctx, BatchOutcome::Failure, BatchLegs::Full).await
+    })
+}
+
+/// A full bound batch whose run is still going upstream and whose
+/// lease ran out a minute ago.
+fn seed_expired_batch<'a>(
+    db: &'a DurableDb,
+    _shape: FixtureShape,
+    settings: &'a SchedulerSettings,
+    ctx: &'a DriveContext,
+) -> DriveFuture<'a> {
+    Box::pin(async move {
+        let batch = claim_cost_batch(db, settings, ctx, BatchLegs::Full).await?;
+        let run_id = upstream_run(
+            ctx,
+            &batch,
+            stow_types::local_ci::LocalCiSeededStatus::InProgress,
+        )
+        .await?;
+        let batch_id = bind_cost_batch(db, ctx, &batch, run_id).await?;
+        db.query(
+            "UPDATE build_batches SET lease_at = datetime('now', '-1 minutes') \
+             WHERE batch_id = ?",
+        )
+        .bind(batch_id)
+        .execute()
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+}
+
+/// `POST /batches/{batch_id}/complete`: the queue write the route performs,
+/// then the wake re-plan its `schedule_alarm` runs.
+async fn complete_batch_route(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+    outcome: BatchOutcome,
+) -> Result<(), String> {
+    let bound = ctx.bound_batch()?;
+    queue::record_batch_completion(
+        db,
+        &bound.batch_id,
+        &batch_completion(bound.run_id, outcome),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    plan_wake(db, settings).await
+}
+
+/// The wall clock, in epoch milliseconds — the alarm's own `now` for
+/// the passes the host drives run queue-side.
+#[cfg(not(target_arch = "wasm32"))]
+fn clock_ms() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the wall clock is past the epoch");
+    i64::try_from(elapsed.as_millis()).expect("epoch milliseconds fit i64")
+}
+
+/// The alarm pass's resolution of the one completed batch. On wasm the
+/// real `resolve_ready_batches`; on host the same queue calls over a
+/// synthetic jobs page and a records check that answers present — the
+/// HTTP the pass wraps around them has no host counterpart.
+async fn resolve_completed_batch(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+    outcome: BatchOutcome,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = outcome;
+        let env = ctx
+            .env
+            .as_ref()
+            .ok_or_else(|| "batch resolution drive needs a Worker env".to_owned())?;
+        super::object::run_batch_step(env, db, settings, super::object::BatchStep::Resolution)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = ctx;
+        let now_ms = clock_ms();
+        let ready = queue::ready_batches(db, now_ms)
+            .await
+            .map_err(|error| error.to_string())?;
+        let [batch] = ready.as_slice() else {
+            return Err(format!("{} batches are ready, expected one", ready.len()));
+        };
+        let now = time::OffsetDateTime::from_unix_timestamp(now_ms / 1000)
+            .map_err(|error| error.to_string())?;
+        let jobs = synthetic_jobs_page(batch, outcome);
+        let resolutions = queue::batch_resolutions(batch, &jobs, |_| true, now)
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "the synthetic jobs page left a leg unsettled".to_owned())?;
+        let any_failure = queue::resolve_batch(
+            db,
+            settings,
+            batch,
+            &resolutions,
+            crate::freeze::DEFAULT_FREEZE_WINDOW_MINUTES,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if any_failure != (outcome == BatchOutcome::Failure) {
+            return Err(format!(
+                "a {} batch resolved with any_failure = {any_failure}",
+                outcome.conclusion()
+            ));
+        }
+        if any_failure {
+            // The failure arm's freeze check: the wasm path's
+            // `evaluate_dispatch_freeze` runs this same read before the
+            // alert side effects a host drive has no counterpart for.
+            queue::freeze_trip_draft(db, &crate::freeze::FreezeSettings::default())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+/// The jobs page of a finished `build-batch.yml` run: every leg's build
+/// and publish jobs under the names `LegJobName` parses. A failing leg
+/// fails its build job at a verdict step and skips its publish job —
+/// which GitHub serves under the unrendered `name:` template (stow#839).
+#[cfg(not(target_arch = "wasm32"))]
+fn synthetic_jobs_page(
+    batch: &queue::ReadyBatch,
+    outcome: BatchOutcome,
+) -> Vec<stow_types::runs::RunJobRow> {
+    use stow_types::runs::{RunJobRow, RunStepRow};
+    let started = time::OffsetDateTime::from_unix_timestamp(1_700_000_000)
+        .expect("a fixed timestamp is in range");
+    let job = |name: String, conclusion: &str, leg: u32, steps: Vec<RunStepRow>| RunJobRow {
+        id: u64::from(leg),
+        name,
+        status: "completed".to_owned(),
+        conclusion: Some(conclusion.to_owned()),
+        started_at: Some(started),
+        completed_at: Some(started + time::Duration::seconds(60 + i64::from(leg))),
+        run_attempt: 1,
+        html_url: format!(
+            "{}/job/{leg}",
+            stow_types::runs::run_url(&batch.run_id.to_string())
+        ),
+        steps,
+    };
+    batch
+        .legs
+        .iter()
+        .flat_map(|leg| {
+            let index = leg.batch_leg;
+            let hash = stow_types::api::TaskHash::of(&leg.task_id);
+            let build_name = format!("leg {index} / build #{index} cost-leg (target) {hash}");
+            let publish_name = format!("leg {index} / publish #{index} {hash}");
+            match outcome {
+                BatchOutcome::Success => [
+                    job(build_name, "success", index, Vec::new()),
+                    job(publish_name, "success", index, Vec::new()),
+                ],
+                BatchOutcome::Failure => [
+                    job(
+                        build_name,
+                        "failure",
+                        index,
+                        vec![RunStepRow {
+                            name: stow_types::runs::VERDICT_STEPS[0].to_owned(),
+                            status: "completed".to_owned(),
+                            conclusion: Some("failure".to_owned()),
+                        }],
+                    ),
+                    job(
+                        stow_types::runs::LegJobName::skipped_publish(index),
+                        "skipped",
+                        index,
+                        Vec::new(),
+                    ),
+                ],
+            }
+        })
+        .collect()
+}
+
+/// The alarm pass's lease check over the one expired bound batch, whose
+/// run is still going: on wasm the real lease pass, whose run lookup
+/// reads the running run the setup seeded at the local CI; on host the
+/// expired-batch read and the extension that verdict applies.
+async fn check_expired_lease(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let env = ctx
+            .env
+            .as_ref()
+            .ok_or_else(|| "lease check drive needs a Worker env".to_owned())?;
+        super::object::run_batch_step(env, db, settings, super::object::BatchStep::Leases)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let bound = ctx.bound_batch()?;
+        let now_ms = clock_ms();
+        let expired = queue::expired_batches(db, now_ms)
+            .await
+            .map_err(|error| error.to_string())?;
+        let [batch] = expired.as_slice() else {
+            return Err(format!("{} batches expired, expected one", expired.len()));
+        };
+        if batch.run_id != Some(bound.run_id) || batch.past_ceiling {
+            return Err(format!(
+                "the expired batch is not a live bound run: {batch:?}"
+            ));
+        }
+        queue::extend_batch_lease(db, settings, &batch.batch_id, now_ms)
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+/// A batch drive's whole cleanup: the run left the batch in the state
+/// it was meant to, then the build samples its legs filed and the
+/// `build_batches` and queue rows it moved go back. The failure
+/// evidence and outcome counts the resolution recorded stay, as the
+/// outcome window keeps them in production. Every step runs whatever
+/// the others return.
+async fn finish_batch_drive(
+    db: &DurableDb,
+    shape: FixtureShape,
+    ctx: &DriveContext,
+    end: BatchEnd,
+) -> Result<(), String> {
+    let mut errors: Vec<String> = Vec::new();
+    let snapshot = ctx.take_restore_rows();
+    match ctx.take_batch() {
+        Some(bound) => {
+            if let Err(error) = verify_batch_end(db, &bound, end).await {
+                errors.push(error);
+            }
+            let batch_id = bound.batch_id;
+            // The legs still carry their batch binding here, so the
+            // samples and stats they filed are addressable through it.
+            for statement in [
+                "DELETE FROM crate_build_samples WHERE generation_id IN \
+                 (SELECT generation_id FROM queue WHERE batch_id = ?)",
+                "DELETE FROM crate_build_stats WHERE EXISTS \
+                 (SELECT 1 FROM queue q WHERE q.batch_id = ? \
+                    AND q.crate_name = crate_build_stats.crate_name \
+                    AND q.target = crate_build_stats.target)",
+            ] {
+                if let Err(error) = db.query(statement).bind(batch_id.clone()).execute().await {
+                    errors.push(format!("remove the batch's build samples: {error}"));
+                }
+            }
+        }
+        None => errors.push("the drive's setup bound no batch".to_owned()),
+    }
+    // A resolution evaluates the freeze breaker; a trip would silence
+    // every later claiming drive.
+    match queue::freeze_enabled(db).await {
+        Ok(false) => {}
+        Ok(true) => {
+            errors.push("the drive tripped the dispatch freeze".to_owned());
+            if let Err(error) = db
+                .query("DELETE FROM settings WHERE key = 'dispatch_freeze'")
+                .execute()
+                .await
+            {
+                errors.push(format!("clear the tripped freeze: {error}"));
+            }
+        }
+        Err(error) => errors.push(error.to_string()),
+    }
+    if let Err(error) = restore_claim_surface(db, shape, &snapshot).await {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// The lease drive's whole cleanup. The run its setup left going
+/// upstream ends first, then the batch drive's own cleanup runs, each
+/// whatever the other returns.
+async fn finish_lease_drive(
+    db: &DurableDb,
+    shape: FixtureShape,
+    settings: &SchedulerSettings,
+    ctx: &DriveContext,
+) -> Result<(), String> {
+    let ended = end_running_run(ctx).await;
+    let finished = finish_batch_drive(
+        db,
+        shape,
+        ctx,
+        BatchEnd::Extended {
+            lease_minutes: settings.stale_dispatch_minutes,
+        },
+    )
+    .await;
+    let errors: Vec<String> = [ended.err(), finished.err()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// End the run the lease drive's setup left going upstream. On wasm
+/// its cancel — the production backend's `cancel_run` — completes the
+/// seeded run on the local CI, which nothing else would: a run left in
+/// progress there holds the harness's build drain open. On host the
+/// run exists nowhere.
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    expect(
+        clippy::unused_async,
+        reason = "only the wasm build seeded a run at the local CI to end"
+    )
+)]
+async fn end_running_run(ctx: &DriveContext) -> Result<(), String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let bound = ctx.bound_batch()?;
+        let env = ctx
+            .env
+            .as_ref()
+            .ok_or_else(|| "lease check drive needs a Worker env".to_owned())?;
+        super::object::cancel_local_ci_run(env, bound.run_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = ctx;
+        Ok(())
+    }
+}
+
+/// The unmetered check that a batch drive's run did its work: a no-op
+/// completion or an unapplied resolution would otherwise price as a
+/// cheap success.
+async fn verify_batch_end(db: &DurableDb, bound: &BoundBatch, end: BatchEnd) -> Result<(), String> {
+    let batch_id = bound.batch_id.as_str();
+    let count = |sql: &'static str, binds: Vec<String>| async move {
+        let mut query = db.query(sql);
+        for bind in binds {
+            query = query.bind(bind);
+        }
+        query
+            .fetch_scalar::<u64>()
+            .await
+            .map_err(|error| error.to_string())
+    };
+    match end {
+        BatchEnd::Completed => {
+            let recorded = count(
+                "SELECT COUNT(*) FROM build_batches WHERE batch_id = ? AND done_run_id = ?",
+                vec![batch_id.to_owned(), bound.run_id.to_string()],
+            )
+            .await?;
+            (recorded == 1)
+                .then_some(())
+                .ok_or_else(|| format!("batch {batch_id} holds no recorded completion"))
+        }
+        BatchEnd::Resolved => {
+            let row = count(
+                "SELECT COUNT(*) FROM build_batches WHERE batch_id = ?",
+                vec![batch_id.to_owned()],
+            )
+            .await?;
+            let in_flight = count(
+                "SELECT COUNT(*) FROM queue WHERE batch_id = ? \
+                 AND status IN ('dispatched', 'running')",
+                vec![batch_id.to_owned()],
+            )
+            .await?;
+            (row == 0 && in_flight == 0).then_some(()).ok_or_else(|| {
+                format!(
+                    "batch {batch_id} was not resolved: row present = {}, {in_flight} legs in flight",
+                    row == 1
+                )
+            })
+        }
+        BatchEnd::Extended { lease_minutes } => {
+            let half_lease_seconds = u64::from(lease_minutes) * 30;
+            let extended = count(
+                "SELECT COUNT(*) FROM build_batches \
+                 WHERE batch_id = ? \
+                   AND lease_at > datetime('now', '+' || ? || ' seconds')",
+                vec![batch_id.to_owned(), half_lease_seconds.to_string()],
+            )
+            .await?;
+            (extended == 1).then_some(()).ok_or_else(|| {
+                format!(
+                    "batch {batch_id}'s lease was not extended by {lease_minutes} minutes — \
+                     the lease check did not find its run still going"
+                )
+            })
+        }
+    }
 }
 
 /// Slice rows a delta report moves — retired from the live set plus the
@@ -2239,6 +3559,57 @@ fn submit_batch_named(
     vec![resync, fresh, human]
 }
 
+/// Delete what a drive's enqueue landed — each request's task row and
+/// dependency edges, and every node of its resolved subgraph from the
+/// node store (the dependency nodes carry derived ids no fixture row
+/// shares) — so the next drive finds the queue as the fixture seeded
+/// it. Three statements over the requests' own ids, whatever the queue
+/// holds; the slot and status counters ride the queue triggers.
+async fn remove_submitted(db: &DurableDb, requests: &[EnqueueRequest]) -> Result<(), String> {
+    let mut task_ids = Vec::with_capacity(requests.len());
+    let mut node_ids = Vec::new();
+    for request in requests {
+        task_ids.push(
+            request
+                .task_id()
+                .map_err(|error| format!("drive task id: {error}"))?,
+        );
+        let graph = request
+            .resolved_dependency_graph()
+            .map_err(|error| format!("drive subgraph: {error}"))?;
+        node_ids.extend(
+            (0..graph.nodes().len())
+                .filter_map(|index| graph.task_id(index))
+                .map(str::to_owned),
+        );
+    }
+    let encode = |ids: &[String]| {
+        serde_json::to_string(ids).map_err(|error| format!("encode drive task ids: {error}"))
+    };
+    let (task_ids, node_ids) = (encode(&task_ids)?, encode(&node_ids)?);
+    for (statement, ids) in [
+        (
+            "DELETE FROM queue_dependencies WHERE task_id IN (SELECT value FROM json_each(?))",
+            &task_ids,
+        ),
+        (
+            "DELETE FROM queue WHERE task_id IN (SELECT value FROM json_each(?))",
+            &task_ids,
+        ),
+        (
+            "DELETE FROM task_nodes WHERE task_id IN (SELECT value FROM json_each(?))",
+            &node_ids,
+        ),
+    ] {
+        db.query(statement)
+            .bind(ids.clone())
+            .execute()
+            .await
+            .map_err(|error| format!("remove submitted tasks: {error}"))?;
+    }
+    Ok(())
+}
+
 /// The request record the drives admit and settle — a `req-drive`
 /// id `rearm_fixture` deletes between runs, so every probe measures the
 /// fresh-admission path rather than a dedup hit.
@@ -2288,23 +3659,8 @@ async fn admit_request_drive(
 /// `HumanRequest` batch whose root is its own fresh task plus a root
 /// that names an existing completed row (the `was_queued` arm).
 fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport {
-    let crate_name = "costgate-request-root";
-    let version = "1.0.0";
+    let root_task = request_root_task(shape);
     let target = stow_types::api::CI_TARGET_TRIPLES[0];
-    let rustc = "1.86.0";
-    let root_task = EnqueueRequest {
-        crate_name: crate_name.parse().expect("request crate"),
-        version: version.parse().expect("request version"),
-        features_json: FeaturesJson::default(),
-        target: target.parse().expect("request target"),
-        rustc_version: rustc.parse().expect("request rustc"),
-        downloads: 1,
-        source: EnqueueSource::HumanRequest,
-        dependency_subgraph: subgraph_of(&[dep_request(shape.dep_row(2))]),
-        preserve_lockfile: false,
-        host_side: false,
-        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-    };
     let root_id = root_task.task_id().expect("derived root task id");
     stow_types::api::RequestOutcomeReport {
         attempt: 1,
@@ -2328,6 +3684,27 @@ fn request_report(shape: FixtureShape) -> stow_types::api::RequestOutcomeReport 
                 },
             ],
         },
+    }
+}
+
+/// The outcome report's own task: a fresh one-dep `HumanRequest` root.
+fn request_root_task(shape: FixtureShape) -> EnqueueRequest {
+    let crate_name = "costgate-request-root";
+    let version = "1.0.0";
+    let target = stow_types::api::CI_TARGET_TRIPLES[0];
+    let rustc = "1.86.0";
+    EnqueueRequest {
+        crate_name: crate_name.parse().expect("request crate"),
+        version: version.parse().expect("request version"),
+        features_json: FeaturesJson::default(),
+        target: target.parse().expect("request target"),
+        rustc_version: rustc.parse().expect("request rustc"),
+        downloads: 1,
+        source: EnqueueSource::HumanRequest,
+        dependency_subgraph: subgraph_of(&[dep_request(shape.dep_row(2))]),
+        preserve_lockfile: false,
+        host_side: false,
+        explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
     }
 }
 
@@ -2605,6 +3982,73 @@ async fn deliver_feed_hour_fully(
             return Ok(());
         }
     }
+}
+
+/// Snapshot into the drive context's restore list every queue row a
+/// drive's feed deliveries can fold — the unbuilt closure, which is
+/// the `demand_pass` fold's exact write set, of every entry the
+/// delivered hours' pages carry. The live staged payloads cover pages
+/// a chain sibling already landed; the `counts`/`entries` spec covers
+/// the pages this drive's own setup stages for an absent hour — the
+/// union names the same entries either way. Taken before the first
+/// delivery so the cleanup writes `demand`, `value`, `dispatch_key`
+/// and `dispatch_eligible` back as found (stow#833); the feed ledger
+/// itself stays — the drives chain on its watermark.
+async fn snapshot_feed_delivery_rows(
+    db: &DurableDb,
+    ctx: &DriveContext,
+    hours: &[(u32, &[u32], FeedPageEntries)],
+) -> Result<(), String> {
+    let mut touched = std::collections::BTreeSet::new();
+    for &(idx, counts, entries) in hours {
+        let hour = feed_drive_hour(idx);
+        for payload in db
+            .query("SELECT payload FROM demand_feed_pages WHERE hour = ?")
+            .bind(hour.as_str())
+            .fetch_scalars::<String>()
+            .await
+            .map_err(|error| format!("read staged pages of {hour}: {error}"))?
+        {
+            let staged: Vec<stow_types::api::SchedulerDemandEntry> = serde_json::from_str(&payload)
+                .map_err(|error| {
+                    format!("staged page payload of {hour} does not decode: {error}")
+                })?;
+            for entry in &staged {
+                feed_entry_closure(db, &mut touched, entry).await?;
+            }
+        }
+        for (page_no, count) in counts.iter().enumerate() {
+            for entry in entries(u32::try_from(page_no).expect("page index"), *count)? {
+                feed_entry_closure(db, &mut touched, &entry).await?;
+            }
+        }
+    }
+    let ids: Vec<String> = touched.into_iter().collect();
+    ctx.set_restore_rows(restore_rows_for(db, &ids).await?);
+    Ok(())
+}
+
+/// Union one page entry's unbuilt closure — the task set a delivery's
+/// `demand_pass` can write for it — into `touched`.
+async fn feed_entry_closure(
+    db: &DurableDb,
+    touched: &mut std::collections::BTreeSet<String>,
+    entry: &stow_types::api::SchedulerDemandEntry,
+) -> Result<(), String> {
+    let closure = queue::demand_closure_tasks(
+        db,
+        &[
+            entry.crate_name.as_str().to_owned(),
+            entry.version.to_string(),
+            entry.features_json.raw(),
+            entry.target.as_str().to_owned(),
+            entry.rustc_version.as_str().to_owned(),
+        ],
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    touched.extend(closure);
+    Ok(())
 }
 
 /// The page-apply drive's own event graph (stow#523): the stored
@@ -2960,7 +4404,8 @@ async fn validate_feed_event_closures(db: &DurableDb, ids: &[String]) -> Result<
 }
 
 /// Delete only the event subgraph's own records — the roots' 512
-/// edges, then the 384 queue rows — every probe keyed by the explicit
+/// edges, the 384 queue rows, then their 384 node-store rows — every
+/// probe keyed by the explicit
 /// typed id list (`json_each` feeds the `task_id` primary keys; no
 /// prefix match or table walk). The queue's status counters live on
 /// triggers over these deletes, so they stay consistent; nothing
@@ -2983,13 +4428,20 @@ async fn clear_feed_event_subgraph(db: &DurableDb) -> Result<(), String> {
         .await
         .map_err(|error| error.to_string())?;
     db.query("DELETE FROM queue WHERE task_id IN (SELECT value FROM json_each(?))")
-        .bind(ids_json)
+        .bind(ids_json.clone())
         .execute()
         .await
         .map_err(|error| format!("clear event rows: {error}"))?;
     let rows = queue::changes(db)
         .await
         .map_err(|error| error.to_string())?;
+    // The enqueue also landed the subgraph's node-store rows, under
+    // the same ids.
+    db.query("DELETE FROM task_nodes WHERE task_id IN (SELECT value FROM json_each(?))")
+        .bind(ids_json)
+        .execute()
+        .await
+        .map_err(|error| format!("clear event nodes: {error}"))?;
     let (want_edges, want_rows) = (2 * u64::from(FEED_EVENT_ROOTS), u64::from(FEED_EVENT_NODES));
     if (edges != 0 || rows != 0) && (edges != want_edges || rows != want_rows) {
         return Err(format!(

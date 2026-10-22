@@ -12,13 +12,24 @@
 //! Shape, in queue-order `n`:
 //! * `n <= pending_end` are `pending` — about 60% of the queue;
 //! * the next ~35% are `completed`, ~2.5% `failed`, and exactly thirty
-//!   `dispatched`/`running` rows — fewer than the default 45-slot
-//!   dispatch limit so the alarm's claim walk actually runs;
+//!   `dispatched`/`running` rows — each a one-slot batch leg with its
+//!   own `build_batches` row, so the thirty hold thirty runner slots,
+//!   fewer than the default 45-slot dispatch limit and the alarm's
+//!   claim walk actually runs;
 //! * the human lane inside the pending range is the pin window alone —
-//!   the claimable pending span is the planted window, and every other
+//!   the claimable pending span is the planted window, the pins parked
+//!   behind a future `not_before` so the claim refuses them without
+//!   moving their `pending`, unblocked probe state, and every other
 //!   pending row parks `dispatch_eligible = 0` below the admission
 //!   floor (a below-floor stored flag is only a stable state for a
-//!   miss-lane row — humans are exempt under every floor), ~5% of
+//!   miss-lane row — humans are exempt under every floor). The window
+//!   carries a stored demand so its Windows rows price above every
+//!   bulk Windows row — under a `VALUE_BAND` floor a miss row clears
+//!   the admission only through the Windows band, so the floored
+//!   claimable set is the window's Windows span, and without the
+//!   demand arm it ties bulk Windows rows on value and the
+//!   `first_requested_at` order lets the bulk in first (stow#833).
+//!   ~5% of
 //!   non-pending rows carry a future
 //!   `not_before`, `first_requested_at` spreads over the trailing two
 //!   days, and exactly
@@ -48,9 +59,18 @@ use crate::errors::QueueError;
 
 /// The host-gate shape — 10k rows — small enough that `cargo test`
 /// stays fast. Only the host pre-check uses it; the workerd harness
-/// seeds `PRODUCTION` and the 1M shape `STOW_BUDGET_SIZES` carries.
+/// seeds `PRODUCTION` and the 1M shape `STOW_TRAFFIC_SIZES` carries.
 #[cfg(test)]
 pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
+
+/// The stored `demand` every window row carries — the demand fold's
+/// own unit of accumulated work. Production bounds `priority + demand
+/// <= PRIORITY_MAX`, so a window row (priority `n % 7 <= 6`) stays
+/// inside the band a real fold could write; the term still prices the
+/// window's Windows rows at `VALUE_BAND + priority + 1000`, ahead of
+/// every bulk Windows row (`VALUE_BAND + priority <= VALUE_BAND + 6`)
+/// in `dispatch_key` order whatever the bulk row's age (stow#833).
+const WINDOW_DEMAND: i64 = 1_000;
 
 /// Rows one crate name covers — the fixture's pinned per-name bound.
 /// `'crate' || (n / CRATE_NAME_ROWS)` bounds every name to at most
@@ -284,6 +304,9 @@ pub enum SeedPhase {
     /// The staging hour's current-generation bulk plus its 256-row
     /// obsolete tail — `n` runs `1..=feed_staged_pages + 256`.
     FeedStaged,
+    /// The breaker's stored bulk — `n` runs `1..=outcome_bucket_rows`
+    /// (stow#816).
+    OutcomeBuckets,
 }
 
 impl SeedPhase {
@@ -298,6 +321,7 @@ impl SeedPhase {
             Self::FeedHeaders => feed_hist_hours(shape),
             Self::FeedPages => feed_hist_pages(shape),
             Self::FeedStaged => feed_staged_pages(shape) + FEED_OBSOLETE_TAIL,
+            Self::OutcomeBuckets => outcome_bucket_rows(shape),
         }
     }
 
@@ -321,7 +345,8 @@ impl SeedPhase {
             Self::DepsMet => Some(Self::FeedHeaders),
             Self::FeedHeaders => Some(Self::FeedPages),
             Self::FeedPages => Some(Self::FeedStaged),
-            Self::FeedStaged => None,
+            Self::FeedStaged => Some(Self::OutcomeBuckets),
+            Self::OutcomeBuckets => None,
         }
     }
 }
@@ -346,7 +371,6 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "rustc_version",
     "downloads",
     "miss_count",
-    "request_count",
     "priority",
     "status",
     "lane",
@@ -371,7 +395,99 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
     "claimed_at",
     "dispatch_eligible",
     "demand",
+    "batch_id",
+    "batch_leg",
 ];
+
+/// The seed's `rustc_version` expression over `n`.
+const RUSTC_CASE_SQL: &str = "CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END";
+
+/// The in-flight rows' `batch_id` expression over `n`: the low 32 hex
+/// digits of the row's `%064x` task id — the high half is zero at any
+/// fixture size, so the low half is what tells two rows apart — and
+/// NULL outside the in-flight range.
+fn in_flight_batch_id_sql(failed_end: u32, in_flight_end: u32) -> String {
+    format!(
+        "CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
+              THEN substr(printf('%064x', n), 33) ELSE NULL END"
+    )
+}
+
+/// The in-flight rows' `batch_id, batch_leg` seed columns: each row is
+/// leg 0 of its own batch.
+fn in_flight_batch_binding_sql(failed_end: u32, in_flight_end: u32) -> String {
+    format!(
+        "{}, CASE WHEN n > {failed_end} AND n <= {in_flight_end} THEN 0 ELSE NULL END",
+        in_flight_batch_id_sql(failed_end, in_flight_end)
+    )
+}
+
+/// The statement that gives every in-flight queue row among `seq_source`
+/// its one-slot `build_batches` row, so in-flight work holds dispatch
+/// slots the way a claimed leg does: `parallelism = 1`, `legs = 1`, the
+/// row's own family, rustc and lane, a bound `github_run_id`, and the
+/// in-flight rows' heartbeat shape — claimed at the same instant the
+/// queue row models, leased a day ahead so the lease check never
+/// reaches them however long a drive runs. An upsert by batch id, so a
+/// replay or a restore rewrites a row a drive moved.
+fn in_flight_batches_upsert_sql(shape: FixtureShape, seq_source: &str) -> String {
+    let pending_end = shape.pending_end();
+    let failed_end = shape.failed_end();
+    let in_flight_end = failed_end + FixtureShape::IN_FLIGHT_ROWS;
+    let human_end = FixtureShape::HUMAN_LANE_ROWS;
+    let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
+    let family =
+        crate::scheduler::queue::dispatch_family_sql(&format!("({})", target_case_sql("n")));
+    let lane = fixture_lane_case_sql(pending_end, human_pin, human_end);
+    let batch_id = in_flight_batch_id_sql(failed_end, in_flight_end);
+    format!(
+        "WITH RECURSIVE seq(n) AS ({seq_source}) \
+         INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              github_run_id, claimed_at, lease_at) \
+         SELECT {batch_id}, {RUSTC_CASE_SQL}, {family}, {lane}, 1, 1, CAST(n AS TEXT), \
+                datetime('now', '-30 minutes'), datetime('now', '+1 day') \
+         FROM seq WHERE n > {failed_end} AND n <= {in_flight_end} \
+         ON CONFLICT(batch_id) DO UPDATE SET \
+             rustc_version = excluded.rustc_version, \
+             dispatch_family = excluded.dispatch_family, lane = excluded.lane, \
+             parallelism = excluded.parallelism, legs = excluded.legs, \
+             github_run_id = excluded.github_run_id, done_run_id = NULL, \
+             done_attempt = NULL, conclusion = NULL, done_at = NULL, \
+             resolve_after = NULL, claimed_at = excluded.claimed_at, \
+             lease_at = excluded.lease_at"
+    )
+}
+
+/// Restore `build_batches` to exactly the fixture's own rows: delete
+/// every batch a claim created and rewrite the in-flight rows' one-slot
+/// batches. A drive whose run claims calls this from its cleanup, so a
+/// batch row a claim inserted — or a fixture row its legless-batch
+/// release dropped — never reaches the next drive's capacity read. The
+/// table holds at most the dispatch slot cap of rows, so both
+/// statements are bounded by the dispatch cap, never by the queue.
+pub async fn restore_batch_rows(db: &DurableDb, shape: FixtureShape) -> Result<(), QueueError> {
+    let failed_end = shape.failed_end();
+    let in_flight_end = failed_end + FixtureShape::IN_FLIGHT_ROWS;
+    db.query(&format!(
+        "WITH RECURSIVE seq(n) AS ({seq}) \
+         DELETE FROM build_batches \
+         WHERE batch_id NOT IN (SELECT {batch_id} FROM seq)",
+        seq = seq_sql(failed_end, in_flight_end),
+        batch_id = in_flight_batch_id_sql(failed_end, in_flight_end),
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("delete claim-created batches: {error}"))?;
+    db.query(&in_flight_batches_upsert_sql(
+        shape,
+        &seq_sql(failed_end, in_flight_end),
+    ))
+    .execute()
+    .await
+    .map_err(|error| format!("restore in-flight batches: {error}"))?;
+    Ok(())
+}
 
 /// The seed's `lane` expression over `n`.
 ///
@@ -380,11 +496,15 @@ const QUEUE_SEED_COLUMNS: &[&str] = &[
 /// because the lane exemption (`lane = 'human' OR value >= floor`)
 /// recomputes a human row to eligible under EVERY admission floor —
 /// a below-floor stored flag is only a stable state for a miss row.
-/// Keeping the parked bulk miss-lane also keeps the pin window the
-/// first rows the claim walks at any floor: humans order ahead of
-/// every miss row in `dispatch_key`, so the claimed set is the pin
-/// — and its pooled closure — even after a floor change flips some
-/// parked rows back to eligible. Rows outside the pending range
+/// The pins stay eligible under every floor but the seed parks them
+/// behind a future `not_before`, so the first rows the claim walks at
+/// any floor are the planted window's — the window's stored demand
+/// prices its Windows rows above every bulk Windows row, so a floored
+/// pass's claimable set is the window's Windows span alone — while
+/// humans order
+/// ahead of every miss row in `dispatch_key`, and a claimable pin
+/// would fill the pass with one-slot human legs instead of the miss
+/// batches the gate prices (stow#833). Rows outside the pending range
 /// keep the upstream lane split (their lane never prices a claim).
 fn fixture_lane_case_sql(pending_end: u32, human_pin: u32, human_end: u32) -> String {
     format!(
@@ -427,26 +547,44 @@ fn queue_seed_insert_sql(
     let human_end = FixtureShape::HUMAN_LANE_ROWS;
     let human_pin = human_end - FixtureShape::HUMAN_PROBE_ROWS;
     let lane_case = &fixture_lane_case_sql(pending_end, human_pin, human_end);
-    let first_at = "datetime('now', '-' || (n % 2880) || ' minutes')";
     let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
-    // The claimable set is exactly the planted window (the human-lane
-    // pin + `DISPATCH_ELIGIBLE_ROWS`) at every size (stow#588): a
-    // pending row outside it is parked `dispatch_eligible = 0` — the
-    // below-the-admission-floor state production persists — so
-    // `idx_queue_claim`'s `dispatch_eligible = 1` equality drops it
-    // from the claim's walk range before the `dispatch_key` ordering
-    // reads a row. A future `not_before` parks a row inside the walk
-    // range instead — the claim examines it and refuses it, stow#597's
-    // read-past — and gating by unmet deps turns the queue into chains
-    // the demand walk follows. `dispatch_eligible = 0` is the only
-    // unclaimable state the index excludes by equality. The bulk edge
-    // distribution stays dev's: the demand walk and the probes' scans
-    // see the same mixed met/unmet rows every other drive's budget was
-    // measured on. Inside the window the ~5% `n % 20 = 1` pin still
-    // applies, as before.
+    // The claimable set is exactly the planted window (the
+    // `DISPATCH_ELIGIBLE_ROWS` span minus its parked rows) at every
+    // size (stow#588): a pending row outside the span is parked
+    // `dispatch_eligible = 0` — the below-the-admission-floor state
+    // production persists — so `idx_queue_claim`'s
+    // `dispatch_eligible = 1` equality drops it from the claim's walk
+    // range before the `dispatch_key` ordering reads a row. A future
+    // `not_before` parks a row inside the walk range instead — the
+    // claim examines it and refuses it, stow#597's read-past — and
+    // gating by unmet deps turns the queue into chains the demand walk
+    // follows. `dispatch_eligible = 0` is the only unclaimable state
+    // the index excludes by equality. The bulk edge distribution stays
+    // dev's: the demand walk and the probes' scans see the same mixed
+    // met/unmet rows every other drive's budget was measured on.
+    // The window rows carry stored `WINDOW_DEMAND`: the floor-claim
+    // drive's `apply_dispatch_floor` recomputes `dispatch_eligible`
+    // from `value`, where only the window's Windows rows clear a
+    // `VALUE_BAND` floor — the demand arm lifts them to
+    // `VALUE_BAND + n % 7 + WINDOW_DEMAND`, ahead of every bulk
+    // Windows row the floor also admits (`VALUE_BAND + n % 7` ties
+    // resolve by `first_requested_at`, and the bulk rows are older).
+    // Without it the floored claim seats bulk Windows rows, whose
+    // edges follow the size-dependent bulk formula and move the node
+    // walk with the fixture size (stow#833).
+    // Inside the window the ~5% `n % 20 = 1` pin still applies, as
+    // before — and the human-lane pin window parks the same way: a
+    // claimable pin would rank first and fill the pass with one-slot
+    // human legs, hiding the miss-batch claim the gate prices
+    // (stow#833), while the lane-position probes only need the pins
+    // `pending` and unblocked. The park outlives the whole traffic-cost
+    // job, like the in-flight stamps below: the post-drive budget pass
+    // reuses this seed after the peak drive, and a park that expires
+    // first frees every pin and parked row into the claim it prices.
     let not_before = &format!(
-        "CASE WHEN (n <= {failed_end} OR n > {in_flight_end}) AND n % 20 = 1 \
-              THEN datetime('now', '+30 minutes') \
+        "CASE WHEN (n <= {failed_end} OR n > {in_flight_end}) \
+                  AND (n % 20 = 1 OR (n > {human_pin} AND n <= {human_end})) \
+              THEN datetime('now', '+1 day') \
               ELSE '1970-01-01 00:00:00' END"
     );
     let last_24h = FixtureShape::LAST_24H_ROWS;
@@ -464,21 +602,42 @@ fn queue_seed_insert_sql(
               WHEN n <= {last_24h} THEN datetime('now', '-' || (n % 1440) || ' minutes') \
               ELSE datetime('now', '-' || (1440 + n % 38880) || ' minutes') END"
     );
-    let task_id = "printf('%064x', n)";
-    let bands_expr = format!(
-        "(CASE WHEN ({lane_case}) = 'human' THEN 2 ELSE 0 END) + \
-         (CASE WHEN ({family}) = 'windows' THEN 1 ELSE 0 END)",
-        family = crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
+    // `first_requested_at <= updated_at` is the production invariant —
+    // every writer moves `updated_at` forward from an insert-time
+    // value equal to `first_requested_at` — so the request stamp is
+    // the transition stamp minus an offset, never an independent
+    // value that could sit ahead of it (stow#786). In-flight rows
+    // keep their request just ahead of the −30-minute claim stamp the
+    // lease models.
+    let first_at = &format!(
+        "CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
+              THEN datetime('now', '-35 minutes') \
+              ELSE datetime({updated_at}, '-' || (60 + n % 4320) || ' minutes') END"
     );
+    let task_id = "printf('%064x', n)";
+    let bands_expr = bands_case_sql(lane_case, &target_case);
+    // Every window row carries `WINDOW_DEMAND` of accumulated demand —
+    // the production formula's own term, so `value`, the
+    // `dispatch_eligible` recompute and `dispatch_key` all derive it
+    // through `value_sql`. Inside the priority band it lifts the
+    // window's Windows rows to `VALUE_BAND + n % 7 + WINDOW_DEMAND`,
+    // ahead of every bulk Windows row, so a floored pass claims the
+    // window's Windows rows before any bulk row (stow#833). Window
+    // non-Windows rows stay at band 0, below the floor, as production
+    // would price them.
+    let demand = &window_demand_sql(human_end, eligible_end);
     let key = format!(
         "({prefix}) || '|' || ({first_at}) || '|' || ({first_at}) || '|' || ({task_id})",
-        prefix = rank_prefix_case_sql(&bands_expr),
+        prefix = rank_prefix_case_sql(&bands_expr, &format!("({demand})")),
     );
     // Non-window pending rows park `dispatch_eligible = 0` — the stored
     // production state a row below the admission floor carries — so the
     // claim page's `dispatch_eligible = 1` index equality excludes them
     // before the walk instead of reading past them per row. Window rows
-    // carry the recomputed flag the production formula gives.
+    // carry the recomputed flag the production formula gives — under a
+    // `VALUE_BAND` floor only the window's Windows rows stay eligible,
+    // the production-shaped outcome a miss row earns through the
+    // family band alone.
     let eligible = format!(
         "CASE WHEN n <= {pending_end} AND (n <= {human_pin} OR n > {eligible_end}) \
               THEN 0 ELSE ({}) END",
@@ -488,10 +647,16 @@ fn queue_seed_insert_sql(
                 &format!("({lane_case})"),
                 &crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
                 "(n % 7)",
-                "0",
+                &format!("({demand})"),
             ),
         ),
     );
+    // `shape_requeue` seeds 0 on every row — the state production
+    // actually carries: only the requeue itself writes the latch, in
+    // the same statement that flips the row back to `pending`, so a
+    // stored `completed` row is never latched (stow#785 — seeding 1
+    // there hid the repair scan's completed-history cost from the
+    // drives).
     format!(
         "WITH RECURSIVE seq(n) AS ({seq_source}) \
          {verb} INTO queue ({columns}) \
@@ -501,8 +666,8 @@ fn queue_seed_insert_sql(
                 '1.' || (n / 20000) || '.' || (n % 500), \
                 '[]', \
                 {target_case}, \
-                CASE WHEN n % 3 < 2 THEN '1.85.0' ELSE '1.86.0' END, \
-                n % 5000, 1, 1, n % 7, \
+                {RUSTC_CASE_SQL}, \
+                n % 5000, 1, n % 7, \
                 CASE WHEN n <= {pending_end} THEN 'pending' \
                      WHEN n <= {completed_end} THEN 'completed' \
                      WHEN n <= {failed_end} THEN 'failed' \
@@ -517,13 +682,13 @@ fn queue_seed_insert_sql(
                 {updated_at}, \
                 CASE WHEN n % 10 = 0 THEN 1 ELSE 0 END, \
                 0, \
-                0, 1, CASE WHEN n > {pending_end} AND n <= {completed_end} THEN 1 ELSE 0 END, \
+                0, 1, 0, \
                 CASE WHEN n > {failed_end} THEN 'run-' || n ELSE NULL END, \
                 lower(hex(randomblob(16))), \
                 0, 0, {wake}, {family}, {value}, {key}, \
                 CASE WHEN n > {failed_end} AND n <= {in_flight_end} \
                      THEN datetime('now', '-30 minutes') ELSE NULL END, \
-                {eligible}, 0 \
+                {eligible}, {demand}, {batch_binding} \
          FROM seq \
          {conflict}",
         columns = QUEUE_SEED_COLUMNS.join(", "),
@@ -538,37 +703,68 @@ fn queue_seed_insert_sql(
             &format!("({lane_case})"),
             &crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
             "(n % 7)",
-            "0",
+            &format!("({demand})"),
         ),
-        key = key,
-        eligible = eligible,
+        batch_binding = in_flight_batch_binding_sql(failed_end, in_flight_end),
     )
 }
 
 /// The `dispatch_key` rank prefix for the seed's small constant
 /// operand set — lane/family bands (0–3) crossed with the `n % 7`
-/// priority — each arm carrying the shared Rust abstraction's fixed
-/// prefix at the unmeasured cost 1, so a fixture row's key is
-/// byte-identical to what a writer derives for the same operands. The
-/// ranking formula itself never appears in SQL; the CASE only
-/// selects among the precomputed prefixes, and an operand outside the
-/// covered set yields NULL — a loud seed failure, not a silent key.
-fn rank_prefix_case_sql(bands_expr: &str) -> String {
+/// priority and the window's demand arm (0 or [`WINDOW_DEMAND`]) — each
+/// arm carrying the shared Rust abstraction's fixed prefix at the
+/// unmeasured cost 1, so a fixture row's key is byte-identical to
+/// what a writer derives for the same operands. The ranking formula
+/// itself never appears in SQL; the CASE only selects among the
+/// precomputed prefixes, and an operand outside the covered set
+/// yields NULL — a loud seed failure, not a silent key.
+fn rank_prefix_case_sql(bands_expr: &str, demand_expr: &str) -> String {
     use std::fmt::Write as _;
-    let mut case = format!("CASE ({bands_expr}) * 7 + (n % 7)");
+    let value_band = crate::scheduler::queue::VALUE_BAND;
+    let mut case =
+        format!("CASE ({demand_expr}) / {WINDOW_DEMAND} * 28 + ({bands_expr}) * 7 + (n % 7)");
     for band in 0_i64..4 {
-        for priority in 0_i64..7 {
-            let lane = if band >= 2 { "human" } else { "miss" };
-            let value = band * crate::scheduler::queue::VALUE_BAND + priority;
-            let prefix = crate::scheduler::rank::rank_prefix(
-                lane,
-                value,
-                crate::scheduler::rank::UNMEASURED_COST,
-            );
-            let _ = write!(case, " WHEN {} THEN '{prefix}'", band * 7 + priority);
+        for demand_band in 0_i64..2 {
+            for priority in 0_i64..7 {
+                let lane = if band >= 2 { "human" } else { "miss" };
+                let value = band * value_band + demand_band * WINDOW_DEMAND + priority;
+                let prefix = crate::scheduler::rank::rank_prefix(
+                    lane,
+                    value,
+                    crate::scheduler::rank::UNMEASURED_COST,
+                );
+                let _ = write!(
+                    case,
+                    " WHEN {} THEN '{prefix}'",
+                    demand_band * 28 + band * 7 + priority
+                );
+            }
         }
     }
     format!("{case} END")
+}
+
+/// The seed's lane/family band operand — `(human ? 2 : 0) +
+/// (windows ? 1 : 0)` over `n` — the expression `dispatch_key`'s
+/// prefix CASE reads.
+fn bands_case_sql(lane_case: &str, target_case: &str) -> String {
+    format!(
+        "(CASE WHEN ({lane_case}) = 'human' THEN 2 ELSE 0 END) + \
+         (CASE WHEN ({family}) = 'windows' THEN 1 ELSE 0 END)",
+        family = crate::scheduler::queue::dispatch_family_sql(&format!("({target_case})")),
+    )
+}
+
+/// The seed's stored `demand` arm: every window row carries
+/// [`WINDOW_DEMAND`] — a production-valid demand (the fold keeps
+/// `priority + demand <= PRIORITY_MAX`, and window priority is
+/// `n % 7 <= 6`) that prices the window's Windows rows above every
+/// bulk Windows row in `dispatch_key` order. Bulk rows keep 0.
+fn window_demand_sql(human_end: u32, eligible_end: u32) -> String {
+    format!(
+        "CASE WHEN n > {human_end} AND n <= {eligible_end} \
+              THEN {WINDOW_DEMAND} ELSE 0 END"
+    )
 }
 
 /// Seed `queue` rows `(lo, hi]`.
@@ -592,6 +788,12 @@ pub async fn seed_queue_chunk(
     .execute()
     .await
     .map_err(|error| format!("seed queue rows: {error}"))?;
+    // The in-flight rows hold dispatch slots: each gets its one-slot
+    // batch in the chunk that seeds it.
+    db.query(&in_flight_batches_upsert_sql(shape, &seq_sql(lo, hi)))
+        .execute()
+        .await
+        .map_err(|error| format!("seed in-flight batches: {error}"))?;
     Ok(())
 }
 
@@ -642,7 +844,126 @@ pub async fn restore_queue_rows(
         .execute()
         .await
         .map_err(|error| format!("restore seeded queue rows: {error}"))?;
+    // A restored in-flight row is a held slot again: its batch row is
+    // rewritten with it.
+    db.query(&in_flight_batches_upsert_sql(
+        shape,
+        "SELECT CAST(value AS INTEGER) FROM json_each(?)",
+    ))
+    .bind(
+        serde_json::to_string(ns)
+            .map_err(|error| QueueError::Sql(format!("encode restore row ids: {error}")))?,
+    )
+    .execute()
+    .await
+    .map_err(|error| format!("restore in-flight batches: {error}"))?;
     Ok(())
+}
+
+/// Re-arm the fixture's in-flight batches whose batch row is gone —
+/// the traffic-cost callback lane's deliveries resolved them — and
+/// answer which batches are armed, so every delivery the lane fires is
+/// a first delivery (stow#833).
+///
+/// A resolved batch's leg row returns to seeded truth at a fresh
+/// generation and its one-slot batch row is rewritten bound to the
+/// fixture's own run, with no completion recorded
+/// ([`restore_queue_rows`]). That run is one the local CI already
+/// serves: the harness seeded it, its jobs page and its leg's records
+/// artifact once, and a finished run's page and records never change
+/// upstream, so a re-armed batch resolves exactly as its first delivery
+/// did. A batch whose row is present is left alone, and so is a leg row
+/// a claim put in flight under another batch. The batch ids, run ids
+/// and leg task ids come from [`FixtureShape::in_flight_batch`], the
+/// shape the lane delivers against.
+///
+/// Returns every armed in-flight index `k`, ascending: a batch bound to
+/// its fixture run with no completion recorded — the freshly seeded
+/// ones, those an earlier call re-armed and the lane has not delivered,
+/// and those this call re-armed. A batch delivered and awaiting its
+/// alarm is not armed. The answer is the whole set, not this call's
+/// increment, so a caller replaces its queue with it and never holds a
+/// batch twice. Bounded by the in-flight group
+/// ([`FixtureShape::IN_FLIGHT_ROWS`]): two keyed reads and one restore
+/// over at most that many rows, never the queue.
+pub async fn rearm_in_flight(
+    db: &DurableDb,
+    shape: FixtureShape,
+    min_age_minutes: u32,
+) -> Result<Vec<u32>, QueueError> {
+    let batches: Vec<(u32, stow_types::fixture::InFlightBatch)> = (0..FixtureShape::IN_FLIGHT_ROWS)
+        .map(|k| (k, shape.in_flight_batch(k)))
+        .collect();
+    let encode = |ids: Vec<String>| {
+        serde_json::to_string(&ids)
+            .map_err(|error| QueueError::Sql(format!("encode in-flight ids: {error}")))
+    };
+    let present: std::collections::BTreeMap<String, HeldBatchRow> = db
+        .query(
+            "SELECT batch_id, github_run_id, done_run_id FROM build_batches \
+             WHERE batch_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(encode(
+            batches
+                .iter()
+                .map(|(_, batch)| batch.batch_id.to_string())
+                .collect(),
+        )?)
+        .fetch_all::<HeldBatchRow>()
+        .await
+        .map_err(|error| format!("read in-flight batch rows: {error}"))?
+        .into_iter()
+        .map(|row| (row.batch_id.clone(), row))
+        .collect();
+    let in_flight: std::collections::BTreeSet<String> = db
+        .query(
+            "SELECT task_id FROM queue \
+             WHERE task_id IN (SELECT value FROM json_each(?)) \
+               AND status IN ('dispatched', 'running')",
+        )
+        .bind(encode(
+            batches
+                .iter()
+                .map(|(_, batch)| batch.task_id.clone())
+                .collect(),
+        )?)
+        .fetch_scalars::<String>()
+        .await
+        .map_err(|error| format!("read in-flight leg rows: {error}"))?
+        .into_iter()
+        .collect();
+    let mut armed = Vec::with_capacity(batches.len());
+    let mut rearmed = Vec::new();
+    for (k, batch) in &batches {
+        match present.get(&batch.batch_id.to_string()) {
+            Some(row) => {
+                if row.done_run_id.is_none()
+                    && row.github_run_id.as_deref() == Some(batch.run_id.to_string().as_str())
+                {
+                    armed.push(*k);
+                }
+            }
+            None if !in_flight.contains(&batch.task_id) => {
+                armed.push(*k);
+                rearmed.push(shape.in_flight_row(*k));
+            }
+            None => {}
+        }
+    }
+    restore_queue_rows(db, shape, min_age_minutes, &rearmed).await?;
+    Ok(armed)
+}
+
+/// A fixture batch row's run binding, for [`rearm_in_flight`].
+#[derive(Debug, skyzen::FromRow)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "the fields are build_batches' column names, which FromRow maps by name"
+)]
+struct HeldBatchRow {
+    batch_id: String,
+    github_run_id: Option<String>,
+    done_run_id: Option<String>,
 }
 
 /// Seed the `phase`'s dependency edges for owner rows `(lo, hi]` — the
@@ -674,14 +995,15 @@ pub async fn seed_edges_chunk(
     // (stow#588): the claim's `deps_met = 1` gate admits only rows
     // whose every edge is met — met means the dep row is published —
     // so claimable rows' children point at the completed range. The
-    // rows the claim can pick — the human-lane pin and the
-    // `DISPATCH_ELIGIBLE_ROWS` window the fixture plants just above
-    // it — all point at that pool. The claimable population is then
-    // fixed at every fixture size — pool dependents are exactly the
-    // planted window — and the claimed set's node-store closure is
-    // `{claimed, their pool nodes}`: depth 2, identical at every
-    // fixture size, the way the in-flight count and the slice delta
-    // are already pinned.
+    // human-lane pin and the `DISPATCH_ELIGIBLE_ROWS` window the
+    // fixture plants just above it share that pool — the pins' edges
+    // keep them unblocked for the lane probes even though their parked
+    // `not_before` takes them out of the claimable set. The claimable
+    // population is then fixed at every fixture size — pool dependents
+    // are exactly the planted span — and the claimed set's node-store
+    // closure is `{claimed, their pool nodes}`: depth 2, identical at
+    // every fixture size, the way the in-flight count and the slice
+    // delta are already pinned.
     //
     // Every other edge spreads over the WHOLE queue — origin/dev's
     // distribution: mixed met/unmet, the bulk shape the demand walk
@@ -1052,9 +1374,11 @@ async fn rearm_feed_window(db: &DurableDb, shape: FixtureShape) -> Result<(), Qu
 ///   `enqueued` one.
 /// - Mutated seeded rows: retry's failed pair, cancel's pair,
 ///   promote's miss-lane row, purge's deleted pair, the resync's row
-///   101 and the complete-run target are re-written through the seed's
-///   own column formulas ([`restore_queue_rows`]) — a row a probe moved
-///   or deleted returns to seeded truth.
+///   101 and the whole in-flight group (the drives' running and
+///   dispatched rows, and every leg the callback lane's deliveries
+///   resolved) are re-written through the seed's own column formulas
+///   ([`restore_queue_rows`]) — a row a probe or the lane moved or
+///   deleted returns to seeded truth.
 /// - Claimed rows: the pass records the ids its own claim moved out
 ///   of `pending` into probe control state
 ///   ([`record_probe_claimed`]); the re-arm restores exactly those
@@ -1116,10 +1440,14 @@ pub async fn rearm(
             .await
             .map_err(|error| QueueError::Sql(format!("re-arm inserted rows: {error}")))?;
     }
+    // The seeded rings are the sample table's intended cost state —
+    // the wholesale delete above removes them with the learned rows,
+    // so re-plant them (stow#833).
+    seed_sample_rings(db).await?;
     // The mutation drives' exact targets. `pending_row`/`failed_row`
     // and friends are the same positional helpers the drives select
     // with, so the restore cannot drift from the selectors.
-    let restored = [
+    let mut restored = vec![
         101, // the resync's fixture identity (its edge set re-seeded below)
         FixtureShape::pending_row(701),
         FixtureShape::pending_row(702),
@@ -1128,9 +1456,25 @@ pub async fn rearm(
         shape.failed_row(1),
         shape.completed_row(0),
         shape.completed_row(1),
-        shape.running_row(),
-        shape.dispatched_row(0),
     ];
+    // The whole in-flight group: the drives move the running and
+    // dispatched rows, and the traffic-cost callback lane's deliveries
+    // resolve any of them (stow#833). Each returns as a bound in-flight
+    // leg, so the batch rows `restore_batch_rows` rewrites below are
+    // held by a leg in flight — never orphans the next pass's stale-batch
+    // sweep would pay to delete.
+    restored.extend((0..FixtureShape::IN_FLIGHT_ROWS).map(|k| shape.in_flight_row(k)));
+    // The delta report's retire band: its dispatch tail's shape
+    // requeue can flip those completed deps back to `pending` (the
+    // repair the corrected `shape_requeue` seed finally lets the
+    // drives see, stow#785) — re-seed them to completed truth.
+    {
+        let live = shape.slice_live_rows(0);
+        let first = shape.slice_first_row(0);
+        for i in 0..super::drives::DELTA_ROWS {
+            restored.push(first + (live - 1 - i) * 9);
+        }
+    }
     // The attempt the running target is at *before* the upsert rewrites
     // it to the seeded 1 — read first so the restore below can step the
     // epoch forward instead of letting the next pass reuse it.
@@ -1153,6 +1497,9 @@ pub async fn rearm(
     // in `settings` under [`PROBE_CLAIMED_KEY`] so the set survives
     // between `POST /budget` calls.
     let claimed_ns = restore_claimed_rows(db, shape, min_age_minutes).await?;
+    // The hot pass's batch rows die with its claims; the in-flight
+    // rows' one-slot batches return whole.
+    restore_batch_rows(db, shape).await?;
     rearm_feed_window(db, shape).await?;
     // Row 101's seeded edge set: the resync's delta sync rewrote it.
     db.query("DELETE FROM queue_dependencies WHERE task_id = printf('%064x', ?)")
@@ -1201,7 +1548,7 @@ pub async fn rearm(
     // dependents of every dep a drive touched — recomputed through the
     // same expressions the production transitions use, over a set
     // bounded by the touched ids, not by the queue.
-    let mut touched: Vec<u32> = restored.to_vec();
+    let mut touched: Vec<u32> = restored.clone();
     touched.extend_from_slice(&claimed_ns);
     for i in 0..super::drives::DELTA_ROWS {
         touched.push(first + (live - 1 - i) * 9);
@@ -1275,7 +1622,8 @@ pub const fn counted_table(phase: SeedPhase) -> Option<CountedTable> {
         | SeedPhase::DepsMet
         | SeedPhase::FeedHeaders
         | SeedPhase::FeedPages
-        | SeedPhase::FeedStaged => None,
+        | SeedPhase::FeedStaged
+        | SeedPhase::OutcomeBuckets => None,
     }
 }
 
@@ -1342,6 +1690,12 @@ pub async fn seed_batch(
                 seed_feed_staged_chunk(db, feed_staged_pages(shape), n, hi).await?;
                 if hi >= phase.range_end(shape) {
                     fix_feed_staging_counters(db, shape).await?;
+                }
+            }
+            SeedPhase::OutcomeBuckets => {
+                seed_outcome_buckets_chunk(db, shape, n, hi).await?;
+                if hi >= phase.range_end(shape) {
+                    seed_sample_rings(db).await?;
                 }
             }
         }
@@ -1482,6 +1836,88 @@ async fn fix_feed_staging_counters(db: &DurableDb, shape: FixtureShape) -> Resul
     Ok(())
 }
 
+/// `queue_rows/16` outcome buckets (clamped `108–64_000`) — the stored
+/// bulk a `attempt_outcome_buckets` scan must be priced against, grown
+/// with the fixture so the bulk-growth check reads it (stow#816). The
+/// floor is the full key space: nine targets times twelve
+/// five-minute offsets.
+fn outcome_bucket_rows(shape: FixtureShape) -> u32 {
+    (shape.queue_rows / 16).clamp(108, 64_000)
+}
+
+/// One bounded `OutcomeBuckets` chunk. Each `n` writes a distinct
+/// `(target, bucket)` key — the target rotates every `offsets` rows,
+/// the bucket steps one width per row — so the table ends at exactly
+/// `outcome_bucket_rows` records whatever the replay. The buckets sit
+/// at and ahead of the current one: the completion expiry delete can
+/// never retire the bulk a scan must be measured against inside a
+/// probe run. `OR IGNORE` keeps a replayed cursor a dedupe pass.
+async fn seed_outcome_buckets_chunk(
+    db: &DurableDb,
+    shape: FixtureShape,
+    n: u32,
+    hi: u32,
+) -> Result<(), QueueError> {
+    if hi <= n {
+        return Ok(());
+    }
+    let offsets = outcome_bucket_rows(shape).div_ceil(target_count());
+    let target_case = target_case_sql(&format!("(n / {offsets})"));
+    let bucket_secs = super::queue::OUTCOME_BUCKET_SECS;
+    db.query(&format!(
+        "WITH RECURSIVE seq(n) AS ({}) \
+         INSERT OR IGNORE INTO attempt_outcome_buckets \
+             (target, bucket, outcomes, failures) \
+         SELECT {target_case}, \
+                (unixepoch('now') / {bucket_secs}) * {bucket_secs} \
+                    + (n % {offsets}) * {bucket_secs}, \
+                n % 5 + 1, 0 \
+         FROM seq",
+        seq_sql(n, hi),
+    ))
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("seed outcome buckets: {error}")))?;
+    Ok(())
+}
+
+/// `BUILD_SAMPLE_WINDOW` sample rows for every `(crate_name, target)`
+/// key the planted dispatch window carries. A busy key's ring sits at
+/// the cap in production, and every resolved batch leg pays the cap
+/// delete and the median recompute over it — an empty table would let
+/// the resolution drives measure ~5-entry rings and under-price the
+/// steady state (stow#833). The keys derive from the same constants
+/// the window is planted from — `w` runs `(HUMAN_LANE_ROWS,
+/// HUMAN_LANE_ROWS + DISPATCH_ELIGIBLE_ROWS]` with
+/// `'crate' || (w / CRATE_NAME_ROWS)` and the row's target arm — so
+/// the ring count depends on the window alone, never `queue_rows`.
+/// `generation_id`s are deterministic ring ids no claim can mint, so
+/// `INSERT OR IGNORE` keeps a replayed completion arm a dedupe pass.
+async fn seed_sample_rings(db: &DurableDb) -> Result<(), QueueError> {
+    let human_end = FixtureShape::HUMAN_LANE_ROWS;
+    let eligible_end = human_end + FixtureShape::DISPATCH_ELIGIBLE_ROWS;
+    let target_case = target_case_sql("w");
+    db.query(&format!(
+        "WITH RECURSIVE seq(n) AS ({}), \
+         window(w) AS (SELECT {human_end} + 1 UNION ALL \
+                       SELECT w + 1 FROM window WHERE w < {eligible_end}) \
+         INSERT OR IGNORE INTO crate_build_samples \
+             (crate_name, target, generation_id, duration_ms) \
+         SELECT 'crate' || (w / {CRATE_NAME_ROWS}), {target_case}, \
+                'seed-ring-' || printf('%016x', n), 45000 + n * 1400 \
+         FROM window CROSS JOIN seq",
+        seq_sql(
+            0,
+            u32::try_from(crate::scheduler::queue::BUILD_SAMPLE_WINDOW)
+                .expect("the sample window fits u32"),
+        ),
+    ))
+    .execute()
+    .await
+    .map_err(|error| QueueError::Sql(format!("seed sample rings: {error}")))?;
+    Ok(())
+}
+
 /// Seed the whole fixture on the host path — the same chunks the/// Seed the whole fixture on the host path — the same chunks the
 /// workerd probe writes, looped until the seed reports done.
 ///
@@ -1534,6 +1970,26 @@ const SEED_TABLES: &[&str] = &[
     // that are pending in the new shape, a chain whose depth grows
     // with the size delta (stow#588).
     "task_nodes",
+    // The feed tables are fixture state the same way: the feed phases
+    // write them `INSERT OR IGNORE` with ids that roll from 1, so the
+    // previous size's rows survive the wipe untouched — a larger
+    // fixture's retained pages and staged bulk persist into the
+    // smaller shape, and the feed drives measure a live window sized
+    // for the old fixture (stow#772 — the `cleanup disturbed live
+    // bulk` breach, same defect class as `task_nodes`).
+    "demand_feed_pages",
+    "demand_feed_hours",
+    // The breaker's outcome bulk is fixture state the same way: the
+    // seed writes it `INSERT OR IGNORE` with time-derived keys, so a
+    // previous size's rows — or a previous run's buckets — survive the
+    // wipe and grow past the new shape's proportion (stow#816, same
+    // defect class as the feed tables above).
+    "attempt_outcome_buckets",
+    // The seeded sample rings are fixture state the same way: a
+    // learned sample from a previous seed's drives would otherwise
+    // survive into a ring that must sit at exactly
+    // `BUILD_SAMPLE_WINDOW` (stow#833).
+    "crate_build_samples",
 ];
 
 /// `POST /budget/seed` — load the fixture through the operator path,
@@ -1764,6 +2220,7 @@ const fn seed_phase_tag(phase: SeedPhase) -> &'static str {
         SeedPhase::FeedHeaders => "feed_headers",
         SeedPhase::FeedPages => "feed_pages",
         SeedPhase::FeedStaged => "feed_staged",
+        SeedPhase::OutcomeBuckets => "outcome_buckets",
     }
 }
 
@@ -1779,6 +2236,7 @@ fn parse_seed_phase(tag: &str) -> Option<SeedPhase> {
         "feed_headers" => Some(SeedPhase::FeedHeaders),
         "feed_pages" => Some(SeedPhase::FeedPages),
         "feed_staged" => Some(SeedPhase::FeedStaged),
+        "outcome_buckets" => Some(SeedPhase::OutcomeBuckets),
         _ => None,
     }
 }
@@ -1925,6 +2383,142 @@ mod tests {
         assert!(
             reset_ns.len() > 5 && reset_ns.windows(2).all(|pair| pair[1] > pair[0]),
             "reset's n is rows wiped so far — strictly increasing across calls: {reset_ns:?}"
+        );
+    }
+
+    /// The reset wipe's table list is the seed's whole write set: a
+    /// reset seed at a smaller size must leave the feed tables and the
+    /// outcome-bucket bulk holding exactly the new shape's rows. The
+    /// feed phases insert `OR IGNORE` with ids that roll from 1, so
+    /// anything the smaller seed does not write is stale bulk
+    /// surviving the wipe (stow#772 — the 1M fixture's staged pages
+    /// persisted into the 100k shape and the cleanup drive read them
+    /// as live bulk).
+    #[tokio::test]
+    async fn reset_seed_clears_the_feed_tables_the_seed_writes() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        let run = |reset, queue_rows| {
+            let db = &db;
+            let settings = &settings;
+            async move {
+                let mut first = true;
+                loop {
+                    let report = seed(
+                        db,
+                        &SchedulerSeedRequest {
+                            queue_rows: Some(queue_rows),
+                            reset: Some(reset && first),
+                            batch: Some(50),
+                        },
+                        settings,
+                    )
+                    .await
+                    .expect("seed call");
+                    first = false;
+                    if report.done {
+                        return;
+                    }
+                }
+            }
+        };
+
+        run(false, 800).await;
+        // Both shapes clamp to the same hour count at these sizes, so
+        // a stale header — and a stale page under it — is planted to
+        // stand in for history a larger fixture leaves.
+        db.query(
+            "INSERT INTO demand_feed_hours (hour, generation, state) \
+             VALUES ('1900-01-01T00', 1, 'delivered')",
+        )
+        .execute()
+        .await
+        .expect("plant stale hour");
+        db.query(
+            "INSERT INTO demand_feed_pages \
+             (hour, generation, page_no, entry_count, page_hash, chain_hash, payload) \
+             VALUES ('1900-01-01T00', 1, 0, 1, 'x', 'x', 'x')",
+        )
+        .execute()
+        .await
+        .expect("plant stale page");
+        // The outcome buckets clamp to the same count too — a stale
+        // row under a key the seed never writes stands in the same
+        // way (stow#816).
+        db.query(
+            "INSERT INTO attempt_outcome_buckets (target, bucket, outcomes, failures) \
+             VALUES ('stale-target', 1, 1, 0)",
+        )
+        .execute()
+        .await
+        .expect("plant stale outcome bucket");
+        // The seeded sample rings are fixture state too — a row under
+        // a key the seed never writes stands in the same way (stow#833).
+        db.query(
+            "INSERT INTO crate_build_samples \
+             (crate_name, target, generation_id, duration_ms) \
+             VALUES ('stale-crate', 'stale-target', 'stale-gen', 1)",
+        )
+        .execute()
+        .await
+        .expect("plant stale sample row");
+        run(true, 200).await;
+
+        let small = FixtureShape { queue_rows: 200 };
+        let hours = db
+            .query("SELECT COUNT(*) FROM demand_feed_hours")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count hours");
+        assert_eq!(
+            hours,
+            i64::from(feed_hist_hours(small)) + 1,
+            "seeded history headers plus the staging hour — no stale rows"
+        );
+        let pages = db
+            .query("SELECT COUNT(*) FROM demand_feed_pages")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count pages");
+        assert_eq!(
+            pages,
+            i64::from(feed_hist_pages(small) + feed_staged_pages(small) + FEED_OBSOLETE_TAIL),
+            "retained pages plus staging bulk and its obsolete tail — no stale rows"
+        );
+        let buckets = db
+            .query("SELECT COUNT(*) FROM attempt_outcome_buckets")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count outcome buckets");
+        assert_eq!(
+            buckets,
+            i64::from(outcome_bucket_rows(small)),
+            "seeded outcome bulk — no stale rows"
+        );
+        assert_seeded_sample_rings(&db).await;
+    }
+
+    /// The window's `(crate_name, target)` keys: `w` runs
+    /// `(HUMAN_LANE_ROWS, HUMAN_LANE_ROWS + DISPATCH_ELIGIBLE_ROWS]`
+    /// and every 50-row crate block covers all `CI_TARGET_TRIPLES`
+    /// arms, so the ring count is the window's constant key count ×
+    /// `BUILD_SAMPLE_WINDOW` at every fixture size (stow#833).
+    async fn assert_seeded_sample_rings(db: &DurableDb) {
+        let human_end = i64::from(FixtureShape::HUMAN_LANE_ROWS);
+        let eligible_end = human_end + i64::from(FixtureShape::DISPATCH_ELIGIBLE_ROWS);
+        let keys = (eligible_end / i64::from(CRATE_NAME_ROWS)
+            - (human_end + 1) / i64::from(CRATE_NAME_ROWS)
+            + 1)
+            * i64::try_from(CI_TARGET_TRIPLES.len()).expect("target count fits i64");
+        let samples = db
+            .query("SELECT COUNT(*) FROM crate_build_samples")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("count build samples");
+        assert_eq!(
+            samples,
+            keys * crate::scheduler::queue::BUILD_SAMPLE_WINDOW,
+            "seeded rings at the cap — no stale rows"
         );
     }
 
@@ -2392,6 +2986,156 @@ mod tests {
         );
     }
 
+    /// A coverage oracle that covers nothing — the cold-cache shape.
+    struct NothingCovered;
+
+    impl crate::scheduler::queue::CoverageOracle for NothingCovered {
+        fn covered(
+            &self,
+            _identities: &[crate::scheduler::queue::SemanticTaskIdentity],
+        ) -> impl std::future::Future<
+            Output = Result<
+                std::collections::BTreeSet<crate::scheduler::queue::SemanticTaskIdentity>,
+                QueueError,
+            >,
+        > + Send {
+            std::future::ready(Ok(std::collections::BTreeSet::new()))
+        }
+    }
+
+    /// The in-flight rows hold dispatch slots, and the planted window
+    /// outlasts one full batched pass on the slots they leave free:
+    /// a pass claims at most `free / k` batches of `B` legs, the
+    /// claimable planted rows exceed that — the human pins sit ahead
+    /// of the window in claim order but their parked `not_before`
+    /// refuses them, so the claimable population is the window alone —
+    /// and a real pass over the seeded fixture takes every slot it can
+    /// from planted rows alone — so the claim never reaches a row an
+    /// earlier drive left claimable, at any fixture size (the window
+    /// is a constant).
+    #[tokio::test]
+    async fn planted_window_exceeds_one_full_batched_pass() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        seed_production_shape(&db, &GATE, settings.dispatch_min_age_minutes)
+            .await
+            .expect("seed");
+        let crate::scheduler::queue::Dispatch::Limited(limit) = settings.dispatch else {
+            panic!("default dispatch is limited");
+        };
+
+        let held: i64 = db
+            .query("SELECT SUM(parallelism) FROM build_batches")
+            .fetch_scalar()
+            .await
+            .expect("held slots");
+        let in_flight: i64 = db
+            .query("SELECT COUNT(*) FROM queue WHERE status IN ('dispatched', 'running')")
+            .fetch_scalar()
+            .await
+            .expect("in-flight rows");
+        assert_eq!(
+            (held, in_flight),
+            (
+                i64::from(FixtureShape::IN_FLIGHT_ROWS),
+                i64::from(FixtureShape::IN_FLIGHT_ROWS)
+            ),
+            "every in-flight row holds exactly one slot"
+        );
+        let unbound: i64 = db
+            .query(
+                "SELECT COUNT(*) FROM queue WHERE status IN ('dispatched', 'running') \
+                 AND (batch_id IS NULL OR batch_leg != 0 \
+                      OR batch_id NOT IN (SELECT batch_id FROM build_batches))",
+            )
+            .fetch_scalar()
+            .await
+            .expect("unbound in-flight rows");
+        assert_eq!(unbound, 0, "every in-flight row is leg 0 of its own batch");
+
+        let free = limit.get() - FixtureShape::IN_FLIGHT_ROWS;
+        let most_legs = free / settings.batch_parallelism * settings.batch_max_tasks;
+        let claimable: u32 = db
+            .query(
+                "SELECT COUNT(*) FROM queue WHERE status = 'pending' \
+                 AND dispatch_eligible = 1 AND deps_met = 1 AND blocked = 0 \
+                 AND not_before <= datetime('now')",
+            )
+            .fetch_scalar()
+            .await
+            .expect("claimable planted rows");
+        assert!(
+            claimable > most_legs,
+            "{claimable} claimable planted rows must exceed the {most_legs} legs one pass \
+             can claim on {free} free slots"
+        );
+
+        let claimed =
+            crate::scheduler::queue::claim_dispatchable_tasks(&db, &settings, &NothingCovered)
+                .await
+                .expect("claim");
+        let slots: u32 = claimed.iter().map(|batch| batch.parallelism).sum();
+        assert_eq!(slots, free, "the pass fills every free slot");
+        // The parked pins refuse the claim, so the claimed set is the
+        // `DISPATCH_ELIGIBLE_ROWS` span alone — a pin reaching the
+        // claim would mean the `not_before` park regressed.
+        let window = (FixtureShape::HUMAN_LANE_ROWS + 1)
+            ..=(FixtureShape::HUMAN_LANE_ROWS + FixtureShape::DISPATCH_ELIGIBLE_ROWS);
+        for task in claimed.iter().flat_map(|batch| &batch.tasks) {
+            let n = u32::try_from(
+                u64::from_str_radix(&task.task_id, 16).expect("fixture task ids are hex"),
+            )
+            .expect("fixture row number fits u32");
+            assert!(
+                window.contains(&n),
+                "claimed row {n} lies outside the planted window {window:?}"
+            );
+        }
+    }
+
+    /// The floor-claim drive's pass stays in the planted window too:
+    /// applying the admission floor recomputes `dispatch_eligible` from
+    /// each row's value, so a bulk row the seed parked but valued at or
+    /// above the floor would turn claimable — and its edges follow the
+    /// size-dependent bulk formula, so the claimed set's node-store
+    /// walk would change with the fixture size (stow#833).
+    #[tokio::test]
+    async fn floored_claim_stays_inside_the_planted_window() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        seed_production_shape(&db, &GATE, settings.dispatch_min_age_minutes)
+            .await
+            .expect("seed");
+        let floored = crate::scheduler::queue::SchedulerSettings {
+            min_dispatch_value: crate::scheduler::queue::VALUE_BAND,
+            ..settings
+        };
+        crate::scheduler::queue::apply_dispatch_floor(&db, &floored)
+            .await
+            .expect("apply floor");
+        let claimed =
+            crate::scheduler::queue::claim_dispatchable_tasks(&db, &floored, &NothingCovered)
+                .await
+                .expect("claim");
+        let window = (FixtureShape::HUMAN_LANE_ROWS + 1)
+            ..=(FixtureShape::HUMAN_LANE_ROWS + FixtureShape::DISPATCH_ELIGIBLE_ROWS);
+        let outside: Vec<u32> = claimed
+            .iter()
+            .flat_map(|batch| &batch.tasks)
+            .map(|task| {
+                u32::try_from(
+                    u64::from_str_radix(&task.task_id, 16).expect("fixture task ids are hex"),
+                )
+                .expect("fixture row number fits u32")
+            })
+            .filter(|n| !window.contains(n))
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "the floored pass claimed rows outside the planted window {window:?}: {outside:?}"
+        );
+    }
+
     /// No fixture node may have a fan-in that grows with queue size:
     /// the dependents a purge or dep expansion walks are bounded by the
     /// shape's own constants, not by stored bulk (stow#588 — the first
@@ -2416,8 +3160,9 @@ mod tests {
                 .fetch_one::<FanIn>()
                 .await
                 .expect("fan-in");
-            // The pinned leaf takes the human-lane pin plus the
-            // DISPATCH_ELIGIBLE_ROWS window — under a hundred edges.
+            // The pinned pool takes the human-lane pin plus the
+            // DISPATCH_ELIGIBLE_ROWS window — under two hundred edges
+            // spread over 64 leaves.
             // Spread picks distribute the rest so no other dep node
             // comes near; the bound is comfortably above both because
             // the exact max is a spread detail the size check does not
@@ -2428,5 +3173,222 @@ mod tests {
                 row.widest
             );
         }
+    }
+
+    /// One in-flight queue row's batch binding, as the drift test reads
+    /// it back.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, skyzen::FromRow)]
+    struct InFlightLegRow {
+        task_id: String,
+        rustc_version: String,
+        batch_id: Option<String>,
+        batch_leg: Option<i64>,
+    }
+
+    /// A seeded queue row's rustc, as the drift test reads it.
+    #[derive(Debug, skyzen::FromRow)]
+    struct SeededRustcRow {
+        task_id: String,
+        rustc_version: String,
+    }
+
+    /// One `build_batches` row's identity, as the drift test reads it.
+    #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, skyzen::FromRow)]
+    struct BatchIdentityRow {
+        batch_id: String,
+        rustc_version: String,
+        github_run_id: Option<String>,
+    }
+
+    /// The edge seed and `stow_types::fixture` describe one fixture: the
+    /// traffic-cost harness derives the in-flight batches it delivers,
+    /// the runs it seeds upstream and the records tags it publishes from
+    /// [`FixtureShape::in_flight_batch`] and `seeded_rustc`, while the
+    /// seed writes them through `RUSTC_CASE_SQL`, the batch-id SQL and
+    /// `CAST(n AS TEXT)`. Seeded and read back, the two must agree row
+    /// for row — a drift would have the lane deliver completions for
+    /// batches the store does not hold, under runs nobody bound.
+    #[tokio::test]
+    async fn seeded_in_flight_batches_match_the_shared_fixture_shape() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        seed_production_shape(&db, &GATE, settings.dispatch_min_age_minutes)
+            .await
+            .expect("seed");
+        let expected: Vec<_> = (0..FixtureShape::IN_FLIGHT_ROWS)
+            .map(|k| GATE.in_flight_batch(k))
+            .collect();
+
+        let mut batches = db
+            .query("SELECT batch_id, rustc_version, github_run_id FROM build_batches")
+            .fetch_all::<BatchIdentityRow>()
+            .await
+            .expect("batch rows");
+        batches.sort();
+        let mut want: Vec<_> = expected
+            .iter()
+            .map(|batch| BatchIdentityRow {
+                batch_id: batch.batch_id.to_string(),
+                rustc_version: batch.rustc_version.to_owned(),
+                github_run_id: Some(batch.run_id.to_string()),
+            })
+            .collect();
+        want.sort();
+        assert_eq!(batches, want, "build_batches rows against in_flight_batch");
+
+        let mut legs = db
+            .query(
+                "SELECT task_id, rustc_version, batch_id, batch_leg FROM queue \
+                 WHERE status IN ('dispatched', 'running')",
+            )
+            .fetch_all::<InFlightLegRow>()
+            .await
+            .expect("in-flight rows");
+        legs.sort();
+        let mut want: Vec<_> = expected
+            .iter()
+            .map(|batch| InFlightLegRow {
+                task_id: batch.task_id.clone(),
+                rustc_version: batch.rustc_version.to_owned(),
+                batch_id: Some(batch.batch_id.to_string()),
+                batch_leg: Some(0),
+            })
+            .collect();
+        want.sort();
+        assert_eq!(legs, want, "in-flight queue rows against in_flight_batch");
+
+        // `seeded_rustc` is the rustc of every seeded row, not only the
+        // in-flight ones: the harness names rustc namespaces from it.
+        let rows = db
+            .query("SELECT task_id, rustc_version FROM queue WHERE task_id NOT LIKE '%-%'")
+            .fetch_all::<SeededRustcRow>()
+            .await
+            .expect("seeded rows");
+        assert_eq!(
+            rows.len(),
+            GATE.queue_rows as usize,
+            "every seeded row read"
+        );
+        for SeededRustcRow {
+            task_id,
+            rustc_version: rustc,
+        } in rows
+        {
+            let n = u64::from_str_radix(&task_id, 16).expect("a seeded task id is %064x");
+            assert_eq!(
+                stow_types::fixture::task_hex_id(n),
+                task_id,
+                "task id of row {n}"
+            );
+            assert_eq!(
+                rustc,
+                stow_types::fixture::seeded_rustc(n),
+                "rustc of row {n}"
+            );
+        }
+    }
+
+    /// The callback lane's refill answers every armed batch and re-arms
+    /// exactly the resolved ones: a fresh fixture is all armed and
+    /// rewrites nothing; a delivered batch awaiting its alarm drops out;
+    /// a resolved batch comes back bound to its own run with its leg in
+    /// flight; a resolved batch whose leg a claim put in flight elsewhere
+    /// stays out, its leg untouched.
+    #[tokio::test]
+    async fn rearm_answers_the_armed_set_and_restores_only_resolved_batches() {
+        let db = memory_db().await.expect("memory db");
+        let settings = crate::scheduler::queue::SchedulerSettings::default();
+        let min_age = settings.dispatch_min_age_minutes;
+        seed_production_shape(&db, &GATE, min_age)
+            .await
+            .expect("seed");
+        let all: Vec<u32> = (0..FixtureShape::IN_FLIGHT_ROWS).collect();
+        assert_eq!(
+            rearm_in_flight(&db, GATE, min_age).await.expect("rearm"),
+            all,
+            "a fresh fixture is all armed"
+        );
+
+        let [delivered, resolved, stolen] = [0, 1, 2].map(|k| GATE.in_flight_batch(k));
+        crate::scheduler::queue::record_batch_completion(
+            &db,
+            &delivered.batch_id.to_string(),
+            &stow_types::api::BatchRunComplete {
+                run_id: delivered.run_id,
+                run_attempt: 1,
+                conclusion: "success".to_owned(),
+                html_url: format!("https://github.invalid/runs/{}", delivered.run_id),
+            },
+        )
+        .await
+        .expect("record the delivery");
+        for (batch, leg_batch) in [(&resolved, None), (&stolen, Some("elsewhere"))] {
+            db.query("DELETE FROM build_batches WHERE batch_id = ?")
+                .bind(batch.batch_id.to_string())
+                .execute()
+                .await
+                .expect("resolve the batch");
+            let status = if leg_batch.is_some() {
+                "running"
+            } else {
+                "completed"
+            };
+            db.query("UPDATE queue SET status = ?, batch_id = ?, batch_leg = 0 WHERE task_id = ?")
+                .bind(status.to_owned())
+                .bind(leg_batch.map(str::to_owned))
+                .bind(batch.task_id.clone())
+                .execute()
+                .await
+                .expect("settle the leg");
+        }
+
+        let armed = rearm_in_flight(&db, GATE, min_age).await.expect("rearm");
+        let want: Vec<u32> = all.iter().copied().filter(|&k| k != 0 && k != 2).collect();
+        assert_eq!(armed, want, "delivered and stolen batches are not armed");
+
+        let row = db
+            .query("SELECT batch_id, rustc_version, github_run_id FROM build_batches WHERE batch_id = ?")
+            .bind(resolved.batch_id.to_string())
+            .fetch_optional::<BatchIdentityRow>()
+            .await
+            .expect("re-armed batch row")
+            .expect("the resolved batch is bound again");
+        assert_eq!(row.github_run_id, Some(resolved.run_id.to_string()));
+        let leg = db
+            .query(
+                "SELECT task_id, rustc_version, batch_id, batch_leg FROM queue \
+                 WHERE task_id = ? AND status IN ('dispatched', 'running')",
+            )
+            .bind(resolved.task_id.clone())
+            .fetch_optional::<InFlightLegRow>()
+            .await
+            .expect("re-armed leg")
+            .expect("the resolved leg is in flight again");
+        assert_eq!(leg.batch_id, Some(resolved.batch_id.to_string()));
+
+        let stolen_leg: Option<String> = db
+            .query("SELECT batch_id FROM queue WHERE task_id = ?")
+            .bind(stolen.task_id.clone())
+            .fetch_scalar()
+            .await
+            .expect("stolen leg");
+        assert_eq!(
+            stolen_leg.as_deref(),
+            Some("elsewhere"),
+            "a claimed leg is left alone"
+        );
+        let stolen_rows = count_rows_where(&db, &stolen.batch_id.to_string()).await;
+        assert_eq!(
+            stolen_rows, 0,
+            "no batch row is rewritten under a claimed leg"
+        );
+    }
+
+    async fn count_rows_where(db: &DurableDb, batch_id: &str) -> i64 {
+        db.query("SELECT COUNT(*) FROM build_batches WHERE batch_id = ?")
+            .bind(batch_id.to_owned())
+            .fetch_scalar()
+            .await
+            .expect("count batch rows")
     }
 }

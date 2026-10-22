@@ -613,6 +613,255 @@ fn crate_lane_drops_bundled_lockfile() {
     assert_eq!(units_named(&out, "dep")[0].version, "1.0.1");
 }
 
+/// A fetched crate's dev-dependencies are not the consumer's graph
+/// (stow#829): the lane strips the tables before resolving, so a
+/// dev-dependency whose requirement cannot resolve — `semver
+/// 0.9.0`'s yanked-only `crates-index` — never fails the resolve, and
+/// a resolvable dev-dependency never leaks into the emitted units.
+#[test]
+fn crate_lane_strips_dev_dependencies() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    for (name, version) in [("dep", "1.0.0"), ("devdep", "1.0.0")] {
+        publish(
+            &reg,
+            &Fixture {
+                name,
+                version,
+                deps: vec![],
+                target_deps: vec![],
+                features: &[],
+                yanked: false,
+                proc_macro: false,
+            },
+        );
+    }
+    // An unpacked `.crate` root: a normal dependency plus a
+    // dev-dependency — one entry resolvable (`devdep`), one that can
+    // never resolve (`missing` is not published at all).
+    let package_dir = work.path().join("crate-root-0.0.0");
+    std::fs::create_dir_all(package_dir.join("src")).unwrap();
+    std::fs::write(package_dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        package_dir.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "dependencies": { "dep": "1" },
+            "dev-dependencies": { "devdep": "1", "missing": "1" },
+        })),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions::default(),
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .unwrap();
+    assert_eq!(units_named(&out, "dep")[0].version, "1.0.0");
+    assert!(
+        units_named(&out, "devdep").is_empty(),
+        "a dev-dependency never joins the emitted graph"
+    );
+}
+
+/// The strip reaches `[target.'cfg(_)'.dev-dependencies]` too — cargo
+/// resolves target-gated tables for every cfg, so an unresolvable one
+/// would fail the fetch-path resolve the same as a top-level table.
+#[test]
+fn crate_lane_strips_target_dev_dependencies() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "devdep",
+            version: "1.0.0",
+            deps: vec![],
+            target_deps: vec![],
+            features: &[],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    let package_dir = work.path().join("crate-root-0.0.0");
+    std::fs::create_dir_all(package_dir.join("src")).unwrap();
+    std::fs::write(package_dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        package_dir.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "target": {
+                "cfg(unix)": { "dev-dependencies": { "devdep": "9" } },
+            },
+        })),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions::default(),
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .unwrap();
+    assert!(
+        units_named(&out, "devdep").is_empty(),
+        "a target-gated dev-dependency never joins the emitted graph"
+    );
+}
+
+/// stow#831: a feature may name a dev-dependency — hashbrown's
+/// `nightly = ["bumpalo/allocator_api"]` — and for a consumer the
+/// entry is inert, so the strip removes it with the table: the
+/// manifest resolves, and the emptied feature still resolves when a
+/// consumer requests it.
+#[test]
+fn crate_lane_strips_feature_entries_naming_dev_dependencies() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "devdep",
+            version: "1.0.0",
+            deps: vec![],
+            target_deps: vec![],
+            features: &[("x", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    // An unpacked `.crate` root shaped like hashbrown 0.15.5: the only
+    // declaration of `devdep` is the dev-dependency table `nightly`
+    // names.
+    let package_dir = work.path().join("crate-root-0.0.0");
+    std::fs::create_dir_all(package_dir.join("src")).unwrap();
+    std::fs::write(package_dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        package_dir.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "dev-dependencies": { "devdep": "1" },
+            "features": { "nightly": ["devdep/x"] },
+        })),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    let targets = vec!["x86_64-unknown-linux-gnu".to_owned()];
+    resolver
+        .resolve_package_dir(&package_dir, &ResolveOptions::default(), &targets)
+        .expect("the stripped manifest resolves");
+    resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions {
+                features: vec!["nightly".to_owned()],
+                ..ResolveOptions::default()
+            },
+            &targets,
+        )
+        .expect("the emptied `nightly` feature still resolves when requested");
+}
+
+/// The weak-dependency spelling `name?/feat` purges the same way.
+#[test]
+fn crate_lane_strips_weak_feature_entries_naming_dev_dependencies() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "devdep",
+            version: "1.0.0",
+            deps: vec![],
+            target_deps: vec![],
+            features: &[("x", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    let package_dir = work.path().join("crate-root-0.0.0");
+    std::fs::create_dir_all(package_dir.join("src")).unwrap();
+    std::fs::write(package_dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        package_dir.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "dev-dependencies": { "devdep": "1" },
+            "features": { "nightly": ["devdep?/x"] },
+        })),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions {
+                features: vec!["nightly".to_owned()],
+                ..ResolveOptions::default()
+            },
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .expect("the stripped manifest resolves");
+}
+
+/// A name declared by BOTH `[dependencies]` and `[dev-dependencies]`
+/// keeps its feature entries — only a key the strip removed entirely
+/// is purged, so `f` still enables `x` on `dep`.
+#[test]
+fn crate_lane_keeps_feature_entries_for_a_still_declared_name() {
+    let work = tempfile::tempdir().unwrap();
+    let reg = work.path().join("registry");
+    std::fs::create_dir_all(&reg).unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "dep",
+            version: "1.0.0",
+            deps: vec![],
+            target_deps: vec![],
+            features: &[("x", &[])],
+            yanked: false,
+            proc_macro: false,
+        },
+    );
+    let package_dir = work.path().join("crate-root-0.0.0");
+    std::fs::create_dir_all(package_dir.join("src")).unwrap();
+    std::fs::write(package_dir.join("src/lib.rs"), "").unwrap();
+    std::fs::write(
+        package_dir.join("Cargo.toml"),
+        toml_document(&json!({
+            "package": { "name": "root", "version": "0.0.0", "edition": "2021" },
+            "dependencies": { "dep": "1" },
+            "dev-dependencies": { "dep": "1", "devdep": "1" },
+            "features": { "f": ["dep/x", "devdep/x"] },
+        })),
+    )
+    .unwrap();
+    let (_home, resolver) = resolver_at(&reg);
+    let out = resolver
+        .resolve_package_dir(
+            &package_dir,
+            &ResolveOptions {
+                features: vec!["f".to_owned()],
+                ..ResolveOptions::default()
+            },
+            &["x86_64-unknown-linux-gnu".to_owned()],
+        )
+        .expect("a still-declared name keeps its feature entry");
+    assert_eq!(
+        units_named(&out, "dep")[0].features,
+        ["x"],
+        "`dep/x` survived the strip and `f` enabled it on `dep`"
+    );
+}
+
 /// A git dep resolves to the sha the dropped lockfile pinned, not the
 /// branch's head.
 #[test]
@@ -1353,8 +1602,10 @@ fn git_dep_with_lock(
 /// Caller-owned inputs stay caller-owned (stow#540):
 /// `resolve_package_dir` reads the package tree and drops only its
 /// bundled `Cargo.lock` — the lane's existing contract — while the
-/// manifest and sources the caller provided survive verbatim, and the
-/// semantic output is unchanged.
+/// manifest and sources the caller provided survive verbatim (the
+/// lane's one manifest mutation, dev-dependency stripping, leaves a
+/// manifest without those tables byte-for-byte), and the semantic
+/// output is unchanged.
 #[test]
 fn resolve_package_dir_preserves_the_callers_tree() {
     let work = tempfile::tempdir().unwrap();

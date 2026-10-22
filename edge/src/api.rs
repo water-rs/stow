@@ -84,7 +84,7 @@ async fn extract_trusted_caller(
         })?;
     github_auth::authenticate(
         &config,
-        &github_auth::CfGitHubTrust::new(OutboundPool::new()),
+        &github_auth::CfGitHubTrust::new(OutboundPool::new(), config.probe_base_url.clone()),
         &jwks,
         &push_verdicts,
         &bearer,
@@ -474,6 +474,35 @@ pub async fn admin_scheduler_budget(
     Ok(Json(
         scheduler_client::scheduler_budget(&scheduler, &request).await?,
     ))
+}
+
+/// `POST /api/v1/admin/scheduler/budget/rearm`
+///
+/// Re-arm the seeded fixture's in-flight batches the traffic-cost
+/// callback lane's deliveries resolved and answer every armed one, so
+/// each delivery it fires is a first delivery (stow#833). Same deploy-var
+/// guard as the seed route.
+pub async fn admin_scheduler_budget_rearm(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+    Json(request): Json<stow_types::api::SchedulerRearmRequest>,
+) -> Result<Json<stow_types::api::SchedulerRearmReport>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::rearm_budget_fixture(&scheduler, &request).await?,
+    ))
+}
+
+/// `GET /api/v1/admin/scheduler/budget/ledger`
+///
+/// The scheduler Durable Object's billed `rowsRead`/`rowsWritten` per
+/// operation since the store's last reset — what the `Preheat cost`
+/// lane (stow#773) diffs between a wave's layers. Same deploy-var guard
+/// as the seed route.
+pub async fn admin_scheduler_budget_ledger(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::SchedulerLedger>, GetArtifactError> {
+    Ok(Json(scheduler_client::scheduler_ledger(&scheduler).await?))
 }
 
 /// `POST /api/v1/admin/scheduler/demand`

@@ -721,13 +721,14 @@ pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<
 
 /// The subset of `identities` the catalog serves: servable rows (each
 /// with a published bundle) exist for the exact crate, version, features,
-/// target and rustc at every unit shape the identity's side requires —
+/// target, rustc and dependency identity at every unit shape the
+/// identity's side requires —
 /// see `required_unit_shapes`: a host-side identity is covered only when
 /// the slice serves both the native-shape and the `--target`-shape host
 /// units its consumers' builds look up. One `IN (VALUES ...)` statement
-/// per batch of twenty identities keeps every statement at D1's
-/// 100-bound-parameter ceiling (five params per identity); the floor and
-/// shape filters apply in memory, on the rows the semantic match
+/// per batch of sixteen identities keeps every statement at D1's
+/// 100-bound-parameter ceiling (six params per identity); the floor and
+/// shape filters apply in memory, on the rows the contextual match
 /// returned.
 ///
 /// The batches are independent reads, so they issue concurrently under
@@ -748,7 +749,7 @@ pub async fn covered_semantic_identities(
     db: &Db,
     identities: &[SemanticTaskIdentity],
 ) -> Result<BTreeSet<SemanticTaskIdentity>, DbError> {
-    const PARAMS_PER_IDENTITY: usize = 5;
+    const PARAMS_PER_IDENTITY: usize = 6;
     const BATCH: usize = sql_batch::D1_MAX_BOUND_PARAMS / PARAMS_PER_IDENTITY;
     // Each batch future owns its `Db` clone and `Vec` of identities, so
     // the oracle's `impl Future + Send` proof rests on owned data and
@@ -778,11 +779,11 @@ async fn covered_batch(
     batch: Vec<SemanticTaskIdentity>,
 ) -> Result<BTreeSet<SemanticTaskIdentity>, DbError> {
     let sql = format!(
-        "SELECT crate_name, version, features_json, target, rustc_version, min_glibc, \
+        "SELECT crate_name, version, features_json, target, rustc_version, dependency_identity, min_glibc, \
                 unit_side, unit_invocation, unit_linked \
          FROM artifacts \
-         WHERE (crate_name, version, features_json, target, rustc_version) IN (VALUES {})",
-        sql_batch::values_rows("(?, ?, ?, ?, ?)", batch.len())
+         WHERE (crate_name, version, features_json, target, rustc_version, dependency_identity) IN (VALUES {})",
+        sql_batch::values_rows("(?, ?, ?, ?, ?, ?)", batch.len())
     );
     let mut query = db.query(&sql);
     for identity in &batch {
@@ -791,7 +792,8 @@ async fn covered_batch(
             .bind(identity.version.as_str())
             .bind(identity.features_json.as_str())
             .bind(identity.target.as_str())
-            .bind(identity.rustc_version.as_str());
+            .bind(identity.rustc_version.as_str())
+            .bind(identity.dependency_identity.as_str());
     }
     let rows = query
         .fetch_all::<CoveredIdentityRow>()
@@ -801,7 +803,7 @@ async fn covered_batch(
     // the identity's side needs, and every contributing row must be
     // loadable on a baseline host — an over-floor row serves nothing.
     let mut shapes_by_identity =
-        BTreeMap::<(String, String, String, String, String), BTreeSet<UnitShape>>::new();
+        BTreeMap::<(String, String, String, String, String, String), BTreeSet<UnitShape>>::new();
     for row in rows {
         let floor = decode_min_glibc(row.min_glibc.as_deref()).map_err(|error| {
             DbError::Invariant(format!(
@@ -826,6 +828,7 @@ async fn covered_batch(
                 row.features_json,
                 row.target,
                 row.rustc_version,
+                row.dependency_identity,
             ))
             .or_default()
             .insert(shape);
@@ -849,6 +852,7 @@ async fn covered_batch(
                     identity.features_json.clone(),
                     identity.target.clone(),
                     identity.rustc_version.clone(),
+                    identity.dependency_identity.clone(),
                 ))
                 .is_some_and(|shapes| shapes.contains(shape))
         });
@@ -866,6 +870,7 @@ struct CoveredIdentityRow {
     features_json: String,
     target: String,
     rustc_version: String,
+    dependency_identity: String,
     unit_side: i64,
     unit_invocation: i64,
     unit_linked: i64,
@@ -1436,6 +1441,9 @@ mod sqlite_tests {
             features_json: features_json.to_owned(),
             target: target.to_owned(),
             rustc_version: RUSTC.to_owned(),
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity")
+                .to_string(),
             host_side: false,
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         };
@@ -1448,6 +1456,65 @@ mod sqlite_tests {
                 .await
                 .expect("coverage");
         assert_eq!(covered, BTreeSet::from([exact.clone()]));
+    }
+
+    /// stow#787: a tuple published under a different dependency context
+    /// covers nothing — the scheduler's edges gate on digest-exact slice
+    /// rows, so retiring a node whose own digest never published strands
+    /// its dependents forever. The same tuple is covered only under the
+    /// matching dependency identity.
+    #[tokio::test]
+    async fn coverage_matches_the_dependency_context() {
+        let db = skyzen_services::Db::connect_sqlite_memory()
+            .await
+            .expect("memory db");
+        apply_schema(&db).await;
+        let mut record = artifact_record(FIRST_DIGEST);
+        let other_digest = "f".repeat(64);
+        record.dependency_identity =
+            stow_types::identity::DependencyIdentity::parse(other_digest.clone()).expect("digest");
+        let check_record = ArtifactRecord {
+            c_metadata: CMetadata::parse("bbbb0000bbbb0000").expect("check c_metadata"),
+            extra_filename: "-bbbb0000bbbb0000".to_owned(),
+            compile_key: "checkcheckcheckcheck".to_owned(),
+            emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
+            unit_shape: stow_types::public_cache::UnitShape {
+                kind: stow_types::public_cache::UnitKind::Unlinked,
+                ..record.unit_shape
+            },
+            oci_reference: format!("{}.check", record.oci_reference),
+            ..record.clone()
+        };
+        insert_artifact_records(&db, &[record.clone(), check_record])
+            .await
+            .expect("insert");
+        let mut identity = SemanticTaskIdentity {
+            crate_name: record.crate_name.as_str().to_owned(),
+            version: record.version.to_string(),
+            features_json: record.features_json.raw(),
+            target: TARGET.to_owned(),
+            rustc_version: RUSTC.to_owned(),
+            host_side: false,
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity")
+                .to_string(),
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        };
+        assert_eq!(
+            covered_semantic_identities(&db, std::slice::from_ref(&identity))
+                .await
+                .expect("coverage"),
+            BTreeSet::new(),
+            "a different-context publication must not cover the pending node"
+        );
+        identity.dependency_identity = other_digest;
+        assert_eq!(
+            covered_semantic_identities(&db, std::slice::from_ref(&identity))
+                .await
+                .expect("coverage"),
+            BTreeSet::from([identity]),
+            "the matching-context publication covers it"
+        );
     }
 
     /// A host-side node is covered only when the slice serves every
@@ -1467,6 +1534,9 @@ mod sqlite_tests {
             features_json: "[]".to_owned(),
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity")
+                .to_string(),
             host_side: true,
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         };
@@ -1653,6 +1723,9 @@ mod sqlite_tests {
                 .raw(),
             target: TARGET.to_owned(),
             rustc_version: RUSTC.to_owned(),
+            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                .expect("leaf identity")
+                .to_string(),
             host_side: false,
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
@@ -1861,14 +1934,14 @@ mod coverage_concurrency_tests {
 
     /// The two rows that cover one bound identity: a target-side
     /// identity's native invocation requires the unlinked and linked
-    /// target shapes, so every five-param tuple maps to both.
+    /// target shapes, so every six-param tuple maps to both.
     fn covering_rows(params: &[DbValue]) -> Vec<serde_json::Value> {
         let text = |value: &DbValue| match value {
             DbValue::Text(text) => text.clone(),
             _ => panic!("identity params bind as text"),
         };
         params
-            .chunks(5)
+            .chunks(6)
             .flat_map(|bound| {
                 [UnitKind::Unlinked, UnitKind::Linked].map(|kind| {
                     serde_json::json!({
@@ -1877,6 +1950,7 @@ mod coverage_concurrency_tests {
                         "features_json": text(&bound[2]),
                         "target": text(&bound[3]),
                         "rustc_version": text(&bound[4]),
+                        "dependency_identity": text(&bound[5]),
                         "unit_side": UnitSide::Target.to_int(),
                         "unit_invocation": UnitInvocation::Native.to_int(),
                         "unit_linked": kind.to_int(),
@@ -1904,6 +1978,7 @@ mod coverage_concurrency_tests {
             target: "x86_64-unknown-linux-gnu".to_owned(),
             rustc_version: "1.85.0".to_owned(),
             host_side: false,
+            dependency_identity: format!("{index:064x}"),
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
         }
     }
@@ -1933,9 +2008,10 @@ mod coverage_concurrency_tests {
         );
     }
 
-    /// One hundred and one identities fan out to six batches: the peak
-    /// admission equals the outbound ceiling — never more — and every
-    /// batch's covered identities still merge into the result.
+    /// One hundred and one identities fan out to seven batches of
+    /// sixteen: the peak admission equals the outbound ceiling — never
+    /// more — and every batch's covered identities still merge into the
+    /// result.
     #[tokio::test]
     async fn concurrency_stays_at_the_outbound_bound() {
         let (db, state) = held_db(HeldResponse::ServeBound);
@@ -1944,7 +2020,7 @@ mod coverage_concurrency_tests {
             .await
             .expect("coverage");
         assert_eq!(covered.len(), 101, "every served identity covers");
-        assert_eq!(state.issued.load(Ordering::SeqCst), 6);
+        assert_eq!(state.issued.load(Ordering::SeqCst), 7);
         assert_eq!(
             state.max_in_flight.load(Ordering::SeqCst),
             MAX_OUTBOUND_INFLIGHT,
@@ -1978,6 +2054,7 @@ mod coverage_concurrency_tests {
             "features_json": "[]",
             "target": "x86_64-unknown-linux-gnu",
             "rustc_version": "1.85.0",
+            "dependency_identity": "0000000000000000000000000000000000000000000000000000000000000000",
             "unit_side": 9,
             "unit_invocation": 0,
             "unit_linked": 0,

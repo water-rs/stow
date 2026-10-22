@@ -22,6 +22,8 @@ use crate::db;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
+use crate::scheduler::batching::FormedBatch;
+use crate::scheduler::dispatch::BuildRuns as _;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{budget, fixture};
@@ -38,6 +40,8 @@ const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
 const STOW_MIN_DISPATCH_VALUE_BINDING: &str = "STOW_MIN_DISPATCH_VALUE";
+const STOW_BATCH_PARALLELISM_BINDING: &str = "STOW_BATCH_PARALLELISM";
+const STOW_BATCH_MAX_TASKS_BINDING: &str = "STOW_BATCH_MAX_TASKS";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -88,6 +92,10 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
         .unwrap_or(defaults.human_daily_task_budget),
         min_dispatch_value: read_optional_i64_binding(env, STOW_MIN_DISPATCH_VALUE_BINDING)?
             .unwrap_or(defaults.min_dispatch_value),
+        batch_parallelism: read_optional_u32_binding(env, STOW_BATCH_PARALLELISM_BINDING)?
+            .unwrap_or(defaults.batch_parallelism),
+        batch_max_tasks: read_optional_u32_binding(env, STOW_BATCH_MAX_TASKS_BINDING)?
+            .unwrap_or(defaults.batch_max_tasks),
     })
 }
 
@@ -164,10 +172,10 @@ impl DurableObject for Scheduler {
                 "/promote".post(queue_promote),
                 "/purge".post(queue_purge),
             )),
-            // The GitHub `workflow_run` webhook's completion channel —
-            // carries task id + outcome and no attempt, which
-            // `queue::complete_run` resolves against the live row.
-            "/tasks/complete-run".post(complete_run),
+            // The batched run's completion channel (stow#833 §3.2):
+            // the report lands on the `build_batches` row verbatim and
+            // the alarm pass resolves each leg from it.
+            "/batches/{batch_id}/complete".post(complete_batch),
             // The human request lane (stow#428): admit deduplicates on
             // the request id and dispatches `resolve-request.yml`;
             // `outcome` is the resolve job's report channel and
@@ -189,6 +197,8 @@ impl DurableObject for Scheduler {
             // carry; production requests hit the guard and 404.
             "/budget".post(scheduler_budget),
             "/budget/seed".post(scheduler_budget_seed),
+            "/budget/rearm".post(scheduler_budget_rearm),
+            "/budget/ledger".at(scheduler_budget_ledger),
             // Trusted demand batches — #522's demand input; reached
             // from `POST /api/v1/admin/scheduler/demand`.
             "/demand".post(scheduler_demand),
@@ -257,6 +267,47 @@ async fn scheduler_budget_seed(
     ))
 }
 
+/// `POST /budget/rearm` — re-arm the seeded fixture's in-flight batches
+/// the callback lane's deliveries resolved and answer every armed one
+/// (stow#833). Same guard as the seed endpoint; a request naming another fixture size than the seeded
+/// one is a 409, since its batch and run ids would not be the store's.
+/// Reached from `POST /api/v1/admin/scheduler/budget/rearm`.
+async fn scheduler_budget_rearm(
+    env: WasmEnv,
+    db: DurableDb,
+    Json(request): Json<stow_types::api::SchedulerRearmRequest>,
+) -> Result<Json<stow_types::api::SchedulerRearmReport>> {
+    if !budget_probe_enabled(&env) {
+        return Err(
+            Error::msg("scheduler budget probe is not enabled on this deploy")
+                .set_status(StatusCode::NOT_FOUND),
+        );
+    }
+    let cursor = fixture::read_seed_cursor(&db)
+        .await
+        .map_err(to_error)?
+        .ok_or_else(|| {
+            Error::msg("no fixture was seeded — nothing to re-arm").set_status(StatusCode::CONFLICT)
+        })?;
+    let seeded = fixture::seed_cursor_shape(&cursor).map_err(to_error)?;
+    if seeded != request.queue_rows {
+        return Err(Error::msg(format!(
+            "re-arm names a {}-row fixture, but the store was seeded at {seeded} rows",
+            request.queue_rows
+        ))
+        .set_status(StatusCode::CONFLICT));
+    }
+    let settings = scheduler_settings(&env)?;
+    let armed = fixture::rearm_in_flight(
+        &db,
+        fixture::FixtureShape { queue_rows: seeded },
+        settings.dispatch_min_age_minutes,
+    )
+    .await
+    .map_err(to_error)?;
+    Ok(Json(stow_types::api::SchedulerRearmReport { armed }))
+}
+
 /// `POST /budget` — replay every drive under the metering backend and
 /// return the real `rowsRead`/`rowsWritten` per route. Same guard as the
 /// seed endpoint. Reached from `POST /api/v1/admin/scheduler/budget`.
@@ -280,7 +331,26 @@ async fn scheduler_budget(
     ))
 }
 
-fn budget_probe_enabled(env: &WasmEnv) -> bool {
+/// `GET /budget/ledger` — the per-operation billed rows the meter booked
+/// since the last reset (stow#773). Same guard as the seed endpoint.
+/// Reached from `GET /api/v1/admin/scheduler/budget/ledger`.
+async fn scheduler_budget_ledger(
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::SchedulerLedger>> {
+    if !budget_probe_enabled(&env) {
+        return Err(
+            Error::msg("scheduler budget probe is not enabled on this deploy")
+                .set_status(StatusCode::NOT_FOUND),
+        );
+    }
+    Ok(Json(meter::ledger(&db).await.map_err(to_error)?))
+}
+
+/// Whether this deploy carries the budget probe — `STOW_SCHEDULER_BUDGET=1`,
+/// the mock stack only. The probe routes answer and the meter books its
+/// per-operation ledger only then.
+pub(super) fn budget_probe_enabled(env: &WasmEnv) -> bool {
     read_optional_string_binding(env, budget::BUDGET_PROBE_BINDING)
         .is_some_and(|value| value == "1")
 }
@@ -533,51 +603,41 @@ async fn refuse_if_frozen(db: &DurableDb) -> Result<()> {
     Ok(())
 }
 
-/// `POST /tasks/complete-run` — the edge's webhook route forwards GitHub's
-/// `workflow_run` event here; the report carries the task id and outcome
-/// but no attempt, which `complete_run` resolves against the live row.
-///
-/// A completion for a task the queue never held answers 404, not 500 —
-/// the report references nothing real. A row whose live attempt or
-/// status no longer matches what the event describes answers 409 — the
-/// row moved on, and the webhook logs both rather than propagating them:
-/// a retried delivery changes nothing about a row that already moved.
-async fn complete_run(
+/// `POST /batches/{batch_id}/complete` — the edge's webhook forwards a
+/// `build-batch.yml` run's `completed` delivery here (stow#833 §3.2).
+/// The write lands even while `github_run_id` is still NULL — an early
+/// webhook that beat the dispatch response — and a duplicate delivery
+/// is a no-op 2xx. A batch the store does not hold answers 404: the
+/// run named nothing real, so the webhook logs the orphan rather than
+/// retrying it.
+async fn complete_batch(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
-    Json(report): Json<stow_types::api::WorkflowRunComplete>,
+    params: Params,
+    Json(report): Json<stow_types::api::BatchRunComplete>,
 ) -> Result<Json<OkResponse>> {
-    let freeze = freeze_settings(&env)?;
-    queue::complete_run(
-        &db,
-        &scheduler_settings(&env)?,
-        &report,
-        freeze.window_minutes,
-    )
-    .await
-    .map_err(|error| {
-        let status = match &error {
-            crate::errors::QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-            crate::errors::QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        to_error(error).set_status(status)
-    })?;
-    // A failed attempt may have closed the window's trip condition —
-    // evaluate while this request still holds the outcome row's write
-    // context. The freeze then eats the dispatch the alarm was about
-    // to run.
-    if !report.success {
-        evaluate_dispatch_freeze(&env, &db, &freeze).await?;
-    }
-    // Same handoff as submit: the run's report is acknowledged as soon
-    // as the queue row lands, and the alarm's dispatch pass — not this
-    // request — runs claim plus the GitHub fan-out. The completion may
-    // leave nothing dispatchable (a failure with an empty queue, a
-    // finished backlog): `schedule_alarm` arms no wake then (stow#444).
+    queue::record_batch_completion(&db, batch_id_param(&params)?, &report)
+        .await
+        .map_err(|error| {
+            let status = match &error {
+                QueueError::UnknownBatch(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            to_error(error).set_status(status)
+        })?;
+    // A recorded completion is resolution work for the alarm — arm the
+    // pass the row's `resolve_after` points at.
     schedule_alarm(&env, &db, &alarm).await?;
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// The `{batch_id}` path parameter — verbatim; a completion naming an
+/// id the store does not hold is the route's 404.
+fn batch_id_param(params: &Params) -> Result<&str> {
+    params
+        .get("batch_id")
+        .map_err(|_| Error::msg("batch id is required").set_status(StatusCode::BAD_REQUEST))
 }
 
 async fn status(db: DurableDb) -> Result<Json<stow_types::api::SchedulerStatus>> {
@@ -742,31 +802,38 @@ pub(super) async fn admit_request_pass(
         max_closure: admission.max_closure,
         dispatched_at,
     };
-    // The same credential arm as `dispatch_pass`: the cached installation
+    // The same backend arm as `dispatch_pass`: the cached installation
     // token — minted inline on expiry — or the mock stack's local-CI URL.
-    let credential = match credential_source {
-        CredentialSource::LocalCi(url) => dispatch::DispatchCredential::LocalCi(url),
-        CredentialSource::GitHub(config) => match github_app::installation_token(db, &config).await
-        {
-            Ok(token) => dispatch::DispatchCredential::GitHub(token),
-            Err(error) => {
-                let error = dispatch::DispatchError::TokenMint(error.to_string());
-                queue::fail_request_dispatch(
-                    db,
-                    &admission.request_id,
-                    attempt,
-                    &error.to_string(),
-                )
-                .await
-                .map_err(to_error)?;
-                return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
-            }
-        },
-    };
     let pool = crate::fetch_guard::OutboundPool::new();
-    if let Err(error) =
-        dispatch::trigger_resolve(&dispatch_payload, &credential, &github_repo, &pool).await
-    {
+    let outcome = match credential_source {
+        CredentialSource::LocalCi(url) => {
+            dispatch::LocalCiBuildRuns::new(&url)
+                .trigger_resolve(&dispatch_payload, &github_repo, &pool)
+                .await
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(db, &config).await {
+                Ok(token) => {
+                    dispatch::GitHubBuildRuns::new(token)
+                        .trigger_resolve(&dispatch_payload, &github_repo, &pool)
+                        .await
+                }
+                Err(error) => {
+                    let error = dispatch::DispatchError::TokenMint(error.to_string());
+                    queue::fail_request_dispatch(
+                        db,
+                        &admission.request_id,
+                        attempt,
+                        &error.to_string(),
+                    )
+                    .await
+                    .map_err(to_error)?;
+                    return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
+                }
+            }
+        }
+    };
+    if let Err(error) = outcome {
         queue::fail_request_dispatch(db, &admission.request_id, attempt, &error.to_string())
             .await
             .map_err(to_error)?;
@@ -957,20 +1024,19 @@ fn iso_now() -> String {
 }
 
 /// After a failed completion, decide whether the trailing window trips
-/// the freeze. `apply_transition` owns the one-alert-per-transition
-/// rule: a live freeze answers `Unchanged` without rewriting the
-/// record or resending the alert. Storage and query errors propagate
-/// (loud); the alert's outcome only ever lands on the record.
+/// the freeze. `freeze_trip_draft` owns the database half — the
+/// already-frozen gate plus the window read — which the host cost
+/// drive calls too, so both arms bill the same statements.
+/// `apply_transition` owns the one-alert-per-transition rule: a live
+/// freeze answers `Unchanged` without rewriting the record or
+/// resending the alert. Storage and query errors propagate (loud);
+/// the alert's outcome only ever lands on the record.
 async fn evaluate_dispatch_freeze(
     env: &WasmEnv,
     db: &DurableDb,
     settings: &FreezeSettings,
 ) -> Result<()> {
-    // Cheap gate first — skip the window query entirely when frozen.
-    if queue::freeze_enabled(db).await.map_err(to_error)? {
-        return Ok(());
-    }
-    let Some(draft) = queue::evaluate_freeze_trip(db, settings)
+    let Some(draft) = queue::freeze_trip_draft(db, settings)
         .await
         .map_err(to_error)?
     else {
@@ -1060,14 +1126,18 @@ async fn record_published_index(
     alarm: Alarm,
     Json(slice): Json<stow_types::api::PublishedSlice>,
 ) -> Result<Json<OkResponse>> {
+    let settings = scheduler_settings(&env)?;
     match queue::record_published_slice(
         &db,
+        &settings,
         slice.target.as_str(),
         slice.rustc_version.as_str(),
-        slice.base_generation,
-        slice.generation,
-        &slice.added,
-        &slice.retired,
+        &stow_types::api::PublishedSliceReport {
+            base_generation: slice.base_generation,
+            generation: slice.generation,
+            added: slice.added,
+            retired: slice.retired,
+        },
     )
     .await
     {
@@ -1103,6 +1173,11 @@ async fn record_published_index(
 async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static str> {
     let multiplier = cost_budget_multiplier(&env)?;
     let (db, meter) = Meter::wrap(db);
+    let meter = if budget_probe_enabled(&env) {
+        meter.with_ledger_op(stow_types::do_budgets::LEDGER_OP_ALARM.to_owned())
+    } else {
+        meter
+    };
     let result = async {
         dispatch_pending(&env, &db).await.map_err(|error| {
             tracing::error!(%error, "scheduler alarm dispatch_pending failed");
@@ -1211,9 +1286,43 @@ fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
     )
 }
 
+/// The local CI a mock stack dispatches to — where the budget probe's
+/// batch-resolution drives seed the run their batch concluded as.
+///
+/// # Errors
+/// The deploy names no `STOW_LOCAL_CI_URL`: the probe runs only on mock
+/// stacks, and every one of them carries it.
+pub(super) fn local_ci_runs(env: &WasmEnv) -> Result<dispatch::LocalCiBuildRuns> {
+    match credential_source(env)? {
+        CredentialSource::LocalCi(url) => Ok(dispatch::LocalCiBuildRuns::new(&url)),
+        CredentialSource::GitHub(_) => Err(Error::msg(
+            "the budget probe's batch drives seed their runs on the local CI, \
+             but the deploy names no STOW_LOCAL_CI_URL",
+        )),
+    }
+}
+
+/// Cancel `run_id` on the local CI through the backend's own
+/// `cancel_run`, under the deploy's `GITHUB_REPO` — how the budget
+/// probe's lease-check drive ends the running run its setup seeded.
+///
+/// # Errors
+/// The deploy names no local CI or no repository, or the cancel failed.
+pub(super) async fn cancel_local_ci_run(env: &WasmEnv, run_id: u64) -> Result<()> {
+    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+    local_ci_runs(env)?
+        .cancel_run(
+            &github_repo,
+            run_id,
+            &crate::fetch_guard::OutboundPool::new(),
+        )
+        .await
+        .map_err(|error| Error::msg(format!("cancel local CI run {run_id}: {error}")))
+}
+
 /// The claim-plus-fan-out half of a dispatch pass, shared with the
 /// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
-/// `wall_ms` covers the concurrent `trigger_build` fan-out and the
+/// `wall_ms` covers the concurrent `dispatch_batch` fan-out and the
 /// counted-D1 coverage lookups a real wake pays. Returns the claimed
 /// task ids — the probe's claim record and the launch gate's claim
 /// count both derive from the pass's own set.
@@ -1223,149 +1332,668 @@ pub(super) async fn dispatch_pass(
     settings: &SchedulerSettings,
     coverage: &impl queue::CoverageOracle,
 ) -> Result<Vec<String>> {
-    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
-    let freeze = freeze_settings(env)?;
-    queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
-        .await
-        .map_err(to_error)?;
-    evaluate_dispatch_freeze(env, db, &freeze).await?;
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
-    let credential_source = credential_source(env)?;
-    let tasks = queue::claim_dispatchable_tasks(db, settings, coverage)
+    let bindings = PassBindings::read(env)?;
+    let scope = bindings.scope(env, db, settings);
+    // §4.3: expired leases settle first, so a completion the lease check
+    // recovers resolves in this same pass.
+    check_batch_leases(&scope, &bindings.credential_source).await?;
+    // §3.2: completed batches resolve before claiming — a resolved
+    // batch's freed slots fill this same pass.
+    resolve_ready_batches(&scope, &bindings.credential_source).await?;
+    let batches = queue::claim_dispatchable_tasks(db, settings, coverage)
         .await
         .map_err(to_error)?;
+    let task_ids: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| batch.tasks.iter().map(|task| task.task_id.clone()))
+        .collect();
     tracing::info!(
-        claimed = tasks.len(),
-        "scheduler dispatch_pending selected tasks"
+        batches = batches.len(),
+        claimed = task_ids.len(),
+        "scheduler dispatch_pending selected batches"
     );
-    if tasks.is_empty() {
+    if batches.is_empty() {
         return Ok(Vec::new());
     }
-    let task_ids: Vec<String> = tasks.iter().map(|task| task.task_id.clone()).collect();
 
-    // The credential resolves once per pass, only when tasks exist: the
+    // The backend resolves once per pass, only when batches exist: the
     // local-CI branch carries no Authorization; the GitHub branch reuses
     // the installation token cached in DO storage while more than five
     // minutes of validity remain and otherwise mints a fresh one. A
-    // failed mint is a dispatch failure for every claimed task — the same
-    // backoff a failed POST would get.
-    let credential = match credential_source {
+    // failed mint is a dispatch failure for every claimed batch — the
+    // same backoff a failed POST would get.
+    match &bindings.credential_source {
         CredentialSource::LocalCi(url) => {
             tracing::info!(url = %url, "dispatching via local-CI endpoint");
-            dispatch::DispatchCredential::LocalCi(url)
+            dispatch_batches(
+                db,
+                settings,
+                &dispatch::LocalCiBuildRuns::new(url),
+                batches,
+                &bindings.github_repo,
+            )
+            .await?;
         }
         CredentialSource::GitHub(config) => {
-            match github_app::installation_token(db, &config).await {
-                Ok(token) => dispatch::DispatchCredential::GitHub(token),
+            match github_app::installation_token(db, config).await {
+                Ok(token) => {
+                    dispatch_batches(
+                        db,
+                        settings,
+                        &dispatch::GitHubBuildRuns::new(token),
+                        batches,
+                        &bindings.github_repo,
+                    )
+                    .await?;
+                }
                 Err(error) => {
                     let error = dispatch::DispatchError::TokenMint(error.to_string());
-                    for task in &tasks {
-                        queue::mark_dispatch_failed(
-                            db,
-                            settings,
-                            &task.task_id,
-                            &task.generation_id,
-                            &error.to_string(),
-                        )
-                        .await
-                        .map_err(to_error)?;
-                        tracing::error!(task_id = %task.task_id, error = %error, "failed to dispatch build");
+                    for batch in &batches {
+                        queue::persist_batch_dispatch(db, settings, batch, Err(error.to_string()))
+                            .await
+                            .map_err(to_error)?;
                     }
-                    return Ok(task_ids);
                 }
             }
         }
-    };
-
-    // The fan-out runs concurrently, bounded twice at the invocation's
-    // outbound ceiling: the stream's `buffer_unordered` admits at most
-    // `MAX_OUTBOUND_INFLIGHT` (4) `workflow_dispatch` calls at once, and
-    // the pool slot `trigger_workflow` waits on enforces the same bound
-    // before any request posts.
-    let pool = crate::fetch_guard::OutboundPool::new();
-    let mut results = stream::iter(tasks.into_iter().enumerate())
-        .map(|(index, task)| {
-            // Each future owns its task and shares the credential,
-            // repo and pool by reference — copied per call so
-            // `async move` moves nothing out of the map closure.
-            let (credential, github_repo, pool) = (&credential, github_repo.as_str(), &pool);
-            async move {
-                let task_id = task.task_id.clone();
-                let generation_id = task.generation_id.clone();
-                (
-                    index,
-                    task_id,
-                    generation_id,
-                    dispatch::trigger_build(&task, credential, github_repo, pool).await,
-                )
-            }
-        })
-        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-        .collect::<Vec<_>>()
-        .await;
-    // A failed dispatch still marks exactly its own task, in the claim
-    // order the sequential loop wrote.
-    results.sort_unstable_by_key(|(index, _, _, _)| *index);
-    for (_, task_id, generation_id, result) in results {
-        persist_dispatch_outcome(db, settings, &task_id, &generation_id, result).await?;
     }
-
-    // A completion may have been persisted while this pass was waiting for
-    // the dispatch response. Consume it now that all returned identities are
-    // bound; the same join also makes this path restart-safe.
-    queue::reconcile_pending_completions(db, settings, freeze.window_minutes)
-        .await
-        .map_err(to_error)?;
-    evaluate_dispatch_freeze(env, db, &freeze).await?;
-
     Ok(task_ids)
 }
 
-async fn persist_dispatch_outcome(
+/// How long a batch whose jobs page cannot have settled yet — or one
+/// whose GitHub/GHCR read failed transiently — defers its resolution:
+/// the 30 s §3.2 grants the page to finish writing. The deferral ends
+/// at the batch's ceiling, where the batch fails instead
+/// ([`queue::defer_unresolved_batch`]).
+const BATCH_RESOLVE_DEFER_MS: i64 = 30_000;
+
+/// How long the lease check leaves a batch whose run lookup, cancel or
+/// token mint failed before the next pass asks again — without it the
+/// alarm would re-arm at `now` for as long as GitHub is failing. A
+/// batch at its ceiling is failed instead ([`queue::retry_unreadable_batch`]).
+const LEASE_RETRY_MS: i64 = BATCH_RESOLVE_DEFER_MS;
+
+/// The GHCR config the batch resolution's records check reads — the
+/// same binding the Worker's webhook builds for the per-task path
+/// (entry.rs).
+fn ghcr_config(env: &WasmEnv) -> crate::api::GhcrConfig {
+    crate::api::GhcrConfig {
+        base_url: read_optional_string_binding(env, crate::entry::GHCR_BASE_URL_BINDING)
+            .unwrap_or_else(|| crate::ghcr::default_base_url().to_owned()),
+        tokens: crate::registry_auth::RegistryTokens::default(),
+    }
+}
+
+/// The bindings an alarm pass's batch steps read, resolved once per
+/// pass.
+struct PassBindings {
+    github_repo: String,
+    freeze: FreezeSettings,
+    credential_source: CredentialSource,
+}
+
+impl PassBindings {
+    fn read(env: &WasmEnv) -> Result<Self> {
+        Ok(Self {
+            github_repo: read_string_binding(env, GITHUB_REPO_BINDING)?,
+            freeze: freeze_settings(env)?,
+            credential_source: credential_source(env)?,
+        })
+    }
+
+    fn scope<'a>(
+        &'a self,
+        env: &'a WasmEnv,
+        db: &'a DurableDb,
+        settings: &'a SchedulerSettings,
+    ) -> PassScope<'a> {
+        PassScope {
+            env,
+            db,
+            settings,
+            github_repo: &self.github_repo,
+            freeze: &self.freeze,
+        }
+    }
+}
+
+/// Which batch step of an alarm pass the budget probe runs on its own.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum BatchStep {
+    /// §4.3's lease check over the expired batches.
+    Leases,
+    /// §3.2's resolution of the completed batches.
+    Resolution,
+}
+
+/// One batch step of the dispatch pass, exactly as [`dispatch_pass`]
+/// runs it — the budget probe's `alarm pass (batch resolution)` and
+/// `alarm pass (lease check)` drives price the step alone.
+pub(super) async fn run_batch_step(
+    env: &WasmEnv,
     db: &DurableDb,
     settings: &SchedulerSettings,
-    task_id: &str,
-    generation_id: &str,
-    outcome: std::result::Result<dispatch::DispatchedRun, dispatch::DispatchError>,
+    step: BatchStep,
 ) -> Result<()> {
-    match outcome {
-        Ok(run) => match queue::bind_dispatch_run(
-            db,
-            task_id,
-            generation_id,
-            &run.workflow_run_id.to_string(),
-        )
-        .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
+    let bindings = PassBindings::read(env)?;
+    let scope = bindings.scope(env, db, settings);
+    match step {
+        BatchStep::Leases => check_batch_leases(&scope, &bindings.credential_source).await,
+        BatchStep::Resolution => resolve_ready_batches(&scope, &bindings.credential_source).await,
+    }
+}
+
+/// What one alarm pass's batch resolution reads from its caller —
+/// the bindings and handles every step of the pass shares.
+struct PassScope<'a> {
+    env: &'a WasmEnv,
+    db: &'a DurableDb,
+    settings: &'a SchedulerSettings,
+    github_repo: &'a str,
+    freeze: &'a FreezeSettings,
+}
+
+/// §4.3: settle every batch whose lease expired — before resolving
+/// and claiming, so a recorded completion resolves and a requeued leg
+/// is claimable in this same pass. It runs whether or not dispatch is
+/// paused: a paused scheduler still owes its in-flight builds the
+/// lease check.
+///
+/// An unbound batch (the dispatch response was lost) has no run to ask
+/// about and requeues its legs without any HTTP. The bound ones are
+/// looked up concurrently ([`check_bound_leases`]); the credential
+/// resolves only when one expired, like the other arms'.
+async fn check_batch_leases(
+    scope: &PassScope<'_>,
+    credential_source: &CredentialSource,
+) -> Result<()> {
+    let PassScope { db, settings, .. } = *scope;
+    let now_ms = now_ms();
+    let mut bound = Vec::new();
+    for batch in queue::expired_batches(db, now_ms).await.map_err(to_error)? {
+        match batch.run_id {
+            None => {
                 tracing::warn!(
-                    task_id = %task_id,
-                    run_id = run.workflow_run_id,
-                    "dispatch run binding skipped — the claimed generation moved on"
+                    batch_id = %batch.batch_id,
+                    "batch lease expired unbound — requeueing its legs"
                 );
+                queue::requeue_unbound_batch(db, settings, &batch.batch_id)
+                    .await
+                    .map_err(to_error)?;
+            }
+            Some(run_id) => bound.push((batch, run_id)),
+        }
+    }
+    if bound.is_empty() {
+        return Ok(());
+    }
+    match credential_source {
+        CredentialSource::LocalCi(url) => {
+            check_bound_leases(scope, &dispatch::LocalCiBuildRuns::new(url), bound, now_ms).await
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(db, config).await {
+                Ok(token) => {
+                    check_bound_leases(scope, &dispatch::GitHubBuildRuns::new(token), bound, now_ms)
+                        .await
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        batches = bound.len(),
+                        "installation token mint failed — leaving expired batches for the next pass"
+                    );
+                    for (batch, _) in &bound {
+                        queue::retry_unreadable_batch(db, batch, now_ms, LEASE_RETRY_MS)
+                            .await
+                            .map_err(to_error)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// What the lease check decided for one bound, expired batch.
+enum LeaseVerdict {
+    /// The run completed — record it as the webhook would have.
+    Completed(stow_types::api::BatchRunComplete),
+    /// The run is still going inside its ceiling.
+    Extend,
+    /// The run outlived its ceiling — cancel it, then fail the batch.
+    Cancel,
+    /// The lookup failed — the next pass asks again.
+    Retry,
+}
+
+/// One bound expired set's lease check. The run lookups, then the
+/// cancels of the runs past their ceiling, each run concurrently under
+/// the invocation's outbound bound; the queue writes apply
+/// sequentially afterward (`&DurableDb` is not `Send`, so it never
+/// enters a concurrent future).
+async fn check_bound_leases(
+    scope: &PassScope<'_>,
+    backend: &impl dispatch::BuildRuns,
+    bound: Vec<(queue::ExpiredBatch, u64)>,
+    now_ms: i64,
+) -> Result<()> {
+    let github_repo = scope.github_repo;
+    let pool = crate::fetch_guard::OutboundPool::new();
+    // Collected before streaming, like the dispatch fan-out's.
+    let lookups: Vec<_> = bound
+        .iter()
+        .map(|&(_, run_id)| backend.run_status(github_repo, run_id, &pool))
+        .collect();
+    let statuses = stream::iter(lookups)
+        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    let mut verdicts = Vec::with_capacity(bound.len());
+    for ((batch, run_id), status) in bound.iter().zip(statuses) {
+        verdicts.push(lease_verdict(batch, *run_id, status)?);
+    }
+    let cancels: Vec<_> = bound
+        .iter()
+        .zip(&verdicts)
+        .filter(|(_, verdict)| matches!(verdict, LeaseVerdict::Cancel))
+        .map(|(&(_, run_id), _)| backend.cancel_run(github_repo, run_id, &pool))
+        .collect();
+    let mut cancels = stream::iter(cancels)
+        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter();
+    for ((batch, run_id), verdict) in bound.iter().zip(verdicts) {
+        let cancelled = matches!(verdict, LeaseVerdict::Cancel).then(|| {
+            cancels
+                .next()
+                .expect("one cancel was issued per past-ceiling verdict")
+        });
+        apply_lease_verdict(scope, batch, *run_id, verdict, cancelled, now_ms).await?;
+    }
+    Ok(())
+}
+
+/// What the lease check decides for one bound, expired batch from its
+/// run's state.
+///
+/// # Errors
+/// A `completed` run with no conclusion is corrupt GitHub state.
+fn lease_verdict(
+    batch: &queue::ExpiredBatch,
+    run_id: u64,
+    status: std::result::Result<stow_types::runs::RunStatus, dispatch::DispatchError>,
+) -> Result<LeaseVerdict> {
+    Ok(match status {
+        Err(error) => {
+            tracing::error!(
+                batch_id = %batch.batch_id,
+                run_id,
+                %error,
+                "run status lookup failed — leaving the batch for the next pass"
+            );
+            LeaseVerdict::Retry
+        }
+        Ok(status) if status.status == "completed" => {
+            let conclusion = status.conclusion.ok_or_else(|| {
+                Error::msg(format!(
+                    "run {run_id} of batch {} is completed with no conclusion",
+                    batch.batch_id
+                ))
+            })?;
+            LeaseVerdict::Completed(stow_types::api::BatchRunComplete {
+                run_id,
+                run_attempt: status.run_attempt,
+                conclusion,
+                html_url: status.html_url,
+            })
+        }
+        Ok(_) if batch.past_ceiling => LeaseVerdict::Cancel,
+        Ok(_) => LeaseVerdict::Extend,
+    })
+}
+
+/// Apply one batch's verdict to the queue. `cancelled` is the cancel
+/// call's outcome for a [`LeaseVerdict::Cancel`] verdict, `None` for
+/// every other.
+async fn apply_lease_verdict(
+    scope: &PassScope<'_>,
+    batch: &queue::ExpiredBatch,
+    run_id: u64,
+    verdict: LeaseVerdict,
+    cancelled: Option<std::result::Result<(), dispatch::DispatchError>>,
+    now_ms: i64,
+) -> Result<()> {
+    let PassScope { db, settings, .. } = *scope;
+    let batch_id = batch.batch_id.as_str();
+    match verdict {
+        LeaseVerdict::Completed(report) => {
+            tracing::info!(
+                batch_id,
+                run_id,
+                conclusion = %report.conclusion,
+                "expired lease found its run completed — recording the lost delivery"
+            );
+            match queue::record_batch_completion(db, batch_id, &report).await {
+                Ok(()) => {}
+                // The row left between the lookup and the write; the run
+                // it named resolves nothing.
+                Err(QueueError::UnknownBatch(_)) => {
+                    tracing::warn!(batch_id, "batch gone before its completion was recorded");
+                }
+                Err(error) => return Err(to_error(error)),
+            }
+        }
+        LeaseVerdict::Extend => {
+            queue::extend_batch_lease(db, settings, batch_id, now_ms)
+                .await
+                .map_err(to_error)?;
+        }
+        LeaseVerdict::Cancel => match cancelled.expect("a cancel verdict carries its cancel") {
+            Ok(()) => {
+                tracing::error!(
+                    batch_id,
+                    run_id,
+                    "run exceeded its ceiling — cancelled, failing its legs"
+                );
+                queue::fail_batch_past_ceiling(db, batch_id, queue::CeilingFailure::RunOutlived)
+                    .await
+                    .map_err(to_error)?;
             }
             Err(error) => {
-                queue::mark_dispatch_failed(
-                    db,
-                    settings,
-                    task_id,
-                    generation_id,
-                    &error.to_string(),
-                )
-                .await
-                .map_err(to_error)?;
-                tracing::error!(task_id = %task_id, %error, "failed to bind dispatch run");
+                tracing::error!(
+                    batch_id,
+                    run_id,
+                    %error,
+                    "cancelling a run past its ceiling failed"
+                );
+                queue::retry_unreadable_batch(db, batch, now_ms, LEASE_RETRY_MS)
+                    .await
+                    .map_err(to_error)?;
             }
         },
-        Err(error) => {
-            queue::mark_dispatch_failed(db, settings, task_id, generation_id, &error.to_string())
+        LeaseVerdict::Retry => {
+            queue::retry_unreadable_batch(db, batch, now_ms, LEASE_RETRY_MS)
                 .await
                 .map_err(to_error)?;
-            tracing::error!(task_id = %task_id, error = %error, "failed to dispatch build");
         }
+    }
+    Ok(())
+}
+
+/// §3.2: resolve every batch whose `completed` delivery is bound and
+/// due — before claiming, so a freed slot fills this same pass. The
+/// backend resolves once, like the dispatch arm's: a token-mint
+/// failure defers every ready batch rather than burning it.
+async fn resolve_ready_batches(
+    scope: &PassScope<'_>,
+    credential_source: &CredentialSource,
+) -> Result<()> {
+    let PassScope { env, db, .. } = *scope;
+    let now_ms = now_ms();
+    let ready = queue::ready_batches(db, now_ms).await.map_err(to_error)?;
+    if ready.is_empty() {
+        return Ok(());
+    }
+    let ghcr = ghcr_config(env);
+    match credential_source {
+        CredentialSource::LocalCi(url) => {
+            resolve_batch_set(
+                scope,
+                &dispatch::LocalCiBuildRuns::new(url),
+                &ghcr,
+                ready,
+                now_ms,
+            )
+            .await
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(db, config).await {
+                Ok(token) => {
+                    resolve_batch_set(
+                        scope,
+                        &dispatch::GitHubBuildRuns::new(token),
+                        &ghcr,
+                        ready,
+                        now_ms,
+                    )
+                    .await
+                }
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        batches = ready.len(),
+                        "installation token mint failed — deferring batch resolution"
+                    );
+                    for batch in &ready {
+                        queue::defer_unresolved_batch(db, batch, now_ms, BATCH_RESOLVE_DEFER_MS)
+                            .await
+                            .map_err(to_error)?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// One ready-batch set's resolution fan-out — the outbound reads
+/// (jobs page, then a manifest read per successful leg) run
+/// concurrently under the invocation's outbound bound, the same bound
+/// the dispatch fan-out runs under. The queue writes apply
+/// sequentially afterward: `&DurableDb` is not `Send`, so it never
+/// enters a concurrent future.
+async fn resolve_batch_set(
+    scope: &PassScope<'_>,
+    backend: &impl dispatch::BuildRuns,
+    ghcr: &crate::api::GhcrConfig,
+    ready: Vec<queue::ReadyBatch>,
+    now_ms: i64,
+) -> Result<()> {
+    let PassScope {
+        env,
+        db,
+        settings,
+        github_repo,
+        freeze,
+    } = *scope;
+    let pool = crate::fetch_guard::OutboundPool::new();
+    let now = time::OffsetDateTime::from_unix_timestamp(now_ms / 1000)
+        .map_err(|error| Error::msg(format!("alarm clock out of range: {error}")))?;
+    // Collected before streaming: a closure inside the stream's type
+    // borrows each batch under a higher-ranked lifetime, and the alarm
+    // future then cannot prove itself `Send`.
+    let probes: Vec<_> = ready
+        .iter()
+        .map(|batch| probe_batch(backend, ghcr, github_repo, batch, &pool, now))
+        .collect();
+    let probes = stream::iter(probes)
+        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    for (batch, probe) in ready.iter().zip(probes) {
+        let Some(resolutions) = probe else {
+            queue::defer_unresolved_batch(db, batch, now_ms, BATCH_RESOLVE_DEFER_MS)
+                .await
+                .map_err(to_error)?;
+            continue;
+        };
+        if queue::resolve_batch(db, settings, batch, &resolutions, freeze.window_minutes)
+            .await
+            .map_err(to_error)?
+        {
+            evaluate_dispatch_freeze(env, db, freeze).await?;
+        }
+    }
+    Ok(())
+}
+
+/// One batch's outbound reads resolved into per-leg resolutions —
+/// `None` while any leg is unsettled or a read failed transiently
+/// (the caller defers the batch 30 s inside its ceiling and fails it at
+/// the ceiling, §3.2). Concurrent-safe: it
+/// touches nothing but the outbound pool.
+async fn probe_batch(
+    backend: &impl dispatch::BuildRuns,
+    ghcr: &crate::api::GhcrConfig,
+    github_repo: &str,
+    batch: &queue::ReadyBatch,
+    pool: &crate::fetch_guard::OutboundPool,
+    now: time::OffsetDateTime,
+) -> Option<Vec<queue::LegResolution>> {
+    let run_id = batch.run_id;
+    let jobs = match backend
+        .attempt_jobs(github_repo, run_id, batch.done_attempt, pool)
+        .await
+    {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            tracing::warn!(batch_id = %batch.batch_id, run_id, %error, "batch jobs page read failed — deferring");
+            return None;
+        }
+    };
+    let outcomes = queue::leg_outcomes(batch, &jobs, now);
+    // One GHCR manifest read per successful leg, concurrently under
+    // the same outbound bound — the tag pins the publish job's
+    // `run_attempt` (§3.1).
+    let checks: Vec<_> = batch
+        .legs
+        .iter()
+        .map(|leg| {
+            let outcome = &outcomes[index_to_usize(leg.batch_leg)];
+            leg_records_present(ghcr, batch, leg, outcome, run_id, pool)
+        })
+        .collect();
+    let checks = stream::iter(checks)
+        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    let mut confirmed = std::collections::BTreeSet::new();
+    for check in checks {
+        match check {
+            Ok(Some(leg_index)) => {
+                confirmed.insert(leg_index);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(batch_id = %batch.batch_id, run_id, %error, "batch records check failed — deferring");
+                return None;
+            }
+        }
+    }
+    let resolutions = queue::batch_resolutions(batch, &jobs, |leg| confirmed.contains(&leg), now);
+    if !batch
+        .legs
+        .iter()
+        .all(|leg| resolutions[index_to_usize(leg.batch_leg)].is_some())
+    {
+        tracing::debug!(batch_id = %batch.batch_id, "batch legs still settling — deferring");
+        return None;
+    }
+    Some(
+        resolutions
+            .into_iter()
+            .enumerate()
+            .map(|(index, resolution)| {
+                resolution.unwrap_or_else(|| queue::LegResolution::Failed {
+                    error: format!("invariant: leg {index} has no queue row"),
+                })
+            })
+            .collect(),
+    )
+}
+
+/// One leg's records-artifact check — a GHCR manifest read on a
+/// `Succeeded` leg only, absent for every other outcome. The tag
+/// pins the publish job's `run_attempt` (§3.1).
+async fn leg_records_present(
+    ghcr: &crate::api::GhcrConfig,
+    batch: &queue::ReadyBatch,
+    leg: &queue::ReadyBatchLeg,
+    outcome: &stow_types::runs::LegOutcome,
+    run_id: u64,
+    pool: &crate::fetch_guard::OutboundPool,
+) -> std::result::Result<Option<u32>, crate::ghcr::FetchError> {
+    use skyzen_cloudflare::worker::send::IntoSendFuture as _;
+    let present = match outcome {
+        stow_types::runs::LegOutcome::Succeeded {
+            publish_attempt, ..
+        } => {
+            crate::ghcr::records_artifact_exists(
+                ghcr,
+                &batch.rustc_version,
+                &leg.task_id,
+                stow_types::records::BuildRun {
+                    run_id,
+                    run_attempt: *publish_attempt,
+                },
+                pool,
+            )
+            .into_send()
+            .await?
+        }
+        _ => false,
+    };
+    std::result::Result::Ok(present.then_some(leg.batch_leg))
+}
+
+/// A leg index as a slice index — `u32` fits `usize` on every stow
+/// target.
+fn index_to_usize(leg: u32) -> usize {
+    usize::try_from(leg).expect("u32 leg index fits usize")
+}
+
+/// The wall clock a pass reads — `Date::now()` returns whole
+/// milliseconds well below 2^53, so the value is exactly
+/// representable and always fits i64.
+fn now_ms() -> i64 {
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        js_sys::Date::now() as i64
+    }
+}
+
+/// The `build-batch.yml` dispatch fan-out over one resolved backend —
+/// one `workflow_dispatch` per formed batch, concurrently, then the
+/// ordered outcome apply (stow#833 §4.2).
+///
+/// The POSTs run under the invocation's outbound bound: the stream's
+/// `buffered` admits at most `MAX_OUTBOUND_INFLIGHT` (4) at once, and
+/// the pool slot `dispatch_batch` waits on enforces the same bound
+/// before any request posts. `buffered` — not `buffer_unordered` —
+/// yields results in the batches' own order, so each outcome stays
+/// matched to its batch. The queue writes then apply sequentially:
+/// `&DurableDb` is not `Send`, so it never enters a concurrent future.
+async fn dispatch_batches(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    backend: &impl dispatch::BuildRuns,
+    batches: Vec<FormedBatch>,
+    github_repo: &str,
+) -> Result<()> {
+    let pool = crate::fetch_guard::OutboundPool::new();
+    // Collected before streaming: a closure inside the stream's type
+    // borrows each batch under a higher-ranked lifetime, and the alarm
+    // future then cannot prove itself `Send`.
+    let dispatches: Vec<_> = batches
+        .iter()
+        .map(|batch| backend.dispatch_batch(&batch.encoded, github_repo, &pool))
+        .collect();
+    let outcomes = stream::iter(dispatches)
+        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+        .collect::<Vec<_>>()
+        .await;
+    for (batch, outcome) in batches.iter().zip(outcomes) {
+        let outcome = outcome
+            .map(|run| run.workflow_run_id)
+            .map_err(|error| error.to_string());
+        queue::persist_batch_dispatch(db, settings, batch, outcome)
+            .await
+            .map_err(to_error)?;
     }
     Ok(())
 }
@@ -1385,11 +2013,7 @@ async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<
 /// The instant and settings every alarm plan is decided under — read
 /// once per pass so a route's plan and its arm see one clock.
 fn alarm_inputs(env: &WasmEnv) -> Result<(i64, SchedulerSettings)> {
-    // `Date::now()` returns whole milliseconds well below 2^53; the value is
-    // exactly representable and always fits i64.
-    #[allow(clippy::cast_possible_truncation)]
-    let now_ms = js_sys::Date::now() as i64;
-    Ok((now_ms, scheduler_settings(env)?))
+    Ok((now_ms(), scheduler_settings(env)?))
 }
 
 fn read_string_binding(env: &WasmEnv, binding_name: &str) -> Result<String> {

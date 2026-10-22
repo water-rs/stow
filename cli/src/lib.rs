@@ -45,6 +45,7 @@ mod profile_guard;
 mod provenance;
 mod resolve;
 mod rustc_args;
+mod sandbox;
 mod state_db;
 mod stats;
 mod supervisor;
@@ -321,7 +322,7 @@ async fn async_main() -> stow_types::error::Result<std::process::ExitStatus> {
     // command loads shares it, so this is the only place that has to
     // know what is open.
     let state_db = StateDb::default();
-    let result = run_cli(cli, &state_db).await;
+    let result = Box::pin(run_cli(cli, &state_db)).await;
     // Closed on every path, before the runtime goes away (stow#682).
     state_db.close().await;
     result
@@ -349,7 +350,7 @@ async fn run_cli(
         }
         CliCommand::Rustc(command) => return run_rustc_wrapper(command, state_db).await,
         CliCommand::Cc(command) => return run_cc_wrapper(command, state_db).await,
-        CliCommand::Predict(command) => cargo_cmd::predict(command, state_db).await,
+        CliCommand::Predict(command) => Box::pin(cargo_cmd::predict(command, state_db)).await,
         CliCommand::Setup(args) => commands::setup_project(args, state_db).await,
         CliCommand::Update => commands::update_self().await,
         CliCommand::Status => commands::status_project(state_db).await,
@@ -519,6 +520,7 @@ async fn finish_rustc_compile(
     post: &PostCompile,
     success: bool,
     local_base: Option<&WrapperEnvBase>,
+    env_cache: &WrapperEnvCache,
     ctx: &BuildContext,
 ) -> stow_types::error::Result<Option<artifact_cache::LocalBuildArtifact>> {
     let Some(parsed) = post.parsed.as_ref() else {
@@ -536,6 +538,7 @@ async fn finish_rustc_compile(
                         inject::materialize_local_build_stable_aliases(
                             parsed,
                             &build.identity,
+                            &base.host_target,
                             inject::OutputDirWriters::StowOnly,
                         )
                         .await,
@@ -546,15 +549,21 @@ async fn finish_rustc_compile(
                             &base.config,
                             parsed,
                             &build.identity,
+                            &base.host_target,
                         )
                         .await,
                     );
                     if parsed.is_locally_cacheable() {
                         log_nonfatal_result(
                             "failed to store locally built artifact in the stow cache",
-                            artifact_cache::store_local_build_outputs(&base.config, parsed, &build)
-                                .await
-                                .map(|_| ()),
+                            artifact_cache::store_local_build_outputs(
+                                &base.config,
+                                parsed,
+                                &build,
+                                &base.host_target,
+                            )
+                            .await
+                            .map(|_| ()),
                         );
                     }
                     artifact = Some(build);
@@ -581,7 +590,17 @@ async fn finish_rustc_compile(
                 }
             }
         }
-        check_build_script_output(parsed)?;
+        if parsed.is_build_script() && parsed.out_dir.is_some() {
+            // The binary and its alias are named for the host the
+            // compiling rustc reports — the build's memoized probe of
+            // that executable, one source whether an env base loaded or
+            // not.
+            let host = env_cache
+                .rustc_host_target(&post.executable)
+                .await
+                .map_err(stow_types::error::Error::msg)?;
+            check_build_script_output(parsed, &host)?;
+        }
     }
     Ok(artifact)
 }
@@ -594,11 +613,19 @@ async fn finish_rustc_compile(
 /// (stow#347).
 fn check_build_script_output(
     parsed: &rustc_args::ParsedRustcArgs,
+    host: &str,
 ) -> stow_types::error::Result<()> {
-    let Some(source_path) = parsed.output_binary_path() else {
+    let Some(source_path) = parsed
+        .output_binary_path(host)
+        .map_err(stow_types::error::Error::msg)?
+    else {
         return Ok(());
     };
-    if parsed.build_script_alias_path().is_none() {
+    if parsed
+        .build_script_alias_path(host)
+        .map_err(stow_types::error::Error::msg)?
+        .is_none()
+    {
         return Ok(());
     }
     if !source_path.exists() {
@@ -715,12 +742,21 @@ pub(crate) struct BuildContext {
     pub(crate) analysis: std::sync::Arc<std::sync::OnceLock<AnalysisFacts>>,
     /// The "the serve map is final" signal `AwaitServeMap` frames wait
     /// on — and the "the build's slice fetch has settled" signal the
-    /// slice memo's missing-slice read waits on (stow#735): `run_cargo`
-    /// shares the enrichment's with the supervisor and completes it
-    /// itself when no fetch is in flight; the standalone wrapper's
-    /// settles by construction — a driver with no pending map answers
-    /// at once (stow#347).
+    /// slice memo's missing-slice read (stow#735) and pending-slice
+    /// miss retry (stow#797) wait on: `run_cargo` shares the
+    /// enrichment's with the supervisor and completes it itself when no
+    /// fetch is in flight; the standalone wrapper's settles by
+    /// construction — a driver with no pending map answers at once
+    /// (stow#347).
     pub(crate) serve_map_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
+    /// The "the cache policy's allow set is committed" signal the plan
+    /// path waits on when an invocation's marker is absent
+    /// (stow#788): armed pending only while a supervised build's
+    /// deferred enrichment still owes the policy directory its coarse
+    /// commit, released by the commit itself or by the guard that
+    /// drops with a failed or aborted enrichment. The standalone
+    /// wrapper's settles by construction — no commit is coming.
+    pub(crate) policy_ready: std::sync::Arc<crate::facade::ServeMapSignal>,
     /// The build's in-flight local compiles, shared with the supervisor:
     /// a post-compile waits on the ones its `--extern` set names before
     /// reading their `materialized_outputs` rows (stow#618). The
@@ -738,6 +774,13 @@ pub(crate) struct BuildContext {
 #[derive(Debug, Clone)]
 pub(crate) struct Latch {
     done: tokio::sync::watch::Sender<bool>,
+    /// Test observation (stow#810): how many waits have found the latch
+    /// pending and parked on it. A test reaches the point where a
+    /// decision is provably held by the latch through this, rather than
+    /// sleeping and asserting the decision has not finished — which
+    /// passes just as well when it never started.
+    #[cfg(test)]
+    parked: tokio::sync::watch::Sender<usize>,
 }
 
 impl Latch {
@@ -746,7 +789,24 @@ impl Latch {
     pub(crate) fn pending() -> Self {
         Self {
             done: tokio::sync::watch::channel(false).0,
+            #[cfg(test)]
+            parked: tokio::sync::watch::channel(0).0,
         }
+    }
+
+    /// Resolve once `waits` waits have parked on this latch — each
+    /// subscribed while it was pending, so a [`Self::complete`] from here
+    /// on is what releases them.
+    #[cfg(test)]
+    pub(crate) async fn parked(&self, waits: usize) {
+        let mut parked = self.parked.subscribe();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            parked.wait_for(|count| *count >= waits),
+        )
+        .await
+        .expect("no wait parked on the latch")
+        .expect("the latch outlives its observation");
     }
 
     /// Fire it: release every waiter, present and late alike.
@@ -767,6 +827,8 @@ impl Latch {
     pub(crate) async fn wait(&self) {
         let mut receiver = self.done.subscribe();
         if !*receiver.borrow() {
+            #[cfg(test)]
+            self.parked.send_modify(|count| *count += 1);
             let _ = receiver.changed().await;
         }
     }
@@ -872,6 +934,7 @@ impl BuildContext {
                 prefetch_candidates,
             })),
             serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+            policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
             // No supervisor shares a standalone invocation's registry —
             // the wait finds nothing and returns at once.
             in_flight: crate::supervisor::server::InFlightUnits::default(),
@@ -1018,7 +1081,8 @@ impl BuildSupervisor {
         success: bool,
         local_base: Option<&WrapperEnvBase>,
     ) {
-        if let Ok(Some(build)) = finish_rustc_compile(post, success, local_base, &self.ctx).await
+        if let Ok(Some(build)) =
+            finish_rustc_compile(post, success, local_base, &self.env_cache, &self.ctx).await
             && let Some(parsed) = post.parsed.as_ref()
             && let Some(unit) = miss_journal::observed_unit(parsed, &build)
         {
@@ -1062,6 +1126,13 @@ impl supervisor::server::Handler for BuildSupervisor {
 
     async fn await_serve_map(self: &std::sync::Arc<Self>) {
         self.ctx.serve_map_ready.wait().await;
+    }
+
+    async fn rustc_host_target(
+        self: &std::sync::Arc<Self>,
+        executable: &std::ffi::OsStr,
+    ) -> Result<String, String> {
+        self.env_cache.rustc_host_target(executable).await
     }
 
     async fn observed(self: &std::sync::Arc<Self>, observation: supervisor::server::Observation) {
@@ -1232,8 +1303,14 @@ async fn run_rustc_standalone(
             let status =
                 run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
             let local_base = env_cache.local_base(&command.executable).await;
-            if let Ok(Some(build)) =
-                finish_rustc_compile(&post, status.success(), local_base.as_deref(), &ctx).await
+            if let Ok(Some(build)) = finish_rustc_compile(
+                &post,
+                status.success(),
+                local_base.as_deref(),
+                &env_cache,
+                &ctx,
+            )
+            .await
                 && let (Some(parsed), Some(base)) = (post.parsed.as_ref(), local_base.as_deref())
             {
                 miss_journal::record_observation(
@@ -1286,11 +1363,29 @@ async fn decide_rustc_invocation(
         );
         return decide_local_only(rustc, &parsed, env_cache, ctx).await;
     }
-    let exact_public_cache_allowed = match cache_policy::public_cache_allowed(
+    // A missing allow marker while the enrichment still owes the policy
+    // directory its commit is "undecided", not "denied": wait out the
+    // commit — bounded — and take the marker once more before ruling
+    // (stow#788). A completed or absent latch is the old path: deny on
+    // absence at once.
+    let mut policy_answer = cache_policy::public_cache_allowed(
         ctx.policy_dir.as_deref(),
         &parsed,
         ctx.public_cache_target.as_deref(),
-    ) {
+    );
+    if policy_answer == Some(false) && !ctx.policy_ready.has_completed() {
+        let _ = tokio::time::timeout(
+            crate::facade::SERVE_MAP_WAIT_TIMEOUT,
+            ctx.policy_ready.wait(),
+        )
+        .await;
+        policy_answer = cache_policy::public_cache_allowed(
+            ctx.policy_dir.as_deref(),
+            &parsed,
+            ctx.public_cache_target.as_deref(),
+        );
+    }
+    let exact_public_cache_allowed = match policy_answer {
         Some(false) => {
             tracing::debug!(
                 crate_name = %parsed.crate_name,
@@ -1530,15 +1625,22 @@ pub(crate) struct WrapperEnvCache {
     /// The local path's bases (`StowConfig::load_local`), shared by
     /// `decide_local_only` and the post-compile finish.
     local_bases: MemoizedBaseMap,
+    /// Each spelling's `rustc -vV` host triple — config-independent, so
+    /// the in-flight marks a dependent's bookkeeping waits on never
+    /// depend on an env base that can legitimately be absent (stow#618);
+    /// the env bases' own `host_target` reads the same cells.
+    host_targets: MemoizedHostMap,
     /// The `PATH` bare spellings resolve through, captured at
     /// construction so the cache reads the environment the build
     /// invoked the wrapper with.
     path: OsString,
     /// The verified index slices this build's lookups read — the driver's
     /// fetch can still be in flight when cargo starts, so a miss waits
-    /// on `serve_map_ready` before its answer is memoized (stow#735);
-    /// each slice is decoded and keyed once per `(target, rustc)`
-    /// instead of once per rustc invocation (stow#347).
+    /// on `serve_map_ready` before its answer is memoized (stow#735),
+    /// and a stale-but-readable slice memoizes with a `fetch_pending`
+    /// flag that lets a later miss wait, refresh, and retry once
+    /// (stow#797); each slice is decoded and keyed once per
+    /// `(target, rustc)` instead of once per rustc invocation (stow#347).
     slices: MemoizedSliceMap,
     /// The circuit's tripped state, read once for the build and kept in
     /// step by the build's own recordings.
@@ -1558,14 +1660,96 @@ type MemoizedBaseMap = std::sync::Mutex<
     >,
 >;
 
+/// One memoized `rustc -vV` host answer per executable spelling: the
+/// probe runs at most once per spelling per build, and its answer —
+/// the triple or the failure — is what every consumer shares.
+type MemoizedHostMap = std::sync::Mutex<
+    std::collections::HashMap<
+        OsString,
+        std::sync::Arc<tokio::sync::OnceCell<Result<String, String>>>,
+    >,
+>;
+
 /// The slice memoization key and cell shape: `(target, rustc)` to a
 /// shared cell each wrapper task awaits.
 type MemoizedSliceMap = std::sync::Mutex<
     std::collections::HashMap<
         (String, String),
-        std::sync::Arc<tokio::sync::OnceCell<Option<std::sync::Arc<SliceIndex>>>>,
+        std::sync::Arc<tokio::sync::OnceCell<std::sync::Arc<SliceMemo>>>,
     >,
 >;
+
+/// One build's memoized answer for an index slice: the freshest decoded
+/// slice the cache has handed it plus whether the build's own fetch
+/// could still replace it — `slice_fetch_pending` decided once, when
+/// the memo is filled, so no invocation pays a pointer read (stow#797).
+/// A lookup that misses on a pending slice waits out `serve_map_ready`,
+/// [`SliceMemo::refresh`] swaps in what the fetch landed — every later
+/// invocation sees it — and the serves retry once; a hit never waits,
+/// and a miss on a settled slice never does either.
+#[derive(Debug)]
+struct SliceMemo {
+    inner: std::sync::Mutex<SliceMemoState>,
+}
+
+#[derive(Debug)]
+struct SliceMemoState {
+    /// The freshest decoded slice this build has read; `refresh`
+    /// replaces it with what the settled fetch landed.
+    slice: Option<std::sync::Arc<SliceIndex>>,
+    /// `slice_fetch_pending` at fill: `true` while the build's fetch may
+    /// still land rows this slice lacks. `false` once the memo was
+    /// filled from the settled answer or a miss's `refresh` took it — a
+    /// fetch that has already landed cannot be waited out twice.
+    fetch_pending: bool,
+}
+
+impl SliceMemo {
+    fn new(slice: Option<SliceIndex>, fetch_pending: bool) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(SliceMemoState {
+                slice: slice.map(std::sync::Arc::new),
+                fetch_pending,
+            }),
+        }
+    }
+
+    /// The memo's answer as one pair under one lock — the slice and its
+    /// pending flag can never describe different generations, which is
+    /// what a racing `refresh` would otherwise allow (stow#797).
+    fn read(&self) -> (Option<std::sync::Arc<SliceIndex>>, bool) {
+        let state = self.inner.lock().expect("slice memo mutex");
+        (state.slice.clone(), state.fetch_pending)
+    }
+
+    /// A pending miss's second answer: the fetch `serve_map_ready`
+    /// gated has settled, so read the cache once more and make its
+    /// answer the build's — every later lookup sees this slice. The
+    /// flag clears with the swap: a settled fetch cannot be waited out
+    /// again, and a sibling that already refreshed short-circuits the
+    /// re-read.
+    async fn refresh(
+        &self,
+        config: &StowConfig,
+        target: &str,
+        rustc_version: &str,
+    ) -> stow_types::error::Result<Option<std::sync::Arc<SliceIndex>>> {
+        {
+            let state = self.inner.lock().expect("slice memo mutex");
+            if !state.fetch_pending {
+                return Ok(state.slice.clone());
+            }
+        }
+        let slice = match index::cached_slice(config, target, rustc_version).await? {
+            Some(slice) => Some(smol::unblock(move || SliceIndex::new(slice)).await),
+            None => None,
+        };
+        let mut state = self.inner.lock().expect("slice memo mutex");
+        state.slice = slice.map(std::sync::Arc::new);
+        state.fetch_pending = false;
+        Ok(state.slice.clone())
+    }
+}
 
 /// Whether the facade's `spelling` and the seeded base's `target` rustc
 /// are the same file — bare names resolved through `path`, the
@@ -1597,6 +1781,7 @@ impl WrapperEnvCache {
             seeded: std::sync::Mutex::new(None),
             env_bases: MemoizedBaseMap::default(),
             local_bases: MemoizedBaseMap::default(),
+            host_targets: MemoizedHostMap::default(),
             path: std::env::var_os("PATH").unwrap_or_default(),
             slices: MemoizedSliceMap::default(),
             circuit_tripped: tokio::sync::OnceCell::new(),
@@ -1643,7 +1828,7 @@ impl WrapperEnvCache {
                     return None;
                 }
             };
-            load_wrapper_env_base(rustc, config)
+            load_wrapper_env_base(rustc, config, self.rustc_host_target(rustc))
                 .await
                 .map(std::sync::Arc::new)
         })
@@ -1660,20 +1845,50 @@ impl WrapperEnvCache {
             .await
     }
 
+    /// The host triple `rustc` compiles target-less units for — one
+    /// `rustc -vV` probe per executable spelling per build, independent
+    /// of the config the env bases load: the marks dependents block on
+    /// must not vanish because a base that can legitimately be absent
+    /// did not load (stow#618). A spelling that resolves to the seeded
+    /// base's file adopts its host answer rather than probing again.
+    pub(crate) async fn rustc_host_target(&self, rustc: &OsStr) -> Result<String, String> {
+        let cell = self
+            .host_targets
+            .lock()
+            .expect("host target map mutex")
+            .entry(rustc.to_os_string())
+            .or_default()
+            .clone();
+        cell.get_or_init(|| async {
+            let seed = self.seeded.lock().expect("seeded env base mutex").clone();
+            if let Some(seed) = seed
+                && resolves_to_same_file(rustc, &seed.rustc, &self.path).await
+            {
+                return Ok(seed.host_target.clone());
+            }
+            rustc_args::rustc_host_target(rustc).await
+        })
+        .await
+        .clone()
+    }
+
     /// The decoded index slice for `(target, rustc)` — read, decompressed
     /// and keyed by `c_metadata` once per build rather than per
     /// invocation. A missing slice may still be in flight — the driver's
     /// fetch runs beside cargo's build, not before it — so absence is
     /// memoized only after `serve_map_ready` says the build's fetch has
-    /// settled (stow#735); an error is not — it keeps today's
-    /// retry-and-warn semantics for a transient read failure.
+    /// settled (stow#735); a stale-but-readable slice memoizes at once
+    /// but flagged `fetch_pending`, so a lookup that misses on it waits
+    /// the fetch out and retries once against what it landed (stow#797).
+    /// An error is not memoized — it keeps today's retry-and-warn
+    /// semantics for a transient read failure.
     async fn slice(
         &self,
         config: &StowConfig,
         target: &str,
         rustc_version: &str,
         serve_map_ready: &crate::facade::ServeMapSignal,
-    ) -> stow_types::error::Result<Option<std::sync::Arc<SliceIndex>>> {
+    ) -> stow_types::error::Result<std::sync::Arc<SliceMemo>> {
         let key = (target.to_owned(), rustc_version.to_owned());
         let cell = self
             .slices
@@ -1683,33 +1898,40 @@ impl WrapperEnvCache {
             .or_default()
             .clone();
         cell.get_or_try_init(|| async {
-            let slice = if let Some(slice) =
-                index::cached_slice(config, target, rustc_version).await?
-            {
-                slice
-            } else {
-                // The fetch can still be in flight when cargo starts:
-                // wait out the build's `serve_map_ready`, then let the
-                // cache's second answer be the memoized one — only then
-                // is absence final for this build (stow#735).
-                let waited = std::time::Instant::now();
-                serve_map_ready.wait().await;
-                tracing::debug!(
-                    target = %target,
-                    rustc_version = %rustc_version,
-                    waited_ms = waited.elapsed().as_millis(),
-                    "index slice lookup waited for the build's fetch to settle"
-                );
-                let Some(slice) = index::cached_slice(config, target, rustc_version).await? else {
-                    return Ok(None);
-                };
-                slice
+            // Pending is decided once, here, and read *before* the
+            // slice: a fetch landing between the two answers then flags
+            // a fresh memo pending — one redundant retry a miss pays —
+            // where the other order can flag a stale memo settled,
+            // which is the stow#797 miss this flag exists to catch.
+            let fetch_pending = index::slice_fetch_pending(config, target, rustc_version).await?;
+            if let Some(slice) = index::cached_slice(config, target, rustc_version).await? {
+                let index = smol::unblock(move || SliceIndex::new(slice)).await;
+                return Ok(std::sync::Arc::new(SliceMemo::new(
+                    Some(index),
+                    fetch_pending,
+                )));
+            }
+            // The fetch can still be in flight when cargo starts: wait
+            // out the build's `serve_map_ready`, then let the cache's
+            // second answer be the memoized one — only then is absence
+            // final for this build (stow#735). Its flag is settled: the
+            // fetch this signal gated has already been waited out.
+            let waited = std::time::Instant::now();
+            serve_map_ready.wait().await;
+            tracing::debug!(
+                target = %target,
+                rustc_version = %rustc_version,
+                waited_ms = waited.elapsed().as_millis(),
+                "index slice lookup waited for the build's fetch to settle"
+            );
+            let index = match index::cached_slice(config, target, rustc_version).await? {
+                // The lookup table is one entry per row the slice
+                // publishes, so it is built on a blocking thread like
+                // the decode behind it (stow#624).
+                Some(slice) => Some(smol::unblock(move || SliceIndex::new(slice)).await),
+                None => None,
             };
-            // The lookup table is one entry per row the slice publishes,
-            // so it is built on a blocking thread like the decode behind
-            // it (stow#624).
-            let index = smol::unblock(move || SliceIndex::new(slice)).await;
-            Ok::<_, stow_types::error::Error>(Some(std::sync::Arc::new(index)))
+            Ok::<_, stow_types::error::Error>(std::sync::Arc::new(SliceMemo::new(index, false)))
         })
         .await
         .cloned()
@@ -1760,18 +1982,22 @@ impl WrapperEnvCache {
 
 /// Load the config, probe the rustc and take the version lease — once
 /// for the whole build. Every step can legitimately be unavailable, so
-/// `None` means "run the real rustc".
-async fn load_wrapper_env_base(rustc: &OsStr, config: StowConfig) -> Option<WrapperEnvBase> {
+/// `None` means "run the real rustc". `host_target` is the build's
+/// memoized per-spelling lookup — the source the supervisor's mark
+/// bookkeeping answers from too, not a second probe.
+async fn load_wrapper_env_base(
+    rustc: &OsStr,
+    config: StowConfig,
+    host_target: impl std::future::Future<Output = Result<String, String>>,
+) -> Option<WrapperEnvBase> {
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing rust cache");
         return None;
     }
     // The host triple and the version probe are independent answers from
     // the same rustc — await them together (stow#608).
-    let (host_target, rustc_version) = tokio::join!(
-        rustc_args::rustc_host_target(rustc),
-        rustc_args::detect_rustc_version(rustc),
-    );
+    let (host_target, rustc_version) =
+        tokio::join!(host_target, rustc_args::detect_rustc_version(rustc));
     let host_target = match host_target {
         Ok(target) => target,
         Err(error) => {
@@ -1982,8 +2208,9 @@ async fn try_remote_serves(
     // freshness, and a registry round trip on every rustc invocation is
     // exactly the cost the local index exists to remove. Absence is a
     // miss — but only once `serve_map_ready` says the build's fetch has
-    // settled (stow#735); an in-flight one is waited out first.
-    let slice = match env
+    // settled (stow#735); a readable-but-stale slice whose fetch is
+    // still in flight serves at once, flagged pending.
+    let memo = match env
         .env_cache
         .slice(
             &env.env_base.config,
@@ -1993,15 +2220,7 @@ async fn try_remote_serves(
         )
         .await
     {
-        Ok(Some(slice)) => slice,
-        Ok(None) => {
-            tracing::debug!(
-                target = %env.target,
-                rustc_version = %env.rustc_version,
-                "no cached index slice, skipping registry serves"
-            );
-            return RemoteServe::Miss;
-        }
+        Ok(memo) => memo,
         Err(error) => {
             tracing::debug!(
                 error = %error,
@@ -2012,13 +2231,91 @@ async fn try_remote_serves(
             return RemoteServe::Miss;
         }
     };
+    let (slice, fetch_pending) = memo.read();
+    let Some(slice) = slice else {
+        tracing::debug!(
+            target = %env.target,
+            rustc_version = %env.rustc_version,
+            "no cached index slice, skipping registry serves"
+        );
+        return RemoteServe::Miss;
+    };
+    let outcome = serves_against_slice(
+        env,
+        parsed,
+        request,
+        &slice,
+        exact_public_cache_allowed,
+        fetch_pending,
+        tally,
+    )
+    .await;
+    // A miss on a pending slice is provisional: the fetch the memo's
+    // flag saw still in flight can carry the row this lookup lacked.
+    // Wait it out, make its answer the build's memo — every later
+    // invocation reads it — and retry once. A hit never waits, and a
+    // miss on a settled slice never does either (stow#797).
+    if !matches!(outcome, RemoteServe::Miss) || !fetch_pending {
+        return outcome;
+    }
+    let waited = std::time::Instant::now();
+    ctx.serve_map_ready.wait().await;
+    tracing::debug!(
+        target = %env.target,
+        rustc_version = %env.rustc_version,
+        waited_ms = waited.elapsed().as_millis(),
+        "index slice miss waited for the build's fetch, retrying on its answer"
+    );
+    match memo
+        .refresh(&env.env_base.config, &env.target, &env.rustc_version)
+        .await
+    {
+        Ok(Some(slice)) => {
+            serves_against_slice(
+                env,
+                parsed,
+                request,
+                &slice,
+                exact_public_cache_allowed,
+                false,
+                tally,
+            )
+            .await
+        }
+        Ok(None) => RemoteServe::Miss,
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                target = %env.target,
+                rustc_version = %env.rustc_version,
+                "failed to re-read the index slice after the fetch settled"
+            );
+            RemoteServe::Miss
+        }
+    }
+}
+
+/// The two registry serves over one decoded slice: exact first, then
+/// the semantic fallback when it is enabled and the exact path did not
+/// serve or disqualify the cache outright. `fetch_pending` marks the
+/// slice provisional — a miss on it records no negative-cache entry,
+/// the settled retry's does (stow#797).
+async fn serves_against_slice(
+    env: &WrapperEnvironment<'_>,
+    parsed: &rustc_args::ParsedRustcArgs,
+    request: &FetchRequest<'_>,
+    slice: &SliceIndex,
+    exact_public_cache_allowed: bool,
+    fetch_pending: bool,
+    tally: &mut LookupTally,
+) -> RemoteServe {
     // A refusal does not end the lookup: the exact row may be unservable
     // while a differently-shaped semantic candidate still loads. Either
     // way, one refusal anywhere means no build should be enqueued —
     // `Refused` outranks `Miss` in the merge.
     let mut refused = false;
     if exact_public_cache_allowed {
-        match try_remote_exact_serve(env, parsed, request, &slice, tally).await {
+        match try_remote_exact_serve(env, parsed, request, slice, fetch_pending, tally).await {
             RemoteServe::Miss => {}
             RemoteServe::Refused => refused = true,
             outcome => return outcome,
@@ -2042,12 +2339,15 @@ async fn try_remote_serves(
 /// Resolve the exact artifact identity against the index slice, stream its
 /// bundle through the edge byte path, and serve it. `Miss` means the index
 /// carries no such artifact (or the negative cache already says so);
-/// `Bypass` means the artifact arrived but could not be used.
+/// `Bypass` means the artifact arrived but could not be used. While
+/// `fetch_pending` marks the slice provisional the miss records nothing:
+/// the negative cache asserts a settled absence (stow#797).
 async fn try_remote_exact_serve(
     env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     slice: &SliceIndex,
+    fetch_pending: bool,
     tally: &mut LookupTally,
 ) -> RemoteServe {
     let negative_cache_hit = match circuit::negative_cache_contains(
@@ -2067,10 +2367,15 @@ async fn try_remote_exact_serve(
         return RemoteServe::Miss;
     }
     let Some(row) = slice.exact_row(request.c_metadata) else {
-        log_nonfatal_result(
-            "failed to record stow negative cache entry",
-            circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
-        );
+        // While the slice's fetch is in flight this absence is
+        // provisional — the fetched slice can carry the row — so the
+        // negative-cache write waits for the settled retry (stow#797).
+        if !fetch_pending {
+            log_nonfatal_result(
+                "failed to record stow negative cache entry",
+                circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
+            );
+        }
         return RemoteServe::Miss;
     };
     if !resolve::row_servable_on_host(row, env.host_glibc) {
@@ -2092,10 +2397,12 @@ async fn try_remote_exact_serve(
         // stale registry blob) after the slice was published. Remember the
         // miss locally until the next slice; the circuit stays closed.
         Err(fetch::FetchError::NotFound) => {
-            log_nonfatal_result(
-                "failed to record stow negative cache entry",
-                circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
-            );
+            if !fetch_pending {
+                log_nonfatal_result(
+                    "failed to record stow negative cache entry",
+                    circuit::record_negative_cache(&env.env_base.config, &env.cache_key).await,
+                );
+            }
             RemoteServe::Miss
         }
         Err(error) => {
@@ -2818,7 +3125,13 @@ async fn materialize_local_cached_bundle(
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
+    match inject::write_artifacts(
+        parsed,
+        &cached_bundle,
+        request.target,
+        inject::OutputDirWriters::StowOnly,
+    )
+    .await
     {
         Ok(()) => finish_local_serve(config, parsed, request, cached_bundle, tally).await,
         Err(error) => {
@@ -2854,7 +3167,9 @@ async fn finish_local_serve(
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
+    if let Err(error) =
+        record_materialized_bundle_outputs(config, parsed, &cached_bundle, request.target).await
+    {
         tracing::debug!(
             error = %error,
             crate_name = %parsed.crate_name,
@@ -2865,7 +3180,7 @@ async fn finish_local_serve(
         tally.failed = true;
         return None;
     }
-    let notifications = match cached_rustc_artifact_notifications(parsed) {
+    let notifications = match cached_rustc_artifact_notifications(parsed, request.target) {
         Ok(notifications) => notifications,
         Err(error) => {
             tracing::debug!(
@@ -3301,8 +3616,13 @@ async fn materialize_semantic_cached_bundle(
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
-    if let Err(error) =
-        inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
+    if let Err(error) = inject::write_artifacts(
+        parsed,
+        &cached_bundle,
+        &semantic_request.target,
+        inject::OutputDirWriters::StowOnly,
+    )
+    .await
     {
         tracing::debug!(
             error = %error,
@@ -3317,7 +3637,10 @@ async fn materialize_semantic_cached_bundle(
         tally.failed = true;
         return None;
     }
-    if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
+    if let Err(error) =
+        record_materialized_bundle_outputs(config, parsed, &cached_bundle, &semantic_request.target)
+            .await
+    {
         tracing::debug!(
             error = %error,
             crate_name = %parsed.crate_name,
@@ -3331,13 +3654,14 @@ async fn materialize_semantic_cached_bundle(
         tally.failed = true;
         return None;
     }
-    let notifications = match cached_rustc_artifact_notifications(parsed) {
+    let notifications = match cached_rustc_artifact_notifications(parsed, &semantic_request.target)
+    {
         Ok(notifications) => notifications,
         Err(error) => {
             tracing::debug!(
-                error = %error,
-                crate_name = %parsed.crate_name,
-                semantic_crate_name = %semantic_request.crate_name,
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    semantic_crate_name = %semantic_request.crate_name,
                 semantic_version = %semantic_request.version,
                 target = %semantic_request.target,
                 rustc_version = %semantic_request.rustc_version,
@@ -3466,7 +3790,13 @@ async fn materialize_downloaded_bundle(
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let config = &env.env_base.config;
-    match inject::write_artifacts(parsed, &cached_bundle, inject::OutputDirWriters::StowOnly).await
+    match inject::write_artifacts(
+        parsed,
+        &cached_bundle,
+        request.target,
+        inject::OutputDirWriters::StowOnly,
+    )
+    .await
     {
         Ok(()) => finish_downloaded_serve(env, parsed, request, cached_bundle, tally).await,
         Err(error) => {
@@ -3505,7 +3835,9 @@ async fn finish_downloaded_serve(
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
     let config = &env.env_base.config;
-    if let Err(error) = record_materialized_bundle_outputs(config, parsed, &cached_bundle).await {
+    if let Err(error) =
+        record_materialized_bundle_outputs(config, parsed, &cached_bundle, request.target).await
+    {
         tracing::debug!(
             error = %error,
             crate_name = %parsed.crate_name,
@@ -3525,7 +3857,7 @@ async fn finish_downloaded_serve(
         tally.failed = true;
         return None;
     }
-    let notifications = match cached_rustc_artifact_notifications(parsed) {
+    let notifications = match cached_rustc_artifact_notifications(parsed, request.target) {
         Ok(notifications) => notifications,
         Err(error) => {
             tracing::debug!(
@@ -4158,6 +4490,7 @@ struct RustcArtifactNotification {
 /// not ask for `artifacts`.
 fn cached_rustc_artifact_notifications(
     parsed: &rustc_args::ParsedRustcArgs,
+    host: &str,
 ) -> stow_types::error::Result<ArtifactNotifications> {
     if !parsed.requests_json_artifact_notifications() {
         return Ok(ArtifactNotifications::default());
@@ -4187,7 +4520,7 @@ fn cached_rustc_artifact_notifications(
     }
     if parsed.emit.contains("link") {
         let artifact = parsed
-            .output_link_path()
+            .output_link_path(host)
             .map_err(stow_types::error::Error::msg)?
             .ok_or_else(|| {
                 stow_types::stow_error!(
@@ -4610,8 +4943,8 @@ mod tests {
         ]))
         .expect("parse rustc args");
 
-        let notifications =
-            cached_rustc_artifact_notifications(&parsed).expect("build artifact notifications");
+        let notifications = cached_rustc_artifact_notifications(&parsed, "aarch64-apple-darwin")
+            .expect("build artifact notifications");
 
         // Byte-identical to the lines rustc itself prints: field order
         // and the `$message_type` tag included (stow#633).
@@ -4648,8 +4981,8 @@ mod tests {
         ]))
         .expect("parse rustc args");
 
-        let notifications =
-            cached_rustc_artifact_notifications(&parsed).expect("build artifact notifications");
+        let notifications = cached_rustc_artifact_notifications(&parsed, "aarch64-apple-darwin")
+            .expect("build artifact notifications");
 
         assert_eq!(
             notifications,
@@ -4681,8 +5014,8 @@ mod tests {
         ]))
         .expect("parse rustc args");
 
-        let notifications =
-            cached_rustc_artifact_notifications(&parsed).expect("build artifact notifications");
+        let notifications = cached_rustc_artifact_notifications(&parsed, "aarch64-apple-darwin")
+            .expect("build artifact notifications");
 
         assert_eq!(
             notifications,
@@ -4861,23 +5194,27 @@ mod tests {
     }
 
     /// A `StowConfig` whose every path and endpoint is a throwaway — the
-    /// env-base tests' shared fixture.
+    /// env-base tests' shared fixture. Its windows outlast any test, so a
+    /// slice written fresh stays fresh and a negative-cache entry stays
+    /// recorded however slow the runner; a test that wants either expired
+    /// sets it to zero (stow#806).
     fn env_base_test_config(dir: &tempfile::TempDir) -> crate::config::StowConfig {
         crate::config::StowConfig {
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: dir.path().join("cache"),
             request_timeout: std::time::Duration::from_millis(50),
-            negative_cache_ttl: std::time::Duration::from_secs(1),
-            circuit_reset_after: std::time::Duration::from_secs(1),
+            negative_cache_ttl: std::time::Duration::from_mins(10),
+            circuit_reset_after: std::time::Duration::from_mins(10),
             circuit_trip_threshold: 1,
             artifact_cache_max_bytes: 1,
-            index_refresh_interval: std::time::Duration::from_secs(1),
+            index_refresh_interval: std::time::Duration::from_mins(10),
             verify_mode: crate::config::VerifyMode::GithubCi,
             state_db: crate::state_db::StateDb::default(),
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
+            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 
@@ -4899,6 +5236,7 @@ mod tests {
             seeded: std::sync::Mutex::new(None),
             env_bases: super::MemoizedBaseMap::default(),
             local_bases: super::MemoizedBaseMap::default(),
+            host_targets: super::MemoizedHostMap::default(),
             path: path.to_os_string(),
             slices: super::MemoizedSliceMap::default(),
             circuit_tripped: tokio::sync::OnceCell::new(),
@@ -4925,7 +5263,13 @@ mod tests {
         else {
             panic!("the seeded env base must exist on a machine with rustc");
         };
-        let Some(lazy) = super::load_wrapper_env_base(rustc.as_os_str(), config).await else {
+        let Some(lazy) = super::load_wrapper_env_base(
+            rustc.as_os_str(),
+            config,
+            crate::rustc_args::rustc_host_target(rustc.as_os_str()),
+        )
+        .await
+        else {
             panic!("the lazy env base must build on the same rustc");
         };
         assert_eq!(seeded.rustc, lazy.rustc);
@@ -5102,14 +5446,16 @@ mod tests {
         let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
 
         // The lookup starts while the slice is still absent: it must
-        // not answer before the build's fetch has settled.
+        // not answer before the build's fetch has settled — it parks on
+        // the signal, and from there only the settle answers it.
         let mut lookup = std::pin::pin!(cache.slice(&config, TARGET, RUSTC, &signal));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(100), &mut lookup)
-                .await
-                .is_err(),
-            "the lookup answered while the build's fetch was still in flight"
-        );
+        tokio::select! {
+            biased;
+            _ = &mut lookup => {
+                panic!("the lookup answered while the build's fetch was still in flight")
+            }
+            () = signal.parked(1) => {}
+        }
         let digest = crate::index::write_cached_test_slice(
             &config,
             TARGET,
@@ -5119,11 +5465,19 @@ mod tests {
         .await
         .expect("write the slice the fetch landed");
         signal.complete();
-        let slice = lookup
-            .await
-            .expect("read the cached slice")
-            .expect("the slice the fetch landed is served");
-        assert_eq!(slice.slice.manifest_digest, digest);
+        let memo = lookup.await.expect("read the cached slice");
+        let (slice, fetch_pending) = memo.read();
+        assert_eq!(
+            slice
+                .expect("the slice the fetch landed is served")
+                .slice
+                .manifest_digest,
+            digest
+        );
+        assert!(
+            !fetch_pending,
+            "the fetch the fill-time wait covered has settled"
+        );
     }
 
     /// stow#735: once the build's fetch has settled, absence is final —
@@ -5143,6 +5497,8 @@ mod tests {
                 .slice(&config, TARGET, RUSTC, &signal)
                 .await
                 .expect("read the cached slice")
+                .read()
+                .0
                 .is_none(),
             "no slice once the fetch has settled reads as absent"
         );
@@ -5159,8 +5515,269 @@ mod tests {
                 .slice(&config, TARGET, RUSTC, &signal)
                 .await
                 .expect("read the cached slice")
+                .read()
+                .0
                 .is_none(),
             "the settled absence is memoized for the rest of the build"
+        );
+    }
+
+    /// stow#797: a stale-but-readable slice memoizes at once — a hit on
+    /// it never waits for the in-flight fetch — and the memo carries the
+    /// pending flag the miss path reads.
+    #[tokio::test]
+    async fn a_pending_slice_memoizes_at_once_flagged() {
+        const TARGET: &str = "x86_64-unknown-linux-gnu";
+        const RUSTC: &str = "1.91.1";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = env_base_test_config(&dir);
+        // A zero interval keeps every cached slice's fetch pending —
+        // the rule `fetch_slice` itself applies (stow#788).
+        config.index_refresh_interval = std::time::Duration::ZERO;
+        let digest = crate::index::write_cached_test_slice(
+            &config,
+            TARGET,
+            RUSTC,
+            &empty_test_index(TARGET, RUSTC),
+        )
+        .await
+        .expect("write the stale slice");
+        let cache = test_cache(std::ffi::OsStr::new(""));
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
+
+        // The signal stays pending for the whole test: if the fill
+        // waited on it, this read could never answer.
+        let memo = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            cache.slice(&config, TARGET, RUSTC, &signal),
+        )
+        .await
+        .expect("a readable slice answers without waiting on the fetch")
+        .expect("read the cached slice");
+        let (slice, fetch_pending) = memo.read();
+        assert_eq!(
+            slice.expect("the stale slice serves").slice.manifest_digest,
+            digest
+        );
+        assert!(
+            fetch_pending,
+            "a slice whose fetch is in flight memoizes flagged pending"
+        );
+    }
+
+    /// The wrapper environment a remote-serve test needs: a real env
+    /// base over `config`, the build's `env_cache`, and an exact-only
+    /// request keyed by `c_metadata` — the dead test registry stands in
+    /// for the edge (stow#797).
+    async fn serve_env<'a>(
+        config: &crate::config::StowConfig,
+        env_cache: &'a super::WrapperEnvCache,
+        target: &str,
+        rustc_version: &str,
+        c_metadata: &str,
+    ) -> super::WrapperEnvironment<'a> {
+        config.ensure_dirs().await.expect("ensure cache dirs");
+        let env_base = std::sync::Arc::new(super::WrapperEnvBase {
+            rustc: OsString::from("rustc"),
+            config: config.clone(),
+            host_target: target.to_owned(),
+            rustc_version: rustc_version.to_owned(),
+            _version_lease: crate::prepare_local_cache(config, rustc_version)
+                .await
+                .expect("prepare local cache"),
+        });
+        super::WrapperEnvironment {
+            env_base,
+            env_cache,
+            circuit_tripped: false,
+            target: target.to_owned(),
+            rustc_version: rustc_version.to_owned(),
+            cache_key: format!("{target}/{rustc_version}/{c_metadata}"),
+            request_c_metadata: c_metadata.to_owned(),
+            semantic_request: None,
+            host_glibc: None,
+        }
+    }
+
+    /// The `BuildContext` the serve tests drive — no policy, no
+    /// analysis facts, `serve_map_ready` under the test's control.
+    fn serve_ctx(
+        serve_map_ready: &std::sync::Arc<crate::facade::ServeMapSignal>,
+    ) -> super::BuildContext {
+        super::BuildContext {
+            policy_dir: None,
+            public_cache_target: None,
+            public_cache_disabled: false,
+            analysis: std::sync::Arc::new(std::sync::OnceLock::from(super::AnalysisFacts {
+                semantic_fallback_enabled: false,
+                unit_nodes: None,
+                prefetch_candidates: std::collections::BTreeMap::new(),
+            })),
+            serve_map_ready: std::sync::Arc::clone(serve_map_ready),
+            policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+            in_flight: crate::supervisor::server::InFlightUnits::default(),
+        }
+    }
+
+    /// The argv of one registry lib unit — enough for the parser; the
+    /// serves themselves key on `request.c_metadata`.
+    fn serve_args(target: &str, c_metadata: &str) -> Vec<OsString> {
+        vec![
+            OsString::from("--crate-name"),
+            OsString::from("demo"),
+            OsString::from("--crate-type"),
+            OsString::from("lib"),
+            OsString::from("--emit"),
+            OsString::from("dep-info,metadata,link"),
+            OsString::from("-C"),
+            OsString::from(format!("metadata={c_metadata}")),
+            OsString::from("--target"),
+            OsString::from(target),
+            OsString::from("lib.rs"),
+        ]
+    }
+
+    /// stow#797: a lookup that misses on a stale slice whose fetch is
+    /// still in flight parks on `serve_map_ready`, writes no
+    /// negative-cache entry while parked, and retries once on the
+    /// fetched slice. Here the retry reaches the row's bundle fetch —
+    /// which the dead test registry refuses (`tally.failed`) — and the
+    /// memo serves the fresh row to every later invocation.
+    #[tokio::test]
+    async fn a_miss_on_a_pending_slice_retries_the_fetched_answer() {
+        const TARGET: &str = "x86_64-unknown-linux-gnu";
+        const RUSTC: &str = "1.91.1";
+        const C_METADATA: &str = "cd800a14379e5df9";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = env_base_test_config(&dir);
+        // A zero interval keeps the cached slice's fetch pending — the
+        // stale-slice miss this test drives (stow#788).
+        config.index_refresh_interval = std::time::Duration::ZERO;
+        crate::index::write_cached_test_slice(
+            &config,
+            TARGET,
+            RUSTC,
+            &empty_test_index(TARGET, RUSTC),
+        )
+        .await
+        .expect("write the stale slice the build starts with");
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
+        let env_cache = test_cache(std::ffi::OsStr::new(""));
+        let env = serve_env(&config, &env_cache, TARGET, RUSTC, C_METADATA).await;
+        let ctx = serve_ctx(&signal);
+        let parsed =
+            ParsedRustcArgs::parse(&serve_args(TARGET, C_METADATA)).expect("parse the unit args");
+        let request = crate::fetch::FetchRequest {
+            target: TARGET,
+            rustc_version: RUSTC,
+            c_metadata: C_METADATA,
+        };
+        let mut tally = super::LookupTally::default();
+
+        // The stale slice lacks the row, but its fetch is still in
+        // flight — the miss must wait for it, not answer. The block
+        // scopes the pinned future so its `tally` borrow ends before
+        // the tally is checked.
+        let outcome = {
+            let mut serve = std::pin::pin!(super::try_remote_serves(
+                &env, &parsed, &request, &ctx, true, &mut tally,
+            ));
+            tokio::select! {
+                biased;
+                _ = &mut serve => {
+                    panic!("the lookup missed on a pending slice without waiting for the fetch")
+                }
+                () = signal.parked(1) => {}
+            }
+            assert!(
+                !crate::circuit::negative_cache_contains(&config, &env.cache_key)
+                    .await
+                    .expect("read the negative cache"),
+                "a pending miss wrote a negative-cache entry"
+            );
+
+            // The fetch lands the row the stale slice lacked, then the
+            // map settles — the order the enrichment writes it.
+            let mut index = empty_test_index(TARGET, RUSTC);
+            index.rows.push(crate::index::index_test_row(C_METADATA));
+            index.header.row_count = 1;
+            crate::index::write_cached_test_slice(&config, TARGET, RUSTC, &index)
+                .await
+                .expect("write the slice the fetch landed");
+            signal.complete();
+            serve.await
+        };
+
+        // The retry finds the row: the bundle fetch it then pays fails
+        // on the dead test registry, which `tally.failed` records.
+        assert!(matches!(outcome, super::RemoteServe::Miss));
+        assert!(
+            tally.failed,
+            "the retry must reach the fetched row's bundle fetch"
+        );
+
+        // And the memo now serves the fetched slice to the whole build.
+        let (slice, fetch_pending) = env_cache
+            .slice(&config, TARGET, RUSTC, &signal)
+            .await
+            .expect("read the memoized slice")
+            .read();
+        assert!(!fetch_pending, "the settled fetch is no longer pending");
+        assert!(
+            slice
+                .expect("the fetched slice")
+                .exact_row(C_METADATA)
+                .is_some(),
+            "later invocations see the row the fetch landed"
+        );
+    }
+
+    /// stow#797: a miss on a slice whose fetch is not pending is the old
+    /// answer — immediate, `serve_map_ready` never awaited, and the
+    /// negative cache records it as it always has.
+    #[tokio::test]
+    async fn a_miss_on_a_settled_slice_never_waits() {
+        const TARGET: &str = "x86_64-unknown-linux-gnu";
+        const RUSTC: &str = "1.91.1";
+        const C_METADATA: &str = "cd800a14379e5df9";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = env_base_test_config(&dir);
+        crate::index::write_cached_test_slice(
+            &config,
+            TARGET,
+            RUSTC,
+            &empty_test_index(TARGET, RUSTC),
+        )
+        .await
+        .expect("write the fresh slice");
+        // The signal stays pending for the whole test — a wait on it
+        // would hang, so the timeout *is* the assertion.
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::pending());
+        let env_cache = test_cache(std::ffi::OsStr::new(""));
+        let env = serve_env(&config, &env_cache, TARGET, RUSTC, C_METADATA).await;
+        let ctx = serve_ctx(&signal);
+        let parsed =
+            ParsedRustcArgs::parse(&serve_args(TARGET, C_METADATA)).expect("parse the unit args");
+        let request = crate::fetch::FetchRequest {
+            target: TARGET,
+            rustc_version: RUSTC,
+            c_metadata: C_METADATA,
+        };
+        let mut tally = super::LookupTally::default();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            super::try_remote_serves(&env, &parsed, &request, &ctx, true, &mut tally),
+        )
+        .await
+        .expect("a miss on a settled slice must not wait on serve_map_ready");
+        assert!(matches!(outcome, super::RemoteServe::Miss));
+        assert!(!tally.failed);
+        assert!(
+            crate::circuit::negative_cache_contains(&config, &env.cache_key)
+                .await
+                .expect("read the negative cache"),
+            "a settled miss records its negative-cache entry"
         );
     }
 
@@ -5189,6 +5806,7 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
+            experimental: crate::config::ExperimentalConfig::default(),
         };
         // A scan shaped like a build-script crate's: `default` resolved
         // plus `probe_from_build_script` the script printed itself.
@@ -5338,7 +5956,7 @@ mod tests {
         use std::time::Duration;
 
         use crate::supervisor::protocol::{Observed, Request, write_frame};
-        use crate::supervisor::{Endpoint, server};
+        use crate::supervisor::{Endpoint, server, server::Handler as _};
         use crate::{AnalysisFacts, BuildContext, BuildSupervisor, WrapperEnvBase};
 
         /// A `tracing` writer whose buffer the test can inspect — the
@@ -5377,6 +5995,7 @@ mod tests {
                 trust_material: std::sync::Arc::default(),
                 registry_http: std::sync::Arc::default(),
                 artifact_cache_staging: std::sync::Arc::default(),
+                experimental: crate::config::ExperimentalConfig::default(),
             }
         }
 
@@ -5436,12 +6055,39 @@ mod tests {
             .expect("write rmeta");
         }
 
-        /// A `BuildSupervisor` whose local base for the `rustc` spelling
-        /// the fixture's frames carry is already memoized with a temp-dir
-        /// config — the cell is set, so `observed` never touches the
-        /// process environment or probes a toolchain.
+        /// A `BuildSupervisor` whose bases for the `rustc` spelling the
+        /// fixture's frames carry are already memoized with a temp-dir
+        /// config — the cells are set, so `observed` and `plan` never
+        /// touch the process environment or probe a toolchain.
         async fn fixture(
             root: &Path,
+        ) -> (
+            crate::config::StowConfig,
+            server::InFlightUnits,
+            Arc<BuildSupervisor>,
+        ) {
+            fixture_ctx(root, |in_flight| BuildContext {
+                policy_dir: None,
+                public_cache_target: Some(HOST_TARGET.to_owned()),
+                public_cache_disabled: false,
+                analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
+                    semantic_fallback_enabled: false,
+                    unit_nodes: None,
+                    prefetch_candidates: std::collections::BTreeMap::new(),
+                })),
+                serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+                policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+                in_flight: in_flight.clone(),
+            })
+            .await
+        }
+
+        /// [`fixture`] with the caller's `BuildContext` — the
+        /// policy-race tests drive `policy_dir`/`policy_ready`
+        /// (stow#788).
+        async fn fixture_ctx(
+            root: &Path,
+            ctx: impl FnOnce(&server::InFlightUnits) -> BuildContext,
         ) -> (
             crate::config::StowConfig,
             server::InFlightUnits,
@@ -5460,28 +6106,20 @@ mod tests {
             });
             let in_flight = server::InFlightUnits::default();
             let env_cache = crate::WrapperEnvCache::new(config.state_db.clone());
-            env_cache
-                .local_bases
-                .lock()
-                .expect("env base map mutex")
-                .insert(
-                    OsString::from("rustc"),
-                    Arc::new(tokio::sync::OnceCell::from(Some(base))),
-                );
+            // Both base maps get the fixture's cell: an unset cell loads
+            // through `StowConfig::load`, which reads the developer's
+            // `~/.stow` — a real index slice for the host there would
+            // serve the fixture's units from state the test never wrote
+            // (stow#800).
+            let cell = Arc::new(tokio::sync::OnceCell::from(Some(base)));
+            for map in [&env_cache.local_bases, &env_cache.env_bases] {
+                map.lock()
+                    .expect("env base map mutex")
+                    .insert(OsString::from("rustc"), Arc::clone(&cell));
+            }
             let handler = Arc::new(BuildSupervisor {
                 env_cache,
-                ctx: BuildContext {
-                    policy_dir: None,
-                    public_cache_target: Some(HOST_TARGET.to_owned()),
-                    public_cache_disabled: false,
-                    analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
-                        semantic_fallback_enabled: false,
-                        unit_nodes: None,
-                        prefetch_candidates: std::collections::BTreeMap::new(),
-                    })),
-                    serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
-                    in_flight: in_flight.clone(),
-                },
+                ctx: ctx(&in_flight),
                 observations: std::sync::Mutex::new(Vec::new()),
                 resolution_done: crate::ResolutionDone::pending(),
             });
@@ -5562,15 +6200,162 @@ mod tests {
             .expect("list stored crates")
         }
 
-        async fn wait_until(mut predicate: impl FnMut() -> bool, what: &str, timeout: Duration) {
-            let deadline = std::time::Instant::now() + timeout;
-            while !predicate() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "timed out waiting for {what}"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
+        /// The `BuildContext` a deferred build hands its supervisor when
+        /// the policy directory is seeded empty and the enrichment still
+        /// owes it the coarse allow commit (stow#788).
+        fn pending_policy_ctx(
+            policy_dir: std::path::PathBuf,
+            ready: &Arc<crate::facade::ServeMapSignal>,
+            in_flight: &server::InFlightUnits,
+        ) -> BuildContext {
+            BuildContext {
+                policy_dir: Some(policy_dir),
+                public_cache_target: Some(HOST_TARGET.to_owned()),
+                public_cache_disabled: false,
+                analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
+                    semantic_fallback_enabled: false,
+                    unit_nodes: None,
+                    prefetch_candidates: std::collections::BTreeMap::new(),
+                })),
+                serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
+                policy_ready: std::sync::Arc::clone(ready),
+                in_flight: in_flight.clone(),
             }
+        }
+
+        /// stow#788: a covered unit that reaches the policy check before
+        /// its allow marker lands waits out the commit instead of
+        /// compiling — the marker lands mid-wait, and the unit is
+        /// served. The artifact is staged locally the way the build's
+        /// own prefetch would land it.
+        #[tokio::test]
+        async fn a_unit_before_its_allow_marker_waits_and_serves() {
+            let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::DEBUG)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let _default = tracing::subscriber::set_default(subscriber);
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+            let policy_dir = tempdir.path().join("policy");
+            std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+            let policy_ready = Arc::new(crate::facade::ServeMapSignal::pending());
+            let (_config, _in_flight, handler) = fixture_ctx(tempdir.path(), |in_flight| {
+                pending_policy_ctx(policy_dir.clone(), &policy_ready, in_flight)
+            })
+            .await;
+
+            let args = unit_args(&registry_src, &out_dir, "demo", "1.0.0", "demometa", &[]);
+
+            let deciding = {
+                let handler = Arc::clone(&handler);
+                let args = args.clone();
+                tokio::spawn(async move { handler.plan(OsString::from("rustc"), args).await })
+            };
+            // The decision found no marker and parked on the owed
+            // commit: from here only the commit can answer it.
+            policy_ready.parked(1).await;
+
+            // The enrichment's commit: the marker lands, then the latch
+            // releases — the order `run_build_enrichment` writes it.
+            crate::cache_policy::write_policy_entries(
+                &policy_dir,
+                &[crate::cache_policy::CachePolicyEntry {
+                    target: HOST_TARGET.to_owned(),
+                    crate_name: "demo".to_owned(),
+                }],
+            )
+            .await
+            .expect("write the allow marker");
+            policy_ready.complete();
+
+            let decision = deciding.await.expect("join the plan");
+            let logs = {
+                let buffer = log.0.lock().expect("log buffer");
+                String::from_utf8_lossy(&buffer).into_owned()
+            };
+            drop(decision);
+            // The marker was honored: the unit ran its lookup — the
+            // slice check only runs on the allowed path — rather than
+            // being denied by timing. With nothing cached it still
+            // compiles, but the allow it waited for was real.
+            assert!(
+                logs.contains("skipping registry serves"),
+                "the allowed path must reach the lookup chain: {logs}"
+            );
+            assert!(
+                !logs.contains("disabled by stow cache policy"),
+                "the waited unit must not see the early deny: {logs}"
+            );
+
+            // A served leaf mints no local-build marker: a dependent
+            // carrying its rlib is not forced to compile behind it.
+            let dependent_args = unit_args(
+                &registry_src,
+                &out_dir,
+                "consumer",
+                "2.0.0",
+                "consmeta",
+                &[("demo", &out_dir.join("libdemo-demometa.rlib"))],
+            );
+            let dependent = crate::rustc_args::ParsedRustcArgs::parse(&dependent_args)
+                .expect("parse dependent");
+            assert!(
+                !crate::must_build_locally(&dependent, HOST_TARGET, Some(&policy_dir)),
+                "a served dependency must not start the local-build cascade"
+            );
+        }
+
+        /// stow#788: once the commit lands without the unit's marker the
+        /// deny is final and immediate — an all-miss build's answer is
+        /// the old path's: one `exists()`, no wait.
+        #[tokio::test]
+        async fn a_marker_absent_after_the_commit_denies_without_waiting() {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create deps dir");
+            let registry_src = tempdir.path().join("cargo_home/registry/src");
+            let policy_dir = tempdir.path().join("policy");
+            std::fs::create_dir_all(&policy_dir).expect("create policy dir");
+            let policy_ready = Arc::new(crate::facade::ServeMapSignal::pending());
+            let (_config, _in_flight, handler) = fixture_ctx(tempdir.path(), |in_flight| {
+                pending_policy_ctx(policy_dir.clone(), &policy_ready, in_flight)
+            })
+            .await;
+            let args = unit_args(&registry_src, &out_dir, "demo", "1.0.0", "demometa", &[]);
+
+            // While the commit is owed, the decision parks on it.
+            let deciding = {
+                let handler = Arc::clone(&handler);
+                let args = args.clone();
+                tokio::spawn(async move { handler.plan(OsString::from("rustc"), args).await })
+            };
+            policy_ready.parked(1).await;
+            policy_ready.complete();
+            let decision = deciding.await.expect("join the plan");
+            assert!(
+                matches!(decision, server::Decision::Compile(_)),
+                "no marker after the commit is a real deny"
+            );
+
+            // Once the latch is settled the same question costs one
+            // marker check — an all-miss build waits on nothing.
+            let started = std::time::Instant::now();
+            let decision = handler.plan(OsString::from("rustc"), args).await;
+            assert!(
+                matches!(decision, server::Decision::Compile(_)),
+                "the settled deny still compiles"
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(500),
+                "a settled latch is not a wait: {:?}",
+                started.elapsed()
+            );
         }
 
         /// A dependent whose report the supervisor handles while its
@@ -5586,7 +6371,7 @@ mod tests {
             let (config, in_flight, handler) = fixture(tempdir.path()).await;
             let supervisor = server::start(
                 handler,
-                in_flight,
+                in_flight.clone(),
                 &std::env::current_exe().expect("current exe"),
             )
             .expect("start supervisor");
@@ -5616,10 +6401,13 @@ mod tests {
             send_observed(&mut consumer_conn, &token, &consumer_args, Some(true)).await;
 
             // No flush here — the report's bookkeeping is what waits, so
-            // the connection's next frame cannot be answered yet. Give it
-            // a beat to prove the wait is real: nothing may be stored
-            // while the dependency is in flight.
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            // the connection's next frame cannot be answered yet. The
+            // dependent's bookkeeping parks on the dependency's flight;
+            // from there nothing may be stored while it is in flight.
+            let dep_rlib =
+                crate::artifact_cache::path_to_string(&out_dir.join("libdep-depmeta.rlib"))
+                    .expect("utf-8 extern path");
+            in_flight.parked_on(&dep_rlib, 1).await;
             assert!(
                 stored_crates(&config).await.is_empty(),
                 "nothing may be stored while the dependency is in flight"
@@ -5630,15 +6418,9 @@ mod tests {
             // store included — has run to its end.
             flush_frames(&mut dep_conn, &token).await;
 
-            // The dependent's wait releases now and its store lands.
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while stored_crates(&config).await.len() != 2 {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "the dependent was not stored"
-                );
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            // The dependent's wait releases now; its connection's flush
+            // answers only once that bookkeeping — store included — ran.
+            flush_frames(&mut consumer_conn, &token).await;
             assert_eq!(stored_crates(&config).await, vec!["consumer", "dep"]);
         }
 
@@ -5695,22 +6477,18 @@ mod tests {
             send_observed(&mut consumer_conn, &token, &consumer_args, None).await;
             send_observed(&mut consumer_conn, &token, &consumer_args, Some(true)).await;
             // The dependent's bookkeeping waits only until the dead
-            // connection's flight completes — then the flush answers.
+            // connection's flight completes — then the flush answers, and
+            // the bookkeeping that logs the skip has run to its end.
             flush_frames(&mut consumer_conn, &token).await;
 
-            wait_until(
-                || {
-                    let captured = log.0.lock().expect("log buffer");
-                    String::from_utf8_lossy(&captured).contains("bookkeeping was never recorded")
-                },
-                "the unrecorded-dependency debug line",
-                Duration::from_secs(10),
-            )
-            .await;
             let captured = {
                 let captured = log.0.lock().expect("log buffer");
                 String::from_utf8_lossy(&captured).into_owned()
             };
+            assert!(
+                captured.contains("bookkeeping was never recorded"),
+                "the unrecorded-dependency debug line:\n{captured}"
+            );
             assert!(
                 captured.contains("consumer2"),
                 "the debug line names the skipped unit:\n{captured}"

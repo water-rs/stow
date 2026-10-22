@@ -10,7 +10,6 @@
 //! the in-flight registry a dependent's bookkeeping waits on (stow#618).
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -57,6 +56,17 @@ pub trait Handler: Send + Sync + 'static {
     /// — and immediately when it already is. Every platform speaks this
     /// over the transport it already carries (stow#347).
     fn await_serve_map(self: &Arc<Self>) -> impl Future<Output = ()> + Send;
+
+    /// The host triple `executable`'s rustc compiles target-less units
+    /// for — its `rustc -vV` `host:` line, probed once per executable and
+    /// memoized for the build. A locally compiling unit's recordable
+    /// outputs are named under it, so the lookup never comes back empty:
+    /// a probe that fails is an error the request reports, not a skipped
+    /// mark (stow#618).
+    fn rustc_host_target(
+        self: &Arc<Self>,
+        executable: &std::ffi::OsStr,
+    ) -> impl Future<Output = Result<String, String>> + Send;
 
     /// What the handler needs to remember between asking for a compile and
     /// hearing that it finished.
@@ -109,7 +119,7 @@ pub struct Supervisor {
     /// connection it accepted has run to its end (stow#618).
     accept_task: Option<tokio::task::JoinHandle<()>>,
     /// Live connection count, read by the drain's overrun warning.
-    connections: Arc<AtomicUsize>,
+    connections: Arc<Connections>,
     /// Holds the socket. Removed by [`Self::shutdown`], or when the
     /// supervisor drops without reaching it.
     #[cfg(unix)]
@@ -167,7 +177,7 @@ impl Supervisor {
                 0
             }
             Err(_elapsed) => {
-                let abandoned = self.connections.load(Ordering::SeqCst);
+                let abandoned = self.connections.live.load(Ordering::SeqCst);
                 tracing::warn!(
                     abandoned,
                     "supervisor shutdown abandoned in-flight facade connections"
@@ -197,7 +207,7 @@ impl Drop for Supervisor {
 }
 
 /// Messages the ticket task owns the state for.
-enum Ticket<P> {
+pub enum Ticket<P> {
     Allocate(P, oneshot::Sender<u64>),
     Take(u64, oneshot::Sender<Option<P>>),
 }
@@ -228,7 +238,7 @@ where
     let (tickets, ticket_rx) = mpsc::unbounded_channel::<Ticket<H::Pending>>();
     tokio::spawn(run_tickets(ticket_rx));
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let connections = Arc::new(AtomicUsize::new(0));
+    let connections = Arc::new(Connections::default());
     let listener = super::bind("stow-supervisor-")?;
     let endpoint = listener.endpoint();
 
@@ -286,7 +296,7 @@ where
 /// 128 bits of randomness, hex. The Unix socket's mode already keeps other
 /// users out; this is what protects the loopback listener, which every
 /// local process can connect to.
-fn mint_token() -> String {
+pub fn mint_token() -> String {
     let mut bytes = [0u8; 16];
     getrandom(&mut bytes);
     hex::encode(bytes)
@@ -308,7 +318,7 @@ fn getrandom(bytes: &mut [u8; 16]) {
     bytes.copy_from_slice(&blake3::hash(seed.as_bytes()).as_bytes()[..16]);
 }
 
-async fn run_tickets<P>(mut messages: mpsc::UnboundedReceiver<Ticket<P>>) {
+pub async fn run_tickets<P>(mut messages: mpsc::UnboundedReceiver<Ticket<P>>) {
     let mut next = 1u64;
     let mut pending = std::collections::HashMap::<u64, P>::new();
     while let Some(message) = messages.recv().await {
@@ -371,6 +381,22 @@ impl InFlightUnits {
             registry: self.clone(),
             unit,
         }
+    }
+
+    /// Resolve once `waits` dependents have parked on the in-flight unit
+    /// registered under `path` — the test observation
+    /// [`crate::Latch::parked`] carries, reached by an `--extern` path
+    /// (stow#810).
+    #[cfg(test)]
+    pub(crate) async fn parked_on(&self, path: &str, waits: usize) {
+        let unit = Arc::clone(
+            self.units
+                .lock()
+                .expect("in-flight units mutex")
+                .get(path)
+                .unwrap_or_else(|| panic!("no unit in flight under {path}")),
+        );
+        unit.done.parked(waits).await;
     }
 
     /// Wait for the bookkeeping of every in-flight unit one of `parsed`'s
@@ -459,18 +485,18 @@ impl Drop for Completion {
 /// A flight one connection started and has not yet reported: the
 /// uncovered path's mark pairs with its report by position, the plan
 /// path's `Compile` answer pairs with the report's ticket.
-struct ConnectionMark {
+pub struct ConnectionMark {
     ticket: Option<u64>,
     completion: Completion,
 }
 
 /// The output paths a locally-compiled unit's bookkeeping records in
-/// `materialized_outputs` — the paths a dependent's `--extern` names —
-/// or `None` for an invocation the parser cannot model, which records
-/// nothing either and so has nothing waiting on it.
-fn recordable_output_paths(args: &[OsString]) -> Option<Vec<String>> {
-    let parsed = ParsedRustcArgs::parse(args).ok()?;
-    let paths = crate::artifact_cache::materialized_output_paths(&parsed).ok()?;
+/// `materialized_outputs` — the paths a dependent's `--extern` names,
+/// whose platform naming follows `host`. `None` only when the paths
+/// themselves cannot be derived: nothing records them, so nothing waits
+/// on them.
+fn recordable_output_paths(parsed: &ParsedRustcArgs, host: &str) -> Option<Vec<String>> {
+    let paths = crate::artifact_cache::materialized_output_paths(parsed, host).ok()?;
     paths
         .iter()
         .map(|path| crate::artifact_cache::path_to_string(path))
@@ -478,13 +504,28 @@ fn recordable_output_paths(args: &[OsString]) -> Option<Vec<String>> {
         .ok()
 }
 
+/// The supervisor's accepted connections, as the shutdown drain sees them.
+#[derive(Debug, Default)]
+struct Connections {
+    /// Connections whose `serve_connection` task has not ended — the
+    /// count the drain's overrun warning reports as abandoned.
+    live: AtomicUsize,
+    /// Test observation (stow#810): the connections the shutdown drain
+    /// still waits on, published once the accept loop stops and after
+    /// every join. A test reaches the point where only the connection it
+    /// holds is left through this, rather than sleeping and hoping the
+    /// drain had its chance to return early.
+    #[cfg(test)]
+    draining: tokio::sync::watch::Sender<Option<usize>>,
+}
+
 /// Decrement the live-connection count when a `serve_connection` task
 /// ends, whatever way it ended.
-struct ConnectionGuard(Arc<AtomicUsize>);
+struct ConnectionGuard(Arc<Connections>);
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -496,7 +537,7 @@ async fn accept_unix<H: Handler>(
     token: String,
     mut shutdown: oneshot::Receiver<()>,
     in_flight: InFlightUnits,
-    connections: Arc<AtomicUsize>,
+    connections: Arc<Connections>,
 ) {
     let mut tasks = tokio::task::JoinSet::new();
     loop {
@@ -506,7 +547,7 @@ async fn accept_unix<H: Handler>(
         };
         match accepted {
             Ok((stream, _)) => {
-                connections.fetch_add(1, Ordering::SeqCst);
+                connections.live.fetch_add(1, Ordering::SeqCst);
                 tasks.spawn(serve_connection(
                     stream,
                     Arc::clone(&handler),
@@ -522,7 +563,7 @@ async fn accept_unix<H: Handler>(
             }
         }
     }
-    drain_connections(tasks).await;
+    drain_connections(tasks, &connections).await;
 }
 
 #[cfg(not(unix))]
@@ -533,7 +574,7 @@ async fn accept_loopback<H: Handler>(
     token: String,
     mut shutdown: oneshot::Receiver<()>,
     in_flight: InFlightUnits,
-    connections: Arc<AtomicUsize>,
+    connections: Arc<Connections>,
 ) {
     let mut tasks = tokio::task::JoinSet::new();
     loop {
@@ -543,7 +584,7 @@ async fn accept_loopback<H: Handler>(
         };
         match accepted {
             Ok((stream, _)) => {
-                connections.fetch_add(1, Ordering::SeqCst);
+                connections.live.fetch_add(1, Ordering::SeqCst);
                 tasks.spawn(serve_connection(
                     stream,
                     Arc::clone(&handler),
@@ -559,7 +600,7 @@ async fn accept_loopback<H: Handler>(
             }
         }
     }
-    drain_connections(tasks).await;
+    drain_connections(tasks, &connections).await;
 }
 
 /// Wait for every accepted connection to run to its end. The build is
@@ -571,11 +612,18 @@ async fn accept_loopback<H: Handler>(
 /// and dropping it aborts the rest — a drain that stopped at the first
 /// clean join cut off exactly the stores it exists to wait for
 /// (stow#660).
-async fn drain_connections(mut tasks: tokio::task::JoinSet<()>) {
+async fn drain_connections(
+    mut tasks: tokio::task::JoinSet<()>,
+    #[cfg_attr(not(test), expect(unused_variables))] connections: &Connections,
+) {
+    #[cfg(test)]
+    connections.draining.send_replace(Some(tasks.len()));
     while let Some(result) = tasks.join_next().await {
         if let Err(error) = result {
             tracing::warn!(%error, "supervisor connection task failed");
         }
+        #[cfg(test)]
+        connections.draining.send_replace(Some(tasks.len()));
     }
 }
 
@@ -585,7 +633,7 @@ async fn serve_connection<S, H>(
     tickets: mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: String,
     in_flight: InFlightUnits,
-    connections: Arc<AtomicUsize>,
+    connections: Arc<Connections>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send,
     H: Handler,
@@ -618,7 +666,7 @@ async fn serve_connection<S, H>(
 /// Answer the request, or `None` when the request is one-way — an
 /// observation carries no reply because the facade that sent it is not
 /// waiting on one.
-async fn answer_request<H: Handler>(
+pub async fn answer_request<H: Handler>(
     handler: &Arc<H>,
     tickets: &mpsc::UnboundedSender<Ticket<H::Pending>>,
     token: &str,
@@ -679,7 +727,21 @@ async fn answer_plan<H: Handler>(
             return Answer::Failed { message: error };
         }
     };
-    let recordable_paths = recordable_output_paths(&args);
+    // The host names the unit's recordable outputs; an invocation the
+    // parser cannot model records nothing and never probes. A probe
+    // that fails fails the request — the mark a dependent blocks on is
+    // never skipped quietly (stow#618).
+    let recordable_paths = match ParsedRustcArgs::parse(&args) {
+        Ok(parsed) => match handler.rustc_host_target(&executable).await {
+            Ok(host) => recordable_output_paths(&parsed, &host),
+            Err(error) => {
+                return Answer::Failed {
+                    message: format!("could not probe the rustc host target: {error}"),
+                };
+            }
+        },
+        Err(_) => None,
+    };
     match handler.plan(executable, args).await {
         Decision::Served(notifications) => Answer::Served(notifications),
         Decision::Compile(pending) => {
@@ -731,11 +793,23 @@ async fn answer_observation<H: Handler>(
     // it — is what the unit's waiters are blocked on (stow#618).
     let _completion = match observed.success {
         None => {
-            if let Some(paths) = recordable_output_paths(&args) {
-                marks.push(ConnectionMark {
-                    ticket: None,
-                    completion: in_flight.register(paths),
-                });
+            if let Ok(parsed) = ParsedRustcArgs::parse(&args) {
+                match handler.rustc_host_target(&executable).await {
+                    Ok(host) => {
+                        if let Some(paths) = recordable_output_paths(&parsed, &host) {
+                            marks.push(ConnectionMark {
+                                ticket: None,
+                                completion: in_flight.register(paths),
+                            });
+                        }
+                    }
+                    // The frame is one-way, so the probe's failure is
+                    // reported in the build's log rather than answered;
+                    // the observation itself still reaches the handler.
+                    Err(error) => {
+                        tracing::warn!(%error, "supervisor could not probe the rustc host target, registering no in-flight mark");
+                    }
+                }
             }
             None
         }
@@ -851,6 +925,13 @@ mod tests {
         fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
         }
+
+        fn rustc_host_target(
+            self: &Arc<Self>,
+            _executable: &std::ffi::OsStr,
+        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+            std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
+        }
     }
 
     /// The whole round trip a facade makes: ask, be told to compile, run
@@ -887,17 +968,45 @@ mod tests {
         assert_eq!(handler.reports.load(Ordering::SeqCst), 1);
     }
 
+    /// A blocking facade's `AwaitServeMap` exchange on the loopback
+    /// `port`: the answer it read, and the instant it read it.
+    fn await_serve_map_blocking(port: u16) -> (super::Answer, std::time::Instant) {
+        use std::io::{Read as _, Write as _};
+
+        let mut peer = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        let request = super::Request::AwaitServeMap(crate::supervisor::protocol::AwaitServeMap {
+            token: "the-token".to_owned(),
+        });
+        let body = serde_json::to_vec(&request).expect("request frame");
+        peer.write_all(
+            &u32::try_from(body.len())
+                .expect("frame length fits u32")
+                .to_le_bytes(),
+        )
+        .expect("write length");
+        peer.write_all(&body).expect("write body");
+        let mut length_bytes = [0_u8; 4];
+        peer.read_exact(&mut length_bytes).expect("read length");
+        let mut answer_body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
+        peer.read_exact(&mut answer_body).expect("read body");
+        let answer = serde_json::from_slice(&answer_body).expect("answer frame");
+        (answer, std::time::Instant::now())
+    }
+
     /// The serve-map wait rides the loopback transport the Windows
     /// build uses: the handler's word releases the answer, so a facade
     /// blocked on it hears the final map land and nothing else
     /// (stow#347).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_serve_map_wait_answers_when_the_map_is_final() {
-        use std::io::{Read as _, Write as _};
-        use std::time::Duration;
+        use std::time::{Duration, Instant};
 
+        /// Answers the wait once `ready` turns true, and reports on
+        /// `parked` the moment a wait has subscribed to it — the point
+        /// from which the answer can only come from the release.
         struct Gated {
             ready: tokio::sync::watch::Receiver<bool>,
+            parked: tokio::sync::mpsc::UnboundedSender<()>,
         }
         impl Handler for Gated {
             type Pending = OsString;
@@ -927,16 +1036,29 @@ mod tests {
 
             fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
                 let mut ready = self.ready.clone();
+                let parked = self.parked.clone();
                 async move {
                     if !*ready.borrow() {
+                        parked.send(()).expect("report the park");
                         let _ = ready.changed().await;
                     }
                 }
             }
+
+            fn rustc_host_target(
+                self: &Arc<Self>,
+                _executable: &std::ffi::OsStr,
+            ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+                std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
+            }
         }
 
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
-        let handler = Arc::new(Gated { ready: ready_rx });
+        let (parked_tx, mut parked_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handler = Arc::new(Gated {
+            ready: ready_rx,
+            parked: parked_tx,
+        });
         let (tickets, ticket_rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::task::spawn(super::run_tickets(ticket_rx));
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -952,46 +1074,43 @@ mod tests {
                 tickets,
                 token,
                 super::InFlightUnits::default(),
-                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                Arc::new(super::Connections::default()),
             )
             .await;
         });
 
-        let (answered_tx, answered_rx) = std::sync::mpsc::channel();
+        let (answered_tx, mut answered_rx) = tokio::sync::oneshot::channel();
         let facade = std::thread::spawn(move || {
-            let mut peer = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-            let request =
-                super::Request::AwaitServeMap(crate::supervisor::protocol::AwaitServeMap {
-                    token: "the-token".to_owned(),
-                });
-            let body = serde_json::to_vec(&request).expect("request frame");
-            peer.write_all(
-                &u32::try_from(body.len())
-                    .expect("frame length fits u32")
-                    .to_le_bytes(),
-            )
-            .expect("write length");
-            peer.write_all(&body).expect("write body");
-            let mut length_bytes = [0_u8; 4];
-            peer.read_exact(&mut length_bytes).expect("read length");
-            let mut answer_body = vec![0_u8; u32::from_le_bytes(length_bytes) as usize];
-            peer.read_exact(&mut answer_body).expect("read body");
-            let answer: super::Answer = serde_json::from_slice(&answer_body).expect("answer frame");
-            answered_tx.send(answer).expect("report answer");
+            answered_tx
+                .send(await_serve_map_blocking(port))
+                .expect("report answer");
         });
 
-        // Nothing may answer while the map is still pending.
-        std::thread::sleep(Duration::from_millis(100));
+        // The wait reaches the handler and parks on the pending map;
+        // from here nothing but the release can answer it.
+        tokio::time::timeout(Duration::from_secs(5), parked_rx.recv())
+            .await
+            .expect("the wait must park on the pending map")
+            .expect("the handler reports its park");
         assert!(
-            answered_rx.try_recv().is_err(),
+            matches!(
+                answered_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
             "the wait answered before the final map landed"
         );
+        let released = Instant::now();
         ready_tx.send(true).expect("release the map");
-        let answer = answered_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the wait must answer");
+        let (answer, answered) = tokio::time::timeout(Duration::from_secs(5), answered_rx)
+            .await
+            .expect("the wait must answer")
+            .expect("the facade reports its answer");
         facade.join().expect("facade thread");
         assert_eq!(answer, super::Answer::ServeMapReady);
+        assert!(
+            answered >= released,
+            "the wait's answer arrived before the map was released"
+        );
     }
 
     /// A served unit never runs rustc, so it never reports.
@@ -1046,12 +1165,37 @@ mod tests {
     }
 
     /// A handler whose post-compile bookkeeping releases on a signal:
-    /// `started` counts reports in flight, `finished` counts ones whose
-    /// bookkeeping ran to its end (stow#618).
+    /// `started` counts reports whose bookkeeping has begun — and
+    /// notifies, so a test waits on the event rather than sampling it —
+    /// `finished` counts ones whose bookkeeping ran to its end
+    /// (stow#618, stow#810).
     struct Bookkeeping {
         release: tokio::sync::watch::Sender<bool>,
-        started: AtomicUsize,
+        started: tokio::sync::watch::Sender<usize>,
         finished: AtomicUsize,
+    }
+
+    impl Bookkeeping {
+        /// Bookkeeping held until the test releases it.
+        fn held() -> Arc<Self> {
+            Arc::new(Self {
+                release: tokio::sync::watch::channel(false).0,
+                started: tokio::sync::watch::channel(0).0,
+                finished: AtomicUsize::new(0),
+            })
+        }
+
+        /// Resolve once `reports` reports' bookkeeping has begun.
+        async fn started(&self, reports: usize) {
+            let mut started = self.started.subscribe();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                started.wait_for(|begun| *begun >= reports),
+            )
+            .await
+            .expect("the report's bookkeeping never started")
+            .expect("the handler outlives the wait");
+        }
     }
 
     impl Handler for Bookkeeping {
@@ -1082,8 +1226,8 @@ mod tests {
                 if observation.success.is_none() {
                     return;
                 }
-                this.started.fetch_add(1, Ordering::SeqCst);
                 let mut release = this.release.subscribe();
+                this.started.send_modify(|begun| *begun += 1);
                 while !*release.borrow() {
                     if release.changed().await.is_err() {
                         return;
@@ -1095,6 +1239,13 @@ mod tests {
 
         fn await_serve_map(self: &Arc<Self>) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
+        }
+
+        fn rustc_host_target(
+            self: &Arc<Self>,
+            _executable: &std::ffi::OsStr,
+        ) -> impl std::future::Future<Output = Result<String, String>> + Send {
+            std::future::ready(Ok("aarch64-apple-darwin".to_owned()))
         }
     }
 
@@ -1145,14 +1296,24 @@ mod tests {
             .expect("write the report frame");
     }
 
-    async fn wait_for(predicate: impl Fn() -> bool + Send + Sync, what: &str) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while !predicate() {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    /// Drive the shutdown `drain` until it waits on exactly one
+    /// connection — the one whose bookkeeping the test holds, since every
+    /// other connection ends at its EOF on its own. The drain publishes
+    /// what it still waits on once the accept loop stops and after each
+    /// join, so this is the drain's own word that it had every chance to
+    /// return and did not; a drain that returns first fails the test
+    /// (stow#810).
+    async fn drain_until_only_the_held_connection_remains(
+        drain: std::pin::Pin<&mut impl std::future::Future<Output = usize>>,
+        mut draining: tokio::sync::watch::Receiver<Option<usize>>,
+    ) {
+        tokio::select! {
+            biased;
+            abandoned = drain => panic!("shutdown returned {abandoned} early"),
+            left = draining.wait_for(|left| *left == Some(1)) => {
+                left.expect("the drain's progress");
             }
-        })
-        .await
-        .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+        }
     }
 
     /// A connection whose bookkeeping is still running when the
@@ -1161,12 +1322,7 @@ mod tests {
     /// when the runtime dropped the task mid-store.
     #[tokio::test]
     async fn shutdown_drains_in_flight_connections() {
-        let (release_tx, _) = tokio::sync::watch::channel(false);
-        let handler = Arc::new(Bookkeeping {
-            release: release_tx,
-            started: AtomicUsize::new(0),
-            finished: AtomicUsize::new(0),
-        });
+        let handler = Bookkeeping::held();
         let mut supervisor = start(
             Arc::clone(&handler),
             super::InFlightUnits::default(),
@@ -1177,17 +1333,11 @@ mod tests {
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
         let mut stream = connect_raw(&endpoint).await;
         send_report(&mut stream, &token).await;
-        wait_for(
-            || handler.started.load(Ordering::SeqCst) == 1,
-            "the report's bookkeeping to start",
-        )
-        .await;
+        handler.started(1).await;
 
+        let draining = supervisor.connections.draining.subscribe();
         let mut drain = std::pin::pin!(supervisor.shutdown());
-        tokio::select! {
-            abandoned = &mut drain => panic!("shutdown returned {abandoned} early"),
-            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-        }
+        drain_until_only_the_held_connection_remains(drain.as_mut(), draining).await;
         assert_eq!(handler.finished.load(Ordering::SeqCst), 0);
         handler.release.send(true).expect("release the bookkeeping");
         drop(stream);
@@ -1196,16 +1346,11 @@ mod tests {
     }
 
     /// The drain waits for every connection, not for the first one it
-    /// joins: a build's early connections finished long before the stop,
-    /// and the one still storing is behind them (stow#660).
+    /// joins: a build's early connections end long before the stop, and
+    /// the one still storing is behind them (stow#660).
     #[tokio::test]
     async fn shutdown_drains_past_connections_that_already_finished() {
-        let (release_tx, _) = tokio::sync::watch::channel(false);
-        let handler = Arc::new(Bookkeeping {
-            release: release_tx,
-            started: AtomicUsize::new(0),
-            finished: AtomicUsize::new(0),
-        });
+        let handler = Bookkeeping::held();
         let mut supervisor = start(
             Arc::clone(&handler),
             super::InFlightUnits::default(),
@@ -1215,29 +1360,21 @@ mod tests {
         let [(_, endpoint), (_, token), _] = supervisor.env();
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
 
-        // Connections that end without any bookkeeping in flight: they
-        // are finished tasks waiting to be joined when the stop comes.
+        // Connections that end without any bookkeeping in flight. Accept
+        // is FIFO, so the held report's bookkeeping starting below means
+        // all three were accepted ahead of it and sit in the drain's set;
+        // each ends at its EOF, so a drain that stopped at its first
+        // clean join returns on one of them.
         for _ in 0..3 {
             drop(connect_raw(&endpoint).await);
         }
-        wait_for(
-            || supervisor.connections.load(Ordering::SeqCst) == 0,
-            "the idle connections to end",
-        )
-        .await;
         let mut stream = connect_raw(&endpoint).await;
         send_report(&mut stream, &token).await;
-        wait_for(
-            || handler.started.load(Ordering::SeqCst) == 1,
-            "the report's bookkeeping to start",
-        )
-        .await;
+        handler.started(1).await;
 
+        let draining = supervisor.connections.draining.subscribe();
         let mut drain = std::pin::pin!(supervisor.shutdown());
-        tokio::select! {
-            abandoned = &mut drain => panic!("shutdown returned {abandoned} early"),
-            () = tokio::time::sleep(std::time::Duration::from_millis(200)) => {}
-        }
+        drain_until_only_the_held_connection_remains(drain.as_mut(), draining).await;
         assert_eq!(handler.finished.load(Ordering::SeqCst), 0);
         handler.release.send(true).expect("release the bookkeeping");
         drop(stream);
@@ -1250,12 +1387,7 @@ mod tests {
     /// hang the build (stow#618).
     #[tokio::test]
     async fn shutdown_abandons_bookkeeping_past_the_budget() {
-        let (release_tx, _) = tokio::sync::watch::channel(false);
-        let handler = Arc::new(Bookkeeping {
-            release: release_tx,
-            started: AtomicUsize::new(0),
-            finished: AtomicUsize::new(0),
-        });
+        let handler = Bookkeeping::held();
         let mut supervisor = start(
             Arc::clone(&handler),
             super::InFlightUnits::default(),
@@ -1266,11 +1398,7 @@ mod tests {
         let endpoint = crate::supervisor::Endpoint::parse(&endpoint).expect("endpoint");
         let mut stream = connect_raw(&endpoint).await;
         send_report(&mut stream, &token).await;
-        wait_for(
-            || handler.started.load(Ordering::SeqCst) == 1,
-            "the report's bookkeeping to start",
-        )
-        .await;
+        handler.started(1).await;
 
         // The release never comes: the drain must give the connection up.
         let abandoned = supervisor
@@ -1312,8 +1440,12 @@ mod tests {
         });
         // The waiter parks on `first`, the flight it reaches first; it
         // has not subscribed to `second` yet.
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
+        in_flight.parked_on("/deps/libfirst.rlib", 1).await;
+        assert_eq!(
+            *second.unit.done.parked.borrow(),
+            0,
+            "the waiter subscribed to `second` before `first` ended"
+        );
         drop(second);
         drop(first);
         tokio::time::timeout(std::time::Duration::from_secs(5), waiter)

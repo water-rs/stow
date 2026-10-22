@@ -77,6 +77,9 @@ pub enum PreheatCommand {
     /// listed repository and enqueues its crates.io graph as ordinary
     /// crate tasks.
     Projects(crate::projects::ProjectsArgs),
+    /// The `Preheat cost` lane's ledger snapshots and report (stow#773)
+    /// — mock-stack only: the ledger exists on budget-probe deploys.
+    Cost(crate::preheat_cost::CostArgs),
 }
 
 #[derive(Args)]
@@ -176,34 +179,35 @@ pub struct PlanArgs {
 }
 
 /// Command entry point.
+///
+/// A lane reaches the edge only to submit: its plan — crates.io,
+/// the resolver, the signed slices — is computed without one, so the
+/// edge is connected up front under `--yes` (a missing `STOW_EDGE_URL`
+/// fails before the resolve spends its minutes) and never otherwise.
+/// Each lane gets its own crates.io client: its pace gate serializes the
+/// lane's API calls and it counts them for the dry-run report.
 pub async fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result<()> {
     match args.command {
         PreheatCommand::Manual(manual) => crate::manual::run(manual, output).await,
         PreheatCommand::Projects(args) => crate::projects::run(args, output).await,
-        command => {
-            let edge = crate::Edge::connect().await?;
-            run_on_edge(&edge, command, output).await
+        PreheatCommand::Cost(args) => crate::preheat_cost::run(args, output).await,
+        PreheatCommand::Top(args) => {
+            let edge = Edge::connect_to_submit(args.yes).await?;
+            top(edge.as_ref(), &mut crates_io::CratesIo::new(), args, output).await
         }
-    }
-}
-
-async fn run_on_edge(
-    edge: &Edge,
-    command: PreheatCommand,
-    output: Output,
-) -> stow_types::error::Result<()> {
-    // One crates.io client per invocation: its pace gate serializes the
-    // lane's API calls and it counts them for the dry-run report.
-    let mut crates_io = crates_io::CratesIo::new();
-    match command {
-        PreheatCommand::Top(args) => top(edge, &mut crates_io, args, output).await,
-        PreheatCommand::Binary(args) => binary(edge, &mut crates_io, args, output).await,
-        PreheatCommand::TopBinaries(args) => top_binaries(edge, &mut crates_io, args, output).await,
-        PreheatCommand::Missed(args) => missed(edge, &crates_io, args, output).await,
-        PreheatCommand::Plan(args) => plan(edge, &mut crates_io, args, output).await,
-        PreheatCommand::Projects(_) | PreheatCommand::Manual(_) => {
-            unreachable!("projects and manual commands dispatch before the edge connect")
+        PreheatCommand::Binary(args) => {
+            let edge = Edge::connect_to_submit(args.yes).await?;
+            binary(edge.as_ref(), &mut crates_io::CratesIo::new(), args, output).await
         }
+        PreheatCommand::TopBinaries(args) => {
+            let edge = Edge::connect_to_submit(args.yes).await?;
+            top_binaries(edge.as_ref(), &mut crates_io::CratesIo::new(), args, output).await
+        }
+        PreheatCommand::Missed(args) => {
+            let edge = Edge::connect_to_submit(args.yes).await?;
+            missed(edge.as_ref(), args, output).await
+        }
+        PreheatCommand::Plan(args) => plan(&mut crates_io::CratesIo::new(), args, output).await,
     }
 }
 
@@ -235,17 +239,15 @@ fn requests_table(requests: &[EnqueueRequest]) -> String {
 /// `preheat` submit lane. Batches post in chunks under the edge's
 /// expanded-task bound.
 async fn submit_plan(
-    edge: &Edge,
+    edge: Option<&Edge>,
     crates_io: &crates_io::CratesIo,
     requests: Vec<EnqueueRequest>,
-    yes: bool,
     output: Output,
 ) -> stow_types::error::Result<()> {
     // The fetch phase ended before this call — the count cannot change.
     let api_requests = crates_io.api_requests();
     render::mutation(
         output,
-        yes,
         requests,
         move |envelope: &render::Planned<Vec<EnqueueRequest>, crate::projects::SubmitOutcome>| {
             let mut out = format!("{} task(s)\n", envelope.plan.len());
@@ -265,15 +267,17 @@ async fn submit_plan(
             let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |requests: &Vec<EnqueueRequest>| {
-            crate::projects::submit_chunked(edge, requests).await
-        },
+        edge.map(|edge| {
+            async move |requests: &Vec<EnqueueRequest>| {
+                crate::projects::submit_chunked(edge, requests).await
+            }
+        }),
     )
     .await
 }
 
 async fn top(
-    edge: &Edge,
+    edge: Option<&Edge>,
     crates_io: &mut crates_io::CratesIo,
     args: TopArgs,
     output: Output,
@@ -388,7 +392,7 @@ async fn top(
         targets = targets.len(),
         "planned top preheat tasks"
     );
-    submit_plan(edge, crates_io, requests, args.yes, output).await
+    submit_plan(edge, crates_io, requests, output).await
 }
 
 /// One crate resolve the `top` lane queues — a ranked crate's selected
@@ -429,7 +433,7 @@ fn flatten_source(resolved: stow_resolver::SourceResolve) -> Vec<EnqueueRequest>
 /// resolve — a name source, never a task (`ArtifactKind` has no
 /// `Bin`).
 async fn binary(
-    edge: &Edge,
+    edge: Option<&Edge>,
     crates_io: &mut crates_io::CratesIo,
     args: BinaryArgs,
     output: Output,
@@ -482,7 +486,7 @@ async fn binary(
             ));
         }
     };
-    submit_plan(edge, crates_io, requests, args.yes, output).await
+    submit_plan(edge, crates_io, requests, output).await
 }
 
 /// The `--targets` option as validated triples — `ci_targets` admits
@@ -599,7 +603,7 @@ async fn resolve_named_release(
 /// tasks. One binary that fails to resolve is reported and skipped —
 /// the rest of the wave still lands.
 async fn top_binaries(
-    edge: &Edge,
+    edge: Option<&Edge>,
     crates_io: &mut crates_io::CratesIo,
     args: TopBinariesArgs,
     output: Output,
@@ -634,7 +638,6 @@ async fn top_binaries(
     let api_requests = crates_io.api_requests();
     render::mutation(
         output,
-        args.yes,
         plan,
         move |envelope: &render::Planned<BinariesPlan, crate::projects::SubmitOutcome>| {
             let plan = &envelope.plan;
@@ -670,7 +673,11 @@ async fn top_binaries(
             let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |plan: &BinariesPlan| crate::projects::submit_chunked(edge, &plan.tasks).await,
+        edge.map(|edge| {
+            async move |plan: &BinariesPlan| {
+                crate::projects::submit_chunked(edge, &plan.tasks).await
+            }
+        }),
     )
     .await
 }
@@ -753,33 +760,33 @@ fn resolve_binaries(
 }
 
 /// One resolved binary's contribution to the plan: its task count.
-#[derive(Debug, serde::Serialize)]
-struct BinaryContribution {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BinaryContribution {
     /// The binary crate's crates.io name.
-    binary: String,
+    pub binary: String,
     /// How many enqueue requests its resolve graphs produced.
-    tasks: usize,
+    pub tasks: usize,
 }
 
 /// A binary that failed to resolve, with its reason.
-#[derive(Debug, serde::Serialize)]
-struct SkippedBinary {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SkippedBinary {
     /// The binary crate's crates.io name.
-    binary: String,
+    pub binary: String,
     /// Why resolution failed — fetch or resolver.
-    reason: String,
+    pub reason: String,
 }
 
 /// The plan `top-binaries` previews and applies: every task every
 /// binary produced, plus per-binary outcomes.
-#[derive(Debug, serde::Serialize)]
-struct BinariesPlan {
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct BinariesPlan {
     /// Every enqueue request across every binary and target.
-    tasks: Vec<EnqueueRequest>,
+    pub tasks: Vec<EnqueueRequest>,
     /// How many requests each binary produced.
-    per_binary: Vec<BinaryContribution>,
+    pub per_binary: Vec<BinaryContribution>,
     /// Binaries resolution failed on, with their reasons.
-    skipped: Vec<SkippedBinary>,
+    pub skipped: Vec<SkippedBinary>,
 }
 
 /// The Analytics Engine query template; `__LIMIT__`, `__SINCE_DAYS__`,
@@ -929,8 +936,7 @@ fn missed_task_id_entry(
 }
 
 async fn missed(
-    edge: &Edge,
-    _crates_io: &crates_io::CratesIo,
+    edge: Option<&Edge>,
     args: MissedArgs,
     output: Output,
 ) -> stow_types::error::Result<()> {
@@ -955,7 +961,7 @@ async fn missed(
     if entries.is_empty() {
         tracing::info!("no missed task ids in the window; nothing to submit");
     }
-    submit_ids_plan(edge, entries, args.yes, output).await
+    submit_ids_plan(edge, entries, output).await
 }
 
 /// The promote-by-id submit: same dry-run/`--yes` envelope as the
@@ -963,14 +969,12 @@ async fn missed(
 /// scheduler resolves each id's subgraph from its node store and
 /// reports the ids it does not hold as `unknown` (stow#588).
 async fn submit_ids_plan(
-    edge: &Edge,
+    edge: Option<&Edge>,
     entries: Vec<stow_types::api::SubmitTaskIdEntry>,
-    yes: bool,
     output: Output,
 ) -> stow_types::error::Result<()> {
     render::mutation(
         output,
-        yes,
         entries,
         move |envelope: &render::Planned<
             Vec<stow_types::api::SubmitTaskIdEntry>,
@@ -997,9 +1001,11 @@ async fn submit_ids_plan(
             let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |entries: &Vec<stow_types::api::SubmitTaskIdEntry>| {
-            crate::projects::submit_ids_chunked(edge, entries).await
-        },
+        edge.map(|edge| {
+            async move |entries: &Vec<stow_types::api::SubmitTaskIdEntry>| {
+                crate::projects::submit_ids_chunked(edge, entries).await
+            }
+        }),
     )
     .await
 }
@@ -1010,7 +1016,6 @@ async fn submit_ids_plan(
 /// requires the exact dependency context and complete unit shapes.
 #[allow(clippy::too_many_lines)] // one lane end to end: fetch → resolve → coverage → enqueue
 async fn plan(
-    _edge: &Edge,
     crates_io: &mut crates_io::CratesIo,
     args: PlanArgs,
     output: Output,

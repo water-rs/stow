@@ -143,7 +143,6 @@ async fn prune(edge: &Edge, args: PruneArgs, output: Output) -> stow_types::erro
     };
     render::mutation(
         output,
-        args.yes,
         plan,
         |envelope: &render::Planned<PrunePlan, ArtifactPruneResponse>| {
             let plan = &envelope.plan;
@@ -171,13 +170,13 @@ async fn prune(edge: &Edge, args: PruneArgs, output: Output) -> stow_types::erro
             let _ = write!(out, "\n{}", render::plan_footer(envelope.dry_run));
             out
         },
-        async move |plan: &PrunePlan| {
+        args.yes.then_some(async move |plan: &PrunePlan| {
             let request = ArtifactPruneRequest {
                 rustc_version: plan.rustc_version.clone(),
             };
             edge.post_json("/api/v1/admin/artifacts/prune", &request)
                 .await
-        },
+        }),
     )
     .await
 }

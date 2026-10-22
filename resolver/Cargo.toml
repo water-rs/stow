@@ -27,6 +27,9 @@ tar = { workspace = true }
 stow-types = { workspace = true }
 zenwave = { workspace = true }
 toml = { workspace = true }
+# Structural manifest edits — dev-dependency stripping on the crate
+# lane — go through toml_edit's document model, never text splicing.
+toml_edit = { version = "0.25", default-features = false, features = ["parse", "display"] }
 url = "2"
 # Commit ids parse through gix-hash's own ObjectId (already locked at
 # 0.25.1 via cargo) — no hand-rolled hex handling.

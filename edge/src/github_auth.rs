@@ -37,11 +37,9 @@ use sha2::Digest as _;
 
 use crate::fetch_guard::{FetchedResponse, GuardedResponse};
 
-/// The OIDC issuer every GitHub Actions token carries.
+/// The OIDC issuer every GitHub Actions token carries — also the
+/// production host the JWKS document comes from.
 const OIDC_ISSUER: &str = "https://token.actions.githubusercontent.com";
-
-/// GitHub's OIDC signing keys endpoint.
-const OIDC_JWKS_URL: &str = "https://token.actions.githubusercontent.com/.well-known/jwks";
 
 /// Clock-skew allowance on `exp`/`nbf` — GitHub's tokens are minted seconds
 /// before use, so a minute is already generous.
@@ -106,6 +104,14 @@ pub struct GitHubTrustConfig {
     pub repo: String,
     /// The `aud` the CI side requests when it mints its OIDC token.
     pub oidc_audience: String,
+    /// Origin every trust probe resolves under — `None` selects
+    /// GitHub's production hosts (`api.github.com` for `/user`,
+    /// `github.com` for the smart-HTTP push probe,
+    /// `token.actions.githubusercontent.com` for the JWKS). The mock
+    /// deploy pins one loopback origin (`STOW_GITHUB_API_URL`) whose
+    /// stub answers every endpoint the check calls, so the mock stack's
+    /// trusted lanes never reach the real API.
+    pub probe_base_url: Option<String>,
 }
 
 /// Ways authentication can fail. `Unauthorized` means the credential itself
@@ -661,6 +667,40 @@ fn read_probe_response<B: FetchedResponse>(
     Ok(verdict)
 }
 
+/// GitHub's REST API origin — the `/user` label probe's production host.
+const GITHUB_API_BASE: &str = "https://api.github.com";
+
+/// GitHub's web origin — the smart-HTTP `info/refs` push probe's
+/// production host.
+const GITHUB_WEB_BASE: &str = "https://github.com";
+
+/// The `git-receive-pack` advertisement URL the push probe GETs —
+/// `base`'s path when the deploy pins a mock origin, `github.com`
+/// otherwise. A trailing slash on `base` is ignored.
+fn push_probe_url(base: Option<&str>, repo: &str) -> String {
+    format!(
+        "{}/{repo}.git/info/refs?service=git-receive-pack",
+        base.unwrap_or(GITHUB_WEB_BASE).trim_end_matches('/')
+    )
+}
+
+/// The `/user` URL a proven credential's label comes from.
+fn user_url(base: Option<&str>) -> String {
+    format!(
+        "{}/user",
+        base.unwrap_or(GITHUB_API_BASE).trim_end_matches('/')
+    )
+}
+
+/// The OIDC signing-keys document URL — the issuer's `.well-known`
+/// path under whichever origin the probes resolve against.
+fn jwks_url(base: Option<&str>) -> String {
+    format!(
+        "{}/.well-known/jwks",
+        base.unwrap_or(OIDC_ISSUER).trim_end_matches('/')
+    )
+}
+
 #[cfg(target_arch = "wasm32")]
 pub use cf_impl::CfGitHubTrust;
 
@@ -670,7 +710,7 @@ pub use cf_impl::CfGitHubTrust;
 /// beside stale keys.
 #[cfg(target_arch = "wasm32")]
 mod cf_impl {
-    use super::{AuthError, GitHubTrustApi, JwkSet, OIDC_JWKS_URL};
+    use super::{AuthError, GitHubTrustApi, JwkSet};
     use crate::fetch_guard::OutboundPool;
     use skyzen_cloudflare::worker::send::SendWrapper;
 
@@ -679,12 +719,21 @@ mod cf_impl {
     /// request that built it.
     pub struct CfGitHubTrust {
         pool: OutboundPool,
+        /// `GitHubTrustConfig::probe_base_url` — the mock origin the
+        /// probes resolve under when the deploy pins one, `None` on
+        /// production.
+        probe_base_url: Option<String>,
     }
 
     impl CfGitHubTrust {
-        /// A trust client drawing its fetch slots from `pool`.
-        pub const fn new(pool: OutboundPool) -> Self {
-            Self { pool }
+        /// A trust client drawing its fetch slots from `pool`, probing
+        /// `probe_base_url` instead of GitHub's production hosts when
+        /// the deploy pins a mock origin.
+        pub const fn new(pool: OutboundPool, probe_base_url: Option<String>) -> Self {
+            Self {
+                pool,
+                probe_base_url,
+            }
         }
     }
 
@@ -759,11 +808,16 @@ mod cf_impl {
     /// PATs, OAuth tokens, `GITHUB_TOKEN` installation tokens); the REST
     /// permissions field does not reflect job-scoped installation tokens.
     /// 200 -> push; 401/403/404 -> no push; anything else -> upstream.
-    async fn push_capable(token: &str, repo: &str, pool: &OutboundPool) -> Result<bool, AuthError> {
+    async fn push_capable(
+        token: &str,
+        repo: &str,
+        base: Option<&str>,
+        pool: &OutboundPool,
+    ) -> Result<bool, AuthError> {
         use base64::Engine;
         let basic =
             base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
-        let url = format!("https://github.com/{repo}.git/info/refs?service=git-receive-pack");
+        let url = super::push_probe_url(base, repo);
         let auth = format!("Basic {basic}");
         let request = SendWrapper::new(
             crate::cf_http::bare_request(
@@ -801,9 +855,10 @@ mod cf_impl {
 
     impl GitHubTrustApi for CfGitHubTrust {
         async fn jwks(&self) -> Result<JwkSet, AuthError> {
-            get_json::<JwkSet>(OIDC_JWKS_URL, "", &self.pool)
+            let url = super::jwks_url(self.probe_base_url.as_deref());
+            get_json::<JwkSet>(&url, "", &self.pool)
                 .await?
-                .ok_or_else(|| AuthError::Upstream(format!("{OIDC_JWKS_URL} not found")))
+                .ok_or_else(|| AuthError::Upstream(format!("{url} not found")))
         }
 
         async fn repo_push_login(
@@ -811,12 +866,16 @@ mod cf_impl {
             token: &str,
             repo: &str,
         ) -> Result<Option<String>, AuthError> {
-            if !push_capable(token, repo, &self.pool).await? {
+            if !push_capable(token, repo, self.probe_base_url.as_deref(), &self.pool).await? {
                 return Ok(None);
             }
-            let label = get_json::<GitHubUser>("https://api.github.com/user", token, &self.pool)
-                .await?
-                .map_or_else(|| credential_class(token).to_owned(), |user| user.login);
+            let label = get_json::<GitHubUser>(
+                &super::user_url(self.probe_base_url.as_deref()),
+                token,
+                &self.pool,
+            )
+            .await?
+            .map_or_else(|| credential_class(token).to_owned(), |user| user.login);
             Ok(Some(label))
         }
     }
@@ -850,6 +909,7 @@ mod tests {
         GitHubTrustConfig {
             repo: "water-rs/stow".to_owned(),
             oidc_audience: "https://stow.waterui.dev".to_owned(),
+            probe_base_url: None,
         }
     }
 
@@ -1606,5 +1666,34 @@ mod tests {
             "2xx must read the body"
         );
         assert!(!cancelled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// With no mock origin pinned, every probe addresses GitHub's
+    /// production hosts — the bearer check's real surface.
+    #[test]
+    fn probe_urls_default_to_github_hosts() {
+        assert_eq!(user_url(None), "https://api.github.com/user");
+        assert_eq!(
+            push_probe_url(None, "water-rs/stow"),
+            "https://github.com/water-rs/stow.git/info/refs?service=git-receive-pack"
+        );
+        assert_eq!(
+            jwks_url(None),
+            "https://token.actions.githubusercontent.com/.well-known/jwks"
+        );
+    }
+
+    /// A pinned mock origin replaces all three hosts — the mock stack's
+    /// trusted lanes never address a real GitHub endpoint (stow#793),
+    /// and a trailing slash on the binding cannot split the path.
+    #[test]
+    fn probe_urls_follow_the_mock_base() {
+        let base = Some("http://127.0.0.1:28123/");
+        assert_eq!(user_url(base), "http://127.0.0.1:28123/user");
+        assert_eq!(
+            push_probe_url(base, "water-rs/stow"),
+            "http://127.0.0.1:28123/water-rs/stow.git/info/refs?service=git-receive-pack"
+        );
+        assert_eq!(jwks_url(base), "http://127.0.0.1:28123/.well-known/jwks");
     }
 }

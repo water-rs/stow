@@ -1,6 +1,6 @@
 //! A loopback HTTP/1.1 server each test owns outright — scripted
-//! per-connection behavior on a maintained Hyper connection, request
-//! heads returned by the joined task, no locks or shared state. The
+//! per-connection behavior on a maintained Hyper connection, requests
+//! returned by the joined task, no locks or shared state. The
 //! server stays up until `join` shuts it down and answers a success
 //! sentinel once the script runs out, so a client retrying where the
 //! contract forbids it is answered — and the test fails — rather than
@@ -61,6 +61,18 @@ pub enum Step {
         /// The response body.
         body: &'static str,
     },
+    /// Answer `status` in GitHub's primary-rate-limit shape —
+    /// `x-ratelimit-remaining: 0` and `x-ratelimit-reset` `reset_in`
+    /// seconds ahead of when the response is built, so the client sees
+    /// a near reset the test can afford to wait out.
+    RateLimited {
+        /// The status code — GitHub answers 403 or 429.
+        status: u16,
+        /// Seconds past the response the `x-ratelimit-reset` epoch lands.
+        reset_in: u64,
+        /// The response body.
+        body: &'static str,
+    },
     /// Answer `status` headers declaring `content_length`, send `body`
     /// once, then hold the connection open — the rest of the declared
     /// body never arrives, so a read that trusted the headers stalls
@@ -81,6 +93,17 @@ pub enum Step {
 /// A captured request's head — method, URI, and the typed headers.
 pub type RequestHead = http::request::Parts;
 
+/// One captured request — head plus the collected body, so a test can
+/// assert what a retry actually sent (the index report's 409 →
+/// full-report resync differs from the delta only in the body).
+#[derive(Debug)]
+pub struct CapturedRequest {
+    /// The request's method, URI and headers.
+    pub head: RequestHead,
+    /// The request body, collected whole.
+    pub body: Bytes,
+}
+
 /// One scripted loopback server — accepts connections until `join`
 /// shuts it down.
 #[derive(Debug)]
@@ -88,7 +111,7 @@ pub struct Loopback {
     /// Base URL — `http://127.0.0.1:<port>`.
     pub url: String,
     shutdown: Option<oneshot::Sender<()>>,
-    task: Option<JoinHandle<Vec<RequestHead>>>,
+    task: Option<JoinHandle<Vec<CapturedRequest>>>,
 }
 
 impl Loopback {
@@ -109,12 +132,12 @@ impl Loopback {
     }
 
     /// Shut the listener down and reap the task, returning every
-    /// request head the server accepted, in order. A server panic or a
+    /// request the server accepted, in order. A server panic or a
     /// shutdown that misses `JOIN_BOUND` propagates as a panic. The
     /// handle stays owned through the timeout: a join that gives up
     /// still leaves `Drop` an abort-able task, and only a completed
     /// task is taken.
-    pub async fn join(mut self) -> Vec<RequestHead> {
+    pub async fn join(mut self) -> Vec<CapturedRequest> {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -140,18 +163,18 @@ impl Drop for Loopback {
 }
 
 /// The accept loop: one connection at a time, each answered by the
-/// next scripted step or `SENTINEL`, until shutdown. Request heads
-/// come back through the bounded channel and leave with the task —
+/// next scripted step or `SENTINEL`, until shutdown. Requests come
+/// back through the bounded channel and leave with the task —
 /// the single producer and the single consumer share no lock.
 async fn run(
     listener: TcpListener,
     mut steps: VecDeque<Step>,
     mut shutdown: oneshot::Receiver<()>,
-) -> Vec<RequestHead> {
+) -> Vec<CapturedRequest> {
     // One request per connection and the receiver drains after each —
     // a single slot is the whole bound; a full channel is a bug.
-    let (head_tx, mut head_rx) = mpsc::channel::<RequestHead>(1);
-    let mut heads = Vec::new();
+    let (head_tx, mut head_rx) = mpsc::channel::<CapturedRequest>(1);
+    let mut requests = Vec::new();
     loop {
         tokio::select! {
             biased;
@@ -165,8 +188,13 @@ async fn run(
                     let tx = tx.clone();
                     let step = service_step.clone();
                     async move {
-                        let (head, _body) = request.into_parts();
-                        tx.try_send(head).expect("the head slot drains each connection");
+                        let (head, body) = request.into_parts();
+                        let body = http_body_util::BodyExt::collect(body)
+                            .await
+                            .map_err(io::Error::other)?
+                            .to_bytes();
+                        tx.try_send(CapturedRequest { head, body })
+                            .expect("the request slot drains each connection");
                         match step {
                             Step::Drop => Err(io::Error::new(
                                 io::ErrorKind::ConnectionAborted,
@@ -177,6 +205,11 @@ async fn run(
                                 retry_after,
                                 body,
                             } => respond(status, retry_after, body),
+                            Step::RateLimited {
+                                status,
+                                reset_in,
+                                body,
+                            } => rate_limited(status, reset_in, body),
                             Step::Stall {
                                 status,
                                 body,
@@ -218,22 +251,22 @@ async fn run(
                     }
                     // Every response step must serve cleanly; anything
                     // else is a server bug, not a scripted outcome.
-                    Step::Respond { .. } => {
+                    Step::Respond { .. } | Step::RateLimited { .. } => {
                         served
                             .expect("each connection serves inside the bound")
                             .expect("a respond step serves the request");
                     }
                 }
-                while let Ok(head) = head_rx.try_recv() {
-                    heads.push(head);
+                while let Ok(captured) = head_rx.try_recv() {
+                    requests.push(captured);
                 }
             }
         }
     }
-    while let Ok(head) = head_rx.try_recv() {
-        heads.push(head);
+    while let Ok(captured) = head_rx.try_recv() {
+        requests.push(captured);
     }
-    heads
+    requests
 }
 
 /// The body every served response shares — boxed so `respond` and
@@ -259,6 +292,28 @@ fn respond(
             .insert(http::header::RETRY_AFTER, HeaderValue::from(hint));
     }
     Ok(response)
+}
+
+/// A typed h1 response in GitHub's primary-rate-limit shape:
+/// `x-ratelimit-remaining: 0` and `x-ratelimit-reset` `reset_in`
+/// seconds ahead of now.
+fn rate_limited(
+    status: u16,
+    reset_in: u64,
+    body: &'static str,
+) -> io::Result<Response<ServedBody>> {
+    use http_body_util::BodyExt as _;
+    let reset = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+        + reset_in;
+    Response::builder()
+        .status(status)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .header("x-ratelimit-remaining", "0")
+        .header("x-ratelimit-reset", reset.to_string())
+        .body(Full::new(Bytes::from_static(body.as_bytes())).boxed())
+        .map_err(io::Error::other)
 }
 
 /// A body that emits its bytes once, then pends forever — the

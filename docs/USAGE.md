@@ -45,6 +45,35 @@ workspace mirror instead of prompting. Recommended for CI.
 stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 ```
 
+`--sandbox` (experimental) runs the cargo build inside a heel sandbox:
+cargo, rustc, every build script, proc-macro and linker it spawns are cut
+off from the machine outside a declared grant set — the workspace and the
+target directory are read/write (writes under the target directory only;
+sources stay read-only), the toolchain, cargo registry and stow's wrapper
+shims are read, credentials files (`credentials`/`credentials.toml`) and
+the home directory are never granted, the clipboard is denied, and the
+environment is an allowlist. Stow fetches dependencies first, then the
+sandboxed cargo runs offline; a sandbox that cannot be set up fails the
+command — there is no unsandboxed fallback.
+
+`--sandbox-deny-network` goes further and denies the build all network
+access: the only channel out of the sandbox is the socket the rustc
+wrapper uses to reach the supervising stow process.
+
+```sh
+stow build --sandbox
+stow build --sandbox-deny-network
+```
+
+The same switches exist in the config file, so an `experimental` table
+enables them for every cargo-running command:
+
+```toml
+[experimental]
+sandbox = true
+sandbox_deny_network = true
+```
+
 ## `stow predict`
 
 Read-only cache-coverage analysis. It posts nothing and enqueues nothing:
@@ -254,12 +283,13 @@ one `index.<target>.<rustc>` OCI artifact per (target, rustc) pair — that
 `~/.stow/index/<target>/<rustc>/` on demand. `stow index refresh` does the
 fetch explicitly for the rustc it probes (or for `--target` /
 `--rustc-version` when given) and prints the resolved tag, row count, and
-manifest digest. Within `STOW_INDEX_REFRESH_SECS` (default 600,
-`index_refresh_secs` in the config file) a cached pointer serves as-is
-and a refresh is a no-op; past it one manifest request revalidates the
-digest and the slice re-downloads only on change. With no cached slice
-and the registry unreachable, refresh fails hard — the same condition
-the wrapper degrades to plain cargo over.
+manifest digest. `stow check`/`build`/`test` serve a cached pointer
+as-is within `STOW_INDEX_REFRESH_SECS` (default 600,
+`index_refresh_secs` in the config file); `stow index refresh` ignores
+the interval. Either way one manifest request revalidates the digest
+and the slice re-downloads only on change. With no cached slice and the
+registry unreachable, refresh fails hard — the same condition the
+wrapper degrades to plain cargo over.
 
 `stow index status` lists every verified slice in the local cache — one
 `index:`/`target:`/`rustc-version:`/`rows:`/`fetched-at:`/
@@ -310,8 +340,8 @@ acting unless `--yes` is given.
   fresh `attempt`, e.g. `--status failed --rustc V --target T`.
 - `stow-admin coverage <crate>[@version] [--target T]` — which servable
   identities exist per CI target, and which targets have none.
-- `stow-admin runs failures --since 24h` — classify failed
-  `build-crate.yml` runs from their job logs, grouped by failure class.
+- `stow-admin runs failures --since 24h` — classify the failed legs of
+  `build-batch.yml` runs from their job logs, grouped by failure class.
 - `stow-admin artifacts inspect <c_metadata> --target T --rustc-version V`
   — the catalog row plus its OCI bundle manifest;
   `artifacts prune --rustc-version V --yes` deletes a retired toolchain's
@@ -388,10 +418,18 @@ acting unless `--yes` is given.
   closure expansion a request would produce; enqueues nothing.
 - `stow-admin preheat manual --crates <file>|--projects <file>
   --rustc-version <v> [--targets a,b] [--in-flight 45]
+  [--batch-parallelism 5] [--batch-max-tasks 40]
   [--source-trees <file>]` — the
   edge-free wave: resolve the input in-process, layer it against the
-  published index, dispatch `build-crate.yml` straight through GitHub's
+  published index, dispatch `build-batch.yml` — one matrix run per
+  packed batch of legs — straight through GitHub's
   `workflow_dispatch`, and publish each index slice as its layer lands.
+  `--in-flight` counts runner slots, the sum of each in-flight batch's
+  `parallelism`; `--batch-parallelism` and `--batch-max-tasks` shape a
+  batch, defaulting to the scheduler's `STOW_BATCH_PARALLELISM` /
+  `STOW_BATCH_MAX_TASKS`. `--dry-run` packs the wave into the batches a
+  drive would send and prints each batch's legs, encoded size and fill
+  of the dispatch input cap — nothing is dispatched.
   Works while Cloudflare is down. Resumable by index, exits non-zero
   with the failed runs' URLs. A run whose failed step is outside the
   build and publish stages — runner setup, toolchain install, artifact
@@ -415,7 +453,7 @@ acting unless `--yes` is given.
   push both to GHCR signed under the index workflow (mock deploys
   delegate to `stow-mock-registry publish-index`), and sync just this
   pass's new records into the edge's D1 catalog. `index-publish.yml`
-  runs this loop after every `build-crate` wave. `index targets` lists
+  runs this loop after every `build-batch` run. `index targets` lists
   the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
@@ -432,5 +470,7 @@ wave builds only what is missing or previously failed.
 access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
 The exceptions never touch the edge: `preheat manual` needs only the
 GitHub credential (plus crates.io and GHCR), `preheat projects generate`
-touches only GitHub, and `index export`/`publish`/`targets` touch only
-the registry. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
+touches only GitHub, `index export`/`publish`/`targets` touch only
+the registry, and a preheat lane (`top`, `top-binaries`, `binary`,
+`missed`, `projects submit`, `plan`) run without `--yes` only plans and
+needs no edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).

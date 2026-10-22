@@ -27,6 +27,7 @@ use std::process::{Command, Output};
 use std::time::SystemTime;
 
 use build_fixture::{refused_url, stow_build_in, stow_setup_in, write_fixture};
+use support::sealed_home_env;
 
 /// Registry crates with build scripts that print `cargo:rerun-if-changed`
 /// / `cargo:rerun-if-env-changed` lines (`anyhow`, `libc`, `serde` — and
@@ -110,27 +111,18 @@ fn served_count(output: &Output) -> usize {
         })
 }
 
-/// Rewrite `src/main.rs` until its mtime is strictly newer than
-/// `reference`: cargo treats an input at-or-before the unit's recorded
-/// invocation time as unchanged, so the touch must land a later tick —
-/// comparing mtimes, never sleeping a fixed time.
+/// Set `path`'s mtime one second past `reference`: cargo treats an input
+/// at-or-before the unit's recorded invocation time as unchanged, so the
+/// touch must land strictly later. Setting the mtime says so outright
+/// instead of rewriting until the filesystem clock ticks (stow#810); a
+/// whole second clears every filesystem's timestamp granularity.
 fn touch_newer_than(path: &Path, reference: SystemTime) {
-    let contents = std::fs::read(path).expect("read file to touch");
-    for _ in 0..2000 {
-        std::fs::write(path, &contents).expect("touch file");
-        let mtime = std::fs::metadata(path)
-            .expect("stat touched file")
-            .modified()
-            .expect("touched file mtime");
-        if mtime > reference {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    panic!(
-        "filesystem clock never moved past {reference:?} for {}",
-        path.display()
-    );
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .expect("open file to touch")
+        .set_modified(reference + std::time::Duration::from_secs(1))
+        .expect("set touched file mtime");
 }
 
 /// Copy `cargo_home/registry` into `other_home` so a plain cargo build
@@ -154,7 +146,9 @@ fn clone_registry_into(cargo_home: &Path, other_home: &Path) {
 /// `cargo build` with no stow wiring at all: a `CARGO_HOME` that never
 /// saw `stow setup`, `RUSTC_WRAPPER` removed from the environment.
 fn plain_cargo_build(dir: &Path, cargo_home: &Path, target_dir: &Path) -> Output {
-    Command::new("cargo")
+    let mut command = Command::new("cargo");
+    sealed_home_env(&mut command, &dir.join("stow-home"));
+    command
         .args(["build", "--offline"])
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home)

@@ -109,7 +109,7 @@ pub fn emit_line(line: &str) {
 /// The plan/apply envelope every mutating command reports: the plan the
 /// operator reviewed, `dry_run: true` while `--yes` was absent, and the
 /// applied result once `--yes` let it run.
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Planned<P, R> {
     /// Nothing was applied — the run only rendered the plan.
     pub dry_run: bool,
@@ -120,25 +120,28 @@ pub struct Planned<P, R> {
     pub result: Option<R>,
 }
 
-/// Run a mutating command's two phases: build `plan`, and only when `yes`
-/// is set run `apply` and fold its result into the emitted envelope.
-/// `apply` borrows the plan so the apply can never drift from what the
-/// operator previewed. Without `--yes` the process exits 0 having changed
-/// nothing.
+/// Run a mutating command's two phases: build `plan`, and only when
+/// `apply` is `Some` run it and fold its result into the emitted envelope.
+/// `Some` is the run that submits (`--yes`); `None` is the dry run, which
+/// exits 0 having changed nothing. `apply` borrows the plan so the apply
+/// can never drift from what the operator previewed.
 pub async fn mutation<P, R>(
     output: Output,
-    yes: bool,
     plan: P,
     human: impl FnOnce(&Planned<P, R>) -> String,
-    apply: impl AsyncFnOnce(&P) -> stow_types::error::Result<R>,
+    apply: Option<impl AsyncFnOnce(&P) -> stow_types::error::Result<R>>,
 ) -> stow_types::error::Result<()>
 where
     P: serde::Serialize,
     R: serde::Serialize,
 {
-    let result = if yes { Some(apply(&plan).await?) } else { None };
+    let dry_run = apply.is_none();
+    let result = match apply {
+        Some(apply) => Some(apply(&plan).await?),
+        None => None,
+    };
     let envelope = Planned {
-        dry_run: !yes,
+        dry_run,
         plan,
         result,
     };

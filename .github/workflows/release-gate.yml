@@ -1,0 +1,413 @@
+name: Release gate
+
+# The checks a release must pass but a routine merge must not wait on: the
+# mock end-to-end, the traffic-cost and preheat-cost tests, the production
+# wave count, and the monthly projection over what those three measured.
+# They run three ways —
+# `workflow_dispatch` on any ref, nightly on dev's head (03:00 ET), and on
+# pull requests and merge groups into main, where the `main` ruleset
+# requires this workflow's `Release gate` check.
+#
+# The `merge_group` trigger carries no branch filter because dev's queue
+# fires it as well as main's: every leg below skips itself when the group's
+# base ref is not main (`github.event.merge_group.base_ref` is the group's
+# target branch), so a dev merge pays only the gate job's seconds while the
+# required check still reports.
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:00 America/New_York; scheduled runs land on the default branch,
+    # which is dev.
+    - cron: "0 7 * * *"
+  pull_request:
+    branches: [main]
+  merge_group:
+
+# Same contract as test.yml: a pull request pushed several times in a row
+# only needs its newest run; scheduled and merge-group runs are records and
+# never cancel one another.
+concurrency:
+  group: release-gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # No debuginfo in CI builds. A failing test reports its file and line
+  # without it, and it was most of every cached target directory: a
+  # workspace `cargo test --no-run` is 11 GB with it and 3.4 GB without,
+  # and compiles in 128 s instead of 174 s. The per-job caches held the full
+  # size, filled the repository's 10 GB cache allowance and evicted each
+  # other.
+  CARGO_PROFILE_DEV_DEBUG: 0
+
+jobs:
+  # Every leg skips itself in a dev merge group — see the header. On any
+  # other trigger it runs unconditionally: a release gate or a nightly tick
+  # has no "changed paths" to scope to, and the nightly exists to catch a
+  # drift no change drove.
+  mock-e2e:
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    name: Mock end-to-end
+    runs-on: ubuntu-latest
+    permissions:
+      # The local edge authenticates its write endpoints against the
+      # credential's own repo permissions — GITHUB_TOKEN needs push
+      # (`contents: write`) to pass. Fork pull requests still receive a
+      # read-only token regardless of this block.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          # Pull requests restore the `dev` cache and never save their own:
+          # a per-PR copy of every job's cache duplicated the whole set
+          # under the PR ref and evicted the build-crate caches (#177).
+          save-if: ${{ github.ref == 'refs/heads/dev' }}
+      # skyzen-cli ships cargo-dist binaries; install-action does not know
+      # the tool and its cargo-binstall fallback compiles it from source
+      # (about eight minutes), so the pinned, digest-checked archive is used.
+      # The workspace build and the consumer projects the e2e script drives
+      # link with mold too.
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      # The mock's dispatched builds link the buster glibc-2.28 sysroot
+      # the way production builds do (stow#336) — same manifest hash key
+      # as the build-crate job's cache; the extracted tree is large
+      # enough to keep between runs.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: glibc-sysroot
+        with:
+          path: ~/.cache/stow
+          key: glibc-sysroot-${{ hashFiles('ci/glibc-sysroot-debs.txt') }}
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: steps.glibc-sysroot.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/stow
+          key: ${{ steps.glibc-sysroot.outputs.cache-primary-key }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      # The mock manifest runs on the Cloudflare provider, so `skyzen dev`
+      # supervises `wrangler dev --local` (workerd).
+      - run: bun install -g wrangler@4
+      # Both binaries take the mock trust root: the build job now consumes
+      # the cache through the same verified-download chain the CLI uses, and
+      # a builder that cannot verify the mock key would quietly skip it.
+      - run: cargo build --release --features stow-cli/mock-verify,stow-build/mock-verify -p stow-cli -p stow-build -p stow-mock-registry -p stow-admin
+      - run: scripts/mock-e2e.sh
+        env:
+          STOW_E2E_WORK_DIR: ${{ runner.temp }}/stow-mock-e2e
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure()
+        with:
+          name: mock-e2e-logs
+          path: ${{ runner.temp }}/stow-mock-e2e/logs
+          if-no-files-found: ignore
+
+  # The traffic-cost test (stow#772): one mock stack — the edge under
+  # `wrangler dev` (workerd), the mock GHCR and the stubbed dispatch
+  # endpoint — answers whether launch user traffic fits the Cloudflare
+  # allowance without overloading the scheduler. It measures every
+  # scheduler drive's billed rows at the 100k and 1M fixtures and Worker
+  # CPU per traffic lane through the isolate's CPU profiler, then drives
+  # every lane at the launch model's peak rate for thirty minutes and
+  # measures the drives again. `scripts/traffic-cost.sh` fails on a row
+  # or CPU budget breach, a drive whose rows grow with the stored bulk,
+  # peak serialized Durable Object wall above its bound, and any overload
+  # signal or 5xx under the drive. Its reports are what the `Monthly
+  # projection` job prices the month from.
+  traffic-cost:
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    name: Traffic cost
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    permissions:
+      # The local edge authenticates its trusted endpoints against the
+      # credential's own repo permissions — GITHUB_TOKEN needs push
+      # (`contents: write`) to pass.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      # The same stow-admin and edge bundle build as mock-e2e, so it
+      # restores that job's cache instead of saving a second copy of it.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - run: scripts/traffic-cost.sh
+        env:
+          STOW_TRAFFIC_WORK_DIR: ${{ runner.temp }}/stow-traffic
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The reports are the run's numbers — kept on a pass too, so the
+      # budgets can be calibrated from them.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: traffic-cost-reports
+          path: ${{ runner.temp }}/stow-traffic/reports
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure() || cancelled()
+        with:
+          name: traffic-cost-logs
+          path: ${{ runner.temp }}/stow-traffic/logs
+          if-no-files-found: ignore
+
+  # The preheat-cost test (stow#773): the same mock stack drives a real
+  # preheat wave through the scheduler — the production lanes submit the
+  # resolved popular-crate graph across every CI target, every dispatch
+  # runs the real build and publish stages with rustc answered by the
+  # mock compiler, publish rounds release the graph layer by layer, and
+  # the same lists are resubmitted the way the daily cron does.
+  # `scripts/preheat-cost.sh` fails on wave or resubmit rows over the
+  # preheat budget, a per-event cost that grows from the first layer to
+  # the last, a node dispatched before its dependencies were published, a
+  # node left unpublished, a resubmit that rebuilds, and any overloaded
+  # answer. The production wave's size is not counted here: resolving the
+  # production lanes outran this job's timeout beside the wave's builds,
+  # so the `Production wave` job counts it.
+  preheat-cost:
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    name: Preheat cost
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # The local edge authenticates its trusted endpoints against the
+      # credential's own repo permissions — GITHUB_TOKEN needs push
+      # (`contents: write`) to pass.
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      # The same release build as mock-e2e (stow-build adds only the mock
+      # compiler), so it restores that job's cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/link-with-mold
+      - uses: ./.github/actions/install-skyzen-cli
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - run: bun install -g wrangler@4
+      - run: scripts/preheat-cost.sh
+        env:
+          STOW_PREHEAT_COST_WORK_DIR: ${{ runner.temp }}/stow-preheat-cost
+          STOW_PREHEAT_COST_LIMIT: 2
+          STOW_PREHEAT_COST_PROJECTS: 0
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The report is the run's numbers — kept on a pass too, so the
+      # budgets can be calibrated from it; the monthly projection job
+      # downloads it.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: preheat-cost-report
+          path: |
+            ${{ runner.temp }}/stow-preheat-cost/preheat-cost-report.json
+            ${{ runner.temp }}/stow-preheat-cost/cost
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure() || cancelled()
+        with:
+          name: preheat-cost-logs
+          path: ${{ runner.temp }}/stow-preheat-cost/logs
+          if-no-files-found: ignore
+
+  # The production wave's size (stow#775): how many distinct nodes the
+  # production preheat lanes submit, which the projection scales the
+  # preheat-cost job's measured per-node costs to. `scripts/production-wave.sh`
+  # resolves the three lanes plan-only (nothing is enqueued, no edge) at the
+  # limit and targets `preheat-admin.yml` runs them with, concurrently and
+  # from the start of the gate: production's resolve takes up to 100
+  # minutes for the projects lane, which is why it has a job of its own
+  # and a timeout of its own. It fails when a lane fails or plans nothing.
+  production-wave:
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    name: Production wave
+    runs-on: ubuntu-latest
+    # Measured 37 minutes (the projects lane dominates), plus half.
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      # Only stow-admin builds here; it restores the cache the other legs
+      # share instead of saving a copy of its own.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/link-with-mold
+      - run: scripts/production-wave.sh
+        env:
+          STOW_PRODUCTION_WAVE_WORK_DIR: ${{ runner.temp }}/stow-production-wave
+      # The count is the run's number — kept on a pass too; the monthly
+      # projection job downloads it.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: production-wave
+          path: ${{ runner.temp }}/stow-production-wave/production-wave.json
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: failure() || cancelled()
+        with:
+          name: production-wave-logs
+          path: |
+            ${{ runner.temp }}/stow-production-wave/logs
+            ${{ runner.temp }}/stow-production-wave/lanes/*/stderr.log
+            ${{ runner.temp }}/stow-production-wave/lanes/*/exit
+          if-no-files-found: ignore
+
+  # The monthly projection (stow#452, stow#775): what a month costs each
+  # Cloudflare product against half its allowance. It needs the three
+  # measurements, so it runs after them: user traffic from the
+  # traffic-cost job's budget and Worker CPU reports at the launch
+  # model's rates, plus the preheat from the preheat-cost job's report —
+  # one full wave per stable rustc release (the cadence `launch-model.toml`
+  # records from Rust's release history) and one resubmit per day, at the
+  # node count the production-wave job counted. `stow-admin traffic-cost
+  # project` prints the traffic, preheat and total beside the bound for
+  # each product and fails when any total is over it.
+  projection:
+    if: github.event_name != 'merge_group' || github.event.merge_group.base_ref == 'refs/heads/main'
+    needs:
+      - traffic-cost
+      - preheat-cost
+      - production-wave
+    name: Monthly projection
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      # Only stow-admin builds here; it restores the cache the other legs
+      # share instead of saving a copy of its own.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: mock-e2e
+          save-if: false
+      - uses: ./.github/actions/link-with-mold
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: traffic-cost-reports
+          path: ${{ runner.temp }}/traffic-cost-reports
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: preheat-cost-report
+          path: ${{ runner.temp }}/preheat-cost-report
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: production-wave
+          path: ${{ runner.temp }}/production-wave
+      - run: cargo build --release -p stow-admin
+      - run: |
+          target/release/stow-admin traffic-cost project \
+            --small "$RUNNER_TEMP/traffic-cost-reports/budget-small.json" \
+            --after "$RUNNER_TEMP/traffic-cost-reports/budget-after.json" \
+            --cpu "$RUNNER_TEMP/traffic-cost-reports/worker-cpu.json" \
+            --preheat "$RUNNER_TEMP/preheat-cost-report/preheat-cost-report.json" \
+            --production "$RUNNER_TEMP/production-wave/production-wave.json" \
+            --model launch-model.toml
+
+  # One check to require — the `main` ruleset names `Release gate` — built
+  # like test.yml's `CI gate`: it needs every leg, `if: always()` runs it
+  # past a failed or cancelled need, and the verdict reads
+  # `needs.*.result` so such a leg turns the gate red. `skipped` passes,
+  # which is what every leg reports in a dev merge group.
+  gate:
+    needs:
+      - mock-e2e
+      - traffic-cost
+      - preheat-cost
+      - production-wave
+      - projection
+    if: always()
+    name: Release gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The gate covers every job only because it needs every job; a new
+      # job that forgets to join `needs:` would ship ungated. Read the
+      # workflow itself and fail if any job other than this one and the
+      # schedule-only reporter — which needs the gate, so the gate cannot
+      # need it — is absent from the list.
+      - name: Needs covers every job
+        run: |
+          needed=$(yq '.jobs.gate.needs.[]' .github/workflows/release-gate.yml | sort)
+          declared=$(yq '.jobs | keys.[]' .github/workflows/release-gate.yml | sort | grep -vx -e gate -e nightly-report)
+          if [ "$needed" != "$declared" ]; then
+            diff <(echo "$declared") <(echo "$needed") || true
+            echo "Release gate needs: must name every other job in release-gate.yml" >&2
+            exit 1
+          fi
+      - name: Every leg succeeded or skipped
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e '[.[].result] | all(. == "success" or . == "skipped")' > /dev/null
+
+  # Schedule ticks alone, after the gate: a failure comments on the open
+  # `nightly` issue — filing one when none is open — and a pass closes
+  # every open one. It needs the legs and the gate so `needs` carries
+  # their results; `if: always()` because a failed leg must not silence
+  # it. The gate's needs-cover check exempts this job.
+  nightly-report:
+    needs:
+      - mock-e2e
+      - traffic-cost
+      - preheat-cost
+      - production-wave
+      - projection
+      - gate
+    if: always() && github.event_name == 'schedule'
+    name: Nightly report
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Report the nightly result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NEEDS: ${{ toJSON(needs) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          failed=$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success" and .value.result != "skipped") | .key] | join(", ")')
+          open_issues=$(gh issue list --label nightly --state open --json number --jq '.[].number')
+          if [ -n "$failed" ]; then
+            body=$(printf 'Nightly release gate failed on commit %s.\n\nFailed jobs: %s\nRun: %s\n' "$GITHUB_SHA" "$failed" "$RUN_URL")
+            if [ -n "$open_issues" ]; then
+              gh issue comment "$(echo "$open_issues" | head -n 1)" --body "$body"
+            else
+              gh issue create --title "Nightly release gate failed" --label nightly --body "$body"
+            fi
+          elif [ -n "$open_issues" ]; then
+            body=$(printf 'Nightly release gate passed on commit %s.\n\nRun: %s\n' "$GITHUB_SHA" "$RUN_URL")
+            while read -r issue; do
+              gh issue comment "$issue" --body "$body"
+              gh issue close "$issue"
+            done <<< "$open_issues"
+          fi

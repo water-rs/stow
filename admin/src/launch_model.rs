@@ -13,6 +13,12 @@
 //!   admissions, enqueues, human requests, status reads, site views and
 //!   build callbacks: the edge writes no AE point for any of them.
 //!
+//! - **Rust's release notes** (`RELEASES.md` in rust-lang/rust, one
+//!   `Version X.Y.Z (YYYY-MM-DD)` heading per stable release, point
+//!   releases included) — the stable-release cadence: how many stable
+//!   rustc releases landed in the [`RELEASE_HISTORY_DAYS`] before the
+//!   window's end. Each one brings a full preheat wave.
+//!
 //! The window's rates divide each count by `days × install_days`. The
 //! launch gate multiplies them back up at `installs × days_per_month`,
 //! so the file holds only what the window measured, not the projection.
@@ -28,7 +34,9 @@ use std::path::PathBuf;
 use askama::Template as _;
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
-use stow_types::launch_model::{LaunchModel, LaunchRates, LaunchRatios, LaunchScale, LaunchWindow};
+use stow_types::launch_model::{
+    LaunchCadence, LaunchModel, LaunchRates, LaunchRatios, LaunchScale, LaunchWindow,
+};
 use stow_types::stow_error;
 
 use crate::cloudflare;
@@ -178,6 +186,68 @@ fn classify_path(method: &str, path: &str) -> Option<RouteKind> {
     }
 }
 
+/// Days of Rust release history the cadence counts, ending at the
+/// window's end (exclusive, like the window itself).
+const RELEASE_HISTORY_DAYS: u32 = 365;
+
+/// One stable rustc release from the published release notes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StableRelease {
+    /// `MAJOR.MINOR.PATCH`.
+    pub version: String,
+    /// Release day — `YYYY-MM-DD`.
+    pub date: String,
+}
+
+/// Every stable release `RELEASES.md` lists, in file order. A heading
+/// is `Version <version> (<date>)`; the pre-1.0 headings (`Version 0.10`)
+/// and 1.0's alphas are not `MAJOR.MINOR.PATCH` releases and are not
+/// stable, so they are left out.
+///
+/// # Errors
+/// A stable release heading whose date is not a calendar day.
+fn parse_stable_releases(notes: &str) -> stow_types::error::Result<Vec<StableRelease>> {
+    notes
+        .lines()
+        .filter_map(|line| {
+            let heading = line.strip_prefix("Version ")?;
+            let (version, date) = heading.split_once(" (")?;
+            let stable =
+                semver::Version::parse(version.trim()).is_ok_and(|parsed| parsed.pre.is_empty());
+            stable.then(|| (version.trim(), date.trim_end().trim_end_matches(')')))
+        })
+        .map(|(version, date)| {
+            time::Date::parse(date, &time::format_description::well_known::Iso8601::DATE)
+                .map_err(|error| stow_error!("release {version} date {date:?}: {error}"))?;
+            Ok(StableRelease {
+                version: version.to_owned(),
+                date: date.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// The `[since, until)` days the cadence counts for a window ending at
+/// `window_end`.
+fn release_period(window_end: &str) -> stow_types::error::Result<(String, String)> {
+    Ok((
+        shift_day(window_end, -i64::from(RELEASE_HISTORY_DAYS))?,
+        window_end.to_owned(),
+    ))
+}
+
+/// The releases published inside the cadence period before `window_end`.
+fn releases_in_period(
+    releases: Vec<StableRelease>,
+    window_end: &str,
+) -> stow_types::error::Result<Vec<StableRelease>> {
+    let (since, until) = release_period(window_end)?;
+    Ok(releases
+        .into_iter()
+        .filter(|release| since <= release.date && release.date < until)
+        .collect())
+}
+
 /// What the export measured for the window — the raw counts the model
 /// derivation divides by install-days. `--from-snapshot` accepts this
 /// shape; `--write-snapshot` emits it.
@@ -198,6 +268,10 @@ pub struct WindowSnapshot {
     /// [`RouteKind::key`] values after the classifier collapsed raw
     /// paths.
     pub requests: BTreeMap<String, u64>,
+    /// The stable rustc releases published in the [`RELEASE_HISTORY_DAYS`]
+    /// before `window_end` — the cadence's count, kept as the releases
+    /// themselves so the model diff and its inputs review together.
+    pub stable_releases: Vec<StableRelease>,
 }
 
 #[derive(Args)]
@@ -318,7 +392,7 @@ async fn gather_snapshot(
     let miss_nodes_sql = MissNodesQuery { window: &window }
         .render()
         .map_err(|error| stow_error!("render launch-model query: {error}"))?;
-    let (install_days, cli_fetches, miss_nodes, requests) = futures_util::try_join!(
+    let (install_days, cli_fetches, miss_nodes, requests, release_notes) = futures_util::try_join!(
         async {
             cloudflare::analytics_engine_sql::<AeCountRow>(&token, &account, &install_days_sql)
                 .await
@@ -330,7 +404,9 @@ async fn gather_snapshot(
         analytic_sum(&token, &account, &cli_fetches_sql, "fetch"),
         analytic_sum(&token, &account, &miss_nodes_sql, "miss"),
         zone_path_counts(&token, &zone, &window.since, &window.until),
+        crate::rust_channel::release_notes(),
     )?;
+    let stable_releases = releases_in_period(parse_stable_releases(&release_notes)?, &window_end)?;
     Ok(WindowSnapshot {
         window_days,
         window_end,
@@ -338,6 +414,7 @@ async fn gather_snapshot(
         cli_fetches,
         miss_nodes,
         requests,
+        stable_releases,
     })
 }
 
@@ -432,10 +509,14 @@ fn render_toml(model: &LaunchModel) -> stow_types::error::Result<String> {
     let body = model.to_toml().map_err(stow_types::error::Error::msg)?;
     Ok(format!(
         "# Regenerated by `stow-admin launch-model export` — hand edits\n\
-         # are lost. `stow-admin launch-gate` and `stow-admin launch-load`\n\
+         # are lost. `stow-admin traffic-cost project`, `verdict` and `peak`\n\
          # read this file; every rate is events per active install per\n\
          # day in `window`, or a flat daily cadence where the lane does\n\
-         # not scale with installs.\n\n{body}"
+         # not scale with installs. `cadence` counts the stable rustc\n\
+         # releases (minor and point) Rust published in the\n\
+         # `period_days` before the window's end; each one invalidates\n\
+         # the public cache and brings a full preheat wave, which the\n\
+         # projection prices once per release.\n\n{body}"
     ))
 }
 
@@ -457,6 +538,18 @@ pub fn derive_model(snapshot: &WindowSnapshot) -> stow_types::error::Result<Laun
         count as f64 / (f64::from(snapshot.window_days) * snapshot.install_days as f64)
     };
     let per_day = |count: u64| count as f64 / f64::from(snapshot.window_days);
+    let (period_start, period_end) = release_period(&snapshot.window_end)?;
+    if let Some(stray) = snapshot
+        .stable_releases
+        .iter()
+        .find(|release| release.date < period_start || period_end <= release.date)
+    {
+        return Err(stow_error!(
+            "snapshot release {} ({}) is outside the cadence period [{period_start}, {period_end})",
+            stray.version,
+            stray.date
+        ));
+    }
     let requests = &snapshot.requests;
     let count = |kind: RouteKind| requests.get(kind.key()).copied().unwrap_or(0);
 
@@ -487,6 +580,11 @@ pub fn derive_model(snapshot: &WindowSnapshot) -> stow_types::error::Result<Laun
             days: snapshot.window_days,
             end: snapshot.window_end.clone(),
             install_days: snapshot.install_days,
+        },
+        cadence: LaunchCadence {
+            stable_releases: u32::try_from(snapshot.stable_releases.len())
+                .map_err(|error| stow_error!("stable release count: {error}"))?,
+            period_days: RELEASE_HISTORY_DAYS,
         },
         rates: LaunchRates {
             cli_byte_path_fetch: round4(per_install_day(snapshot.cli_fetches)),
@@ -532,6 +630,15 @@ fn render_model(model: &LaunchModel) -> String {
         model.window.days,
         model.window.end,
         model.window.install_days,
+    );
+    let _ = std::fmt::Write::write_fmt(
+        &mut out,
+        format_args!(
+            "cadence — {} stable releases in {} days ({:.2}/month)\n",
+            model.cadence.stable_releases,
+            model.cadence.period_days,
+            model.monthly_stable_releases()
+        ),
     );
     let mut table = crate::render::Table::new(&["kind", "events/month"]);
     for (label, kind) in [
@@ -621,6 +728,92 @@ mod tests {
         }
     }
 
+    /// An excerpt of the release notes' shape: a point release, a
+    /// minor, a 1.0 alpha and the pre-1.0 headings.
+    const NOTES: &str = "\
+Version 1.98.1 (2026-09-03)
+==========================
+
+* [fix a thing](https://example.invalid/1)
+
+Version 1.98.0 (2026-08-20)
+==========================
+
+Version 1.0.0-alpha.2 (2015-02-20)
+==================================
+
+Version 0.10 (2014-04-03)
+=========================
+
+Version 0.3  (2012-07-12)
+=========================
+";
+
+    #[test]
+    fn release_notes_yield_stable_releases_only() {
+        let releases = parse_stable_releases(NOTES).expect("parse");
+        let found: Vec<(&str, &str)> = releases
+            .iter()
+            .map(|release| (release.version.as_str(), release.date.as_str()))
+            .collect();
+        assert_eq!(found, [("1.98.1", "2026-09-03"), ("1.98.0", "2026-08-20")]);
+    }
+
+    #[test]
+    fn a_stable_heading_with_a_bad_date_is_refused() {
+        let error = parse_stable_releases("Version 1.98.1 (2026-13-40)\n").expect_err("bad date");
+        assert!(error.to_string().contains("1.98.1"), "{error}");
+    }
+
+    #[test]
+    fn the_cadence_counts_the_year_before_the_window_end() {
+        let release = |version: &str, date: &str| StableRelease {
+            version: version.to_owned(),
+            date: date.to_owned(),
+        };
+        let kept = releases_in_period(
+            vec![
+                // The window's own end day is outside the period ...
+                release("1.99.0", "2026-09-27"),
+                release("1.98.1", "2026-09-26"),
+                // ... its first day, 365 days earlier, is inside.
+                release("1.90.0", "2025-09-27"),
+                release("1.89.0", "2025-09-26"),
+            ],
+            "2026-09-27",
+        )
+        .expect("period");
+        let versions: Vec<&str> = kept
+            .iter()
+            .map(|release| release.version.as_str())
+            .collect();
+        assert_eq!(versions, ["1.98.1", "1.90.0"]);
+    }
+
+    #[test]
+    fn a_snapshot_release_outside_the_period_is_refused() {
+        let mut snapshot: WindowSnapshot =
+            serde_json::from_str(SNAPSHOT).expect("fixture snapshot parses");
+        snapshot.stable_releases.push(StableRelease {
+            version: "1.89.0".to_owned(),
+            date: "2025-08-07".to_owned(),
+        });
+        let error = derive_model(&snapshot).expect_err("stale release must refuse");
+        assert!(error.to_string().contains("1.89.0"), "{error}");
+    }
+
+    #[test]
+    fn the_fixture_cadence_is_its_release_count() {
+        let snapshot: WindowSnapshot =
+            serde_json::from_str(SNAPSHOT).expect("fixture snapshot parses");
+        let model = derive_model(&snapshot).expect("fixture derives a model");
+        assert_eq!(
+            usize::try_from(model.cadence.stable_releases).expect("count fits"),
+            snapshot.stable_releases.len()
+        );
+        assert_eq!(model.cadence.period_days, RELEASE_HISTORY_DAYS);
+    }
+
     #[test]
     fn empty_window_refuses() {
         let snapshot = WindowSnapshot {
@@ -630,6 +823,7 @@ mod tests {
             cli_fetches: 0,
             miss_nodes: 0,
             requests: BTreeMap::new(),
+            stable_releases: Vec::new(),
         };
         assert!(derive_model(&snapshot).is_err());
     }
