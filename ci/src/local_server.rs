@@ -1861,6 +1861,7 @@ mod tests {
     }
 
     /// An executable shell script at `path` that exits `code`.
+    #[cfg(unix)]
     fn script(path: &std::path::Path, code: i32) {
         use std::os::unix::fs::PermissionsExt;
         std::fs::write(path, format!("#!/bin/sh\nexit {code}\n")).unwrap();
@@ -1869,6 +1870,7 @@ mod tests {
 
     /// The recorded jobs of `run`, read the way the edge reads GitHub's
     /// jobs page, classified for the batch's one leg.
+    #[cfg(unix)]
     fn classified(state: &LocalServerState, run: &BatchRun) -> LegOutcome {
         let page = serde_json::json!({
             "jobs": state.jobs.lock().unwrap()[&run.workflow_run_id],
@@ -1922,6 +1924,7 @@ mod tests {
 
     /// A stubbed leg whose records push succeeds records two `success`
     /// jobs the leg classifier accepts as a success.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_landed_leg_records_two_successful_jobs() {
         let dir = tempfile::tempdir().unwrap();
@@ -2141,6 +2144,7 @@ mod tests {
     /// A build stage that exits non-zero fails the `Run the untrusted
     /// build stage` step — the crate's verdict — and skips the publish
     /// job.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_build_is_a_verdict_and_skips_publish() {
         let dir = tempfile::tempdir().unwrap();
@@ -2162,6 +2166,7 @@ mod tests {
 
     /// A records push that fails fails the `Run the trusted publish
     /// stage` step.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_failed_publish_is_a_verdict_on_the_publish_step() {
         let dir = tempfile::tempdir().unwrap();
@@ -2212,6 +2217,7 @@ mod tests {
     /// job running at its first step, no publish job and no records —
     /// until its cancel, which completes it as `cancelled` with the job
     /// rows a cancelled build leaves. A second cancel changes nothing.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_seeded_running_run_stays_in_progress_until_its_cancel() {
         let dir = tempfile::tempdir().unwrap();
@@ -2394,6 +2400,7 @@ mod tests {
     /// Only a succeeded run's legs publish records: the failed run's
     /// leg pushes nothing, so the mock registry binary is never run for
     /// it — a registry that refuses every push fails only the success.
+    #[cfg(unix)]
     #[tokio::test]
     async fn only_succeeded_legs_publish_records() {
         let dir = tempfile::tempdir().unwrap();
