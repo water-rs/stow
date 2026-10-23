@@ -1435,7 +1435,7 @@ struct GhRun {
     conclusion: Option<String>,
     /// The run's latest attempt — GitHub answers it on every workflow
     /// run row, and the jobs read is scoped to it (stow#852).
-    run_attempt: u32,
+    run_attempt: u64,
 }
 
 impl github::RunRow for GhRun {

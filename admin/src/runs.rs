@@ -15,7 +15,6 @@ use stow_types::runs::{
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
 use time::OffsetDateTime;
-use zenwave::ResponseExt as _;
 
 use crate::github::{self, BUILD_WORKFLOW};
 use crate::render::{self, Output, Table};
@@ -423,89 +422,83 @@ pub fn leg_build_job(jobs: &[RunJobRow], leg: u32) -> Option<&RunJobRow> {
 /// The attempt is pinned: the default `filter=latest` jobs view
 /// (`GET …/runs/{id}/jobs`) answers 502 on every request for a run
 /// whose failed legs were rerun, while the attempt-scoped view serves
-/// the same rows (stow#852). The preheat driver's `attempt_jobs` and
-/// the edge's `attempt_jobs_path` read the same path.
+/// the same rows (stow#852). The edge's `attempt_jobs_path` reads the
+/// same path.
 ///
 /// A batch carries 2 × `STOW_BATCH_MAX_TASKS` jobs and that bound is
 /// configurable, so a single `per_page=100` read silently truncates a
 /// large batch; the pager follows the RFC 8288 `Link` header's
 /// `rel="next"` (`stow_types::runs::link_next`, the same parse the
 /// edge's `attempt_jobs` runs) until GitHub names no next page.
-/// `runs failures`, `builds digest` and the watchdog all read their
-/// jobs through here — the one pager, nowhere duplicated.
+/// `runs failures`, `builds digest`, the watchdog and the preheat
+/// driver all read their jobs through here — the one pager, nowhere
+/// duplicated.
 pub async fn fetch_run_jobs(
     token: &str,
     run_id: u64,
-    attempt: u32,
+    attempt: u64,
 ) -> stow_types::error::Result<Vec<RunJobRow>> {
-    fetch_jobs_pages(Some(token), &run_jobs_url(run_id, attempt)).await
-}
-
-/// `GET …/runs/{run_id}/attempts/{attempt}/jobs?per_page=100` — the
-/// first page the pager opens; later pages ride the `Link` header's
-/// URLs verbatim.
-fn run_jobs_url(run_id: u64, attempt: u32) -> String {
-    format!(
-        "{}/repos/{}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+    fetch_attempt_jobs(
+        Some(token),
         github::API_BASE,
-        github::REPO
+        run_id,
+        attempt,
+        None,
+        Backoff::new,
     )
+    .await
 }
 
-/// The pager loop behind [`fetch_run_jobs`] over absolute URLs —
-/// split so a test can point the first page at a loopback server.
-/// `Authorization` rides only when `token` is `Some` (the same
-/// convention `github::send_get` holds for loopback reads).
-async fn fetch_jobs_pages(
+/// [`fetch_run_jobs`] at a resolved API root and under the caller's
+/// retry policy — `backoff` is the fresh per-page budget factory (the
+/// report readers pass [`Backoff::new`]; the preheat driver passes
+/// [`Backoff::outage`], a wave holding no runner may wait an incident
+/// out). `pages` is the conditional cache a repeated reader carries —
+/// `None` for a one-shot read, which walks the pages through an
+/// ephemeral one; a carried cache revalidates each page URL on its
+/// own `ETag`, so a re-read pays a full body only for a page that
+/// changed. A `Link` pointing outside the base the first page was
+/// read from is refused: followed verbatim it would carry the
+/// operator token to a host the API never named. `Authorization`
+/// rides only when `token` is `Some` (the same convention
+/// `github::send_get` holds for loopback reads).
+pub async fn fetch_attempt_jobs(
     token: Option<&str>,
-    first_url: &str,
+    base: &str,
+    run_id: u64,
+    attempt: u64,
+    pages: Option<&mut github::ConditionalPages<RunJobsPage>>,
+    backoff: fn() -> Backoff,
 ) -> stow_types::error::Result<Vec<RunJobRow>> {
+    let mut ephemeral = github::ConditionalPages::new();
+    let pages = pages.unwrap_or(&mut ephemeral);
     let mut jobs = Vec::new();
-    let mut url = first_url.to_owned();
+    let mut url = run_jobs_url(base, run_id, attempt);
     loop {
-        let response = github::send_get(
-            token,
-            &url,
-            Some("application/vnd.github+json"),
-            None,
-            Backoff::new(),
-        )
-        .await
-        .map_err(|error| stow_error!("GET {url}: {error}"))?;
-        let next = response
-            .headers()
-            .get("link")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|header| stow_types::runs::link_next(Some(header)))
-            .map(str::to_owned);
-        let mut page: RunJobsPage = response
-            .error_for_status()
-            .await
-            .map_err(|error| stow_error!("GET {url}: {error}"))?
-            .into_json()
-            .await
-            .map_err(|error| stow_error!("read {url}: {error}"))?;
-        jobs.append(&mut page.jobs);
+        let (page, next) = pages.get(token, &url, backoff()).await?;
+        jobs.extend_from_slice(&page.jobs);
         let Some(next) = next else { break };
-        url = next;
+        if !next.starts_with(&format!("{base}/")) {
+            return Err(stow_error!(
+                "jobs page `Link` next {next} leaves {base} — refused"
+            ));
+        }
+        url = next.to_owned();
     }
     Ok(jobs)
 }
 
+/// `GET {base}/repos/{REPO}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100`
+/// — the first page the pager opens; later pages ride the `Link`
+/// header's URLs verbatim.
+fn run_jobs_url(base: &str, run_id: u64, attempt: u64) -> String {
+    format!(
+        "{base}/repos/{}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+        github::REPO
+    )
+}
+
 // ===== GitHub REST shapes =====
-
-#[derive(Debug, serde::Deserialize)]
-struct WorkflowRun {
-    id: u64,
-    html_url: String,
-    run_attempt: u32,
-}
-
-impl github::RunRow for WorkflowRun {
-    fn run_id(&self) -> u64 {
-        self.id
-    }
-}
 
 /// One classified failure, for the report's example lists.
 #[derive(Debug, serde::Serialize)]
@@ -550,7 +543,7 @@ pub async fn run(token: &str, args: RunsArgs, output: Output) -> stow_types::err
 async fn fetch_failed_runs(
     token: &str,
     since: std::time::Duration,
-) -> stow_types::error::Result<Vec<WorkflowRun>> {
+) -> stow_types::error::Result<Vec<github::WorkflowRunRow>> {
     let until = time::OffsetDateTime::now_utc();
     github::runs_in_range(
         BUILD_WORKFLOW,
@@ -558,7 +551,8 @@ async fn fetch_failed_runs(
         until - since,
         until,
         |path| async move {
-            github::get::<github::RunsPage<WorkflowRun>>(token, &path, Backoff::new()).await
+            github::get::<github::RunsPage<github::WorkflowRunRow>>(token, &path, Backoff::new())
+                .await
         },
     )
     .await
@@ -569,7 +563,7 @@ async fn fetch_failed_runs(
 /// failures.
 async fn classify_runs(
     token: &str,
-    runs: &[WorkflowRun],
+    runs: &[github::WorkflowRunRow],
 ) -> stow_types::error::Result<Vec<FailureGroup>> {
     let mut groups: BTreeMap<FailureClass, Vec<FailureExample>> = BTreeMap::new();
     for run in runs {
@@ -694,6 +688,7 @@ async fn failures(
 #[cfg(test)]
 mod tests {
     use stow_types::runs::{LegJobName, RunStepRow};
+    use stow_types::transient::Backoff;
 
     use super::{
         FailureClass, LegFailure, LegOutcome, RunFailure, RunJobRow, TaskHash, classify_log,
@@ -1074,7 +1069,7 @@ mod tests {
     #[test]
     fn run_jobs_url_pins_the_attempt() {
         assert_eq!(
-            super::run_jobs_url(42, 3),
+            super::run_jobs_url(crate::github::API_BASE, 42, 3),
             format!(
                 "{}/repos/{}/actions/runs/42/attempts/3/jobs?per_page=100",
                 crate::github::API_BASE,
@@ -1083,62 +1078,150 @@ mod tests {
         );
     }
 
-    /// The jobs pager follows `Link: <…>; rel="next"`: a batch's jobs
-    /// can outrun one `per_page=100` page, and both pages' rows must
-    /// land in the answer. `test_server`'s steps cannot emit a `Link`
-    /// header, so the fixture speaks HTTP/1.1 itself — a read of the
-    /// request head, then the scripted response, connection closed.
-    #[tokio::test]
-    async fn fetch_jobs_pages_follows_link_next() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    /// One job row in the page shape the endpoint serves.
+    fn job_json(id: u64) -> String {
+        format!(
+            "{{\"id\":{id},\"name\":\"job {id}\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":null,\"completed_at\":null,\"run_attempt\":1,\"html_url\":\"\",\"steps\":[]}}"
+        )
+    }
+
+    /// A `RunJobsPage` body of the given job ids — `'static` the way
+    /// [`Step`] wants its bodies.
+    fn jobs_page(ids: &[u64]) -> &'static str {
+        Box::leak(
+            format!(
+                "{{\"jobs\":[{}]}}",
+                ids.iter()
+                    .map(|id| job_json(*id))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    /// A loopback server bound ahead of `Loopback::start_on` so its
+    /// own address can ride the scripted `Link` headers.
+    async fn paged_server(etags: bool) -> (crate::test_server::Loopback, String) {
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback binds");
-        let addr = listener.local_addr().expect("bound");
-        let base = format!("http://{addr}");
-        let job = |id: u64| {
-            format!(
-                "{{\"id\":{id},\"name\":\"job {id}\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":null,\"completed_at\":null,\"run_attempt\":1,\"html_url\":\"\",\"steps\":[]}}"
-            )
+        let base = format!("http://{}", listener.local_addr().expect("bound"));
+        let headers = |etag: Option<&str>, link: Option<String>| {
+            etag.map_or_else(Vec::new, |etag| {
+                vec![("etag".to_owned(), format!("\"{etag}\""))]
+            })
+            .into_iter()
+            .chain(link.map(|link| ("link".to_owned(), link)))
+            .collect::<Vec<_>>()
         };
-        let respond = |link: Option<String>, id: u64| {
-            let body = format!("{{\"jobs\":[{}]}}", job(id));
-            let link = link.map_or(String::new(), |url| {
-                format!("link: <{url}>; rel=\"next\"\r\n")
-            });
-            format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{link}content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            )
-        };
-        let responses = [respond(Some(format!("{base}/page2")), 1), respond(None, 2)];
-        let server = tokio::spawn(async move {
-            for response in responses {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let mut buffer = vec![0_u8; 4096];
-                let mut head = Vec::new();
-                loop {
-                    let read = socket.read(&mut buffer).await.expect("read");
-                    head.extend_from_slice(&buffer[..read]);
-                    if head.windows(4).any(|w| w == b"\r\n\r\n") || read == 0 {
-                        break;
-                    }
-                }
-                socket
-                    .write_all(response.as_bytes())
-                    .await
-                    .expect("write response");
-            }
-        });
-        let jobs = super::fetch_jobs_pages(None, &format!("{base}/page1"))
+        let server = crate::test_server::Loopback::start_on(
+            listener,
+            base.clone(),
+            vec![
+                crate::test_server::Step::RespondWith {
+                    status: 200,
+                    retry_after: None,
+                    headers: headers(
+                        etags.then_some("p1"),
+                        Some(format!("<{base}/page2>; rel=\"next\"")),
+                    ),
+                    body: jobs_page(&[1]),
+                },
+                crate::test_server::Step::RespondWith {
+                    status: 200,
+                    retry_after: None,
+                    headers: headers(etags.then_some("p2"), None),
+                    body: jobs_page(&[2]),
+                },
+                crate::test_server::Step::Respond {
+                    status: 304,
+                    retry_after: None,
+                    body: "",
+                },
+                crate::test_server::Step::Respond {
+                    status: 304,
+                    retry_after: None,
+                    body: "",
+                },
+            ],
+        );
+        (server, base)
+    }
+
+    /// The jobs pager follows `Link: <…>; rel="next"`: a batch's jobs
+    /// can outrun one `per_page=100` page, and both pages' rows must
+    /// land in the answer.
+    #[tokio::test]
+    async fn fetch_attempt_jobs_follows_link_next() {
+        let (server, base) = paged_server(false).await;
+        let jobs = super::fetch_attempt_jobs(None, &base, 7, 2, None, Backoff::new)
             .await
             .expect("two pages of jobs");
-        server.await.expect("server");
+        let heads = server.join().await;
         assert_eq!(
             jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
             vec![1, 2]
         );
+        assert_eq!(heads.len(), 2);
+        assert_eq!(heads[1].head.uri.path(), "/page2");
+    }
+
+    /// A carried [`github::ConditionalPages`] revalidates each page on
+    /// the `ETag` its own last 200 served: a second walk sends
+    /// `If-None-Match`, and 304s answer the cached pages — including
+    /// the first page's cached `next`, so the walk still reaches page
+    /// two.
+    #[tokio::test]
+    async fn fetch_attempt_jobs_revalidates_pages_on_their_own_etags() {
+        let (server, base) = paged_server(true).await;
+        let mut pages = crate::github::ConditionalPages::new();
+        for _ in 0..2 {
+            let jobs = super::fetch_attempt_jobs(None, &base, 7, 2, Some(&mut pages), Backoff::new)
+                .await
+                .expect("the cached walk answers the same rows");
+            assert_eq!(
+                jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        }
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 4, "two-page walk, twice");
+        assert!(heads[0].head.headers.get("if-none-match").is_none());
+        assert!(heads[1].head.headers.get("if-none-match").is_none());
+        assert_eq!(
+            heads[2].head.headers.get("if-none-match").expect("etag"),
+            "\"p1\""
+        );
+        assert_eq!(
+            heads[3].head.headers.get("if-none-match").expect("etag"),
+            "\"p2\""
+        );
+        assert_eq!(heads[3].head.uri.path(), "/page2");
+    }
+
+    /// A `Link` naming a host off the read's own base is refused — the
+    /// operator token must never follow it.
+    #[tokio::test]
+    async fn fetch_attempt_jobs_refuses_an_off_origin_link() {
+        use crate::test_server::{Loopback, Step};
+
+        let server = Loopback::start(vec![Step::RespondWith {
+            status: 200,
+            retry_after: None,
+            headers: vec![(
+                "link".to_owned(),
+                "<https://example.com/jobs?page=2>; rel=\"next\"".to_owned(),
+            )],
+            body: jobs_page(&[1]),
+        }])
+        .await;
+        let error = super::fetch_attempt_jobs(None, &server.url, 7, 2, None, Backoff::new)
+            .await
+            .expect_err("an off-origin link is refused");
+        assert!(error.to_string().contains("leaves"), "{error}");
+        server.join().await;
     }
 }

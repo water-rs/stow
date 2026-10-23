@@ -36,7 +36,7 @@ use stow_types::public_cache::{UnitInvocation, required_unit_shapes};
 use stow_types::records::parse_batch_run_title;
 use stow_types::registry::{CacheRepository, cache_repository};
 use stow_types::runs::{
-    GITHUB_CLOCK_ALLOWANCE, LegFailure, LegJobName, LegOutcome, RunFailure, RunJobRow, RunJobsPage,
+    GITHUB_CLOCK_ALLOWANCE, LegFailure, LegJobName, LegOutcome, RunFailure, RunJobRow,
     classify_legs,
 };
 use stow_types::stow_error;
@@ -47,7 +47,7 @@ use stow_types::trusted_builder::{
 };
 use zenwave::{Client, ResponseExt};
 
-use crate::github::{WriteFailure, classify_write};
+use crate::github::{WorkflowRunRow, WriteFailure, classify_write};
 use crate::render::{self, Output};
 
 /// The build-crate runs poll cadence.
@@ -1818,7 +1818,15 @@ async fn classify_github_run(
     state: &RunState,
     wave: &mut Wave<'_>,
 ) -> stow_types::error::Result<()> {
-    let jobs = attempt_jobs(token, state.workflow_run_id, state.run_attempt).await?;
+    let jobs = crate::runs::fetch_attempt_jobs(
+        Some(token),
+        crate::github::API_BASE,
+        state.workflow_run_id,
+        state.run_attempt,
+        None,
+        Backoff::outage,
+    )
+    .await?;
     let outcomes = {
         let batch = wave.batches.get(&state.batch_id).expect("classified batch");
         match classify_legs(
@@ -2944,60 +2952,6 @@ async fn local_run_states(
         .collect())
 }
 
-/// `GET …/runs/{id}/attempts/{attempt}/jobs?per_page=100`, following
-/// `Link: rel="next"` until the pages exhaust — every job row of the
-/// pinned attempt. A `Link` pointing outside `api.github.com` is
-/// refused: followed verbatim it would carry the operator token to a
-/// host the API never named.
-async fn attempt_jobs(
-    token: &str,
-    run_id: u64,
-    attempt: u64,
-) -> stow_types::error::Result<Vec<RunJobRow>> {
-    const PER_PAGE: u32 = 100;
-    let mut jobs = Vec::new();
-    let mut url = format!(
-        "{}/repos/{}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page={PER_PAGE}",
-        crate::github::API_BASE,
-        crate::github::REPO,
-    );
-    loop {
-        let response = crate::github::send_get(
-            Some(token),
-            &url,
-            Some("application/vnd.github+json"),
-            None,
-            Backoff::outage(),
-        )
-        .await
-        .map_err(|error| stow_error!("GET {url}: {error}"))?;
-        let link = response
-            .headers()
-            .get("link")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let page: RunJobsPage = response
-            .error_for_status()
-            .await
-            .map_err(|error| stow_error!("GET {url}: {error}"))?
-            .into_json()
-            .await
-            .map_err(|error| stow_error!("read {url}: {error}"))?;
-        jobs.extend(page.jobs);
-        match stow_types::runs::link_next(link.as_deref()) {
-            Some(next) if next.starts_with(&format!("{}/", crate::github::API_BASE)) => {
-                url = next.to_owned();
-            }
-            Some(next) => {
-                return Err(stow_error!(
-                    "jobs page `Link` next {next} leaves api.github.com — refused"
-                ));
-            }
-            None => return Ok(jobs),
-        }
-    }
-}
-
 /// The layer's one-time adoption sweep: every `build-batch.yml` run in
 /// the closed `[adopt_since, now]` window, newest first so the newest
 /// run covering a node binds it. A GitHub run reads its attempt's jobs
@@ -3036,7 +2990,15 @@ async fn adopt_runs(
         }
         let (legs, expected) = match dispatch {
             Dispatch::GitHub { token } => {
-                let jobs = attempt_jobs(token, state.workflow_run_id, state.run_attempt).await?;
+                let jobs = crate::runs::fetch_attempt_jobs(
+                    Some(token),
+                    crate::github::API_BASE,
+                    state.workflow_run_id,
+                    state.run_attempt,
+                    None,
+                    Backoff::outage,
+                )
+                .await?;
                 adopt_github_legs(&jobs, &open_hash, wave.nodes)
             }
             Dispatch::Local { .. } => adopt_local_legs(&state, wave.nodes),
@@ -3123,31 +3085,6 @@ fn adopt_local_legs(
         }
     }
     (legs, expected)
-}
-
-/// One run row as both `workflow_runs` listings and `actions/runs/{id}`
-/// serve it — the fields the driver needs.
-#[derive(serde::Deserialize)]
-struct WorkflowRunRow {
-    id: u64,
-    display_title: String,
-    head_sha: String,
-    status: String,
-    conclusion: Option<String>,
-    html_url: String,
-    /// GitHub's attempt counter — `rerun-failed-jobs` bumps it.
-    run_attempt: u64,
-    /// GitHub's creation time for the run — the unresolved-dispatch
-    /// resolution accepts a run only at or after its node's attempt
-    /// (minus [`GITHUB_CLOCK_ALLOWANCE`]).
-    #[serde(with = "time::serde::rfc3339")]
-    created_at: time::OffsetDateTime,
-}
-
-impl crate::github::RunRow for WorkflowRunRow {
-    fn run_id(&self) -> u64 {
-        self.id
-    }
 }
 
 /// `GET /git/ref/heads/{branch}` — the fields the driver needs.
@@ -3679,6 +3616,9 @@ mod tests {
             html_url: format!("https://github.com/water-rs/stow/actions/runs/{workflow_run_id}"),
             run_attempt: 1,
             created_at: time::OffsetDateTime::UNIX_EPOCH,
+            actor: crate::github::Actor {
+                login: "test-actor".to_owned(),
+            },
         }
     }
 
