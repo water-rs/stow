@@ -61,7 +61,7 @@ pub fn is_ci_target(target: &str) -> bool {
 /// for the rest. The scheduler caps dispatches per family because the
 /// pools are sized very differently — the org's macOS pool is the
 /// smallest — and starts the slow Windows legs of a wave first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RunnerFamily {
     /// `ubuntu-latest` — also hosts the Android and wasm builds.
     Linux,
@@ -3438,4 +3438,290 @@ pub mod scheduler_lanes {
     /// Every scheduler-lane path — the router's mount list and the WAF
     /// rule's block list are both built from this.
     pub const ALL: &[&str] = &[ADMISSIONS, ENQUEUE, REQUESTS, REQUEST, REQUEST_PAGE];
+}
+
+/// The admission class a submission tree arrives under (stow#878).
+///
+/// Each entry point the scheduler's rank prices separately (#879).
+/// Priority is a property of the entry point, not the node: operations
+/// carries the caller's choice, every other source is the scheduler's
+/// default for that lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SubmissionSource {
+    /// An operations submission (`stow-admin`) — the caller sets the
+    /// priority the tree's nodes enter the rank with.
+    Operations {
+        /// The caller-chosen priority operand.
+        priority: i64,
+    },
+    /// A CLI cache miss — proof-of-work admission.
+    CacheMiss,
+    /// An #882 inexact superset-hit report — the same proof-of-work
+    /// admission as a miss, queued at very low priority.
+    InexactHit,
+    /// A Turnstile-admitted `stow.waterui.dev` request — the human lane.
+    HumanRequest,
+    /// A trusted preheat lane (top, binaries, projects, missed, dirs).
+    Preheat,
+}
+
+/// One node of a [`SubmissionTree`].
+///
+/// The queue identity columns of the retired `EnqueueRequest` plus the
+/// node's direct-dependency edges, sent once per source instead of
+/// embedded under every dependent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmissionNode {
+    /// The node's canonical task id — the submitter computes it and the
+    /// merge verifies its identity columns re-derive it.
+    pub task_id: String,
+    /// Crate name to build.
+    pub crate_name: CrateName,
+    /// Crate version to build.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Whether the node compiles for the build host.
+    #[serde(default)]
+    pub host_side: bool,
+    /// The explicit `--target` spelling flag (stow#736).
+    pub explicit_spelling: crate::public_cache::ExplicitSpelling,
+    /// Build against the binary's published `Cargo.lock` (overlay lane).
+    #[serde(default)]
+    pub preserve_lockfile: bool,
+    /// The Merkle dependency digest the task id commits to (stow#588).
+    pub dependency_identity: crate::identity::DependencyIdentity,
+    /// Indexes into [`SubmissionTree::nodes`] naming this node's
+    /// direct dependencies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<u32>,
+    /// The source's demand signal for this node (crates.io downloads
+    /// for preheat, 0 for misses).
+    #[serde(default)]
+    pub downloads: u64,
+}
+
+/// One dependency tree from one source (stow#878).
+///
+/// The unit every submitter posts once — a project, a crate, a miss —
+/// each node once, merged into the scheduler's graph by task id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmissionTree {
+    /// The entry point this tree arrives under.
+    pub source: SubmissionSource,
+    /// Indexes into `nodes` of the submissions' roots — the crates the
+    /// source actually asked for.
+    pub roots: Vec<u32>,
+    /// Every node in the tree, each once, in the resolved graph's
+    /// canonical order.
+    pub nodes: Vec<SubmissionNode>,
+}
+
+/// One dispatch pass's claim on one task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchClaim {
+    /// The claimed task.
+    pub task_id: String,
+    /// The generation minted for this claim.
+    pub generation: u64,
+    /// The attempt cycle the claim runs under.
+    pub attempt: u32,
+}
+
+/// One dispatch response binding.
+///
+/// The run a claim's `workflow_dispatch` returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchBinding {
+    /// The claimed task.
+    pub task_id: String,
+    /// The generation this binding fences to.
+    pub generation: u64,
+    /// The GitHub Actions run id the dispatch returned.
+    pub run_id: String,
+}
+
+/// The operator mutations `Mutate` records.
+///
+/// The selector is resolved to ids before the event is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationKind {
+    /// Re-queue a terminal task.
+    Retry,
+    /// Drop a pending task.
+    Cancel,
+    /// Move a task to the human lane.
+    Promote,
+    /// Remove aged rows outright.
+    Purge,
+}
+
+/// One demand-batch contribution to one task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandEntry {
+    /// The task the batch's closure reached.
+    pub task_id: String,
+    /// This batch's total contribution.
+    pub delta: i64,
+}
+
+/// The human request lane's lifecycle events.
+///
+/// The `requests` record state machine carried as log entries.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RequestEvent {
+    /// The record was admitted and a resolve run dispatched.
+    Admitted {
+        /// The admission's fields.
+        admission: Box<RequestAdmission>,
+        /// The dispatched attempt.
+        attempt: u32,
+        /// The unix-second dispatch stamp.
+        dispatched_at: i64,
+    },
+    /// A `workflow_run` lifecycle event for the resolve run.
+    RunUpdated {
+        /// The update payload.
+        update: Box<RequestRunUpdate>,
+    },
+    /// The resolve job's outcome report landed.
+    Outcome {
+        /// The reported attempt.
+        attempt: u32,
+        /// `enqueued` or `failed`.
+        state: String,
+        /// The serialized stored roots (present when enqueued).
+        outcome_json: Option<String>,
+        /// The failure reason (present when failed).
+        error: Option<String>,
+    },
+}
+
+/// One accepted event in the scheduler's flat append-only log (stow#878).
+///
+/// Every state change the in-memory graph survives a forced eviction
+/// by is one of these, appended before the request or pass that
+/// produced it is acknowledged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "event")]
+pub enum SchedulerEvent {
+    /// One chunk of a multi-row submission: a `SubmissionTree` split at
+    /// ~1 MiB so no row nears the platform's row-size bound, appended
+    /// inside one transaction before the submit is acknowledged. `roots`
+    /// rides part 0; `nodes` carries this part's slice of the tree.
+    Submit {
+        /// The entry point the whole tree arrives under.
+        source: SubmissionSource,
+        /// This part's index.
+        part: u32,
+        /// Total parts the tree was split into.
+        parts: u32,
+        /// Tree roots — set on part 0 only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roots: Vec<u32>,
+        /// This part's nodes.
+        nodes: Vec<SubmissionNode>,
+    },
+    /// An index-publish report: the unit shapes a live slice serves.
+    SliceReport {
+        /// The slice's compilation target.
+        target: TargetTriple,
+        /// The slice's rustc.
+        rustc_version: WireRustcVersion,
+        /// The report's declared base (delta reports).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_generation: Option<i64>,
+        /// The index generation this report publishes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<i64>,
+        /// Membership rows the report adds.
+        added: Vec<PublishedSliceRow>,
+        /// Membership rows the report retires.
+        retired: Vec<PublishedSliceRow>,
+    },
+    /// One dispatch pass's whole claim set — one row for every claim of
+    /// the pass, appended before the first `workflow_dispatch` posts.
+    Claims {
+        /// The pass's claims, in claim order.
+        claims: Vec<DispatchClaim>,
+    },
+    /// One dispatch pass's whole binding set — one row after the
+    /// concurrent dispatch POSTs return.
+    Bindings {
+        /// The pass's bindings.
+        bindings: Vec<DispatchBinding>,
+    },
+    /// A `workflow_run` `in_progress` delivery for a run the scheduler
+    /// did not dispatch — external occupancy only; the scheduler's own
+    /// `in_progress` deliveries persist nothing.
+    ExternalRunStarted {
+        /// The Actions run id.
+        run_id: String,
+        /// The run's runner family.
+        family: RunnerFamily,
+    },
+    /// A `workflow_run` `completed` delivery — applies to a bound run,
+    /// parks until the binding lands, or just consumes an external run.
+    RunFinished {
+        /// The Actions run id.
+        run_id: String,
+        /// The task the run's title named.
+        task_id: String,
+        /// The mapped conclusion.
+        success: bool,
+        /// The conclusion was `cancelled`.
+        #[serde(default)]
+        cancelled: bool,
+        /// Failure description.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// An operator mutation, selector already resolved to ids.
+    Mutate {
+        /// The mutation applied.
+        op: MutationKind,
+        /// The tasks it applied to.
+        task_ids: Vec<String>,
+    },
+    /// A human request lane lifecycle step.
+    Request {
+        /// The record the step applies to.
+        request_id: String,
+        /// The lifecycle event.
+        kind: RequestEvent,
+    },
+    /// An accepted demand batch folded into the graph.
+    Demand {
+        /// The batch's durable identity (replays dedupe on it).
+        batch_id: String,
+        /// The folded contributions.
+        entries: Vec<DemandEntry>,
+    },
+    /// The dispatch freeze's transition record (`None` = cleared).
+    Freeze {
+        /// The serialized record while engaged.
+        record: Option<Box<crate::api::DispatchFreezeRecord>>,
+    },
+    /// The admission floor the operator reset stamped.
+    Floor {
+        /// `min_dispatch_value`.
+        value: i64,
+    },
+    /// One successful build's claim-to-completion duration — folded
+    /// into the per-(crate, target) expected-cost stats.
+    BuildSample {
+        /// The built crate.
+        crate_name: CrateName,
+        /// Its compilation target.
+        target: TargetTriple,
+        /// The measured duration.
+        duration_ms: u64,
+    },
 }
