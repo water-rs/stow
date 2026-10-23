@@ -1,7 +1,7 @@
 //! `stow-admin preheat manual` — the operator-driven preheat of
 //! water-rs/stow#455. Cloudflare may be fully offline: the driver
 //! resolves the graph in-process, layers it topologically, packs each
-//! layer's dispatchable nodes into `build-batch.yml` batches (stow#833)
+//! layer's dispatchable nodes into `build-crate.yml` runs
 //! and dispatches them straight through the GitHub API (or the local
 //! CI server under `--dispatch-url`), and lets the registry be the only
 //! record store — the scheduler's `tasks/submit` and every edge route
@@ -25,30 +25,24 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use oci_client::manifest::OciImageManifest;
-use stow_types::api::{
-    BatchEncoder, BatchFit, BatchId, BuildTaskPayload, EnqueueDependency, EnqueueRequest,
-    RunnerFamily, TaskHash,
-};
+use stow_types::api::{BuildTaskPayload, EnqueueDependency, EnqueueRequest};
 use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 use stow_types::index::{ArtifactIndexRow, STOW_INDEX_MEDIA_TYPE, index_tag};
-use stow_types::local_ci::LocalCiLeg;
 use stow_types::public_cache::{UnitInvocation, required_unit_shapes};
-use stow_types::records::parse_batch_run_title;
+use stow_types::records::parse_run_title;
 use stow_types::registry::{CacheRepository, cache_repository};
-use stow_types::runs::{
-    GITHUB_CLOCK_ALLOWANCE, LegFailure, LegJobName, LegOutcome, RunFailure, RunJobRow,
-    classify_legs,
-};
+use stow_types::runs::{GITHUB_CLOCK_ALLOWANCE, RunFailure};
 use stow_types::stow_error;
 use stow_types::task_graph::TaskNodeIdentity;
 use stow_types::transient::Backoff;
 use stow_types::trusted_builder::{
-    BATCH_WORKFLOW_FILE, BATCH_WORKFLOW_NAME, BRANCH, INDEX_CERTIFICATE_IDENTITY,
+    BRANCH, INDEX_CERTIFICATE_IDENTITY, WORKFLOW_FILE, WORKFLOW_NAME,
 };
 use zenwave::{Client, ResponseExt};
 
 use crate::github::{WorkflowRunRow, WriteFailure, classify_write};
 use crate::render::{self, Output};
+use crate::runs::{TaskOutcome, classify_page};
 
 /// The build-crate runs poll cadence.
 const RUN_POLL_SECONDS: u64 = 30;
@@ -104,20 +98,11 @@ pub struct ManualArgs {
     /// The stable rustc every task pins — `1.85.0`-style.
     #[arg(long)]
     rustc_version: String,
-    /// Runner slots in flight at once — the sum of in-flight batches'
-    /// `parallelism`, kept under the org's 60-runner ceiling so the
+    /// Runner slots in flight at once — one `build-crate.yml` run
+    /// holds one slot, kept under the org's 60-runner ceiling so the
     /// repo's own CI still gets runners.
     #[arg(long, default_value_t = 45)]
     in_flight: u32,
-    /// `k` — the `max-parallel` runner slots one `build-batch.yml`
-    /// matrix holds; a batch dispatches with `min(legs, k)` (stow#833).
-    /// Defaults to the scheduler's `STOW_BATCH_PARALLELISM` default.
-    #[arg(long, default_value_t = stow_types::api::DEFAULT_BATCH_PARALLELISM)]
-    batch_parallelism: u32,
-    /// `B` — the leg bound at which a batch closes (stow#833). Defaults
-    /// to the scheduler's `STOW_BATCH_MAX_TASKS` default.
-    #[arg(long, default_value_t = stow_types::api::DEFAULT_BATCH_MAX_TASKS)]
-    batch_max_tasks: u32,
     /// Comma-separated CI target triples to resolve and dispatch for —
     /// defaults to every `CI_TARGET_TRIPLES` entry. The mock lane
     /// narrows it to the host triple.
@@ -167,24 +152,23 @@ struct UnansweredDispatch {
 }
 
 /// A `rerun-failed-jobs` write sent but never answered clearly. The
-/// poll that sees the run take the rerun pushes the [`RerunRecord`]s
-/// the success path would have pushed — `legs` names every leg the
-/// ask was for, each with the job and step its failure named.
+/// poll that sees the run take the rerun pushes the [`RerunRecord`]
+/// the success path would have pushed — `tasks` names the task the
+/// ask was for, with the job and step its failure named.
 struct PendingRerun {
     /// The failed `run_attempt` the rerun was asked on.
     attempt: u64,
     /// When the write went out — the `RUN_GRACE_MINUTES` deadline after
     /// which an unchanged run is classified again, resending the ask.
     asked_at: tokio::time::Instant,
-    /// Every leg that earned the ask — a rerun reruns only the failed
-    /// legs, so each keeps its own record.
-    legs: Vec<RerunLeg>,
+    /// The task that earned the ask — one task is one run.
+    task: RerunTask,
 }
 
-/// One leg a rerun was asked for: the node's task id, the job it
+/// The task a rerun was asked for: the node's task id, the job it
 /// failed in and that job's failed step (or conclusion) when it had
 /// one — the fields a [`RerunRecord`] reports.
-struct RerunLeg {
+struct RerunTask {
     task_id: String,
     job: String,
     step: Option<String>,
@@ -257,28 +241,27 @@ impl WriteGate {
 
 /// The mutable wave state every fold, resolution and send pass inside
 /// `drive_layer` shares: the node map, the open-task set, the bound
-/// batches, the rerun report and the write gate.
+/// runs, the rerun report and the write gate.
 struct Wave<'a> {
     nodes: &'a mut BTreeMap<String, NodeRun>,
     open: &'a mut BTreeSet<String>,
-    batches: &'a mut HashMap<BatchId, BoundRun>,
+    runs: &'a mut HashMap<String, BoundRun>,
     reruns: &'a mut Vec<RerunRecord>,
     gate: &'a mut WriteGate,
 }
 
-/// One node's run to completion — its leg rides one `build-batch.yml`
-/// run with the rest of its batch; the outcome surfaces through the
-/// leg's jobs.
+/// One node's run to completion — one `build-crate.yml` run is one
+/// task; the outcome surfaces through its jobs.
 struct NodeRun {
     request: EnqueueRequest,
-    /// `Some(url)` once a run exists for the node's batch — absent
-    /// while the dispatch is still inside GitHub's registration grace.
+    /// `Some(url)` once a run exists for the node — absent while the
+    /// dispatch is still inside GitHub's registration grace.
     run_url: Option<String>,
-    /// The run the node's leg is bound to — guards every outcome fold:
-    /// only the bound run may settle the node.
+    /// The run the node's task is bound to — guards every outcome
+    /// fold: only the bound run may settle the node.
     workflow_run_id: Option<u64>,
-    /// The node rides a sent or adopted batch — it holds its batch's
-    /// slots and is never sent twice.
+    /// The node rides a sent or adopted run — it holds its slot and
+    /// is never sent twice.
     dispatched: bool,
     done: bool,
     failed: bool,
@@ -288,25 +271,16 @@ struct NodeRun {
     blocked_by: Option<String>,
 }
 
-/// A batch the wave dispatched or adopted — the slot holder and the
-/// poll unit (stow#833). An entry holds `parallelism` runner slots
-/// while it lives, so `--in-flight` is the sum over entries; a settled
-/// batch's entry drops and its slots free.
+/// A run the wave dispatched or adopted — the slot holder and the
+/// poll unit. One task is one run and holds one runner slot while it
+/// lives, so `--in-flight` is the count of entries; a settled run's
+/// entry drops and its slot frees.
 struct BoundRun {
-    /// Leg index → the wave node's task id the leg carries — every leg
-    /// of a minted batch; only the legs an adopted run's job names
-    /// bound onto open nodes.
-    legs: BTreeMap<u32, String>,
-    /// `expected[i]` — leg `i`'s [`TaskHash`] for `classify_legs`: the
-    /// node's `blake3(task_id)[..16]` for a minted leg, the job name's
-    /// own hash for an adopted one, a placeholder for a leg no job
-    /// named.
-    expected: Vec<TaskHash>,
-    /// The matrix's `max-parallel` — the runner slots `--in-flight`
-    /// counts while the run is in flight or its dispatch unresolved.
-    parallelism: u32,
-    /// The run id once bound — absent while a minted batch's dispatch
-    /// answer is still ambiguous.
+    /// The wave node's task id — the dispatch's identity and the run
+    /// title's `<rustc>-<task_id>` tail.
+    task_id: String,
+    /// The run id once bound — absent while a minted dispatch's answer
+    /// is still ambiguous.
     workflow_run_id: Option<u64>,
     /// `Some(url)` once a state row names it.
     run_url: Option<String>,
@@ -320,16 +294,16 @@ struct BoundRun {
     /// graces read it.
     observed: bool,
     /// A dispatch whose answer was ambiguous — the write may or may not
-    /// have reached the dispatcher, so the batch counts as dispatched
-    /// (it holds its `parallelism` slots and is never sent again)
-    /// while the resolution listing settles it. `None` when the last
-    /// send's answer was clear.
+    /// have reached the dispatcher, so the task counts as dispatched
+    /// (it holds its slot and is never sent again) while the
+    /// resolution listing settles it. `None` when the last send's
+    /// answer was clear.
     unresolved: Option<UnansweredDispatch>,
     /// A `rerun-failed-jobs` write whose answer was ambiguous — what
     /// was asked, held until a later row says whether the run took it.
     pending_rerun: Option<PendingRerun>,
     /// The confirmed dispatch's send time — `RUN_GRACE_MINUTES`
-    /// applies per batch.
+    /// applies per run.
     dispatched_at: Option<std::time::Instant>,
 }
 
@@ -349,15 +323,15 @@ enum Dispatch {
     },
 }
 
-/// One batch run's state as the driver reads it — `b<batch_id>` keyed,
-/// so the GitHub `workflow_runs` rows (`display_title`, parsed through
-/// `parse_batch_run_title`) and the local server's `LocalCiRun` rows
-/// fold onto the same record. A run this wave could not have
-/// dispatched never produces one.
+/// One run's state as the driver reads it — `<task_id>` keyed, so the
+/// GitHub `workflow_runs` rows (`display_title`, parsed through
+/// `parse_run_title`) and the local server's `LocalCiRun` rows fold
+/// onto the same record. A run this wave could not have dispatched
+/// never produces one.
 #[derive(Debug, Clone)]
 struct RunState {
-    /// The `b<batch_id>` the run's title carries — the binding key.
-    batch_id: BatchId,
+    /// The `<task_id>` the run's title carries — the binding key.
+    task_id: String,
     workflow_run_id: u64,
     status: String,
     conclusion: Option<String>,
@@ -378,10 +352,10 @@ struct RunState {
     /// local server's rows carry none: every run it lists was made by
     /// a dispatch it took, so `None` accepts.
     created_at: Option<time::OffsetDateTime>,
-    /// The local backend's per-leg rows, straight off `GET /tasks` —
-    /// GitHub's rows carry none: a GitHub run's leg outcomes come from
+    /// The local backend's task outcome, straight off `GET /tasks` —
+    /// GitHub's rows carry none: a GitHub run's task outcome comes from
     /// the attempt's jobs page at classify time.
-    legs: Vec<LocalCiLeg>,
+    error: Option<String>,
 }
 
 impl RunState {
@@ -398,7 +372,7 @@ impl RunState {
 }
 
 fn retain_latest_run(
-    latest: &mut HashMap<BatchId, RunState>,
+    latest: &mut HashMap<String, RunState>,
     state: RunState,
     tracked_workflow_run_id: Option<u64>,
 ) {
@@ -406,10 +380,10 @@ fn retain_latest_run(
         return;
     }
     let replace = latest
-        .get(&state.batch_id)
+        .get(&state.task_id)
         .is_none_or(|current| state.workflow_run_id > current.workflow_run_id);
     if replace {
-        latest.insert(state.batch_id.clone(), state);
+        latest.insert(state.task_id.clone(), state);
     }
 }
 
@@ -417,12 +391,6 @@ fn retain_latest_run(
 pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result<()> {
     if args.in_flight == 0 {
         return Err(stow_error!("--in-flight must be at least 1"));
-    }
-    if args.batch_parallelism == 0 {
-        return Err(stow_error!("--batch-parallelism must be at least 1"));
-    }
-    if args.batch_max_tasks == 0 {
-        return Err(stow_error!("--batch-max-tasks must be at least 1"));
     }
     if args.crates.is_none() && args.projects.is_none() && args.dirs.is_none() {
         return Err(stow_error!(
@@ -452,16 +420,13 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
     }
     let (mut nodes, edges) = build_graph(resolved.requests)?;
 
-    let mut policy = BatchPolicy::new(
-        &rustc_version,
-        args.batch_parallelism,
-        args.batch_max_tasks,
-        args.in_flight,
-        mint_batch_salt(),
-    );
+    let policy = DispatchPolicy {
+        rustc_version: &rustc_version,
+        in_flight: args.in_flight,
+    };
 
     if args.dry_run {
-        return dry_run_report(&nodes, &mut policy);
+        return dry_run_report(&nodes);
     }
 
     let dispatch = match &args.dispatch_url {
@@ -500,14 +465,14 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
 
     let layers = layer_graph(&nodes, &edges, &covered)?;
 
-    let mut drive = Drive {
+    let drive = Drive {
         dispatch: &dispatch,
         args: &args,
         catalog: &catalog,
         policy,
         adopt_since,
     };
-    let report = drive_layers(&mut drive, &layers, &mut nodes, &edges).await?;
+    let report = drive_layers(&drive, &layers, &mut nodes, &edges).await?;
 
     finish_report(
         &nodes,
@@ -526,56 +491,17 @@ struct Drive<'a> {
     dispatch: &'a Dispatch,
     args: &'a ManualArgs,
     catalog: &'a Index<'a>,
-    policy: BatchPolicy<'a>,
+    policy: DispatchPolicy<'a>,
     adopt_since: time::OffsetDateTime,
 }
 
-/// Everything batch formation reads, owned once per invocation (stow#833):
-/// the wave's rustc, `--batch-parallelism`, `--batch-max-tasks`, the
-/// `--in-flight` slot limit and the id-minting state — the per-invocation
-/// salt plus the ordinal counter that separates batches inside it.
-struct BatchPolicy<'a> {
+/// Everything dispatch reads, owned once per invocation: the wave's
+/// rustc and the `--in-flight` slot limit — one task is one run and
+/// holds one runner slot.
+struct DispatchPolicy<'a> {
     rustc_version: &'a WireRustcVersion,
-    /// `k` — the most `max-parallel` slots one batch holds.
-    parallelism: u32,
-    /// `B` — the leg bound at which a batch closes.
-    max_tasks: u32,
-    /// The runner slots in-flight batches may hold in total.
+    /// The runner slots in-flight runs may hold in total.
     in_flight: u32,
-    /// The per-invocation salt batch ids derive from.
-    salt: [u8; 16],
-    /// Batches minted so far under `salt`.
-    ordinal: u64,
-}
-
-/// The per-invocation salt batch ids derive from — no state file, so a
-/// fresh salt is what keeps one wave's `b<…>` ids distinct from the
-/// next invocation's inside the adoption window.
-fn mint_batch_salt() -> [u8; 16] {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("the system clock reads before the Unix epoch")
-        .as_nanos();
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&std::process::id().to_le_bytes());
-    hasher.update(&nanos.to_le_bytes());
-    hasher.finalize().as_bytes()[..16]
-        .try_into()
-        .expect("a blake3 digest holds 32 bytes")
-}
-
-/// Mint the id a batch's run title and the unanswered-dispatch
-/// resolution match on: `salt` separates invocations, `ordinal` the
-/// batches inside one — a node batches at most once, so the first
-/// leg's task id makes colliding contents impossible.
-fn mint_batch_id(salt: &[u8; 16], ordinal: u64, first_leg: &str) -> BatchId {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(salt);
-    hasher.update(&ordinal.to_le_bytes());
-    hasher.update(first_leg.as_bytes());
-    hasher.finalize().to_hex()[..32]
-        .parse()
-        .expect("32 lowercase hex is a batch id")
 }
 
 /// Every layer's outcome folded for the finish report: failures as
@@ -593,7 +519,7 @@ struct WaveReport {
 /// done nodes earned. A layer that drove nothing to done — every node
 /// failed or was skipped behind a failure — publishes nothing.
 async fn drive_layers(
-    drive: &mut Drive<'_>,
+    drive: &Drive<'_>,
     layers: &[Vec<String>],
     nodes: &mut BTreeMap<String, NodeRun>,
     edges: &BTreeMap<String, BTreeSet<String>>,
@@ -623,7 +549,7 @@ async fn drive_layers(
             },
             nodes,
             &mut report.reruns,
-            &mut drive.policy,
+            &drive.policy,
             drive.adopt_since,
         )
         .await?;
@@ -1304,32 +1230,29 @@ pub async fn published_slice_rows(
     Ok(Some(index.rows))
 }
 
-/// `--dry-run`: pack every wave node into the batches a drive would
-/// send — the same `BatchEncoder` measurements a dispatch runs — and
-/// report each batch's legs, encoded size and fill of the dispatch
-/// input cap (stow#588, stow#833).
-fn dry_run_report(
-    nodes: &BTreeMap<String, NodeRun>,
-    policy: &mut BatchPolicy<'_>,
-) -> stow_types::error::Result<()> {
-    let pending: BTreeSet<String> = nodes.keys().cloned().collect();
-    let batches = policy.form_batches(&pending, nodes, u32::MAX)?;
-    let mut out = format!(
-        "dry run: {} batch(es) covering {} node(s), none dispatched",
-        batches.len(),
-        nodes.len()
-    );
-    let mut sizes = Vec::with_capacity(batches.len());
-    for (index, batch) in batches.iter().enumerate() {
-        sizes.push(batch.encoded.len());
+/// `--dry-run`: encode every wave node's task payload exactly as a
+/// drive would send it and report each one's size and fill of the
+/// dispatch input cap (stow#588).
+fn dry_run_report(nodes: &BTreeMap<String, NodeRun>) -> stow_types::error::Result<()> {
+    let mut out = format!("dry run: {} node(s), none dispatched", nodes.len());
+    let mut sizes = Vec::with_capacity(nodes.len());
+    for (index, (id, node)) in nodes.iter().enumerate() {
+        let encoded = serde_json::to_string(&task_payload(id, &node.request))
+            .map_err(|error| stow_error!("encode {id}: {error}"))?;
+        if encoded.len() > stow_types::api::DISPATCH_INPUT_LIMIT {
+            return Err(stow_error!(
+                "task {id} encodes to {} bytes — over the {}-char dispatch input cap",
+                encoded.len(),
+                stow_types::api::DISPATCH_INPUT_LIMIT
+            ));
+        }
+        sizes.push(encoded.len());
         let _ = writeln!(
             out,
-            "  batch {index}: {} legs, {} bytes ({}% of the {}-char input cap), parallelism {}",
-            batch.legs.len(),
-            batch.encoded.len(),
-            batch.encoded.len() * 100 / stow_types::api::DISPATCH_INPUT_LIMIT,
+            "  task {index}: {} bytes ({}% of the {}-char input cap)",
+            encoded.len(),
+            encoded.len() * 100 / stow_types::api::DISPATCH_INPUT_LIMIT,
             stow_types::api::DISPATCH_INPUT_LIMIT,
-            batch.parallelism,
         );
     }
     sizes.sort_unstable();
@@ -1340,7 +1263,7 @@ fn dry_run_report(
             .unwrap_or(0);
         let _ = writeln!(
             out,
-            "  encoded batch input: max {max} bytes, p99 {p99} bytes"
+            "  encoded task input: max {max} bytes, p99 {p99} bytes"
         );
     }
     render::emit_line(&out);
@@ -1369,177 +1292,6 @@ fn task_payload(task_id: &str, request: &EnqueueRequest) -> BuildTaskPayload {
     }
 }
 
-/// A packed batch at send time: its minted id, leg order, encoded
-/// `batch` input and slot claim (stow#833).
-struct FormedBatch {
-    batch_id: BatchId,
-    /// Leg task ids in matrix order — `legs[i]` is leg `i`'s node.
-    legs: Vec<String>,
-    /// `BatchEncoder::finish()` — the `batch` `workflow_dispatch`
-    /// input, already under `DISPATCH_INPUT_LIMIT`.
-    encoded: String,
-    /// `min(legs, --batch-parallelism, free slots)` — the matrix's
-    /// `max-parallel` and the slots `--in-flight` counts.
-    parallelism: u32,
-}
-
-/// The id the fit-check encoders carry — as wide as a minted one, so
-/// the sealed encoding measures the same.
-fn measuring_batch_id() -> BatchId {
-    "00000000000000000000000000000000"
-        .parse()
-        .expect("32 hex digits are a batch id")
-}
-
-impl<'a> BatchPolicy<'a> {
-    const fn new(
-        rustc_version: &'a WireRustcVersion,
-        parallelism: u32,
-        max_tasks: u32,
-        in_flight: u32,
-        salt: [u8; 16],
-    ) -> Self {
-        Self {
-            rustc_version,
-            parallelism,
-            max_tasks,
-            in_flight,
-            salt,
-            ordinal: 0,
-        }
-    }
-
-    /// A fit-check encoder: framed under the full `--batch-parallelism`,
-    /// the widest framing any sealed batch can carry.
-    fn measuring_encoder(&self) -> stow_types::error::Result<BatchEncoder> {
-        BatchEncoder::new(
-            measuring_batch_id(),
-            self.rustc_version.clone(),
-            self.parallelism,
-        )
-    }
-
-    /// Pack a layer's dispatchable nodes into [`FormedBatch`]es: the
-    /// nodes group by `(rustc_version, runner_family(target))` — the
-    /// manual lane has one lane — each group packs through
-    /// `BatchEncoder`, and a batch closes when a push reports it full or
-    /// it reaches `max_tasks` legs. A node that does not fit even alone
-    /// is the encoder's own hard error naming it. Each formed batch
-    /// draws its `parallelism` — `min(legs, parallelism, free_slots)` —
-    /// from `free_slots`; when none remain the pass stops and the
-    /// unformed nodes wait for the next iteration.
-    fn form_batches(
-        &mut self,
-        pending: &BTreeSet<String>,
-        nodes: &BTreeMap<String, NodeRun>,
-        mut free_slots: u32,
-    ) -> stow_types::error::Result<Vec<FormedBatch>> {
-        // A `HashMap` key has no order; iterate `RunnerFamily::ALL` so the
-        // pass's batch order is deterministic.
-        let mut groups: HashMap<RunnerFamily, Vec<String>> = HashMap::new();
-        for id in pending {
-            let node = nodes.get(id).expect("pending node");
-            if node.dispatched {
-                continue;
-            }
-            let family =
-                stow_types::api::runner_family(node.request.target.as_str()).ok_or_else(|| {
-                    stow_error!("{id} targets {} — no runner family", node.request.target)
-                })?;
-            groups.entry(family).or_default().push(id.clone());
-        }
-        let mut batches = Vec::new();
-        for family in RunnerFamily::ALL {
-            let Some(group) = groups.get(&family) else {
-                continue;
-            };
-            let mut staged: Vec<String> = Vec::new();
-            let mut encoder = self.measuring_encoder()?;
-            for id in group {
-                let node = nodes.get(id).expect("group node");
-                let payload = task_payload(id, &node.request);
-                match encoder.push(&payload)? {
-                    BatchFit::Fits => staged.push(id.clone()),
-                    BatchFit::Full => {
-                        // A `Full` push leaves the encoder untouched — seal
-                        // the staged legs and retry the task on a fresh
-                        // batch. The staged set is never empty: an empty
-                        // batch's oversize is an error, never `Full`.
-                        let Some(batch) = self.seal_batch(&mut staged, nodes, &mut free_slots)?
-                        else {
-                            return Ok(batches);
-                        };
-                        batches.push(batch);
-                        encoder = self.measuring_encoder()?;
-                        match encoder.push(&payload)? {
-                            BatchFit::Fits => staged.push(id.clone()),
-                            BatchFit::Full => {
-                                unreachable!("an empty batch errors on oversize, never Full")
-                            }
-                        }
-                    }
-                }
-                if u32::try_from(staged.len()).expect("staged count fits u32") >= self.max_tasks {
-                    let Some(batch) = self.seal_batch(&mut staged, nodes, &mut free_slots)? else {
-                        return Ok(batches);
-                    };
-                    batches.push(batch);
-                    encoder = self.measuring_encoder()?;
-                }
-            }
-            if !staged.is_empty() {
-                let Some(batch) = self.seal_batch(&mut staged, nodes, &mut free_slots)? else {
-                    return Ok(batches);
-                };
-                batches.push(batch);
-            }
-        }
-        Ok(batches)
-    }
-
-    /// Seal the staged legs into a [`FormedBatch`]: re-encode under the
-    /// batch's real `parallelism` — `min(legs, self.parallelism,
-    /// free_slots)` — which can only shrink the framing the fit-check
-    /// measured under `self.parallelism`, so every staged leg fits.
-    /// `None` when no slot remains: the staged nodes stay unsent for the
-    /// next pass.
-    fn seal_batch(
-        &mut self,
-        staged: &mut Vec<String>,
-        nodes: &BTreeMap<String, NodeRun>,
-        free_slots: &mut u32,
-    ) -> stow_types::error::Result<Option<FormedBatch>> {
-        debug_assert!(!staged.is_empty(), "a batch never seals empty");
-        let legs = u32::try_from(staged.len()).expect("a staged group fits u32");
-        let parallelism = legs.min(self.parallelism).min(*free_slots);
-        if parallelism == 0 {
-            return Ok(None);
-        }
-        *free_slots -= parallelism;
-        self.ordinal += 1;
-        let batch_id = mint_batch_id(&self.salt, self.ordinal, &staged[0]);
-        let mut encoder =
-            BatchEncoder::new(batch_id.clone(), self.rustc_version.clone(), parallelism)?;
-        for id in staged.iter() {
-            let node = nodes.get(id).expect("staged node");
-            match encoder.push(&task_payload(id, &node.request))? {
-                BatchFit::Fits => {}
-                BatchFit::Full => {
-                    return Err(stow_error!(
-                        "batch {batch_id} leg {id} exceeds the cap its fit-check measured under"
-                    ));
-                }
-            }
-        }
-        Ok(Some(FormedBatch {
-            batch_id,
-            legs: std::mem::take(staged),
-            encoded: encoder.finish()?,
-            parallelism,
-        }))
-    }
-}
-
 /// What one dispatch send settled — the driver's dispatch pass reads
 /// this to decide whether the pass continues.
 enum DispatchAnswer {
@@ -1553,35 +1305,22 @@ enum DispatchAnswer {
     RateLimited(WriteFailure),
 }
 
-/// Dispatch a formed batch: a confirmed send binds it to the run id
+/// Dispatch one task: a confirmed send binds it to the run id
 /// returned; an ambiguous answer leaves it [`BoundRun::unresolved`]
-/// with its legs' nodes held; a rate limit leaves it unsent; a
-/// refusal is the error it always was.
-async fn dispatch_batch(
+/// with its node held; a rate limit leaves it unsent; a refusal is
+/// the error it always was.
+async fn dispatch_task(
     dispatch: &Dispatch,
-    formed: FormedBatch,
+    task_id: String,
+    encoded: String,
     wave: &mut Wave<'_>,
 ) -> stow_types::error::Result<DispatchAnswer> {
     // Both clocks ride every ambiguous attempt: the wall clock bounds
     // the resolution listing, the monotonic instant the re-send grace.
     let wall = time::OffsetDateTime::now_utc();
     let instant = tokio::time::Instant::now();
-    let legs: BTreeMap<u32, String> = formed
-        .legs
-        .iter()
-        .enumerate()
-        .map(|(index, id)| {
-            (
-                u32::try_from(index).expect("leg index fits u32"),
-                id.clone(),
-            )
-        })
-        .collect();
-    let expected = formed.legs.iter().map(|id| TaskHash::of(id)).collect();
     let mut bound = BoundRun {
-        legs,
-        expected,
-        parallelism: formed.parallelism,
+        task_id: task_id.clone(),
         workflow_run_id: None,
         run_url: None,
         etag: None,
@@ -1591,24 +1330,20 @@ async fn dispatch_batch(
         pending_rerun: None,
         dispatched_at: None,
     };
-    match dispatch.send(&formed.encoded).await {
+    match dispatch.send(&encoded).await {
         Ok(run_id) => {
             bound.workflow_run_id = Some(run_id);
             bound.dispatched_at = Some(std::time::Instant::now());
-            for id in &formed.legs {
-                wave.nodes.get_mut(id).expect("leg node").dispatched = true;
-            }
-            wave.batches.insert(formed.batch_id, bound);
+            wave.nodes.get_mut(&task_id).expect("task node").dispatched = true;
+            wave.runs.insert(task_id, bound);
             Ok(DispatchAnswer::Bound)
         }
         Err(failure @ WriteFailure::Refused(_)) => Err(failure.into()),
         Err(failure) => {
             if matches!(failure, WriteFailure::Ambiguous(_)) {
                 bound.unresolved = Some(UnansweredDispatch { wall, instant });
-                for id in &formed.legs {
-                    wave.nodes.get_mut(id).expect("leg node").dispatched = true;
-                }
-                wave.batches.insert(formed.batch_id, bound);
+                wave.nodes.get_mut(&task_id).expect("task node").dispatched = true;
+                wave.runs.insert(task_id, bound);
                 return Ok(DispatchAnswer::Ambiguous(failure));
             }
             Ok(DispatchAnswer::RateLimited(failure))
@@ -1616,77 +1351,69 @@ async fn dispatch_batch(
     }
 }
 
-/// Fold one observed run state that needs no leg classification —
+/// Fold one observed run state that needs no task classification —
 /// shared by the one-time adoption fold and every bound-run poll for
 /// rows that are not completed failures on current code. A stale
-/// failure drops the batch's binding so its nodes dispatch afresh; an
-/// in-flight row binds; a completed success marks every covered node
-/// done and frees the batch's slots.
-fn fold_simple(batch_id: &BatchId, state: &RunState, wave: &mut Wave<'_>, main_head: &str) {
+/// failure drops the run's binding so its node dispatches afresh; an
+/// in-flight row binds; a completed success marks the node done and
+/// frees the run's slot.
+fn fold_simple(task_id: &str, state: &RunState, wave: &mut Wave<'_>, main_head: &str) {
     if state.stale_failure(main_head) {
-        // The run this batch was tracking ended as a failure of older
-        // code: release the nodes still bound to it — they dispatch
+        // The run this task was tracking ended as a failure of older
+        // code: release the node still bound to it — it dispatches
         // afresh. The match is the bound run id, so a node a newer run
         // claimed is untouched.
-        if let Some(batch) = wave.batches.get(batch_id) {
-            release_legs(batch, state.workflow_run_id, wave.nodes);
+        if let Some(run) = wave.runs.get(task_id) {
+            release_task(run, state.workflow_run_id, wave.nodes);
         }
-        wave.batches.remove(batch_id);
+        wave.runs.remove(task_id);
         return;
     }
-    let Some(batch) = wave.batches.get_mut(batch_id) else {
+    let Some(run) = wave.runs.get_mut(task_id) else {
         return;
     };
-    bind_run(batch, state, wave.nodes);
+    bind_run(run, state, wave.nodes);
     if state.status == "completed" && state.conclusion.as_deref() == Some("success") {
-        let task_ids: Vec<String> = batch.legs.values().cloned().collect();
-        for task_id in task_ids {
-            let node = wave.nodes.get_mut(&task_id).expect("a bound run's leg");
-            if node.workflow_run_id == Some(state.workflow_run_id) {
-                node.done = true;
-                wave.open.remove(&task_id);
-            }
+        let node = wave.nodes.get_mut(task_id).expect("a bound run's task");
+        if node.workflow_run_id == Some(state.workflow_run_id) {
+            node.done = true;
+            wave.open.remove(task_id);
         }
-        // The run settled every covered leg — its slots free.
-        wave.batches.remove(batch_id);
+        // The run settled its task — its slot frees.
+        wave.runs.remove(task_id);
     }
 }
 
-/// Bind a batch's covered nodes to `state`'s run without judging the
-/// outcome — a bound run settles an ambiguous dispatch, and `latest`
-/// records the freshest row so a 304 refold sees it rather than a
-/// stale predecessor. A node a newer run already claimed keeps its
-/// binding.
-fn bind_run(batch: &mut BoundRun, state: &RunState, nodes: &mut BTreeMap<String, NodeRun>) {
-    batch.run_url = Some(state.url.clone());
-    batch.workflow_run_id = Some(state.workflow_run_id);
-    batch.unresolved = None;
-    batch.latest = Some(state.clone());
-    batch.observed = true;
-    for task_id in batch.legs.values() {
-        let node = nodes.get_mut(task_id).expect("a bound run's leg");
-        if node
-            .workflow_run_id
-            .is_none_or(|id| id == state.workflow_run_id)
-        {
-            node.run_url = Some(state.url.clone());
-            node.workflow_run_id = Some(state.workflow_run_id);
-            node.dispatched = true;
-        }
+/// Bind a task's node to `state`'s run without judging the outcome —
+/// a bound run settles an ambiguous dispatch, and `latest` records
+/// the freshest row so a 304 refold sees it rather than a stale
+/// predecessor. A node a newer run already claimed keeps its binding.
+fn bind_run(run: &mut BoundRun, state: &RunState, nodes: &mut BTreeMap<String, NodeRun>) {
+    run.run_url = Some(state.url.clone());
+    run.workflow_run_id = Some(state.workflow_run_id);
+    run.unresolved = None;
+    run.latest = Some(state.clone());
+    run.observed = true;
+    let node = nodes.get_mut(&run.task_id).expect("a bound run's task");
+    if node
+        .workflow_run_id
+        .is_none_or(|id| id == state.workflow_run_id)
+    {
+        node.run_url = Some(state.url.clone());
+        node.workflow_run_id = Some(state.workflow_run_id);
+        node.dispatched = true;
     }
 }
 
-/// Release a batch's nodes its run can no longer answer for — a stale
-/// failure's fold or an expired grace: each node still bound to the
+/// Release a run's node it can no longer answer for — a stale
+/// failure's fold or an expired grace: the node still bound to the
 /// run returns to unsent.
-fn release_legs(batch: &BoundRun, run_id: u64, nodes: &mut BTreeMap<String, NodeRun>) {
-    for task_id in batch.legs.values() {
-        let node = nodes.get_mut(task_id).expect("a bound run's leg");
-        if node.workflow_run_id == Some(run_id) {
-            node.run_url = None;
-            node.workflow_run_id = None;
-            node.dispatched = false;
-        }
+fn release_task(run: &BoundRun, run_id: u64, nodes: &mut BTreeMap<String, NodeRun>) {
+    let node = nodes.get_mut(&run.task_id).expect("a bound run's task");
+    if node.workflow_run_id == Some(run_id) {
+        node.run_url = None;
+        node.workflow_run_id = None;
+        node.dispatched = false;
     }
 }
 
@@ -1701,64 +1428,52 @@ struct RerunRecord {
     run_attempt: u64,
 }
 
-/// One settled jobs page's leg fold: apply each outcome to its node —
-/// a success marks done, a verdict or invariant fails, and an
-/// infrastructure or concluded leg earns a rerun slot — unless the run
-/// is at `MAX_RUN_ATTEMPTS`, where it fails with the rest. Returns
-/// every leg that earned the rerun for the ask and its records.
-fn fold_leg_outcomes(
-    outcomes: &[LegOutcome],
-    batch: &BoundRun,
+/// One settled run's task fold: apply the outcome to its node — a
+/// success marks done, a verdict fails, and an infrastructure or
+/// concluded task earns a rerun slot — unless the run is at
+/// `MAX_RUN_ATTEMPTS`, where it fails with the rest. Returns the task
+/// that earned the rerun for the ask and its record.
+fn fold_run_outcome(
+    outcome: &TaskOutcome,
+    run: &BoundRun,
     run_id: u64,
     maxed: bool,
     nodes: &mut BTreeMap<String, NodeRun>,
     open: &mut BTreeSet<String>,
-) -> Vec<RerunLeg> {
-    let mut earners = Vec::new();
-    for (index, outcome) in outcomes.iter().enumerate() {
-        let leg = u32::try_from(index).expect("leg index fits u32");
-        let Some(task_id) = batch.legs.get(&leg) else {
-            continue;
-        };
-        let Some(node) = nodes.get_mut(task_id) else {
-            continue;
-        };
-        if node.workflow_run_id != Some(run_id) {
-            continue;
-        }
-        match outcome {
-            LegOutcome::Succeeded { .. } => {
-                node.done = true;
-                open.remove(task_id);
-            }
-            LegOutcome::Unsettled => {
-                unreachable!("a settled page holds no unsettled leg")
-            }
-            LegOutcome::Failed(failure) => match failure {
-                LegFailure::Run(RunFailure::Infrastructure { job, step, .. }) if !maxed => {
-                    earners.push(RerunLeg {
-                        task_id: task_id.clone(),
-                        job: job.clone(),
-                        step: step.clone(),
-                    });
-                }
-                LegFailure::Concluded {
-                    job, conclusion, ..
-                } if !maxed => {
-                    earners.push(RerunLeg {
-                        task_id: task_id.clone(),
-                        job: job.clone(),
-                        step: Some(conclusion.clone()),
-                    });
-                }
-                _ => {
-                    node.failed = true;
-                    open.remove(task_id);
-                }
-            },
-        }
+) -> Option<RerunTask> {
+    let node = nodes.get_mut(&run.task_id)?;
+    if node.workflow_run_id != Some(run_id) {
+        return None;
     }
-    earners
+    match outcome {
+        TaskOutcome::Succeeded => {
+            node.done = true;
+            open.remove(&run.task_id);
+            None
+        }
+        TaskOutcome::Unsettled => None,
+        TaskOutcome::Failed(failure) => match failure {
+            crate::runs::TaskFailure::Run(RunFailure::Infrastructure { job, step, .. })
+                if !maxed =>
+            {
+                Some(RerunTask {
+                    task_id: run.task_id.clone(),
+                    job: job.clone(),
+                    step: step.clone(),
+                })
+            }
+            crate::runs::TaskFailure::Concluded { job, conclusion } if !maxed => Some(RerunTask {
+                task_id: run.task_id.clone(),
+                job: job.clone(),
+                step: Some(conclusion.clone()),
+            }),
+            _ => {
+                node.failed = true;
+                open.remove(&run.task_id);
+                None
+            }
+        },
+    }
 }
 
 /// The rerun write's answer applied: confirmed records every earning
@@ -1767,39 +1482,34 @@ fn fold_leg_outcomes(
 /// rate limit asks nothing — the row classifies again once the gate
 /// reopens; a refusal is the error it always was.
 fn apply_rerun_answer(
-    batch_id: &BatchId,
+    task_id: &str,
     state: &RunState,
-    earners: Vec<RerunLeg>,
+    earner: RerunTask,
     answer: Result<(), WriteFailure>,
     wave: &mut Wave<'_>,
 ) -> stow_types::error::Result<()> {
     match answer {
         Ok(()) => {
             wave.gate.confirmed();
-            for leg in &earners {
-                wave.reruns.push(RerunRecord {
-                    task_id: leg.task_id.clone(),
-                    url: state.url.clone(),
-                    job: leg.job.clone(),
-                    step: leg.step.clone(),
-                    run_attempt: state.run_attempt + 1,
-                });
-            }
-            let batch = wave.batches.get_mut(batch_id).expect("rerun batch");
-            batch.etag = None;
-            batch.latest = None;
+            wave.reruns.push(RerunRecord {
+                task_id: earner.task_id,
+                url: state.url.clone(),
+                job: earner.job,
+                step: earner.step,
+                run_attempt: state.run_attempt + 1,
+            });
+            let run = wave.runs.get_mut(task_id).expect("rerun run");
+            run.etag = None;
+            run.latest = None;
             Ok(())
         }
         Err(failure @ WriteFailure::Refused(_)) => Err(failure.into()),
         Err(failure) => {
             if matches!(failure, WriteFailure::Ambiguous(_)) {
-                wave.batches
-                    .get_mut(batch_id)
-                    .expect("rerun batch")
-                    .pending_rerun = Some(PendingRerun {
+                wave.runs.get_mut(task_id).expect("rerun run").pending_rerun = Some(PendingRerun {
                     attempt: state.run_attempt,
                     asked_at: tokio::time::Instant::now(),
-                    legs: earners,
+                    task: earner,
                 });
             }
             wave.gate.hold(&failure)
@@ -1807,12 +1517,11 @@ fn apply_rerun_answer(
     }
 }
 
-/// The GitHub arm of a completed non-success fold: the attempt's jobs
-/// classify each leg with `classify_legs` — a settled page folds every
-/// leg, an unsettled one defers the whole run until the next poll. An
-/// infrastructure leg earns `rerun-failed-jobs` on the batch run —
-/// one write reruns only the failed legs — bounded by
-/// `MAX_RUN_ATTEMPTS`.
+/// The GitHub arm of a completed non-success fold: the attempt's
+/// jobs classify the task with `classify_page` — a settled run folds
+/// its task, an unsettled one defers until the next poll. An
+/// infrastructure task earns `rerun-failed-jobs` on the run —
+/// bounded by `MAX_RUN_ATTEMPTS`.
 async fn classify_github_run(
     token: &str,
     state: &RunState,
@@ -1827,64 +1536,42 @@ async fn classify_github_run(
         Backoff::outage,
     )
     .await?;
-    let outcomes = {
-        let batch = wave.batches.get(&state.batch_id).expect("classified batch");
-        match classify_legs(
-            &batch.expected,
-            state.conclusion.as_deref().unwrap_or(""),
-            &jobs,
-            time::OffsetDateTime::now_utc(),
-        ) {
-            Ok(outcomes) => outcomes,
-            // An undecodable page — a job that is not a leg, an index
-            // past the batch — fails the batch once as every leg's
-            // invariant, never retries it forever.
-            Err(error) => vec![
-                LegOutcome::Failed(LegFailure::Invariant(error.to_string()));
-                batch.expected.len()
-            ],
-        }
-    };
-    if outcomes
-        .iter()
-        .any(|outcome| matches!(outcome, LegOutcome::Unsettled))
-    {
+    let outcome = classify_page(
+        &jobs,
+        state.conclusion.as_deref().unwrap_or(""),
+        time::OffsetDateTime::now_utc(),
+    )
+    .map_err(|error| stow_error!("run {}: {error}", state.workflow_run_id))?;
+    if matches!(outcome, TaskOutcome::Unsettled) {
         // The jobs page was still settling — bind and read again next
         // poll; the run's own row may 304 forever, so `latest` is what
         // re-enters here.
-        let batch = wave
-            .batches
-            .get_mut(&state.batch_id)
-            .expect("classified batch");
-        bind_run(batch, state, wave.nodes);
+        let run = wave.runs.get_mut(&state.task_id).expect("classified run");
+        bind_run(run, state, wave.nodes);
         return Ok(());
     }
     let maxed = state.run_attempt >= MAX_RUN_ATTEMPTS;
-    let earners = {
-        let batch = wave
-            .batches
-            .get_mut(&state.batch_id)
-            .expect("classified batch");
-        bind_run(batch, state, wave.nodes);
-        fold_leg_outcomes(
-            &outcomes,
-            batch,
+    let earner = {
+        let run = wave.runs.get_mut(&state.task_id).expect("classified run");
+        bind_run(run, state, wave.nodes);
+        fold_run_outcome(
+            &outcome,
+            run,
             state.workflow_run_id,
             maxed,
             wave.nodes,
             wave.open,
         )
     };
-    if earners.is_empty() {
-        // Every leg settled — the run's slots free with the batch.
-        wave.batches.remove(&state.batch_id);
+    let Some(earner) = earner else {
+        // The task settled — the run's slot frees.
+        wave.runs.remove(&state.task_id);
         return Ok(());
-    }
+    };
     tracing::warn!(
         run = state.workflow_run_id,
-        legs = earners.len(),
         attempt = state.run_attempt + 1,
-        "infrastructure failures; rerunning the run's failed legs"
+        "infrastructure failure; rerunning the run's failed jobs"
     );
     let answer = crate::github::post_empty(
         token,
@@ -1892,49 +1579,45 @@ async fn classify_github_run(
         &serde_json::json!({}),
     )
     .await;
-    apply_rerun_answer(&state.batch_id, state, earners, answer, wave)
+    apply_rerun_answer(&state.task_id, state, earner, answer, wave)
 }
 
-/// The local arm of a completed-run fold: `state.legs` carries each
-/// leg's own status and conclusion — a leg completed `success` marks
-/// its node done and every other settled answer fails it, final, for
-/// the local server has no runner infrastructure to retry. A leg the
-/// completed run never settled fails with it.
-fn fold_local_legs(state: &RunState, wave: &mut Wave<'_>) {
+/// The local arm of a completed-run fold: the run's own status and
+/// conclusion settle its task — `success` marks its node done and
+/// every other settled answer fails it, final, for the local server
+/// has no runner infrastructure to retry.
+fn fold_local_task(state: &RunState, wave: &mut Wave<'_>) {
     {
-        let Some(batch) = wave.batches.get_mut(&state.batch_id) else {
+        let Some(run) = wave.runs.get_mut(&state.task_id) else {
             return;
         };
-        bind_run(batch, state, wave.nodes);
+        bind_run(run, state, wave.nodes);
     }
-    for leg in &state.legs {
-        let Some(node) = wave.nodes.get_mut(&leg.task_id) else {
-            continue;
-        };
-        if node.workflow_run_id != Some(state.workflow_run_id) {
-            continue;
-        }
-        match (leg.status.as_str(), leg.conclusion.as_deref()) {
+    let Some(node) = wave.nodes.get_mut(&state.task_id) else {
+        wave.runs.remove(&state.task_id);
+        return;
+    };
+    if node.workflow_run_id == Some(state.workflow_run_id) {
+        match (state.status.as_str(), state.conclusion.as_deref()) {
             ("completed", Some("success")) => {
                 node.done = true;
-                wave.open.remove(&leg.task_id);
+                wave.open.remove(&state.task_id);
             }
             ("completed", _) => {
-                if let Some(error) = &leg.error {
-                    tracing::warn!(task = %leg.task_id, %error, "leg failed");
+                if let Some(error) = &state.error {
+                    tracing::warn!(task = %state.task_id, %error, "task failed");
                 }
                 node.failed = true;
-                wave.open.remove(&leg.task_id);
+                wave.open.remove(&state.task_id);
             }
-            _ if state.status == "completed" => {
-                node.failed = true;
-                wave.open.remove(&leg.task_id);
+            _ => {
+                // Still in flight — the run stays bound.
+                return;
             }
-            _ => {}
         }
     }
-    // The run is completed — its slots free.
-    wave.batches.remove(&state.batch_id);
+    // The run is completed — its slot frees.
+    wave.runs.remove(&state.task_id);
 }
 
 /// The async half `fold_simple` cannot do: a completed non-success run
@@ -1959,27 +1642,26 @@ async fn classify_and_fold(
     main_head: &str,
 ) -> stow_types::error::Result<()> {
     match wave
-        .batches
-        .get(&state.batch_id)
-        .and_then(|batch| batch.pending_rerun.as_ref())
+        .runs
+        .get(&state.task_id)
+        .and_then(|run| run.pending_rerun.as_ref())
     {
         Some(pending) if state.run_attempt > pending.attempt || state.status != "completed" => {
             let pending = wave
-                .batches
-                .get_mut(&state.batch_id)
-                .expect("pending batch")
+                .runs
+                .get_mut(&state.task_id)
+                .expect("pending run")
                 .pending_rerun
                 .take()
                 .expect("pending rerun");
-            for leg in pending.legs {
-                wave.reruns.push(RerunRecord {
-                    task_id: leg.task_id,
-                    url: state.url.clone(),
-                    job: leg.job,
-                    step: leg.step,
-                    run_attempt: pending.attempt + 1,
-                });
-            }
+            let task = pending.task;
+            wave.reruns.push(RerunRecord {
+                task_id: task.task_id,
+                url: state.url.clone(),
+                job: task.job,
+                step: task.step,
+                run_attempt: pending.attempt + 1,
+            });
         }
         Some(pending)
             if pending.asked_at.elapsed()
@@ -1990,27 +1672,24 @@ async fn classify_and_fold(
             // resolves. The row still binds — it is the bound run's
             // freshest state, and a 304 refolds it rather than a stale
             // predecessor.
-            let batch = wave
-                .batches
-                .get_mut(&state.batch_id)
-                .expect("pending batch");
-            bind_run(batch, &state, wave.nodes);
+            let run = wave.runs.get_mut(&state.task_id).expect("pending run");
+            bind_run(run, &state, wave.nodes);
             return Ok(());
         }
         Some(_) => {
             // The same completed attempt past the grace — the write
             // did not happen as far as the run can tell: drop the
             // pending record and classify again below.
-            wave.batches
-                .get_mut(&state.batch_id)
-                .expect("pending batch")
+            wave.runs
+                .get_mut(&state.task_id)
+                .expect("pending run")
                 .pending_rerun = None;
         }
         None => {}
     }
     let failed = state.status == "completed" && state.conclusion.as_deref() != Some("success");
-    if !failed || state.stale_failure(main_head) || !wave.batches.contains_key(&state.batch_id) {
-        fold_simple(&state.batch_id, &state, wave, main_head);
+    if !failed || state.stale_failure(main_head) || !wave.runs.contains_key(&state.task_id) {
+        fold_simple(&state.task_id, &state, wave, main_head);
         return Ok(());
     }
     // The run row lags a rerun request by a beat: a failure row for an
@@ -2026,15 +1705,12 @@ async fn classify_and_fold(
     // Classification may ask for a rerun — a write, so it waits out a
     // closed gate exactly like a dispatch does.
     if !wave.gate.open() {
-        let batch = wave
-            .batches
-            .get_mut(&state.batch_id)
-            .expect("classified batch");
-        bind_run(batch, &state, wave.nodes);
+        let run = wave.runs.get_mut(&state.task_id).expect("classified run");
+        bind_run(run, &state, wave.nodes);
         return Ok(());
     }
     match dispatch {
-        Dispatch::Local { .. } => fold_local_legs(&state, wave),
+        Dispatch::Local { .. } => fold_local_task(&state, wave),
         Dispatch::GitHub { token } => classify_github_run(token, &state, wave).await?,
     }
     Ok(())
@@ -2042,9 +1718,8 @@ async fn classify_and_fold(
 
 /// One tick's partition of a layer for the progress line: `done`,
 /// `failed`, `skipped`, `dispatched` and `remaining` sum to `total`,
-/// and `running_batches` breaks out the dispatched legs whose bound
-/// run GitHub still reports `in_progress` — batch-granular, so it
-/// never reads as legs building.
+/// and `running` breaks out the dispatched tasks whose bound run
+/// GitHub still reports `in_progress`.
 #[derive(Default, Debug, PartialEq, Eq)]
 struct LayerProgress {
     total: usize,
@@ -2052,15 +1727,15 @@ struct LayerProgress {
     failed: usize,
     skipped: usize,
     dispatched: usize,
-    running_batches: usize,
+    running: usize,
     remaining: usize,
 }
 
 /// Partition `layer`'s nodes into the progress counts — pure: the wave
 /// state the driver already holds answers every count, and `open` is
 /// never consulted since its unresolved-unblocked subset is exactly
-/// `remaining` plus the in-flight part of `dispatched`. A settled leg
-/// keeps `dispatched` set (the folds never clear it), so the
+/// `remaining` plus the in-flight part of `dispatched`. A settled
+/// task keeps `dispatched` set (the folds never clear it), so the
 /// `dispatched` arm must re-test `done`/`failed`, and `skipped` stands
 /// apart because blocked nodes are dropped before dispatch. The
 /// partition is structural — each node lands in one bucket — and the
@@ -2068,17 +1743,16 @@ struct LayerProgress {
 fn layer_progress(
     layer: &[String],
     nodes: &BTreeMap<String, NodeRun>,
-    batches: &HashMap<BatchId, BoundRun>,
+    runs: &HashMap<String, BoundRun>,
 ) -> LayerProgress {
-    let running: BTreeSet<u64> = batches
+    let running: BTreeSet<u64> = runs
         .values()
-        .filter(|batch| {
-            batch
-                .latest
+        .filter(|run| {
+            run.latest
                 .as_ref()
                 .is_some_and(|state| state.status == "in_progress")
         })
-        .filter_map(|batch| batch.workflow_run_id)
+        .filter_map(|run| run.workflow_run_id)
         .collect();
     let mut progress = LayerProgress {
         total: layer.len(),
@@ -2098,7 +1772,7 @@ fn layer_progress(
                 .workflow_run_id
                 .is_some_and(|run_id| running.contains(&run_id))
             {
-                progress.running_batches += 1;
+                progress.running += 1;
             }
         } else {
             progress.remaining += 1;
@@ -2137,7 +1811,7 @@ fn log_layer_progress(position: LayerPosition, progress: &LayerProgress) {
         failed = progress.failed,
         skipped = progress.skipped,
         dispatched = progress.dispatched,
-        running_batches = progress.running_batches,
+        running = progress.running,
         remaining = progress.remaining,
         "layer progress"
     );
@@ -2164,7 +1838,7 @@ async fn drive_layer(
     position: LayerPosition,
     nodes: &mut BTreeMap<String, NodeRun>,
     reruns: &mut Vec<RerunRecord>,
-    policy: &mut BatchPolicy<'_>,
+    policy: &DispatchPolicy<'_>,
     adopt_since: time::OffsetDateTime,
 ) -> stow_types::error::Result<()> {
     let mut open: BTreeSet<String> = layer
@@ -2185,11 +1859,11 @@ async fn drive_layer(
     // answer.
     let mut head_cache: Option<HeadCache> = None;
     let mut gate = WriteGate::new();
-    let mut batches = HashMap::new();
+    let mut runs = HashMap::new();
     let mut wave = Wave {
         nodes,
         open: &mut open,
-        batches: &mut batches,
+        runs: &mut runs,
         reruns,
         gate: &mut gate,
     };
@@ -2199,7 +1873,6 @@ async fn drive_layer(
         &mut wave,
         adopt_since,
         policy.rustc_version,
-        policy.parallelism,
         &main_head,
     )
     .await?;
@@ -2211,27 +1884,24 @@ async fn drive_layer(
         // Settle the sends GitHub may never have heard: one listing
         // over the window from the earliest unresolved attempt to now.
         resolve_unanswered(dispatch, &mut wave, &main_head, policy.rustc_version).await?;
-        for outcome in dispatch
-            .poll_bound(wave.batches, policy.rustc_version)
-            .await?
-        {
+        for outcome in dispatch.poll_bound(wave.runs, policy.rustc_version).await? {
             fold_bound_outcome(dispatch, outcome, &mut wave, &main_head).await?;
         }
         dispatch_open(dispatch, &mut wave, policy).await?;
         if wave.open.is_empty() {
             // The final line — the last state is never a tick stale.
-            log_layer_progress(position, &layer_progress(layer, wave.nodes, wave.batches));
+            log_layer_progress(position, &layer_progress(layer, wave.nodes, wave.runs));
             return Ok(());
         }
         if last_progress.elapsed() >= std::time::Duration::from_secs(LAYER_PROGRESS_SECONDS) {
-            log_layer_progress(position, &layer_progress(layer, wave.nodes, wave.batches));
+            log_layer_progress(position, &layer_progress(layer, wave.nodes, wave.runs));
             last_progress = tokio::time::Instant::now();
         }
         let overdue: Vec<String> = wave
-            .batches
+            .runs
             .values()
-            .filter(|batch| dispatch_overdue(batch))
-            .flat_map(|batch| batch.legs.values().cloned())
+            .filter(|run| dispatch_overdue(run))
+            .map(|run| run.task_id.clone())
             .collect();
         if !overdue.is_empty() {
             return Err(stow_error!(
@@ -2256,20 +1926,17 @@ async fn fold_bound_outcome(
 ) -> stow_types::error::Result<()> {
     match outcome {
         BoundPoll::State {
-            batch_id,
+            task_id,
             state,
             etag,
         } => {
-            if let Some(batch) = wave.batches.get_mut(&batch_id) {
-                batch.etag = etag;
+            if let Some(run) = wave.runs.get_mut(&task_id) {
+                run.etag = etag;
             }
             classify_and_fold(dispatch, state, wave, main_head).await?;
         }
-        BoundPoll::Unmodified(batch_id) => {
-            let cached = wave
-                .batches
-                .get(&batch_id)
-                .and_then(|batch| batch.latest.clone());
+        BoundPoll::Unmodified(task_id) => {
+            let cached = wave.runs.get(&task_id).and_then(|run| run.latest.clone());
             if let Some(state) = cached {
                 classify_and_fold(dispatch, state, wave, main_head).await?;
             }
@@ -2280,37 +1947,39 @@ async fn fold_bound_outcome(
 }
 
 /// One iteration's dispatch pass, gated by the wave's write gate:
-/// group the open undispatched nodes by `(rustc, runner family)`, pack
-/// them into batches and send each serially — mutating calls are what
-/// GitHub's secondary rate limits push back on; only reads fan out.
-/// `--in-flight` counts the runner slots in-flight batches hold — the
-/// sum of their `parallelism`. An ambiguous or rate-limited answer
-/// ends the pass: the batch the answer belongs to has already taken
-/// its slots, and sends stay paused until the backoff's wait elapses.
+/// send each open undispatched node's task serially — mutating calls
+/// are what GitHub's secondary rate limits push back on; only reads
+/// fan out. One task is one run and holds one runner slot, so
+/// `--in-flight` is the count of in-flight runs. An ambiguous or
+/// rate-limited answer ends the pass: the task the answer belongs to
+/// has already taken its slot, and sends stay paused until the
+/// backoff's wait elapses.
 async fn dispatch_open(
     dispatch: &Dispatch,
     wave: &mut Wave<'_>,
-    policy: &mut BatchPolicy<'_>,
+    policy: &DispatchPolicy<'_>,
 ) -> stow_types::error::Result<()> {
     if !wave.gate.open() {
         return Ok(());
     }
-    let used: u32 = wave
-        .batches
-        .values()
-        .fold(0_u32, |sum, batch| sum.saturating_add(batch.parallelism));
-    let free = policy.in_flight.saturating_sub(used);
+    let free = policy
+        .in_flight
+        .saturating_sub(u32::try_from(wave.runs.len()).unwrap_or(u32::MAX));
     if free == 0 {
         return Ok(());
     }
-    let pending: BTreeSet<String> = wave
+    let pending: Vec<String> = wave
         .open
         .iter()
         .filter(|id| !wave.nodes.get(*id).expect("open node").dispatched)
+        .take(usize::try_from(free).unwrap_or(usize::MAX))
         .cloned()
         .collect();
-    for formed in policy.form_batches(&pending, wave.nodes, free)? {
-        match dispatch_batch(dispatch, formed, wave).await? {
+    for task_id in pending {
+        let node = wave.nodes.get(&task_id).expect("open node");
+        let encoded = serde_json::to_string(&task_payload(&task_id, &node.request))
+            .map_err(|error| stow_error!("encode {task_id}: {error}"))?;
+        match dispatch_task(dispatch, task_id, encoded, wave).await? {
             DispatchAnswer::Bound => wave.gate.confirmed(),
             DispatchAnswer::Ambiguous(failure) | DispatchAnswer::RateLimited(failure) => {
                 return wave.gate.hold(&failure);
@@ -2335,9 +2004,9 @@ async fn resolve_unanswered(
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<()> {
     let floor = wave
-        .batches
+        .runs
         .values()
-        .filter_map(|batch| batch.unresolved.as_ref().map(|attempt| attempt.wall))
+        .filter_map(|run| run.unresolved.as_ref().map(|attempt| attempt.wall))
         .min();
     let Some(floor) = floor else {
         return Ok(());
@@ -2349,28 +2018,28 @@ async fn resolve_unanswered(
             rustc_version,
         )
         .await?;
-    let mut latest = HashMap::<BatchId, RunState>::new();
-    retain_qualifying_runs(&mut latest, states, wave.batches);
+    let mut latest = HashMap::<String, RunState>::new();
+    retain_qualifying_runs(&mut latest, states, wave.runs);
     for state in latest.into_values() {
         classify_and_fold(dispatch, state, wave, main_head).await?;
     }
     let grace = std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES);
-    let expired: Vec<BatchId> = wave
-        .batches
+    let expired: Vec<String> = wave
+        .runs
         .iter()
-        .filter(|(_, batch)| {
-            batch
-                .unresolved
+        .filter(|(_, run)| {
+            run.unresolved
                 .as_ref()
                 .is_some_and(|attempt| attempt.instant.elapsed() > grace)
         })
         .map(|(id, _)| id.clone())
         .collect();
     for id in expired {
-        let batch = wave.batches.remove(&id).expect("expired batch");
-        for task_id in batch.legs.values() {
-            wave.nodes.get_mut(task_id).expect("leg node").dispatched = false;
-        }
+        let run = wave.runs.remove(&id).expect("expired run");
+        wave.nodes
+            .get_mut(&run.task_id)
+            .expect("task node")
+            .dispatched = false;
     }
     Ok(())
 }
@@ -2382,15 +2051,15 @@ async fn resolve_unanswered(
 /// qualifying runs the newest binds — `retain_latest_run` keeps the
 /// highest run id, and GitHub's ids mint in creation order.
 fn retain_qualifying_runs(
-    latest: &mut HashMap<BatchId, RunState>,
+    latest: &mut HashMap<String, RunState>,
     states: impl IntoIterator<Item = RunState>,
-    batches: &HashMap<BatchId, BoundRun>,
+    runs: &HashMap<String, BoundRun>,
 ) {
     for state in states {
-        let Some(batch) = batches.get(&state.batch_id) else {
+        let Some(run) = runs.get(&state.task_id) else {
             continue;
         };
-        let Some(attempt) = batch.unresolved.as_ref() else {
+        let Some(attempt) = run.unresolved.as_ref() else {
             continue;
         };
         if state
@@ -2399,7 +2068,7 @@ fn retain_qualifying_runs(
         {
             continue;
         }
-        retain_latest_run(latest, state, batch.workflow_run_id);
+        retain_latest_run(latest, state, run.workflow_run_id);
     }
 }
 
@@ -2593,10 +2262,10 @@ impl Dispatch {
             Self::GitHub { token } => {
                 let response: WorkflowDispatchResponse = crate::github::post(
                     token,
-                    &format!("actions/workflows/{BATCH_WORKFLOW_FILE}/dispatches"),
+                    &format!("actions/workflows/{WORKFLOW_FILE}/dispatches"),
                     &serde_json::json!({
                         "ref": BRANCH,
-                        "inputs": { "batch": encoded },
+                        "inputs": { "task": encoded },
                         "return_run_details": true,
                     }),
                 )
@@ -2606,10 +2275,10 @@ impl Dispatch {
             Self::Local { base } => {
                 let url = format!("{base}/dispatch");
                 let body = serde_json::json!({
-                    "event_type": "build-batch",
+                    "event_type": "build-crate",
                     "client_payload": serde_json::from_str::<serde_json::Value>(encoded)
                         .map_err(|error| {
-                            WriteFailure::Refused(format!("decode batch payload: {error}"))
+                            WriteFailure::Refused(format!("decode task payload: {error}"))
                         })?,
                 });
                 let refused = |error: zenwave::Error| {
@@ -2676,10 +2345,10 @@ impl Dispatch {
         }
     }
 
-    /// Every `build-batch.yml` run of `rustc_version`'s in the closed
+    /// Every `build-crate.yml` run of `rustc_version`'s in the closed
     /// `[since, until]` window — GitHub range-enumerates `created` so
     /// the whole window is read past the 1000-row cap; the local server
-    /// answers its whole task list, each row carrying its legs.
+    /// answers its whole task list, each row its own task's outcome.
     async fn list_runs(
         &self,
         since: time::OffsetDateTime,
@@ -2689,7 +2358,7 @@ impl Dispatch {
         match self {
             Self::GitHub { token } => {
                 let rows = crate::github::runs_in_range(
-                    BATCH_WORKFLOW_FILE,
+                    WORKFLOW_FILE,
                     &format!("event=workflow_dispatch&branch={BRANCH}"),
                     since,
                     until,
@@ -2706,9 +2375,9 @@ impl Dispatch {
                 Ok(rows
                     .into_iter()
                     .filter_map(|run| {
-                        let (rustc, batch_id) = parse_batch_run_title(&run.display_title)?;
+                        let (rustc, task_id) = parse_run_title(&run.display_title)?;
                         (rustc == rustc_version.as_str()).then(|| RunState {
-                            batch_id,
+                            task_id: task_id.to_owned(),
                             workflow_run_id: run.id,
                             status: run.status,
                             conclusion: run.conclusion,
@@ -2716,7 +2385,7 @@ impl Dispatch {
                             head_sha: run.head_sha,
                             run_attempt: run.run_attempt,
                             created_at: Some(run.created_at),
-                            legs: Vec::new(),
+                            error: None,
                         })
                     })
                     .collect())
@@ -2735,19 +2404,17 @@ impl Dispatch {
     /// from one list read.
     async fn poll_bound(
         &self,
-        batches: &HashMap<BatchId, BoundRun>,
+        runs: &HashMap<String, BoundRun>,
         rustc_version: &WireRustcVersion,
     ) -> stow_types::error::Result<Vec<BoundPoll>> {
         match self {
             Self::GitHub { token } => futures_util::stream::iter(
-                batches
-                    .iter()
-                    .filter_map(|(batch_id, batch)| {
-                        batch.workflow_run_id.map(|run_id| {
-                            (batch_id.clone(), run_id, batch.etag.clone(), batch.observed)
-                        })
+                runs.iter()
+                    .filter_map(|(task_id, run)| {
+                        run.workflow_run_id
+                            .map(|run_id| (task_id.clone(), run_id, run.etag.clone(), run.observed))
                     })
-                    .map(|(batch_id, run_id, etag, observed)| async move {
+                    .map(|(task_id, run_id, etag, observed)| async move {
                         let path = format!("actions/runs/{run_id}");
                         match crate::github::get_conditional_result::<WorkflowRunRow>(
                             token,
@@ -2758,19 +2425,19 @@ impl Dispatch {
                         .await
                         {
                             Ok(crate::github::Conditional::Unmodified) => {
-                                Ok(BoundPoll::Unmodified(batch_id))
+                                Ok(BoundPoll::Unmodified(task_id))
                             }
                             Ok(crate::github::Conditional::Modified { body: row, etag }) => {
                                 let Some(state) =
-                                    bound_run_state(row, run_id, &batch_id, rustc_version)?
+                                    bound_run_state(row, run_id, &task_id, rustc_version)?
                                 else {
-                                    // `Pending` leaves the batch's
+                                    // `Pending` leaves the run's
                                     // `etag` untouched, so the next
                                     // poll reads the row again.
                                     return untitled_run(run_id, observed);
                                 };
                                 Ok(BoundPoll::State {
-                                    batch_id,
+                                    task_id,
                                     state,
                                     etag,
                                 })
@@ -2789,19 +2456,19 @@ impl Dispatch {
             .collect(),
             Self::Local { base } => {
                 // The same tracked-id binding GitHub gets: a local row
-                // that is not the batch's bound run id is dropped
-                // before the fold, so an old same-batch completion can
+                // that is not the task's bound run id is dropped
+                // before the fold, so an old same-task completion can
                 // never answer a newer bound retry.
-                let bound: BTreeSet<u64> = batches
+                let bound: BTreeSet<u64> = runs
                     .values()
-                    .filter_map(|batch| batch.workflow_run_id)
+                    .filter_map(|run| run.workflow_run_id)
                     .collect();
                 Ok(local_run_states(base, rustc_version)
                     .await?
                     .into_iter()
                     .filter(|state| bound.contains(&state.workflow_run_id))
                     .map(|state| BoundPoll::State {
-                        batch_id: state.batch_id.clone(),
+                        task_id: state.task_id.clone(),
                         state,
                         etag: None,
                     })
@@ -2830,11 +2497,11 @@ fn dispatch_overdue(batch: &BoundRun) -> bool {
 /// materialized or its row's title has not rendered yet.
 enum BoundPoll {
     State {
-        batch_id: BatchId,
+        task_id: String,
         state: RunState,
         etag: Option<String>,
     },
-    Unmodified(BatchId),
+    Unmodified(String),
     Pending,
 }
 
@@ -2875,15 +2542,15 @@ struct HeadCache {
 }
 
 /// Fold a `GET actions/runs/{id}` row into a run state: the row's own id
-/// must be the bound one and its `display_title` the batch's
-/// `<rustc>-b<batch_id>` — anything else means GitHub answered for a
-/// different run, which is never a state this batch may take. A row still
+/// must be the bound one and its `display_title` the task's
+/// `<rustc>-<task_id>` — anything else means GitHub answered for a
+/// different run, which is never a state this task may take. A row still
 /// titled with the workflow's own `name:` is GitHub not having rendered
 /// `run-name` yet — `Ok(None)`, a title pending rather than a state.
 fn bound_run_state(
     row: WorkflowRunRow,
     run_id: u64,
-    batch_id: &BatchId,
+    task_id: &str,
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<Option<RunState>> {
     if row.id != run_id {
@@ -2892,23 +2559,23 @@ fn bound_run_state(
             row.id
         ));
     }
-    if row.display_title == BATCH_WORKFLOW_NAME {
+    if row.display_title == WORKFLOW_NAME {
         return Ok(None);
     }
-    let Some((rustc, title_batch)) = parse_batch_run_title(&row.display_title) else {
+    let Some((rustc, title_task)) = parse_run_title(&row.display_title) else {
         return Err(stow_error!(
-            "actions/runs/{run_id} title {:?} is not a batch title",
+            "actions/runs/{run_id} title {:?} is not a task title",
             row.display_title
         ));
     };
-    if rustc != rustc_version.as_str() || title_batch != *batch_id {
+    if rustc != rustc_version.as_str() || title_task != task_id {
         return Err(stow_error!(
-            "actions/runs/{run_id} title {:?} does not match bound batch {batch_id}",
+            "actions/runs/{run_id} title {:?} does not match bound task {task_id}",
             row.display_title
         ));
     }
     Ok(Some(RunState {
-        batch_id: title_batch,
+        task_id: title_task.to_owned(),
         workflow_run_id: row.id,
         status: row.status,
         conclusion: row.conclusion,
@@ -2916,13 +2583,13 @@ fn bound_run_state(
         head_sha: row.head_sha,
         run_attempt: row.run_attempt,
         created_at: Some(row.created_at),
-        legs: Vec::new(),
+        error: None,
     }))
 }
 
 /// The local CI server's `/tasks` rows folded to run states — one
-/// `RunState` per batch run of this wave's rustc, its `LocalCiLeg` rows
-/// riding inside.
+/// `RunState` per task run of this wave's rustc, its status,
+/// conclusion and error riding the row directly.
 async fn local_run_states(
     base: &str,
     rustc_version: &WireRustcVersion,
@@ -2936,9 +2603,9 @@ async fn local_run_states(
         .tasks
         .iter()
         .filter_map(|run| {
-            let (rustc, batch_id) = parse_batch_run_title(&run.display_title)?;
+            let (rustc, task_id) = parse_run_title(&run.display_title)?;
             (rustc == rustc_version.as_str()).then(|| RunState {
-                batch_id,
+                task_id: task_id.to_owned(),
                 workflow_run_id: run.workflow_run_id,
                 status: run.status.clone(),
                 conclusion: run.conclusion.clone(),
@@ -2946,27 +2613,22 @@ async fn local_run_states(
                 head_sha: String::new(),
                 run_attempt: 1,
                 created_at: None,
-                legs: run.legs.clone(),
+                error: run.error.clone(),
             })
         })
         .collect())
 }
 
-/// The layer's one-time adoption sweep: every `build-batch.yml` run in
+/// The layer's one-time adoption sweep: every `build-crate.yml` run in
 /// the closed `[adopt_since, now]` window, newest first so the newest
-/// run covering a node binds it. A GitHub run reads its attempt's jobs
-/// — each leg maps back to its node by the 16-hex hash in the job
-/// name; the local server's leg rows name their task ids directly.
-/// Every adopted run becomes a bound batch charged
-/// `adopted_parallelism` slots — its real `max-parallel` is not on the
-/// row, and `k` is the bound — and folds through the same path a bound
-/// poll takes.
+/// run covering a node binds it. The run's title names its task id —
+/// an undispatched open node binds the run and folds through the same
+/// path a bound poll takes.
 async fn adopt_runs(
     dispatch: &Dispatch,
     wave: &mut Wave<'_>,
     adopt_since: time::OffsetDateTime,
     rustc_version: &WireRustcVersion,
-    adopted_parallelism: u32,
     main_head: &str,
 ) -> stow_types::error::Result<()> {
     if wave.open.is_empty() {
@@ -2977,41 +2639,26 @@ async fn adopt_runs(
         .await?;
     // Newest first: the newest run covering a node wins its binding.
     states.sort_by_key(|state| std::cmp::Reverse(state.workflow_run_id));
-    let open_hash: HashMap<TaskHash, String> = wave
-        .open
-        .iter()
-        .map(|id| (TaskHash::of(id), id.clone()))
-        .collect();
     for state in states {
-        // A run's staleness is on its row — a stale run's jobs never
-        // need reading.
+        // A run's staleness is on its row — a stale run's node never
+        // binds.
         if state.stale_failure(main_head) {
             continue;
         }
-        let (legs, expected) = match dispatch {
-            Dispatch::GitHub { token } => {
-                let jobs = crate::runs::fetch_attempt_jobs(
-                    Some(token),
-                    crate::github::API_BASE,
-                    state.workflow_run_id,
-                    state.run_attempt,
-                    None,
-                    Backoff::outage,
-                )
-                .await?;
-                adopt_github_legs(&jobs, &open_hash, wave.nodes)
-            }
-            Dispatch::Local { .. } => adopt_local_legs(&state, wave.nodes),
+        // The run's title gives its task id — one task is one run.
+        let Some(node) = wave.nodes.get_mut(&state.task_id) else {
+            continue;
         };
-        if legs.is_empty() {
+        if node.dispatched {
             continue;
         }
-        wave.batches.insert(
-            state.batch_id.clone(),
+        node.dispatched = true;
+        node.run_url = Some(state.url.clone());
+        node.workflow_run_id = Some(state.workflow_run_id);
+        wave.runs.insert(
+            state.task_id.clone(),
             BoundRun {
-                legs,
-                expected,
-                parallelism: adopted_parallelism,
+                task_id: state.task_id.clone(),
                 workflow_run_id: Some(state.workflow_run_id),
                 run_url: Some(state.url.clone()),
                 etag: None,
@@ -3025,66 +2672,6 @@ async fn adopt_runs(
         classify_and_fold(dispatch, state, wave, main_head).await?;
     }
     Ok(())
-}
-
-/// A candidate GitHub run's leg map at adoption: every parseable job
-/// name lands its leg's 16-hex hash into `expected`, and a hash an
-/// undispatched open node claims maps the leg to its task id —
-/// adoption binds legs by hash, not by position. A skipped job's
-/// unrendered name (stow#839) carries no hash — it still claims its
-/// leg's slot in `expected` but binds nothing. Gaps in `expected`
-/// fill with a placeholder: a leg that never left the matrix's queue
-/// carries no called-job name until it runs.
-fn adopt_github_legs(
-    jobs: &[RunJobRow],
-    open_hash: &HashMap<TaskHash, String>,
-    nodes: &BTreeMap<String, NodeRun>,
-) -> (BTreeMap<u32, String>, Vec<TaskHash>) {
-    let phantom = TaskHash::of("");
-    let mut expected: Vec<TaskHash> = Vec::new();
-    let mut legs: BTreeMap<u32, String> = BTreeMap::new();
-    for job in jobs {
-        let Some(parsed) = LegJobName::parse(&job.name) else {
-            continue;
-        };
-        let leg = usize::try_from(parsed.leg).expect("leg index fits usize");
-        if expected.len() <= leg {
-            expected.resize(leg + 1, phantom.clone());
-        }
-        let Some(hash) = parsed.hash else {
-            continue;
-        };
-        if expected[leg] == phantom {
-            expected[leg] = hash.clone();
-        }
-        if let Some(task_id) = open_hash.get(&hash)
-            && !nodes.get(task_id).expect("open node").dispatched
-        {
-            legs.insert(parsed.leg, task_id.clone());
-        }
-    }
-    (legs, expected)
-}
-
-/// A local run's leg map at adoption — the `LocalCiLeg` rows carry the
-/// task id outright, so no hash indirection is needed.
-fn adopt_local_legs(
-    state: &RunState,
-    nodes: &BTreeMap<String, NodeRun>,
-) -> (BTreeMap<u32, String>, Vec<TaskHash>) {
-    let mut legs = BTreeMap::new();
-    let mut expected = Vec::new();
-    for leg in &state.legs {
-        let index = usize::try_from(leg.leg).expect("leg index fits usize");
-        if expected.len() <= index {
-            expected.resize(index + 1, TaskHash::of(""));
-        }
-        expected[index] = TaskHash::of(&leg.task_id);
-        if nodes.get(&leg.task_id).is_some_and(|node| !node.dispatched) {
-            legs.insert(leg.leg, leg.task_id.clone());
-        }
-    }
-    (legs, expected)
 }
 
 /// `GET /git/ref/heads/{branch}` — the fields the driver needs.
@@ -3106,8 +2693,10 @@ struct WorkflowDispatchResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runs::TaskFailure;
     use clap::Parser;
-    use stow_types::runs::RunStepRow;
+    use stow_types::api::TaskHash;
+    use stow_types::runs::{RunJobRow, RunStepRow};
 
     /// `main`'s sha in the test fixtures.
     const MAIN_HEAD: &str = "1111111111111111111111111111111111111111";
@@ -3793,13 +3382,10 @@ mod tests {
         );
     }
 
-    /// The `b<…>` title segment a fixture run carries — a distinct
-    /// 32-hex `BatchId` derived from its run id, so `run_state_with_id`
-    /// and `bound_batch` agree on it.
-    fn batch_id_for(run_id: u64) -> BatchId {
-        format!("{run_id:032x}")
-            .parse()
-            .expect("32 hex digits are a batch id")
+    /// The task id a fixture run's title carries — `run_state_with_id`
+    /// and `bound_run` agree on it.
+    fn task_id_for(run_id: u64) -> String {
+        format!("task-{run_id}")
     }
 
     fn run_state(status: &str, conclusion: Option<&str>, ran_current_code: bool) -> RunState {
@@ -3813,7 +3399,7 @@ mod tests {
         ran_current_code: bool,
     ) -> RunState {
         RunState {
-            batch_id: batch_id_for(workflow_run_id),
+            task_id: task_id_for(workflow_run_id),
             workflow_run_id,
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
@@ -3825,17 +3411,6 @@ mod tests {
             },
             run_attempt: 1,
             created_at: None,
-            legs: Vec::new(),
-        }
-    }
-
-    /// One `LocalCiLeg` row — the local lane's per-leg answer.
-    fn local_leg(leg: u32, task_id: &str, status: &str, conclusion: Option<&str>) -> LocalCiLeg {
-        LocalCiLeg {
-            leg,
-            task_id: task_id.to_owned(),
-            status: status.to_owned(),
-            conclusion: conclusion.map(str::to_owned),
             error: None,
         }
     }
@@ -3869,18 +3444,11 @@ mod tests {
         }
     }
 
-    /// A bound batch whose leg `i` is `legs[i]`'s node, on run
-    /// `run_id`, observed, carrying the expected hashes a minted batch
-    /// would.
-    fn bound_batch(legs: &[String], run_id: u64) -> BoundRun {
+    /// A bound run carrying `task_id`'s node, on run `run_id`,
+    /// observed, with the expected hash a minted dispatch would.
+    fn bound_run(task_id: &str, run_id: u64) -> BoundRun {
         BoundRun {
-            legs: legs
-                .iter()
-                .enumerate()
-                .map(|(index, id)| (u32::try_from(index).expect("leg index"), id.clone()))
-                .collect(),
-            expected: legs.iter().map(|id| TaskHash::of(id)).collect(),
-            parallelism: u32::try_from(legs.len()).expect("legs fit u32"),
+            task_id: task_id.to_owned(),
             workflow_run_id: Some(run_id),
             run_url: Some(format!(
                 "https://github.com/water-rs/stow/actions/runs/{run_id}"
@@ -3894,29 +3462,21 @@ mod tests {
         }
     }
 
-    /// A batch whose dispatch answer never arrived — its legs' nodes
-    /// are held `dispatched` while the resolution listing settles it.
-    fn unresolved_batch(
-        batches: &mut HashMap<BatchId, BoundRun>,
+    /// A run whose dispatch answer never arrived — its node is held
+    /// `dispatched` while the resolution listing settles it.
+    fn unresolved_run(
+        runs: &mut HashMap<String, BoundRun>,
         nodes: &mut BTreeMap<String, NodeRun>,
-        batch_id: BatchId,
-        legs: &[String],
+        task_id: &str,
+        run_id: u64,
         wall: time::OffsetDateTime,
     ) {
-        for id in legs {
-            nodes.get_mut(id).expect("leg node").dispatched = true;
-        }
-        batches.insert(
-            batch_id,
+        nodes.get_mut(task_id).expect("task node").dispatched = true;
+        runs.insert(
+            task_id.to_owned(),
             BoundRun {
-                legs: legs
-                    .iter()
-                    .enumerate()
-                    .map(|(index, id)| (u32::try_from(index).expect("leg index"), id.clone()))
-                    .collect(),
-                expected: legs.iter().map(|id| TaskHash::of(id)).collect(),
-                parallelism: u32::try_from(legs.len()).expect("legs fit u32"),
-                workflow_run_id: None,
+                task_id: task_id.to_owned(),
+                workflow_run_id: Some(run_id),
                 run_url: None,
                 etag: None,
                 latest: None,
@@ -3936,14 +3496,14 @@ mod tests {
     fn wave<'a>(
         nodes: &'a mut BTreeMap<String, NodeRun>,
         open: &'a mut BTreeSet<String>,
-        batches: &'a mut HashMap<BatchId, BoundRun>,
+        runs: &'a mut HashMap<String, BoundRun>,
         reruns: &'a mut Vec<RerunRecord>,
         gate: &'a mut WriteGate,
     ) -> Wave<'a> {
         Wave {
             nodes,
             open,
-            batches,
+            runs,
             reruns,
             gate,
         }
@@ -3952,11 +3512,11 @@ mod tests {
     #[test]
     fn numeric_latest_run_wins_over_unordered_old_failure() {
         let mut latest = HashMap::new();
-        let batch = batch_id_for(1);
+        let batch = task_id_for(1);
         let mut newer = run_state_with_id(10, "in_progress", None, true);
-        newer.batch_id = batch.clone();
+        newer.task_id = batch.clone();
         let mut older = run_state_with_id(9, "completed", Some("failure"), false);
-        older.batch_id = batch.clone();
+        older.task_id = batch.clone();
         retain_latest_run(&mut latest, newer, None);
         retain_latest_run(&mut latest, older, None);
         let selected = latest.remove(&batch).expect("latest run");
@@ -3967,11 +3527,11 @@ mod tests {
     #[test]
     fn numeric_latest_run_wins_over_unordered_old_success() {
         let mut latest = HashMap::new();
-        let batch = batch_id_for(1);
+        let batch = task_id_for(1);
         let mut older = run_state_with_id(9, "completed", Some("success"), true);
-        older.batch_id = batch.clone();
+        older.task_id = batch.clone();
         let mut newer = run_state_with_id(10, "in_progress", None, true);
-        newer.batch_id = batch.clone();
+        newer.task_id = batch.clone();
         retain_latest_run(&mut latest, older, None);
         retain_latest_run(&mut latest, newer, None);
         let selected = latest.remove(&batch).expect("latest run");
@@ -3998,21 +3558,21 @@ mod tests {
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
         let row = run_row(
             11,
-            &format!("1.99.0-b{}", batch_id_for(10)),
+            &format!("1.99.0-{}", task_id_for(10)),
             "completed",
             Some("success"),
         );
-        assert!(bound_run_state(row, 10, &batch_id_for(10), &rustc).is_err());
+        assert!(bound_run_state(row, 10, &task_id_for(10), &rustc).is_err());
     }
 
-    /// The bound id's title must be `<rustc>-b<batch_id>` — a row for
+    /// The bound id's title must be `<rustc>-b<task_id>` — a row for
     /// a different batch, a different rustc, or no batch title at all
     /// is a hard error, not a fold.
     #[test]
     fn a_bound_poll_validates_the_run_title() {
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        let batch = batch_id_for(10);
-        let title = format!("1.99.0-b{batch}");
+        let batch = task_id_for(10);
+        let title = format!("1.99.0-{batch}");
         let state = bound_run_state(
             run_row(10, &title, "completed", Some("success")),
             10,
@@ -4024,7 +3584,7 @@ mod tests {
             bound_run_state(
                 run_row(
                     10,
-                    &format!("1.99.0-b{}", batch_id_for(11)),
+                    &format!("1.99.0-{}", task_id_for(11)),
                     "completed",
                     Some("success")
                 ),
@@ -4036,12 +3596,7 @@ mod tests {
         );
         assert!(
             bound_run_state(
-                run_row(
-                    10,
-                    &format!("1.98.0-b{batch}"),
-                    "completed",
-                    Some("success")
-                ),
+                run_row(10, &format!("1.98.0-{batch}"), "completed", Some("success")),
                 10,
                 &batch,
                 &rustc
@@ -4050,7 +3605,7 @@ mod tests {
         );
         assert!(
             bound_run_state(
-                run_row(10, "no-batch-title", "completed", Some("success")),
+                run_row(10, "untitled-run", "completed", Some("success")),
                 10,
                 &batch,
                 &rustc
@@ -4060,16 +3615,16 @@ mod tests {
     }
 
     /// stow#704 at batch scope: until GitHub renders a run's
-    /// `run-name`, its `display_title` is `build-batch.yml`'s `name:` —
+    /// `run-name`, its `display_title` is `build-crate.yml`'s `name:` —
     /// a title pending, `Ok(None)`, not a state and not another
     /// workflow's run. The id check still comes first.
     #[test]
     fn an_untitled_bound_run_is_not_a_state() {
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        let batch = batch_id_for(10);
+        let batch = task_id_for(10);
         assert!(matches!(
             bound_run_state(
-                run_row(10, BATCH_WORKFLOW_NAME, "queued", None),
+                run_row(10, WORKFLOW_NAME, "queued", None),
                 10,
                 &batch,
                 &rustc
@@ -4078,7 +3633,7 @@ mod tests {
         ));
         assert!(
             bound_run_state(
-                run_row(10, BATCH_WORKFLOW_NAME, "queued", None),
+                run_row(10, WORKFLOW_NAME, "queued", None),
                 11,
                 &batch,
                 &rustc
@@ -4112,21 +3667,15 @@ mod tests {
             })
             .collect();
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
-        let mut batches = HashMap::new();
+        let mut runs = HashMap::new();
         for (name, run_id) in [("won", 100), ("lost", 101), ("flying", 102)] {
-            batches.insert(
-                batch_id_for(run_id),
-                bound_batch(std::slice::from_ref(&ids[name]), run_id),
-            );
+            runs.insert(ids[name].clone(), bound_run(&ids[name], run_id));
         }
-        batches.insert(
-            batch_id_for(50),
-            bound_batch(std::slice::from_ref(&ids["stale"]), 50),
-        );
-        {
-            let stale = nodes.get_mut(&ids["stale"]).expect("stale node");
-            stale.workflow_run_id = Some(50);
-            stale.dispatched = true;
+        runs.insert(ids["stale"].clone(), bound_run(&ids["stale"], 50));
+        for (name, run_id) in [("won", 100), ("lost", 101), ("flying", 102), ("stale", 50)] {
+            let node = nodes.get_mut(&ids[name]).expect("bound node");
+            node.workflow_run_id = Some(run_id);
+            node.dispatched = true;
         }
         let dispatch = Dispatch::Local {
             base: "http://localhost".to_owned(),
@@ -4134,36 +3683,28 @@ mod tests {
         let mut reruns = Vec::new();
         let mut gate = WriteGate::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
-            classify_and_fold(
-                &dispatch,
-                run_state_with_id(100, "completed", Some("success"), true),
-                &mut wave,
-                MAIN_HEAD,
-            )
-            .await
-            .expect("the successful run folds");
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
+            let mut won_state = run_state_with_id(100, "completed", Some("success"), true);
+            won_state.task_id = ids["won"].clone();
+            classify_and_fold(&dispatch, won_state, &mut wave, MAIN_HEAD)
+                .await
+                .expect("the successful run folds");
             let mut lost = run_state_with_id(101, "completed", Some("failure"), true);
-            lost.legs = vec![local_leg(0, &ids["lost"], "completed", Some("failure"))];
+            lost.task_id = ids["lost"].clone();
+            lost.error = Some("the build failed".to_owned());
             classify_and_fold(&dispatch, lost, &mut wave, MAIN_HEAD)
                 .await
                 .expect("the failed run folds");
-            classify_and_fold(
-                &dispatch,
-                run_state_with_id(102, "in_progress", None, true),
-                &mut wave,
-                MAIN_HEAD,
-            )
-            .await
-            .expect("the in-flight run binds");
-            classify_and_fold(
-                &dispatch,
-                run_state_with_id(50, "completed", Some("failure"), false),
-                &mut wave,
-                MAIN_HEAD,
-            )
-            .await
-            .expect("the stale run releases");
+            let mut flying = run_state_with_id(102, "in_progress", None, true);
+            flying.task_id = ids["flying"].clone();
+            classify_and_fold(&dispatch, flying, &mut wave, MAIN_HEAD)
+                .await
+                .expect("the in-flight run binds");
+            let mut stale = run_state_with_id(50, "completed", Some("failure"), false);
+            stale.task_id = ids["stale"].clone();
+            classify_and_fold(&dispatch, stale, &mut wave, MAIN_HEAD)
+                .await
+                .expect("the stale run releases");
         }
 
         let won = &ids["won"];
@@ -4183,7 +3724,7 @@ mod tests {
             "the stale run's node returns to unsent"
         );
         assert!(open.contains(stale));
-        assert!(!batches.contains_key(&batch_id_for(50)));
+        assert!(!runs.contains_key(&ids["stale"]));
     }
 
     /// A stale row for a different run id of the same batch never
@@ -4197,19 +3738,16 @@ mod tests {
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
         nodes.get_mut(&task).expect("node").workflow_run_id = Some(50);
         nodes.get_mut(&task).expect("node").dispatched = true;
-        let mut batches = HashMap::from([(
-            batch_id_for(50),
-            bound_batch(std::slice::from_ref(&task), 50),
-        )]);
+        let mut runs = HashMap::from([(task.clone(), bound_run(&task, 50))]);
         let mut other = run_state_with_id(99, "completed", Some("failure"), false);
-        other.batch_id = batch_id_for(50);
+        other.task_id = task.clone();
         let dispatch = Dispatch::Local {
             base: "http://localhost".to_owned(),
         };
         let mut reruns = Vec::new();
         let mut gate = WriteGate::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
             classify_and_fold(&dispatch, other, &mut wave, MAIN_HEAD)
                 .await
                 .expect("fold");
@@ -4225,9 +3763,9 @@ mod tests {
     #[test]
     fn an_old_same_batch_completion_cannot_answer_a_bound_retry() {
         let mut latest = HashMap::new();
-        let batch = batch_id_for(50);
+        let batch = task_id_for(50);
         let mut old = run_state_with_id(40, "completed", Some("success"), true);
-        old.batch_id = batch.clone();
+        old.task_id = batch.clone();
         retain_latest_run(&mut latest, old, Some(50));
         assert!(latest.is_empty(), "untracked id dropped before the fold");
 
@@ -4246,17 +3784,15 @@ mod tests {
         let task = node_task_id(request_by_name("flake", &nodes)).expect("task id");
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
         nodes.get_mut(&task).expect("node").workflow_run_id = Some(50);
-        let batch = bound_batch(std::slice::from_ref(&task), 50);
-        let outcomes = vec![LegOutcome::Failed(LegFailure::Run(
-            RunFailure::Infrastructure {
-                job: format!("leg 0 / build #0 flake 1.0.0 ({T}) {}", TaskHash::of(&task)),
-                step: Some("Set up runner".to_owned()),
-                html_url: "https://github.com/water-rs/stow/actions/runs/50/job/1".to_owned(),
-            },
-        ))];
-        let earners = fold_leg_outcomes(&outcomes, &batch, 50, true, &mut nodes, &mut open);
+        let batch = bound_run(&task, 50);
+        let outcome = TaskOutcome::Failed(TaskFailure::Run(RunFailure::Infrastructure {
+            job: format!("leg 0 / build #0 flake 1.0.0 ({T}) {}", TaskHash::of(&task)),
+            step: Some("Set up runner".to_owned()),
+            html_url: "https://github.com/water-rs/stow/actions/runs/50/job/1".to_owned(),
+        }));
+        let earners = fold_run_outcome(&outcome, &batch, 50, true, &mut nodes, &mut open);
         assert!(
-            earners.is_empty(),
+            earners.is_none(),
             "at MAX_RUN_ATTEMPTS nothing earns a rerun"
         );
         assert!(nodes[&task].failed && !open.contains(&task));
@@ -4272,20 +3808,18 @@ mod tests {
             build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
         let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
-        let mut batches = HashMap::from([(
-            batch_id_for(50),
-            bound_batch(std::slice::from_ref(&task), 50),
-        )]);
+        let mut runs = HashMap::from([(task.clone(), bound_run(&task, 50))]);
         let mut state = run_state_with_id(50, "completed", Some("failure"), true);
+        state.task_id = task.clone();
         state.run_attempt = MAX_RUN_ATTEMPTS;
-        state.legs = vec![local_leg(0, &task, "completed", Some("failure"))];
+        state.error = Some("the build failed".to_owned());
         let dispatch = Dispatch::Local {
             base: "http://localhost".to_owned(),
         };
         let mut reruns = Vec::new();
         let mut gate = WriteGate::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
             classify_and_fold(&dispatch, state, &mut wave, MAIN_HEAD)
                 .await
                 .expect("fold");
@@ -4309,40 +3843,35 @@ mod tests {
             node.workflow_run_id = Some(77);
             node.dispatched = true;
         }
-        let mut batches = HashMap::from([(
-            batch_id_for(77),
-            bound_batch(std::slice::from_ref(&task), 77),
-        )]);
+        let mut runs = HashMap::from([(task.clone(), bound_run(&task, 77))]);
         {
-            let batch = batches.get_mut(&batch_id_for(77)).expect("batch");
+            let batch = runs.get_mut(&task).expect("batch");
             batch.etag = Some("etag".to_owned());
             batch.latest = Some(run_state_with_id(77, "in_progress", None, true));
         }
-        let outcomes = vec![LegOutcome::Failed(LegFailure::Run(
-            RunFailure::Infrastructure {
-                job: format!("leg 0 / build #0 flake 1.0.0 ({T}) {}", TaskHash::of(&task)),
-                step: Some("Run dtolnay/rust-toolchain".to_owned()),
-                html_url: "https://github.com/water-rs/stow/actions/runs/77/job/1".to_owned(),
-            },
-        ))];
+        let outcome = TaskOutcome::Failed(TaskFailure::Run(RunFailure::Infrastructure {
+            job: format!("leg 0 / build #0 flake 1.0.0 ({T}) {}", TaskHash::of(&task)),
+            step: Some("Run dtolnay/rust-toolchain".to_owned()),
+            html_url: "https://github.com/water-rs/stow/actions/runs/77/job/1".to_owned(),
+        }));
         let earners = {
-            let batch = batches.get(&batch_id_for(77)).expect("batch");
-            fold_leg_outcomes(&outcomes, batch, 77, false, &mut nodes, &mut open)
+            let batch = runs.get(&task).expect("batch");
+            fold_run_outcome(&outcome, batch, 77, false, &mut nodes, &mut open)
         };
-        assert_eq!(earners.len(), 1);
+        let earner = earners.expect("a rerun earner");
         let state = run_state_with_id(77, "completed", Some("failure"), true);
         let mut reruns = Vec::new();
         let mut gate = WriteGate::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
-            apply_rerun_answer(&batch_id_for(77), &state, earners, Ok(()), &mut wave)
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
+            apply_rerun_answer(&task, &state, earner, Ok(()), &mut wave)
                 .expect("a confirmed rerun applies");
         }
         let node = &nodes[&task];
         assert!(open.contains(&task) && !node.failed && !node.done);
         assert_eq!(node.workflow_run_id, Some(77));
         assert!(node.dispatched);
-        let batch = &batches[&batch_id_for(77)];
+        let batch = &runs[&task];
         assert!(batch.etag.is_none() && batch.latest.is_none());
         assert_eq!(reruns.len(), 1);
         assert_eq!(reruns[0].run_attempt, 2);
@@ -4363,31 +3892,26 @@ mod tests {
             node.workflow_run_id = Some(88);
             node.dispatched = true;
         }
-        let mut batches = HashMap::from([(
-            batch_id_for(88),
-            bound_batch(std::slice::from_ref(&task), 88),
-        )]);
-        let outcomes = vec![LegOutcome::Failed(LegFailure::Run(
-            RunFailure::Infrastructure {
-                job: "-".to_owned(),
-                step: None,
-                html_url: String::new(),
-            },
-        ))];
+        let mut runs = HashMap::from([(task.clone(), bound_run(&task, 88))]);
+        let outcome = TaskOutcome::Failed(TaskFailure::Run(RunFailure::Infrastructure {
+            job: "-".to_owned(),
+            step: None,
+            html_url: String::new(),
+        }));
         let earners = {
-            let batch = batches.get(&batch_id_for(88)).expect("batch");
-            fold_leg_outcomes(&outcomes, batch, 88, false, &mut nodes, &mut open)
+            let batch = runs.get(&task).expect("batch");
+            fold_run_outcome(&outcome, batch, 88, false, &mut nodes, &mut open)
         };
-        assert_eq!(earners.len(), 1);
+        let earner = earners.expect("a rerun earner");
         let state = run_state_with_id(88, "completed", Some("failure"), true);
         let mut reruns = Vec::new();
         let mut gate = WriteGate::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
             apply_rerun_answer(
-                &batch_id_for(88),
+                &task,
                 &state,
-                earners,
+                earner,
                 Err(WriteFailure::Ambiguous("timeout".to_owned())),
                 &mut wave,
             )
@@ -4397,7 +3921,7 @@ mod tests {
         assert!(open.contains(&task) && !node.failed && node.dispatched);
         assert_eq!(node.workflow_run_id, Some(88));
         assert!(
-            batches[&batch_id_for(88)].pending_rerun.is_some(),
+            runs[&task].pending_rerun.is_some(),
             "the unanswered ask rides the batch until a row answers it"
         );
     }
@@ -4415,14 +3939,14 @@ mod tests {
         let (leaf, mid) = (ids("leaf"), ids("mid"));
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
         nodes.get_mut(&leaf).expect("node").workflow_run_id = Some(90);
-        let batch = bound_batch(std::slice::from_ref(&leaf), 90);
-        let outcomes = vec![LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict {
+        let batch = bound_run(&leaf, 90);
+        let outcome = TaskOutcome::Failed(TaskFailure::Run(RunFailure::Verdict {
             job: format!("leg 0 / build #0 leaf 1.0.0 ({T}) {}", TaskHash::of(&leaf)),
             step: "cargo build".to_owned(),
             html_url: "https://github.com/water-rs/stow/actions/runs/90/job/1".to_owned(),
-        }))];
-        let earners = fold_leg_outcomes(&outcomes, &batch, 90, false, &mut nodes, &mut open);
-        assert!(earners.is_empty(), "a verdict never earns a rerun");
+        }));
+        let earners = fold_run_outcome(&outcome, &batch, 90, false, &mut nodes, &mut open);
+        assert!(earners.is_none(), "a verdict never earns a rerun");
         assert!(nodes[&leaf].failed && !open.contains(&leaf));
         let blocked = mark_blocked(std::slice::from_ref(&mid), &mut nodes, &edges);
         assert_eq!(blocked, vec![(mid.clone(), leaf)]);
@@ -4439,7 +3963,7 @@ mod tests {
             crate::test_server::Step::Respond {
                 status: 200,
                 retry_after: None,
-                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-b0123456789abcdef0123456789abcdef","status":"completed","conclusion":"success","html_url":"http://localhost/run/7","path":".github/workflows/build-batch.yml","dispatched_at_ms":0,"completed_at_ms":0,"error":null,"delivery_errors":[],"legs":[{"leg":0,"task_id":"taskabc","status":"completed","conclusion":"success"}]}]}"#,
+                body: r#"{"tasks":[{"workflow_run_id":7,"display_title":"1.99.0-taskabc","status":"completed","conclusion":"success","html_url":"http://localhost/run/7","path":".github/workflows/build-crate.yml","dispatched_at_ms":0,"completed_at_ms":0,"error":null,"delivery_errors":[],"task_id":"taskabc"}]}"#,
             },
         ])
         .await;
@@ -4448,15 +3972,10 @@ mod tests {
             .await
             .expect("a dropped connection retries");
         assert_eq!(runs.len(), 1);
-        assert_eq!(
-            runs[0].batch_id,
-            "0123456789abcdef0123456789abcdef"
-                .parse()
-                .expect("batch id")
-        );
+        assert_eq!(runs[0].task_id, "taskabc");
         assert_eq!(runs[0].workflow_run_id, 7);
-        assert_eq!(runs[0].legs.len(), 1);
-        assert_eq!(runs[0].legs[0].task_id, "taskabc");
+        assert_eq!(runs[0].task_id, "taskabc");
+        assert_eq!(runs[0].conclusion.as_deref(), Some("success"));
         let heads = server.join().await;
         assert_eq!(heads.len(), 2);
         for request in &heads {
@@ -4476,24 +3995,19 @@ mod tests {
     /// attempt (minus [`GITHUB_CLOCK_ALLOWANCE`]) may answer it, and
     /// the newest of the qualifying runs is the one that binds.
     #[tokio::test]
-    async fn an_unresolved_batch_binds_the_newest_qualifying_run() {
+    async fn an_unresolved_run_binds_the_newest_qualifying_run() {
         const T: &str = "x86_64-unknown-linux-gnu";
         let (mut nodes, _) =
             build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
         let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
-        let mut batches = HashMap::new();
-        let batch = batch_id_for(9);
-        unresolved_batch(
-            &mut batches,
-            &mut nodes,
-            batch.clone(),
-            std::slice::from_ref(&task),
-            at(1_000_000),
-        );
+        let mut runs = HashMap::new();
+        let batch = task.clone();
+        unresolved_run(&mut runs, &mut nodes, &task, 9, at(1_000_000));
         let state = |run_id: u64, created_unix: i64| {
             let mut state = run_state_with_id(run_id, "in_progress", None, true);
-            state.batch_id = batch.clone();
+            state.task_id = task.clone();
+            state.task_id = batch.clone();
             state.created_at = Some(at(created_unix));
             state
         };
@@ -4509,7 +4023,7 @@ mod tests {
                 // The newest qualifying run binds.
                 state(9, 1_000_000 + 5),
             ],
-            &batches,
+            &runs,
         );
         let selected = latest.remove(&batch).expect("a qualifying run");
         assert_eq!(selected.workflow_run_id, 9);
@@ -4520,7 +4034,7 @@ mod tests {
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
             classify_and_fold(&dispatch, selected, &mut wave, MAIN_HEAD)
                 .await
                 .expect("fold");
@@ -4528,29 +4042,23 @@ mod tests {
         let node = &nodes[&task];
         assert_eq!(node.workflow_run_id, Some(9));
         assert!(node.dispatched);
-        assert!(batches[&batch].unresolved.is_none());
+        assert!(runs[&batch].unresolved.is_none());
     }
 
     /// An attempt the listing never answers — GitHub never took the
     /// write — returns to unsent once the grace expires, so the next
     /// dispatch pass sends it again.
     #[tokio::test(start_paused = true)]
-    async fn an_unresolved_batch_past_the_grace_returns_to_unsent() {
+    async fn an_unresolved_run_past_the_grace_returns_to_unsent() {
         const T: &str = "x86_64-unknown-linux-gnu";
         let (mut nodes, _) =
             build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
         let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
-        let mut batches = HashMap::new();
-        let batch = batch_id_for(9);
-        unresolved_batch(
-            &mut batches,
-            &mut nodes,
-            batch.clone(),
-            std::slice::from_ref(&task),
-            at(1_000_000),
-        );
-        // The listing answers nothing for the batch — an empty mock CI.
+        let mut runs = HashMap::new();
+        let batch = task.clone();
+        unresolved_run(&mut runs, &mut nodes, &task, 9, at(1_000_000));
+        // The listing answers nothing for the run — an empty mock CI.
         let server = MockCi::start(&[], &[], "1.99.0").await;
         let dispatch = Dispatch::Local {
             base: server.url.clone(),
@@ -4559,19 +4067,19 @@ mod tests {
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
             // Inside the grace the attempt stays unresolved.
             resolve_unanswered(&dispatch, &mut wave, MAIN_HEAD, &rustc)
                 .await
                 .expect("resolve");
-            assert!(wave.batches[&batch].unresolved.is_some() && wave.nodes[&task].dispatched);
+            assert!(wave.runs[&batch].unresolved.is_some() && wave.nodes[&task].dispatched);
             // Past it, the batch drops and the node returns to unsent.
             tokio::time::advance(std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES + 60)).await;
             resolve_unanswered(&dispatch, &mut wave, MAIN_HEAD, &rustc)
                 .await
                 .expect("resolve");
         }
-        assert!(batches.is_empty());
+        assert!(runs.is_empty());
         assert!(!nodes[&task].dispatched);
         server.shutdown().await;
     }
@@ -4580,25 +4088,19 @@ mod tests {
     /// materialized — an unresolved batch carries no confirmed id and
     /// can never be overdue.
     #[test]
-    fn the_overdue_check_never_fires_for_an_unresolved_batch() {
+    fn the_overdue_check_never_fires_for_an_unresolved_run() {
         const T: &str = "x86_64-unknown-linux-gnu";
         let (mut nodes, _) =
             build_graph(vec![request("task", T, false, &[])]).expect("valid graph");
         let task = node_task_id(request_by_name("task", &nodes)).expect("task id");
-        let mut batches = HashMap::new();
-        let batch = batch_id_for(9);
-        unresolved_batch(
-            &mut batches,
-            &mut nodes,
-            batch.clone(),
-            std::slice::from_ref(&task),
-            at(1_000_000),
-        );
-        assert!(!dispatch_overdue(&batches[&batch]));
+        let mut runs = HashMap::new();
+        let batch = task.clone();
+        unresolved_run(&mut runs, &mut nodes, &task, 9, at(1_000_000));
+        assert!(!dispatch_overdue(&runs[&batch]));
         // A confirmed send's unmaterialized run still fires past the
         // grace — the check itself is unchanged.
         {
-            let entry = batches.get_mut(&batch).expect("batch");
+            let entry = runs.get_mut(&batch).expect("batch");
             entry.unresolved = None;
             entry.workflow_run_id = Some(9);
             entry.observed = false;
@@ -4608,7 +4110,7 @@ mod tests {
                     .expect("the host has been up longer than the grace"),
             );
         }
-        assert!(dispatch_overdue(&batches[&batch]));
+        assert!(dispatch_overdue(&runs[&batch]));
     }
 
     /// The progress counts partition the layer: done, failed, blocked,
@@ -4667,25 +4169,19 @@ mod tests {
             .get_mut(&ids["blocked"])
             .expect("blocked node")
             .blocked_by = Some(ids["failed"].clone());
-        let mut batches = HashMap::new();
-        unresolved_batch(
-            &mut batches,
-            &mut nodes,
-            batch_id_for(9),
-            std::slice::from_ref(&ids["unresolved"]),
-            at(1_000_000),
-        );
+        let mut runs = HashMap::new();
+        unresolved_run(&mut runs, &mut nodes, &ids["unresolved"], 9, at(1_000_000));
         for (name, run_id, status) in [("queued", 50, "queued"), ("running", 51, "in_progress")] {
             {
                 let node = nodes.get_mut(&ids[name]).expect("bound node");
                 node.dispatched = true;
                 node.workflow_run_id = Some(run_id);
             }
-            let mut batch = bound_batch(std::slice::from_ref(&ids[name]), run_id);
+            let mut batch = bound_run(&ids[name], run_id);
             batch.latest = Some(run_state_with_id(run_id, status, None, true));
-            batches.insert(batch_id_for(run_id), batch);
+            runs.insert(ids[name].clone(), batch);
         }
-        let progress = layer_progress(&layer, &nodes, &batches);
+        let progress = layer_progress(&layer, &nodes, &runs);
         assert_eq!(
             progress,
             LayerProgress {
@@ -4694,7 +4190,7 @@ mod tests {
                 failed: 1,
                 skipped: 1,
                 dispatched: 3,
-                running_batches: 1,
+                running: 1,
                 remaining: 1,
             }
         );
@@ -4725,23 +4221,18 @@ mod tests {
             node.dispatched = true;
             node.workflow_run_id = Some(50);
         }
-        let mut batches = HashMap::from([(
-            batch_id_for(50),
-            bound_batch(std::slice::from_ref(&task), 50),
-        )]);
-        batches
-            .get_mut(&batch_id_for(50))
-            .expect("batch")
-            .pending_rerun = Some(PendingRerun {
+        let mut runs = HashMap::from([(task.clone(), bound_run(&task, 50))]);
+        runs.get_mut(&task).expect("batch").pending_rerun = Some(PendingRerun {
             attempt: 1,
             asked_at: tokio::time::Instant::now(),
-            legs: vec![RerunLeg {
+            task: RerunTask {
                 task_id: task.clone(),
                 job: "build".to_owned(),
                 step: Some("setup".to_owned()),
-            }],
+            },
         });
         let mut state = run_state_with_id(50, "in_progress", None, true);
+        state.task_id = task.clone();
         state.run_attempt = 2;
         let dispatch = Dispatch::Local {
             base: "http://localhost".to_owned(),
@@ -4749,7 +4240,7 @@ mod tests {
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
             classify_and_fold(&dispatch, state, &mut wave, MAIN_HEAD)
                 .await
                 .expect("fold");
@@ -4761,7 +4252,7 @@ mod tests {
         assert_eq!(reruns[0].run_attempt, 2);
         let node = &nodes[&task];
         assert!(open.contains(&task) && !node.failed);
-        assert!(batches[&batch_id_for(50)].pending_rerun.is_none());
+        assert!(runs[&task].pending_rerun.is_none());
     }
 
     /// The same completed attempt inside the grace is no answer — the
@@ -4778,23 +4269,18 @@ mod tests {
             node.dispatched = true;
             node.workflow_run_id = Some(50);
         }
-        let mut batches = HashMap::from([(
-            batch_id_for(50),
-            bound_batch(std::slice::from_ref(&task), 50),
-        )]);
-        batches
-            .get_mut(&batch_id_for(50))
-            .expect("batch")
-            .pending_rerun = Some(PendingRerun {
+        let mut runs = HashMap::from([(task.clone(), bound_run(&task, 50))]);
+        runs.get_mut(&task).expect("batch").pending_rerun = Some(PendingRerun {
             attempt: 1,
             asked_at: tokio::time::Instant::now(),
-            legs: vec![RerunLeg {
+            task: RerunTask {
                 task_id: task.clone(),
                 job: "build".to_owned(),
                 step: None,
-            }],
+            },
         });
         let mut state = run_state_with_id(50, "completed", Some("failure"), true);
+        state.task_id = task.clone();
         state.run_attempt = 1;
         let dispatch = Dispatch::Local {
             base: "http://localhost".to_owned(),
@@ -4802,13 +4288,13 @@ mod tests {
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
             classify_and_fold(&dispatch, state, &mut wave, MAIN_HEAD)
                 .await
                 .expect("fold");
         }
         let node = &nodes[&task];
-        assert!(batches[&batch_id_for(50)].pending_rerun.is_some());
+        assert!(runs[&task].pending_rerun.is_some());
         assert!(!node.failed && open.contains(&task));
         assert!(reruns.is_empty());
     }
@@ -4828,140 +4314,57 @@ mod tests {
             node.dispatched = true;
             node.workflow_run_id = Some(50);
         }
-        let mut batches = HashMap::from([(
-            batch_id_for(50),
-            bound_batch(std::slice::from_ref(&task), 50),
-        )]);
-        batches
-            .get_mut(&batch_id_for(50))
-            .expect("batch")
-            .pending_rerun = Some(PendingRerun {
+        let mut runs = HashMap::from([(task.clone(), bound_run(&task, 50))]);
+        runs.get_mut(&task).expect("batch").pending_rerun = Some(PendingRerun {
             attempt: 1,
             asked_at: tokio::time::Instant::now(),
-            legs: vec![RerunLeg {
+            task: RerunTask {
                 task_id: task.clone(),
                 job: "build".to_owned(),
                 step: None,
-            }],
+            },
         });
         // The ask is now older than the grace.
         tokio::time::advance(std::time::Duration::from_secs(60 * RUN_GRACE_MINUTES + 60)).await;
         let mut state = run_state_with_id(50, "completed", Some("failure"), true);
+        state.task_id = task.clone();
         state.run_attempt = 1;
-        state.legs = vec![local_leg(0, &task, "completed", Some("failure"))];
+        state.error = Some("the build failed".to_owned());
         let dispatch = Dispatch::Local {
             base: "http://localhost".to_owned(),
         };
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
             classify_and_fold(&dispatch, state, &mut wave, MAIN_HEAD)
                 .await
                 .expect("fold");
         }
         let node = &nodes[&task];
         assert!(
-            !batches.contains_key(&batch_id_for(50)),
+            !runs.contains_key(&task),
             "the settled run's batch frees its slots"
         );
         assert!(node.failed && !open.contains(&task));
     }
 
-    /// Packing closes a group at `--batch-max-tasks` legs: three nodes
-    /// of one `(rustc, runner family)` group at max 2 split 2 + 1, and
-    /// each batch's parallelism is `min(legs, --batch-parallelism)`.
+    /// A run whose task hit infrastructure earns the rerun — the
+    /// node stays open and bound while a confirmed answer applies
+    /// its ask.
     #[test]
-    fn packing_splits_a_group_at_batch_max_tasks() {
-        const T: &str = "x86_64-unknown-linux-gnu";
-        let (nodes, _) = build_graph(vec![
-            request("a", T, false, &[]),
-            request("b", T, false, &[]),
-            request("c", T, false, &[]),
-        ])
-        .expect("valid graph");
-        let pending: BTreeSet<String> = nodes.keys().cloned().collect();
-        let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        let mut policy = BatchPolicy::new(&rustc, 5, 2, u32::MAX, [0u8; 16]);
-        let batches = policy
-            .form_batches(&pending, &nodes, u32::MAX)
-            .expect("formation");
-        assert_eq!(batches.len(), 2, "three legs at max 2 split 2 + 1");
-        assert_eq!(batches[0].legs.len(), 2);
-        assert_eq!(batches[1].legs.len(), 1);
-        assert_eq!(batches[0].parallelism, 2, "min(legs, --batch-parallelism)");
-        assert_eq!(batches[1].parallelism, 1);
-    }
-
-    /// A leg whose job-name hash is not its node's `TaskHash` is an
-    /// invariant failure naming both hashes — and the fold fails that
-    /// leg's node, never a sibling's.
-    #[test]
-    fn a_leg_job_hash_mismatch_names_both_and_fails_the_node() {
+    fn an_infrastructure_failure_earns_a_rerun() {
         const T: &str = "x86_64-unknown-linux-gnu";
         let (mut nodes, _) =
-            build_graph(vec![request("victim", T, false, &[])]).expect("valid graph");
-        let task = node_task_id(request_by_name("victim", &nodes)).expect("task id");
+            build_graph(vec![request("flake", T, false, &[])]).expect("valid graph");
+        let task = node_task_id(request_by_name("flake", &nodes)).expect("task id");
         let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
-        let batch = bound_batch(std::slice::from_ref(&task), 50);
-        let expected = TaskHash::of(&task);
-        let wrong = TaskHash::of("not-this-task");
-        assert_ne!(expected, wrong);
-        let jobs = vec![
-            job_row(
-                &format!("leg 0 / build #0 victim 1.0.0 ({T}) {wrong}"),
-                "completed",
-                Some("success"),
-                &[],
-            ),
-            job_row(
-                &format!("leg 0 / publish #0 {wrong}"),
-                "completed",
-                Some("success"),
-                &[],
-            ),
-        ];
-        let outcomes =
-            classify_legs(&batch.expected, "failure", &jobs, at(120)).expect("classified");
-        let [LegOutcome::Failed(LegFailure::Invariant(message))] = outcomes.as_slice() else {
-            panic!("a hash mismatch is an invariant failure: {outcomes:?}");
-        };
-        assert!(
-            message.contains(&wrong.to_string()) && message.contains(&expected.to_string()),
-            "the invariant names the job's hash and the node's: {message}"
-        );
         nodes.get_mut(&task).expect("node").workflow_run_id = Some(50);
-        let earners = fold_leg_outcomes(&outcomes, &batch, 50, false, &mut nodes, &mut open);
-        assert!(earners.is_empty());
-        assert!(nodes[&task].failed && !open.contains(&task));
-    }
-
-    /// One batch run, two legs: an infrastructure failure on leg 0 and
-    /// a success on leg 1. Only the failed leg earns the rerun — the
-    /// successful node is done and the failed one stays open and bound.
-    #[test]
-    fn an_infrastructure_leg_earns_a_rerun_while_its_sibling_is_done() {
-        const T: &str = "x86_64-unknown-linux-gnu";
-        let (mut nodes, _) = build_graph(vec![
-            request("flake", T, false, &[]),
-            request("ready", T, false, &[]),
-        ])
-        .expect("valid graph");
-        let ids = |name: &str| node_task_id(request_by_name(name, &nodes)).expect("task id");
-        let (flake, ready) = (ids("flake"), ids("ready"));
-        let mut open: BTreeSet<String> = nodes.keys().cloned().collect();
-        for task in [&flake, &ready] {
-            let node = nodes.get_mut(task).expect("node");
-            node.workflow_run_id = Some(50);
-            node.dispatched = true;
-        }
-        let batch = bound_batch(&[flake.clone(), ready.clone()], 50);
+        nodes.get_mut(&task).expect("node").dispatched = true;
+        let batch = bound_run(&task, 50);
         let jobs = vec![
             job_row(
-                &format!(
-                    "leg 0 / build #0 flake 1.0.0 ({T}) {}",
-                    TaskHash::of(&flake)
-                ),
+                &format!("build flake 1.0.0 ({T})"),
                 "completed",
                 Some("failure"),
                 &[
@@ -4969,64 +4372,35 @@ mod tests {
                     ("Build", "completed", Some("skipped")),
                 ],
             ),
-            job_row(
-                &format!("leg 0 / publish #0 {}", TaskHash::of(&flake)),
-                "completed",
-                Some("skipped"),
-                &[],
-            ),
-            job_row(
-                &format!(
-                    "leg 1 / build #1 ready 1.0.0 ({T}) {}",
-                    TaskHash::of(&ready)
-                ),
-                "completed",
-                Some("success"),
-                &[],
-            ),
-            job_row(
-                &format!("leg 1 / publish #1 {}", TaskHash::of(&ready)),
-                "completed",
-                Some("success"),
-                &[],
-            ),
+            job_row("publish", "completed", Some("skipped"), &[]),
         ];
-        let outcomes =
-            classify_legs(&batch.expected, "failure", &jobs, at(120)).expect("classified");
+        let outcome = classify_page(&jobs, "failure", at(120)).expect("classified");
         assert!(
             matches!(
-                outcomes[0],
-                LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure { .. }))
+                outcome,
+                TaskOutcome::Failed(TaskFailure::Run(RunFailure::Infrastructure { .. }))
             ),
-            "leg 0 is the infrastructure failure: {outcomes:?}"
+            "the task is the infrastructure failure: {outcome:?}"
         );
+        let earners = fold_run_outcome(&outcome, &batch, 50, false, &mut nodes, &mut open);
+        let earner = earners.expect("the failed task earns the rerun");
+        assert_eq!(earner.task_id, task);
         assert!(
-            matches!(outcomes[1], LegOutcome::Succeeded { .. }),
-            "leg 1 succeeded: {outcomes:?}"
+            open.contains(&task) && !nodes[&task].failed,
+            "the infrastructure task stays open for its rerun"
         );
-        let earners = fold_leg_outcomes(&outcomes, &batch, 50, false, &mut nodes, &mut open);
-        assert_eq!(earners.len(), 1, "only the failed leg earns the rerun");
-        assert_eq!(earners[0].task_id, flake);
-        assert!(
-            nodes[&ready].done && !open.contains(&ready),
-            "the successful leg's node is done"
-        );
-        assert!(
-            open.contains(&flake) && !nodes[&flake].failed,
-            "the infrastructure leg stays open for its rerun"
-        );
-        let mut batches = HashMap::from([(batch_id_for(50), batch)]);
+        let mut runs = HashMap::from([(task.clone(), batch)]);
         let state = run_state_with_id(50, "completed", Some("failure"), true);
         let mut reruns = Vec::new();
         let mut gate = WriteGate::new();
         {
-            let mut wave = wave(&mut nodes, &mut open, &mut batches, &mut reruns, &mut gate);
-            apply_rerun_answer(&batch_id_for(50), &state, earners, Ok(()), &mut wave)
+            let mut wave = wave(&mut nodes, &mut open, &mut runs, &mut reruns, &mut gate);
+            apply_rerun_answer(&task, &state, earner, Ok(()), &mut wave)
                 .expect("a confirmed rerun applies");
         }
         assert_eq!(reruns.len(), 1);
-        assert_eq!(reruns[0].task_id, flake);
-        assert_eq!(nodes[&flake].workflow_run_id, Some(50));
+        assert_eq!(reruns[0].task_id, task);
+        assert_eq!(nodes[&task].workflow_run_id, Some(50));
     }
 
     /// The in-test local CI server `Dispatch::Local` drives: it
@@ -5042,17 +4416,14 @@ mod tests {
 
     #[derive(Default)]
     struct MockCiState {
-        /// `(batch_id, run_id, leg task ids)` per recorded dispatch,
-        /// in order.
-        recorded: Vec<(String, u64, Vec<String>)>,
-        /// The task id of every leg of every `/dispatch` the server
-        /// saw — including the ones it answered 500.
+        /// `(task_id, run_id)` per recorded dispatch, in order.
+        recorded: Vec<(String, u64)>,
+        /// The task id of every `/dispatch` the server saw —
+        /// including the ones it answered 500.
         seen: Vec<String>,
-        /// First-leg crate names whose next dispatch records then
-        /// answers 500.
+        /// Crate names whose next dispatch records then answers 500.
         ghost: BTreeSet<String>,
-        /// First-leg crate names whose next dispatch answers 500
-        /// unrecorded.
+        /// Crate names whose next dispatch answers 500 unrecorded.
         unrecorded: BTreeSet<String>,
         next_id: u64,
         rustc: String,
@@ -5070,13 +4441,13 @@ mod tests {
             state
                 .recorded
                 .iter()
-                .map(|(batch_id, run_id, legs)| {
+                .map(|(task_id, run_id)| {
                     serde_json::json!({
                         "workflow_run_id": run_id,
-                        "display_title": format!("{}-b{}", state.rustc, batch_id),
+                        "display_title": format!("{}-{}", state.rustc, task_id),
                         "path": format!(
                             ".github/workflows/{}",
-                            stow_types::trusted_builder::BATCH_WORKFLOW_FILE
+                            stow_types::trusted_builder::WORKFLOW_FILE
                         ),
                         "status": "completed",
                         "conclusion": "success",
@@ -5085,16 +4456,7 @@ mod tests {
                         "completed_at_ms": 0,
                         "error": null,
                         "delivery_errors": [],
-                        "legs": legs
-                            .iter()
-                            .enumerate()
-                            .map(|(leg, task_id)| serde_json::json!({
-                                "leg": leg,
-                                "task_id": task_id,
-                                "status": "completed",
-                                "conclusion": "success",
-                            }))
-                            .collect::<Vec<_>>(),
+                        "task_id": task_id,
                     })
                 })
                 .collect()
@@ -5127,32 +4489,22 @@ mod tests {
                             let body: serde_json::Value =
                                 serde_json::from_slice(&body).expect("dispatch body");
                             let payload = &body["client_payload"];
-                            let batch_id =
-                                payload["batch_id"].as_str().expect("batch_id").to_owned();
-                            let legs: Vec<String> = payload["tasks"]
-                                .as_array()
-                                .expect("tasks")
-                                .iter()
-                                .map(|task| task["task_id"].as_str().expect("task_id").to_owned())
-                                .collect();
-                            let crate_name = payload["tasks"]
-                                .as_array()
-                                .expect("tasks")
-                                .first()
-                                .and_then(|task| task["crate_name"].as_str())
-                                .expect("first leg's crate_name")
+                            let task_id = payload["task_id"].as_str().expect("task_id").to_owned();
+                            let crate_name = payload["crate_name"]
+                                .as_str()
+                                .expect("crate_name")
                                 .to_owned();
                             let mut state = state.lock().expect("mock state");
-                            state.seen.extend(legs.iter().cloned());
+                            state.seen.push(task_id.clone());
                             let run_id = state.next_id;
                             state.next_id += 1;
                             let fail = if state.ghost.remove(&crate_name) {
-                                state.recorded.push((batch_id, run_id, legs));
+                                state.recorded.push((task_id, run_id));
                                 true
                             } else if state.unrecorded.remove(&crate_name) {
                                 true
                             } else {
-                                state.recorded.push((batch_id, run_id, legs));
+                                state.recorded.push((task_id, run_id));
                                 false
                             };
                             drop(state);
@@ -5224,10 +4576,13 @@ mod tests {
             base: server.url.clone(),
         };
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        let mut policy = BatchPolicy::new(&rustc, 1, 1, 8, [0u8; 16]);
+        let policy = DispatchPolicy {
+            rustc_version: &rustc,
+            in_flight: 8,
+        };
         let mut reruns = Vec::new();
         {
-            // One leg per batch, one slot per batch — each node gets
+            // One task per run, one slot per run — each node gets
             // its own dispatch so the scripted answers key on it.
             let drive = drive_layer(
                 &dispatch,
@@ -5235,7 +4590,7 @@ mod tests {
                 LayerPosition { index: 0, of: 1 },
                 &mut nodes,
                 &mut reruns,
-                &mut policy,
+                &policy,
                 at(0),
             );
             tokio::pin!(drive);
@@ -5257,8 +4612,7 @@ mod tests {
                     state
                         .recorded
                         .iter()
-                        .flat_map(|(_, _, legs)| legs.iter())
-                        .filter(|task_id| *task_id == id)
+                        .filter(|(task_id, _)| task_id == id)
                         .count(),
                     1,
                     "{id} recorded exactly once"
@@ -5318,7 +4672,10 @@ mod tests {
             base: server.url.clone(),
         };
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
-        let mut policy = BatchPolicy::new(&rustc, 1, 1, 8, [0u8; 16]);
+        let policy = DispatchPolicy {
+            rustc_version: &rustc,
+            in_flight: 8,
+        };
         let mut reruns = Vec::new();
         {
             let drive = async {
@@ -5336,7 +4693,7 @@ mod tests {
                         },
                         &mut nodes,
                         &mut reruns,
-                        &mut policy,
+                        &policy,
                         at(0),
                     )
                     .await?;

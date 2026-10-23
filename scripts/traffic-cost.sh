@@ -205,7 +205,7 @@ http_listening() {
 # callback, so nothing a previous step dispatched is still landing.
 builds_drained() {
     curl -sf --max-time 5 "http://${LOCAL_CI_ADDR}/tasks" | jq -e '
-        [.tasks[] | select(.path == ".github/workflows/build-batch.yml")
+        [.tasks[] | select(.path == ".github/workflows/build-crate.yml")
                   | select(.status != "completed")] | length == 0' >/dev/null
 }
 
@@ -404,16 +404,16 @@ budget_pass() {
 budget_pass "large" --queue-rows "$LARGE" --reset
 budget_pass "small" --queue-rows "$SMALL" --reset
 
-# The callback lane reports the fixture's in-flight batches `completed`:
-# each in-flight row is leg 0 of its own one-leg batch, bound to a
-# `build-batch.yml` run this local CI never dispatched. In production the
-# run's jobs page and each leg's records artifact exist before the
-# `completed` delivery does, and the alarm resolves the batch from both —
-# without them every completion would defer against a 404 jobs page
-# until its ceiling. So the local CI records each bound run as a finished
-# success and publishes each leg's records artifact under the run's
-# per-build tag `records-<rustc>-<hash>-<run id>-1`, at the batch's own
-# rustc. `traffic-cost fixture-runs` owns the shape math.
+# The callback lane reports the fixture's in-flight tasks `completed`:
+# each in-flight row is its own one-task run, bound to a `build-crate.yml`
+# run this local CI never dispatched. In production the run's jobs page
+# and the task's records artifact exist before the `completed` delivery
+# does, and the alarm resolves the task from both — without them every
+# completion would defer against a 404 jobs page until its ceiling. So
+# the local CI records each bound run as a finished success and publishes
+# the task's records artifact under the run's per-build tag
+# `records-<rustc>-<hash>-<run id>-1`, at the task's own rustc.
+# `traffic-cost fixture-runs` owns the shape math.
 admin --json traffic-cost fixture-runs --queue-rows "$SMALL" \
     >"$WORK_DIR/fixture-runs.json" 2>"$LOG_DIR/fixture-runs.log" \
     || die "traffic-cost fixture-runs failed — see $LOG_DIR/fixture-runs.log"
@@ -421,7 +421,7 @@ curl -sf --max-time 60 -X POST -H 'Content-Type: application/json' \
     --data-binary @"$WORK_DIR/fixture-runs.json" \
     "http://${LOCAL_CI_ADDR}/seeded-runs" >>"$LOG_DIR/fixture-runs.log" \
     || die "local CI refused the fixture's runs — see $LOG_DIR/local-ci.log"
-echo "[traffic] recorded $(jq '.runs | length' "$WORK_DIR/fixture-runs.json") in-flight fixture batch runs and their legs' records artifacts"
+echo "[traffic] recorded $(jq '.runs | length' "$WORK_DIR/fixture-runs.json") in-flight fixture task runs and their records artifacts"
 
 LANE_ARGS=(
     --model "$REPO_ROOT/launch-model.toml"

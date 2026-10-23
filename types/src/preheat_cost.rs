@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::{SchedulerLedger, SchedulerLedgerOp};
 use crate::do_budgets::{
-    DO_BUDGETS, LEDGER_OP_ALARM, LEDGER_OP_BATCH_COMPLETE, PREHEAT_BUDGET, grew,
+    DO_BUDGETS, LEDGER_OP_ALARM, LEDGER_OP_TASK_COMPLETE, PREHEAT_BUDGET, grew,
 };
 use crate::local_ci::LocalCiRun;
 
@@ -30,12 +30,12 @@ use crate::local_ci::LocalCiRun;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
-    /// A preheat lane's trusted batch submit.
+    /// A preheat lane's trusted task submit.
     Submit,
     /// The alarm's dispatch pass.
     Dispatch,
-    /// A batch run's `workflow_run` completion — one per
-    /// `build-batch.yml` run, however many legs it carried.
+    /// A build run's `workflow_run` completion — one per
+    /// `build-crate.yml` run, so one per task.
     Completion,
     /// An `index-publish` slice report, which also dispatches the
     /// dependents it releases.
@@ -57,14 +57,14 @@ impl EventKind {
         match self {
             Self::Submit => "POST /tasks/submit/trusted",
             Self::Dispatch => LEDGER_OP_ALARM,
-            Self::Completion => LEDGER_OP_BATCH_COMPLETE,
+            Self::Completion => LEDGER_OP_TASK_COMPLETE,
             Self::SliceReport => "POST /index/published",
         }
     }
 
     /// The stow#433 drive whose budget one event of this kind must fit,
     /// for the kinds whose event has a fixed size: one alarm pass claims
-    /// at most the dispatch cap. A submit batch, a batch completion and a
+    /// at most the dispatch cap. A submit, a completion and a
     /// slice report scale with what they carry, so their fixture drives
     /// do not bound a wave's events.
     #[must_use]
@@ -316,14 +316,10 @@ pub struct PhaseCost {
     pub budget_rows_read: f64,
     /// The budget's `rowsWritten` for this phase at this node count.
     pub budget_rows_written: f64,
-    /// `build-batch.yml` runs the local CI was dispatched during the
-    /// phase — the completions the phase must have paid.
-    pub batches: u64,
-    /// Legs across those runs — the builds the phase dispatched.
-    pub legs: u64,
-    /// `legs / batches`, the achieved `b̄` every per-batch cost is
-    /// spread over; `None` when the phase dispatched no batch.
-    pub legs_per_batch: Option<f64>,
+    /// `build-crate.yml` runs the local CI was dispatched during the
+    /// phase — one per task — the completions the phase must have
+    /// paid.
+    pub tasks: u64,
     /// Wall milliseconds from the phase's first to its last ledger read.
     pub wall_ms: u64,
 }
@@ -347,10 +343,9 @@ pub struct LayerCost {
     pub layer: usize,
     /// Task ids the layer's round first published.
     pub published: u64,
-    /// `build-batch.yml` runs dispatched during the layer.
-    pub batches: u64,
-    /// Legs across those runs.
-    pub legs: u64,
+    /// `build-crate.yml` runs dispatched during the layer — one per
+    /// task.
+    pub tasks: u64,
     /// Per event kind.
     pub kinds: Vec<KindCost>,
 }
@@ -473,29 +468,19 @@ fn kind(costs: &[KindCost], kind: EventKind) -> &KindCost {
         .expect("kind_costs yields every EventKind")
 }
 
-/// The `build-batch.yml` runs dispatched in `(from_ms, to_ms]`, and
-/// the legs they carried. Other workflows the local CI ran (a request's
-/// resolve) are not builds.
-fn batches_between(runs: &[LocalCiRun], from_ms: u64, to_ms: u64) -> (u64, u64) {
+/// The `build-crate.yml` runs dispatched in `(from_ms, to_ms]` — one
+/// per task. Other workflows the local CI ran (a request's resolve)
+/// are not builds.
+fn build_tasks_between(runs: &[LocalCiRun], from_ms: u64, to_ms: u64) -> u64 {
     let path = format!(
         ".github/workflows/{}",
-        crate::trusted_builder::BATCH_WORKFLOW_FILE
+        crate::trusted_builder::WORKFLOW_FILE
     );
     runs.iter()
         .filter(|run| {
             run.path == path && run.dispatched_at_ms > from_ms && run.dispatched_at_ms <= to_ms
         })
-        .fold((0, 0), |(batches, legs), run| {
-            (batches + 1, legs + run.legs.len() as u64)
-        })
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "leg and batch counts stay far below f64's exact-integer range"
-)]
-fn per_batch(legs: u64, batches: u64) -> Option<f64> {
-    (batches > 0).then(|| legs as f64 / batches as f64)
+        .count() as u64
 }
 
 fn phase_cost(
@@ -513,7 +498,7 @@ fn phase_cost(
         .filter(|op| !EventKind::ALL.iter().any(|kind| kind.ledger_op() == op.op))
         .map(|op| (*op).clone())
         .collect();
-    let (batches, legs) = batches_between(runs, phase.start.taken_at_ms, phase.end.taken_at_ms);
+    let tasks = build_tasks_between(runs, phase.start.taken_at_ms, phase.end.taken_at_ms);
     Ok(PhaseCost {
         kinds: kind_costs(&ops),
         other_ops,
@@ -521,9 +506,7 @@ fn phase_cost(
         rows_written: counted.iter().map(|op| op.rows_written).sum(),
         budget_rows_read: budget.0,
         budget_rows_written: budget.1,
-        batches,
-        legs,
-        legs_per_batch: per_batch(legs, batches),
+        tasks,
         wall_ms: phase
             .end
             .taken_at_ms
@@ -536,12 +519,10 @@ fn layers(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::Resul
     let mut out = Vec::with_capacity(phase.rounds.len());
     for (index, round) in phase.rounds.iter().enumerate() {
         let ops = ledger_delta(&previous.ledger, &round.end.ledger)?;
-        let (batches, legs) = batches_between(runs, previous.taken_at_ms, round.end.taken_at_ms);
         out.push(LayerCost {
             layer: index + 1,
             published: round.published.len() as u64,
-            batches,
-            legs,
+            tasks: build_tasks_between(runs, previous.taken_at_ms, round.end.taken_at_ms),
             kinds: kind_costs(&ops),
         });
         previous = &round.end;
@@ -596,8 +577,8 @@ fn totals_check(name: &str, cost: &PhaseCost) -> Check {
     )
 }
 
-/// Every batch run a phase dispatched completes through exactly one
-/// `POST /batches/{batch_id}/complete`, and nothing else books one —
+/// Every build run a phase dispatched completes through exactly one
+/// `POST /tasks/complete-run`, and nothing else books one —
 /// the count the projection prices completions at. Fewer means a
 /// completion never reached the scheduler or was booked under another
 /// ledger key; more means a run's completion was paid twice.
@@ -605,11 +586,11 @@ fn completions_check(name: &str, cost: &PhaseCost) -> Check {
     let completions = kind(&cost.kinds, EventKind::Completion).events;
     check(
         name,
-        completions == cost.batches,
+        completions == cost.tasks,
         format!(
-            "{completions} completions booked under `{}`, {} batch runs dispatched",
+            "{completions} completions booked under `{}`, {} build runs dispatched",
             EventKind::Completion.ledger_op(),
-            cost.batches
+            cost.tasks
         ),
     )
 }
@@ -768,38 +749,36 @@ fn order_check(observed: &WaveObservations) -> Check {
         .collect();
     let mut violations = Vec::new();
     for run in &observed.runs {
-        // `available` turns on the run's dispatch time alone, so it is
-        // computed once per run rather than once per leg.
         let available: BTreeSet<&String> = rounds
             .iter()
             .filter(|round| round.before_report.taken_at_ms <= run.dispatched_at_ms)
             .flat_map(|round| &round.published)
             .collect();
-        for leg in &run.legs {
-            let task_id = leg.task_id.as_str();
-            let Some(node) = observed.nodes.get(task_id) else {
-                continue;
-            };
-            let missing: Vec<&String> = node
-                .dependencies
-                .iter()
-                .filter(|dep| !available.contains(dep))
-                .collect();
-            if !missing.is_empty() {
-                violations.push(format!(
-                    "{task_id} dispatched at {} before {} of its dependencies were published (first: {})",
-                    run.dispatched_at_ms,
-                    missing.len(),
-                    missing[0]
-                ));
-            }
-            if let Some(error) = leg
-                .error
-                .as_deref()
-                .filter(|error| error.contains(FOREIGN_UNIT_MARKER))
-            {
-                violations.push(format!("{task_id} compiled a dependency itself: {error}"));
-            }
+        let Some(task_id) = run.task_id.as_deref() else {
+            continue;
+        };
+        let Some(node) = observed.nodes.get(task_id) else {
+            continue;
+        };
+        let missing: Vec<&String> = node
+            .dependencies
+            .iter()
+            .filter(|dep| !available.contains(dep))
+            .collect();
+        if !missing.is_empty() {
+            violations.push(format!(
+                "{task_id} dispatched at {} before {} of its dependencies were published (first: {})",
+                run.dispatched_at_ms,
+                missing.len(),
+                missing[0]
+            ));
+        }
+        if let Some(error) = run
+            .error
+            .as_deref()
+            .filter(|error| error.contains(FOREIGN_UNIT_MARKER))
+        {
+            violations.push(format!("{task_id} compiled a dependency itself: {error}"));
         }
     }
     check(
@@ -807,12 +786,12 @@ fn order_check(observed: &WaveObservations) -> Check {
         violations.is_empty(),
         if violations.is_empty() {
             format!(
-                "{} legs checked",
+                "{} tasks checked",
                 observed
                     .runs
                     .iter()
-                    .map(|run| run.legs.len())
-                    .sum::<usize>()
+                    .filter(|run| run.task_id.is_some())
+                    .count()
             )
         } else {
             summarise(&violations)
@@ -826,19 +805,13 @@ fn published_check(observed: &WaveObservations) -> Check {
         .keys()
         .filter(|task_id| !observed.covered.contains(*task_id))
         .map(|task_id| {
-            // Two sources: the leg's own error when the leg produced
-            // one, else the run-level error — it holds only failures no
-            // leg owns (the dispatch, a webhook delivery), so it applies
-            // to every leg the run carried.
+            // The run's own error — the build's, the dispatch's or a
+            // webhook delivery's — names why the task never published.
             let last_error = observed
                 .runs
                 .iter()
-                .filter_map(|run| {
-                    run.legs
-                        .iter()
-                        .find(|leg| leg.task_id == *task_id)
-                        .and_then(|leg| leg.error.as_deref().or(run.error.as_deref()))
-                })
+                .filter(|run| run.task_id.as_deref() == Some(task_id.as_str()))
+                .filter_map(|run| run.error.as_deref())
                 .next_back();
             last_error.map_or_else(
                 || format!("{task_id}: never published"),
@@ -955,14 +928,11 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
         totals_check("Resubmit total within the preheat budget", &resubmit),
         check(
             "Resubmit rebuilt nothing",
-            resubmit.legs == 0,
-            format!(
-                "{} legs in {} batch runs dispatched by the resubmit",
-                resubmit.legs, resubmit.batches
-            ),
+            resubmit.tasks == 0,
+            format!("{} build runs dispatched by the resubmit", resubmit.tasks),
         ),
-        completions_check("Wave completions equal its batch runs", &wave),
-        completions_check("Resubmit completions equal its batch runs", &resubmit),
+        completions_check("Wave completions equal its build runs", &wave),
+        completions_check("Resubmit completions equal its build runs", &resubmit),
         check(
             "Wave ran in at least three layers",
             layers.len() >= 3,
@@ -998,10 +968,10 @@ mod tests {
         ProductionTask, Round, WaveObservations, analyse, count_production, ledger_delta,
     };
     use crate::api::{SchedulerLedger, SchedulerLedgerOp};
-    use crate::local_ci::{LocalCiLeg, LocalCiRun};
+    use crate::local_ci::LocalCiRun;
 
     /// A ledger whose kinds each ran `events` times — completions
-    /// `completions` times, one per batch run — at `rate` rows read and
+    /// `completions` times, one per build run — at `rate` rows read and
     /// one written per event, plus `completion_extra` reads on
     /// completions.
     fn ledger(events: u64, completions: u64, rate: u64, completion_extra: u64) -> SchedulerLedger {
@@ -1035,27 +1005,21 @@ mod tests {
     fn run(task_id: &str, dispatched_at_ms: u64) -> LocalCiRun {
         LocalCiRun {
             workflow_run_id: dispatched_at_ms,
-            // A real batch run's title — `<rustc>-b<32 lowercase hex>`.
-            display_title: format!("1.99.1-b{task_id:0>32}"),
+            // A real build run's title — `<rustc>-<task_id>`.
+            display_title: format!("1.99.1-{task_id}"),
             status: "completed".to_owned(),
             conclusion: Some("success".to_owned()),
             html_url: String::new(),
-            path: ".github/workflows/build-batch.yml".to_owned(),
+            path: ".github/workflows/build-crate.yml".to_owned(),
             dispatched_at_ms,
             completed_at_ms: Some(dispatched_at_ms + 1),
             error: None,
             delivery_errors: Vec::new(),
-            legs: vec![LocalCiLeg {
-                leg: 0,
-                task_id: task_id.to_owned(),
-                status: "completed".to_owned(),
-                conclusion: Some("success".to_owned()),
-                error: None,
-            }],
+            task_id: Some(task_id.to_owned()),
         }
     }
 
-    /// A three-layer chain a → b → c, one one-leg batch run per node:
+    /// A three-layer chain a → b → c, one build run per node:
     /// each layer runs 10 events per kind and one completion at 20 rows
     /// each; `completion_growth` adds that many reads to each later
     /// layer's completion in total.
@@ -1184,36 +1148,18 @@ mod tests {
     }
 
     #[test]
-    fn a_foreign_unit_failure_names_only_its_own_leg() {
+    fn a_foreign_unit_failure_names_only_its_own_task() {
         let mut observed = chain(0);
-        // One run, two failed legs: only a's carries the foreign-unit
-        // marker, while its message names leg 1 — attribution reads the
-        // leg's own error, never the run's joined summary.
-        let mut run = run("b", 95);
-        run.conclusion = Some("failure".to_owned());
-        run.legs = vec![
-            LocalCiLeg {
-                leg: 0,
-                task_id: "a".to_owned(),
-                status: "completed".to_owned(),
-                conclusion: Some("failure".to_owned()),
-                error: Some(
-                    "leg 0 build: Error: unit of leg 1 is not the task's own crate".to_owned(),
-                ),
-            },
-            LocalCiLeg {
-                leg: 1,
-                task_id: "b".to_owned(),
-                status: "completed".to_owned(),
-                conclusion: Some("failure".to_owned()),
-                error: Some("leg 1 build: Error: rustc failed".to_owned()),
-            },
-        ];
-        run.error = Some(format!(
-            "2 of 2 legs failed; {}",
-            run.legs[0].error.as_deref().expect("leg error")
-        ));
-        observed.runs[1] = run;
+        // Two failed runs: only a's carries the foreign-unit marker —
+        // attribution reads the run's own error.
+        let mut a = run("a", 10);
+        a.conclusion = Some("failure".to_owned());
+        a.error = Some("Error: unit of b is not the task's own crate".to_owned());
+        let mut b = run("b", 95);
+        b.conclusion = Some("failure".to_owned());
+        b.error = Some("Error: rustc failed".to_owned());
+        observed.runs[0] = a;
+        observed.runs[1] = b;
         let report = analyse(&observed).expect("analyse");
         let order = report
             .checks
@@ -1294,54 +1240,41 @@ mod tests {
     fn a_phase_bills_every_counted_operation_as_a_request() {
         let report = analyse(&chain(0)).expect("analyse");
         // Three kinds at 30 events each over the three layers, and one
-        // completion per batch run.
+        // completion per build run.
         assert_eq!(report.wave.requests(), 3 * 30 + 3);
     }
 
     #[test]
-    fn a_phase_reports_its_achieved_legs_per_batch() {
+    fn a_phase_counts_its_build_runs() {
         let mut observed = chain(0);
-        // b's run carries a second leg; a resolve run is no batch.
-        observed.runs[1].legs.push(LocalCiLeg {
-            leg: 1,
-            task_id: "a".to_owned(),
-            status: "completed".to_owned(),
-            conclusion: Some("success".to_owned()),
-            error: None,
-        });
+        // A resolve run is no build.
         let mut resolve = run("x", 96);
         resolve.path = ".github/workflows/resolve-request.yml".to_owned();
-        resolve.legs.clear();
+        resolve.task_id = None;
         observed.runs.push(resolve);
         let report = analyse(&observed).expect("analyse");
-        assert_eq!((report.wave.batches, report.wave.legs), (3, 4));
-        assert_eq!(report.wave.legs_per_batch, Some(4.0 / 3.0));
-        assert_eq!(report.resubmit.legs_per_batch, None);
-        let layers: Vec<(u64, u64)> = report
-            .layers
-            .iter()
-            .map(|layer| (layer.batches, layer.legs))
-            .collect();
-        assert_eq!(layers, [(2, 3), (1, 1), (0, 0)]);
+        assert_eq!(report.wave.tasks, 3);
+        let layers: Vec<u64> = report.layers.iter().map(|layer| layer.tasks).collect();
+        assert_eq!(layers, [2, 1, 0]);
         assert!(failed(&report).is_empty(), "{:?}", report.checks);
     }
 
     #[test]
-    fn a_completion_count_off_the_batch_runs_fails() {
-        // A fourth batch run whose completion never booked.
+    fn a_completion_count_off_the_build_runs_fails() {
+        // A fourth build run whose completion never booked.
         let mut observed = chain(0);
         observed.runs.push(run("c", 196));
         let report = analyse(&observed).expect("analyse");
-        assert_eq!(failed(&report), ["Wave completions equal its batch runs"]);
+        assert_eq!(failed(&report), ["Wave completions equal its build runs"]);
 
-        // Completions booked under each batch's own path, as a ledger
-        // that does not collapse the batch id books them.
+        // Completions booked under a different op name, as a ledger
+        // that keys completions elsewhere books them.
         let mut observed = chain(0);
         for round in &mut observed.wave.rounds {
             for snapshot in [&mut round.before_report, &mut round.end] {
                 for op in &mut snapshot.ledger.ops {
                     if op.op == EventKind::Completion.ledger_op() {
-                        op.op = format!("POST /batches/{:032x}/complete", 7);
+                        op.op = "POST /tasks/7/complete-run".to_owned();
                     }
                 }
             }
@@ -1351,7 +1284,7 @@ mod tests {
         observed.resubmit.end.ledger = observed.wave.end.ledger.clone();
         let report = analyse(&observed).expect("analyse");
         assert!(
-            failed(&report).contains(&"Wave completions equal its batch runs"),
+            failed(&report).contains(&"Wave completions equal its build runs"),
             "{:?}",
             report.checks
         );

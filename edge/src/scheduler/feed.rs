@@ -831,8 +831,6 @@ mod tests {
             max_queue_pending: 2_000,
             human_daily_task_budget: 2_000,
             min_dispatch_value: 0,
-            batch_parallelism: 5,
-            batch_max_tasks: 40,
         }
     }
 

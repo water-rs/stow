@@ -13,7 +13,7 @@
 //!   preheat waves and daily resubmits the Preheat cost report measures
 //!   (stow#775). The release gate runs it in its own job, once all
 //!   three tests' reports exist;
-//! - `fixture-runs` prints the runs the fixture's in-flight batches are
+//! - `fixture-runs` prints the runs the fixture's in-flight tasks are
 //!   bound to, which the harness records in the local CI before the
 //!   callback lane completes them.
 
@@ -57,7 +57,7 @@ enum TrafficCostCommand {
     /// Project the month — user traffic plus the preheat waves and
     /// resubmits — against half of each product's allowance.
     Project(project::ProjectArgs),
-    /// Print the `build-batch.yml` runs the fixture's in-flight batches
+    /// Print the `build-crate.yml` runs the fixture's in-flight tasks
     /// are bound to, for the local CI's `POST /seeded-runs`.
     FixtureRuns(fixture_runs::FixtureRunsArgs),
 }

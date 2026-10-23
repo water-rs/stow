@@ -133,13 +133,6 @@ CREATE TABLE IF NOT EXISTS queue (
     -- excludes the under-floor bulk before any rank or wake walk
     -- reaches it.
     dispatch_eligible INTEGER NOT NULL DEFAULT 1,
-    -- The batch this row's live generation dispatched under (stow#833):
-    -- `build_batches.batch_id` plus the leg's index into the batch's
-    -- `tasks` list. NULL while the generation went out per-task or is
-    -- unbound; the generation fence still decides what a completion may
-    -- touch.
-    batch_id TEXT,
-    batch_leg INTEGER,
     UNIQUE(crate_name, version, features_json, target, rustc_version, host_side, dependency_identity)
 );
 
@@ -499,45 +492,6 @@ ON queue (target, first_requested_at);
 CREATE INDEX IF NOT EXISTS idx_queue_crate_first
 ON queue (crate_name, first_requested_at);
 
--- A batch resolution's leg walk: every queue row bound to one
--- `build_batches.batch_id`, ordered by its matrix leg index so the
--- outcome apply reads legs in wire order.
-CREATE INDEX IF NOT EXISTS idx_queue_batch
-ON queue (batch_id, batch_leg);
-
--- One `workflow_dispatch` of `build-batch.yml` (stow#833): up to
--- `legs` claimed tasks sharing `rustc_version`, `dispatch_family` and
--- `lane`, fanned out under `max-parallel: parallelism` — the runner
--- slots the family's in-flight accounting charges this row. The batch
--- row is inserted `dispatched`-bound before the POST and deleted when
--- its legs resolve, so no row outlives its run.
--- `github_run_id` binds the dispatch response's `workflow_run_id`;
--- `done_*` holds an early `workflow_run` completion that beat that
--- binding; `resolve_after` defers a page still settling inside the
--- classifier's window; `lease_at` is the stale-dispatch cutoff the
--- alarm's lease check reads.
-CREATE TABLE IF NOT EXISTS build_batches (
-    batch_id TEXT PRIMARY KEY,
-    rustc_version TEXT NOT NULL,
-    dispatch_family TEXT NOT NULL,
-    lane TEXT NOT NULL,
-    parallelism INTEGER NOT NULL,
-    legs INTEGER NOT NULL,
-    github_run_id TEXT,
-    done_run_id TEXT, done_attempt INTEGER, conclusion TEXT, done_at TEXT,
-    resolve_after TEXT,
-    claimed_at TEXT NOT NULL, lease_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_build_batches_family
-ON build_batches (dispatch_family);
-
-CREATE INDEX IF NOT EXISTS idx_build_batches_lease
-ON build_batches (lease_at);
-
-CREATE INDEX IF NOT EXISTS idx_build_batches_resolve
-ON build_batches (resolve_after);
-
 -- The exact (status, lane) counts `status()` reports, maintained by
 -- trigger instead of a whole-queue GROUP BY on every request. The
 -- triggers fire on every write path — request handlers, operator
@@ -718,6 +672,23 @@ CREATE TABLE IF NOT EXISTS attempt_outcomes_v2 (
 -- finished_at — the index keeps those scans off the row payload.
 CREATE INDEX IF NOT EXISTS idx_attempt_outcomes_v2_finished
 ON attempt_outcomes_v2 (finished_at);
+
+-- A verified workflow completion can beat the scheduler's write of the
+-- `workflow_dispatch` response. Keep that event by the run identity until
+-- the exact response binds the same run to the claimed generation. Rows are
+-- bounded by in-flight dispatches and are deleted when the binding applies
+-- or the unbound generation is abandoned.
+CREATE TABLE IF NOT EXISTS pending_run_completions (
+    github_run_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    success INTEGER NOT NULL CHECK (success IN (0, 1)),
+    error TEXT,
+    received_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_run_completions_task
+ON pending_run_completions (task_id);
+
 
 -- The dispatch-freeze transition log the watchdog (#450) turns into the
 -- `incident` issue record: one append-only row per engage/clear so a

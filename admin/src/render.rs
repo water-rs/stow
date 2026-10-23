@@ -310,7 +310,7 @@ fn clock(instant: time::OffsetDateTime, tz: &jiff::tz::TimeZone, seconds: bool) 
 
 /// The whole human frame as text — the snapshot the render tests
 /// pin (§3): `queue` and `github` headers, the per-target roll-up
-/// (`queued` reads `queued (slotted)` — it counts only legs holding a
+/// (`queued` reads `queued (slotted)` — it counts only tasks holding a
 /// slot, §2.6), the runs table and the failures list.
 pub fn table_frame(frame: &WatchFrame, tz: &jiff::tz::TimeZone) -> String {
     let mut out = String::new();
@@ -330,29 +330,29 @@ pub fn table_frame(frame: &WatchFrame, tz: &jiff::tz::TimeZone) -> String {
         .filter(|run| run.status == "queued")
         .count();
     let in_progress = frame.runs.len() - queued;
-    let done: u32 = frame.targets.iter().map(|target| target.legs.done).sum();
+    let done: u32 = frame.targets.iter().map(|target| target.tasks.done).sum();
     let since = clock(frame.since, tz, false);
     let _ = writeln!(
         out,
-        "github  {} runs ({queued} queued · {in_progress} in progress) · since {since}: {done} legs done · {} failed",
+        "github  {} runs ({queued} queued · {in_progress} in progress) · since {since}: {done} tasks done · {} failed",
         frame.runs.len(),
         frame.failures.len()
     );
     if !frame.targets.is_empty() {
         let _ = writeln!(out);
         let mut table = Table::new(&["target", "queued (slotted)", "building", "done", "failed"]);
-        let mut totals = crate::watch::LegCounts::default();
+        let mut totals = crate::watch::TaskCounts::default();
         for target in &frame.targets {
-            totals.queued += target.legs.queued;
-            totals.building += target.legs.building;
-            totals.done += target.legs.done;
-            totals.failed += target.legs.failed;
+            totals.queued += target.tasks.queued;
+            totals.building += target.tasks.building;
+            totals.done += target.tasks.done;
+            totals.failed += target.tasks.failed;
             table.push([
                 target.target.clone(),
-                target.legs.queued.to_string(),
-                target.legs.building.to_string(),
-                target.legs.done.to_string(),
-                target.legs.failed.to_string(),
+                target.tasks.queued.to_string(),
+                target.tasks.building.to_string(),
+                target.tasks.done.to_string(),
+                target.tasks.failed.to_string(),
             ]);
         }
         table.push([
@@ -367,18 +367,18 @@ pub fn table_frame(frame: &WatchFrame, tz: &jiff::tz::TimeZone) -> String {
     if !frame.runs.is_empty() {
         let _ = writeln!(out);
         let mut table = Table::new(&[
-            "run", "batch", "actor", "status", "attempt", "q/b/d/f", "age", "url",
+            "run", "task", "actor", "status", "attempt", "q/b/d/f", "age", "url",
         ]);
         for run in &frame.runs {
             table.push([
                 run.run_id.to_string(),
-                run.batch_id.as_str().chars().take(8).collect(),
+                run.task_id.chars().take(8).collect::<String>(),
                 run.actor.clone(),
                 run.status.clone(),
                 run.run_attempt.to_string(),
                 format!(
                     "{}/{}/{}/{}",
-                    run.legs.queued, run.legs.building, run.legs.done, run.legs.failed
+                    run.tasks.queued, run.tasks.building, run.tasks.done, run.tasks.failed
                 ),
                 age(u64::try_from(run.age_seconds).unwrap_or(0)),
                 run.url.clone(),
@@ -480,8 +480,7 @@ mod tests {
     /// the runs table and the failures list (stow#853 §3).
     #[test]
     fn table_frame_snapshot() {
-        use crate::watch::{LegCounts, RunView, SchedulerView, TargetView, WatchFrame};
-        use stow_types::api::BatchId;
+        use crate::watch::{RunView, SchedulerView, TargetView, TaskCounts, WatchFrame};
         use time::OffsetDateTime;
 
         let at = |unix: i64| OffsetDateTime::from_unix_timestamp(unix).expect("ts");
@@ -497,16 +496,15 @@ mod tests {
             },
             runs: vec![RunView {
                 run_id: 7,
-                batch_id: "0123456789abcdef0123456789abcdef"
-                    .parse::<BatchId>()
-                    .expect("batch"),
+                task_id: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                    .to_owned(),
                 rustc: "1.99.0".to_owned(),
                 actor: "stow-bot".to_owned(),
                 status: "in_progress".to_owned(),
                 run_attempt: 2,
                 age_seconds: 600,
                 url: "https://github.com/water-rs/stow/actions/runs/7".to_owned(),
-                legs: LegCounts {
+                tasks: TaskCounts {
                     queued: 1,
                     building: 2,
                     done: 1,
@@ -515,7 +513,7 @@ mod tests {
             }],
             targets: vec![TargetView {
                 target: "x86_64-unknown-linux-gnu".to_owned(),
-                legs: LegCounts {
+                tasks: TaskCounts {
                     queued: 1,
                     building: 2,
                     done: 1,
@@ -527,13 +525,13 @@ mod tests {
         let text = super::table_frame(&frame, &jiff::tz::TimeZone::UTC);
         let expected = "\
 queue  pending 7 miss · 3 human · blocked 2 · dispatched 1 · running 4
-github  1 runs (0 queued · 1 in progress) · since 00:08: 1 legs done · 0 failed
+github  1 runs (0 queued · 1 in progress) · since 00:08: 1 tasks done · 0 failed
 
 target                    queued (slotted)  building  done  failed
 x86_64-unknown-linux-gnu  1                 2         1     0
 total                     1                 2         1     0
 
-run  batch     actor     status       attempt  q/b/d/f  age    url
+run  task      actor     status       attempt  q/b/d/f  age    url
 7    01234567  stow-bot  in_progress  2        1/2/1/0  10m0s  https://github.com/water-rs/stow/actions/runs/7";
         assert_eq!(text, expected);
     }

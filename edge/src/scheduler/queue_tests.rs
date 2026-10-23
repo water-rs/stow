@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::future::Future;
 
-use stow_types::api::{BuildTaskPayload, EnqueueRequest, EnqueueSource};
+use stow_types::api::{EnqueueRequest, EnqueueSource};
 use stow_types::identity::FeaturesJson;
 
 use super::{
@@ -73,79 +73,16 @@ const fn settings() -> SchedulerSettings {
         max_queue_pending: 2_000,
         human_daily_task_budget: 2_000,
         min_dispatch_value: 0,
-        // A batch of one is exactly the pre-batch claim: the existing
-        // assertions keep their one-slot-per-row expectations.
-        batch_parallelism: 1,
-        batch_max_tasks: 1,
     }
 }
 
-/// A claimed leg as the claim assertions read it: the generation its
-/// claim minted, and the leg's identity as the batch's encoded payload
-/// carries it (`Deref` to the [`BuildTaskPayload`]).
-#[derive(Clone, Debug)]
-struct ClaimedLeg {
-    generation_id: String,
-    payload: BuildTaskPayload,
-}
-
-impl std::ops::Deref for ClaimedLeg {
-    type Target = BuildTaskPayload;
-
-    fn deref(&self) -> &BuildTaskPayload {
-        &self.payload
-    }
-}
-
-impl ClaimedLeg {
-    /// The claim's `(task_id, generation_id)` fence key, as the
-    /// dispatch-failure backoff takes it.
-    fn queued(&self) -> super::QueuedTask {
-        super::QueuedTask {
-            task_id: self.payload.task_id.clone(),
-            generation_id: self.generation_id.clone(),
-        }
-    }
-}
-
-/// Every leg of `batches` in the batches' close order, each paired with
-/// its identity decoded from the batch's encoded `BuildBatchPayload` —
-/// production keeps no more of a claimed row than its fence key.
-fn claimed_legs(
-    batches: &[crate::scheduler::batching::FormedBatch],
-) -> Vec<(super::QueuedTask, BuildTaskPayload)> {
-    batches
-        .iter()
-        .flat_map(|batch| {
-            let encoded: stow_types::api::BuildBatchPayload =
-                serde_json::from_str(&batch.encoded).expect("decode encoded batch");
-            batch
-                .tasks
-                .iter()
-                .enumerate()
-                .map(|(leg, task)| (task.clone(), encoded.task(leg).expect("decode batch leg")))
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
-/// `claim_dispatchable_tasks` flattened to the pre-batch
-/// claimed-row shape the claim assertions were written against —
-/// legs in the batches' close order.
+/// `claim_dispatchable_tasks` — the claimed tasks in dispatch order.
 async fn claim_flat(
     db: &DurableDb,
     settings: &SchedulerSettings,
     coverage: &impl CoverageOracle,
-) -> Result<Vec<ClaimedLeg>, QueueError> {
-    Ok(
-        claimed_legs(&super::claim_dispatchable_tasks(db, settings, coverage).await?)
-            .into_iter()
-            .map(|(task, payload)| ClaimedLeg {
-                generation_id: task.generation_id,
-                payload,
-            })
-            .collect(),
-    )
+) -> Result<Vec<super::QueuedTask>, QueueError> {
+    super::claim_dispatchable_tasks(db, settings, coverage).await
 }
 
 const fn paused_settings() -> SchedulerSettings {
@@ -368,35 +305,17 @@ async fn mark_active(db: &DurableDb, crate_name: &str, target: &str, status: &st
     .execute()
     .await
     .expect("mark task active");
-    // In-flight is a batch holding slots, not a bare queue row: the
-    // `parallelism = 1`, one-leg batch is the per-task shape the
-    // fixture stands in for, and the leg binding makes the pair
-    // consistent. The batch id is the task id's first 32 hex.
-    let task_id = task_id_on(crate_name, target);
-    let batch_id = &task_id[..32];
-    let family = match stow_types::api::runner_family(target).expect("fixture family") {
-        stow_types::api::RunnerFamily::Linux => "linux",
-        stow_types::api::RunnerFamily::MacOs => "macos",
-        stow_types::api::RunnerFamily::Windows => "windows",
-    };
+    // In-flight is a bound run: `dispatched`/`running` rows hold their
+    // slot through `github_run_id`, as the dispatch binding writes it.
     db.query(
-        "INSERT INTO build_batches \
-             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
-              claimed_at, lease_at) \
-         VALUES (?, ?, ?, 'miss', 1, 1, ?, datetime(?, ?)) \
-         ON CONFLICT(batch_id) DO UPDATE SET \
-             claimed_at = excluded.claimed_at, lease_at = excluded.lease_at",
+        "UPDATE queue SET github_run_id = 'run-' || task_id \
+         WHERE crate_name = ? AND target = ? AND status IN ('dispatched', 'running')",
     )
-    .bind(batch_id.to_owned())
-    .bind(RUSTC)
-    .bind(family)
-    .bind(ROW_TS)
-    .bind(ROW_TS)
-    .bind(format!("+{STALE_DISPATCH_MINUTES} minutes"))
+    .bind(crate_name.to_owned())
+    .bind(target)
     .execute()
     .await
-    .expect("seed in-flight batch row");
-    bind_leg(db, &task_id, batch_id, 0).await;
+    .expect("bind in-flight run");
 }
 
 /// `enqueue` always stamps `first_requested_at = datetime('now')`; tests
@@ -594,57 +513,67 @@ async fn submit_while_paused_enqueues_but_claims_nothing() {
     assert_eq!(super::status(&db).await.expect("status").pending, 1);
 }
 
-/// An expired unbound batch requeues its legs while paused: the
-/// lease check runs ahead of the claim's pause check, so a paused
-/// scheduler still gets its in-flight builds back.
+/// An expired unbound task requeues while paused: the stale sweep runs
+/// ahead of the claim's pause check, so a paused scheduler still gets
+/// its in-flight builds back (stow#876 — by `claimed_at` clock, with no
+/// run-status read).
 #[tokio::test]
-async fn paused_lease_check_still_requeues_an_unbound_batch() {
+async fn paused_stale_recovery_still_requeues_an_unbound_task() {
     let db = memory_db().await.expect("memory db");
     super::enqueue(&db, &[request("busy", &[])], &paused_settings())
         .await
         .expect("enqueue");
     mark_active(&db, "busy", TARGET, "dispatched").await;
-
-    let expired = super::expired_batches(&db, ROW_TS_MS + stale_ms())
-        .await
-        .expect("expired batches");
-    assert_eq!(expired.len(), 1);
-    super::requeue_unbound_batch(&db, &paused_settings(), &expired[0].batch_id)
-        .await
-        .expect("requeue");
     let claimed = claim_flat(&db, &paused_settings(), &NoCoverage)
         .await
-        .expect("claim");
+        .expect("claim while paused");
     assert!(claimed.is_empty());
     assert_eq!(status_of(&db, "busy").await, "pending");
 }
 
-/// A two-leg, one-slot batch in flight since `ROW_TS` (so two rounds,
-/// a 420-minute ceiling), its lease expiring at `ROW_TS + stale`.
-/// `run_id` binds it the way the dispatch response would; `None`
-/// leaves it unbound.
-async fn two_leg_batch(db: &DurableDb, run_id: Option<&str>) -> String {
+/// Two in-flight tasks bound to one run's ids, as the stale sweep's
+/// clock reads them.
+async fn two_bound_tasks(db: &DurableDb, run_id: Option<&str>) {
     enqueue(db, &[request("leg-a", &[]), request("leg-b", &[])])
         .await
-        .expect("enqueue legs");
+        .expect("enqueue tasks");
     mark_active(db, "leg-a", TARGET, "dispatched").await;
     mark_active(db, "leg-b", TARGET, "dispatched").await;
-    let task_a = task_id_on("leg-a", TARGET);
-    let task_b = task_id_on("leg-b", TARGET);
-    let (batch_id, other) = (task_a[..32].to_owned(), &task_b[..32]);
-    bind_leg(db, &task_b, &batch_id, 1).await;
-    db.query("DELETE FROM build_batches WHERE batch_id = ?")
-        .bind(other.to_owned())
+    // `mark_active` stamps `ROW_TS`, already past the stale window
+    // against real `now` — the tests age the rows they want recovered,
+    // so both start fresh.
+    db.query(
+        "UPDATE queue SET claimed_at = datetime('now'), updated_at = datetime('now') \
+         WHERE status IN ('dispatched', 'running')",
+    )
+    .execute()
+    .await
+    .expect("stamp fresh claims");
+    match run_id {
+        Some(run_id) => {
+            bind_run(db, &task_id_on("leg-a", TARGET), run_id).await;
+            bind_run(db, &task_id_on("leg-b", TARGET), run_id).await;
+        }
+        None => {
+            db.query(
+                "UPDATE queue SET github_run_id = NULL \
+                 WHERE status IN ('dispatched', 'running')",
+            )
+            .execute()
+            .await
+            .expect("unbind the tasks");
+        }
+    }
+}
+
+/// Stamp a bound run on an in-flight row.
+async fn bind_run(db: &DurableDb, task_id: &str, run_id: &str) {
+    db.query("UPDATE queue SET github_run_id = ? WHERE task_id = ?")
+        .bind(run_id.to_owned())
+        .bind(task_id.to_owned())
         .execute()
         .await
-        .expect("drop the second fixture batch");
-    db.query("UPDATE build_batches SET legs = 2, github_run_id = ? WHERE batch_id = ?")
-        .bind(run_id)
-        .bind(batch_id.clone())
-        .execute()
-        .await
-        .expect("shape the fixture batch");
-    batch_id
+        .expect("bind run");
 }
 
 async fn queue_error(db: &DurableDb, name: &str) -> String {
@@ -655,17 +584,6 @@ async fn queue_error(db: &DurableDb, name: &str) -> String {
         .expect("error_msg")
 }
 
-async fn batch_lease_ms(db: &DurableDb, batch_id: &str) -> Option<i64> {
-    db.query(
-        "SELECT CAST(strftime('%s', lease_at) AS INTEGER) * 1000 \
-         FROM build_batches WHERE batch_id = ?",
-    )
-    .bind(batch_id.to_owned())
-    .fetch_scalar_optional::<i64>()
-    .await
-    .expect("read lease")
-}
-
 async fn active_slots(db: &DurableDb) -> u32 {
     super::count_active_by_family(db)
         .await
@@ -673,178 +591,89 @@ async fn active_slots(db: &DurableDb) -> u32 {
         .total
 }
 
-/// §4.3: an expired unbound batch has no run to ask about — both legs
-/// requeue in one statement and the row delete frees the batch's slots.
+/// An unbound in-flight row has no run to ask about: past
+/// `stale_dispatch_minutes` the sweep requeues it and frees its slot.
 #[tokio::test]
-async fn an_expired_unbound_batch_requeues_its_legs_and_frees_its_slots() {
+async fn an_expired_unbound_task_requeues_and_frees_its_slot() {
     let db = memory_db().await.expect("memory db");
-    let batch_id = two_leg_batch(&db, None).await;
-    assert_eq!(active_slots(&db).await, 1);
-
-    let expired = super::expired_batches(&db, ROW_TS_MS + stale_ms())
+    two_bound_tasks(&db, None).await;
+    db.query("UPDATE queue SET claimed_at = datetime('now', ?), updated_at = datetime('now', ?)")
+        .bind(format!("-{} minutes", STALE_DISPATCH_MINUTES + 1))
+        .bind(format!("-{} minutes", STALE_DISPATCH_MINUTES + 1))
+        .execute()
         .await
-        .expect("expired batches");
-    assert_eq!(
-        expired,
-        vec![super::ExpiredBatch {
-            batch_id: batch_id.clone(),
-            run_id: None,
-            past_ceiling: false,
-        }]
-    );
-    super::requeue_unbound_batch(&db, &settings(), &batch_id)
+        .expect("age both tasks");
+    assert_eq!(active_slots(&db).await, 2);
+    let claimed = claim_flat(&db, &settings(), &NoCoverage)
         .await
-        .expect("requeue");
-
-    assert_eq!(status_of(&db, "leg-a").await, "pending");
-    assert_eq!(status_of(&db, "leg-b").await, "pending");
-    assert!(build_batch(&db, &batch_id).await.is_none());
-    assert_eq!(active_slots(&db).await, 0);
-}
-
-/// §4.3: a batch whose lease has not run out is not listed, so the
-/// lease check cannot touch it; at the lease instant it is.
-#[tokio::test]
-async fn a_batch_inside_its_lease_is_not_expired() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = two_leg_batch(&db, Some("4242")).await;
-
-    let inside = super::expired_batches(&db, ROW_TS_MS + stale_ms() - 1)
-        .await
-        .expect("inside the lease");
-    assert!(inside.is_empty(), "{inside:?}");
-    let expired = super::expired_batches(&db, ROW_TS_MS + stale_ms())
-        .await
-        .expect("at the lease");
-    assert_eq!(expired.len(), 1);
-    assert_eq!(expired[0].batch_id, batch_id);
-    assert_eq!(expired[0].run_id, Some(4242));
-    assert_eq!(status_of(&db, "leg-a").await, "dispatched");
-    assert_eq!(active_slots(&db).await, 1);
-}
-
-/// §4.3: a bound batch whose run completed is recorded as the webhook
-/// would — it leaves the lease check for the resolution pass, and its
-/// legs stay in flight rather than being redispatched.
-#[tokio::test]
-async fn a_completed_run_is_recorded_without_redispatch() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = two_leg_batch(&db, Some("4242")).await;
-    let now_ms = ROW_TS_MS + stale_ms();
-
-    super::record_batch_completion(&db, &batch_id, &batch_run_complete(4242, 1, "success"))
-        .await
-        .expect("record the lost delivery");
-
-    assert!(
-        super::expired_batches(&db, now_ms)
-            .await
-            .expect("expired batches")
-            .is_empty(),
-        "a recorded completion belongs to the resolution pass"
-    );
-    // `resolve_after` is the recording instant (wall clock), so the
-    // resolution pass looks from well after it.
-    let resolution_ms = now_ms + 3650 * 86_400_000;
-    let ready = super::ready_batches(&db, resolution_ms)
-        .await
-        .expect("ready");
-    assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].batch_id, batch_id);
-    assert_eq!(ready[0].run_id, 4242);
-    assert_eq!(ready[0].legs.len(), 2);
-    let cheap = SchedulerSettings {
-        dispatch_min_age_minutes: 0,
-        ..settings()
-    };
-    assert!(
-        claim_flat(&db, &cheap, &NoCoverage)
-            .await
-            .expect("claim")
-            .is_empty()
-    );
+        .expect("stale sweep");
+    assert_eq!(claimed.len(), 2, "the recovered tasks re-claim fresh");
     assert_eq!(status_of(&db, "leg-a").await, "dispatched");
     assert_eq!(status_of(&db, "leg-b").await, "dispatched");
-    assert_eq!(active_slots(&db).await, 1);
+    assert_eq!(active_slots(&db).await, 2);
 }
 
-/// §4.3: a run still going inside its ceiling keeps its legs and its
-/// slots; only the lease moves, and the alarm re-arms on the new one.
+/// A task inside its stale window is left alone — `ROW_TS` is fresh
+/// against a `stale_dispatch_minutes` window.
 #[tokio::test]
-async fn an_in_progress_run_has_its_lease_extended() {
+async fn a_task_inside_its_stale_window_is_not_recovered() {
     let db = memory_db().await.expect("memory db");
-    let batch_id = two_leg_batch(&db, Some("4242")).await;
-    let now_ms = ROW_TS_MS + stale_ms();
-
-    super::extend_batch_lease(&db, &settings(), &batch_id, now_ms)
+    two_bound_tasks(&db, Some("4242")).await;
+    // Only `leg-a` is stale: wind its `claimed_at` past the window,
+    // `leg-b` stays fresh against it.
+    db.query(
+        "UPDATE queue SET claimed_at = datetime('now', ?), updated_at = datetime('now', ?) \
+         WHERE crate_name = 'leg-a'",
+    )
+    .bind(format!("-{} minutes", STALE_DISPATCH_MINUTES + 1))
+    .bind(format!("-{} minutes", STALE_DISPATCH_MINUTES + 1))
+    .execute()
+    .await
+    .expect("age leg-a");
+    let claimed = claim_flat(&db, &settings(), &NoCoverage)
         .await
-        .expect("extend");
-
-    assert_eq!(
-        batch_lease_ms(&db, &batch_id).await,
-        Some(now_ms + stale_ms())
-    );
-    let expired = super::expired_batches(&db, now_ms)
-        .await
-        .expect("expired batches");
-    assert!(expired.is_empty(), "{expired:?}");
+        .expect("stale sweep");
+    assert_eq!(claimed.len(), 1, "only the stale task re-claims");
+    assert_eq!(claimed[0].crate_name, "leg-a");
     assert_eq!(status_of(&db, "leg-a").await, "dispatched");
-    assert_eq!(active_slots(&db).await, 1);
-    let plan = next_alarm(&db, now_ms, &settings())
-        .await
-        .expect("next_alarm");
-    assert_eq!(plan, AlarmPlan::At(now_ms + stale_ms()));
+    assert_eq!(status_of(&db, "leg-b").await, "dispatched");
+    assert_eq!(active_slots(&db).await, 2);
 }
 
-/// §4.3: the ceiling is `claimed_at + ⌈legs / parallelism⌉ × 180 min + 60 min`
-/// — here two rounds, 420 minutes. A batch past it has its in-flight legs
-/// failed in one statement with the ceiling error and its row released.
+/// The sweep requeues the stale row and its parked completion goes
+/// with it: a completion for the abandoned generation can never apply
+/// to the row's next claim.
 #[tokio::test]
-async fn a_run_past_its_ceiling_fails_its_legs() {
+async fn a_stale_task_recovers_and_its_parked_completion_is_discarded() {
     let db = memory_db().await.expect("memory db");
-    let batch_id = two_leg_batch(&db, Some("4242")).await;
-    let minute = 60_000;
-
-    let inside = super::expired_batches(&db, ROW_TS_MS + 419 * minute)
+    two_bound_tasks(&db, Some("4242")).await;
+    db.query("UPDATE queue SET claimed_at = datetime('now', ?), updated_at = datetime('now', ?)")
+        .bind(format!("-{} minutes", STALE_DISPATCH_MINUTES + 1))
+        .bind(format!("-{} minutes", STALE_DISPATCH_MINUTES + 1))
+        .execute()
         .await
-        .expect("inside the ceiling");
-    assert!(!inside[0].past_ceiling);
-    let past = super::expired_batches(&db, ROW_TS_MS + 420 * minute)
+        .expect("age both tasks");
+    db.query(
+        "INSERT INTO pending_run_completions \
+             (task_id, success, error, github_run_id, received_at) \
+         VALUES (?, 1, NULL, '4242', datetime('now'))",
+    )
+    .bind(task_id_on("leg-a", TARGET))
+    .execute()
+    .await
+    .expect("park a completion");
+    claim_flat(&db, &settings(), &NoCoverage)
         .await
-        .expect("past the ceiling");
-    assert!(past[0].past_ceiling);
-
-    super::fail_batch_past_ceiling(&db, &batch_id, super::CeilingFailure::RunOutlived)
-        .await
-        .expect("fail the batch");
-
-    for name in ["leg-a", "leg-b"] {
-        assert_eq!(status_of(&db, name).await, "failed");
-        assert_eq!(
-            queue_error(&db, name).await,
-            "infrastructure: run exceeded its ceiling"
-        );
-    }
-    assert!(build_batch(&db, &batch_id).await.is_none());
-    assert_eq!(active_slots(&db).await, 0);
-}
-
-/// A completion recorded while the cancel was in flight is the
-/// resolution pass's: the ceiling failure leaves the legs and the row.
-#[tokio::test]
-async fn a_recorded_completion_wins_over_the_ceiling_failure() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = two_leg_batch(&db, Some("4242")).await;
-    super::record_batch_completion(&db, &batch_id, &batch_run_complete(4242, 1, "cancelled"))
-        .await
-        .expect("record");
-
-    super::fail_batch_past_ceiling(&db, &batch_id, super::CeilingFailure::RunOutlived)
-        .await
-        .expect("fail the batch");
-
+        .expect("stale sweep");
     assert_eq!(status_of(&db, "leg-a").await, "dispatched");
-    assert!(build_batch(&db, &batch_id).await.is_some());
+    assert_eq!(status_of(&db, "leg-b").await, "dispatched");
+    let parked: i64 = db
+        .query("SELECT COUNT(*) FROM pending_run_completions")
+        .fetch_scalar()
+        .await
+        .expect("count parked completions");
+    assert_eq!(parked, 0, "the abandoned generation's completion is gone");
+    assert_eq!(active_slots(&db).await, 2);
 }
 
 #[tokio::test]
@@ -3056,7 +2885,7 @@ async fn macos_cap_skips_macos_rows_but_claims_other_families() {
 }
 
 /// Within a lane, Windows-family rows claim before other targets even
-/// when the other row was requested first — the Windows legs are the
+/// when the other row was requested first — the Windows builds are the
 /// slowest in a wave, so they start first.
 #[tokio::test]
 async fn windows_tasks_claim_before_linux_within_a_lane() {
@@ -5347,8 +5176,8 @@ fn report(
 }
 
 /// Complete a claimed row's live generation through [`super::complete`]
-/// the way a batch leg's resolution does — `sample_ms` is the leg's
-/// runner time, `None` for a failure.
+/// the way a run's completion does — `sample_ms` is the task's
+/// claim-to-completion time, `None` for a failure.
 async fn complete_live(
     db: &DurableDb,
     task_id: &str,
@@ -5519,9 +5348,15 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
     )
     .await
     .expect("cancel A");
-    super::back_off_dispatch_legs(&db, &settings(), &[first.queued()], "late A failure")
-        .await
-        .expect("fence late A failure after cancel");
+    super::mark_dispatch_failed(
+        &db,
+        &settings(),
+        &first.task_id,
+        &first.generation_id,
+        "late A failure",
+    )
+    .await
+    .expect("fence late A failure after cancel");
     assert_eq!(row_column(&db, "fenced", "status").await, "failed");
 
     super::apply_mutation(
@@ -5543,9 +5378,15 @@ async fn late_dispatch_failure_cannot_overwrite_cancelled_or_retried_generation(
         .await
         .expect("bind B");
 
-    super::back_off_dispatch_legs(&db, &settings(), &[first.queued()], "late A failure")
-        .await
-        .expect("fence late A failure after retry");
+    super::mark_dispatch_failed(
+        &db,
+        &settings(),
+        &first.task_id,
+        &first.generation_id,
+        "late A failure",
+    )
+    .await
+    .expect("fence late A failure after retry");
     assert_eq!(row_column(&db, "fenced", "status").await, "dispatched");
     assert_eq!(row_column(&db, "fenced", "github_run_id").await, "run-b");
 }
@@ -5675,9 +5516,15 @@ async fn late_failure_cannot_match_purged_recreated_generation() {
         second.generation_id
     );
 
-    super::back_off_dispatch_legs(&db, &settings(), &[first.queued()], "late A")
-        .await
-        .expect("fence old failure");
+    super::mark_dispatch_failed(
+        &db,
+        &settings(),
+        &first.task_id,
+        &first.generation_id,
+        "late A",
+    )
+    .await
+    .expect("fence old failure");
     assert_eq!(row_column(&db, "recreated", "status").await, "dispatched");
     assert_eq!(
         row_column(&db, "recreated", "generation_id").await,
@@ -5695,7 +5542,7 @@ const fn reference_backoff_minutes(attempts: u32) -> u32 {
     }
 }
 
-/// The SQL backoff expression the batch backoff writes equals the
+/// The SQL backoff expression the dispatch backoff writes equals the
 /// documented `min(2^min(attempts, 6), cap)` for every attempt count
 /// across the exponent clamp and the cap.
 #[tokio::test]
@@ -5721,9 +5568,9 @@ async fn backoff_minutes_sql_matches_the_documented_curve() {
 
 /// Bind a claimed row's generation to `github_run_id` the way the
 /// retired per-task dispatch did — setup for the
-/// `back_off_dispatch_legs` fence, which still reads
-/// `queue.github_run_id`. Production binds one run per batch
-/// ([`super::bind_batch_run`]) and never writes this column.
+/// `mark_dispatch_failed` fence, which still reads
+/// `queue.github_run_id` — the binding [`super::bind_dispatch_run`]
+/// writes after a successful `workflow_dispatch`.
 async fn bind_dispatch_run(
     db: &DurableDb,
     task_id: &str,
@@ -5745,909 +5592,226 @@ async fn bind_dispatch_run(
     Ok(result.rows_written > 0)
 }
 
-/// A `build_batches` row the way the claim pass inserts it — bound to
-/// its run once the dispatch response landed (`github_run_id` set),
-/// still unbound while that response is in flight (stow#833).
-async fn seed_build_batch(db: &DurableDb, batch_id: &str, github_run_id: Option<&str>) {
-    db.query(
-        "INSERT INTO build_batches \
-             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
-              github_run_id, claimed_at, lease_at) \
-         VALUES (?, ?, 'linux', 'miss', 5, 2, ?, ?, ?)",
-    )
-    .bind(batch_id.to_owned())
-    .bind(RUSTC)
-    .bind(github_run_id)
-    .bind(ROW_TS)
-    .bind(ROW_TS)
-    .execute()
-    .await
-    .expect("seed build_batches row");
-}
-
-/// The `BatchRunComplete` the webhook forwards — run identity
-/// verbatim, the conclusion GitHub reported.
-fn batch_run_complete(
-    run_id: u64,
-    run_attempt: u32,
-    conclusion: &str,
-) -> stow_types::api::BatchRunComplete {
-    stow_types::api::BatchRunComplete {
-        run_id,
-        run_attempt,
-        conclusion: conclusion.to_owned(),
-        html_url: format!("https://github.com/water-rs/stow/actions/runs/{run_id}"),
+/// A `WorkflowRunComplete` for `task`'s bound run — what the webhook
+/// forwards after its GHCR records check.
+fn run_complete(task_id: &str, run_id: u64, success: bool) -> stow_types::api::WorkflowRunComplete {
+    stow_types::api::WorkflowRunComplete {
+        task_id: task_id.to_owned(),
+        success,
+        error: (!success).then(|| "failure".to_owned()),
+        github_run_id: Some(run_id.to_string()),
     }
 }
 
-#[derive(skyzen::FromRow)]
-struct BuildBatchRow {
-    github_run_id: Option<String>,
-    done_run_id: Option<String>,
-    done_attempt: Option<i64>,
-    conclusion: Option<String>,
-    done_at: Option<String>,
-    resolve_after: Option<String>,
-}
-
-async fn build_batch(db: &DurableDb, batch_id: &str) -> Option<BuildBatchRow> {
-    db.query(
-        "SELECT github_run_id, done_run_id, done_attempt, conclusion, done_at, resolve_after \
-         FROM build_batches WHERE batch_id = ?",
-    )
-    .bind(batch_id.to_owned())
-    .fetch_optional::<BuildBatchRow>()
-    .await
-    .expect("read build_batches row")
-}
-
-/// §3.2: a completion naming a batch the store never held is
-/// `UnknownBatch` — the route's 404, which the webhook logs as an
-/// orphan run from an abandoned dispatch.
+/// §3.2: `complete_run` settles the bound row — success lands
+/// `completed`, failure re-queues behind backoff, and a duplicate is a
+/// no-op under the generation fence.
 #[tokio::test]
-async fn a_batch_completion_for_an_unknown_batch_is_rejected() {
+async fn a_run_completion_settles_the_task_and_a_duplicate_is_a_noop() {
     let db = memory_db().await.expect("memory db");
-    let error = super::record_batch_completion(
+    enqueue(&db, &[request("built", &[])])
+        .await
+        .expect("enqueue");
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let task = &claimed[0];
+    super::bind_dispatch_run(&db, &task.task_id, &task.generation_id, "4242")
+        .await
+        .expect("bind run");
+    super::complete_run(
         &db,
-        "0123456789abcdef0123456789abcdef",
-        &batch_run_complete(4242, 1, "success"),
+        &settings(),
+        &run_complete(&task.task_id, 4242, true),
+        60,
     )
     .await
-    .expect_err("an unknown batch is refused");
-    assert!(matches!(error, QueueError::UnknownBatch(_)), "{error}");
-}
-
-/// §3.2: the first delivery writes the `done_*` fields and marks the
-/// row resolvable now; a duplicate delivery is guarded by
-/// `done_run_id IS NULL` — it changes nothing and still answers Ok.
-#[tokio::test]
-async fn a_batch_completion_writes_the_row_and_a_duplicate_is_a_noop() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = "0123456789abcdef0123456789abcdef";
-    seed_build_batch(&db, batch_id, Some("4242")).await;
-    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 1, "failure"))
-        .await
-        .expect("first delivery applies");
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert_eq!(row.done_run_id.as_deref(), Some("4242"));
-    assert_eq!(row.done_attempt, Some(1));
-    assert_eq!(row.conclusion.as_deref(), Some("failure"));
-    assert!(row.done_at.is_some() && row.resolve_after.is_some());
-    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 3, "success"))
-        .await
-        .expect("a duplicate delivery is a no-op");
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert_eq!(row.done_run_id.as_deref(), Some("4242"));
-    assert_eq!(row.done_attempt, Some(1));
-    assert_eq!(row.conclusion.as_deref(), Some("failure"));
-}
-
-/// §4.2: a `completed` webhook that beats the dispatch response's
-/// binding is held on the batch row itself — `github_run_id` still
-/// NULL, the `done_*` fields written — for the alarm's resolution to
-/// apply once the run is bound.
-#[tokio::test]
-async fn an_early_batch_completion_is_held_before_the_binding() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = "fedcba9876543210fedcba9876543210";
-    seed_build_batch(&db, batch_id, None).await;
-    super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "success"))
-        .await
-        .expect("an early completion is held");
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert!(row.github_run_id.is_none(), "the binding is still open");
-    assert_eq!(row.done_run_id.as_deref(), Some("9001"));
-    assert_eq!(row.done_attempt, Some(1));
-    assert_eq!(row.conclusion.as_deref(), Some("success"));
-    assert!(row.resolve_after.is_some());
-}
-
-/// A bound, completed batch — `github_run_id` set and the `done_*`
-/// fields written — with `resolve_after` where the caller wants it.
-async fn seed_ready_batch(
-    db: &DurableDb,
-    batch_id: &str,
-    run_id: &str,
-    conclusion: &str,
-    resolve_after: &str,
-) {
-    db.query(
-        "INSERT INTO build_batches \
-             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
-              github_run_id, done_run_id, done_attempt, conclusion, done_at, \
-              resolve_after, claimed_at, lease_at) \
-         VALUES (?, ?, 'linux', 'miss', 5, 2, ?, ?, 1, ?, ?, ?, ?, ?)",
-    )
-    .bind(batch_id.to_owned())
-    .bind(RUSTC)
-    .bind(run_id.to_owned())
-    .bind(run_id.to_owned())
-    .bind(conclusion.to_owned())
-    .bind(ROW_TS)
-    .bind(resolve_after.to_owned())
-    .bind(ROW_TS)
-    .bind(ROW_TS)
-    .execute()
-    .await
-    .expect("seed ready build_batches row");
-}
-
-/// A batch whose completion is recorded against its bound run wakes
-/// the alarm at its `resolve_after`, never at its past lease — a
-/// deferred resolution must not re-arm the alarm at `now` every pass —
-/// while an unrecorded batch still wakes at its lease.
-#[tokio::test]
-async fn a_recorded_batch_wakes_at_its_resolution_not_its_lease() {
-    let db = memory_db().await.expect("memory db");
-    seed_ready_batch(
+    .expect("complete");
+    assert_eq!(status_of(&db, "built").await, "completed");
+    super::complete_run(
         &db,
-        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-        "8888",
-        "success",
-        "2099-01-01 00:00:00",
+        &settings(),
+        &run_complete(&task.task_id, 4242, true),
+        60,
     )
-    .await;
-    assert_eq!(
-        super::earliest_batch_wake_ms(&db).await.expect("wake"),
-        Some(4_070_908_800_000),
-        "a deferred recorded batch wakes at its resolve_after"
-    );
-    seed_build_batch(&db, "ffffffffffffffffffffffffffffffff", Some("9999")).await;
-    assert_eq!(
-        super::earliest_batch_wake_ms(&db).await.expect("wake"),
-        Some(ROW_TS_MS),
-        "an unrecorded batch wakes at its lease"
-    );
+    .await
+    .expect_err("duplicate completion is stale");
+    assert_eq!(status_of(&db, "built").await, "completed");
 }
 
-/// Bind a claimed row to a batch leg directly — tests that seed their
-/// own `build_batches` rows attach legs to them without a claim.
-async fn bind_leg(db: &DurableDb, task_id: &str, batch_id: &str, batch_leg: i64) {
-    db.query("UPDATE queue SET batch_id = ?, batch_leg = ? WHERE task_id = ?")
-        .bind(batch_id.to_owned())
-        .bind(batch_leg)
-        .bind(task_id.to_owned())
+/// §3.2: a completion arriving before its dispatch's binding parks in
+/// `pending_run_completions` and `bind_dispatch_run` drains it —
+/// applied, then deleted.
+#[tokio::test]
+async fn an_early_completion_is_held_until_the_binding() {
+    let db = memory_db().await.expect("memory db");
+    enqueue(&db, &[request("early", &[])])
+        .await
+        .expect("enqueue");
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let task = &claimed[0];
+    super::complete_run(
+        &db,
+        &settings(),
+        &run_complete(&task.task_id, 4242, true),
+        60,
+    )
+    .await
+    .expect("park early completion");
+    let parked: i64 = db
+        .query("SELECT COUNT(*) FROM pending_run_completions WHERE task_id = ?")
+        .bind(task.task_id.clone())
+        .fetch_scalar()
+        .await
+        .expect("count parked");
+    assert_eq!(parked, 1, "the early completion waits for its binding");
+    assert_eq!(status_of(&db, "early").await, "dispatched");
+    super::bind_dispatch_run(&db, &task.task_id, &task.generation_id, "4242")
+        .await
+        .expect("bind run");
+    super::reconcile_pending_completions(&db, &settings(), 60)
+        .await
+        .expect("reconcile");
+    assert_eq!(status_of(&db, "early").await, "completed");
+    let parked: i64 = db
+        .query("SELECT COUNT(*) FROM pending_run_completions WHERE task_id = ?")
+        .bind(task.task_id.clone())
+        .fetch_scalar()
+        .await
+        .expect("count parked");
+    assert_eq!(parked, 0, "the drained completion is deleted");
+}
+
+/// §3.2: a completion naming a run other than the bound one belongs to
+/// a stale generation — consumed, the bound row untouched.
+#[tokio::test]
+async fn a_completion_naming_another_run_is_consumed_as_stale() {
+    let db = memory_db().await.expect("memory db");
+    enqueue(&db, &[request("busy", &[])])
+        .await
+        .expect("enqueue");
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let task = &claimed[0];
+    super::bind_dispatch_run(&db, &task.task_id, &task.generation_id, "4242")
+        .await
+        .expect("bind run");
+    super::complete_run(
+        &db,
+        &settings(),
+        &run_complete(&task.task_id, 9001, true),
+        60,
+    )
+    .await
+    .expect_err("a foreign run is stale");
+    assert_eq!(status_of(&db, "busy").await, "dispatched");
+}
+
+/// §3.2: `record_task_run_update` moves the bound row `dispatched` →
+/// `running`, is a no-op on redelivery, and rejects a foreign run.
+#[tokio::test]
+async fn a_run_update_moves_dispatched_to_running() {
+    let db = memory_db().await.expect("memory db");
+    enqueue(&db, &[request("live", &[])])
+        .await
+        .expect("enqueue");
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let task = &claimed[0];
+    super::bind_dispatch_run(&db, &task.task_id, &task.generation_id, "4242")
+        .await
+        .expect("bind run");
+    super::record_task_run_update(&db, &task.task_id, "4242")
+        .await
+        .expect("in_progress");
+    assert_eq!(status_of(&db, "live").await, "running");
+    // A redelivery of the same update is consumed idempotently.
+    super::record_task_run_update(&db, &task.task_id, "4242")
+        .await
+        .expect("redelivery");
+    super::record_task_run_update(&db, &task.task_id, "9001")
+        .await
+        .expect_err("a foreign run is stale");
+    assert_eq!(status_of(&db, "live").await, "running");
+}
+
+/// §3.2: a completion for an unknown task is rejected, not parked.
+#[tokio::test]
+async fn a_completion_for_an_unknown_task_is_rejected() {
+    let db = memory_db().await.expect("memory db");
+    super::complete_run(
+        &db,
+        &settings(),
+        &run_complete(&"f".repeat(64), 4242, true),
+        60,
+    )
+    .await
+    .expect_err("unknown task");
+}
+
+/// §3.2: `bind_dispatch_run`'s superseded-run delete — parked
+/// completions for the runs the binding replaced go with it, while a
+/// completion for the bound run applies.
+#[tokio::test]
+async fn binding_a_run_discards_superseded_completions() {
+    let db = memory_db().await.expect("memory db");
+    enqueue(&db, &[request("task", &[])])
+        .await
+        .expect("enqueue");
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let task = &claimed[0];
+    // Two early completions park for runs 9001 and 4242.
+    for run_id in [9001_u64, 4242] {
+        db.query(
+            "INSERT INTO pending_run_completions \
+                 (task_id, success, error, github_run_id, received_at) \
+             VALUES (?, 1, NULL, ?, datetime('now'))",
+        )
+        .bind(task.task_id.clone())
+        .bind(run_id.to_string())
         .execute()
         .await
-        .expect("bind leg");
-}
-
-/// Enqueue every name and claim the lot — `settings()`'s ten slots
-/// take them all once `first_requested_at` clears the age gate.
-async fn claim_tasks(db: &DurableDb, names: &[&str]) -> Vec<ClaimedLeg> {
-    let requests: Vec<EnqueueRequest> = names.iter().map(|name| request(name, &[])).collect();
-    enqueue(db, &requests).await.expect("enqueue legs");
-    for name in names {
-        set_first_requested_at(db, name, PAST_TS).await;
+        .expect("park completion");
     }
-    claim_flat(db, &settings(), &NoCoverage)
+    super::bind_dispatch_run(&db, &task.task_id, &task.generation_id, "4242")
         .await
-        .expect("claim legs")
+        .expect("bind run");
+    let parked: Vec<String> = db
+        .query("SELECT github_run_id FROM pending_run_completions WHERE task_id = ?")
+        .bind(task.task_id.clone())
+        .fetch_scalars::<String>()
+        .await
+        .expect("parked runs");
+    assert_eq!(parked, ["4242"], "only the bound run's completion stays");
+    super::reconcile_pending_completions(&db, &settings(), 60)
+        .await
+        .expect("reconcile");
+    assert_eq!(status_of(&db, "task").await, "completed");
 }
 
-/// The claimed leg for one crate — claim order follows the dispatch
-/// key, so tests bind legs by name, never position.
-fn claimed_task<'a>(claimed: &'a [ClaimedLeg], crate_name: &str) -> &'a ClaimedLeg {
+/// The claimed task for one crate — claim order follows the dispatch
+/// key, so tests pick by name, never position.
+async fn claim_tasks(db: &DurableDb, names: &[&str]) -> Vec<super::QueuedTask> {
+    let requests: Vec<EnqueueRequest> = names.iter().map(|name| request(name, &[])).collect();
+    enqueue(db, &requests).await.expect("enqueue tasks");
+    claim_flat(db, &claim_settings(), &NoCoverage)
+        .await
+        .expect("claim tasks")
+}
+
+fn claimed_task<'a>(claimed: &'a [super::QueuedTask], crate_name: &str) -> &'a super::QueuedTask {
     claimed
         .iter()
         .find(|task| task.crate_name == crate_name)
-        .expect("task was claimed")
+        .unwrap_or_else(|| panic!("{crate_name} was not claimed"))
 }
 
-/// §3.2: `ready_batches` surfaces a batch once its completion is
-/// bound to the dispatched run and due — an early completion still
-/// waiting on the dispatch response's binding and a batch deferred
-/// past `now` stay out — and legs come back in `batch_leg` wire
-/// order, not claim order.
-#[tokio::test]
-async fn ready_batches_surfaces_only_bound_due_batches() {
-    let db = memory_db().await.expect("memory db");
-    let ready = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let unbound = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    let deferred = "cccccccccccccccccccccccccccccccc";
-    // Claim before seeding: the pass's stale recovery deletes a
-    // `build_batches` row with no in-flight leg, so seeded rows must
-    // land after it — and after they land, `bind_leg` supplies the
-    // legs the next sweep looks for.
-    let claimed = claim_tasks(&db, &["legged-a", "legged-b"]).await;
-    seed_ready_batch(&db, ready, "4242", "success", PAST_TS).await;
-    // A completion held ahead of the binding — `done_run_id` set,
-    // `github_run_id` NULL — is not resolvable.
-    seed_build_batch(&db, unbound, None).await;
-    super::record_batch_completion(&db, unbound, &batch_run_complete(9001, 1, "success"))
-        .await
-        .expect("held completion");
-    // Bound and done, but deferred past `now`.
-    seed_ready_batch(&db, deferred, "5555", "success", "2099-01-01 00:00:00").await;
-
-    bind_leg(&db, &claimed_task(&claimed, "legged-a").task_id, ready, 1).await;
-    bind_leg(&db, &claimed_task(&claimed, "legged-b").task_id, ready, 0).await;
-
-    let batches = super::ready_batches(&db, ROW_TS_MS)
-        .await
-        .expect("ready batches");
-    assert_eq!(batches.len(), 1, "only the bound due batch resolves");
-    let batch = &batches[0];
-    assert_eq!(batch.batch_id, ready);
-    assert_eq!(batch.run_id, 4242);
-    assert_eq!(batch.done_attempt, 1);
-    assert_eq!(batch.conclusion, "success");
-    let legs = &batch.legs;
-    assert_eq!(legs.len(), 2);
-    let (b, a) = (
-        claimed_task(&claimed, "legged-b"),
-        claimed_task(&claimed, "legged-a"),
-    );
-    assert_eq!(legs[0].batch_leg, 0);
-    assert_eq!(legs[0].task_id, b.task_id);
-    assert_eq!(legs[0].generation_id, b.generation_id);
-    assert_eq!(legs[0].attempt, b.attempt);
-    assert_eq!(legs[1].batch_leg, 1);
-    assert_eq!(legs[1].task_id, a.task_id);
-}
-
-/// §3.2/§4.1: every settled leg applies through `complete`'s own
-/// contract — a success lands `completed` with the batch's run id,
-/// a failure under `MAX_BUILD_ATTEMPTS` requeues behind backoff with
-/// `attempt` bumped and its error evidence recorded — and resolving
-/// deletes the batch row, which is what releases its slots.
-#[tokio::test]
-async fn a_resolved_batch_applies_each_leg_and_releases_its_row() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = "dddddddddddddddddddddddddddddddd";
-    let claimed = claim_tasks(&db, &["leg-ok", "leg-bad"]).await;
-    seed_ready_batch(&db, batch_id, "7777", "failure", PAST_TS).await;
-    bind_leg(&db, &claimed_task(&claimed, "leg-ok").task_id, batch_id, 0).await;
-    bind_leg(&db, &claimed_task(&claimed, "leg-bad").task_id, batch_id, 1).await;
-
-    let ready = super::ready_batches(&db, ROW_TS_MS)
-        .await
-        .expect("ready batches");
-    let batch = ready
-        .iter()
-        .find(|batch| batch.batch_id == batch_id)
-        .expect("the seeded batch is ready");
-    let any_failure = super::resolve_batch(
-        &db,
-        &settings(),
-        batch,
-        &[
-            super::LegResolution::Succeeded {
-                duration_ms: 123_456,
-            },
-            super::LegResolution::Failed {
-                error: "verdict: leg 1 / Run the untrusted build stage (u)".to_owned(),
-            },
-        ],
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("resolve");
-    assert!(any_failure, "one failed leg reports failure");
-
-    assert_eq!(row_column(&db, "leg-ok", "status").await, "completed");
-    assert_eq!(row_column(&db, "leg-ok", "github_run_id").await, "7777");
-    assert_eq!(row_column(&db, "leg-bad", "status").await, "pending");
-    assert_eq!(
-        row_column(&db, "leg-bad", "CAST(attempt AS TEXT)").await,
-        "2"
-    );
-    assert_eq!(
-        row_column(&db, "leg-bad", "error_msg").await,
-        "verdict: leg 1 / Run the untrusted build stage (u)"
-    );
-    // The breaker's evidence carries the failure's class — its first line.
-    assert_eq!(
-        db.query("SELECT failure_class FROM attempt_outcomes_v2")
-            .fetch_scalar::<String>()
-            .await
-            .expect("outcome evidence"),
-        "verdict: leg 1 / Run the untrusted build stage (u)"
-    );
-    // The batch row is gone — the only release of its slots.
-    assert!(
-        build_batch(&db, batch_id).await.is_none(),
-        "resolving deletes the batch row"
-    );
-}
-
-/// §4.2: a leg whose queue row moved on — here cancelled back to
-/// `pending` while still bound to the batch — is refused by
-/// `complete`'s generation/status fence and ignored, never an error:
-/// the batch resolves on its other legs and its row still deletes. A
-/// fenced-off failure counts for nothing toward the caller's
-/// once-per-batch breaker gate.
-#[tokio::test]
-async fn a_stale_leg_is_ignored_by_the_generation_fence() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    let claimed = claim_tasks(&db, &["live-leg", "dead-leg"]).await;
-    seed_ready_batch(&db, batch_id, "8888", "failure", PAST_TS).await;
-    bind_leg(
-        &db,
-        &claimed_task(&claimed, "live-leg").task_id,
-        batch_id,
-        0,
-    )
-    .await;
-    bind_leg(
-        &db,
-        &claimed_task(&claimed, "dead-leg").task_id,
-        batch_id,
-        1,
-    )
-    .await;
-    // The row is cancelled between the jobs-page read and the apply:
-    // still bound to the batch, no longer in flight.
-    db.query("UPDATE queue SET status = 'pending' WHERE task_id = ?")
-        .bind(claimed_task(&claimed, "dead-leg").task_id.clone())
-        .execute()
-        .await
-        .expect("cancel the leg's row");
-
-    let ready = super::ready_batches(&db, ROW_TS_MS)
-        .await
-        .expect("ready batches");
-    let batch = ready
-        .iter()
-        .find(|batch| batch.batch_id == batch_id)
-        .expect("the seeded batch is ready");
-    let any_failure = super::resolve_batch(
-        &db,
-        &settings(),
-        batch,
-        &[
-            super::LegResolution::Succeeded {
-                duration_ms: 60_000,
-            },
-            super::LegResolution::Failed {
-                error: "infrastructure: leg 1 / - (u)".to_owned(),
-            },
-        ],
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("resolve");
-    assert!(!any_failure, "a fenced-off leg applied nothing");
-    assert_eq!(row_column(&db, "live-leg", "status").await, "completed");
-    assert_eq!(
-        db.query(
-            "SELECT COALESCE(error_msg, '<untouched>') FROM queue WHERE crate_name = 'dead-leg'"
-        )
-        .fetch_scalar::<String>()
-        .await
-        .expect("dead leg row"),
-        "<untouched>",
-        "the stale leg's row is untouched"
-    );
-    assert!(build_batch(&db, batch_id).await.is_none());
-}
-
-/// §4.1: a batch leg's build sample is its runner time — the leg's
-/// own two jobs, measured on GitHub's clock — never
-/// claim-to-completion across the batch's rounds; `claimed_at` stays
-/// only for the lease.
-#[tokio::test]
-async fn a_batch_leg_samples_its_runner_time() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = "ffffffffffffffffffffffffffffffff";
-    let claimed = claim_tasks(&db, &["timed-leg"]).await;
-    seed_ready_batch(&db, batch_id, "9999", "success", PAST_TS).await;
-    let leg = claimed_task(&claimed, "timed-leg");
-    bind_leg(&db, &leg.task_id, batch_id, 0).await;
-    // Push the claim stamp far into the past: a claim-to-completion
-    // sample would land years, so an exact runner-time value proves
-    // which duration was measured.
-    db.query("UPDATE queue SET claimed_at = '2020-01-01 00:00:00' WHERE task_id = ?")
-        .bind(leg.task_id.clone())
-        .execute()
-        .await
-        .expect("age the claim stamp");
-
-    let ready = super::ready_batches(&db, ROW_TS_MS)
-        .await
-        .expect("ready batches");
-    let batch = ready
-        .iter()
-        .find(|batch| batch.batch_id == batch_id)
-        .expect("the seeded batch is ready");
-    let any_failure = super::resolve_batch(
-        &db,
-        &settings(),
-        batch,
-        &[super::LegResolution::Succeeded {
-            duration_ms: 123_456,
-        }],
-        TEST_WINDOW_MINUTES,
-    )
-    .await
-    .expect("resolve");
-    assert!(!any_failure);
-    assert_eq!(
-        db.query("SELECT duration_ms FROM crate_build_samples WHERE crate_name = 'timed-leg'")
-            .fetch_scalar::<i64>()
-            .await
-            .expect("sample"),
-        123_456,
-        "the sample is the leg's runner time"
-    );
-}
-
-/// §3.2: an unsettled leg defers the whole batch — `defer_batch`
-/// pushes `resolve_after`, and `ready_batches` leaves the batch alone
-/// until it is due again.
-#[tokio::test]
-async fn defer_batch_pushes_resolution_out() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = "12121212121212121212121212121212";
-    seed_ready_batch(&db, batch_id, "3131", "failure", PAST_TS).await;
-    super::defer_batch(&db, batch_id, ROW_TS_MS + 30_000)
-        .await
-        .expect("defer");
-    assert!(
-        super::ready_batches(&db, ROW_TS_MS)
-            .await
-            .expect("ready batches")
-            .is_empty(),
-        "a deferred batch is not ready"
-    );
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert_eq!(
-        row.resolve_after.as_deref(),
-        Some("2026-01-01 00:00:30"),
-        "resolve_after moved thirty seconds out"
-    );
-    assert!(
-        super::ready_batches(&db, ROW_TS_MS + 30_000)
-            .await
-            .expect("ready batches")
-            .iter()
-            .any(|batch| batch.batch_id == batch_id),
-        "the batch is ready once due"
-    );
-}
-
-/// Every `build_batches` row is in some pass's set: a resolvable row
-/// (`done_run_id = github_run_id`) is the resolution pass's, every
-/// other one the lease check's (`done_run_id IS NULL OR github_run_id
-/// IS NULL`). A row both skip would hold its slots and wake the alarm
-/// at its `resolve_after` forever.
-async fn assert_no_orphan_batches(db: &DurableDb) {
-    let orphans = db
-        .query(
-            "SELECT batch_id FROM build_batches \
-             WHERE done_run_id IS NOT NULL AND github_run_id IS NOT NULL \
-               AND done_run_id != github_run_id",
-        )
-        .fetch_scalars::<String>()
-        .await
-        .expect("list orphan batches");
-    assert!(orphans.is_empty(), "batches no pass consumes: {orphans:?}");
-}
-
-/// A bound, completed batch with its two legs attached — the batch a
-/// resolution pass gets and cannot answer. Claimed at `ROW_TS` with two
-/// legs over five slots: one round, a 240-minute ceiling.
-async fn seed_stuck_batch(db: &DurableDb, batch_id: &str) {
-    let claimed = claim_tasks(db, &["stuck-a", "stuck-b"]).await;
-    seed_ready_batch(db, batch_id, "4242", "success", PAST_TS).await;
-    bind_leg(db, &claimed_task(&claimed, "stuck-a").task_id, batch_id, 0).await;
-    bind_leg(db, &claimed_task(&claimed, "stuck-b").task_id, batch_id, 1).await;
-    // The claim formed batch rows of its own for these legs; the seeded
-    // row replaces them.
-    db.query("DELETE FROM build_batches WHERE batch_id != ?")
-        .bind(batch_id.to_owned())
-        .execute()
-        .await
-        .expect("drop the claim's own batch rows");
-}
-
-const STUCK_BATCH: &str = "34343434343434343434343434343434";
-const CEILING_MS: i64 = ROW_TS_MS + 240 * 60_000;
-
-/// Stow#833: a resolution with no answer at its ceiling fails the legs
-/// still in flight, refreshes their dependents and deletes the row,
-/// instead of deferring forever.
-#[tokio::test]
-async fn an_unresolved_batch_past_its_ceiling_fails_its_legs_and_leaves_flight() {
-    let db = memory_db().await.expect("memory db");
-    seed_stuck_batch(&db, STUCK_BATCH).await;
-    enqueue(&db, &[request("parent", &[dependency("stuck-a")])])
-        .await
-        .expect("enqueue dependent");
-    assert_eq!(
-        row_column(&db, "parent", "CAST(blocked AS TEXT)").await,
-        "0"
-    );
-
-    let ready = super::ready_batches(&db, ROW_TS_MS)
-        .await
-        .expect("ready batches");
-    assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].ceiling_ms, CEILING_MS);
-    let outcome = super::defer_unresolved_batch(&db, &ready[0], CEILING_MS, 30_000)
-        .await
-        .expect("fail the stalled batch");
-
-    assert_eq!(outcome, super::BatchRetry::Failed);
-    for name in ["stuck-a", "stuck-b"] {
-        assert_eq!(row_column(&db, name, "status").await, "failed");
-        assert_eq!(
-            row_column(&db, name, "error_msg").await,
-            "infrastructure: run results unreadable or unsettled past its ceiling"
-        );
-    }
-    assert_eq!(
-        row_column(&db, "parent", "CAST(blocked AS TEXT)").await,
-        "1"
-    );
-    assert!(build_batch(&db, STUCK_BATCH).await.is_none());
-    assert_eq!(active_slots(&db).await, 0);
-    assert_no_orphan_batches(&db).await;
-}
-
-/// Inside the ceiling the same unanswered batch defers 30 s and keeps
-/// its legs and its slots.
-#[tokio::test]
-async fn an_unresolved_batch_before_its_ceiling_defers() {
-    let db = memory_db().await.expect("memory db");
-    seed_stuck_batch(&db, STUCK_BATCH).await;
-    let now_ms = CEILING_MS - 1;
-
-    let ready = super::ready_batches(&db, now_ms)
-        .await
-        .expect("ready batches");
-    let outcome = super::defer_unresolved_batch(&db, &ready[0], now_ms, 30_000)
-        .await
-        .expect("defer");
-
-    assert_eq!(outcome, super::BatchRetry::Deferred);
-    assert_eq!(row_column(&db, "stuck-a", "status").await, "dispatched");
-    assert_eq!(active_slots(&db).await, 5);
-    assert!(
-        super::ready_batches(&db, now_ms)
-            .await
-            .expect("ready batches")
-            .is_empty()
-    );
-    assert_eq!(
-        super::ready_batches(&db, now_ms + 30_000)
-            .await
-            .expect("ready batches")
-            .len(),
-        1
-    );
-    assert_no_orphan_batches(&db).await;
-}
-
-/// The lease check's retry arm (a failed run lookup, cancel or token
-/// mint) fails a batch that reached its ceiling, and keeps moving the
-/// lease of one inside it.
-#[tokio::test]
-async fn a_lease_retry_past_the_ceiling_fails_the_batch() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = two_leg_batch(&db, Some("4242")).await;
-    let minute = 60_000;
-
-    let inside = super::expired_batches(&db, ROW_TS_MS + 419 * minute)
-        .await
-        .expect("inside the ceiling");
-    let retried = super::retry_unreadable_batch(&db, &inside[0], ROW_TS_MS + 419 * minute, 30_000)
-        .await
-        .expect("retry inside the ceiling");
-    assert_eq!(retried, super::BatchRetry::Deferred);
-    assert_eq!(
-        batch_lease_ms(&db, &batch_id).await,
-        Some(ROW_TS_MS + 419 * minute + 30_000)
-    );
-    assert_eq!(status_of(&db, "leg-a").await, "dispatched");
-
-    let past = super::expired_batches(&db, ROW_TS_MS + 420 * minute)
-        .await
-        .expect("past the ceiling");
-    let retried = super::retry_unreadable_batch(&db, &past[0], ROW_TS_MS + 420 * minute, 30_000)
-        .await
-        .expect("retry past the ceiling");
-    assert_eq!(retried, super::BatchRetry::Failed);
-    for name in ["leg-a", "leg-b"] {
-        assert_eq!(status_of(&db, name).await, "failed");
-        assert_eq!(
-            queue_error(&db, name).await,
-            "infrastructure: run state unreadable past its ceiling"
-        );
-    }
-    assert!(build_batch(&db, &batch_id).await.is_none());
-    assert_eq!(active_slots(&db).await, 0);
-    assert_no_orphan_batches(&db).await;
-}
-
-/// A completion recorded between the failed lookup and the ceiling
-/// failure wins: the legs and the row are the resolution pass's.
-#[tokio::test]
-async fn a_recorded_completion_wins_over_an_unreadable_ceiling_failure() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = two_leg_batch(&db, Some("4242")).await;
-    let past = super::expired_batches(&db, ROW_TS_MS + 420 * 60_000)
-        .await
-        .expect("past the ceiling");
-    super::record_batch_completion(&db, &batch_id, &batch_run_complete(4242, 1, "success"))
-        .await
-        .expect("record");
-
-    super::retry_unreadable_batch(&db, &past[0], ROW_TS_MS + 420 * 60_000, 30_000)
-        .await
-        .expect("retry");
-
-    assert_eq!(status_of(&db, "leg-a").await, "dispatched");
-    assert!(build_batch(&db, &batch_id).await.is_some());
-    assert_no_orphan_batches(&db).await;
-}
-
-/// A completion naming a run other than the one the row is bound to
-/// writes nothing and is an `Invariant` naming the batch and both runs
-/// — it would otherwise leave a row neither pass consumes.
-#[tokio::test]
-async fn a_completion_naming_another_run_than_the_bound_one_is_an_invariant() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = "56565656565656565656565656565656";
-    seed_build_batch(&db, batch_id, Some("4242")).await;
-
-    let error =
-        super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "success"))
-            .await
-            .expect_err("a foreign run is refused");
-
-    let QueueError::Invariant(message) = &error else {
-        panic!("expected an invariant, got {error}");
-    };
-    for named in [batch_id, "4242", "9001"] {
-        assert!(message.contains(named), "{message}");
-    }
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert!(row.done_run_id.is_none(), "nothing was written");
-    assert_no_orphan_batches(&db).await;
-
-    // A second run after the bound one's completion is refused too.
-    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 1, "success"))
-        .await
-        .expect("the bound run's completion lands");
-    let error =
-        super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "failure"))
-            .await
-            .expect_err("a second run is refused");
-    assert!(matches!(error, QueueError::Invariant(_)), "{error}");
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert_eq!(row.done_run_id.as_deref(), Some("4242"));
-    assert_eq!(row.conclusion.as_deref(), Some("success"));
-    assert_no_orphan_batches(&db).await;
-}
-
-/// A duplicate delivery of the recorded run answers Ok and writes
-/// nothing — not even a later attempt's `done_at`.
-#[tokio::test]
-async fn a_duplicate_completion_of_the_same_run_writes_nothing() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = "78787878787878787878787878787878";
-    seed_build_batch(&db, batch_id, Some("4242")).await;
-    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 1, "failure"))
-        .await
-        .expect("first delivery");
-    db.query("UPDATE build_batches SET done_at = '2000-01-01 00:00:00' WHERE batch_id = ?")
-        .bind(batch_id.to_owned())
-        .execute()
-        .await
-        .expect("mark the recorded row");
-
-    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 2, "success"))
-        .await
-        .expect("a duplicate is Ok");
-
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert_eq!(row.done_at.as_deref(), Some("2000-01-01 00:00:00"));
-    assert_eq!(row.done_attempt, Some(1));
-    assert_eq!(row.conclusion.as_deref(), Some("failure"));
-    assert_no_orphan_batches(&db).await;
-}
-
-/// Binding a dispatch response's run against an early completion from
-/// another run is an `Invariant` and writes nothing; the matching run
-/// still binds.
-#[tokio::test]
-async fn binding_a_run_over_another_runs_early_completion_is_an_invariant() {
-    let db = memory_db().await.expect("memory db");
-    let batch_id = "90909090909090909090909090909090";
-    seed_build_batch(&db, batch_id, None).await;
-    super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "success"))
-        .await
-        .expect("the early completion is held");
-
-    let error = super::bind_batch_run(&db, batch_id, "4242")
-        .await
-        .expect_err("a different run cannot bind");
-
-    let QueueError::Invariant(message) = &error else {
-        panic!("expected an invariant, got {error}");
-    };
-    for named in [batch_id, "4242", "9001"] {
-        assert!(message.contains(named), "{message}");
-    }
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert!(row.github_run_id.is_none(), "the bind wrote nothing");
-    assert_no_orphan_batches(&db).await;
-
-    assert!(
-        super::bind_batch_run(&db, batch_id, "9001")
-            .await
-            .expect("the completing run binds"),
-    );
-    assert_no_orphan_batches(&db).await;
-}
-
-/// The dispatch outcome that binds over a foreign early completion
-/// fails the dispatch: the legs back off and the row is released,
-/// rather than a row neither pass consumes.
-#[tokio::test]
-async fn a_dispatch_bound_over_a_foreign_completion_releases_the_batch() {
-    let db = memory_db().await.expect("memory db");
-    let batch = claim_one_batch(&db).await;
-    let batch_id = batch.batch_id.as_str();
-    super::record_batch_completion(&db, batch_id, &batch_run_complete(9001, 1, "success"))
-        .await
-        .expect("the early completion is held");
-
-    super::persist_batch_dispatch(&db, &batched_settings(), &batch, Ok(4242))
-        .await
-        .expect("persist the dispatch");
-
-    assert!(build_batch(&db, batch_id).await.is_none());
-    assert_eq!(active_slots(&db).await, 0);
-    assert_no_orphan_batches(&db).await;
-}
-
-/// A stored run id that is not numeric is corrupt state: the resolution
-/// read refuses it by name instead of deferring the batch forever.
-#[tokio::test]
-async fn a_ready_batch_with_a_non_numeric_run_id_is_an_invariant() {
-    let db = memory_db().await.expect("memory db");
-    seed_ready_batch(&db, STUCK_BATCH, "run-1", "success", PAST_TS).await;
-
-    let error = super::ready_batches(&db, ROW_TS_MS)
-        .await
-        .expect_err("a non-numeric run id is corrupt");
-
-    let QueueError::Invariant(message) = &error else {
-        panic!("expected an invariant, got {error}");
-    };
-    assert!(
-        message.contains(STUCK_BATCH) && message.contains("run-1"),
-        "{message}"
-    );
-}
-
-/// §4.1's whole table: every `LegOutcome` shape maps to its queue
-/// resolution — runner-time success, the records-absent failure
-/// (the webhook's own wording), the three `RunFailure` texts,
-/// `Concluded`, `Invariant`, `startup_failure` — and `Unsettled`
-/// maps to no resolution at all.
-#[test]
-fn the_leg_resolution_maps_every_outcome_row() {
-    use stow_types::runs::{LegFailure, LegOutcome, RunFailure};
-    use time::OffsetDateTime;
-
-    let succeeded = LegOutcome::Succeeded {
-        started_at: OffsetDateTime::from_unix_timestamp(999_900).expect("ts"),
-        completed_at: OffsetDateTime::from_unix_timestamp(1_000_000).expect("ts"),
-        publish_attempt: 1,
-    };
-    assert_eq!(
-        super::leg_resolution(&succeeded, true, "task-abc", "run-url"),
-        Some(super::LegResolution::Succeeded {
-            duration_ms: 100_000
-        }),
-        "a confirmed success samples its runner time"
-    );
-    assert_eq!(
-        super::leg_resolution(&succeeded, false, "task-abc", "run-url"),
-        Some(super::LegResolution::Failed {
-            error:
-                "GitHub reports success but the records artifact for task task-abc is not in GHCR"
-                    .to_owned()
-        }),
-        "records absent is the webhook's own wording"
-    );
-
-    let url = "https://github.com/water-rs/stow/actions/runs/1/job/7";
-    let cases: [(LegOutcome, &str); 6] = [
-        (
-            LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict {
-                job: "leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h".to_owned(),
-                step: "Run the untrusted build stage".to_owned(),
-                html_url: url.to_owned(),
-            })),
-            "verdict: leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h / Run the untrusted build stage (https://github.com/water-rs/stow/actions/runs/1/job/7)",
-        ),
-        (
-            LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure {
-                job: "leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h".to_owned(),
-                step: Some("Set up the runner".to_owned()),
-                html_url: url.to_owned(),
-            })),
-            "infrastructure: leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h / Set up the runner (https://github.com/water-rs/stow/actions/runs/1/job/7)",
-        ),
-        (
-            LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure {
-                job: "leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h".to_owned(),
-                step: None,
-                html_url: url.to_owned(),
-            })),
-            "infrastructure: leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) h / - (https://github.com/water-rs/stow/actions/runs/1/job/7)",
-        ),
-        (
-            LegOutcome::Failed(LegFailure::Run(RunFailure::Infrastructure {
-                job: "-".to_owned(),
-                step: None,
-                html_url: String::new(),
-            })),
-            "infrastructure: startup_failure (https://github.com/water-rs/stow/actions/runs/9)",
-        ),
-        (
-            LegOutcome::Failed(LegFailure::Concluded {
-                job: "leg 1 / publish #1 h".to_owned(),
-                conclusion: "cancelled".to_owned(),
-                html_url: url.to_owned(),
-            }),
-            "cancelled: leg 1 / publish #1 h (https://github.com/water-rs/stow/actions/runs/1/job/7)",
-        ),
-        (
-            LegOutcome::Failed(LegFailure::Invariant(
-                "leg 0 has no jobs on the page".to_owned(),
-            )),
-            "invariant: leg 0 has no jobs on the page",
-        ),
-    ];
-    for (outcome, expected) in cases {
-        assert_eq!(
-            super::leg_resolution(
-                &outcome,
-                true,
-                "task",
-                "https://github.com/water-rs/stow/actions/runs/9"
-            ),
-            Some(super::LegResolution::Failed {
-                error: expected.to_owned()
-            }),
-            "{outcome:?}"
-        );
-    }
-    assert_eq!(
-        super::leg_resolution(&LegOutcome::Unsettled, false, "task", "run-url"),
-        None,
-        "unsettled is no resolution yet"
-    );
-}
-
-/// A `pending` count at or above `max_queue_pending` turns miss-lane
-/// submits away; human-lane and trusted submits still get in.
 #[tokio::test]
 async fn full_queue_refuses_miss_lane_but_not_human_or_trusted() {
     let db = memory_db().await.expect("memory db");
@@ -8558,7 +7722,7 @@ async fn request_outcome_refuses_a_stale_attempt() {
 // ---- stow#524: expected build cost ----
 
 /// Claim a row and complete it successfully with a runner time of
-/// `minutes` — one honest sample of the path a batch leg takes.
+/// `minutes` — one honest sample of the path a task's run takes.
 async fn complete_success_at_minutes(db: &DurableDb, task_id: &str, minutes: u32) {
     claim_flat(db, &claim_settings(), &NoCoverage)
         .await
@@ -8729,7 +7893,7 @@ async fn reentry_fixture() -> (DurableDb, String) {
 /// Every nonpending→pending re-entry reprices through the shared
 /// refresh: a row whose key was written before a cost move must
 /// leave the transition carrying the new cost's rank — on the
-/// operator `Retry` and on `back_off_dispatch_legs` here, on the
+/// operator `Retry` and on `mark_dispatch_failed` here, on the
 /// stale-lease recovery and the incomplete-shape requeue in the
 /// sibling test — while rows that did not transition keep their
 /// keys byte-for-byte.
@@ -8753,7 +7917,7 @@ async fn retry_and_dispatch_failure_reprice_against_moved_cost() {
     assert_eq!(status_of(&db, "retried").await, "pending");
     assert_eq!(prefix_of(&db, "retried").await, priced());
 
-    // back_off_dispatch_legs: dispatched (run unbound) → pending.
+    // mark_dispatch_failed: dispatched (run unbound) → pending.
     db.query(
         "UPDATE queue SET status = 'dispatched', generation_id = 'gen-fd' \
              WHERE crate_name = 'failed-dispatch'",
@@ -8761,13 +7925,11 @@ async fn retry_and_dispatch_failure_reprice_against_moved_cost() {
     .execute()
     .await
     .expect("mark dispatched");
-    super::back_off_dispatch_legs(
+    super::mark_dispatch_failed(
         &db,
         &settings(),
-        &[super::QueuedTask {
-            task_id: task_id_on("failed-dispatch", TARGET),
-            generation_id: "gen-fd".to_owned(),
-        }],
+        &task_id_on("failed-dispatch", TARGET),
+        "gen-fd",
         "workflow_dispatch failed",
     )
     .await
@@ -8783,13 +7945,25 @@ async fn stale_recovery_and_shape_requeue_reprice_against_moved_cost() {
     let (db, stale_prefix) = reentry_fixture().await;
     let priced = repriced_prefix;
 
-    // Unbound-batch lease expiry: running, past the lease → pending.
+    // Stale recovery by clock: running, past stale_dispatch_minutes →
+    // pending.
     mark_active(&db, "stale", TARGET, "running").await;
-    let task_id = task_id_on("stale", TARGET);
-    super::requeue_unbound_batch(&db, &settings(), &task_id[..32])
+    db.query(
+        "UPDATE queue SET claimed_at = datetime('now', ?), updated_at = datetime('now', ?) \
+         WHERE crate_name = 'stale'",
+    )
+    .bind(format!("-{} minutes", STALE_DISPATCH_MINUTES + 1))
+    .bind(format!("-{} minutes", STALE_DISPATCH_MINUTES + 1))
+    .execute()
+    .await
+    .expect("age the stale row");
+    claim_flat(&db, &settings(), &NoCoverage)
         .await
-        .expect("recover stale");
-    assert_eq!(status_of(&db, "stale").await, "pending");
+        .expect("stale sweep");
+    // The sweep's requeue repriced the row through `pending` before the
+    // same pass re-claimed it — `first_requested_at = ROW_TS` is already
+    // past the age gate.
+    assert_eq!(status_of(&db, "stale").await, "dispatched");
     assert_eq!(prefix_of(&db, "stale").await, priced());
 
     // Incomplete-shape requeue: completed dep → pending once.
@@ -9439,7 +8613,8 @@ async fn dispatch_walk_rebuilds_shared_grandchildren_into_each_context() {
         }
         // The payload path: subgraph + the task's own identity re-derive
         // the claimed task id.
-        let graph = task.payload.verified_dependency_graph().expect("verify");
+        let payload = super::task_payload(task).expect("payload");
+        let graph = payload.verified_dependency_graph().expect("verify");
         assert_eq!(
             graph.task_id(0),
             Some(task.task_id.as_str()),
@@ -9787,600 +8962,5 @@ async fn per_event_costs_track_the_event_not_stored_history() {
     assert!(
         !stow_types::do_budgets::grew(report_min as f64, report_max as f64),
         "report reads grew with stored rows: {report_reads:?}"
-    );
-}
-// ===== Batched claim pass (stow#833 §1.2) =====
-
-/// Settings with real `k`/`B` — a miss batch holds `k = 3` slots and
-/// closes at `B = 4` legs.
-const fn batched_settings() -> SchedulerSettings {
-    SchedulerSettings {
-        dispatch_min_age_minutes: 0,
-        batch_parallelism: 3,
-        batch_max_tasks: 4,
-        ..settings()
-    }
-}
-
-/// §1.2: capacity is slots, not rows — the batches a pass forms hold
-/// Σ `parallelism` ≤ `STOW_MAX_CONCURRENT_JOBS`, and a row past the
-/// pool stays pending.
-#[tokio::test]
-async fn batches_claim_by_slots_not_rows() {
-    let db = memory_db().await.expect("memory db");
-    // 17 same-key miss rows, 10 slots, k=3, B=4: four full batches —
-    // 3+3+3+1 slots — and the 17th row is denied a fresh batch.
-    let requests: Vec<EnqueueRequest> = (0..17).map(|i| request(&format!("t{i}"), &[])).collect();
-    enqueue(&db, &requests).await.expect("enqueue");
-
-    let settings = SchedulerSettings {
-        dispatch: Dispatch::from_max_concurrent_jobs(10),
-        ..batched_settings()
-    };
-    let batches = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
-        .await
-        .expect("claim");
-    assert_eq!(batches.len(), 4);
-    assert_eq!(
-        batches
-            .iter()
-            .map(|batch| batch.tasks.len())
-            .collect::<Vec<_>>(),
-        vec![4, 4, 4, 4]
-    );
-    let slots: u32 = batches.iter().map(|batch| batch.parallelism).sum();
-    assert_eq!(
-        slots, 10,
-        "Σ parallelism is the slot total, not the leg count"
-    );
-    assert_eq!(
-        super::status(&db).await.expect("status").pending,
-        1,
-        "the row past the pool stays pending"
-    );
-
-    // And the next pass claims nothing — the slots are all held.
-    let again = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
-        .await
-        .expect("claim again");
-    assert!(again.is_empty(), "in-flight parallelism counts as slots");
-}
-
-/// §1.2/§1.3: the macOS family's own cap bounds its batches inside
-/// the shared pool — a macOS batch never reserves past the cap's
-/// remainder.
-#[tokio::test]
-async fn the_macos_cap_bounds_macos_batches() {
-    let db = memory_db().await.expect("memory db");
-    let requests: Vec<EnqueueRequest> = (0..5)
-        .map(|i| request_on(&format!("m{i}"), MACOS_TARGET, &[]))
-        .collect();
-    enqueue(&db, &requests).await.expect("enqueue");
-
-    // macOS cap 3 against k=3, B=4: one batch of four legs on three
-    // slots, and the fifth row is denied — its family is spent.
-    let settings = SchedulerSettings {
-        max_concurrent_macos_jobs: 3,
-        ..batched_settings()
-    };
-    let batches = super::claim_dispatchable_tasks(&db, &settings, &NoCoverage)
-        .await
-        .expect("claim");
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].tasks.len(), 4);
-    assert_eq!(
-        batches[0].parallelism, 3,
-        "the cap bounds the batch's slots"
-    );
-    assert_eq!(super::status(&db).await.expect("status").pending, 1);
-}
-
-/// §1.1/§1.5: human and miss rows of one `(rustc, family)` never
-/// share a batch — the lane is part of the key.
-#[tokio::test]
-async fn human_and_miss_rows_form_separate_batches() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[
-            request("miss-a", &[]),
-            request("miss-b", &[]),
-            human_request("human-c"),
-        ],
-    )
-    .await
-    .expect("enqueue");
-
-    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
-        .await
-        .expect("claim");
-    assert_eq!(batches.len(), 2);
-    // The human row outranks the misses and opens its batch first;
-    // every human leg runs at once (parallelism = legs).
-    assert_eq!(batches[0].lane, stow_types::api::TaskLane::Human);
-    assert_eq!(batches[0].tasks.len(), 1);
-    assert_eq!(batches[0].parallelism, 1);
-    assert_eq!(batches[1].lane, stow_types::api::TaskLane::Miss);
-    assert_eq!(batches[1].tasks.len(), 2);
-    assert_eq!(batches[1].parallelism, 2);
-}
-
-/// §1.2: the head row always goes out — a lone claimable row opens
-/// its key's batch.
-#[tokio::test]
-async fn the_head_row_always_goes_out_batched() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("head", &[])])
-        .await
-        .expect("enqueue");
-
-    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
-        .await
-        .expect("claim");
-    assert_eq!(batches.len(), 1);
-    assert_eq!(claimed_legs(&batches)[0].1.crate_name, "head");
-    assert_eq!(batches[0].parallelism, 1);
-}
-
-/// §1.2: legs order longest-first by `crate_build_stats.median_ms` —
-/// GitHub starts matrix legs in order as slots free, so the longest
-/// legs start first. An unmeasured pair sorts last, as it does for
-/// the rank.
-#[tokio::test]
-async fn legs_order_longest_first_in_a_batch() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(
-        &db,
-        &[
-            request("fast", &[]),
-            request("slow", &[]),
-            request("mid", &[]),
-            request("unmeasured", &[]),
-        ],
-    )
-    .await
-    .expect("enqueue");
-    for (name, median) in [("fast", "100"), ("mid", "400"), ("slow", "900")] {
-        db.query(
-            "INSERT INTO crate_build_stats (crate_name, target, builds, median_ms) \
-             VALUES (?, ?, 1, ?)",
-        )
-        .bind(name)
-        .bind(TARGET)
-        .bind(median)
-        .execute()
-        .await
-        .expect("seed build stats");
-    }
-
-    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
-        .await
-        .expect("claim");
-    assert_eq!(batches.len(), 1);
-    let legs = claimed_legs(&batches);
-    let order: Vec<&str> = legs
-        .iter()
-        .map(|(_, payload)| payload.crate_name.as_str())
-        .collect();
-    assert_eq!(order, ["slow", "mid", "fast", "unmeasured"]);
-}
-
-/// §1.2: a row whose dependency is not in its published slice is
-/// never batched — `deps_met` gates the page itself, even when the
-/// dependency is claimed in the same pass's frontier.
-#[tokio::test]
-async fn a_dependent_is_never_batched_with_its_dependency() {
-    let db = memory_db().await.expect("memory db");
-    enqueue(&db, &[request("dep", &[])])
-        .await
-        .expect("enqueue dep");
-    enqueue(&db, &[request("parent", &[dependency("dep")])])
-        .await
-        .expect("enqueue dependent");
-
-    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
-        .await
-        .expect("claim");
-    assert_eq!(batches.len(), 1);
-    assert_eq!(batches[0].tasks.len(), 1);
-    assert_eq!(claimed_legs(&batches)[0].1.crate_name, "dep");
-    assert_parent_status(
-        &db,
-        stow_types::api::QueueTaskStatus::Pending,
-        &[dependency("dep")],
-    )
-    .await;
-}
-
-/// A formed batch persists its `build_batches` row — slots, lane,
-/// family, rustc — and binds its legs' `batch_id`/`batch_leg` in
-/// matrix order.
-#[tokio::test]
-async fn a_formed_batch_writes_its_row_and_leg_bindings() {
-    #[derive(skyzen::FromRow)]
-    struct BatchRow {
-        rustc_version: String,
-        dispatch_family: String,
-        lane: String,
-        parallelism: i64,
-        legs: i64,
-        github_run_id: Option<String>,
-        claimed_at: String,
-        lease_at: String,
-    }
-    #[derive(skyzen::FromRow)]
-    struct LegRow {
-        task_id: String,
-        batch_leg: i64,
-    }
-
-    let db = memory_db().await.expect("memory db");
-    let requests: Vec<EnqueueRequest> = (0..3).map(|i| request(&format!("l{i}"), &[])).collect();
-    enqueue(&db, &requests).await.expect("enqueue");
-
-    let batches = super::claim_dispatchable_tasks(&db, &batched_settings(), &NoCoverage)
-        .await
-        .expect("claim");
-    assert_eq!(batches.len(), 1);
-    let batch = &batches[0];
-    let batch_id = batch.batch_id.as_str();
-
-    let row = db
-        .query(
-            "SELECT rustc_version, dispatch_family, lane, parallelism, legs, \
-                    github_run_id, claimed_at, lease_at \
-             FROM build_batches WHERE batch_id = ?",
-        )
-        .bind(batch_id)
-        .fetch_optional::<BatchRow>()
-        .await
-        .expect("read batch row")
-        .expect("the batch row exists");
-    assert_eq!(row.rustc_version, RUSTC);
-    assert_eq!(row.dispatch_family, "linux");
-    assert_eq!(row.lane, "miss");
-    assert_eq!(row.parallelism, 3);
-    assert_eq!(row.legs, 3);
-    assert!(
-        row.github_run_id.is_none(),
-        "the dispatch response binds it later"
-    );
-    // The lease is claimed_at + stale_dispatch_minutes.
-    let lease = db
-        .query("SELECT lease_at = datetime(claimed_at, '+60 minutes') FROM build_batches WHERE batch_id = ?")
-        .bind(batch_id)
-        .fetch_scalar::<i64>()
-        .await
-        .expect("lease check");
-    assert_eq!(lease, 1);
-
-    // Every leg carries its batch binding in matrix order.
-    let legs = db
-        .query("SELECT task_id, batch_leg FROM queue WHERE batch_id = ? ORDER BY batch_leg")
-        .bind(batch_id)
-        .fetch_all::<LegRow>()
-        .await
-        .expect("read leg bindings");
-    assert_eq!(legs.len(), 3);
-    for (index, leg) in legs.iter().enumerate() {
-        assert_eq!(leg.batch_leg, i64::try_from(index).expect("leg index"));
-        assert_eq!(leg.task_id, batch.tasks[index].task_id);
-    }
-}
-
-/// Claim three same-key rows into one batch - the batch a dispatch
-/// outcome then persists against.
-async fn claim_one_batch(db: &DurableDb) -> super::FormedBatch {
-    let requests: Vec<EnqueueRequest> = (0..3).map(|i| request(&format!("d{i}"), &[])).collect();
-    enqueue(db, &requests).await.expect("enqueue");
-    let mut batches = super::claim_dispatchable_tasks(db, &batched_settings(), &NoCoverage)
-        .await
-        .expect("claim");
-    assert_eq!(batches.len(), 1, "one key, one batch");
-    let batch = batches.remove(0);
-    assert_eq!(batch.tasks.len(), 3);
-    batch
-}
-
-/// A failed dispatch - POST, network, unreadable response or token
-/// mint - backs off every leg of the batch and deletes the batch row,
-/// which releases its slots (stow#833 section 4.2).
-#[tokio::test]
-async fn a_failed_batch_dispatch_backs_off_every_leg_and_deletes_the_row() {
-    #[derive(skyzen::FromRow)]
-    struct LegState {
-        status: String,
-        error_msg: Option<String>,
-        dispatch_attempts: i64,
-        backed_off: i64,
-    }
-
-    let db = memory_db().await.expect("memory db");
-    let batch = claim_one_batch(&db).await;
-    assert!(build_batch(&db, batch.batch_id.as_str()).await.is_some());
-
-    super::persist_batch_dispatch(
-        &db,
-        &batched_settings(),
-        &batch,
-        Err("GitHub API error: 502".to_owned()),
-    )
-    .await
-    .expect("persist the failed dispatch");
-
-    for (task, payload) in claimed_legs(std::slice::from_ref(&batch)) {
-        let leg = db
-            .query(
-                "SELECT status, error_msg, dispatch_attempts, \
-                        not_before > datetime('now') AS backed_off \
-                 FROM queue WHERE task_id = ?",
-            )
-            .bind(task.task_id.clone())
-            .fetch_one::<LegState>()
-            .await
-            .expect("read leg");
-        assert_eq!(leg.status, "pending", "{} requeues", payload.crate_name);
-        assert_eq!(leg.error_msg.as_deref(), Some("GitHub API error: 502"));
-        assert_eq!(leg.dispatch_attempts, 1);
-        assert_eq!(
-            leg.backed_off, 1,
-            "{} waits out a backoff",
-            payload.crate_name
-        );
-    }
-    assert!(
-        build_batch(&db, batch.batch_id.as_str()).await.is_none(),
-        "the failed batch's row is deleted"
-    );
-}
-
-/// A successful dispatch binds the run once, on the batch row - no leg
-/// row takes a run id, and a second bind cannot overwrite the first
-/// (stow#833 section 4.2).
-#[tokio::test]
-async fn a_successful_batch_dispatch_binds_the_batch_once() {
-    let db = memory_db().await.expect("memory db");
-    let batch = claim_one_batch(&db).await;
-    let batch_id = batch.batch_id.as_str();
-
-    super::persist_batch_dispatch(&db, &batched_settings(), &batch, Ok(4242))
-        .await
-        .expect("persist the dispatch");
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert_eq!(row.github_run_id.as_deref(), Some("4242"));
-    let bound_legs = db
-        .query("SELECT count(*) FROM queue WHERE github_run_id IS NOT NULL")
-        .fetch_scalar::<i64>()
-        .await
-        .expect("count bound legs");
-    assert_eq!(bound_legs, 0, "one bind per batch, not per task");
-    let dispatched = db
-        .query("SELECT count(*) FROM queue WHERE batch_id = ? AND status = 'dispatched'")
-        .bind(batch_id.to_owned())
-        .fetch_scalar::<i64>()
-        .await
-        .expect("count dispatched legs");
-    assert_eq!(dispatched, 3, "the legs stay in flight");
-
-    assert!(
-        !super::bind_batch_run(&db, batch_id, "9999")
-            .await
-            .expect("rebind"),
-        "a bound batch takes no second binding"
-    );
-    let row = build_batch(&db, batch_id).await.expect("batch row");
-    assert_eq!(row.github_run_id.as_deref(), Some("4242"));
-}
-
-/// A `completed` delivery recorded before the dispatch response bound
-/// the run is not resolvable while the binding is open, and is due the
-/// moment the bind lands (stow#833 section 4.2).
-#[tokio::test]
-async fn an_early_completion_resolves_once_the_dispatch_binds_the_batch() {
-    // Past every `resolve_after` the test writes.
-    const LATER_MS: i64 = 4_102_444_800_000;
-
-    let db = memory_db().await.expect("memory db");
-    let batch = claim_one_batch(&db).await;
-    let batch_id = batch.batch_id.as_str();
-
-    super::record_batch_completion(&db, batch_id, &batch_run_complete(4242, 1, "success"))
-        .await
-        .expect("the early completion is held");
-    assert!(
-        super::ready_batches(&db, LATER_MS)
-            .await
-            .expect("ready batches")
-            .is_empty(),
-        "an unbound batch does not resolve"
-    );
-
-    super::persist_batch_dispatch(&db, &batched_settings(), &batch, Ok(4242))
-        .await
-        .expect("persist the dispatch");
-    let ready = super::ready_batches(&db, LATER_MS)
-        .await
-        .expect("ready batches");
-    assert_eq!(ready.len(), 1, "the bind makes the held completion due");
-    assert_eq!(ready[0].batch_id, batch_id);
-    assert_eq!(ready[0].run_id, 4242);
-    assert_eq!(ready[0].legs.len(), 3);
-}
-
-/// One queue row's claim-visible columns, for before/after
-/// comparison.
-#[derive(Debug, PartialEq, Eq, skyzen::FromRow)]
-struct StampedRow {
-    task_id: String,
-    status: String,
-    generation_id: String,
-    claimed_at: Option<String>,
-    dispatch_attempts: i64,
-    updated_at: String,
-    batch_id: Option<String>,
-    batch_leg: Option<i64>,
-}
-
-async fn stamped_rows(db: &DurableDb) -> Vec<StampedRow> {
-    db.query(
-        "SELECT task_id, status, generation_id, claimed_at, dispatch_attempts, updated_at, \
-                batch_id, batch_leg \
-         FROM queue ORDER BY task_id",
-    )
-    .fetch_all::<StampedRow>()
-    .await
-    .expect("read rows")
-}
-
-/// A row a pass does not batch is never written: no claim and no
-/// restore touches it, so its `generation_id`, `claimed_at`,
-/// `dispatch_attempts` and `updated_at` all keep their values.
-#[tokio::test]
-async fn an_unbatched_row_is_never_written() {
-    let db = memory_db().await.expect("memory db");
-    let requests: Vec<EnqueueRequest> = (0..3).map(|i| request(&format!("u{i}"), &[])).collect();
-    enqueue(&db, &requests).await.expect("enqueue");
-    // A past `updated_at` makes any write to a row visible: a touched
-    // row would carry `datetime('now')`.
-    db.query("UPDATE queue SET updated_at = ?")
-        .bind(PAST_TS.to_owned())
-        .execute()
-        .await
-        .expect("age rows");
-    let before = stamped_rows(&db).await;
-
-    // One slot: one row claims, the other two stay out of every batch.
-    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
-        .await
-        .expect("claim");
-    assert_eq!(claimed.len(), 1);
-
-    let after = stamped_rows(&db).await;
-    let mut untouched = 0;
-    for (was, now) in before.iter().zip(&after) {
-        if was.task_id == claimed[0].task_id {
-            assert_eq!(now.status, "dispatched");
-            continue;
-        }
-        assert_eq!(was, now, "an unbatched row is not written");
-        untouched += 1;
-    }
-    assert_eq!(untouched, 2);
-}
-
-/// An artifact catalog that, on its first question, flips the head
-/// row out of `pending` the way a concurrent pass's claim does — the
-/// coverage lookup is the D1 await between a pass's page read and its
-/// claim, so this is the race window itself, with no test seam in the
-/// claim code.
-struct RacingCoverage<'a> {
-    db: &'a DurableDb,
-    raced: std::sync::Mutex<Option<String>>,
-}
-
-impl CoverageOracle for RacingCoverage<'_> {
-    fn covered(
-        &self,
-        identities: &[SemanticTaskIdentity],
-    ) -> impl Future<Output = Result<BTreeSet<SemanticTaskIdentity>, QueueError>> + Send {
-        let head = identities
-            .first()
-            .map(|identity| identity.crate_name.clone());
-        async move {
-            let first = {
-                let mut raced = self.raced.lock().expect("raced head");
-                let first = raced.is_none().then_some(head).flatten();
-                raced.clone_from(&first);
-                first
-            };
-            if let Some(head) = first {
-                self.db
-                    .query(
-                        "UPDATE queue \
-                         SET status = 'dispatched', generation_id = 'racer', \
-                             dispatch_attempts = dispatch_attempts + 1 \
-                         WHERE crate_name = ?",
-                    )
-                    .bind(head)
-                    .execute()
-                    .await
-                    .map_err(|error| QueueError::Sql(error.to_string()))?;
-            }
-            Ok(BTreeSet::new())
-        }
-    }
-}
-
-/// A batch that loses a leg to a concurrent pass is dropped whole: its
-/// won legs return to `pending` with their pre-claim stamps and no
-/// batch binding, it gets no `build_batches` row, and the pass's other
-/// batches are unaffected.
-#[tokio::test]
-async fn a_batch_that_lost_a_leg_is_dropped_and_its_won_legs_restored() {
-    let db = memory_db().await.expect("memory db");
-    let requests: Vec<EnqueueRequest> = (0..3).map(|i| request(&format!("r{i}"), &[])).collect();
-    enqueue(&db, &requests).await.expect("enqueue");
-    let before = stamped_rows(&db).await;
-    // Two legs per batch: the head and the second row share a batch,
-    // the third opens its own.
-    let settings = SchedulerSettings {
-        batch_max_tasks: 2,
-        ..batched_settings()
-    };
-    let coverage = RacingCoverage {
-        db: &db,
-        raced: std::sync::Mutex::new(None),
-    };
-
-    let batches = super::claim_dispatchable_tasks(&db, &settings, &coverage)
-        .await
-        .expect("claim");
-    let raced = coverage
-        .raced
-        .lock()
-        .expect("raced head")
-        .clone()
-        .expect("the race ran");
-
-    assert_eq!(batches.len(), 1, "the head's batch is dropped");
-    assert_eq!(batches[0].tasks.len(), 1);
-    let (survivor, survivor_payload) = claimed_legs(&batches).remove(0);
-    assert_ne!(survivor_payload.crate_name.as_str(), raced);
-
-    let after = stamped_rows(&db).await;
-    for (was, now) in before.iter().zip(&after) {
-        let name = requests
-            .iter()
-            .find(|request| request.task_id().expect("task id").as_str() == was.task_id)
-            .map(|request| request.crate_name.to_string())
-            .expect("row from a request");
-        if name == raced {
-            assert_eq!(
-                (now.status.as_str(), now.generation_id.as_str()),
-                ("dispatched", "racer")
-            );
-        } else if survivor_payload.crate_name.as_str() == name {
-            assert_eq!(now.status, "dispatched");
-            assert_eq!(now.generation_id, survivor.generation_id);
-            assert_eq!(now.batch_id.as_deref(), Some(batches[0].batch_id.as_str()));
-            assert_eq!(now.batch_leg, Some(0));
-        } else {
-            // The dropped batch's won leg: claim undone, nothing bound.
-            assert_eq!(now.status, "pending");
-            assert_eq!(now.generation_id, was.generation_id);
-            assert_eq!(now.claimed_at, was.claimed_at);
-            assert_eq!(now.dispatch_attempts, was.dispatch_attempts);
-            assert_eq!((now.batch_id.as_deref(), now.batch_leg), (None, None));
-        }
-    }
-    let batch_rows = db
-        .query("SELECT batch_id FROM build_batches")
-        .fetch_scalars::<String>()
-        .await
-        .expect("read batch rows");
-    assert_eq!(
-        batch_rows,
-        [batches[0].batch_id.as_str().to_owned()],
-        "only the surviving batch is written"
     );
 }

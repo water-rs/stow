@@ -1068,7 +1068,7 @@ if [ "$(uname -s)" = "Linux" ]; then
         "$REPO_ROOT/ci/glibc-sysroot/install.sh" "$SYSROOT" \
             || die "glibc sysroot install failed"
     fi
-    # stow#850: the library root the aarch64 leg provisions — the
+    # stow#850: the library root the aarch64 build provisions — the
     # lock's amd64 and arm64 debs extracted under one tree, verified
     # against the lock's sha256; the debs cache keyed by lock hash
     # like the sysroot's manifest does.
@@ -1078,7 +1078,7 @@ if [ "$(uname -s)" = "Linux" ]; then
             "$REPO_ROOT/ci/system-libs/lock.txt" | cut -d' ' -f1)" \
         "$SYS_LIBS" || die "system-libs install failed"
     # The aarch64 shim needs the cross drivers the image lacks — the
-    # same apt set the leg installs until stow#862's B1 locks the
+    # same apt set the aarch64 build installs until stow#862's B1 locks the
     # toolchain too.
     if [ ! -x /usr/bin/aarch64-linux-gnu-gcc-12 ]; then
         sudo apt-get update -qq

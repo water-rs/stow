@@ -250,14 +250,14 @@ Dispatch is additionally capped per GitHub Actions runner family —
 `stow_types::api::runner_family` maps each `CI_TARGET_TRIPLES` member
 onto the pool its `runs-on` entry in `build-crate.yml` resolves to
 (Linux, macOS, or Windows). `STOW_MAX_CONCURRENT_JOBS` bounds total
-in-flight runner slots — the sum of each claimed `build-batch.yml`
-batch's `parallelism`, the matrix's `max-parallel` — against the org's
+in-flight runner slots — one per claimed `build-crate.yml`
+run — against the org's
 60-runner fleet (`0` pauses dispatch
 entirely — see `DEPLOYMENT.md`), and
 `STOW_MAX_CONCURRENT_MACOS_JOBS` bounds macOS-family slots so a
 full wave cannot occupy the whole 20-runner macOS pool. Within a lane,
 Windows-family rows claim first regardless of request age because the
-Windows legs are the slowest in a wave; rows whose family is saturated
+Windows tasks are the slowest in a wave; rows whose family is saturated
 stay pending, and the alarm then wakes at the earliest in-flight lease
 expiry rather than re-firing immediately.
 
@@ -266,7 +266,7 @@ non-yanked release when the body omits it) and the current stable rustc,
 then hands the request to the scheduler's `POST /requests` — the
 request record (`requests` table) is born `accepted` and dispatched
 there to `resolve-request.yml` on `main` through the same GitHub App
-`workflow_dispatch` arm `dispatch_batch` uses for `build-batch.yml`.
+`workflow_dispatch` arm `dispatch_task` uses for `build-crate.yml`.
 `resolve-request.yml` runs `stow-admin request resolve`: `stow-resolver`
 expands the crate's dependency closure over crates.io metadata — normal
 and build edges, optional-dependency feature activation, `cfg(...)`
@@ -435,11 +435,11 @@ foreign version — and a `row_count` checked against the decoded body.
 `.github/workflows/index-publish.yml` is dispatch-only: scheduled and
 `workflow_run` workflows run on the default branch (`dev`), whose
 identity the CLI rejects, so `index-publish-cron.yml` dispatches it on
-`main` after every completed `build-batch` run (a ten-minute schedule is
+`main` after every completed `build-crate` run (a ten-minute schedule is
 the backstop; GitHub delivers those ticks hours apart), and its first
 step refuses any other ref. A run does one `stow-admin index export
 --out-dir --rustc-version` pass scoped to one rustc — the completed
-run's `<rustc>-b<batch_id>` title names it, and the pass pulls and
+run's `<rustc>-<task_id>` title names it, and the pass pulls and
 verifies the published `index`/`folded` pair per `(target, rustc)`
 slice of that rustc and then only the `records-<rustc>-*` artifacts no
 folded set covers, all from GHCR with no edge round-trip — and emits an
@@ -527,10 +527,10 @@ charges whoever arrives next for a backlog everyone built — which is why
 The build job never calls the edge: records live only in GHCR, and the
 scheduler learns the outcome from GitHub's `workflow_run` webhook — the
 edge verifies `X-Hub-Signature-256`, parses `display_title`
-(`<rustc>-b<batch_id>`) into its rustc and batch id, and forwards the
-run's identity to the scheduler's `POST /batches/{batch_id}/complete`.
-The alarm pass then resolves the batch: it reads the run's
-attempt-jobs page, classifies each leg, and completes a leg's task
+(`<rustc>-<task_id>`) into its rustc and task id, and forwards the
+run's identity to the scheduler's `POST /tasks/complete-run`.
+The alarm pass then resolves the task: it reads the run's
+attempt-jobs page, classifies the task, and completes it
 only after the records artifact its publish job pushed verifies in
 GHCR. `stow-admin index export` rebuilds each index slice
 from those signed records, and the `artifacts` D1 table is a mirror
@@ -542,7 +542,7 @@ What each hop is allowed to do:
 |---|---|---|
 | stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{rustc_version}/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
 | edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/sync`, gated by repo push users and bound to records already published in GHCR); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
-| scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-batch.yml` on `main` |
+| scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
 | `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
@@ -561,9 +561,8 @@ token that Fulcio would sign for. Everything it hands over is
 attacker-influenced, so the publisher (`ci/src/stage.rs`, `ci/src/closure.rs`,
 `ci/src/validate.rs`) establishes what it believes on its own:
 
-- the task comes from the batch the `workflow_dispatch` event file
-  carries (`GITHUB_EVENT_PATH`'s `inputs.batch`), leg `--leg` of it, not
-  from the build job;
+- the task comes from the `workflow_dispatch` event file
+  (`GITHUB_EVENT_PATH`'s `inputs.task`), not from the build job;
   the build output's copy must equal it;
 - every blob is content-addressed and re-hashed against the digest the plan
   records for it;
@@ -644,7 +643,7 @@ certificate therefore cannot sign anything after that certificate expires.
 > **Records binding.** CI never calls the edge to record builds — each
 > build's records land in GHCR as a cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
 > artifact under the pinned `build-crate.yml` identity, and every reader
-> (`index export`, the batch-leg resolution's manifest check) verifies
+> (`index export`, the task-resolution's manifest check) verifies
 > that signature
 > before trusting the rows. The D1 `artifacts` table is a mirror: the
 > `sync` endpoint only accepts rows identical to what the registry's
@@ -653,11 +652,11 @@ certificate therefore cannot sign anything after that certificate expires.
 >
 > **Completion binding.** GitHub's `workflow_run` webhook is HMAC-signed
 > with `STOW_GITHUB_WEBHOOK_SECRET`, which only GitHub and the edge hold;
-> the edge accepts a completion only for a `build-batch.yml` run on `main`
-> whose `display_title` parses as `<rustc>-b<batch_id>`, and the
-> scheduler resolves each leg only after
+> the edge accepts a completion only for a `build-crate.yml` run on `main`
+> whose `display_title` parses as `<rustc>-<task_id>`, and the
+> scheduler resolves the task only after
 > the records artifact
-> that leg's publish job pushed verifies in GHCR — a forged "success" cannot mint catalog rows.
+> its publish job pushed verifies in GHCR — a forged "success" cannot mint catalog rows.
 
 ## Local artifact cache
 
@@ -849,7 +848,7 @@ deserialization.
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
 | POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
-| POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-batch.yml` run completed; the edge parses `display_title` (`<rustc>-b<batch_id>`) → batch id and forwards the run's identity to the scheduler's `POST /batches/{batch_id}/complete`; the alarm's resolution completes each leg only once the records artifact its publish job pushed verifies in GHCR |
+| POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-crate.yml` run completed; the edge parses `display_title` (`<rustc>-<task_id>`) → task id and forwards the run's identity to the scheduler's `POST /tasks/complete-run`; the alarm's resolution completes the task only once the records artifact its publish job pushed verifies in GHCR |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection — lane depths for `stow-admin status --watch` (stow#853) |
 
 Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed.
@@ -891,8 +890,8 @@ flowing and the operator can always flip the rule back off.
 The zone's WAF maintenance rules protect the worker; the **dispatch freeze** protects the
 runner allowance and the Cloudflare bill. The object is event-driven —
 nothing polls, nothing wakes on a timer: two trips evaluate on the events
-that change their inputs. A leg's completion — applied when the
-batch's resolution settles it — upserts one
+that change their inputs. A task's completion — applied when the
+task's resolution settles it — upserts one
 five-minute bucket in `attempt_outcome_buckets` per target — retried
 attempts keep counting — and the object sums the trailing window's
 buckets (at most `window / 5min` per target whatever the traffic) and
@@ -912,7 +911,7 @@ flag, storage key, and purpose from the WAF maintenance rules — and `dispatch_
 gates on it, so the queue keeps accepting misses while nothing more is
 handed to runners. While frozen, the work-submitting routes
 (`scheduler/tasks/submit`, `scheduler/requests/{id}/outcome`) answer 503
-naming the trigger; the `github/workflow-run` webhook and the batch
+naming the trigger; the `github/workflow-run` webhook and the task
 completion it forwards stay open so
 in-flight builds still land. Recovery is manual only:
 `POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
@@ -937,7 +936,7 @@ read from Actions, never from the edge.
 Which builds failed is a third channel neither of those owns: the
 failure *rate* alerts, an alert per build would be noise. Once a day
 `build-failure-digest.yml` runs `stow-admin builds digest` — it lists
-the `build-batch.yml` legs that failed in the previous 24 hours,
+the `build-crate.yml` tasks that failed in the previous 24 hours,
 classifies each by the step it died in (the manual driver's
 verdict/infrastructure classes), and posts one comment on the single
 open `incident`-labelled issue `Daily failed builds` — opened on the

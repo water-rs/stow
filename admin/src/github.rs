@@ -23,7 +23,7 @@ pub const USER_AGENT: &str = "stow-admin";
 /// watchdog's pipeline signals inspect — the batch workflow, whose
 /// runs carry every leg (stow#833). Spelled once in `stow_types` with
 /// the identity the scheduler dispatches to and certificates assert.
-pub use stow_types::trusted_builder::BATCH_WORKFLOW_FILE as BUILD_WORKFLOW;
+pub use stow_types::trusted_builder::WORKFLOW_FILE as BUILD_WORKFLOW;
 
 /// `GET` one API path under `/repos/{REPO}/` and decode the JSON body.
 /// The response body rides zenwave errors, so a rejection carries
@@ -693,14 +693,14 @@ pub trait RunRow {
 
 /// One run row as both `workflow_runs` listings and `actions/runs/{id}`
 /// serve it — every field the crate's run readers share: identity and
-/// `run_attempt` for the jobs reads, `display_title` for the batch
+/// `run_attempt` for the jobs reads, `display_title` for the task
 /// binding, `head_sha`/`created_at` for staleness and dispatch
 /// resolution, `actor` for who dispatched.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct WorkflowRunRow {
     /// The run's id.
     pub id: u64,
-    /// The rendered `run-name` — `<rustc>-b<batch_id>` for a batch run.
+    /// The rendered `run-name` — `<rustc>-<task_id>` for a run.
     pub display_title: String,
     /// The commit the run builds.
     pub head_sha: String,

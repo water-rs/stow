@@ -1,17 +1,13 @@
 //! `stow-admin runs failures --since <duration>` — fetch failed
-//! `build-batch.yml` runs from GitHub Actions, classify every leg of
-//! each run's jobs page, pull each failed leg's job log, classify the
-//! failure, and group by class.
+//! `build-crate.yml` runs from GitHub Actions, classify each run's
+//! jobs page, pull the failed job's log, classify the failure, and
+//! group by class.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
-use stow_types::api::TaskHash;
-use stow_types::runs::{
-    LegFailure, LegJobKind, LegJobName, LegOutcome, RunFailure, RunJobRow, RunJobsPage,
-    classify_legs,
-};
+use stow_types::runs::{RunFailure, RunJobRow, RunJobsPage, classify_failure};
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
 use time::OffsetDateTime;
@@ -27,7 +23,7 @@ pub struct RunsArgs {
 
 #[derive(Subcommand)]
 pub enum RunsCommand {
-    /// List failed build-batch legs in the window, grouped by the
+    /// List failed build-crate runs in the window, grouped by the
     /// failure class their job logs show.
     Failures(FailuresArgs),
 }
@@ -219,7 +215,7 @@ fn is_error_line(line: &str) -> bool {
 
 /// Classify one job log. Scans error lines top-down for a known class;
 /// when none match, a run whose log never shows a wrapper step's
-/// `stow-build build|publish --leg` command died before the wrapper
+/// `stow-build build|publish` command died before the wrapper
 /// executed — the runner-loss and setup-failure bucket. `watchdog`
 /// reuses it for the incident's failure-class breakdown.
 pub fn classify_log(log: &str) -> (FailureClass, Option<String>) {
@@ -244,13 +240,13 @@ pub fn classify_log(log: &str) -> (FailureClass, Option<String>) {
     }
     // The workflow's banner for the two wrapper steps
     // (build-crate.yml): the untrusted build's multi-line script echoes
-    // `stow-build build --leg …` inside its `##[group]Run` block, and
-    // the trusted publish's single-line `run:` is
-    // `##[group]Run stow-build publish --leg …`. The `--leg` flag is
-    // what pins the match to the step commands — a bare `stow-build`
+    // `stow-build build --output-dir …` inside its `##[group]Run` block,
+    // and the trusted publish's single-line `run:` is
+    // `##[group]Run stow-build publish --input-dir …`. The subcommand
+    // flags pin the match to the step commands — a bare `stow-build`
     // substring also matches the stow-toolchain action's download
     // chatter, which runs before the wrapper ever starts (stow#870).
-    if !(log.contains("stow-build build --leg") || log.contains("stow-build publish --leg")) {
+    if !(log.contains("stow-build build --") || log.contains("stow-build publish --")) {
         return (FailureClass::WrapperNeverExecuted, None);
     }
     (FailureClass::Unknown, None)
@@ -265,159 +261,132 @@ pub fn first_error_line(log: &str) -> Option<String> {
         .map(|line| line.trim().to_owned())
 }
 
-/// The job whose log classifies a failed leg — the row the `jobs/{id}/logs`
-/// read asks for, `None` for an [`LegFailure::Invariant`] (its message is
+/// The job whose log classifies a failed run — the row the
+/// `jobs/{id}/logs` read asks for, `None` when the failure names no
 /// the evidence, there is no log) or a named job absent from the page.
 /// Shared by `runs failures` and the watch: the watch keys its
 /// `log_class` memo on the returned row's id, so the row must be named
 /// before any fetch is decided (stow#853).
-pub fn leg_log_job<'a>(failure: &LegFailure, jobs: &'a [RunJobRow]) -> Option<&'a RunJobRow> {
-    let job = failure_job(failure)?;
-    jobs.iter().find(|row| row.name == *job)
+pub fn failure_log_job<'a>(failure: &TaskFailure, jobs: &'a [RunJobRow]) -> Option<&'a RunJobRow> {
+    jobs.iter().find(|row| row.name == *failure_job(failure))
 }
 
-/// The job a leg failure names — `None` for an invariant failure,
-/// which names no job.
-const fn failure_job(failure: &LegFailure) -> Option<&String> {
+/// The job a task failure names — `"-"` when it names no job row.
+const fn failure_job(failure: &TaskFailure) -> &String {
     match failure {
-        LegFailure::Run(
+        TaskFailure::Run(
             RunFailure::Verdict { job, .. } | RunFailure::Infrastructure { job, .. },
         )
-        | LegFailure::Concluded { job, .. } => Some(job),
-        LegFailure::Invariant(_) => None,
+        | TaskFailure::Concluded { job, .. } => job,
     }
 }
 
 /// `(failure, log)` → `(job_name, class, evidence)` — the shared
-/// per-leg failure read `runs failures` and the watch make. `log` is
-/// the named job's log when the caller read it: an [`LegFailure::Invariant`]
-/// is its own evidence, an absent or unreadable log reads
-/// [`FailureClass::Unknown`] with none, anything else is
+/// failure read `runs failures` and the watch make. `log` is the named
+/// job's log when the caller read it: an absent or unreadable log
+/// reads [`FailureClass::Unknown`] with none, anything else is
 /// [`classify_log`]'s answer. `job_name` is the report's display name —
-/// `leg <i>` for an invariant, which names no job.
-pub fn leg_failure_class(
-    leg: u32,
-    failure: &LegFailure,
+/// `"-"` for the case that names no job.
+pub fn failure_class_of(
+    failure: &TaskFailure,
     log: Option<&str>,
 ) -> (String, FailureClass, Option<String>) {
-    let job = failure_job(failure).map_or_else(|| format!("leg {leg}"), Clone::clone);
-    let (class, evidence) = match (failure, log) {
-        (LegFailure::Invariant(message), _) => (FailureClass::Unknown, Some(message.clone())),
-        (_, None) => (FailureClass::Unknown, None),
-        (_, Some(log)) => classify_log(log),
-    };
+    let job = failure_job(failure).clone();
+    let (class, evidence) = log.map_or((FailureClass::Unknown, None), classify_log);
     (job, class, evidence)
 }
 
-// ===== Leg classification =====
+// ===== Run classification =====
 //
 // `VERDICT_STEPS`, `STEP_SETTLE_WINDOW`, `RunFailure`,
-// `classify_failure`, the jobs-page row types and the per-leg
-// classifier (`classify_legs`, `LegJobName`, `LegOutcome`,
-// `LegFailure`) live in `stow_types::runs` — the edge's batch resolver
-// runs the same contract. `classify_log` and its `FailureClass` stay
-// here: they read job logs, which only `runs failures`, `builds
-// digest` and `watchdog` pull.
+// `classify_failure` and the jobs-page row types live in
+// `stow_types::runs` — the edge's watchdog runs the same contract.
+// `classify_log` and its `FailureClass` stay here: they read job
+// logs, which only `runs failures`, `builds digest` and `watchdog`
+// pull.
 
-/// One leg of a `build-batch.yml` run's jobs page and its outcome.
-#[derive(Debug)]
-pub struct PageLeg {
-    /// The leg index — the `#N` in `leg N / build #N …`.
-    pub leg: u32,
-    /// The leg's [`TaskHash`] from its job-name suffix — `None` when
-    /// every job the leg has on the page is unrendered (skipped jobs
-    /// carry the `name:` template verbatim, stow#839): the leg still
-    /// classifies — skipped jobs conclude `skipped` — it just holds no
-    /// hash to report.
-    pub hash: Option<TaskHash>,
-    /// The leg's classified outcome.
-    pub outcome: LegOutcome,
+/// A task's failure — a classified [`RunFailure`], or the plain
+/// conclusion a cancelled or skipped run leaves without any job to
+/// classify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskFailure {
+    /// `classify_failure`'s verdict.
+    Run(RunFailure),
+    /// The task's job concluded without a failure — an operator
+    /// cancel, `skipped` collateral or a `timed_out` runner.
+    Concluded {
+        /// The task's build job's name, or `"-"` when no build row
+        /// ever landed.
+        job: String,
+        /// The conclusion the job carried — `cancelled`, `skipped`,
+        /// `timed_out`, …
+        conclusion: String,
+    },
 }
 
-/// Classify every leg present on a `build-batch.yml` run's jobs page —
-/// the shared classifier driven by the page itself (stow#833).
+/// Where a run's task settled — `classify_failure`'s answer plus the
+/// conclusions that need no page (stow#853).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskOutcome {
+    /// The run's jobs are done and none failed.
+    Succeeded,
+    /// The run's task failed — the failure rides.
+    Failed(TaskFailure),
+    /// The page is still writing or the run has not finished — the
+    /// caller repolls.
+    Unsettled,
+}
+
+/// Classify a `build-crate.yml` run's jobs page — one task per run.
 ///
-/// The admin readers hold no batch manifest, so each leg's expected
-/// [`TaskHash`] is read out of its own job names: the hash cross-check
-/// still fires when one leg's rendered jobs disagree, a leg index
-/// repeating a job kind still fails as a duplicate, and a non-leg job
-/// name is a schema surprise the caller fails on. A skipped job's name
-/// is the workflow's `name:` template verbatim (stow#839) — it names
-/// its leg through the caller prefix but carries no hash, so the leg's
-/// expected hash is its first *rendered* job's; a leg whose jobs are
-/// all unrendered reports `hash: None`. Legs come back in index
-/// order. A leg with no job rows never ran — under `fail-fast` a
-/// run's tail legs can be cancelled before scheduling — and produces
-/// no entry: it is neither a completed leg nor a failed one.
-/// `Unsettled` outcomes are the caller's signal to repoll.
-///
-/// `run_conclusion` is the run's reported conclusion — the
-/// `startup_failure`-with-no-jobs case the classifier treats as every
-/// leg's lost runner.
+/// A `failure`-concluded run reads `classify_failure`'s answer:
+/// `Some` settles the task failed, `None` (a page still writing, or
+/// an unsettled job inside the settle window) defers. A completed
+/// `success` run's page is all-success — `Succeeded`. A terminal
+/// conclusion that is neither — `cancelled`, `skipped`,
+/// `timed_out` — is a `Concluded` failure the reports read as
+/// collateral, not an attempted build. Anything else is `Unsettled`:
+/// the run is still in flight.
 pub fn classify_page(
     jobs: &[RunJobRow],
     run_conclusion: &str,
     now: OffsetDateTime,
-) -> stow_types::error::Result<Vec<PageLeg>> {
-    let mut legs: BTreeMap<u32, Option<TaskHash>> = BTreeMap::new();
-    for job in jobs {
-        let Some(parsed) = LegJobName::parse(&job.name) else {
-            return Err(stow_error!(
-                "batch run jobs page names a non-leg job {:?}",
-                job.name
-            ));
-        };
-        // The first rendered job's hash stands as the leg's expected
-        // hash; a second rendered job disagreeing fails the leg's hash
-        // check inside `classify_legs`.
-        let entry = legs.entry(parsed.leg).or_insert(None);
-        if entry.is_none() {
-            *entry = parsed.hash;
+) -> stow_types::error::Result<TaskOutcome> {
+    match run_conclusion {
+        "success" => Ok(TaskOutcome::Succeeded),
+        "failure" => Ok(
+            classify_failure(jobs, now)?.map_or(TaskOutcome::Unsettled, |failure| {
+                TaskOutcome::Failed(TaskFailure::Run(failure))
+            }),
+        ),
+        "" | "queued" | "in_progress" | "waiting" | "requested" | "pending" => {
+            Ok(TaskOutcome::Unsettled)
+        }
+        conclusion => {
+            let job = build_job(jobs);
+            Ok(TaskOutcome::Failed(TaskFailure::Concluded {
+                job: job.map_or_else(|| "-".to_owned(), |row| row.name.clone()),
+                conclusion: job
+                    .and_then(|row| row.conclusion.as_deref())
+                    .unwrap_or(conclusion)
+                    .to_owned(),
+            }))
         }
     }
-    let Some(&last) = legs.keys().next_back() else {
-        return Ok(Vec::new());
-    };
-    // Entries for leg indexes absent from the page — or whose jobs are
-    // all unrendered — are never read for their hash: `classify_leg`
-    // consults `expected[leg]` only when a rendered job name claims a
-    // hash, so any valid hash fills them.
-    let placeholder: TaskHash = "0000000000000000".parse().expect("16 zero hex");
-    let expected: Vec<TaskHash> = (0..=last)
-        .map(|leg| {
-            legs.get(&leg)
-                .and_then(Clone::clone)
-                .unwrap_or_else(|| placeholder.clone())
-        })
-        .collect();
-    let outcomes = classify_legs(&expected, run_conclusion, jobs, now)?;
-    Ok(outcomes
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, outcome)| {
-            let leg = u32::try_from(index).expect("leg index fits u32");
-            legs.get(&leg).map(|hash| PageLeg {
-                leg,
-                hash: hash.clone(),
-                outcome,
-            })
-        })
-        .collect())
 }
 
-/// Whether a failed leg was actually attempted — a leg whose jobs
-/// were `cancelled` or `skipped` is `fail-fast` collateral or an
-/// operator's cancel, never a failed build the reports count.
-pub fn leg_attempted(failure: &LegFailure) -> bool {
-    !matches!(failure, LegFailure::Concluded { conclusion, .. } if matches!(conclusion.as_str(), "cancelled" | "skipped"))
+/// Whether a failed run's task was actually attempted — a `Concluded`
+/// `cancelled`/`skipped` is an operator's cancel or collateral, never
+/// a failed build the reports count.
+pub fn attempted(failure: &TaskFailure) -> bool {
+    !matches!(failure, TaskFailure::Concluded { conclusion, .. } if matches!(conclusion.as_str(), "cancelled" | "skipped"))
 }
 
-/// What a leg's `build` job name carries — the digest's grouping keys
-/// and the watchdog's target evidence. `build-batch.yml` writes it as
-/// `build #<leg> <crate> <version> (<target>) <hash>` under the
-/// `leg <leg> / ` caller prefix.
+/// What a task's `build` job name carries — the digest's grouping
+/// keys and the watchdog's target evidence. `build-crate.yml` writes
+/// it as `build <crate> <version> (<target>)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LegLabel {
+pub struct TaskLabel {
     /// Crate name as known to crates.io.
     pub crate_name: String,
     /// Exact crate version.
@@ -426,56 +395,37 @@ pub struct LegLabel {
     pub target: String,
 }
 
-/// Parse a leg `build` job's name back into its label.
-///
-/// [`LegJobName::parse`] has already vetted the
-/// `build #<leg> … <16 hex>` frame; what remains between the leg
-/// index and the hash is `<crate> <version> (<target>)`, where the
-/// version must be semver — neither a crate name nor a target can
-/// carry a space, so the splits are unambiguous. `None` on a name
-/// that is not a leg `build` job's or whose label does not match —
-/// the callers fail fast on it: the run is ours, so an unreadable
-/// label is a schema surprise.
-pub fn leg_label(job_name: &str) -> Option<LegLabel> {
-    let parsed = LegJobName::parse(job_name)?;
-    if parsed.kind != LegJobKind::Build {
-        return None;
-    }
-    // An unrendered build name carries the label template, not a
-    // label — nothing readable to return.
-    let hash = parsed.hash.as_ref()?;
-    let segment = job_name.rsplit_once(" / ").map_or(job_name, |(_, s)| s);
-    let label = segment
-        .strip_prefix(&format!("build #{} ", parsed.leg))?
-        .strip_suffix(&format!(" {hash}"))?;
+/// Parse a `build` job's name back into its label — the job names the
+/// crate, version and target; `None` on a name that is not a `build`
+/// job's or whose label does not match (the callers fail fast on it:
+/// the run is ours, so an unreadable label is a schema surprise).
+pub fn task_label(job_name: &str) -> Option<TaskLabel> {
+    let label = job_name.strip_prefix("build ")?;
     let (name_version, target) = label.rsplit_once(" (")?;
     let target = target.strip_suffix(')')?;
     let (crate_name, version) = name_version.split_once(' ')?;
     if crate_name.is_empty() || semver::Version::parse(version).is_err() || target.is_empty() {
         return None;
     }
-    Some(LegLabel {
+    Some(TaskLabel {
         crate_name: crate_name.to_owned(),
         version: version.to_owned(),
         target: target.to_owned(),
     })
 }
 
-/// The leg's `build` job row on the page — its name is the label
-/// source and its id the log path for legs that need it.
-pub fn leg_build_job(jobs: &[RunJobRow], leg: u32) -> Option<&RunJobRow> {
-    jobs.iter().find(|job| {
-        LegJobName::parse(&job.name)
-            .is_some_and(|name| name.leg == leg && name.kind == LegJobKind::Build)
-    })
+/// The run's `build` job row on the page — its name is the label
+/// source and its id the log path.
+pub fn build_job(jobs: &[RunJobRow]) -> Option<&RunJobRow> {
+    jobs.iter().find(|job| job.name.starts_with("build "))
 }
 
-/// Where a live leg is — the watch's split of `classify_page`'s
-/// `Unsettled` plus its two settled answers (stow#853). Only the
-/// watch reads it; nothing does before that lands.
+/// Where a live run's task is — the watch's split of
+/// `classify_page`'s `Unsettled` plus its two settled answers
+/// (stow#853). Only the watch reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LegProgress {
-    /// The build job holds a matrix slot and waits for a runner.
+pub enum TaskProgress {
+    /// The build job waits for a runner.
     Queued,
     /// The build job is running.
     Building,
@@ -485,93 +435,78 @@ pub enum LegProgress {
     /// A `failure` row's verdict is still undecided — its step rows
     /// inside `STEP_SETTLE_WINDOW` or a sibling row still writing.
     Settling,
-    /// `classify_page` settled the leg `Succeeded`.
+    /// `classify_page` settled the run `Succeeded`.
     Done,
-    /// `classify_page` settled the leg failed — the failure rides.
-    Failed(LegFailure),
+    /// `classify_page` settled the run failed — the failure rides.
+    Failed(TaskFailure),
 }
 
-/// One leg of a live `build-batch.yml` run — the watch's row, unused
-/// until the watch lands.
+/// One `build-crate.yml` run's live task — the watch's row.
 #[derive(Debug, Clone)]
-pub struct LiveLeg {
-    /// The leg index — the `#N` in `leg N / build #N …`.
-    pub leg: u32,
-    /// Where the leg is.
-    pub progress: LegProgress,
+pub struct LiveTask {
+    /// Where the task is.
+    pub progress: TaskProgress,
     /// Crate, version and target from the build job's name — `None`
-    /// while the name is unrendered.
-    pub label: Option<LegLabel>,
+    /// while the build job has not landed.
+    pub label: Option<TaskLabel>,
 }
 
 /// `classify_page` with `Unsettled` split into live progress — the
-/// watch's per-leg truth, unused until the watch lands. `Succeeded`
-/// and `Failed` carry through; an
-/// `Unsettled` leg names where it stands: waiting on a runner
-/// ([`LegProgress::Queued`]), running ([`LegProgress::Building`]),
-/// build done and publish pending ([`LegProgress::Publishing`]), or
-/// still writing a failure ([`LegProgress::Settling`]). Legs absent
-/// from the page produce no entry, as `classify_page` already does.
+/// watch's per-task truth. `Succeeded` and `Failed` carry through; an
+/// `Unsettled` run names where its task stands: waiting on a runner
+/// ([`TaskProgress::Queued`]), running ([`TaskProgress::Building`]),
+/// build done and publish pending ([`TaskProgress::Publishing`]), or
+/// still writing a failure ([`TaskProgress::Settling`]).
 ///
 /// # Errors
-/// `classify_page`'s — plus an `Unsettled` leg with no build row or a
-/// build row reporting a status the table does not name: both are
-/// schema surprises, never a bucket.
-pub fn live_legs(
+/// An `Unsettled` run whose build row reports a status the table
+/// does not name — a schema surprise, never a bucket.
+pub fn live_task(
     jobs: &[RunJobRow],
     run_conclusion: &str,
     now: OffsetDateTime,
-) -> stow_types::error::Result<Vec<LiveLeg>> {
-    classify_page(jobs, run_conclusion, now)?
-        .into_iter()
-        .map(|leg| {
-            let progress = match &leg.outcome {
-                LegOutcome::Succeeded { .. } => LegProgress::Done,
-                LegOutcome::Failed(failure) => LegProgress::Failed(failure.clone()),
-                LegOutcome::Unsettled => live_progress(leg.leg, jobs)?,
-            };
-            let label = leg_build_job(jobs, leg.leg).and_then(|job| leg_label(&job.name));
-            Ok(LiveLeg {
-                leg: leg.leg,
-                progress,
-                label,
-            })
-        })
-        .collect()
+) -> stow_types::error::Result<LiveTask> {
+    let progress = match classify_page(jobs, run_conclusion, now)? {
+        TaskOutcome::Succeeded => TaskProgress::Done,
+        TaskOutcome::Failed(failure) => TaskProgress::Failed(failure),
+        TaskOutcome::Unsettled => task_progress(jobs)?,
+    };
+    let label = build_job(jobs).and_then(|job| task_label(&job.name));
+    Ok(LiveTask { progress, label })
 }
 
-/// One `Unsettled` leg's progress from its own rows. Any `failure`
+/// One `Unsettled` run's progress from its rows. Any `failure`
 /// conclusion is the verdict still settling — `classify_failure`
-/// defers on unsettled step rows inside their window and on a sibling
-/// job still writing, and both leave the leg undecided. Otherwise the
-/// build row says where the leg is, conclusion over status: a build
-/// row carrying `success` is past the build stage whatever its
-/// `status` still says (stow#863), and `Unsettled` then means the
-/// publish row is absent or still running — `Publishing`.
-fn live_progress(leg: u32, jobs: &[RunJobRow]) -> stow_types::error::Result<LegProgress> {
-    if jobs.iter().any(|job| {
-        job.conclusion.as_deref() == Some("failure")
-            && LegJobName::parse(&job.name).is_some_and(|name| name.leg == leg)
-    }) {
-        return Ok(LegProgress::Settling);
+/// defers on unsettled step rows inside their window and on a
+/// sibling job still writing, and both leave the task undecided.
+/// Otherwise the build row says where the task is, conclusion over
+/// status: a build row carrying `success` is past the build stage
+/// whatever its `status` still says (stow#863), and `Unsettled` then
+/// means the publish row is absent or still running — `Publishing`.
+fn task_progress(jobs: &[RunJobRow]) -> stow_types::error::Result<TaskProgress> {
+    if jobs
+        .iter()
+        .any(|job| job.conclusion.as_deref() == Some("failure"))
+    {
+        return Ok(TaskProgress::Settling);
     }
-    let Some(build) = leg_build_job(jobs, leg) else {
-        return Err(stow_error!(
-            "unsettled leg {leg} has no build job on the page"
-        ));
+    let Some(build) = build_job(jobs) else {
+        // The run landed but its build job has not — GitHub serves
+        // an empty page while the run queues.
+        return Ok(TaskProgress::Queued);
     };
     if build.conclusion.as_deref() == Some("success") {
-        return Ok(LegProgress::Publishing);
+        return Ok(TaskProgress::Publishing);
     }
     Ok(match build.status.as_str() {
-        "queued" | "waiting" | "pending" | "requested" => LegProgress::Queued,
-        "in_progress" => LegProgress::Building,
+        "queued" | "waiting" | "pending" | "requested" => TaskProgress::Queued,
+        "in_progress" => TaskProgress::Building,
         // `completed` without a `conclusion` yet — the row is still
-        // being written, so the leg is undecided.
-        "completed" => LegProgress::Settling,
+        // being written, so the task is undecided.
+        "completed" => TaskProgress::Settling,
         status => {
             return Err(stow_error!(
-                "unsettled leg {leg}'s build job {:?} reports status {status}",
+                "unsettled run's build job {:?} reports status {status}",
                 build.name
             ));
         }
@@ -583,13 +518,12 @@ fn live_progress(leg: u32, jobs: &[RunJobRow]) -> stow_types::error::Result<LegP
 ///
 /// The attempt is pinned: the default `filter=latest` jobs view
 /// (`GET …/runs/{id}/jobs`) answers 502 on every request for a run
-/// whose failed legs were rerun, while the attempt-scoped view serves
+/// whose failed task was rerun, while the attempt-scoped view serves
 /// the same rows (stow#852). The edge's `attempt_jobs_path` reads the
 /// same path.
 ///
-/// A batch carries 2 × `STOW_BATCH_MAX_TASKS` jobs and that bound is
-/// configurable, so a single `per_page=100` read silently truncates a
-/// large batch; the pager follows the RFC 8288 `Link` header's
+/// A run carries at most two jobs, but the pager still follows the
+/// RFC 8288 `Link` header's
 /// `rel="next"` (`stow_types::runs::link_next`, the same parse the
 /// edge's `attempt_jobs` runs) until GitHub names no next page.
 /// `runs failures`, `builds digest`, the watchdog and the preheat
@@ -676,7 +610,7 @@ struct FailureExample {
 #[derive(Debug, serde::Serialize)]
 struct FailureGroup {
     class: FailureClass,
-    legs: usize,
+    tasks: usize,
     examples: Vec<FailureExample>,
 }
 
@@ -686,7 +620,7 @@ struct FailuresReport {
     workflow: &'static str,
     since_seconds: u64,
     failed_runs: usize,
-    failed_legs: usize,
+    failed_tasks: usize,
     groups: Vec<FailureGroup>,
 }
 
@@ -696,12 +630,11 @@ pub async fn run(token: &str, args: RunsArgs, output: Output) -> stow_types::err
     }
 }
 
-/// Every failed run of the batch workflow in the closed window
+/// Every failed run of the build workflow in the closed window
 /// `[now-since, now]` — range enumeration reads the whole window past
 /// GitHub's 1000-row listing cap, so a dense failure wave no longer
-/// drops its tail (stow#555). One failed leg fails its whole run, so
-/// the listing is of runs *carrying* failures — the legs inside are
-/// what classify.
+/// drops its tail (stow#555). Each run is one task, so the listing is
+/// of the failed tasks themselves.
 async fn fetch_failed_runs(
     token: &str,
     since: std::time::Duration,
@@ -720,9 +653,8 @@ async fn fetch_failed_runs(
     .await
 }
 
-/// Classify each failed run's legs on its attempt's jobs page, then
-/// fetch each failed leg's failed-job log and group the classified
-/// failures.
+/// Classify each failed run on its attempt's jobs page, then fetch
+/// each failed run's failed-job log and group the classified failures.
 async fn classify_runs(
     token: &str,
     runs: &[github::WorkflowRunRow],
@@ -730,44 +662,44 @@ async fn classify_runs(
     let mut groups: BTreeMap<FailureClass, Vec<FailureExample>> = BTreeMap::new();
     for run in runs {
         let jobs = fetch_run_jobs(token, run.id, run.run_attempt).await?;
-        for leg in classify_page(&jobs, "failure", OffsetDateTime::now_utc())? {
-            let LegOutcome::Failed(failure) = &leg.outcome else {
-                continue;
-            };
-            if !leg_attempted(failure) {
-                continue;
-            }
-            let (job_name, class, evidence) = match leg_log_job(failure, &jobs) {
-                Some(job) => {
-                    let log_url = format!(
-                        "https://api.github.com/repos/{}/actions/jobs/{}/logs",
-                        github::REPO,
-                        job.id
-                    );
-                    match github::get_text(token, &log_url, Backoff::new()).await {
-                        Ok(log) => leg_failure_class(leg.leg, failure, Some(&log)),
-                        Err(error) => {
-                            tracing::warn!(job_id = job.id, %error, "job log unavailable; skipping");
-                            continue;
-                        }
+        let TaskOutcome::Failed(failure) =
+            classify_page(&jobs, "failure", OffsetDateTime::now_utc())?
+        else {
+            continue;
+        };
+        if !attempted(&failure) {
+            continue;
+        }
+        let (job_name, class, evidence) = match failure_log_job(&failure, &jobs) {
+            Some(job) => {
+                let log_url = format!(
+                    "https://api.github.com/repos/{}/actions/jobs/{}/logs",
+                    github::REPO,
+                    job.id
+                );
+                match github::get_text(token, &log_url, Backoff::new()).await {
+                    Ok(log) => failure_class_of(&failure, Some(&log)),
+                    Err(error) => {
+                        tracing::warn!(job_id = job.id, %error, "job log unavailable; skipping");
+                        continue;
                     }
                 }
-                // The failure names no log to read — an invariant is
-                // its own evidence, anything else classifies `Unknown`.
-                None => leg_failure_class(leg.leg, failure, None),
-            };
-            groups.entry(class).or_default().push(FailureExample {
-                run_url: run.html_url.clone(),
-                job: job_name,
-                evidence,
-            });
-        }
+            }
+            // The failure names no log to read — anything else
+            // classifies `Unknown`.
+            None => failure_class_of(&failure, None),
+        };
+        groups.entry(class).or_default().push(FailureExample {
+            run_url: run.html_url.clone(),
+            job: job_name,
+            evidence,
+        });
     }
     Ok(groups
         .into_iter()
         .map(|(class, examples)| FailureGroup {
             class,
-            legs: examples.len(),
+            tasks: examples.len(),
             examples,
         })
         .collect())
@@ -780,31 +712,30 @@ async fn failures(
 ) -> stow_types::error::Result<()> {
     let runs = fetch_failed_runs(token, args.since).await?;
     let groups = classify_runs(token, &runs).await?;
-    let failed_legs = groups.iter().map(|group| group.legs).sum();
+    let failed_tasks = groups.iter().map(|group| group.tasks).sum();
 
     let report = FailuresReport {
         workflow: BUILD_WORKFLOW,
         since_seconds: args.since.as_secs(),
         failed_runs: runs.len(),
-        failed_legs,
+        failed_tasks,
         groups,
     };
     render::emit(output, &report, |report| {
         if report.groups.is_empty() {
             return format!(
-                "no failed {} legs in the last {}",
+                "no failed {} runs in the last {}",
                 report.workflow,
                 render::age(report.since_seconds)
             );
         }
         let mut out = format!(
-            "{} failed leg(s) across {} failed {} run(s) in the last {}\n",
-            report.failed_legs,
-            report.failed_runs,
+            "{} failed {} run(s) in the last {}\n",
+            report.failed_tasks,
             report.workflow,
             render::age(report.since_seconds)
         );
-        let mut table = Table::new(&["class", "legs", "example"]);
+        let mut table = Table::new(&["class", "runs", "example"]);
         for group in &report.groups {
             let example = group
                 .examples
@@ -812,7 +743,7 @@ async fn failures(
                 .map_or("-", |example| example.run_url.as_str());
             table.push([
                 group.class.as_str().to_owned(),
-                group.legs.to_string(),
+                group.tasks.to_string(),
                 example.to_owned(),
             ]);
         }
@@ -837,13 +768,24 @@ async fn failures(
 
 #[cfg(test)]
 mod tests {
-    use stow_types::runs::{LegJobName, RunStepRow};
+    use stow_types::runs::RunStepRow;
     use stow_types::transient::Backoff;
 
     use super::{
-        FailureClass, LegFailure, LegOutcome, RunFailure, RunJobRow, TaskHash, classify_log,
-        classify_page, leg_attempted, leg_label, log_line_body,
+        FailureClass, RunFailure, RunJobRow, TaskFailure, TaskOutcome, TaskProgress, attempted,
+        classify_log, classify_page, failure_class_of, failure_log_job, live_task, log_line_body,
+        task_label,
     };
+
+    /// Did the classified run's task actually attempt — a cancelled or
+    /// skipped collateral and a jobless `startup_failure` both read
+    /// `false`, an attempted failure `true`.
+    fn run_attempted(jobs: &[RunJobRow], run_conclusion: &str) -> bool {
+        matches!(
+            classify_page(jobs, run_conclusion, at(1_000)),
+            Ok(TaskOutcome::Failed(failure)) if attempted(&failure)
+        )
+    }
 
     /// The jobs-log API stamps every line with an RFC 3339 timestamp, so a
     /// fixture without one tests a format that never arrives. This is the
@@ -997,21 +939,21 @@ mod tests {
     fn wrapper_never_executed_when_build_step_absent() {
         // A runner-loss log may carry error lines the known classes do
         // not match; what makes it a never-executed wrapper is that no
-        // `stow-build … --leg` step banner appears at all.
+        // `stow-build …` step banner appears at all.
         let log = "Waiting for a runner to pick up this job...\n##[error]error: something odd\n";
         assert_eq!(classify_log(log).0, FailureClass::WrapperNeverExecuted);
     }
 
     /// Either wrapper step's banner proves the wrapper ran — the
-    /// publish stage's `##[group]Run stow-build publish --leg …` and
-    /// the build stage's `stow-build build --leg …`, echoed on its own
+    /// publish stage's `##[group]Run stow-build publish …` and
+    /// the build stage's `stow-build build …`, echoed on its own
     /// line inside the multi-line script's `##[group]Run` block
     /// (build-crate.yml, stow#870).
     #[test]
     fn unknown_when_wrapper_ran_but_no_pattern_matched() {
         for banner in [
-            "##[group]Run stow-build publish --leg 0 --input-dir \"/home/runner/work/_temp/stow-build-output\"",
-            "##[group]Run set -euo pipefail\nstow-build build --leg 0 --output-dir \"/home/runner/work/_temp/stow-build-output\"",
+            "##[group]Run stow-build publish --input-dir \"/home/runner/work/_temp/stow-build-output\"",
+            "##[group]Run set -euo pipefail\nstow-build build --output-dir \"/home/runner/work/_temp/stow-build-output\"",
         ] {
             let log = format!("{banner}\n##[error]error: something odd\n");
             assert_eq!(classify_log(&log).0, FailureClass::Unknown, "{banner}");
@@ -1024,18 +966,18 @@ mod tests {
         assert_eq!(classify_log(log).0, FailureClass::ToolchainTargetMissing);
     }
 
-    // ----- Batch legs (stow#833) -----
+    // ----- Run classification (stow#833) -----
 
     fn at(unix: i64) -> time::OffsetDateTime {
         time::OffsetDateTime::from_unix_timestamp(unix).expect("timestamp")
     }
 
-    /// One job row of a `build-batch.yml` run's page — settled
+    /// One job row of a `build-crate.yml` run's page — settled
     /// (`completed`) unless the fixture says otherwise.
-    fn job_row(name: String, conclusion: Option<&str>, steps: Vec<RunStepRow>) -> RunJobRow {
+    fn job_row(name: &str, conclusion: Option<&str>, steps: Vec<RunStepRow>) -> RunJobRow {
         RunJobRow {
             id: 0,
-            name,
+            name: name.to_owned(),
             status: "completed".to_owned(),
             conclusion: conclusion.map(str::to_owned),
             started_at: Some(at(50)),
@@ -1046,66 +988,51 @@ mod tests {
         }
     }
 
-    /// Leg `i`'s build job name as `build-batch.yml` writes it —
-    /// `leg i / build #i <crate> <version> (<target>) <hash>`.
-    fn build_name(leg: u32, task_id: &str) -> (TaskHash, String) {
-        let hash = TaskHash::of(task_id);
-        let name =
-            format!("leg {leg} / build #{leg} serde 1.0.0 (x86_64-unknown-linux-gnu) {hash}");
-        (hash, name)
+    /// The build job's name as `build-crate.yml` writes it —
+    /// `build <crate> <version> (<target>)`.
+    fn build_name() -> &'static str {
+        "build serde 1.0.0 (x86_64-unknown-linux-gnu)"
     }
 
-    /// Leg `i`'s publish job name — `leg i / publish #i <hash>`.
-    fn publish_name(leg: u32, task_id: &str) -> String {
-        format!("leg {leg} / publish #{leg} {}", TaskHash::of(task_id))
+    /// The publish job's name — `publish`.
+    fn publish_name() -> &'static str {
+        "publish"
     }
 
     /// The build job name's label round-trips: crate, version and the
-    /// verbatim target, with or without the `leg N / ` caller prefix.
+    /// verbatim target.
     #[test]
-    fn leg_label_reads_crate_version_target() {
-        let hash = TaskHash::of("some-task-id");
-        for name in [
-            format!("leg 7 / build #7 gix-hash 0.27.0 (aarch64-pc-windows-msvc) {hash}"),
-            format!("build #7 gix-hash 0.27.0 (aarch64-pc-windows-msvc) {hash}"),
-        ] {
-            let label = leg_label(&name).expect("label");
-            assert_eq!(label.crate_name, "gix-hash");
-            assert_eq!(label.version, "0.27.0");
-            assert_eq!(label.target, "aarch64-pc-windows-msvc");
-        }
+    fn task_label_reads_crate_version_target() {
+        let label = task_label("build gix-hash 0.27.0 (aarch64-pc-windows-msvc)").expect("label");
+        assert_eq!(label.crate_name, "gix-hash");
+        assert_eq!(label.version, "0.27.0");
+        assert_eq!(label.target, "aarch64-pc-windows-msvc");
     }
 
     /// A publish job's name carries no label; anything off the
-    /// `<crate> <version> (<target>)` shape — a missing version, a
-    /// non-semver one, a missing target — parses nothing.
+    /// `build <crate> <version> (<target>)` shape — a missing version,
+    /// a non-semver one, a missing target — parses nothing.
     #[test]
-    fn leg_label_rejects_non_build_and_malformed_names() {
-        let hash = TaskHash::of("some-task-id");
+    fn task_label_rejects_non_build_and_malformed_names() {
         for name in [
-            format!("leg 3 / publish #3 {hash}"),
-            format!("build #3 serde (x86_64-unknown-linux-gnu) {hash}"),
-            format!("build #3 serde not-semver (x86_64-unknown-linux-gnu) {hash}"),
-            format!("build #3 serde 1.0.0 x86_64-unknown-linux-gnu {hash}"),
-            "build-crate".to_owned(),
+            "publish",
+            "build serde (x86_64-unknown-linux-gnu)",
+            "build serde not-semver (x86_64-unknown-linux-gnu)",
+            "build serde 1.0.0 x86_64-unknown-linux-gnu",
+            "build-crate",
         ] {
-            assert_eq!(leg_label(&name), None, "{name}");
+            assert_eq!(task_label(name), None, "{name}");
         }
     }
 
-    /// A failed run's page classifies per leg: the verdict leg is a
-    /// failed leg; the cancelled collateral leg is not attempted; the
-    /// successful leg is neither.
+    /// A failed run's page classifies its task: a verdict step fails
+    /// the run as the crate's verdict; the cancelled publish is
+    /// `fail-fast` collateral.
     #[test]
-    fn classify_page_reports_each_leg_on_its_own_merits() {
-        let (hash0, build0) = build_name(0, "task-a");
-        let (_hash1, build1) = build_name(1, "task-b");
-        let (_hash2, build2) = build_name(2, "task-c");
+    fn classify_page_reports_a_verdict_failure() {
         let jobs = vec![
-            job_row(build0, Some("success"), vec![]),
-            job_row(publish_name(0, "task-a"), Some("success"), vec![]),
             job_row(
-                build1,
+                build_name(),
                 Some("failure"),
                 vec![RunStepRow {
                     name: "Run the untrusted build stage".to_owned(),
@@ -1113,156 +1040,73 @@ mod tests {
                     conclusion: Some("failure".to_owned()),
                 }],
             ),
-            job_row(publish_name(1, "task-b"), Some("skipped"), vec![]),
-            job_row(build2, Some("cancelled"), vec![]),
-            job_row(publish_name(2, "task-c"), Some("cancelled"), vec![]),
+            job_row(publish_name(), Some("skipped"), vec![]),
         ];
-        let legs = classify_page(&jobs, "failure", at(1_000)).expect("classified");
-        assert_eq!(legs.len(), 3);
-        assert_eq!(legs[0].hash.as_ref(), Some(&hash0));
-        assert!(matches!(legs[0].outcome, LegOutcome::Succeeded { .. }));
-        let LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { .. })) = &legs[1].outcome
-        else {
-            panic!("leg 1 is the crate's verdict: {:?}", legs[1].outcome);
-        };
-        let LegOutcome::Failed(failure) = &legs[2].outcome else {
-            panic!("leg 2 concluded cancelled: {:?}", legs[2].outcome);
-        };
-        let LegFailure::Concluded { conclusion, .. } = failure else {
-            panic!("leg 2 concluded cancelled: {failure:?}");
-        };
-        assert_eq!(conclusion, "cancelled");
-        assert!(!leg_attempted(failure));
+        match classify_page(&jobs, "failure", at(1_000)).expect("classified") {
+            TaskOutcome::Failed(TaskFailure::Run(RunFailure::Verdict { step, .. })) => {
+                assert_eq!(step, "Run the untrusted build stage");
+            }
+            other => panic!("the task is the crate's verdict: {other:?}"),
+        }
+        assert!(run_attempted(&jobs, "failure"));
     }
 
     /// stow#863: run 39842358378 — a `completed` run's job row served
     /// `in_progress` with `conclusion: "success"` already written. The
-    /// conclusion settles the row whatever `status` says: the leg
+    /// conclusion settles the row whatever `status` says: the task
     /// reads `Succeeded` on the first read rather than repolling.
     #[test]
-    fn classify_page_settles_a_leg_on_its_conclusion() {
-        let (_hash, build) = build_name(0, "task-a");
-        let mut publish = job_row(publish_name(0, "task-a"), Some("success"), vec![]);
+    fn classify_page_settles_a_run_on_its_conclusion() {
+        let mut publish = job_row(publish_name(), Some("success"), vec![]);
         publish.status = "in_progress".to_owned();
-        let jobs = vec![job_row(build, Some("success"), vec![]), publish];
-        let legs = classify_page(&jobs, "success", at(1_000)).expect("classified");
-        assert!(matches!(legs[0].outcome, LegOutcome::Succeeded { .. }));
+        let jobs = vec![job_row(build_name(), Some("success"), vec![]), publish];
+        assert_eq!(
+            classify_page(&jobs, "success", at(1_000)).expect("classified"),
+            TaskOutcome::Succeeded
+        );
     }
 
-    /// stow#839: the observed page — each leg's build fails at a
-    /// verdict step and its skipped publish's name comes back
-    /// unrendered — reads both legs as verdict failures; each leg's
-    /// hash still comes from its rendered build job.
+    /// A cancelled run's task was never attempted — the report does
+    /// not count operator collateral as a failed build.
     #[test]
-    fn classify_page_reads_skipped_jobs_unrendered_names() {
-        let (hash0, build0) = build_name(0, "task-a");
-        let (_hash1, build1) = build_name(1, "task-b");
-        let skipped_publish =
-            |leg: u32| job_row(LegJobName::skipped_publish(leg), Some("skipped"), vec![]);
-        let verdict_step = || RunStepRow {
-            name: "Run the untrusted build stage".to_owned(),
-            status: "completed".to_owned(),
-            conclusion: Some("failure".to_owned()),
-        };
+    fn classify_page_marks_a_cancelled_run_not_attempted() {
         let jobs = vec![
-            job_row(build0, Some("failure"), vec![verdict_step()]),
-            skipped_publish(0),
-            job_row(build1, Some("failure"), vec![verdict_step()]),
-            skipped_publish(1),
+            job_row(build_name(), Some("cancelled"), vec![]),
+            job_row(publish_name(), Some("skipped"), vec![]),
         ];
-        let legs = classify_page(&jobs, "failure", at(1_000)).expect("classified");
-        assert_eq!(legs.len(), 2);
-        assert_eq!(legs[0].hash.as_ref(), Some(&hash0));
-        for leg in &legs {
-            assert!(
-                matches!(
-                    leg.outcome,
-                    LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { .. }))
-                ),
-                "{:?}",
-                leg.outcome
-            );
+        assert!(!run_attempted(&jobs, "cancelled"));
+    }
+
+    /// A run that lost its runner before any job ran — no rows, the
+    /// `startup_failure` shape — classifies infrastructure.
+    #[test]
+    fn classify_page_a_jobless_failure_is_infrastructure() {
+        match classify_page(&[], "failure", at(1_000)).expect("classified") {
+            TaskOutcome::Failed(TaskFailure::Run(RunFailure::Infrastructure { job, .. })) => {
+                assert_eq!(job, "-");
+            }
+            other => panic!("a jobless failure is infrastructure: {other:?}"),
         }
+        assert!(!run_attempted(&[], "cancelled"));
     }
 
-    /// stow#839: a leg whose only jobs are unrendered — every job
-    /// skipped — has no rendered hash to derive; it reports
-    /// `hash: None` and classifies by conclusion, a defined outcome
-    /// rather than a panic.
-    #[test]
-    fn classify_page_reports_an_unrendered_only_leg_without_a_hash() {
-        let jobs = vec![
-            job_row(
-                "leg 0 / build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}".to_owned(),
-                Some("skipped"),
-                vec![],
-            ),
-            job_row(
-                "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}".to_owned(),
-                Some("skipped"),
-                vec![],
-            ),
-        ];
-        let legs = classify_page(&jobs, "failure", at(1_000)).expect("classified");
-        let [leg] = &legs[..] else {
-            panic!("one leg on the page: {legs:?}");
-        };
-        assert_eq!(leg.hash, None);
-        let LegOutcome::Failed(LegFailure::Concluded { conclusion, .. }) = &leg.outcome else {
-            panic!("an all-skipped leg concludes skipped: {:?}", leg.outcome);
-        };
-        assert_eq!(conclusion, "skipped");
-    }
+    // ----- Live progress (stow#853) -----
 
-    /// The page is the manifest: a leg whose jobs disagree on the
-    /// hash is that leg's invariant failure even with no batch to
-    /// check against.
-    #[test]
-    fn classify_page_still_catches_a_hash_mismatch() {
-        let (_hash, build) = build_name(0, "task-a");
-        let jobs = vec![
-            job_row(build, Some("success"), vec![]),
-            job_row(publish_name(0, "task-b"), Some("success"), vec![]),
-        ];
-        let legs = classify_page(&jobs, "success", at(1_000)).expect("classified");
-        let LegOutcome::Failed(LegFailure::Invariant(message)) = &legs[0].outcome else {
-            panic!(
-                "a disagreeing hash is the leg's invariant: {:?}",
-                legs[0].outcome
-            );
-        };
-        assert!(message.contains("hash"));
-    }
-
-    /// A job name that is not a leg job fails the whole read — the
-    /// run is ours, so an unreadable name is a schema surprise, never
-    /// a leg to skip.
-    #[test]
-    fn classify_page_fails_on_a_non_leg_job() {
-        let job = job_row("build-crate".to_owned(), Some("failure"), vec![]);
-        assert!(classify_page(&[job], "failure", at(1_000)).is_err());
-    }
-
-    // ----- Live legs (stow#853) -----
-
-    /// A live page's job row — everything `classify_page` reads is
-    /// scriptable: the `status`/`conclusion` settle pair, the
-    /// started/completed stamps `Succeeded` needs and the step rows a
-    /// settling failure shows.
+    /// One job row of a live run — `status`/`conclusion`/`completed_at`
+    /// as GitHub serves them mid-write.
     fn live_job(
-        name: String,
+        name: &str,
         status: &str,
         conclusion: Option<&str>,
-        started_at: Option<i64>,
         completed_at: Option<i64>,
         steps: Vec<RunStepRow>,
     ) -> RunJobRow {
         RunJobRow {
             id: 0,
-            name,
+            name: name.to_owned(),
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
-            started_at: started_at.map(at),
+            started_at: Some(at(50)),
             completed_at: completed_at.map(at),
             run_attempt: 1,
             html_url: String::new(),
@@ -1270,8 +1114,6 @@ mod tests {
         }
     }
 
-    /// One step row — a failed job still writing shows `in_progress`
-    /// or `pending` steps past a completed one.
     fn live_step(name: &str, status: &str, conclusion: Option<&str>) -> RunStepRow {
         RunStepRow {
             name: name.to_owned(),
@@ -1280,311 +1122,145 @@ mod tests {
         }
     }
 
-    /// `queued`/`waiting`/`pending`/`requested` on the build row is the
-    /// leg holding a slot and waiting for a runner — `Queued` — and
-    /// the label rides the rendered build name.
+    /// A queued build row is a queued task.
     #[test]
-    fn a_queued_build_row_is_a_queued_leg() {
-        for status in ["queued", "waiting", "pending", "requested"] {
-            let (_, build) = build_name(0, "task-a");
-            let jobs = vec![live_job(build, status, None, None, None, vec![])];
-            let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-            let [leg] = &legs[..] else {
-                panic!("one leg on the page: {legs:?}");
-            };
-            assert_eq!(leg.leg, 0);
-            assert_eq!(leg.progress, super::LegProgress::Queued, "{status}");
-            assert_eq!(
-                leg.label.as_ref().map(|label| label.target.as_str()),
-                Some("x86_64-unknown-linux-gnu")
-            );
-        }
+    fn a_queued_build_row_is_a_queued_task() {
+        let jobs = vec![live_job(build_name(), "queued", None, None, vec![])];
+        let task = live_task(&jobs, "in_progress", at(1_000)).expect("classified");
+        assert_eq!(task.progress, TaskProgress::Queued);
+        assert!(task.label.is_some());
     }
 
-    /// `in_progress` on the build row is the leg on a runner —
-    /// `Building`.
+    /// An in-progress build row is a building task.
     #[test]
     fn an_in_progress_build_row_is_building() {
-        let (_, build) = build_name(0, "task-a");
-        let jobs = vec![live_job(
-            build,
-            "in_progress",
-            None,
-            Some(900),
-            None,
-            vec![],
-        )];
-        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-        assert_eq!(legs[0].progress, super::LegProgress::Building);
+        let jobs = vec![live_job(build_name(), "in_progress", None, None, vec![])];
+        let task = live_task(&jobs, "in_progress", at(1_000)).expect("classified");
+        assert_eq!(task.progress, TaskProgress::Building);
     }
 
-    /// build `success` with no publish row is `Publishing` — the leg
-    /// is unsettled only because the publish row has not landed. The
-    /// stow#863 shape — `in_progress` with the `success` conclusion
-    /// already written — is the same thing: the conclusion is the
-    /// truer word, so it is not `Building`.
+    /// A succeeded build with no publish row yet is publishing —
+    /// `classify_page` cannot settle the run until the publish lands.
     #[test]
     fn a_succeeded_build_is_publishing() {
-        for (status, conclusion) in [
-            ("completed", Some("success")),
-            ("in_progress", Some("success")),
-        ] {
-            let (_, build) = build_name(0, "task-a");
-            let jobs = vec![live_job(
-                build,
-                status,
-                conclusion,
-                Some(900),
-                Some(950),
-                vec![],
-            )];
-            let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-            assert_eq!(
-                legs[0].progress,
-                super::LegProgress::Publishing,
-                "{status}/{conclusion:?}"
-            );
-        }
-    }
-
-    /// build `success` with the publish row still running is
-    /// `Publishing` too — the leg's build stage is done.
-    #[test]
-    fn a_running_publish_row_is_publishing() {
-        let (_, build) = build_name(0, "task-a");
-        let jobs = vec![
-            live_job(
-                build,
-                "completed",
-                Some("success"),
-                Some(900),
-                Some(950),
-                vec![],
-            ),
-            live_job(
-                publish_name(0, "task-a"),
-                "in_progress",
-                None,
-                Some(960),
-                None,
-                vec![],
-            ),
-        ];
-        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-        assert_eq!(legs[0].progress, super::LegProgress::Publishing);
-    }
-
-    /// A `failure` row whose step rows are still inside
-    /// `STEP_SETTLE_WINDOW` leaves the verdict undecided —
-    /// `Settling`.
-    #[test]
-    fn a_failure_still_settling_is_settling() {
-        let (_, build) = build_name(0, "task-a");
         let jobs = vec![live_job(
-            build,
+            build_name(),
             "completed",
-            Some("failure"),
-            Some(900),
-            Some(995),
-            vec![
-                live_step("Check out the repository", "completed", Some("success")),
-                live_step("Run the untrusted build stage", "in_progress", None),
-            ],
-        )];
-        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-        assert_eq!(legs[0].progress, super::LegProgress::Settling);
-    }
-
-    /// A `failure` row with a sibling job still writing is `Settling`
-    /// too — `classify_failure` wants every row settled before it
-    /// names a class.
-    #[test]
-    fn a_failure_with_a_sibling_still_writing_is_settling() {
-        let (_, build) = build_name(0, "task-a");
-        let jobs = vec![
-            live_job(
-                build,
-                "completed",
-                Some("failure"),
-                Some(900),
-                Some(950),
-                vec![live_step(
-                    "Run the untrusted build stage",
-                    "completed",
-                    Some("failure"),
-                )],
-            ),
-            live_job(
-                publish_name(0, "task-a"),
-                "in_progress",
-                None,
-                Some(960),
-                None,
-                vec![],
-            ),
-        ];
-        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-        assert_eq!(legs[0].progress, super::LegProgress::Settling);
-    }
-
-    /// Past `STEP_SETTLE_WINDOW` plus the clock allowance the same
-    /// page is the lost-runner failure — settled, `Failed`, not
-    /// `Settling`.
-    #[test]
-    fn a_failure_past_the_settle_window_is_failed() {
-        let (_, build) = build_name(0, "task-a");
-        let jobs = vec![live_job(
-            build,
-            "completed",
-            Some("failure"),
-            Some(700),
-            Some(800),
-            vec![
-                live_step("Check out the repository", "completed", Some("success")),
-                live_step("Run the untrusted build stage", "in_progress", None),
-            ],
-        )];
-        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-        assert!(matches!(
-            legs[0].progress,
-            super::LegProgress::Failed(LegFailure::Run(RunFailure::Infrastructure { .. }))
-        ));
-    }
-
-    /// Both jobs `success` — the leg is `Done`.
-    #[test]
-    fn a_succeeded_leg_is_done() {
-        let (_, build) = build_name(0, "task-a");
-        let jobs = vec![
-            live_job(
-                build,
-                "completed",
-                Some("success"),
-                Some(900),
-                Some(950),
-                vec![],
-            ),
-            live_job(
-                publish_name(0, "task-a"),
-                "completed",
-                Some("success"),
-                Some(960),
-                Some(990),
-                vec![],
-            ),
-        ];
-        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-        assert_eq!(legs[0].progress, super::LegProgress::Done);
-    }
-
-    /// A cancelled leg is a failed leg whose conclusion names the
-    /// outcome — the live view does not drop it the way the report's
-    /// `leg_attempted` does.
-    #[test]
-    fn a_concluded_leg_is_failed_with_its_conclusion() {
-        let (_, build) = build_name(0, "task-a");
-        let jobs = vec![
-            live_job(
-                build,
-                "completed",
-                Some("cancelled"),
-                Some(900),
-                Some(950),
-                vec![],
-            ),
-            live_job(
-                publish_name(0, "task-a"),
-                "completed",
-                Some("cancelled"),
-                Some(960),
-                Some(990),
-                vec![],
-            ),
-        ];
-        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-        assert!(matches!(
-            legs[0].progress,
-            super::LegProgress::Failed(LegFailure::Concluded { ref conclusion, .. })
-                if conclusion == "cancelled"
-        ));
-    }
-
-    /// stow#839: a leg whose only jobs are unrendered carries no
-    /// label and no hash — it still classifies `Failed` by its
-    /// conclusions.
-    #[test]
-    fn an_unrendered_leg_carries_no_label_or_hash() {
-        let jobs = vec![
-            live_job(
-                "leg 0 / build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}"
-                    .to_owned(),
-                "completed",
-                Some("skipped"),
-                Some(900),
-                Some(950),
-                vec![],
-            ),
-            live_job(
-                "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}".to_owned(),
-                "completed",
-                Some("skipped"),
-                Some(960),
-                Some(990),
-                vec![],
-            ),
-        ];
-        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
-        let [leg] = &legs[..] else {
-            panic!("one leg on the page: {legs:?}");
-        };
-        assert_eq!(leg.label, None);
-        assert!(matches!(
-            leg.progress,
-            super::LegProgress::Failed(LegFailure::Concluded { .. })
-        ));
-    }
-
-    /// An `Unsettled` leg whose only row is a publish job is a schema
-    /// surprise — a leg cannot publish a build it never ran — never a
-    /// bucket.
-    #[test]
-    fn an_unsettled_leg_without_a_build_row_fails() {
-        let jobs = vec![live_job(
-            publish_name(0, "task-a"),
-            "in_progress",
-            None,
-            Some(960),
-            None,
+            Some("success"),
+            Some(100),
             vec![],
         )];
-        assert!(super::live_legs(&jobs, "", at(1_000)).is_err());
+        let task = live_task(&jobs, "in_progress", at(1_000)).expect("classified");
+        assert_eq!(task.progress, TaskProgress::Publishing);
+    }
+
+    /// A running publish row is publishing — the build read `success`
+    /// before the publish was written.
+    #[test]
+    fn a_running_publish_row_is_publishing() {
+        let jobs = vec![
+            live_job(
+                build_name(),
+                "completed",
+                Some("success"),
+                Some(100),
+                vec![],
+            ),
+            live_job(publish_name(), "in_progress", None, None, vec![]),
+        ];
+        let task = live_task(&jobs, "in_progress", at(1_000)).expect("classified");
+        assert_eq!(task.progress, TaskProgress::Publishing);
+    }
+
+    /// A `failure` row whose verdict step is still writing inside the
+    /// settle window is `Settling`, not a premature class.
+    #[test]
+    fn a_failure_still_settling_is_settling() {
+        let jobs = vec![live_job(
+            build_name(),
+            "completed",
+            Some("failure"),
+            Some(995),
+            vec![live_step(
+                "Run the untrusted build stage",
+                "in_progress",
+                None,
+            )],
+        )];
+        let task = live_task(&jobs, "failure", at(1_000)).expect("classified");
+        assert_eq!(task.progress, TaskProgress::Settling);
+    }
+
+    /// A failure past the settle window is `Failed` — the first
+    /// unsettled step names where the runner was lost.
+    #[test]
+    fn a_failure_past_the_settle_window_is_failed() {
+        let jobs = vec![live_job(
+            build_name(),
+            "completed",
+            Some("failure"),
+            Some(100),
+            vec![live_step(
+                "Run the untrusted build stage",
+                "in_progress",
+                None,
+            )],
+        )];
+        let task = live_task(&jobs, "failure", at(1_000)).expect("classified");
+        assert!(matches!(
+            task.progress,
+            TaskProgress::Failed(TaskFailure::Run(RunFailure::Infrastructure { .. }))
+        ));
+    }
+
+    /// A success run reads `Done`, whatever its rows still write.
+    #[test]
+    fn a_succeeded_run_is_done() {
+        let jobs = vec![
+            live_job(
+                build_name(),
+                "completed",
+                Some("success"),
+                Some(100),
+                vec![],
+            ),
+            live_job(publish_name(), "in_progress", None, None, vec![]),
+        ];
+        let task = live_task(&jobs, "success", at(1_000)).expect("classified");
+        assert_eq!(task.progress, TaskProgress::Done);
+    }
+
+    /// A run landed but its build job has not — the empty page reads
+    /// `Queued`, not an error.
+    #[test]
+    fn an_empty_page_is_queued() {
+        let task = live_task(&[], "in_progress", at(1_000)).expect("classified");
+        assert_eq!(task.progress, TaskProgress::Queued);
     }
 
     /// A build row reporting a status the live table does not name is
     /// a schema surprise, not a bucket.
     #[test]
     fn an_unknown_build_status_fails() {
-        let (_, build) = build_name(0, "task-a");
-        let jobs = vec![live_job(build, "hiccup", None, Some(900), None, vec![])];
-        assert!(super::live_legs(&jobs, "", at(1_000)).is_err());
+        let jobs = vec![live_job(build_name(), "hiccup", None, Some(900), vec![])];
+        assert!(live_task(&jobs, "in_progress", at(1_000)).is_err());
     }
 
     // ----- The shared failure class (stow#853) -----
 
-    /// A `Run`/`Concluded` failure's class comes from the named job's
-    /// log — the row the fetch asks for.
+    /// A failed run's class comes from the named job's log — the row
+    /// the fetch asks for.
     #[test]
-    fn leg_log_job_names_the_failed_row() {
-        let (_, build) = build_name(0, "task-a");
-        let failure = LegFailure::Run(RunFailure::Verdict {
-            job: build.clone(),
+    fn failure_log_job_names_the_failed_row() {
+        let failure = TaskFailure::Run(RunFailure::Verdict {
+            job: build_name().to_owned(),
             step: "Run the untrusted build stage".to_owned(),
             html_url: String::new(),
         });
-        let mut row = job_row(build, Some("failure"), vec![]);
+        let mut row = job_row(build_name(), Some("failure"), vec![]);
         row.id = 42;
         assert_eq!(
-            super::leg_log_job(&failure, &[row]).map(|row| row.id),
+            failure_log_job(&failure, &[row]).map(|row| row.id),
             Some(42)
         );
     }
@@ -1592,47 +1268,29 @@ mod tests {
     /// A named job absent from the page has no log to read — `None`,
     /// the `Unknown` with no evidence.
     #[test]
-    fn leg_failure_class_is_unknown_without_a_log() {
-        let (_, build) = build_name(0, "task-a");
-        let failure = LegFailure::Concluded {
-            job: build,
-            conclusion: "cancelled".to_owned(),
+    fn failure_class_is_unknown_without_a_log() {
+        let failure = TaskFailure::Run(RunFailure::Infrastructure {
+            job: "-".to_owned(),
+            step: None,
             html_url: String::new(),
-        };
-        assert!(super::leg_log_job(&failure, &[]).is_none());
-        let (_, class, evidence) = super::leg_failure_class(0, &failure, None);
+        });
+        assert!(failure_log_job(&failure, &[]).is_none());
+        let (_, class, evidence) = failure_class_of(&failure, None);
         assert_eq!(class, FailureClass::Unknown);
         assert_eq!(evidence, None);
-    }
-
-    /// An invariant failure is its own evidence — the message names
-    /// the mismatch; there is no log to read.
-    #[test]
-    fn leg_failure_class_an_invariant_is_its_own_evidence() {
-        let failure = LegFailure::Invariant("leg 2's jobs disagree on the hash".to_owned());
-        assert!(super::leg_log_job(&failure, &[]).is_none());
-        let (job, class, evidence) = super::leg_failure_class(2, &failure, None);
-        assert_eq!(job, "leg 2");
-        assert_eq!(class, FailureClass::Unknown);
-        assert_eq!(
-            evidence.as_deref(),
-            Some("leg 2's jobs disagree on the hash")
-        );
     }
 
     /// The named job's log classifies through `classify_log` — the
     /// same answer `runs failures` reports.
     #[test]
-    fn leg_failure_class_reads_the_log() {
-        let (_, build) = build_name(0, "task-a");
-        let failure = LegFailure::Run(RunFailure::Infrastructure {
-            job: build.clone(),
+    fn failure_class_reads_the_log() {
+        let failure = TaskFailure::Run(RunFailure::Infrastructure {
+            job: build_name().to_owned(),
             step: None,
             html_url: String::new(),
         });
-        let (job, class, evidence) =
-            super::leg_failure_class(0, &failure, Some(WINDOWS_LINKER_LOG));
-        assert_eq!(job, build);
+        let (job, class, evidence) = failure_class_of(&failure, Some(WINDOWS_LINKER_LOG));
+        assert_eq!(job, build_name());
         assert_eq!(class, FailureClass::LinkerUnusable);
         assert_eq!(
             evidence.as_deref(),
@@ -1727,7 +1385,7 @@ mod tests {
         (server, base)
     }
 
-    /// The jobs pager follows `Link: <…>; rel="next"`: a batch's jobs
+    /// The jobs pager follows `Link: <…>; rel="next"`: a run's jobs
     /// can outrun one `per_page=100` page, and both pages' rows must
     /// land in the answer.
     #[tokio::test]

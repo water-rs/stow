@@ -8,7 +8,8 @@ const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
 const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
 const SCHEDULER_SUBMIT_IDS_URL: &str = "https://scheduler.internal/tasks/submit/ids";
-const SCHEDULER_BATCHES_URL: &str = "https://scheduler.internal/batches";
+const SCHEDULER_COMPLETE_RUN_URL: &str = "https://scheduler.internal/tasks/complete-run";
+const SCHEDULER_RUN_UPDATE_URL: &str = "https://scheduler.internal/tasks/run-update";
 const SCHEDULER_REQUESTS_URL: &str = "https://scheduler.internal/requests";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
@@ -62,21 +63,24 @@ pub async fn send_task_ids(
 }
 
 /// The `workflow_run` webhook's completion channel for a
-/// `build-batch.yml` run (stow#833 §3.2): `POST
-/// /batches/{batch_id}/complete` carries the run's identity verbatim —
-/// one forward per batch — and the object's alarm pass resolves the
-/// legs from it.
-pub async fn send_batch_complete(
+/// `build-crate.yml` run (stow#876): `POST /tasks/complete-run`
+/// carries the verified outcome — one forward per task, one task per
+/// run.
+pub async fn send_run_complete(
     namespace: &CfDurableNamespace,
-    batch_id: &stow_types::api::BatchId,
-    report: &stow_types::api::BatchRunComplete,
+    report: &stow_types::api::WorkflowRunComplete,
 ) -> Result<(), SchedulerClientError> {
-    send_json(
-        namespace,
-        &format!("{SCHEDULER_BATCHES_URL}/{batch_id}/complete"),
-        report,
-    )
-    .await
+    send_json(namespace, SCHEDULER_COMPLETE_RUN_URL, report).await
+}
+
+/// The `workflow_run` webhook's `in_progress` channel for a
+/// `build-crate.yml` run: `POST /tasks/run-update` moves the bound row
+/// `dispatched` → `running` (stow#876).
+pub async fn send_task_run_update(
+    namespace: &CfDurableNamespace,
+    update: &stow_types::api::TaskRunUpdate,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_RUN_UPDATE_URL, update).await
 }
 
 pub async fn get_status(

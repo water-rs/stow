@@ -1,10 +1,10 @@
 //! Dispatch of build and resolve work to the Actions control plane —
-//! one [`BuildRuns`] implementation per backend (stow#833).
+//! one [`BuildRuns`] implementation per backend.
 //!
 //! The trait, the backend types and every pure helper — the dispatch
-//! payload builders, the run-details/status/jobs decoders and the URL
-//! paths — compile on every target so they host-test; request
-//! construction and the `CfFetch` plumbing are `wasm32`-only, like
+//! payload builders, the run-details decoder and the URL paths —
+//! compile on every target so they host-test; request construction and
+//! the `CfFetch` plumbing are `wasm32`-only, like
 //! [`crate::github_app`]'s signing and token-exchange half.
 
 use std::future::Future;
@@ -21,16 +21,12 @@ use crate::fetch_guard::OutboundPool;
 use crate::fetch_guard::{FetchedResponse, GuardedResponse};
 use crate::github_app::InstallationToken;
 
-/// `per_page` for the attempt-jobs page — at the `B = 40` leg bound a
-/// batch's 80 jobs fit one page; deeper batches still page by `Link`.
-const JOBS_PAGE_SIZE: u32 = 100;
-
 /// The run identity a successful `workflow_dispatch` returns — GitHub's
 /// `return_run_details` response (`workflow_run_id`, `run_url`,
 /// `html_url`); the local-CI mock answers the same fields. The build
-/// lane binds `workflow_run_id` once to the dispatched batch's
-/// `build_batches` row, so a `workflow_run` completion resolves only
-/// the run that batch dispatched.
+/// lane binds `workflow_run_id` once to the dispatched task's queue
+/// row, so a `workflow_run` completion resolves only the run that
+/// task dispatched.
 pub struct DispatchedRun {
     /// The Actions run id GitHub assigned the dispatched run.
     pub workflow_run_id: u64,
@@ -40,20 +36,20 @@ pub struct DispatchedRun {
     pub html_url: String,
 }
 
-/// The Actions control plane every build/resolve dispatch and batch
-/// run lookup goes through (stow#833 §5) — a type per backend,
-/// replacing the per-request `DispatchCredential` branching.
+/// The Actions control plane every build/resolve dispatch goes
+/// through — a type per backend, replacing the per-request
+/// `DispatchCredential` branching.
 ///
 /// `GitHub` serves the real REST API under the App installation token
 /// the Durable Object caches; `LocalCi` serves the same paths —
 /// `repos/{repo}/actions/…` plus its `/dispatch` event POST — on the
-/// loopback `STOW_LOCAL_CI_URL`, so the run lookups never branch on
-/// which backend answered.
+/// loopback `STOW_LOCAL_CI_URL`.
 pub trait BuildRuns: Sync {
-    /// `workflow_dispatch` of `build-batch.yml` with `encoded` — the
-    /// [`stow_types::api::BatchEncoder`] output — as the `batch`
-    /// input; resolves to the run identity the batch row binds.
-    fn dispatch_batch<'a>(
+    /// `workflow_dispatch` of `build-crate.yml` with `encoded` — the
+    /// [`stow_types::api::BuildTaskPayload::encode_dispatch_task`]
+    /// output — as the `task` input; resolves to the run identity the
+    /// task's row binds.
+    fn trigger_build<'a>(
         &'a self,
         encoded: &'a str,
         repo: &'a str,
@@ -68,35 +64,6 @@ pub trait BuildRuns: Sync {
         &'a self,
         dispatch: &'a stow_types::api::RequestDispatch,
         repo: &'a str,
-        pool: &'a OutboundPool,
-    ) -> impl Future<Output = Result<(), DispatchError>> + Send + 'a;
-
-    /// `GET /repos/{repo}/actions/runs/{run_id}` — the run's coarse
-    /// state the batch lease check reads (§4.3).
-    fn run_status<'a>(
-        &'a self,
-        repo: &'a str,
-        run_id: u64,
-        pool: &'a OutboundPool,
-    ) -> impl Future<Output = Result<stow_types::runs::RunStatus, DispatchError>> + Send + 'a;
-
-    /// `GET …/runs/{run_id}/attempts/{attempt}/jobs?per_page=100`,
-    /// following `Link: rel="next"` until the pages exhaust — every
-    /// job row of the pinned attempt, first page first.
-    fn attempt_jobs<'a>(
-        &'a self,
-        repo: &'a str,
-        run_id: u64,
-        attempt: u32,
-        pool: &'a OutboundPool,
-    ) -> impl Future<Output = Result<Vec<stow_types::runs::RunJobRow>, DispatchError>> + Send + 'a;
-
-    /// `POST /repos/{repo}/actions/runs/{run_id}/cancel` — the lease
-    /// check's past-ceiling arm.
-    fn cancel_run<'a>(
-        &'a self,
-        repo: &'a str,
-        run_id: u64,
         pool: &'a OutboundPool,
     ) -> impl Future<Output = Result<(), DispatchError>> + Send + 'a;
 }
@@ -129,26 +96,6 @@ impl LocalCiBuildRuns {
             url: url.trim_end_matches('/').to_owned(),
         }
     }
-
-    /// `POST {base}/seeded-runs` — have the mock record finished runs
-    /// that no dispatch through it created, publishing each succeeded
-    /// leg's records artifact first, and answer each run's id. The
-    /// budget probe's batch-resolution drives seed the run their claimed
-    /// batch concluded as here, so the resolution reads the jobs page
-    /// and records production's run leaves (stow#833).
-    #[cfg(target_arch = "wasm32")]
-    pub async fn seed_runs(
-        &self,
-        seeded: &stow_types::local_ci::LocalCiSeededRuns,
-        pool: &OutboundPool,
-    ) -> Result<stow_types::local_ci::LocalCiSeededRunIds, DispatchError> {
-        let payload = serde_json::to_value(seeded)
-            .map_err(|error| DispatchError::Response(error.to_string()))?;
-        let request = self.api_request(worker::Method::Post, "seeded-runs", Some(&payload))?;
-        let body = body_text(send(&request, pool).await?).await?;
-        serde_json::from_str(&body)
-            .map_err(|error| DispatchError::Response(format!("{error}: {body}")))
-    }
 }
 
 /// The workflow and payload sent through either dispatch transport.
@@ -165,26 +112,6 @@ struct WorkflowDispatch<'a> {
 /// `/dispatch` event endpoint instead.
 fn workflow_dispatch_path(repo: &str, workflow_file: &str) -> String {
     format!("repos/{repo}/actions/workflows/{workflow_file}/dispatches")
-}
-
-/// `repos/{repo}/actions/runs/{id}` — both backends serve it under
-/// their own base.
-fn run_path(repo: &str, run_id: u64) -> String {
-    format!("repos/{repo}/actions/runs/{run_id}")
-}
-
-/// `…/runs/{id}/attempts/{n}/jobs?per_page=100` — the first page the
-/// pager opens; later pages ride the `Link` header's URLs verbatim.
-fn attempt_jobs_path(repo: &str, run_id: u64, attempt: u32) -> String {
-    format!(
-        "{}/attempts/{attempt}/jobs?per_page={JOBS_PAGE_SIZE}",
-        run_path(repo, run_id)
-    )
-}
-
-/// `…/runs/{id}/cancel`.
-fn cancel_path(repo: &str, run_id: u64) -> String {
-    format!("{}/cancel", run_path(repo, run_id))
 }
 
 /// Resolve `path_or_url` under `base` — the path helpers' output
@@ -240,21 +167,6 @@ fn decode_build_run_details(body: &str) -> Result<DispatchedRun, DispatchError> 
             run_url: details.run_url,
             html_url: details.html_url,
         })
-        .map_err(|error| DispatchError::Response(format!("{error}: {body}")))
-}
-
-/// `GET …/actions/runs/{id}`'s body — the lease check's
-/// `status`/`conclusion`/`run_attempt` triple.
-fn decode_run_status(body: &str) -> Result<stow_types::runs::RunStatus, DispatchError> {
-    serde_json::from_str::<stow_types::runs::RunStatus>(body)
-        .map_err(|error| DispatchError::Response(format!("{error}: {body}")))
-}
-
-/// One attempt-jobs page's body — the `jobs` array GitHub wraps the
-/// rows in.
-fn decode_jobs_page(body: &str) -> Result<Vec<stow_types::runs::RunJobRow>, DispatchError> {
-    serde_json::from_str::<stow_types::runs::RunJobsPage>(body)
-        .map(|page| page.jobs)
         .map_err(|error| DispatchError::Response(format!("{error}: {body}")))
 }
 
@@ -410,22 +322,9 @@ trait BuildRunsBackend: Sync {
     ) -> Result<worker::Request, DispatchError>;
 }
 
-/// GET one page: status check, `Link` header captured before the body
-/// is consumed, body read to text.
-#[cfg(target_arch = "wasm32")]
-async fn get_page(
-    request: &worker::Request,
-    pool: &OutboundPool,
-) -> Result<(Option<String>, String), DispatchError> {
-    let response = send(request, pool).await?;
-    let link = response.get_ref().header("Link");
-    let body = body_text(response).await?;
-    Ok((link, body))
-}
-
 #[cfg(target_arch = "wasm32")]
 impl<R: BuildRunsBackend> BuildRuns for R {
-    async fn dispatch_batch(
+    async fn trigger_build(
         &self,
         encoded: &str,
         repo: &str,
@@ -436,9 +335,9 @@ impl<R: BuildRunsBackend> BuildRuns for R {
         let response = post_workflow_dispatch(
             self,
             &WorkflowDispatch {
-                workflow_file: stow_types::trusted_builder::BATCH_WORKFLOW_FILE,
-                event_type: "build-batch",
-                input_name: "batch",
+                workflow_file: stow_types::trusted_builder::WORKFLOW_FILE,
+                event_type: "build-crate",
+                input_name: "task",
                 input: &input,
                 return_run_details: true,
             },
@@ -452,7 +351,7 @@ impl<R: BuildRunsBackend> BuildRuns for R {
                 run_id = run.workflow_run_id,
                 run_url = %run.run_url,
                 html_url = %run.html_url,
-                "dispatched build batch"
+                "dispatched build task"
             );
         })
     }
@@ -496,47 +395,6 @@ impl<R: BuildRunsBackend> BuildRuns for R {
             );
         })
     }
-
-    async fn run_status(
-        &self,
-        repo: &str,
-        run_id: u64,
-        pool: &OutboundPool,
-    ) -> Result<stow_types::runs::RunStatus, DispatchError> {
-        let request = self.api_request(worker::Method::Get, &run_path(repo, run_id), None)?;
-        let (_, body) = get_page(&request, pool).await?;
-        decode_run_status(&body)
-    }
-
-    async fn attempt_jobs(
-        &self,
-        repo: &str,
-        run_id: u64,
-        attempt: u32,
-        pool: &OutboundPool,
-    ) -> Result<Vec<stow_types::runs::RunJobRow>, DispatchError> {
-        let mut jobs = Vec::new();
-        let mut url = attempt_jobs_path(repo, run_id, attempt);
-        loop {
-            let request = self.api_request(worker::Method::Get, &url, None)?;
-            let (link, body) = get_page(&request, pool).await?;
-            jobs.extend(decode_jobs_page(&body)?);
-            match stow_types::runs::link_next(link.as_deref()) {
-                Some(next) => url = String::from(next),
-                None => return Ok(jobs),
-            }
-        }
-    }
-
-    async fn cancel_run(
-        &self,
-        repo: &str,
-        run_id: u64,
-        pool: &OutboundPool,
-    ) -> Result<(), DispatchError> {
-        let request = self.api_request(worker::Method::Post, &cancel_path(repo, run_id), None)?;
-        send(&request, pool).await.map(|_| ())
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -563,8 +421,7 @@ pub enum DispatchError {
 #[cfg(test)]
 mod tests {
     use super::{
-        attempt_jobs_path, cancel_path, decode_build_run_details, decode_jobs_page,
-        decode_run_status, ensure_success_status, github_dispatch_payload, run_path, scoped_url,
+        decode_build_run_details, ensure_success_status, github_dispatch_payload, scoped_url,
         workflow_dispatch_path,
     };
 
@@ -601,15 +458,9 @@ mod tests {
     #[test]
     fn the_run_endpoint_paths_are_shared_verbatim() {
         assert_eq!(
-            workflow_dispatch_path("water-rs/stow", "build-batch.yml"),
-            "repos/water-rs/stow/actions/workflows/build-batch.yml/dispatches"
+            workflow_dispatch_path("water-rs/stow", "build-crate.yml"),
+            "repos/water-rs/stow/actions/workflows/build-crate.yml/dispatches"
         );
-        assert_eq!(run_path("o/r", 42), "repos/o/r/actions/runs/42");
-        assert_eq!(
-            attempt_jobs_path("o/r", 42, 3),
-            "repos/o/r/actions/runs/42/attempts/3/jobs?per_page=100"
-        );
-        assert_eq!(cancel_path("o/r", 42), "repos/o/r/actions/runs/42/cancel");
     }
 
     /// A `Link`-returned absolute URL is followed only inside the
@@ -649,43 +500,5 @@ mod tests {
         ] {
             assert!(scoped_url("http://127.0.0.1:8787", url).is_err(), "{url}");
         }
-    }
-
-    /// The lease check's decode: `status`/`conclusion`/`run_attempt`
-    /// out of GitHub's run object, extras ignored, absent fields an
-    /// error.
-    #[test]
-    fn run_status_decoding_reads_the_lease_fields() {
-        let status = decode_run_status(
-            r#"{"status":"in_progress","conclusion":null,"run_attempt":1,
-               "html_url":"https://github.com/o/r/actions/runs/1"}"#,
-        )
-        .expect("decodes");
-        assert_eq!(status.status, "in_progress");
-        assert!(decode_run_status("not-json").is_err());
-        assert!(decode_run_status(r#"{"status":"completed"}"#).is_err());
-    }
-
-    /// A jobs page decodes into `RunJobRow`s — two legs' four jobs in
-    /// one `jobs` array.
-    #[test]
-    fn jobs_page_decoding_reads_the_rows() {
-        let page = decode_jobs_page(
-            r#"{"total_count":2,"jobs":[
-                 {"id":1,"name":"leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) 0123456789abcdef",
-                  "status":"completed","conclusion":"success",
-                  "started_at":"2026-10-18T00:00:00Z","completed_at":"2026-10-18T00:02:00Z",
-                  "run_attempt":1,"html_url":"u","steps":[]},
-                 {"id":2,"name":"leg 0 / publish #0 0123456789abcdef",
-                  "status":"in_progress","conclusion":null,
-                  "started_at":"2026-10-18T00:02:10Z","completed_at":null,
-                  "run_attempt":1,"html_url":"u","steps":[]}
-               ]}"#,
-        )
-        .expect("decodes");
-        assert_eq!(page.len(), 2);
-        assert_eq!(page[0].run_attempt, 1);
-        assert_eq!(page[1].conclusion, None);
-        assert!(decode_jobs_page("{}").is_err());
     }
 }

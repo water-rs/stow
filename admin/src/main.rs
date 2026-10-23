@@ -141,7 +141,7 @@ enum Command {
 #[derive(Args)]
 struct StatusArgs {
     /// The live build-queue view (stow#853): the scheduler's queue
-    /// merged with `build-batch.yml`'s in-flight runs, re-rendered
+    /// merged with `build-crate.yml`'s in-flight runs, re-rendered
     /// every 30 s until Ctrl-C. Under `--json` each frame is one
     /// NDJSON line.
     #[arg(long)]

@@ -7,7 +7,7 @@ name: Index publish cron
 # lane only ticks: it dispatches `index-publish.yml` on `main`, the same
 # way `preheat-cron.yml` dispatches the admin lane.
 #
-# The tick is event-driven: every completed `build-batch` run — the only
+# The tick is event-driven: every completed `build-crate` run — the only
 # thing that lands records in GHCR — dispatches a publish, so a newly
 # pushed records artifact reaches the index within one publish run. The
 # schedule is the backstop for a `workflow_run` event GitHub failed to
@@ -16,7 +16,7 @@ name: Index publish cron
 
 on:
   workflow_run:
-    workflows: [build-batch]
+    workflows: [build-crate]
     types: [completed]
   schedule:
     - cron: "*/10 * * * *"
@@ -43,7 +43,7 @@ jobs:
       # run syncs the D1 catalog and reports each slice; unset, it
       # publishes the index and skips both — the workflow never probes.
       # A `workflow_run` tick also forwards the rustc the completed run's
-      # `<rustc>-b<batch_id>` title names; a schedule or manual tick leaves
+      # `<rustc>-<task_id>` title names; a schedule or manual tick leaves
       # the input empty and index-publish takes the stable channel.
       - name: Dispatch index-publish on main
         env:

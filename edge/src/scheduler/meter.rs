@@ -337,7 +337,7 @@ impl Meter {
 /// collapsed to [`LEDGER_OP_BATCH_COMPLETE`], so every record's reads
 /// and every batch's completion land on one row each.
 ///
-/// [`LEDGER_OP_BATCH_COMPLETE`]: stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE
+/// [`LEDGER_OP_BATCH_COMPLETE`]: stow_types::do_budgets::LEDGER_OP_TASK_COMPLETE
 #[must_use]
 pub fn ledger_op(method: &str, path: &str) -> String {
     if method == "POST"
@@ -346,7 +346,7 @@ pub fn ledger_op(method: &str, path: &str) -> String {
             .and_then(|rest| rest.strip_suffix("/complete"))
             .is_some_and(|batch_id| !batch_id.is_empty() && !batch_id.contains('/'))
     {
-        return stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE.to_owned();
+        return stow_types::do_budgets::LEDGER_OP_TASK_COMPLETE.to_owned();
     }
     let route = path.strip_prefix("/requests/").map_or_else(
         || path.to_owned(),
@@ -554,7 +554,7 @@ mod tests {
     /// `/batches/` collapses into it.
     #[test]
     fn a_batch_completion_collapses_to_the_shared_ledger_op() {
-        let completion = stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE;
+        let completion = stow_types::do_budgets::LEDGER_OP_TASK_COMPLETE;
         assert_eq!(
             super::ledger_op("POST", "/batches/00000000000000000000000000000001/complete"),
             completion

@@ -16,10 +16,6 @@ STOW_DISPATCH_MIN_AGE_MINUTES = "5"
 # 4 macOS runners free.
 STOW_MAX_CONCURRENT_JOBS = "45"
 STOW_MAX_CONCURRENT_MACOS_JOBS = "16"
-# Batch shape (stow#833): each build-batch.yml matrix holds k runner
-# slots (max-parallel) and up to B legs — eight rounds at the defaults.
-STOW_BATCH_PARALLELISM = "5"
-STOW_BATCH_MAX_TASKS = "40"
 STOW_STALE_DISPATCH_MINUTES = "60"
 # Enqueue-admission scaling: one extra proof-of-work bit per 50 pending
 # tasks, floored at STOW_POW_MIN_BITS and capped at 24 bits.

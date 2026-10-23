@@ -133,12 +133,6 @@ pub enum QueueError {
     /// A completion report referenced a task the queue has no row for.
     #[error("completion report for unknown task `{0}`")]
     UnknownTask(String),
-    /// A batch completion named a `build_batches` row the store does
-    /// not hold — an orphan run from an abandoned dispatch, or a
-    /// delivery for a batch already resolved. Handlers map this to
-    /// `404 Not Found`.
-    #[error("completion report for unknown batch `{0}`")]
-    UnknownBatch(String),
     /// A completion report named a real task but not its live attempt or
     /// an in-flight status — a stale report for a superseded attempt or a
     /// duplicate of one already applied. Handlers map this to `409

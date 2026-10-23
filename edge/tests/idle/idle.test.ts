@@ -16,7 +16,7 @@
 // code is added: inspection goes through `runInDurableObject` on the
 // real instance, and every outbound fetch routes through the
 // `dispatch-stub` outbound service (see vitest.config.ts), which
-// answers exactly what a batch's lifecycle needs — the `/dispatch`
+// answers exactly what a task run's lifecycle needs — the `/dispatch`
 // event POST, the run status and attempt-jobs reads, and the records
 // manifest's GHCR GET — and 500s the rest: an egress this suite does
 // not expect poisons the row under test.
@@ -176,36 +176,34 @@ async function waitForStatus(stub: DurableObjectStub, wanted: string) {
 	throw new Error(`no row reached status ${wanted}`);
 }
 
-// The claimed task's `build_batches` row once the dispatch response has
-// bound its run — the pair the webhook's `done_run_id = github_run_id`
-// match then requires. The row lands ahead of the dispatch POST, so
-// seeing `dispatched` is not yet proof the run is bound.
-async function waitForBatch(stub: DurableObjectStub, taskId: string) {
+// The claimed task's bound run id once the dispatch response has
+// landed it — the run the webhook's `completed` delivery then reports.
+// The id lands ahead of the dispatch POST, so seeing `dispatched` is
+// not yet proof the run is bound.
+async function waitForRun(stub: DurableObjectStub, taskId: string) {
 	for (let i = 0; i < 80; i++) {
-		const row = await runInDurableObject(stub, async (_instance, ctx) => {
+		const runId = await runInDurableObject(stub, async (_instance, ctx) => {
 			const rows = ctx.storage.sql
 				.exec(
-					"SELECT b.batch_id, b.github_run_id \
-					 FROM build_batches b JOIN queue q ON q.batch_id = b.batch_id \
-					 WHERE q.task_id = ?",
+					"SELECT github_run_id FROM queue WHERE task_id = ?",
 					taskId,
 				)
-				.toArray() as { batch_id: string; github_run_id: string | null }[];
-			return rows[0] ?? null;
+				.toArray() as { github_run_id: string | null }[];
+			return rows[0]?.github_run_id ?? null;
 		});
-		if (row?.github_run_id != null) {
-			return row as { batch_id: string; github_run_id: string };
+		if (runId != null) {
+			return runId;
 		}
 		await new Promise((r) => setTimeout(r, 25));
 	}
-	throw new Error("no build_batches row bound a run for the claimed task");
+	throw new Error("no queue row bound a run for the claimed task");
 }
 
 // The full idle contract for a queue that has nothing to do. Two
 // layers, in order:
 //
 //   1. Natural state — whatever alarm the real event (reset, submit,
-//      batch-complete, freeze) left armed. If one is armed, it must run
+//      run-complete, freeze) left armed. If one is armed, it must run
 //      exactly once and leave nothing behind: `getAlarm() === null`
 //      afterwards and a second invocation `false`. A re-arm chain fails
 //      here, before any probe touches the instance. If nothing is
@@ -256,30 +254,28 @@ describe("scheduler idle proof (stow#593)", () => {
 		expect(body.inserted).toBe(1);
 
 		// Submit armed a real alarm; it fired on workerd's schedule,
-		// claimed the task into a batch and dispatched it against the
-		// stub — the only egress this suite permits.
+		// claimed the task and dispatched its own run against the stub —
+		// the only egress this suite permits.
 		const rows = await waitForStatus(stub, "dispatched");
 		const task = rows.find((r) => r.status === "dispatched")!;
 
 		// The same route the workflow_run webhook drives: the report
-		// names the batch and the run the dispatch bound, and lands
-		// `done_*`/`resolve_after` on its row for the alarm's
-		// resolution pass.
-		const batch = await waitForBatch(stub, task.task_id);
-		const res = await stub.fetch(`${DO}/batches/${batch.batch_id}/complete`, {
+		// names the task and its bound run, and lands the outcome on
+		// its row for the alarm's resolution pass.
+		const runId = await waitForRun(stub, task.task_id);
+		const res = await stub.fetch(`${DO}/tasks/complete-run`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({
-				run_id: Number(batch.github_run_id),
-				run_attempt: 1,
-				conclusion: "success",
-				html_url: `http://127.0.0.1:28124/runs/${batch.github_run_id}`,
+				task_id: task.task_id,
+				success: true,
+				github_run_id: runId,
 			}),
 		});
 		expect(res.status).toBe(200);
 
 		// The completion armed the pass at `resolve_after = now`; the
-		// live alarm then read the run's jobs page and the leg's
+		// live alarm then read the run's jobs page and the task's
 		// records manifest off the stub before completing the row.
 		await waitForStatus(stub, "completed");
 		const after = await statusCounts(stub);
@@ -288,7 +284,7 @@ describe("scheduler idle proof (stow#593)", () => {
 		await expectQuiescent(stub, after);
 	});
 
-	it("positive control: an in-flight batch lease keeps the alarm armed", async () => {
+	it("positive control: an in-flight task lease keeps the alarm armed", async () => {
 		const stub = await freshStub();
 		await reset(stub);
 		const { status } = await submit(stub, [enqueue("idle-inflight")]);
@@ -298,30 +294,34 @@ describe("scheduler idle proof (stow#593)", () => {
 		const counts = await statusCounts(stub);
 		expect(counts.dispatched ?? counts.running).toBe(1);
 
-		// The lease is a per-batch fact: claim wrote
-		// `build_batches.lease_at = claimed_at +
-		// STOW_STALE_DISPATCH_MINUTES` (insert_batch_rows), and while
-		// the run's completion is unrecorded `earliest_batch_wake_ms`
-		// returns MIN(lease_at) — so the armed wake is exactly that
+		// The lease is a per-task fact: the claiming pass wakes at the
+		// in-flight row's `claimed_at + STOW_STALE_DISPATCH_MINUTES`
+		// (`earliest_active_lease_expiry_ms` minimizes it over
+		// `dispatched`/`running`) — so the armed wake is exactly that
 		// stored instant. Poll until the claiming pass has re-armed: a
 		// mid-pass read would find the alarm still consumed.
+		const staleMs =
+			Number((env as Env2).STOW_STALE_DISPATCH_MINUTES) * 60_000;
+		expect(staleMs).toBeGreaterThan(0);
 		let armed: number | null = null;
 		for (let i = 0; i < 80; i++) {
-			const { leaseMs, alarm } = await runInDurableObject(
+			const { claimedMs, alarm } = await runInDurableObject(
 				stub,
 				async (_instance, ctx) => {
 					const rows = ctx.storage.sql
 						.exec(
-							"SELECT CAST(strftime('%s', lease_at) AS INTEGER) AS epoch \
-							 FROM build_batches",
+							"SELECT CAST(strftime('%s', claimed_at) AS INTEGER) AS epoch \
+							 FROM queue \
+							 WHERE status IN ('dispatched', 'running')",
 						)
 						.toArray() as { epoch: number }[];
 					return {
-						leaseMs: rows.length === 0 ? null : rows[0].epoch * 1000,
+						claimedMs: rows.length === 0 ? null : rows[0].epoch * 1000,
 						alarm: await ctx.storage.getAlarm(),
 					};
 				},
 			);
+			const leaseMs = claimedMs === null ? null : claimedMs + staleMs;
 			if (leaseMs !== null && alarm === leaseMs) {
 				armed = alarm;
 				break;
@@ -333,11 +333,9 @@ describe("scheduler idle proof (stow#593)", () => {
 		// checked against the binding itself rather than the row it
 		// reads — a wrong lease formula cannot pass by agreeing with
 		// itself. The tolerance covers claim-to-assert time.
-		const staleMs = Number((env as Env2).STOW_STALE_DISPATCH_MINUTES) * 60_000;
-		expect(staleMs).toBeGreaterThan(0);
 		expect(Math.abs((armed as number) - (Date.now() + staleMs))).toBeLessThan(60_000);
 
-		// A fired pass finds the batch inside its lease — nothing
+		// A fired pass finds the task inside its lease — nothing
 		// claimed, nothing resolved — and re-arms the same instant: a
 		// disconnected or no-op instance cannot pass this check.
 		expect(await runDurableObjectAlarm(stub)).toBe(true);
