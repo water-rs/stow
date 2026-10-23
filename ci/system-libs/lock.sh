@@ -328,7 +328,9 @@ pc_libdir="$(find "$merged" -type d -name pkgconfig | paste -sd:)"
 while IFS= read -r pc; do
     mod="$(basename "$pc" .pc)"
     rel="${pc#"$merged"/}"
-    sed "s|$merged||g" "$pc" | grep -q '/usr' \
+    # Strip every relocated "<root>/usr" — what is left naming /usr
+    # was never rewritten.
+    sed "s|$merged/usr||g" "$pc" | grep -q '/usr' \
         && fail "$rel still names /usr after relocation"
     flags="$(PKG_CONFIG_PATH='' PKG_CONFIG_SYSROOT_DIR='' \
         PKG_CONFIG_LIBDIR="$pc_libdir" \
