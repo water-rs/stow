@@ -1075,13 +1075,11 @@ if [ "$(uname -s)" = "Linux" ]; then
     SYS_LIBS="$WORK_DIR/stow-system-libs"
     SYS_DEBS="${XDG_CACHE_HOME:-$HOME/.cache}/stow/system-debs-$(sha256sum \
         "$REPO_ROOT/ci/system-libs/lock.txt" | cut -d' ' -f1)"
-    # Both gnu legs' sets, exactly as the legs provision them — the
-    # second call lands the superset root (amd64 + arm64 halves) the
-    # checks run against, and each call extracts its toolchain set
-    # (mold, then the aarch64 cross toolchain) into / with tar -k.
-    "$REPO_ROOT/ci/system-libs/install.sh" x86_64-unknown-linux-gnu \
-        "$SYS_DEBS" "$WORK_DIR/stow-system-libs-x86_64" \
-        || die "system-libs install (x86_64) failed"
+    # The aarch64 leg's sets are a superset of the x86_64 leg's
+    # (libs-amd64 and mold, plus libs-arm64 and the cross toolchain),
+    # so one install provisions both halves the checks run against. A
+    # second, x86_64 install would re-extract mold into / and trip
+    # tar -k on files the first one wrote; a leg only ever installs once.
     "$REPO_ROOT/ci/system-libs/install.sh" aarch64-unknown-linux-gnu \
         "$SYS_DEBS" "$SYS_LIBS" || die "system-libs install (aarch64) failed"
     "$REPO_ROOT/ci/glibc-sysroot/wrappers.sh" "$SYSROOT" "$SYS_LIBS" \
