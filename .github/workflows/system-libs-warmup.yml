@@ -1,0 +1,40 @@
+# Warm the system-debs actions/cache entry the gnu Linux legs read
+# (stow#862 §7 B3): when the lock or the scripts that decide the
+# entry's contents change on main, fetch + sha256-verify + install
+# through the same composite action the legs use, so the next
+# build-crate.yml dispatch restores a hit instead of downloading.
+# A save on main is the ref the legs' workflow_dispatch runs on main
+# restore from. Separate from test.yml because `paths:` filtering is
+# workflow-level and test.yml's main push must stay unfiltered.
+name: system-libs warmup
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ci/system-libs/**
+      - .github/actions/system-debs/**
+      - .github/workflows/system-libs-warmup.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: system-debs-warmup
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    name: warm system-debs (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/system-debs
+        with:
+          target: ${{ matrix.target }}

@@ -1073,21 +1073,15 @@ if [ "$(uname -s)" = "Linux" ]; then
     # against the lock's sha256; the debs cache keyed by lock hash
     # like the sysroot's manifest does.
     SYS_LIBS="$WORK_DIR/stow-system-libs"
+    SYS_DEBS="${XDG_CACHE_HOME:-$HOME/.cache}/stow/system-debs-$(sha256sum \
+        "$REPO_ROOT/ci/system-libs/lock.txt" | cut -d' ' -f1)"
+    # The aarch64 leg's sets are a superset of the x86_64 leg's
+    # (libs-amd64 and mold, plus libs-arm64 and the cross toolchain),
+    # so one install provisions both halves the checks run against. A
+    # second, x86_64 install would re-extract mold into / and trip
+    # tar -k on files the first one wrote; a leg only ever installs once.
     "$REPO_ROOT/ci/system-libs/install.sh" aarch64-unknown-linux-gnu \
-        "${XDG_CACHE_HOME:-$HOME/.cache}/stow/system-debs-$(sha256sum \
-            "$REPO_ROOT/ci/system-libs/lock.txt" | cut -d' ' -f1)" \
-        "$SYS_LIBS" || die "system-libs install failed"
-    # The aarch64 shim needs the cross drivers the image lacks — the
-    # same apt set the leg installs until stow#862's B1 locks the
-    # toolchain too.
-    if [ ! -x /usr/bin/aarch64-linux-gnu-gcc-12 ]; then
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu mold \
-            || die "cross toolchain install failed"
-        sudo ln -sf /usr/bin/ld.mold /usr/aarch64-linux-gnu/bin/ld.mold
-    fi
+        "$SYS_DEBS" "$SYS_LIBS" || die "system-libs install (aarch64) failed"
     "$REPO_ROOT/ci/glibc-sysroot/wrappers.sh" "$SYSROOT" "$SYS_LIBS" \
         || die "glibc sysroot wrapper write failed"
     "$REPO_ROOT/ci/glibc-sysroot/check-cxx.sh" "$SYSROOT" \
@@ -1389,6 +1383,40 @@ jq -e ".[] | select(.crate_name == \"$HOST_DEPS_CRATE\")" <<<"$plan_tasks" >/dev
     || die "plan has no $HOST_DEPS_CRATE task"
 echo "[mock-e2e] heck version resolved by the plan: $HECK_VERSION"
 
+# stow#862 B2: an openssl-sys build through the sandbox proves the
+# amd64 system-library root's grant and env — pkg-config finds the
+# root's libssl.pc, the shim links -L<root>, and the build script's
+# linked probe runs with the image's libssl.so.3. Only on Linux:
+# the root exists there alone. Its tasks go out in the same submit
+# and drain in the same waves as the host-deps batch.
+syslibs_tasks='[]'
+syslibs_count=0
+if [ "$(uname -s)" = Linux ]; then
+    OPENSSL_SYS_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
+        'https://index.crates.io/op/en/openssl-sys' \
+        | jq -rs '[.[] | select(.yanked | not) | .vers | select(startswith("0.9."))]
+                  | sort_by(split(".") | map(tonumber)) | last // empty')"
+    [ -n "$OPENSSL_SYS_VERSION" ] \
+        || die "no non-yanked openssl-sys 0.9.x found on crates.io"
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+        STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
+        STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+        "$BIN/stow-admin" --json preheat plan \
+        "openssl-sys@$OPENSSL_SYS_VERSION" \
+        --features-json '[]' \
+        --target "$HOST_TARGET" \
+        --rustc-version "$RUSTC_VERSION" \
+        >"$WORK_DIR/preheat-plan-syslibs.json" 2>"$LOG_DIR/preheat-plan-syslibs.log" \
+        || die "openssl-sys preheat plan failed — see $LOG_DIR/preheat-plan-syslibs.log"
+    syslibs_tasks="$(jq '[.targets[].tasks[]]' "$WORK_DIR/preheat-plan-syslibs.json")"
+    syslibs_count="$(jq 'length' <<<"$syslibs_tasks")"
+    [ "$syslibs_count" -ge 2 ] \
+        || die "openssl-sys plan returned $syslibs_count tasks — expected it plus host deps"
+    echo "[mock-e2e] openssl-sys $OPENSSL_SYS_VERSION plan: $syslibs_count tasks"
+fi
+plan_tasks="$(jq -n --argjson a "$plan_tasks" --argjson b "$syslibs_tasks" '$a + $b')"
+task_count=$((task_count + syslibs_count))
+
 # The demand-feed fixtures park on absent anchors for the rest of the
 # run — pending counts them forever — so the wave loop measures the
 # batch as a delta over the status counts taken the moment before
@@ -1497,6 +1525,17 @@ for dep in "$HOST_DEPS_CRATE" proc-macro2 quote syn unicode-ident; do
     [ "$n" = "2" ] || die "$dep covers $n host shapes under $HOST_TARGET, expected 2"
 done
 echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
+
+# The openssl-sys node (stow#862 B2) must have registered artifacts —
+# its build script's sandbox run is what proved the amd64 root's
+# grant and env.
+if [ "$(uname -s)" = Linux ]; then
+    syslib_rows="$(d1 "SELECT count(*) AS n FROM artifacts \
+        WHERE crate_name = 'openssl-sys' AND target = '$HOST_TARGET'")"
+    [ "$(jq -r '.[0].results[0].n' <<<"$syslib_rows")" -ge 1 ] \
+        || die "openssl-sys registered no artifacts under $HOST_TARGET"
+    echo "[mock-e2e] catalog: openssl-sys registered artifacts under $HOST_TARGET"
+fi
 
 # The proc-macro unit's honest floor — measured by the sysrooted build
 # the way production links — must sit at or under the index's published
