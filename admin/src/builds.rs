@@ -105,12 +105,15 @@ pub async fn run(token: &str, args: BuildsArgs, output: Output) -> stow_types::e
 
 // ===== Collecting the failures =====
 
-/// A run listing row — the fields the digest reads: the id for the
-/// jobs path and the URL for the comment.
+/// A run listing row — the fields the digest reads: the id and
+/// attempt for the jobs path and the URL for the comment.
 #[derive(Debug, serde::Deserialize)]
 struct DigestRun {
     id: u64,
     html_url: String,
+    /// The run's latest attempt — the jobs page is read scoped to it
+    /// (stow#852).
+    run_attempt: u32,
     /// When the run last changed — for a completed run, when it completed.
     #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
@@ -213,10 +216,11 @@ impl FailureKind {
 async fn classify_run(
     token: &str,
     run_id: u64,
+    attempt: u32,
 ) -> stow_types::error::Result<(Vec<RunJobRow>, Vec<runs::PageLeg>)> {
     let mut attempts = SETTLE_ATTEMPTS;
     loop {
-        let jobs = runs::fetch_run_jobs(token, run_id).await?;
+        let jobs = runs::fetch_run_jobs(token, run_id, attempt).await?;
         let legs = runs::classify_page(&jobs, "failure", OffsetDateTime::now_utc())?;
         if legs.iter().all(|leg| leg.outcome != LegOutcome::Unsettled) {
             return Ok((jobs, legs));
@@ -302,7 +306,7 @@ fn failure_fields(
 /// jobs page → one entry per failed leg, keyed by the label in its
 /// `build` job's name and its task hash.
 async fn inspect_run(token: &str, run: &DigestRun) -> stow_types::error::Result<Vec<FailureEntry>> {
-    let (jobs, legs) = classify_run(token, run.id).await?;
+    let (jobs, legs) = classify_run(token, run.id, run.run_attempt).await?;
     let mut entries = Vec::new();
     for leg in &legs {
         let LegOutcome::Failed(failure) = &leg.outcome else {
@@ -842,6 +846,7 @@ mod tests {
         let run = |id, updated_at: &str| DigestRun {
             id,
             html_url: String::new(),
+            run_attempt: 1,
             updated_at: OffsetDateTime::parse(updated_at, &Rfc3339).expect("updated_at"),
         };
         let kept = completed_in(

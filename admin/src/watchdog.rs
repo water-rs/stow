@@ -646,7 +646,7 @@ impl Watcher<'_> {
         // incident of its own).
         let pages: Vec<Vec<RunJobRow>> =
             futures_util::stream::iter(runs.iter().map(|run| async move {
-                runs::fetch_run_jobs(self.gh_token, run.id)
+                runs::fetch_run_jobs(self.gh_token, run.id, run.run_attempt)
                     .await
                     .map_err(|error| format!("run {}: jobs fetch: {error}", run.id))
             }))
@@ -691,10 +691,7 @@ impl Watcher<'_> {
         } else {
             failed_legs.len() as f64 / completed_legs as f64 * 100.0
         };
-        let retrying: Vec<&GhRun> = runs
-            .iter()
-            .filter(|run| run.run_attempt.unwrap_or(1) >= 3)
-            .collect();
+        let retrying: Vec<&GhRun> = runs.iter().filter(|run| run.run_attempt >= 3).collect();
 
         let mut evidence_rate = Vec::new();
         let mut evidence_retry = Vec::new();
@@ -718,11 +715,7 @@ impl Watcher<'_> {
             }
         }
         for run in retrying.iter().take(5) {
-            evidence_retry.push(format!(
-                "{} (attempt {})",
-                run.html_url,
-                run.run_attempt.unwrap_or(1)
-            ));
+            evidence_retry.push(format!("{} (attempt {})", run.html_url, run.run_attempt));
         }
         if retrying.len() > 5 {
             evidence_retry.push(format!("+{} more retried runs", retrying.len() - 5));
@@ -1440,8 +1433,9 @@ struct GhRun {
     html_url: String,
     #[serde(default)]
     conclusion: Option<String>,
-    #[serde(default)]
-    run_attempt: Option<u32>,
+    /// The run's latest attempt — GitHub answers it on every workflow
+    /// run row, and the jobs read is scoped to it (stow#852).
+    run_attempt: u32,
 }
 
 impl github::RunRow for GhRun {
