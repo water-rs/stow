@@ -678,10 +678,21 @@ ON attempt_outcomes_v2 (finished_at);
 -- the exact response binds the same run to the claimed generation. Rows are
 -- bounded by in-flight dispatches and are deleted when the binding applies
 -- or the unbound generation is abandoned.
+-- `build-crate.yml` runs the scheduler did not dispatch — counted from
+-- `workflow_run` deliveries (`in_progress` for an unbound run adds,
+-- `completed`/`cancelled` removes; a dispatch binding also removes)
+-- and reconciled by the CI interface's `status` listing at a bounded
+-- cadence, only while the queue has work (stow#877).
+CREATE TABLE IF NOT EXISTS external_runs (
+    github_run_id TEXT PRIMARY KEY,
+    runner_family TEXT NOT NULL CHECK (runner_family IN ('linux', 'macos', 'windows', 'unknown'))
+);
+
 CREATE TABLE IF NOT EXISTS pending_run_completions (
     github_run_id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
     success INTEGER NOT NULL CHECK (success IN (0, 1)),
+    cancelled INTEGER NOT NULL DEFAULT 0 CHECK (cancelled IN (0, 1)),
     error TEXT,
     received_at TEXT NOT NULL DEFAULT (datetime('now'))
 );

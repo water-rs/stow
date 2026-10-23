@@ -25,7 +25,12 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use oci_client::manifest::OciImageManifest;
-use stow_types::api::{BuildTaskPayload, EnqueueDependency, EnqueueRequest};
+use stow_types::api::{
+    BuildTaskPayload, EnqueueDependency, EnqueueRequest, RunnerFamily, runner_family,
+};
+use stow_types::ci::{
+    CiInterface, DispatchError as CiDispatchError, STOW_MACOS_RUNNER_BUDGET, STOW_RUNNER_BUDGET,
+};
 use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 use stow_types::index::{ArtifactIndexRow, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::public_cache::{UnitInvocation, required_unit_shapes};
@@ -38,9 +43,9 @@ use stow_types::transient::Backoff;
 use stow_types::trusted_builder::{
     BRANCH, INDEX_CERTIFICATE_IDENTITY, WORKFLOW_FILE, WORKFLOW_NAME,
 };
-use zenwave::{Client, ResponseExt};
 
-use crate::github::{WorkflowRunRow, WriteFailure, classify_write};
+use crate::ci::ZenwaveTransport;
+use crate::github::{WorkflowRunRow, WriteFailure};
 use crate::render::{self, Output};
 use crate::runs::{TaskOutcome, classify_page};
 
@@ -99,9 +104,10 @@ pub struct ManualArgs {
     #[arg(long)]
     rustc_version: String,
     /// Runner slots in flight at once — one `build-crate.yml` run
-    /// holds one slot, kept under the org's 60-runner ceiling so the
-    /// repo's own CI still gets runners.
-    #[arg(long, default_value_t = 45)]
+    /// holds one slot, bounded by the shared
+    /// [`STOW_RUNNER_BUDGET`] margin so the rest of the org keeps
+    /// runners (stow#877).
+    #[arg(long, default_value_t = STOW_RUNNER_BUDGET)]
     in_flight: u32,
     /// Comma-separated CI target triples to resolve and dispatch for —
     /// defaults to every `CI_TARGET_TRIPLES` entry. The mock lane
@@ -307,18 +313,30 @@ struct BoundRun {
     dispatched_at: Option<std::time::Instant>,
 }
 
-/// The two dispatch backends, selected by `--dispatch-url`: GitHub's
-/// `workflow_dispatch` API with the operator's token, or the mock's local
-/// CI server.
-enum Dispatch {
-    /// Real GitHub Actions.
+/// The wave's CI handle: the shared [`CiInterface`] every submit and
+/// occupancy read goes through (stow#877), plus the backend particulars
+/// `refresh_head`/`list_runs`/`poll_bound` still read — GitHub's run
+/// rows through the same token, the local server's through its
+/// `/tasks` list.
+struct Dispatch {
+    /// The one privileged CI interface this wave drives.
+    interface: CiInterface<ZenwaveTransport>,
+    /// What the run-row reads hang off.
+    reads: DispatchReads,
+}
+
+/// The backend the wave's run-row reads hang off — `list_runs`,
+/// `poll_bound` and the `main` head `refresh_head` reads.
+enum DispatchReads {
+    /// Real GitHub Actions — the operator token `crate::github_token`
+    /// resolved.
     GitHub {
-        /// The operator token `crate::github_token` resolved.
+        /// The installation-scoped API token.
         token: String,
     },
     /// The mock `stow-build serve` base URL.
     Local {
-        /// Base URL — `/dispatch` and `/tasks` hang off it.
+        /// Base URL — `/tasks` hangs off it.
         base: String,
     },
 }
@@ -429,13 +447,23 @@ pub async fn run(args: ManualArgs, _output: Output) -> stow_types::error::Result
         return dry_run_report(&nodes);
     }
 
-    let dispatch = match &args.dispatch_url {
-        Some(url) => Dispatch::Local {
-            base: url.trim_end_matches('/').to_owned(),
-        },
-        None => Dispatch::GitHub {
-            token: crate::github_token().await?,
-        },
+    let dispatch = if let Some(url) = &args.dispatch_url {
+        Dispatch {
+            interface: CiInterface::local_ci(url.trim_end_matches('/'), ZenwaveTransport),
+            reads: DispatchReads::Local {
+                base: url.trim_end_matches('/').to_owned(),
+            },
+        }
+    } else {
+        let token = crate::github_token().await?;
+        Dispatch {
+            interface: CiInterface::github(
+                stow_types::trusted_builder::REPOSITORY,
+                &token,
+                ZenwaveTransport,
+            ),
+            reads: DispatchReads::GitHub { token },
+        }
     };
 
     let base = crate::index_cmd::registry_base()?;
@@ -1709,9 +1737,9 @@ async fn classify_and_fold(
         bind_run(run, &state, wave.nodes);
         return Ok(());
     }
-    match dispatch {
-        Dispatch::Local { .. } => fold_local_task(&state, wave),
-        Dispatch::GitHub { token } => classify_github_run(token, &state, wave).await?,
+    match &dispatch.reads {
+        DispatchReads::Local { .. } => fold_local_task(&state, wave),
+        DispatchReads::GitHub { token } => classify_github_run(token, &state, wave).await?,
     }
     Ok(())
 }
@@ -1962,25 +1990,58 @@ async fn dispatch_open(
     if !wave.gate.open() {
         return Ok(());
     }
-    let free = policy
-        .in_flight
-        .saturating_sub(u32::try_from(wave.runs.len()).unwrap_or(u32::MAX));
-    if free == 0 {
-        return Ok(());
-    }
-    let pending: Vec<String> = wave
+    let undispatched = wave
         .open
         .iter()
-        .filter(|id| !wave.nodes.get(*id).expect("open node").dispatched)
-        .take(usize::try_from(free).unwrap_or(usize::MAX))
-        .cloned()
-        .collect();
-    for task_id in pending {
+        .any(|id| !wave.nodes.get(id).expect("open node").dispatched);
+    if !undispatched {
+        return Ok(());
+    }
+    // The shared margin (stow#877): `status` counts every queued and
+    // in-progress `build-crate.yml` run — the scheduler's dispatches
+    // and another `preheat manual` wave hold slots the wave's own run
+    // list cannot see — and the wave keeps at most the budgeted share.
+    // The read fails closed: no status answer, no sends this pass.
+    let external = match dispatch.interface.status().await {
+        Ok(occupancy) => occupancy,
+        Err(error) => {
+            tracing::warn!(%error, "CI occupancy read failed — holding sends this pass");
+            return Ok(());
+        }
+    };
+    let own = u32::try_from(wave.runs.len()).unwrap_or(u32::MAX);
+    let own_macos = wave
+        .runs
+        .keys()
+        .filter_map(|id| wave.nodes.get(id))
+        .filter(|node| runner_family(node.request.target.as_str()) == Some(RunnerFamily::MacOs))
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
+    let mut taken = external.total().max(own);
+    let mut taken_macos = external.of(RunnerFamily::MacOs).max(own_macos);
+    for task_id in wave.open.clone() {
+        if taken >= policy.in_flight.min(STOW_RUNNER_BUDGET) {
+            return Ok(());
+        }
         let node = wave.nodes.get(&task_id).expect("open node");
+        if node.dispatched {
+            continue;
+        }
+        let is_macos = runner_family(node.request.target.as_str()) == Some(RunnerFamily::MacOs);
+        if is_macos && taken_macos >= STOW_MACOS_RUNNER_BUDGET {
+            continue;
+        }
         let encoded = serde_json::to_string(&task_payload(&task_id, &node.request))
             .map_err(|error| stow_error!("encode {task_id}: {error}"))?;
         match dispatch_task(dispatch, task_id, encoded, wave).await? {
-            DispatchAnswer::Bound => wave.gate.confirmed(),
+            DispatchAnswer::Bound => {
+                wave.gate.confirmed();
+                taken += 1;
+                if is_macos {
+                    taken_macos += 1;
+                }
+            }
             DispatchAnswer::Ambiguous(failure) | DispatchAnswer::RateLimited(failure) => {
                 return wave.gate.hold(&failure);
             }
@@ -2095,8 +2156,8 @@ async fn publish_and_wait(
     if slices.is_empty() {
         return Ok(());
     }
-    match dispatch {
-        Dispatch::GitHub { token } => {
+    match &dispatch.reads {
+        DispatchReads::GitHub { token } => {
             let mut inputs = serde_json::json!({});
             if let Some(url) = args.edge_url.clone() {
                 inputs["stow_edge_url"] = serde_json::Value::String(url);
@@ -2130,7 +2191,7 @@ async fn publish_and_wait(
                 }
             }
         }
-        Dispatch::Local { .. } => {
+        DispatchReads::Local { .. } => {
             local_index_publish(rustc_version).await?;
         }
     }
@@ -2250,6 +2311,33 @@ async fn local_index_publish(rustc_version: &WireRustcVersion) -> stow_types::er
     Ok(())
 }
 
+/// A [`CiDispatchError`] as the wave's [`WriteFailure`]: a rate limit
+/// or a refused status provably did not happen; a 5xx or a transport
+/// failure may have landed, so it resolves ambiguously.
+fn send_failure(error: CiDispatchError) -> WriteFailure {
+    match error {
+        CiDispatchError::RateLimited {
+            status,
+            retry_after_secs,
+        } => WriteFailure::RateLimited {
+            message: format!("dispatch rate-limited (HTTP {status})"),
+            hint: retry_after_secs.map(std::time::Duration::from_secs),
+        },
+        CiDispatchError::Api { status, body } if status >= 500 => {
+            WriteFailure::Ambiguous(format!("dispatch: HTTP {status}: {body}"))
+        }
+        CiDispatchError::Api { status, body } => {
+            WriteFailure::Refused(format!("dispatch: HTTP {status}: {body}"))
+        }
+        CiDispatchError::Network(error) | CiDispatchError::Response(error) => {
+            WriteFailure::Ambiguous(format!("dispatch: {error}"))
+        }
+        CiDispatchError::OutOfScope(error) | CiDispatchError::TokenMint(error) => {
+            WriteFailure::Refused(error)
+        }
+    }
+}
+
 impl Dispatch {
     /// Send the build-batch dispatch: GitHub's `workflow_dispatch` of
     /// `build-batch.yml` with the `batch` input under the operator
@@ -2258,54 +2346,11 @@ impl Dispatch {
     /// on a confirmed send, or the [`WriteFailure`] kind an ambiguous
     /// answer resolves through.
     async fn send(&self, encoded: &str) -> Result<u64, WriteFailure> {
-        match self {
-            Self::GitHub { token } => {
-                let response: WorkflowDispatchResponse = crate::github::post(
-                    token,
-                    &format!("actions/workflows/{WORKFLOW_FILE}/dispatches"),
-                    &serde_json::json!({
-                        "ref": BRANCH,
-                        "inputs": { "task": encoded },
-                        "return_run_details": true,
-                    }),
-                )
-                .await?;
-                Ok(response.workflow_run_id)
-            }
-            Self::Local { base } => {
-                let url = format!("{base}/dispatch");
-                let body = serde_json::json!({
-                    "event_type": "build-crate",
-                    "client_payload": serde_json::from_str::<serde_json::Value>(encoded)
-                        .map_err(|error| {
-                            WriteFailure::Refused(format!("decode task payload: {error}"))
-                        })?,
-                });
-                let refused = |error: zenwave::Error| {
-                    WriteFailure::Refused(format!("build POST {url}: {error}"))
-                };
-                let context = format!("POST {url}");
-                let payload_bytes = serde_json::to_vec(&body).map_err(|error| {
-                    WriteFailure::Refused(format!("build POST {url} body: {error}"))
-                })?;
-                let mut client = zenwave::client();
-                let response: WorkflowDispatchResponse = client
-                    .post(&url)
-                    .map_err(refused)?
-                    .header("Content-Type", "application/json")
-                    .map_err(refused)?
-                    .bytes_body(payload_bytes)
-                    .await
-                    .map_err(|error| classify_write(&context, &error))?
-                    .error_for_status()
-                    .await
-                    .map_err(|error| classify_write(&context, &error))?
-                    .into_json()
-                    .await
-                    .map_err(|error| WriteFailure::Ambiguous(format!("read {context}: {error}")))?;
-                Ok(response.workflow_run_id)
-            }
-        }
+        self.interface
+            .submit(encoded)
+            .await
+            .map(|run| run.workflow_run_id)
+            .map_err(send_failure)
     }
 
     /// `main`'s head — GitHub reads it conditionally (a 304 keeps the
@@ -2315,8 +2360,8 @@ impl Dispatch {
         &self,
         cache: &mut Option<HeadCache>,
     ) -> stow_types::error::Result<String> {
-        match self {
-            Self::GitHub { token } => {
+        match &self.reads {
+            DispatchReads::GitHub { token } => {
                 let etag = cache.as_ref().and_then(|cache| cache.etag.as_deref());
                 match crate::github::get_conditional::<GitRef>(
                     token,
@@ -2341,7 +2386,7 @@ impl Dispatch {
                         .clone()),
                 }
             }
-            Self::Local { .. } => Ok(String::new()),
+            DispatchReads::Local { .. } => Ok(String::new()),
         }
     }
 
@@ -2355,8 +2400,8 @@ impl Dispatch {
         until: time::OffsetDateTime,
         rustc_version: &WireRustcVersion,
     ) -> stow_types::error::Result<Vec<RunState>> {
-        match self {
-            Self::GitHub { token } => {
+        match &self.reads {
+            DispatchReads::GitHub { token } => {
                 let rows = crate::github::runs_in_range(
                     WORKFLOW_FILE,
                     &format!("event=workflow_dispatch&branch={BRANCH}"),
@@ -2390,7 +2435,7 @@ impl Dispatch {
                     })
                     .collect())
             }
-            Self::Local { base } => local_run_states(base, rustc_version).await,
+            DispatchReads::Local { base } => local_run_states(base, rustc_version).await,
         }
     }
 
@@ -2407,8 +2452,8 @@ impl Dispatch {
         runs: &HashMap<String, BoundRun>,
         rustc_version: &WireRustcVersion,
     ) -> stow_types::error::Result<Vec<BoundPoll>> {
-        match self {
-            Self::GitHub { token } => futures_util::stream::iter(
+        match &self.reads {
+            DispatchReads::GitHub { token } => futures_util::stream::iter(
                 runs.iter()
                     .filter_map(|(task_id, run)| {
                         run.workflow_run_id
@@ -2454,7 +2499,7 @@ impl Dispatch {
             .await
             .into_iter()
             .collect(),
-            Self::Local { base } => {
+            DispatchReads::Local { base } => {
                 // The same tracked-id binding GitHub gets: a local row
                 // that is not the task's bound run id is dropped
                 // before the fold, so an old same-task completion can
@@ -2685,13 +2730,17 @@ struct GitRefObject {
     sha: String,
 }
 
-#[derive(serde::Deserialize)]
-struct WorkflowDispatchResponse {
-    workflow_run_id: u64,
-}
-
 #[cfg(test)]
 mod tests {
+    fn local_dispatch(base: &str) -> Dispatch {
+        Dispatch {
+            interface: CiInterface::local_ci(base, ZenwaveTransport),
+            reads: DispatchReads::Local {
+                base: base.to_owned(),
+            },
+        }
+    }
+
     use super::*;
     use crate::runs::TaskFailure;
     use clap::Parser;
@@ -3677,9 +3726,7 @@ mod tests {
             node.workflow_run_id = Some(run_id);
             node.dispatched = true;
         }
-        let dispatch = Dispatch::Local {
-            base: "http://localhost".to_owned(),
-        };
+        let dispatch = local_dispatch("http://localhost");
         let mut reruns = Vec::new();
         let mut gate = WriteGate::new();
         {
@@ -3741,9 +3788,7 @@ mod tests {
         let mut runs = HashMap::from([(task.clone(), bound_run(&task, 50))]);
         let mut other = run_state_with_id(99, "completed", Some("failure"), false);
         other.task_id = task.clone();
-        let dispatch = Dispatch::Local {
-            base: "http://localhost".to_owned(),
-        };
+        let dispatch = local_dispatch("http://localhost");
         let mut reruns = Vec::new();
         let mut gate = WriteGate::new();
         {
@@ -3813,9 +3858,7 @@ mod tests {
         state.task_id = task.clone();
         state.run_attempt = MAX_RUN_ATTEMPTS;
         state.error = Some("the build failed".to_owned());
-        let dispatch = Dispatch::Local {
-            base: "http://localhost".to_owned(),
-        };
+        let dispatch = local_dispatch("http://localhost");
         let mut reruns = Vec::new();
         let mut gate = WriteGate::new();
         {
@@ -4028,9 +4071,7 @@ mod tests {
         let selected = latest.remove(&batch).expect("a qualifying run");
         assert_eq!(selected.workflow_run_id, 9);
 
-        let dispatch = Dispatch::Local {
-            base: "http://localhost".to_owned(),
-        };
+        let dispatch = local_dispatch("http://localhost");
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
         {
@@ -4060,9 +4101,7 @@ mod tests {
         unresolved_run(&mut runs, &mut nodes, &task, 9, at(1_000_000));
         // The listing answers nothing for the run — an empty mock CI.
         let server = MockCi::start(&[], &[], "1.99.0").await;
-        let dispatch = Dispatch::Local {
-            base: server.url.clone(),
-        };
+        let dispatch = local_dispatch(&server.url);
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
@@ -4234,9 +4273,7 @@ mod tests {
         let mut state = run_state_with_id(50, "in_progress", None, true);
         state.task_id = task.clone();
         state.run_attempt = 2;
-        let dispatch = Dispatch::Local {
-            base: "http://localhost".to_owned(),
-        };
+        let dispatch = local_dispatch("http://localhost");
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
         {
@@ -4282,9 +4319,7 @@ mod tests {
         let mut state = run_state_with_id(50, "completed", Some("failure"), true);
         state.task_id = task.clone();
         state.run_attempt = 1;
-        let dispatch = Dispatch::Local {
-            base: "http://localhost".to_owned(),
-        };
+        let dispatch = local_dispatch("http://localhost");
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
         {
@@ -4330,9 +4365,7 @@ mod tests {
         state.task_id = task.clone();
         state.run_attempt = 1;
         state.error = Some("the build failed".to_owned());
-        let dispatch = Dispatch::Local {
-            base: "http://localhost".to_owned(),
-        };
+        let dispatch = local_dispatch("http://localhost");
         let mut gate = WriteGate::new();
         let mut reruns = Vec::new();
         {
@@ -4518,6 +4551,19 @@ mod tests {
                     ),
                 )
                 .route("/tasks", axum::routing::get(mock_tasks))
+                // `Dispatch::status()` asks the GitHub-shaped
+                // workflow-runs listing (stow#877); the mock completes
+                // every recorded run instantly, so queued and
+                // in-progress are always empty.
+                .route(
+                    "/repos/water-rs/stow/actions/workflows/build-crate.yml/runs",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({
+                            "total_count": 0,
+                            "workflow_runs": [],
+                        }))
+                    }),
+                )
                 .with_state(shared);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -4572,9 +4618,7 @@ mod tests {
         let (kept, ghost, unrecorded) = (ids("kept"), ids("ghost"), ids("unrecorded"));
         let layer: Vec<String> = nodes.keys().cloned().collect();
         let server = MockCi::start(&["ghost"], &["unrecorded"], "1.99.0").await;
-        let dispatch = Dispatch::Local {
-            base: server.url.clone(),
-        };
+        let dispatch = local_dispatch(&server.url);
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
         let policy = DispatchPolicy {
             rustc_version: &rustc,
@@ -4668,9 +4712,7 @@ mod tests {
         assert_eq!(mark_covered_done(&mut nodes, &covered), 1);
         let layers = layer_graph(&nodes, &edges, &covered).expect("layers");
         let server = MockCi::start(&[], &[], "1.99.0").await;
-        let dispatch = Dispatch::Local {
-            base: server.url.clone(),
-        };
+        let dispatch = local_dispatch(&server.url);
         let rustc = WireRustcVersion::parse("1.99.0").expect("rustc");
         let policy = DispatchPolicy {
             rustc_version: &rustc,

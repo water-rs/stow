@@ -1826,9 +1826,14 @@ async fn payload_driven_queue_updates_seek_the_primary_key() {
         db: &db,
         raced: AtomicBool::new(false),
     };
-    let claimed = queue::claim_dispatchable_tasks(&db, &settings, &coverage)
-        .await
-        .expect("claim");
+    let claimed = queue::claim_dispatchable_tasks(
+        &db,
+        &settings,
+        &coverage,
+        &stow_types::ci::Occupancy::EMPTY,
+    )
+    .await
+    .expect("claim");
     assert!(
         !claimed.is_empty(),
         "the pass must keep a task for the back-off to fail"

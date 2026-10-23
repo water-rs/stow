@@ -22,7 +22,6 @@ use crate::db;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
-use crate::scheduler::dispatch::BuildRuns as _;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{budget, fixture};
@@ -617,21 +616,34 @@ async fn complete_run(
     Json(report): Json<stow_types::api::WorkflowRunComplete>,
 ) -> Result<Json<OkResponse>> {
     let freeze = freeze_settings(&env)?;
-    queue::complete_run(
+    let outcome = queue::complete_run(
         &db,
         &scheduler_settings(&env)?,
         &report,
         freeze.window_minutes,
     )
-    .await
-    .map_err(|error| {
-        let status = match &error {
-            QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-            QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        to_error(error).set_status(status)
-    })?;
+    .await;
+    // A run another submitter dispatched leaves the external set here
+    // (stow#877): its completion is consumed whether the queue held a
+    // task for it (stale against our bound run) or never did — the
+    // set tracks run ids, not tasks.
+    if let Some(run_id) = &report.github_run_id {
+        queue::external_run_gone(&db, run_id)
+            .await
+            .map_err(to_error)?;
+    }
+    match outcome {
+        Ok(()) => {}
+        Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => {
+            tracing::info!(
+                task_id = %report.task_id,
+                run_id = ?report.github_run_id,
+                "workflow_run completion resolved an external run"
+            );
+            return Ok(Json(OkResponse { ok: true }));
+        }
+        Err(error) => return Err(to_error(error)),
+    }
     // A failed attempt may have closed the window's trip condition —
     // evaluate while this request still holds the outcome row's write
     // context. The freeze then eats the dispatch the alarm was about
@@ -659,16 +671,24 @@ async fn apply_task_run_update(
     db: DurableDb,
     Json(update): Json<stow_types::api::TaskRunUpdate>,
 ) -> Result<Json<OkResponse>> {
-    queue::record_task_run_update(&db, &update.task_id, &update.github_run_id)
-        .await
-        .map_err(|error| {
-            let status = match &error {
-                QueueError::UnknownTask(_) => StatusCode::NOT_FOUND,
-                QueueError::StaleCompletion { .. } => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
+    match queue::record_task_run_update(&db, &update.task_id, &update.github_run_id).await {
+        Ok(()) => {
+            // Ours — a raced external count is dropped by the bind;
+            // an unbound earlier delivery may already have added it.
+            queue::external_run_gone(&db, &update.github_run_id)
+                .await
+                .map_err(to_error)?;
+        }
+        Err(QueueError::UnknownTask(_) | QueueError::StaleCompletion { .. }) => {
+            // No claimed row names this run — another submitter's
+            // `build-crate.yml` run (stow#877): it holds a runner slot
+            // the claim must price in until its completion removes it.
+            queue::external_run_seen(&db, &update.github_run_id, &update.task_id)
+                .await
+                .map_err(to_error)?;
+        }
+        Err(error) => return Err(to_error(error)),
+    }
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -839,16 +859,20 @@ pub(super) async fn admit_request_pass(
     let pool = crate::fetch_guard::OutboundPool::new();
     let outcome = match credential_source {
         CredentialSource::LocalCi(url) => {
-            dispatch::LocalCiBuildRuns::new(&url)
-                .trigger_resolve(&dispatch_payload, &github_repo, &pool)
+            dispatch::CiInterface::local_ci(&url, dispatch::CfTransport::new(pool.clone()))
+                .submit_resolve(&dispatch_payload)
                 .await
         }
         CredentialSource::GitHub(config) => {
             match github_app::installation_token(db, &config).await {
                 Ok(token) => {
-                    dispatch::GitHubBuildRuns::new(token)
-                        .trigger_resolve(&dispatch_payload, &github_repo, &pool)
-                        .await
+                    dispatch::CiInterface::github(
+                        &github_repo,
+                        &token.token,
+                        dispatch::CfTransport::new(pool.clone()),
+                    )
+                    .submit_resolve(&dispatch_payload)
+                    .await
                 }
                 Err(error) => {
                     let error = dispatch::DispatchError::TokenMint(error.to_string());
@@ -1324,6 +1348,11 @@ fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
 /// counted-D1 coverage lookups a real wake pays. Returns the claimed
 /// task ids — the probe's claim record and the launch gate's claim
 /// count both derive from the pass's own set.
+/// `status` reconciles the delivery-tracked external set at most once
+/// per this many minutes — ≤2 listing calls each, ≤12 calls/hour while
+/// the queue has work (stow#877).
+const STATUS_RECONCILE_MS: i64 = 10 * 60 * 1000;
+
 pub(super) async fn dispatch_pass(
     env: &WasmEnv,
     db: &DurableDb,
@@ -1345,7 +1374,59 @@ pub(super) async fn dispatch_pass(
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
     let bindings = PassBindings::read(env)?;
-    let tasks = queue::claim_dispatchable_tasks(db, settings, coverage)
+    // The backend resolves once per pass, before the claim: the local-CI
+    // branch carries no Authorization; the GitHub branch reuses the
+    // installation token cached in DO storage while more than five
+    // minutes of validity remain and otherwise mints a fresh one. A
+    // failed mint fails the pass with every row still `pending` — a
+    // transient mint outage is not worth a burned build attempt.
+    let pool = crate::fetch_guard::OutboundPool::new();
+    let interface = match &bindings.credential_source {
+        CredentialSource::LocalCi(url) => {
+            tracing::info!(url = %url, "dispatching via local-CI endpoint");
+            dispatch::CiInterface::local_ci(url, dispatch::CfTransport::new(pool.clone()))
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(db, config).await {
+                Ok(token) => dispatch::CiInterface::github(
+                    &bindings.github_repo,
+                    &token.token,
+                    dispatch::CfTransport::new(pool.clone()),
+                ),
+                Err(error) => {
+                    let error = dispatch::DispatchError::TokenMint(error.to_string());
+                    return Err(to_error(error.to_string()));
+                }
+            }
+        }
+    };
+    // External occupancy (stow#877): runs this scheduler did not
+    // dispatch are tracked from `workflow_run` deliveries —
+    // `in_progress` for an unbound run adds, `completed` removes —
+    // and `status` only reconciles the set: at most once per
+    // STATUS_RECONCILE minutes and only while the queue holds work,
+    // so an idle scheduler costs zero calls. A reconcile failure is
+    // not worth burning the pass over — the delivery-tracked set is
+    // the primary source; `status` only corrects its drift.
+    let now = now_ms();
+    if queue::has_dispatchable_or_inflight(db)
+        .await
+        .map_err(to_error)?
+        && queue::external_reconcile_due(db, STATUS_RECONCILE_MS, now)
+            .await
+            .map_err(to_error)?
+    {
+        match interface.status_runs().await {
+            Ok(listed) => queue::reconcile_external_runs(db, &listed, now)
+                .await
+                .map_err(to_error)?,
+            Err(error) => {
+                tracing::warn!(%error, "CI status reconcile failed — keeping delivery-tracked external occupancy");
+            }
+        }
+    }
+    let occupancy = queue::external_occupancy(db).await.map_err(to_error)?;
+    let tasks = queue::claim_dispatchable_tasks(db, settings, coverage, &occupancy)
         .await
         .map_err(to_error)?;
     let task_ids: Vec<String> = tasks.iter().map(|task| task.task_id.clone()).collect();
@@ -1356,54 +1437,7 @@ pub(super) async fn dispatch_pass(
     if tasks.is_empty() {
         return Ok(Vec::new());
     }
-
-    // The backend resolves once per pass, only when tasks exist: the
-    // local-CI branch carries no Authorization; the GitHub branch reuses
-    // the installation token cached in DO storage while more than five
-    // minutes of validity remain and otherwise mints a fresh one. A
-    // failed mint is a dispatch failure for every claimed task — the
-    // same backoff a failed POST would get.
-    match &bindings.credential_source {
-        CredentialSource::LocalCi(url) => {
-            tracing::info!(url = %url, "dispatching via local-CI endpoint");
-            dispatch_tasks(
-                db,
-                settings,
-                &dispatch::LocalCiBuildRuns::new(url),
-                tasks,
-                &bindings.github_repo,
-            )
-            .await?;
-        }
-        CredentialSource::GitHub(config) => {
-            match github_app::installation_token(db, config).await {
-                Ok(token) => {
-                    dispatch_tasks(
-                        db,
-                        settings,
-                        &dispatch::GitHubBuildRuns::new(token),
-                        tasks,
-                        &bindings.github_repo,
-                    )
-                    .await?;
-                }
-                Err(error) => {
-                    let error = dispatch::DispatchError::TokenMint(error.to_string());
-                    for task in &tasks {
-                        queue::mark_dispatch_failed(
-                            db,
-                            settings,
-                            &task.task_id,
-                            &task.generation_id,
-                            &error.to_string(),
-                        )
-                        .await
-                        .map_err(to_error)?;
-                    }
-                }
-            }
-        }
-    }
+    dispatch_tasks(db, settings, &interface, tasks).await?;
 
     // A completion may have been persisted while this pass was waiting
     // for the dispatch responses. Consume it now that all returned
@@ -1456,11 +1490,9 @@ fn now_ms() -> i64 {
 async fn dispatch_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
-    backend: &impl dispatch::BuildRuns,
+    backend: &dispatch::CiInterface<dispatch::CfTransport>,
     tasks: Vec<queue::QueuedTask>,
-    github_repo: &str,
 ) -> Result<()> {
-    let pool = crate::fetch_guard::OutboundPool::new();
     // Collected before streaming: a closure inside the stream's type
     // borrows each task under a higher-ranked lifetime, and the alarm
     // future then cannot prove itself `Send`.
@@ -1474,10 +1506,9 @@ async fn dispatch_tasks(
                         .map_err(|error| QueueError::Invariant(format!("encode task: {error}")))
                 })
                 .map_err(|error| dispatch::DispatchError::Response(error.to_string()));
-            let pool = pool.clone();
             async move {
                 match encoded {
-                    Ok(encoded) => backend.trigger_build(&encoded, github_repo, &pool).await,
+                    Ok(encoded) => backend.submit(&encoded).await,
                     Err(error) => Err(error),
                 }
             }
