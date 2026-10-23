@@ -170,9 +170,29 @@ check_bindgen() {
     echo "check-system-libs: clang --target=$clang_target parses <openssl/ssl.h>"
 }
 
+# Loader order after install.sh's zz-stow-system-libs.conf drop-in
+# (stow#862 B2): a soname the image ships must still resolve from the
+# image, a root-only one from the root.
+check_ldconfig() {
+    [ -d "$syslibs/usr/lib/x86_64-linux-gnu" ] || return 0
+    local ssl va
+    ssl="$(ldconfig -p | awk '/libssl\.so\.3.*x86-64/{print $NF; exit}')"
+    case "$ssl" in
+        "$syslibs"*) fail "libssl.so.3 resolves to $ssl — the image's copy must stay first";;
+        "") fail "libssl.so.3 is not in the loader cache at all";;
+    esac
+    va="$(ldconfig -p | awk '/libva\.so\.2.*x86-64/{print $NF; exit}')"
+    case "$va" in
+        "$syslibs"*) ;;
+        *) fail "libva.so.2 resolves to ${va:-nothing} — the root's copy should";;
+    esac
+    echo "check-system-libs: loader keeps the image's libssl.so.3 first, libva.so.2 from the root"
+}
+
 if [ -n "$syslibs" ] && [ -d "$syslibs" ]; then
     check_pc x86_64-linux-gnu amd64
     check_bindgen x86_64-linux-gnu x86_64-unknown-linux-gnu x86_64_unknown_linux_gnu
     check_pc aarch64-linux-gnu arm64
     check_bindgen aarch64-linux-gnu aarch64-unknown-linux-gnu aarch64_unknown_linux_gnu
+    check_ldconfig
 fi

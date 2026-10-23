@@ -96,6 +96,18 @@ done
 mv "$staging" "$root"
 staging=
 
+# Register the root's amd64 half with the loader (stow#862): host
+# executables — build scripts, proc-macros, tests that dlopen —
+# resolve the root's sonames after the image's own. `zz-` sorts last
+# in ld.so.conf.d, so a library the image ships (`libssl.so.3`)
+# still resolves from the image; only the root-only ones
+# (`libva.so.2`, …) bind to it.
+if [ -d "$root/usr/lib/x86_64-linux-gnu" ]; then
+    echo "$root/usr/lib/x86_64-linux-gnu" \
+        | sudo tee /etc/ld.so.conf.d/zz-stow-system-libs.conf > /dev/null
+    sudo ldconfig
+fi
+
 # The toolchain debs land in / at the same paths apt used — -k makes
 # any collision with an image file a hard failure rather than a
 # silent overwrite behind dpkg's back.
