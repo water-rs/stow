@@ -670,8 +670,9 @@ pub async fn post_empty(
 /// window at the cap subdivides rather than pages past it (stow#555).
 pub const RUNS_LISTING_CAP: usize = 1000;
 /// Concurrent independent range reads while enumerating — the same
-/// explicit bound every read fan-out in this crate uses.
-const RANGE_READ_CONCURRENCY: usize = 8;
+/// explicit bound every read fan-out in this crate uses (the watch's
+/// per-run jobs and log reads included, stow#853).
+pub const RANGE_READ_CONCURRENCY: usize = 8;
 
 /// The `runs` listing's page shape — `total_count` is what makes the cap
 /// visible before page 11 silently empties.
@@ -695,7 +696,7 @@ pub trait RunRow {
 /// `run_attempt` for the jobs reads, `display_title` for the batch
 /// binding, `head_sha`/`created_at` for staleness and dispatch
 /// resolution, `actor` for who dispatched.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct WorkflowRunRow {
     /// The run's id.
     pub id: u64,
@@ -725,7 +726,7 @@ pub struct WorkflowRunRow {
 
 /// The `actor` object a run row carries — only the login is read, and
 /// only by the watch.
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Actor {
     /// The actor's login — the watch renders it.
     pub login: String,

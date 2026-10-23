@@ -193,6 +193,220 @@ pub fn size(bytes: u64) -> String {
     }
 }
 
+// ===== The live watch frame (stow#853 §3) =====
+
+use std::io::{self, IsTerminal as _};
+
+use crossterm::ExecutableCommand;
+use crossterm::cursor::MoveTo;
+use crossterm::terminal::{Clear, ClearType};
+
+use crate::watch::WatchFrame;
+
+/// One value as one compact JSON line on `out` — NDJSON, so a line
+/// consumer (`jq -c`, `head -1`) reads each tick as it lands (§3).
+/// An `io::Result`, so a `BrokenPipe` reaches the caller where
+/// `println!` would panic.
+pub fn emit_ndjson(out: &mut impl io::Write, value: &impl serde::Serialize) -> io::Result<()> {
+    let line = serde_json::to_string(value).map_err(io::Error::other)?;
+    writeln!(out, "{line}")
+}
+
+/// The live frame's stdout sink: repaint in place on a TTY, append
+/// otherwise, one NDJSON line under `--json` (§3). Everything the
+/// watch writes leaves through here — `render.rs` keeps its only-
+/// stdout-writer contract.
+pub struct Screen<W = io::Stdout> {
+    out: W,
+    output: Output,
+    /// Repaint in place — stdout is a terminal.
+    tty: bool,
+    /// The system zone the header clock renders in — resolved once,
+    /// never UTC unless the zone is UTC.
+    tz: jiff::tz::TimeZone,
+    /// The first frame clears the screen; later frames move home and
+    /// clear down, so nothing piles into scrollback and the last
+    /// frame stays after exit.
+    first: bool,
+}
+
+impl Screen<io::Stdout> {
+    /// The sink on stdout — `IsTerminal` decides repaint-vs-append.
+    pub fn new(output: Output, tz: jiff::tz::TimeZone) -> Self {
+        Self {
+            out: io::stdout(),
+            output,
+            tty: io::stdout().is_terminal(),
+            tz,
+            first: true,
+        }
+    }
+}
+
+impl<W: io::Write> Screen<W> {
+    /// A sink on any writer — the tests' captured output and a
+    /// forced TTY-ness.
+    #[cfg(test)]
+    pub const fn for_test(out: W, output: Output, tty: bool, tz: jiff::tz::TimeZone) -> Self {
+        Self {
+            out,
+            output,
+            tty,
+            tz,
+            first: true,
+        }
+    }
+
+    /// Render one frame — the loop's whole per-tick write.
+    pub fn render(&mut self, frame: &WatchFrame) -> io::Result<()> {
+        match self.output {
+            Output::Json => {
+                emit_ndjson(&mut self.out, frame)?;
+            }
+            Output::Table if self.tty => self.repaint(frame)?,
+            Output::Table => {
+                let stamp = clock(frame.at, &self.tz, true);
+                writeln!(self.out, "\n— {stamp} —")?;
+                writeln!(self.out, "{}", table_frame(frame, &self.tz))?;
+            }
+        }
+        self.out.flush()
+    }
+
+    /// Repaint: clear once, then move-home + clear-down each frame.
+    /// The frame is truncated to the terminal's rows, ending with
+    /// `… N more runs` when it overflows (§3).
+    fn repaint(&mut self, frame: &WatchFrame) -> io::Result<()> {
+        if self.first {
+            self.out.execute(Clear(ClearType::All))?;
+            self.first = false;
+        } else {
+            self.out.execute(MoveTo(0, 0))?;
+            self.out.execute(Clear(ClearType::FromCursorDown))?;
+        }
+        let mut text = table_frame(frame, &self.tz);
+        if let Ok((_, rows)) = crossterm::terminal::size() {
+            let height = usize::from(rows);
+            let lines: Vec<&str> = text.lines().collect();
+            if lines.len() > height {
+                let keep = height.saturating_sub(1);
+                let mut truncated: String = lines[..keep].join("\n");
+                let _ = write!(truncated, "\n… {} more runs", lines.len() - keep);
+                text = truncated;
+            }
+        }
+        writeln!(self.out, "{text}")
+    }
+}
+
+/// Format one instant's `HH:MM`/`HH:MM:SS` in `tz` — DST is handled
+/// per instant, so a frame is right whatever day it crosses.
+fn clock(instant: time::OffsetDateTime, tz: &jiff::tz::TimeZone, seconds: bool) -> String {
+    let timestamp = jiff::Timestamp::from_second(instant.unix_timestamp())
+        .unwrap_or(jiff::Timestamp::UNIX_EPOCH);
+    let format = if seconds { "%H:%M:%S" } else { "%H:%M" };
+    timestamp.to_zoned(tz.clone()).strftime(format).to_string()
+}
+
+/// The whole human frame as text — the snapshot the render tests
+/// pin (§3): `queue` and `github` headers, the per-target roll-up
+/// (`queued` reads `queued (slotted)` — it counts only legs holding a
+/// slot, §2.6), the runs table and the failures list.
+pub fn table_frame(frame: &WatchFrame, tz: &jiff::tz::TimeZone) -> String {
+    let mut out = String::new();
+    let scheduler = &frame.scheduler;
+    let _ = writeln!(
+        out,
+        "queue  pending {} miss · {} human · blocked {} · dispatched {} · running {}",
+        scheduler.pending_miss,
+        scheduler.pending_human,
+        scheduler.blocked,
+        scheduler.dispatched,
+        scheduler.running
+    );
+    let queued = frame
+        .runs
+        .iter()
+        .filter(|run| run.status == "queued")
+        .count();
+    let in_progress = frame.runs.len() - queued;
+    let done: u32 = frame.targets.iter().map(|target| target.legs.done).sum();
+    let since = clock(frame.since, tz, false);
+    let _ = writeln!(
+        out,
+        "github  {} runs ({queued} queued · {in_progress} in progress) · since {since}: {done} legs done · {} failed",
+        frame.runs.len(),
+        frame.failures.len()
+    );
+    if !frame.targets.is_empty() {
+        let _ = writeln!(out);
+        let mut table = Table::new(&["target", "queued (slotted)", "building", "done", "failed"]);
+        let mut totals = crate::watch::LegCounts::default();
+        for target in &frame.targets {
+            totals.queued += target.legs.queued;
+            totals.building += target.legs.building;
+            totals.done += target.legs.done;
+            totals.failed += target.legs.failed;
+            table.push([
+                target.target.clone(),
+                target.legs.queued.to_string(),
+                target.legs.building.to_string(),
+                target.legs.done.to_string(),
+                target.legs.failed.to_string(),
+            ]);
+        }
+        table.push([
+            "total".to_owned(),
+            totals.queued.to_string(),
+            totals.building.to_string(),
+            totals.done.to_string(),
+            totals.failed.to_string(),
+        ]);
+        let _ = writeln!(out, "{}", table.render());
+    }
+    if !frame.runs.is_empty() {
+        let _ = writeln!(out);
+        let mut table = Table::new(&[
+            "run", "batch", "actor", "status", "attempt", "q/b/d/f", "age", "url",
+        ]);
+        for run in &frame.runs {
+            table.push([
+                run.run_id.to_string(),
+                run.batch_id.as_str().chars().take(8).collect(),
+                run.actor.clone(),
+                run.status.clone(),
+                run.run_attempt.to_string(),
+                format!(
+                    "{}/{}/{}/{}",
+                    run.legs.queued, run.legs.building, run.legs.done, run.legs.failed
+                ),
+                age(u64::try_from(run.age_seconds).unwrap_or(0)),
+                run.url.clone(),
+            ]);
+        }
+        let _ = writeln!(out, "{}", table.render());
+    }
+    if !frame.failures.is_empty() {
+        let _ = writeln!(out);
+        let mut table = Table::new(&["target", "crate", "version", "class", "job"]);
+        for failure in &frame.failures {
+            let class = failure.log_class.map_or_else(
+                || failure.coarse_class.clone(),
+                |class| format!("{} · {}", failure.coarse_class, class.as_str()),
+            );
+            table.push([
+                failure.target.clone().unwrap_or_else(|| "-".to_owned()),
+                failure.crate_name.clone().unwrap_or_else(|| "-".to_owned()),
+                failure.version.clone().unwrap_or_else(|| "-".to_owned()),
+                class,
+                failure.job_url.clone().unwrap_or_else(|| "-".to_owned()),
+            ]);
+        }
+        let _ = writeln!(out, "{}", table.render());
+    }
+    out.trim_end().to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Output, Planned, Table, age, emit, plan_footer, size};
@@ -259,6 +473,69 @@ mod tests {
         assert_eq!(size(512), "512 B");
         assert_eq!(size(2_048), "2.0 KiB");
         assert_eq!(size(5 * (1 << 30)), "5.0 GiB");
+    }
+
+    /// The whole human frame pinned as text — the queue/github
+    /// headers, the `queued (slotted)` target table and its total,
+    /// the runs table and the failures list (stow#853 §3).
+    #[test]
+    fn table_frame_snapshot() {
+        use crate::watch::{LegCounts, RunView, SchedulerView, TargetView, WatchFrame};
+        use stow_types::api::BatchId;
+        use time::OffsetDateTime;
+
+        let at = |unix: i64| OffsetDateTime::from_unix_timestamp(unix).expect("ts");
+        let frame = WatchFrame {
+            at: at(1_000),
+            since: at(500),
+            scheduler: SchedulerView {
+                pending_miss: 7,
+                pending_human: 3,
+                blocked: 2,
+                dispatched: 1,
+                running: 4,
+            },
+            runs: vec![RunView {
+                run_id: 7,
+                batch_id: "0123456789abcdef0123456789abcdef"
+                    .parse::<BatchId>()
+                    .expect("batch"),
+                rustc: "1.99.0".to_owned(),
+                actor: "stow-bot".to_owned(),
+                status: "in_progress".to_owned(),
+                run_attempt: 2,
+                age_seconds: 600,
+                url: "https://github.com/water-rs/stow/actions/runs/7".to_owned(),
+                legs: LegCounts {
+                    queued: 1,
+                    building: 2,
+                    done: 1,
+                    failed: 0,
+                },
+            }],
+            targets: vec![TargetView {
+                target: "x86_64-unknown-linux-gnu".to_owned(),
+                legs: LegCounts {
+                    queued: 1,
+                    building: 2,
+                    done: 1,
+                    failed: 0,
+                },
+            }],
+            failures: vec![],
+        };
+        let text = super::table_frame(&frame, &jiff::tz::TimeZone::UTC);
+        let expected = "\
+queue  pending 7 miss · 3 human · blocked 2 · dispatched 1 · running 4
+github  1 runs (0 queued · 1 in progress) · since 00:08: 1 legs done · 0 failed
+
+target                    queued (slotted)  building  done  failed
+x86_64-unknown-linux-gnu  1                 2         1     0
+total                     1                 2         1     0
+
+run  batch     actor     status       attempt  q/b/d/f  age    url
+7    01234567  stow-bot  in_progress  2        1/2/1/0  10m0s  https://github.com/water-rs/stow/actions/runs/7";
+        assert_eq!(text, expected);
     }
 
     #[test]

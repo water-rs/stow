@@ -7,15 +7,20 @@
 //! and renders what `frame` yields. Nothing here fetches.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write;
 
+use futures_util::StreamExt;
 use stow_types::api::{BatchId, SchedulerStatus};
 use stow_types::records::parse_batch_run_title;
-use stow_types::runs::{LegFailure, RunFailure, RunJobRow};
+use stow_types::runs::{LegFailure, RunFailure, RunJobRow, RunJobsPage};
 use stow_types::stow_error;
-use stow_types::trusted_builder::BATCH_WORKFLOW_NAME;
+use stow_types::transient::Backoff;
+use stow_types::trusted_builder::{BATCH_WORKFLOW_FILE, BATCH_WORKFLOW_NAME};
 use time::OffsetDateTime;
 
-use crate::github::WorkflowRunRow;
+use crate::Edge;
+use crate::github::{self, ConditionalPages, RunsPage, WorkflowRunRow};
+use crate::render::Screen;
 use crate::runs::{self, FailureClass, LegProgress, LiveLeg};
 
 /// The session's in-memory fleet — every in-flight batch run, every
@@ -91,12 +96,6 @@ impl Fleet {
             next_failure_seq: 0,
             log_class: HashMap::new(),
         }
-    }
-
-    /// The class the memo already holds for a failed job's log —
-    /// `None` until the log has been read once this session.
-    pub fn log_class(&self, job_id: u64) -> Option<FailureClass> {
-        self.log_class.get(&job_id).copied()
     }
 
     /// Record one failed job's classified log — keyed by job id, so a
@@ -243,6 +242,27 @@ impl Fleet {
             );
         }
         Ok(())
+    }
+
+    /// `(run_id, run_attempt)` of each run the listing reports
+    /// `in_progress` — the jobs reads the next tick owes. A `queued`
+    /// run has no jobs and is not read (§2.2).
+    pub fn in_progress(&self) -> Vec<(u64, u64)> {
+        self.runs
+            .iter()
+            .filter(|(_, track)| track.status == "in_progress")
+            .map(|(&run_id, track)| (run_id, track.run_attempt))
+            .collect()
+    }
+
+    /// The failed jobs whose log class is still unset — the reads the
+    /// next tick owes, bounded by failures, not by ticks (§2.3).
+    pub fn unclassified_jobs(&self) -> Vec<u64> {
+        self.failures
+            .values()
+            .filter_map(|track| track.job_id)
+            .filter(|job_id| !self.log_class.contains_key(job_id))
+            .collect()
     }
 
     /// One render's worth of state — the scheduler counts the caller
@@ -505,6 +525,259 @@ pub struct FailureView {
     /// failure, which names no job.
     pub job_url: Option<String>,
 }
+// ===== The watch loop (stow#853 §3) =====
+
+/// One tick every [`TICK_INTERVAL`] — the same 30 s cadence
+/// `manual::RUN_POLL_SECONDS` and the cost model hold.
+const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The scheduler half of each tick — the queue's own status route.
+const SCHEDULER_STATUS_PATH: &str = "/api/v1/scheduler/status";
+
+/// The session's watch — the `Fleet` plus the conditional caches that
+/// make every repeated read an `If-None-Match` (§2.4).
+pub struct Watch {
+    /// The model — runs, legs, failures, the log-class memo.
+    fleet: Fleet,
+    /// The `queued` listing's per-URL page cache.
+    queued: ConditionalPages<RunsPage<WorkflowRunRow>>,
+    /// The `in_progress` listing's per-URL page cache.
+    in_progress: ConditionalPages<RunsPage<WorkflowRunRow>>,
+    /// Each in-flight run's jobs-page cache — dropped at `retire`.
+    run_pages: HashMap<u64, ConditionalPages<RunJobsPage>>,
+}
+
+impl Watch {
+    /// A watch starting now — `since` anchors the frame header.
+    pub fn new(since: OffsetDateTime) -> Self {
+        Self {
+            fleet: Fleet::new(since),
+            queued: ConditionalPages::new(),
+            in_progress: ConditionalPages::new(),
+            run_pages: HashMap::new(),
+        }
+    }
+
+    /// The loop: a `30 s` interval (first tick immediate,
+    /// `MissedTickBehavior::Delay` so a slow tick slides rather than
+    /// stacks) driving tick-plus-render, raced against Ctrl-C — a won
+    /// signal drops the in-flight tick and exits 0 (§3). A broken
+    /// stdout exits 0 too (`--json --watch | head -1`); any read
+    /// error exits non-zero, naming the read.
+    ///
+    /// # Errors
+    /// Any read's `Err` — retries exhausted, a refusal, a title or job
+    /// the schema can't read — and a stdout write that is not
+    /// `BrokenPipe`.
+    pub async fn run<W: Write>(
+        &mut self,
+        edge: &Edge,
+        token: &str,
+        base: &str,
+        screen: &mut Screen<W>,
+    ) -> stow_types::error::Result<()> {
+        let mut interval = tokio::time::interval(TICK_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let work = async {
+                interval.tick().await;
+                self.tick(edge, token, base, OffsetDateTime::now_utc())
+                    .await
+            };
+            tokio::select! {
+                result = work => {
+                    let frame = result?;
+                    match screen.render(&frame) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            return Err(stow_error!("render frame: {error}"));
+                        }
+                    }
+                }
+                signal = tokio::signal::ctrl_c() => {
+                    signal.map_err(|error| stow_error!("ctrl_c handler: {error}"))?;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// One tick — `join!` of the scheduler read and the GitHub
+    /// refresh, then the failure logs, then the frame. Any read's
+    /// `Err` exits the watch: it never renders a frame built on a
+    /// failed read.
+    ///
+    /// # Errors
+    /// The scheduler read's, any listing's, any jobs page's or final
+    /// read's — the first one, as the exit's message.
+    pub async fn tick(
+        &mut self,
+        edge: &Edge,
+        token: &str,
+        base: &str,
+        now: OffsetDateTime,
+    ) -> stow_types::error::Result<WatchFrame> {
+        let (scheduler, refresh) = tokio::join!(
+            edge.get_json_retried::<SchedulerStatus>(SCHEDULER_STATUS_PATH, Backoff::new()),
+            self.github_refresh(token, base, now),
+        );
+        let scheduler = scheduler?;
+        refresh?;
+        self.read_logs(token, base).await;
+        Ok(self.fleet.frame(now, &scheduler))
+    }
+
+    /// The GitHub half of a tick: the two listings concurrently,
+    /// every `in_progress` run's jobs page at the read bound, then
+    /// the dropped runs' one-time final reads.
+    async fn github_refresh(
+        &mut self,
+        token: &str,
+        base: &str,
+        now: OffsetDateTime,
+    ) -> stow_types::error::Result<()> {
+        let (queued, in_progress) = tokio::join!(
+            fetch_listing(token, base, "queued", &mut self.queued),
+            fetch_listing(token, base, "in_progress", &mut self.in_progress),
+        );
+        let rows = queued?.into_iter().chain(in_progress?).collect::<Vec<_>>();
+        let dropped = self.fleet.apply_listing(rows)?;
+
+        let in_flight = self.fleet.in_progress();
+        let reads = futures_util::stream::iter(in_flight)
+            .map(|(run_id, attempt)| {
+                let mut pages = self
+                    .run_pages
+                    .remove(&run_id)
+                    .unwrap_or_else(ConditionalPages::new);
+                async move {
+                    let result = runs::fetch_attempt_jobs(
+                        Some(token),
+                        base,
+                        run_id,
+                        attempt,
+                        Some(&mut pages),
+                        Backoff::new,
+                    )
+                    .await;
+                    (run_id, pages, result)
+                }
+            })
+            .buffered(github::RANGE_READ_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for (run_id, pages, result) in reads {
+            self.run_pages.insert(run_id, pages);
+            self.fleet.apply_jobs(run_id, "", &result?, now)?;
+        }
+
+        let completions = futures_util::stream::iter(dropped)
+            .map(|run_id| async move {
+                let row = github::get_url_json::<WorkflowRunRow>(
+                    &format!("{base}/repos/{}/actions/runs/{run_id}", github::REPO),
+                    Some(token),
+                    Backoff::new(),
+                )
+                .await?;
+                let jobs = runs::fetch_attempt_jobs(
+                    Some(token),
+                    base,
+                    run_id,
+                    row.run_attempt,
+                    None,
+                    Backoff::new,
+                )
+                .await?;
+                stow_types::error::Result::Ok((row, jobs))
+            })
+            .buffered(github::RANGE_READ_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for completion in completions {
+            let (row, jobs) = completion?;
+            self.run_pages.remove(&row.id);
+            self.fleet.retire(&row, &jobs, now)?;
+        }
+        Ok(())
+    }
+
+    /// Each unclassified failed job's log, at the read bound — the
+    /// memo keys the class on the job id, so a log is fetched once
+    /// per failure, never once per tick. A failed read warns and
+    /// stays unclassified for the next tick: a dead token fails the
+    /// listings first, so a log failure is the log's own — late
+    /// publication or retention, not the watch's.
+    async fn read_logs(&mut self, token: &str, base: &str) {
+        let pending = self.fleet.unclassified_jobs();
+        let results = futures_util::stream::iter(pending)
+            .map(|job_id| async move {
+                let url = format!("{base}/repos/{}/actions/jobs/{job_id}/logs", github::REPO);
+                (job_id, github::get_text(token, &url, Backoff::new()).await)
+            })
+            .buffered(github::RANGE_READ_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for (job_id, result) in results {
+            match result {
+                Ok(log) => {
+                    let (class, _) = runs::classify_log(&log);
+                    self.fleet.record_log_class(job_id, class);
+                }
+                Err(error) => {
+                    tracing::warn!(job_id, %error, "job log unavailable; classifying next tick");
+                }
+            }
+        }
+    }
+}
+
+/// One listing's rows — the `runs?status=<s>&per_page=100` walk
+/// through `pages`, following `Link: rel="next"` until
+/// `total_count` is in hand (§2.1). Fails past
+/// `github::RUNS_LISTING_CAP` and on a `Link` off `base`, same as the
+/// jobs pager.
+async fn fetch_listing(
+    token: &str,
+    base: &str,
+    status: &str,
+    pages: &mut ConditionalPages<RunsPage<WorkflowRunRow>>,
+) -> stow_types::error::Result<Vec<WorkflowRunRow>> {
+    let mut url = format!(
+        "{base}/repos/{}/actions/workflows/{BATCH_WORKFLOW_FILE}/runs?status={status}&per_page=100",
+        github::REPO
+    );
+    let mut rows = Vec::new();
+    loop {
+        let (page, next) = pages
+            .get(Some(token), &url, Backoff::new())
+            .await
+            .map_err(|error| stow_error!("GET {url}: {error}"))?;
+        rows.extend(page.workflow_runs.iter().cloned());
+        if u64::try_from(rows.len()).unwrap_or(u64::MAX) >= page.total_count {
+            break;
+        }
+        if rows.len() > github::RUNS_LISTING_CAP {
+            return Err(stow_error!(
+                "runs listing passed {} rows — the cap is {}",
+                rows.len(),
+                github::RUNS_LISTING_CAP
+            ));
+        }
+        let Some(next) = next else { break };
+        let next = next.to_owned();
+        if !next.starts_with(&format!("{base}/")) {
+            return Err(stow_error!(
+                "listing page link {next} leaves the read's base {base}"
+            ));
+        }
+        url = next;
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,8 +1174,7 @@ mod tests {
             .apply_jobs(1, "", &[failed_jobs(0), failed_jobs(1)].concat(), at(1_000))
             .expect("jobs");
         fleet.record_log_class(30, FailureClass::LinkerUnusable);
-        assert_eq!(fleet.log_class(30), Some(FailureClass::LinkerUnusable));
-        assert_eq!(fleet.log_class(31), None);
+        assert_eq!(fleet.unclassified_jobs(), [31]);
         let frame = fleet.frame(at(1_000), &scheduler(0, 0));
         assert_eq!(frame.failures.len(), 2);
         // Newest first — leg 1 failed second, and its job's log has
@@ -925,6 +1197,271 @@ mod tests {
             })
             .expect("leg 0's failure");
         assert_eq!(leg_zero.log_class, Some(FailureClass::LinkerUnusable));
+    }
+
+    // ----- The I/O loop (stow#853 §3) -----
+
+    use crate::test_server::{Loopback, Step};
+
+    /// A `RunsPage` body carrying `rows` run ids.
+    fn listing(rows: &[String]) -> &'static str {
+        let count = rows.len();
+        let rows = rows.join(",");
+        Box::leak(
+            format!("{{\"total_count\":{count},\"workflow_runs\":[{rows}]}}").into_boxed_str(),
+        )
+    }
+
+    /// One `WorkflowRunRow` JSON object.
+    fn run_json(id: u64, status: &str, conclusion: Option<&str>, attempt: u64) -> String {
+        let conclusion = conclusion.map_or_else(|| "null".to_owned(), |c| format!("\"{c}\""));
+        format!(
+            "{{\"id\":{id},\"display_title\":\"{TITLE}\",\"head_sha\":\"s\",\"status\":\"{status}\",\"conclusion\":{conclusion},\"html_url\":\"u\",\"run_attempt\":{attempt},\"created_at\":\"1970-01-01T00:00:00Z\",\"actor\":{{\"login\":\"stow-bot\"}}}}"
+        )
+    }
+
+    /// A `RunJobsPage` body — one settled build+publish pair per leg.
+    fn jobs_json() -> &'static str {
+        "{\"jobs\":[{\"id\":30,\"name\":\"leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) 0123456789abcdef\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":\"1970-01-01T00:15:00Z\",\"completed_at\":\"1970-01-01T00:15:50Z\",\"run_attempt\":1,\"html_url\":\"j\",\"steps\":[]},{\"id\":40,\"name\":\"leg 0 / publish #0 0123456789abcdef\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":\"1970-01-01T00:16:00Z\",\"completed_at\":\"1970-01-01T00:16:30Z\",\"run_attempt\":1,\"html_url\":\"j\",\"steps\":[]}]}"
+    }
+
+    /// The queue status the scheduler endpoint answers.
+    const STATUS_JSON: &str = "{\"pending\":10,\"human_pending\":3,\"blocked\":2,\"dispatched\":1,\"running\":4,\"completed\":9,\"failed\":0}";
+
+    /// A 200 step carrying an `ETag`.
+    fn ok_etag(etag: &str, body: &'static str) -> Step {
+        Step::RespondWith {
+            status: 200,
+            retry_after: None,
+            headers: vec![("etag".to_owned(), format!("\"{etag}\""))],
+            body,
+        }
+    }
+
+    /// Two ticks: every repeated read — listings and the in-flight
+    /// run's jobs page — goes out `If-None-Match` and the 304s render
+    /// the same frame (§2.1, §2.4).
+    #[tokio::test]
+    async fn two_ticks_revalidate_and_render_the_same_frame() {
+        let github = Loopback::start(vec![
+            // tick 1 — both listings 200 with etags, the run's page 200.
+            ok_etag("lq", listing(&[run_json(7, "in_progress", None, 1)])),
+            ok_etag("li", listing(&[])),
+            ok_etag("lj", jobs_json()),
+            // tick 2 — every URL revalidates, all 304.
+            Step::Respond {
+                status: 304,
+                retry_after: None,
+                body: "",
+            },
+            Step::Respond {
+                status: 304,
+                retry_after: None,
+                body: "",
+            },
+            Step::Respond {
+                status: 304,
+                retry_after: None,
+                body: "",
+            },
+        ])
+        .await;
+        let edge_server = Loopback::start(vec![
+            Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: STATUS_JSON,
+            },
+            Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: STATUS_JSON,
+            },
+        ])
+        .await;
+        let edge = crate::Edge::for_test(edge_server.url.clone());
+        let mut watch = Watch::new(at(0));
+        let first = watch
+            .tick(&edge, "tok", &github.url, at(1_000))
+            .await
+            .expect("tick");
+        let second = watch
+            .tick(&edge, "tok", &github.url, at(1_000))
+            .await
+            .expect("tick");
+        assert_eq!(first, second);
+        assert_eq!(first.targets[0].legs.done, 1);
+        let heads = github.join().await;
+        let etags: Vec<Option<String>> = heads
+            .iter()
+            .map(|head| {
+                head.head
+                    .headers
+                    .get("if-none-match")
+                    .map(|value| value.to_str().expect("ascii").to_owned())
+            })
+            .collect();
+        // The first tick sent no validator; the second tick sent each
+        // page's own ETag — the listings race, so compare the set.
+        assert_eq!(etags[0], None);
+        assert_eq!(etags[1], None);
+        let mut second: Vec<_> = etags[3..].iter().flatten().cloned().collect();
+        second.sort();
+        assert_eq!(second, vec!["\"li\"", "\"lj\"", "\"lq\""]);
+        let _ = edge_server.join().await;
+    }
+
+    /// A run that leaves both listings is read once — row plus its
+    /// final attempt's page — then frozen (§2.1).
+    #[tokio::test]
+    async fn a_dropped_run_gets_one_final_read() {
+        let github = Loopback::start(vec![
+            // tick 1: run 7 in flight.
+            ok_etag("lq", listing(&[run_json(7, "in_progress", None, 1)])),
+            ok_etag("li", listing(&[])),
+            ok_etag("lj", jobs_json()),
+            // tick 2: gone from both listings — a completion changes
+            // the listing, so the revalidation is a 200 with the run
+            // absent — then its row + final page, read once.
+            ok_etag("lq2", listing(&[])),
+            ok_etag("li2", listing(&[])),
+            Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: Box::leak(run_json(7, "completed", Some("success"), 1).into_boxed_str()),
+            },
+            ok_etag("lf", jobs_json()),
+        ])
+        .await;
+        let edge_server = Loopback::start(vec![
+            Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: STATUS_JSON,
+            },
+            Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: STATUS_JSON,
+            },
+        ])
+        .await;
+        let edge = crate::Edge::for_test(edge_server.url.clone());
+        let mut watch = Watch::new(at(0));
+        watch
+            .tick(&edge, "tok", &github.url, at(1_000))
+            .await
+            .expect("tick");
+        let frame = watch
+            .tick(&edge, "tok", &github.url, at(1_100))
+            .await
+            .expect("tick");
+        assert_eq!(frame.runs, [] as [RunView; 0]);
+        assert_eq!(frame.targets[0].legs.done, 1);
+        let _ = github.join().await;
+        let _ = edge_server.join().await;
+    }
+
+    /// A 401 on either read — scheduler or GitHub — exits `Err`; the
+    /// watch never renders a frame built on a failed read (§3).
+    #[tokio::test]
+    async fn a_401_from_either_source_exits_err() {
+        for (github_steps, edge_steps) in [
+            (
+                vec![Step::Respond {
+                    status: 401,
+                    retry_after: None,
+                    body: "no",
+                }],
+                vec![Step::Respond {
+                    status: 200,
+                    retry_after: None,
+                    body: STATUS_JSON,
+                }],
+            ),
+            (
+                vec![ok_etag("lq", listing(&[])), ok_etag("li", listing(&[]))],
+                vec![Step::Respond {
+                    status: 401,
+                    retry_after: None,
+                    body: "no",
+                }],
+            ),
+        ] {
+            let github = Loopback::start(github_steps).await;
+            let edge_server = Loopback::start(edge_steps).await;
+            let edge = crate::Edge::for_test(edge_server.url.clone());
+            let mut watch = Watch::new(at(0));
+            assert!(
+                watch
+                    .tick(&edge, "tok", &github.url, at(1_000))
+                    .await
+                    .is_err()
+            );
+            let _ = github.join().await;
+            let _ = edge_server.join().await;
+        }
+    }
+
+    /// A scheduler 503 then 200 retries under `Backoff` and the tick
+    /// still renders (§1).
+    #[tokio::test]
+    async fn a_scheduler_503_retries_and_renders() {
+        let github = Loopback::start(vec![
+            ok_etag("lq", listing(&[])),
+            ok_etag("li", listing(&[])),
+        ])
+        .await;
+        let edge_server = Loopback::start(vec![
+            Step::Respond {
+                status: 503,
+                retry_after: None,
+                body: "down",
+            },
+            Step::Respond {
+                status: 200,
+                retry_after: None,
+                body: STATUS_JSON,
+            },
+        ])
+        .await;
+        let edge = crate::Edge::for_test(edge_server.url.clone());
+        let mut watch = Watch::new(at(0));
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            watch.tick(&edge, "tok", &github.url, at(1_000)),
+        )
+        .await
+        .expect("the retry lands inside the bound")
+        .expect("tick");
+        assert_eq!(frame.scheduler.pending_miss, 7);
+        let _ = github.join().await;
+        let _ = edge_server.join().await;
+    }
+
+    /// `--json` emits exactly one compact `WatchFrame` line per
+    /// render — the NDJSON contract (§3).
+    #[test]
+    fn json_mode_emits_one_ndjson_line_per_frame() {
+        let mut fleet = Fleet::new(at(500));
+        fleet
+            .apply_listing([run_row(1, "in_progress", None, 1, 400, TITLE)])
+            .expect("listing");
+        let frame = fleet.frame(at(1_000), &scheduler(10, 3));
+        let mut out = Vec::new();
+        let mut screen = crate::render::Screen::for_test(
+            &mut out,
+            crate::render::Output::Json,
+            false,
+            jiff::tz::TimeZone::UTC,
+        );
+        screen.render(&frame).expect("render");
+        screen.render(&frame).expect("render");
+        let text = String::from_utf8(out).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let parsed: WatchFrame = serde_json::from_str(lines[0]).expect("ndjson round-trips");
+        assert_eq!(parsed, frame);
     }
 
     /// The frame serializes — `at`/`since` as rfc3339, `batch_id` as

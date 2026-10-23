@@ -489,12 +489,6 @@ pub enum LegProgress {
 pub struct LiveLeg {
     /// The leg index — the `#N` in `leg N / build #N …`.
     pub leg: u32,
-    /// The leg's [`TaskHash`] from its job names — `None` on an
-    /// all-unrendered leg (stow#839), which the cancelled or skipped
-    /// paths produce. Only the records check reads it, and that lands
-    /// with the watch.
-    #[cfg_attr(not(test), expect(dead_code))]
-    pub hash: Option<TaskHash>,
     /// Where the leg is.
     pub progress: LegProgress,
     /// Crate, version and target from the build job's name — `None`
@@ -531,7 +525,6 @@ pub fn live_legs(
             let label = leg_build_job(jobs, leg.leg).and_then(|job| leg_label(&job.name));
             Ok(LiveLeg {
                 leg: leg.leg,
-                hash: leg.hash,
                 progress,
                 label,
             })
@@ -1256,7 +1249,7 @@ mod tests {
     #[test]
     fn a_queued_build_row_is_a_queued_leg() {
         for status in ["queued", "waiting", "pending", "requested"] {
-            let (hash, build) = build_name(0, "task-a");
+            let (_, build) = build_name(0, "task-a");
             let jobs = vec![live_job(build, status, None, None, None, vec![])];
             let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
             let [leg] = &legs[..] else {
@@ -1264,7 +1257,6 @@ mod tests {
             };
             assert_eq!(leg.leg, 0);
             assert_eq!(leg.progress, super::LegProgress::Queued, "{status}");
-            assert_eq!(leg.hash.as_ref(), Some(&hash));
             assert_eq!(
                 leg.label.as_ref().map(|label| label.target.as_str()),
                 Some("x86_64-unknown-linux-gnu")
@@ -1509,7 +1501,6 @@ mod tests {
             panic!("one leg on the page: {legs:?}");
         };
         assert_eq!(leg.label, None);
-        assert_eq!(leg.hash, None);
         assert!(matches!(
             leg.progress,
             super::LegProgress::Failed(LegFailure::Concluded { .. })
