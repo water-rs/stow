@@ -1,0 +1,94 @@
+name: system-libs lock
+
+# Generates ci/system-libs/lock.txt — every deb the Linux build legs
+# provision (the pkg-config system libraries, the aarch64 cross
+# toolchain and mold) resolved at one snapshot.ubuntu.com instant and
+# pinned by sha256 (stow#850, stow#862). It runs where apt exists: a
+# hosted Ubuntu runner, not anyone's machine.
+#
+# workflow_dispatch takes the instant as an input and uploads the
+# generated lock — the bump path: dispatch it, commit the artifact's
+# lock.txt (and for the first lock, remove ci/system-libs/snapshot).
+#
+# pull_request on the generator, the lists or the lock proves the
+# committed lock still reproduces from its inputs: the instant comes
+# from the lock's '# snapshot:' header — the single source of truth
+# for T once a lock exists — the lock regenerates, and a difference
+# fails the run (the instant is immutable, so it must reproduce
+# byte-for-byte). Before the first lock is committed the instant comes
+# from ci/system-libs/snapshot instead and the result uploads as an
+# artifact — that artifact is how the first lock gets made — and a
+# tree carrying both files fails.
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: snapshot.ubuntu.com instant, e.g. 20261022T200000Z
+        required: true
+        type: string
+  pull_request:
+    paths:
+      - ci/system-libs/**
+      - .github/workflows/system-libs-lock.yml
+
+permissions: {}
+
+concurrency:
+  group: system-libs-lock-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  generate:
+    name: Generate the system-libs lock
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Index fetch for three suites x two architectures, then ~120 MB of
+    # debs from the snapshot; the checks and the write are seconds.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Pick the snapshot instant
+        id: t
+        env:
+          INPUT_SNAPSHOT: ${{ inputs.snapshot }}
+        run: |
+          set -euo pipefail
+          lock=ci/system-libs/lock.txt
+          committed=false
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+              t="$INPUT_SNAPSHOT"
+          elif [ -f "$lock" ]; then
+              committed=true
+              if [ -f ci/system-libs/snapshot ]; then
+                  echo "::error::ci/system-libs/snapshot and $lock coexist — once a lock is committed its '# snapshot:' header is the single source of truth for T; remove the snapshot file" >&2
+                  exit 1
+              fi
+              t="$(sed -n 's/^# snapshot: //p' "$lock")"
+              [ -n "$t" ] && [ "$(printf '%s' "$t" | wc -l)" -eq 0 ] \
+                  || { echo "::error::$lock carries no single '# snapshot: <T>' header line" >&2; exit 1; }
+          else
+              t="$(grep -Ev '^[[:space:]]*(#|$)' ci/system-libs/snapshot | head -1)"
+          fi
+          {
+              echo "t=$t"
+              echo "committed=$committed"
+          } >> "$GITHUB_OUTPUT"
+          echo "snapshot instant: $t"
+      - name: Generate the lock
+        run: ci/system-libs/lock.sh "${{ steps.t.outputs.t }}" "$RUNNER_TEMP/lock.txt"
+      - name: Prove the committed lock reproduces
+        if: github.event_name == 'pull_request' && steps.t.outputs.committed == 'true'
+        run: diff -u ci/system-libs/lock.txt "$RUNNER_TEMP/lock.txt"
+      # Dispatched runs produce the lock to commit; a pull request
+      # without a committed lock produces it for the first commit —
+      # the follow-up that adds it also removes ci/system-libs/snapshot.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'workflow_dispatch' || steps.t.outputs.committed != 'true'
+        with:
+          name: system-libs-lock
+          path: ${{ runner.temp }}/lock.txt
+          if-no-files-found: error
+          retention-days: 30

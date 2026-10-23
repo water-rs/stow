@@ -93,9 +93,22 @@
 # the sysroot — while the aarch64 pair stays optional (the
 # x86_64 leg has no cross toolchain to ask) but lands both
 # or neither.
+#
+# <system-libs-root> is the lock-extracted tree install.sh
+# lands (stow#850): for each shim whose <triple> the root
+# carries, the runner's last-resort dirs gain the root's own
+# ahead of them — the -L sits after argv (a vendored lib
+# keeps winning) but before /usr/lib/<triple>, and the
+# -idirafter pair before the runner's. When the root has an
+# arm64 half the script also writes the cross pkg-config
+# pkgconf:arm64 used to provide, aarch64-linux-gnu-pkg-config,
+# execing the native pkg-config with the root's arm64 .pc
+# dirs as PKG_CONFIG_LIBDIR (the image's /usr/share/pkgconfig
+# stays, as the personality's did).
 set -euo pipefail
 
-sysroot="${1:?usage: wrappers.sh <sysroot-dir>}"
+sysroot="${1:?usage: wrappers.sh <sysroot-dir> [<system-libs-root>]}"
+syslibs="${2:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p "$sysroot/bin"
@@ -131,12 +144,21 @@ write_wrapper() {
     rm -f "$sysroot/bin/$shim"
     local own_include
     own_include="$("$real" -print-file-name=include)"
+    # The root's dirs precede the runner's last resorts only when
+    # the root carries this shim's architecture.
+    local ldir="" idirs=""
+    if [ -n "$syslibs" ] && [ -d "$syslibs/usr/lib/$triple" ]; then
+        ldir="-L$syslibs/usr/lib/$triple"
+        idirs="-idirafter $syslibs/usr/include/$triple -idirafter $syslibs/usr/include"
+    fi
     sed -e "s|@SYSROOT@|$sysroot|g" \
         -e "s|@OWN_INCLUDE@|$own_include|g" \
         -e "s|@ARCH@|$arch|g" \
         -e "s|@TRIPLE@|$triple|g" \
         -e "s|@CXX@|$cxx|g" \
         -e "s|@REAL@|$real|g" \
+        -e "s|@SYS_LIBS_LDIR@|$ldir|g" \
+        -e "s|@SYS_LIBS_IDIRS@|$idirs|g" \
         "$here/wrapper.sh.in" > "$sysroot/bin/$shim"
     chmod +x "$sysroot/bin/$shim"
 }
@@ -161,4 +183,21 @@ if [ -x "$cross_cc" ] || [ -x "$cross_cxx" ]; then
     write_wrapper aarch64-linux-gnu-g++ "$cross_cxx" aarch64 aarch64-linux-gnu 1
 else
     rm -f "$sysroot/bin/aarch64-linux-gnu-gcc" "$sysroot/bin/aarch64-linux-gnu-g++"
+fi
+
+# The cross pkg-config the arm64 .pc files probe through —
+# PKG_CONFIG_aarch64_unknown_linux_gnu names it in the job env —
+# exists only when the root carries the arm64 half.
+if [ -n "$syslibs" ] && [ -d "$syslibs/usr/lib/aarch64-linux-gnu" ]; then
+    cat > "$sysroot/bin/aarch64-linux-gnu-pkg-config" <<EOF
+#!/usr/bin/env bash
+# Written by wrappers.sh (stow#850): what pkgconf:arm64's personality
+# provided while the arm64 libraries were dpkg-installed — the arm64
+# multiarch .pc dirs, now the lock root's, plus /usr/share/pkgconfig.
+exec env PKG_CONFIG_LIBDIR="$syslibs/usr/lib/aarch64-linux-gnu/pkgconfig:$syslibs/usr/share/pkgconfig:/usr/share/pkgconfig" \
+    pkg-config "\$@"
+EOF
+    chmod +x "$sysroot/bin/aarch64-linux-gnu-pkg-config"
+else
+    rm -f "$sysroot/bin/aarch64-linux-gnu-pkg-config"
 fi
