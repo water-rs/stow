@@ -991,7 +991,7 @@ async fn resolve_sources(
                         &mut failures,
                     );
                 },
-            );
+            )?;
         }
         if let Some(path) = &projects {
             resolve_projects_lane(
@@ -1014,7 +1014,7 @@ async fn resolve_sources(
                 |_, dir, result| {
                     progress.collect(dir.display(), result, &mut requests, &mut failures);
                 },
-            );
+            )?;
         }
         Ok::<_, stow_types::error::Error>((requests, failures, unresolved_projects))
     })
@@ -1065,7 +1065,7 @@ fn resolve_projects_lane(
         |_, repo, result| {
             progress.collect(repo, result, requests, unresolved_projects);
         },
-    );
+    )?;
     Ok(())
 }
 

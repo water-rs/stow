@@ -59,6 +59,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The lanes' shared resolve root — each lane's workers shard their
+  # CARGO_HOMEs under it; cached whole below so the sparse crates.io
+  # index and fetched manifests stay warm between dispatches.
+  STOW_RESOLVE_CARGO_HOME: ${{ github.workspace }}/.stow-preheat-cargo
 
 jobs:
   preheat:
@@ -74,6 +78,20 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: . -> target
+      # One cache entry per UTC day per rustc: the key lands once a day,
+      # `actions/cache` skips the save on an exact-key hit, and the
+      # restore-key prefixes hand every run the most recent index — the
+      # repo's 10 GB Actions allowance is not spent on per-request saves.
+      - name: Cache stamp
+        id: cache-stamp
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ${{ env.STOW_RESOLVE_CARGO_HOME }}
+          key: preheat-cargo-${{ runner.os }}-${{ inputs.rustc_version }}-${{ steps.cache-stamp.outputs.day }}
+          restore-keys: |
+            preheat-cargo-${{ runner.os }}-${{ inputs.rustc_version }}-
+            preheat-cargo-${{ runner.os }}-
       - name: Build stow-admin
         run: cargo build --release -p stow-admin
       # stow-admin mints a fresh Actions OIDC JWT for every edge request

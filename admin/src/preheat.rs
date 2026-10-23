@@ -360,7 +360,7 @@ async fn top(
                 )
             },
             |index, _job, result| slots[index] = Some(result),
-        );
+        )?;
         Ok::<_, stow_types::error::Error>((jobs, slots))
     })
     .await
@@ -723,7 +723,7 @@ fn resolve_binaries(
             )
         },
         |index, _job, result| slots[index] = Some(result),
-    );
+    )?;
     let mut plan = BinariesPlan {
         tasks: Vec::new(),
         per_binary: Vec::with_capacity(candidates.len()),
