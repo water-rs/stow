@@ -111,17 +111,13 @@ pub struct LaunchRatios {
     /// lower: missed nodes are deduplicated upstream and not every
     /// admission is redeemed.
     pub builds_per_miss: f64,
-    /// `POST /api/v1/github/workflow-run` deliveries per build — one
-    /// per `completed` run plus retried deliveries.
+    /// `POST /api/v1/github/workflow-run` deliveries per build —
+    /// the run's `in_progress` and `completed` plus retried
+    /// deliveries.
     ///
-    /// Builds run as legs of `build-batch.yml` runs (stow#833): a run
-    /// of `b̄` legs on average earns one `completed` delivery, one
-    /// Durable Object request and at most two alarm passes, so per
-    /// build those are `1/b̄`, `1/b̄` and `≤ 2/b̄`. Holding this ratio at
-    /// one prices every build as its own run — an over-estimate of the
-    /// completion's Durable Object requests at every `b̄ ≥ 1`, and of
-    /// the completion's share of [`EventKind::AlarmPass`] together with
-    /// it (`2` modelled against `≤ 3/b̄`).
+    /// A build is its own `build-crate.yml` run (stow#876): each run
+    /// earns one `in_progress` and one `completed` delivery, so the
+    /// ratio's model value is 2 before retries.
     pub callbacks_per_build: f64,
     /// Queue rows a single human request submits — the request's whole
     /// dependency closure. The submit itself is one scheduler call; the
@@ -177,8 +173,8 @@ pub enum EventKind {
     /// Dispatched builds — `miss_node × builds_per_miss + HumanTask`.
     Build,
     /// `workflow_run` webhook deliveries — `Build × callbacks_per_build`.
-    /// Each is priced as a batch run's `completed` delivery, the one
-    /// the webhook forwards to the scheduler.
+    /// Each is priced as a build run's delivery, the one the webhook
+    /// forwards to the scheduler.
     BuildCallback,
     /// Scheduler alarm passes. One armed event causes one pass; passes
     /// coalesce while the alarm is already armed, so this is an upper
