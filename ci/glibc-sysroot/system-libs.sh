@@ -11,7 +11,7 @@
 # libraries are the runner image's: the shims search its
 # multiarch include and library directories after the
 # sysroot's (wrappers.sh says why in that order). The packages
-# are ci/runner-system-libs.txt, one list for both legs.
+# are ci/system-libs/libs.txt, one list for both legs.
 #
 # The aarch64 leg cross-compiles on an x86_64 runner, so it
 # installs the arm64 builds of the same packages beside the
@@ -29,7 +29,7 @@ set -euo pipefail
 target="${1:?usage: system-libs.sh <target-triple>}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-mapfile -t packages < <(grep -Ev '^[[:space:]]*(#|$)' "$here/../runner-system-libs.txt")
+mapfile -t packages < <(grep -Ev '^[[:space:]]*(#|$)' "$here/../system-libs/libs.txt")
 
 case "$target" in
     x86_64-unknown-linux-gnu)

@@ -1,0 +1,10 @@
+# Packages the aarch64-unknown-linux-gnu build leg installs on top of
+# the runner image — the names now inline in build-crate.yml —
+# resolved by lock.sh into the lock's
+# toolchain-aarch64-unknown-linux-gnu set (stow#862). One name per
+# line.
+gcc-aarch64-linux-gnu
+g++-aarch64-linux-gnu
+gcc-12-aarch64-linux-gnu
+g++-12-aarch64-linux-gnu
+mold
