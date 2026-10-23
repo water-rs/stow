@@ -10,39 +10,39 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 
 use futures_util::StreamExt;
-use stow_types::api::{BatchId, SchedulerStatus};
-use stow_types::records::parse_batch_run_title;
-use stow_types::runs::{LegFailure, RunFailure, RunJobRow, RunJobsPage};
+use stow_types::api::SchedulerStatus;
+use stow_types::records::parse_run_title;
+use stow_types::runs::{RunFailure, RunJobRow, RunJobsPage};
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
-use stow_types::trusted_builder::{BATCH_WORKFLOW_FILE, BATCH_WORKFLOW_NAME};
+use stow_types::trusted_builder::{WORKFLOW_FILE, WORKFLOW_NAME};
 use time::OffsetDateTime;
 
 use crate::Edge;
 use crate::github::{self, ConditionalPages, RunsPage, WorkflowRunRow};
 use crate::render::Screen;
-use crate::runs::{self, FailureClass, LegProgress, LiveLeg};
+use crate::runs::{self, FailureClass, LiveTask, TaskProgress};
 
-/// The session's in-memory fleet — every in-flight batch run, every
-/// `(run, leg)`'s latest live state, the session's failures and the
-/// log classes it classified.
+/// The session's in-memory fleet — every in-flight run, each run's
+/// task's latest live state, the session's failures and the log
+/// classes it classified.
 pub struct Fleet {
     /// Watch start — `frame`'s `since`.
     since: OffsetDateTime,
     /// In-flight runs, keyed by run id.
     runs: BTreeMap<u64, RunTrack>,
-    /// `(run_id, leg)` → the latest `LiveLeg` — a rerun's page
-    /// overwrites the same key, so a leg that failed attempt 1 and
-    /// succeeded on attempt 2 counts once (§2.1).
-    legs: BTreeMap<(u64, u32), LiveLeg>,
+    /// `run_id` → the latest `LiveTask` — a rerun's page overwrites
+    /// the same key, so a task that failed attempt 1 and succeeded on
+    /// attempt 2 counts once (§2.1).
+    tasks: BTreeMap<u64, LiveTask>,
     /// Completed runs frozen this session — run id to the attempt it
     /// completed at. A reappearance with a later `run_attempt` is a
     /// rerun and re-enters; one at the same attempt is a stale
     /// listing row and stays frozen.
     finished: BTreeMap<u64, u64>,
-    /// `(run_id, leg)` → the leg's failure track — present exactly
-    /// while the leg's latest outcome is `Failed`.
-    failures: BTreeMap<(u64, u32), FailureTrack>,
+    /// `run_id` → the task's failure track — present exactly while
+    /// the run's latest outcome is `Failed`.
+    failures: BTreeMap<u64, FailureTrack>,
     /// The next failure's discovery order — the frame lists failures
     /// newest first.
     next_failure_seq: u64,
@@ -57,8 +57,8 @@ pub struct Fleet {
 struct RunTrack {
     /// The parsed title's rustc — `1.99.0`.
     rustc: String,
-    /// The parsed title's batch id.
-    batch_id: BatchId,
+    /// The parsed title's task id.
+    task_id: String,
     /// `actor.login` — the account the run dispatched under.
     actor: String,
     /// The listing status — `queued` or `in_progress`.
@@ -71,8 +71,9 @@ struct RunTrack {
     created_at: OffsetDateTime,
 }
 
-/// What a failed leg's `FailureView` needs and the `LiveLeg` does not
-/// carry — captured at `apply_jobs` while the jobs page is in hand.
+/// What a failed run's `FailureView` needs and the `LiveTask` does
+/// not carry — captured at `apply_jobs` while the jobs page is in
+/// hand.
 #[derive(Debug)]
 struct FailureTrack {
     /// Discovery order — failures list newest first.
@@ -90,7 +91,7 @@ impl Fleet {
         Self {
             since,
             runs: BTreeMap::new(),
-            legs: BTreeMap::new(),
+            tasks: BTreeMap::new(),
             finished: BTreeMap::new(),
             failures: BTreeMap::new(),
             next_failure_seq: 0,
@@ -113,9 +114,9 @@ impl Fleet {
     /// rerun — it un-freezes and tracks again (§2.1).
     ///
     /// # Errors
-    /// A batch-workflow row whose title is neither
-    /// `BATCH_WORKFLOW_NAME` nor a parsable `<rustc>-b<batch_id>` — a
-    /// schema surprise, never ignored.
+    /// A build-workflow row whose title is neither `WORKFLOW_NAME`
+    /// nor a parsable `<rustc>-<task_id>` — a schema surprise, never
+    /// ignored.
     pub fn apply_listing(
         &mut self,
         rows: impl IntoIterator<Item = WorkflowRunRow>,
@@ -129,7 +130,7 @@ impl Fleet {
                 }
                 self.finished.remove(&row.id);
             }
-            let Some((rustc, batch_id)) = row_batch(&row)? else {
+            let Some((rustc, task_id)) = row_task(&row)? else {
                 continue;
             };
             present.insert(row.id);
@@ -137,7 +138,7 @@ impl Fleet {
                 row.id,
                 RunTrack {
                     rustc,
-                    batch_id,
+                    task_id,
                     actor: row.actor.login,
                     status: row.status,
                     run_attempt: row.run_attempt,
@@ -158,16 +159,14 @@ impl Fleet {
         Ok(dropped)
     }
 
-    /// Fold one run's jobs page — `live_legs` under `run_conclusion`
+    /// Fold one run's jobs page — `live_task` under `run_conclusion`
     /// (`""` while the run flies; only a completed run's own
-    /// conclusion settles its legs). Each present leg's latest
-    /// `LiveLeg` overwrites its `(run, leg)` entry and its failure
-    /// track; legs absent from the page keep their last outcome.
+    /// conclusion settles its task). The task's latest `LiveTask`
+    /// overwrites its `run_id` entry and its failure track.
     ///
     /// # Errors
-    /// `live_legs`'s — a non-leg job, an unrendered name outside a
-    /// skipped job, or an unsettled leg in a shape the live table
-    /// does not name.
+    /// `live_task`'s — a non-build job or an unsettled run in a shape
+    /// the live table does not name.
     pub fn apply_jobs(
         &mut self,
         run_id: u64,
@@ -175,46 +174,45 @@ impl Fleet {
         jobs: &[RunJobRow],
         now: OffsetDateTime,
     ) -> stow_types::error::Result<()> {
-        for leg in runs::live_legs(jobs, run_conclusion, now)? {
-            match &leg.progress {
-                LegProgress::Failed(failure) => {
-                    let log_job = runs::leg_log_job(failure, jobs);
-                    // A failure keeps the place it took when first seen:
-                    // re-reading the same page every tick must not
-                    // reorder the newest-first list.
-                    let seq = if let Some(track) = self.failures.get(&(run_id, leg.leg)) {
-                        track.seq
-                    } else {
-                        self.next_failure_seq += 1;
-                        self.next_failure_seq
-                    };
-                    self.failures.insert(
-                        (run_id, leg.leg),
-                        FailureTrack {
-                            seq,
-                            job_id: log_job.map(|row| row.id),
-                            job_url: log_job.map(|row| row.html_url.clone()),
-                        },
-                    );
-                }
-                _ => {
-                    self.failures.remove(&(run_id, leg.leg));
-                }
+        let task = runs::live_task(jobs, run_conclusion, now)?;
+        match &task.progress {
+            TaskProgress::Failed(failure) => {
+                let log_job = runs::failure_log_job(failure, jobs);
+                // A failure keeps the place it took when first seen:
+                // re-reading the same page every tick must not reorder
+                // the newest-first list.
+                let seq = if let Some(track) = self.failures.get(&run_id) {
+                    track.seq
+                } else {
+                    self.next_failure_seq += 1;
+                    self.next_failure_seq
+                };
+                self.failures.insert(
+                    run_id,
+                    FailureTrack {
+                        seq,
+                        job_id: log_job.map(|row| row.id),
+                        job_url: log_job.map(|row| row.html_url.clone()),
+                    },
+                );
             }
-            self.legs.insert((run_id, leg.leg), leg);
+            _ => {
+                self.failures.remove(&run_id);
+            }
         }
+        self.tasks.insert(run_id, task);
         Ok(())
     }
 
     /// Freeze a run that left the listings, given the row the
     /// `actions/runs/{id}` re-read returned and its final attempt's
-    /// jobs page. A `completed` run folds its settled legs once and
+    /// jobs page. A `completed` run folds its settled task once and
     /// is never read again; a row still reading `queued`/
     /// `in_progress` is the run having left the two listings
     /// mid-transition — the row is the truth, so it tracks again.
     ///
     /// # Errors
-    /// `apply_jobs`'s, and [`row_batch`]'s title rule on the
+    /// `apply_jobs`'s, and [`row_task`]'s title rule on the
     /// re-tracked path.
     pub fn retire(
         &mut self,
@@ -227,12 +225,12 @@ impl Fleet {
             self.finished.insert(row.id, row.run_attempt);
             return Ok(());
         }
-        if let Some((rustc, batch_id)) = row_batch(row)? {
+        if let Some((rustc, task_id)) = row_task(row)? {
             self.runs.insert(
                 row.id,
                 RunTrack {
                     rustc,
-                    batch_id,
+                    task_id,
                     actor: row.actor.login.clone(),
                     status: row.status.clone(),
                     run_attempt: row.run_attempt,
@@ -266,7 +264,7 @@ impl Fleet {
     }
 
     /// One render's worth of state — the scheduler counts the caller
-    /// already read, the in-flight runs with their leg buckets, the
+    /// already read, the in-flight runs with their task buckets, the
     /// per-target roll-up and the session's failures newest first.
     pub fn frame(&self, now: OffsetDateTime, scheduler: &SchedulerStatus) -> WatchFrame {
         let mut runs: Vec<RunView> = self
@@ -274,14 +272,14 @@ impl Fleet {
             .iter()
             .map(|(&run_id, track)| RunView {
                 run_id,
-                batch_id: track.batch_id.clone(),
+                task_id: track.task_id.clone(),
                 rustc: track.rustc.clone(),
                 actor: track.actor.clone(),
                 status: track.status.clone(),
                 run_attempt: track.run_attempt,
                 age_seconds: (now - track.created_at).whole_seconds().max(0),
                 url: track.url.clone(),
-                legs: self.leg_counts(run_id),
+                tasks: self.task_counts(run_id),
             })
             .collect();
         runs.sort_by(|a, b| {
@@ -290,20 +288,18 @@ impl Fleet {
                 .then(b.age_seconds.cmp(&a.age_seconds))
         });
 
-        let mut targets: BTreeMap<String, LegCounts> = BTreeMap::new();
-        for leg in self.legs.values() {
-            let Some(label) = &leg.label else {
-                // An all-unrendered leg lands in no target bucket —
-                // it still counts toward its run.
+        let mut targets: BTreeMap<String, TaskCounts> = BTreeMap::new();
+        for task in self.tasks.values() {
+            let Some(label) = &task.label else {
                 continue;
             };
             targets
                 .entry(label.target.clone())
                 .or_default()
-                .count(&leg.progress);
+                .count(&task.progress);
         }
 
-        let mut failures: Vec<((u64, u32), &FailureTrack)> = self
+        let mut failures: Vec<(u64, &FailureTrack)> = self
             .failures
             .iter()
             .map(|(&key, track)| (key, track))
@@ -312,14 +308,14 @@ impl Fleet {
         let failures = failures
             .into_iter()
             .map(|(key, track)| {
-                let leg = &self.legs[&key];
-                let LegProgress::Failed(failure) = &leg.progress else {
-                    unreachable!("a failure track keys a leg whose latest outcome is Failed")
+                let task = &self.tasks[&key];
+                let TaskProgress::Failed(failure) = &task.progress else {
+                    unreachable!("a failure track keys a task whose latest outcome is Failed")
                 };
                 FailureView {
-                    target: leg.label.as_ref().map(|label| label.target.clone()),
-                    crate_name: leg.label.as_ref().map(|label| label.crate_name.clone()),
-                    version: leg.label.as_ref().map(|label| label.version.clone()),
+                    target: task.label.as_ref().map(|label| label.target.clone()),
+                    crate_name: task.label.as_ref().map(|label| label.crate_name.clone()),
+                    version: task.label.as_ref().map(|label| label.version.clone()),
                     coarse_class: coarse_class(failure),
                     log_class: track
                         .job_id
@@ -342,44 +338,45 @@ impl Fleet {
             runs,
             targets: targets
                 .into_iter()
-                .map(|(target, legs)| TargetView { target, legs })
+                .map(|(target, tasks)| TargetView { target, tasks })
                 .collect(),
             failures,
         }
     }
 
-    /// One run's legs in the §2.3 buckets.
-    fn leg_counts(&self, run_id: u64) -> LegCounts {
-        let mut counts = LegCounts::default();
-        for ((_, _), leg) in self.legs.range((run_id, 0)..=(run_id, u32::MAX)) {
-            counts.count(&leg.progress);
+    /// One run's task in the §2.3 buckets.
+    fn task_counts(&self, run_id: u64) -> TaskCounts {
+        let mut counts = TaskCounts::default();
+        if let Some(task) = self.tasks.get(&run_id) {
+            counts.count(&task.progress);
         }
         counts
     }
 }
 
-/// A listing row's `(rustc, batch_id)` — `parse_batch_run_title`
-/// under `manual::bound_run_state`'s rule (§2.4): a title still
-/// reading `BATCH_WORKFLOW_NAME` is `run-name` not rendered yet, and
-/// anything else unparseable fails fast.
-fn row_batch(row: &WorkflowRunRow) -> stow_types::error::Result<Option<(String, BatchId)>> {
-    if row.display_title == BATCH_WORKFLOW_NAME {
+/// A listing row's `(rustc, task_id)` — `parse_run_title` under
+/// `manual::bound_run_state`'s rule (§2.4): a title still reading
+/// `WORKFLOW_NAME` is `run-name` not rendered yet, and anything else
+/// unparseable fails fast.
+fn row_task(row: &WorkflowRunRow) -> stow_types::error::Result<Option<(String, String)>> {
+    if row.display_title == WORKFLOW_NAME {
         return Ok(None);
     }
-    let Some((rustc, batch_id)) = parse_batch_run_title(&row.display_title) else {
+    let Some((rustc, task_id)) = parse_run_title(&row.display_title) else {
         return Err(stow_error!(
-            "batch run {} carries an unparseable title {:?}",
+            "build run {} carries an unparseable title {:?}",
             row.id,
             row.display_title
         ));
     };
-    Ok(Some((rustc.to_owned(), batch_id)))
+    Ok(Some((rustc.to_owned(), task_id.to_owned())))
 }
 
-/// `RunView` order — runs with failed legs first, then in-progress,
-/// then queued; `frame` sorts oldest first inside each group (§3).
+/// `RunView` order — runs with failed tasks first, then
+/// in-progress, then queued; `frame` sorts oldest first inside each
+/// group (§3).
 fn rank(view: &RunView) -> u8 {
-    if view.legs.failed > 0 {
+    if view.tasks.failed > 0 {
         0
     } else if view.status == "in_progress" {
         1
@@ -390,17 +387,19 @@ fn rank(view: &RunView) -> u8 {
 
 /// The page-free failure class — `verdict:<step>` for a
 /// `RunFailure::Verdict`, `infrastructure[:<step>]` for
-/// `Infrastructure`, the conclusion for a `Concluded` leg and
-/// `invariant` for an `Invariant` (§2.3).
-fn coarse_class(failure: &LegFailure) -> String {
+/// `Infrastructure` (§2.3).
+fn coarse_class(failure: &crate::runs::TaskFailure) -> String {
     match failure {
-        LegFailure::Run(RunFailure::Verdict { step, .. }) => format!("verdict:{step}"),
-        LegFailure::Run(RunFailure::Infrastructure { step, .. }) => step.as_ref().map_or_else(
-            || "infrastructure".to_owned(),
-            |step| format!("infrastructure:{step}"),
-        ),
-        LegFailure::Concluded { conclusion, .. } => conclusion.clone(),
-        LegFailure::Invariant(_) => "invariant".to_owned(),
+        crate::runs::TaskFailure::Run(RunFailure::Verdict { step, .. }) => {
+            format!("verdict:{step}")
+        }
+        crate::runs::TaskFailure::Run(RunFailure::Infrastructure { step, .. }) => {
+            step.as_ref().map_or_else(
+                || "infrastructure".to_owned(),
+                |step| format!("infrastructure:{step}"),
+            )
+        }
+        crate::runs::TaskFailure::Concluded { conclusion, .. } => conclusion.clone(),
     }
 }
 
@@ -416,12 +415,12 @@ pub struct WatchFrame {
     pub since: OffsetDateTime,
     /// The scheduler queue's counts at this render.
     pub scheduler: SchedulerView,
-    /// In-flight runs — failed legs first, then in-progress, then
+    /// In-flight runs — failed tasks first, then in-progress, then
     /// queued, oldest first inside each group.
     pub runs: Vec<RunView>,
-    /// Per-target roll-up — the same legs as `runs`, by target.
+    /// Per-target roll-up — the same tasks as `runs`, by target.
     pub targets: Vec<TargetView>,
-    /// The session's failed legs, newest first.
+    /// The session's failed runs, newest first.
     pub failures: Vec<FailureView>,
 }
 
@@ -441,31 +440,32 @@ pub struct SchedulerView {
     pub running: u32,
 }
 
-/// One leg bucket — `runs` and `targets` add up over the same legs.
+/// One task bucket — `runs` and `targets` add up over the same
+/// tasks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct LegCounts {
-    /// Legs waiting on a runner.
+pub struct TaskCounts {
+    /// Tasks waiting on a runner.
     pub queued: u32,
-    /// Legs building, publishing or still settling a failure.
+    /// Tasks building, publishing or still settling a failure.
     pub building: u32,
-    /// Legs done.
+    /// Tasks done.
     pub done: u32,
-    /// Legs failed.
+    /// Tasks failed.
     pub failed: u32,
 }
 
-impl LegCounts {
-    /// Fold one leg's progress into its §2.3 column — `Queued` is
+impl TaskCounts {
+    /// Fold one task's progress into its §2.3 column — `Queued` is
     /// queued, the three still-moving progresses building, `Done`
     /// done and `Failed` failed.
-    const fn count(&mut self, progress: &LegProgress) {
+    const fn count(&mut self, progress: &TaskProgress) {
         match progress {
-            LegProgress::Queued => self.queued += 1,
-            LegProgress::Building | LegProgress::Publishing | LegProgress::Settling => {
+            TaskProgress::Queued => self.queued += 1,
+            TaskProgress::Building | TaskProgress::Publishing | TaskProgress::Settling => {
                 self.building += 1;
             }
-            LegProgress::Done => self.done += 1,
-            LegProgress::Failed(_) => self.failed += 1,
+            TaskProgress::Done => self.done += 1,
+            TaskProgress::Failed(_) => self.failed += 1,
         }
     }
 }
@@ -475,9 +475,9 @@ impl LegCounts {
 pub struct RunView {
     /// The run's id.
     pub run_id: u64,
-    /// The batch the run builds.
-    pub batch_id: BatchId,
-    /// The rustc the batch compiles.
+    /// The task the run builds.
+    pub task_id: String,
+    /// The rustc the task compiles.
     pub rustc: String,
     /// `actor.login` — who dispatched.
     pub actor: String,
@@ -490,34 +490,34 @@ pub struct RunView {
     pub age_seconds: i64,
     /// The run's Actions URL.
     pub url: String,
-    /// The run's legs, bucketed.
-    pub legs: LegCounts,
+    /// The run's task, bucketed.
+    pub tasks: TaskCounts,
 }
 
-/// One target's roll-up — the same legs as `runs`, grouped by
+/// One target's roll-up — the same tasks as `runs`, grouped by
 /// `label.target`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TargetView {
     /// The target triple.
     pub target: String,
-    /// The target's legs, bucketed — serialized flat next to
+    /// The target's tasks, bucketed — serialized flat next to
     /// `target`.
     #[serde(flatten)]
-    pub legs: LegCounts,
+    pub tasks: TaskCounts,
 }
 
-/// One failed leg — the session's failures, newest first (§2.3: the
+/// One failed run — the session's failures, newest first (§2.3: the
 /// coarse class off the page, the log class once read).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FailureView {
-    /// The leg's target — `None` on an unrendered leg (stow#839).
+    /// The task's target — `None` while its build job has not landed.
     pub target: Option<String>,
-    /// The leg's crate — `None` on an unrendered leg.
+    /// The task's crate — `None` while its build job has not landed.
     pub crate_name: Option<String>,
-    /// The leg's version — `None` on an unrendered leg.
+    /// The task's version — `None` while its build job has not landed.
     pub version: Option<String>,
-    /// The page-free class — `verdict:<step>`,
-    /// `infrastructure[:<step>]`, the conclusion, or `invariant`.
+    /// The page-free class — `verdict:<step>` or
+    /// `infrastructure[:<step>]`.
     pub coarse_class: String,
     /// The log class once the log read landed — `None` until then.
     pub log_class: Option<FailureClass>,
@@ -537,7 +537,7 @@ const SCHEDULER_STATUS_PATH: &str = "/api/v1/scheduler/status";
 /// The session's watch — the `Fleet` plus the conditional caches that
 /// make every repeated read an `If-None-Match` (§2.4).
 pub struct Watch {
-    /// The model — runs, legs, failures, the log-class memo.
+    /// The model — runs, tasks, failures, the log-class memo.
     fleet: Fleet,
     /// The `queued` listing's per-URL page cache.
     queued: ConditionalPages<RunsPage<WorkflowRunRow>>,
@@ -746,7 +746,7 @@ async fn fetch_listing(
     pages: &mut ConditionalPages<RunsPage<WorkflowRunRow>>,
 ) -> stow_types::error::Result<Vec<WorkflowRunRow>> {
     let mut url = format!(
-        "{base}/repos/{}/actions/workflows/{BATCH_WORKFLOW_FILE}/runs?status={status}&per_page=100",
+        "{base}/repos/{}/actions/workflows/{WORKFLOW_FILE}/runs?status={status}&per_page=100",
         github::REPO
     );
     let mut rows = Vec::new();
@@ -789,11 +789,11 @@ mod tests {
         OffsetDateTime::from_unix_timestamp(unix).expect("timestamp")
     }
 
-    /// The title every batch run renders — `<rustc>-b<batch_id>`.
-    const TITLE: &str = "1.99.0-b0123456789abcdef0123456789abcdef";
+    /// The title every run renders — `<rustc>-<task_id>`.
+    const TITLE: &str = "1.99.0-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     /// A listing row — `display_title` defaults to [`TITLE`] because
-    /// `run-name` only ever fails to render as `BATCH_WORKFLOW_NAME`.
+    /// `run-name` only ever fails to render as `WORKFLOW_NAME`.
     fn run_row(
         id: u64,
         status: &str,
@@ -826,10 +826,10 @@ mod tests {
         }
     }
 
-    /// A leg's job row — every field `live_legs` reads is scriptable.
-    fn leg_job(
+    /// A job row — every field `live_task` reads is scriptable.
+    fn job(
         id: u64,
-        name: String,
+        name: &str,
         status: &str,
         conclusion: Option<&str>,
         started_at: Option<i64>,
@@ -838,7 +838,7 @@ mod tests {
     ) -> RunJobRow {
         RunJobRow {
             id,
-            name,
+            name: name.to_owned(),
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
             started_at: started_at.map(at),
@@ -849,31 +849,27 @@ mod tests {
         }
     }
 
-    /// `leg N / build #N <crate> <version> (<target>) <16-hex hash>`.
-    fn build(leg: u32) -> String {
-        format!("leg {leg} / build #{leg} serde 1.0.0 (x86_64-unknown-linux-gnu) 0123456789abcdef")
-    }
+    /// `build <crate> <version> (<target>)`.
+    const BUILD: &str = "build serde 1.0.0 (x86_64-unknown-linux-gnu)";
 
-    /// `leg N / publish #N <16-hex hash>`.
-    fn publish(leg: u32) -> String {
-        format!("leg {leg} / publish #{leg} 0123456789abcdef")
-    }
+    /// `publish`.
+    const PUBLISH: &str = "publish";
 
-    /// Both jobs of a leg reading `completed`/`success`.
-    fn settled_jobs(leg: u32) -> Vec<RunJobRow> {
+    /// Both jobs of a task reading `completed`/`success`.
+    fn settled_jobs() -> Vec<RunJobRow> {
         vec![
-            leg_job(
-                10 + u64::from(leg),
-                build(leg),
+            job(
+                10,
+                BUILD,
                 "completed",
                 Some("success"),
                 Some(900),
                 Some(950),
                 vec![],
             ),
-            leg_job(
-                20 + u64::from(leg),
-                publish(leg),
+            job(
+                20,
+                PUBLISH,
                 "completed",
                 Some("success"),
                 Some(960),
@@ -883,13 +879,13 @@ mod tests {
         ]
     }
 
-    /// A leg's build job failed its verdict step with every row
+    /// The task's build job failed its verdict step with every row
     /// settled — a `RunFailure::Verdict`.
-    fn failed_jobs(leg: u32) -> Vec<RunJobRow> {
+    fn failed_jobs() -> Vec<RunJobRow> {
         vec![
-            leg_job(
-                30 + u64::from(leg),
-                build(leg),
+            job(
+                30,
+                BUILD,
                 "completed",
                 Some("failure"),
                 Some(900),
@@ -900,9 +896,9 @@ mod tests {
                     Some("failure"),
                 )],
             ),
-            leg_job(
-                40 + u64::from(leg),
-                publish(leg),
+            job(
+                40,
+                PUBLISH,
                 "completed",
                 Some("skipped"),
                 Some(960),
@@ -942,14 +938,14 @@ mod tests {
             .apply_jobs(
                 7,
                 "",
-                &[leg_job(30, build(0), "queued", None, None, None, vec![])],
+                &[job(30, BUILD, "queued", None, None, None, vec![])],
                 at(1_000),
             )
             .expect("jobs");
         let frame = fleet.frame(at(1_000), &scheduler(10, 3));
         assert_eq!(frame.runs.len(), 1);
         assert_eq!(frame.runs[0].status, "in_progress");
-        assert_eq!(frame.runs[0].legs.queued, 1);
+        assert_eq!(frame.runs[0].tasks.queued, 1);
         assert_eq!(frame.runs[0].age_seconds, 600);
         assert_eq!(frame.since, at(500));
         assert_eq!(frame.scheduler.pending_miss, 7);
@@ -960,33 +956,33 @@ mod tests {
         fleet
             .retire(
                 &run_row(7, "completed", Some("success"), 1, 400, TITLE),
-                &settled_jobs(0),
+                &settled_jobs(),
                 at(1_100),
             )
             .expect("retire");
         let frame = fleet.frame(at(1_100), &scheduler(0, 0));
         assert_eq!(frame.runs, [] as [RunView; 0]);
-        assert_eq!(frame.targets[0].legs.done, 1);
+        assert_eq!(frame.targets[0].tasks.done, 1);
     }
 
-    /// A rerun re-enters at `run_attempt + 1`; a leg that failed
+    /// A rerun re-enters at `run_attempt + 1`; a task that failed
     /// attempt 1 and succeeded on attempt 2 counts once, as done —
     /// and a same-attempt reappearance stays frozen (§2.1).
     #[test]
-    fn a_rerun_reenters_and_a_flipped_leg_counts_once() {
+    fn a_rerun_reenters_and_a_flipped_task_counts_once() {
         let mut fleet = Fleet::new(at(0));
         fleet
             .apply_listing([run_row(7, "in_progress", None, 1, 0, TITLE)])
             .expect("listing");
         fleet
-            .apply_jobs(7, "", &failed_jobs(0), at(1_000))
+            .apply_jobs(7, "", &failed_jobs(), at(1_000))
             .expect("jobs");
         let dropped = fleet.apply_listing([]).expect("listing");
         assert_eq!(dropped, vec![7]);
         fleet
             .retire(
                 &run_row(7, "completed", Some("failure"), 1, 0, TITLE),
-                &failed_jobs(0),
+                &failed_jobs(),
                 at(1_100),
             )
             .expect("retire");
@@ -1001,15 +997,15 @@ mod tests {
         let frame = fleet.frame(at(1_200), &scheduler(0, 0));
         assert_eq!(frame.runs.len(), 1);
         assert_eq!(frame.runs[0].run_attempt, 2);
-        // The leg's attempt-1 outcome stands until the new page lands.
+        // The task's attempt-1 outcome stands until the new page lands.
         assert_eq!(frame.failures.len(), 1);
 
         fleet
-            .apply_jobs(7, "", &settled_jobs(0), at(1_300))
+            .apply_jobs(7, "success", &settled_jobs(), at(1_300))
             .expect("jobs");
         let frame = fleet.frame(at(1_300), &scheduler(0, 0));
-        assert_eq!(frame.targets[0].legs.done, 1);
-        assert_eq!(frame.targets[0].legs.failed, 0);
+        assert_eq!(frame.targets[0].tasks.done, 1);
+        assert_eq!(frame.targets[0].tasks.failed, 0);
         assert_eq!(frame.failures, [] as [FailureView; 0]);
 
         // Completed again — and a stale listing row at the old
@@ -1018,7 +1014,7 @@ mod tests {
         fleet
             .retire(
                 &run_row(7, "completed", Some("success"), 2, 0, TITLE),
-                &settled_jobs(0),
+                &settled_jobs(),
                 at(1_400),
             )
             .expect("retire");
@@ -1028,11 +1024,11 @@ mod tests {
         assert_eq!(dropped, [] as [u64; 0]);
         let frame = fleet.frame(at(1_500), &scheduler(0, 0));
         assert_eq!(frame.runs, [] as [RunView; 0]);
-        assert_eq!(frame.targets[0].legs.done, 1);
+        assert_eq!(frame.targets[0].tasks.done, 1);
     }
 
     /// The per-target roll-up and the per-run buckets add up over the
-    /// same legs — the frame's own cross-check (§3).
+    /// same tasks — the frame's own cross-check (§3).
     #[test]
     fn per_target_sums_equal_per_run_sums() {
         let mut fleet = Fleet::new(at(0));
@@ -1040,19 +1036,28 @@ mod tests {
             .apply_listing([
                 run_row(1, "in_progress", None, 1, 0, TITLE),
                 run_row(2, "in_progress", None, 1, 0, TITLE),
+                run_row(3, "queued", None, 1, 0, TITLE),
             ])
             .expect("listing");
         fleet
-            .apply_jobs(1, "", &settled_jobs(0), at(1_000))
+            .apply_jobs(1, "success", &settled_jobs(), at(1_000))
             .expect("jobs");
         fleet
             .apply_jobs(
                 2,
                 "",
                 &[
-                    leg_job(30, build(0), "in_progress", None, Some(900), None, vec![]),
-                    leg_job(31, build(1), "queued", None, None, None, vec![]),
+                    job(30, BUILD, "in_progress", None, Some(900), None, vec![]),
+                    job(31, PUBLISH, "queued", None, None, None, vec![]),
                 ],
+                at(1_000),
+            )
+            .expect("jobs");
+        fleet
+            .apply_jobs(
+                3,
+                "",
+                &[job(32, BUILD, "queued", None, None, None, vec![])],
                 at(1_000),
             )
             .expect("jobs");
@@ -1060,28 +1065,31 @@ mod tests {
         let run_totals: u32 = frame
             .runs
             .iter()
-            .map(|run| run.legs.queued + run.legs.building + run.legs.done + run.legs.failed)
+            .map(|run| run.tasks.queued + run.tasks.building + run.tasks.done + run.tasks.failed)
             .sum();
         let target_totals: u32 = frame
             .targets
             .iter()
             .map(|target| {
-                target.legs.queued + target.legs.building + target.legs.done + target.legs.failed
+                target.tasks.queued
+                    + target.tasks.building
+                    + target.tasks.done
+                    + target.tasks.failed
             })
             .sum();
         assert_eq!(run_totals, 3);
         assert_eq!(run_totals, target_totals);
         let target = &frame.targets[0];
         assert_eq!(target.target, "x86_64-unknown-linux-gnu");
-        assert_eq!(target.legs.done, 1);
-        assert_eq!(target.legs.building, 1);
-        assert_eq!(target.legs.queued, 1);
+        assert_eq!(target.tasks.done, 1);
+        assert_eq!(target.tasks.building, 1);
+        assert_eq!(target.tasks.queued, 1);
     }
 
-    /// An all-unrendered leg (stow#839) counts toward its run but
+    /// An all-unrendered task (stow#839) counts toward its run but
     /// lands in no target bucket.
     #[test]
-    fn an_unrendered_leg_counts_under_no_target() {
+    fn an_unrendered_task_counts_under_no_target() {
         let mut fleet = Fleet::new(at(0));
         fleet
             .apply_listing([run_row(1, "in_progress", None, 1, 0, TITLE)])
@@ -1090,10 +1098,9 @@ mod tests {
             .apply_jobs(
                 1,
                 "cancelled",
-                &[leg_job(
+                &[job(
                     30,
-                    "leg 0 / build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}"
-                        .to_owned(),
+                    "build ${{ inputs.label }} (${{ inputs.target }})",
                     "completed",
                     Some("skipped"),
                     Some(900),
@@ -1104,7 +1111,7 @@ mod tests {
             )
             .expect("jobs");
         let frame = fleet.frame(at(1_000), &scheduler(0, 0));
-        assert_eq!(frame.runs[0].legs.failed, 1);
+        assert_eq!(frame.runs[0].tasks.failed, 1);
         assert_eq!(frame.targets, [] as [TargetView; 0]);
         let failure = &frame.failures[0];
         assert_eq!(failure.coarse_class, "skipped");
@@ -1112,13 +1119,13 @@ mod tests {
         assert_eq!(failure.crate_name, None);
     }
 
-    /// A title still reading `BATCH_WORKFLOW_NAME` is `run-name` not
+    /// A title still reading `WORKFLOW_NAME` is `run-name` not
     /// rendered yet — ignored, not tracked, not an error (§2.4).
     #[test]
     fn an_unrendered_title_is_ignored() {
         let mut fleet = Fleet::new(at(0));
         let dropped = fleet
-            .apply_listing([run_row(9, "queued", None, 1, 0, BATCH_WORKFLOW_NAME)])
+            .apply_listing([run_row(9, "queued", None, 1, 0, WORKFLOW_NAME)])
             .expect("listing");
         assert_eq!(dropped, [] as [u64; 0]);
         assert_eq!(
@@ -1128,13 +1135,13 @@ mod tests {
     }
 
     /// Any other unparseable title on this workflow is a schema
-    /// surprise — the run is ours, so the title must read a batch.
+    /// surprise — the run is ours, so the title must read a task.
     #[test]
     fn an_unparseable_title_fails() {
         let mut fleet = Fleet::new(at(0));
         assert!(
             fleet
-                .apply_listing([run_row(9, "queued", None, 1, 0, "some-hand-run")])
+                .apply_listing([run_row(9, "queued", None, 1, 0, "untitled")])
                 .is_err()
         );
     }
@@ -1168,35 +1175,35 @@ mod tests {
     fn failures_list_newest_first_with_the_log_class() {
         let mut fleet = Fleet::new(at(0));
         fleet
-            .apply_listing([run_row(1, "in_progress", None, 1, 0, TITLE)])
+            .apply_listing([
+                run_row(1, "in_progress", None, 1, 0, TITLE),
+                run_row(2, "in_progress", None, 1, 0, TITLE),
+            ])
             .expect("listing");
         fleet
-            .apply_jobs(1, "", &[failed_jobs(0), failed_jobs(1)].concat(), at(1_000))
+            .apply_jobs(1, "failure", &failed_jobs(), at(1_000))
+            .expect("jobs");
+        let mut second = failed_jobs();
+        second[0].id = 31;
+        fleet
+            .apply_jobs(2, "failure", &second, at(1_100))
             .expect("jobs");
         fleet.record_log_class(30, FailureClass::LinkerUnusable);
         assert_eq!(fleet.unclassified_jobs(), [31]);
         let frame = fleet.frame(at(1_000), &scheduler(0, 0));
         assert_eq!(frame.failures.len(), 2);
-        // Newest first — leg 1 failed second, and its job's log has
-        // not been read, so it lists no class.
         assert_eq!(
             frame.failures[0].coarse_class,
             "verdict:Run the untrusted build stage"
         );
         assert_eq!(frame.failures[0].crate_name.as_deref(), Some("serde"));
+        // Newest first — run 2's job has no memo entry yet; run 1's
+        // classified job 30 joined its class.
         assert_eq!(frame.failures[0].log_class, None);
-        // The memo keyed on leg 0's failed job id joined its class.
-        let leg_zero = frame
-            .failures
-            .iter()
-            .find(|failure| {
-                failure
-                    .job_url
-                    .as_deref()
-                    .is_some_and(|url| url.ends_with("/30"))
-            })
-            .expect("leg 0's failure");
-        assert_eq!(leg_zero.log_class, Some(FailureClass::LinkerUnusable));
+        assert_eq!(
+            frame.failures[1].log_class,
+            Some(FailureClass::LinkerUnusable)
+        );
     }
 
     // ----- The I/O loop (stow#853 §3) -----
@@ -1220,9 +1227,9 @@ mod tests {
         )
     }
 
-    /// A `RunJobsPage` body — one settled build+publish pair per leg.
+    /// A `RunJobsPage` body — one settled build+publish pair.
     fn jobs_json() -> &'static str {
-        "{\"jobs\":[{\"id\":30,\"name\":\"leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) 0123456789abcdef\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":\"1970-01-01T00:15:00Z\",\"completed_at\":\"1970-01-01T00:15:50Z\",\"run_attempt\":1,\"html_url\":\"j\",\"steps\":[]},{\"id\":40,\"name\":\"leg 0 / publish #0 0123456789abcdef\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":\"1970-01-01T00:16:00Z\",\"completed_at\":\"1970-01-01T00:16:30Z\",\"run_attempt\":1,\"html_url\":\"j\",\"steps\":[]}]}"
+        "{\"jobs\":[{\"id\":30,\"name\":\"build serde 1.0.0 (x86_64-unknown-linux-gnu)\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":\"1970-01-01T00:15:00Z\",\"completed_at\":\"1970-01-01T00:15:50Z\",\"run_attempt\":1,\"html_url\":\"j\",\"steps\":[]},{\"id\":40,\"name\":\"publish\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":\"1970-01-01T00:16:00Z\",\"completed_at\":\"1970-01-01T00:16:30Z\",\"run_attempt\":1,\"html_url\":\"j\",\"steps\":[]}]}"
     }
 
     /// The queue status the scheduler endpoint answers.
@@ -1290,7 +1297,7 @@ mod tests {
             .await
             .expect("tick");
         assert_eq!(first, second);
-        assert_eq!(first.targets[0].legs.done, 1);
+        assert_eq!(first.targets[0].tasks.building, 1);
         let heads = github.join().await;
         let etags: Vec<Option<String>> = heads
             .iter()
@@ -1357,7 +1364,7 @@ mod tests {
             .await
             .expect("tick");
         assert_eq!(frame.runs, [] as [RunView; 0]);
-        assert_eq!(frame.targets[0].legs.done, 1);
+        assert_eq!(frame.targets[0].tasks.done, 1);
         let _ = github.join().await;
         let _ = edge_server.join().await;
     }
@@ -1464,8 +1471,8 @@ mod tests {
         assert_eq!(parsed, frame);
     }
 
-    /// The frame serializes — `at`/`since` as rfc3339, `batch_id` as
-    /// its hex string, `TargetView`'s legs flat next to `target` —
+    /// The frame serializes — `at`/`since` as rfc3339, `task_id` as
+    /// its string, `TargetView`'s counts flat next to `target` —
     /// and round-trips.
     #[test]
     fn a_frame_serializes_and_round_trips() {
@@ -1474,19 +1481,19 @@ mod tests {
             .apply_listing([run_row(1, "in_progress", None, 1, 400, TITLE)])
             .expect("listing");
         fleet
-            .apply_jobs(1, "", &settled_jobs(0), at(1_000))
+            .apply_jobs(1, "success", &settled_jobs(), at(1_000))
             .expect("jobs");
         let frame = fleet.frame(at(1_000), &scheduler(10, 3));
         let json = serde_json::to_value(&frame).expect("serialize");
         assert_eq!(json["at"], "1970-01-01T00:16:40Z");
         assert_eq!(json["since"], "1970-01-01T00:08:20Z");
         assert_eq!(
-            json["runs"][0]["batch_id"],
-            "0123456789abcdef0123456789abcdef"
+            json["runs"][0]["task_id"],
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         );
         assert_eq!(json["targets"][0]["target"], "x86_64-unknown-linux-gnu");
         assert_eq!(json["targets"][0]["done"], 1);
-        assert!(json["targets"][0].get("legs").is_none());
+        assert!(json["targets"][0].get("tasks").is_none());
         let round_trip: WatchFrame = serde_json::from_value(json).expect("deserialize");
         assert_eq!(round_trip, frame);
     }
