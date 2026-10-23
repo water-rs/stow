@@ -392,17 +392,23 @@ async fn gather_snapshot(
     let miss_nodes_sql = MissNodesQuery { window: &window }
         .render()
         .map_err(|error| stow_error!("render launch-model query: {error}"))?;
+    let sql_base = cloudflare::analytics_sql_base()?;
     let (install_days, cli_fetches, miss_nodes, requests, release_notes) = futures_util::try_join!(
         async {
-            cloudflare::analytics_engine_sql::<AeCountRow>(&token, &account, &install_days_sql)
-                .await
-                .map_err(|error| stow_error!("analytics engine: {error}"))?
-                .first()
-                .map(|row| row.value)
-                .ok_or_else(|| stow_error!("install-days query returned no row"))
+            cloudflare::analytics_engine_sql::<AeCountRow>(
+                &sql_base,
+                &token,
+                &account,
+                &install_days_sql,
+            )
+            .await
+            .map_err(|error| stow_error!("analytics engine: {error}"))?
+            .first()
+            .map(|row| row.value)
+            .ok_or_else(|| stow_error!("install-days query returned no row"))
         },
-        analytic_sum(&token, &account, &cli_fetches_sql, "fetch"),
-        analytic_sum(&token, &account, &miss_nodes_sql, "miss"),
+        analytic_sum(&sql_base, &token, &account, &cli_fetches_sql, "fetch"),
+        analytic_sum(&sql_base, &token, &account, &miss_nodes_sql, "miss"),
         zone_path_counts(&token, &zone, &window.since, &window.until),
         crate::rust_channel::release_notes(),
     )?;
@@ -422,12 +428,13 @@ async fn gather_snapshot(
 /// estimate — decoded at the actual column type and validated
 /// losslessly before its u64 use rather than clamped.
 async fn analytic_sum(
+    sql_base: &str,
     token: &str,
     account: &str,
     sql: &str,
     what: &'static str,
 ) -> stow_types::error::Result<u64> {
-    cloudflare::analytics_engine_sql::<AeSumRow>(token, account, sql)
+    cloudflare::analytics_engine_sql::<AeSumRow>(sql_base, token, account, sql)
         .await
         .map_err(|error| stow_error!("analytics engine: {error}"))?
         .first()

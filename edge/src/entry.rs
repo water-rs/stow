@@ -51,7 +51,11 @@ pub async fn fetch(
     wasm::launch(|env| async move { worker(&env) }, request, env, ctx).await
 }
 
-fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
+fn worker(
+    env: &wasm::Env,
+) -> crate::no_store::NoStoreOnError<
+    crate::faults::OverloadFaults<Router, skyzen_cloudflare::worker::AnalyticsEngineDataset>,
+> {
     let d1 = CfD1::from_env(env, STOW_DB_BINDING)
         .unwrap_or_else(|error| panic!("failed to load D1 binding '{STOW_DB_BINDING}': {error}"));
     let db = Db::new(d1);
@@ -142,7 +146,7 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
         .with(db)
         .with(State(scheduler))
         .with(State(cache))
-        .with(State(analytics))
+        .with(State(analytics.clone()))
         .with(State(stats))
         .with(State(ghcr))
         .with(State(resolver_settings))
@@ -167,8 +171,10 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
 
     // The outermost response boundary — every error answer leaves here,
     // so `Cache-Control: no-store` is stamped in one place rather than
-    // per handler (`no_store` module docs).
-    crate::no_store::NoStoreOnError::new(router)
+    // per handler (`no_store` module docs). Inside it, the fault
+    // recorder counts each overload-marked answer into the bound
+    // Analytics Engine dataset (stow#888; `faults` module docs).
+    crate::no_store::NoStoreOnError::new(crate::faults::OverloadFaults::new(router, analytics))
 }
 
 /// Every route that requires a trusted caller — the admin surface and

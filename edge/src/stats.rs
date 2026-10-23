@@ -36,6 +36,20 @@ impl AnalyticsConsent {
     #[cfg(test)]
     pub const DENIED: Self = Self(false);
 
+    /// Consent read off a request's headers — the single read the
+    /// `Extractor` impl and the overload-fault recorder both honour, so
+    /// `x-stow-no-analytics` means the same thing on every analytics
+    /// write.
+    pub(crate) fn from_request(request: &skyzen::Request) -> Self {
+        Self(
+            request
+                .headers()
+                .get(NO_ANALYTICS_HEADER)
+                .and_then(|value| value.to_str().ok())
+                != Some("1"),
+        )
+    }
+
     /// Whether analytics may be written for this request.
     pub const fn allowed(self) -> bool {
         self.0
@@ -189,7 +203,7 @@ mod worker {
     use skyzen::Request;
     use skyzen::extract::Extractor;
 
-    use super::{AnalyticsConsent, NO_ANALYTICS_HEADER};
+    use super::AnalyticsConsent;
     use crate::errors::GetArtifactError;
 
     impl Extractor for AnalyticsConsent {
@@ -198,12 +212,7 @@ mod worker {
         fn extract(
             request: &mut Request,
         ) -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
-            let opted_out = request
-                .headers()
-                .get(NO_ANALYTICS_HEADER)
-                .and_then(|value| value.to_str().ok())
-                == Some("1");
-            std::future::ready(Ok(Self(!opted_out)))
+            std::future::ready(Ok(Self::from_request(request)))
         }
     }
 

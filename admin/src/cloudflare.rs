@@ -16,6 +16,44 @@ pub const API_BASE: &str = "https://api.cloudflare.com/client/v4";
 /// The environment variable carrying the account API token.
 pub const API_TOKEN_ENV: &str = "CLOUDFLARE_API_TOKEN";
 
+/// `STOW_CF_ANALYTICS_SQL_BASE` — test-only override of the REST base
+/// Analytics Engine SQL POSTs target. Production never sets it; a
+/// mock/e2e harness points it at a loopback fixture.
+pub const ANALYTICS_SQL_BASE_ENV: &str = "STOW_CF_ANALYTICS_SQL_BASE";
+
+/// REST base the `analytics_engine/sql` POSTs target: [`API_BASE`],
+/// unless [`ANALYTICS_SQL_BASE_ENV`] names a loopback fixture. The
+/// loopback pin is a credential guard — `Authorization` carries the
+/// account API token, so a remote override would exfiltrate it.
+///
+/// # Errors
+/// The override is set but does not parse as a URL or names a
+/// non-loopback host.
+pub fn analytics_sql_base() -> stow_types::error::Result<String> {
+    let Ok(base) = std::env::var(ANALYTICS_SQL_BASE_ENV) else {
+        return Ok(API_BASE.to_owned());
+    };
+    loopback_sql_base(&base)
+}
+
+/// The `STOW_CF_ANALYTICS_SQL_BASE` loopback pin on one candidate URL.
+fn loopback_sql_base(base: &str) -> stow_types::error::Result<String> {
+    let parsed = url::Url::parse(base)
+        .map_err(|error| stow_error!("{ANALYTICS_SQL_BASE_ENV} {base:?}: {error}"))?;
+    let loopback = match parsed.host() {
+        Some(url::Host::Domain(domain)) => domain == "localhost",
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if !loopback {
+        return Err(stow_error!(
+            "{ANALYTICS_SQL_BASE_ENV} must name a loopback host, got {base:?}"
+        ));
+    }
+    Ok(base.trim_end_matches('/').to_owned())
+}
+
 /// How long one analytics POST may take before it counts as failed.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
@@ -198,11 +236,12 @@ struct SqlEnvelope<T> {
 /// # Errors
 /// Transport, HTTP status, decode and API errors, as text.
 pub async fn analytics_engine_sql<T: DeserializeOwned>(
+    sql_base: &str,
     token: &str,
     account_id: &str,
     sql: &str,
 ) -> Result<Vec<T>, String> {
-    let url = format!("{API_BASE}/accounts/{account_id}/analytics_engine/sql");
+    let url = format!("{sql_base}/accounts/{account_id}/analytics_engine/sql");
     let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
     let request = client
         .post(&url)
@@ -231,4 +270,26 @@ pub async fn analytics_engine_sql<T: DeserializeOwned>(
         return Err(format!("Analytics Engine SQL errors: {messages}"));
     }
     Ok(envelope.data)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The override pin: loopback hosts pass (trailing slash trimmed),
+    /// anything remote or unparseable is refused.
+    #[test]
+    fn analytics_sql_base_override_is_loopback_only() {
+        assert_eq!(
+            super::loopback_sql_base("http://127.0.0.1:9000/").unwrap(),
+            "http://127.0.0.1:9000"
+        );
+        super::loopback_sql_base("http://localhost:1").unwrap();
+        super::loopback_sql_base("http://[::1]:1").unwrap();
+        for remote in [
+            "https://api.cloudflare.com/client/v4",
+            "http://10.0.0.1",
+            "not a url",
+        ] {
+            super::loopback_sql_base(remote).expect_err(remote);
+        }
+    }
 }

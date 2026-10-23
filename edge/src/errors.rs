@@ -287,6 +287,20 @@ pub enum SchedulerClientError {
         /// Underlying error message.
         message: String,
     },
+    /// The platform shed the call — a "Durable Object is overloaded"
+    /// rejection, thrown by `stub.fetch` or returned in a non-2xx body.
+    /// Kept distinct: the fault recorder keys on this variant to mark
+    /// the error response the watchdog counts (stow#888).
+    #[error("scheduler {url} shed the call as overloaded: {message}")]
+    Overloaded {
+        /// URL that was being fetched.
+        url: String,
+        /// HTTP status when the rejection arrived as a response;
+        /// `None` when the runtime threw before answering.
+        status: Option<u16>,
+        /// The thrown error's text or the response body.
+        message: String,
+    },
     /// HTTP non-2xx response.
     #[error("scheduler {url} returned HTTP {status}: {body}")]
     Http {
@@ -416,9 +430,23 @@ pub enum GetArtifactError {
     /// `error` names the stored trigger so the operator sees why.
     #[error("{0}", status = SERVICE_UNAVAILABLE)]
     DispatchFrozen(String),
+    /// The platform shed the scheduler call — the DO's own `overloaded`
+    /// rejection. Transient like the freeze refusal, so it answers the
+    /// same 503; the fault recorder marks its envelope with the
+    /// `OverloadFault` extension (stow#888). The [`OVERLOADED_PREFIX`]
+    /// in its display is the marker that survives the router's
+    /// `Box<dyn HttpError>` erasure — the detail is redacted from the
+    /// 5xx body anyway, so clients never see it.
+    #[error("overloaded: {0}", status = SERVICE_UNAVAILABLE)]
+    SchedulerOverloaded(String),
     #[error("internal server error: {0}")]
     InternalWithMessage(String),
 }
+
+/// The [`GetArtifactError::SchedulerOverloaded`] display prefix — the
+/// boundary the router's `Box<dyn HttpError>` preserves for the fault
+/// recorder.
+pub const OVERLOADED_PREFIX: &str = "overloaded:";
 
 impl From<SchedulerClientError> for GetArtifactError {
     fn from(error: SchedulerClientError) -> Self {
@@ -448,6 +476,12 @@ impl From<SchedulerClientError> for GetArtifactError {
             // submit naming a task the queue never held — and the body
             // is the scheduler's own client-safe message, so it reaches
             // the caller verbatim instead of as a bare 500.
+            // The platform's own overload rejection — distinct from a
+            // queue refusal because the fault recorder tags its answer
+            // with the marker the watchdog counts.
+            SchedulerClientError::Overloaded { message, .. } => {
+                Self::SchedulerOverloaded(scheduler_error_message(&message).to_owned())
+            }
             SchedulerClientError::Http { status, body, .. } if (400..500).contains(&status) => {
                 Self::BadRequestWithMessage(format!("scheduler rejected the request: {body}"))
             }
