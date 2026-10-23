@@ -287,6 +287,14 @@ pub fn spawn_drain(target_dir: &Path) {
     if finished_journals(target_dir).is_empty() {
         return;
     }
+    spawn_drain_unconditional(target_dir);
+}
+
+/// Spawn the detached drainer whether or not a journal is pending — the
+/// day's usage report rides in the same process, and an all-hit build
+/// leaves no journal for [`spawn_drain`] to find (stow#889). The child
+/// exits promptly when it finds nothing to do.
+pub fn spawn_drain_unconditional(target_dir: &Path) {
     // Under a shim name `current_exe` is the runtime's role name —
     // `expand_wrapper_role` leaves the `__drain-misses` subcommand
     // untouched regardless of argv[0]'s name.
@@ -537,9 +545,27 @@ pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::
     // needs (stow#667).
     lower_own_priority();
     for journal in prepared {
+        // A journal is one build; a `stow-`-named file is a supervised
+        // build's journal, already counted at the driver's tail —
+        // counting it again would double it.
+        if is_plain_cargo_journal(&journal.journal) {
+            crate::report::bump_build(&config).await;
+        }
         post_journal(&config, journal).await;
     }
+    crate::report::maybe_report(&config).await;
     Ok(())
+}
+
+/// Whether the journal file belongs to a plain `cargo` build — its
+/// build token is the parent cargo's pid, so it lacks the `stow-`
+/// prefix `supervised_build` writes.
+fn is_plain_cargo_journal(journal: &Path) -> bool {
+    journal
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix(JOURNAL_PREFIX))
+        .is_some_and(|rest| !rest.starts_with("stow-"))
 }
 
 /// Drop the drain's scheduling priority for its CPU-only posting

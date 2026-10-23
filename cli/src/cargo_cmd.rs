@@ -4584,12 +4584,22 @@ async fn finish_cargo_run(
         // given up first: the drain this build spawns must find the
         // gate open (stow#667).
         plan.project.foreground.release();
+        // The day's usage report posts from the detached drain — never
+        // on the build's wall clock — so a due report is a reason to
+        // spawn that drain even when this build leaves no journal
+        // (stow#889).
+        let report_due = crate::report::report_due_today(config).await;
         journal_and_drain_misses(
             plan.project,
             plan.cargo_args,
             plan.current_dir,
             &handler.observations(),
+            report_due,
         );
+        // One supervised run is one build the install ran — counted
+        // here rather than by the journal, whose supervised files the
+        // drain skips to keep the count single.
+        crate::report::bump_build(config).await;
     }
     // Nothing writes into the scratch directory any more — cargo has
     // exited, the analysis is gone and the supervisor has drained — so
@@ -5448,6 +5458,7 @@ fn journal_and_drain_misses(
     cargo_args: &[OsString],
     current_dir: &Path,
     observations: &[crate::artifact_cache::ObservedUnit],
+    report_due: bool,
 ) {
     let target_dir = resolved_target_dir(project, cargo_args, current_dir);
     // The drain mints each miss's dependency subgraph off the build's
@@ -5484,7 +5495,14 @@ fn journal_and_drain_misses(
         &target_dir,
         &expanded_cache_key,
     );
-    crate::miss_journal::spawn_drain(&target_dir);
+    // An all-hit build leaves no journal for `spawn_drain` to find;
+    // a due usage report forces the spawn so the day's deltas still
+    // leave the machine through the detached lane (stow#889).
+    if report_due {
+        crate::miss_journal::spawn_drain_unconditional(&target_dir);
+    } else {
+        crate::miss_journal::spawn_drain(&target_dir);
+    }
 }
 
 /// The `PrefetchArtifactRow`s `STOW_PREFETCH_ARTIFACTS_PATH`'s file
