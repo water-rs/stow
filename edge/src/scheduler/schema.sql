@@ -798,3 +798,22 @@ CREATE TABLE IF NOT EXISTS crate_build_stats (
 -- row — instead of just the pending set it may rewrite.
 CREATE INDEX IF NOT EXISTS idx_queue_pending_crate_target
 ON queue (crate_name, target) WHERE status = 'pending';
+-- stow#878: the flat persistence substrate the in-memory graph
+-- survives a forced eviction by. `event_log` is the append-only log —
+-- one row per accepted event, dropped to the watermark after each
+-- snapshot; `snapshot_chunks` carries the chunked serialized graph;
+-- `store_meta` holds the snapshot watermark. Nothing else about the
+-- dependency graph is a table.
+CREATE TABLE IF NOT EXISTS event_log (
+    seq INTEGER PRIMARY KEY,
+    event BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snapshot_chunks (
+    chunk INTEGER PRIMARY KEY,
+    tag TEXT NOT NULL,
+    payload BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS store_meta (
+    key TEXT PRIMARY KEY,
+    value BLOB NOT NULL
+);

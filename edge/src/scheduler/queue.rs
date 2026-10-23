@@ -101,7 +101,7 @@ const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 /// Failed-build retry cap: a failure reported while `attempt` is under
 /// this re-queues the row under `not_before` backoff; a failure at the cap
 /// parks it `failed` for an operator `retry`, which resets the cycle to 1.
-const MAX_BUILD_ATTEMPTS: u32 = 4;
+pub const MAX_BUILD_ATTEMPTS: u32 = 4;
 
 /// The bounded window of successful-build durations each
 /// `(crate_name, target)` keeps in `crate_build_samples` — newest by
@@ -205,7 +205,7 @@ impl Default for SchedulerSettings {
 
 /// Priority is the third precedence operand of `queue.value` — dispatch
 /// orders on value before the FIFO tie-breakers.
-fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> {
+pub fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> {
     let downloads_bucket = downloads / 1000;
     let downloads_bucket = i64::try_from(downloads_bucket)
         .map_err(|_| format!("downloads bucket exceeds i64: {downloads_bucket}"))?;
@@ -5076,7 +5076,7 @@ pub fn task_payload(task: &QueuedTask) -> Result<BuildTaskPayload, QueueError> {
 /// The dispatch-failure backoff in minutes: `2^min(attempts, 6)` capped
 /// at `MAX_DISPATCH_BACKOFF_MINUTES`, so a persistent failure (GitHub
 /// outage, bad token) never spins the alarm in a zero-delay retry loop.
-fn dispatch_backoff_minutes(attempts: u32) -> u32 {
+pub fn dispatch_backoff_minutes(attempts: u32) -> u32 {
     2u32.checked_pow(attempts.min(6))
         .unwrap_or(MAX_DISPATCH_BACKOFF_MINUTES)
         .min(MAX_DISPATCH_BACKOFF_MINUTES)
