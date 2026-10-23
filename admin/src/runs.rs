@@ -15,7 +15,6 @@ use stow_types::runs::{
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
 use time::OffsetDateTime;
-use zenwave::ResponseExt as _;
 
 use crate::github::{self, BUILD_WORKFLOW};
 use crate::render::{self, Output, Table};
@@ -45,7 +44,9 @@ fn parse_duration(raw: &str) -> Result<std::time::Duration, String> {
 }
 
 /// A failure class the log classifier can assign.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
     /// The toolchain or runner image lacks the task's target.
@@ -256,6 +257,50 @@ pub fn first_error_line(log: &str) -> Option<String> {
         .map(|line| line.trim().to_owned())
 }
 
+/// The job whose log classifies a failed leg — the row the `jobs/{id}/logs`
+/// read asks for, `None` for an [`LegFailure::Invariant`] (its message is
+/// the evidence, there is no log) or a named job absent from the page.
+/// Shared by `runs failures` and the watch: the watch keys its
+/// `log_class` memo on the returned row's id, so the row must be named
+/// before any fetch is decided (stow#853).
+pub fn leg_log_job<'a>(failure: &LegFailure, jobs: &'a [RunJobRow]) -> Option<&'a RunJobRow> {
+    let job = failure_job(failure)?;
+    jobs.iter().find(|row| row.name == *job)
+}
+
+/// The job a leg failure names — `None` for an invariant failure,
+/// which names no job.
+const fn failure_job(failure: &LegFailure) -> Option<&String> {
+    match failure {
+        LegFailure::Run(
+            RunFailure::Verdict { job, .. } | RunFailure::Infrastructure { job, .. },
+        )
+        | LegFailure::Concluded { job, .. } => Some(job),
+        LegFailure::Invariant(_) => None,
+    }
+}
+
+/// `(failure, log)` → `(job_name, class, evidence)` — the shared
+/// per-leg failure read `runs failures` and the watch make. `log` is
+/// the named job's log when the caller read it: an [`LegFailure::Invariant`]
+/// is its own evidence, an absent or unreadable log reads
+/// [`FailureClass::Unknown`] with none, anything else is
+/// [`classify_log`]'s answer. `job_name` is the report's display name —
+/// `leg <i>` for an invariant, which names no job.
+pub fn leg_failure_class(
+    leg: u32,
+    failure: &LegFailure,
+    log: Option<&str>,
+) -> (String, FailureClass, Option<String>) {
+    let job = failure_job(failure).map_or_else(|| format!("leg {leg}"), Clone::clone);
+    let (class, evidence) = match (failure, log) {
+        (LegFailure::Invariant(message), _) => (FailureClass::Unknown, Some(message.clone())),
+        (_, None) => (FailureClass::Unknown, None),
+        (_, Some(log)) => classify_log(log),
+    };
+    (job, class, evidence)
+}
+
 // ===== Leg classification =====
 //
 // `VERDICT_STEPS`, `STEP_SETTLE_WINDOW`, `RunFailure`,
@@ -417,95 +462,197 @@ pub fn leg_build_job(jobs: &[RunJobRow], leg: u32) -> Option<&RunJobRow> {
     })
 }
 
+/// Where a live leg is — the watch's split of `classify_page`'s
+/// `Unsettled` plus its two settled answers (stow#853). Only the
+/// watch reads it; nothing does before that lands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LegProgress {
+    /// The build job holds a matrix slot and waits for a runner.
+    Queued,
+    /// The build job is running.
+    Building,
+    /// The build job is done `success`; the publish job has not
+    /// landed or has not concluded.
+    Publishing,
+    /// A `failure` row's verdict is still undecided — its step rows
+    /// inside `STEP_SETTLE_WINDOW` or a sibling row still writing.
+    Settling,
+    /// `classify_page` settled the leg `Succeeded`.
+    Done,
+    /// `classify_page` settled the leg failed — the failure rides.
+    Failed(LegFailure),
+}
+
+/// One leg of a live `build-batch.yml` run — the watch's row, unused
+/// until the watch lands.
+#[derive(Debug, Clone)]
+pub struct LiveLeg {
+    /// The leg index — the `#N` in `leg N / build #N …`.
+    pub leg: u32,
+    /// Where the leg is.
+    pub progress: LegProgress,
+    /// Crate, version and target from the build job's name — `None`
+    /// while the name is unrendered.
+    pub label: Option<LegLabel>,
+}
+
+/// `classify_page` with `Unsettled` split into live progress — the
+/// watch's per-leg truth, unused until the watch lands. `Succeeded`
+/// and `Failed` carry through; an
+/// `Unsettled` leg names where it stands: waiting on a runner
+/// ([`LegProgress::Queued`]), running ([`LegProgress::Building`]),
+/// build done and publish pending ([`LegProgress::Publishing`]), or
+/// still writing a failure ([`LegProgress::Settling`]). Legs absent
+/// from the page produce no entry, as `classify_page` already does.
+///
+/// # Errors
+/// `classify_page`'s — plus an `Unsettled` leg with no build row or a
+/// build row reporting a status the table does not name: both are
+/// schema surprises, never a bucket.
+pub fn live_legs(
+    jobs: &[RunJobRow],
+    run_conclusion: &str,
+    now: OffsetDateTime,
+) -> stow_types::error::Result<Vec<LiveLeg>> {
+    classify_page(jobs, run_conclusion, now)?
+        .into_iter()
+        .map(|leg| {
+            let progress = match &leg.outcome {
+                LegOutcome::Succeeded { .. } => LegProgress::Done,
+                LegOutcome::Failed(failure) => LegProgress::Failed(failure.clone()),
+                LegOutcome::Unsettled => live_progress(leg.leg, jobs)?,
+            };
+            let label = leg_build_job(jobs, leg.leg).and_then(|job| leg_label(&job.name));
+            Ok(LiveLeg {
+                leg: leg.leg,
+                progress,
+                label,
+            })
+        })
+        .collect()
+}
+
+/// One `Unsettled` leg's progress from its own rows. Any `failure`
+/// conclusion is the verdict still settling — `classify_failure`
+/// defers on unsettled step rows inside their window and on a sibling
+/// job still writing, and both leave the leg undecided. Otherwise the
+/// build row says where the leg is, conclusion over status: a build
+/// row carrying `success` is past the build stage whatever its
+/// `status` still says (stow#863), and `Unsettled` then means the
+/// publish row is absent or still running — `Publishing`.
+fn live_progress(leg: u32, jobs: &[RunJobRow]) -> stow_types::error::Result<LegProgress> {
+    if jobs.iter().any(|job| {
+        job.conclusion.as_deref() == Some("failure")
+            && LegJobName::parse(&job.name).is_some_and(|name| name.leg == leg)
+    }) {
+        return Ok(LegProgress::Settling);
+    }
+    let Some(build) = leg_build_job(jobs, leg) else {
+        return Err(stow_error!(
+            "unsettled leg {leg} has no build job on the page"
+        ));
+    };
+    if build.conclusion.as_deref() == Some("success") {
+        return Ok(LegProgress::Publishing);
+    }
+    Ok(match build.status.as_str() {
+        "queued" | "waiting" | "pending" | "requested" => LegProgress::Queued,
+        "in_progress" => LegProgress::Building,
+        // `completed` without a `conclusion` yet — the row is still
+        // being written, so the leg is undecided.
+        "completed" => LegProgress::Settling,
+        status => {
+            return Err(stow_error!(
+                "unsettled leg {leg}'s build job {:?} reports status {status}",
+                build.name
+            ));
+        }
+    })
+}
+
 /// Every job row of a run's attempt — the whole list, not one page
 /// (stow#833).
 ///
 /// The attempt is pinned: the default `filter=latest` jobs view
 /// (`GET …/runs/{id}/jobs`) answers 502 on every request for a run
 /// whose failed legs were rerun, while the attempt-scoped view serves
-/// the same rows (stow#852). The preheat driver's `attempt_jobs` and
-/// the edge's `attempt_jobs_path` read the same path.
+/// the same rows (stow#852). The edge's `attempt_jobs_path` reads the
+/// same path.
 ///
 /// A batch carries 2 × `STOW_BATCH_MAX_TASKS` jobs and that bound is
 /// configurable, so a single `per_page=100` read silently truncates a
 /// large batch; the pager follows the RFC 8288 `Link` header's
 /// `rel="next"` (`stow_types::runs::link_next`, the same parse the
 /// edge's `attempt_jobs` runs) until GitHub names no next page.
-/// `runs failures`, `builds digest` and the watchdog all read their
-/// jobs through here — the one pager, nowhere duplicated.
+/// `runs failures`, `builds digest`, the watchdog and the preheat
+/// driver all read their jobs through here — the one pager, nowhere
+/// duplicated.
 pub async fn fetch_run_jobs(
     token: &str,
     run_id: u64,
-    attempt: u32,
+    attempt: u64,
 ) -> stow_types::error::Result<Vec<RunJobRow>> {
-    fetch_jobs_pages(Some(token), &run_jobs_url(run_id, attempt)).await
-}
-
-/// `GET …/runs/{run_id}/attempts/{attempt}/jobs?per_page=100` — the
-/// first page the pager opens; later pages ride the `Link` header's
-/// URLs verbatim.
-fn run_jobs_url(run_id: u64, attempt: u32) -> String {
-    format!(
-        "{}/repos/{}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+    fetch_attempt_jobs(
+        Some(token),
         github::API_BASE,
-        github::REPO
+        run_id,
+        attempt,
+        None,
+        Backoff::new,
     )
+    .await
 }
 
-/// The pager loop behind [`fetch_run_jobs`] over absolute URLs —
-/// split so a test can point the first page at a loopback server.
-/// `Authorization` rides only when `token` is `Some` (the same
-/// convention `github::send_get` holds for loopback reads).
-async fn fetch_jobs_pages(
+/// [`fetch_run_jobs`] at a resolved API root and under the caller's
+/// retry policy — `backoff` is the fresh per-page budget factory (the
+/// report readers pass [`Backoff::new`]; the preheat driver passes
+/// [`Backoff::outage`], a wave holding no runner may wait an incident
+/// out). `pages` is the conditional cache a repeated reader carries —
+/// `None` for a one-shot read, which walks the pages through an
+/// ephemeral one; a carried cache revalidates each page URL on its
+/// own `ETag`, so a re-read pays a full body only for a page that
+/// changed. A `Link` pointing outside the base the first page was
+/// read from is refused: followed verbatim it would carry the
+/// operator token to a host the API never named. `Authorization`
+/// rides only when `token` is `Some` (the same convention
+/// `github::send_get` holds for loopback reads).
+pub async fn fetch_attempt_jobs(
     token: Option<&str>,
-    first_url: &str,
+    base: &str,
+    run_id: u64,
+    attempt: u64,
+    pages: Option<&mut github::ConditionalPages<RunJobsPage>>,
+    backoff: fn() -> Backoff,
 ) -> stow_types::error::Result<Vec<RunJobRow>> {
+    let mut ephemeral = github::ConditionalPages::new();
+    let pages = pages.unwrap_or(&mut ephemeral);
     let mut jobs = Vec::new();
-    let mut url = first_url.to_owned();
+    let mut url = run_jobs_url(base, run_id, attempt);
     loop {
-        let response = github::send_get(
-            token,
-            &url,
-            Some("application/vnd.github+json"),
-            None,
-            Backoff::new(),
-        )
-        .await
-        .map_err(|error| stow_error!("GET {url}: {error}"))?;
-        let next = response
-            .headers()
-            .get("link")
-            .and_then(|value| value.to_str().ok())
-            .and_then(|header| stow_types::runs::link_next(Some(header)))
-            .map(str::to_owned);
-        let mut page: RunJobsPage = response
-            .error_for_status()
-            .await
-            .map_err(|error| stow_error!("GET {url}: {error}"))?
-            .into_json()
-            .await
-            .map_err(|error| stow_error!("read {url}: {error}"))?;
-        jobs.append(&mut page.jobs);
+        let (page, next) = pages.get(token, &url, backoff()).await?;
+        jobs.extend_from_slice(&page.jobs);
         let Some(next) = next else { break };
-        url = next;
+        if !next.starts_with(&format!("{base}/")) {
+            return Err(stow_error!(
+                "jobs page `Link` next {next} leaves {base} — refused"
+            ));
+        }
+        url = next.to_owned();
     }
     Ok(jobs)
 }
 
+/// `GET {base}/repos/{REPO}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100`
+/// — the first page the pager opens; later pages ride the `Link`
+/// header's URLs verbatim.
+fn run_jobs_url(base: &str, run_id: u64, attempt: u64) -> String {
+    format!(
+        "{base}/repos/{}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+        github::REPO
+    )
+}
+
 // ===== GitHub REST shapes =====
-
-#[derive(Debug, serde::Deserialize)]
-struct WorkflowRun {
-    id: u64,
-    html_url: String,
-    run_attempt: u32,
-}
-
-impl github::RunRow for WorkflowRun {
-    fn run_id(&self) -> u64 {
-        self.id
-    }
-}
 
 /// One classified failure, for the report's example lists.
 #[derive(Debug, serde::Serialize)]
@@ -550,7 +697,7 @@ pub async fn run(token: &str, args: RunsArgs, output: Output) -> stow_types::err
 async fn fetch_failed_runs(
     token: &str,
     since: std::time::Duration,
-) -> stow_types::error::Result<Vec<WorkflowRun>> {
+) -> stow_types::error::Result<Vec<github::WorkflowRunRow>> {
     let until = time::OffsetDateTime::now_utc();
     github::runs_in_range(
         BUILD_WORKFLOW,
@@ -558,7 +705,8 @@ async fn fetch_failed_runs(
         until - since,
         until,
         |path| async move {
-            github::get::<github::RunsPage<WorkflowRun>>(token, &path, Backoff::new()).await
+            github::get::<github::RunsPage<github::WorkflowRunRow>>(token, &path, Backoff::new())
+                .await
         },
     )
     .await
@@ -569,7 +717,7 @@ async fn fetch_failed_runs(
 /// failures.
 async fn classify_runs(
     token: &str,
-    runs: &[WorkflowRun],
+    runs: &[github::WorkflowRunRow],
 ) -> stow_types::error::Result<Vec<FailureGroup>> {
     let mut groups: BTreeMap<FailureClass, Vec<FailureExample>> = BTreeMap::new();
     for run in runs {
@@ -581,36 +729,24 @@ async fn classify_runs(
             if !leg_attempted(failure) {
                 continue;
             }
-            let (job_name, log_job) = match failure {
-                LegFailure::Run(
-                    RunFailure::Verdict { job, .. } | RunFailure::Infrastructure { job, .. },
-                )
-                | LegFailure::Concluded { job, .. } => {
-                    (job.clone(), jobs.iter().find(|row| row.name == *job))
-                }
-                LegFailure::Invariant(_) => (format!("leg {}", leg.leg), None),
-            };
-            let (class, evidence) = match (failure, log_job) {
-                // An invariant failure is its own evidence — the
-                // message names the mismatch; there is no log to read.
-                (LegFailure::Invariant(message), _) => {
-                    (FailureClass::Unknown, Some(message.clone()))
-                }
-                (_, None) => (FailureClass::Unknown, None),
-                (_, Some(job)) => {
+            let (job_name, class, evidence) = match leg_log_job(failure, &jobs) {
+                Some(job) => {
                     let log_url = format!(
                         "https://api.github.com/repos/{}/actions/jobs/{}/logs",
                         github::REPO,
                         job.id
                     );
                     match github::get_text(token, &log_url, Backoff::new()).await {
-                        Ok(log) => classify_log(&log),
+                        Ok(log) => leg_failure_class(leg.leg, failure, Some(&log)),
                         Err(error) => {
                             tracing::warn!(job_id = job.id, %error, "job log unavailable; skipping");
                             continue;
                         }
                     }
                 }
+                // The failure names no log to read — an invariant is
+                // its own evidence, anything else classifies `Unknown`.
+                None => leg_failure_class(leg.leg, failure, None),
             };
             groups.entry(class).or_default().push(FailureExample {
                 run_url: run.html_url.clone(),
@@ -694,6 +830,7 @@ async fn failures(
 #[cfg(test)]
 mod tests {
     use stow_types::runs::{LegJobName, RunStepRow};
+    use stow_types::transient::Backoff;
 
     use super::{
         FailureClass, LegFailure, LegOutcome, RunFailure, RunJobRow, TaskHash, classify_log,
@@ -961,6 +1098,20 @@ mod tests {
         assert!(!leg_attempted(failure));
     }
 
+    /// stow#863: run 39842358378 — a `completed` run's job row served
+    /// `in_progress` with `conclusion: "success"` already written. The
+    /// conclusion settles the row whatever `status` says: the leg
+    /// reads `Succeeded` on the first read rather than repolling.
+    #[test]
+    fn classify_page_settles_a_leg_on_its_conclusion() {
+        let (_hash, build) = build_name(0, "task-a");
+        let mut publish = job_row(publish_name(0, "task-a"), Some("success"), vec![]);
+        publish.status = "in_progress".to_owned();
+        let jobs = vec![job_row(build, Some("success"), vec![]), publish];
+        let legs = classify_page(&jobs, "success", at(1_000)).expect("classified");
+        assert!(matches!(legs[0].outcome, LegOutcome::Succeeded { .. }));
+    }
+
     /// stow#839: the observed page — each leg's build fails at a
     /// verdict step and its skipped publish's name comes back
     /// unrendered — reads both legs as verdict failures; each leg's
@@ -1055,12 +1206,409 @@ mod tests {
         assert!(classify_page(&[job], "failure", at(1_000)).is_err());
     }
 
+    // ----- Live legs (stow#853) -----
+
+    /// A live page's job row — everything `classify_page` reads is
+    /// scriptable: the `status`/`conclusion` settle pair, the
+    /// started/completed stamps `Succeeded` needs and the step rows a
+    /// settling failure shows.
+    fn live_job(
+        name: String,
+        status: &str,
+        conclusion: Option<&str>,
+        started_at: Option<i64>,
+        completed_at: Option<i64>,
+        steps: Vec<RunStepRow>,
+    ) -> RunJobRow {
+        RunJobRow {
+            id: 0,
+            name,
+            status: status.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+            started_at: started_at.map(at),
+            completed_at: completed_at.map(at),
+            run_attempt: 1,
+            html_url: String::new(),
+            steps,
+        }
+    }
+
+    /// One step row — a failed job still writing shows `in_progress`
+    /// or `pending` steps past a completed one.
+    fn live_step(name: &str, status: &str, conclusion: Option<&str>) -> RunStepRow {
+        RunStepRow {
+            name: name.to_owned(),
+            status: status.to_owned(),
+            conclusion: conclusion.map(str::to_owned),
+        }
+    }
+
+    /// `queued`/`waiting`/`pending`/`requested` on the build row is the
+    /// leg holding a slot and waiting for a runner — `Queued` — and
+    /// the label rides the rendered build name.
+    #[test]
+    fn a_queued_build_row_is_a_queued_leg() {
+        for status in ["queued", "waiting", "pending", "requested"] {
+            let (_, build) = build_name(0, "task-a");
+            let jobs = vec![live_job(build, status, None, None, None, vec![])];
+            let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+            let [leg] = &legs[..] else {
+                panic!("one leg on the page: {legs:?}");
+            };
+            assert_eq!(leg.leg, 0);
+            assert_eq!(leg.progress, super::LegProgress::Queued, "{status}");
+            assert_eq!(
+                leg.label.as_ref().map(|label| label.target.as_str()),
+                Some("x86_64-unknown-linux-gnu")
+            );
+        }
+    }
+
+    /// `in_progress` on the build row is the leg on a runner —
+    /// `Building`.
+    #[test]
+    fn an_in_progress_build_row_is_building() {
+        let (_, build) = build_name(0, "task-a");
+        let jobs = vec![live_job(
+            build,
+            "in_progress",
+            None,
+            Some(900),
+            None,
+            vec![],
+        )];
+        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+        assert_eq!(legs[0].progress, super::LegProgress::Building);
+    }
+
+    /// build `success` with no publish row is `Publishing` — the leg
+    /// is unsettled only because the publish row has not landed. The
+    /// stow#863 shape — `in_progress` with the `success` conclusion
+    /// already written — is the same thing: the conclusion is the
+    /// truer word, so it is not `Building`.
+    #[test]
+    fn a_succeeded_build_is_publishing() {
+        for (status, conclusion) in [
+            ("completed", Some("success")),
+            ("in_progress", Some("success")),
+        ] {
+            let (_, build) = build_name(0, "task-a");
+            let jobs = vec![live_job(
+                build,
+                status,
+                conclusion,
+                Some(900),
+                Some(950),
+                vec![],
+            )];
+            let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+            assert_eq!(
+                legs[0].progress,
+                super::LegProgress::Publishing,
+                "{status}/{conclusion:?}"
+            );
+        }
+    }
+
+    /// build `success` with the publish row still running is
+    /// `Publishing` too — the leg's build stage is done.
+    #[test]
+    fn a_running_publish_row_is_publishing() {
+        let (_, build) = build_name(0, "task-a");
+        let jobs = vec![
+            live_job(
+                build,
+                "completed",
+                Some("success"),
+                Some(900),
+                Some(950),
+                vec![],
+            ),
+            live_job(
+                publish_name(0, "task-a"),
+                "in_progress",
+                None,
+                Some(960),
+                None,
+                vec![],
+            ),
+        ];
+        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+        assert_eq!(legs[0].progress, super::LegProgress::Publishing);
+    }
+
+    /// A `failure` row whose step rows are still inside
+    /// `STEP_SETTLE_WINDOW` leaves the verdict undecided —
+    /// `Settling`.
+    #[test]
+    fn a_failure_still_settling_is_settling() {
+        let (_, build) = build_name(0, "task-a");
+        let jobs = vec![live_job(
+            build,
+            "completed",
+            Some("failure"),
+            Some(900),
+            Some(995),
+            vec![
+                live_step("Check out the repository", "completed", Some("success")),
+                live_step("Run the untrusted build stage", "in_progress", None),
+            ],
+        )];
+        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+        assert_eq!(legs[0].progress, super::LegProgress::Settling);
+    }
+
+    /// A `failure` row with a sibling job still writing is `Settling`
+    /// too — `classify_failure` wants every row settled before it
+    /// names a class.
+    #[test]
+    fn a_failure_with_a_sibling_still_writing_is_settling() {
+        let (_, build) = build_name(0, "task-a");
+        let jobs = vec![
+            live_job(
+                build,
+                "completed",
+                Some("failure"),
+                Some(900),
+                Some(950),
+                vec![live_step(
+                    "Run the untrusted build stage",
+                    "completed",
+                    Some("failure"),
+                )],
+            ),
+            live_job(
+                publish_name(0, "task-a"),
+                "in_progress",
+                None,
+                Some(960),
+                None,
+                vec![],
+            ),
+        ];
+        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+        assert_eq!(legs[0].progress, super::LegProgress::Settling);
+    }
+
+    /// Past `STEP_SETTLE_WINDOW` plus the clock allowance the same
+    /// page is the lost-runner failure — settled, `Failed`, not
+    /// `Settling`.
+    #[test]
+    fn a_failure_past_the_settle_window_is_failed() {
+        let (_, build) = build_name(0, "task-a");
+        let jobs = vec![live_job(
+            build,
+            "completed",
+            Some("failure"),
+            Some(700),
+            Some(800),
+            vec![
+                live_step("Check out the repository", "completed", Some("success")),
+                live_step("Run the untrusted build stage", "in_progress", None),
+            ],
+        )];
+        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+        assert!(matches!(
+            legs[0].progress,
+            super::LegProgress::Failed(LegFailure::Run(RunFailure::Infrastructure { .. }))
+        ));
+    }
+
+    /// Both jobs `success` — the leg is `Done`.
+    #[test]
+    fn a_succeeded_leg_is_done() {
+        let (_, build) = build_name(0, "task-a");
+        let jobs = vec![
+            live_job(
+                build,
+                "completed",
+                Some("success"),
+                Some(900),
+                Some(950),
+                vec![],
+            ),
+            live_job(
+                publish_name(0, "task-a"),
+                "completed",
+                Some("success"),
+                Some(960),
+                Some(990),
+                vec![],
+            ),
+        ];
+        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+        assert_eq!(legs[0].progress, super::LegProgress::Done);
+    }
+
+    /// A cancelled leg is a failed leg whose conclusion names the
+    /// outcome — the live view does not drop it the way the report's
+    /// `leg_attempted` does.
+    #[test]
+    fn a_concluded_leg_is_failed_with_its_conclusion() {
+        let (_, build) = build_name(0, "task-a");
+        let jobs = vec![
+            live_job(
+                build,
+                "completed",
+                Some("cancelled"),
+                Some(900),
+                Some(950),
+                vec![],
+            ),
+            live_job(
+                publish_name(0, "task-a"),
+                "completed",
+                Some("cancelled"),
+                Some(960),
+                Some(990),
+                vec![],
+            ),
+        ];
+        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+        assert!(matches!(
+            legs[0].progress,
+            super::LegProgress::Failed(LegFailure::Concluded { ref conclusion, .. })
+                if conclusion == "cancelled"
+        ));
+    }
+
+    /// stow#839: a leg whose only jobs are unrendered carries no
+    /// label and no hash — it still classifies `Failed` by its
+    /// conclusions.
+    #[test]
+    fn an_unrendered_leg_carries_no_label_or_hash() {
+        let jobs = vec![
+            live_job(
+                "leg 0 / build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}"
+                    .to_owned(),
+                "completed",
+                Some("skipped"),
+                Some(900),
+                Some(950),
+                vec![],
+            ),
+            live_job(
+                "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}".to_owned(),
+                "completed",
+                Some("skipped"),
+                Some(960),
+                Some(990),
+                vec![],
+            ),
+        ];
+        let legs = super::live_legs(&jobs, "", at(1_000)).expect("classified");
+        let [leg] = &legs[..] else {
+            panic!("one leg on the page: {legs:?}");
+        };
+        assert_eq!(leg.label, None);
+        assert!(matches!(
+            leg.progress,
+            super::LegProgress::Failed(LegFailure::Concluded { .. })
+        ));
+    }
+
+    /// An `Unsettled` leg whose only row is a publish job is a schema
+    /// surprise — a leg cannot publish a build it never ran — never a
+    /// bucket.
+    #[test]
+    fn an_unsettled_leg_without_a_build_row_fails() {
+        let jobs = vec![live_job(
+            publish_name(0, "task-a"),
+            "in_progress",
+            None,
+            Some(960),
+            None,
+            vec![],
+        )];
+        assert!(super::live_legs(&jobs, "", at(1_000)).is_err());
+    }
+
+    /// A build row reporting a status the live table does not name is
+    /// a schema surprise, not a bucket.
+    #[test]
+    fn an_unknown_build_status_fails() {
+        let (_, build) = build_name(0, "task-a");
+        let jobs = vec![live_job(build, "hiccup", None, Some(900), None, vec![])];
+        assert!(super::live_legs(&jobs, "", at(1_000)).is_err());
+    }
+
+    // ----- The shared failure class (stow#853) -----
+
+    /// A `Run`/`Concluded` failure's class comes from the named job's
+    /// log — the row the fetch asks for.
+    #[test]
+    fn leg_log_job_names_the_failed_row() {
+        let (_, build) = build_name(0, "task-a");
+        let failure = LegFailure::Run(RunFailure::Verdict {
+            job: build.clone(),
+            step: "Run the untrusted build stage".to_owned(),
+            html_url: String::new(),
+        });
+        let mut row = job_row(build, Some("failure"), vec![]);
+        row.id = 42;
+        assert_eq!(
+            super::leg_log_job(&failure, &[row]).map(|row| row.id),
+            Some(42)
+        );
+    }
+
+    /// A named job absent from the page has no log to read — `None`,
+    /// the `Unknown` with no evidence.
+    #[test]
+    fn leg_failure_class_is_unknown_without_a_log() {
+        let (_, build) = build_name(0, "task-a");
+        let failure = LegFailure::Concluded {
+            job: build,
+            conclusion: "cancelled".to_owned(),
+            html_url: String::new(),
+        };
+        assert!(super::leg_log_job(&failure, &[]).is_none());
+        let (_, class, evidence) = super::leg_failure_class(0, &failure, None);
+        assert_eq!(class, FailureClass::Unknown);
+        assert_eq!(evidence, None);
+    }
+
+    /// An invariant failure is its own evidence — the message names
+    /// the mismatch; there is no log to read.
+    #[test]
+    fn leg_failure_class_an_invariant_is_its_own_evidence() {
+        let failure = LegFailure::Invariant("leg 2's jobs disagree on the hash".to_owned());
+        assert!(super::leg_log_job(&failure, &[]).is_none());
+        let (job, class, evidence) = super::leg_failure_class(2, &failure, None);
+        assert_eq!(job, "leg 2");
+        assert_eq!(class, FailureClass::Unknown);
+        assert_eq!(
+            evidence.as_deref(),
+            Some("leg 2's jobs disagree on the hash")
+        );
+    }
+
+    /// The named job's log classifies through `classify_log` — the
+    /// same answer `runs failures` reports.
+    #[test]
+    fn leg_failure_class_reads_the_log() {
+        let (_, build) = build_name(0, "task-a");
+        let failure = LegFailure::Run(RunFailure::Infrastructure {
+            job: build.clone(),
+            step: None,
+            html_url: String::new(),
+        });
+        let (job, class, evidence) =
+            super::leg_failure_class(0, &failure, Some(WINDOWS_LINKER_LOG));
+        assert_eq!(job, build);
+        assert_eq!(class, FailureClass::LinkerUnusable);
+        assert_eq!(
+            evidence.as_deref(),
+            Some("error: linking with `link.exe` failed: exit code: 0xc0000142")
+        );
+    }
+
     /// The first page is the attempt-scoped view — the default
     /// `filter=latest` jobs path 502s on rerun runs (stow#852).
     #[test]
     fn run_jobs_url_pins_the_attempt() {
         assert_eq!(
-            super::run_jobs_url(42, 3),
+            super::run_jobs_url(crate::github::API_BASE, 42, 3),
             format!(
                 "{}/repos/{}/actions/runs/42/attempts/3/jobs?per_page=100",
                 crate::github::API_BASE,
@@ -1069,62 +1617,150 @@ mod tests {
         );
     }
 
-    /// The jobs pager follows `Link: <…>; rel="next"`: a batch's jobs
-    /// can outrun one `per_page=100` page, and both pages' rows must
-    /// land in the answer. `test_server`'s steps cannot emit a `Link`
-    /// header, so the fixture speaks HTTP/1.1 itself — a read of the
-    /// request head, then the scripted response, connection closed.
-    #[tokio::test]
-    async fn fetch_jobs_pages_follows_link_next() {
-        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    /// One job row in the page shape the endpoint serves.
+    fn job_json(id: u64) -> String {
+        format!(
+            "{{\"id\":{id},\"name\":\"job {id}\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":null,\"completed_at\":null,\"run_attempt\":1,\"html_url\":\"\",\"steps\":[]}}"
+        )
+    }
+
+    /// A `RunJobsPage` body of the given job ids — `'static` the way
+    /// [`Step`] wants its bodies.
+    fn jobs_page(ids: &[u64]) -> &'static str {
+        Box::leak(
+            format!(
+                "{{\"jobs\":[{}]}}",
+                ids.iter()
+                    .map(|id| job_json(*id))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+            .into_boxed_str(),
+        )
+    }
+
+    /// A loopback server bound ahead of `Loopback::start_on` so its
+    /// own address can ride the scripted `Link` headers.
+    async fn paged_server(etags: bool) -> (crate::test_server::Loopback, String) {
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("loopback binds");
-        let addr = listener.local_addr().expect("bound");
-        let base = format!("http://{addr}");
-        let job = |id: u64| {
-            format!(
-                "{{\"id\":{id},\"name\":\"job {id}\",\"status\":\"completed\",\"conclusion\":\"success\",\"started_at\":null,\"completed_at\":null,\"run_attempt\":1,\"html_url\":\"\",\"steps\":[]}}"
-            )
+        let base = format!("http://{}", listener.local_addr().expect("bound"));
+        let headers = |etag: Option<&str>, link: Option<String>| {
+            etag.map_or_else(Vec::new, |etag| {
+                vec![("etag".to_owned(), format!("\"{etag}\""))]
+            })
+            .into_iter()
+            .chain(link.map(|link| ("link".to_owned(), link)))
+            .collect::<Vec<_>>()
         };
-        let respond = |link: Option<String>, id: u64| {
-            let body = format!("{{\"jobs\":[{}]}}", job(id));
-            let link = link.map_or(String::new(), |url| {
-                format!("link: <{url}>; rel=\"next\"\r\n")
-            });
-            format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n{link}content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            )
-        };
-        let responses = [respond(Some(format!("{base}/page2")), 1), respond(None, 2)];
-        let server = tokio::spawn(async move {
-            for response in responses {
-                let (mut socket, _) = listener.accept().await.expect("accept");
-                let mut buffer = vec![0_u8; 4096];
-                let mut head = Vec::new();
-                loop {
-                    let read = socket.read(&mut buffer).await.expect("read");
-                    head.extend_from_slice(&buffer[..read]);
-                    if head.windows(4).any(|w| w == b"\r\n\r\n") || read == 0 {
-                        break;
-                    }
-                }
-                socket
-                    .write_all(response.as_bytes())
-                    .await
-                    .expect("write response");
-            }
-        });
-        let jobs = super::fetch_jobs_pages(None, &format!("{base}/page1"))
+        let server = crate::test_server::Loopback::start_on(
+            listener,
+            base.clone(),
+            vec![
+                crate::test_server::Step::RespondWith {
+                    status: 200,
+                    retry_after: None,
+                    headers: headers(
+                        etags.then_some("p1"),
+                        Some(format!("<{base}/page2>; rel=\"next\"")),
+                    ),
+                    body: jobs_page(&[1]),
+                },
+                crate::test_server::Step::RespondWith {
+                    status: 200,
+                    retry_after: None,
+                    headers: headers(etags.then_some("p2"), None),
+                    body: jobs_page(&[2]),
+                },
+                crate::test_server::Step::Respond {
+                    status: 304,
+                    retry_after: None,
+                    body: "",
+                },
+                crate::test_server::Step::Respond {
+                    status: 304,
+                    retry_after: None,
+                    body: "",
+                },
+            ],
+        );
+        (server, base)
+    }
+
+    /// The jobs pager follows `Link: <…>; rel="next"`: a batch's jobs
+    /// can outrun one `per_page=100` page, and both pages' rows must
+    /// land in the answer.
+    #[tokio::test]
+    async fn fetch_attempt_jobs_follows_link_next() {
+        let (server, base) = paged_server(false).await;
+        let jobs = super::fetch_attempt_jobs(None, &base, 7, 2, None, Backoff::new)
             .await
             .expect("two pages of jobs");
-        server.await.expect("server");
+        let heads = server.join().await;
         assert_eq!(
             jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
             vec![1, 2]
         );
+        assert_eq!(heads.len(), 2);
+        assert_eq!(heads[1].head.uri.path(), "/page2");
+    }
+
+    /// A carried [`github::ConditionalPages`] revalidates each page on
+    /// the `ETag` its own last 200 served: a second walk sends
+    /// `If-None-Match`, and 304s answer the cached pages — including
+    /// the first page's cached `next`, so the walk still reaches page
+    /// two.
+    #[tokio::test]
+    async fn fetch_attempt_jobs_revalidates_pages_on_their_own_etags() {
+        let (server, base) = paged_server(true).await;
+        let mut pages = crate::github::ConditionalPages::new();
+        for _ in 0..2 {
+            let jobs = super::fetch_attempt_jobs(None, &base, 7, 2, Some(&mut pages), Backoff::new)
+                .await
+                .expect("the cached walk answers the same rows");
+            assert_eq!(
+                jobs.iter().map(|job| job.id).collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+        }
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 4, "two-page walk, twice");
+        assert!(heads[0].head.headers.get("if-none-match").is_none());
+        assert!(heads[1].head.headers.get("if-none-match").is_none());
+        assert_eq!(
+            heads[2].head.headers.get("if-none-match").expect("etag"),
+            "\"p1\""
+        );
+        assert_eq!(
+            heads[3].head.headers.get("if-none-match").expect("etag"),
+            "\"p2\""
+        );
+        assert_eq!(heads[3].head.uri.path(), "/page2");
+    }
+
+    /// A `Link` naming a host off the read's own base is refused — the
+    /// operator token must never follow it.
+    #[tokio::test]
+    async fn fetch_attempt_jobs_refuses_an_off_origin_link() {
+        use crate::test_server::{Loopback, Step};
+
+        let server = Loopback::start(vec![Step::RespondWith {
+            status: 200,
+            retry_after: None,
+            headers: vec![(
+                "link".to_owned(),
+                "<https://example.com/jobs?page=2>; rel=\"next\"".to_owned(),
+            )],
+            body: jobs_page(&[1]),
+        }])
+        .await;
+        let error = super::fetch_attempt_jobs(None, &server.url, 7, 2, None, Backoff::new)
+            .await
+            .expect_err("an off-origin link is refused");
+        assert!(error.to_string().contains("leaves"), "{error}");
+        server.join().await;
     }
 }

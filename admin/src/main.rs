@@ -35,6 +35,7 @@ mod source_trees;
 #[cfg(test)]
 mod test_server;
 mod traffic_cost;
+mod watch;
 mod watchdog;
 
 use std::fmt::Write as _;
@@ -49,6 +50,7 @@ use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
 use stow_types::stow_error;
+use stow_types::transient::{Backoff, is_transient_status, retry_after_hint};
 use tracing_subscriber::EnvFilter;
 use zenwave::{Client, ResponseExt};
 
@@ -90,7 +92,7 @@ enum Command {
     /// Scheduler overview: lane depths, oldest pending age, in-flight
     /// runs with their GitHub URLs, and per-target outcomes over the
     /// trailing 24 hours.
-    Status,
+    Status(StatusArgs),
     /// Inspect and mutate scheduler queue rows.
     Queue(queue::QueueArgs),
     /// Scheduler operations — the store reset and anything else that
@@ -134,6 +136,16 @@ enum Command {
     Submit(SubmitArgs),
     /// Canary deployment verdicts for the edge Worker.
     Deploy(deploy::DeployArgs),
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    /// The live build-queue view (stow#853): the scheduler's queue
+    /// merged with `build-batch.yml`'s in-flight runs, re-rendered
+    /// every 30 s until Ctrl-C. Under `--json` each frame is one
+    /// NDJSON line.
+    #[arg(long)]
+    watch: bool,
 }
 
 #[derive(Args)]
@@ -226,7 +238,7 @@ fn run<F: std::future::Future>(future: F) -> stow_types::error::Result<F::Output
 
 async fn dispatch(command: Command, output: Output) -> stow_types::error::Result<()> {
     match command {
-        Command::Status => status(&Edge::connect().await?, output).await,
+        Command::Status(args) => status(&Edge::connect().await?, args, output).await,
         Command::Queue(args) => queue::run(&Edge::connect().await?, args, output).await,
         Command::Scheduler(args) => scheduler::run(&Edge::connect().await?, args, output).await,
         Command::Coverage(args) => coverage::run(&Edge::connect().await?, args, output).await,
@@ -352,6 +364,63 @@ impl Edge {
             .into_json()
             .await
             .map_err(|error| stow_error!("decode {url}: {error}"))
+    }
+
+    /// `get_json` under `backoff` — the watch's scheduler read retries
+    /// a transient status or transport cut the way `github::send_get`
+    /// does: a bounded budget, the answer's `Retry-After` honored, and
+    /// the last refusal surfacing once the budget is spent (stow#853).
+    /// The request is rebuilt each attempt because a minted bearer is
+    /// per-request.
+    pub(crate) async fn get_json_retried<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        mut backoff: Backoff,
+    ) -> stow_types::error::Result<T> {
+        loop {
+            let url = format!("{}{path}", self.base);
+            let bearer = self.bearer().await?;
+            let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
+            let request = client
+                .get(&url)
+                .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
+                .and_then(|request| match &self.version_override {
+                    Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
+                    None => Ok(request),
+                })
+                .map_err(|error| stow_error!("GET {url}: {error}"))?;
+            match request.await {
+                Ok(response) => {
+                    if !is_transient_status(response.status().as_u16()) {
+                        return response
+                            .error_for_status()
+                            .await
+                            .map_err(|error| stow_error!("GET {url}: {error}"))?
+                            .into_json()
+                            .await
+                            .map_err(|error| stow_error!("decode {url}: {error}"));
+                    }
+                    let retry_after = retry_after_hint(response.headers());
+                    let status = response.status();
+                    let Some(wait) = backoff.next_wait(retry_after) else {
+                        let error = response
+                            .error_for_status()
+                            .await
+                            .expect_err("a transient status is an error status");
+                        return Err(stow_error!("GET {url}: {error}"));
+                    };
+                    tracing::warn!(%status, wait = ?wait, "edge read transient; retrying");
+                    tokio::time::sleep(wait).await;
+                }
+                Err(error) => {
+                    let Some(wait) = backoff.next_wait(None) else {
+                        return Err(stow_error!("GET {url}: {error}"));
+                    };
+                    tracing::warn!(%error, wait = ?wait, "edge read cut; retrying");
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
     }
 
     /// `POST` a JSON body to an edge path and decode its JSON answer.
@@ -551,8 +620,17 @@ fn encode_uri_component(value: &str) -> String {
     out
 }
 
-/// `GET /api/v1/admin/status` rendered for the operator.
-async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
+/// `GET /api/v1/admin/status` rendered for the operator — or, under
+/// `--watch`, the live build-queue view until Ctrl-C (stow#853).
+async fn status(edge: &Edge, args: StatusArgs, output: Output) -> stow_types::error::Result<()> {
+    if args.watch {
+        let token = github_token().await?;
+        let tz = jiff::tz::TimeZone::try_system()
+            .map_err(|error| stow_error!("system time zone cannot be determined: {error}"))?;
+        let mut watch = watch::Watch::new(time::OffsetDateTime::now_utc());
+        let mut screen = render::Screen::new(output, tz);
+        return watch.run(edge, &token, github::API_BASE, &mut screen).await;
+    }
     let status: AdminStatus = edge.get_json("/api/v1/admin/status").await?;
     render::emit(output, &status, |status| {
         let mut out = String::new();

@@ -36,7 +36,15 @@ dirs = "7"
 oci-client = { version = "0.16.1", default-features = false }
 futures-util = "0.3"
 tempfile.workspace = true
-tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+# The live view's repaint needs only cursor and clear commands —
+# nothing pulls crossterm's platform extras (stow#853).
+crossterm = { version = "0.29", default-features = false }
+# `time` cannot read the local offset under a multi-thread runtime, so
+# the watch's header clock resolves the zone through jiff: `tz-system`
+# (pulls `std`) finds the zone, `tzdb-zoneinfo` reads the system's own
+# TZif files for its DST rules (stow#853).
+jiff = { version = "0.2.37", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 hmac = "0.13"
 sha2 = "0.11"
 hex.workspace = true
