@@ -37,10 +37,6 @@ mod cost_gate;
 #[cfg(any(test, target_arch = "wasm32"))]
 pub mod do_budgets;
 
-/// §1.2 batch formation — the pure packer the batched claim pass
-/// drives (stow#833).
-pub mod batching;
-
 #[cfg(target_arch = "wasm32")]
 pub mod budget;
 pub mod dispatch;

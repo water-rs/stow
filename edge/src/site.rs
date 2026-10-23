@@ -46,7 +46,7 @@ const AUDIT_URL: &str = "https://github.com/water-rs/stow/blob/main/docs/acceler
 
 /// The target the cache lookup picker selects by default — a visitor's
 /// own platform cannot be guessed reliably, so the picker defaults to
-/// the most common CI leg.
+/// the most common CI target.
 const DEFAULT_LOOKUP_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 /// Page configuration probed once at worker startup.

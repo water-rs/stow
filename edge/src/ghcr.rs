@@ -283,7 +283,7 @@ pub enum FetchError {
 /// this run pushed and no other build's. The manifest's artifact type
 /// and task-id annotation must both match, so a tag pointing at anything
 /// else does not satisfy the check. Shared by the webhook's per-task
-/// path and the scheduler's batch-leg resolution (stow#833 §3.2).
+/// path and the scheduler's per-task records resolution.
 #[cfg(target_arch = "wasm32")]
 pub async fn records_artifact_exists(
     config: &crate::api::GhcrConfig,
