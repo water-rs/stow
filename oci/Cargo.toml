@@ -32,7 +32,18 @@ oci-client = { version = "0.16.1", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = [
     "rustls-no-provider",
 ] }
-sigstore = { version = "0.14.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
+sigstore = { version = "0.14.0", default-features = false, features = ["cosign", "verify", "rustls-tls"] }
+# The TUF-verified trust-root loader (stow#869): `sigstore` 0.14's own
+# `sigstore-trust-root` feature pinned `tough` 0.22 to an expired embedded
+# TUF root and reported transport failures as `root metadata is expired`.
+# `rustls-no-provider` resolves the process-level provider the binaries
+# install (ring); `aws-lc-rs` is the `sigstore-crypto` backend TUF metadata
+# verification needs and is already in the lockfile.
+sigstore-trust-root = { version = "0.15.0", default-features = false, features = [
+    "tuf",
+    "rustls-no-provider",
+    "aws-lc-rs",
+] }
 base64 = "0.23"
 hex.workspace = true
 sha2 = "0.11"
@@ -51,6 +62,10 @@ mock-verify = []
 [dev-dependencies]
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["macros", "rt"] }
+# The protobuf types `sigstore` 0.14's `SigstoreTrustRoot` parsed
+# `trusted_root.json` into — the parity test replays the retired
+# extraction over the same bytes (stow#869).
+sigstore_protobuf_specs = "0.5"
 # The registry client resolves its TLS provider from the process default;
 # a test that builds one installs `ring` the way the binaries do.
 rustls.workspace = true
