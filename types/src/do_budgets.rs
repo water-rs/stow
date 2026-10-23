@@ -691,6 +691,73 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         rows_written: 2,
         wall_ms: 60,
     },
+    // The seven manual-batch rows below (stow#854) are PROVISIONAL —
+    // host-gate measurements carried at roughly double, pending the
+    // release-gate workerd run's billed numbers the same way the
+    // stow#833 rows waited for theirs. The bound each names is the
+    // batch's leg count (`STOW_BATCH_MAX_TASKS`) and the share read's
+    // `STOW_MAX_CONCURRENT_JOBS` in-flight rows — never the queue.
+    DriveBudget {
+        // Fresh insert-and-claim over 40 legs — host measured
+        // 18/212/241.
+        name: "POST /manual-batches (fresh)",
+        statements: 40,
+        rows_read: 450,
+        rows_written: 500,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
+        // Claim-only (legs already pending) — host measured 15/172/121.
+        name: "POST /manual-batches (claim)",
+        statements: 35,
+        rows_read: 350,
+        rows_written: 250,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
+        // Failed legs + one blocked dependent each — host measured
+        // 16/172/161.
+        name: "POST /manual-batches (retry failed)",
+        statements: 35,
+        rows_read: 350,
+        rows_written: 350,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
+        // All-refused over an in-flight set — host measured 12/91/0.
+        name: "POST /manual-batches (held)",
+        statements: 25,
+        rows_read: 200,
+        rows_written: 0,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
+        // `ShareFull` — freeze probe + the share's `GROUP BY`.
+        // Host measured 2/4/0.
+        name: "POST /manual-batches (share full)",
+        statements: 8,
+        rows_read: 20,
+        rows_written: 0,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
+        // `Dispatched` bind: one keyed `UPDATE build_batches` + the
+        // re-plan. Host measured 7/7/1.
+        name: "POST /manual-batches/dispatch (bind)",
+        statements: 16,
+        rows_read: 20,
+        rows_written: 4,
+        wall_ms: 3_000,
+    },
+    DriveBudget {
+        // `NotDispatched`: the 40-leg requeue + row delete + re-plan.
+        // Host measured 10/88/121.
+        name: "POST /manual-batches/dispatch (release)",
+        statements: 24,
+        rows_read: 200,
+        rows_written: 250,
+        wall_ms: 3_000,
+    },
 ];
 
 /// One traffic lane's Worker CPU budget — milliseconds of isolate CPU

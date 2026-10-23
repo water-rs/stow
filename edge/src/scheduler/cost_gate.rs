@@ -567,6 +567,89 @@ const BUDGETS: &[RouteBudget] = &[
         rows_written: 2,
         scan_allowlist: &[],
     },
+    // The manual-batch drives (stow#854). Each register drive's run
+    // includes the share's `GROUP BY` over in-flight `build_batches`
+    // rows — A ≤ `STOW_MAX_CONCURRENT_JOBS` (45), the same bound the
+    // stow#833 rows name — plus the per-leg probe/claim, bounded by
+    // `STOW_BATCH_MAX_TASKS` (40). Budgeted at the 10k host measurement
+    // plus ~20%.
+    RouteBudget {
+        // Fresh insert-and-claim: 40 legs' `enqueue_inner` (node-store
+        // + queue inserts), the leg probe, mint+claim, the batch row
+        // and the route's `schedule_alarm` re-plan. Measured 18
+        // statements, 212 reads, 241 writes.
+        name: "POST /manual-batches (fresh)",
+        statements: 22,
+        rows_read: 254,
+        rows_written: 290,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // The claim-only path — legs already pending (the
+        // `preheat-cron` overlap): `enqueue_inner` is a no-op, the
+        // probe and claim run. Measured 15 statements, 172 reads, 121
+        // writes.
+        name: "POST /manual-batches (claim)",
+        statements: 18,
+        rows_read: 206,
+        rows_written: 146,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // The operator retry: 40 failed legs claimed plus one blocked
+        // dependent each — `refresh_dependents` writes the unblock.
+        // Bound: `STOW_BATCH_MAX_TASKS` legs × D dependents. Measured
+        // 16 statements, 172 reads, 161 writes.
+        name: "POST /manual-batches (retry failed)",
+        statements: 20,
+        rows_read: 206,
+        rows_written: 194,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // The second registration over an in-flight set: probe reads
+        // the 40 legs, all `InFlight`, `Registered { parallelism: 0 }`
+        // writes nothing — the alarm re-plan still runs. Measured 12
+        // statements, 91 reads, 0 writes.
+        name: "POST /manual-batches (held)",
+        statements: 15,
+        rows_read: 110,
+        rows_written: 0,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // `ShareFull` — the freeze probe and the share's `GROUP BY`
+        // over ≤ `STOW_MAX_CONCURRENT_JOBS` in-flight rows; nothing
+        // else runs. Measured 2 statements, 4 reads, 0 writes.
+        name: "POST /manual-batches (share full)",
+        statements: 4,
+        rows_read: 8,
+        rows_written: 0,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // `Dispatched` → `bind_batch_run`: one keyed
+        // `UPDATE build_batches` plus the re-plan. Measured 7
+        // statements, 7 reads, 1 write — the same shape as the
+        // completion forward.
+        name: "POST /manual-batches/dispatch (bind)",
+        statements: 9,
+        rows_read: 9,
+        rows_written: 2,
+        scan_allowlist: &[],
+    },
+    RouteBudget {
+        // `NotDispatched`: the 40-leg requeue (`status`/deps_met/
+        // blocked/wake per leg via `idx_queue_batch`,
+        // `refresh_dispatch_keys`, the row delete) plus the re-plan.
+        // Bound: `STOW_BATCH_MAX_TASKS` legs. Measured 10 statements,
+        // 88 reads, 121 writes.
+        name: "POST /manual-batches/dispatch (release)",
+        statements: 12,
+        rows_read: 106,
+        rows_written: 146,
+        scan_allowlist: &[],
+    },
 ];
 
 /// One measured route run.

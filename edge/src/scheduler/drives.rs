@@ -17,7 +17,8 @@ use std::pin::Pin;
 
 use skyzen_services::durable::{Alarm, DurableDb};
 use stow_types::api::{
-    EnqueueDependency, EnqueueRequest, EnqueueSource, PublishedSliceRow, QueueSelector,
+    EnqueueDependency, EnqueueRequest, EnqueueSource, ManualBatchDispatch, ManualBatchRegistered,
+    ManualBatchRegistration, ManualDispatchOutcome, PublishedSliceRow, QueueSelector,
     QueueTaskStatus,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
@@ -2304,6 +2305,266 @@ pub const DRIVES: &[Drive] = &[
             })
         }),
     },
+    // The manual-batch drives (stow#854): the driver registers each
+    // `preheat manual` batch before `workflow_dispatch` and reports
+    // the send's outcome after. Every register drive's run pays the
+    // share's `GROUP BY` over the in-flight `build_batches` rows —
+    // bounded by `STOW_MAX_CONCURRENT_JOBS`, the same bound the batch
+    // rows above name — plus the per-leg probe/claim work, bounded by
+    // `STOW_BATCH_MAX_TASKS` legs.
+    Drive {
+        // 40 legs no lane ever queued: the insert-and-claim path —
+        // `enqueue_inner`'s node-store and queue inserts for every
+        // leg, the per-leg claim probe, the mint+claim UPDATE, and the
+        // batch row. The route's `schedule_alarm` runs on a
+        // `Registered` answer, so `plan_wake` is metered with it.
+        name: "POST /manual-batches (fresh)",
+        setup: None,
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                manual_register_drive(db, settings, MANUAL_FRESH_ID, manual_legs("fresh")).await
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(
+                async move { remove_manual_batch(db, MANUAL_FRESH_ID, manual_legs("fresh")).await },
+            )
+        }),
+    },
+    Drive {
+        // The same registration where every leg already sits `pending`
+        // — the steady state the `preheat-cron` overlap produces:
+        // `enqueue_inner` is a no-op, the drive prices the claim.
+        name: "POST /manual-batches (claim)",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                queue::enqueue_trusted(db, &manual_legs("claim"), settings)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                manual_register_drive(db, settings, MANUAL_CLAIM_ID, manual_legs("claim")).await
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(
+                async move { remove_manual_batch(db, MANUAL_CLAIM_ID, manual_legs("claim")).await },
+            )
+        }),
+    },
+    Drive {
+        // The operator-retry registration: the legs sit `failed` with
+        // one dependent each blocked on them, so the run prices the
+        // claim's attempt reset plus `refresh_dependents` — D =
+        // `STOW_BATCH_MAX_TASKS` dependents.
+        name: "POST /manual-batches (retry failed)",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                let legs = manual_legs("retry");
+                queue::enqueue_trusted(db, &legs, settings)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // Park the legs `failed`, then land one dependent
+                // apiece — the dependents' `blocked` reads true.
+                let ids = serde_json::to_string(&task_ids_of(&legs)?)
+                    .map_err(|error| format!("manual leg ids: {error}"))?;
+                db.query(
+                    "UPDATE queue SET status = 'failed' \
+                     WHERE task_id IN (SELECT value FROM json_each(?))",
+                )
+                .bind(ids)
+                .execute()
+                .await
+                .map_err(|error| format!("park manual legs failed: {error}"))?;
+                let deps = manual_dependents(&legs);
+                queue::enqueue_trusted(db, &deps, settings)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let dep_ids = serde_json::to_string(&task_ids_of(&deps)?)
+                    .map_err(|error| format!("dependent ids: {error}"))?;
+                db.query(
+                    "UPDATE queue SET blocked = 1 \
+                     WHERE task_id IN (SELECT value FROM json_each(?))",
+                )
+                .bind(dep_ids)
+                .execute()
+                .await
+                .map_err(|error| format!("block manual dependents: {error}"))?;
+                Ok(())
+            })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                manual_register_drive(db, settings, MANUAL_RETRY_ID, manual_legs("retry")).await
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                let mut all = manual_legs("retry");
+                all.extend(manual_dependents(&manual_legs("retry")));
+                remove_manual_batch(db, MANUAL_RETRY_ID, all).await
+            })
+        }),
+    },
+    Drive {
+        // The overlapping second registration: setup registers batch A
+        // over the legs, the run registers batch B — every leg reads
+        // `InFlight` and no batch row is written. `Registered` still
+        // arms the alarm, so `plan_wake` is metered.
+        name: "POST /manual-batches (held)",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                queue::register_manual_batch(
+                    db,
+                    settings,
+                    &manual_registration_at(MANUAL_HELD_ID, 1, manual_legs("held")),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                manual_register_drive(db, settings, MANUAL_HELD2_ID, manual_legs("held")).await
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                remove_manual_batch(db, MANUAL_HELD_ID, manual_legs("held")).await?;
+                db.query("DELETE FROM build_batches WHERE batch_id = ?")
+                    .bind(MANUAL_HELD2_ID)
+                    .execute()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })
+        }),
+    },
+    Drive {
+        // The share-full refusal: setup's fill rows bring
+        // `SUM(parallelism)` to `limit − reserve`, so the run's share
+        // read answers 0 — `ShareFull` writes nothing and the route
+        // skips `schedule_alarm`. The seeded count reads from
+        // `settings`, the same knobs `traffic-cost.sh` reads for
+        // `DISPATCH_LIMIT`.
+        name: "POST /manual-batches (share full)",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move { fill_manual_share(db, settings).await })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                let registered = queue::register_manual_batch(
+                    db,
+                    settings,
+                    &manual_registration(MANUAL_FULL_ID, manual_legs("full")),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                if !matches!(registered, ManualBatchRegistered::ShareFull { .. }) {
+                    return Err(format!("expected ShareFull, got {registered:?}"));
+                }
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                db.query("DELETE FROM build_batches WHERE batch_id = ?")
+                    .bind(MANUAL_FILL_ID)
+                    .execute()
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        }),
+    },
+    Drive {
+        // The dispatch report's `Dispatched` arm: one keyed
+        // `bind_batch_run` UPDATE on the registered batch plus the
+        // route's `schedule_alarm` re-plan.
+        name: "POST /manual-batches/dispatch (bind)",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                queue::register_manual_batch(
+                    db,
+                    settings,
+                    &manual_registration(MANUAL_BIND_ID, manual_legs("bind")),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                queue::record_manual_dispatch(
+                    db,
+                    settings,
+                    &manual_dispatch_report(
+                        MANUAL_BIND_ID,
+                        ManualDispatchOutcome::Dispatched {
+                            run_id: BATCH_DRIVE_RUN_ID,
+                        },
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                plan_wake(db, settings).await
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(
+                async move { remove_manual_batch(db, MANUAL_BIND_ID, manual_legs("bind")).await },
+            )
+        }),
+    },
+    Drive {
+        // The dispatch report's `NotDispatched` arm: the 40-leg
+        // requeue (`requeue_unbound_batch` — status/deps_met/blocked/
+        // wake per leg, `refresh_dispatch_keys`, the row delete) plus
+        // the route's `schedule_alarm` re-plan.
+        name: "POST /manual-batches/dispatch (release)",
+        setup: Some(|db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                queue::register_manual_batch(
+                    db,
+                    settings,
+                    &manual_registration(MANUAL_RELEASE_ID, manual_legs("release")),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+            })
+        }),
+        run: |db, _shape, settings, _ctx| {
+            Box::pin(async move {
+                queue::record_manual_dispatch(
+                    db,
+                    settings,
+                    &manual_dispatch_report(
+                        MANUAL_RELEASE_ID,
+                        ManualDispatchOutcome::NotDispatched,
+                    ),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                plan_wake(db, settings).await
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, _ctx| {
+            Box::pin(async move {
+                db.query("DELETE FROM build_batches WHERE batch_id = ?")
+                    .bind(MANUAL_RELEASE_ID)
+                    .execute()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                remove_submitted(db, &manual_legs("release")).await
+            })
+        }),
+    },
 ];
 
 /// One dispatch pass exactly as `run_alarm` runs it, minus the metering
@@ -3608,6 +3869,196 @@ async fn remove_submitted(db: &DurableDb, requests: &[EnqueueRequest]) -> Result
             .map_err(|error| format!("remove submitted tasks: {error}"))?;
     }
     Ok(())
+}
+
+/// `STOW_BATCH_MAX_TASKS` legs per drive — the per-event bound every
+/// manual-batch row names.
+const DRIVE_MANUAL_LEGS: usize = 40;
+
+/// The drives' batch ids — 32 lowercase hex each, one per drive so a
+/// leaked row from a failed probe can never alias the next drive's.
+const MANUAL_FRESH_ID: &str = "854a854a854a854a854a854a854a854a";
+const MANUAL_CLAIM_ID: &str = "854b854b854b854b854b854b854b854b";
+const MANUAL_RETRY_ID: &str = "854c854c854c854c854c854c854c854c";
+const MANUAL_HELD_ID: &str = "854d854d854d854d854d854d854d854d";
+const MANUAL_HELD2_ID: &str = "854e854e854e854e854e854e854e854e";
+const MANUAL_FILL_ID: &str = "854f854f854f854f854f854f854f854f";
+const MANUAL_FULL_ID: &str = "85508550855085508550855085508550";
+const MANUAL_BIND_ID: &str = "85518551855185518551855185518551";
+const MANUAL_RELEASE_ID: &str = "85528552855285528552855285528552";
+
+/// The drives' manual-batch legs: 40 leaf requests under
+/// `costgate-manual-{prefix}-*`, one rustc and one CI triple —
+/// `validate_manual_legs`'s single-family rule — each name space no
+/// fixture crate or other drive shares.
+fn manual_legs(prefix: &str) -> Vec<EnqueueRequest> {
+    (0..DRIVE_MANUAL_LEGS)
+        .map(|i| EnqueueRequest {
+            crate_name: format!("costgate-manual-{prefix}-{i:02}")
+                .parse()
+                .expect("manual leg crate"),
+            version: "1.0.0".parse().expect("manual leg version"),
+            features_json: FeaturesJson::default(),
+            target: dep_target(0).parse().expect("manual leg target"),
+            rustc_version: "1.86.0".parse().expect("manual leg rustc"),
+            downloads: 10,
+            source: EnqueueSource::CacheMiss,
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
+            preserve_lockfile: false,
+            host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        })
+        .collect()
+}
+
+/// One dependent row per leg — the dep edge names the leg's own
+/// identity, so the registration's `refresh_dependents` write lands on
+/// it (stow#854's D).
+fn manual_dependents(legs: &[EnqueueRequest]) -> Vec<EnqueueRequest> {
+    legs.iter()
+        .enumerate()
+        .map(|(i, leg)| EnqueueRequest {
+            crate_name: format!("costgate-manual-dep-{i:02}")
+                .parse()
+                .expect("dependent crate"),
+            version: "1.0.0".parse().expect("dependent version"),
+            features_json: FeaturesJson::default(),
+            target: leg.target.clone(),
+            rustc_version: leg.rustc_version.clone(),
+            downloads: 10,
+            source: EnqueueSource::CacheMiss,
+            dependency_subgraph: subgraph_of(&[EnqueueDependency {
+                dependency_identity: stow_types::identity::DependencyIdentity::leaf()
+                    .expect("leaf digest"),
+                crate_name: leg.crate_name.clone(),
+                version: leg.version.clone(),
+                features_json: leg.features_json.clone(),
+                target: leg.target.clone(),
+                rustc_version: leg.rustc_version.clone(),
+                host_side: leg.host_side,
+                explicit_spelling: leg.explicit_spelling,
+            }]),
+            preserve_lockfile: false,
+            host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        })
+        .collect()
+}
+
+/// The requests' task ids, for a setup's `json_each` UPDATE.
+fn task_ids_of(requests: &[EnqueueRequest]) -> Result<Vec<String>, String> {
+    requests
+        .iter()
+        .map(|request| {
+            request
+                .task_id()
+                .map_err(|error| format!("manual leg task id: {error}"))
+        })
+        .collect()
+}
+
+/// A wire registration over `legs` — the driver's `parallelism` is the
+/// leg count, the maximum it would ask.
+fn manual_registration(batch_id: &str, legs: Vec<EnqueueRequest>) -> ManualBatchRegistration {
+    manual_registration_at(
+        batch_id,
+        u32::try_from(legs.len()).expect("legs fit u32"),
+        legs,
+    )
+}
+
+/// The same at an explicit `parallelism` — the held drive's setup
+/// batch asks one slot so its row charges the share 1, leaving the
+/// run's second registration room to reach the leg refusals.
+fn manual_registration_at(
+    batch_id: &str,
+    parallelism: u32,
+    legs: Vec<EnqueueRequest>,
+) -> ManualBatchRegistration {
+    ManualBatchRegistration {
+        batch_id: batch_id.parse().expect("drive batch id"),
+        rustc_version: "1.86.0".parse().expect("drive rustc"),
+        parallelism: std::num::NonZeroU32::new(parallelism).expect("parallelism > 0"),
+        legs,
+    }
+}
+
+/// A wire dispatch report for `batch_id`.
+fn manual_dispatch_report(batch_id: &str, outcome: ManualDispatchOutcome) -> ManualBatchDispatch {
+    ManualBatchDispatch {
+        batch_id: batch_id.parse().expect("drive batch id"),
+        outcome,
+    }
+}
+
+/// The register drive's metered run: `register_manual_batch`, then the
+/// `schedule_alarm` re-plan the route runs on a `Registered` answer.
+async fn manual_register_drive(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    batch_id: &str,
+    legs: Vec<EnqueueRequest>,
+) -> Result<(), String> {
+    let registered =
+        queue::register_manual_batch(db, settings, &manual_registration(batch_id, legs))
+            .await
+            .map_err(|error| error.to_string())?;
+    if matches!(registered, ManualBatchRegistered::Registered { .. }) {
+        plan_wake(db, settings).await?;
+    }
+    Ok(())
+}
+
+/// The share-full setup: fill `build_batches` to `limit − reserve` so
+/// the run's share read answers 0. One row whose `parallelism` is the
+/// gap — the accounting reads the sum, so a single fill row models it.
+async fn fill_manual_share(db: &DurableDb, settings: &SchedulerSettings) -> Result<(), String> {
+    let queue::Dispatch::Limited(limit) = settings.dispatch else {
+        return Err("the share-full drive needs a limited dispatch".to_owned());
+    };
+    let occupied = db
+        .query("SELECT COALESCE(SUM(parallelism), 0) FROM build_batches")
+        .fetch_scalar::<i64>()
+        .await
+        .map_err(|error| format!("occupied slots: {error}"))?;
+    let gap = limit
+        .get()
+        .saturating_sub(settings.human_reserve.shared)
+        .saturating_sub(u32::try_from(occupied).map_err(|error| error.to_string())?);
+    if gap == 0 {
+        return Ok(());
+    }
+    db.query(
+        "INSERT INTO build_batches \
+             (batch_id, rustc_version, dispatch_family, lane, parallelism, legs, \
+              github_run_id, claimed_at, lease_at) \
+         VALUES (?, '1.86.0', 'linux', 'miss', ?, 1, '0', \
+                 datetime('now', '-30 minutes'), datetime('now', '+1 day'))",
+    )
+    .bind(MANUAL_FILL_ID)
+    .bind(i64::from(gap))
+    .execute()
+    .await
+    .map(|_| ())
+    .map_err(|error| format!("fill manual share: {error}"))
+}
+
+/// A register/dispatch drive's cleanup: the batch row, then the legs
+/// (and their nodes) through `remove_submitted`.
+async fn remove_manual_batch(
+    db: &DurableDb,
+    batch_id: &str,
+    legs: Vec<EnqueueRequest>,
+) -> Result<(), String> {
+    db.query("DELETE FROM build_batches WHERE batch_id = ?")
+        .bind(batch_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("delete drive batch {batch_id}: {error}"))?;
+    remove_submitted(db, &legs).await
 }
 
 /// The request record the drives admit and settle — a `req-drive`
