@@ -132,11 +132,15 @@ fn class_of(line: &str) -> Option<FailureClass> {
     {
         return Some(FailureClass::LinkerUnusable);
     }
-    // rustc's own diagnostics carry an error code; a linker failure does
-    // not, and reports its own line first. An old crate that no longer
-    // compiles on the task's toolchain is a permanent answer, not a
-    // transient one, so it is worth separating from `unknown`.
-    if line.starts_with("error[E") {
+    // rustc's own diagnostics carry an error code; cargo's `could not
+    // compile … due to N previous error(s)` summary stands in for the
+    // diagnostics that do not — a `compile_error!` is a bare `error:`
+    // line (stow#870). A linker failure reports its own line first, so
+    // a `could not compile` that follows it never reaches this matcher.
+    // An old crate that no longer compiles on the task's toolchain is a
+    // permanent answer, not a transient one, so it is worth separating
+    // from `unknown`.
+    if line.starts_with("error[E") || line.contains("could not compile") {
         return Some(FailureClass::SourceRejected);
     }
     // ci/src/validate.rs refusals and plan.rs's planner errors.
@@ -214,10 +218,10 @@ fn is_error_line(line: &str) -> bool {
 }
 
 /// Classify one job log. Scans error lines top-down for a known class;
-/// when none match, a run whose log never shows the `stow-build build`
-/// step starting died before the wrapper executed — the runner-loss and
-/// setup-failure bucket. `watchdog` reuses it for the incident's
-/// failure-class breakdown.
+/// when none match, a run whose log never shows a wrapper step's
+/// `stow-build build|publish --leg` command died before the wrapper
+/// executed — the runner-loss and setup-failure bucket. `watchdog`
+/// reuses it for the incident's failure-class breakdown.
 pub fn classify_log(log: &str) -> (FailureClass, Option<String>) {
     for line in log.lines() {
         let line = log_line_body(line);
@@ -238,11 +242,15 @@ pub fn classify_log(log: &str) -> (FailureClass, Option<String>) {
             return (class, Some(line.trim().to_owned()));
         }
     }
-    // `##[group]Run ./target/release/stow-build …` is the workflow's
-    // banner for both wrapper steps (`build` and `publish`); a bare
-    // `stow-build` substring would also match the host compile of the
-    // binary itself, which runs before the wrapper ever starts.
-    if !log.contains("Run ./target/release/stow-build") {
+    // The workflow's banner for the two wrapper steps
+    // (build-crate.yml): the untrusted build's multi-line script echoes
+    // `stow-build build --leg …` inside its `##[group]Run` block, and
+    // the trusted publish's single-line `run:` is
+    // `##[group]Run stow-build publish --leg …`. The `--leg` flag is
+    // what pins the match to the step commands — a bare `stow-build`
+    // substring also matches the stow-toolchain action's download
+    // chatter, which runs before the wrapper ever starts (stow#870).
+    if !(log.contains("stow-build build --leg") || log.contains("stow-build publish --leg")) {
         return (FailureClass::WrapperNeverExecuted, None);
     }
     (FailureClass::Unknown, None)
@@ -895,8 +903,26 @@ mod tests {
         assert_eq!(classify_log(log).0, FailureClass::SourceRejected);
     }
 
-    /// A linker failure also ends in `could not compile`; its own line
-    /// comes first and carries no error code, so the two never collide.
+    /// clircle 0.6.1's `compile_error!` on wasm32-unknown-unknown, as
+    /// the real job log carried it: the diagnostic has no error code,
+    /// so cargo's `could not compile` summary is the line that names
+    /// the rejection (stow#870).
+    const COMPILE_ERROR_LOG: &str = "2026-10-09T14:42:17.1183201Z error: Neither cfg(unix) nor cfg(windows) was true, aborting.\n2026-10-09T14:42:17.2100448Z error: could not compile `clircle` (lib) due to 1 previous error\n2026-10-09T14:42:17.5406119Z Error: Error(Message(\"cargo check failed for clircle 0.6.1 on wasm32-unknown-unknown with status exit status: 101\"))\n";
+
+    /// A `compile_error!` rejection — no `error[E…]` line exists — is a
+    /// source rejection on cargo's summary line, not `unknown`.
+    #[test]
+    fn a_compile_error_is_a_source_rejection() {
+        let (class, evidence) = classify_log(COMPILE_ERROR_LOG);
+        assert_eq!(class, FailureClass::SourceRejected);
+        assert_eq!(
+            evidence.as_deref(),
+            Some("error: could not compile `clircle` (lib) due to 1 previous error")
+        );
+    }
+
+    /// A linker failure also ends in `could not compile`; the scan
+    /// reaches the linker line first, so its class still wins.
     #[test]
     fn a_linker_failure_is_not_a_source_rejection() {
         assert_eq!(
@@ -969,16 +995,27 @@ mod tests {
 
     #[test]
     fn wrapper_never_executed_when_build_step_absent() {
-        // A runner-loss log has no error line the known classes match and
-        // the `stow-build build` step never appears.
-        let log = "Waiting for a runner to pick up this job...\n";
+        // A runner-loss log may carry error lines the known classes do
+        // not match; what makes it a never-executed wrapper is that no
+        // `stow-build … --leg` step banner appears at all.
+        let log = "Waiting for a runner to pick up this job...\n##[error]error: something odd\n";
         assert_eq!(classify_log(log).0, FailureClass::WrapperNeverExecuted);
     }
 
+    /// Either wrapper step's banner proves the wrapper ran — the
+    /// publish stage's `##[group]Run stow-build publish --leg …` and
+    /// the build stage's `stow-build build --leg …`, echoed on its own
+    /// line inside the multi-line script's `##[group]Run` block
+    /// (build-crate.yml, stow#870).
     #[test]
     fn unknown_when_wrapper_ran_but_no_pattern_matched() {
-        let log = "##[group]Run ./target/release/stow-build build --output-dir /tmp/out\n##[error]error: something odd\n";
-        assert_eq!(classify_log(log).0, FailureClass::Unknown);
+        for banner in [
+            "##[group]Run stow-build publish --leg 0 --input-dir \"/home/runner/work/_temp/stow-build-output\"",
+            "##[group]Run set -euo pipefail\nstow-build build --leg 0 --output-dir \"/home/runner/work/_temp/stow-build-output\"",
+        ] {
+            let log = format!("{banner}\n##[error]error: something odd\n");
+            assert_eq!(classify_log(&log).0, FailureClass::Unknown, "{banner}");
+        }
     }
 
     #[test]
