@@ -1882,6 +1882,12 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         // passthrough is what `toolchain_grant_dirs` keys on to grant
         // the whole tree (its bin/ holds the PATH-resolved driver shims).
         "STOW_GLIBC_SYSROOT",
+        // The lock-extracted system-library root (stow#850): the
+        // sandbox passes it through and `toolchain_grant_dirs` grants
+        // read+exec on the tree. `CMAKE_PREFIX_PATH` is how CMake's
+        // find_* modules reach the same root.
+        "STOW_SYSTEM_LIBS",
+        "CMAKE_PREFIX_PATH",
         // The MSVC developer environment. `LIB` and `INCLUDE` are how the
         // linker and the `cc` crate find the CRT and the Windows SDK; the
         // install-root variables are how a build script locates the same
@@ -1909,6 +1915,9 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         "CPPFLAGS_",
         "LDFLAGS_",
         "PKG_CONFIG_",
+        // bindgen's extra clang args, global and per-target spellings —
+        // they carry the system-library root's -isystem include dirs.
+        "BINDGEN_EXTRA_CLANG_ARGS",
     ];
     let android = targets_android(target);
     names
@@ -1942,6 +1951,10 @@ fn toolchain_grant_dirs(
         // runner's home: sandboxed compiles read its headers and link
         // inputs through it.
         "STOW_GLIBC_SYSROOT",
+        // The system-library root extracted from the lock's debs
+        // (stow#850): sandboxed pkg-config, compile and link probes
+        // read its headers, .pc files and libraries.
+        "STOW_SYSTEM_LIBS",
     ];
     const TOOLCHAIN_EXE_PREFIXES: &[&str] = &["CARGO_TARGET_", "CC_", "CXX_", "AR_", "RANLIB_"];
     let android = targets_android(target);
@@ -3671,6 +3684,7 @@ checksum = "33"
     fn the_job_s_own_toolchain_variables_reach_every_task() {
         let sysroot = TempDir::new().expect("sysroot dir");
         let sdkroot = TempDir::new().expect("sdkroot dir");
+        let syslibs = TempDir::new().expect("system-libs dir");
         let linker_dir = TempDir::new().expect("linker dir");
         let linker = linker_dir.path().join("aarch64-linux-gnu-ld");
         std::fs::write(&linker, b"#!/bin/sh\n").expect("linker file");
@@ -3686,6 +3700,10 @@ checksum = "33"
                     sdkroot.path().as_os_str().to_owned(),
                 ),
                 (
+                    OsString::from("STOW_SYSTEM_LIBS"),
+                    syslibs.path().as_os_str().to_owned(),
+                ),
+                (
                     OsString::from("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"),
                     linker.as_os_str().to_owned(),
                 ),
@@ -3693,7 +3711,7 @@ checksum = "33"
             .into_iter()
         };
         let dirs = toolchain_grant_dirs("x86_64-unknown-linux-gnu", vars());
-        for dir in [sysroot.path(), sdkroot.path(), linker_dir.path()] {
+        for dir in [sysroot.path(), sdkroot.path(), syslibs.path(), linker_dir.path()] {
             assert!(
                 dirs.contains(&dir.to_path_buf()),
                 "{} must be granted to a non-Android task",
@@ -3711,12 +3729,21 @@ checksum = "33"
             [
                 "PKG_CONFIG_aarch64_unknown_linux_gnu".to_owned(),
                 "PKG_CONFIG_PATH".to_owned(),
+                "STOW_SYSTEM_LIBS".to_owned(),
+                "CMAKE_PREFIX_PATH".to_owned(),
+                "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu".to_owned(),
             ]
             .into_iter(),
         );
         assert_eq!(
             passed,
-            ["PKG_CONFIG_aarch64_unknown_linux_gnu", "PKG_CONFIG_PATH"]
+            [
+                "PKG_CONFIG_aarch64_unknown_linux_gnu",
+                "PKG_CONFIG_PATH",
+                "STOW_SYSTEM_LIBS",
+                "CMAKE_PREFIX_PATH",
+                "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu",
+            ]
         );
         for target in ["x86_64-unknown-linux-gnu", "aarch64-linux-android"] {
             assert!(

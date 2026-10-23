@@ -98,6 +98,17 @@ jobs:
       # through the NDK clang pinned here, Apple targets through Xcode's
       # `cc`, Windows through the MSVC toolchain lookup, and wasm32 through
       # the rust-lld the toolchain itself ships.
+      # The debs ci/system-libs/install.sh verifies and extracts —
+      # one cache entry per lock version, restored like the glibc
+      # sysroot's, but re-verified against the lock's sha256 on every
+      # hit (stow#850). aarch64 only for now; B1/B2 extend the same
+      # mechanism to the toolchain sets and the x86_64 leg.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: inputs.target == 'aarch64-unknown-linux-gnu'
+        id: system-debs
+        with:
+          path: ~/stow-system-debs
+          key: system-debs-${{ inputs.target }}-${{ hashFiles('ci/system-libs/lock.txt') }}
       - name: Configure the cross toolchain
         shell: bash
         env:
@@ -130,12 +141,18 @@ jobs:
               sudo apt-get install -y --no-install-recommends mold
               ;;
             aarch64-unknown-linux-gnu)
-              # The arm64 builds of the same system libraries, through
-              # dpkg multiarch, and the cross pkg-config that finds them
-              # (stow#729); the script also refreshes the apt index.
-              ci/glibc-sysroot/system-libs.sh "$TASK_TARGET"
+              # Both architectures' system libraries come from the
+              # sha256 lock (stow#850): extracted into
+              # ~/stow-system-libs, never dpkg-installed, so the
+              # ports/multiarch coupling with the image is gone. The
+              # cross pkg-config is the sysroot-written
+              # aarch64-linux-gnu-pkg-config, not pkgconf:arm64.
+              ci/system-libs/install.sh "$TASK_TARGET" \
+                "$HOME/stow-system-debs" "$HOME/stow-system-libs"
               # The sysroot shims drive GCC 12 (stow#693); the runner image
-              # ships the native drivers and not the cross ones.
+              # ships the native drivers and not the cross ones — still
+              # the apt path until stow#862's B1 locks the toolchain too.
+              sudo apt-get update -qq
               sudo apt-get install -y --no-install-recommends \
                 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu mold \
                 gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu
@@ -160,6 +177,11 @@ jobs:
               echo "SDKROOT=$(xcrun --sdk iphonesimulator --show-sdk-path)" >> "$GITHUB_ENV"
               ;;
           esac
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: inputs.target == 'aarch64-unknown-linux-gnu' && steps.system-debs.outputs.cache-hit != 'true'
+        with:
+          path: ~/stow-system-debs
+          key: ${{ steps.system-debs.outputs.cache-primary-key }}
       # The sysroot setup — install, compiler wrappers, untrusted-build
       # env — lives in ci/glibc-sysroot/*.sh so the mock end-to-end runs
       # build the way this job builds (stow#336).
@@ -181,7 +203,7 @@ jobs:
       - name: Write the sysroot compiler wrappers
         if: runner.os == 'Linux'
         shell: bash
-        run: ci/glibc-sysroot/wrappers.sh "$HOME/stow-glibc-2.28"
+        run: ci/glibc-sysroot/wrappers.sh "$HOME/stow-glibc-2.28" "$HOME/stow-system-libs"
       # toolchain-publish.yml publishes stow-build and stow-cli (and on
       # Linux stow-admin) once per main commit per host platform from the merge queue; this
       # job pulls that artifact — digest-pinned, cosign-verified against the
@@ -197,7 +219,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$RUNNER_OS" = "Linux" ]; then
-            eval "$(ci/glibc-sysroot/env.sh "$HOME/stow-glibc-2.28")"
+            eval "$(ci/glibc-sysroot/env.sh "$HOME/stow-glibc-2.28" "$HOME/stow-system-libs")"
           fi
           stow-build build --leg ${{ inputs.leg }} --output-dir "${{ runner.temp }}/stow-build-output"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

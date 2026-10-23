@@ -318,13 +318,11 @@ while IFS= read -r p; do
 done < <(comm -12 "$work/paths-amd64" "$work/paths-arm64")
 
 # --- 5. Self-check the relocated library root -----------------------
-# The relocation install.sh applies on the leg: .pc prefix=/usr points
-# at the root, absolute symlinks resolve inside it.
-find "$merged" -type l -lname '/*' | while IFS= read -r l; do
-    ln -sfn "$merged$(readlink "$l")" "$l"
-done
-find "$merged" -type f -name '*.pc' -print0 \
-    | xargs -0 -r sed -i -E "s|^prefix=/usr/?\$|prefix=$merged/usr|"
+# The relocation install.sh applies on the leg: .pc variables whose
+# value is /usr or under it name the root's usr/, absolute symlinks
+# resolve inside it. One script — relocate.sh — does it for the
+# generator's check and the leg alike, so the two cannot drift.
+"$here/relocate.sh" "$merged"
 
 pc_libdir="$(find "$merged" -type d -name pkgconfig | paste -sd:)"
 while IFS= read -r pc; do
