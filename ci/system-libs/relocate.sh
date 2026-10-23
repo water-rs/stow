@@ -27,4 +27,4 @@ find "$tree" -type l -lname '/*' | while IFS= read -r l; do
     ln -sfn "$into$(readlink "$l")" "$l"
 done
 find "$tree" -type f -name '*.pc' -print0 \
-    | xargs -0 -r sed -i -E "s|^([A-Za-z_][A-Za-z0-9_.]*)=/usr(/|$)|\1=$into/usr\2|"
+    | xargs -0 -r sed -i -E "s#^([A-Za-z_][A-Za-z0-9_.]*)=/usr(/|\$)#\1=$into/usr\2#"
