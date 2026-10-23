@@ -3711,7 +3711,12 @@ checksum = "33"
             .into_iter()
         };
         let dirs = toolchain_grant_dirs("x86_64-unknown-linux-gnu", vars());
-        for dir in [sysroot.path(), sdkroot.path(), syslibs.path(), linker_dir.path()] {
+        for dir in [
+            sysroot.path(),
+            sdkroot.path(),
+            syslibs.path(),
+            linker_dir.path(),
+        ] {
             assert!(
                 dirs.contains(&dir.to_path_buf()),
                 "{} must be granted to a non-Android task",
