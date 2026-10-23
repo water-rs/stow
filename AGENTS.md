@@ -24,6 +24,8 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
   - the stow CLI, behind proof of work, at a very low default priority: on a cache miss, and on a hit served by a superset instead of the exact feature set, which queues the exact chain;
   - stow.waterui.dev, at 30× the CLI's priority;
   - preheat, which submits one dependency tree per source.
+- Preheat resolves on GitHub-hosted runners and submits to the scheduler. It runs on its schedule and on each new stable Rust release, which a newreleases.io webhook reports and preheat confirms against the official channel manifest.
+- The edge writes usage statistics to Analytics Engine. A point carries no IP address, request id, dependency graph or lockfile; installs are counted by a daily-salted hash that cannot be joined across days; small counts are never published; `STOW_NO_ANALYTICS=1` writes nothing.
 
 ## Trust
 
@@ -34,6 +36,7 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 ## Rules
 
 - Every residual cost is the product: remove a cost before presenting it as a trade-off, and never narrow a feature to avoid one.
+- Each metered Cloudflare resource stays under 80% of its monthly Workers Paid allowance.
 - Fail fast on inconsistent identity or schema; no fallbacks.
 - The repository carries no migration or compatibility code. Each store has one schema and the code is written against it alone; a schema change is an operator reset of the store, refilled from the signed records or the next wave.
 - Request code and the alarm never create, alter or backfill anything. Their cost scales with the event, never with stored data; idle cost is zero; independent outbound calls run concurrently under a stated bound; no runner is held by waiting. Each scheduler route and the alarm has a drive in `edge/src/scheduler/drives.rs`, gated by `scripts/traffic-cost.sh`, and a change on those paths states its cost.
@@ -51,5 +54,6 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 
 ## Validation
 
+- A change is verified on the local mock stack. Production is never used to confirm a change, not even with a short load test.
 - Lint on stable. `stow-edge` is linted for the host and for `wasm32-unknown-unknown`; a function alive only through host tests is dead and is removed.
 - Local Wrangler failures are not evidence against repository logic without proof.
