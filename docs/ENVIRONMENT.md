@@ -48,7 +48,8 @@ default, and the purpose.
 | `CC` / `CXX` / `AR` / `RANLIB` / `LD`, the `CFLAGS` / `CXXFLAGS` / `CPPFLAGS` / `LDFLAGS` family, `SDKROOT` / `DEVELOPER_DIR`, the MSVC developer environment (`LIB`, `INCLUDE`, `VCINSTALLDIR`, `VCToolsInstallDir`, `WindowsSdkDir`, `WindowsSdkBinPath`, `WindowsSdkVerBinPath`, `WindowsSDKVersion`, `WindowsSDKLibVersion`, `UniversalCRTSdkDir`, `UCRTVersion`), the Android roots (`ANDROID_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_NDK`, `ANDROID_NDK_HOME`, `ANDROID_NDK_ROOT`, `ANDROID_NDK_LATEST_HOME`), `PKG_CONFIG*` / `CMAKE_*` / `LC_*` / `CARGO_TARGET_*` / `CARGO_TERM_*` / `CARGO_BUILD_*` / `RUSTUP_*` | unset | Under `--sandbox`, the environment allowlist: toolchain variables are passed into the sandboxed build verbatim, and a variable naming an executable file (`CARGO_TARGET_<triple>_LINKER`, `CC_<triple>` and friends) or a toolchain root (`SDKROOT`, `DEVELOPER_DIR`, the Android roots) additionally grants read+execute on the directory it names. `CARGO_TARGET_DIR`, `CARGO_HOME` and `RUSTUP_HOME` are never passed through — the sandbox resolves and sets them itself. |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` (any case) | unset | Under `--sandbox` these are filtered out: heel publishes its own in-process proxy as `HTTP_PROXY`/`HTTPS_PROXY` inside the sandbox so every outbound connection goes through the declared network policy. |
 | `STOW_CLI_GITHUB_TOKEN` | falls back to `GITHUB_TOKEN`, then `GH_TOKEN` | GitHub token `stow update` sends with its release lookups — only useful against rate limits or a private mirror. |
-| `STOW_NO_ANALYTICS` | unset | When `1`, every edge request carries `x-stow-no-analytics: 1` and the edge writes no usage-statistics point and computes no install hash for it. See [`PRIVACY.md`](../PRIVACY.md). |
+| `STOW_NO_ANALYTICS` | unset | When `1`, every edge request carries `x-stow-no-analytics: 1` and the edge writes no usage-statistics point and computes no install hash for it. The CLI also sends no daily build report at all. See [`PRIVACY.md`](../PRIVACY.md). |
+| `CI` | unset (set by CI providers) | When present (any value), every edge request carries `x-stow-ci: 1` so the usage statistics can split CI from local builds. Standard convention — GitHub Actions, GitLab CI and friends set it. See [`PRIVACY.md`](../PRIVACY.md). |
 | `RUST_LOG` | unset (defaults to `warn`) | Standard tracing-env-filter directive (e.g., `stow_cli=debug,info`). Without it, only `warn`/`error` events print — one per condition per build; per-unit lookup detail and per-attempt retries sit at `debug`. |
 
 `stow stats` prints this install's own cache counters (`--json` for
@@ -211,8 +212,10 @@ The release gate's `Traffic cost` job runs this script on the mock stack
 |---|---|---|
 | `STOW_DB` | _required_ (D1 binding) | Artifact catalog database. |
 | `STOW_ANALYTICS` | _required_ (Analytics Engine binding) | `stow_cache_misses` dataset — every cache miss is one data point here, so demand analytics never spend D1 row writes. |
+| `STOW_STATS` | _required_ (Analytics Engine binding) | `stow_events` dataset — `hit` points on uncached bundle fetches and `build` points on accepted `POST /api/v1/build-report` reports (stow#889). |
 | `CF_ACCOUNT_ID` | _required_ (var) | Cloudflare account id the Analytics Engine SQL API is queried under for `GET /api/v1/stats`. |
 | `CF_ANALYTICS_TOKEN` | _required_ (secret) | API token with Analytics Engine read on the account — the `Authorization: Bearer` credential `GET /api/v1/stats` queries with. |
+| `STOW_STATS_SALT_SECRET` | _required_ (secret) | Daily install-hash salt — the edge hashes it with the request's IP to count installs per day without storing the IP; rotate to rekey, never published. |
 | `SCHEDULER` | _required_ (Durable Object binding) | Build scheduler queue. |
 | `GITHUB_REPO` | `water-rs/stow` | Repo every trusted credential must resolve inside (OIDC `repository` claim and the push-permission check), and the repository the scheduler triggers `workflow_dispatch` of `build-batch.yml` on. |
 | `STOW_OIDC_AUDIENCE` | _required_ (var) | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests. |

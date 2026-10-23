@@ -793,23 +793,39 @@ Four workflows keep it warm:
 
 ## Usage statistics
 
-Anonymous usage events go to the `stow_cache_misses` Analytics Engine
-dataset (binding `STOW_ANALYTICS`), never to D1 — anonymous traffic
-cannot spend billed row writes. The one live shape is the `graph` miss
-the admissions handler writes per uncovered node. Every write is gated
-on the `x-stow-no-analytics: 1` request header, which the CLI sends on
-every request when `STOW_NO_ANALYTICS=1` is set (`edge/src/stats.rs`'s
-`AnalyticsConsent` extractor — every write takes the consent as an
-argument, so the opt-out is honoured by construction).
+Anonymous usage events go to two Analytics Engine datasets, never to
+D1 — anonymous traffic cannot spend billed row writes
+(`edge/src/stats.rs`). `stow_cache_misses` (binding `STOW_ANALYTICS`)
+holds the `graph` miss the admissions handler writes per uncovered
+node. `stow_events` (binding `STOW_STATS`) holds two point kinds:
+
+- `hit` — one point per bundle fetch the platform cache lets through
+  to the Worker. The digest-addressed byte path knows only the bundle
+  digest, so the point carries the digest plus request dimensions
+  (rustc, CLI version, OS, country, CI/local) and the daily-salted
+  install hash as its index. Most fetches never reach the Worker, so
+  the count is an edge-observed lower bound used for ranking only —
+  `stow-admin index join` resolves the digests to crate identities
+  offline from the public signed index slices.
+- `build` — one point per accepted `POST /api/v1/build-report`. The
+  CLI accumulates builds, cache-served artifacts, locally compiled
+  artifacts and `cpu_millis_saved` locally and posts the deltas at
+  most once per UTC day per install — one Worker request and one
+  point, with the same install hash and dimensions. The edge keeps no
+  identity store, so the report carries no crate names or digests.
+
+Every write is gated on the `x-stow-no-analytics: 1` request header,
+which the CLI sends on every request when `STOW_NO_ANALYTICS=1` is set
+(`edge/src/stats.rs`'s `AnalyticsConsent` extractor — every write takes
+the consent as an argument, so the opt-out is honoured by construction).
+The CLI sends no build report at all under the opt-out, and the edge
+drops any report that arrives with the header regardless.
 
 `GET /api/v1/stats` answers `UsageStats` by running the
 `edge/src/sql/stats_*.sql` queries against the Analytics Engine SQL API
 (`POST …/accounts/{CF_ACCOUNT_ID}/analytics_engine/sql`, authorized by
 the `CF_ANALYTICS_TOKEN` secret); the answer's one-hour `Cache-Control`
-lets Workers Cache replay it between runs. The hit-side queries read `stow_events`, the
-retired hit dataset: the digest-addressed byte path carries no artifact
-identity and writes nothing, so its points drain under the 90-day
-retention and the derived figures decay to zero. `GET /stats`
+lets Workers Cache replay it between runs. `GET /stats`
 renders the same numbers as a public page. The full data contract —
 fields, retention, opt-out — is documented in
 [`PRIVACY.md`](../PRIVACY.md).
@@ -827,6 +843,7 @@ deserialization.
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
 | GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
 | GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Workers-Cached for one hour |
+| POST `/api/v1/build-report` | none | `BuildReport` | 204 | One install's daily usage counters — at most one report per install per UTC day, one `stow_events` `build` point per accepted report |
 | GET `/api/v1/bundles/{rustc_version}/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Byte fetch — the only artifact-serving route; the `{rustc_version}` segment names the artifact's GHCR package and the `sha256:<64 hex>` segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
 | POST `/api/v1/admin/artifacts/sync` | Bearer: repo push user | `Vec<ArtifactRecord>` chunk | `OkResponse` | Mirror the GHCR records into the D1 catalog — `stow-admin index sync` inside `index-publish.yml` |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |

@@ -22,10 +22,38 @@ One point per cache miss (unsampled), with:
   `graph`), and the missed node's dependency edges as JSON.
 - **Doubles:** `1.0`.
 
-A second dataset, `stow_events`, holds one point per sampled cache hit
-from the era when the byte path resolved catalog rows and knew the
-artifact's identity; the digest-addressed byte path carries no identity
-and writes nothing, so that dataset only drains under retention.
+A second dataset, `stow_events`, holds two point kinds:
+
+- **`build` — one point per accepted daily build report** (unsampled).
+  Each install's CLI sends at most one report per UTC day to
+  `POST /api/v1/build-report` — four counters with the deltas since the
+  last report: builds run, artifacts served from the cache, artifacts
+  compiled locally, and `cpu_millis_saved` (the recorded compile time
+  of the served artifacts, summed). No crate names, digests, dependency
+  graph or lockfile is ever in the body.
+- **`hit` — one point per uncached bundle fetch** (unsampled). The
+  digest-addressed byte path knows only the bundle digest it served, so
+  the point carries that digest and nothing else about the artifact;
+  `stow-admin` resolves digests to crate identities offline from the
+  public signed index. Most cache hits never reach the Worker — the
+  platform cache answers them — so this point counts the cold path
+  only and is used solely for ranking, never as a total.
+
+Every `stow_events` point carries, as its index and dimension blobs:
+
+- **Index:** the install hash — the day's UTC date and a random per-day
+  salt hashed with the request's IP address, so an install counts once
+  per day and cannot be joined across days.
+- **Blobs:** the point kind (`hit`/`build`), the rustc version on hit
+  points, a size bucket on hit points, the CLI version and operating
+  system parsed from the `stow-cli/<version> (<os>)` user agent, the
+  surface the request came through, the bundle digest on hit points,
+  Cloudflare's country code (`CF-IPCountry`; the IP itself is never
+  stored), and `ci` or `local` from the `x-stow-ci` header the CLI
+  sends when `CI` is set.
+- **Doubles:** `hit` points store `1.0`, `0.0`, the bundle's byte size;
+  `build` points store `1.0`, `cpu_millis_saved`, hits, misses and
+  builds.
 
 ## What is never collected
 
@@ -40,6 +68,11 @@ and writes nothing, so that dataset only drains under retention.
 
 Raw Analytics Engine data points are retained for 90 days by Cloudflare.
 Only the published aggregates on `/stats` survive beyond that window.
+Published figures are suppressed when they could single out a user:
+the daily install average requires at least **20** distinct installs,
+and every leaderboard bucket — digest, rustc, CLI version, operating
+system, country and CI/local — is published only when at least **20**
+distinct install-days landed in it, however many hits it counted.
 
 ## Opting out
 
