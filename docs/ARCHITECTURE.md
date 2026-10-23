@@ -920,7 +920,7 @@ volume). The cost trip is self-metered: `MeteringBackend`, a `DurableDbBackend`
 wrapper the middleware installs in place of the request's `DurableDb`,
 reads `rowsRead`/`rowsWritten` off every statement's cursor — the exact
 counters Cloudflare bills on — and a per-request settle folds them into
-the `do_meter` day row; the moment a UTC day's totals pass (the monthly
+the `do_meter` day row; the moment a UTC day's totals pass (80% of the monthly
 included allowance / 30 × `STOW_COST_BUDGET_MULTIPLIER`), dispatch
 freezes on the operation that crossed it. On a trip the
 object writes a `dispatch_freeze` record into `settings` — a different
@@ -983,7 +983,7 @@ is unset or malformed.
 | `STOW_FREEZE_WINDOW_MINUTES` | `60` | Trailing window the dispatch-freeze trip counts terminal outcomes over; long enough to see the measured failure-wave rate decisively, short enough that a stale burst cannot haunt the next day |
 | `STOW_FREEZE_MIN_OUTCOMES` | `50` | Sample floor for the trip condition: a stream (fleet aggregate or one target) must record this many terminal outcomes in the window before its failure ratio is read — below it nothing trips however bad the ratio |
 | `STOW_FREEZE_FAIL_PERCENT` | `50` | Failure ratio (percent) a sufficiently-sampled stream must reach to freeze dispatch; the trip needs both the sample floor and this ratio, never either alone |
-| `STOW_COST_BUDGET_MULTIPLIER` | `1.0` | Scales the scheduler object's self-metered daily SQL budget (Workers Paid monthly allowances / 30) — the trip fires on the operation that crosses it |
+| `STOW_COST_BUDGET_MULTIPLIER` | `1.0` | Scales the scheduler object's self-metered daily SQL budget (80% of the Workers Paid monthly allowances / 30 — the stow#883 line's daily share) — the trip fires on the operation that crosses it |
 | `STOW_ALERT_FROM` | `alerts@stow.waterui.dev` | Sender address of freeze-transition alert emails; must live on a domain onboarded and Enabled under Compute → Email Service → Email Sending (`E_SENDER_NOT_VERIFIED` otherwise) |
 | `STOW_ALERT_TO` | `me@lexo.cool` | Recipient of the freeze + clear transition emails |
 | `STOW_ALERT_EMAIL` (`send_email` binding) | declared in `Skyzen.toml` only | Email Service send binding the transition alerts go through; the mock/local manifests deliberately omit it so their alert path resolves to `Disabled` and can never reach Cloudflare's sending API |

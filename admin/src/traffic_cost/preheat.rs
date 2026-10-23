@@ -170,8 +170,6 @@ pub(super) fn test_report(nodes: u64) -> PreheatCostReport {
         other_ops: Vec::new(),
         rows_read: 1_000,
         rows_written: 500,
-        budget_rows_read: f64::INFINITY,
-        budget_rows_written: f64::INFINITY,
         tasks: 100,
         wall_ms: 0,
     };

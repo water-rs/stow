@@ -1222,9 +1222,9 @@ pub struct DispatchFreezeCost {
     pub metric: CostMetric,
     /// Usage so far today (UTC) in the metric's unit.
     pub used: f64,
-    /// The daily budget the usage is compared against — the monthly
-    /// Workers Paid allowance divided by 30, times
-    /// `STOW_COST_BUDGET_MULTIPLIER`.
+    /// The daily budget the usage is compared against — 80% of the
+    /// monthly Workers Paid allowance divided by 30, times
+    /// `STOW_COST_BUDGET_MULTIPLIER` (stow#883).
     pub budget: f64,
     /// Every metric over budget (the trip names `metric`, this lists
     /// all of them).

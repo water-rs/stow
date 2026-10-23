@@ -14,9 +14,10 @@
 //! (and once per alarm pass) — the DO bills `rowsRead` and
 //! `rowsWritten`, so the meter measures exactly what costs money.
 //!
-//! The day the meter crosses `monthly allowance / 30 *
-//! STOW_COST_BUDGET_MULTIPLIER`, dispatch freezes on the operation that
-//! crossed it — not on a later poll. The `incident` issue record and
+//! The day the meter crosses `80% of the monthly allowance / 30 *
+//! STOW_COST_BUDGET_MULTIPLIER` — one day of the stow#883 cost line —
+//! dispatch freezes on the operation that crossed it — not on a later
+//! poll. The `incident` issue record and
 //! the while-frozen digest stay the watchdog's (#450); the edge sends
 //! only the transition email.
 
@@ -31,8 +32,9 @@ use crate::errors::QueueError;
 
 /// The Workers Paid DO allowances the meter's daily budget lines divide
 /// — one table in `stow-types`, shared with the watchdog and the
-/// `Preheat cost` lane.
-pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY};
+/// `Preheat cost` lane — and the daily derivation of the stow#883 line
+/// they are checked against.
+pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY, daily_budget};
 
 /// `STOW_COST_BUDGET_MULTIPLIER`'s default — scales every daily
 /// budget, so a shared account can trip earlier by lowering it.
@@ -45,13 +47,6 @@ pub fn parse_f64_binding(binding_name: &str, raw: &str) -> Result<f64, QueueErro
     raw.parse::<f64>().map_err(|error| {
         QueueError::Invariant(format!("parse binding '{binding_name}' as f64: {error}"))
     })
-}
-
-/// The per-day budget is the included month spread over thirty days —
-/// the same convention the deleted GraphQL probe used, now applied to
-/// what the DO itself measured instead of what analytics reported.
-const fn daily_budget(monthly: f64, multiplier: f64) -> f64 {
-    monthly / 30.0 * multiplier
 }
 
 /// The day's meter row after the pending counts folded in — the values
@@ -731,7 +726,8 @@ mod tests {
     #[tokio::test]
     async fn budget_scales_with_the_multiplier() {
         let budget = daily_budget(DO_ROWS_WRITTEN_MONTHLY, 1.0);
-        assert!((budget - DO_ROWS_WRITTEN_MONTHLY / 30.0).abs() < f64::EPSILON);
-        assert!((daily_budget(30.0, 2.0) - 2.0).abs() < f64::EPSILON);
+        let expected = DO_ROWS_WRITTEN_MONTHLY * stow_types::do_budgets::DAILY_SHARE;
+        assert!((budget - expected).abs() < f64::EPSILON);
+        assert!((daily_budget(30.0, 2.0) - 1.6).abs() < f64::EPSILON);
     }
 }

@@ -24,7 +24,7 @@
 # drive, a lane error share over 1%, a response outside a lane's
 # designed statuses, or a lane p99 over 10 s.
 #
-# The monthly projection against half of each product's allowance is not
+# The monthly projection against 80% of each product's allowance is not
 # here: it adds the preheat waves and daily resubmits the Preheat cost
 # job measures, so the release gate's `Monthly projection` job runs it
 # (`stow-admin traffic-cost project`) over this run's budget-small.json,

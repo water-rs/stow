@@ -78,8 +78,8 @@ STOW_FREEZE_FAIL_PERCENT = "50"
 # `issues` grant, deliberately.
 STOW_ALERT_FROM = "alerts@stow.waterui.dev"
 STOW_ALERT_TO = "me@lexo.cool"
-# Scales the scheduler DO's per-day SQL budget (monthly included
-# allowance / 30): the object self-meters rowsRead/rowsWritten off its
+# Scales the scheduler DO's per-day SQL budget (80% of the monthly included
+# allowance / 30 — the stow#883 line's daily share): the object self-meters rowsRead/rowsWritten off its
 # own cursors and freezes dispatch the moment a day crosses budget —
 # no scheduled probe, so nothing here costs while idle. Lower it to
 # trip earlier on a shared account.

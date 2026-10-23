@@ -57,7 +57,7 @@ without overloading the scheduler. In one stack start it:
 5. judges the run (`stow-admin traffic-cost verdict`): row budgets,
    growth with stored rows, and peak serialized Durable Object wall.
 
-The monthly projection against half of each product's allowance is the
+The monthly projection against 80% of each product's allowance is the
 release gate's separate `Monthly projection` job (`stow-admin
 traffic-cost project`): it prices user traffic from this run's
 `reports/budget-small.json`, `budget-after.json` and `worker-cpu.json`

@@ -26,75 +26,89 @@ pub const LEDGER_OP_ALARM: &str = "alarm";
 /// every run's completion lands on one row.
 pub const LEDGER_OP_TASK_COMPLETE: &str = "POST /tasks/complete-run";
 
+/// The one cost line every allowance consumer derives from (stow#883):
+/// each metered Cloudflare resource stays under 80% of its monthly
+/// Workers Paid allowance (AGENTS.md).
+///
+/// The release gate's monthly projection bounds each product's total —
+/// user traffic plus preheat — at this fraction of its allowance
+/// (`stow-admin traffic-cost project`); the in-edge breaker and the
+/// preheat budget derive from it through [`DAILY_SHARE`].
+pub const ALLOWANCE_FRACTION: f64 = 0.8;
+
+/// One UTC day's share of the line — `ALLOWANCE_FRACTION / 30`.
+///
+/// The in-edge cost breaker freezes dispatch once a UTC day's billed
+/// rows pass this share of the monthly allowance
+/// (`edge/src/scheduler/meter.rs`, [`daily_budget`]), so a sustained
+/// burn at the line's pace trips within a day; and one preheat wave's
+/// share is one day of the line (`PREHEAT_BUDGET`) — a wave must
+/// complete inside a day.
+pub const DAILY_SHARE: f64 = ALLOWANCE_FRACTION / 30.0;
+
+/// The in-edge breaker's daily budget on `monthly`: one thirtieth of
+/// the line, scaled by `STOW_COST_BUDGET_MULTIPLIER` so a shared
+/// account can trip earlier.
+#[must_use]
+pub const fn daily_budget(monthly: f64, multiplier: f64) -> f64 {
+    monthly * DAILY_SHARE * multiplier
+}
+
 /// The scheduler cost one preheat wave and one daily resubmit may spend
-/// — the `Preheat cost` lane's (stow#773) totals gate.
+/// — the totals bound the monthly projection enforces at the measured
+/// production wave's node count (stow#773, stow#883).
 ///
-/// Derived from the Workers Paid allowance above and the two mechanisms
-/// that already divide it:
+/// - **The wave** may spend one day of the line — [`DAILY_SHARE`] of the
+///   monthly allowance — because a wave must complete inside a day;
+///   spreading one over several days is not an option. A wave that does
+///   not fit is a scheduler spending too many rows per node. User
+///   traffic rides the same day's budget, so a wave plus a day of
+///   line-pace traffic can cross the in-edge breaker's daily threshold:
+///   the measured traffic share is far below the line, and the breaker
+///   is the runtime guard for the day that stops being true.
+/// - **The daily resubmit** (`preheat-cron.yml` fires every day) lands
+///   on a graph that is already built: its work is recognising that, so
+///   it is held to a hundredth of a wave — room to read its own runs,
+///   none to rebuild or rewrite the graph.
 ///
-/// - **The in-edge cost breaker** freezes dispatch once a UTC day's
-///   billed rows pass a thirtieth of the monthly allowance
-///   (`edge/src/scheduler/meter.rs`, `daily_budget`, at the production
-///   multiplier of 1). A wave that crosses it stops itself mid-graph.
-/// - **The launch gate** (stow#452) holds projected user traffic at half
-///   of every allowance — half of each day's thirtieth.
-///
-/// So a wave gets the other half of one day: `1/30 × 1/2 = 1/60` of the
-/// monthly allowance, and a full wave completes inside it in one go —
-/// spreading a wave over several days is not an option. A wave that
-/// does not fit is a scheduler spending too many rows per node. The daily resubmit (`preheat-cron.yml` fires every day)
-/// lands on a graph that is already built: its work is recognising
-/// that, so it is held to a hundredth of a wave — room to read its own
-/// runs, none to rebuild or rewrite the graph.
-///
-/// Both shares are per node, over [`Self::FULL_WAVE_NODES`]: a run of
-/// `n` nodes is held to `n / FULL_WAVE_NODES` of the share, so a
-/// per-node cost that would overrun the full wave fails a reduced-scale
-/// run too.
+/// The bound is evaluated where the measurement exists: the `Preheat
+/// cost` report carries the measured per-node costs and the monthly
+/// projection scales them to `production-wave.json`'s node count — a
+/// per-node cost that would overrun the production wave fails there,
+/// not against a checked-in wave size.
 #[derive(Debug, Clone, Copy)]
 pub struct PreheatBudget {
-    /// Fraction of each monthly allowance one full wave may spend.
+    /// Fraction of each monthly allowance one full production wave may
+    /// spend.
     pub wave_share: f64,
     /// Fraction of the wave's share one resubmit may spend.
     pub resubmit_of_wave: f64,
 }
 
 impl PreheatBudget {
-    /// Nodes in a full production wave: the top-100 crates, the
-    /// top-100 binaries' and the curated projects' lockfiles, resolved
-    /// across every `CI_TARGET_TRIPLES` entry (stow#773's measured
-    /// order of magnitude). The per-node share divides by it.
-    pub const FULL_WAVE_NODES: f64 = 16_000.0;
-
-    /// The (`rowsRead`, `rowsWritten`) one wave of `nodes` may spend.
+    /// The (`rowsRead`, `rowsWritten`) one production wave may spend.
     #[must_use]
-    pub fn wave(&self, nodes: u64) -> (f64, f64) {
-        Self::share(self.wave_share, nodes)
+    pub fn wave(&self) -> (f64, f64) {
+        (
+            DO_ROWS_READ_MONTHLY * self.wave_share,
+            DO_ROWS_WRITTEN_MONTHLY * self.wave_share,
+        )
     }
 
-    /// The (`rowsRead`, `rowsWritten`) one resubmit over `nodes` may
+    /// The (`rowsRead`, `rowsWritten`) one production resubmit may
     /// spend.
     #[must_use]
-    pub fn resubmit(&self, nodes: u64) -> (f64, f64) {
-        Self::share(self.wave_share * self.resubmit_of_wave, nodes)
-    }
-
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "node counts stay far below f64's exact-integer range"
-    )]
-    fn share(share: f64, nodes: u64) -> (f64, f64) {
-        let fraction = nodes as f64 / Self::FULL_WAVE_NODES;
+    pub fn resubmit(&self) -> (f64, f64) {
         (
-            DO_ROWS_READ_MONTHLY * share * fraction,
-            DO_ROWS_WRITTEN_MONTHLY * share * fraction,
+            DO_ROWS_READ_MONTHLY * self.wave_share * self.resubmit_of_wave,
+            DO_ROWS_WRITTEN_MONTHLY * self.wave_share * self.resubmit_of_wave,
         )
     }
 }
 
 /// The preheat lane's split of the allowance — see [`PreheatBudget`].
 pub const PREHEAT_BUDGET: PreheatBudget = PreheatBudget {
-    wave_share: 1.0 / 60.0,
+    wave_share: DAILY_SHARE,
     resubmit_of_wave: 0.01,
 };
 

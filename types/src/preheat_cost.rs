@@ -21,9 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{SchedulerLedger, SchedulerLedgerOp};
-use crate::do_budgets::{
-    DO_BUDGETS, LEDGER_OP_ALARM, LEDGER_OP_TASK_COMPLETE, PREHEAT_BUDGET, grew,
-};
+use crate::do_budgets::{DO_BUDGETS, LEDGER_OP_ALARM, LEDGER_OP_TASK_COMPLETE, grew};
 use crate::local_ci::LocalCiRun;
 
 /// The event kinds a wave is made of, each one scheduler operation.
@@ -302,7 +300,7 @@ impl KindCost {
 }
 
 /// One phase's cost.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseCost {
     /// Per event kind.
     pub kinds: Vec<KindCost>,
@@ -312,10 +310,6 @@ pub struct PhaseCost {
     pub rows_read: u64,
     /// `rowsWritten` over every counted operation.
     pub rows_written: u64,
-    /// The budget's `rowsRead` for this phase at this node count.
-    pub budget_rows_read: f64,
-    /// The budget's `rowsWritten` for this phase at this node count.
-    pub budget_rows_written: f64,
     /// `build-crate.yml` runs the local CI was dispatched during the
     /// phase — one per task — the completions the phase must have
     /// paid.
@@ -381,7 +375,7 @@ pub struct Check {
 }
 
 /// `preheat-cost-report.json`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreheatCostReport {
     /// The rustc the wave built for.
     pub rustc_version: String,
@@ -483,11 +477,7 @@ fn build_tasks_between(runs: &[LocalCiRun], from_ms: u64, to_ms: u64) -> u64 {
         .count() as u64
 }
 
-fn phase_cost(
-    phase: &PhaseObservations,
-    runs: &[LocalCiRun],
-    budget: (f64, f64),
-) -> crate::error::Result<PhaseCost> {
+fn phase_cost(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::Result<PhaseCost> {
     let ops = ledger_delta(&phase.start.ledger, &phase.end.ledger)?;
     let counted: Vec<&SchedulerLedgerOp> = ops
         .iter()
@@ -504,8 +494,6 @@ fn phase_cost(
         other_ops,
         rows_read: counted.iter().map(|op| op.rows_read).sum(),
         rows_written: counted.iter().map(|op| op.rows_written).sum(),
-        budget_rows_read: budget.0,
-        budget_rows_written: budget.1,
         tasks,
         wall_ms: phase
             .end
@@ -558,23 +546,6 @@ fn check(name: impl Into<String>, passed: bool, detail: impl Into<String>) -> Ch
         passed,
         detail: detail.into(),
     }
-}
-
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "row counts stay far below f64's exact-integer range"
-)]
-fn totals_check(name: &str, cost: &PhaseCost) -> Check {
-    let passed = (cost.rows_read as f64) <= cost.budget_rows_read
-        && (cost.rows_written as f64) <= cost.budget_rows_written;
-    check(
-        name,
-        passed,
-        format!(
-            "rowsRead {} of {:.0}, rowsWritten {} of {:.0}",
-            cost.rows_read, cost.budget_rows_read, cost.rows_written, cost.budget_rows_written
-        ),
-    )
 }
 
 /// Every build run a phase dispatched completes through exactly one
@@ -913,19 +884,13 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
     for node in observed.nodes.values() {
         *nodes_per_target.entry(node.target.clone()).or_default() += 1;
     }
-    let wave = phase_cost(&observed.wave, &observed.runs, PREHEAT_BUDGET.wave(nodes))?;
-    let resubmit = phase_cost(
-        &observed.resubmit,
-        &observed.runs,
-        PREHEAT_BUDGET.resubmit(nodes),
-    )?;
+    let wave = phase_cost(&observed.wave, &observed.runs)?;
+    let resubmit = phase_cost(&observed.resubmit, &observed.runs)?;
     let layers = layers(&observed.wave, &observed.runs)?;
     let mut lanes = lane_costs("wave", &observed.wave)?;
     lanes.extend(lane_costs("resubmit", &observed.resubmit)?);
 
     let mut checks = vec![
-        totals_check("Wave total within the preheat budget", &wave),
-        totals_check("Resubmit total within the preheat budget", &resubmit),
         check(
             "Resubmit rebuilt nothing",
             resubmit.tasks == 0,
