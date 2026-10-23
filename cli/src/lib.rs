@@ -43,6 +43,7 @@ mod mold;
 mod prefetch;
 mod profile_guard;
 mod provenance;
+mod report;
 mod resolve;
 mod rustc_args;
 mod sandbox;

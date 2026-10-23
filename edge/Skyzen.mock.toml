@@ -54,6 +54,7 @@ TURNSTILE_HOSTNAME = "example.com"
 # which the mock registry stubs.
 CF_ACCOUNT_ID = "00000000000000000000000000000000"
 CF_ANALYTICS_TOKEN = "mock-analytics-token"
+STOW_STATS_SALT_SECRET = "mock-stats-salt"
 # `stow-mock-registry serve` answers POST /analytics_engine/sql with one
 # union row every stats_*.sql query decodes. Loopback-only by the same
 # rule as STOW_LOCAL_CI_URL — the token rides in Authorization.
@@ -77,3 +78,7 @@ new_sqlite_classes = ["Scheduler"]
 [[cloudflare.raw.analytics_engine_datasets]]
 binding = "STOW_ANALYTICS"
 dataset = "stow_cache_misses"
+
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_STATS"
+dataset = "stow_events"
