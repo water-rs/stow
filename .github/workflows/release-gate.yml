@@ -295,7 +295,7 @@ jobs:
           if-no-files-found: ignore
 
   # The monthly projection (stow#452, stow#775): what a month costs each
-  # Cloudflare product against half its allowance. It needs the three
+  # Cloudflare product against the stow#883 line (80% of its allowance). It needs the three
   # measurements, so it runs after them: user traffic from the
   # traffic-cost job's budget and Worker CPU reports at the launch
   # model's rates, plus the preheat from the preheat-cost job's report —

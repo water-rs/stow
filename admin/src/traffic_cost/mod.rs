@@ -8,7 +8,7 @@
 //!   on any overload signal or 5xx;
 //! - `verdict` judges the scheduler budget reports: row budgets, growth
 //!   with stored rows, and the peak serialized Durable Object wall;
-//! - `project` is the monthly projection against half of each allowance
+//! - `project` is the monthly projection against 80% of each allowance
 //!   — user traffic from those reports and the CPU report, plus the
 //!   preheat waves and daily resubmits the Preheat cost report measures
 //!   (stow#775). The release gate runs it in its own job, once all
@@ -55,7 +55,7 @@ enum TrafficCostCommand {
     /// serialized wall.
     Verdict(verdict::VerdictArgs),
     /// Project the month — user traffic plus the preheat waves and
-    /// resubmits — against half of each product's allowance.
+    /// resubmits — against 80% of each product's allowance.
     Project(project::ProjectArgs),
     /// Print the `build-crate.yml` runs the fixture's in-flight tasks
     /// are bound to, for the local CI's `POST /seeded-runs`.

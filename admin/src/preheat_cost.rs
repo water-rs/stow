@@ -468,22 +468,12 @@ fn render_production(wave: &ProductionWave) -> String {
 }
 
 fn render_report(report: &PreheatCostReport) -> String {
-    let mut phases = Table::new(&[
-        "phase",
-        "rows read",
-        "budget",
-        "rows written",
-        "budget",
-        "runs",
-        "wall s",
-    ]);
+    let mut phases = Table::new(&["phase", "rows read", "rows written", "runs", "wall s"]);
     for (name, phase) in [("wave", &report.wave), ("resubmit", &report.resubmit)] {
         phases.push([
             name.to_owned(),
             phase.rows_read.to_string(),
-            format!("{:.0}", phase.budget_rows_read),
             phase.rows_written.to_string(),
-            format!("{:.0}", phase.budget_rows_written),
             phase.tasks.to_string(),
             (phase.wall_ms / 1000).to_string(),
         ]);
