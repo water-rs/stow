@@ -79,6 +79,7 @@ async fn async_main() -> stow_types::error::Result<()> {
         Command::PublishIndex(request) => publish_index(request).await,
         Command::IndexFromRecords(request) => index_from_records(request).await,
         Command::PushRecords(request) => push_records(request).await,
+        Command::RetagRecords(request) => retag_records(request).await,
         Command::PutBlob(request) => put_blob(request).await,
         Command::Serve(request) => serve_registry(request).await,
     }
@@ -318,12 +319,69 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
     .await?;
     // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
     write_manifest(&request.registry_root, &repo, &tag, &manifest_bytes).await?;
+    // The `built-<rustc>-<task_id hash>` marker `push_records` also
+    // points at the same manifest (stow#877): a run checking whether
+    // the task's signed records already exist reads one tag, and a
+    // superseding run's early exit re-tags what this marker names.
+    write_manifest(
+        &request.registry_root,
+        &repo,
+        &stow_types::records::published_tag(rustc.as_str(), &request.task_id),
+        &manifest_bytes,
+    )
+    .await?;
     tracing::info!(
         oci_reference = %oci_reference,
         digest = %manifest_digest,
         task_id = %request.task_id,
         records = records.len(),
         "pushed mock records artifact"
+    );
+    Ok(())
+}
+
+/// `retag-records` — the early-exited run's publish: the `built-`
+/// marker's manifest is re-tagged under this run's `records-` tag AND
+/// signed for it, so the `sha256-<digest>.sig` bundle gains a layer
+/// binding this tag alongside the original run's (stow#877).
+async fn retag_records(request: RetagRecordsArgs) -> stow_types::error::Result<()> {
+    let rustc = WireRustcVersion::parse(&request.rustc_version)
+        .map_err(|error| stow_types::stow_error!("--rustc-version: {error}"))?;
+    let repository = cache_repository(&rustc);
+    let repo = repository.path().to_string();
+    let marker_path = request.registry_root.join("manifests").join(&repo).join(
+        stow_types::records::published_tag(rustc.as_str(), &request.task_id),
+    );
+    let manifest_bytes = read(&marker_path).await.map_err(|error| {
+        stow_types::stow_error!("read built- marker {}: {error}", marker_path.display())
+    })?;
+    let manifest_digest = sha256_digest(&manifest_bytes);
+    let oci_reference = repository.reference(&records_tag(
+        rustc.as_str(),
+        &request.task_id,
+        BuildRun {
+            run_id: request.run_id,
+            run_attempt: request.run_attempt,
+        },
+    ));
+    let key_pair = load_key_pair(&request.private_key_path).await?;
+    let signer = key_pair
+        .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
+        .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
+    write_mock_signature(
+        &request.registry_root,
+        &signer,
+        &oci_reference,
+        &manifest_digest,
+    )
+    .await?;
+    let (_, tag) = split_reference(&oci_reference)?;
+    write_manifest(&request.registry_root, &repo, &tag, &manifest_bytes).await?;
+    tracing::info!(
+        oci_reference = %oci_reference,
+        digest = %manifest_digest,
+        task_id = %request.task_id,
+        "re-tagged and re-signed mock records artifact"
     );
     Ok(())
 }
@@ -1207,6 +1265,12 @@ enum Command {
     /// mock signature — the write the production publish stage performs
     /// on GHCR once a build's records live there (stow#455).
     PushRecords(PushRecordsArgs),
+    /// Re-tag the `built-` marker's manifest under another run's
+    /// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag AND
+    /// sign it — production's early-exited run re-signs via
+    /// `put_signed_manifest`, since every reader binds the signature
+    /// to the tag it pulled (stow#877).
+    RetagRecords(RetagRecordsArgs),
     /// Store one deterministic blob of `--size` bytes and print its
     /// digest — a bundle-sized body the edge's byte path can stream,
     /// for the traffic-cost CPU measurement (`scripts/traffic-cost.sh`).
@@ -1238,6 +1302,26 @@ struct PushRecordsArgs {
     #[arg(long = "run-id")]
     run_id: u64,
     /// The run's attempt — the tag's last leg.
+    #[arg(long = "run-attempt")]
+    run_attempt: u32,
+    #[arg(long = "registry-root")]
+    registry_root: PathBuf,
+    #[arg(long = "private-key")]
+    private_key_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RetagRecordsArgs {
+    /// The task whose `built-` marker points at the manifest.
+    #[arg(long = "task-id")]
+    task_id: String,
+    /// The rustc the task ran under.
+    #[arg(long = "rustc-version")]
+    rustc_version: String,
+    /// The run the re-tag publishes under.
+    #[arg(long = "run-id")]
+    run_id: u64,
+    /// The run's attempt.
     #[arg(long = "run-attempt")]
     run_attempt: u32,
     #[arg(long = "registry-root")]
