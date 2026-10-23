@@ -1815,7 +1815,7 @@ async fn analytics_engine_sql_answer(
     if let Some(fixtures) = &state.demand_fixtures
         && body.contains("stow_cache_misses")
     {
-        match demand_query_hour(&body) {
+        match demand_query_hour(body) {
             // A demand query whose bound is malformed or ambiguous is a
             // provider-side failure, never a guess.
             Err(message) => {
