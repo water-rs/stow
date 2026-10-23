@@ -485,6 +485,10 @@ fn registry_app_with_probe(
             get(serve_edge_bundle).head(serve_edge_bundle),
         )
         .route("/analytics_engine/sql", post(analytics_engine_sql))
+        .route(
+            "/accounts/{account}/analytics_engine/sql",
+            post(analytics_engine_sql_account),
+        )
         .route("/user", get(github_user))
         .route("/{owner}/{repo}/info/refs", get(github_info_refs))
         .with_state(MockRegistryState {
@@ -1778,6 +1782,27 @@ async fn analytics_engine_sql(
     State(state): State<MockRegistryState>,
     body: String,
 ) -> Response<Body> {
+    analytics_engine_sql_answer(&state, None, &body).await
+}
+
+/// `POST /accounts/{account}/analytics_engine/sql` — the account-scoped
+/// shape `stow-admin` posts (the watchdog, `preheat missed`, the launch
+/// model). The account id carries the scripting knob: names containing
+/// `overloaded` answer a breaching fault count, names containing
+/// `empty` a dead dataset, anything else the live-clear answer.
+async fn analytics_engine_sql_account(
+    State(state): State<MockRegistryState>,
+    AxumPath(account): AxumPath<String>,
+    body: String,
+) -> Response<Body> {
+    analytics_engine_sql_answer(&state, Some(&account), &body).await
+}
+
+async fn analytics_engine_sql_answer(
+    state: &MockRegistryState,
+    account: Option<&str>,
+    body: &str,
+) -> Response<Body> {
     // Fixture mode (stow#523 harness): the optional `--demand-fixtures`
     // directory carries one verbatim document per requested hour —
     // `YYYY-MM-DDTHH.json` — so the harness edits a file between runs
@@ -1790,7 +1815,7 @@ async fn analytics_engine_sql(
     if let Some(fixtures) = &state.demand_fixtures
         && body.contains("stow_cache_misses")
     {
-        match demand_query_hour(&body) {
+        match demand_query_hour(body) {
             // A demand query whose bound is malformed or ambiguous is a
             // provider-side failure, never a guess.
             Err(message) => {
@@ -1892,6 +1917,27 @@ async fn analytics_engine_sql(
             ],
             "data": data,
             "rows": data.len()
+        }))
+        .into_response();
+    }
+    // The watchdog's overload query (stow#888): `index1='#fault'`
+    // points in `stow_cache_misses`. The account path selects the
+    // scripted answer — `overloaded` breaches, `empty` is the
+    // dead-dataset case, anything else is live and clear — so a
+    // harness drives all three by setting `CF_ACCOUNT_ID`.
+    if body.contains("stow_cache_misses") && body.contains("'#fault'") {
+        let (events, points) = match account {
+            Some(account) if account.contains("overloaded") => ("3", "17"),
+            Some(account) if account.contains("empty") => ("0", "0"),
+            _ => ("0", "42"),
+        };
+        return Json(serde_json::json!({
+            "meta": [
+                {"name": "events", "type": "Float64"},
+                {"name": "points", "type": "UInt64"}
+            ],
+            "data": [{"events": events, "points": points}],
+            "rows": 1
         }))
         .into_response();
     }
@@ -2264,9 +2310,9 @@ mod tests {
 
     use super::{
         Arc, Body, MockRegistryState, Mutex, Path, RegistryProbe, SigStoreKeyPair, SigningScheme,
-        TokenState, analytics_engine_sql, create_dir_all, demand_query_hour, log_demand_query,
-        manifest_file_name, registry_app_with_probe, split_reference, write, write_blob,
-        write_manifest, write_mock_signature,
+        TokenState, analytics_engine_sql, analytics_engine_sql_answer, create_dir_all,
+        demand_query_hour, log_demand_query, manifest_file_name, registry_app_with_probe,
+        split_reference, write, write_blob, write_manifest, write_mock_signature,
     };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-1.98.0/manifests/latest";
@@ -3307,6 +3353,43 @@ mod tests {
             let log = tokio::fs::read_to_string(&log_path).await.expect("log");
             assert_eq!(log.lines().count(), 2);
             assert!(log.contains("\"served\":false"));
+        });
+    }
+
+    /// The watchdog's overload query (`stow_cache_misses` +
+    /// `index1='#fault'`, stow#888) gets the three scripted answers its
+    /// cases need, keyed on the account the SQL base path carries:
+    /// `overloaded` breaches, `empty` is the dead dataset, and anything
+    /// else — including the unscoped route — is live and clear.
+    #[test]
+    fn watchdog_fault_query_answers_the_three_scripted_cases() {
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let state = MockRegistryState {
+            registry_root: root.path().to_path_buf(),
+            token_realm: "http://127.0.0.1/token".to_owned(),
+            tokens: Arc::new(Mutex::new(TokenState::default())),
+            requests: None,
+            refusals: None,
+            toggles: None,
+            demand_fixtures: None,
+        };
+        let sql = "SELECT sumIf(_sample_interval * double1, index1 = '#fault' AND blob1 = 'overloaded') AS events, count() AS points FROM stow_cache_misses WHERE timestamp >= NOW() - INTERVAL '1' HOUR FORMAT JSON";
+        block_on(async move {
+            for (account, events, points) in [
+                (Some("mock-overloaded-account"), "3", "17"),
+                (Some("mock-empty-account"), "0", "0"),
+                (Some("mock-live-account"), "0", "42"),
+                (None, "0", "42"),
+            ] {
+                let response = analytics_engine_sql_answer(&state, account, sql).await;
+                assert_eq!(response.status(), StatusCode::OK, "{account:?}");
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+                assert_eq!(json["data"][0]["events"], events, "{account:?}");
+                assert_eq!(json["data"][0]["points"], points, "{account:?}");
+            }
         });
     }
 }

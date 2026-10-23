@@ -1780,10 +1780,16 @@ pub async fn enqueue_admitted_task(
             cap = admission.max_queue_pending,
             "refusing enqueue ticket: scheduler queue is full"
         );
-        return rate_limited_response(
+        let mut response = rate_limited_response(
             "scheduler queue is full; retry after it drains",
             QUEUE_FULL_RETRY_AFTER_SECS,
-        );
+        )?;
+        // The shed itself is the overload signal the watchdog counts —
+        // mark the reply so the outer fault recorder writes it (stow#888).
+        response
+            .extensions_mut()
+            .insert(crate::faults::OverloadFault);
+        return Ok(response);
     }
     let required = admission::difficulty(admission.min_bits);
     let solved =
@@ -1809,10 +1815,14 @@ pub async fn enqueue_admitted_task(
         // The edge check raced another submit wave: the Durable Object's
         // own pending-depth cap refused this one.
         Err(crate::errors::SchedulerClientError::Http { status: 429, .. }) => {
-            return rate_limited_response(
+            let mut response = rate_limited_response(
                 "scheduler queue is full; retry after it drains",
                 QUEUE_FULL_RETRY_AFTER_SECS,
-            );
+            )?;
+            response
+                .extensions_mut()
+                .insert(crate::faults::OverloadFault);
+            return Ok(response);
         }
         Err(error) => return Err(error.into()),
     }

@@ -34,7 +34,7 @@ use std::fmt::Write as _;
 use askama::Template;
 use clap::{Args, Subcommand};
 use futures_util::StreamExt as _;
-use stow_types::analytics::{self, Envelope};
+use stow_types::analytics;
 use stow_types::api::{AdminStatus, DispatchFreeze};
 use stow_types::identity::WireRustcVersion;
 use stow_types::runs::{LegFailure, LegOutcome, RunFailure, RunJobRow};
@@ -272,7 +272,7 @@ const SIGNALS: &[Signal] = &[
     },
     Signal {
         id: "edge.do.overloaded",
-        label: "DO `overloaded` events (Analytics Engine, written by #438)",
+        label: "`overloaded` fault events (Analytics Engine stow_cache_misses)",
         window_secs: HOUR,
         min_sample: 0,
         threshold: 1.0,
@@ -491,6 +491,10 @@ struct Watcher<'a> {
     /// The edge URL's host — the `http.host` term the maintenance rules
     /// carry.
     host: &'a str,
+    /// REST base `overloaded_reading` posts its Analytics Engine SQL
+    /// to — `cloudflare::API_BASE` in production, a loopback fixture
+    /// under `STOW_CF_ANALYTICS_SQL_BASE` (stow#888's mock seam).
+    analytics_sql_base: &'a str,
     now: OffsetDateTime,
 }
 
@@ -580,43 +584,47 @@ impl Watcher<'_> {
 
     // ----- Analytics Engine: DO overloaded events -----
 
-    /// `stow_events` `blob1='overloaded'` count over the hour — the edge
-    /// writes the event at the point it catches a DO `overloaded` error
-    /// (#438); until that writer lands the count is legitimately 0.
+    /// `stow_cache_misses` overload count over the hour — the edge
+    /// writes `index1='#fault', blob1='overloaded'` points at every
+    /// overload it detects: the platform's "Durable Object is
+    /// overloaded" answer and its own queue-full refusals (stow#888).
+    /// `count()` over the same window is the liveness probe: a dataset
+    /// that received no points at all means the writer chain is down,
+    /// and the collector fails naming the dataset rather than reporting
+    /// a legitimate zero.
     async fn overloaded_reading(&self) -> Result<Vec<Reading>, String> {
-        // Additive estimate: `_sample_interval * double1` sums each
-        // point's engine-recorded interval times its stored weight —
-        // `count()` for today's unsampled writes, scaled if sampled.
-        let query = "SELECT sum(_sample_interval * double1) AS events FROM stow_events \
-                     WHERE blob1 = 'overloaded' \
-                     AND timestamp >= NOW() - INTERVAL '1' HOUR \
+        // `sumIf` keeps the additive estimate's shape — each point's
+        // `_sample_interval * double1` — restricted to the overload
+        // markers, so unsampled writes count as `count()` while sampled
+        // ones stay scaled.
+        let query = "SELECT sumIf(_sample_interval * double1, index1 = '#fault' AND blob1 = 'overloaded') AS events, \
+                     count() AS points FROM stow_cache_misses \
+                     WHERE timestamp >= NOW() - INTERVAL '1' HOUR \
                      FORMAT JSON";
-        let url = format!("{API_BASE}/accounts/{}/analytics_engine/sql", self.account);
-        let mut client = zenwave::client().timeout(std::time::Duration::from_secs(45));
-        let response = client
-            .post(&url)
-            .and_then(|request| {
-                request.header("Authorization", format!("Bearer {}", self.cf_token))
-            })
-            .map(|request| request.bytes_body(query.as_bytes().to_vec()))
-            .map_err(|error| format!("POST {url}: {error}"))?
-            .await
-            .map_err(|error| format!("POST {url}: {error}"))?
-            .error_for_status()
-            .await
-            .map_err(|error| format!("POST {url}: {error}"))?;
-        let envelope: Envelope<AnalyticsRow> = response
-            .into_json()
-            .await
-            .map_err(|error| format!("decode {url}: {error}"))?;
-        let events = envelope.data.first().map_or(0.0, |row| row.events);
+        let rows = cloudflare::analytics_engine_sql::<AnalyticsRow>(
+            self.analytics_sql_base,
+            self.cf_token,
+            self.account,
+            query,
+        )
+        .await?;
+        let row = rows
+            .first()
+            .ok_or_else(|| "stow_cache_misses aggregate query returned no row".to_owned())?;
+        if row.points == 0 {
+            return Err(
+                "stow_cache_misses received no points in the last hour — the edge's analytics writer chain is down"
+                    .to_owned(),
+            );
+        }
         let signal = signal("edge.do.overloaded");
         Ok(vec![Reading {
             signal,
-            sample: 1,
-            value: events,
+            sample: row.points,
+            value: row.events,
             evidence: vec![format!(
-                "stow_events blob1='overloaded' last hour: {events}"
+                "stow_cache_misses index1='#fault' blob1='overloaded' last hour: {}",
+                row.events
             )],
         }])
     }
@@ -1419,10 +1427,14 @@ impl CfSnapshot {
 
 #[derive(Debug, serde::Deserialize)]
 struct AnalyticsRow {
-    // `sum(_sample_interval * double1)` is a Float64 — a plain JSON
-    // number (the quoted form is accepted too).
+    // `sumIf(_sample_interval * double1, …)` is a Float64 — a plain
+    // JSON number (the quoted form is accepted too).
     #[serde(default, deserialize_with = "analytics::de_f64")]
     events: f64,
+    /// `count()` over the window — the liveness probe; `UInt64` arrives
+    /// quoted on the wire.
+    #[serde(default, deserialize_with = "analytics::de_u64")]
+    points: u64,
 }
 
 // ----- GitHub wire types -----
@@ -2287,6 +2299,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
     let zone = maintenance::zone_id()?;
     let host = maintenance::host_from_url(edge.base()).map_err(|error| stow_error!("{error}"))?;
+    let sql_base = cloudflare::analytics_sql_base()?;
     let watcher = Watcher {
         edge,
         gh_token: &gh_token,
@@ -2294,6 +2307,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         account: &account,
         zone: &zone,
         host: &host,
+        analytics_sql_base: &sql_base,
         now: OffsetDateTime::now_utc(),
     };
 
@@ -2581,6 +2595,7 @@ async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
     let zone = maintenance::zone_id()?;
     let host = maintenance::host_from_url(edge.base()).map_err(|error| stow_error!("{error}"))?;
+    let sql_base = cloudflare::analytics_sql_base()?;
     let watcher = Watcher {
         edge,
         gh_token: &gh_token,
@@ -2588,6 +2603,7 @@ async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         account: &account,
         zone: &zone,
         host: &host,
+        analytics_sql_base: &sql_base,
         now: OffsetDateTime::now_utc(),
     };
     let mut outcome = ApplyOutcome::default();
@@ -3118,15 +3134,131 @@ mod tests {
     /// aggregates — `"0"` decodes just like `0` (issue #485).
     #[test]
     fn analytics_response_decodes_quoted_numbers() {
-        let json =
-            r#"{"meta":[{"name":"events","type":"UInt64"}],"data":[{"events":"0"}],"rows":1}"#;
-        let envelope: Envelope<AnalyticsRow> = serde_json::from_str(json).unwrap();
+        let json = r#"{"meta":[{"name":"events","type":"Float64"},{"name":"points","type":"UInt64"}],"data":[{"events":"0","points":"42"}],"rows":1}"#;
+        let envelope: analytics::Envelope<AnalyticsRow> = serde_json::from_str(json).unwrap();
         assert_eq!(envelope.data[0].events, 0.0);
+        assert_eq!(envelope.data[0].points, 42);
         // An unquoted number decodes too — a Float64 column stays a
         // plain JSON number on the wire.
-        let envelope: Envelope<AnalyticsRow> =
-            serde_json::from_str(r#"{"data":[{"events":17}]}"#).unwrap();
+        let envelope: analytics::Envelope<AnalyticsRow> =
+            serde_json::from_str(r#"{"data":[{"events":17,"points":5}]}"#).unwrap();
         assert_eq!(envelope.data[0].events, 17.0);
+        assert_eq!(envelope.data[0].points, 5);
+    }
+
+    /// A `Watcher` pointed at a loopback Analytics Engine fixture —
+    /// every field but `analytics_sql_base` is inert for the overload
+    /// collector.
+    fn sql_watcher<'a>(edge: &'a crate::Edge, sql_base: &'a str) -> Watcher<'a> {
+        Watcher {
+            edge,
+            gh_token: "gh-test",
+            cf_token: "cf-test",
+            account: "test-account",
+            zone: "zone-test",
+            host: "stow.waterui.dev",
+            analytics_sql_base: sql_base,
+            now: OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn sql_edge() -> crate::Edge {
+        crate::Edge {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: None,
+            version_override: None,
+        }
+    }
+
+    /// The watchdog query must name the live dataset and carry both the
+    /// fault marker and the liveness aggregate — asserted off the
+    /// captured request, not presumed.
+    fn assert_watchdog_sql(body: &[u8]) {
+        let sql = std::str::from_utf8(body).expect("SQL body is UTF-8");
+        assert!(sql.contains("stow_cache_misses"), "{sql}");
+        assert!(sql.contains("index1 = '#fault'"), "{sql}");
+        assert!(sql.contains("blob1 = 'overloaded'"), "{sql}");
+        assert!(sql.contains("count() AS points"), "{sql}");
+    }
+
+    /// Overload points over the trailing hour → the reading breaches
+    /// the `edge.do.overloaded` threshold (`Effect::Alert`), with the
+    /// dataset point count as the sample basis.
+    #[tokio::test]
+    async fn overloaded_reading_alerts_above_threshold() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: r#"{"meta":[],"data":[{"events":"3","points":"17"}],"rows":1}"#,
+        }])
+        .await;
+        let edge = sql_edge();
+        let watcher = sql_watcher(&edge, &server.url);
+        let readings = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            watcher.overloaded_reading(),
+        )
+        .await
+        .expect("read completes within the deadline")
+        .expect("a live dataset with overload points reads");
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].signal.id, "edge.do.overloaded");
+        assert_eq!(readings[0].sample, 17);
+        assert_eq!(verdict(&readings[0]), Verdict::Breach);
+        let requests = server.join().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].head.uri.path(),
+            "/accounts/test-account/analytics_engine/sql"
+        );
+        assert_watchdog_sql(&requests[0].body);
+    }
+
+    /// A live dataset (`points` > 0) with zero overload markers → the
+    /// signal is `clear`, not an incident.
+    #[tokio::test]
+    async fn overloaded_reading_clears_on_live_dataset() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: r#"{"meta":[],"data":[{"events":"0","points":"42"}],"rows":1}"#,
+        }])
+        .await;
+        let edge = sql_edge();
+        let watcher = sql_watcher(&edge, &server.url);
+        let readings = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            watcher.overloaded_reading(),
+        )
+        .await
+        .expect("read completes within the deadline")
+        .expect("a live dataset reads");
+        assert_eq!(verdict(&readings[0]), Verdict::Clear);
+        assert_watchdog_sql(&server.join().await[0].body);
+    }
+
+    /// A dataset that received no points at all in the window is a dead
+    /// writer chain — the collector fails and the error names
+    /// `stow_cache_misses`, never a silent zero.
+    #[tokio::test]
+    async fn overloaded_reading_fails_on_dead_dataset() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: r#"{"meta":[],"data":[{"events":"0","points":"0"}],"rows":1}"#,
+        }])
+        .await;
+        let edge = sql_edge();
+        let watcher = sql_watcher(&edge, &server.url);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            watcher.overloaded_reading(),
+        )
+        .await
+        .expect("read completes within the deadline")
+        .expect_err("a pointless dataset is a collector failure");
+        assert!(error.contains("stow_cache_misses"), "{error}");
+        server.join().await;
     }
 
     /// A GraphQL `errors` array is a hard error — never a partial read.
