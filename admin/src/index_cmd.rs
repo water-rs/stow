@@ -22,7 +22,7 @@
 //! `<file>.prev` — the base `index report`'s
 //! `{base_generation, added, retired}` delta diffs against.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use clap::{Args, Subcommand};
 use futures_util::{StreamExt as _, TryStreamExt as _};
@@ -38,6 +38,7 @@ use stow_types::registry::{CacheRepository, cache_repository, sha256_digest};
 use stow_types::stow_error;
 
 use crate::Edge;
+use crate::cloudflare;
 use crate::render;
 use zenwave::ResponseExt as _;
 
@@ -101,6 +102,10 @@ pub enum IndexCommand {
     /// list `index-publish.yml` iterates, read from the binary so the
     /// workflow never carries its own copy.
     Targets,
+    /// Resolve the public hit leaderboard's bundle digests to crate
+    /// identities through the signed index slices (stow#889) — the
+    /// edge keeps no identity store, so the offline join lives here.
+    Join(IndexJoinArgs),
 }
 
 #[derive(Args)]
@@ -128,6 +133,15 @@ pub struct IndexSyncArgs {
     /// The `new-records.json` file `index export` wrote.
     #[arg(long)]
     file: std::path::PathBuf,
+}
+
+#[derive(Args)]
+pub struct IndexJoinArgs {
+    /// The rustc whose `index.<target>.<rustc>` slices resolve the
+    /// digests — repeat for every rustc that published during the
+    /// leaderboard's window.
+    #[arg(long = "rustc-version")]
+    rustc_versions: Vec<String>,
 }
 
 /// One entry of the `slices.json` array `index export` writes — also the
@@ -233,6 +247,7 @@ pub async fn run(args: IndexArgs) -> stow_types::error::Result<()> {
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())
         }
+        IndexCommand::Join(args) => index_join(args).await,
     }
 }
 
@@ -1181,6 +1196,166 @@ async fn publish_index_mock(
     Ok((report.manifest_digest, outcome))
 }
 
+/// `CF_ACCOUNT_ID` — the account the digest leaderboard's Analytics
+/// Engine SQL reads.
+const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
+
+/// The edge's 30-day digest leaderboard query, shared so the join
+/// resolves exactly the rows `/stats` and `/api/v1/stats` publish.
+const TOP_DIGESTS_SQL: &str = include_str!("../../edge/src/sql/stats_top_digests.sql");
+
+/// One row of [`TOP_DIGESTS_SQL`] — `(digest, scaled hits)`; the sum
+/// is `Float64` on the wire.
+#[derive(Debug, serde::Deserialize)]
+pub struct DigestLeaderboardRow {
+    /// The served bundle digest, `sha256:…`.
+    pub name: String,
+    /// The edge-observed hit count — an undercount of real usage, the
+    /// same caveat the leaderboard itself carries.
+    #[serde(deserialize_with = "stow_types::analytics::de_f64")]
+    pub hits: f64,
+}
+
+/// The crate identity a verified index slice gives one bundle digest —
+/// crate, version, target and rustc.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinedIdentity {
+    /// Crate name as published on crates.io.
+    pub crate_name: String,
+    /// Exact crate version.
+    pub version: String,
+    /// The slice's compilation target.
+    pub target: String,
+    /// The slice's rustc version.
+    pub rustc_version: String,
+}
+
+/// One leaderboard row after the join — `None` when no verified slice
+/// carries the digest (a bundle published before the current slices,
+/// or one whose slice was re-exported under a different format).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinedEntry {
+    /// The edge-observed hit count.
+    pub hits: f64,
+    /// The digest's identity from a verified slice.
+    pub identity: Option<JoinedIdentity>,
+}
+
+/// Resolve each leaderboard digest against the rows of verified
+/// slices. One digest names one bundle across every slice, so the
+/// first match wins — the same digest never maps to two identities.
+pub fn join_leaderboard(
+    digests: Vec<DigestLeaderboardRow>,
+    slices: &[ArtifactIndex],
+) -> Vec<JoinedEntry> {
+    let lookup: HashMap<&str, (&ArtifactIndexHeader, &ArtifactIndexRow)> = slices
+        .iter()
+        .flat_map(|index| {
+            index
+                .rows
+                .iter()
+                .map(|row| (row.bundle_digest.as_str(), (&index.header, row)))
+        })
+        .collect();
+    digests
+        .into_iter()
+        .map(|row| JoinedEntry {
+            hits: row.hits,
+            identity: lookup
+                .get(row.name.as_str())
+                .map(|(header, row)| JoinedIdentity {
+                    crate_name: row.crate_name.to_string(),
+                    version: row.version.to_string(),
+                    target: header.target.to_string(),
+                    rustc_version: header.rustc_version.to_string(),
+                }),
+        })
+        .collect()
+}
+
+/// `index join` — pull the public digest leaderboard from Analytics
+/// Engine, pull and verify the signed index slices for each named
+/// rustc, and print the resolved leaderboard. The edge publishes the
+/// digest under an undercount caveat; the identity here is the same
+/// one the CLI resolved when it fetched the bundle.
+async fn index_join(args: IndexJoinArgs) -> stow_types::error::Result<()> {
+    let token = cloudflare::api_token()?;
+    let account =
+        std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
+    let sql_base = cloudflare::analytics_sql_base()?;
+    let digests = cloudflare::analytics_engine_sql::<DigestLeaderboardRow>(
+        &sql_base,
+        &token,
+        &account,
+        TOP_DIGESTS_SQL,
+    )
+    .await
+    .map_err(|error| stow_error!("analytics engine: {error}"))?;
+
+    let base = registry_base()?;
+    let http = stow_oci::RegistryHttp::new().await?;
+    let trust = records_trust().await?;
+    let mut slices = Vec::new();
+    for version in &args.rustc_versions {
+        let rustc_version = WireRustcVersion::parse(version.clone())
+            .map_err(|error| stow_error!("--rustc-version: {error}"))?;
+        let repository = cache_repository(&rustc_version);
+        let session = base.session(&repository, &http);
+        let mut tags = session
+            .list_tags()
+            .await
+            .map_err(|error| stow_error!("list registry tags: {error}"))?;
+        tags.sort();
+        let pulls = tags.into_iter().filter_map(|tag| {
+            let target = index_tag_parts(&tag)?.0.to_owned();
+            Some((tag, target))
+        });
+        let pulls: Vec<_> = pulls
+            .map(|(tag, target)| {
+                let session = &session;
+                let repository = &repository;
+                let trust = &trust;
+                let rustc_version = &rustc_version;
+                async move {
+                    let Some(pulled) =
+                        stow_oci::pull_index(session, &target, rustc_version.as_str()).await?
+                    else {
+                        return Err(stow_error!(
+                            "index tag {tag} listed but its manifest does not exist"
+                        ));
+                    };
+                    let reference = session.reference(&tag)?;
+                    verify_artifact(
+                        session,
+                        trust,
+                        &reference,
+                        &repository.reference(&tag),
+                        &pulled.manifest_digest,
+                        INDEX_CERT_URL,
+                    )
+                    .await?;
+                    decode_published_slice(&reference, rustc_version, &pulled.bytes)
+                }
+            })
+            .collect();
+        slices.extend(futures_util::future::try_join_all(pulls).await?);
+    }
+
+    for entry in join_leaderboard(digests, &slices) {
+        let identity = entry.identity.map_or_else(
+            || "unresolved".to_owned(),
+            |identity| {
+                format!(
+                    "{}@{} {} {}",
+                    identity.crate_name, identity.version, identity.target, identity.rustc_version
+                )
+            },
+        );
+        render::emit_line(&format!("{identity}\t{:.0}", entry.hits));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2027,5 +2202,36 @@ mod tests {
         .expect_err("a non-conflict refusal is an error");
         let requests = server.join().await;
         assert_eq!(requests.len(), 1, "no resync follows a non-409 refusal");
+    }
+
+    /// The join resolves a leaderboard digest to its crate identity
+    /// through a fixture slice's row and leaves a digest no slice
+    /// carries marked unresolved (stow#889).
+    #[test]
+    fn join_leaderboard_resolves_digests_through_slice_rows() {
+        let index = prev_index(vec![record_to_index_row(&record("ab12"))], 1);
+        let digest = index.rows[0].bundle_digest.clone();
+        let joined = join_leaderboard(
+            vec![
+                DigestLeaderboardRow {
+                    name: digest,
+                    hits: 30.0,
+                },
+                DigestLeaderboardRow {
+                    name: "sha256:unpublished".to_owned(),
+                    hits: 20.0,
+                },
+            ],
+            &[index],
+        );
+        assert_eq!(joined.len(), 2);
+        let identity = joined[0].identity.as_ref().expect("resolved identity");
+        assert_eq!(identity.crate_name, "serde");
+        assert_eq!(identity.version, "1.0.0");
+        assert_eq!(identity.target, TARGET);
+        assert_eq!(identity.rustc_version, RUSTC);
+        assert_eq!(joined[0].hits, 30.0);
+        assert!(joined[1].identity.is_none());
+        assert_eq!(joined[1].hits, 20.0);
     }
 }

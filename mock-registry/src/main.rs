@@ -1946,10 +1946,12 @@ async fn analytics_engine_sql_answer(
         "errors": [],
         "messages": [],
         "data": [{
+            "builds_24h": 42.0,
             "hits_24h": 420.0,
-            "hit_compile_millis_30d": 3_600_000.0,
+            "misses_24h": 30.0,
+            "cpu_millis_saved_30d": 3_600_000.0,
             "install_days_7d": "140",
-            "misses_24h": "30",
+            "install_days": "30",
             "name": "mock-crate",
             "hits": 420.0
         }]

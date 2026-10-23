@@ -364,33 +364,47 @@ impl EventLog for RecordingEventLog {
     }
 }
 
-/// `stats_events.sql` — hit totals and CPU milliseconds saved, from the
-/// `stow_events` dataset.
+/// `stats_events.sql` — builds, hits, misses and CPU milliseconds saved,
+/// from the `build` points of the `stow_events` dataset.
 const EVENTS_SQL: &str = include_str!("sql/stats_events.sql");
 
 /// `stats_installs.sql` — distinct install-days over 7 days, from the
 /// `stow_events` dataset.
 const INSTALLS_SQL: &str = include_str!("sql/stats_installs.sql");
 
-/// `stats_misses.sql` — unsampled miss count, from `stow_cache_misses`.
-const MISSES_SQL: &str = include_str!("sql/stats_misses.sql");
+/// `stats_top_digests.sql` — the 10 most-served bundle digests over 30
+/// days.
+const TOP_DIGESTS_SQL: &str = include_str!("sql/stats_top_digests.sql");
 
-/// `stats_top_crates.sql` — the 10 most-served crates over 30 days.
-const TOP_CRATES_SQL: &str = include_str!("sql/stats_top_crates.sql");
+/// `stats_rustc_versions.sql` — hits per rustc version over 30 days.
+const RUSTC_VERSIONS_SQL: &str = include_str!("sql/stats_rustc_versions.sql");
 
-/// `stats_targets.sql` — hits per compilation target over 30 days.
-const TARGETS_SQL: &str = include_str!("sql/stats_targets.sql");
-
-/// `stats_cli_versions.sql` — hits per `stow-cli` version over 30 days.
+/// `stats_cli_versions.sql` — reported activity per `stow-cli` version
+/// over 30 days.
 const CLI_VERSIONS_SQL: &str = include_str!("sql/stats_cli_versions.sql");
+
+/// `stats_operating_systems.sql` — reported activity per operating
+/// system over 30 days.
+const OPERATING_SYSTEMS_SQL: &str = include_str!("sql/stats_operating_systems.sql");
+
+/// `stats_countries.sql` — reported activity per request country over
+/// 30 days.
+const COUNTRIES_SQL: &str = include_str!("sql/stats_countries.sql");
+
+/// `stats_environments.sql` — reported activity split between CI and
+/// local builds over 30 days.
+const ENVIRONMENTS_SQL: &str = include_str!("sql/stats_environments.sql");
 
 /// The Analytics Engine SQL API prefix `run_sql` posts under when no
 /// `STOW_STATS_SQL_URL` override points the route at a stub.
 pub const SQL_API_URL: &str = "https://api.cloudflare.com/client/v4/accounts";
 
-/// Below this many distinct installs per day the figure is suppressed —
-/// stow publishes no small counts that could single out a user.
-const MIN_PUBLISHABLE_INSTALLS: f64 = 20.0;
+/// Below this many distinct installs per day — or distinct
+/// install-days inside one leaderboard bucket — the figure is
+/// suppressed: stow publishes no small counts that could single out a
+/// user, and a bucket is only publishable when at least this many
+/// installs' daily hashes landed in it.
+const MIN_PUBLISHABLE_INSTALLS: u64 = 20;
 
 /// The demand-feed query rendered from the checked-in
 /// `templates/demand_feed.sql` askama template — the only
@@ -414,9 +428,13 @@ const INSTALL_WINDOW_DAYS: f64 = 7.0;
 #[derive(Debug, Deserialize)]
 struct EventsRow {
     #[serde(deserialize_with = "analytics::de_f64")]
+    builds_24h: f64,
+    #[serde(deserialize_with = "analytics::de_f64")]
     hits_24h: f64,
     #[serde(deserialize_with = "analytics::de_f64")]
-    hit_compile_millis_30d: f64,
+    misses_24h: f64,
+    #[serde(deserialize_with = "analytics::de_f64")]
+    cpu_millis_saved_30d: f64,
 }
 
 /// One row of [`INSTALLS_SQL`]. `count(DISTINCT …)` is a `UInt64`,
@@ -427,22 +445,34 @@ struct InstallsRow {
     install_days_7d: u64,
 }
 
-/// One row of [`MISSES_SQL`]. `sum(_sample_interval * double1)` is
-/// a `Float64` — an estimate that is integral under today's
-/// double1 = 1.0 write pattern.
-#[derive(Debug, Deserialize)]
-struct MissesRow {
-    #[serde(deserialize_with = "analytics::de_f64")]
-    misses_24h: f64,
-}
-
-/// One row of a leaderboard query — `(name, scaled hits)`; `sum` over
-/// `double1` is `Float64`.
+/// One row of a leaderboard query — `(name, scaled hits, distinct
+/// install-days)`; the `sum` is `Float64` and `count(DISTINCT index1)`
+/// a quoted `UInt64` on the wire.
 #[derive(Debug, Deserialize)]
 struct LeaderboardRow {
     name: String,
     #[serde(deserialize_with = "analytics::de_f64")]
     hits: f64,
+    #[serde(deserialize_with = "analytics::de_u64")]
+    install_days: u64,
+}
+
+/// The six leaderboard query results — one `Vec<LeaderboardRow>` per
+/// published dimension.
+#[derive(Debug)]
+struct LeaderboardRows {
+    /// Most-served bundle digests (`blob10` of `hit` points).
+    top_digests: Vec<LeaderboardRow>,
+    /// Hits per rustc (`blob3` of `hit` points).
+    rustc_versions: Vec<LeaderboardRow>,
+    /// Reported activity per `stow-cli` version (`blob7` of `build`).
+    cli_versions: Vec<LeaderboardRow>,
+    /// Reported activity per OS (`blob8` of `build` points).
+    operating_systems: Vec<LeaderboardRow>,
+    /// Reported activity per request country (`blob11` of `build`).
+    countries: Vec<LeaderboardRow>,
+    /// Reported activity per CI/local (`blob12` of `build` points).
+    environments: Vec<LeaderboardRow>,
 }
 
 /// Map the six query results into the public [`UsageStats`]. The SQL
@@ -459,13 +489,11 @@ struct LeaderboardRow {
 fn usage_stats_from_rows(
     events: &EventsRow,
     installs: &InstallsRow,
-    misses: &MissesRow,
-    top_crates: Vec<LeaderboardRow>,
-    targets: Vec<LeaderboardRow>,
-    cli_versions: Vec<LeaderboardRow>,
+    leaderboards: LeaderboardRows,
 ) -> Result<UsageStats, String> {
+    let builds_24h = analytics::f64_to_u64_exact(events.builds_24h, "builds_24h")?;
     let hits_24h = analytics::f64_to_u64_exact(events.hits_24h, "hits_24h")?;
-    let misses_24h = analytics::f64_to_u64_exact(misses.misses_24h, "misses_24h")?;
+    let misses_24h = analytics::f64_to_u64_exact(events.misses_24h, "misses_24h")?;
     let served_24h = hits_24h
         .checked_add(misses_24h)
         .ok_or_else(|| "served_24h overflows u64".to_owned())?;
@@ -474,9 +502,9 @@ fn usage_stats_from_rows(
     } else {
         hits_24h as f64 / served_24h as f64
     };
-    let cpu_hours_saved_30d = events.hit_compile_millis_30d / 3_600_000.0;
+    let cpu_hours_saved_30d = events.cpu_millis_saved_30d / 3_600_000.0;
     let daily_installs = installs.install_days_7d as f64 / INSTALL_WINDOW_DAYS;
-    let daily_active_installs_7d = if daily_installs >= MIN_PUBLISHABLE_INSTALLS {
+    let daily_active_installs_7d = if daily_installs >= MIN_PUBLISHABLE_INSTALLS as f64 {
         Some(analytics::f64_to_u64_exact(
             daily_installs.round(),
             "daily installs",
@@ -484,8 +512,12 @@ fn usage_stats_from_rows(
     } else {
         None
     };
+    // A bucket fewer than `MIN_PUBLISHABLE_INSTALLS` distinct
+    // install-days landed in stays unpublished — however many hits
+    // those installs produced.
     let entries = |rows: Vec<LeaderboardRow>| {
         rows.into_iter()
+            .filter(|row| row.install_days >= MIN_PUBLISHABLE_INSTALLS)
             .map(|row| {
                 Ok(UsageStatEntry {
                     name: row.name,
@@ -496,13 +528,17 @@ fn usage_stats_from_rows(
     };
     Ok(UsageStats {
         daily_active_installs_7d,
+        builds_24h,
         hits_24h,
         misses_24h,
         hit_rate_24h,
         cpu_hours_saved_30d,
-        top_crates_30d: entries(top_crates)?,
-        targets_30d: entries(targets)?,
-        cli_versions_30d: entries(cli_versions)?,
+        top_digests_30d: entries(leaderboards.top_digests)?,
+        rustc_versions_30d: entries(leaderboards.rustc_versions)?,
+        cli_versions_30d: entries(leaderboards.cli_versions)?,
+        operating_systems_30d: entries(leaderboards.operating_systems)?,
+        countries_30d: entries(leaderboards.countries)?,
+        environments_30d: entries(leaderboards.environments)?,
     })
 }
 
@@ -773,24 +809,38 @@ mod worker {
         // Six independent HTTP queries against the same analytics
         // endpoint — one shared transport, a fixed `try_join` bound of
         // six, first error propagates.
-        let (events, installs, misses, top_crates, targets, cli_versions) = futures_util::try_join!(
+        let (
+            events,
+            installs,
+            top_digests,
+            rustc_versions,
+            cli_versions,
+            operating_systems,
+            countries,
+            environments,
+        ) = futures_util::try_join!(
             run_sql(context, super::EVENTS_SQL),
             run_sql(context, super::INSTALLS_SQL),
-            run_sql(context, super::MISSES_SQL),
-            run_sql(context, super::TOP_CRATES_SQL),
-            run_sql(context, super::TARGETS_SQL),
+            run_sql(context, super::TOP_DIGESTS_SQL),
+            run_sql(context, super::RUSTC_VERSIONS_SQL),
             run_sql(context, super::CLI_VERSIONS_SQL),
+            run_sql(context, super::OPERATING_SYSTEMS_SQL),
+            run_sql(context, super::COUNTRIES_SQL),
+            run_sql(context, super::ENVIRONMENTS_SQL),
         )?;
         let events = first_row(events, "stats_events")?;
         let installs = first_row(installs, "stats_installs")?;
-        let misses = first_row(misses, "stats_misses")?;
         super::usage_stats_from_rows(
             &events,
             &installs,
-            &misses,
-            top_crates,
-            targets,
-            cli_versions,
+            super::LeaderboardRows {
+                top_digests,
+                rustc_versions,
+                cli_versions,
+                operating_systems,
+                countries,
+                environments,
+            },
         )
         .map_err(crate::errors::GetArtifactError::InternalWithMessage)
     }
@@ -803,15 +853,16 @@ pub use worker::{StatsContext, compute_usage_stats, demand_feed_query};
 mod tests {
     use super::{
         AnalyticsConsent, DemandFeedSql, EventsRow, Hit, HitTelemetry, InstallsRow, LeaderboardRow,
-        MissesRow, RecordingEventLog, install_hash, record_build_report, record_hit,
+        LeaderboardRows, RecordingEventLog, install_hash, record_build_report, record_hit,
         usage_stats_from_rows, user_agent_dimensions,
     };
     use stow_types::api::BuildReport;
 
-    fn leaderboard(name: &str, hits: f64) -> LeaderboardRow {
+    fn leaderboard(name: &str, hits: f64, install_days: u64) -> LeaderboardRow {
         LeaderboardRow {
             name: name.to_owned(),
             hits,
+            install_days,
         }
     }
 
@@ -824,30 +875,33 @@ mod tests {
     fn format_json_rows_decode_through_to_usage_stats() {
         type Envelope<T> = stow_types::analytics::Envelope<T>;
         let events: Envelope<EventsRow> = serde_json::from_str(
-            r#"{"data":[{"hits_24h":1234.0,"hit_compile_millis_30d":9000000.0}]}"#,
+            r#"{"data":[{"builds_24h":50.0,"hits_24h":1234.0,"misses_24h":101.0,"cpu_millis_saved_30d":9000000.0}]}"#,
         )
         .expect("events");
         let installs: Envelope<InstallsRow> =
             serde_json::from_str(r#"{"data":[{"install_days_7d":"140"}]}"#).expect("installs");
-        // `misses_24h` is a `Float64` column — the quoted form decodes
-        // too, but the plain JSON number is the wire shape.
-        let misses: Envelope<MissesRow> =
-            serde_json::from_str(r#"{"data":[{"misses_24h":101.0}]}"#).expect("misses");
-        let top_crates: Envelope<LeaderboardRow> =
-            serde_json::from_str(r#"{"data":[{"name":"serde","hits":99.0}]}"#).expect("top crates");
+        let top_digests: Envelope<LeaderboardRow> = serde_json::from_str(
+            r#"{"data":[{"name":"sha256:ab","hits":99.0,"install_days":"30"}]}"#,
+        )
+        .expect("top digests");
         let stats = usage_stats_from_rows(
             &events.data[0],
             &installs.data[0],
-            &misses.data[0],
-            top_crates.data,
-            Vec::new(),
-            Vec::new(),
+            LeaderboardRows {
+                top_digests: top_digests.data,
+                rustc_versions: Vec::new(),
+                cli_versions: Vec::new(),
+                operating_systems: Vec::new(),
+                countries: Vec::new(),
+                environments: Vec::new(),
+            },
         )
         .expect("integral wire counts map");
+        assert_eq!(stats.builds_24h, 50);
         assert_eq!(stats.hits_24h, 1_234);
         assert_eq!(stats.misses_24h, 101);
         assert_eq!(stats.daily_active_installs_7d, Some(20));
-        assert_eq!(stats.top_crates_30d[0].hits, 99);
+        assert_eq!(stats.top_digests_30d[0].hits, 99);
         // A drifted column name (e.g. installs_24h) deserializes to an
         // error rather than a silently missing figure.
         assert!(
@@ -858,17 +912,21 @@ mod tests {
         // never a silent clamp or round.
         for bad in [serde_json::json!(1234.5), serde_json::json!(-1.0)] {
             let events: Envelope<EventsRow> = serde_json::from_value(serde_json::json!({
-                "data": [{"hits_24h": bad, "hit_compile_millis_30d": 0.0}]
+                "data": [{"builds_24h": 0.0, "hits_24h": bad, "misses_24h": 0.0, "cpu_millis_saved_30d": 0.0}]
             }))
             .expect("fractional events still decode as Float64");
             assert!(
                 usage_stats_from_rows(
                     &events.data[0],
                     &installs.data[0],
-                    &misses.data[0],
-                    Vec::new(),
-                    Vec::new(),
-                    Vec::new(),
+                    LeaderboardRows {
+                        top_digests: Vec::new(),
+                        rustc_versions: Vec::new(),
+                        cli_versions: Vec::new(),
+                        operating_systems: Vec::new(),
+                        countries: Vec::new(),
+                        environments: Vec::new(),
+                    },
                 )
                 .is_err()
             );
@@ -892,22 +950,34 @@ mod tests {
 
     #[test]
     fn usage_stats_mapping_scales_and_suppresses() {
-        // SUM(_sample_interval * double1) in SQL already applies the
+        // SUM(_sample_interval * double*) in SQL already applies the
         // sample weight — each count is integral.
         let stats = usage_stats_from_rows(
             &EventsRow {
+                builds_24h: 37.0,
                 hits_24h: 1_234.0,
-                hit_compile_millis_30d: 3_600_000.0 * 2.5,
+                misses_24h: 101.0,
+                cpu_millis_saved_30d: 3_600_000.0 * 2.5,
             },
             &InstallsRow {
                 install_days_7d: 19 * 7,
             },
-            &MissesRow { misses_24h: 101.0 },
-            vec![leaderboard("serde", 99.0)],
-            vec![leaderboard("x86_64-unknown-linux-gnu", 1_000.0)],
-            vec![leaderboard("0.5.0", 42.0)],
+            LeaderboardRows {
+                top_digests: vec![
+                    leaderboard("sha256:ab", 99.0, 30),
+                    // 500 scaled hits from only 3 distinct installs —
+                    // the bucket suppresses on install-days, not hits.
+                    leaderboard("sha256:cd", 500.0, 3),
+                ],
+                rustc_versions: vec![leaderboard("1.99.0", 1_000.0, 30)],
+                cli_versions: vec![leaderboard("0.5.0", 42.0, 25)],
+                operating_systems: vec![leaderboard("linux", 200.0, 30)],
+                countries: vec![leaderboard("US", 150.0, 30)],
+                environments: vec![leaderboard("ci", 80.0, 22), leaderboard("local", 120.0, 30)],
+            },
         )
         .expect("integral wire counts map");
+        assert_eq!(stats.builds_24h, 37);
         assert_eq!(stats.hits_24h, 1_234);
         assert_eq!(stats.misses_24h, 101);
         assert_eq!(stats.daily_active_installs_7d, None);
@@ -917,24 +987,39 @@ mod tests {
             stats.hit_rate_24h
         );
         assert!((stats.cpu_hours_saved_30d - 2.5).abs() < 1e-9);
-        assert_eq!(stats.top_crates_30d[0].name, "serde");
-        assert_eq!(stats.top_crates_30d[0].hits, 99);
+        // The 500-hit bucket is suppressed: only 3 distinct
+        // install-days landed in it, however large the hit count.
+        assert_eq!(stats.top_digests_30d.len(), 1);
+        assert_eq!(stats.top_digests_30d[0].name, "sha256:ab");
+        assert_eq!(stats.top_digests_30d[0].hits, 99);
+        assert_eq!(stats.rustc_versions_30d[0].name, "1.99.0");
+        assert_eq!(stats.cli_versions_30d[0].name, "0.5.0");
+        assert_eq!(stats.operating_systems_30d[0].name, "linux");
+        assert_eq!(stats.countries_30d[0].name, "US");
+        assert_eq!(stats.environments_30d.len(), 2);
+        assert_eq!(stats.environments_30d[0].name, "ci");
     }
 
     #[test]
     fn usage_stats_mapping_publishes_installs_at_threshold() {
         let stats = usage_stats_from_rows(
             &EventsRow {
+                builds_24h: 0.0,
                 hits_24h: 0.0,
-                hit_compile_millis_30d: 0.0,
+                misses_24h: 0.0,
+                cpu_millis_saved_30d: 0.0,
             },
             &InstallsRow {
                 install_days_7d: 20 * 7,
             },
-            &MissesRow { misses_24h: 0.0 },
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
+            LeaderboardRows {
+                top_digests: Vec::new(),
+                rustc_versions: Vec::new(),
+                cli_versions: Vec::new(),
+                operating_systems: Vec::new(),
+                countries: Vec::new(),
+                environments: Vec::new(),
+            },
         )
         .expect("integral wire counts map");
         assert_eq!(stats.daily_active_installs_7d, Some(20));

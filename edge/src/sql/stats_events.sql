@@ -1,15 +1,16 @@
--- Hit totals for the public stats surface, from the `stow_events`
--- dataset. The additive scaled estimate is SUM(_sample_interval *
--- double1): `_sample_interval` is the engine's recorded sampling
--- interval per point and `double1` the caller's stored weight, so
--- unsampled points (`_sample_interval` = 1) still count their full
--- weight. double2 is compile_millis. The install count lives in
--- stats_installs.sql: the Analytics Engine SQL API has no conditional
--- distinct count, so it needs its own WHERE clause. The outer WHERE
--- bounds the scan at the largest window any condition uses (30 days).
+-- Builds, cache hits, local compiles and CPU milliseconds saved, from
+-- the `build` points of the `stow_events` dataset: the installs' CLIs
+-- report each day's counters in one point (stow#889), doubles 2–5 the
+-- reported cpu_millis_saved, hits, misses and builds. Each point's
+-- stored weight is its sampling interval: SUM(_sample_interval *
+-- doubleN) is the exact count under today's unsampled writes and stays
+-- correct if the dataset ever samples. The outer WHERE bounds the scan
+-- at the largest window any condition uses (30 days).
 SELECT
-    sumIf(_sample_interval * double1, blob1 = 'hit' AND timestamp >= NOW() - INTERVAL '1' DAY) AS hits_24h,
-    sumIf(_sample_interval * double1 * double2, blob1 = 'hit' AND timestamp >= NOW() - INTERVAL '30' DAY) AS hit_compile_millis_30d
+    sumIf(_sample_interval * double5, blob1 = 'build' AND timestamp >= NOW() - INTERVAL '1' DAY) AS builds_24h,
+    sumIf(_sample_interval * double3, blob1 = 'build' AND timestamp >= NOW() - INTERVAL '1' DAY) AS hits_24h,
+    sumIf(_sample_interval * double4, blob1 = 'build' AND timestamp >= NOW() - INTERVAL '1' DAY) AS misses_24h,
+    sumIf(_sample_interval * double2, blob1 = 'build' AND timestamp >= NOW() - INTERVAL '30' DAY) AS cpu_millis_saved_30d
 FROM stow_events
 WHERE timestamp >= NOW() - INTERVAL '30' DAY
 FORMAT JSON

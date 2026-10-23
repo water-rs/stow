@@ -4243,22 +4243,41 @@ pub struct UsageStats {
     /// hits are sampled, so it is a lower bound). `None` below the minimum
     /// publication threshold — stow never reports small counts.
     pub daily_active_installs_7d: Option<u64>,
-    /// Cache hits served in the last 24 hours (sample-scaled estimate).
+    /// Builds the installs' CLIs counted in the last 24 hours, from the
+    /// daily build reports.
+    pub builds_24h: u64,
+    /// Artifacts served from the cache in the last 24 hours, from the
+    /// daily build reports.
     pub hits_24h: u64,
-    /// Cache misses served in the last 24 hours.
+    /// Artifacts compiled locally in the last 24 hours, from the daily
+    /// build reports.
     pub misses_24h: u64,
     /// `hits_24h / (hits_24h + misses_24h)`; `0.0` when nothing was served.
     pub hit_rate_24h: f64,
     /// CPU-hours of rustc compilation saved in the last 30 days: the
-    /// recorded compile time of every artifact served, sample-scaled.
+    /// recorded compile time of every artifact served, as the installs'
+    /// CLIs reported it.
     pub cpu_hours_saved_30d: f64,
-    /// Most-served crates over the last 30 days.
-    pub top_crates_30d: Vec<UsageStatEntry>,
-    /// Hits per compilation target over the last 30 days.
-    pub targets_30d: Vec<UsageStatEntry>,
-    /// Hits per CLI version over the last 30 days; requests that sent no
-    /// `stow-cli` user agent are not counted under any version.
+    /// Most-served bundle digests over the last 30 days, edge-observed —
+    /// an undercount of real usage, since the platform cache answers most
+    /// fetches before the Worker runs. The digest carries no identity;
+    /// `stow-admin` resolves each to a crate from the public signed
+    /// index.
+    pub top_digests_30d: Vec<UsageStatEntry>,
+    /// Hits per rustc version over the last 30 days, edge-observed.
+    pub rustc_versions_30d: Vec<UsageStatEntry>,
+    /// Reported activity per `stow-cli` version over the last 30 days;
+    /// requests that sent no `stow-cli` user agent are not counted under
+    /// any version.
     pub cli_versions_30d: Vec<UsageStatEntry>,
+    /// Reported activity per operating system over the last 30 days.
+    pub operating_systems_30d: Vec<UsageStatEntry>,
+    /// Reported activity per request country over the last 30 days —
+    /// Cloudflare's country code only.
+    pub countries_30d: Vec<UsageStatEntry>,
+    /// Reported activity split between CI and local builds over the
+    /// last 30 days.
+    pub environments_30d: Vec<UsageStatEntry>,
 }
 
 /// One `(name, hits)` bucket of a [`UsageStats`] leaderboard.
