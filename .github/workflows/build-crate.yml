@@ -101,14 +101,13 @@ jobs:
       # The debs ci/system-libs/install.sh verifies and extracts —
       # one cache entry per lock version, restored like the glibc
       # sysroot's, but re-verified against the lock's sha256 on every
-      # hit (stow#850). aarch64 only for now; B1/B2 extend the same
-      # mechanism to the toolchain sets and the x86_64 leg.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # hit (stow#850, stow#862). The restore/install/save lives in
+      # ./.github/actions/system-debs so the main-push warm-up fills
+      # the same entry the legs read.
+      - uses: ./.github/actions/system-debs
         if: endsWith(inputs.target, '-unknown-linux-gnu')
-        id: system-debs
         with:
-          path: ~/stow-system-debs
-          key: system-debs-${{ inputs.target }}-${{ hashFiles('ci/system-libs/lock.txt') }}
+          target: ${{ inputs.target }}
       - name: Configure the cross toolchain
         shell: bash
         env:
@@ -133,26 +132,12 @@ jobs:
                 echo "AR_${cc_key}=$ndk_bin/llvm-ar"
               } >> "$GITHUB_ENV"
               ;;
-            x86_64-unknown-linux-gnu)
-              # The system libraries crate build scripts link through
-              # pkg-config — the image ships only some (stow#729) — and
-              # mold: all from the sha256 lock (stow#850, stow#862),
-              # never through apt.
-              ci/system-libs/install.sh "$TASK_TARGET" \
-                "$HOME/stow-system-debs" "$HOME/stow-system-libs"
-              ;;
             aarch64-unknown-linux-gnu)
-              # Both architectures' system libraries come from the
-              # sha256 lock (stow#850): extracted into
-              # ~/stow-system-libs, never dpkg-installed, so the
-              # ports/multiarch coupling with the image is gone. The
-              # cross pkg-config is the sysroot-written
+              # Both architectures' system libraries and the cross
+              # toolchain come from the sha256 lock via the
+              # system-debs step above — never apt (stow#850, stow#862).
+              # The cross pkg-config is the sysroot-written
               # aarch64-linux-gnu-pkg-config, not pkgconf:arm64.
-              ci/system-libs/install.sh "$TASK_TARGET" \
-                "$HOME/stow-system-debs" "$HOME/stow-system-libs"
-              # The sysroot shims drive GCC 12 (stow#693) — installed from
-              # the lock too; install.sh links ld.mold into the cross
-              # toolchain's search path and smoke-tests the set.
               {
                 echo "CARGO_TARGET_${target_key}_LINKER=aarch64-linux-gnu-gcc"
                 echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
@@ -170,11 +155,6 @@ jobs:
               echo "SDKROOT=$(xcrun --sdk iphonesimulator --show-sdk-path)" >> "$GITHUB_ENV"
               ;;
           esac
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: endsWith(inputs.target, '-unknown-linux-gnu') && steps.system-debs.outputs.cache-hit != 'true'
-        with:
-          path: ~/stow-system-debs
-          key: ${{ steps.system-debs.outputs.cache-primary-key }}
       # The sysroot setup — install, compiler wrappers, untrusted-build
       # env — lives in ci/glibc-sysroot/*.sh so the mock end-to-end runs
       # build the way this job builds (stow#336).
