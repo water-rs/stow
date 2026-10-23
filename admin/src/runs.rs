@@ -44,7 +44,9 @@ fn parse_duration(raw: &str) -> Result<std::time::Duration, String> {
 }
 
 /// A failure class the log classifier can assign.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureClass {
     /// The toolchain or runner image lacks the task's target.
@@ -464,7 +466,6 @@ pub fn leg_build_job(jobs: &[RunJobRow], leg: u32) -> Option<&RunJobRow> {
 /// `Unsettled` plus its two settled answers (stow#853). Only the
 /// watch reads it; nothing does before that lands.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code))]
 pub enum LegProgress {
     /// The build job holds a matrix slot and waits for a runner.
     Queued,
@@ -485,13 +486,14 @@ pub enum LegProgress {
 /// One leg of a live `build-batch.yml` run — the watch's row, unused
 /// until the watch lands.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), expect(dead_code))]
 pub struct LiveLeg {
     /// The leg index — the `#N` in `leg N / build #N …`.
     pub leg: u32,
     /// The leg's [`TaskHash`] from its job names — `None` on an
     /// all-unrendered leg (stow#839), which the cancelled or skipped
-    /// paths produce.
+    /// paths produce. Only the records check reads it, and that lands
+    /// with the watch.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub hash: Option<TaskHash>,
     /// Where the leg is.
     pub progress: LegProgress,
@@ -513,7 +515,6 @@ pub struct LiveLeg {
 /// `classify_page`'s — plus an `Unsettled` leg with no build row or a
 /// build row reporting a status the table does not name: both are
 /// schema surprises, never a bucket.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn live_legs(
     jobs: &[RunJobRow],
     run_conclusion: &str,
@@ -546,7 +547,6 @@ pub fn live_legs(
 /// row carrying `success` is past the build stage whatever its
 /// `status` still says (stow#863), and `Unsettled` then means the
 /// publish row is absent or still running — `Publishing`.
-#[cfg_attr(not(test), expect(dead_code))]
 fn live_progress(leg: u32, jobs: &[RunJobRow]) -> stow_types::error::Result<LegProgress> {
     if jobs.iter().any(|job| {
         job.conclusion.as_deref() == Some("failure")

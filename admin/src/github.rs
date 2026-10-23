@@ -719,8 +719,7 @@ pub struct WorkflowRunRow {
     pub created_at: time::OffsetDateTime,
     /// Who dispatched the run — the App's `[bot]` login on
     /// scheduler-dispatched runs, the operator's on `preheat manual`.
-    /// The watch renders it; nothing reads it before that.
-    #[expect(dead_code)]
+    /// The watch renders it.
     pub actor: Actor,
 }
 
@@ -728,8 +727,7 @@ pub struct WorkflowRunRow {
 /// only by the watch.
 #[derive(Debug, serde::Deserialize)]
 pub struct Actor {
-    /// The actor's login — read by the watch only.
-    #[expect(dead_code)]
+    /// The actor's login — the watch renders it.
     pub login: String,
 }
 

@@ -35,6 +35,8 @@ mod source_trees;
 #[cfg(test)]
 mod test_server;
 mod traffic_cost;
+#[cfg_attr(not(test), expect(dead_code))]
+mod watch;
 mod watchdog;
 
 use std::fmt::Write as _;
