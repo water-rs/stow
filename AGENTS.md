@@ -6,8 +6,20 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 
 - stow is a graph of library and macro crates. A node is one crate at one identity: crate, version, feature set, target, rustc, profile, side, and the digest of its resolved dependency subgraph. Binaries, projects and workspaces are never nodes; they only name crates.
 - Every source of work names crates; the resolver (`stow-resolver`, run in the lanes, never the edge) turns names into nodes at the identities consumers compile. Edges are build order: a build compiles its own node and is served the rest, and compiling anything else is a defect.
-- A node's identity is the one a real consumer's build computes. Versions converge on the latest semver-compatible release; feature sets are never forced.
+- A node's identity is the one a real consumer's build computes. Versions converge on the latest semver-compatible release.
+- Feature sets are never unioned. A set contained in another set of the same crate, version, target and side is served by the smallest containing set, ties broken by the sorted list; CI and the CLI apply the same rule, and the CLI moves to another set only once the whole chain its build needs under that choice is published.
+- One task is one `build-crate.yml` run; dispatch is never batched.
 - Deduplication is node identity; no mechanism is added on top of it.
+
+## Architecture
+
+- The CI interface reports how many `build-crate.yml` runs are queued and running per runner family, and submits one task as one run. It is FIFO and never reorders. Only operations tooling and the scheduler use it.
+- The scheduler is one instance holding the dependency graph in memory. It persists only an append-only log and snapshots, appends an event before acknowledging it, and merges each submitted dependency tree by task id. It learns run state from `workflow_run` `in_progress` and `completed` deliveries and uses the CI interface's status only to reconcile.
+- Priority lives only in the scheduler: a node's rank is its priority times the time it has waited. Its entry points are:
+  - operations, at a priority the caller sets;
+  - the stow CLI, behind proof of work, at a very low default priority: on a cache miss, and on a hit served by a superset instead of the exact feature set, which queues the exact chain;
+  - stow.waterui.dev, at 30× the CLI's priority;
+  - preheat, which submits one dependency tree per source.
 
 ## Trust
 
