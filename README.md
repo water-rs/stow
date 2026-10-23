@@ -73,7 +73,7 @@ Every Rust developer compiles the same popular crates over and over. Stow replac
       v                           v  │                    bundles +    │  (workflow_dispatch)
   cargo target/          ┌───────────────────┐       records-<r>-<id>    │
       ▲                  │  Scheduler (DO)   │<───────────────┘         │
-      │                  │  (priority queue, │    a batch leg is done   │
+      │                  │  (priority queue, │    a task is done   │
       │                  │   dedup, dispatch)│    only once its records │
       │                  └────────┬──────────┘    artifact verifies      │
       │                           │ writes                            │
@@ -128,16 +128,16 @@ A Cloudflare Durable Object that manages the build queue. It exposes two public-
 
 Task completion arrives from GitHub's `workflow_run` webhook at `POST /api/v1/github/workflow-run` — trusted CI never calls the edge.
 
-Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — it raises the request count and recomputes the priority from the latest downloads and miss count, but `first_requested_at` is untouched, so a resubmit never lets a task jump its lane's queue. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-batch.yml` on `main` — one run packs up to 40 tasks as matrix legs, each leg calling `build-crate.yml`, which stays the signing identity.
+Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — it raises the request count and recomputes the priority from the latest downloads and miss count, but `first_requested_at` is untouched, so a resubmit never lets a task jump its lane's queue. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-crate.yml` on `main` — one task is one run.
 
 ### CI (`ci/`)
 
 The trusted build runner, hosted on GitHub Actions. This is the root of trust — every workflow run is public and auditable by anyone.
 
-1. Receives the batch as a `workflow_dispatch` input from the scheduler — `build-batch.yml`'s matrix calls `build-crate.yml` once per leg, and the leg reads its task out of the dispatch event file.
+1. Receives its task as the `workflow_dispatch` `task` input from the scheduler — `build-crate.yml` reads its `BuildTaskPayload` out of the dispatch event file.
 2. `build` job (read-only token, no secrets): builds the crate with the specified features, target, and rustc version, and hands the outputs over as a workflow artifact. Third-party build scripts run here and nowhere else.
 3. `publish` job (GHCR token, OIDC): validates the build output against the task and a dependency closure it resolves itself, then pushes the artifacts to OCI storage (GHCR) and signs them with cosign.
-4. Pushes the build's artifact records to GHCR as one cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` OCI artifact, under the same `build-crate.yml` identity. GitHub's `workflow_run` webhook — not the runner — reports the completed batch run to the edge; the scheduler then resolves each leg, completing its task only once the leg's records artifact verifies in GHCR.
+4. Pushes the build's artifact records to GHCR as one cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` OCI artifact, under the same `build-crate.yml` identity. GitHub's `workflow_run` webhook — not the runner — reports the completed run to the edge; the scheduler then completes the task once its records artifact verifies in GHCR.
 
 ### Admin (`admin/`)
 

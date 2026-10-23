@@ -359,13 +359,11 @@ skyzen deploy --provider cloudflare --manifest edge/Skyzen.toml
 
 ## CI runner (GitHub Actions)
 
-Trusted builds are `.github/workflows/build-batch.yml` on `main` of
+Trusted builds are `.github/workflows/build-crate.yml` on `main` of
 `water-rs/stow`. The scheduler dispatches it with `workflow_dispatch`
-(`ref: main`, one `batch` input carrying the JSON `BuildBatchPayload`),
-and the run's matrix calls `build-crate.yml` once per leg — the called
-workflow stays the signing identity, so batching changes nothing a
-client verifies;
-the runner is picked from the leg's target (`ubuntu-latest`,
+(`ref: main`, one `task` input carrying the JSON `BuildTaskPayload`) —
+one task is one run — and the workflow stays the signing identity;
+the runner is picked from the task's target (`ubuntu-latest`,
 `macos-14`, `windows-latest`). Add a target by extending the
 `runs-on` map in `build-crate.yml`.
 
@@ -376,17 +374,17 @@ its output directory as a workflow artifact. `publish` runs only when
 task and an independently resolved dependency closure, and only then
 pushes the bundle plus the build's `Vec<ArtifactRecord>` (as one signed
 OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`,
-one per leg) to GHCR, cosign-signing both
+one per task) to GHCR, cosign-signing both
 (keyless, `id-token: write`). The job never calls the edge — GitHub's
 `workflow_run` webhook delivery reports the outcome instead, and the
-scheduler's alarm pass checks the records artifact each successful leg
-published exists before completing its task. See
+scheduler's alarm pass checks the records artifact each successful task
+published exists before completing it. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
 publisher checks.
 
-`build-batch.yml` reads no repository variables — `run-name` carries
-`<rustc>-b<batch_id>` so the webhook's `display_title` parses back into
-the run's rustc and batch id.
+`build-crate.yml` reads no repository variables — `run-name` carries
+`<rustc>-<task_id>` so the webhook's `display_title` parses back into
+the run's rustc and task id.
 
 `GHCR_TOKEN` is the job's own `GITHUB_TOKEN` (`packages: write`), and
 cosign signs with the job's OIDC identity, so the certificate subject is
@@ -440,7 +438,7 @@ call is a GitHub identity, verified as described below.
 ### GitHub webhook — `workflow_run`
 
 Task completion reaches the scheduler through GitHub's webhook, not
-through CI: `build-batch.yml` sets `run-name` to `<rustc>-b<batch_id>` and a
+through CI: `build-crate.yml` sets `run-name` to `<rustc>-<task_id>` and a
 repository webhook POSTs `workflow_run` `completed` events to
 `https://stow.waterui.dev/api/v1/github/workflow-run`. Configure it once
 in the repo settings:
@@ -453,10 +451,10 @@ in the repo settings:
 - **Active:** on
 
 The route accepts a delivery only when the run is `completed` for
-`build-batch.yml` on `main`; it parses `display_title` into the run's
-rustc and batch id and forwards the run's identity to the scheduler's
-`POST /batches/{batch_id}/complete`. The alarm pass then resolves the
-batch from the run's attempt-jobs page, and a leg's task completes
+`build-crate.yml` on `main`; it parses `display_title` into the run's
+rustc and task id and forwards the run's identity to the scheduler's
+`POST /tasks/complete-run`. The alarm pass then resolves the
+task from the run's attempt-jobs page, and the task completes
 only after the records
 artifact its publish job pushed (tagged by run id and attempt)
 exists and verifies in GHCR, so a spoofed success cannot mint a catalog
@@ -533,15 +531,15 @@ stow-admin preheat top-binaries \
 
 Each invocation enqueues the resolved crate tasks and returns immediately. The
 scheduler dispatches them to GitHub Actions in parallel as
-`build-batch.yml` runs (subject to
-`STOW_MAX_CONCURRENT_JOBS`, default 45 — runner slots, the sum of
-in-flight batches' `parallelism` — the per-family
+`build-crate.yml` runs (subject to
+`STOW_MAX_CONCURRENT_JOBS`, default 45 — runner slots, one per
+in-flight run — the per-family
 `STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and
 `STOW_DISPATCH_MIN_AGE_MINUTES`; failed dispatches retry with
-exponential backoff, and a batch whose lease expires after
+exponential backoff, and a task whose lease expires after
 `STOW_STALE_DISPATCH_MINUTES`, default 60, has its run read: completed
 resolves as if the webhook had arrived, still-running extends the
-lease, unbound requeues its legs).
+lease, unbound requeues).
 
 For first-time bring-up, also run `preheat top` for the library base
 pool. The library pool and the binary pool are independent.

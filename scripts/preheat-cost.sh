@@ -473,16 +473,15 @@ start_lanes() {
     log "started the $phase lanes (pid $LANES_PID), log: $LOG_DIR/lanes-$phase.log"
 }
 
-# The local CI's `build-batch.yml` runs, as four counts: runs still in
-# flight, runs, legs across them, and legs that succeeded. A batch run
-# carries many legs, so the run count is the completions the scheduler
-# paid and the leg count the builds; successes count per leg, which is
+# The local CI's `build-crate.yml` runs, as four counts: runs still in
+# flight, runs, tasks across them, and tasks that succeeded. One task is
+# one run, so the run count is both the completions the scheduler paid
+# and the builds; successes count per task, which is
 # the task.
 local_ci_counts() {
     curl -fsS --max-time 30 "${LOCAL_CI_URL}/tasks" | jq -r '
-        [.tasks[] | select(.path == ".github/workflows/build-batch.yml")] as $runs
-        | [$runs[].legs[]] as $legs
-        | "\([$runs[] | select(.status != "completed")] | length) \($runs | length) \($legs | length) \([$legs[] | select(.conclusion == "success")] | length)"'
+        [.tasks[] | select(.path == ".github/workflows/build-crate.yml")] as $tasks
+        | "\([$tasks[] | select(.status != "completed")] | length) \($tasks | length) \([$tasks[] | select(.conclusion == "success")] | length)"'
 }
 
 ROUND=0
@@ -540,7 +539,7 @@ PUBLISHED_SUCCESSES=0
 
 drive_phase() {
     local phase="$1" deadline=$((SECONDS + PHASE_DEADLINE))
-    local counts inflight runs legs succeeded status
+    local counts inflight tasks succeeded status
     local pending dispatched running failed lanes_done
     while :; do
         check_children_alive
@@ -548,7 +547,7 @@ drive_phase() {
         lanes_done=0
         kill -0 "$LANES_PID" 2>/dev/null || lanes_done=1
         counts="$(local_ci_counts)" || die "local CI /tasks unreadable"
-        read -r inflight runs legs succeeded <<<"$counts"
+        read -r inflight tasks succeeded <<<"$counts"
         status="$(curl -fsS --max-time 30 "$SCHEDULER_URL/status")" || die "scheduler status unreadable"
         pending="$(jq -r .pending <<<"$status")"
         dispatched="$(jq -r .dispatched <<<"$status")"
@@ -564,7 +563,7 @@ drive_phase() {
                     start_edge
                 fi
                 PUBLISHED_SUCCESSES="$succeeded"
-                log "$phase: $legs legs in $runs batch runs so far ($(awk -v legs="$legs" -v runs="$runs" 'BEGIN { printf "%.2f", legs / runs }') legs/batch)"
+                log "$phase: $tasks task runs so far"
                 publish_round "$phase"
                 continue
             fi

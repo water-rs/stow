@@ -331,7 +331,7 @@ acting unless `--yes` is given.
   dependencies, oldest pending age, in-flight builds with their GitHub
   Actions run URLs, and per-target outcomes over the trailing 24 h.
   `--watch` repaints a live view of the scheduler queue merged with
-  `build-batch.yml`'s in-flight runs every 30 s until Ctrl-C; under
+  `build-crate.yml`'s in-flight runs every 30 s until Ctrl-C; under
   `--json` each frame is one NDJSON line per tick.
 - `stow-admin queue list [--status failed] [--target T] [--rustc V] [--crate X] [--older-than 24h]`
   — filtered queue rows; `queue retry|cancel|promote|purge`
@@ -343,8 +343,8 @@ acting unless `--yes` is given.
   fresh `attempt`, e.g. `--status failed --rustc V --target T`.
 - `stow-admin coverage <crate>[@version] [--target T]` — which servable
   identities exist per CI target, and which targets have none.
-- `stow-admin runs failures --since 24h` — classify the failed legs of
-  `build-batch.yml` runs from their job logs, grouped by failure class.
+- `stow-admin runs failures --since 24h` — classify the failed tasks of
+  `build-crate.yml` runs from their job logs, grouped by failure class.
 - `stow-admin artifacts inspect <c_metadata> --target T --rustc-version V`
   — the catalog row plus its OCI bundle manifest;
   `artifacts prune --rustc-version V --yes` deletes a retired toolchain's
@@ -421,18 +421,14 @@ acting unless `--yes` is given.
   closure expansion a request would produce; enqueues nothing.
 - `stow-admin preheat manual --crates <file>|--projects <file>
   --rustc-version <v> [--targets a,b] [--in-flight 45]
-  [--batch-parallelism 5] [--batch-max-tasks 40]
   [--source-trees <file>]` — the
   edge-free wave: resolve the input in-process, layer it against the
-  published index, dispatch `build-batch.yml` — one matrix run per
-  packed batch of legs — straight through GitHub's
+  published index, dispatch `build-crate.yml` — one run per
+  task — straight through GitHub's
   `workflow_dispatch`, and publish each index slice as its layer lands.
-  `--in-flight` counts runner slots, the sum of each in-flight batch's
-  `parallelism`; `--batch-parallelism` and `--batch-max-tasks` shape a
-  batch, defaulting to the scheduler's `STOW_BATCH_PARALLELISM` /
-  `STOW_BATCH_MAX_TASKS`. `--dry-run` packs the wave into the batches a
-  drive would send and prints each batch's legs, encoded size and fill
-  of the dispatch input cap — nothing is dispatched.
+  `--in-flight` bounds the runs in flight — one task is one run.
+  `--dry-run` prints each task's dispatch input and its encoded size —
+  nothing is dispatched.
   Works while Cloudflare is down. Resumable by index, exits non-zero
   with the failed runs' URLs. A run whose failed step is outside the
   build and publish stages — runner setup, toolchain install, artifact
@@ -456,7 +452,7 @@ acting unless `--yes` is given.
   push both to GHCR signed under the index workflow (mock deploys
   delegate to `stow-mock-registry publish-index`), and sync just this
   pass's new records into the edge's D1 catalog. `index-publish.yml`
-  runs this loop after every `build-batch` run. `index targets` lists
+  runs this loop after every `build-crate` run. `index targets` lists
   the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
