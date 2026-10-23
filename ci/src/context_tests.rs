@@ -9,7 +9,7 @@
 /// `RUSTUP_TOOLCHAIN=<release>` resolves it through the real rustup
 /// home the sandbox already grants.
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::OnceLock;
 
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -236,21 +236,9 @@ fn write_crate_tarball(
     hex::encode(Sha256::digest(std::fs::read(&tarball).unwrap()))
 }
 
-/// Process-global env mutations — every spawned `cargo`/`rustup` sees
-/// them — serialize every test that touches them.
-fn env_guard() -> MutexGuard<'static, ()> {
-    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-    // Poisoned guards mean an earlier test panicked while holding env —
-    // the mutations it made are still valid, so keep going.
-    GUARD
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// The `CARGO_HOME` the test process started with — captured before any
-/// test points it at a local registry, so spawned `cargo build`/`cargo
-/// resolve` commands for test binaries still see the real toolchain home.
+/// The `CARGO_HOME` the test process started with — read, never mutated
+/// — so spawned `cargo build`/`cargo resolve` commands for test binaries
+/// still see the real toolchain home.
 fn original_cargo_home() -> Option<PathBuf> {
     static ORIGINAL: OnceLock<Option<PathBuf>> = OnceLock::new();
     ORIGINAL
@@ -756,11 +744,13 @@ async fn wrapper_workspace(reg: &Path, task: &BuildTaskPayload) -> (TempDir, Bui
 /// local registry, then every `check`-phase unit graph must mint
 /// `task.task_id` — `verify_dependency_context` verbatim.
 async fn verify(
+    cargo_home: &Path,
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
 ) -> stow_types::error::Result<()> {
-    task::fetch_workspace_dependencies(task, workspace).await?;
-    let graphs = task::phase_unit_graphs(task, workspace, CargoSubcommand::Check).await?;
+    task::fetch_workspace_dependencies(cargo_home, task, workspace).await?;
+    let graphs =
+        task::phase_unit_graphs(cargo_home, task, workspace, CargoSubcommand::Check).await?;
     task::verify_dependency_context(task, &graphs)
 }
 
@@ -771,7 +761,6 @@ async fn verify(
 /// child context it was dispatched for.
 #[test]
 fn the_alloc_stdlib_shape_mints_two_ids_and_each_wrapper_verifies() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -821,13 +810,14 @@ fn the_alloc_stdlib_shape_mints_two_ids_and_each_wrapper_verifies() {
         "the same parent tuple over different child features is two tasks"
     );
 
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     smol::block_on(async {
         for task in [&task_a, &task_b] {
             let (_root, workspace) = wrapper_workspace(&reg, task).await;
-            verify(task, &workspace).await.unwrap_or_else(|error| {
-                panic!("wrapper for {} did not verify: {error:#}", task.task_id)
-            });
+            verify(cargo_home.path(), task, &workspace)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("wrapper for {} did not verify: {error:#}", task.task_id)
+                });
         }
     });
 }
@@ -839,7 +829,6 @@ fn the_alloc_stdlib_shape_mints_two_ids_and_each_wrapper_verifies() {
 /// never express.
 #[test]
 fn a_grandchild_widened_by_another_consumer_reproduces() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -894,11 +883,10 @@ fn a_grandchild_widened_by_another_consumer_reproduces() {
         "mid's subgraph pins the widened leaf feature set"
     );
 
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     let task = payload_for(&mid);
     smol::block_on(async {
         let (_root, workspace) = wrapper_workspace(&reg, &task).await;
-        verify(&task, &workspace)
+        verify(cargo_home.path(), &task, &workspace)
             .await
             .expect("widened grandchild context verifies");
     });
@@ -909,7 +897,6 @@ fn a_grandchild_widened_by_another_consumer_reproduces() {
 /// target-side node; both wrapper shapes verify.
 #[test]
 fn a_build_dep_and_a_normal_dep_at_different_features_verify() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -960,11 +947,10 @@ fn a_build_dep_and_a_normal_dep_at_different_features_verify() {
     assert_eq!(host_shared[0].features_json.raw(), "[\"bs\"]");
     assert_eq!(target_shared[0].features_json.raw(), "[\"norm\"]");
 
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     let task = payload_for(&target_side);
     smol::block_on(async {
         let (_root, workspace) = wrapper_workspace(&reg, &task).await;
-        verify(&task, &workspace)
+        verify(cargo_home.path(), &task, &workspace)
             .await
             .expect("split-side context verifies");
     });
@@ -974,7 +960,6 @@ fn a_build_dep_and_a_normal_dep_at_different_features_verify() {
 /// host-side and its dependencies pin under `[build-dependencies]`.
 #[test]
 fn a_proc_macro_subtree_verifies() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -1009,10 +994,9 @@ fn a_proc_macro_subtree_verifies() {
     assert!(pm.host_side, "a proc-macro task is host-side");
     let task = payload_for(&pm);
 
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     smol::block_on(async {
         let (_root, workspace) = wrapper_workspace(&reg, &task).await;
-        verify(&task, &workspace)
+        verify(cargo_home.path(), &task, &workspace)
             .await
             .expect("proc-macro subtree verifies");
     });
@@ -1025,7 +1009,6 @@ fn a_proc_macro_subtree_verifies() {
 /// task id all agree for both sides of `shared`.
 #[test]
 fn native_dedup_shadow_mints_the_resolver_ids() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -1068,12 +1051,12 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
 
     // The cargo home must carry a Cargo.lock and the fetched sources —
     // run the real fetch path first.
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     let rustc = pinned_rustc_version();
     smol::block_on(async {
         let status = async_process::Command::new("cargo")
             .args(["fetch", "--manifest-path"])
             .arg(&manifest)
+            .env("CARGO_HOME", cargo_home.path())
             .env("RUSTUP_TOOLCHAIN", active_toolchain())
             .status()
             .await
@@ -1101,7 +1084,7 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
                 manifest.parent().unwrap(),
                 host.as_str(),
                 rustc,
-                None,
+                Some(cargo_home.path()),
             )
         };
         // Native spelling: no `--target` — cargo dedups `shared` into
@@ -1143,7 +1126,6 @@ fn native_dedup_shadow_mints_the_resolver_ids() {
 /// graph mints the one task id (the flag is never identity).
 #[test]
 fn a_flagged_target_side_task_verifies_under_both_invocations() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -1183,10 +1165,9 @@ fn a_flagged_target_side_task_verifies_under_both_invocations() {
     );
     let task = payload_for(&lib);
 
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     smol::block_on(async {
         let (_root, workspace) = wrapper_workspace(&reg, &task).await;
-        verify(&task, &workspace)
+        verify(cargo_home.path(), &task, &workspace)
             .await
             .expect("the flagged task verifies under both spellings");
     });
@@ -1197,7 +1178,6 @@ fn a_flagged_target_side_task_verifies_under_both_invocations() {
 /// claiming a different dependency identity than the closure verified.
 #[test]
 fn an_altered_subgraph_fails_the_context_check() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -1230,10 +1210,9 @@ fn an_altered_subgraph_fails_the_context_check() {
     let requests = resolve_requests(cargo_home.path(), &manifest);
     let mut task = payload_for(&request_for(&requests, "taskcrate"));
 
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     smol::block_on(async {
         let (_root, workspace) = wrapper_workspace(&reg, &task).await;
-        verify(&task, &workspace)
+        verify(cargo_home.path(), &task, &workspace)
             .await
             .expect("unaltered payload verifies");
 
@@ -1261,7 +1240,7 @@ fn an_altered_subgraph_fails_the_context_check() {
             .task_id(0)
             .expect("resolved root")
             .to_owned();
-        let error = verify(&task, &workspace)
+        let error = verify(cargo_home.path(), &task, &workspace)
             .await
             .expect_err("altered subgraph fails");
         assert!(
@@ -1276,7 +1255,6 @@ fn an_altered_subgraph_fails_the_context_check() {
 /// so storage and lookup never merge them.
 #[test]
 fn differing_build_dep_features_change_the_compile_key() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -1336,12 +1314,13 @@ fn differing_build_dep_features_change_the_compile_key() {
         "differing build-dep contexts mint different task ids"
     );
 
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     let (runtime, capture) = build_binaries();
     smol::block_on(async {
         let mut metadata: Vec<(String, String)> = Vec::new();
         for task in [&task_a, &task_b] {
-            metadata.push(capture_build_dep_keys(&reg, task, &runtime, &capture).await);
+            metadata.push(
+                capture_build_dep_keys(cargo_home.path(), &reg, task, &runtime, &capture).await,
+            );
         }
         assert_ne!(
             metadata[0].0, metadata[1].0,
@@ -1363,6 +1342,7 @@ fn differing_build_dep_features_change_the_compile_key() {
 /// build-script unit is where the build-dep context lands — its compile
 /// key hashes the dep identities it was given.
 async fn capture_build_dep_keys(
+    cargo_home: &Path,
     reg: &Path,
     task: &BuildTaskPayload,
     runtime: &Path,
@@ -1372,7 +1352,7 @@ async fn capture_build_dep_keys(
     let capture_dir = root.path().join(".stow-rustc-capture");
     std::fs::create_dir_all(&capture_dir).expect("capture dir");
     let workspace = workspace.with_capture_dir(capture_dir);
-    task::fetch_workspace_dependencies(task, &workspace)
+    task::fetch_workspace_dependencies(cargo_home, task, &workspace)
         .await
         .expect("fetch deps");
     let target_dir = TempDir::new().expect("target dir");
@@ -1384,6 +1364,7 @@ async fn capture_build_dep_keys(
         heel::NetworkAuditLog::file(root.path().join("network-audit.jsonl")).expect("audit log");
     let setup = PhaseSetup {
         workspace: &workspace,
+        cargo_home,
         wrappers: &wrappers,
         runtime_wrapper: runtime,
         capture_wrapper: capture,
@@ -1458,7 +1439,6 @@ fn target_side_children(graph: &stow_types::task_graph::ResolvedTaskGraph) -> (V
 /// windows-sys dep into a Linux task's children).
 #[test]
 fn platform_gated_dependencies_match_the_cargo_unit_graph() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -1491,10 +1471,9 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
     );
     let host = host_triple();
     let windows = "x86_64-pc-windows-msvc";
-    // `resolver_at` builds `stow-rustc-shim` — before CARGO_HOME points
-    // at the fixture registry, which cannot serve its real crates.
+    // `resolver_at` builds `stow-rustc-shim` — with the real cargo home,
+    // which the fixture registry cannot serve its real crates from.
     let resolver = resolver_at(cargo_home.path());
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     let rustc = pinned_rustc_version();
     let outputs = resolver
         .resolve(
@@ -1509,6 +1488,7 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
         let status = async_process::Command::new("cargo")
             .args(["fetch", "--manifest-path"])
             .arg(&manifest)
+            .env("CARGO_HOME", cargo_home.path())
             .env("RUSTUP_TOOLCHAIN", active_toolchain())
             .status()
             .await
@@ -1537,7 +1517,7 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
                 manifest.parent().unwrap(),
                 host.as_str(),
                 rustc,
-                None,
+                Some(cargo_home.path()),
             )
             .await
             .unwrap_or_else(|error| panic!("{target} cargo --unit-graph: {error}"));
@@ -1575,7 +1555,6 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
 /// `rustc_version`.
 #[test]
 fn a_build_edge_out_of_a_scriptless_package_mints_no_units() {
-    let _env = env_guard();
     let (cargo_home, reg) = registry_home();
     let scratch = tempfile::tempdir().unwrap();
     publish(
@@ -1627,15 +1606,15 @@ fn a_build_edge_out_of_a_scriptless_package_mints_no_units() {
         "a plain dependency resolves at default features"
     );
 
-    unsafe { std::env::set_var("CARGO_HOME", cargo_home.path()) };
     smol::block_on(async {
         let (_root, workspace) = wrapper_workspace(&reg, &task).await;
-        task::fetch_workspace_dependencies(&task, &workspace)
+        task::fetch_workspace_dependencies(cargo_home.path(), &task, &workspace)
             .await
             .expect("fetch deps");
-        let graphs = task::phase_unit_graphs(&task, &workspace, CargoSubcommand::Build)
-            .await
-            .expect("phase unit graphs");
+        let graphs =
+            task::phase_unit_graphs(cargo_home.path(), &task, &workspace, CargoSubcommand::Build)
+                .await
+                .expect("phase unit graphs");
         task::verify_dependency_context(&task, &graphs).expect("the dispatched context verifies");
         let (packages, lib_packages) =
             crate::closure::package_sets(&task, &graphs).expect("closure");

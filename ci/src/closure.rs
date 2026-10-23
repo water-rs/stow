@@ -124,14 +124,16 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
             })?
             .to_path_buf(),
     );
-    task::fetch_workspace_dependencies(task, &workspace).await?;
+    let cargo_home = task::cargo_home()?;
+    task::fetch_workspace_dependencies(&cargo_home, task, &workspace).await?;
     // stow#588: the publisher verifies the dependency context the same
     // way the build job does — the pristine wrapper workspace's own
     // `cargo --unit-graph` answers projected onto the shared task-unit
     // model must mint the dispatched task id in every phase and
     // invocation spelling. The same graphs then answer the publishable
     // set: they are the exact set of units cargo planned to compile.
-    let unit_graphs = task::phase_unit_graphs(task, &workspace, task::cargo_subcommand()?).await?;
+    let unit_graphs =
+        task::phase_unit_graphs(&cargo_home, task, &workspace, task::cargo_subcommand()?).await?;
     task::verify_dependency_context(task, &unit_graphs)?;
     let (packages, lib_packages) = package_sets(task, &unit_graphs)?;
     let dependency_identity = task
