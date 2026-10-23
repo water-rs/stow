@@ -119,6 +119,10 @@ name = "STOW_GITHUB_WEBHOOK_SECRET"
 name = "TURNSTILE_SECRET_KEY"
 
 
+# Daily-salted install-hash key for the usage-statistics indexes.
+[[secret]]
+name = "STOW_STATS_SALT_SECRET"
+
 # API token with Analytics Engine read on the account — queried by
 # /api/v1/stats for the public usage page.
 [[secret]]
@@ -134,6 +138,13 @@ routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "wat
 [[cloudflare.raw.analytics_engine_datasets]]
 binding = "STOW_ANALYTICS"
 dataset = "stow_cache_misses"
+
+# Usage statistics — byte-path hit points (edge-observed undercount by
+# design) and the CLI's per-day build reports. The index is a
+# daily-salted install hash, never an IP.
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_STATS"
+dataset = "stow_events"
 
 # Workers Cache — the platform cache that answers cacheable GETs before
 # this Worker runs. A hit is still billed as a Workers request; what it

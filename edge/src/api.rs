@@ -1251,6 +1251,8 @@ pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtif
 pub async fn get_bundle(
     params: Params,
     State(ghcr): State<GhcrConfig>,
+    State(stats_ctx): State<stats::StatsContext>,
+    telemetry: stats::HitTelemetry,
 ) -> Result<Response, GetArtifactError> {
     let rustc_version = params
         .get("rustc_version")
@@ -1266,9 +1268,26 @@ pub async fn get_bundle(
         )));
     }
 
-    open_bundle_stream(&ghcr, &rustc_version, digest)
+    let response = open_bundle_stream(&ghcr, &rustc_version, digest)
         .await
-        .map_err(registry_fetch_error)
+        .map_err(registry_fetch_error)?;
+    // The platform cache replays most fetches before this worker runs,
+    // so a hit point is recorded only for serves it observed — an
+    // undercount by design (stow#889): the digest is what the request
+    // already named, identity is recovered offline.
+    stats_ctx.record_hit(
+        &telemetry,
+        &stats::Hit {
+            rustc_version: rustc_version.as_str(),
+            digest,
+            bundle_size: response
+                .headers()
+                .get(skyzen::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok()),
+        },
+    );
+    Ok(response)
 }
 
 /* ---- index slices ---- */
@@ -1935,6 +1954,21 @@ pub async fn usage_stats(
 ) -> Result<Response, GetArtifactError> {
     let stats = stats::compute_usage_stats(&stats_ctx).await?;
     cacheable_json(&stats, USAGE_STATS_MAX_AGE)
+}
+
+/// POST /api/v1/build-report — the CLI's at-most-daily usage rollup
+/// (stow#889): one `build` point in `stow_events` carrying the deltas
+/// the body reports — hits, misses, builds and CPU milliseconds saved
+/// that the platform cache hides from the byte path. Anonymous and
+/// write-only: no D1, no scheduler, the consent extractor decides
+/// whether the point lands at all.
+pub async fn build_report(
+    Json(report): Json<stow_types::api::BuildReport>,
+    State(stats_ctx): State<stats::StatsContext>,
+    telemetry: stats::HitTelemetry,
+) -> Result<StatusCode, GetArtifactError> {
+    stats_ctx.record_build_report(&telemetry, &report);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 impl GetArtifactError {

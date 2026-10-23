@@ -33,6 +33,8 @@ const STOW_ANALYTICS_BINDING: &str = "STOW_ANALYTICS";
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
 const STOW_STATS_SQL_URL_BINDING: &str = "STOW_STATS_SQL_URL";
+const STOW_STATS_BINDING: &str = "STOW_STATS";
+const STOW_STATS_SALT_SECRET_BINDING: &str = "STOW_STATS_SALT_SECRET";
 const STOW_GITHUB_WEBHOOK_SECRET_BINDING: &str = "STOW_GITHUB_WEBHOOK_SECRET";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
@@ -66,6 +68,8 @@ fn worker(
     let analytics = env_binding::required_analytics_dataset(env, STOW_ANALYTICS_BINDING);
     let account_id = env_binding::required_string(env, CF_ACCOUNT_ID_BINDING);
     let stats = StatsContext {
+        dataset: env_binding::required_analytics_dataset(env, STOW_STATS_BINDING),
+        salt_secret: env_binding::required_string(env, STOW_STATS_SALT_SECRET_BINDING),
         analytics_token: env_binding::required_string(env, CF_ANALYTICS_TOKEN_BINDING),
         // `STOW_STATS_SQL_URL` is the mock manifest's override; it is
         // absent in production, where the route always posts the account's
@@ -267,6 +271,7 @@ fn anonymous_nodes() -> Vec<RouteNode> {
             "/{target}/{rustc_version}/{digest}".at(api::get_index_slice),
         )),
         lanes::ADMISSIONS.post(api::mint_miss_admissions),
+        "/api/v1/build-report".post(api::build_report),
         "/api/v1/stats".at(api::usage_stats),
         lanes::ENQUEUE.post(api::enqueue_admitted_task),
         lanes::REQUESTS.post(api::submit_crate_request),

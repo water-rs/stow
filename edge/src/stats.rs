@@ -13,12 +13,17 @@
 //! The pure helpers are host-compilable for unit tests; the request
 //! extractors and the SQL API calls are wasm-only.
 
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Deserialize;
+use sha2::Sha256;
 use stow_types::analytics;
-use stow_types::api::{UsageStatEntry, UsageStats};
+use stow_types::api::{BuildReport, UsageStatEntry, UsageStats};
 
 /// Header the CLI sets on every edge request when `STOW_NO_ANALYTICS=1`.
 pub const NO_ANALYTICS_HEADER: &str = "x-stow-no-analytics";
+
+/// Header the CLI sets when the build runs in CI (`CI` is set).
+pub const CI_HEADER: &str = "x-stow-ci";
 
 /// Whether the request consented to usage analytics — `false` when the
 /// client sent `x-stow-no-analytics: 1`. Every analytics write takes the
@@ -53,6 +58,309 @@ impl AnalyticsConsent {
     /// Whether analytics may be written for this request.
     pub const fn allowed(self) -> bool {
         self.0
+    }
+}
+
+/// The `event` blob discriminators.
+const HIT_EVENT: &str = "hit";
+const BUILD_EVENT: &str = "build";
+
+/// The `surface` blob of every hit point — the digest-addressed byte
+/// path (`GET /api/v1/bundles/{rustc}/{digest}`).
+const HIT_SURFACE: &str = "digest";
+
+/// Truncated install-hash length in hex characters.
+const INSTALL_HASH_HEX_CHARS: usize = 16;
+
+type InstallMac = Hmac<Sha256>;
+
+/// Coarse bundle-size bucket for the `size_bucket` blob.
+pub const fn size_bucket(bytes: u64) -> &'static str {
+    const MIB: u64 = 1024 * 1024;
+    if bytes < MIB {
+        "<1MB"
+    } else if bytes < 10 * MIB {
+        "1-10MB"
+    } else if bytes < 100 * MIB {
+        "10-100MB"
+    } else {
+        ">100MB"
+    }
+}
+
+/// Parse the `stow-cli/<version> (<os>)` user agent the CLI sends into
+/// the `(cli_version, os_family)` dimensions. Anything else — a
+/// browser, a missing header — yields two empty strings so foreign
+/// traffic never lands in the version leaderboard.
+pub fn user_agent_dimensions(user_agent: Option<&str>) -> (&str, &str) {
+    let Some(rest) = user_agent.and_then(|value| value.strip_prefix("stow-cli/")) else {
+        return ("", "");
+    };
+    let (version, rest) = rest.split_once(' ').map_or((rest, ""), |(v, r)| (v, r));
+    let os = rest
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .unwrap_or("");
+    (version, os)
+}
+
+/// The daily-salted install hash: `hex(HMAC-SHA256(daily, ip))[..16]`
+/// where `daily = HMAC-SHA256(salt_secret, day)` and `day` is the
+/// current UTC date (`YYYY-MM-DD`). The salt secret never leaves the
+/// worker, the derived daily key is never stored, and the IP is hashed
+/// inside the worker and never written — so the index counts distinct
+/// installs per day and cannot be joined across days (#220's
+/// construction, restored verbatim).
+#[must_use]
+pub fn install_hash(salt_secret: &str, day: &str, client_ip: &str) -> String {
+    let mut salt_mac = InstallMac::new_from_slice(salt_secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
+    salt_mac.update(day.as_bytes());
+    let daily_secret = salt_mac.finalize().into_bytes();
+    let mut mac =
+        InstallMac::new_from_slice(&daily_secret).expect("HMAC accepts keys of any length");
+    mac.update(client_ip.as_bytes());
+    let hash = mac.finalize().into_bytes();
+    hex::encode(&hash[..INSTALL_HASH_HEX_CHARS / 2])
+}
+
+/// One bundle fetch the Worker observed — one `stow_events` data
+/// point.
+#[derive(Debug)]
+pub struct Hit<'a> {
+    /// The rustc the path named.
+    pub rustc_version: &'a str,
+    /// The `sha256:…` bundle digest served — identity is recovered
+    /// offline from the public signed index, so the point carries the
+    /// digest and nothing else the request did not already name.
+    pub digest: &'a str,
+    /// The blob's content length; `None` when the registry reported
+    /// none — `bundle_size`/`size_bucket` stay empty then.
+    pub bundle_size: Option<u64>,
+}
+
+/// The request-carried dimensions every usage point shares:
+/// `(cli_version, os_family)` off the user agent, `country` off the
+/// request's Cloudflare metadata, `environment` off `x-stow-ci`.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestDims<'a> {
+    /// `stow-cli` version, or `""`.
+    pub cli_version: &'a str,
+    /// OS family from the user agent, or `""`.
+    pub os_family: &'a str,
+    /// Two-letter country code, or `""` when Cloudflare sent none.
+    pub country: &'a str,
+    /// `"ci"` or `"local"` — the CLI's `x-stow-ci` flag.
+    pub environment: &'a str,
+}
+
+/// Everything the usage writers need from one request: consent, the
+/// connecting IP for the install hash, the `stow-cli` user agent, the
+/// request's country, and the `x-stow-ci` flag. Extracted once per
+/// request so a handler cannot forget a piece.
+#[derive(Debug, Clone)]
+pub struct HitTelemetry {
+    /// Whether analytics may be written for this request.
+    pub consent: AnalyticsConsent,
+    /// `CF-Connecting-IP`; hashed into the install index and dropped.
+    pub client_ip: Option<String>,
+    /// The `User-Agent` header, parsed into `cli_version`/`os_family`.
+    pub user_agent: Option<String>,
+    /// `CF-IPCountry` — the two-letter country Cloudflare geolocates
+    /// the connecting IP to; `None` when absent.
+    pub country: Option<String>,
+    /// `x-stow-ci: 1` — the CLI's "this build runs in CI" flag.
+    pub ci: bool,
+}
+
+impl HitTelemetry {
+    /// The blob dimensions this request carries.
+    pub fn dims(&self) -> RequestDims<'_> {
+        let (cli_version, os_family) = user_agent_dimensions(self.user_agent.as_deref());
+        RequestDims {
+            cli_version,
+            os_family,
+            country: self.country.as_deref().unwrap_or(""),
+            environment: if self.ci { "ci" } else { "local" },
+        }
+    }
+}
+
+/// One hit point's blob tuple, in dataset column order: `(event,
+/// target, rustc_version, crate_name, version, size_bucket,
+/// cli_version, os_family, surface, bundle_digest, country,
+/// environment)`.
+///
+/// The digest-addressed byte path never sees the artifact's identity —
+/// `target`, `crate_name` and `version` stay empty and are recovered
+/// offline from the public signed index slices. The layout keeps the
+/// pre-#467 slots so draining points of the old shape still decode.
+pub fn hit_blobs<'a>(hit: &'a Hit<'a>, dims: &RequestDims<'a>) -> [&'a str; 12] {
+    [
+        HIT_EVENT,
+        "",
+        hit.rustc_version,
+        "",
+        "",
+        hit.bundle_size.map_or("", size_bucket),
+        dims.cli_version,
+        dims.os_family,
+        HIT_SURFACE,
+        hit.digest,
+        dims.country,
+        dims.environment,
+    ]
+}
+
+/// `(weight, reserved, bundle_size)` — weight 1.0: the install-hash
+/// index already gives equitable per-install sampling, so the legacy
+/// 1/10 write-time sample is gone. double2 stays 0: the edge cannot
+/// know a digest's recorded compile time — the `build` point carries
+/// the CLI-measured figure instead.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Analytics Engine doubles are f64; bundle sizes are far below 2^53"
+)]
+pub const fn hit_doubles(hit: &Hit<'_>) -> [f64; 3] {
+    let size = match hit.bundle_size {
+        Some(bytes) => bytes as f64,
+        None => 0.0,
+    };
+    [1.0, 0.0, size]
+}
+
+/// One build report's blob tuple — the same column order as a hit
+/// point so the shared dimension slots line up (`cli_version` blob7,
+/// `os_family` blob8, `country` blob11, `environment` blob12).
+pub const fn build_blobs<'a>(dims: &RequestDims<'a>) -> [&'a str; 12] {
+    [
+        BUILD_EVENT,
+        "",
+        "",
+        "",
+        "",
+        "",
+        dims.cli_version,
+        dims.os_family,
+        "",
+        "",
+        dims.country,
+        dims.environment,
+    ]
+}
+
+/// `(weight, cpu_millis_saved, hits, misses, builds)` — every counter
+/// is the report's delta since its last report.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Analytics Engine doubles are f64; the counters are far below 2^53"
+)]
+pub const fn build_doubles(report: &BuildReport) -> [f64; 5] {
+    [
+        1.0,
+        report.cpu_millis_saved as f64,
+        report.hits as f64,
+        report.misses as f64,
+        report.builds as f64,
+    ]
+}
+
+/// Where `stow_events` points go. The worker writes the bound
+/// Analytics Engine dataset; host tests record the points they were
+/// handed — the same boundary `miss_logger::MissLog` draws for
+/// `stow_cache_misses`.
+pub trait EventLog: Sync {
+    /// Write one point. Infallible at the call site — analytics are a
+    /// side channel that must never fail the request that observed it.
+    fn write_event(&self, index: Option<&str>, blobs: &[&str], doubles: &[f64]);
+}
+
+/// Write one usage point gated on the request's consent; `day` is the
+/// UTC `YYYY-MM-DD` the install hash salts on.
+fn write_usage_point(
+    log: &impl EventLog,
+    salt_secret: &str,
+    day: &str,
+    telemetry: &HitTelemetry,
+    blobs: &[&str],
+    doubles: &[f64],
+) {
+    if !telemetry.consent.allowed() {
+        return;
+    }
+    let index = telemetry
+        .client_ip
+        .as_deref()
+        .map(|ip| install_hash(salt_secret, day, ip));
+    log.write_event(index.as_deref(), blobs, doubles);
+}
+
+/// Write one `hit` point for a bundle the Worker served — recorded
+/// only on serves the platform cache did not answer, so it is an
+/// edge-observed undercount by design (stow#889).
+pub fn record_hit(
+    log: &impl EventLog,
+    salt_secret: &str,
+    day: &str,
+    telemetry: &HitTelemetry,
+    hit: &Hit<'_>,
+) {
+    let dims = telemetry.dims();
+    write_usage_point(
+        log,
+        salt_secret,
+        day,
+        telemetry,
+        &hit_blobs(hit, &dims),
+        &hit_doubles(hit),
+    );
+}
+
+/// Write one `build` point for the CLI's at-most-daily report —
+/// the hits, misses, builds and CPU time the edge cannot observe
+/// behind the platform cache.
+pub fn record_build_report(
+    log: &impl EventLog,
+    salt_secret: &str,
+    day: &str,
+    telemetry: &HitTelemetry,
+    report: &BuildReport,
+) {
+    let dims = telemetry.dims();
+    write_usage_point(
+        log,
+        salt_secret,
+        day,
+        telemetry,
+        &build_blobs(&dims),
+        &build_doubles(report),
+    );
+}
+
+/// One recorded point: `(index, blobs, doubles)`.
+#[cfg(test)]
+pub type RecordedPoint = (Option<String>, Vec<String>, Vec<f64>);
+
+/// Recording [`EventLog`] for host tests — stores each point so
+/// assertions see exactly what the dataset would store.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct RecordingEventLog {
+    /// One [`RecordedPoint`] per `write_event` call.
+    pub points: std::sync::Mutex<Vec<RecordedPoint>>,
+}
+
+#[cfg(test)]
+impl EventLog for RecordingEventLog {
+    fn write_event(&self, index: Option<&str>, blobs: &[&str], doubles: &[f64]) {
+        self.points
+            .lock()
+            .expect("recording event log mutex")
+            .push((
+                index.map(str::to_owned),
+                blobs.iter().map(|blob| (*blob).to_owned()).collect(),
+                doubles.to_vec(),
+            ));
     }
 }
 
@@ -202,8 +510,10 @@ fn usage_stats_from_rows(
 mod worker {
     use skyzen::Request;
     use skyzen::extract::Extractor;
+    use skyzen::header;
+    use skyzen_cloudflare::worker::{AnalyticsEngineDataPointBuilder, AnalyticsEngineDataset};
 
-    use super::AnalyticsConsent;
+    use super::{AnalyticsConsent, EventLog, HitTelemetry};
     use crate::errors::GetArtifactError;
 
     impl Extractor for AnalyticsConsent {
@@ -216,10 +526,66 @@ mod worker {
         }
     }
 
-    /// The credentials the public stats endpoint uses to query the
+    impl Extractor for HitTelemetry {
+        type Error = GetArtifactError;
+
+        fn extract(
+            request: &mut Request,
+        ) -> impl std::future::Future<Output = Result<Self, Self::Error>> + Send {
+            let consent = request
+                .headers()
+                .get(super::NO_ANALYTICS_HEADER)
+                .and_then(|value| value.to_str().ok())
+                != Some("1");
+            let client_ip = request
+                .headers()
+                .get("cf-connecting-ip")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let user_agent = request
+                .headers()
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let country = request
+                .headers()
+                .get("cf-ipcountry")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let ci = request
+                .headers()
+                .get(super::CI_HEADER)
+                .and_then(|value| value.to_str().ok())
+                == Some("1");
+            std::future::ready(Ok(Self {
+                consent: AnalyticsConsent(consent),
+                client_ip,
+                user_agent,
+                country,
+                ci,
+            }))
+        }
+    }
+
+    /// Today's date in UTC (`YYYY-MM-DD`) from `js_sys::Date` — the
+    /// only clock the worker runtime exposes.
+    fn current_utc_day() -> String {
+        let iso = js_sys::Date::new_0()
+            .to_iso_string()
+            .as_string()
+            .unwrap_or_default();
+        iso.get(..10).unwrap_or(&iso).to_owned()
+    }
+
+    /// The `stow_events` dataset binding, the install-hash salt, and
+    /// the credentials the public stats endpoint uses to query the
     /// Analytics Engine SQL API.
     #[derive(Debug, Clone)]
     pub struct StatsContext {
+        /// `STOW_STATS` Analytics Engine dataset binding.
+        pub dataset: AnalyticsEngineDataset,
+        /// `STOW_STATS_SALT_SECRET` Worker secret.
+        pub salt_secret: String,
         /// `CF_ANALYTICS_TOKEN` — an API token with Analytics Engine read
         /// on the account. A credential: never logged, never in a response.
         pub analytics_token: String,
@@ -227,6 +593,47 @@ mod worker {
         /// endpoint under `CF_ACCOUNT_ID`, or the harness stub
         /// `STOW_STATS_SQL_URL` names.
         pub sql_url: String,
+    }
+
+    impl StatsContext {
+        /// Write one `hit` point for a bundle the Worker served.
+        pub fn record_hit(&self, telemetry: &HitTelemetry, hit: &super::Hit<'_>) {
+            super::record_hit(
+                &self.dataset,
+                &self.salt_secret,
+                &current_utc_day(),
+                telemetry,
+                hit,
+            );
+        }
+
+        /// Write one `build` point for the CLI's usage report.
+        pub fn record_build_report(
+            &self,
+            telemetry: &HitTelemetry,
+            report: &stow_types::api::BuildReport,
+        ) {
+            super::record_build_report(
+                &self.dataset,
+                &self.salt_secret,
+                &current_utc_day(),
+                telemetry,
+                report,
+            );
+        }
+    }
+
+    impl EventLog for AnalyticsEngineDataset {
+        fn write_event(&self, index: Option<&str>, blobs: &[&str], doubles: &[f64]) {
+            let result = AnalyticsEngineDataPointBuilder::new()
+                .indexes(index.into_iter().collect::<Vec<_>>())
+                .blobs(blobs.iter().copied())
+                .doubles(doubles.iter().copied())
+                .write_to(self);
+            if let Err(error) = result {
+                tracing::warn!(%error, "failed to write usage event to Analytics Engine");
+            }
+        }
     }
 
     /// POST `sql` to the Analytics Engine SQL API under the shared
@@ -395,8 +802,11 @@ pub use worker::{StatsContext, compute_usage_stats, demand_feed_query};
 #[cfg(test)]
 mod tests {
     use super::{
-        DemandFeedSql, EventsRow, InstallsRow, LeaderboardRow, MissesRow, usage_stats_from_rows,
+        AnalyticsConsent, DemandFeedSql, EventsRow, Hit, HitTelemetry, InstallsRow, LeaderboardRow,
+        MissesRow, RecordingEventLog, install_hash, record_build_report, record_hit,
+        usage_stats_from_rows, user_agent_dimensions,
     };
+    use stow_types::api::BuildReport;
 
     fn leaderboard(name: &str, hits: f64) -> LeaderboardRow {
         LeaderboardRow {
@@ -529,5 +939,112 @@ mod tests {
         .expect("integral wire counts map");
         assert_eq!(stats.daily_active_installs_7d, Some(20));
         assert!((stats.hit_rate_24h - 0.0).abs() < f64::EPSILON);
+    }
+
+    /// A full telemetry tuple for the point-shape tests.
+    fn telemetry() -> HitTelemetry {
+        HitTelemetry {
+            consent: AnalyticsConsent::ALLOWED,
+            client_ip: Some("203.0.113.7".to_owned()),
+            user_agent: Some("stow-cli/0.5.0 (macos)".to_owned()),
+            country: Some("US".to_owned()),
+            ci: true,
+        }
+    }
+
+    /// The `hit` point's blob/double layout and the consent gate: a
+    /// denied request writes nothing.
+    #[test]
+    fn hit_point_shape_and_consent_gate() {
+        let log = RecordingEventLog::default();
+        let hit = Hit {
+            rustc_version: "1.91.1",
+            digest: "sha256:aaaa",
+            bundle_size: Some(5 * 1024 * 1024),
+        };
+        record_hit(&log, "salt", "2026-10-23", &telemetry(), &hit);
+        record_hit(
+            &log,
+            "salt",
+            "2026-10-23",
+            &HitTelemetry {
+                consent: AnalyticsConsent::DENIED,
+                ..telemetry()
+            },
+            &hit,
+        );
+        let points = log.points.lock().expect("recording lock").clone();
+        assert_eq!(points.len(), 1);
+        let (index, blobs, doubles) = &points[0];
+        assert_eq!(
+            index.as_deref(),
+            Some(install_hash("salt", "2026-10-23", "203.0.113.7").as_str())
+        );
+        assert_eq!(
+            blobs.as_slice(),
+            &[
+                "hit",
+                "",
+                "1.91.1",
+                "",
+                "",
+                "1-10MB",
+                "0.5.0",
+                "macos",
+                "digest",
+                "sha256:aaaa",
+                "US",
+                "ci",
+            ]
+        );
+        assert_eq!(*doubles, vec![1.0, 0.0, 5.0 * 1024.0 * 1024.0]);
+    }
+
+    /// The `build` point carries the report's deltas in its doubles and
+    /// the request dimensions in the hit-aligned blob slots.
+    #[test]
+    fn build_report_point_shape() {
+        let log = RecordingEventLog::default();
+        let report = BuildReport {
+            builds: 3,
+            hits: 40,
+            misses: 2,
+            cpu_millis_saved: 90_000,
+        };
+        record_build_report(&log, "salt", "2026-10-23", &telemetry(), &report);
+        let points = log.points.lock().expect("recording lock").clone();
+        assert_eq!(points.len(), 1);
+        let (_index, blobs, doubles) = &points[0];
+        assert_eq!(blobs[0], "build");
+        assert_eq!(blobs[6], "0.5.0");
+        assert_eq!(blobs[7], "macos");
+        assert_eq!(blobs[10], "US");
+        assert_eq!(blobs[11], "ci");
+        assert_eq!(*doubles, vec![1.0, 90_000.0, 40.0, 2.0, 3.0]);
+    }
+
+    /// The install hash is the #220 construction: daily-salted, 16 hex
+    /// chars, different every day, never the IP itself.
+    #[test]
+    fn install_hash_is_daily_salted() {
+        let hash = install_hash("salt", "2026-10-23", "10.0.0.1");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(hash, install_hash("salt", "2026-10-23", "10.0.0.1"));
+        assert_ne!(hash, install_hash("salt", "2026-10-24", "10.0.0.1"));
+        assert_ne!(hash, install_hash("salt", "2026-10-23", "10.0.0.2"));
+        assert_ne!(hash, install_hash("other-salt", "2026-10-23", "10.0.0.1"));
+    }
+
+    /// `stow-cli/<v> (<os>)` parses; anything else yields two empties.
+    #[test]
+    fn user_agent_dimensions_parses_stow_cli() {
+        assert_eq!(
+            user_agent_dimensions(Some("stow-cli/0.5.0 (linux)")),
+            ("0.5.0", "linux")
+        );
+        assert_eq!(user_agent_dimensions(Some("stow-cli/0.5.0")), ("0.5.0", ""));
+        assert_eq!(user_agent_dimensions(Some("curl/8")), ("", ""));
+        assert_eq!(user_agent_dimensions(None), ("", ""));
     }
 }

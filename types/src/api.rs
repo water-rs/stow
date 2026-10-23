@@ -1361,6 +1361,28 @@ pub struct EnqueueTicket {
     pub request: EnqueueRequest,
 }
 
+/// Request body for `POST /api/v1/build-report`: the install's usage
+/// deltas accumulated since its last report (stow#889).
+///
+/// The CLI posts at most one report per UTC day per install; every
+/// counter is a delta, not a total. The body carries no crate names,
+/// digests, dependency graph or lockfile — identity dimensions arrive
+/// on headers (`User-Agent`, `x-stow-ci`) and the edge's cf metadata.
+/// Under `STOW_NO_ANALYTICS=1` the CLI posts no report at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BuildReport {
+    /// Builds the install ran since the last report — supervised runs
+    /// plus drained plain-cargo builds.
+    pub builds: u64,
+    /// Artifacts served from the cache (local or downloaded).
+    pub hits: u64,
+    /// Artifacts compiled locally.
+    pub misses: u64,
+    /// Recorded compile time of every served artifact — the rustc CPU
+    /// time this install skipped.
+    pub cpu_millis_saved: u64,
+}
+
 /// Request body for `POST /api/v1/admissions`: the misses a client's
 /// local index resolution found, plus the resolved graph the edge
 /// expands into enqueue tasks.
