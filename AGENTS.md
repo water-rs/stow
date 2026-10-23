@@ -13,6 +13,10 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 
 ## Architecture
 
+- The edge is the public entry point and keeps no database. It streams bundles from GHCR with an immutable `Cache-Control`, so the Workers cache serves every repeat; caches crates.io answers in the Cache API; and forwards admissions, human requests and GitHub `workflow_run` deliveries to the scheduler.
+- The CLI resolves every key against the signed index it pulls from GHCR. Its dependency graph leaves the machine only as the misses and inexact hits it reports.
+- `build-crate.yml` builds one node in an untrusted job with no credentials and publishes it from a trusted job that re-validates its dependency closure. A task carries its node and its dependency subtree, which pins what it is built against.
+- `index-publish.yml` folds the signed records into signed per-target, per-rustc index slices in GHCR and reports each slice to the scheduler.
 - The CI interface reports how many `build-crate.yml` runs are queued and running per runner family, and submits one task as one run. It is FIFO and never reorders. Only operations tooling and the scheduler use it.
 - The scheduler is one instance holding the dependency graph in memory. It persists only an append-only log and snapshots, appends an event before acknowledging it, and merges each submitted dependency tree by task id. It learns run state from `workflow_run` `in_progress` and `completed` deliveries and uses the CI interface's status only to reconcile.
 - Priority lives only in the scheduler: a node's rank is its priority times the time it has waited. Its entry points are:
