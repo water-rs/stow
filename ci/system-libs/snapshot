@@ -1,7 +1,0 @@
-# The snapshot.ubuntu.com instant ci/system-libs/lock.sh generates the
-# lock at — read by the system-libs-lock workflow only while no
-# ci/system-libs/lock.txt is committed. Once a lock lands, its
-# '# snapshot:' header is the single source of truth for T, the
-# workflow fails a PR that still carries this file, and the commit
-# adding lock.txt removes it.
-20261022T200000Z
