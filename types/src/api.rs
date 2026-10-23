@@ -957,6 +957,11 @@ pub struct WorkflowRunComplete {
     /// Failure description when `success` is false — the conclusion and,
     /// on a missing records artifact, which tag the edge looked for.
     pub error: Option<String>,
+    /// The run's `conclusion` was `cancelled` — a superseded duplicate of
+    /// the task's concurrency group (stow#877): not a build verdict, so the
+    /// scheduler re-queues the task instead of recording a failure.
+    #[serde(default)]
+    pub cancelled: bool,
     /// The GitHub Actions run id, stamped onto the queue row so
     /// `stow-admin status` surfaces the run URL.
     #[serde(default)]

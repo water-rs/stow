@@ -974,6 +974,7 @@ mod tests {
             display_title: format!("1.99.1-{task_id}"),
             status: "completed".to_owned(),
             conclusion: Some("success".to_owned()),
+            built: true,
             html_url: String::new(),
             path: ".github/workflows/build-crate.yml".to_owned(),
             dispatched_at_ms,

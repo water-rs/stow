@@ -13,6 +13,7 @@ pub mod artifact;
 pub mod bundle;
 pub mod bundle_schema;
 pub mod capture;
+pub mod ci;
 pub mod crate_info;
 pub mod do_budgets;
 pub mod env_name;

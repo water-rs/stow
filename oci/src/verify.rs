@@ -66,6 +66,19 @@ pub fn verify_material(
     }
 }
 
+/// The `docker_reference` a cosign `SimpleSigning` payload binds.
+///
+/// `None` when the bytes are not a `SimpleSigning` payload. Callers
+/// that verify a manifest aliased under several tags (a `built-`
+/// marker on a records manifest, stow#877) read which reference a
+/// layer binds before pinning it.
+#[must_use]
+pub fn payload_docker_reference(payload_bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<SimpleSigning>(payload_bytes)
+        .ok()
+        .map(|payload| payload.critical.identity.docker_reference)
+}
+
 /// Verify `materials` — every signature layer the artifact's
 /// `sha256-<digest>.sig` manifest carries.
 ///

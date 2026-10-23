@@ -52,6 +52,12 @@ pub struct LocalCiRun {
     /// A build run's task — the scheduler task id the run builds. A
     /// `resolve-request` run has none: it fans nothing out.
     pub task_id: Option<String>,
+    /// Whether the run actually ran the build stage — `false` on a
+    /// queued/cancelled run and on one whose records already existed in
+    /// the registry, so a harness can prove a doubly-submitted task
+    /// built once (stow#877).
+    #[serde(default)]
+    pub built: bool,
 }
 
 /// `POST /seeded-runs`: `build-crate.yml` runs that exist upstream

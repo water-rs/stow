@@ -15,7 +15,7 @@ use stow_types::api::ArtifactRecord;
 use stow_types::identity::WireRustcVersion;
 use stow_types::records::{
     BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
-    is_records_tag, records_tag,
+    is_records_tag, published_tag, records_tag,
 };
 use stow_types::registry::{cache_repository, sha256_digest};
 
@@ -127,6 +127,17 @@ where
         })
         .await
         .map_err(|error| stow_types::stow_error!("push records manifest {reference}: {error}"))?;
+    // The `built-<rustc>-<task_id hash>` marker points at the same
+    // manifest (stow#877): a run checking whether the task's signed
+    // records already exist fetches one tag — no re-sign needed, the
+    // digest is identical.
+    let marker_reference = session.reference(&published_tag(rustc_version.as_str(), task_id))?;
+    session
+        .put_manifest(&marker_reference, &manifest_bytes)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("push published marker {marker_reference}: {error}")
+        })?;
     tracing::info!(
         oci_reference = %reference,
         digest = %manifest_digest,
