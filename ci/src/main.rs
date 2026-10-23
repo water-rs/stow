@@ -40,7 +40,7 @@ mod workspace_mirror;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use stow_types::api::{BuildBatchPayload, BuildTaskPayload};
+use stow_types::api::BuildTaskPayload;
 use tracing_subscriber::EnvFilter;
 
 const GITHUB_EVENT_PATH_ENV: &str = "GITHUB_EVENT_PATH";
@@ -64,12 +64,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Stage {
-    /// Untrusted stage: compile the leg's crate and write the build output.
+    /// Untrusted stage: compile the task's crate and write the build output.
     Build {
-        /// The leg of the dispatched batch to build — its index in the
-        /// batch's `tasks`.
-        #[arg(long)]
-        leg: usize,
         /// Directory to write the build output into (created if missing).
         #[arg(long)]
         output_dir: PathBuf,
@@ -77,10 +73,6 @@ enum Stage {
     /// Trusted stage: validate a build output, then push, sign and publish
     /// its records artifact into GHCR.
     Publish {
-        /// The leg of the dispatched batch to publish — the `build`
-        /// stage's `--leg`.
-        #[arg(long)]
-        leg: usize,
         /// Directory a `build` stage wrote.
         #[arg(long)]
         input_dir: PathBuf,
@@ -110,13 +102,11 @@ fn main() -> stow_types::error::Result<()> {
     }
     let cli = Cli::parse();
     match cli.command {
-        Stage::Build { leg, output_dir } => smol::block_on(build_stage(leg, &output_dir)),
+        Stage::Build { output_dir } => smol::block_on(build_stage(&output_dir)),
         // `RegistrySession` drives reqwest/hyper, which needs a Tokio
         // reactor; the build stage is smol-only because cargo/rustc
         // capture never touches HTTP.
-        Stage::Publish { leg, input_dir } => {
-            tokio_runtime()?.block_on(publish_stage(leg, &input_dir))
-        }
+        Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
         Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
     }
 }
@@ -128,7 +118,7 @@ fn tokio_runtime() -> stow_types::error::Result<tokio::runtime::Runtime> {
         .map_err(|error| stow_types::stow_error!("build tokio runtime: {error}"))
 }
 
-async fn build_stage(leg: usize, output_dir: &std::path::Path) -> stow_types::error::Result<()> {
+async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<()> {
     // The mock compiler exists only in a `mock-compile` build; a switch
     // that reaches any other build must not quietly compile for real.
     #[cfg(not(feature = "mock-compile"))]
@@ -138,7 +128,7 @@ async fn build_stage(leg: usize, output_dir: &std::path::Path) -> stow_types::er
              `mock-compile` feature"
         ));
     }
-    let task = load_task_payload(leg)?;
+    let task = load_task_payload()?;
     async_fs::create_dir_all(output_dir).await?;
     let built = task::build(&task, output_dir).await?;
     let report = dep_scan::scan_artifacts(&built, &task).await?;
@@ -163,8 +153,8 @@ async fn build_stage(leg: usize, output_dir: &std::path::Path) -> stow_types::er
     Ok(())
 }
 
-async fn publish_stage(leg: usize, input_dir: &std::path::Path) -> stow_types::error::Result<()> {
-    let task = load_task_payload(leg)?;
+async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result<()> {
+    let task = load_task_payload()?;
     let pushed = publish(&task, input_dir).await.map_err(|error| {
         tracing::error!(task_id = %task.task_id, %error, "publish stage failed");
         error
@@ -309,18 +299,15 @@ async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<
     local_server::serve(listen, state).await
 }
 
-/// The task both stages act on: leg `leg` of the batch the run was
-/// dispatched with. The batch rides the `workflow_dispatch` event file
-/// (`GITHUB_EVENT_PATH`), so the publish job's copy comes from the
-/// scheduler, never from the build job.
-fn load_task_payload(leg: usize) -> stow_types::error::Result<BuildTaskPayload> {
-    task_from_event_file(
-        std::path::Path::new(&env_required(GITHUB_EVENT_PATH_ENV)?),
-        leg,
-    )
+/// The task both stages act on — the one `build-crate.yml` input the
+/// run was dispatched with. The task rides the `workflow_dispatch`
+/// event file (`GITHUB_EVENT_PATH`), so the publish job's copy comes
+/// from the scheduler, never from the build job.
+fn load_task_payload() -> stow_types::error::Result<BuildTaskPayload> {
+    task_from_event_file(std::path::Path::new(&env_required(GITHUB_EVENT_PATH_ENV)?))
 }
 
-/// The `workflow_dispatch` event file: only the `batch` input is read.
+/// The `workflow_dispatch` event file: only the `task` input is read.
 #[derive(serde::Deserialize)]
 struct DispatchEvent {
     inputs: Option<DispatchInputs>,
@@ -328,15 +315,14 @@ struct DispatchEvent {
 
 #[derive(serde::Deserialize)]
 struct DispatchInputs {
-    /// The JSON-encoded [`BuildBatchPayload`].
-    batch: Option<String>,
+    /// The JSON-encoded [`BuildTaskPayload`].
+    task: Option<String>,
 }
 
-/// Leg `leg` of the batch in the dispatch event file at `event_path`
-/// (`.inputs.batch`, a JSON-encoded [`BuildBatchPayload`]).
+/// The task in the dispatch event file at `event_path`
+/// (`.inputs.task`, a JSON-encoded [`BuildTaskPayload`]).
 fn task_from_event_file(
     event_path: &std::path::Path,
-    leg: usize,
 ) -> stow_types::error::Result<BuildTaskPayload> {
     let raw = std::fs::read(event_path).map_err(|error| {
         stow_types::stow_error!(
@@ -344,7 +330,7 @@ fn task_from_event_file(
             event_path.display()
         )
     })?;
-    task_from_event(&raw, event_path, leg)
+    task_from_event(&raw, event_path)
 }
 
 /// [`task_from_event_file`] over the file's bytes, which the async local
@@ -352,7 +338,6 @@ fn task_from_event_file(
 pub(crate) fn task_from_event(
     raw: &[u8],
     event_path: &std::path::Path,
-    leg: usize,
 ) -> stow_types::error::Result<BuildTaskPayload> {
     let event: DispatchEvent = serde_json::from_slice(raw).map_err(|error| {
         stow_types::stow_error!(
@@ -360,19 +345,15 @@ pub(crate) fn task_from_event(
             event_path.display()
         )
     })?;
-    let batch = event
-        .inputs
-        .and_then(|inputs| inputs.batch)
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "dispatch event file {} has no `inputs.batch`",
-                event_path.display()
-            )
-        })?;
-    let batch: BuildBatchPayload = serde_json::from_str(&batch).map_err(|error| {
-        stow_types::stow_error!("parse `inputs.batch` of {}: {error}", event_path.display())
+    let task = event.inputs.and_then(|inputs| inputs.task).ok_or_else(|| {
+        stow_types::stow_error!(
+            "dispatch event file {} has no `inputs.task`",
+            event_path.display()
+        )
     })?;
-    batch.task(leg)
+    serde_json::from_str(&task).map_err(|error| {
+        stow_types::stow_error!("parse `inputs.task` of {}: {error}", event_path.display())
+    })
 }
 
 fn env_required(name: &str) -> stow_types::error::Result<String> {
@@ -408,15 +389,15 @@ fn install_tracing() {
         .try_init();
 }
 
-/// A batch of single-crate legs for the tests that read or record one.
+/// Single-crate tasks for the tests that read one.
 #[cfg(test)]
-mod batch_fixture {
-    use stow_types::api::{BatchEncoder, BuildTaskPayload};
+mod task_fixture {
+    use stow_types::api::BuildTaskPayload;
     use stow_types::identity::{
         CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
     };
 
-    fn task(crate_name: &str) -> BuildTaskPayload {
+    pub fn task(crate_name: &str) -> BuildTaskPayload {
         BuildTaskPayload {
             task_id: format!("task-{crate_name}"),
             attempt: 1,
@@ -435,25 +416,15 @@ mod batch_fixture {
         }
     }
 
-    /// The encoded batch (`inputs.batch`) holding one leg per name in
-    /// `crates`, at `parallelism` slots.
-    pub fn encoded_batch(crates: &[&str], parallelism: u32) -> String {
-        let mut encoder = BatchEncoder::new(
-            "0123456789abcdef0123456789abcdef".parse().unwrap(),
-            WireRustcVersion::parse("1.91.1").unwrap(),
-            parallelism,
-        )
-        .unwrap();
-        for name in crates {
-            encoder.push(&task(name)).unwrap();
-        }
-        encoder.finish().unwrap()
+    /// The encoded `inputs.task` for one name.
+    pub fn encoded_task(crate_name: &str) -> String {
+        serde_json::to_string(&task(crate_name)).unwrap()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_fixture::encoded_batch, task_from_event_file};
+    use super::{task_fixture::encoded_task, task_from_event_file};
 
     fn event_file(contents: &serde_json::Value) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -462,11 +433,11 @@ mod tests {
     }
 
     #[test]
-    fn a_leg_is_read_from_the_event_files_batch() {
+    fn a_task_is_read_from_the_event_files_inputs() {
         let event = event_file(&serde_json::json!({
-            "inputs": { "batch": encoded_batch(&["serde", "tokio"], 2) }
+            "inputs": { "task": encoded_task("tokio") }
         }));
-        let task = task_from_event_file(event.path(), 1).unwrap();
+        let task = task_from_event_file(event.path()).unwrap();
         assert_eq!(task.task_id, "task-tokio");
         assert_eq!(task.crate_name.as_str(), "tokio");
         assert_eq!(task.rustc_version.as_str(), "1.91.1");
@@ -474,35 +445,31 @@ mod tests {
 
     #[test]
     fn a_missing_event_file_names_the_path() {
-        let error = task_from_event_file(std::path::Path::new("/nonexistent/event.json"), 0)
+        let error = task_from_event_file(std::path::Path::new("/nonexistent/event.json"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("/nonexistent/event.json"), "{error}");
     }
 
     #[test]
-    fn a_missing_batch_input_is_named() {
+    fn a_missing_task_input_is_named() {
         for contents in [
             serde_json::json!({}),
             serde_json::json!({ "inputs": {} }),
-            serde_json::json!({ "inputs": { "batch": null } }),
+            serde_json::json!({ "inputs": { "task": null } }),
         ] {
             let event = event_file(&contents);
-            let error = task_from_event_file(event.path(), 0)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("inputs.batch"), "{contents}: {error}");
+            let error = task_from_event_file(event.path()).unwrap_err().to_string();
+            assert!(error.contains("inputs.task"), "{contents}: {error}");
         }
     }
 
     #[test]
-    fn an_out_of_range_leg_is_an_error() {
+    fn a_malformed_task_input_is_named() {
         let event = event_file(&serde_json::json!({
-            "inputs": { "batch": encoded_batch(&["serde"], 1) }
+            "inputs": { "task": "{not json" }
         }));
-        let error = task_from_event_file(event.path(), 1)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("leg 1 is out of range"), "{error}");
+        let error = task_from_event_file(event.path()).unwrap_err().to_string();
+        assert!(error.contains("inputs.task"), "{error}");
     }
 }
