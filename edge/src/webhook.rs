@@ -463,6 +463,10 @@ async fn complete_build_task(
         task_id: task_id.to_owned(),
         success,
         error,
+        // A `cancelled` conclusion is the concurrency group's verdict on a
+        // superseded duplicate — the scheduler re-queues the task instead
+        // of recording a failure (stow#877).
+        cancelled: run.conclusion.as_deref() == Some("cancelled"),
         github_run_id: Some(run.id.to_string()),
     };
     match forward.send_run_complete(&completion).await {

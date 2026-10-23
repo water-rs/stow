@@ -82,7 +82,7 @@ async fn claim_flat(
     settings: &SchedulerSettings,
     coverage: &impl CoverageOracle,
 ) -> Result<Vec<super::QueuedTask>, QueueError> {
-    super::claim_dispatchable_tasks(db, settings, coverage).await
+    super::claim_dispatchable_tasks(db, settings, coverage, &stow_types::ci::Occupancy::EMPTY).await
 }
 
 const fn paused_settings() -> SchedulerSettings {
@@ -3211,6 +3211,7 @@ async fn failed_build_retries_behind_its_backoff() {
         &db,
         &claim_settings(),
         &super::BuildCompleteReport {
+            cancelled: false,
             task_id: claimed[0].task_id.clone(),
             generation_id: claimed[0].generation_id.clone(),
             attempt: claimed[0].attempt,
@@ -3326,6 +3327,7 @@ async fn human_rerequest_resurrects_completed_and_claims() {
         &db,
         &claim_settings(),
         &super::BuildCompleteReport {
+            cancelled: false,
             task_id: claimed[0].task_id.clone(),
             generation_id: claimed[0].generation_id.clone(),
             attempt: claimed[0].attempt,
@@ -3926,6 +3928,7 @@ async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
         &db,
         &claim_settings(),
         &super::BuildCompleteReport {
+            cancelled: false,
             task_id: id.clone(),
             generation_id: claimed[0].generation_id.clone(),
             attempt: claimed[0].attempt,
@@ -3952,6 +3955,7 @@ async fn complete_marks_a_held_task_and_rejects_an_unknown_one() {
         &db,
         &claim_settings(),
         &super::BuildCompleteReport {
+            cancelled: false,
             task_id: "never-enqueued".to_owned(),
             generation_id: "unknown-generation".to_owned(),
             attempt: 1,
@@ -5165,6 +5169,7 @@ fn report(
     success: bool,
 ) -> super::BuildCompleteReport {
     super::BuildCompleteReport {
+        cancelled: false,
         task_id: task_id.to_owned(),
         generation_id: generation_id.to_owned(),
         attempt,
@@ -5204,6 +5209,7 @@ async fn complete_live(
             attempt: live.attempt,
             success,
             error: (!success).then(|| "build failed".to_owned()),
+            cancelled: false,
             github_run_id: None,
             sample_ms,
         },
@@ -5235,6 +5241,7 @@ async fn seed_failed_retry_cycle(db: &DurableDb, id: &str, cycle: &str) {
             db,
             &settings(),
             &super::BuildCompleteReport {
+                cancelled: false,
                 task_id: id.to_owned(),
                 generation_id: db
                     .query("SELECT generation_id FROM queue WHERE task_id = ?")
@@ -5411,6 +5418,7 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
         &db,
         &settings(),
         &super::BuildCompleteReport {
+            cancelled: false,
             task_id: id.clone(),
             generation_id: first.generation_id.clone(),
             attempt: 4,
@@ -5443,6 +5451,7 @@ async fn purge_recreate_keeps_failure_evidence_under_new_generation() {
         &db,
         &settings(),
         &super::BuildCompleteReport {
+            cancelled: false,
             task_id: id.clone(),
             generation_id: second.generation_id.clone(),
             attempt: second.attempt,
@@ -5599,6 +5608,7 @@ fn run_complete(task_id: &str, run_id: u64, success: bool) -> stow_types::api::W
         task_id: task_id.to_owned(),
         success,
         error: (!success).then(|| "failure".to_owned()),
+        cancelled: false,
         github_run_id: Some(run_id.to_string()),
     }
 }
@@ -5637,6 +5647,70 @@ async fn a_run_completion_settles_the_task_and_a_duplicate_is_a_noop() {
     .await
     .expect_err("duplicate completion is stale");
     assert_eq!(status_of(&db, "built").await, "completed");
+}
+
+/// stow#877: the concurrency group's `cancelled` verdict on a
+/// superseded duplicate is not a build outcome — the row re-queues
+/// `pending` on the same attempt, bound run cleared, and a fresh
+/// claim re-dispatches it instead of a failure consuming the task.
+#[tokio::test]
+async fn a_cancelled_superseded_run_requeues_without_an_attempt() {
+    let db = memory_db().await.expect("memory db");
+    enqueue(&db, &[request("superseded", &[])])
+        .await
+        .expect("enqueue");
+    let claimed = claim_flat(&db, &claim_settings(), &NoCoverage)
+        .await
+        .expect("claim");
+    let task = &claimed[0];
+    super::bind_dispatch_run(&db, &task.task_id, &task.generation_id, "4242")
+        .await
+        .expect("bind run");
+    super::complete_run(
+        &db,
+        &settings(),
+        &stow_types::api::WorkflowRunComplete {
+            task_id: task.task_id.clone(),
+            success: false,
+            error: Some("workflow run concluded `cancelled`".to_owned()),
+            cancelled: true,
+            github_run_id: Some("4242".to_owned()),
+        },
+        60,
+    )
+    .await
+    .expect("cancelled completes");
+    assert_eq!(status_of(&db, "superseded").await, "pending");
+    let attempt: i64 = db
+        .query("SELECT attempt FROM queue WHERE crate_name = ?")
+        .bind("superseded".to_owned())
+        .fetch_scalar()
+        .await
+        .expect("attempt");
+    assert_eq!(attempt, 1, "a cancellation spends no attempt");
+    let bound: i64 = db
+        .query("SELECT COUNT(*) FROM queue WHERE crate_name = ? AND github_run_id IS NOT NULL")
+        .bind("superseded".to_owned())
+        .fetch_scalar()
+        .await
+        .expect("bound");
+    assert_eq!(bound, 0, "the dead run's binding is cleared");
+    let reclaimed = claim_flat(&db, &claim_settings(), &NoCoverage)
+        .await
+        .expect("re-claim");
+    assert_eq!(reclaimed.len(), 1, "the re-queued task claims again");
+    super::bind_dispatch_run(&db, &task.task_id, &reclaimed[0].generation_id, "7777")
+        .await
+        .expect("re-bind");
+    super::complete_run(
+        &db,
+        &settings(),
+        &run_complete(&task.task_id, 7777, true),
+        60,
+    )
+    .await
+    .expect("success completes");
+    assert_eq!(status_of(&db, "superseded").await, "completed");
 }
 
 /// §3.2: a completion arriving before its dispatch's binding parks in
@@ -7340,6 +7414,7 @@ async fn a_completion_reads_a_constant_row_count_as_the_window_fills() {
             &db,
             &claim_settings(),
             &super::BuildCompleteReport {
+                cancelled: false,
                 task_id: claimed[0].task_id.clone(),
                 generation_id: claimed[0].generation_id.clone(),
                 attempt: claimed[0].attempt,
@@ -7386,6 +7461,7 @@ async fn outcome_bucket_stays_aligned_under_the_do_binding() {
     super::record_attempt_outcome(
         &db,
         &super::BuildCompleteReport {
+            cancelled: false,
             task_id: "aligned".to_owned(),
             generation_id: "gen-aligned".to_owned(),
             attempt: 1,
@@ -7784,6 +7860,7 @@ async fn backward_completion_span_fails_without_polluting_stats() {
         attempt: 1,
         success: true,
         error: None,
+        cancelled: false,
         github_run_id: Some("run-skew".to_owned()),
         sample_ms: None,
     };
@@ -8294,6 +8371,7 @@ async fn refreshed_scores_price_their_own_crate_target() {
             attempt: 1,
             success: true,
             error: None,
+            cancelled: false,
             github_run_id: None,
             sample_ms: None,
         },

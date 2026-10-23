@@ -2924,10 +2924,14 @@ mod tests {
              can claim on the free slots"
         );
 
-        let claimed =
-            crate::scheduler::queue::claim_dispatchable_tasks(&db, &settings, &NothingCovered)
-                .await
-                .expect("claim");
+        let claimed = crate::scheduler::queue::claim_dispatchable_tasks(
+            &db,
+            &settings,
+            &NothingCovered,
+            &stow_types::ci::Occupancy::EMPTY,
+        )
+        .await
+        .expect("claim");
         assert_eq!(
             u32::try_from(claimed.len()).expect("claim count fits u32"),
             free,
@@ -2970,10 +2974,14 @@ mod tests {
         crate::scheduler::queue::apply_dispatch_floor(&db, &floored)
             .await
             .expect("apply floor");
-        let claimed =
-            crate::scheduler::queue::claim_dispatchable_tasks(&db, &floored, &NothingCovered)
-                .await
-                .expect("claim");
+        let claimed = crate::scheduler::queue::claim_dispatchable_tasks(
+            &db,
+            &floored,
+            &NothingCovered,
+            &stow_types::ci::Occupancy::EMPTY,
+        )
+        .await
+        .expect("claim");
         let window = (FixtureShape::HUMAN_LANE_ROWS + 1)
             ..=(FixtureShape::HUMAN_LANE_ROWS + FixtureShape::DISPATCH_ELIGIBLE_ROWS);
         let outside: Vec<u32> = claimed

@@ -52,6 +52,18 @@ use zenwave::{Client, ResponseExt};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// One task's `build-crate.yml` concurrency group: the run the group
+/// runs and the one queued behind it.
+#[derive(Debug, Default)]
+struct GroupRuns {
+    /// The run building or publishing now.
+    active: Option<u64>,
+    /// The run queued behind `active` — a new dispatch in the group
+    /// cancels and replaces it, as GitHub keeps at most one pending run
+    /// per `cancel-in-progress: false` group.
+    pending: Option<u64>,
+}
+
 /// Per-process state injected into every `/dispatch` invocation.
 #[derive(Clone)]
 pub struct LocalServerState {
@@ -78,6 +90,16 @@ pub struct LocalServerState {
     /// drives them, so their cancel settles them itself
     /// ([`Self::cancel_undriven_run`]).
     undriven: Arc<Mutex<BTreeSet<u64>>>,
+    /// `build-crate.yml`'s concurrency group per task id (stow#877):
+    /// `build-crate-<task_id>` admits at most one active run and one
+    /// pending run behind it — a dispatch arriving while a run of the
+    /// same task is live cancels the pending one, exactly as GitHub
+    /// does for `cancel-in-progress: false`.
+    groups: Arc<Mutex<BTreeMap<String, GroupRuns>>>,
+    /// The `inputs.task` payload each run id was dispatched with — a
+    /// promoted or superseded run's webhook and job names need it long
+    /// after the dispatch handler returned.
+    task_payloads: Arc<Mutex<BTreeMap<u64, BuildTaskPayload>>>,
     /// The local equivalent of GitHub assigning a fresh id to every
     /// workflow dispatch and every job.
     next_id: Arc<AtomicU64>,
@@ -119,6 +141,8 @@ impl LocalServerState {
             jobs: Arc::new(Mutex::new(BTreeMap::new())),
             cancels: Arc::new(Mutex::new(BTreeSet::new())),
             undriven: Arc::new(Mutex::new(BTreeSet::new())),
+            groups: Arc::new(Mutex::new(BTreeMap::new())),
+            task_payloads: Arc::new(Mutex::new(BTreeMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             runners: Arc::new(Semaphore::new(
                 std::thread::available_parallelism()
@@ -164,6 +188,7 @@ impl LocalServerState {
                 error: None,
                 delivery_errors: Vec::new(),
                 task_id: None,
+                built: false,
             });
         status.clone_into(&mut entry.status);
         entry.conclusion = conclusion.map(str::to_owned);
@@ -200,6 +225,53 @@ impl LocalServerState {
             .lock()
             .expect("cancels mutex poisoned")
             .contains(&run_id)
+    }
+
+    /// The run's build stage actually spawned `stow-build` — the flag a
+    /// harness reads to prove a doubly-submitted task compiled once.
+    fn mark_built(&self, workflow_run_id: u64) {
+        if let Some(run) = self
+            .runs
+            .lock()
+            .expect("runs mutex poisoned")
+            .get_mut(&workflow_run_id.to_string())
+        {
+            run.built = true;
+        }
+    }
+
+    /// The task a run id was dispatched with.
+    fn task_payload(&self, workflow_run_id: u64) -> Option<BuildTaskPayload> {
+        self.task_payloads
+            .lock()
+            .expect("task payloads mutex poisoned")
+            .get(&workflow_run_id)
+            .cloned()
+    }
+
+    /// The mock-registry manifest file `tag` would live at — the same
+    /// `manifests/<repo>/<tag>` layout `stow-mock-registry` serves.
+    fn manifest_path(
+        &self,
+        rustc_version: &stow_types::identity::WireRustcVersion,
+        tag: &str,
+    ) -> std::path::PathBuf {
+        let repository = stow_types::registry::cache_repository(rustc_version);
+        std::path::Path::new(&self.mock_registry_root)
+            .join("manifests")
+            .join(repository.path().to_string())
+            .join(tag)
+    }
+
+    /// The `built-<rustc>-<task_id hash>` marker the publish stage
+    /// writes — a run whose task already holds one exits without
+    /// building, exactly as `build-crate.yml` short-circuits (stow#877).
+    fn records_exist(&self, task: &BuildTaskPayload) -> bool {
+        self.manifest_path(
+            &task.rustc_version,
+            &stow_types::records::published_tag(task.rustc_version.as_str(), &task.task_id),
+        )
+        .exists()
     }
 
     /// Seed the dispatched run's task — `run_task` flips the row
@@ -470,6 +542,7 @@ impl LocalServerState {
                 error: failed.then(|| "build: seeded as failed".to_owned()),
                 delivery_errors: Vec::new(),
                 task_id: Some(seeded.task_id.clone()),
+                built: false,
             },
         );
         let build = self.begin_job(run_id, format!("build {}", seeded.task_id), BUILD_JOB_STEPS);
@@ -645,6 +718,7 @@ fn build_router(state: LocalServerState) -> Router {
         // `LocalCiBuildRuns` drives on the loopback base — the same
         // paths and shapes api.github.com serves, for run ids this
         // mock allocated.
+        "/repos/{owner}/{repo}/actions/workflows/{workflow}/runs".at(list_workflow_runs),
         "/repos/{owner}/{repo}/actions/runs/{id}".at(get_run),
         "/repos/{owner}/{repo}/actions/runs/{id}/attempts/{attempt}/jobs".at(get_attempt_jobs),
         "/repos/{owner}/{repo}/actions/runs/{id}/cancel".post(cancel_run),
@@ -730,6 +804,102 @@ fn run_response(state: &LocalServerState, run_id: u64) -> Response {
         }),
         StatusCode::OK,
     )
+}
+
+/// `status`/`per_page`/`page` of the workflow runs listing — the
+/// filters `stow_types::ci::CiInterface::status` sends (`queued`,
+/// `in_progress`), GitHub's 30-row default page.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+struct WorkflowRunsQuery {
+    /// `queued`, `in_progress` or `completed`; absent lists every run.
+    status: Option<String>,
+    /// Rows per page — GitHub's default 30, capped at 100.
+    per_page: Option<u32>,
+    /// 1-based page index — GitHub's default 1.
+    page: Option<u32>,
+}
+
+/// `GET /repos/{o}/{r}/actions/workflows/{file}/runs` — the listing the
+/// CI interface's `status` reads: `build-crate.yml` runs filtered by
+/// `status`, paged with the `Link: rel="next"` GitHub emits while a
+/// page follows, each row in the run-object shape [`run_response`]
+/// serves singly.
+async fn list_workflow_runs(
+    State(state): State<LocalServerState>,
+    params: Params,
+    Query(query): Query<WorkflowRunsQuery>,
+) -> Response {
+    let Some(workflow) = params.get("workflow").ok() else {
+        return not_found();
+    };
+    let wanted_path = format!(".github/workflows/{workflow}");
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(30).clamp(1, 100) as usize;
+    let runs: Vec<stow_types::local_ci::LocalCiRun> = state
+        .runs
+        .lock()
+        .expect("runs mutex poisoned")
+        .values()
+        .filter(|run| run.path == wanted_path)
+        .filter(|run| {
+            query
+                .status
+                .as_deref()
+                .is_none_or(|status| run.status == status)
+        })
+        .cloned()
+        .collect();
+    let total_count = runs.len();
+    // GitHub lists newest first; the mock's ids mint in dispatch order,
+    // so descending ids stand in for created-descending.
+    let mut runs = runs;
+    runs.sort_by_key(|run| std::cmp::Reverse(run.workflow_run_id));
+    let start = usize::try_from(page - 1).unwrap_or(usize::MAX) * per_page;
+    let window: Vec<serde_json::Value> = runs
+        .iter()
+        .skip(start)
+        .take(per_page)
+        .map(|run| {
+            serde_json::json!({
+                "id": run.workflow_run_id,
+                "name": workflow_name(&run.path),
+                "display_title": run.display_title,
+                "status": run.status,
+                "conclusion": run.conclusion,
+                "run_attempt": RUN_ATTEMPT,
+                "html_url": run.html_url,
+                "path": run.path,
+                "event": "workflow_dispatch",
+                "head_branch": stow_types::trusted_builder::BRANCH,
+            })
+        })
+        .collect();
+    let mut response = json_response(
+        &serde_json::json!({
+            "total_count": total_count,
+            "workflow_runs": window,
+        }),
+        StatusCode::OK,
+    );
+    if start + per_page < total_count {
+        let owner = params.get("owner").unwrap_or_default();
+        let repo = params.get("repo").unwrap_or_default();
+        let mut next = format!(
+            "http://{}/repos/{owner}/{repo}/actions/workflows/{workflow}/runs?per_page={per_page}&page={}",
+            state.listen,
+            page + 1,
+        );
+        if let Some(status) = &query.status {
+            use std::fmt::Write as _;
+            let _ = write!(next, "&status={status}");
+        }
+        response.headers_mut().insert(
+            skyzen::header::LINK,
+            skyzen::header::HeaderValue::from_str(&format!("<{next}>; rel=\"next\""))
+                .expect("link header value"),
+        );
+    }
+    response
 }
 
 /// `per_page`/`page` of the attempt-jobs listing — GitHub defaults a
@@ -964,9 +1134,86 @@ fn dispatch_build(state: LocalServerState, task: BuildTaskPayload) -> Response {
         None,
     );
     state.seed_task(workflow_run_id, &task);
+    state
+        .task_payloads
+        .lock()
+        .expect("task payloads mutex poisoned")
+        .insert(workflow_run_id, task.clone());
+    // The concurrency group `build-crate.yml` declares: one active run
+    // and one pending run per task id; a dispatch while a pending run
+    // waits cancels that pending run.
+    let start = {
+        let mut groups = state.groups.lock().expect("groups mutex poisoned");
+        let group = groups.entry(task.task_id.clone()).or_default();
+        let start = match (group.active, group.pending.take()) {
+            (None, None) => {
+                group.active = Some(workflow_run_id);
+                true
+            }
+            (_, superseded) => {
+                if let Some(superseded_id) = superseded {
+                    tokio::spawn(cancel_superseded(state.clone(), superseded_id));
+                }
+                group.pending = Some(workflow_run_id);
+                false
+            }
+        };
+        drop(groups);
+        start
+    };
     let response = dispatch_response(&run);
-    tokio::spawn(drive_task(state, task, workflow_run_id));
+    if start {
+        tokio::spawn(drive_task(state, task, workflow_run_id));
+    }
     json_response(&response, StatusCode::ACCEPTED)
+}
+
+/// The pending run a newer dispatch in its concurrency group replaced:
+/// its jobs never ran, its `completed`/`cancelled` `workflow_run`
+/// delivery goes out as any cancellation's does — the scheduler must
+/// see it to re-queue the task rather than record a failure (stow#877).
+async fn cancel_superseded(state: LocalServerState, workflow_run_id: u64) {
+    let Some(task) = state.task_payload(workflow_run_id) else {
+        return;
+    };
+    state.close_unstarted_job(workflow_run_id, build_job_name(&task), "cancelled");
+    state.skip_job(workflow_run_id);
+    let report = task_workflow_run(
+        &state,
+        &task,
+        workflow_run_id,
+        "completed",
+        Some("cancelled"),
+        None,
+    );
+    if let Err(error) = post_workflow_run(&state, &report).await {
+        state.record_error(workflow_run_id, &format!("workflow_run webhook: {error}"));
+    }
+    state.set_task(workflow_run_id, "completed", Some("cancelled"), None);
+}
+
+/// The group's `active` slot frees: the pending run behind it — when
+/// one waits — becomes the active run and drives now.
+fn promote_pending(state: &LocalServerState, task_id: &str) {
+    let next = {
+        let mut groups = state.groups.lock().expect("groups mutex poisoned");
+        let Some(group) = groups.get_mut(task_id) else {
+            return;
+        };
+        group.active = None;
+        if let Some(next) = group.pending.take() {
+            group.active = Some(next);
+            Some(next)
+        } else {
+            groups.remove(task_id);
+            None
+        }
+    };
+    if let Some(next_id) = next
+        && let Some(task) = state.task_payload(next_id)
+    {
+        tokio::spawn(drive_task(state.clone(), task, next_id));
+    }
 }
 
 /// Run the dispatched task — deliver `in_progress` as its build starts
@@ -975,6 +1222,14 @@ fn dispatch_build(state: LocalServerState, task: BuildTaskPayload) -> Response {
 /// `GET /tasks`, so a caller that sees no build run in progress knows
 /// no callback is still in flight (scripts/traffic-cost.sh).
 async fn drive_task(state: LocalServerState, task: BuildTaskPayload, workflow_run_id: u64) {
+    // A run whose task's signed records already exist exits without
+    // building — `build-crate.yml`'s early-exit check, mirrored: the
+    // superseding or following run re-tags the manifest that proves the
+    // task built and never compiles (stow#877).
+    if state.records_exist(&task) {
+        early_exit(state, task, workflow_run_id).await;
+        return;
+    }
     // `failure` is the run's conclusion cause; `run_error` is only the
     // failure no stage owns.
     let (failure, run_error) = match run_task(&state, &task, workflow_run_id).await {
@@ -1033,6 +1288,59 @@ async fn drive_task(state: LocalServerState, task: BuildTaskPayload, workflow_ru
         );
         state.record_error(workflow_run_id, &format!("workflow_run webhook: {error}"));
     }
+    promote_pending(&state, &task.task_id);
+}
+
+/// The early-exit path of [`drive_task`]: the records marker exists, so
+/// the run delivers `in_progress`, skips its build, re-tags the
+/// existing records manifest under its own `records-<…>-<run_id>-<1>`
+/// tag — the webhook's per-run check still resolves — and completes
+/// `success` having compiled nothing (`built` stays `false`).
+async fn early_exit(state: LocalServerState, task: BuildTaskPayload, workflow_run_id: u64) {
+    state.set_task(workflow_run_id, "in_progress", None, None);
+    let started = task_workflow_run(&state, &task, workflow_run_id, "in_progress", None, None);
+    if let Err(error) = post_workflow_run(&state, &started).await {
+        tracing::warn!(task_id = %task.task_id, %error, "in_progress delivery refused");
+    }
+    state.close_unstarted_job(workflow_run_id, build_job_name(&task), "skipped");
+    let publish_job = state.begin_job(workflow_run_id, publish_job_name(), PUBLISH_JOB_STEPS);
+    // Re-tag AND re-sign — readers bind the signature to the tag they
+    // pulled, so the run's own records tag needs a signature layer of
+    // its own, exactly as `stow-build publish` does on GHCR (stow#877).
+    let error = match retag_records(&state, &task, workflow_run_id).await {
+        Ok(()) => {
+            state.finish_job(workflow_run_id, publish_job, "success", &["success"]);
+            None
+        }
+        Err(error) => {
+            let error = format!("publish: retag records manifest: {error}");
+            state.finish_job(workflow_run_id, publish_job, "failure", &["failure"]);
+            Some(error)
+        }
+    };
+    let conclusion = if error.is_some() {
+        "failure"
+    } else {
+        "success"
+    };
+    let report = task_workflow_run(
+        &state,
+        &task,
+        workflow_run_id,
+        "completed",
+        Some(conclusion),
+        error.clone(),
+    );
+    if let Err(error) = post_workflow_run(&state, &report).await {
+        state.record_error(workflow_run_id, &format!("workflow_run webhook: {error}"));
+    }
+    state.set_task(
+        workflow_run_id,
+        "completed",
+        Some(conclusion),
+        error.as_deref(),
+    );
+    promote_pending(&state, &task.task_id);
 }
 
 /// A `resolve-request` dispatch (stow#428): the stub absorbs the hop
@@ -1285,6 +1593,7 @@ async fn build_stage(run: &TaskRun) -> stow_types::error::Result<TaskLayout> {
         .acquire()
         .await
         .expect("the runner pool is never closed");
+    run.state.mark_built(run.workflow_run_id);
     // The child is the untrusted build stage: it gets the event file and
     // nothing else, exactly as the production build job does.
     let status = run_build_stage(run, &layout).await?;
@@ -1484,6 +1793,48 @@ async fn push_records(
     }
     Err(stow_types::stow_error!(
         "mock registry push-records failed with status {status}"
+    ))
+}
+
+/// The early-exited run's publish: `stow-mock-registry retag-records`
+/// re-tags the `built-` marker's manifest under this run's `records-`
+/// tag and appends a mock signature binding it (stow#877).
+async fn retag_records(
+    state: &LocalServerState,
+    task: &BuildTaskPayload,
+    workflow_run_id: u64,
+) -> stow_types::error::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mock_registry_exe = exe
+        .parent()
+        .ok_or_else(|| {
+            stow_types::stow_error!("cannot determine parent directory of stow-build binary")
+        })?
+        .join(format!(
+            "stow-mock-registry{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+    let status = async_process::Command::new(&mock_registry_exe)
+        .arg("retag-records")
+        .arg("--task-id")
+        .arg(&task.task_id)
+        .arg("--rustc-version")
+        .arg(task.rustc_version.as_str())
+        .arg("--run-id")
+        .arg(workflow_run_id.to_string())
+        .arg("--run-attempt")
+        .arg(RUN_ATTEMPT.to_string())
+        .arg("--registry-root")
+        .arg(PathBuf::from(&state.mock_registry_root))
+        .arg("--private-key")
+        .arg(PathBuf::from(&state.mock_private_key_path))
+        .status()
+        .await?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(stow_types::stow_error!(
+        "mock registry retag-records failed with status {status}"
     ))
 }
 

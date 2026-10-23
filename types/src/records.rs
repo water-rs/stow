@@ -127,6 +127,30 @@ pub fn records_tag(rustc_version: &str, task_id: &str, build: BuildRun) -> Strin
     tag
 }
 
+/// `built-<rustc>-<task_id hash>` — the published-records marker tag.
+///
+/// A publish points it at the task's records manifest, so a
+/// `build-crate.yml` run learns "this task's signed records already
+/// exist" in one manifest fetch (stow#877): two submitters naming the
+/// same task race to one build, and the superseded or following run
+/// exits without building by re-tagging the manifest this tag names
+/// instead of compiling. The tag space stays disjoint from `records-`,
+/// which the index export folds.
+///
+/// # Panics
+///
+/// When the produced tag exceeds [`MAX_OCI_TAG_LEN`].
+#[must_use]
+pub fn published_tag(rustc_version: &str, task_id: &str) -> String {
+    let digest = blake3::hash(task_id.as_bytes()).to_hex();
+    let tag = format!("built-{rustc_version}-{digest}");
+    assert!(
+        tag.len() <= MAX_OCI_TAG_LEN,
+        "published tag {tag:?} exceeds {MAX_OCI_TAG_LEN} chars"
+    );
+    tag
+}
+
 /// Whether `field` is a decimal literal — non-empty ASCII digits, so no
 /// sign and no leading `+` pass.
 fn is_decimal(field: &str) -> bool {

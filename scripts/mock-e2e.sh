@@ -1218,6 +1218,102 @@ curl -fsS --max-time 10 -H "Authorization: Bearer ${registry_token}" \
     -o /dev/null \
     || die "index slice index.${HOST_TARGET}.${RUSTC_VERSION} missing after the manual wave"
 
+# stow#877 — both submitters build the task once. `preheat manual`
+# dispatches unicode-ident through the shared CI interface while the
+# same task goes through the scheduler's submit → claim → dispatch
+# path. Both `workflow_dispatch`es name the same task id, so the local
+# CI concurrency group keeps one run pending behind the other; when
+# the first run's publish lands the records marker, the pending run
+# drives, sees it, and exits without compiling — `built` across the
+# task's runs counts exactly one.
+UNICODE_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
+    'https://index.crates.io/un/ic/unicode-ident' \
+    | jq -rs '[.[] | select(.yanked | not) | .vers] | sort_by(split(".") | map(tonumber)) | last // empty')"
+[ -n "$UNICODE_VERSION" ] || die "no non-yanked unicode-ident found on crates.io"
+echo "[mock-e2e] dual-submitter task: unicode-ident $UNICODE_VERSION (manual + scheduler)"
+printf 'unicode-ident\n' >"$WORK_DIR/dual-crates.txt"
+isolated_env \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
+    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+    STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
+    STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
+    "$BIN/stow-admin" preheat manual \
+    --crates "$WORK_DIR/dual-crates.txt" \
+    --rustc-version "$RUSTC_VERSION" \
+    --targets "$HOST_TARGET" \
+    --dispatch-url "http://${LOCAL_CI_ADDR}" \
+    --in-flight 4 \
+    >"$LOG_DIR/preheat-manual-dual.log" 2>&1 &
+DUAL_MANUAL_PID=$!
+
+# The scheduler's dispatch lands while the manual wave's run is still
+# in flight: poll the mock's task list until the run registers, then
+# submit the identical task through the edge.
+deadline=$((SECONDS + 600))
+dual_task=""
+while :; do
+    check_children_alive
+    dual_task="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" 2>/dev/null \
+        | jq -r '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident"))) | .task_id] | first // empty' 2>/dev/null || true)"
+    [ -n "$dual_task" ] && break
+    [ "$SECONDS" -ge "$deadline" ] && { cat "$LOG_DIR/preheat-manual-dual.log"; die "manual wave did not dispatch unicode-ident within 600s"; }
+    sleep 2
+done
+echo "[mock-e2e] dual task $dual_task running under preheat manual; submitting through the scheduler"
+status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+completed_before=0
+[ -n "$status_json" ] && completed_before="$(jq -r '.completed' <<<"$status_json")"
+
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" submit \
+    --crate-name "unicode-ident" \
+    --version "$UNICODE_VERSION" \
+    --features-json '[]' \
+    --target "$HOST_TARGET" \
+    --rustc-version "$RUSTC_VERSION" \
+    --yes \
+    >"$LOG_DIR/admin-submit-dual.log" 2>&1 \
+    || { cat "$LOG_DIR/admin-submit-dual.log"; die "stow-admin submit (dual) failed"; }
+
+# Every run of the task settles: the queued duplicate drives after the
+# first publishes, sees the records marker, and early-exits.
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    open_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident"))) | select(.status != "completed")] | length')"
+    [ "$open_runs" -eq 0 ] && break
+    [ "$SECONDS" -ge "$deadline" ] && die "dual task still has $open_runs open run(s) after ${TASK_DEADLINE}s"
+    sleep 5
+done
+wait "$DUAL_MANUAL_PID" \
+    || { cat "$LOG_DIR/preheat-manual-dual.log"; die "dual manual wave failed"; }
+
+# The scheduler's own completion arrived over the run's webhook —
+# completed ticks up by exactly one and nothing failed.
+deadline=$((SECONDS + 300))
+while :; do
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+    if [ -n "$status_json" ]; then
+        echo "[mock-e2e] scheduler (dual): $status_json"
+        [ "$(jq -r '.failed' <<<"$status_json")" -ge 1 ] \
+            && die "scheduler failed the dual task: $status_json"
+        [ "$(jq -r '.completed' <<<"$status_json")" -gt "$completed_before" ] && break
+    fi
+    [ "$SECONDS" -ge "$deadline" ] && die "scheduler did not complete the dual task within 300s"
+    sleep 5
+done
+
+dual_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+    | jq '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident")))]')"
+dual_count="$(jq 'length' <<<"$dual_runs")"
+dual_built="$(jq '[.[] | select(.built)] | length' <<<"$dual_runs")"
+dual_failed="$(jq '[.[] | select(.conclusion != null and .conclusion != "success")] | length' <<<"$dual_runs")"
+echo "[mock-e2e] dual task $dual_task: $dual_count dispatches, $dual_built compiled, $dual_failed non-success"
+[ "$dual_count" -ge 2 ] || die "expected at least 2 dispatches for the dual-submitted task, saw $dual_count"
+[ "$dual_built" -eq 1 ] || die "dual task compiled $dual_built times across $dual_count dispatches — expected 1"
+[ "$dual_failed" -eq 0 ] || die "a dual dispatch did not conclude success: $dual_runs"
+
 # Throwaway consumer pinned to the exact version the scheduler just built.
 # `stow status` below reads the config.toml `stow setup` writes.
 CONSUMER="$WORK_DIR/itoa-consumer"

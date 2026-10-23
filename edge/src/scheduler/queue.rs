@@ -1531,6 +1531,10 @@ struct BuildCompleteReport {
     attempt: u32,
     success: bool,
     error: Option<String>,
+    /// The run's `conclusion` was `cancelled` — a superseded duplicate of
+    /// the task's concurrency group (stow#877), not a build verdict: the
+    /// row re-queues `pending` rather than spending an attempt.
+    cancelled: bool,
     github_run_id: Option<String>,
     /// The build-cost sample's duration: claim to completion on the
     /// scheduler's clock (`claimed_at` is the claim instant; `None`
@@ -1548,32 +1552,208 @@ struct CompletedTargetRow {
 /// `window_minutes` bounds the outcome evidence the record keeps: the
 /// freeze breaker's window, so the expiry deletes carried inside the
 /// insert drop exactly what the trip check can no longer read.
-async fn complete(
+/// A `workflow_run` `in_progress` delivery for a run no claimed row
+/// names — a run another submitter (`preheat manual`, another wave)
+/// dispatched — joins the external occupancy set under the family its
+/// task id's target leg resolves to (stow#877).
+pub(super) async fn external_run_seen(
     db: &DurableDb,
-    settings: &SchedulerSettings,
-    report: &BuildCompleteReport,
-    window_minutes: u32,
+    github_run_id: &str,
+    task_id: &str,
 ) -> Result<(), QueueError> {
-    let generation_id = report.generation_id.clone();
-    // The `RETURNING` columns feed the outcome counter and the
-    // build-cost sample below without a second read.
-    // The report must name the row's live attempt in an in-flight status:
-    // without that predicate a late or duplicate report for a superseded
-    // attempt would overwrite the state of the attempt the row has since
-    // been resurrected into (resurrection bumps `attempt`).
-    //
+    let family = stow_types::ci::family_of_task_id(task_id).map_or("unknown", family_name);
+    db.query("INSERT OR REPLACE INTO external_runs (github_run_id, runner_family) VALUES (?, ?)")
+        .bind(github_run_id.to_owned())
+        .bind(family)
+        .execute()
+        .await
+        .map_err(|error| format!("record external run: {error}"))?;
+    Ok(())
+}
+
+const fn family_name(family: RunnerFamily) -> &'static str {
+    match family {
+        RunnerFamily::Linux => "linux",
+        RunnerFamily::MacOs => "macos",
+        RunnerFamily::Windows => "windows",
+    }
+}
+
+/// The run left the CI surface — a `completed`/`cancelled` delivery,
+/// or a dispatch binding that made it ours. An absent id is a no-op.
+pub(super) async fn external_run_gone(
+    db: &DurableDb,
+    github_run_id: &str,
+) -> Result<(), QueueError> {
+    db.query("DELETE FROM external_runs WHERE github_run_id = ?")
+        .bind(github_run_id.to_owned())
+        .execute()
+        .await
+        .map_err(|error| format!("drop external run: {error}"))?;
+    Ok(())
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct ExternalFamilyRow {
+    runner_family: String,
+    count: i64,
+}
+
+/// The external occupancy the claim subtracts — runs another submitter
+/// dispatched, by runner family.
+pub(super) async fn external_occupancy(
+    db: &DurableDb,
+) -> Result<stow_types::ci::Occupancy, QueueError> {
+    let rows = db
+        .query("SELECT runner_family, COUNT(*) AS count FROM external_runs GROUP BY runner_family")
+        .fetch_all::<ExternalFamilyRow>()
+        .await
+        .map_err(|error| format!("read external runs: {error}"))?;
+    let mut occupancy = stow_types::ci::Occupancy::EMPTY;
+    for row in rows {
+        let count = u32::try_from(row.count).unwrap_or(u32::MAX);
+        for _ in 0..count {
+            match row.runner_family.as_str() {
+                "linux" => occupancy.add(RunnerFamily::Linux),
+                "macos" => occupancy.add(RunnerFamily::MacOs),
+                "windows" => occupancy.add(RunnerFamily::Windows),
+                _ => occupancy.add_unknown(),
+            }
+        }
+    }
+    Ok(occupancy)
+}
+
+const EXTERNAL_RECONCILED_KEY: &str = "external_runs_reconciled_ms";
+
+#[derive(Debug, skyzen::FromRow)]
+struct SettingValueRow {
+    value: String,
+}
+
+/// Whether the external set needs a `status` reconcile — never
+/// reconciled, or the last one is older than `cadence_ms`.
+pub(super) async fn external_reconcile_due(
+    db: &DurableDb,
+    cadence_ms: i64,
+    now_ms: i64,
+) -> Result<bool, QueueError> {
+    let stamped = db
+        .query("SELECT value FROM settings WHERE key = ?")
+        .bind(EXTERNAL_RECONCILED_KEY)
+        .fetch_optional::<SettingValueRow>()
+        .await
+        .map_err(|error| format!("read external reconcile stamp: {error}"))?;
+    Ok(match stamped {
+        None => true,
+        Some(row) => row
+            .value
+            .parse::<i64>()
+            .map_or(true, |at| now_ms.saturating_sub(at) >= cadence_ms),
+    })
+}
+
+#[derive(Debug, skyzen::FromRow)]
+struct BoundRunRow {
+    github_run_id: String,
+}
+
+/// `status()` answers which `build-crate.yml` runs hold slots; every
+/// listed run the queue has not bound is external — the set is
+/// replaced wholesale and the reconcile stamped.
+pub(super) async fn reconcile_external_runs(
+    db: &DurableDb,
+    listed: &[stow_types::ci::CiRunListing],
+    now_ms: i64,
+) -> Result<(), QueueError> {
+    let bound: std::collections::BTreeSet<String> = db
+        .query("SELECT github_run_id FROM queue WHERE github_run_id IS NOT NULL")
+        .fetch_all::<BoundRunRow>()
+        .await
+        .map_err(|error| format!("read bound run ids: {error}"))?
+        .into_iter()
+        .map(|row| row.github_run_id)
+        .collect();
+    db.query("DELETE FROM external_runs")
+        .execute()
+        .await
+        .map_err(|error| format!("clear external runs: {error}"))?;
+    for run in listed {
+        let run_id = run.workflow_run_id.to_string();
+        if bound.contains(&run_id) {
+            continue;
+        }
+        let family = run.family.map_or("unknown", family_name);
+        db.query(
+            "INSERT OR REPLACE INTO external_runs (github_run_id, runner_family) VALUES (?, ?)",
+        )
+        .bind(run_id)
+        .bind(family)
+        .execute()
+        .await
+        .map_err(|error| format!("record external run: {error}"))?;
+    }
+    db.query("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)")
+        .bind(EXTERNAL_RECONCILED_KEY)
+        .bind(now_ms.to_string())
+        .execute()
+        .await
+        .map_err(|error| format!("stamp external reconcile: {error}"))?;
+    Ok(())
+}
+
+/// `pending`, `dispatched` or `running` rows exist — reconcile costs
+/// nothing while the queue is idle.
+pub(super) async fn has_dispatchable_or_inflight(db: &DurableDb) -> Result<bool, QueueError> {
+    let count: i64 = db
+        .query("SELECT COUNT(*) FROM queue WHERE status IN ('pending', 'dispatched', 'running')")
+        .fetch_scalar()
+        .await
+        .map_err(|error| format!("count active rows: {error}"))?;
+    Ok(count > 0)
+}
+
+/// The settle write [`complete`] runs: `cancelled` re-queues on the
+/// same attempt, `success` lands `completed`, and a failure re-queues
+/// behind backoff — or parks `failed` at `MAX_BUILD_ATTEMPTS`.
+fn complete_statement(settings: &SchedulerSettings, report: &BuildCompleteReport) -> String {
     // A failure under `MAX_BUILD_ATTEMPTS` re-queues the row behind the
     // same exponential backoff a dispatch failure applies — 2^cycle
     // minutes, capped — with `attempt` bumped so the next dispatch is a
     // new generation; at the cap the row parks `failed` until an
     // operator `retry` returns it to `pending` at attempt 1. SET terms
     // see the old row, so `attempt` is the cycle position that failed.
+    //
+    // A `cancelled` conclusion is the concurrency group's verdict on a
+    // superseded duplicate (stow#877) — the task's build moved to the
+    // newer run, so the row re-queues `pending` on the *same* attempt
+    // with no backoff and no failure evidence: neither the attempt
+    // budget nor the freeze breaker's window may read it as a failure.
     let retry = format!("attempt < {MAX_BUILD_ATTEMPTS}");
     let next_not_before = format!(
         "datetime('now', '+' || {} || ' minutes')",
         backoff_minutes_sql("attempt")
     );
-    let statement = if report.success {
+    if report.cancelled && !report.success {
+        format!(
+            "UPDATE queue \
+             SET status = 'pending', error_msg = ?, github_run_id = NULL, \
+                 claimed_at = NULL, not_before = datetime('now'), \
+                 deps_met = {deps_met}, blocked = {blocked}, wake_at = {wake}, \
+                 updated_at = datetime('now') \
+             WHERE task_id = ? AND generation_id = ? \
+               AND status IN ('dispatched', 'running') \
+             RETURNING target, crate_name, status",
+            deps_met = deps_met_sql("queue.task_id"),
+            blocked = blocked_sql("queue.task_id"),
+            wake = wake_at_sql(
+                "lane",
+                "first_requested_at",
+                "datetime('now')",
+                settings.dispatch_min_age_minutes,
+            ),
+        )
+    } else if report.success {
         "UPDATE queue \
          SET status = 'completed', error_msg = ?, github_run_id = COALESCE(?, github_run_id), \
              updated_at = datetime('now') \
@@ -1605,11 +1785,33 @@ async fn complete(
                 settings.dispatch_min_age_minutes,
             ),
         )
-    };
-    let updated = db
+    }
+}
+
+async fn complete(
+    db: &DurableDb,
+    settings: &SchedulerSettings,
+    report: &BuildCompleteReport,
+    window_minutes: u32,
+) -> Result<(), QueueError> {
+    let generation_id = report.generation_id.clone();
+    // The `RETURNING` columns feed the outcome counter and the
+    // build-cost sample below without a second read.
+    // The report must name the row's live attempt in an in-flight status:
+    // without that predicate a late or duplicate report for a superseded
+    // attempt would overwrite the state of the attempt the row has since
+    // been resurrected into (resurrection bumps `attempt`).
+    let statement = complete_statement(settings, report);
+    let cancelled_requeue = report.cancelled && !report.success;
+    let query = db
         .query(&statement)
-        .bind(report.error.clone().unwrap_or_default())
-        .bind(report.github_run_id.clone())
+        .bind(report.error.clone().unwrap_or_default());
+    let query = if cancelled_requeue {
+        query
+    } else {
+        query.bind(report.github_run_id.clone())
+    };
+    let updated = query
         .bind(report.task_id.clone())
         .bind(generation_id.clone())
         .fetch_optional::<CompletedTargetRow>()
@@ -1626,7 +1828,7 @@ async fn complete(
     // A dep whose attempt just exhausted is the one outside-the-row
     // event that flips a pending dependent's `blocked` flag — refresh
     // exactly its dependents.
-    if !report.success {
+    if !report.success && !cancelled_requeue {
         refresh_dependents(
             db,
             "SELECT value AS task_id FROM json_each(?)",
@@ -1647,14 +1849,18 @@ async fn complete(
     if completed.status == "pending" {
         refresh_dispatch_keys(db, std::slice::from_ref(&report.task_id)).await?;
     }
-    record_attempt_outcome(
-        db,
-        report,
-        &generation_id,
-        &completed.target,
-        window_minutes,
-    )
-    .await?;
+    // A cancellation is not an attempt outcome — the freeze breaker's
+    // failure window must not see a superseded duplicate.
+    if !cancelled_requeue {
+        record_attempt_outcome(
+            db,
+            report,
+            &generation_id,
+            &completed.target,
+            window_minutes,
+        )
+        .await?;
+    }
     // A success is the build cost's only honest measurement, and the
     // generation fence above is what keeps a late or duplicate report
     // out of the sample window.
@@ -2052,6 +2258,7 @@ pub async fn complete_run(
             attempt: row.attempt,
             success: report.success,
             error: report.error.clone(),
+            cancelled: report.cancelled,
             github_run_id: report.github_run_id.clone(),
             sample_ms: report.success.then_some(row.duration_ms),
         },
@@ -2089,6 +2296,7 @@ struct PendingCompletionRow {
     github_run_id: String,
     task_id: String,
     success: i64,
+    cancelled: i64,
     error: Option<String>,
     received_at: String,
 }
@@ -2116,14 +2324,15 @@ async fn persist_pending_completion(
     let inserted = db
         .query(
             "INSERT INTO pending_run_completions \
-                 (github_run_id, task_id, success, error) \
-             SELECT ?, task_id, ?, ? FROM queue \
+                 (github_run_id, task_id, success, cancelled, error) \
+             SELECT ?, task_id, ?, ?, ? FROM queue \
              WHERE task_id = ? AND status IN ('dispatched', 'running') \
                AND github_run_id IS NULL \
              ON CONFLICT(github_run_id) DO NOTHING",
         )
         .bind(github_run_id.to_owned())
         .bind(i64::from(report.success))
+        .bind(i64::from(report.cancelled))
         .bind(report.error.clone())
         .bind(report.task_id.clone())
         .execute()
@@ -2135,7 +2344,7 @@ async fn persist_pending_completion(
 
     let existing = db
         .query(
-            "SELECT github_run_id, task_id, success, error, received_at \
+            "SELECT github_run_id, task_id, success, cancelled, error, received_at \
              FROM pending_run_completions WHERE github_run_id = ?",
         )
         .bind(github_run_id.to_owned())
@@ -2147,6 +2356,7 @@ async fn persist_pending_completion(
         Some(existing)
             if existing.task_id == report.task_id
                 && existing.success == i64::from(report.success)
+                && existing.cancelled == i64::from(report.cancelled)
                 && existing.error == report.error =>
         {
             Ok(true)
@@ -2184,7 +2394,7 @@ async fn apply_pending_completion_for_binding(
 
     let pending = db
         .query(
-            "SELECT github_run_id, task_id, success, error, received_at \
+            "SELECT github_run_id, task_id, success, cancelled, error, received_at \
              FROM pending_run_completions \
              WHERE task_id = ? AND github_run_id = ?",
         )
@@ -2198,6 +2408,7 @@ async fn apply_pending_completion_for_binding(
     };
     let report = BuildCompleteReport {
         task_id: pending.task_id,
+        cancelled: pending.cancelled != 0,
         generation_id: generation_id.to_owned(),
         attempt: db
             .query("SELECT attempt FROM queue WHERE task_id = ? AND generation_id = ?")
@@ -2311,6 +2522,9 @@ pub async fn bind_dispatch_run(
     if result.rows_written == 0 {
         return Ok(false);
     }
+    // The run is the scheduler's own now — an `in_progress` delivery
+    // that raced ahead of this bind counted it external (stow#877).
+    external_run_gone(db, github_run_id).await?;
     // A completion from an orphaned run can arrive while this generation is
     // claimed but still unbound. Once the native response binds Y, every
     // pending event for the task except Y belongs to an older or ambiguous
@@ -4242,6 +4456,7 @@ pub async fn claim_dispatchable_tasks(
     db: &DurableDb,
     settings: &SchedulerSettings,
     coverage: &impl CoverageOracle,
+    external: &stow_types::ci::Occupancy,
 ) -> Result<Vec<QueuedTask>, QueueError> {
     // Stale recovery runs ahead of the pause check: a paused scheduler
     // owes its in-flight builds the same lease-expiry reclaim.
@@ -4262,12 +4477,18 @@ pub async fn claim_dispatchable_tasks(
     // dependent's edge is decidable only at the report that publishes
     // them — an alarm pass precedes that data and cannot know.
     let active = count_active_by_family(db).await?;
-    let mut total_slots = limit.get().saturating_sub(active.total);
+    // External runs are by construction runs the queue has not bound
+    // (delivery-tracked, status-reconciled), so own + external is the
+    // honest count — `max` was only needed while external included the
+    // scheduler's own runs (stow#877).
+    let mut total_slots = limit.get().saturating_sub(active.total + external.total());
     let mut macos_slots = settings
         .max_concurrent_macos_jobs
-        .saturating_sub(active.of(RunnerFamily::MacOs));
+        .saturating_sub(active.of(RunnerFamily::MacOs) + external.of(RunnerFamily::MacOs));
     tracing::info!(
         running = active.total,
+        external_total = external.total(),
+        external_macos = external.of(RunnerFamily::MacOs),
         available = total_slots,
         macos_available = macos_slots,
         ?settings,

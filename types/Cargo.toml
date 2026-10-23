@@ -48,6 +48,7 @@ object = { version = "0.39.1", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+futures-lite = { version = "2.6", default-features = false, features = ["std"] }
 serial_test = "4"
 tempfile = "3"
 

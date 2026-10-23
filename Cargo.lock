@@ -8154,6 +8154,7 @@ name = "stow-types"
 version = "0.7.0"
 dependencies = [
  "blake3",
+ "futures-lite",
  "hex",
  "hmac 0.13.0",
  "http",

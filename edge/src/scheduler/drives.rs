@@ -1724,6 +1724,11 @@ pub const DRIVES: &[Drive] = &[
         // `SUBGRAPH_WALK_MAX_LEVELS` (64) statements and `O(Σ reachable
         // nodes)` rows read, bounded by the dispatched tasks' own
         // subgraphs, never the queue bulk.
+        // External-run occupancy (stow#877): the pass pays one
+        // `external_runs` count and one `settings` stamp read per pass,
+        // and — only while rows are pending/dispatched/running — one
+        // `status` reconcile per `STATUS_RECONCILE_MS` (10 min): ≤2
+        // `runs` listing calls, ≤12 calls/hour while active, zero idle.
         name: "alarm pass",
         setup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move { snapshot_claim_surface(db, settings, ctx, &[]).await })
@@ -2320,9 +2325,14 @@ async fn dispatch_pass_drive(
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let claimed = queue::claim_dispatchable_tasks(db, &pass_settings, &NoCoverage)
-                .await
-                .map_err(|error| error.to_string())?;
+            let claimed = queue::claim_dispatchable_tasks(
+                db,
+                &pass_settings,
+                &NoCoverage,
+                &stow_types::ci::Occupancy::EMPTY,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             let task_ids: Vec<String> = claimed.iter().map(|task| task.task_id.clone()).collect();
             ctx.record_claimed(task_ids.clone());
             task_ids
@@ -2397,15 +2407,20 @@ async fn claim_pass(
             .as_ref()
             .ok_or_else(|| format!("{probe} needs the counted D1"))?;
         let coverage = super::object::CatalogCoverage { db: d1.clone() };
-        queue::claim_dispatchable_tasks(db, settings, &coverage)
+        queue::claim_dispatchable_tasks(db, settings, &coverage, &stow_types::ci::Occupancy::EMPTY)
             .await
             .map_err(|error| error.to_string())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        queue::claim_dispatchable_tasks(db, settings, &NoCoverage)
-            .await
-            .map_err(|error| error.to_string())
+        queue::claim_dispatchable_tasks(
+            db,
+            settings,
+            &NoCoverage,
+            &stow_types::ci::Occupancy::EMPTY,
+        )
+        .await
+        .map_err(|error| error.to_string())
     }
 }
 
@@ -2700,6 +2715,7 @@ fn run_completion(bound: &BoundRun, outcome: RunOutcome) -> stow_types::api::Wor
         task_id: bound.task.clone(),
         success,
         error,
+        cancelled: false,
         github_run_id: Some(bound.run.to_string()),
     }
 }

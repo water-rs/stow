@@ -23,9 +23,10 @@ pub use index::{
     IndexPublishOutcome, PulledFolded, PulledIndex, publish_folded, publish_index,
     published_index_content_sha256, pull_folded, pull_index, pull_published_index,
 };
+pub use oci_client::Reference;
 pub use records::{
     PulledRecords, RecordsPublishOutcome, list_records_tags, pull_records, pull_records_by_tag,
     push_records, push_records_with,
 };
 pub use registry::{RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest};
-pub use sign::sign_artifact;
+pub use sign::{put_signed_manifest, sign_artifact};

@@ -56,6 +56,8 @@ env:
 jobs:
   build:
     name: build ${{ fromJSON(inputs.task).crate_name }} ${{ fromJSON(inputs.task).version }} (${{ fromJSON(inputs.task).target }})
+    outputs:
+      records-exist: ${{ steps.records-exist.outputs.found }}
     runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-14","aarch64-apple-ios":"macos-14","aarch64-apple-ios-sim":"macos-14","aarch64-linux-android":"ubuntu-latest","x86_64-unknown-linux-gnu":"ubuntu-latest","aarch64-unknown-linux-gnu":"ubuntu-latest","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-latest"}')[fromJSON(inputs.task).target] }}
     permissions:
       contents: read
@@ -200,7 +202,22 @@ jobs:
         with:
           binaries: stow-build stow-cli
           github-token: ${{ secrets.GITHUB_TOKEN }}
+      # stow#877: a duplicate dispatch — two submitters naming the same
+      # task, or the concurrency group re-running a queued run — must not
+      # compile twice. `records-exist` reads the task's
+      # `built-<rustc>-<task_id hash>` marker in GHCR; on `found` the
+      # untrusted stage and its artifact skip, and the trusted publish
+      # job re-tags the proven manifest under this run's records tag.
+      # The check is a trusted binary under a read-only token — the
+      # untrusted stage never sees the credential.
+      - name: Check for existing records
+        id: records-exist
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "found=$(stow-build records-exist)" >> "$GITHUB_OUTPUT"
       - name: Run the untrusted build stage
+        if: steps.records-exist.outputs.found != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -209,6 +226,7 @@ jobs:
           fi
           stow-build build --output-dir "${{ runner.temp }}/stow-build-output"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.records-exist.outputs.found != 'true'
         with:
           name: build-output
           path: ${{ runner.temp }}/stow-build-output
@@ -278,6 +296,7 @@ jobs:
         with:
           toolchain: ${{ fromJSON(inputs.task).rustc_version }}
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: needs.build.outputs.records-exist != 'true'
         with:
           name: build-output
           path: ${{ runner.temp }}/stow-build-output
