@@ -770,6 +770,7 @@ pub async fn compile_host(task: &BuildTaskPayload) -> stow_types::error::Result<
 /// whole resolved closure, build-script deps and transitives included,
 /// at the identities cargo will actually compile them at.
 pub async fn phase_unit_graphs(
+    cargo_home: &Path,
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
     cargo_subcommand: CargoSubcommand,
@@ -812,7 +813,7 @@ pub async fn phase_unit_graphs(
                 workspace.workspace_root(),
                 runner_host_triple(task)?,
                 &task.rustc_version,
-                None,
+                Some(cargo_home),
             )
             .await?;
             graphs.push(PhaseUnitGraph {
@@ -1012,7 +1013,8 @@ pub async fn build(
     };
     let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
 
-    fetch_workspace_dependencies(task, &workspace).await?;
+    let cargo_home = cargo_home()?;
+    fetch_workspace_dependencies(&cargo_home, task, &workspace).await?;
 
     let cargo_subcommand = cargo_subcommand()?;
     // Cargo's own unit graphs are computed once for the whole build:
@@ -1020,7 +1022,7 @@ pub async fn build(
     // and spelling will compile (stow#588), and consumption reads the
     // same answers — a graph that cannot be produced fails the build,
     // not just the cache path.
-    let unit_graphs = phase_unit_graphs(task, &workspace, cargo_subcommand).await?;
+    let unit_graphs = phase_unit_graphs(&cargo_home, task, &workspace, cargo_subcommand).await?;
     verify_dependency_context(task, &unit_graphs)?;
     let (_consume_store_dir, consume_store) = stage_consumption_store(task, &unit_graphs).await?;
 
@@ -1054,6 +1056,7 @@ pub async fn build(
 
     let setup = PhaseSetup {
         workspace: &workspace,
+        cargo_home: &cargo_home,
         wrappers: &wrappers,
         runtime_wrapper: &runtime_wrapper,
         capture_wrapper: &capture_wrapper,
@@ -1165,6 +1168,7 @@ pub fn verified_run_toolchain(task: &BuildTaskPayload) -> stow_types::error::Res
 /// flags don't exist on `fetch`: it downloads the full dependency closure
 /// for every feature and every target.
 pub async fn fetch_workspace_dependencies(
+    cargo_home: &Path,
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
 ) -> stow_types::error::Result<()> {
@@ -1172,7 +1176,8 @@ pub async fn fetch_workspace_dependencies(
     fetch
         .arg("fetch")
         .arg("--manifest-path")
-        .arg(workspace.manifest_path());
+        .arg(workspace.manifest_path())
+        .env("CARGO_HOME", path_arg(cargo_home)?);
     // Fetch never takes `--locked`: the generated wrapper's seeded lockfile
     // is not one cargo can be held to — it must still prune bundled entries
     // the wrapper graph cannot reach and fill in the dep edges. Under
@@ -1210,6 +1215,10 @@ pub async fn fetch_workspace_dependencies(
 /// The per-run state every sandboxed phase shares.
 pub struct PhaseSetup<'a> {
     pub workspace: &'a BuildWorkspace,
+    /// The cargo home the sandboxed phases see: its caches are granted
+    /// read-only and it is exported to them as `CARGO_HOME`. Callers pass
+    /// [`cargo_home`]'s answer; a test passes the home its fixture built.
+    pub cargo_home: &'a Path,
     pub wrappers: &'a wrapper_shim::WrapperShimPaths,
     pub runtime_wrapper: &'a Path,
     pub capture_wrapper: &'a Path,
@@ -1288,7 +1297,7 @@ pub async fn run_sandboxed_phase(
             path_arg(setup.workspace.capture_dir())?,
         )
         .env(STOW_BUILD_CAPTURE_IPC_ENV, path_arg(run.ipc_endpoint)?)
-        .env("CARGO_HOME", path_arg(&cargo_home()?)?)
+        .env("CARGO_HOME", path_arg(run.setup.cargo_home)?)
         .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
         .current_dir(setup.workspace.workspace_root());
     if let Some(store_dir) = setup.consume_store {
@@ -1541,6 +1550,7 @@ pub async fn phase_sandbox(
         ));
 
     for (path, access, reason) in sandbox_grants(
+        setup.cargo_home,
         workspace,
         run_dir,
         wrappers,
@@ -1565,7 +1575,9 @@ pub async fn phase_sandbox(
 /// The filesystem grant set for one phase — nothing else on the host is
 /// reachable. Every entry names the tool that needs it and why, because each
 /// one is a hole in the boundary this task exists to close.
+#[allow(clippy::too_many_arguments)]
 fn sandbox_grants(
+    cargo_home: &Path,
     workspace: &BuildWorkspace,
     run_dir: &Path,
     wrappers: &wrapper_shim::WrapperShimPaths,
@@ -1574,9 +1586,8 @@ fn sandbox_grants(
     consume_store: Option<&Path>,
     target: &str,
 ) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
-    let cargo_home = cargo_home()?;
     let rustup_home = rustup_home()?;
-    ensure_package_cache_lock(&cargo_home)?;
+    ensure_package_cache_lock(cargo_home)?;
 
     let tools_dir = wrappers
         .rustc_wrapper
@@ -1634,7 +1645,7 @@ fn sandbox_grants(
         ));
     }
 
-    conditional_grants(&cargo_home, &rustup_home, target, &mut grants);
+    conditional_grants(cargo_home, &rustup_home, target, &mut grants);
 
     grants.extend(compiler_search_grants());
     grants.extend(msvc.grants());
@@ -2607,24 +2618,11 @@ mod tests {
         }
     }
 
-    /// Point the consumption config at a registry no slice can be read
-    /// from, without any network: the scheme is refused before a request.
-    fn unreadable_registry(cache_dir: &Path) {
-        // SAFETY: nextest runs each test in its own process, and every
-        // test that sets these sets the same values.
-        unsafe {
-            std::env::set_var("STOW_CACHE_DIR", cache_dir);
-            std::env::set_var("STOW_REGISTRY_BASE_URL", "ftp://127.0.0.1");
-        }
-    }
-
     /// stow#817: a task with published dependencies that cannot read its
     /// slice fails with the slice error — building on would compile the
     /// closure the scheduler promised it would be served.
     #[test]
     fn a_task_whose_slice_cannot_be_read_fails_naming_the_slice() {
-        let cache_dir = TempDir::new().expect("cache dir");
-        unreadable_registry(cache_dir.path());
         let mut task = task_with_features(&[]);
         task.dependency_subgraph = TaskSubgraph {
             root_deps: vec![0],
@@ -2638,8 +2636,14 @@ mod tests {
             }],
         };
 
-        let error = smol::block_on(super::stage_consumption_store(&task, &[]))
-            .expect_err("an unreadable slice fails the build");
+        let error = smol::block_on(crate::consume::slices_for_task_with(&task, |_, _| {
+            Box::pin(async {
+                Err(stow_types::stow_error!(
+                    "ftp://127.0.0.1 is not a supported registry scheme"
+                ))
+            })
+        }))
+        .expect_err("an unreadable slice fails the build");
         let text = format!("{error:#}");
         assert!(
             text.contains("index slice for aarch64-apple-darwin"),
@@ -2653,7 +2657,6 @@ mod tests {
     #[test]
     fn a_task_without_dependencies_consumes_nothing() {
         let cache_dir = TempDir::new().expect("cache dir");
-        unreadable_registry(cache_dir.path());
         let (store, path) = smol::block_on(super::stage_consumption_store(
             &task_with_features(&[]),
             &[],
@@ -3296,6 +3299,7 @@ checksum = "33"
         msvc: &super::MsvcToolchain,
         target: &str,
         extra_env: &[(String, String)],
+        cargo_home: &Path,
     ) {
         let capture_dir = root.join(".stow-rustc-capture");
         std::fs::create_dir_all(&capture_dir).expect("capture dir");
@@ -3320,6 +3324,7 @@ checksum = "33"
             heel::NetworkAuditLog::file(root.join("network-audit.jsonl")).expect("audit log");
         let setup = super::PhaseSetup {
             workspace: &workspace,
+            cargo_home,
             wrappers: &wrappers,
             runtime_wrapper: &wrapper,
             capture_wrapper: &wrapper,
@@ -3347,7 +3352,7 @@ checksum = "33"
             )
             .env(
                 "CARGO_HOME",
-                super::path_arg(&cargo_home().expect("cargo home")).expect("utf8 cargo home"),
+                super::path_arg(cargo_home).expect("utf8 cargo home"),
             )
             .env(
                 "RUSTUP_HOME",
@@ -3402,7 +3407,8 @@ checksum = "33"
             let target_dir = TempDir::new().expect("target dir");
             let host = host_triple();
             let msvc = super::MsvcToolchain::resolve(&host).expect("MSVC toolchain");
-            cargo_build_probe(root, target_dir.path(), &msvc, &host, &[]).await;
+            let cargo_home = cargo_home().expect("cargo home");
+            cargo_build_probe(root, target_dir.path(), &msvc, &host, &[], &cargo_home).await;
         });
     }
 
@@ -3474,6 +3480,7 @@ checksum = "33"
             let probe_object = target_dir.path().join("probe.obj");
             let msvc = super::MsvcToolchain::resolve("aarch64-pc-windows-msvc")
                 .expect("resolve the arm64 MSVC toolchain");
+            let cargo_home = cargo_home().expect("cargo home");
             cargo_build_probe(
                 root,
                 target_dir.path(),
@@ -3483,6 +3490,7 @@ checksum = "33"
                     "STOW_PROBE_OBJECT".to_owned(),
                     super::path_arg(&probe_object).expect("utf8 probe path"),
                 )],
+                &cargo_home,
             )
             .await;
             let bytes = std::fs::read(&probe_object).expect("read the probe object");
@@ -3491,6 +3499,49 @@ checksum = "33"
                 "probe.obj must be an ARM64 COFF object; its first bytes are {bytes:02x?}"
             );
         });
+    }
+
+    /// The sandbox starts with no environment, so a sandboxed `env` may
+    /// print only the names the builder passes through — `PATH`, the
+    /// probe hook, the toolchain set for the task's target — and what
+    /// heel itself injects: its IPC endpoint, the temp dir it points at
+    /// the working directory, and the proxy config it forwards when
+    /// network access is on.
+    #[cfg(unix)]
+    fn assert_sandbox_env_is_isolated(env_text: &str, target: &str) {
+        let mut allowed: std::collections::BTreeSet<String> = [
+            "PATH",
+            STOW_PROBE_FORBIDDEN_PATH_ENV,
+            "HEEL_IPC_ENDPOINT",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+        allowed.extend(toolchain_env_names(
+            target,
+            std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+        ));
+        let leaked: Vec<String> = env_text
+            .lines()
+            .filter_map(|line| line.split('=').next())
+            .filter(|name| !name.is_empty() && !allowed.contains(*name))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            leaked.is_empty() && env_text.lines().any(|line| line.starts_with("PATH=")),
+            "sandboxed process saw the parent environment ({leaked:?}):\n{env_text}"
+        );
     }
 
     /// A process inside the phase sandbox must not be able to read the host
@@ -3502,10 +3553,6 @@ checksum = "33"
     #[test]
     fn sandboxed_process_cannot_read_host_checkout_or_parent_env() {
         smol::block_on(async {
-            // A sentinel only the parent environment carries: it must be
-            // invisible inside the sandbox.
-            const SENTINEL: &str = "STOW_SANDBOX_PROBE_SENTINEL";
-
             let workspace_root = TempDir::new().expect("workspace root");
             let target_dir = TempDir::new().expect("target dir");
             let tools_dir = TempDir::new().expect("tools dir");
@@ -3535,6 +3582,7 @@ checksum = "33"
             let host = host_triple();
             let msvc = super::MsvcToolchain::resolve(&host).expect("MSVC toolchain");
             let grants = sandbox_grants(
+                &cargo_home,
                 &workspace,
                 target_dir.path(),
                 &wrappers,
@@ -3562,13 +3610,10 @@ checksum = "33"
             // manifest — the host checkout a build script must not reach.
             let host_checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
             assert!(host_checkout.exists());
-            unsafe {
-                std::env::set_var(SENTINEL, "stow-probe-secret");
-                std::env::set_var(STOW_PROBE_FORBIDDEN_PATH_ENV, &host_checkout);
-            }
 
             let setup = super::PhaseSetup {
                 workspace: &workspace,
+                cargo_home: &cargo_home,
                 wrappers: &wrappers,
                 runtime_wrapper: &wrapper,
                 capture_wrapper: &wrapper,
@@ -3595,11 +3640,7 @@ checksum = "33"
             );
 
             let env_output = sandbox.command("env").output().await.expect("env output");
-            let env_text = String::from_utf8_lossy(&env_output.stdout);
-            assert!(
-                !env_text.contains("stow-probe-secret"),
-                "sandboxed process saw the parent environment:\n{env_text}"
-            );
+            assert_sandbox_env_is_isolated(&String::from_utf8_lossy(&env_output.stdout), &host);
 
             // A connection attempt — allowed or not — must land in the audit
             // log. Port 1 refuses everywhere, so this probe is offline-safe.
@@ -3615,11 +3656,6 @@ checksum = "33"
                 audit.contains("127.0.0.1"),
                 "audit log recorded no decision for the probe: {audit}"
             );
-
-            unsafe {
-                std::env::remove_var(SENTINEL);
-                std::env::remove_var(STOW_PROBE_FORBIDDEN_PATH_ENV);
-            }
         });
     }
 
