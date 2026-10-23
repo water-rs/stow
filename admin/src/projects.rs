@@ -489,7 +489,7 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
                 });
             }
         },
-    );
+    )?;
     let envelope = render::Planned {
         dry_run: edge.is_none(),
         plan,

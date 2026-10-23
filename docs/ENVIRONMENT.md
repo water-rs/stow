@@ -72,6 +72,8 @@ JSON) and sends nothing.
 | `STOW_MOCK_PUBLIC_KEY_PATH` | unset | Mock cosign key `index export`/`preheat manual`/`preheat plan` verify records and index slices against under a mock registry — the `mock-verify` code path, never production. |
 | `STOW_CACHE_DIR` | `~/.cache/stow` | Fulcio/Rekor trust material cache for `index export`, `preheat manual` and `preheat plan` signature verification. |
 | `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), operator-visible here. |
+| `STOW_RESOLVE_CARGO_HOME` | fresh per-process tempdir | Root every resolve `CARGO_HOME` the process creates lives under: the lane's own resolver at `<root>/main`, each resolve worker's at `<root>/worker-N`. The preheat lanes and `preheat manual` read it through the resolve pool; `production-wave.sh` sets it per lane (`<root>/<NN>-<lane>`) and `preheat-admin.yml` and `release-gate.yml`'s `Production wave` job point it at their `actions/cache`-restored directories so the sparse crates.io index and `.crate` bodies stay warm across runs. Unset keeps the temporary root — the lanes' historical isolation. |
+| `STOW_RESOLVE_CONCURRENCY` | `4` | Worker count a lane fans its resolves across; each worker owns its own `CARGO_HOME` shard under the resolve root. The knob the stow#884 concurrency measurements were taken through. |
 
 `stow-admin index export --out-dir <dir>` lists the registry's
 `records-*` tags once, pulls and verifies only the records artifacts the
@@ -175,6 +177,7 @@ credential is involved (`docs/MOCK.md`).
 | `STOW_PRODUCTION_WAVE_LIMIT` | the `limit` input's default in `.github/workflows/preheat-admin.yml` | `--limit` of `preheat top` and `preheat top-binaries`. |
 | `STOW_PRODUCTION_WAVE_TARGETS` | the `targets` input's default in `.github/workflows/preheat-admin.yml` | Comma-separated `--targets` of every lane. |
 | `STOW_PRODUCTION_WAVE_DEADLINE` | `3300` | Seconds each lane may run before it is killed; the count then refuses the lane. |
+| `STOW_RESOLVE_CARGO_HOME` | `$WORK_DIR/resolve-cargo` | The shared resolve root the script exports to each lane as `<root>/<NN>-<lane>` — separate per lane because the lanes run concurrently and a worker's resolve holds cargo's exclusive package-cache lock. Point it at a cache-restored directory so warm runs skip the cold index/`.crate` fetch. |
 | `STOW_E2E_TOOLCHAIN` | `stable` | The rustup toolchain whose version the lanes resolve for (`RUSTUP_TOOLCHAIN`). |
 
 ## stow-mock-registry

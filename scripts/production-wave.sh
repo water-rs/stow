@@ -40,6 +40,14 @@
 #                                  default in preheat-admin.yml)
 #   STOW_PRODUCTION_WAVE_DEADLINE  seconds each lane may take before it
 #                                  is killed (default 3300)
+#   STOW_RESOLVE_CARGO_HOME        the root every lane's resolve
+#                                  CARGO_HOMEs live under — lane <NN>-<name>
+#                                  resolves against <root>/<NN>-<name>, so
+#                                  the lanes stay parallel while a CI
+#                                  cache restoring the root keeps the
+#                                  index and .crate bodies warm across
+#                                  runs (default: $WORK_DIR/resolve-cargo,
+#                                  per-run scratch)
 #   STOW_E2E_TOOLCHAIN             rustup toolchain for the run (default:
 #                                  stable)
 set -euo pipefail
@@ -65,7 +73,14 @@ else
 fi
 LOG_DIR="$WORK_DIR/logs"
 LANES_DIR="$WORK_DIR/lanes"
-mkdir -p "$LOG_DIR" "$LANES_DIR"
+# The resolve root sits beside the lane scratch, never inside it: the
+# gate restores it from `actions/cache`, and a restored tree must not
+# trip the empty-WORK_DIR check above. Each lane gets its own
+# subdirectory — the lanes run concurrently and a worker's resolve holds
+# cargo's exclusive package-cache lock, so lanes sharing one home would
+# serialize against each other.
+RESOLVE_ROOT="${STOW_RESOLVE_CARGO_HOME:-$WORK_DIR/resolve-cargo}"
+mkdir -p "$LOG_DIR" "$LANES_DIR" "$RESOLVE_ROOT"
 
 LANE_PIDS=()
 
@@ -147,6 +162,7 @@ if ! RUSTUP_TOOLCHAIN="$RUSTC_VERSION" rustc --version >/dev/null 2>&1; then
 fi
 
 log "work dir: $WORK_DIR"
+log "resolve root: $RESOLVE_ROOT"
 log "rustc $RUSTC_VERSION; limit $LIMIT; targets $TARGETS; lane deadline ${LANE_DEADLINE}s"
 
 cd "$REPO_ROOT"
@@ -163,7 +179,8 @@ plan_lane() {
     shift 2
     local dir="$LANES_DIR/$order-$lane"
     mkdir -p "$dir"
-    timeout --kill-after=30 "$LANE_DEADLINE" \
+    STOW_RESOLVE_CARGO_HOME="$RESOLVE_ROOT/$order-$lane" \
+        timeout --kill-after=30 "$LANE_DEADLINE" \
         "$BIN/stow-admin" --json preheat "$@" >"$dir/plan.json" 2>"$dir/stderr.log" || status=$?
     echo "$status" >"$dir/exit"
     log "lane $lane exited $status"
