@@ -113,7 +113,7 @@ struct DigestRun {
     html_url: String,
     /// The run's latest attempt — the jobs page is read scoped to it
     /// (stow#852).
-    run_attempt: u32,
+    run_attempt: u64,
     /// When the run last changed — for a completed run, when it completed.
     #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
@@ -216,7 +216,7 @@ impl FailureKind {
 async fn classify_run(
     token: &str,
     run_id: u64,
-    attempt: u32,
+    attempt: u64,
 ) -> stow_types::error::Result<(Vec<RunJobRow>, Vec<runs::PageLeg>)> {
     let mut attempts = SETTLE_ATTEMPTS;
     loop {

@@ -330,6 +330,9 @@ acting unless `--yes` is given.
 - `stow-admin status` — lane depths, dependents blocked behind failed
   dependencies, oldest pending age, in-flight builds with their GitHub
   Actions run URLs, and per-target outcomes over the trailing 24 h.
+  `--watch` repaints a live view of the scheduler queue merged with
+  `build-batch.yml`'s in-flight runs every 30 s until Ctrl-C; under
+  `--json` each frame is one NDJSON line per tick.
 - `stow-admin queue list [--status failed] [--target T] [--rustc V] [--crate X] [--older-than 24h]`
   — filtered queue rows; `queue retry|cancel|promote|purge`
   mutate the same selection (explicit `--task-id`s or filter flags),

@@ -850,7 +850,7 @@ deserialization.
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
 | POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
 | POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-batch.yml` run completed; the edge parses `display_title` (`<rustc>-b<batch_id>`) → batch id and forwards the run's identity to the scheduler's `POST /batches/{batch_id}/complete`; the alarm's resolution completes each leg only once the records artifact its publish job pushed verifies in GHCR |
-| GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
+| GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection — lane depths for `stow-admin status --watch` (stow#853) |
 
 Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed.
 

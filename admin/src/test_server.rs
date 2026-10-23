@@ -61,6 +61,20 @@ pub enum Step {
         /// The response body.
         body: &'static str,
     },
+    /// Answer `status` with `body` plus scripted response headers —
+    /// `Respond` cannot emit an `ETag` or a `Link`, and the header
+    /// values are runtime strings because a `Link` target embeds the
+    /// loopback port.
+    RespondWith {
+        /// The status code.
+        status: u16,
+        /// `Retry-After` delta-seconds to answer with.
+        retry_after: Option<u64>,
+        /// Extra response headers, in answer order.
+        headers: Vec<(String, String)>,
+        /// The response body.
+        body: &'static str,
+    },
     /// Answer `status` in GitHub's primary-rate-limit shape —
     /// `x-ratelimit-remaining: 0` and `x-ratelimit-reset` `reset_in`
     /// seconds ahead of when the response is built, so the client sees
@@ -122,10 +136,17 @@ impl Loopback {
             .await
             .expect("loopback binds");
         let addr: SocketAddr = listener.local_addr().expect("bound address");
+        Self::start_on(listener, format!("http://{addr}"), steps)
+    }
+
+    /// Serve `steps` on a listener the test bound itself — for scripts
+    /// that must know the base URL they serve, like a `Link` target
+    /// carrying the port.
+    pub fn start_on(listener: TcpListener, base: String, steps: Vec<Step>) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let task = tokio::spawn(run(listener, steps.into(), shutdown_rx));
         Self {
-            url: format!("http://{addr}"),
+            url: base,
             shutdown: Some(shutdown_tx),
             task: Some(task),
         }
@@ -205,6 +226,12 @@ async fn run(
                                 retry_after,
                                 body,
                             } => respond(status, retry_after, body),
+                            Step::RespondWith {
+                                status,
+                                retry_after,
+                                headers,
+                                body,
+                            } => respond_with(status, retry_after, &headers, body),
                             Step::RateLimited {
                                 status,
                                 reset_in,
@@ -251,7 +278,9 @@ async fn run(
                     }
                     // Every response step must serve cleanly; anything
                     // else is a server bug, not a scripted outcome.
-                    Step::Respond { .. } | Step::RateLimited { .. } => {
+                    Step::Respond { .. }
+                    | Step::RespondWith { .. }
+                    | Step::RateLimited { .. } => {
                         served
                             .expect("each connection serves inside the bound")
                             .expect("a respond step serves the request");
@@ -290,6 +319,25 @@ fn respond(
         response
             .headers_mut()
             .insert(http::header::RETRY_AFTER, HeaderValue::from(hint));
+    }
+    Ok(response)
+}
+
+/// [`respond`] plus the scripted extra headers — the `ETag`/`Link`
+/// carriers conditional-request tests read back.
+fn respond_with(
+    status: u16,
+    retry_after: Option<u64>,
+    headers: &[(String, String)],
+    body: &'static str,
+) -> io::Result<Response<ServedBody>> {
+    let mut response = respond(status, retry_after, body)?;
+    for (name, value) in headers {
+        response.headers_mut().append(
+            name.parse::<http::header::HeaderName>()
+                .map_err(io::Error::other)?,
+            HeaderValue::try_from(value.as_str()).map_err(io::Error::other)?,
+        );
     }
     Ok(response)
 }
