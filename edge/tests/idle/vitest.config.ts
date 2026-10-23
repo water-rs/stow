@@ -33,7 +33,7 @@ const d1Schema = readFileSync(
 // answers the manifest whose `artifactType` and task-id annotation the
 // records check requires. No cosign material is involved on this read
 // path — the check is manifest shape, not signature verification.
-const DISPATCH_STUB = `
+const DISPATCH_STUB = String.raw`
 // The runs this isolate has dispatched, run id → BuildTaskPayload.
 // One in-flight run per test makes collisions impossible, but the
 // counter keeps the run ids distinct anyway.
