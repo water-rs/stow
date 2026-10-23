@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
-# Provision a Linux build leg's system-library root from
-# ci/system-libs/lock.txt (stow#850): for each deb of the target's
-# library sets, download it into <debs-dir> only if absent, verify
-# every one against the lock's sha256, extract into a staging copy of
+# Provision a Linux build leg from ci/system-libs/lock.txt
+# (stow#850, stow#862): for each deb of the target's sets, download
+# it into <debs-dir> only if absent, verify every one against the
+# lock's sha256, extract the library sets into a staging copy of
 # <root>, relocate, and land it with an atomic mv — the same shape
-# ci/glibc-sysroot/install.sh has. The debs never enter dpkg's
-# database, so the Multi-Arch: same coupling that broke the leg
-# whenever the runner image rolled newer than ports cannot occur.
+# ci/glibc-sysroot/install.sh has — and extract the toolchain set
+# into / with `tar -x -k`, at the same paths apt used. No deb enters
+# dpkg's database, so the Multi-Arch: same coupling that broke the
+# leg whenever the runner image rolled newer than ports cannot
+# occur.
 #
 # Usage: ci/system-libs/install.sh <target-triple> <debs-dir> <root>
 #
-# <target-triple> picks the sets: the aarch64 leg extracts libs-amd64
-# (its host side — every Linux leg then presents the same host world)
-# and libs-arm64; the x86_64 leg gets libs-amd64 once B2 switches it
-# over. The toolchain sets stay out for now — the cross GCC and mold
-# still come through apt until B1 (stow#862).
+# <target-triple> picks the sets: the aarch64 leg gets libs-amd64
+# (its host side — every Linux leg presents the same host world),
+# libs-arm64 and the aarch64 cross toolchain + mold; the x86_64 leg
+# gets libs-amd64 and mold. The toolchain debs collide with nothing
+# on the image — `tar -k` fails the leg if that stops being true —
+# and their base runtime libraries are the image's, which the smoke
+# test at the end proves (one empty TU through the cross driver and
+# ar, plus `mold --version`).
 #
 # Integrity is the git commit's: <debs-dir> is an actions/cache entry
 # keyed on the lock hash, and a poisoned or truncated deb fails
-# `sha256sum -c` before anything extracts. Needs curl, sha256sum and
-# dpkg-deb.
+# `sha256sum -c` before anything extracts. Needs curl, sha256sum,
+# dpkg-deb and sudo for the / extraction.
 set -euo pipefail
 
 target="${1:?usage: install.sh <target-triple> <debs-dir> <root>}"
@@ -31,8 +36,12 @@ lock="$here/lock.txt"
 fail() { echo "install.sh: $*" >&2; exit 1; }
 
 case "$target" in
-    x86_64-unknown-linux-gnu)   libsets="libs-amd64";;
-    aarch64-unknown-linux-gnu)  libsets="libs-amd64 libs-arm64";;
+    x86_64-unknown-linux-gnu)
+        libsets="libs-amd64"
+        tcsets="toolchain-x86_64-unknown-linux-gnu";;
+    aarch64-unknown-linux-gnu)
+        libsets="libs-amd64 libs-arm64"
+        tcsets="toolchain-aarch64-unknown-linux-gnu";;
     *) fail "$target is not a Linux target the builders provision";;
 esac
 [ -f "$lock" ] \
@@ -53,29 +62,63 @@ codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
 mkdir -p "$debs"
 manifest="$debs.lock.sha256"
 : > "$manifest"
-files=()
+libfiles=()
+tcfiles=()
 while read -r sname sha file url; do
-    case " $libsets " in *" $sname "*) ;; *) continue;; esac
-    files+=("$file")
+    case " $libsets " in
+        *" $sname "*) libfiles+=("$file");;
+        *) case " $tcsets " in
+               *" $sname "*) tcfiles+=("$file");;
+               *) continue;;
+           esac;;
+    esac
     [ -f "$debs/$file" ] || curl -fsSL --retry 3 -o "$debs/$file" "$url" \
         || fail "downloading $url failed"
     printf '%s  %s\n' "$sha" "$file" >> "$manifest"
 done < <(grep -Ev '^[[:space:]]*(#|$)' "$lock")
-[ "${#files[@]}" -gt 0 ] || fail "no lock lines matched sets: $libsets"
+[ "${#libfiles[@]}" -gt 0 ] || fail "no lock lines matched sets: $libsets"
+[ "${#tcfiles[@]}" -gt 0 ] || fail "no lock lines matched sets: $tcsets"
 (cd "$debs" && sha256sum -c --quiet "$manifest") \
     || fail "a deb in $debs does not match the lock's sha256"
 rm -f "$manifest"
 
-# Extract into a sibling staging dir and land with mv — the tree is
-# only ever complete or absent. Repointed symlinks and rewritten .pc
-# prefixes name the final <root>, never the staging dir.
+# Extract the libraries into a sibling staging dir and land with mv —
+# the tree is only ever complete or absent. Repointed symlinks and
+# rewritten .pc prefixes name the final <root>, never the staging dir.
 staging="$root.tmp.$$"
 trap '[ -n "$staging" ] && rm -rf "$staging" || true' EXIT
 mkdir -p "$staging"
-for f in "${files[@]}"; do
+for f in "${libfiles[@]}"; do
     dpkg-deb -x "$debs/$f" "$staging"
 done
 "$here/relocate.sh" "$staging" "$root"
 [ -e "$root" ] && rm -rf "$root"
 mv "$staging" "$root"
 staging=
+
+# The toolchain debs land in / at the same paths apt used — -k makes
+# any collision with an image file a hard failure rather than a
+# silent overwrite behind dpkg's back.
+for f in "${tcfiles[@]}"; do
+    dpkg-deb --fsys-tarfile "$debs/$f" | sudo tar -x -k -C / \
+        || fail "extracting $f into / failed — a file collided with the image"
+done
+
+# `-fuse-ld=mold` asks collect2 for ld.mold on the cross toolchain's
+# own search path, which /usr/bin does not reach.
+if [ "$target" = aarch64-unknown-linux-gnu ]; then
+    sudo ln -sf /usr/bin/ld.mold /usr/aarch64-linux-gnu/bin/ld.mold
+fi
+
+# Smoke test: the toolchain's base runtime libraries are the image's
+# — prove the image still provides them before the leg builds.
+smoke="$(mktemp -d)"; trap 'rm -rf "$smoke"' EXIT
+: > "$smoke/empty.c"
+mold --version > /dev/null || fail "mold does not run after extraction"
+if [ "$target" = aarch64-unknown-linux-gnu ]; then
+    aarch64-linux-gnu-gcc-12 -c "$smoke/empty.c" -o "$smoke/empty.o" \
+        || fail "aarch64-linux-gnu-gcc-12 does not run after extraction"
+    aarch64-linux-gnu-ar rcs "$smoke/empty.a" "$smoke/empty.o" \
+        || fail "aarch64-linux-gnu-ar does not run after extraction"
+fi
+rm -rf "$smoke"; trap - EXIT

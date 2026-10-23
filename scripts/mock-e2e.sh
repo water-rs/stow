@@ -1073,21 +1073,17 @@ if [ "$(uname -s)" = "Linux" ]; then
     # against the lock's sha256; the debs cache keyed by lock hash
     # like the sysroot's manifest does.
     SYS_LIBS="$WORK_DIR/stow-system-libs"
+    SYS_DEBS="${XDG_CACHE_HOME:-$HOME/.cache}/stow/system-debs-$(sha256sum \
+        "$REPO_ROOT/ci/system-libs/lock.txt" | cut -d' ' -f1)"
+    # Both gnu legs' sets, exactly as the legs provision them — the
+    # second call lands the superset root (amd64 + arm64 halves) the
+    # checks run against, and each call extracts its toolchain set
+    # (mold, then the aarch64 cross toolchain) into / with tar -k.
+    "$REPO_ROOT/ci/system-libs/install.sh" x86_64-unknown-linux-gnu \
+        "$SYS_DEBS" "$WORK_DIR/stow-system-libs-x86_64" \
+        || die "system-libs install (x86_64) failed"
     "$REPO_ROOT/ci/system-libs/install.sh" aarch64-unknown-linux-gnu \
-        "${XDG_CACHE_HOME:-$HOME/.cache}/stow/system-debs-$(sha256sum \
-            "$REPO_ROOT/ci/system-libs/lock.txt" | cut -d' ' -f1)" \
-        "$SYS_LIBS" || die "system-libs install failed"
-    # The aarch64 shim needs the cross drivers the image lacks — the
-    # same apt set the leg installs until stow#862's B1 locks the
-    # toolchain too.
-    if [ ! -x /usr/bin/aarch64-linux-gnu-gcc-12 ]; then
-        sudo apt-get update -qq
-        sudo apt-get install -y --no-install-recommends \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu mold \
-            || die "cross toolchain install failed"
-        sudo ln -sf /usr/bin/ld.mold /usr/aarch64-linux-gnu/bin/ld.mold
-    fi
+        "$SYS_DEBS" "$SYS_LIBS" || die "system-libs install (aarch64) failed"
     "$REPO_ROOT/ci/glibc-sysroot/wrappers.sh" "$SYSROOT" "$SYS_LIBS" \
         || die "glibc sysroot wrapper write failed"
     "$REPO_ROOT/ci/glibc-sysroot/check-cxx.sh" "$SYSROOT" \

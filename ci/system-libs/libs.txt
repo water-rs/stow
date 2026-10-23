@@ -1,9 +1,9 @@
 # Development packages of the system libraries crate build scripts
 # link through pkg-config on the Linux builders (stow#729): one
-# package name per line, the same list for both legs. Until the legs
-# switch to the lock, ci/glibc-sysroot/system-libs.sh installs each
-# name natively for x86_64-unknown-linux-gnu and as its arm64 build,
-# through dpkg multiarch, for aarch64-unknown-linux-gnu.
+# package name per line, the same list for both legs. The legs
+# provision them from the lock through ci/system-libs/install.sh —
+# the amd64 builds on both legs, the arm64 builds on aarch64
+# (stow#850, stow#862).
 # ci/system-libs/lock.sh resolves the same names at one
 # snapshot.ubuntu.com instant for both architectures (stow#850). The
 # x86_64 image ships further development packages of its own (zlib,

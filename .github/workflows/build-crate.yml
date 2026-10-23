@@ -104,7 +104,7 @@ jobs:
       # hit (stow#850). aarch64 only for now; B1/B2 extend the same
       # mechanism to the toolchain sets and the x86_64 leg.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: inputs.target == 'aarch64-unknown-linux-gnu'
+        if: endsWith(inputs.target, '-unknown-linux-gnu')
         id: system-debs
         with:
           path: ~/stow-system-debs
@@ -135,10 +135,11 @@ jobs:
               ;;
             x86_64-unknown-linux-gnu)
               # The system libraries crate build scripts link through
-              # pkg-config — the image ships only some (stow#729). The
-              # script also refreshes the apt index.
-              ci/glibc-sysroot/system-libs.sh "$TASK_TARGET"
-              sudo apt-get install -y --no-install-recommends mold
+              # pkg-config — the image ships only some (stow#729) — and
+              # mold: all from the sha256 lock (stow#850, stow#862),
+              # never through apt.
+              ci/system-libs/install.sh "$TASK_TARGET" \
+                "$HOME/stow-system-debs" "$HOME/stow-system-libs"
               ;;
             aarch64-unknown-linux-gnu)
               # Both architectures' system libraries come from the
@@ -149,17 +150,9 @@ jobs:
               # aarch64-linux-gnu-pkg-config, not pkgconf:arm64.
               ci/system-libs/install.sh "$TASK_TARGET" \
                 "$HOME/stow-system-debs" "$HOME/stow-system-libs"
-              # The sysroot shims drive GCC 12 (stow#693); the runner image
-              # ships the native drivers and not the cross ones — still
-              # the apt path until stow#862's B1 locks the toolchain too.
-              sudo apt-get update -qq
-              sudo apt-get install -y --no-install-recommends \
-                gcc-aarch64-linux-gnu g++-aarch64-linux-gnu mold \
-                gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu
-              # `-fuse-ld=mold` asks collect2 for `ld.mold` on the cross
-              # toolchain's own search path, which /usr/bin does not reach
-              # — link the apt install's `ld.mold` in where it looks.
-              sudo ln -sf /usr/bin/ld.mold /usr/aarch64-linux-gnu/bin/ld.mold
+              # The sysroot shims drive GCC 12 (stow#693) — installed from
+              # the lock too; install.sh links ld.mold into the cross
+              # toolchain's search path and smoke-tests the set.
               {
                 echo "CARGO_TARGET_${target_key}_LINKER=aarch64-linux-gnu-gcc"
                 echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
@@ -178,7 +171,7 @@ jobs:
               ;;
           esac
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: inputs.target == 'aarch64-unknown-linux-gnu' && steps.system-debs.outputs.cache-hit != 'true'
+        if: endsWith(inputs.target, '-unknown-linux-gnu') && steps.system-debs.outputs.cache-hit != 'true'
         with:
           path: ~/stow-system-debs
           key: ${{ steps.system-debs.outputs.cache-primary-key }}
