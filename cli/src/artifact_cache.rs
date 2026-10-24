@@ -548,17 +548,23 @@ pub async fn load_semantic_cached_bundle(
     let crate_types_json = serde_json::to_string(&request.crate_types)?;
     let requested_version = Version::parse(&request.version)
         .wrap_err_with(|| format!("parse semantic cache request version {}", request.version))?;
+    let requested_features = serde_json::from_str::<Vec<String>>(&request.features_json)
+        .wrap_err("parse semantic cache request features_json")?;
+    // `features_json` and `dependency_c_metadata_json` stay out of the
+    // WHERE clause (stow#881): a contained request is served from the
+    // smallest published set containing it, whose dependency identity
+    // is the serving set's own build context — the Rust-side filter
+    // keeps containment while the chain check that gates a move ran
+    // upstream at prefetch-staging time.
     let rows = sqlx::query_as::<_, SemanticCacheCandidateRow>(
-        "SELECT c_metadata, crate_version, emit_json \
+        "SELECT c_metadata, crate_version, emit_json, features_json \
          FROM artifact_cache_entries \
-         WHERE rustc_version = ? AND target = ? AND crate_name = ? AND features_json = ? \
-           AND dependency_c_metadata_json = ? AND profile_json = ? AND kind_json = ? AND crate_types_json = ?",
+         WHERE rustc_version = ? AND target = ? AND crate_name = ? \
+           AND profile_json = ? AND kind_json = ? AND crate_types_json = ?",
     )
     .bind(&request.rustc_version)
     .bind(&request.target)
     .bind(&request.crate_name)
-    .bind(&request.features_json)
-    .bind(&request.dependency_c_metadata_json)
     .bind(profile_json)
     .bind(kind_json)
     .bind(crate_types_json)
@@ -567,20 +573,19 @@ pub async fn load_semantic_cached_bundle(
     let mut candidates = rows
         .into_iter()
         .filter_map(|row| {
-            match semantic_candidate_from_row(row, &requested_version, &request.emit) {
+            match semantic_candidate_from_row(
+                row,
+                &requested_version,
+                &request.emit,
+                &requested_features,
+            ) {
                 Ok(Some(candidate)) => Some(Ok(candidate)),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
             }
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
-    candidates.sort_by(|left, right| {
-        right
-            .version
-            .cmp(&left.version)
-            .then(left.emit_len.cmp(&right.emit_len))
-            .then(left.c_metadata.cmp(&right.c_metadata))
-    });
+    candidates.sort_by(compare_semantic_candidates);
     let Some(candidate) = candidates.into_iter().next() else {
         return Ok(None);
     };
@@ -605,16 +610,20 @@ pub async fn load_semantic_cached_bundle_candidates(
     let crate_types_json = serde_json::to_string(&request.crate_types)?;
     let requested_version = Version::parse(&request.version)
         .wrap_err_with(|| format!("parse semantic cache request version {}", request.version))?;
+    let requested_features = serde_json::from_str::<Vec<String>>(&request.features_json)
+        .wrap_err("parse semantic cache request features_json")?;
+    // `features_json` stays out of the WHERE clause (stow#881): a
+    // contained request is served from the smallest published set
+    // containing it.
     let rows = sqlx::query_as::<_, SemanticCacheCandidateRow>(
-        "SELECT c_metadata, crate_version, emit_json \
+        "SELECT c_metadata, crate_version, emit_json, features_json \
          FROM artifact_cache_entries \
-         WHERE rustc_version = ? AND target = ? AND crate_name = ? AND features_json = ? \
+         WHERE rustc_version = ? AND target = ? AND crate_name = ? \
            AND profile_json = ? AND kind_json = ? AND crate_types_json = ?",
     )
     .bind(&request.rustc_version)
     .bind(&request.target)
     .bind(&request.crate_name)
-    .bind(&request.features_json)
     .bind(profile_json)
     .bind(kind_json)
     .bind(crate_types_json)
@@ -623,20 +632,19 @@ pub async fn load_semantic_cached_bundle_candidates(
     let mut candidates = rows
         .into_iter()
         .filter_map(|row| {
-            match semantic_candidate_from_row(row, &requested_version, &request.emit) {
+            match semantic_candidate_from_row(
+                row,
+                &requested_version,
+                &request.emit,
+                &requested_features,
+            ) {
                 Ok(Some(candidate)) => Some(Ok(candidate)),
                 Ok(None) => None,
                 Err(error) => Some(Err(error)),
             }
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
-    candidates.sort_by(|left, right| {
-        right
-            .version
-            .cmp(&left.version)
-            .then(left.emit_len.cmp(&right.emit_len))
-            .then(left.c_metadata.cmp(&right.c_metadata))
-    });
+    candidates.sort_by(compare_semantic_candidates);
 
     let mut bundles = Vec::with_capacity(candidates.len());
     for candidate in candidates {
@@ -2590,6 +2598,7 @@ struct SemanticCacheCandidateRow {
     c_metadata: String,
     crate_version: String,
     emit_json: String,
+    features_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2597,6 +2606,10 @@ struct SemanticCacheCandidate {
     version: Version,
     c_metadata: String,
     emit_len: usize,
+    /// The bundle's recorded feature set — a request is served from the
+    /// smallest staged set containing it (stow#881), so the order keys
+    /// on this.
+    features: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2674,6 +2687,7 @@ fn semantic_candidate_from_row(
     row: SemanticCacheCandidateRow,
     requested_version: &Version,
     requested_emit: &[String],
+    requested_features: &[String],
 ) -> stow_types::error::Result<Option<SemanticCacheCandidate>> {
     let candidate_version = Version::parse(&row.crate_version)
         .wrap_err_with(|| format!("parse cached semantic crate version {}", row.crate_version))?;
@@ -2693,11 +2707,37 @@ fn semantic_candidate_from_row(
     {
         return Ok(None);
     }
+    // A bundle serves the request when its recorded feature set contains
+    // the requested one — superset serving, never unioned (stow#881).
+    let candidate_features = serde_json::from_str::<Vec<String>>(&row.features_json)
+        .wrap_err("parse cached features_json")?;
+    if !stow_types::feature_sets::contains_all(&candidate_features, requested_features) {
+        return Ok(None);
+    }
     Ok(Some(SemanticCacheCandidate {
         version: candidate_version,
         c_metadata: row.c_metadata,
         emit_len: candidate_emit.len(),
+        features: candidate_features,
     }))
+}
+
+/// The deterministic order a staged semantic candidate is tried in: the
+/// smallest containing feature set first (the stow#881 serving set —
+/// an exactly-matching bundle always precedes a superset), then the
+/// previous order of version descending, shortest emit list and
+/// `c_metadata`.
+fn compare_semantic_candidates(
+    left: &SemanticCacheCandidate,
+    right: &SemanticCacheCandidate,
+) -> std::cmp::Ordering {
+    left.features
+        .len()
+        .cmp(&right.features.len())
+        .then(left.features.cmp(&right.features))
+        .then(right.version.cmp(&left.version))
+        .then(left.emit_len.cmp(&right.emit_len))
+        .then(left.c_metadata.cmp(&right.c_metadata))
 }
 
 async fn load_artifact_outputs(

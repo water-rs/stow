@@ -237,9 +237,15 @@ fn requests_table(trees: &[stow_types::api::SubmissionTree]) -> String {
 async fn submit_plan(
     edge: Option<&Edge>,
     crates_io: &crates_io::CratesIo,
-    trees: Vec<stow_types::api::SubmissionTree>,
+    mut trees: Vec<stow_types::api::SubmissionTree>,
     output: Output,
 ) -> stow_types::error::Result<()> {
+    // Contained feature sets are served from their smallest containing
+    // set rather than built (stow#881): substitute across the lane's
+    // whole batch before the plan renders and before anything submits —
+    // the plan-only output is the production wave count's input, so it
+    // must carry the substituted task ids.
+    crate::manual::substitute_against_published(&mut trees).await?;
     // The fetch phase ended before this call — the count cannot change.
     let api_requests = crates_io.api_requests();
     render::mutation(

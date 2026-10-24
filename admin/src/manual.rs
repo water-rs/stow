@@ -92,7 +92,7 @@ pub async fn run(args: ManualArgs, output: Output) -> stow_types::error::Result<
     let source = SubmissionSource::Operations {
         priority: args.priority.saturating_mul(100),
     };
-    let trees = resolved
+    let mut trees = resolved
         .sources
         .iter()
         .map(|tasks| SubmissionTree::from_enqueue_requests(source, tasks))
@@ -104,6 +104,8 @@ pub async fn run(args: ManualArgs, output: Output) -> stow_types::error::Result<
         render::emit_line("no tasks resolved");
         return Ok(());
     }
+    // The plan renders the substituted ids, so substitute before it.
+    substitute_against_published(&mut trees).await?;
     render::mutation(
         output,
         trees,
@@ -532,6 +534,68 @@ pub async fn contextual_coverage(
         spellings,
     )
     .await
+}
+
+/// Pull and verify the `index.<target>.<rustc>` slices the superset
+/// substitution pool reads (stow#881): the same verified rows
+/// `covered_nodes` answers coverage from, kept with their slice
+/// coordinates so a row's task identity is reconstructable.
+pub async fn published_slices(
+    pairs: &BTreeSet<(TargetTriple, WireRustcVersion)>,
+) -> stow_types::error::Result<Vec<stow_types::api::PublishedIndexSlice>> {
+    let base = crate::index_cmd::registry_base()?;
+    let http = stow_oci::RegistryHttp::new().await?;
+    let trust = crate::index_cmd::records_trust().await?;
+    // The cache repository is per-rustc; group the pull by it.
+    let mut by_rustc = BTreeMap::<&WireRustcVersion, Vec<&TargetTriple>>::new();
+    for (target, rustc_version) in pairs {
+        by_rustc.entry(rustc_version).or_default().push(target);
+    }
+    let mut slices = Vec::new();
+    for (rustc_version, targets) in by_rustc {
+        let repository = cache_repository(rustc_version);
+        let session = base.session(&repository, &http);
+        let index = Index {
+            session: &session,
+            repository: &repository,
+            trust: &trust,
+        };
+        let rows_per_target: Vec<Option<Vec<ArtifactIndexRow>>> = futures_util::stream::iter(
+            targets
+                .iter()
+                .map(|target| published_slice_rows(&index, target, rustc_version)),
+        )
+        .buffered(SLICE_PULL_CONCURRENCY)
+        .try_collect()
+        .await?;
+        for (target, rows) in targets.iter().zip(rows_per_target) {
+            if let Some(rows) = rows {
+                slices.push(stow_types::api::PublishedIndexSlice {
+                    target: (*target).clone(),
+                    rustc_version: rustc_version.clone(),
+                    rows,
+                });
+            }
+        }
+    }
+    Ok(slices)
+}
+
+/// Serve every contained feature set in `trees` from its smallest
+/// containing set (stow#881). The pool is the batch plus the published
+/// sets in the signed slices covering the batch's own (target, rustc)
+/// pairs; a host-side node's `target` is its family's host triple, so
+/// the pairs cover host slices too.
+pub async fn substitute_against_published(
+    trees: &mut [SubmissionTree],
+) -> stow_types::error::Result<()> {
+    let pairs = trees
+        .iter()
+        .flat_map(|tree| &tree.nodes)
+        .map(|node| (node.target.clone(), node.rustc_version.clone()))
+        .collect::<BTreeSet<_>>();
+    let published = published_slices(&pairs).await?;
+    SubmissionTree::substitute_contained_sets(trees, &published)
 }
 
 /// The three handles the index-slice pulls share — `pub` so the
