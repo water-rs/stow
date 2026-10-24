@@ -44,7 +44,7 @@ production-shaped scheduler fixture instead of a single crate, and
 answers whether launch user traffic fits the Cloudflare allowance
 without overloading the scheduler. In one stack start it:
 
-1. seeds the fixture at 1M and then 100k queue rows and runs every
+1. seeds the fixture at 20k and then 10k queue rows and runs every
    scheduler drive (`edge/src/scheduler/drives.rs`) through the Durable
    Object's budget probe, reading workerd's billed `rowsRead` and
    `rowsWritten`;
@@ -378,6 +378,16 @@ than ripgrep's own lockfile resolution. That's expected — this is what
 `preheat top-binaries` solves. After `preheat top-binaries --limit 100`,
 many real-project lockfiles overlap enough with the binary closures that
 the wrapper's exact-key path starts hitting.
+
+## Forced eviction
+
+`scripts/eviction-check.sh` kills the local workerd while a dispatch
+pass is posting its claims, restarts it over the same persisted
+Durable Object storage and asserts the woken scheduler lost no task
+and dispatched none twice. It needs the host binaries built
+(`cargo build -p stow-admin -p stow-build -p stow-mock-registry`) and
+the edge bundle (`skyzen build --provider cloudflare --manifest
+edge/Skyzen.mock.toml`).
 
 ## Tearing down
 

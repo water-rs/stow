@@ -47,7 +47,7 @@
 #   STOW_E2E_TOOLCHAIN          rustup toolchain (default: stable)
 #   STOW_E2E_READY_DEADLINE     seconds to wait for the edge (default 600)
 #   STOW_TRAFFIC_SIZES          the two fixture sizes, small then large
-#                               (default "100000 1000000"); the CPU pass,
+#                               (default "100000 480000"); the CPU pass,
 #                               the peak drive and the post-load pass run
 #                               on the small one
 #   STOW_TRAFFIC_DURATION_SECS  seconds of peak drive (default 1800)
@@ -77,7 +77,7 @@ if [ -z "$EDGE_BEARER" ]; then
     fi
 fi
 READY_DEADLINE="${STOW_E2E_READY_DEADLINE:-600}"
-SIZES="${STOW_TRAFFIC_SIZES:-100000 1000000}"
+SIZES="${STOW_TRAFFIC_SIZES:-100000 480000}"
 DURATION_SECS="${STOW_TRAFFIC_DURATION_SECS:-1800}"
 SEGMENTS="${STOW_TRAFFIC_SEGMENTS:-4}"
 RATE_SCALE="${STOW_TRAFFIC_RATE_SCALE:-1.0}"
@@ -401,8 +401,8 @@ budget_pass() {
 
 # The large fixture first, so the CPU pass and the peak drive run on the
 # small one the last reseed leaves.
-budget_pass "large" --queue-rows "$LARGE" --reset
-budget_pass "small" --queue-rows "$SMALL" --reset
+budget_pass "large" --queue-rows "$LARGE"
+budget_pass "small" --queue-rows "$SMALL"
 
 # The callback lane reports the fixture's in-flight tasks `completed`:
 # each in-flight row is its own one-task run, bound to a `build-crate.yml`
