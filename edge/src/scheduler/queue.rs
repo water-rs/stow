@@ -30,12 +30,31 @@ const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 /// parks it `failed` for an operator `retry`, which resets the cycle to 1.
 pub const MAX_BUILD_ATTEMPTS: u32 = 4;
 
-/// The bounded window of successful-build durations each
-/// `(crate_name, target)` keeps in `crate_build_samples` — newest by
-/// insertion. One completion's median recompute reads at most this
-/// many rows and the cap delete keeps no more, so the statistic
-/// never grows a historical scan (stow#524).
-pub(super) const BUILD_SAMPLE_WINDOW: usize = 32;
+/// The priority operand a CLI cache miss carries, in centi-units —
+/// the unit every other entry point's priority is a multiple of
+/// (stow#879). A node's rank is `operand × time waited`, so `100` is
+/// the `1` of the issue's table.
+pub const MISS_PRIORITY: i64 = 100;
+/// `stow.waterui.dev` — 30× the CLI's priority.
+pub const REQUEST_PRIORITY: i64 = 3_000;
+/// Preheat — a tenth of the CLI's priority.
+pub const PREHEAT_PRIORITY: i64 = 10;
+/// The inexact-hit report — a hundredth of the CLI's priority.
+pub const INEXACT_PRIORITY: i64 = 1;
+
+/// The priority operand a submission tree's nodes enter the rank with
+/// (stow#879): the source's class, or the caller's own value for
+/// operations. The operand is what `rank = operand × waited` reads.
+pub const fn source_priority(source: stow_types::api::SubmissionSource) -> i64 {
+    use stow_types::api::SubmissionSource as S;
+    match source {
+        S::Operations { priority } => priority,
+        S::CacheMiss => MISS_PRIORITY,
+        S::HumanRequest => REQUEST_PRIORITY,
+        S::Preheat => PREHEAT_PRIORITY,
+        S::InexactHit => INEXACT_PRIORITY,
+    }
+}
 
 /// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
 /// miss-lane submits start being refused. The edge handler reads the same
@@ -103,16 +122,15 @@ pub struct SchedulerSettings {
     /// Human-lane tasks accepted per UTC day, counted in the
     /// `human_daily_task_budget` table.
     pub human_daily_task_budget: u32,
-    /// Admission floor on `queue.value` (stow#525 I10): a pending
-    /// miss-lane row claims only while its score reaches this bound —
-    /// under-floor work stays queued and visible rather than being
-    /// built. `0` admits everything. The human lane is exempt: a
-    /// request someone asked for by name is never held by the floor.
-    /// Parsed from `STOW_MIN_DISPATCH_VALUE` as a nonnegative i64 —
-    /// the *operator input* the reset route stamps into `settings` and
-    /// derives `dispatch_eligible` from. A changed binding takes
-    /// effect only through that pass: the queue's writers and probes
-    /// read the persisted answer, never this field.
+    /// Admission floor on a node's rank operand (its priority,
+    /// stow#879): a pending non-request node claims only while its
+    /// operand reaches this bound — under-floor work stays queued and
+    /// visible rather than being built. `0` admits everything. The
+    /// human lane is exempt: a request someone asked for by name is
+    /// never held by the floor. Parsed from `STOW_MIN_DISPATCH_VALUE`
+    /// as a nonnegative i64 — the *operator input* the deploy binding
+    /// stamps on each wake. A changed binding takes effect on the next
+    /// [`crate::scheduler::graph::Graph::set_floor`] call.
     pub min_dispatch_value: i64,
 }
 
@@ -129,32 +147,6 @@ impl Default for SchedulerSettings {
         }
     }
 }
-
-/// Priority is the third precedence operand of `queue.value` — dispatch
-/// orders on value before the FIFO tie-breakers.
-pub fn compute_priority(downloads: u64, miss_count: u32) -> Result<i64, QueueError> {
-    let downloads_bucket = downloads / 1000;
-    let downloads_bucket = i64::try_from(downloads_bucket)
-        .map_err(|_| format!("downloads bucket exceeds i64: {downloads_bucket}"))?;
-    Ok(downloads_bucket + i64::from(miss_count) * 10)
-}
-
-/// The largest priority [`compute_priority`] can return, derived from
-/// its operand types — `u64::MAX / 1000 + 10 × u32::MAX` — not a
-/// guessed cap: a precedence band this wide can never alias a priority
-/// across a band boundary.
-const PRIORITY_MAX: i64 = (u64::MAX / 1000 + 10 * u32::MAX as u64).cast_signed();
-
-/// Width of one precedence band in `queue.value`. The persisted value
-/// is `bands × VALUE_BAND + MAX(0, priority) + MAX(0, demand)`, with
-/// the human lane contributing two bands and the Windows family one —
-/// today's "human first, then Windows, then priority" claim order
-/// encoded additively in one descending number (stow#442 I6), with
-/// accumulated demand folding into the same priority band (stow#522).
-/// The largest value a row can take is `3 × VALUE_BAND + PRIORITY_MAX
-/// = 4 × PRIORITY_MAX + 3 = 73,787,148,093,530,007`, below
-/// `i64::MAX`, so no operand can overflow the column.
-pub(super) const VALUE_BAND: i64 = PRIORITY_MAX + 1;
 
 /// Seconds from `now_unix` to the next UTC midnight — the `Retry-After`
 /// the edge attaches to a daily-budget refusal, matching the
@@ -512,10 +504,11 @@ pub fn record_request_run_update(
 pub fn crate_request_status(
     graph: &crate::scheduler::graph::Graph,
     request_id: &str,
+    now: i64,
 ) -> Result<Option<stow_types::api::CrateRequestStatus>, QueueError> {
     match load_request(graph, request_id) {
         Some(record) => Ok(Some(request_record_status(record, &|ids: &[String]| {
-            graph.probe_roots(ids)
+            graph.probe_roots(ids, now)
         })?)),
         None => Ok(None),
     }
@@ -591,48 +584,6 @@ const MAX_DEMAND_BATCH_ENTRIES: usize = 256;
 /// the `UNION` walk dedups diamonds and cycles — while distinct
 /// identities contribute their own deltas to a task they share.
 ///
-/// Durability is a typed batch record, not a payload blob:
-/// `demand_batches` stores the canonical input's blake3 fingerprint,
-/// the touched count, and a `prepared`/`accepted` state — never the
-/// contribution set itself, which lives relationally as
-/// `demand_contributions` rows keyed by `(task_id, batch_id)` and
-/// staged in JSON chunks bounded well under the workerd string limit.
-/// A delivery whose record says `accepted` answers from the header —
-/// stored count, no writes, no live walk — and a same-id delivery
-/// whose canonical fingerprint differs fails before any write, draft
-/// or accepted. Only a `prepared` record may be retried: staging is
-/// not a promise, so the same input recomputes the CURRENT closure,
-/// clears only this batch's own staged rows, re-stages, and accepts —
-/// a later admission can never wedge an accepted remainder, because
-/// no such state exists.
-///
-/// Acceptance is the last statement, and it is atomic: the guarded
-/// `UPDATE` flipping `prepared` to `accepted` fires the `demand_fold`
-/// trigger, which folds every staged delta into
-/// `demand`/`value`/`dispatch_key` inside that one statement, verifies
-/// the staged count reached the accepted count, then retires this
-/// batch's staged rows — an accepted batch's replay reads only the
-/// header, so consumed staging cannot accumulate (stow#523). A
-/// failure anywhere — including the trigger's own `RAISE(ABORT)` —
-/// rolls back the transition AND all triggered queue effects, staged
-/// rows preserved for accept-or-retry. Once it returns, the batch is
-/// complete; nothing accepted is ever applied again. `value` and
-/// `dispatch_key` refresh for the event's own closure only.
-///
-/// A batch id is a window identity, not a lookup key: the first
-/// accepted payload wins the id. Input order and duplicate identities
-/// are canonicalized by summing per-identity deltas into the sorted
-/// `BTreeMap` below, so two spellings of the same observation share
-/// one fingerprint; a legitimately different hour is a different
-/// batch id (#523 names them).
-///
-/// Validation precedes every mutation: deltas are `u64` checked into
-/// `i64`, per-task sums use checked arithmetic, and the band bound —
-/// `priority + demand <= PRIORITY_MAX`, the guard that keeps demand
-/// inside the priority band so lane/family precedence cannot break —
-/// is verified in SQL over the exact row set this event will fold,
-/// before a single write. An overrun answers as an error, never a
-/// clamp or a REAL promotion.
 /// The graph-side demand batch — dedup on `graph.demand_batches` and
 /// hand back the `Demand` event for the route to append (stow#878
 /// stage 7). A recorded `batch_id` carrying a different fingerprint
@@ -668,7 +619,7 @@ pub fn apply_demand(
             None,
         ));
     }
-    let contributions = graph.demand_contributions(&deltas, PRIORITY_MAX)?;
+    let contributions = graph.demand_contributions(&deltas)?;
     let entries: Vec<stow_types::api::DemandEntry> = contributions
         .into_iter()
         .map(|(task_id, delta)| stow_types::api::DemandEntry { task_id, delta })

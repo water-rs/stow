@@ -346,6 +346,27 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        name: "POST /tasks/submit (operations)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 400,
+    },
+    DriveBudget {
+        name: "POST /tasks/submit (preheat)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 400,
+    },
+    DriveBudget {
+        name: "POST /tasks/submit (inexact-hit)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 400,
+    },
+    DriveBudget {
         name: "POST /demand",
         statements: 3,
         rows_read: 5,

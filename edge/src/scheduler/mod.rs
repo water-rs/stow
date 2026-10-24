@@ -17,9 +17,6 @@ pub mod feed;
 pub mod graph;
 pub mod meter;
 pub mod queue;
-/// The exact `value`/`dispatch_key` rank — one shared Rust derivation
-/// every queue writer binds from (stow#524).
-pub mod rank;
 /// The graph-and-store cores of the routes, shared by the Durable
 /// Object handlers and the cost harness.
 pub mod routes;

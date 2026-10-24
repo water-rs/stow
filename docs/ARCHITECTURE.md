@@ -208,23 +208,18 @@ right cost; burning CPU minutes on a blake3 puzzle would only punish the
 person the lane exists for, while the miss path's PoW stays sized for
 scripted CLI redemption and is unchanged.
 
-Accepted work lands in the scheduler's `human` lane, which dispatches
-ahead of the `miss` lane: `claim_dispatchable_tasks` orders by a
-persisted dispatch key — an explicit human-lane prefix, then an exact
-rational rank of the row's whole `value` (precedence and family bands
-plus `priority` and accumulated demand) divided by the
-`(crate_name, target)` expected build cost
-(`crate_build_stats.median_ms`, the bounded-window median of real
-claim-to-completion durations; a positive measured cost, with
-unmeasured crates dividing by 1 and keeping full demand value) — with
-`first_requested_at`, `created_at` and `task_id`
-as stable FIFO tie-breakers at equal rank, so no miss queueing
-ahead of time can starve a human request, and human rows are exempt
-from `STOW_DISPATCH_MIN_AGE_MINUTES` (the coalescing hold exists to
-batch identical misses; a human already said exactly what they want).
-Re-requesting a queued crate through this API promotes its row to the
-human lane; the miss path never demotes a human row — the `lane` column
-only ever moves `'miss' → 'human'`.
+Accepted work lands in the scheduler's `human` lane at 30× the CLI
+miss's priority. Every ready node ranks by its priority times the time
+it has waited since it was first requested, with first-requested FIFO
+ties, so a request typed here overtakes misses that have waited less
+than 30 times as long while old preheat or miss work is never starved.
+Human nodes are exempt from `STOW_DISPATCH_MIN_AGE_MINUTES` (the
+coalescing hold exists to batch identical misses; a human already said
+exactly what they want) and from the `STOW_MIN_DISPATCH_VALUE` floor.
+Re-requesting a queued crate through this API promotes it to the human
+lane and raises its priority to the human class; a node reached from
+several entry points keeps the highest priority and its first-requested
+time.
 
 The crate named in the request is itself only a name source: the
 expansion drops any package crates.io's version record marks

@@ -79,15 +79,6 @@ impl Lane {
         }
     }
 
-    /// The `lane` operand `rank::raw_value` prices — the human lane
-    /// keeps its precedence band until #879 rewrites the rank.
-    pub(super) const fn sql_lane(self) -> &'static str {
-        match self {
-            Self::Human | Self::Operations => "human",
-            Self::Miss | Self::Preheat => "miss",
-        }
-    }
-
     const fn bits(self) -> u8 {
         self as u8
     }

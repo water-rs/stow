@@ -417,9 +417,6 @@ pub fn apply_events(graph: &mut Graph, events: &[Logged]) {
                 graph.apply(other, *at);
             }
         }
-        // The log already carries the samples a replayed completion
-        // produces as `BuildSample` rows of its own.
-        graph.take_samples();
     }
     complete(graph, &mut pending);
 }

@@ -24,7 +24,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::node::{Extra, Flags, NO_STATE, Node, State, Status};
-use super::{AttemptOutcome, CostWindow, FeedSession, Graph, IdKey, Meter, RequestRecord};
+use super::{AttemptOutcome, FeedSession, Graph, IdKey, Meter, RequestRecord};
 use crate::errors::QueueError;
 
 /// The payload text one row carries, about: a section's row closes
@@ -56,14 +56,13 @@ enum Section {
     Published,
     Extras,
     Outcomes,
-    Stats,
     Requests,
     FeedPages,
     Batches,
 }
 
 impl Section {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 10] = [
         Self::Head,
         Self::Intern,
         Self::Nodes,
@@ -71,7 +70,6 @@ impl Section {
         Self::Published,
         Self::Extras,
         Self::Outcomes,
-        Self::Stats,
         Self::Requests,
         Self::FeedPages,
         Self::Batches,
@@ -86,7 +84,6 @@ impl Section {
             Self::Published => "published",
             Self::Extras => "extras",
             Self::Outcomes => "outcomes",
-            Self::Stats => "stats",
             Self::Requests => "requests",
             Self::FeedPages => "feed_page",
             Self::Batches => "batches",
@@ -103,7 +100,7 @@ impl Section {
     const fn encoding(self) -> Encoding {
         match self {
             Self::Nodes | Self::Edges | Self::Published => Encoding::Raw,
-            Self::Extras | Self::Outcomes | Self::Stats => Encoding::Packed,
+            Self::Extras | Self::Outcomes => Encoding::Packed,
             Self::Head | Self::Intern | Self::Requests | Self::FeedPages | Self::Batches => {
                 Encoding::Json
             }
@@ -395,7 +392,6 @@ impl Graph {
                 }
                 Section::Extras => writer.fill(self.extras.iter().skip(at))?,
                 Section::Outcomes => writer.fill(self.attempt_outcomes.iter().skip(at))?,
-                Section::Stats => writer.fill(self.build_stats.iter().skip(at))?,
                 Section::Requests => writer.fill(self.requests.iter().skip(at))?,
                 Section::FeedPages => writer.fill(
                     self.feed_sessions
@@ -525,14 +521,7 @@ impl SnapshotLoader {
                 graph.attempt_outcomes.push_back(outcome);
                 Ok(())
             }),
-            Section::Stats => decode_items(
-                section,
-                payload,
-                |(key, window): ((u32, u8), CostWindow)| {
-                    graph.build_stats.insert(key, window);
-                    Ok(())
-                },
-            ),
+
             Section::Requests => {
                 decode_items(section, payload, |(id, record): (String, RequestRecord)| {
                     graph.requests.insert(id, record);

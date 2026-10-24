@@ -187,6 +187,12 @@ struct SubmitArgs {
     /// hand-submitted tasks; every resolver-emitted task carries false.
     #[arg(long, default_value_t = false)]
     preserve_lockfile: bool,
+    /// The priority the tasks enter the rank with, as a multiple of the
+    /// CLI miss's (stow#879): `--priority 30` is the website class.
+    /// Defaults to the website class — an operator submission is a named
+    /// request.
+    #[arg(long, default_value_t = 30)]
+    priority: i64,
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
@@ -878,7 +884,9 @@ async fn submit_command(
     .await
     .map_err(|error| stow_error!("submit resolver task: {error}"))??;
     let trees = vec![stow_types::api::SubmissionTree::from_enqueue_requests(
-        stow_types::api::SubmissionSource::Operations { priority: 0 },
+        stow_types::api::SubmissionSource::Operations {
+            priority: args.priority.saturating_mul(100),
+        },
         &requests,
     )?];
     render::mutation(
