@@ -22,7 +22,7 @@ edge. Detailed trust analysis lives in
 
 The production manifest is [`edge/Skyzen.toml`](../edge/Skyzen.toml). It
 declares the `Scheduler` Durable Object with its
-`v1` class declaration, the five runtime `[[secret]]` names (never values), the
+`v1` class declaration, the seven runtime `[[secret]]` names (never values), the
 non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 `[cloudflare.raw]` routes.
 
@@ -35,6 +35,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    skyzen secret set TURNSTILE_SECRET_KEY       # Turnstile secret key paired with the TURNSTILE_SITE_KEY var
    skyzen secret set CF_ANALYTICS_TOKEN         # API token with Analytics Engine read, used by GET /api/v1/stats
    skyzen secret set STOW_GITHUB_WEBHOOK_SECRET # HMAC key verifying GitHub's workflow_run webhook (below)
+   skyzen secret set STOW_NEWRELEASES_WEBHOOK_SECRET # HMAC key verifying newreleases.io deliveries (below)
+   skyzen secret set STOW_STATS_SALT_SECRET     # key for the daily install-hash salt of the usage statistics
    ```
 
    `CF_ANALYTICS_TOKEN` is an account-level API token (dashboard: *My
@@ -446,7 +448,8 @@ release feed (stow#880), replacing the cron poll: subscribe a webhook
 on the `rust-lang/rust` project in the newreleases.io settings, posting
 to `https://stow.waterui.dev/api/v1/newreleases/release`, then copy the
 webhook's signing key into the `STOW_NEWRELEASES_WEBHOOK_SECRET`
-secret. Each delivery carries `X-Newreleases-Timestamp` and
+repository secret, which `deploy-edge.yml` uploads as the Worker secret
+of the same name. Each delivery carries `X-Newreleases-Timestamp` and
 `X-Newreleases-Signature` — the hex HMAC-SHA256 of
 `<timestamp>.<body>` under that key — and the edge refuses anything
 unsigned, stale (±300 s) or naming another project. A verified

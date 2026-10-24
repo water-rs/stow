@@ -107,6 +107,11 @@ name = "STOW_POW_CHALLENGE_SECRET"
 [[secret]]
 name = "STOW_GITHUB_WEBHOOK_SECRET"
 
+# HMAC secret verifying newreleases.io deliveries to
+# /api/v1/newreleases/release — the new-stable-release wake for preheat.
+[[secret]]
+name = "STOW_NEWRELEASES_WEBHOOK_SECRET"
+
 [[secret]]
 name = "TURNSTILE_SECRET_KEY"
 
