@@ -116,6 +116,8 @@ if [ -n "${STOW_PREHEAT_COST_WORK_DIR:-}" ]; then
         exit 1
     fi
     mkdir -p "$WORK_DIR"
+    # Later steps run from other directories; pin a relative value.
+    WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 else
     WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/stow-preheat-cost.XXXXXX")"
 fi

@@ -52,6 +52,8 @@ export RUSTUP_TOOLCHAIN=stable
 
 WORK="${STOW_EVICTION_WORK_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/stow-eviction.XXXXXX")}"
 mkdir -p "$WORK/logs" "$WORK/edge-state" "$WORK/keys" "$WORK/mock-registry" "$WORK/local-ci"
+# Later steps run from other directories; pin a relative value.
+WORK="$(cd "$WORK" && pwd)"
 PIDS=()
 die() { echo "eviction-check: $*" >&2; exit 1; }
 
