@@ -207,24 +207,26 @@ pub async fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result
 
 /// The human table for a batch of enqueue requests — the plan every
 /// `preheat` submit previews.
-fn requests_table(requests: &[EnqueueRequest]) -> String {
+fn requests_table(trees: &[stow_types::api::SubmissionTree]) -> String {
     let mut table = Table::new(&[
         "crate", "version", "target", "features", "rustc", "source", "lockfile",
     ]);
-    for request in requests {
-        table.push([
-            request.crate_name.as_str().to_owned(),
-            request.version.to_string(),
-            request.target.as_str().to_owned(),
-            request.features_json.raw(),
-            request.rustc_version.as_str().to_owned(),
-            format!("{:?}", request.source),
-            if request.preserve_lockfile {
-                "source".to_owned()
-            } else {
-                "latest".to_owned()
-            },
-        ]);
+    for tree in trees {
+        for node in &tree.nodes {
+            table.push([
+                node.crate_name.as_str().to_owned(),
+                node.version.to_string(),
+                node.target.as_str().to_owned(),
+                node.features_json.raw(),
+                node.rustc_version.as_str().to_owned(),
+                format!("{:?}", tree.source),
+                if node.preserve_lockfile {
+                    "source".to_owned()
+                } else {
+                    "latest".to_owned()
+                },
+            ]);
+        }
     }
     table.render()
 }
@@ -235,16 +237,20 @@ fn requests_table(requests: &[EnqueueRequest]) -> String {
 async fn submit_plan(
     edge: Option<&Edge>,
     crates_io: &crates_io::CratesIo,
-    requests: Vec<EnqueueRequest>,
+    trees: Vec<stow_types::api::SubmissionTree>,
     output: Output,
 ) -> stow_types::error::Result<()> {
     // The fetch phase ended before this call — the count cannot change.
     let api_requests = crates_io.api_requests();
     render::mutation(
         output,
-        requests,
-        move |envelope: &render::Planned<Vec<EnqueueRequest>, crate::projects::SubmitOutcome>| {
-            let mut out = format!("{} task(s)\n", envelope.plan.len());
+        trees,
+        move |envelope: &render::Planned<
+            Vec<stow_types::api::SubmissionTree>,
+            crate::projects::SubmitOutcome,
+        >| {
+            let nodes: usize = envelope.plan.iter().map(|tree| tree.nodes.len()).sum();
+            let mut out = format!("{nodes} task(s)\n");
             if !envelope.plan.is_empty() {
                 let _ = write!(out, "{}", requests_table(&envelope.plan));
             }
@@ -262,8 +268,8 @@ async fn submit_plan(
             out
         },
         edge.map(|edge| {
-            async move |requests: &Vec<EnqueueRequest>| {
-                crate::projects::submit_chunked(edge, requests).await
+            async move |trees: &Vec<stow_types::api::SubmissionTree>| {
+                crate::projects::submit_chunked(edge, trees).await
             }
         }),
     )
@@ -359,7 +365,7 @@ async fn top(
     })
     .await
     .expect("resolve pool panicked")?;
-    let mut requests = Vec::new();
+    let mut trees = Vec::new();
     for (job, slot) in jobs.iter().zip(slots) {
         let resolved = slot
             .expect("the pool produces one result per job")
@@ -378,15 +384,15 @@ async fn top(
                 "ranked crate ships no library — resolved as a name source"
             );
         }
-        requests.extend(flatten_source(resolved));
+        trees.push(source_tree(resolved));
     }
     tracing::info!(
         api_requests = crates_io.api_requests(),
-        tasks = requests.len(),
+        tasks = trees.iter().map(|tree| tree.nodes.len()).sum::<usize>(),
         targets = targets.len(),
         "planned top preheat tasks"
     );
-    submit_plan(edge, crates_io, requests, output).await
+    submit_plan(edge, crates_io, trees, output).await
 }
 
 /// One crate resolve the `top` lane queues — a ranked crate's selected
@@ -412,6 +418,17 @@ fn flatten_source(resolved: stow_resolver::SourceResolve) -> Vec<EnqueueRequest>
         .into_iter()
         .flat_map(|(_target, tasks)| tasks)
         .collect()
+}
+
+/// One submission tree per resolved source (stow#878): every
+/// `flatten_source` output folds into the tree the scheduler merges by
+/// task id — the per-task embedded subgraph shape is gone.
+fn source_tree(resolved: stow_resolver::SourceResolve) -> stow_types::api::SubmissionTree {
+    stow_types::api::SubmissionTree::from_enqueue_requests(
+        stow_types::api::SubmissionSource::Preheat,
+        &flatten_source(resolved),
+    )
+    .expect("resolved source converts to a submission tree")
 }
 
 /// `preheat binary <crate>[@version]` — cache the whole dependency
@@ -462,16 +479,17 @@ async fn binary(
     .await
     .expect("resolve pool panicked")?;
     let requests = match resolved.map_err(|error| stow_error!("{error}"))? {
-        BinaryResolve::Tasks { tasks } => {
+        BinaryResolve::Tasks { trees } => {
+            let node_count: usize = trees.iter().map(|tree| tree.nodes.len()).sum();
             tracing::info!(
                 %crate_name,
                 version = %release.version,
                 targets = targets.len(),
-                tasks = tasks.len(),
+                tasks = node_count,
                 %rustc_version,
                 "planned named-binary preheat tasks"
             );
-            tasks
+            trees
         }
         BinaryResolve::NoBinary => {
             return Err(stow_error!(
@@ -499,10 +517,10 @@ fn typed_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec<
 /// dependency graph yields, or the answer that this lane does not
 /// apply — the crate ships no binary target.
 enum BinaryResolve {
-    /// The crates.io graph resolved into tasks.
+    /// The crates.io graph resolved into one submission tree.
     Tasks {
-        /// Every enqueue request the resolve produced.
-        tasks: Vec<EnqueueRequest>,
+        /// The tree the resolve produced (stow#878).
+        trees: Vec<stow_types::api::SubmissionTree>,
     },
     /// The crate has no `[[bin]]` — a name source this lane skips.
     NoBinary,
@@ -544,7 +562,7 @@ fn resolve_binary_crate(
         return Ok(BinaryResolve::NoBinary);
     }
     Ok(BinaryResolve::Tasks {
-        tasks: flatten_source(source),
+        trees: vec![source_tree(source)],
     })
 }
 
@@ -623,7 +641,7 @@ async fn top_binaries(
     .expect("resolve pool panicked")?;
     tracing::info!(
         binaries = plan.per_binary.len(),
-        tasks = plan.tasks.len(),
+        tasks = plan.trees.iter().map(|tree| tree.nodes.len()).sum::<usize>(),
         skipped = plan.skipped.len(),
         targets = targets.len(),
         %rustc_version,
@@ -637,7 +655,10 @@ async fn top_binaries(
             let plan = &envelope.plan;
             let mut out = format!(
                 "{} task(s) from {} binaries\n",
-                plan.tasks.len(),
+                plan.trees
+                    .iter()
+                    .map(|tree| tree.nodes.len())
+                    .sum::<usize>(),
                 plan.per_binary.len()
             );
             if !plan.per_binary.is_empty() {
@@ -669,7 +690,7 @@ async fn top_binaries(
         },
         edge.map(|edge| {
             async move |plan: &BinariesPlan| {
-                crate::projects::submit_chunked(edge, &plan.tasks).await
+                crate::projects::submit_chunked(edge, &plan.trees).await
             }
         }),
     )
@@ -719,19 +740,20 @@ fn resolve_binaries(
         |index, _job, result| slots[index] = Some(result),
     )?;
     let mut plan = BinariesPlan {
-        tasks: Vec::new(),
+        trees: Vec::new(),
         per_binary: Vec::with_capacity(candidates.len()),
         skipped: Vec::new(),
     };
     for (job, slot) in jobs.iter().zip(slots) {
         match slot.expect("the pool produces one result per job") {
-            Ok(BinaryResolve::Tasks { tasks }) => {
-                tracing::info!(binary = %job.name, tasks = tasks.len(), "resolved");
+            Ok(BinaryResolve::Tasks { trees }) => {
+                let node_count: usize = trees.iter().map(|tree| tree.nodes.len()).sum();
+                tracing::info!(binary = %job.name, tasks = node_count, "resolved");
                 plan.per_binary.push(BinaryContribution {
                     binary: job.name.clone(),
-                    tasks: tasks.len(),
+                    tasks: node_count,
                 });
-                plan.tasks.extend(tasks);
+                plan.trees.extend(trees);
             }
             Ok(BinaryResolve::NoBinary) => {
                 let reason = format!("{} {} ships no binary target", job.name, job.version);
@@ -775,8 +797,8 @@ pub struct SkippedBinary {
 /// binary produced, plus per-binary outcomes.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BinariesPlan {
-    /// Every enqueue request across every binary and target.
-    pub tasks: Vec<EnqueueRequest>,
+    /// Every submission tree across every binary and target (stow#878).
+    pub trees: Vec<stow_types::api::SubmissionTree>,
     /// How many requests each binary produced.
     pub per_binary: Vec<BinaryContribution>,
     /// Binaries resolution failed on, with their reasons.

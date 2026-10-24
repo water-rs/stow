@@ -1,0 +1,3718 @@
+//! The scheduler's in-memory dependency graph (stow#878).
+//!
+//! Nodes, edges, per-node state and the ready set live here and nowhere
+//! else: every accepted event mutates this structure and lands in the
+//! flat log before it is acknowledged (`store.rs`); a wake rebuilds the
+//! whole structure from a snapshot plus the log tail.
+//!
+//! Layout is sized against the 128 MiB object bound (`target/878-plan.md`
+//! §2): a node is one fixed 68-byte record in an arena, its strings
+//! interned once as `u32` ids and its dependency digest an inline
+//! 32-byte value; its task id is never stored but re-minted from those
+//! fields. The queue state of a node that has not published rides a
+//! 48-byte slab entry, freed on publish; the fields few nodes carry sit
+//! in a side table. Edges are flat `u32` arrays — forward spans per node
+//! plus a CSR reverse index — and the ready set holds node indexes
+//! only, ordered at claim time. A published node stays only while a
+//! retained node still depends on it (dispatch payloads carry dependency
+//! identities) and is dropped, with its edges, once its last dependent
+//! is gone; a compaction squeezes the dropped records out. Every
+//! derived index (id and identity tables, reverse edges, ready set,
+//! counters) is rebuilt on load; the snapshot carries only the
+//! irreducible state.
+
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+
+use serde::{Deserialize, Serialize};
+use stow_types::api::{
+    BuildTaskPayload, PublishedSliceRow, RunnerFamily, SchedulerEvent, SubgraphNode,
+    SubmissionNode, SubmissionSource, SubmissionTree, SubmitTaskIdEntry, TaskSubgraph,
+    runner_family,
+};
+use stow_types::public_cache::{ExplicitSpelling, UnitShape};
+use stow_types::task_graph::canonical_task_id;
+
+use crate::errors::QueueError;
+use crate::scheduler::{queue, rank};
+
+mod edges;
+mod index;
+mod node;
+mod snapshot;
+
+use edges::Edges;
+use index::{Interner, IxTable, hash_of};
+use node::{Extra, Flags, Lane, NO_STATE, Node, ParkedCompletion, State, Status};
+
+pub use snapshot::{SnapshotChunk, SnapshotCursor, SnapshotLoader};
+
+/// The edge's required-shape mask, derived exactly like
+/// [`queue::dep_edge_requirements`]: host-side deps owe a linked unit
+/// under each spelled invocation; target-side deps owe the linked and
+/// unlinked unit under each.
+fn required_shape_mask(dep_host_side: bool, invocations: i64) -> u8 {
+    let mut mask = 0u8;
+    for invocation in 0..2i64 {
+        if invocations & (1 << invocation) != 0 {
+            mask |= 1 << (invocation * 2 + 1);
+            if !dep_host_side {
+                mask |= 1 << (invocation * 2);
+            }
+        }
+    }
+    mask
+}
+
+/// One published slice row's contribution to a dep key's shape mask.
+const fn shape_bit(shape: UnitShape) -> u8 {
+    1 << (shape.invocation.to_int() * 2 + shape.kind.to_int())
+}
+
+/// The shapes a node itself must publish before it leaves memory — the
+/// same set `required_unit_shapes` computes for the node's own build.
+fn node_published_mask(host_side: bool, target: &str, explicit: ExplicitSpelling) -> u8 {
+    let invocation = if host_side
+        || runner_family(target).is_some_and(|family| family.host_triple() == target)
+    {
+        stow_types::public_cache::UnitInvocation::Native
+    } else {
+        stow_types::public_cache::UnitInvocation::Target
+    };
+    let mut mask = 0u8;
+    for shape in stow_types::public_cache::required_unit_shapes(host_side, invocation, explicit) {
+        mask |= shape_bit(shape);
+    }
+    mask
+}
+
+/// The 16-byte key a task id keys the published-shape map by: the
+/// leading bytes of the BLAKE3 hash of its canonical string.
+type IdKey = [u8; 16];
+
+/// The probe keys of one canonical task id.
+#[derive(Debug, Clone, Copy)]
+struct IdKeys {
+    /// Probe key of the id index.
+    tag: u32,
+    /// Key of the published-shape map.
+    key: IdKey,
+}
+
+impl IdKeys {
+    fn of(task_id: &str) -> Self {
+        let hash = blake3::hash(task_id.as_bytes());
+        let bytes = hash.as_bytes();
+        let tag = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&bytes[..16]);
+        Self { tag, key }
+    }
+}
+
+/// What the graph derives once per target triple it has seen.
+#[derive(Debug)]
+struct TargetInfo {
+    name: Box<str>,
+    /// The runner family the target builds on.
+    family: Option<RunnerFamily>,
+    /// The `dispatch_family` label the rank prices.
+    dispatch: &'static str,
+    /// The unit shapes a node of this target must publish, indexed by
+    /// `[host_side][explicit_spelling]`.
+    own_masks: [[u8; 2]; 2],
+}
+
+impl TargetInfo {
+    fn new(name: &str) -> Self {
+        let mask = |host: bool, explicit: bool| {
+            node_published_mask(
+                host,
+                name,
+                if explicit {
+                    ExplicitSpelling::KeysApart
+                } else {
+                    ExplicitSpelling::KeysAsNative
+                },
+            )
+        };
+        Self {
+            name: name.into(),
+            family: runner_family(name),
+            dispatch: rank::dispatch_family(name),
+            own_masks: [
+                [mask(false, false), mask(false, true)],
+                [mask(true, false), mask(true, true)],
+            ],
+        }
+    }
+}
+
+/// A (crate, target) pair's recent build durations and their median —
+/// the rank's cost operand.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct CostWindow {
+    /// The newest [`SAMPLE_WINDOW`] durations, oldest first.
+    samples: Vec<u32>,
+    /// The median of `samples`, kept so a rank never sorts.
+    #[serde(skip)]
+    median: u32,
+}
+
+impl CostWindow {
+    fn push(&mut self, duration_ms: u32) {
+        if self.samples.len() >= SAMPLE_WINDOW {
+            self.samples.remove(0);
+        }
+        self.samples.push(duration_ms.max(1));
+        self.refresh();
+    }
+
+    fn refresh(&mut self) {
+        let mut sorted = self.samples.clone();
+        sorted.sort_unstable();
+        self.median = sorted[sorted.len() / 2];
+    }
+}
+
+/// A claimed node's place in the claim heap: ascending order is claim
+/// order — rank, then first request, then arrival.
+type Candidate = std::cmp::Reverse<(rank::Rank, i64, u32)>;
+
+/// The class a failed attempt is counted under — the error's first
+/// line, capped so a stack dump cannot explode the class list, or
+/// `unknown` for a failure that carried no error (`None` on success
+/// or cancellation, which the freeze window never counts).
+fn failure_class_of(success: bool, error: Option<&str>) -> Option<String> {
+    const MAX_PREFIX_CHARS: usize = 200;
+    if success {
+        return None;
+    }
+    Some(
+        error
+            .and_then(|error| error.lines().next())
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map_or_else(
+                || "unknown".to_owned(),
+                |line| line.chars().take(MAX_PREFIX_CHARS).collect(),
+            ),
+    )
+}
+/// The scheduler's self-counted billed rows (stow#878 review): no
+/// `do_meter`/`probe_meter` table counts itself. `store.rs` books every
+/// row it reads and writes here; the snapshot carries the counters and
+/// replay re-counts the log tail it reads.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct Meter {
+    /// UTC day (`YYYY-MM-DD`) the counters apply to.
+    pub day: String,
+    /// Rows the DO read today.
+    pub rows_read: u64,
+    /// Rows the DO wrote today.
+    pub rows_written: u64,
+    /// Per-operation ledger for the budget probe — `ops` carries
+    /// `(statements, rows_read, rows_written)`.
+    #[serde(default)]
+    pub ops: BTreeMap<String, (u64, u64, u64)>,
+}
+
+impl Meter {
+    /// Roll the counters at a UTC-day boundary — the daily budget the
+    /// breaker evaluates is per UTC day.
+    pub fn roll_to(&mut self, day: &str) {
+        if self.day != day {
+            day.clone_into(&mut self.day);
+            self.rows_read = 0;
+            self.rows_written = 0;
+        }
+    }
+
+    /// Book billed rows against the day.
+    pub const fn add(&mut self, rows_read: u64, rows_written: u64) {
+        self.rows_read += rows_read;
+        self.rows_written += rows_written;
+    }
+
+    /// Book one operation's billed rows under its ledger entry.
+    pub fn record(&mut self, op: &str, rows_read: u64, rows_written: u64) {
+        self.add(rows_read, rows_written);
+        let slot = self.ops.entry(op.to_owned()).or_default();
+        slot.0 += 1;
+        slot.1 += rows_read;
+        slot.2 += rows_written;
+    }
+
+    /// Re-count one replayed log row: the row was written at `at_ms`,
+    /// on that UTC day's meter. The snapshot carries the counters up
+    /// to its cut; the tail's writes since then died with the isolate
+    /// that booked them, so the wake books them again.
+    pub fn replayed(&mut self, at_ms: i64) {
+        self.roll_to(&utc_day(at_ms));
+        self.rows_written += 1;
+    }
+}
+
+/// The UTC day (`YYYY-MM-DD`) of a unix-ms instant — the meter's key.
+pub fn utc_day(ms: i64) -> String {
+    format_utc(ms)[..10].to_owned()
+}
+
+/// One demand-feed hour — the `demand_feed_hours` row plus its
+/// `demand_feed_pages` staging, replayed through `Feed` events
+/// (stow#878 stage 7).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FeedSession {
+    /// The generation stamp — the begin's unix-second attempt id,
+    /// monotonically bumped on rotate.
+    pub generation: i64,
+    /// `staging` | `complete` | `delivered`.
+    pub state: String,
+    /// Pages staged under the live generation.
+    pub staged_pages: u32,
+    /// Entries staged under the live generation.
+    pub staged_entries: u32,
+    /// Pages the delivery has already folded into `Demand` events —
+    /// `deliver` applies page `applied_pages` next.
+    pub applied_pages: u32,
+    /// The declared page count the `Complete` barrier recorded.
+    pub page_count: u32,
+    /// The declared entry total the `Complete` barrier recorded.
+    pub entry_count: i64,
+    /// Staged pages — `staged[i]` is page `i`'s wire entries; the
+    /// deliver loop folds page `applied_pages` next. Emptied on the
+    /// terminal `Deliver`.
+    pub staged: Vec<Vec<stow_types::api::SchedulerDemandEntry>>,
+    /// Ordered page hashes — the complete-manifest check's material.
+    pub page_hashes: Vec<String>,
+    /// Ordered chain hashes — `chain[i]` is blake3(chain[i-1] +
+    /// `page_hashes[i]`) — the manifest's last element.
+    pub chain_hashes: Vec<String>,
+}
+
+/// One completed attempt — the `attempt_outcomes_v2` /
+/// `attempt_outcome_buckets` equivalent, folded in-place at event
+/// apply and pruned by the freeze window at read (stow#878 stage 7).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AttemptOutcome {
+    /// The task's interned id resolved to its string.
+    pub task_id: String,
+    /// The minted generation the attempt ran under.
+    pub generation_id: String,
+    /// The attempt that ran.
+    pub attempt: u32,
+    /// The CI target the trip tallies on.
+    pub target: String,
+    /// `Some(first error line)` on failure, `None` on success.
+    pub failure_class: Option<String>,
+    /// The platform run id, when the binding carried one.
+    pub run_id: String,
+    /// When the completion landed (unix ms).
+    pub finished_at_ms: i64,
+}
+
+/// The ring's bound — the window filter happens at read, so the cap
+/// only bounds memory.
+const ATTEMPT_OUTCOME_CAP: usize = 4_096;
+
+/// One request-lane record — the `requests` table's row carried in
+/// memory and replayed through `Request` events (stow#878 stage 7).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RequestRecord {
+    /// The admission the first attempt stored.
+    pub admission: Box<stow_types::api::RequestAdmission>,
+    /// The live attempt — `RunUpdated`/`Outcome` events fence on it.
+    pub attempt: u32,
+    /// The unix-second dispatch stamp.
+    pub dispatched_at: i64,
+    /// `accepted` | `resolving` | `enqueued` | `failed`.
+    pub state: String,
+    /// The resolve run's title/id once `in_progress` lands.
+    pub run_id: Option<String>,
+    /// The resolve run's URL once `in_progress` lands.
+    pub run_url: Option<String>,
+    /// The serialized stored roots once `enqueued`.
+    pub outcome_json: Option<String>,
+    /// The failure reason once `failed`.
+    pub error: Option<String>,
+}
+
+/// The whole in-memory graph. Nothing here serializes whole: the
+/// snapshot (`snapshot.rs`) walks it one byte-bounded chunk at a time,
+/// and a wake decodes it one chunk at a time — neither side ever holds
+/// the graph's image in memory (stow#878 review).
+#[derive(Debug, Default)]
+pub struct Graph {
+    /// Crate names, versions and feature lists, each stored once.
+    intern: Interner,
+    /// Every target triple the graph holds a node for; a node's
+    /// `target` byte indexes it.
+    targets: Vec<TargetInfo>,
+    /// Likewise the rustc versions.
+    rustcs: Vec<Box<str>>,
+    /// Task-id probe index over `nodes`, keyed by `Node::id_tag`.
+    /// Freed nodes stay in it until the next compaction and are
+    /// skipped.
+    ids: IxTable,
+    /// Identity probe index — `(crate, version, features, target,
+    /// rustc)` of every node, either side, any digest: the demand
+    /// feed's root lookup.
+    idents: IxTable,
+    /// The node arena. Indexes are stable between compactions and
+    /// compactions keep creation order.
+    nodes: Vec<Node>,
+    /// Queue state of the nodes that have not published.
+    states: Vec<State>,
+    /// Vacant `states` slots, reused before the slab grows.
+    free_states: Vec<u32>,
+    /// The rare per-node fields; see [`Extra`].
+    extras: HashMap<u32, Extra>,
+    /// Forward edges and the reverse index.
+    edges: Edges,
+    /// Published unit-shape mask per task id.
+    published: HashMap<IdKey, u8>,
+    /// Dispatchable pending nodes. The claim orders them; the set
+    /// itself holds node indexes only.
+    ready: BTreeSet<u32>,
+    /// Dispatched and running nodes.
+    inflight: BTreeSet<u32>,
+    /// Nodes per [`Status`].
+    counts: [u32; Status::COUNT],
+    /// External `build-crate.yml` runs (stow#877): run id → family bit.
+    external_runs: HashMap<u64, u8>,
+    /// The dispatch freeze record while engaged.
+    freeze: Option<stow_types::api::DispatchFreezeRecord>,
+    /// The recent freeze transitions, oldest first, bounded by
+    /// [`FREEZE_HISTORY`] — the `GET /dispatch-freeze` log.
+    freeze_history: std::collections::VecDeque<stow_types::api::DispatchFreezeTransition>,
+    /// The admission floor (`min_dispatch_value`).
+    floor: i64,
+    /// Per-(crate, target) expected build cost (stow#524), keyed by
+    /// the interned crate and the target byte.
+    build_stats: HashMap<(u32, u8), CostWindow>,
+    /// Completions and failures per UTC hour and target byte — the
+    /// admin status's trailing-day tally, since a published node keeps
+    /// no state to count.
+    outcome_hours: BTreeMap<(i64, u8), (u32, u32)>,
+    /// `BuildSample` events a completion produced and the caller has
+    /// yet to append and apply; see [`Self::take_samples`].
+    samples: Vec<SchedulerEvent>,
+    /// The next claim generation — monotonic, snapshot-carried.
+    next_generation: u64,
+    /// When the run listing last reconciled — memory only: a wake
+    /// reconciles at once.
+    reconciled_at: i64,
+    /// The request lane's records — the `requests` table's rows,
+    /// replayed by `Request` events (stow#878 stage 7).
+    pub requests: std::collections::BTreeMap<String, RequestRecord>,
+    /// Human-lane daily spend the `human_daily_task_budget` row held —
+    /// `(unix-day index, task_count)`, the same UTC-day rollover
+    /// `date('now')` gave the table.
+    pub human_budget: (i64, i64),
+    /// The sliding-window evidence the dispatch-freeze trip reads —
+    /// every applied run outcome, capped; the window filter happens
+    /// at read so replay needs no setting.
+    pub attempt_outcomes: std::collections::VecDeque<AttemptOutcome>,
+    /// Demand-feed hours by `YYYY-MM-DDTHH` — staging sessions carry
+    /// their pages until `Deliver` folds them.
+    pub feed_sessions: std::collections::BTreeMap<String, FeedSession>,
+    /// `batch_id` → `(input_hash, touched_count)` — the `demand_batches`
+    /// dedup the `/demand` route's replay guard reads.
+    pub demand_batches: std::collections::BTreeMap<String, (String, i64)>,
+    /// The delivered-hour cursor — `settings`' `watermark` key. Begin
+    /// and deliver both fence on the canonical successor.
+    pub feed_watermark: Option<String>,
+    /// The in-memory billed-row counters.
+    pub meter: Meter,
+    /// Log rows appended — or replayed — since the last snapshot; the
+    /// trigger `SNAPSHOT_EVENT_THRESHOLD` reads.
+    pub log_since_snapshot: u64,
+    /// JSON bytes of those rows - the byte trigger
+    /// `SNAPSHOT_BYTE_THRESHOLD` reads. Zero after a snapshot (it covers
+    /// the whole log), recounted from the tail rows on replay.
+    pub log_bytes_since_snapshot: u64,
+}
+
+/// Freeze transitions the graph keeps for `GET /dispatch-freeze`.
+const FREEZE_HISTORY: usize = 25;
+
+/// One claimed node, ready for payload build and dispatch.
+#[derive(Debug)]
+pub struct Claimed {
+    /// The task id (re-materialized from the interner).
+    pub task_id: String,
+    /// The minted generation.
+    pub generation: u64,
+    /// The attempt cycle.
+    pub attempt: u32,
+    /// The dispatch payload, subgraph rebuilt.
+    pub payload: BuildTaskPayload,
+}
+
+/// What a merge changed.
+#[derive(Debug, Default)]
+pub struct MergeReport {
+    /// Brand-new nodes.
+    pub inserted: u32,
+    /// Nodes already present (updated or skipped).
+    pub merged: u32,
+}
+
+/// What one run-finished event resolved to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum FinishOutcome {
+    /// Applied to a bound run.
+    Applied,
+    /// Parked — the run's binding has not landed yet.
+    Parked,
+    /// An external run's completion was consumed.
+    External,
+    /// No live state named this run (stale delivery).
+    Stale,
+}
+
+/// What one in-progress delivery resolved to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// A dispatched run moved to `running` (bound on delivery if its
+    /// binding had not yet landed).
+    Applied,
+    /// A run the scheduler did not dispatch — tracked as external.
+    External,
+    /// A repeated or unknown delivery.
+    Stale,
+}
+
+/// The window a (crate, target) build-cost stat keeps.
+const SAMPLE_WINDOW: usize = queue::BUILD_SAMPLE_WINDOW;
+
+/// The 32 bytes a dependency identity's 64 hex digits spell.
+fn digest_bytes(identity: &stow_types::identity::DependencyIdentity) -> [u8; 32] {
+    let mut digest = [0u8; 32];
+    hex::decode_to_slice(identity.as_str(), &mut digest)
+        .expect("a dependency identity is 64 lowercase hex digits");
+    digest
+}
+
+/// The canonical task id a submission node's identity columns spell.
+fn minted_id(sub: &SubmissionNode) -> String {
+    canonical_task_id(
+        sub.crate_name.as_str(),
+        &sub.version.to_string(),
+        &sub.features_json.raw(),
+        sub.target.as_str(),
+        sub.rustc_version.as_str(),
+        sub.dependency_identity.as_str(),
+        sub.host_side,
+    )
+}
+
+/// The identity-index hash of a node's five-field identity.
+fn ident_hash(crate_name: u32, version: u32, features: u32, target: u8, rustc: u8) -> u64 {
+    hash_of(&(crate_name, version, features, target, rustc))
+}
+
+/// A node to insert.
+struct NewNode<'a> {
+    crate_name: &'a str,
+    version: &'a str,
+    features: &'a str,
+    target: &'a str,
+    rustc: &'a str,
+    digest: [u8; 32],
+    keys: IdKeys,
+    flags: Flags,
+    /// `None` inserts the node already published.
+    state: Option<State>,
+}
+
+/// Node-slab, index and bookkeeping primitives.
+impl Graph {
+    fn node(&self, ix: u32) -> &Node {
+        &self.nodes[ix as usize]
+    }
+
+    fn node_mut(&mut self, ix: u32) -> &mut Node {
+        &mut self.nodes[ix as usize]
+    }
+
+    /// The queue state of an unpublished node.
+    fn state(&self, ix: u32) -> &State {
+        let slot = self.node(ix).state;
+        assert_ne!(
+            slot, NO_STATE,
+            "node {ix} is published and holds no queue state"
+        );
+        &self.states[slot as usize]
+    }
+
+    fn state_mut(&mut self, ix: u32) -> &mut State {
+        let slot = self.node(ix).state;
+        assert_ne!(
+            slot, NO_STATE,
+            "node {ix} is published and holds no queue state"
+        );
+        &mut self.states[slot as usize]
+    }
+
+    fn alloc_state(&mut self, state: State) -> u32 {
+        if let Some(slot) = self.free_states.pop() {
+            self.states[slot as usize] = state;
+            slot
+        } else {
+            self.states.push(state);
+            u32::try_from(self.states.len() - 1).expect("state slab holds fewer than 2^32 entries")
+        }
+    }
+
+    /// The edge range of a node's forward span.
+    fn edge_range(&self, ix: u32) -> std::ops::Range<usize> {
+        let node = self.node(ix);
+        let start = node.edges_start as usize;
+        start..start + usize::from(node.edges_len)
+    }
+
+    /// The nodes `ix` depends on, once per edge.
+    fn deps_of(&self, ix: u32) -> impl Iterator<Item = u32> + '_ {
+        self.edge_range(ix).map(|edge| self.edges.dep(edge))
+    }
+
+    /// The nodes holding an edge onto `ix`, deduplicated and alive.
+    fn dependents_of(&self, ix: u32) -> Vec<u32> {
+        let mut owners = self.edges.owners_of(ix);
+        owners.sort_unstable();
+        owners.dedup();
+        owners.retain(|&owner| self.node(owner).status != Status::Free);
+        owners
+    }
+
+    /// A node's rank operand: the raw value its lane, family and
+    /// priority operands price — what the admission floor compares and
+    /// the admin listing renders.
+    fn raw_value(&self, ix: u32) -> i64 {
+        let node = self.node(ix);
+        let state = self.state(ix);
+        rank::raw_value(
+            node.flags.lane().sql_lane(),
+            self.targets[usize::from(node.target)].dispatch,
+            state.priority,
+            state.demand,
+        )
+    }
+
+    /// The node's claim rank: human lane first, then the exact ratio
+    /// of its raw value to the expected build cost of its crate and
+    /// target.
+    fn rank_of(&self, ix: u32) -> rank::Rank {
+        let node = self.node(ix);
+        rank::Rank::new(
+            node.flags.lane() == Lane::Human,
+            self.raw_value(ix),
+            self.expected_cost(node.crate_name, node.target),
+        )
+    }
+
+    /// Per-(crate, target) expected build cost: the median of the
+    /// sample window, `UNMEASURED_COST` before any sample — the rank's
+    /// cost operand.
+    fn expected_cost(&self, crate_name: u32, target: u8) -> std::num::NonZero<i64> {
+        self.build_stats
+            .get(&(crate_name, target))
+            .and_then(|window| std::num::NonZero::new(i64::from(window.median)))
+            .unwrap_or(rank::UNMEASURED_COST)
+    }
+
+    /// Whether a node may dispatch apart from its age/backoff gate.
+    fn dispatchable(&self, ix: u32) -> bool {
+        let node = self.node(ix);
+        node.status == Status::Pending
+            && node.unmet == 0
+            && !node.flags.blocked()
+            && (node.flags.lane() == Lane::Human || self.raw_value(ix) >= self.floor)
+    }
+
+    /// Re-evaluate a node's ready-set membership.
+    fn refresh_ready(&mut self, ix: u32) {
+        if self.dispatchable(ix) {
+            self.ready.insert(ix);
+        } else {
+            self.ready.remove(&ix);
+        }
+    }
+
+    /// Move a node to `to`, keeping the per-status counters and the
+    /// in-flight set.
+    fn set_status(&mut self, ix: u32, to: Status) {
+        let node = &mut self.nodes[ix as usize];
+        let from = std::mem::replace(&mut node.status, to);
+        if from == to {
+            return;
+        }
+        self.counts[from.index()] -= 1;
+        self.counts[to.index()] += 1;
+        if from.in_flight() {
+            self.inflight.remove(&ix);
+        }
+        if to.in_flight() {
+            self.inflight.insert(ix);
+        }
+    }
+
+    /// Run `edit` on the node's extra fields, creating the entry on
+    /// demand and dropping it again when nothing is left set.
+    fn edit_extra<R>(&mut self, ix: u32, edit: impl FnOnce(&mut Extra) -> R) -> R {
+        let extra = self.extras.entry(ix).or_default();
+        let result = edit(extra);
+        if extra.is_blank() {
+            self.extras.remove(&ix);
+        }
+        result
+    }
+
+    fn run_id_of(&self, ix: u32) -> u64 {
+        self.extras.get(&ix).map_or(0, |extra| extra.run_id)
+    }
+
+    fn generation_of(&self, ix: u32) -> u64 {
+        self.extras.get(&ix).map_or(0, |extra| extra.generation)
+    }
+
+    fn claimed_at_of(&self, ix: u32) -> i64 {
+        self.extras.get(&ix).map_or(0, |extra| extra.claimed_at)
+    }
+
+    fn not_before_of(&self, ix: u32) -> i64 {
+        self.extras.get(&ix).map_or(0, |extra| extra.not_before)
+    }
+
+    fn error_of(&self, ix: u32) -> Option<&str> {
+        self.extras
+            .get(&ix)
+            .and_then(|extra| extra.error.as_deref())
+    }
+
+    /// This node's own required published shapes.
+    fn own_mask(&self, ix: u32) -> u8 {
+        let node = self.node(ix);
+        self.targets[usize::from(node.target)].own_masks[usize::from(node.flags.host())]
+            [usize::from(node.flags.explicit())]
+    }
+
+    fn target_id(&mut self, name: &str) -> Result<u8, QueueError> {
+        if let Some(at) = self.targets.iter().position(|target| &*target.name == name) {
+            return Ok(u8::try_from(at).expect("target ids fit u8"));
+        }
+        let id = u8::try_from(self.targets.len()).map_err(|_| {
+            QueueError::Invariant("the graph holds more than 256 distinct targets".into())
+        })?;
+        self.targets.push(TargetInfo::new(name));
+        Ok(id)
+    }
+
+    fn rustc_id(&mut self, name: &str) -> Result<u8, QueueError> {
+        if let Some(at) = self.rustcs.iter().position(|rustc| &**rustc == name) {
+            return Ok(u8::try_from(at).expect("rustc ids fit u8"));
+        }
+        let id = u8::try_from(self.rustcs.len()).map_err(|_| {
+            QueueError::Invariant("the graph holds more than 256 distinct rustc versions".into())
+        })?;
+        self.rustcs.push(name.into());
+        Ok(id)
+    }
+
+    fn target_lookup(&self, name: &str) -> Option<u8> {
+        let at = self
+            .targets
+            .iter()
+            .position(|target| &*target.name == name)?;
+        Some(u8::try_from(at).expect("target ids fit u8"))
+    }
+
+    fn rustc_lookup(&self, name: &str) -> Option<u8> {
+        let at = self.rustcs.iter().position(|rustc| &**rustc == name)?;
+        Some(u8::try_from(at).expect("rustc ids fit u8"))
+    }
+
+    /// Re-mint a node's canonical task id from its fields.
+    fn task_id_of(&self, ix: u32) -> String {
+        let node = self.node(ix);
+        canonical_task_id(
+            self.intern.at(node.crate_name),
+            self.intern.at(node.version),
+            self.intern.at(node.features),
+            &self.targets[usize::from(node.target)].name,
+            &self.rustcs[usize::from(node.rustc)],
+            &hex::encode(node.digest),
+            node.flags.host(),
+        )
+    }
+
+    /// The live node whose canonical task id is `task_id`.
+    fn find_id(&self, task_id: &str, keys: IdKeys) -> Option<u32> {
+        self.ids.candidates(u64::from(keys.tag)).find(|&ix| {
+            let node = self.node(ix);
+            node.id_tag == keys.tag && node.status != Status::Free && self.task_id_of(ix) == task_id
+        })
+    }
+
+    /// Look up a node index by task id string.
+    fn node_ix(&self, task_id: &str) -> Option<u32> {
+        self.find_id(task_id, IdKeys::of(task_id))
+    }
+
+    /// Append a node and index it.
+    fn insert_node(&mut self, new: &NewNode<'_>) -> Result<u32, QueueError> {
+        let ix = u32::try_from(self.nodes.len())
+            .map_err(|_| QueueError::Invariant("node count overflows u32".into()))?;
+        let crate_name = self.intern.intern(new.crate_name);
+        let version = self.intern.intern(new.version);
+        let features = self.intern.intern(new.features);
+        let target = self.target_id(new.target)?;
+        let rustc = self.rustc_id(new.rustc)?;
+        let status = if new.state.is_some() {
+            Status::Pending
+        } else {
+            Status::Published
+        };
+        let state = new.state.map_or(NO_STATE, |state| self.alloc_state(state));
+        self.nodes.push(Node {
+            digest: new.digest,
+            crate_name,
+            version,
+            features,
+            id_tag: new.keys.tag,
+            state,
+            edges_start: u32::try_from(self.edges.len())
+                .map_err(|_| QueueError::Invariant("edge count overflows u32".into()))?,
+            refs: 0,
+            edges_len: 0,
+            unmet: 0,
+            target,
+            rustc,
+            status,
+            flags: new.flags,
+        });
+        self.counts[status.index()] += 1;
+        let nodes = &self.nodes;
+        self.ids.insert(u64::from(new.keys.tag), ix, |held| {
+            u64::from(nodes[held as usize].id_tag)
+        });
+        self.idents.insert(
+            ident_hash(crate_name, version, features, target, rustc),
+            ix,
+            |held| {
+                let node = &nodes[held as usize];
+                ident_hash(
+                    node.crate_name,
+                    node.version,
+                    node.features,
+                    node.target,
+                    node.rustc,
+                )
+            },
+        );
+        Ok(ix)
+    }
+
+    /// A node becomes published: its queue state goes, and the node
+    /// itself goes with it unless a retained node still depends on it.
+    fn publish(&mut self, ix: u32) {
+        if !self.node(ix).status.has_state() {
+            return;
+        }
+        self.set_status(ix, Status::Published);
+        let slot = std::mem::replace(&mut self.node_mut(ix).state, NO_STATE);
+        self.free_states.push(slot);
+        self.extras.remove(&ix);
+        self.ready.remove(&ix);
+        if self.node(ix).refs == 0 {
+            self.release(ix);
+        }
+    }
+
+    /// Free a published node nothing retained depends on, and every
+    /// published node that only it kept alive.
+    fn release(&mut self, ix: u32) {
+        let mut work = vec![ix];
+        while let Some(ix) = work.pop() {
+            debug_assert_eq!(self.node(ix).status, Status::Published);
+            self.set_status(ix, Status::Free);
+            for edge in self.edge_range(ix) {
+                let dep = self.edges.dep(edge);
+                let held = self.node_mut(dep);
+                held.refs -= 1;
+                if held.refs == 0 && held.status == Status::Published {
+                    work.push(dep);
+                }
+            }
+        }
+    }
+
+    /// Squeeze the freed records out once they are an eighth of the
+    /// arena.
+    fn maybe_compact(&mut self) {
+        let dead = self.counts[Status::Free.index()] as usize;
+        if dead >= COMPACT_FLOOR && dead * 8 >= self.nodes.len() {
+            self.compact();
+        }
+    }
+
+    /// Drop every freed node and its edges in place. Creation order
+    /// survives, so the claim's arrival tie-break is unchanged, and the
+    /// derived indexes are rebuilt over the new indexes.
+    pub(crate) fn compact(&mut self) {
+        /// Remap entry of a dropped node.
+        const GONE: u32 = u32::MAX;
+        let dead = self.counts[Status::Free.index()];
+        if dead == 0 {
+            return;
+        }
+        let mut remap = vec![GONE; self.nodes.len()];
+        let mut kept = 0u32;
+        for (at, node) in self.nodes.iter().enumerate() {
+            if node.status != Status::Free {
+                remap[at] = kept;
+                kept += 1;
+            }
+        }
+        self.edges.compact(
+            self.nodes
+                .iter()
+                .filter(|node| node.status != Status::Free)
+                .map(|node| (node.edges_start as usize, usize::from(node.edges_len))),
+            &remap,
+        );
+        let mut write = 0usize;
+        let mut edges_end = 0u32;
+        for read in 0..self.nodes.len() {
+            if self.nodes[read].status == Status::Free {
+                continue;
+            }
+            let mut node = self.nodes[read];
+            node.edges_start = edges_end;
+            edges_end += u32::from(node.edges_len);
+            self.nodes[write] = node;
+            write += 1;
+        }
+        self.nodes.truncate(write);
+        self.ready = self
+            .ready
+            .iter()
+            .map(|&ix| remap[ix as usize])
+            .collect::<BTreeSet<_>>();
+        self.inflight = self
+            .inflight
+            .iter()
+            .map(|&ix| remap[ix as usize])
+            .collect::<BTreeSet<_>>();
+        self.extras = std::mem::take(&mut self.extras)
+            .into_iter()
+            .map(|(ix, extra)| (remap[ix as usize], extra))
+            .collect();
+        self.counts[Status::Free.index()] = 0;
+        self.rebuild_indexes_over_nodes();
+    }
+
+    /// Rebuild the id and identity tables and the reverse edges over
+    /// the current arena.
+    fn rebuild_indexes_over_nodes(&mut self) {
+        let nodes = &self.nodes;
+        let mut ids = IxTable::with_entries(nodes.len());
+        let mut idents = IxTable::with_entries(nodes.len());
+        for (at, node) in nodes.iter().enumerate() {
+            let ix = u32::try_from(at).expect("node indexes fit u32");
+            ids.insert(u64::from(node.id_tag), ix, |held| {
+                u64::from(nodes[held as usize].id_tag)
+            });
+            idents.insert(
+                ident_hash(
+                    node.crate_name,
+                    node.version,
+                    node.features,
+                    node.target,
+                    node.rustc,
+                ),
+                ix,
+                |held| {
+                    let node = &nodes[held as usize];
+                    ident_hash(
+                        node.crate_name,
+                        node.version,
+                        node.features,
+                        node.target,
+                        node.rustc,
+                    )
+                },
+            );
+        }
+        self.ids = ids;
+        self.idents = idents;
+        self.edges.rebuild_reverse(
+            nodes.len(),
+            nodes.iter().enumerate().map(|(at, node)| {
+                (
+                    u32::try_from(at).expect("node indexes fit u32"),
+                    node.edges_start as usize,
+                    usize::from(node.edges_len),
+                )
+            }),
+        );
+    }
+}
+
+/// Freed nodes below which a compaction is never worth its pass.
+const COMPACT_FLOOR: usize = 1_024;
+
+/// Merge, publish and the claim gate.
+impl Graph {
+    /// Merge one submission tree by task id. `now` is unix ms.
+    ///
+    /// A node id commits to its subtree: an existing id's edge set is
+    /// never rewritten — the merge only ever raises `downloads` and
+    /// `priority` on it. New nodes are born gated; each edge's `met`
+    /// answers against the published-shape masks at insert. A node
+    /// whose own shapes are already published is born published: it
+    /// stays only as long as a node of this tree depends on it.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` on a malformed tree (a root or dep index
+    /// out of range, or a task id that does not re-derive from its
+    /// identity columns).
+    pub fn merge(&mut self, tree: &SubmissionTree, now: i64) -> Result<MergeReport, QueueError> {
+        let ids = Self::validate_tree(tree)?;
+        let lane = Lane::from_source(tree.source);
+        let op_priority = match tree.source {
+            SubmissionSource::Operations { priority } => priority,
+            _ => 0,
+        };
+        let mut report = MergeReport::default();
+        // Pass 1: find or insert every node by task id.
+        let mut node_ixs = Vec::with_capacity(tree.nodes.len());
+        let mut is_fresh = Vec::with_capacity(tree.nodes.len());
+        let mut fresh = Vec::new();
+        for (sub, keys) in tree.nodes.iter().zip(&ids) {
+            let priority = op_priority + queue::compute_priority(sub.downloads, 0)?;
+            if let Some(ix) = self.find_id(&sub.task_id, *keys) {
+                if self.node(ix).status.has_state() {
+                    let state = self.state_mut(ix);
+                    state.downloads = state.downloads.max(sub.downloads);
+                    state.priority = state.priority.max(priority);
+                    self.refresh_ready(ix);
+                }
+                node_ixs.push(ix);
+                is_fresh.push(false);
+                report.merged += 1;
+                continue;
+            }
+            let ix = self.insert_new(sub, *keys, lane, priority, now)?;
+            node_ixs.push(ix);
+            is_fresh.push(true);
+            fresh.push(ix);
+            if self.node(ix).status == Status::Pending {
+                report.inserted += 1;
+            } else {
+                report.merged += 1;
+            }
+        }
+        if lane == Lane::Human {
+            // Human-lane spend folds in here so replay re-charges
+            // identically: a human-source merge pays one task per
+            // fresh insert (the graph never promotes or resurrects on
+            // a remerge — stow#878 stage 7).
+            let today = now.div_euclid(86_400_000);
+            if self.human_budget.0 != today {
+                self.human_budget = (today, 0);
+            }
+            self.human_budget.1 += i64::from(report.inserted);
+        }
+        // Pass 2: edges for the fresh nodes only — an existing id's
+        // subtree is committed by its first submission.
+        for (sub_at, sub) in tree.nodes.iter().enumerate() {
+            if is_fresh[sub_at] {
+                self.merge_edges(tree, &ids, &node_ixs, sub, node_ixs[sub_at])?;
+            }
+        }
+        // A node born published that nothing in the tree depends on
+        // has nothing left to keep.
+        for ix in fresh {
+            let node = self.node(ix);
+            if node.status == Status::Published && node.refs == 0 {
+                self.release(ix);
+            }
+        }
+        self.maybe_compact();
+        Ok(report)
+    }
+
+    /// The tree's shape and identity check, shared by `merge` and
+    /// `merge_changes`: roots and deps in range, every task id the
+    /// canonical id of its identity columns. Returns each node's probe
+    /// keys.
+    fn validate_tree(tree: &SubmissionTree) -> Result<Vec<IdKeys>, QueueError> {
+        let len = tree.nodes.len();
+        if let Some(root) = tree.roots.iter().find(|&&root| root as usize >= len) {
+            return Err(QueueError::Invariant(format!(
+                "submission root index {root} out of range ({len} nodes)"
+            )));
+        }
+        if let Some(dep) = tree
+            .nodes
+            .iter()
+            .flat_map(|sub| &sub.deps)
+            .find(|&&dep| dep as usize >= len)
+        {
+            return Err(QueueError::Invariant(format!(
+                "submission dep index {dep} out of range ({len} nodes)"
+            )));
+        }
+        tree.nodes
+            .iter()
+            .map(|sub| {
+                let minted = minted_id(sub);
+                if minted != sub.task_id {
+                    return Err(QueueError::Invariant(format!(
+                        "submission task id {} does not re-derive from its identity columns ({minted})",
+                        sub.task_id
+                    )));
+                }
+                Ok(IdKeys::of(&sub.task_id))
+            })
+            .collect()
+    }
+
+    /// Insert a node no live node holds the id of; born published when
+    /// the index already serves its own shapes.
+    fn insert_new(
+        &mut self,
+        sub: &SubmissionNode,
+        keys: IdKeys,
+        lane: Lane,
+        priority: i64,
+        now: i64,
+    ) -> Result<u32, QueueError> {
+        let explicit = sub.explicit_spelling == ExplicitSpelling::KeysApart;
+        let target = self.target_id(sub.target.as_str())?;
+        let own = self.targets[usize::from(target)].own_masks[usize::from(sub.host_side)]
+            [usize::from(explicit)];
+        let published = self.published.get(&keys.key).copied().unwrap_or(0);
+        let state = (published & own != own).then_some(State {
+            first_requested: now,
+            updated: now,
+            priority,
+            demand: 0,
+            downloads: sub.downloads,
+            attempt: 1,
+            dispatch_attempts: 0,
+        });
+        self.insert_node(&NewNode {
+            crate_name: sub.crate_name.as_str(),
+            version: &sub.version.to_string(),
+            features: &sub.features_json.raw(),
+            target: sub.target.as_str(),
+            rustc: sub.rustc_version.as_str(),
+            digest: digest_bytes(&sub.dependency_identity),
+            keys,
+            flags: Flags::new(sub.host_side, explicit, sub.preserve_lockfile, lane),
+            state,
+        })
+    }
+
+    /// Whether merging `tree` would change the graph — a node it adds,
+    /// or a `downloads`/`priority` it would raise — after checking the
+    /// tree is well formed. A resubmission that changes nothing needs no
+    /// log row: replaying it would be a no-op.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` on a malformed tree, the same tree
+    /// [`Graph::merge`] refuses.
+    pub fn merge_changes(&self, tree: &SubmissionTree) -> Result<bool, QueueError> {
+        let ids = Self::validate_tree(tree)?;
+        let op_priority = match tree.source {
+            SubmissionSource::Operations { priority } => priority,
+            _ => 0,
+        };
+        for (sub, keys) in tree.nodes.iter().zip(&ids) {
+            let Some(ix) = self.find_id(&sub.task_id, *keys) else {
+                return Ok(true);
+            };
+            if !self.node(ix).status.has_state() {
+                continue;
+            }
+            let state = self.state(ix);
+            if sub.downloads > state.downloads
+                || state.priority < op_priority + queue::compute_priority(sub.downloads, 0)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// One fresh node's edge list — `merge`'s second pass.
+    fn merge_edges(
+        &mut self,
+        tree: &SubmissionTree,
+        ids: &[IdKeys],
+        node_ixs: &[u32],
+        sub: &SubmissionNode,
+        owner: u32,
+    ) -> Result<(), QueueError> {
+        let owner_explicit = if sub.explicit_spelling == ExplicitSpelling::KeysApart {
+            ExplicitSpelling::KeysApart
+        } else {
+            ExplicitSpelling::KeysAsNative
+        };
+        let edges_start = u32::try_from(self.edges.len())
+            .map_err(|_| QueueError::Invariant("edge count overflows u32".into()))?;
+        let mut unmet = 0u16;
+        let mut blocked = false;
+        for &dep_at in &sub.deps {
+            let dep_sub = &tree.nodes[dep_at as usize];
+            let dep_ix = node_ixs[dep_at as usize];
+            let (invocations, _shapes) = queue::dep_edge_requirements(
+                sub.target.as_str(),
+                sub.host_side,
+                owner_explicit,
+                dep_sub.target.as_str(),
+                dep_sub.host_side,
+                dep_sub.explicit_spelling,
+            );
+            let required = required_shape_mask(dep_sub.host_side, invocations);
+            let published = self
+                .published
+                .get(&ids[dep_at as usize].key)
+                .copied()
+                .unwrap_or(0);
+            let met = published & required == required;
+            if !met {
+                unmet = unmet.checked_add(1).ok_or_else(|| {
+                    QueueError::Invariant(format!("task {} has more than 65535 edges", sub.task_id))
+                })?;
+            }
+            self.edges.push(owner, dep_ix, required, met)?;
+            self.node_mut(dep_ix).refs += 1;
+            // A fresh node is blocked when any dep is a live failed
+            // node.
+            blocked |= self.node(dep_ix).status == Status::Failed;
+        }
+        let edges_len = u16::try_from(self.edges.len() - edges_start as usize).map_err(|_| {
+            QueueError::Invariant(format!("task {} has more than 65535 edges", sub.task_id))
+        })?;
+        let node = self.node_mut(owner);
+        node.edges_start = edges_start;
+        node.edges_len = edges_len;
+        node.unmet = unmet;
+        node.flags.set_blocked(blocked);
+        if self.edges.reverse_stale() {
+            self.rebuild_reverse();
+        }
+        self.refresh_ready(owner);
+        Ok(())
+    }
+
+    /// Rebuild the reverse edges over the live arena.
+    fn rebuild_reverse(&mut self) {
+        let nodes = &self.nodes;
+        self.edges.rebuild_reverse(
+            nodes.len(),
+            nodes.iter().enumerate().map(|(at, node)| {
+                (
+                    u32::try_from(at).expect("node indexes fit u32"),
+                    node.edges_start as usize,
+                    usize::from(node.edges_len),
+                )
+            }),
+        );
+    }
+
+    /// Apply a published-slice report: add/retire unit shapes, flip the
+    /// edges they touch, and drop nodes whose own shapes are served.
+    /// Returns the number of edge flips.
+    pub fn apply_slice_report(
+        &mut self,
+        target: &str,
+        rustc_version: &str,
+        added: &[PublishedSliceRow],
+        retired: &[PublishedSliceRow],
+    ) -> u32 {
+        let mut flips = 0;
+        for row in retired {
+            flips += self.apply_slice_row(target, rustc_version, row, false);
+        }
+        for row in added {
+            flips += self.apply_slice_row(target, rustc_version, row, true);
+        }
+        self.maybe_compact();
+        flips
+    }
+
+    fn apply_slice_row(
+        &mut self,
+        target: &str,
+        rustc: &str,
+        row: &PublishedSliceRow,
+        added: bool,
+    ) -> u32 {
+        let task_id = canonical_task_id(
+            row.crate_name.as_str(),
+            &row.version.to_string(),
+            &row.features_json.raw(),
+            target,
+            rustc,
+            row.dependency_identity.as_str(),
+            row.unit_shape.side == stow_types::public_cache::UnitSide::Host,
+        );
+        let keys = IdKeys::of(&task_id);
+        let bit = shape_bit(row.unit_shape);
+        let mask = {
+            let entry = self.published.entry(keys.key).or_insert(0);
+            if added {
+                *entry |= bit;
+            } else {
+                *entry &= !bit;
+            }
+            *entry
+        };
+        if mask == 0 {
+            self.published.remove(&keys.key);
+        }
+        let Some(ix) = self.find_id(&task_id, keys) else {
+            return 0;
+        };
+        let mut flips = 0;
+        for owner in self.dependents_of(ix) {
+            let mut flipped = false;
+            for edge in self.edge_range(owner) {
+                if self.edges.dep(edge) != ix {
+                    continue;
+                }
+                let required = self.edges.required(edge);
+                let met = mask & required == required;
+                if self.edges.met(edge) == met {
+                    continue;
+                }
+                self.edges.set_met(edge, met);
+                let node = self.node_mut(owner);
+                node.unmet = if met {
+                    node.unmet.saturating_sub(1)
+                } else {
+                    node.unmet + 1
+                };
+                flips += 1;
+                flipped = true;
+            }
+            if flipped {
+                self.refresh_ready(owner);
+            }
+        }
+        // A live node whose own published shapes are now covered
+        // leaves the queue.
+        if added && self.node(ix).status.has_state() {
+            let own = self.own_mask(ix);
+            if mask & own == own {
+                self.publish(ix);
+            }
+        }
+        flips
+    }
+
+    /// Whether the index reports shapes for a task id the graph no
+    /// longer holds a node for — a node that published and was freed.
+    pub fn is_published(&self, task_id: &str) -> bool {
+        self.node_ix(task_id).is_none()
+            && self
+                .published
+                .get(&IdKeys::of(task_id).key)
+                .is_some_and(|&mask| mask != 0)
+    }
+
+    /// The ids among `ids` that [`Self::is_published`] answers for.
+    pub fn published_of(&self, ids: &[String]) -> BTreeSet<String> {
+        ids.iter()
+            .filter(|id| self.is_published(id))
+            .cloned()
+            .collect()
+    }
+}
+
+/// Claims and the run lifecycle.
+impl Graph {
+    /// Claim up to `total_free` (and `macos_free` for the macOS family)
+    /// ready nodes, minting one generation per claim. `now` is unix ms;
+    /// nodes whose `not_before` is in the future are skipped. Returns
+    /// claims in rank order — the dispatch pass writes ONE `Claims`
+    /// event for this set before posting, and ONE `Bindings` row after.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when a claimed node's payload cannot be
+    /// rebuilt or its target has no runner family.
+    pub fn claim(
+        &mut self,
+        total_free: u32,
+        macos_free: u32,
+        now: i64,
+        stale_ms: i64,
+    ) -> Result<Vec<Claimed>, QueueError> {
+        // Stale-lease recovery first: in-flight nodes whose claim
+        // outlived the lease return to pending.
+        let stale: Vec<u32> = self
+            .inflight
+            .iter()
+            .copied()
+            .filter(|&ix| self.claimed_at_of(ix) + stale_ms <= now)
+            .collect();
+        for ix in stale {
+            self.set_status(ix, Status::Pending);
+            self.state_mut(ix).updated = now;
+            self.edit_extra(ix, |extra| {
+                extra.claimed_at = 0;
+                extra.run_id = 0;
+                extra.parked = None;
+            });
+            self.refresh_ready(ix);
+        }
+        if self.freeze.is_some() {
+            return Ok(Vec::new());
+        }
+        // The ready set holds indexes only; the order is computed
+        // here, over the candidates past their backoff.
+        let mut heap: BinaryHeap<Candidate> = self
+            .ready
+            .iter()
+            .copied()
+            .filter(|&ix| self.not_before_of(ix) <= now)
+            .map(|ix| std::cmp::Reverse((self.rank_of(ix), self.state(ix).first_requested, ix)))
+            .collect();
+        let mut claimed = Vec::new();
+        let mut macos_taken = 0u32;
+        while claimed.len() < total_free as usize {
+            let Some(std::cmp::Reverse((_, _, ix))) = heap.pop() else {
+                break;
+            };
+            let target = &self.targets[usize::from(self.node(ix).target)];
+            let family = target.family.ok_or_else(|| {
+                QueueError::Invariant(format!(
+                    "pending task {} targets `{}`, no runner family",
+                    self.task_id_of(ix),
+                    target.name
+                ))
+            })?;
+            if family == RunnerFamily::MacOs && macos_taken >= macos_free {
+                continue;
+            }
+            let generation = self.next_generation + 1;
+            self.mark_claimed(ix, generation, now);
+            if family == RunnerFamily::MacOs {
+                macos_taken += 1;
+            }
+            claimed.push(Claimed {
+                task_id: self.task_id_of(ix),
+                generation,
+                attempt: u32::from(self.state(ix).attempt),
+                payload: self.task_payload(ix)?,
+            });
+        }
+        Ok(claimed)
+    }
+
+    /// The claim transition shared by [`Self::claim`] and the replay of
+    /// a `Claims` event: the node leaves the ready set dispatched under
+    /// `generation`, unbound, with its dispatch attempt counted.
+    fn mark_claimed(&mut self, ix: u32, generation: u64, now: i64) {
+        self.next_generation = self.next_generation.max(generation);
+        self.set_status(ix, Status::Dispatched);
+        let state = self.state_mut(ix);
+        state.dispatch_attempts = state.dispatch_attempts.saturating_add(1);
+        state.updated = now;
+        self.edit_extra(ix, |extra| {
+            extra.generation = generation;
+            extra.claimed_at = now;
+            extra.run_id = 0;
+            extra.parked = None;
+        });
+        self.ready.remove(&ix);
+    }
+
+    /// Bind a dispatch response's run id to a claim's generation, and
+    /// consume a completion parked on the claim when one is waiting.
+    /// Returns whether the binding applied (false = stale generation).
+    pub fn bind(&mut self, task_id: &str, generation: u64, run_id: u64, now: i64) -> bool {
+        let Some(ix) = self.node_ix(task_id) else {
+            return false;
+        };
+        if !self.node(ix).status.in_flight() || self.generation_of(ix) != generation {
+            return false;
+        }
+        self.state_mut(ix).updated = now;
+        let parked = self.edit_extra(ix, |extra| {
+            extra.run_id = run_id;
+            extra.parked.take()
+        });
+        if let Some(parked) = parked
+            && parked.run_id == run_id
+        {
+            self.finish_run_inner(ix, parked.success, parked.cancelled, parked.error, now);
+        }
+        true
+    }
+
+    /// A `workflow_dispatch` failure re-queues the claim under the
+    /// dispatch backoff its attempt count earns.
+    pub fn mark_dispatch_failed(&mut self, task_id: &str, generation: u64, error: &str, now: i64) {
+        let Some(ix) = self.node_ix(task_id) else {
+            return;
+        };
+        if !self.node(ix).status.in_flight()
+            || self.generation_of(ix) != generation
+            || self.run_id_of(ix) != 0
+        {
+            return;
+        }
+        self.set_status(ix, Status::Pending);
+        let state = self.state_mut(ix);
+        state.updated = now;
+        let backoff = i64::from(queue::dispatch_backoff_minutes(u32::from(
+            state.dispatch_attempts,
+        ))) * 60_000;
+        self.edit_extra(ix, |extra| {
+            extra.error = Some(error.into());
+            extra.not_before = now + backoff;
+            extra.parked = None;
+        });
+        self.refresh_ready(ix);
+    }
+
+    /// A `workflow_run` `in_progress` delivery. A delivery naming a
+    /// dispatched-but-unbound claim binds it — the run's own record is
+    /// the authoritative binding (review Q6's delivery-side leg).
+    pub fn run_started(
+        &mut self,
+        task_id: &str,
+        run_id: u64,
+        family: RunnerFamily,
+        now: i64,
+    ) -> StartOutcome {
+        if let Some(ix) = self.node_ix(task_id)
+            && self.node(ix).status.in_flight()
+        {
+            let bound = self.run_id_of(ix);
+            if bound == run_id || bound == 0 {
+                if bound == 0 {
+                    self.edit_extra(ix, |extra| extra.run_id = run_id);
+                }
+                self.set_status(ix, Status::Running);
+                self.state_mut(ix).updated = now;
+                return StartOutcome::Applied;
+            }
+            return StartOutcome::Stale;
+        }
+        let bit = 1u8 << (family as u8);
+        if self.external_runs.insert(run_id, bit).is_none() {
+            StartOutcome::External
+        } else {
+            StartOutcome::Stale
+        }
+    }
+
+    /// Reconcile the run set after a wake (#877, review Q6): the
+    /// `status` listing is the truth for occupancy, and a run title
+    /// (`<rustc>-<task_id>`) that names an unbound dispatched claim
+    /// re-lands its binding.
+    pub fn reconcile_runs(&mut self, runs: &[(u64, String, RunnerFamily)], now: i64) {
+        self.reconciled_at = now;
+        self.external_runs.clear();
+        for (run_id, title, family) in runs {
+            let task_id = title
+                .split_once('-')
+                .map(|(_, task_id)| task_id)
+                .unwrap_or_default();
+            if let Some(ix) = self.node_ix(task_id)
+                && self.node(ix).status.in_flight()
+                && self.run_id_of(ix) == 0
+            {
+                let generation = self.generation_of(ix);
+                self.bind(task_id, generation, *run_id, now);
+                continue;
+            }
+            self.external_runs.insert(*run_id, 1u8 << (*family as u8));
+        }
+    }
+
+    /// A `workflow_run` `completed` delivery.
+    pub fn run_finished(
+        &mut self,
+        task_id: &str,
+        run_id: u64,
+        success: bool,
+        cancelled: bool,
+        error: Option<String>,
+        now: i64,
+    ) -> FinishOutcome {
+        let was_external = self.external_runs.remove(&run_id).is_some();
+        let stale = if was_external {
+            FinishOutcome::External
+        } else {
+            FinishOutcome::Stale
+        };
+        let Some(ix) = self.node_ix(task_id) else {
+            return stale;
+        };
+        if !self.node(ix).status.in_flight() {
+            return stale;
+        }
+        let bound = self.run_id_of(ix);
+        if bound == 0 {
+            self.edit_extra(ix, |extra| {
+                extra.parked = Some(ParkedCompletion {
+                    run_id,
+                    success,
+                    cancelled,
+                    error,
+                });
+            });
+            return FinishOutcome::Parked;
+        }
+        if bound != run_id {
+            return FinishOutcome::Stale;
+        }
+        self.finish_run_inner(ix, success, cancelled, error, now);
+        FinishOutcome::Applied
+    }
+
+    /// The completion's own transition — shared by the direct apply and
+    /// the parked-consume path.
+    fn finish_run_inner(
+        &mut self,
+        ix: u32,
+        success: bool,
+        cancelled: bool,
+        error: Option<String>,
+        now: i64,
+    ) {
+        self.state_mut(ix).updated = now;
+        let target = self.node(ix).target;
+        if !cancelled || success {
+            let attempt = self.state(ix).attempt;
+            self.attempt_outcomes.push_back(AttemptOutcome {
+                task_id: self.task_id_of(ix),
+                generation_id: self.generation_of(ix).to_string(),
+                attempt: u32::from(attempt.saturating_add(u8::from(!success))),
+                target: self.targets[usize::from(target)].name.to_string(),
+                failure_class: failure_class_of(success, error.as_deref()),
+                run_id: self.run_id_of(ix).to_string(),
+                finished_at_ms: now,
+            });
+            while self.attempt_outcomes.len() > ATTEMPT_OUTCOME_CAP {
+                self.attempt_outcomes.pop_front();
+            }
+        }
+        if cancelled && !success {
+            // Superseded duplicate — re-queue without an attempt bump.
+            self.set_status(ix, Status::Pending);
+            self.edit_extra(ix, |extra| {
+                extra.run_id = 0;
+                extra.claimed_at = 0;
+            });
+            self.refresh_ready(ix);
+            return;
+        }
+        if success {
+            self.set_status(ix, Status::Completed);
+            self.tally_outcome(now, target, true);
+            let elapsed = now.saturating_sub(self.claimed_at_of(ix));
+            self.samples.push(SchedulerEvent::BuildSample {
+                crate_name: stow_types::identity::CrateName::parse(
+                    self.intern.at(self.node(ix).crate_name),
+                )
+                .expect("graph crate names were typed at merge"),
+                target: stow_types::identity::TargetTriple::parse(
+                    &*self.targets[usize::from(target)].name,
+                )
+                .expect("graph targets were typed at merge"),
+                duration_ms: u64::try_from(elapsed).unwrap_or(0),
+            });
+            return;
+        }
+        let state = self.state_mut(ix);
+        state.attempt = state.attempt.saturating_add(1);
+        let attempt = u32::from(state.attempt);
+        if attempt > queue::MAX_BUILD_ATTEMPTS {
+            self.set_status(ix, Status::Failed);
+            self.edit_extra(ix, |extra| extra.error = error.map(Into::into));
+            self.tally_outcome(now, target, false);
+            // Dependents of a failed dep become blocked.
+            for owner in self.dependents_of(ix) {
+                self.node_mut(owner).flags.set_blocked(true);
+                self.refresh_ready(owner);
+            }
+        } else {
+            self.set_status(ix, Status::Pending);
+            let backoff = i64::from(queue::dispatch_backoff_minutes(attempt)) * 60_000;
+            self.edit_extra(ix, |extra| {
+                extra.error = error.map(Into::into);
+                extra.not_before = now + backoff;
+            });
+            self.refresh_ready(ix);
+        }
+    }
+
+    /// Count one finished build (or exhausted task) on its UTC hour —
+    /// the admin status's trailing-day tally, kept two days.
+    fn tally_outcome(&mut self, now: i64, target: u8, completed: bool) {
+        let hour = now.div_euclid(3_600_000);
+        let tally = self.outcome_hours.entry((hour, target)).or_default();
+        if completed {
+            tally.0 += 1;
+        } else {
+            tally.1 += 1;
+        }
+        let keep_from = hour - OUTCOME_HOURS_KEPT;
+        while let Some(entry) = self.outcome_hours.first_entry() {
+            if entry.key().0 >= keep_from {
+                break;
+            }
+            entry.remove();
+        }
+    }
+
+    /// The `BuildSample` events completions produced since the last
+    /// call — the caller appends them to the log and applies them.
+    /// Replay discards them: the log already carries its own.
+    pub fn take_samples(&mut self) -> Vec<SchedulerEvent> {
+        std::mem::take(&mut self.samples)
+    }
+
+    /// Fold one successful build's duration into its (crate, target)
+    /// window. A name or target the graph has not seen cannot be
+    /// ranked, so its sample is dropped.
+    fn record_sample(&mut self, crate_name: &str, target: &str, duration_ms: u64) {
+        let (Some(crate_id), Some(target_id)) =
+            (self.intern.get(crate_name), self.target_lookup(target))
+        else {
+            return;
+        };
+        self.build_stats
+            .entry((crate_id, target_id))
+            .or_default()
+            .push(u32::try_from(duration_ms).unwrap_or(u32::MAX));
+    }
+}
+
+/// Trailing hours the outcome tally keeps — a day for the admin
+/// window plus the hour being filled.
+const OUTCOME_HOURS_KEPT: i64 = 25;
+
+/// Demand, operator mutations, payloads and the counters the routes read.
+impl Graph {
+    /// The per-task contributions of one demand batch: every unbuilt
+    /// node an identity names (either side) plus the unbuilt
+    /// dependencies behind its unmet edges, deduped across diamonds and
+    /// roots, each carrying the sum of the deltas that reached it.
+    ///
+    /// # Errors
+    /// `QueueError::Overflow` on a delta sum, `QueueError::Invariant`
+    /// when a delta exceeds a task's priority-band headroom — checked
+    /// for every task before anything folds, naming the offenders.
+    pub fn demand_contributions(
+        &self,
+        deltas: &BTreeMap<[String; 5], i64>,
+        priority_max: i64,
+    ) -> Result<Vec<(String, i64)>, QueueError> {
+        let mut contributions: BTreeMap<u32, i64> = BTreeMap::new();
+        for (identity, delta) in deltas {
+            let [crate_name, version, features, target, rustc] = identity;
+            let (Some(crate_name), Some(version), Some(features), Some(target), Some(rustc)) = (
+                self.intern.get(crate_name),
+                self.intern.get(version),
+                self.intern.get(features),
+                self.target_lookup(target),
+                self.rustc_lookup(rustc),
+            ) else {
+                continue;
+            };
+            let mut walk: Vec<u32> = self
+                .idents
+                .candidates(ident_hash(crate_name, version, features, target, rustc))
+                .filter(|&ix| {
+                    let node = self.node(ix);
+                    node.status != Status::Free
+                        && (
+                            node.crate_name,
+                            node.version,
+                            node.features,
+                            node.target,
+                            node.rustc,
+                        ) == (crate_name, version, features, target, rustc)
+                })
+                .collect();
+            let mut seen: HashSet<u32> = HashSet::new();
+            while let Some(ix) = walk.pop() {
+                if !matches!(self.node(ix).status, Status::Pending | Status::Failed)
+                    || !seen.insert(ix)
+                {
+                    continue;
+                }
+                let total = contributions.entry(ix).or_insert(0);
+                *total = total.checked_add(*delta).ok_or(QueueError::Overflow {
+                    field: "task demand contribution",
+                    value: u64::MAX,
+                })?;
+                for edge in self.edge_range(ix) {
+                    if !self.edges.met(edge) {
+                        walk.push(self.edges.dep(edge));
+                    }
+                }
+            }
+        }
+        let mut offending = Vec::new();
+        let mut out = Vec::with_capacity(contributions.len());
+        for (ix, delta) in contributions {
+            let state = self.state(ix);
+            let task_id = self.task_id_of(ix);
+            if delta
+                > priority_max
+                    .saturating_sub(state.priority.max(0))
+                    .saturating_sub(state.demand.max(0))
+            {
+                offending.push(task_id);
+            } else {
+                out.push((task_id, delta));
+            }
+        }
+        if !offending.is_empty() {
+            return Err(QueueError::Invariant(format!(
+                "demand would overflow the priority band on {} task(s): {}",
+                offending.len(),
+                offending.join(", ")
+            )));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// An accepted demand batch folded into the affected nodes.
+    pub fn fold_demand(&mut self, entries: &[(String, i64)]) {
+        for (task_id, delta) in entries {
+            if let Some(ix) = self.node_ix(task_id)
+                && self.node(ix).status.has_state()
+            {
+                let state = self.state_mut(ix);
+                state.demand = state.demand.saturating_add(*delta);
+                self.refresh_ready(ix);
+            }
+        }
+    }
+
+    /// Operator mutations over explicit task ids. Returns the rows
+    /// affected; each verb's own status/lane predicate bounds its
+    /// domain, so a selector can only narrow it — `retry` revives only
+    /// `failed` rows, `cancel` fails only live ones, `promote` moves
+    /// only pending miss-lane rows, `purge` removes only terminal ones.
+    pub fn mutate(
+        &mut self,
+        op: stow_types::api::MutationKind,
+        task_ids: &[String],
+        now: i64,
+    ) -> u32 {
+        use stow_types::api::MutationKind;
+        let mut affected = 0;
+        for task_id in task_ids {
+            let Some(ix) = self.node_ix(task_id) else {
+                continue;
+            };
+            let status = self.node(ix).status;
+            if !status.has_state() {
+                continue;
+            }
+            // `rose` — the node left `failed`; `fell` — it entered it.
+            let (changed, rose, fell) = match op {
+                MutationKind::Retry if status == Status::Failed => {
+                    self.set_status(ix, Status::Pending);
+                    self.state_mut(ix).attempt = 1;
+                    self.edit_extra(ix, |extra| {
+                        extra.error = None;
+                        extra.not_before = 0;
+                    });
+                    (true, true, false)
+                }
+                MutationKind::Cancel
+                    if matches!(
+                        status,
+                        Status::Pending | Status::Dispatched | Status::Running
+                    ) =>
+                {
+                    self.set_status(ix, Status::Failed);
+                    self.edit_extra(ix, |extra| {
+                        extra.error = Some("cancelled by operator".into());
+                        extra.parked = None;
+                    });
+                    self.tally_outcome(now, self.node(ix).target, false);
+                    (true, false, true)
+                }
+                MutationKind::Promote
+                    if status == Status::Pending && self.node(ix).flags.lane() != Lane::Human =>
+                {
+                    self.node_mut(ix).flags.set_lane(Lane::Human);
+                    (true, false, false)
+                }
+                MutationKind::Purge if matches!(status, Status::Completed | Status::Failed) => {
+                    (true, false, false)
+                }
+                _ => (false, false, false),
+            };
+            if !changed {
+                continue;
+            }
+            self.state_mut(ix).updated = now;
+            self.ready.remove(&ix);
+            // A dep entering or leaving `failed` flips its dependents'
+            // blocked flag.
+            if rose || fell {
+                for owner in self.dependents_of(ix) {
+                    let waits = self
+                        .edge_range(owner)
+                        .any(|edge| self.edges.dep(edge) == ix && !self.edges.met(edge));
+                    if waits && self.node(owner).status == Status::Pending {
+                        let blocked = fell || self.has_failed_dep(owner);
+                        self.node_mut(owner).flags.set_blocked(blocked);
+                        self.refresh_ready(owner);
+                    }
+                }
+            }
+            if op == MutationKind::Purge {
+                self.publish(ix);
+            } else {
+                self.refresh_ready(ix);
+            }
+            affected += 1;
+        }
+        self.maybe_compact();
+        affected
+    }
+
+    /// Whether any unmet edge of `owner` points at a live failed node.
+    fn has_failed_dep(&self, owner: u32) -> bool {
+        self.edge_range(owner).any(|edge| {
+            !self.edges.met(edge) && self.node(self.edges.dep(edge)).status == Status::Failed
+        })
+    }
+
+    /// Rebuild a claimed node's `BuildTaskPayload` — identity fields
+    /// plus the dependency subgraph walked over the retained nodes
+    /// (stow#588's contract, from memory).
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when a dep identity no longer decodes —
+    /// memory corruption, since identities were typed at merge.
+    pub fn task_payload(&self, ix: u32) -> Result<BuildTaskPayload, QueueError> {
+        let task_id = self.task_id_of(ix);
+        let invalid =
+            |error: String| QueueError::Invariant(format!("claimed task {task_id}: {error}"));
+        // BFS over dep nodes; visit order is the wire order.
+        let mut seen: HashMap<u32, u32> = HashMap::new();
+        let mut order: Vec<u32> = Vec::new();
+        let mut root_deps = Vec::new();
+        for dep in self.deps_of(ix) {
+            let rank = *seen.entry(dep).or_insert_with(|| {
+                order.push(dep);
+                u32::try_from(order.len() - 1).unwrap_or(u32::MAX)
+            });
+            root_deps.push(rank);
+        }
+        let mut head = 0;
+        while head < order.len() {
+            let dep = order[head];
+            head += 1;
+            for child in self.deps_of(dep) {
+                if let std::collections::hash_map::Entry::Vacant(entry) = seen.entry(child) {
+                    entry.insert(u32::try_from(order.len()).unwrap_or(u32::MAX));
+                    order.push(child);
+                }
+            }
+        }
+        let mut nodes = Vec::with_capacity(order.len());
+        for &dep in &order {
+            let node = self.node(dep);
+            let identity = self.identity_of(node).map_err(|e| invalid(e.to_string()))?;
+            nodes.push(SubgraphNode {
+                crate_name: identity.crate_name,
+                version: identity.version,
+                features_json: identity.features_json,
+                host_side: node.flags.host(),
+                keys_apart: node.flags.explicit(),
+                deps: self.deps_of(dep).map(|child| seen[&child]).collect(),
+            });
+        }
+        let node = self.node(ix);
+        let identity = self.identity_of(node).map_err(|e| invalid(e.to_string()))?;
+        Ok(BuildTaskPayload {
+            task_id: task_id.clone(),
+            attempt: u32::from(self.state(ix).attempt),
+            crate_name: identity.crate_name,
+            version: identity.version,
+            features_json: identity.features_json,
+            target: identity.target,
+            rustc_version: identity.rustc_version,
+            preserve_lockfile: node.flags.preserve(),
+            host_side: node.flags.host(),
+            explicit_spelling: if node.flags.explicit() {
+                ExplicitSpelling::KeysApart
+            } else {
+                ExplicitSpelling::KeysAsNative
+            },
+            dependency_subgraph: TaskSubgraph { root_deps, nodes },
+        })
+    }
+
+    /// The promote lane's id-only submit: a known id raises its
+    /// downloads and priority in place, any other id is reported
+    /// unknown — never re-minted. A node that published and was freed
+    /// is unknown too: its build is in the index and there is nothing
+    /// left to raise.
+    pub fn submit_by_ids(&mut self, entries: &[SubmitTaskIdEntry]) -> (u32, Vec<String>) {
+        let mut inserted = 0;
+        let mut unknown = Vec::new();
+        for entry in entries {
+            let Some(ix) = self.node_ix(&entry.task_id) else {
+                unknown.push(entry.task_id.clone());
+                continue;
+            };
+            if self.node(ix).status.has_state() {
+                let state = self.state_mut(ix);
+                state.downloads = state.downloads.max(entry.downloads);
+                if let Ok(priority) = queue::compute_priority(entry.downloads, 0) {
+                    state.priority = state.priority.max(priority);
+                }
+                self.refresh_ready(ix);
+            }
+            inserted += 1;
+        }
+        (inserted, unknown)
+    }
+
+    /// `GET /status` counts — computed from the arena, no trigger.
+    pub fn status_counts(&self) -> BTreeMap<&'static str, u64> {
+        let mut counts = BTreeMap::new();
+        for node in &self.nodes {
+            let label = match node.status {
+                Status::Pending if node.flags.blocked() => "blocked",
+                Status::Pending => "pending",
+                Status::Dispatched => "dispatched",
+                Status::Running => "running",
+                Status::Completed => "completed",
+                Status::Failed => "failed",
+                Status::Published | Status::Free => continue,
+            };
+            *counts.entry(label).or_insert(0) += 1;
+            if node.flags.lane() == Lane::Human && node.status == Status::Pending {
+                *counts.entry("human_pending").or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    /// Dispatch slots free under `settings`: the cap minus in-flight and
+    /// external occupancy, in total and for the macOS family.
+    pub fn free_slots(&self, settings: &queue::SchedulerSettings) -> (u32, u32) {
+        let (inflight, macos_inflight) = self.inflight();
+        let total = match settings.dispatch {
+            queue::Dispatch::Limited(limit) => limit.get(),
+            queue::Dispatch::Paused => 0,
+        }
+        .saturating_sub(inflight)
+        .saturating_sub(self.external_total());
+        let macos = settings
+            .max_concurrent_macos_jobs
+            .saturating_sub(macos_inflight)
+            .saturating_sub(self.external_family(RunnerFamily::MacOs));
+        (total, macos)
+    }
+
+    /// Return a completed, unpublished node to the queue as never
+    /// claimed - the budget fixture's re-arm of a run its lanes resolved.
+    /// Reports whether the node was completed.
+    pub fn reopen_completed(&mut self, task_id: &str) -> bool {
+        let Some(ix) = self.node_ix(task_id) else {
+            return false;
+        };
+        if self.node(ix).status != Status::Completed {
+            return false;
+        }
+        self.set_status(ix, Status::Pending);
+        self.state_mut(ix).attempt = 0;
+        self.extras.remove(&ix);
+        self.refresh_ready(ix);
+        true
+    }
+
+    /// The wake the graph plans: the earliest instant an alarm can make
+    /// progress, or a delete when nothing can. Pending work counts only
+    /// while a slot is free for it and it clears the floor, its
+    /// dependencies and its age gate; in-flight work counts by its lease
+    /// expiry. `Now` means work is claimable already.
+    pub fn wake_plan(&self, now: i64, settings: &queue::SchedulerSettings) -> queue::AlarmPlan {
+        if self.freeze.is_some() {
+            return queue::AlarmPlan::Delete;
+        }
+        let min_age = i64::from(settings.dispatch_min_age_minutes) * 60_000;
+        let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
+        let (free, macos_free) = self.free_slots(settings);
+        let mut wake: Option<i64> = None;
+        if free > 0 {
+            for &ix in &self.ready {
+                let node = self.node(ix);
+                let macos =
+                    self.targets[usize::from(node.target)].family == Some(RunnerFamily::MacOs);
+                if macos && macos_free == 0 {
+                    continue;
+                }
+                let age_gate = if node.flags.lane() == Lane::Human {
+                    0
+                } else {
+                    min_age
+                };
+                let eligible_at =
+                    (self.state(ix).first_requested + age_gate).max(self.not_before_of(ix));
+                if eligible_at <= now {
+                    return queue::AlarmPlan::At(now);
+                }
+                if wake.is_none_or(|w| eligible_at < w) {
+                    wake = Some(eligible_at);
+                }
+            }
+        }
+        for &ix in &self.inflight {
+            let expiry = self.claimed_at_of(ix) + stale;
+            if expiry > now && wake.is_none_or(|w| expiry < w) {
+                wake = Some(expiry);
+            }
+        }
+        wake.map_or(queue::AlarmPlan::Delete, queue::AlarmPlan::At)
+    }
+
+    /// The recent freeze transitions, newest first.
+    pub fn freeze_transitions(&self) -> Vec<stow_types::api::DispatchFreezeTransition> {
+        self.freeze_history.iter().rev().cloned().collect()
+    }
+
+    /// The freeze record while engaged.
+    pub const fn freeze(&self) -> Option<&stow_types::api::DispatchFreezeRecord> {
+        self.freeze.as_ref()
+    }
+
+    /// Stamp the admission floor (`min_dispatch_value`, a deploy
+    /// binding — never persisted) and re-evaluate eligibility when it
+    /// moved.
+    pub fn set_floor(&mut self, floor: i64) {
+        if self.floor == floor {
+            return;
+        }
+        self.floor = floor;
+        for ix in 0..u32::try_from(self.nodes.len()).expect("node indexes fit u32") {
+            self.refresh_ready(ix);
+        }
+    }
+
+    /// Whether a task id names a node the graph holds.
+    pub fn has_task(&self, task_id: &str) -> bool {
+        self.node_ix(task_id).is_some()
+    }
+
+    /// The graph's held sizes: `(nodes, edges, published)` — live
+    /// nodes, their dependency edges, and published task ids.
+    pub fn sizes(&self) -> (u64, u64, u64) {
+        let live = self.nodes.len() - self.counts[Status::Free.index()] as usize;
+        (
+            live as u64,
+            self.edges.len() as u64,
+            self.published.len() as u64,
+        )
+    }
+
+    /// The pending-queue depth `STOW_MAX_QUEUE_PENDING` gates.
+    pub const fn pending_depth(&self) -> u32 {
+        self.counts[Status::Pending.index()]
+    }
+
+    /// External occupancy by runner family (stow#877).
+    pub fn external_family(&self, family: RunnerFamily) -> u32 {
+        u32::try_from(
+            self.external_runs
+                .values()
+                .filter(|&&bit| bit & (1u8 << (family as u8)) != 0)
+                .count(),
+        )
+        .unwrap_or(u32::MAX)
+    }
+
+    /// In-flight (dispatched + running) count, total and per family.
+    pub fn inflight(&self) -> (u32, u32) {
+        let macos = self
+            .inflight
+            .iter()
+            .filter(|&&ix| {
+                self.targets[usize::from(self.node(ix).target)].family == Some(RunnerFamily::MacOs)
+            })
+            .count();
+        (
+            u32::try_from(self.inflight.len()).unwrap_or(u32::MAX),
+            u32::try_from(macos).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// Whether the run listing is due for another reconcile: the graph
+    /// holds dispatchable or in-flight work and `interval_ms` passed
+    /// since the last one. An idle scheduler never asks.
+    pub fn reconcile_due(&self, now: i64, interval_ms: i64) -> bool {
+        now - self.reconciled_at >= interval_ms
+            && (!self.ready.is_empty() || !self.inflight.is_empty())
+    }
+
+    /// External occupancy (runs the scheduler did not dispatch).
+    pub fn external_total(&self) -> u32 {
+        u32::try_from(self.external_runs.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Heap bytes the arenas, tables and edge arrays hold — the
+    /// layout's measured size, apart from the side states.
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.intern.heap_bytes()
+            + self.ids.heap_bytes()
+            + self.idents.heap_bytes()
+            + self.nodes.capacity() * size_of::<Node>()
+            + self.states.capacity() * size_of::<State>()
+            + self.edges.heap_bytes()
+            + self.published.capacity() * (size_of::<IdKey>() + 1)
+            + self.ready.len() * size_of::<u32>() * 2
+    }
+}
+
+impl Graph {
+    /// A `Freeze` event: set or clear the record and log the transition.
+    fn apply_freeze(
+        &mut self,
+        record: Option<&stow_types::api::DispatchFreezeRecord>,
+        at: &str,
+        trigger: &stow_types::api::DispatchFreezeTrigger,
+    ) {
+        self.freeze = record.cloned();
+        self.freeze_history
+            .push_back(stow_types::api::DispatchFreezeTransition {
+                at: at.to_owned(),
+                event: if record.is_some() {
+                    stow_types::api::FreezeTransitionEvent::Engaged
+                } else {
+                    stow_types::api::FreezeTransitionEvent::Cleared
+                },
+                trigger: Some(trigger.clone()),
+            });
+        while self.freeze_history.len() > FREEZE_HISTORY {
+            self.freeze_history.pop_front();
+        }
+    }
+
+    /// Count `bytes` appended to (or replayed from) the log since the
+    /// last snapshot.
+    pub const fn log_appended(&mut self, bytes: u64) {
+        self.log_bytes_since_snapshot += bytes;
+    }
+
+    /// Whether the log tail a wake would replay has crossed a snapshot
+    /// threshold, events or bytes - whichever comes first.
+    #[must_use]
+    pub const fn snapshot_due(&self) -> bool {
+        self.log_since_snapshot > super::store::SNAPSHOT_EVENT_THRESHOLD
+            || self.log_bytes_since_snapshot > super::store::SNAPSHOT_BYTE_THRESHOLD
+    }
+
+    /// Apply one decoded log event — the replay half of wake. The
+    /// submit reassembly buffer lives in `store.rs`; this handles the
+    /// one-row-per-event kinds.
+    pub fn apply(&mut self, event: &SchedulerEvent, now: i64) {
+        self.log_since_snapshot += 1;
+        match event {
+            SchedulerEvent::SliceReport {
+                target,
+                rustc_version,
+                added,
+                retired,
+                ..
+            } => {
+                self.apply_slice_report(target.as_str(), rustc_version.as_str(), added, retired);
+            }
+            SchedulerEvent::Claims { claims } => {
+                for claim in claims {
+                    // A claim on an in-flight node is a stale-lease
+                    // recovery the original pass ran before it
+                    // claimed: the lease return is not logged, its
+                    // re-claim is.
+                    if let Some(ix) = self.node_ix(&claim.task_id)
+                        && matches!(
+                            self.node(ix).status,
+                            Status::Pending | Status::Dispatched | Status::Running
+                        )
+                    {
+                        self.state_mut(ix).attempt = u8::try_from(claim.attempt).unwrap_or(u8::MAX);
+                        self.mark_claimed(ix, claim.generation, now);
+                    }
+                }
+            }
+            SchedulerEvent::Bindings { bindings } => {
+                for binding in bindings {
+                    if let Ok(run_id) = binding.run_id.parse::<u64>() {
+                        self.bind(&binding.task_id, binding.generation, run_id, now);
+                    }
+                }
+            }
+            SchedulerEvent::ExternalRunStarted { run_id, family } => {
+                if let Ok(run_id) = run_id.parse::<u64>() {
+                    self.external_runs.insert(run_id, 1u8 << (*family as u8));
+                }
+            }
+            SchedulerEvent::RunFinished {
+                run_id,
+                task_id,
+                success,
+                cancelled,
+                error,
+            } => {
+                if let Ok(run_id) = run_id.parse::<u64>() {
+                    self.run_finished(task_id, run_id, *success, *cancelled, error.clone(), now);
+                }
+            }
+            SchedulerEvent::Mutate { op, task_ids } => {
+                self.mutate(*op, task_ids, now);
+            }
+            SchedulerEvent::SubmitIds { entries } => {
+                self.submit_by_ids(entries);
+            }
+            SchedulerEvent::Demand {
+                batch_id,
+                input_hash,
+                entries,
+            } => {
+                self.fold_demand(
+                    &entries
+                        .iter()
+                        .map(|entry| (entry.task_id.clone(), entry.delta))
+                        .collect::<Vec<_>>(),
+                );
+                self.demand_batches.insert(
+                    batch_id.clone(),
+                    (
+                        input_hash.clone(),
+                        i64::try_from(entries.len()).unwrap_or(i64::MAX),
+                    ),
+                );
+            }
+            SchedulerEvent::Freeze {
+                record,
+                at,
+                trigger,
+            } => self.apply_freeze(record.as_deref(), at, trigger),
+            SchedulerEvent::BuildSample {
+                crate_name,
+                target,
+                duration_ms,
+            } => self.record_sample(crate_name.as_str(), target.as_str(), *duration_ms),
+            // `Submit` parts are reassembled by the replay loop in
+            // `store.rs` before this is reached; `Request` lifecycle
+            // events land with the request-lane cutover (stage 7).
+            SchedulerEvent::Submit { .. } => {}
+            SchedulerEvent::Request { request_id, kind } => {
+                self.apply_request_event(request_id, kind);
+            }
+            SchedulerEvent::Feed { hour, kind } => self.apply_feed_event(hour, kind),
+        }
+    }
+}
+
+impl Graph {
+    /// One request-lane lifecycle step (stow#878 stage 7). Attempt
+    /// fencing replays cleanly: a superseded attempt's `RunUpdated` or
+    /// `Outcome` lands on the live record's attempt check and drops.
+    fn apply_request_event(&mut self, request_id: &str, kind: &stow_types::api::RequestEvent) {
+        use stow_types::api::{RequestEvent, RequestRunAction};
+        match kind {
+            RequestEvent::Admitted {
+                admission,
+                attempt,
+                dispatched_at,
+            } => {
+                self.requests.insert(
+                    request_id.to_owned(),
+                    RequestRecord {
+                        admission: admission.clone(),
+                        attempt: *attempt,
+                        dispatched_at: *dispatched_at,
+                        state: "accepted".to_owned(),
+                        run_id: None,
+                        run_url: None,
+                        outcome_json: None,
+                        error: None,
+                    },
+                );
+            }
+            RequestEvent::RunUpdated { update } => {
+                if let Some(record) = self.requests.get_mut(request_id)
+                    && update.attempt == record.attempt
+                {
+                    match update.action {
+                        RequestRunAction::InProgress if record.state == "accepted" => {
+                            "resolving".clone_into(&mut record.state);
+                            record.run_id.clone_from(&update.run_id);
+                            record.run_url.clone_from(&update.run_url);
+                        }
+                        RequestRunAction::Completed if record.state != "enqueued" => {
+                            "failed".clone_into(&mut record.state);
+                            record.error = Some(match update.conclusion.as_deref() {
+                                Some("success") => {
+                                    "resolve run completed without an outcome report".to_owned()
+                                }
+                                conclusion => format!(
+                                    "resolve run finished `{conclusion:?}`{}",
+                                    update
+                                        .run_url
+                                        .as_deref()
+                                        .map(|url| format!(" ({url})"))
+                                        .unwrap_or_default()
+                                ),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            RequestEvent::Outcome {
+                attempt,
+                state,
+                outcome_json,
+                error,
+            } => {
+                if let Some(record) = self.requests.get_mut(request_id)
+                    && *attempt == record.attempt
+                {
+                    record.state.clone_from(state);
+                    record.outcome_json.clone_from(outcome_json);
+                    record.error.clone_from(error);
+                }
+            }
+        }
+    }
+
+    /// The feed hour's lifecycle — the `demand_feed_hours` /
+    /// `demand_feed_pages` rows' machine (stow#878 stage 7).
+    fn apply_feed_event(&mut self, hour: &str, kind: &stow_types::api::FeedEvent) {
+        use stow_types::api::FeedEvent as K;
+        match kind {
+            K::Begin { generation } => {
+                let session = self
+                    .feed_sessions
+                    .entry(hour.to_owned())
+                    .or_insert_with(|| FeedSession {
+                        generation: 0,
+                        state: "staging".to_owned(),
+                        staged_pages: 0,
+                        staged_entries: 0,
+                        applied_pages: 0,
+                        page_count: 0,
+                        entry_count: 0,
+                        staged: Vec::new(),
+                        page_hashes: Vec::new(),
+                        chain_hashes: Vec::new(),
+                    });
+                session.generation = *generation;
+                "staging".clone_into(&mut session.state);
+                session.staged_pages = 0;
+                session.staged_entries = 0;
+                session.applied_pages = 0;
+                session.page_count = 0;
+                session.entry_count = 0;
+                session.staged.clear();
+                session.page_hashes.clear();
+                session.chain_hashes.clear();
+            }
+            K::Page {
+                page_no, entries, ..
+            } => {
+                if let Some(session) = self.feed_sessions.get_mut(hour)
+                    && session.state == "staging"
+                    && *page_no == session.staged_pages
+                {
+                    let payload =
+                        stow_types::api::demand_feed_page_payload(entries).unwrap_or_default();
+                    let page_hash = blake3::hash(payload.as_bytes());
+                    let chain_hash = if *page_no == 0 {
+                        page_hash
+                    } else {
+                        let previous = session
+                            .chain_hashes
+                            .last()
+                            .and_then(|hex| blake3::Hash::from_hex(hex).ok())
+                            .expect("chain hash under page_no>0 fence");
+                        stow_types::api::demand_feed_chain(&previous, &page_hash)
+                    };
+                    session.page_hashes.push(page_hash.to_hex().to_string());
+                    session.chain_hashes.push(chain_hash.to_hex().to_string());
+                    session.staged_pages += 1;
+                    session.staged_entries +=
+                        u32::try_from(entries.len()).expect("a page holds at most 256 entries");
+                    session.staged.push(entries.clone());
+                }
+            }
+            K::Complete { .. } => {
+                if let Some(session) = self.feed_sessions.get_mut(hour)
+                    && session.state == "staging"
+                {
+                    "complete".clone_into(&mut session.state);
+                    session.page_count = session.staged_pages;
+                    session.entry_count = i64::from(session.staged_entries);
+                }
+            }
+            K::ApplyPage { page_no } => {
+                if let Some(session) = self.feed_sessions.get_mut(hour)
+                    && session.state == "complete"
+                    && *page_no == session.applied_pages
+                {
+                    session.applied_pages += 1;
+                }
+            }
+            K::Deliver { .. } => {
+                if let Some(session) = self.feed_sessions.get_mut(hour)
+                    && session.state == "complete"
+                    && session.applied_pages == session.page_count
+                {
+                    "delivered".clone_into(&mut session.state);
+                    session.staged.clear();
+                    session.page_hashes.clear();
+                    session.chain_hashes.clear();
+                    self.feed_watermark = Some(hour.to_owned());
+                }
+            }
+            K::Expire => {
+                self.feed_sessions.remove(hour);
+            }
+        }
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS` UTC for a unix-ms instant — the text form the
+/// listing's timestamps carry.
+fn format_utc(ms: i64) -> String {
+    let at = time::OffsetDateTime::from_unix_timestamp(ms.div_euclid(1000))
+        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second()
+    )
+}
+
+/// The operator listing's row bound — an unbounded scan of a hot
+/// graph would stall the object's single thread.
+const ADMIN_LIST_LIMIT: u32 = 500;
+
+/// The graph's answer for a request's root ids; see
+/// [`Graph::probe_roots`].
+#[derive(Debug, Default, Clone)]
+pub struct RootProbe {
+    /// Queue status of the roots the graph holds.
+    pub statuses: BTreeMap<String, stow_types::api::RequestStatus>,
+    /// The roots whose unit shapes are published.
+    pub published: BTreeSet<String>,
+}
+
+/// A node's typed identity. The fields were typed at merge, so a parse
+/// failure here is memory corruption, never data.
+struct NodeIdentity {
+    crate_name: stow_types::identity::CrateName,
+    version: stow_types::identity::CrateVersion,
+    features_json: stow_types::identity::FeaturesJson,
+    target: stow_types::identity::TargetTriple,
+    rustc_version: stow_types::identity::WireRustcVersion,
+}
+
+/// Read-side views for the request lane, the operator listing and the
+/// admin status — all pure functions of the arena.
+impl Graph {
+    fn identity_of(&self, node: &Node) -> Result<NodeIdentity, QueueError> {
+        let invalid = |field: &str, error: String| {
+            QueueError::Invariant(format!(
+                "node {} stored {field}: {error}",
+                self.intern.at(node.crate_name)
+            ))
+        };
+        Ok(NodeIdentity {
+            crate_name: stow_types::identity::CrateName::parse(self.intern.at(node.crate_name))
+                .map_err(|e| invalid("crate_name", e.to_string()))?,
+            version: stow_types::identity::CrateVersion::new(
+                semver::Version::parse(self.intern.at(node.version))
+                    .map_err(|e| invalid("version", e.to_string()))?,
+            ),
+            features_json: stow_types::identity::FeaturesJson::from_sorted(
+                serde_json::from_str(self.intern.at(node.features))
+                    .map_err(|e| invalid("features_json", e.to_string()))?,
+            )
+            .map_err(|e| invalid("features_json", e.to_string()))?,
+            target: stow_types::identity::TargetTriple::parse(
+                &*self.targets[usize::from(node.target)].name,
+            )
+            .map_err(|e| invalid("target", e.to_string()))?,
+            rustc_version: stow_types::identity::WireRustcVersion::parse(
+                &*self.rustcs[usize::from(node.rustc)],
+            )
+            .map_err(|e| invalid("rustc_version", e.to_string()))?,
+        })
+    }
+
+    /// The wire status of a node: `blocked` is a pending node parked
+    /// behind a failed dependency.
+    fn wire_status(node: &Node) -> stow_types::api::QueueTaskStatus {
+        use stow_types::api::QueueTaskStatus as S;
+        match node.status {
+            Status::Pending if node.flags.blocked() => S::Blocked,
+            Status::Pending => S::Pending,
+            Status::Dispatched => S::Dispatched,
+            Status::Running => S::Running,
+            Status::Completed | Status::Published => S::Completed,
+            Status::Failed => S::Failed,
+            Status::Free => unreachable!("a freed node is never viewed"),
+        }
+    }
+
+    const fn wire_lane(node: &Node) -> stow_types::api::TaskLane {
+        match node.flags.lane() {
+            Lane::Human | Lane::Operations => stow_types::api::TaskLane::Human,
+            Lane::Miss | Lane::Preheat => stow_types::api::TaskLane::Miss,
+        }
+    }
+
+    /// What holds a blocked node: the first failed dependency's task
+    /// id, or `unknown dependency identity` when no live failed node
+    /// explains the flag.
+    fn blocked_by(&self, ix: u32) -> Option<String> {
+        let node = self.node(ix);
+        if node.status != Status::Pending || !node.flags.blocked() {
+            return None;
+        }
+        self.edge_range(ix)
+            .filter(|&edge| !self.edges.met(edge))
+            .map(|edge| self.edges.dep(edge))
+            .filter(|&dep| self.node(dep).status == Status::Failed)
+            .map(|dep| self.task_id_of(dep))
+            .min()
+            .or_else(|| Some("unknown dependency identity".to_owned()))
+    }
+
+    /// 1-based position of a pending human node in dispatch order: the
+    /// pending human nodes that rank ahead of it, plus one. The order is
+    /// the claim order — rank, then request instant, then arrival.
+    fn human_position(&self, ix: u32) -> u32 {
+        let order = |ix: u32| (self.rank_of(ix), self.state(ix).first_requested, ix);
+        let mine = order(ix);
+        let ahead = (0..u32::try_from(self.nodes.len()).expect("node indexes fit u32"))
+            .filter(|&other| {
+                let node = self.node(other);
+                node.status == Status::Pending
+                    && node.flags.lane() == Lane::Human
+                    && order(other) < mine
+            })
+            .count();
+        u32::try_from(ahead).unwrap_or(u32::MAX).saturating_add(1)
+    }
+
+    /// A node's queue status for the request lane — the operator-facing
+    /// fields `RequestStatus` carries.
+    pub fn request_status(&self, task_id: &str) -> Option<stow_types::api::RequestStatus> {
+        let ix = self.node_ix(task_id)?;
+        let node = self.node(ix);
+        let identity = self
+            .identity_of(node)
+            .expect("graph identities were typed at merge");
+        let status = Self::wire_status(node);
+        let lane = Self::wire_lane(node);
+        let human_pending = lane == stow_types::api::TaskLane::Human
+            && status == stow_types::api::QueueTaskStatus::Pending;
+        Some(stow_types::api::RequestStatus {
+            task_id: task_id.to_owned(),
+            crate_name: identity.crate_name,
+            version: identity.version,
+            features_json: identity.features_json,
+            target: identity.target,
+            rustc_version: identity.rustc_version,
+            lane,
+            status,
+            human_lane_position: human_pending.then(|| self.human_position(ix)),
+            blocked_by: self.blocked_by(ix),
+            preserve_lockfile: node.flags.preserve(),
+        })
+    }
+
+    /// What the graph says about a request's root ids: the queue
+    /// status of the ones it holds and which ones are published (a
+    /// published node with no dependents is freed and holds no status).
+    pub fn probe_roots(&self, ids: &[String]) -> RootProbe {
+        RootProbe {
+            statuses: ids
+                .iter()
+                .filter_map(|id| self.request_status(id).map(|status| (id.clone(), status)))
+                .collect(),
+            published: self.published_of(ids),
+        }
+    }
+
+    /// The nodes a selector names. Explicit ids select those nodes;
+    /// otherwise the filter predicates conjoin. Published nodes carry
+    /// no queue state and are never selected.
+    ///
+    /// # Errors
+    /// `QueueError::EmptySelector` when no id and no predicate is set.
+    fn select(
+        &self,
+        selector: &stow_types::api::QueueSelector,
+        now: i64,
+    ) -> Result<Vec<u32>, QueueError> {
+        if !selector.task_ids.is_empty() {
+            return Ok(selector
+                .task_ids
+                .iter()
+                .filter_map(|id| self.node_ix(id))
+                .filter(|&ix| self.node(ix).status.has_state())
+                .collect());
+        }
+        if selector.status.is_none()
+            && selector.target.is_none()
+            && selector.rustc_version.is_none()
+            && selector.crate_name.is_none()
+            && selector.older_than_secs.is_none()
+        {
+            return Err(QueueError::EmptySelector);
+        }
+        let target = selector
+            .target
+            .as_ref()
+            .map(|target| self.target_lookup(target.as_str()));
+        let rustc = selector
+            .rustc_version
+            .as_ref()
+            .map(|rustc| self.rustc_lookup(rustc.as_str()));
+        let crate_name = selector
+            .crate_name
+            .as_ref()
+            .map(|name| self.intern.get(name.as_str()));
+        let cutoff = selector
+            .older_than_secs
+            .map(|secs| now.saturating_sub(i64::try_from(secs).unwrap_or(i64::MAX) * 1000));
+        Ok(
+            (0..u32::try_from(self.nodes.len()).expect("node indexes fit u32"))
+                .filter(|&ix| {
+                    let node = self.node(ix);
+                    node.status.has_state()
+                        && selector
+                            .status
+                            .is_none_or(|status| Self::wire_status(node) == status)
+                        && target.is_none_or(|t| t == Some(node.target))
+                        && rustc.is_none_or(|r| r == Some(node.rustc))
+                        && crate_name.is_none_or(|c| c == Some(node.crate_name))
+                        && cutoff.is_none_or(|cutoff| self.state(ix).updated <= cutoff)
+                })
+                .collect(),
+        )
+    }
+
+    /// The task ids a mutation selector resolves to — `purge` demands
+    /// an age floor so it can never sweep live work.
+    ///
+    /// # Errors
+    /// `QueueError::EmptySelector`, or `QueueError::PurgeRequiresAge`
+    /// for an id-less purge without `older_than`.
+    pub fn select_ids(
+        &self,
+        op: stow_types::api::MutationKind,
+        selector: &stow_types::api::QueueSelector,
+        now: i64,
+    ) -> Result<Vec<String>, QueueError> {
+        if op == stow_types::api::MutationKind::Purge
+            && selector.task_ids.is_empty()
+            && selector.older_than_secs.is_none()
+        {
+            return Err(QueueError::PurgeRequiresAge);
+        }
+        Ok(self
+            .select(selector, now)?
+            .into_iter()
+            .map(|ix| self.task_id_of(ix))
+            .collect())
+    }
+
+    /// Queue rows matching a selector, newest first — by last
+    /// transition for terminal statuses, by request instant otherwise.
+    /// A fully empty selector lists everything.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when a node's identity cannot decode.
+    pub fn list(
+        &self,
+        selector: &stow_types::api::QueueSelector,
+        now: i64,
+    ) -> Result<Vec<stow_types::api::QueueTask>, QueueError> {
+        let mut ixs = match self.select(selector, now) {
+            Ok(ixs) => ixs,
+            Err(QueueError::EmptySelector) => (0..u32::try_from(self.nodes.len())
+                .expect("node indexes fit u32"))
+                .filter(|&ix| self.node(ix).status.has_state())
+                .collect(),
+            Err(error) => return Err(error),
+        };
+        let terminal = matches!(
+            selector.status,
+            Some(
+                stow_types::api::QueueTaskStatus::Completed
+                    | stow_types::api::QueueTaskStatus::Failed
+            )
+        );
+        ixs.sort_by_key(|&ix| {
+            let state = self.state(ix);
+            std::cmp::Reverse((
+                if terminal {
+                    state.updated
+                } else {
+                    state.first_requested
+                },
+                ix,
+            ))
+        });
+        let limit = selector
+            .limit
+            .map_or(ADMIN_LIST_LIMIT, |limit| limit.clamp(1, ADMIN_LIST_LIMIT));
+        ixs.truncate(limit as usize);
+        ixs.into_iter()
+            .map(|ix| {
+                let node = self.node(ix);
+                let state = self.state(ix);
+                let identity = self.identity_of(node)?;
+                let run_id = self.run_id_of(ix);
+                Ok(stow_types::api::QueueTask {
+                    task_id: self.task_id_of(ix),
+                    crate_name: identity.crate_name,
+                    version: identity.version,
+                    features_json: identity.features_json,
+                    target: identity.target,
+                    rustc_version: identity.rustc_version,
+                    lane: Self::wire_lane(node),
+                    status: Self::wire_status(node),
+                    attempt: u32::from(state.attempt),
+                    error: self.error_of(ix).unwrap_or_default().to_owned(),
+                    downloads: state.downloads,
+                    dispatch_attempts: u32::from(state.dispatch_attempts),
+                    preserve_lockfile: node.flags.preserve(),
+                    github_run_id: (run_id != 0).then(|| run_id.to_string()),
+                    first_requested_at: format_utc(state.first_requested),
+                    created_at: format_utc(state.first_requested),
+                    updated_at: format_utc(state.updated),
+                    blocked_by: self.blocked_by(ix),
+                    host_side: node.flags.host(),
+                    value: self.raw_value(ix).to_string(),
+                })
+            })
+            .collect()
+    }
+
+    /// The operator view behind `GET /admin/status`.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when an in-flight node's identity cannot
+    /// decode.
+    pub fn admin_status(&self, now: i64) -> Result<stow_types::api::AdminStatus, QueueError> {
+        let counts = self.status_counts();
+        let count = |label: &str| {
+            u32::try_from(counts.get(label).copied().unwrap_or(0)).unwrap_or(u32::MAX)
+        };
+        let pending = count("pending").saturating_add(count("blocked"));
+        let human_pending = count("human_pending");
+        let oldest_pending = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| node.status == Status::Pending)
+            .map(|(ix, _)| {
+                self.state(u32::try_from(ix).expect("node indexes fit u32"))
+                    .first_requested
+            })
+            .min()
+            .map(|first| u64::try_from((now - first).max(0) / 1000).unwrap_or(0));
+        let mut in_flight: Vec<u32> = self.inflight.iter().copied().collect();
+        in_flight.sort_by_key(|&ix| (self.claimed_at_of(ix), ix));
+        let in_flight = in_flight
+            .into_iter()
+            .map(|ix| {
+                let node = self.node(ix);
+                let state = self.state(ix);
+                let identity = self.identity_of(node)?;
+                let run_id = self.run_id_of(ix);
+                Ok(stow_types::api::AdminInFlight {
+                    task_id: self.task_id_of(ix),
+                    crate_name: identity.crate_name,
+                    version: identity.version,
+                    target: identity.target,
+                    rustc_version: identity.rustc_version,
+                    status: Self::wire_status(node),
+                    attempt: u32::from(state.attempt),
+                    dispatch_attempts: u32::from(state.dispatch_attempts),
+                    claimed_at: format_utc(self.claimed_at_of(ix)),
+                    github_run_id: (run_id != 0).then(|| run_id.to_string()),
+                })
+            })
+            .collect::<Result<Vec<_>, QueueError>>()?;
+        // The trailing day, to the hour: a published node keeps no
+        // state to count, so completions are tallied as they land.
+        let since = (now - 24 * 3_600_000).div_euclid(3_600_000);
+        let mut by_target: BTreeMap<u8, (u32, u32)> = BTreeMap::new();
+        for (&(hour, target), &(completed, failed)) in &self.outcome_hours {
+            if hour >= since {
+                let tally = by_target.entry(target).or_default();
+                tally.0 += completed;
+                tally.1 += failed;
+            }
+        }
+        let targets = by_target
+            .into_iter()
+            .filter(|(_, (completed, failed))| completed + failed > 0)
+            .map(|(target, (completed_24h, failed_24h))| {
+                Ok(stow_types::api::AdminTargetStats {
+                    target: stow_types::identity::TargetTriple::parse(
+                        &*self.targets[usize::from(target)].name,
+                    )?,
+                    completed_24h,
+                    failed_24h,
+                })
+            })
+            .collect::<Result<Vec<_>, QueueError>>()?;
+        Ok(stow_types::api::AdminStatus {
+            pending_miss: pending.saturating_sub(human_pending),
+            pending_human: human_pending,
+            blocked: count("blocked"),
+            oldest_pending_seconds: oldest_pending,
+            in_flight,
+            targets,
+            dispatch_frozen: self.freeze.is_some(),
+        })
+    }
+}
+
+impl Graph {
+    /// Rebuild every index and counter the snapshot does not carry,
+    /// over the arenas a load just filled.
+    ///
+    /// # Errors
+    /// `QueueError::Invariant` when the snapshot's edges disagree with
+    /// its nodes.
+    fn rebuild_after_load(&mut self) -> Result<(), QueueError> {
+        let mut end = 0u32;
+        for node in &mut self.nodes {
+            node.edges_start = end;
+            end = end
+                .checked_add(u32::from(node.edges_len))
+                .ok_or_else(|| QueueError::Invariant("snapshot edge spans overflow u32".into()))?;
+        }
+        if end as usize != self.edges.len() {
+            return Err(QueueError::Invariant(format!(
+                "snapshot node spans cover {end} edges but it carries {}",
+                self.edges.len()
+            )));
+        }
+        for ix in 0..self.nodes.len() {
+            let ix = u32::try_from(ix).expect("node indexes fit u32");
+            let range = self.edge_range(ix);
+            let mut unmet = 0u16;
+            for edge in range {
+                let dep = self.edges.dep(edge) as usize;
+                let held = self.nodes.get_mut(dep).ok_or_else(|| {
+                    QueueError::Invariant(format!("snapshot edge names node {dep} past the arena"))
+                })?;
+                held.refs += 1;
+                if !self.edges.met(edge) {
+                    unmet += 1;
+                }
+            }
+            let node = self.node_mut(ix);
+            node.unmet = unmet;
+            let status = node.status;
+            self.counts[status.index()] += 1;
+            if status.in_flight() {
+                self.inflight.insert(ix);
+            }
+        }
+        for window in self.build_stats.values_mut() {
+            window.refresh();
+        }
+        self.rebuild_indexes_over_nodes();
+        for ix in 0..u32::try_from(self.nodes.len()).expect("node indexes fit u32") {
+            self.refresh_ready(ix);
+        }
+        Ok(())
+    }
+}
+/// The scheduler's in-memory graph — one cell per Durable Object
+/// instance, owned by [`Scheduler`] and layered into its router so
+/// handlers extract it as `State<GraphCell>`. `State` requires
+/// `Send + Sync` unconditionally — `Arc<Mutex>` supplies them on every
+/// target with no unsafe impls: on wasm32 the single-threaded isolate
+/// makes the lock a no-op wrapper, and on host the mutex is simply
+/// correct. The lock is held only inside `with` — never across an
+/// `.await`, so the DO input gate's serialization holds either way.
+#[derive(Clone, Default)]
+pub struct GraphCell {
+    graph: std::sync::Arc<std::sync::Mutex<Graph>>,
+    /// Whether `graph` holds the woken state rather than the empty
+    /// placeholder a reset leaves behind.
+    loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the wake, cleared by the one request that runs the
+    /// post-wake CI status reconcile.
+    reconcile_due: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The isolate's cached GitHub App installation token.
+    tokens: crate::github_app::TokenCache,
+}
+
+impl std::fmt::Debug for GraphCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("GraphCell").finish_non_exhaustive()
+    }
+}
+
+/// Proof that the graph is loaded this isolate: the only way to read or
+/// mutate it. A [`GraphCell`] hands one out from [`GraphCell::loaded`]
+/// once the wake has installed the graph, so touching the graph before
+/// loading it does not compile.
+#[derive(Clone, Copy)]
+pub struct LoadedGraph<'a> {
+    cell: &'a GraphCell,
+}
+
+impl<'a> LoadedGraph<'a> {
+    /// Mutate the in-memory graph — never across an `.await` and never
+    /// re-entrant (a nested `with` would deadlock on the mutex).
+    pub(crate) fn with<R>(self, f: impl FnOnce(&mut Graph) -> R) -> R {
+        f(&mut self.cell.graph.lock().expect("graph cell poisoned"))
+    }
+    /// The isolate's installation-token cache.
+    pub(crate) const fn tokens(self) -> &'a crate::github_app::TokenCache {
+        &self.cell.tokens
+    }
+    /// The cell this handle proves loaded.
+    pub(crate) const fn cell(self) -> &'a GraphCell {
+        self.cell
+    }
+}
+
+impl GraphCell {
+    /// The loaded-graph handle, or `None` while the graph is not yet
+    /// loaded this isolate (before the wake, or after a reset).
+    pub(crate) fn loaded(&self) -> Option<LoadedGraph<'_>> {
+        self.loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(LoadedGraph { cell: self })
+    }
+    /// Install the freshly loaded graph — the wake. When another
+    /// request installed one while this wake awaited the store, the
+    /// loser is dropped: its replay saw a log the winner has since
+    /// appended to. The winner's install makes the post-wake reconcile
+    /// fall due. Returns the proof that the graph is now loaded.
+    pub(crate) fn install(&self, graph: Graph) -> LoadedGraph<'_> {
+        let mut slot = self.graph.lock().expect("graph cell poisoned");
+        if !self.loaded.load(std::sync::atomic::Ordering::Acquire) {
+            *slot = graph;
+            self.loaded
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.reconcile_due
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(slot);
+        LoadedGraph { cell: self }
+    }
+    /// Take the post-wake reconcile duty — `true` for exactly one
+    /// caller per wake.
+    pub(crate) fn take_reconcile(&self) -> bool {
+        self.reconcile_due
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Drop the in-memory graph — the operator reset: the next
+    /// request wakes from the (reset) store.
+    pub(crate) fn clear(&self) {
+        *self.graph.lock().expect("graph cell poisoned") = Graph::default();
+        self.loaded
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    /// The isolate's installation-token cache.
+    pub(crate) const fn tokens(&self) -> &crate::github_app::TokenCache {
+        &self.tokens
+    }
+}
+
+/// `freeze::FreezeStore` over the in-memory graph — the transition
+/// machinery runs on the same state `claim` gates on. Each `set` and
+/// `delete` applies a `Freeze` event to the graph and stages it for
+/// the caller to append to the log ([`Self::take_events`]): the
+/// store's futures are `Send`, the `DurableDb` handle is not, so the
+/// log write cannot happen inside them. `at`/`now_ms` stamp clear
+/// transitions the store itself cannot timestamp (engages take the
+/// record's own `frozen_at`).
+pub struct GraphFreezeStore<'a> {
+    cell: LoadedGraph<'a>,
+    at: String,
+    now_ms: i64,
+    staged: std::sync::Mutex<Vec<SchedulerEvent>>,
+}
+
+impl<'a> GraphFreezeStore<'a> {
+    /// The graph this store stages transitions for.
+    pub const fn cell(&self) -> LoadedGraph<'a> {
+        self.cell
+    }
+
+    /// The transition's wall-clock `at` and monotonic `now_ms`.
+    pub const fn new(cell: LoadedGraph<'a>, at: String, now_ms: i64) -> Self {
+        Self {
+            cell,
+            at,
+            now_ms,
+            staged: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The `Freeze` events applied so far, for the caller to append.
+    pub fn take_events(&self) -> Vec<SchedulerEvent> {
+        std::mem::take(&mut *self.staged.lock().expect("staged freeze events"))
+    }
+
+    fn commit(&self, event: SchedulerEvent) {
+        self.cell.with(|graph| graph.apply(&event, self.now_ms));
+        self.staged
+            .lock()
+            .expect("staged freeze events")
+            .push(event);
+    }
+}
+
+impl crate::freeze::FreezeStore for GraphFreezeStore<'_> {
+    fn record(
+        &self,
+    ) -> impl std::future::Future<
+        Output = Result<Option<stow_types::api::DispatchFreezeRecord>, QueueError>,
+    > + Send {
+        let record = self.cell.with(|graph| graph.freeze().cloned());
+        async move { Ok(record) }
+    }
+    fn set(
+        &self,
+        record: &stow_types::api::DispatchFreezeRecord,
+    ) -> impl std::future::Future<Output = Result<(), QueueError>> + Send {
+        self.commit(SchedulerEvent::Freeze {
+            at: record.frozen_at.clone(),
+            trigger: record.trigger.clone(),
+            record: Some(Box::new(record.clone())),
+        });
+        async { Ok(()) }
+    }
+    fn delete(&self) -> impl std::future::Future<Output = Result<(), QueueError>> + Send {
+        let trigger = self
+            .cell
+            .with(|graph| graph.freeze().map(|record| record.trigger.clone()))
+            .unwrap_or(stow_types::api::DispatchFreezeTrigger::Manual);
+        self.commit(SchedulerEvent::Freeze {
+            record: None,
+            at: self.at.clone(),
+            trigger,
+        });
+        async { Ok(()) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stow_types::api::MutationKind;
+    use stow_types::identity::{
+        CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
+    };
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitSide};
+
+    const TARGET: &str = "x86_64-unknown-linux-gnu";
+    const RUSTC: &str = "1.85.0";
+
+    fn sub(name: &str) -> SubmissionNode {
+        let mut node = SubmissionNode {
+            task_id: String::new(),
+            crate_name: CrateName::parse(name).expect("crate name"),
+            version: CrateVersion::new(semver::Version::new(1, 0, 0)),
+            features_json: FeaturesJson::from_sorted(Vec::new()).expect("features"),
+            target: TargetTriple::parse(TARGET).expect("target"),
+            rustc_version: WireRustcVersion::parse(RUSTC).expect("rustc"),
+            host_side: false,
+            explicit_spelling: ExplicitSpelling::KeysAsNative,
+            preserve_lockfile: false,
+            dependency_identity: DependencyIdentity::from_task_ids([name]).expect("dep identity"),
+            deps: Vec::new(),
+            downloads: 10,
+        };
+        node.task_id = minted_id(&node);
+        node
+    }
+
+    /// The canonical task id of the test node `name`.
+    fn id(name: &str) -> String {
+        sub(name).task_id
+    }
+
+    /// A → B → C chain (a depends on b, b on c), nodes in leaf order.
+    fn chain() -> SubmissionTree {
+        let c = sub("c");
+        let mut b = sub("b");
+        b.deps = vec![0];
+        let mut a = sub("a");
+        a.deps = vec![1];
+        SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![2],
+            nodes: vec![c, b, a],
+        }
+    }
+
+    fn solo() -> SubmissionTree {
+        SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![0],
+            nodes: vec![sub("solo")],
+        }
+    }
+
+    fn published_row(name: &str, kind: UnitKind) -> PublishedSliceRow {
+        PublishedSliceRow {
+            crate_name: CrateName::parse(name).expect("crate"),
+            version: CrateVersion::new(semver::Version::new(1, 0, 0)),
+            features_json: FeaturesJson::from_sorted(Vec::new()).expect("features"),
+            unit_shape: UnitShape {
+                side: UnitSide::Target,
+                invocation: UnitInvocation::Native,
+                kind,
+            },
+            dependency_identity: DependencyIdentity::from_task_ids([name]).expect("dep identity"),
+        }
+    }
+
+    fn publish(graph: &mut Graph, name: &str) -> u32 {
+        graph.apply_slice_report(
+            TARGET,
+            RUSTC,
+            &[
+                published_row(name, UnitKind::Linked),
+                published_row(name, UnitKind::Unlinked),
+            ],
+            &[],
+        )
+    }
+
+    fn status_of(graph: &Graph, name: &str) -> Option<Status> {
+        graph.node_ix(&id(name)).map(|ix| graph.node(ix).status)
+    }
+
+    #[test]
+    fn records_keep_their_sizes() {
+        assert_eq!(size_of::<Node>(), 68);
+        assert_eq!(size_of::<State>(), 48);
+    }
+
+    #[test]
+    fn merge_inserts_and_dedups_by_task_id() {
+        let mut graph = Graph::default();
+        let report = graph.merge(&chain(), 1000).expect("merge");
+        assert_eq!((report.inserted, report.merged), (3, 0));
+        let report = graph.merge(&chain(), 2000).expect("remerge");
+        assert_eq!((report.inserted, report.merged), (0, 3));
+        assert_eq!(graph.status_counts()["pending"], 3);
+    }
+
+    #[test]
+    fn merge_refuses_an_id_its_columns_do_not_derive() {
+        let mut tree = solo();
+        tree.nodes[0].task_id = "not-the-canonical-id".to_owned();
+        let mut graph = Graph::default();
+        assert!(matches!(
+            graph.merge(&tree, 0),
+            Err(QueueError::Invariant(_))
+        ));
+        assert!(matches!(
+            graph.merge_changes(&tree),
+            Err(QueueError::Invariant(_))
+        ));
+    }
+
+    #[test]
+    fn ids_re_mint_from_the_node() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        for name in ["a", "b", "c"] {
+            let ix = graph.node_ix(&id(name)).expect("node");
+            assert_eq!(graph.task_id_of(ix), id(name));
+        }
+        assert!(graph.node_ix("c-id").is_none());
+    }
+
+    #[test]
+    fn gate_blocks_until_dep_publishes() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        // Only the leaf is ready; a and b sit behind unmet edges.
+        assert_eq!(graph.ready.len(), 1);
+        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].task_id, id("c"));
+    }
+
+    #[test]
+    fn publish_flips_edges_and_releases_dependents() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        graph.claim(45, 16, 0, 3_600_000).expect("claim c");
+        graph.run_finished(&id("c"), 100, true, false, None, 50_000);
+        let flips = publish(&mut graph, "c");
+        assert_eq!(flips, 1, "b's edge to c flips");
+        // b still depends on c, so c is retained without queue state.
+        assert_eq!(status_of(&graph, "c"), Some(Status::Published));
+        let claimed = graph.claim(45, 16, 60_000, 3_600_000).expect("claim b");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].task_id, id("b"));
+        // The payload's subgraph rebuilds c from the retained node.
+        assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);
+        assert_eq!(
+            claimed[0].payload.dependency_subgraph.nodes[0]
+                .crate_name
+                .as_str(),
+            "c"
+        );
+    }
+
+    #[test]
+    fn a_published_node_is_freed_with_its_last_dependent() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        publish(&mut graph, "c");
+        // b and a still hang on c through b.
+        assert_eq!(status_of(&graph, "c"), Some(Status::Published));
+        publish(&mut graph, "b");
+        assert_eq!(status_of(&graph, "b"), Some(Status::Published));
+        assert_eq!(status_of(&graph, "c"), Some(Status::Published));
+        publish(&mut graph, "a");
+        // a had no dependent: it goes, and b and c with it.
+        for name in ["a", "b", "c"] {
+            assert_eq!(status_of(&graph, name), None, "{name} freed");
+            assert!(graph.is_published(&id(name)), "{name} stays published");
+        }
+        assert_eq!(graph.states.len() - graph.free_states.len(), 0);
+        graph.compact();
+        assert_eq!(graph.sizes().0, 0);
+        assert_eq!(graph.edges.len(), 0);
+    }
+
+    #[test]
+    fn a_resubmitted_published_node_is_not_rebuilt() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        publish(&mut graph, "c");
+        publish(&mut graph, "b");
+        publish(&mut graph, "a");
+        graph.compact();
+        let report = graph.merge(&chain(), 1_000).expect("remerge");
+        assert_eq!(
+            (report.inserted, report.merged),
+            (0, 3),
+            "everything the index serves is born published"
+        );
+        assert!(graph.ready.is_empty());
+        assert_eq!(graph.pending_depth(), 0);
+        // Born published and unreferenced: nothing stays.
+        graph.compact();
+        assert_eq!(graph.sizes().0, 0);
+    }
+
+    #[test]
+    fn a_new_dependent_retains_a_published_node() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        publish(&mut graph, "c");
+        publish(&mut graph, "b");
+        publish(&mut graph, "a");
+        graph.compact();
+        // d depends on c, which published and was freed: it is rebuilt
+        // from the tree as a published node and kept for d.
+        let c = sub("c");
+        let mut d = sub("d");
+        d.deps = vec![0];
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![1],
+                    nodes: vec![c, d],
+                },
+                2_000,
+            )
+            .expect("merge d");
+        assert_eq!(status_of(&graph, "c"), Some(Status::Published));
+        assert_eq!(graph.ready.len(), 1, "d's only edge is met");
+        let claimed = graph.claim(45, 16, 10_000_000, 3_600_000).expect("claim d");
+        assert_eq!(claimed[0].task_id, id("d"));
+        assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);
+    }
+
+    #[test]
+    fn compaction_keeps_ids_edges_and_the_ready_set() {
+        let mut graph = Graph::default();
+        // Leaves l0..l1999, each with a dependent d0..d1999.
+        let mut nodes = Vec::new();
+        for n in 0..2_000 {
+            nodes.push(sub(&format!("l{n}")));
+        }
+        for n in 0..2_000u32 {
+            let mut dependent = sub(&format!("d{n}"));
+            dependent.deps = vec![n];
+            nodes.push(dependent);
+        }
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![],
+                    nodes,
+                },
+                0,
+            )
+            .expect("merge");
+        // Publish every leaf of the first half, then their dependents:
+        // the freed leaves and dependents leave holes in the arena.
+        for n in 0..1_000 {
+            publish(&mut graph, &format!("l{n}"));
+        }
+        for n in 0..1_000 {
+            publish(&mut graph, &format!("d{n}"));
+        }
+        assert_eq!(graph.sizes().0, 2_000);
+        graph.compact();
+        assert_eq!(graph.nodes.len(), 2_000);
+        for n in 1_000..2_000 {
+            let leaf = graph.node_ix(&id(&format!("l{n}"))).expect("leaf");
+            let dependent = graph.node_ix(&id(&format!("d{n}"))).expect("dependent");
+            assert_eq!(
+                graph.deps_of(dependent).collect::<Vec<_>>(),
+                vec![leaf],
+                "edge survives the renumbering"
+            );
+            assert_eq!(graph.edges.owners_of(leaf), vec![dependent]);
+        }
+        assert_eq!(graph.ready.len(), 1_000, "the unpublished leaves");
+        // The renumbered graph still flips edges.
+        assert_eq!(publish(&mut graph, "l1500"), 1);
+        assert_eq!(graph.ready.len(), 1_000, "l1500 left, d1500 joined");
+    }
+
+    #[test]
+    fn many_edges_flip_across_a_reverse_rebuild() {
+        let mut graph = Graph::default();
+        // One shared leaf with enough dependents to push the overlay
+        // past a rebuild.
+        let mut nodes = vec![sub("shared")];
+        let dependents = REBUILD_PROBE;
+        for n in 0..dependents {
+            let mut dependent = sub(&format!("x{n}"));
+            dependent.deps = vec![0];
+            nodes.push(dependent);
+        }
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![],
+                    nodes,
+                },
+                0,
+            )
+            .expect("merge");
+        let flips = publish(&mut graph, "shared");
+        assert_eq!(flips as usize, dependents);
+        assert_eq!(graph.ready.len(), dependents);
+    }
+
+    /// Edges onto one leaf: more than the reverse index's rebuild floor.
+    const REBUILD_PROBE: usize = 9_000;
+
+    #[test]
+    fn completion_without_binding_parks_and_applies_on_bind() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let generation = claimed[0].generation;
+        let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
+        assert_eq!(outcome, FinishOutcome::Parked);
+        assert!(graph.bind(&id("solo"), generation, 4242, 11_000));
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
+        let samples = graph.take_samples();
+        assert_eq!(samples.len(), 1, "the completion produced a build sample");
+    }
+
+    #[test]
+    fn build_samples_fold_into_the_expected_cost() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        graph.bind(&id("solo"), claimed[0].generation, 7, 1_000);
+        graph.run_finished(&id("solo"), 7, true, false, None, 61_000);
+        let samples = graph.take_samples();
+        assert!(graph.take_samples().is_empty(), "taken once");
+        for sample in &samples {
+            graph.apply(sample, 61_000);
+        }
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        let node = *graph.node(ix);
+        assert_eq!(
+            graph.expected_cost(node.crate_name, node.target).get(),
+            61_000,
+            "claim-to-completion, folded by the event"
+        );
+        // The sample window rides the snapshot.
+        let mut cursor = SnapshotCursor::default();
+        let mut loader = SnapshotLoader::default();
+        while let Some(chunk) = graph.next_snapshot_chunk(&mut cursor).expect("chunk") {
+            loader.apply(chunk.tag, &chunk.payload).expect("row");
+        }
+        let restored = loader.finish().expect("load");
+        let ix = restored.node_ix(&id("solo")).expect("node");
+        let node = *restored.node(ix);
+        assert_eq!(
+            restored.expected_cost(node.crate_name, node.target).get(),
+            61_000
+        );
+    }
+
+    #[test]
+    fn failure_retries_then_fails_and_blocks_dependents() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim c");
+        graph.bind(&id("c"), claimed[0].generation, 77, 1_000);
+        for _ in 1..queue::MAX_BUILD_ATTEMPTS {
+            graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 2_000);
+            let ix = graph.node_ix(&id("c")).expect("node");
+            assert_eq!(graph.node(ix).status, Status::Pending);
+            graph.edit_extra(ix, |extra| extra.not_before = 0);
+            graph.refresh_ready(ix);
+            let claimed = graph.claim(45, 16, 3_000, 3_600_000).expect("reclaim");
+            graph.bind(&id("c"), claimed[0].generation, 77, 4_000);
+        }
+        graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 5_000);
+        assert_eq!(status_of(&graph, "c"), Some(Status::Failed));
+        let b = graph.node_ix(&id("b")).expect("b");
+        assert!(graph.node(b).flags.blocked());
+        assert_eq!(graph.ready.len(), 0);
+        let affected = graph.mutate(MutationKind::Retry, &[id("c")], 6_000);
+        assert_eq!(affected, 1);
+        assert!(!graph.node(b).flags.blocked());
+    }
+
+    #[test]
+    fn stale_lease_reclaims_dispatch() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let claimed = graph.claim(45, 16, 4_000_000, 3_600_000).expect("stale");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].task_id, id("solo"));
+    }
+
+    #[test]
+    fn submit_ids_promotes_known_and_reports_unknown() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        let (inserted, unknown) = graph.submit_by_ids(&[
+            SubmitTaskIdEntry {
+                task_id: id("a"),
+                downloads: 5,
+            },
+            SubmitTaskIdEntry {
+                task_id: "ghost".into(),
+                downloads: 5,
+            },
+        ]);
+        assert_eq!(inserted, 1);
+        assert_eq!(unknown, vec!["ghost"]);
+    }
+
+    #[test]
+    fn snapshot_round_trip_preserves_state() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        graph.run_finished(&id("c"), 100, true, false, None, 10_000);
+        publish(&mut graph, "c");
+        graph.meter.roll_to("2026-10-23");
+        graph.meter.record("test", 7, 11);
+        let mut cursor = SnapshotCursor::default();
+        let mut loader = SnapshotLoader::default();
+        while let Some(chunk) = graph.next_snapshot_chunk(&mut cursor).expect("chunk") {
+            loader.apply(chunk.tag, &chunk.payload).expect("row");
+        }
+        let mut restored = loader.finish().expect("load");
+        assert_eq!(restored.status_counts(), graph.status_counts());
+        assert_eq!(restored.meter.rows_written, 11);
+        let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
+        assert_eq!(claimed[0].task_id, id("b"));
+        assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_refuses_a_graph_with_freed_nodes() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        publish(&mut graph, "solo");
+        assert_eq!(graph.counts[Status::Free.index()], 1);
+        assert!(
+            graph
+                .next_snapshot_chunk(&mut SnapshotCursor::default())
+                .is_err()
+        );
+        graph.compact();
+        assert!(
+            graph
+                .next_snapshot_chunk(&mut SnapshotCursor::default())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn cancelled_completion_requeues_without_attempt() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        graph.bind(&id("solo"), claimed[0].generation, 9, 1_000);
+        let outcome = graph.run_finished(&id("solo"), 9, false, true, None, 2_000);
+        assert_eq!(outcome, FinishOutcome::Applied);
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        assert_eq!(graph.node(ix).status, Status::Pending);
+        assert_eq!(graph.state(ix).attempt, 1);
+    }
+
+    #[test]
+    fn external_runs_count_occupancy() {
+        let mut graph = Graph::default();
+        let outcome = graph.run_started("nobodys-task", 555, RunnerFamily::Linux, 0);
+        assert_eq!(outcome, StartOutcome::External);
+        assert_eq!(graph.external_total(), 1);
+        graph.run_finished("nobodys-task", 555, true, false, None, 0);
+        assert_eq!(graph.external_total(), 0);
+    }
+
+    #[test]
+    fn claim_order_is_rank_then_arrival() {
+        let mut graph = Graph::default();
+        let mut cheap = sub("cheap");
+        cheap.downloads = 1_000;
+        let mut dear = sub("dear");
+        dear.downloads = 9_000_000;
+        let first = sub("first");
+        graph
+            .merge(
+                &SubmissionTree {
+                    source: SubmissionSource::CacheMiss,
+                    roots: vec![],
+                    nodes: vec![cheap, dear, first],
+                },
+                0,
+            )
+            .expect("merge");
+        let claimed = graph.claim(2, 16, 0, 3_600_000).expect("claim");
+        let ids: Vec<_> = claimed.iter().map(|claim| claim.task_id.clone()).collect();
+        assert_eq!(ids, vec![id("dear"), id("cheap")]);
+    }
+
+    /// The record's presence is the flag: the `Freeze` event sets it,
+    /// a clear lands as `record: None` — the SQL `settings` row it
+    /// replaced read exactly that way (stow#878 stage 7).
+    #[test]
+    fn freeze_record_applies_and_clears() {
+        use stow_types::api::{
+            ChannelOutcome, DispatchFreezeRecord, DispatchFreezeTrigger, SchedulerEvent,
+        };
+        let record = DispatchFreezeRecord {
+            frozen_at: "2026-09-22T03:51:00Z".to_owned(),
+            trigger: DispatchFreezeTrigger::Manual,
+            notify: ChannelOutcome::Disabled {
+                reason: "test".to_owned(),
+            },
+        };
+        let mut graph = Graph::default();
+        assert!(graph.freeze().is_none());
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: record.frozen_at.clone(),
+                trigger: record.trigger.clone(),
+                record: Some(Box::new(record.clone())),
+            },
+            0,
+        );
+        assert_eq!(graph.freeze(), Some(&record));
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: "2026-09-22T04:00:00Z".to_owned(),
+                trigger: DispatchFreezeTrigger::Manual,
+                record: None,
+            },
+            0,
+        );
+        assert!(graph.freeze().is_none());
+    }
+
+    /// While frozen, claim returns nothing and `next_wake` plans no
+    /// alarm — but merge keeps accepting misses, which dispatch on the
+    /// clear. The queue-side `claim`/`next_alarm` gates it replaced
+    /// read the same flag (stow#878 stage 7).
+    #[test]
+    fn freeze_gates_claim_and_next_wake_but_not_merge() {
+        use stow_types::api::{
+            ChannelOutcome, DispatchFreezeRecord, DispatchFreezeTrigger, SchedulerEvent,
+        };
+        let record = DispatchFreezeRecord {
+            frozen_at: "2026-09-22T03:51:00Z".to_owned(),
+            trigger: DispatchFreezeTrigger::Manual,
+            notify: ChannelOutcome::Disabled {
+                reason: "test".to_owned(),
+            },
+        };
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge while frozen");
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: record.frozen_at.clone(),
+                trigger: record.trigger.clone(),
+                record: Some(Box::new(record)),
+            },
+            0,
+        );
+        assert!(graph.claim(45, 16, 0, 3_600_000).expect("claim").is_empty());
+        assert_eq!(
+            graph.wake_plan(0, &queue::SchedulerSettings::default()),
+            queue::AlarmPlan::Delete
+        );
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: "2026-09-22T04:00:00Z".to_owned(),
+                trigger: DispatchFreezeTrigger::Manual,
+                record: None,
+            },
+            0,
+        );
+        assert_eq!(graph.claim(45, 16, 0, 3_600_000).expect("claim").len(), 1);
+    }
+}

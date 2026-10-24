@@ -87,7 +87,7 @@ CREATE TABLE dependency_graph_misses (
     admitted_at TEXT NOT NULL,
     queued_at TEXT,
     depends_on_json TEXT NOT NULL DEFAULT '[]',
-    subgraph_json TEXT NOT NULL,
+    tree_json TEXT NOT NULL,
     task_id TEXT NOT NULL,
     PRIMARY KEY (crate_name, version, features_json, target, rustc_version, host_side)
 );

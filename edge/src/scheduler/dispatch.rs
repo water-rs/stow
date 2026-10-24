@@ -21,7 +21,7 @@ use crate::fetch_guard::{FetchedResponse, GuardedResponse};
 use stow_types::ci::{CiRequest, CiResponse, CiTransport};
 
 #[cfg(target_arch = "wasm32")]
-pub use stow_types::ci::{CiInterface, DispatchError, DispatchedRun};
+pub use stow_types::ci::{CiInterface, DispatchError};
 
 /// `CfFetch` under the pool's outbound bound — the transport the
 /// scheduler's [`CiInterface`] drives on wasm.

@@ -318,7 +318,10 @@ async fn submit_outcome(
     let report = RequestOutcomeReport {
         attempt: dispatch.attempt,
         outcome: RequestOutcome::Resolved {
-            tasks: plan.tasks,
+            trees: vec![stow_types::api::SubmissionTree::from_enqueue_requests(
+                stow_types::api::SubmissionSource::HumanRequest,
+                &plan.tasks,
+            )?],
             roots: plan.roots,
         },
     };

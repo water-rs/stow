@@ -32,7 +32,7 @@ use stow_types::api::{
     QueueSelector, ResolvedDependencyGraphEntry, SchedulerRearmReport, SchedulerRearmRequest,
 };
 use stow_types::fixture::{
-    FixtureShape, InFlightRun, REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED, task_hex_id,
+    FixtureShape, InFlightRun, REQUEST_FIXTURE_ENQUEUED, REQUEST_FIXTURE_FAILED, fixture_task_id,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 use stow_types::launch_model::{EventKind, LaunchModel};
@@ -299,7 +299,7 @@ fn failed_task_id(k: u64, queue_rows: u64) -> String {
         .saturating_sub(shape.completed_end())
         .max(1);
     let index = u32::try_from(k % u64::from(span)).unwrap_or_default();
-    task_hex_id(u64::from(shape.failed_row(index)))
+    fixture_task_id(u64::from(shape.failed_row(index)))
 }
 
 /// Real crates the submit lane rotates through — each posts a pinned
@@ -526,8 +526,18 @@ fn mint_ticket(
     min_bits: u32,
     request: &EnqueueRequest,
 ) -> Result<EnqueueTicket, String> {
-    let task_id = request.task_id().map_err(|error| error.to_string())?;
-    let request_json = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    let tree = stow_types::api::SubmissionTree::from_enqueue_requests(
+        stow_types::api::SubmissionSource::CacheMiss,
+        std::slice::from_ref(request),
+    )
+    .map_err(|error| error.to_string())?;
+    let task_id = tree
+        .roots
+        .first()
+        .and_then(|&root| tree.nodes.get(root as usize))
+        .map(|node| node.task_id.clone())
+        .ok_or("submission tree names no roots")?;
+    let request_json = serde_json::to_vec(&tree).map_err(|error| error.to_string())?;
     let challenge = issue_challenge(secret, &task_id, &request_json, now_minute());
     let required = difficulty(min_bits);
     // The scan bound is 2^(bits+14) — at the default 12 that is ~16M
@@ -543,7 +553,7 @@ fn mint_ticket(
         task_id,
         challenge,
         nonce,
-        request: request.clone(),
+        tree,
     })
 }
 
@@ -609,8 +619,14 @@ async fn plan(
         Fire::TrustedSubmit { rustc } => Ok(Plan::PostJson {
             url: format!("{base}/api/v1/scheduler/tasks/submit"),
             bearer: Some(bearer().await?),
-            body: serde_json::to_value(vec![submit_task(rustc, counter)?])
+            body: serde_json::to_value(vec![
+                stow_types::api::SubmissionTree::from_enqueue_requests(
+                    stow_types::api::SubmissionSource::HumanRequest,
+                    &[submit_task(rustc, counter)?],
+                )
                 .map_err(|error| error.to_string())?,
+            ])
+            .map_err(|error| error.to_string())?,
         }),
         Fire::WorkflowRun(lane) => {
             // An armed run, so the delivery is production's first

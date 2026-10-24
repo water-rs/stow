@@ -2,7 +2,7 @@
 //!
 //! The seed SQL lives in `edge/src/scheduler/fixture.rs`; what lives
 //! here is the *shape* — which queue-order `n` is pending, completed,
-//! failed or in-flight, and the `%064x` task id it carries — so every
+//! failed or in-flight, and the canonical task id it carries — so every
 //! consumer computes the same row: the edge's seeders and drives, the
 //! host drift gate, and `stow-admin traffic-cost`'s lanes (which
 //! name seeded ids directly). A shape that exists in two places drifts —
@@ -159,7 +159,7 @@ impl FixtureShape {
         InFlightRun {
             run_id: n,
             rustc_version: seeded_rustc(n),
-            task_id: task_hex_id(n),
+            task_id: fixture_task_id(n),
         }
     }
 
@@ -221,11 +221,79 @@ fn target_count() -> u32 {
     u32::try_from(CI_TARGET_TRIPLES.len()).expect("target count fits u32")
 }
 
-/// A seeded queue row's task id — `printf('%064x', n)` in the seed SQL.
+/// Nodes one crate name covers — the fixture's pinned per-name bound.
+///
+/// `'crate' || (n / CRATE_NAME_ROWS)` bounds every name to at most
+/// `CRATE_NAME_ROWS` nodes at any `queue_rows`, so a `crate_name =`
+/// selector reads a size-invariant cardinality at every size.
+pub const CRATE_NAME_ROWS: u32 = 50;
+
+/// A fixture node's crate name and version. `(crate, version)` is
+/// injective in `n` at any size — `n / 20000` carries the quotient in
+/// the version and `n % 500` its low digits.
 #[must_use]
-pub fn task_hex_id(n: u64) -> String {
+pub fn crate_identity(n: u32) -> (String, String) {
+    (
+        format!("crate{}", n / CRATE_NAME_ROWS),
+        format!("1.{}.{}", n / 20000, n % 500),
+    )
+}
+
+/// A fixture node's target — the `n % len` spread over
+/// [`CI_TARGET_TRIPLES`].
+#[must_use]
+pub const fn target_of(n: u32) -> &'static str {
+    CI_TARGET_TRIPLES[n as usize % CI_TARGET_TRIPLES.len()]
+}
+
+/// A seeded node's dependency digest — its own number as 64 hex
+/// digits, the formula the edges and slice rows agree on.
+#[must_use]
+pub fn digest_hex(n: u64) -> String {
     format!("{n:064x}")
 }
+
+/// The canonical task id of fixture node `n`.
+///
+/// The identity [`crate_identity`], [`target_of`] and [`seeded_rustc`] spread over
+/// the row, host-side on every tenth, with [`digest_hex`] as its
+/// dependency digest — the id the scheduler re-mints from the node.
+///
+/// # Panics
+/// When `n` exceeds the fixture's `u32` row range.
+#[must_use]
+pub fn fixture_task_id(n: u64) -> String {
+    let row = u32::try_from(n).expect("fixture rows fit u32");
+    let (crate_name, version) = crate_identity(row);
+    crate::task_graph::canonical_task_id(
+        &crate_name,
+        &version,
+        &crate::identity::FeaturesJson::default().raw(),
+        target_of(row),
+        seeded_rustc(n),
+        &digest_hex(n),
+        row.is_multiple_of(10),
+    )
+}
+
+/// The canonical task id of a drive-owned node outside the fixture's
+/// row range: crate `name` at `1.0.0` on `target` under rustc `1.86.0`,
+/// `seed` as its dependency digest.
+#[must_use]
+pub fn named_task_id(name: &str, seed: u64, target: &str) -> String {
+    crate::task_graph::canonical_task_id(
+        name,
+        "1.0.0",
+        &crate::identity::FeaturesJson::default().raw(),
+        target,
+        NAMED_RUSTC,
+        &digest_hex(seed),
+        false,
+    )
+}
+
+/// The rustc every drive-owned node compiles under.
+pub const NAMED_RUSTC: &str = "1.86.0";
 
 /// The `enqueued` fixture request record's id.
 ///
@@ -254,7 +322,7 @@ mod tests {
         for (k, run) in (0..).zip(&runs) {
             let n = u64::from(shape.in_flight_row(k));
             assert_eq!(run.run_id, n);
-            assert_eq!(run.task_id, format!("{n:064x}"));
+            assert_eq!(run.task_id, super::fixture_task_id(n));
             assert_eq!(run.rustc_version, seeded_rustc(n));
         }
         // Both rustc arms are in flight, so a lane that titled every

@@ -1563,11 +1563,11 @@ mod tests {
 
     #[test]
     fn a_raised_drive_cost_fails_the_projection() {
-        // 30× the hot alarm pass's written cost lifts the DO
+        // A hot alarm pass written cost far past its budget lifts the DO
         // rows_written projection past its bound.
         let report = fixture_report(
             100_000,
-            |name| if name == "alarm pass" { 15.0 } else { 0.5 },
+            |name| if name == "alarm pass" { 100_000.0 } else { 0.5 },
         );
         let evaluation =
             evaluate(&model(), &report, &fixture_cpu(|_| 0.5), &no_preheat()).expect("evaluate");

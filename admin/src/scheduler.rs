@@ -13,9 +13,9 @@ use stow_types::api::{
 use crate::Edge;
 use crate::render::{self, Output};
 
-/// The budget pass replays every scheduler drive on the seeded fixture
-/// inside one Durable Object request, so it legitimately outlives the
-/// 45 s default edge bound — sized ~10× over the measured pass duration
+/// The fixture seed builds the graph and the budget pass replays every
+/// scheduler drive on it, each inside one Durable Object request, so
+/// both legitimately outlive the 45 s default edge bound — sized ~10× over the measured pass duration
 /// at the 100k fixture.
 const BUDGET_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(15);
 
@@ -43,15 +43,12 @@ pub enum SchedulerCommand {
     /// answers only on deploys carrying `STOW_SCHEDULER_BUDGET=1`
     /// (the mock stack); use `seed` to load the fixture first.
     Budget {
-        /// Queue rows to seed before measuring (skips seeding when the
-        /// queue is already populated).
+        /// Queue rows to seed before measuring; seeding wipes the
+        /// store first, so a store holding an earlier fixture is fine.
         #[arg(long)]
         queue_rows: Option<u32>,
-        /// Wipe the fixture tables and reseed — needed when the local
-        /// Durable Object store already holds an earlier fixture.
-        #[arg(long)]
-        reset: bool,
-        /// Do not seed; measure against the queue as it stands.
+        /// Do not seed; measure the fixture the store was last seeded
+        /// with (the probe reseeds it to its canonical state).
         #[arg(long)]
         no_seed: bool,
         /// Override the deploy's dispatch cap for the alarm-pass drives.
@@ -86,10 +83,9 @@ pub async fn run(
         SchedulerCommand::Reset { yes } => reset(edge, yes, output).await,
         SchedulerCommand::Budget {
             queue_rows,
-            reset,
             no_seed,
             dispatch_limit,
-        } => budget(edge, queue_rows, reset, no_seed, dispatch_limit, output).await,
+        } => budget(edge, queue_rows, no_seed, dispatch_limit, output).await,
         SchedulerCommand::DemandFeed { hour } => {
             crate::demand_feed::run(edge, crate::demand_feed::DemandFeedArgs { hour }, output).await
         }
@@ -112,84 +108,63 @@ async fn reset(edge: &Edge, yes: bool, output: Output) -> stow_types::error::Res
     })
 }
 
+/// Run `call`, repeating it up to three more times after a failure: the
+/// dev runtime drops the Durable Object stub connection after a long
+/// request, and the same call succeeds on a fresh one.
+async fn retry_dropped_stub<T, Fut: std::future::Future<Output = stow_types::error::Result<T>>>(
+    what: &str,
+    mut call: impl FnMut() -> Fut,
+) -> stow_types::error::Result<T> {
+    let mut attempts = 0u8;
+    loop {
+        match call().await {
+            Ok(value) => return Ok(value),
+            Err(error) if attempts < 3 => {
+                attempts += 1;
+                eprintln!("[budget] {what} call failed, retrying: {error}");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 async fn budget(
     edge: &Edge,
     queue_rows: Option<u32>,
-    reset: bool,
     no_seed: bool,
     dispatch_limit: Option<u32>,
     output: Output,
 ) -> stow_types::error::Result<()> {
     if !no_seed {
-        // One call seeds at most one bounded chunk — a whole 100k-row
-        // fixture outlives a single DO request — so the loop ends when
-        // the probe reports the seed done, not on the first response.
-        // `reset` is only sent on the first call; sending it again
-        // would restart the wipe it begins.
-        //
-        // There is no call-count bound: every phase's range is finite
-        // and a call that ran a step always moves the cursor, so the
-        // exact bound is progress itself — a call that returns without
-        // advancing (phase, n) is the stall, and it names both.
-        let mut first = true;
-        let mut attempts = 0u8;
-        let mut progress: Option<(String, u64)> = None;
-        loop {
-            // The seed is resumable from its `settings` cursor, so a
-            // transient workerd failure (a dropped dev-runtime stub
-            // connection) retries the same step rather than restarting.
-            let seed: SchedulerSeedReport = match edge
-                .post_json(
-                    "/api/v1/admin/scheduler/budget/seed",
-                    &serde_json::json!({
-                        "queue_rows": queue_rows,
-                        "reset": first && reset,
-                    }),
-                )
-                .await
-            {
-                Ok(report) => report,
-                Err(error) if attempts < 3 => {
-                    attempts += 1;
-                    eprintln!("[budget] seed call failed, retrying: {error}");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            attempts = 0;
-            eprintln!(
-                "[budget] seed: phase={} n={} queue={} deps={} slices={} done={}",
-                seed.phase,
-                seed.n,
-                seed.queue_rows,
-                seed.dependency_rows,
-                seed.slice_rows,
-                seed.done
-            );
-            first = false;
-            let position = (seed.phase.clone(), seed.n);
-            if !seed.done && progress.as_ref() == Some(&position) {
-                // A call that ran but moved nothing — budgeting a
-                // partial fixture is worse than failing here.
-                return Err(stow_types::error::Error::msg(format!(
-                    "scheduler seed stalled: phase={} n={} unchanged across calls",
-                    seed.phase, seed.n
-                )));
-            }
-            progress = Some(position);
-            if seed.done {
-                break;
-            }
-        }
+        // One call wipes the store and seeds the whole fixture, so a
+        // transient workerd failure (a dropped dev-runtime stub
+        // connection) retries the same call rather than resuming.
+        let body = serde_json::json!({ "queue_rows": queue_rows });
+        let seed: SchedulerSeedReport = retry_dropped_stub("seed", || {
+            edge.post_json_with_timeout(
+                "/api/v1/admin/scheduler/budget/seed",
+                &body,
+                BUDGET_PROBE_TIMEOUT,
+            )
+        })
+        .await?;
+        eprintln!(
+            "[budget] seeded: nodes={} edges={} published={}",
+            seed.nodes, seed.edges, seed.published
+        );
     }
-    let report: SchedulerBudgetReport = edge
-        .post_json_with_timeout(
+    // The first call after a long seed meets the same dropped stub, and
+    // the probe reseeds the fixture itself, so the retry is the same call.
+    let request = SchedulerBudgetRequest { dispatch_limit };
+    let report: SchedulerBudgetReport = retry_dropped_stub("probe", || {
+        edge.post_json_with_timeout(
             "/api/v1/admin/scheduler/budget",
-            &SchedulerBudgetRequest { dispatch_limit },
+            &request,
             BUDGET_PROBE_TIMEOUT,
         )
-        .await?;
+    })
+    .await?;
     let over = report.over_budget;
     render::emit(output, &report, render_budget_table)?;
     if over {

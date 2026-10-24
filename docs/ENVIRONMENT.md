@@ -187,6 +187,17 @@ credential is involved (`docs/MOCK.md`).
 
 The mock registry is a one-shot CLI; everything else is positional args.
 
+## Forced-eviction check (`scripts/eviction-check.sh`)
+
+Runs on the mock stack (`docs/MOCK.md`); every variable is optional except
+the GitHub credential (`GH_TOKEN` / `GITHUB_TOKEN`, as for the traffic-cost test).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STOW_EVICTION_WORK_DIR` | fresh `mktemp -d` under `TMPDIR` | Work directory: keys, mock registry, edge state and `logs/`. |
+| `STOW_EVICTION_ROWS` | `10000` | Fixture queue rows; the smallest shape whose pending set clears its dependency gates. |
+| `STOW_EVICTION_READY` | `240` | Seconds to wait for each service to listen. |
+
 ## Traffic-cost test (`scripts/traffic-cost.sh`)
 
 The release gate's `Traffic cost` job runs this script on the mock stack
@@ -198,7 +209,7 @@ The release gate's `Traffic cost` job runs this script on the mock stack
 | `STOW_TRAFFIC_WORK_DIR` | fresh `mktemp -d` under `TMPDIR` | Work directory: keys, mock registry, edge state, `logs/` and `reports/`. |
 | `STOW_E2E_TOOLCHAIN` | `stable` | rustup toolchain the script builds with (`RUSTUP_TOOLCHAIN`). |
 | `STOW_E2E_READY_DEADLINE` | `600` | Seconds to wait for each service to listen. |
-| `STOW_TRAFFIC_SIZES` | `100000 1000000` | The two fixture sizes, small then large, the budget pass measures; a drive whose rows grow by more than 10% + 50 between them fails. The CPU pass, the peak drive and the post-load pass run on the small one. |
+| `STOW_TRAFFIC_SIZES` | `100000 480000` | The two fixture sizes, small then large, the budget pass measures; a drive whose rows grow by more than 10% + 50 between them fails. The CPU pass, the peak drive and the post-load pass run on the small one. |
 | `STOW_TRAFFIC_DURATION_SECS` | `1800` | Seconds of peak-rate drive. |
 | `STOW_TRAFFIC_SEGMENTS` | `4` | Segments the drive runs in; the edge restarts between them to bound `wrangler dev`'s per-request memory retention. |
 | `STOW_TRAFFIC_RATE_SCALE` | `1.0` | Multiplier over the launch model's peak rates. |

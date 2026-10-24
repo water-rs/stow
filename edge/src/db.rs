@@ -1,16 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
-
-use futures_util::stream::{self, StreamExt as _, TryStreamExt as _};
 use semver::Version;
 use skyzen_services::{BatchStatement, Db};
-use stow_types::api::{ArtifactRecord, EnqueueRequest};
+use stow_types::api::ArtifactRecord;
 use stow_types::identity::validate_emit_sorted;
 use stow_types::index::ArtifactIndexRow;
-use stow_types::public_cache::{UnitInvocation, UnitShape, UnitSide, required_unit_shapes};
+use stow_types::public_cache::{UnitInvocation, UnitShape, UnitSide};
 
 use crate::errors::DbError;
-use crate::scheduler::queue::SemanticTaskIdentity;
-use crate::sql_batch;
 
 #[derive(Debug, skyzen::FromRow)]
 struct QueuedDependencyGraphMissRow {
@@ -20,10 +15,7 @@ struct QueuedDependencyGraphMissRow {
     target: String,
     rustc_version: String,
     host_side: i64,
-    /// The node's explicit-spelling flag (stow#736).
-    explicit_spelling: i64,
-    seen_count: u64,
-    subgraph_json: String,
+    tree_json: String,
     task_id: String,
 }
 
@@ -719,164 +711,6 @@ pub async fn delete_artifacts_for_rustc(db: &Db, rustc_version: &str) -> Result<
         .map_err(|_| DbError::Invariant(format!("deleted row count {} exceeds u32", deleted.len())))
 }
 
-/// The subset of `identities` the catalog serves: servable rows (each
-/// with a published bundle) exist for the exact crate, version, features,
-/// target, rustc and dependency identity at every unit shape the
-/// identity's side requires —
-/// see `required_unit_shapes`: a host-side identity is covered only when
-/// the slice serves both the native-shape and the `--target`-shape host
-/// units its consumers' builds look up. One `IN (VALUES ...)` statement
-/// per batch of sixteen identities keeps every statement at D1's
-/// 100-bound-parameter ceiling (six params per identity); the floor and
-/// shape filters apply in memory, on the rows the contextual match
-/// returned.
-///
-/// The batches are independent reads, so they issue concurrently under
-/// the invocation's outbound ceiling
-/// ([`crate::fetch_guard::MAX_OUTBOUND_INFLIGHT`]) rather than serially:
-/// a claim page over twenty identities would otherwise pay one catalog
-/// round trip per batch while its invocation sits open, on a latency its
-/// frontier size alone sets. Each batch's covered set unions into the
-/// result — `buffer_unordered` completion order cannot leak into a
-/// `BTreeSet` merge.
-///
-/// A measured glibc floor above [`stow_types::glibc::GLIBC_BASELINE`]
-/// breaks servability on a baseline host — the row publishes, but the
-/// pending rebuild that exists to replace it must not be retired as
-/// covered. Floors compare as `GlibcVersion`, never as text (`'2.4'`
-/// sorts above `'2.28'`).
-pub async fn covered_semantic_identities(
-    db: &Db,
-    identities: &[SemanticTaskIdentity],
-) -> Result<BTreeSet<SemanticTaskIdentity>, DbError> {
-    const PARAMS_PER_IDENTITY: usize = 6;
-    const BATCH: usize = sql_batch::D1_MAX_BOUND_PARAMS / PARAMS_PER_IDENTITY;
-    // Each batch future owns its `Db` clone and `Vec` of identities, so
-    // the oracle's `impl Future + Send` proof rests on owned data and
-    // never on the chunk borrows' lifetimes. Ownership stays bounded:
-    // the stream materializes one chunk at a time, so live owned data
-    // never exceeds the buffer's active futures.
-    stream::iter(
-        identities
-            .chunks(BATCH)
-            .map(<[SemanticTaskIdentity]>::to_vec),
-    )
-    .map(|batch| covered_batch(db.clone(), batch))
-    .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-    .try_fold(BTreeSet::new(), |mut covered, batch_covered| async move {
-        covered.extend(batch_covered);
-        Ok::<BTreeSet<SemanticTaskIdentity>, DbError>(covered)
-    })
-    .await
-}
-
-/// One coverage batch, run as a unit of
-/// [`covered_semantic_identities`]' bounded fan-out: query, fetch and
-/// the pure fold are per-batch independent, so each future yields the
-/// subset of `batch` the catalog covers.
-async fn covered_batch(
-    db: Db,
-    batch: Vec<SemanticTaskIdentity>,
-) -> Result<BTreeSet<SemanticTaskIdentity>, DbError> {
-    let sql = format!(
-        "SELECT crate_name, version, features_json, target, rustc_version, dependency_identity, min_glibc, \
-                unit_side, unit_invocation, unit_linked \
-         FROM artifacts \
-         WHERE (crate_name, version, features_json, target, rustc_version, dependency_identity) IN (VALUES {})",
-        sql_batch::values_rows("(?, ?, ?, ?, ?, ?)", batch.len())
-    );
-    let mut query = db.query(&sql);
-    for identity in &batch {
-        query = query
-            .bind(identity.crate_name.as_str())
-            .bind(identity.version.as_str())
-            .bind(identity.features_json.as_str())
-            .bind(identity.target.as_str())
-            .bind(identity.rustc_version.as_str())
-            .bind(identity.dependency_identity.as_str());
-    }
-    let rows = query
-        .fetch_all::<CoveredIdentityRow>()
-        .await
-        .map_err(|error| DbError::Query(format!("db query: {error}")))?;
-    // Rows are the semantic matches; coverage requires every shape
-    // the identity's side needs, and every contributing row must be
-    // loadable on a baseline host — an over-floor row serves nothing.
-    let mut shapes_by_identity =
-        BTreeMap::<(String, String, String, String, String, String), BTreeSet<UnitShape>>::new();
-    for row in rows {
-        let floor = decode_min_glibc(row.min_glibc.as_deref()).map_err(|error| {
-            DbError::Invariant(format!(
-                "artifact row {}/{}: min_glibc: {error}",
-                row.target, row.rustc_version
-            ))
-        })?;
-        if floor.is_some_and(|floor| floor > stow_types::glibc::GLIBC_BASELINE) {
-            continue;
-        }
-        let shape = decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
-            .map_err(|error| {
-                DbError::Invariant(format!(
-                    "artifact row {}/{}: {error}",
-                    row.target, row.rustc_version
-                ))
-            })?;
-        shapes_by_identity
-            .entry((
-                row.crate_name,
-                row.version,
-                row.features_json,
-                row.target,
-                row.rustc_version,
-                row.dependency_identity,
-            ))
-            .or_default()
-            .insert(shape);
-    }
-    let mut covered = BTreeSet::new();
-    for identity in batch {
-        // The invocation the identity's own task spells: native on
-        // the runner family's host triple, `--target` otherwise. A
-        // host-side identity needs every consumer shape regardless.
-        let invocation = stow_types::api::runner_family(identity.target.as_str())
-            .map_or(UnitInvocation::Target, |family| {
-                UnitInvocation::for_task(identity.target.as_str(), family.host_triple())
-            });
-        let required =
-            required_unit_shapes(identity.host_side, invocation, identity.explicit_spelling);
-        let covered_all = required.iter().all(|shape| {
-            shapes_by_identity
-                .get(&(
-                    identity.crate_name.clone(),
-                    identity.version.clone(),
-                    identity.features_json.clone(),
-                    identity.target.clone(),
-                    identity.rustc_version.clone(),
-                    identity.dependency_identity.clone(),
-                ))
-                .is_some_and(|shapes| shapes.contains(shape))
-        });
-        if covered_all {
-            covered.insert(identity);
-        }
-    }
-    Ok(covered)
-}
-
-#[derive(Debug, skyzen::FromRow)]
-struct CoveredIdentityRow {
-    crate_name: String,
-    version: String,
-    features_json: String,
-    target: String,
-    rustc_version: String,
-    dependency_identity: String,
-    unit_side: i64,
-    unit_invocation: i64,
-    unit_linked: i64,
-    min_glibc: Option<String>,
-}
-
 /// The outcome of one admitted-miss drain: the requests re-minted from
 /// stored subgraphs, plus how many rows were consumed without one — a
 /// row whose stored subgraph does not decode or whose stored task id
@@ -884,7 +718,9 @@ struct CoveredIdentityRow {
 /// explicit skip (stow#588).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct MissDrain {
-    pub requests: Vec<EnqueueRequest>,
+    /// The submission trees re-minted from stored rows (stow#878) —
+    /// the scheduler takes the whole tree per admitted miss.
+    pub trees: Vec<stow_types::api::SubmissionTree>,
     pub skipped: usize,
 }
 
@@ -906,7 +742,7 @@ pub async fn take_dependency_graph_misses(db: &Db, limit: usize) -> Result<MissD
     // channel for unadmitted misses.
     let rows = db
         .query(
-            "SELECT crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, seen_count, subgraph_json, task_id \
+            "SELECT crate_name, version, features_json, target, rustc_version, host_side, tree_json, task_id \
              FROM dependency_graph_misses \
              WHERE queued_at IS NULL \
              ORDER BY seen_count DESC, last_seen_at DESC, first_seen_at ASC \
@@ -918,7 +754,7 @@ pub async fn take_dependency_graph_misses(db: &Db, limit: usize) -> Result<MissD
         .map_err(|error| format!("select dependency graph misses for draining: {error}"))?;
 
     let mut drain = MissDrain {
-        requests: Vec::with_capacity(rows.len()),
+        trees: Vec::with_capacity(rows.len()),
         skipped: 0,
     };
     for row in rows {
@@ -938,8 +774,8 @@ pub async fn take_dependency_graph_misses(db: &Db, limit: usize) -> Result<MissD
         .await
         .map_err(|error| format!("mark dependency graph miss queued: {error}"))?;
 
-        match miss_request(&row).map_err(|error| error.to_string())? {
-            Some(request) => drain.requests.push(request),
+        match miss_tree(&row) {
+            Some(tree) => drain.trees.push(tree),
             None => drain.skipped += 1,
         }
     }
@@ -951,60 +787,25 @@ pub async fn take_dependency_graph_misses(db: &Db, limit: usize) -> Result<MissD
 /// undecodable subgraph or a stored task id that disagrees with what
 /// the subgraph derives is never promoted to a guessed context
 /// (stow#588). Field decode failures are errors.
-fn miss_request(row: &QueuedDependencyGraphMissRow) -> Result<Option<EnqueueRequest>, DbError> {
-    let crate_name = stow_types::identity::CrateName::parse(row.crate_name.as_str())
-        .map_err(|error| format!("draining miss crate_name `{}`: {error}", row.crate_name))?;
-    let version = stow_types::identity::CrateVersion::new(
-        Version::parse(row.version.as_str())
-            .map_err(|error| format!("draining miss version `{}`: {error}", row.version))?,
-    );
-    let features_json: Vec<String> = serde_json::from_str(row.features_json.as_str())
-        .map_err(|error| format!("draining miss features_json: {error}"))?;
-    let features_json = stow_types::identity::FeaturesJson::from_sorted(features_json)
-        .map_err(|error| format!("draining miss features_json: {error}"))?;
-    let target = stow_types::identity::TargetTriple::parse(row.target.as_str())
-        .map_err(|error| format!("draining miss target `{}`: {error}", row.target))?;
-    let rustc_version = stow_types::identity::WireRustcVersion::parse(row.rustc_version.as_str())
-        .map_err(|error| {
-        format!(
-            "draining miss rustc_version `{}`: {error}",
-            row.rustc_version
-        )
-    })?;
-    let dependency_subgraph = match serde_json::from_str::<stow_types::api::TaskSubgraph>(
-        &row.subgraph_json,
-    ) {
-        Ok(subgraph) => subgraph,
+fn miss_tree(row: &QueuedDependencyGraphMissRow) -> Option<stow_types::api::SubmissionTree> {
+    let tree = match serde_json::from_str::<stow_types::api::SubmissionTree>(&row.tree_json) {
+        Ok(tree) => tree,
         Err(error) => {
-            tracing::warn!(%error, crate_name = %row.crate_name, "skipping a miss drain row with undecodable subgraph");
-            return Ok(None);
+            tracing::warn!(%error, crate_name = %row.crate_name, "skipping a miss drain row with undecodable tree");
+            return None;
         }
     };
-    let request = EnqueueRequest {
-        crate_name,
-        version,
-        features_json,
-        target,
-        rustc_version,
-        downloads: row.seen_count,
-        source: stow_types::api::EnqueueSource::CacheMiss,
-        dependency_subgraph,
-        preserve_lockfile: false,
-        host_side: row.host_side != 0,
-        explicit_spelling: if row.explicit_spelling != 0 {
-            stow_types::public_cache::ExplicitSpelling::KeysApart
-        } else {
-            stow_types::public_cache::ExplicitSpelling::KeysAsNative
-        },
-    };
-    let derived_task_id = request
-        .task_id()
-        .map_err(|error| format!("draining miss task id: {error}"))?;
-    if row.task_id != derived_task_id.as_str() {
-        tracing::warn!(crate_name = %row.crate_name, task_id = %derived_task_id, stored = ?row.task_id, "skipping a miss drain row whose stored task id disagrees with its subgraph");
-        return Ok(None);
+    let root = tree
+        .roots
+        .first()
+        .and_then(|&root| tree.nodes.get(root as usize));
+    match root {
+        Some(root) if root.task_id == row.task_id => Some(tree),
+        _ => {
+            tracing::warn!(crate_name = %row.crate_name, stored = ?row.task_id, "skipping a miss drain row whose stored task id disagrees with its tree");
+            None
+        }
     }
-    Ok(Some(request))
 }
 
 /// Flip the `queued_at` marker for the misses matching `requests`.
@@ -1014,7 +815,7 @@ fn miss_request(row: &QueuedDependencyGraphMissRow) -> Result<Option<EnqueueRequ
 /// drain already claimed them).
 pub async fn set_dependency_graph_misses_queued(
     db: &Db,
-    requests: &[EnqueueRequest],
+    trees: &[stow_types::api::SubmissionTree],
     queued: bool,
 ) -> Result<(), DbError> {
     let sql = if queued {
@@ -1028,14 +829,21 @@ pub async fn set_dependency_graph_misses_queued(
          WHERE crate_name = ? AND version = ? AND features_json = ? AND target = ? AND rustc_version = ? \
            AND host_side = ?"
     };
-    for request in requests {
+    for tree in trees {
+        let root = tree
+            .roots
+            .first()
+            .and_then(|&root| tree.nodes.get(root as usize))
+            .ok_or_else(|| {
+                DbError::from("set miss queued: submission tree names no roots".to_owned())
+            })?;
         db.query(sql)
-            .bind(request.crate_name.as_str())
-            .bind(request.version.to_string())
-            .bind(request.features_json.raw())
-            .bind(request.target.as_str())
-            .bind(request.rustc_version.as_str())
-            .bind(i64::from(request.host_side))
+            .bind(root.crate_name.as_str())
+            .bind(root.version.to_string())
+            .bind(root.features_json.raw())
+            .bind(root.target.as_str())
+            .bind(root.rustc_version.as_str())
+            .bind(i64::from(root.host_side))
             .execute()
             .await
             .map_err(|error| format!("update dependency graph miss queued marker: {error}"))?;
@@ -1050,41 +858,57 @@ pub async fn set_dependency_graph_misses_queued(
 /// Repeat admissions re-mark the same row (`seen_count`/`last_seen_at`
 /// track demand) without touching `queued_at`: a miss already handed to the
 /// scheduler stays marked as sent.
-pub async fn record_admitted_miss(db: &Db, request: &EnqueueRequest) -> Result<(), DbError> {
-    let depends_on = request
-        .depends_on()
-        .map_err(|error| format!("derive admitted miss depends_on: {error}"))?;
+pub async fn record_admitted_miss(
+    db: &Db,
+    tree: &stow_types::api::SubmissionTree,
+) -> Result<(), DbError> {
+    // The miss identity is the tree's first root; the row stores the
+    // whole tree so the drain hands the scheduler exactly what the
+    // ticket carried (stow#878).
+    let root = tree
+        .roots
+        .first()
+        .and_then(|&root| tree.nodes.get(root as usize))
+        .ok_or_else(|| {
+            DbError::from("record admitted miss: submission tree names no roots".to_owned())
+        })?;
+    let depends_on: Vec<String> = root
+        .deps
+        .iter()
+        .filter_map(|&dep| {
+            tree.nodes
+                .get(dep as usize)
+                .map(|node| node.task_id.clone())
+        })
+        .collect();
     let depends_on_json = serde_json::to_string(&depends_on)
         .map_err(|error| format!("serialize admitted miss depends_on: {error}"))?;
-    let subgraph_json = serde_json::to_string(&request.dependency_subgraph)
-        .map_err(|error| format!("serialize admitted miss subgraph: {error}"))?;
-    let task_id = request
-        .task_id()
-        .map_err(|error| format!("derive admitted miss task id: {error}"))?;
+    let tree_json = serde_json::to_string(tree)
+        .map_err(|error| format!("serialize admitted miss tree: {error}"))?;
     db.query(
         "INSERT INTO dependency_graph_misses \
-         (crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, depends_on_json, subgraph_json, task_id, seen_count, first_seen_at, last_seen_at, admitted_at) \
+         (crate_name, version, features_json, target, rustc_version, host_side, explicit_spelling, depends_on_json, tree_json, task_id, seen_count, first_seen_at, last_seen_at, admitted_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, datetime('now'), datetime('now'), datetime('now')) \
          ON CONFLICT(crate_name, version, features_json, target, rustc_version, host_side) \
          DO UPDATE SET seen_count = seen_count + 1, last_seen_at = datetime('now'), admitted_at = datetime('now'), \
              depends_on_json = CASE WHEN excluded.depends_on_json IN ('', '[]') \
                  THEN dependency_graph_misses.depends_on_json \
                  ELSE excluded.depends_on_json END, \
-             subgraph_json = excluded.subgraph_json, task_id = excluded.task_id, \
+             tree_json = excluded.tree_json, task_id = excluded.task_id, \
              explicit_spelling = excluded.explicit_spelling",
     )
-    .bind(request.crate_name.as_str())
-    .bind(request.version.to_string())
-    .bind(request.features_json.raw())
-    .bind(request.target.as_str())
-    .bind(request.rustc_version.as_str())
-    .bind(i64::from(request.host_side))
+    .bind(root.crate_name.as_str())
+    .bind(root.version.to_string())
+    .bind(root.features_json.raw())
+    .bind(root.target.as_str())
+    .bind(root.rustc_version.as_str())
+    .bind(i64::from(root.host_side))
     .bind(i64::from(
-        request.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart,
+        root.explicit_spelling == stow_types::public_cache::ExplicitSpelling::KeysApart,
     ))
     .bind(depends_on_json)
-    .bind(subgraph_json)
-    .bind(task_id)
+    .bind(tree_json)
+    .bind(root.task_id.as_str())
     .execute()
     .await
     .map_err(|error| format!("record admitted miss: {error}"))?;
@@ -1118,10 +942,6 @@ pub async fn apply_schema(db: &Db) {
 /// so it runs the same statements production runs.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod sqlite_tests {
-    use std::collections::BTreeSet;
-
-    use crate::scheduler::queue::SemanticTaskIdentity;
-
     use stow_types::api::{ArtifactRecord, EnqueueRequest};
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
@@ -1131,8 +951,8 @@ mod sqlite_tests {
 
     use super::{
         apply_schema, artifact_index_page, artifact_record as fetch_artifact_record,
-        covered_semantic_identities, insert_artifact_records, record_admitted_miss,
-        set_dependency_graph_misses_queued, take_dependency_graph_misses,
+        insert_artifact_records, record_admitted_miss, set_dependency_graph_misses_queued,
+        take_dependency_graph_misses,
     };
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -1189,6 +1009,18 @@ mod sqlite_tests {
             compile_millis: 1_234,
             min_glibc: None,
         }
+    }
+
+    fn miss_tree(request: EnqueueRequest) -> stow_types::api::SubmissionTree {
+        stow_types::api::SubmissionTree::from_enqueue_requests(
+            stow_types::api::SubmissionSource::CacheMiss,
+            &[request],
+        )
+        .expect("request converts to a submission tree")
+    }
+
+    fn root_of(tree: &stow_types::api::SubmissionTree) -> &stow_types::api::SubmissionNode {
+        &tree.nodes[tree.roots[0] as usize]
     }
 
     fn enqueue_request(crate_name: &str, version: &str, features: &[&str]) -> EnqueueRequest {
@@ -1257,11 +1089,11 @@ mod sqlite_tests {
             take_dependency_graph_misses(&db, 10)
                 .await
                 .expect("take misses")
-                .requests,
-            Vec::<EnqueueRequest>::new()
+                .trees,
+            Vec::<stow_types::api::SubmissionTree>::new()
         );
 
-        record_admitted_miss(&db, &request)
+        record_admitted_miss(&db, &miss_tree(request.clone()))
             .await
             .expect("record admitted miss");
         assert_eq!(
@@ -1273,20 +1105,20 @@ mod sqlite_tests {
         let drained = take_dependency_graph_misses(&db, 10)
             .await
             .expect("take misses")
-            .requests;
+            .trees;
         assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].crate_name.as_str(), "serde");
+        assert_eq!(root_of(&drained[0]).crate_name.as_str(), "serde");
         assert_eq!(
-            drained[0].depends_on().expect("drained deps"),
-            request.depends_on().expect("request deps")
+            root_of(&drained[0]).task_id,
+            request.task_id().expect("request id")
         );
         // Draining marks the row queued, so a later drain cannot resend it.
         assert_eq!(
             take_dependency_graph_misses(&db, 10)
                 .await
                 .expect("take misses")
-                .requests,
-            Vec::<EnqueueRequest>::new()
+                .trees,
+            Vec::<stow_types::api::SubmissionTree>::new()
         );
 
         // The send-failure path restores the marker and the next drain
@@ -1297,7 +1129,7 @@ mod sqlite_tests {
         let redrained = take_dependency_graph_misses(&db, 10)
             .await
             .expect("take misses")
-            .requests;
+            .trees;
         assert_eq!(redrained.len(), 1);
     }
 
@@ -1312,10 +1144,10 @@ mod sqlite_tests {
         apply_schema(&db).await;
         let request = enqueue_request("serde", "1.0.5", &["derive"]);
 
-        record_admitted_miss(&db, &request)
+        record_admitted_miss(&db, &miss_tree(request.clone()))
             .await
             .expect("record admitted miss");
-        record_admitted_miss(&db, &request)
+        record_admitted_miss(&db, &miss_tree(request.clone()))
             .await
             .expect("re-record admitted miss");
 
@@ -1327,9 +1159,9 @@ mod sqlite_tests {
         let drained = take_dependency_graph_misses(&db, 10)
             .await
             .expect("take misses")
-            .requests;
+            .trees;
         assert_eq!(drained.len(), 1);
-        record_admitted_miss(&db, &request)
+        record_admitted_miss(&db, &miss_tree(request.clone()))
             .await
             .expect("re-record after queueing");
         assert_eq!(
@@ -1340,8 +1172,8 @@ mod sqlite_tests {
             take_dependency_graph_misses(&db, 10)
                 .await
                 .expect("take misses")
-                .requests,
-            Vec::<EnqueueRequest>::new()
+                .trees,
+            Vec::<stow_types::api::SubmissionTree>::new()
         );
     }
 
@@ -1370,10 +1202,10 @@ mod sqlite_tests {
             }],
         };
 
-        record_admitted_miss(&db, &request)
+        record_admitted_miss(&db, &miss_tree(request.clone()))
             .await
             .expect("record target-side miss");
-        record_admitted_miss(&db, &host_request)
+        record_admitted_miss(&db, &miss_tree(host_request.clone()))
             .await
             .expect("record host-side miss");
 
@@ -1381,11 +1213,11 @@ mod sqlite_tests {
         let mut drained = take_dependency_graph_misses(&db, 10)
             .await
             .expect("take misses")
-            .requests;
-        drained.sort_by_key(|drain| drain.host_side);
+            .trees;
+        drained.sort_by_key(|drain| root_of(drain).host_side);
         assert_eq!(drained.len(), 2);
-        assert!(!drained[0].host_side);
-        assert!(drained[1].host_side);
+        assert!(!root_of(&drained[0]).host_side);
+        assert!(root_of(&drained[1]).host_side);
 
         // The send-failure restore must also key on the side: restoring
         // the host request touches only the host row.
@@ -1400,335 +1232,6 @@ mod sqlite_tests {
             miss_count_where(&db, "host_side = 0 AND queued_at IS NOT NULL").await,
             1
         );
-    }
-
-    /// Coverage is exact on every identity column.
-    #[tokio::test]
-    async fn covered_identities_match_servable_rows_exactly() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        apply_schema(&db).await;
-        let record = artifact_record(FIRST_DIGEST);
-        // A target-side node is covered when both shapes its task
-        // publishes are servable: the build unit and the check unit —
-        // a second row at a different `c_metadata` (the check unit's
-        // compile identity differs from the build unit's).
-        let unit_shape = |kind| stow_types::public_cache::UnitShape {
-            side: stow_types::public_cache::UnitSide::Target,
-            invocation: stow_types::public_cache::UnitInvocation::Native,
-            kind,
-        };
-        let record = ArtifactRecord {
-            unit_shape: unit_shape(stow_types::public_cache::UnitKind::Linked),
-            ..record.clone()
-        };
-        let check_record = ArtifactRecord {
-            c_metadata: CMetadata::parse("bbbb0000bbbb0000").expect("check c_metadata"),
-            extra_filename: "-bbbb0000bbbb0000".to_owned(),
-            compile_key: "checkcheckcheckcheck".to_owned(),
-            emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
-            unit_shape: unit_shape(stow_types::public_cache::UnitKind::Unlinked),
-            oci_reference: format!("{}.check", record.oci_reference),
-            ..record.clone()
-        };
-        insert_artifact_records(&db, &[record.clone(), check_record])
-            .await
-            .expect("insert");
-        let identity = |features_json: &str, target: &str| SemanticTaskIdentity {
-            crate_name: record.crate_name.as_str().to_owned(),
-            version: record.version.to_string(),
-            features_json: features_json.to_owned(),
-            target: target.to_owned(),
-            rustc_version: RUSTC.to_owned(),
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity")
-                .to_string(),
-            host_side: false,
-            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-        };
-        let exact = identity(&record.features_json.raw(), TARGET);
-        let other_features = identity("[\"extra\"]", TARGET);
-        let other_target = identity(&record.features_json.raw(), "aarch64-apple-darwin");
-
-        let covered =
-            covered_semantic_identities(&db, &[exact.clone(), other_features, other_target])
-                .await
-                .expect("coverage");
-        assert_eq!(covered, BTreeSet::from([exact.clone()]));
-    }
-
-    /// stow#787: a tuple published under a different dependency context
-    /// covers nothing — the scheduler's edges gate on digest-exact slice
-    /// rows, so retiring a node whose own digest never published strands
-    /// its dependents forever. The same tuple is covered only under the
-    /// matching dependency identity.
-    #[tokio::test]
-    async fn coverage_matches_the_dependency_context() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        apply_schema(&db).await;
-        let mut record = artifact_record(FIRST_DIGEST);
-        let other_digest = "f".repeat(64);
-        record.dependency_identity =
-            stow_types::identity::DependencyIdentity::parse(other_digest.clone()).expect("digest");
-        let check_record = ArtifactRecord {
-            c_metadata: CMetadata::parse("bbbb0000bbbb0000").expect("check c_metadata"),
-            extra_filename: "-bbbb0000bbbb0000".to_owned(),
-            compile_key: "checkcheckcheckcheck".to_owned(),
-            emit: vec!["dep-info".to_owned(), "metadata".to_owned()],
-            unit_shape: stow_types::public_cache::UnitShape {
-                kind: stow_types::public_cache::UnitKind::Unlinked,
-                ..record.unit_shape
-            },
-            oci_reference: format!("{}.check", record.oci_reference),
-            ..record.clone()
-        };
-        insert_artifact_records(&db, &[record.clone(), check_record])
-            .await
-            .expect("insert");
-        let mut identity = SemanticTaskIdentity {
-            crate_name: record.crate_name.as_str().to_owned(),
-            version: record.version.to_string(),
-            features_json: record.features_json.raw(),
-            target: TARGET.to_owned(),
-            rustc_version: RUSTC.to_owned(),
-            host_side: false,
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity")
-                .to_string(),
-            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-        };
-        assert_eq!(
-            covered_semantic_identities(&db, std::slice::from_ref(&identity))
-                .await
-                .expect("coverage"),
-            BTreeSet::new(),
-            "a different-context publication must not cover the pending node"
-        );
-        identity.dependency_identity = other_digest;
-        assert_eq!(
-            covered_semantic_identities(&db, std::slice::from_ref(&identity))
-                .await
-                .expect("coverage"),
-            BTreeSet::from([identity]),
-            "the matching-context publication covers it"
-        );
-    }
-
-    /// A host-side node is covered only when the slice serves every
-    /// host-unit shape — both kinds under both invocation spellings,
-    /// since consumers on either spelling look host units up at
-    /// different keys. One spelling alone leaves one consumer shape
-    /// unserved.
-    #[tokio::test]
-    async fn covered_host_side_identity_needs_both_host_shapes() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        apply_schema(&db).await;
-        let mut identity = SemanticTaskIdentity {
-            crate_name: "heck".to_owned(),
-            version: "0.5.0".to_owned(),
-            features_json: "[]".to_owned(),
-            target: TARGET.to_owned(),
-            rustc_version: RUSTC.to_owned(),
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity")
-                .to_string(),
-            host_side: true,
-            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-        };
-
-        let base = artifact_record(FIRST_DIGEST);
-        let host_unit = |c_metadata: &str, invocation, kind| ArtifactRecord {
-            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
-            extra_filename: format!("-{c_metadata}"),
-            compile_key: format!("{c_metadata}{c_metadata}"),
-            crate_name: CrateName::parse("heck").expect("name"),
-            version: CrateVersion::new(semver::Version::parse("0.5.0").expect("version")),
-            features_json: FeaturesJson::canonicalize(Vec::<String>::new()).expect("features"),
-            unit_shape: stow_types::public_cache::UnitShape {
-                side: stow_types::public_cache::UnitSide::Host,
-                invocation,
-                kind,
-            },
-            oci_reference: format!("{}.{}", base.oci_reference, c_metadata),
-            ..base.clone()
-        };
-        let native_invocation = stow_types::public_cache::UnitInvocation::Native;
-        let target_invocation = stow_types::public_cache::UnitInvocation::Target;
-        let linked = stow_types::public_cache::UnitKind::Linked;
-        let unlinked = stow_types::public_cache::UnitKind::Unlinked;
-
-        // One invocation spelling's pair covers neither the native nor
-        // the `--target` consumer completely.
-        insert_artifact_records(
-            &db,
-            &[
-                host_unit("cccc0000cccc0000", target_invocation, linked),
-                host_unit("cccc0000cccc0001", target_invocation, unlinked),
-            ],
-        )
-        .await
-        .expect("insert");
-        assert_eq!(
-            covered_semantic_identities(&db, std::slice::from_ref(&identity))
-                .await
-                .expect("coverage"),
-            BTreeSet::new(),
-            "the `--target` spelling alone does not serve a native consumer's host dep"
-        );
-
-        insert_artifact_records(
-            &db,
-            &[
-                host_unit("cccc0000cccc0002", native_invocation, linked),
-                host_unit("cccc0000cccc0003", native_invocation, unlinked),
-            ],
-        )
-        .await
-        .expect("insert");
-        assert_eq!(
-            covered_semantic_identities(&db, std::slice::from_ref(&identity))
-                .await
-                .expect("coverage"),
-            BTreeSet::from([identity.clone()]),
-            "both host shapes cover the host-side identity"
-        );
-
-        // A target-side identity over the same rows is not covered:
-        // every row serves the host side, which the target side's
-        // required set does not match.
-        identity.host_side = false;
-        assert_eq!(
-            covered_semantic_identities(&db, std::slice::from_ref(&identity))
-                .await
-                .expect("coverage"),
-            BTreeSet::new()
-        );
-    }
-
-    /// A published row whose measured floor exceeds the builder baseline
-    /// publishes in the index but is not servable on a baseline host —
-    /// it must not count as coverage, or the retire oracle would kill
-    /// the pending rebuild that exists to replace it. The compare is
-    /// `GlibcVersion`, never text: `'2.4'` sorts above `'2.28'` as a
-    /// string.
-    ///
-    /// Coverage needs both rules at once: each identity's rows carry the
-    /// two target-side shapes a native invocation requires, so only the
-    /// floor distinguishes them.
-    #[tokio::test]
-    async fn over_floor_rows_do_not_cover_their_identity() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        apply_schema(&db).await;
-        let floor = |minor: u32| {
-            Some(stow_types::glibc::GlibcVersion {
-                major: 2,
-                minor,
-                patch: 0,
-            })
-        };
-        // A target-side native identity is covered by the linked and
-        // unlinked shapes together — each floor variant gets both rows.
-        let shaped_pair =
-            |c_metadata_prefix: &str, version: &str, min_glibc| -> Vec<ArtifactRecord> {
-                [
-                    stow_types::public_cache::UnitKind::Linked,
-                    stow_types::public_cache::UnitKind::Unlinked,
-                ]
-                .iter()
-                .enumerate()
-                .map(|(i, kind)| ArtifactRecord {
-                    c_metadata: CMetadata::parse(format!("{c_metadata_prefix}{i}"))
-                        .expect("c_metadata"),
-                    extra_filename: format!("-{c_metadata_prefix}{i}"),
-                    compile_key: format!("{c_metadata_prefix}{i}{c_metadata_prefix}{i}"),
-                    version: CrateVersion::new(semver::Version::parse(version).expect("version")),
-                    unit_shape: stow_types::public_cache::UnitShape {
-                        side: stow_types::public_cache::UnitSide::Target,
-                        invocation: stow_types::public_cache::UnitInvocation::Native,
-                        kind: *kind,
-                    },
-                    min_glibc,
-                    oci_reference: format!(
-                        "{}.{c_metadata_prefix}{i}",
-                        artifact_record(FIRST_DIGEST).oci_reference
-                    ),
-                    ..artifact_record(FIRST_DIGEST)
-                })
-                .collect()
-            };
-        // Three identities at distinct floors: 2.39 (over), 2.28 (at
-        // baseline), measured-no-floor ('').
-        let mut rows: Vec<ArtifactRecord> = Vec::new();
-        rows.extend(shaped_pair("bbbbbbbbbbbbbbb", "1.0.0", floor(39)));
-        rows.extend(shaped_pair("ccccccccccccccc", "1.0.1", floor(28)));
-        rows.extend(shaped_pair("ddddddddddddddd", "1.0.2", None));
-        insert_artifact_records(&db, &rows).await.expect("insert");
-        // The over-floor identity also carries a baseline sibling pair:
-        // coverage is any-servable-row per shape, so it covers after
-        // all — only the 2.39-alone identity must not.
-        insert_artifact_records(&db, &shaped_pair("999999999999999", "1.0.0", floor(28)))
-            .await
-            .expect("insert baseline sibling");
-
-        let covered = covered_semantic_identities(
-            &db,
-            &[over_identity(), baseline_identity(), no_floor_identity()],
-        )
-        .await
-        .expect("coverage");
-        assert_eq!(
-            covered.len(),
-            3,
-            "over-floor-alone, at-baseline and no-floor identities all cover — but see below"
-        );
-
-        // Removing the baseline sibling leaves the 1.0.0 identity with
-        // only the 2.39 rows — now it must not cover.
-        db.query("DELETE FROM artifacts WHERE c_metadata LIKE '999999999999999%'")
-            .execute()
-            .await
-            .expect("drop sibling");
-        let covered = covered_semantic_identities(
-            &db,
-            &[over_identity(), baseline_identity(), no_floor_identity()],
-        )
-        .await
-        .expect("coverage");
-        assert_eq!(covered.len(), 2);
-        assert!(!covered.contains(&over_identity()));
-    }
-
-    fn over_identity() -> SemanticTaskIdentity {
-        identity_at("1.0.0")
-    }
-    fn baseline_identity() -> SemanticTaskIdentity {
-        identity_at("1.0.1")
-    }
-    fn no_floor_identity() -> SemanticTaskIdentity {
-        identity_at("1.0.2")
-    }
-    fn identity_at(version: &str) -> SemanticTaskIdentity {
-        SemanticTaskIdentity {
-            crate_name: "serde".to_owned(),
-            version: version.to_owned(),
-            features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
-                .expect("features")
-                .raw(),
-            target: TARGET.to_owned(),
-            rustc_version: RUSTC.to_owned(),
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity")
-                .to_string(),
-            host_side: false,
-            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-        }
     }
 
     /// A re-register must update the mutable columns while preserving
@@ -1825,263 +1328,5 @@ mod sqlite_tests {
             vec!["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "eeeeeeeeeeeeeeee"],
             "pages must cover each servable row exactly once, in order"
         );
-    }
-}
-/// Coverage-batch concurrency tests against a scripted `DbBackend`. The
-/// question this module answers — do independent batches overlap, and is
-/// the overlap bounded — is about when statements enter the backend,
-/// which only a controlled fake reports deterministically: it counts
-/// admissions and holds every query at one yield point, so a serial
-/// caller peaks at one in-flight statement while the bounded fan-out
-/// fills its ceiling — no timers, no network.
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod coverage_concurrency_tests {
-    use std::collections::BTreeSet;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use skyzen_services::sql::{
-        DbBackend, DbDialect, DbError as BackendError, DbExecResult, DbValue,
-    };
-    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitSide};
-
-    use crate::errors::DbError;
-    use crate::fetch_guard::MAX_OUTBOUND_INFLIGHT;
-    use crate::scheduler::queue::SemanticTaskIdentity;
-
-    use super::covered_semantic_identities;
-
-    /// A `DbBackend` that measures overlap: `in_flight` is bumped when
-    /// a statement enters and released only after a yield point, so
-    /// `max_in_flight` is the count of statements the caller held open
-    /// at one instant.
-    #[derive(Clone)]
-    struct HeldBackend {
-        state: Arc<HeldState>,
-        response: HeldResponse,
-    }
-
-    #[derive(Default)]
-    struct HeldState {
-        /// Statements the caller issued.
-        issued: AtomicUsize,
-        /// Statements inside the backend right now.
-        in_flight: AtomicUsize,
-        /// The peak `in_flight` ever observed.
-        max_in_flight: AtomicUsize,
-    }
-
-    /// What a held query answers once released.
-    #[derive(Clone)]
-    enum HeldResponse {
-        /// Fail every query with a backend error.
-        Fail,
-        /// Answer every query with these rows verbatim.
-        Rows(Vec<serde_json::Value>),
-        /// Answer every bound identity with its covering shape pair —
-        /// the unlinked and linked target-side rows a native
-        /// invocation requires, synthesized per five-param tuple.
-        ServeBound,
-    }
-
-    impl DbBackend for HeldBackend {
-        fn dialect(&self) -> DbDialect {
-            DbDialect::Sqlite
-        }
-
-        async fn query(
-            &self,
-            _query: &str,
-            params: &[DbValue],
-        ) -> Result<DbExecResult, BackendError> {
-            let in_flight = self.state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-            self.state
-                .max_in_flight
-                .fetch_max(in_flight, Ordering::SeqCst);
-            self.state.issued.fetch_add(1, Ordering::SeqCst);
-            // Suspend so sibling batches reach admission before this
-            // one completes — under a serial caller the next batch
-            // cannot exist yet, so `in_flight` never passes 1.
-            tokio::task::yield_now().await;
-            self.state.in_flight.fetch_sub(1, Ordering::SeqCst);
-            match &self.response {
-                HeldResponse::Fail => Err(BackendError::Backend {
-                    message: "d1 unavailable".to_owned(),
-                    source: None,
-                }),
-                HeldResponse::Rows(rows) => Ok(DbExecResult {
-                    rows: rows.clone(),
-                    ..DbExecResult::default()
-                }),
-                HeldResponse::ServeBound => Ok(DbExecResult {
-                    rows: covering_rows(params),
-                    ..DbExecResult::default()
-                }),
-            }
-        }
-
-        fn execute(
-            &self,
-            _query: &str,
-            _params: &[DbValue],
-        ) -> impl std::future::Future<Output = Result<DbExecResult, BackendError>> + Send {
-            std::future::ready(Err(BackendError::Backend {
-                message: "coverage reads never execute".to_owned(),
-                source: None,
-            }))
-        }
-    }
-
-    /// The two rows that cover one bound identity: a target-side
-    /// identity's native invocation requires the unlinked and linked
-    /// target shapes, so every six-param tuple maps to both.
-    fn covering_rows(params: &[DbValue]) -> Vec<serde_json::Value> {
-        let text = |value: &DbValue| match value {
-            DbValue::Text(text) => text.clone(),
-            _ => panic!("identity params bind as text"),
-        };
-        params
-            .chunks(6)
-            .flat_map(|bound| {
-                [UnitKind::Unlinked, UnitKind::Linked].map(|kind| {
-                    serde_json::json!({
-                        "crate_name": text(&bound[0]),
-                        "version": text(&bound[1]),
-                        "features_json": text(&bound[2]),
-                        "target": text(&bound[3]),
-                        "rustc_version": text(&bound[4]),
-                        "dependency_identity": text(&bound[5]),
-                        "unit_side": UnitSide::Target.to_int(),
-                        "unit_invocation": UnitInvocation::Native.to_int(),
-                        "unit_linked": kind.to_int(),
-                        "min_glibc": "",
-                    })
-                })
-            })
-            .collect()
-    }
-
-    fn held_db(response: HeldResponse) -> (skyzen_services::Db, Arc<HeldState>) {
-        let backend = HeldBackend {
-            state: Arc::new(HeldState::default()),
-            response,
-        };
-        let state = Arc::clone(&backend.state);
-        (skyzen_services::Db::new(backend), state)
-    }
-
-    fn identity(index: usize) -> SemanticTaskIdentity {
-        SemanticTaskIdentity {
-            crate_name: format!("crate{index}"),
-            version: "1.0.0".to_owned(),
-            features_json: "[]".to_owned(),
-            target: "x86_64-unknown-linux-gnu".to_owned(),
-            rustc_version: "1.85.0".to_owned(),
-            host_side: false,
-            dependency_identity: format!("{index:064x}"),
-            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-        }
-    }
-
-    /// Twenty identities fit one batch; twenty-one force a second. Both
-    /// batches must be inside the backend together — `max_in_flight`
-    /// bumps on admission and releases only after the held query
-    /// completes, so 2 proves overlap where a serial loop peaks at 1.
-    /// Both batch results still merge into one covered set.
-    #[tokio::test]
-    async fn independent_batches_overlap_admission() {
-        let (db, state) = held_db(HeldResponse::ServeBound);
-        let identities: Vec<SemanticTaskIdentity> = (0..21).map(identity).collect();
-        let covered = covered_semantic_identities(&db, &identities)
-            .await
-            .expect("coverage");
-        assert_eq!(covered, identities.iter().cloned().collect::<BTreeSet<_>>());
-        assert_eq!(
-            state.issued.load(Ordering::SeqCst),
-            2,
-            "21 identities is exactly two 20-identity statements"
-        );
-        assert_eq!(
-            state.max_in_flight.load(Ordering::SeqCst),
-            2,
-            "both batches were admitted before either completed"
-        );
-    }
-
-    /// One hundred and one identities fan out to seven batches of
-    /// sixteen: the peak admission equals the outbound ceiling — never
-    /// more — and every batch's covered identities still merge into the
-    /// result.
-    #[tokio::test]
-    async fn concurrency_stays_at_the_outbound_bound() {
-        let (db, state) = held_db(HeldResponse::ServeBound);
-        let identities: Vec<SemanticTaskIdentity> = (0..101).map(identity).collect();
-        let covered = covered_semantic_identities(&db, &identities)
-            .await
-            .expect("coverage");
-        assert_eq!(covered.len(), 101, "every served identity covers");
-        assert_eq!(state.issued.load(Ordering::SeqCst), 7);
-        assert_eq!(
-            state.max_in_flight.load(Ordering::SeqCst),
-            MAX_OUTBOUND_INFLIGHT,
-            "peak in-flight statements hit the bound and never pass it"
-        );
-    }
-
-    /// A backend failure still fails the whole lookup — the fan-out
-    /// does not swallow the first error it meets.
-    #[tokio::test]
-    async fn a_failed_batch_fails_the_lookup() {
-        let (db, _state) = held_db(HeldResponse::Fail);
-        let identities: Vec<SemanticTaskIdentity> = (0..21).map(identity).collect();
-        let error = covered_semantic_identities(&db, &identities)
-            .await
-            .expect_err("a failed query must fail the lookup");
-        assert!(
-            matches!(&error, DbError::Query(message) if message.contains("d1 unavailable")),
-            "unexpected error: {error}"
-        );
-    }
-
-    /// A corrupt unit-shape triplet stays an invariant error on
-    /// whatever batch it lands in — the concurrent fold keeps the same
-    /// failure contract the serial loop had.
-    #[tokio::test]
-    async fn a_corrupt_shape_row_fails_the_lookup() {
-        let corrupt = serde_json::json!({
-            "crate_name": "crate0",
-            "version": "1.0.0",
-            "features_json": "[]",
-            "target": "x86_64-unknown-linux-gnu",
-            "rustc_version": "1.85.0",
-            "dependency_identity": "0000000000000000000000000000000000000000000000000000000000000000",
-            "unit_side": 9,
-            "unit_invocation": 0,
-            "unit_linked": 0,
-            "min_glibc": "",
-        });
-        let (db, _state) = held_db(HeldResponse::Rows(vec![corrupt]));
-        let identities: Vec<SemanticTaskIdentity> = (0..21).map(identity).collect();
-        let error = covered_semantic_identities(&db, &identities)
-            .await
-            .expect_err("a corrupt shape must fail the lookup");
-        assert!(
-            matches!(&error, DbError::Invariant(message) if message.contains("corrupt unit shape")),
-            "unexpected error: {error}"
-        );
-    }
-
-    /// Batches that answer no rows leave every identity uncovered —
-    /// merging empty batch sets stays empty, and the statement count
-    /// is still one per batch.
-    #[tokio::test]
-    async fn empty_batches_merge_to_no_coverage() {
-        let (db, state) = held_db(HeldResponse::Rows(Vec::new()));
-        let identities: Vec<SemanticTaskIdentity> = (0..41).map(identity).collect();
-        let covered = covered_semantic_identities(&db, &identities)
-            .await
-            .expect("coverage");
-        assert!(covered.is_empty());
-        assert_eq!(state.issued.load(Ordering::SeqCst), 3);
     }
 }

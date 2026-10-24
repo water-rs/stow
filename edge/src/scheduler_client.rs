@@ -25,12 +25,12 @@ const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
-    requests: &[stow_types::api::EnqueueRequest],
+    trees: &[stow_types::api::SubmissionTree],
 ) -> Result<(), SchedulerClientError> {
-    if requests.is_empty() {
+    if trees.is_empty() {
         return Ok(());
     }
-    send_json(namespace, SCHEDULER_SUBMIT_URL, requests).await
+    send_json(namespace, SCHEDULER_SUBMIT_URL, trees).await
 }
 
 /// The trusted submit channel: `/tasks/submit/trusted` skips the
@@ -38,17 +38,17 @@ pub async fn send_enqueue(
 /// repo-writer credential check. Anonymous callers keep `send_enqueue`.
 pub async fn send_enqueue_trusted(
     namespace: &CfDurableNamespace,
-    requests: &[stow_types::api::EnqueueRequest],
+    trees: &[stow_types::api::SubmissionTree],
 ) -> Result<u32, SchedulerClientError> {
     #[derive(serde::Deserialize)]
     struct InsertedResponse {
         inserted: u32,
     }
-    if requests.is_empty() {
+    if trees.is_empty() {
         return Ok(0);
     }
     let response: InsertedResponse =
-        post_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, requests).await?;
+        post_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, trees).await?;
     Ok(response.inserted)
 }
 
