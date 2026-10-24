@@ -69,6 +69,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The scheduler dispatches this workflow on a newreleases.io
+      # delivery that only claims a version (stow#880) — the official
+      # channel manifest is the authority, so the input is confirmed
+      # before a toolchain installs or a resolve spends anything. A
+      # forged or stale delivery costs exactly this check.
+      - name: Confirm the input is the live stable rustc
+        env:
+          RUSTC_VERSION: ${{ inputs.rustc_version }}
+        run: |
+          set -euo pipefail
+          version="$(curl -fsS https://static.rust-lang.org/dist/channel-rust-stable.toml \
+            | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
+          if [ "$version" != "$RUSTC_VERSION" ]; then
+            echo "::error::dispatched for rustc $RUSTC_VERSION, but the stable channel serves $version"
+            exit 1
+          fi
       # Resolution runs in-process now: stow-resolver probes `rustc -vV`
       # and `--print cfg`, so the toolchain must be the same version the
       # tasks target, not floating `stable`.

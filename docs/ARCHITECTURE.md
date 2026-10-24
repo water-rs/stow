@@ -44,7 +44,7 @@ anyone integrating with or modifying the trust-critical paths.
   the lanes share.
 - `admin/` (`stow-admin`): the operations CLI — index
   export/publish/sync, preheat lanes (`preheat manual` resolves
-  in-process and dispatches a whole wave), `request resolve` (the
+  in-process and submits a whole wave to the scheduler), `request resolve` (the
   Actions half of the request lane), queue mutations and the scheduler
   reset. Every lane resolves in-process with `stow-resolver`.
 - `mock-registry/` (`stow-mock-registry`): the local mock OCI registry
@@ -498,7 +498,7 @@ What each hop is allowed to do:
 | scheduler DO | its SQLite store | its SQLite store; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/{target}/{rustc_version}` when its `stow_edge_url` input is set |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/{target}/{rustc_version}` when its `stow_edge_url` input is set |
 
 The edge's remaining crates.io reads are the request route's version and
 rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,

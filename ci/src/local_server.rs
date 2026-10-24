@@ -6,9 +6,9 @@
 //! for end-to-end tests without touching real GitHub Actions — the
 //! GitHub-shaped run endpoints the edge's `LocalCiBuildRuns` drives on
 //! the same loopback base (`GET/POST …/actions/runs/{id}` plus the
-//! attempt-jobs listing and `…/cancel`), and `GET /tasks`, the
-//! run-state list `stow-admin preheat manual` polls in its
-//! `--dispatch-url` mode.
+//! attempt-jobs listing and `…/cancel`), `GET /tasks`, the run-state
+//! list the mock e2e polls, and the `preheat` event the scheduler's
+//! new-stable dispatch posts (stow#880).
 //!
 //! A run mirrors the production shape exactly: one run id for the task,
 //! an event file carrying the dispatch input, a build in one process,
@@ -727,10 +727,9 @@ fn build_router(state: LocalServerState) -> Router {
     .build()
 }
 
-/// `GET /tasks` — the run list `stow-admin preheat manual` polls when it
-/// drives the local runner, answering the same shape the GitHub runs API
-/// does (`status`/`conclusion`/`display_title` semantics), one row per
-/// dispatched task.
+/// `GET /tasks` — the run list the mock e2e polls, answering the same
+/// shape the GitHub runs API does (`status`/`conclusion`/`display_title`
+/// semantics), one row per dispatched task.
 async fn list_tasks(State(state): State<LocalServerState>) -> Response {
     let tasks = state
         .runs
@@ -1095,6 +1094,27 @@ async fn dispatch(
                 Ok(dispatch) => dispatch_resolve(state, dispatch),
                 Err(error) => json_response(
                     &bad_request(&format!("resolve-request payload: {error}")),
+                    StatusCode::BAD_REQUEST,
+                ),
+            }
+        }
+        // The scheduler's new-stable preheat dispatch (stow#880): the
+        // mock runs no resolver fleet, so the event only needs the
+        // POST accepted — the `rustc_version` input is carried for
+        // parity with `preheat-admin.yml`.
+        "preheat" => {
+            match serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
+                event.client_payload,
+            ) {
+                Ok(inputs)
+                    if inputs
+                        .get("rustc_version")
+                        .is_some_and(serde_json::Value::is_string) =>
+                {
+                    json_response(&serde_json::json!({ "ok": true }), StatusCode::OK)
+                }
+                _ => json_response(
+                    &bad_request("preheat payload needs a `rustc_version` string"),
                     StatusCode::BAD_REQUEST,
                 ),
             }

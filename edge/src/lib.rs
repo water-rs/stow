@@ -72,7 +72,9 @@ mod ghcr;
 mod runtime_settings;
 #[cfg(target_arch = "wasm32")]
 mod scheduler_client;
-// The handler's deps are wasm-only, but its signature/decode/pin logic
-// is what the tests exercise — test builds need it on host too.
+// The handlers' deps are wasm-only, but their signature/decode/pin
+// logic is what the tests exercise — test builds need them on host too.
+#[cfg(any(target_arch = "wasm32", test))]
+mod release_hook;
 #[cfg(any(target_arch = "wasm32", test))]
 mod webhook;

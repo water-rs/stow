@@ -1916,6 +1916,43 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
+        // The newreleases.io forward's object half (stow#880): on
+        // wasm the real `preheat_release_pass` — credential arm plus
+        // the `workflow_dispatch` POST to the local-CI dispatcher; on
+        // host there is no store work, so the drive measures nothing
+        // but the meter's own settle.
+        name: "POST /preheat/release",
+        setup: None,
+        run: |_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let env = ctx
+                        .env
+                        .as_ref()
+                        .ok_or_else(|| "preheat release drive needs a Worker env".to_owned())?;
+                    super::object::preheat_release_pass(
+                        &ctx.graph,
+                        env,
+                        &stow_types::api::PreheatReleaseRequest {
+                            rustc_version: "1.90.0".parse().map_err(|error| {
+                                format!("preheat release rustc version: {error}")
+                            })?,
+                        },
+                    )
+                    .await
+                    .map_err(text)
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = ctx;
+                    Ok(())
+                }
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
         name: "POST /tasks/submit (inexact-hit)",
         setup: None,
         run: |db, _shape, settings, ctx| {

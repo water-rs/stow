@@ -5,12 +5,14 @@ name: Preheat the public cache
 # the top of crates.io is preheated unattended rather than waiting for a
 # user's miss to teach the scheduler what to build.
 #
-# Two things make a wave necessary and both are time-driven: a new stable
-# rustc invalidates the whole pool (the cache identity pins the exact
-# version), and the top-N lists move as crates publish. So this lane
-# dispatches once per UTC day, and immediately when the stable channel
-# moves. The marker is an actions/cache entry keyed by both, which makes
-# every extra poll in between a no-op.
+# Two things make a wave necessary: a new stable rustc invalidates the
+# whole pool (the cache identity pins the exact version), and the top-N
+# lists move as crates publish. The release half is the newreleases.io
+# webhook — its delivery reaches the edge, and the scheduler dispatches
+# `preheat-admin.yml` for it (stow#880). This lane is the other half: a
+# once-per-UTC-day refresh for the moving lists. The marker is an
+# actions/cache entry keyed by version and day, which makes a same-day
+# re-run a no-op.
 #
 # Re-submitting the whole list is cheap on purpose: the scheduler
 # deduplicates on task identity, leaves completed tasks completed, and
@@ -18,7 +20,7 @@ name: Preheat the public cache
 # only builds what is genuinely missing or previously failed.
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 0 * * *"
   workflow_dispatch:
 
 permissions:

@@ -11,7 +11,6 @@
 mod artifacts;
 mod builds;
 mod cache;
-mod ci;
 mod cloudflare;
 mod coverage;
 mod crates_io;

@@ -15,8 +15,8 @@
 #      `index report`, as index-publish.yml runs them), then run the same
 #      wave by hand through
 #      `stow-admin preheat manual` on a crate with a real dependency
-#      (walkdir → same-file) so layering and per-layer publish are
-#      exercised
+#      (walkdir → same-file) so the operations-lane submit and the
+#      scheduler's own dispatch chain are exercised
 #   5. `stow index refresh` + `stow check` a throwaway consumer crate in
 #      mock-key verify mode and assert the dependency was served from the
 #      cache via local index resolution and a direct digest pull
@@ -1239,13 +1239,14 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 [ "${index_rows:-0}" -ge 1 ] \
     || die "cached index slice is empty (rows=$index_rows) — export/publish lost the task row"
 
-# The same wave, driven by hand: `preheat manual` resolves the crate
-# list in-process, layers it, dispatches straight to the local CI
-# server, and publishes the index slice between layers — the edge only
-# sees the runs' webhook completions. walkdir carries one unix dep
-# (same-file), so the wave lands in two layers.
+# The same wave, submitted by hand: `preheat manual` resolves the crate
+# list in-process and submits one tree per source to the scheduler's
+# operations lane (stow#880) — the scheduler then claims and dispatches
+# to the local CI server, exactly as the stow-admin submit wave did.
+# walkdir carries one unix dep (same-file), so the wave holds two
+# tasks.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
-fg isolated_env \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
@@ -1254,14 +1255,28 @@ fg isolated_env \
     --crates "$WORK_DIR/manual-crates.txt" \
     --rustc-version "$RUSTC_VERSION" \
     --targets "$HOST_TARGET" \
-    --dispatch-url "http://${LOCAL_CI_ADDR}" \
-    --in-flight 4 \
+    --yes \
     >"$LOG_DIR/preheat-manual.log" 2>&1 \
     || { cat "$LOG_DIR/preheat-manual.log"; die "stow-admin preheat manual failed — see $LOG_DIR/preheat-manual.log"; }
 
-# The manual run's publish must have landed a slice serving walkdir —
-# the driver's own wait loop already proved it, but assert the registry
-# view directly so a driver-side wait bug cannot hide a lost publish.
+# Poll the local CI until every dispatched run settles, then run the
+# publish pass — the same export → publish → report sequence
+# index-publish.yml drives, which the scheduler-dispatched wave leaves
+# to that lane too.
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    open_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq '[.tasks[] | select(.status != "completed")] | length')"
+    [ "$open_runs" -eq 0 ] && break
+    [ "$SECONDS" -ge "$deadline" ] && die "manual wave still has $open_runs open run(s) after ${TASK_DEADLINE}s"
+    sleep 5
+done
+fg publish_slices "manual"
+
+# The manual wave's publish must have landed a slice serving walkdir —
+# assert the registry view directly so a pipeline-side wait bug cannot
+# hide a lost publish.
 # The mock registry, like GHCR, serves /v2 only to an anonymous bearer
 # minted by its token endpoint.
 registry_token="$(curl -fsS --max-time 10 \
@@ -1273,13 +1288,11 @@ curl -fsS --max-time 10 -H "Authorization: Bearer ${registry_token}" \
     -o /dev/null \
     || die "index slice index.${HOST_TARGET}.${RUSTC_VERSION} missing after the manual wave"
 
-# stow#877 — both submitters build the task once. `preheat manual`
-# dispatches unicode-ident through the shared CI interface while the
-# same task goes through the scheduler's submit → claim → dispatch
-# path. Both `workflow_dispatch`es name the same task id, so the local
-# CI concurrency group keeps one run pending behind the other; when
-# the first run's publish lands the records marker, the pending run
-# drives, sees it, and exits without compiling — `built` across the
+# stow#880 — one task id, one build, however many submissions.
+# `preheat manual` resolves unicode-ident and submits it through the
+# operations lane; `stow-admin submit` posts the identical task right
+# behind. The scheduler merges by task id, so the second submit
+# inserts nothing and exactly one run exists — `built` across the
 # task's runs counts exactly one.
 UNICODE_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
     'https://index.crates.io/un/ic/unicode-ident' \
@@ -1287,7 +1300,7 @@ UNICODE_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
 [ -n "$UNICODE_VERSION" ] || die "no non-yanked unicode-ident found on crates.io"
 echo "[mock-e2e] dual-submitter task: unicode-ident $UNICODE_VERSION (manual + scheduler)"
 printf 'unicode-ident\n' >"$WORK_DIR/dual-crates.txt"
-isolated_env \
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
@@ -1296,25 +1309,13 @@ isolated_env \
     --crates "$WORK_DIR/dual-crates.txt" \
     --rustc-version "$RUSTC_VERSION" \
     --targets "$HOST_TARGET" \
-    --dispatch-url "http://${LOCAL_CI_ADDR}" \
-    --in-flight 4 \
-    >"$LOG_DIR/preheat-manual-dual.log" 2>&1 &
-DUAL_MANUAL_PID=$!
+    --yes \
+    >"$LOG_DIR/preheat-manual-dual.log" 2>&1 \
+    || { cat "$LOG_DIR/preheat-manual-dual.log"; die "stow-admin preheat manual (dual) failed"; }
 
-# The scheduler's dispatch lands while the manual wave's run is still
-# in flight: poll the mock's task list until the run registers, then
-# submit the identical task through the edge.
-deadline=$((SECONDS + 600))
-dual_task=""
-while :; do
-    check_children_alive
-    dual_task="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" 2>/dev/null \
-        | jq -r '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident"))) | .task_id] | first // empty' 2>/dev/null || true)"
-    [ -n "$dual_task" ] && break
-    [ "$SECONDS" -ge "$deadline" ] && { cat "$LOG_DIR/preheat-manual-dual.log"; die "manual wave did not dispatch unicode-ident within 600s"; }
-    sleep 2
-done
-echo "[mock-e2e] dual task $dual_task running under preheat manual; submitting through the scheduler"
+# The identical task submitted the second way: the scheduler merges by
+# task id, so the operations submit behind it inserts nothing and no
+# second `workflow_dispatch` exists for the node.
 status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
 completed_before=0
 [ -n "$status_json" ] && completed_before="$(jq -r '.completed' <<<"$status_json")"
@@ -1329,9 +1330,10 @@ fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     --yes \
     >"$LOG_DIR/admin-submit-dual.log" 2>&1 \
     || { cat "$LOG_DIR/admin-submit-dual.log"; die "stow-admin submit (dual) failed"; }
+grep -q "inserted 0" "$LOG_DIR/admin-submit-dual.log" \
+    || { cat "$LOG_DIR/admin-submit-dual.log"; die "dual submit inserted a second task — the merge should hold one"; }
 
-# Every run of the task settles: the queued duplicate drives after the
-# first publishes, sees the records marker, and early-exits.
+# The task's one run settles.
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
@@ -1341,8 +1343,6 @@ while :; do
     [ "$SECONDS" -ge "$deadline" ] && die "dual task still has $open_runs open run(s) after ${TASK_DEADLINE}s"
     sleep 5
 done
-wait "$DUAL_MANUAL_PID" \
-    || { cat "$LOG_DIR/preheat-manual-dual.log"; die "dual manual wave failed"; }
 
 # The scheduler's own completion arrived over the run's webhook —
 # completed ticks up by exactly one and nothing failed.
@@ -1364,8 +1364,8 @@ dual_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
 dual_count="$(jq 'length' <<<"$dual_runs")"
 dual_built="$(jq '[.[] | select(.built)] | length' <<<"$dual_runs")"
 dual_failed="$(jq '[.[] | select(.conclusion != null and .conclusion != "success")] | length' <<<"$dual_runs")"
-echo "[mock-e2e] dual task $dual_task: $dual_count dispatches, $dual_built compiled, $dual_failed non-success"
-[ "$dual_count" -ge 2 ] || die "expected at least 2 dispatches for the dual-submitted task, saw $dual_count"
+echo "[mock-e2e] dual task: $dual_count dispatches, $dual_built compiled, $dual_failed non-success"
+[ "$dual_count" -eq 1 ] || die "expected exactly 1 dispatch for the dual-submitted task, saw $dual_count"
 [ "$dual_built" -eq 1 ] || die "dual task compiled $dual_built times across $dual_count dispatches — expected 1"
 [ "$dual_failed" -eq 0 ] || die "a dual dispatch did not conclude success: $dual_runs"
 

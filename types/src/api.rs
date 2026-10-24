@@ -2961,6 +2961,18 @@ pub struct PreheatPlanResponse {
     pub targets: Vec<PreheatPlanTarget>,
 }
 
+/// The verified newreleases.io delivery the edge forwards to the
+/// scheduler (stow#880).
+///
+/// The release's claimed rustc version. The scheduler dispatches
+/// `preheat-admin.yml` for it; the workflow's own manifest check is the
+/// authority, so the payload is only a hint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PreheatReleaseRequest {
+    /// The rustc version the delivery claims went stable.
+    pub rustc_version: WireRustcVersion,
+}
+
 /// One target's enqueue plan inside [`PreheatPlanResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PreheatPlanTarget {

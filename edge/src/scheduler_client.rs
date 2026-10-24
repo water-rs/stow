@@ -22,6 +22,7 @@ const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
 const SCHEDULER_BUDGET_LEDGER_URL: &str = "https://scheduler.internal/budget/ledger";
 const SCHEDULER_BUDGET_REARM_URL: &str = "https://scheduler.internal/budget/rearm";
 const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
+const SCHEDULER_PREHEAT_RELEASE_URL: &str = "https://scheduler.internal/preheat/release";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -269,6 +270,17 @@ const SCHEDULER_DEMAND_FEED_COMPLETE_URL: &str = "https://scheduler.internal/dem
 const SCHEDULER_DEMAND_FEED_CLEANUP_URL: &str = "https://scheduler.internal/demand-feed/cleanup";
 const SCHEDULER_DEMAND_FEED_DELIVER_URL: &str = "https://scheduler.internal/demand-feed/deliver";
 const SCHEDULER_DEMAND_FEED_STATUS_URL: &str = "https://scheduler.internal/demand-feed/status";
+
+/// `POST /preheat/release` — the verified newreleases.io delivery's
+/// claimed stable rustc (stow#880). The object dispatches
+/// `preheat-admin.yml` through the CI interface; a dispatch failure is
+/// the caller's 502, which newreleases.io's retry redelivers.
+pub async fn send_preheat_release(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::PreheatReleaseRequest,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_PREHEAT_RELEASE_URL, request).await
+}
 
 /// `POST /demand-feed/begin` — open or rotate the hour's staging
 /// attempt (stow#523); a resume answers a fresh generation.
