@@ -497,22 +497,19 @@ fn admin_all_nine_targets_every_lane() {
     assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
 
     let want = expected_targets();
-    for sub in ["top-binaries"] {
-        let calls = admin_calls(&scn, sub);
-        assert_eq!(calls.len(), 1, "{sub}: {calls:?}");
-        let argv = &calls[0];
-        assert_eq!(
-            flag_value(argv, "--targets").as_deref(),
-            Some(want.as_str()),
-            "{sub}"
-        );
-        assert_eq!(
-            flag_value(argv, "--rustc-version").as_deref(),
-            Some("1.98.1")
-        );
-        assert_eq!(flag_value(argv, "--limit").as_deref(), Some("100"));
-        assert!(argv.iter().any(|a| a == "--yes"));
-    }
+    let calls = admin_calls(&scn, "top-binaries");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let argv = &calls[0];
+    assert_eq!(
+        flag_value(argv, "--targets").as_deref(),
+        Some(want.as_str())
+    );
+    assert_eq!(
+        flag_value(argv, "--rustc-version").as_deref(),
+        Some("1.98.1")
+    );
+    assert_eq!(flag_value(argv, "--limit").as_deref(), Some("100"));
+    assert!(argv.iter().any(|a| a == "--yes"));
     let submits = admin_calls(&scn, "projects");
     assert_eq!(submits.len(), 1, "{submits:?}");
     assert_eq!(submits[0][0], "submit");
