@@ -33,7 +33,7 @@ use stow_types::do_budgets::{DO_BUDGETS, DriveBudget, grew};
 
 use super::drives::{self, DriveContext};
 use super::fixture::{self, FixtureShape};
-use super::graph::GraphCell;
+use super::graph::{GraphCell, LoadedGraph};
 use super::queue::SchedulerSettings;
 use super::test_db::{LoggedStatement, counting_memory_db};
 
@@ -138,7 +138,7 @@ fn a_wall_breach_is_reported_not_gated() {
 /// What a drive may not leave behind: a pending node it added or moved
 /// is claimable by the next pass, and a slot it took changes the next
 /// capacity read.
-fn claimable_surface(cell: &GraphCell) -> (u32, (u32, u32)) {
+fn claimable_surface(cell: LoadedGraph<'_>) -> (u32, (u32, u32)) {
     cell.with(|graph| (graph.pending_depth(), graph.inflight()))
 }
 
@@ -158,7 +158,7 @@ async fn run_one_drive(
 ) -> Result<Measured, String> {
     let mut keep = 0;
     let mut base = 0;
-    let before = claimable_surface(&ctx.graph);
+    let before = claimable_surface(ctx.loaded());
     let outcome =
         drives::drive_lifecycle(
             drive,
@@ -202,7 +202,7 @@ async fn run_one_drive(
         _ => Ok(()),
     };
     let statements = log.lock().expect("statement log")[base..].to_vec();
-    let after = claimable_surface(&ctx.graph);
+    let after = claimable_surface(ctx.loaded());
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => {
             if before != after {
@@ -429,6 +429,7 @@ async fn rearm_restores_the_seeded_state() {
     fixture::seed(&db, &cell, shape, drives::HOST_NOW_MS)
         .await
         .expect("seed fixture");
+    let cell = cell.loaded().expect("seeded");
     let seeded = cell.with(|graph| graph.status_counts());
     let run = shape.in_flight_run(0);
     let finished = cell.with(|graph| {
@@ -443,7 +444,7 @@ async fn rearm_restores_the_seeded_state() {
     });
     assert_eq!(finished, super::graph::FinishOutcome::Applied);
     assert_ne!(cell.with(|graph| graph.status_counts()), seeded);
-    fixture::rearm(&db, &cell, shape, drives::HOST_NOW_MS)
+    fixture::rearm(&db, cell, shape, drives::HOST_NOW_MS)
         .await
         .expect("rearm");
     assert_eq!(cell.with(|graph| graph.status_counts()), seeded);

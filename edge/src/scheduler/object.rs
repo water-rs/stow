@@ -65,22 +65,28 @@ fn route_error(error: QueueError) -> Error {
 /// one request that installed it then runs the post-wake `status`
 /// reconcile, which re-binds own runs by title (review Q6) and rebuilds
 /// external occupancy.
-async fn ensure_graph(env: &WasmEnv, db: &DurableDb, cell: &graph::GraphCell) -> Result<()> {
-    if !cell.loaded() {
+async fn ensure_graph<'a>(
+    env: &WasmEnv,
+    db: &DurableDb,
+    cell: &'a graph::GraphCell,
+) -> Result<graph::LoadedGraph<'a>> {
+    let loaded = if let Some(loaded) = cell.loaded() {
+        loaded
+    } else {
         let (mut graph, events) = store::load(db).await.map_err(to_error)?;
         store::apply_events(&mut graph, &events);
-        cell.install(graph);
-    }
+        cell.install(graph)
+    };
     // The admission floor is a deploy binding, never persisted: every
     // wake plan and claim reads the one stamped here.
     let floor = scheduler_settings(env)?.min_dispatch_value;
-    cell.with(|graph| graph.set_floor(floor));
+    loaded.with(|graph| graph.set_floor(floor));
     if cell.take_reconcile() {
         // The CI `status` listing is the truth for runs a snapshot's
         // eviction could have orphaned (claims whose bindings never
         // landed). A failure leaves the replayed state: the delivery
         // stream and the stale lease repair the same drift.
-        let listed = match ci_interface(env, cell).await {
+        let listed = match ci_interface(env, loaded).await {
             Ok(interface) => interface.status_runs().await,
             Err(error) => Err(dispatch::DispatchError::Response(error.to_string())),
         };
@@ -96,8 +102,8 @@ async fn ensure_graph(env: &WasmEnv, db: &DurableDb, cell: &graph::GraphCell) ->
                         )
                     })
                     .collect();
-                cell.with(|graph| graph.reconcile_runs(&listed, now_ms()));
-                routes::flush_samples(cell, db, now_ms())
+                loaded.with(|graph| graph.reconcile_runs(&listed, now_ms()));
+                routes::flush_samples(loaded, db, now_ms())
                     .await
                     .map_err(to_error)?;
             }
@@ -106,7 +112,7 @@ async fn ensure_graph(env: &WasmEnv, db: &DurableDb, cell: &graph::GraphCell) ->
             }
         }
     }
-    Ok(())
+    Ok(loaded)
 }
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
@@ -358,9 +364,10 @@ async fn scheduler_budget_rearm(
     // Re-arming reopens the resolved runs and rebinds them: the
     // graph binds all thirty in-flight runs again with no
     // completion recorded.
+    let graph = ensure_graph(&env, &db, &graph).await?;
     fixture::rearm(
         &db,
-        &graph,
+        graph,
         fixture::FixtureShape { queue_rows: seeded },
         now_ms(),
     )
@@ -410,8 +417,8 @@ async fn scheduler_budget_ledger(
     }
     // The ledger lives on the graph: a freshly woken isolate loads it
     // first, like every other route that reads the graph.
-    ensure_graph(&env, &db, &graph).await?;
-    Ok(Json(meter::ledger(&graph)))
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(meter::ledger(graph)))
 }
 
 /// Whether this deploy carries the budget probe — `STOW_SCHEDULER_BUDGET=1`,
@@ -432,8 +439,8 @@ async fn scheduler_demand(
     Json(request): Json<stow_types::api::SchedulerDemandRequest>,
 ) -> Result<Json<stow_types::api::SchedulerDemandReport>> {
     let (now_ms, settings) = alarm_inputs(&env)?;
-    ensure_graph(&env, &db, &graph).await?;
-    let (report, plan) = routes::demand(&graph, &db, &request, &settings, now_ms)
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let (report, plan) = routes::demand(graph, &db, &request, &settings, now_ms)
         .await
         .map_err(route_error)?;
     // A folded batch can raise a queue row over the admission floor
@@ -465,8 +472,8 @@ async fn demand_feed_begin(
     db: DurableDb,
     Json(request): Json<stow_types::api::DemandFeedBeginRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedBeginReport>> {
-    ensure_graph(&env, &db, &graph).await?;
-    routes::feed_begin(&graph, &db, &request.hour, feed_now_secs())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::feed_begin(graph, &db, &request.hour, feed_now_secs())
         .await
         .map(Json)
         .map_err(demand_feed_error)
@@ -479,8 +486,8 @@ async fn demand_feed_page(
     db: DurableDb,
     Json(request): Json<stow_types::api::DemandFeedPageRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    ensure_graph(&env, &db, &graph).await?;
-    routes::feed_page(&graph, &db, &request, feed_now_secs())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::feed_page(graph, &db, &request, feed_now_secs())
         .await
         .map_err(demand_feed_error)?;
     Ok(Json(serde_json::json!({"staged": true})))
@@ -495,8 +502,8 @@ async fn demand_feed_complete(
     db: DurableDb,
     Json(request): Json<stow_types::api::DemandFeedCompleteRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    ensure_graph(&env, &db, &graph).await?;
-    routes::feed_complete(&graph, &db, &request, feed_now_secs())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::feed_complete(graph, &db, &request, feed_now_secs())
         .await
         .map_err(demand_feed_error)?;
     Ok(Json(serde_json::json!({"complete": true})))
@@ -511,8 +518,8 @@ async fn demand_feed_cleanup(
     db: DurableDb,
     Json(request): Json<stow_types::api::DemandFeedCleanupRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedCleanupReport>> {
-    ensure_graph(&env, &db, &graph).await?;
-    routes::feed_cleanup(&graph, &db, &request.hour, feed_now_secs())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::feed_cleanup(graph, &db, &request.hour, feed_now_secs())
         .await
         .map(Json)
         .map_err(demand_feed_error)
@@ -529,8 +536,8 @@ async fn demand_feed_deliver(
     Json(request): Json<stow_types::api::DemandFeedDeliverRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedDeliverReport>> {
     let (now_ms, settings) = alarm_inputs(&env)?;
-    ensure_graph(&env, &db, &graph).await?;
-    let (report, plan) = routes::feed_deliver(&graph, &db, &request.hour, &settings, now_ms)
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let (report, plan) = routes::feed_deliver(graph, &db, &request.hour, &settings, now_ms)
         .await
         .map_err(demand_feed_error)?;
     queue::arm_alarm(&alarm, plan).await.map_err(|error| {
@@ -547,7 +554,7 @@ async fn demand_feed_status(
     env: WasmEnv,
     db: DurableDb,
 ) -> Result<Json<stow_types::api::DemandFeedStatus>> {
-    ensure_graph(&env, &db, &graph).await?;
+    let graph = ensure_graph(&env, &db, &graph).await?;
     Ok(Json(graph.with(|graph| feed::feed_status(graph))))
 }
 
@@ -600,11 +607,11 @@ async fn submit_tasks_by_id(
     alarm: Alarm,
     Json(body): Json<stow_types::api::SubmitTaskIdsRequest>,
 ) -> Result<Json<stow_types::api::SubmitTaskIdsResponse>> {
-    ensure_graph(&env, &db, &graph).await?;
+    let graph = ensure_graph(&env, &db, &graph).await?;
     if graph.with(|graph| graph.freeze().is_some()) {
         return Err(Error::msg("dispatch is frozen").set_status(StatusCode::SERVICE_UNAVAILABLE));
     }
-    let (inserted, unknown) = routes::submit_ids(&graph, &db, &body.tasks, now_ms())
+    let (inserted, unknown) = routes::submit_ids(graph, &db, &body.tasks, now_ms())
         .await
         .map_err(route_error)?;
     let outcome = queue::SubmitTaskIdsOutcome { inserted, unknown };
@@ -615,7 +622,7 @@ async fn submit_tasks_by_id(
         );
     }
     // Same hand-off as submit: the alarm pass owns dispatch.
-    schedule_alarm(&env, &db, &alarm, &graph).await?;
+    schedule_alarm(&env, &db, &alarm, graph.cell()).await?;
     Ok(Json(stow_types::api::SubmitTaskIdsResponse {
         submitted: u32::try_from(body.tasks.len()).map_err(|_| {
             to_error("submit-ids task count exceeds u32").set_status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -634,7 +641,7 @@ async fn submit(
     enforce_pending_cap: bool,
 ) -> Result<Json<InsertedResponse>> {
     let settings = scheduler_settings(env)?;
-    ensure_graph(env, db, graph).await?;
+    let graph = ensure_graph(env, db, graph).await?;
     if !enforce_pending_cap && graph.with(|graph| graph.freeze().is_some()) {
         return Err(Error::msg("dispatch is frozen").set_status(StatusCode::SERVICE_UNAVAILABLE));
     }
@@ -652,7 +659,7 @@ async fn submit(
     // decides whether a wake can make progress at all: a submit whose
     // rows all sit behind unmet gates arms nothing, while a stale
     // in-flight lease still arms at its expiry (stow#444).
-    schedule_alarm(env, db, alarm, graph).await?;
+    schedule_alarm(env, db, alarm, graph.cell()).await?;
     Ok(Json(InsertedResponse { inserted }))
 }
 
@@ -661,7 +668,7 @@ async fn submit(
 /// would merely wait are declined with the freeze reason. Anonymous
 /// submits stay open: a miss costs nothing until it dispatches, and
 /// dropping it would just blind the queue.
-fn refuse_if_frozen(graph: &graph::GraphCell) -> Result<()> {
+fn refuse_if_frozen(graph: graph::LoadedGraph<'_>) -> Result<()> {
     if let Some(record) = graph.with(|graph| graph.freeze().cloned()) {
         let reason = format!(
             "dispatch is frozen ({})",
@@ -704,7 +711,7 @@ pub(super) async fn complete_run_pass(
     report: &stow_types::api::WorkflowRunComplete,
 ) -> Result<()> {
     let freeze = freeze_settings(env)?;
-    ensure_graph(env, db, graph).await?;
+    let graph = ensure_graph(env, db, graph).await?;
     let now = now_ms();
     let outcome = routes::complete_run(graph, db, report, now)
         .await
@@ -732,7 +739,7 @@ pub(super) async fn complete_run_pass(
     // request — runs claim plus the GitHub fan-out. The completion may
     // leave nothing dispatchable (a failure with an empty queue, a
     // finished backlog): `schedule_alarm` arms no wake then (stow#444).
-    schedule_alarm(env, db, alarm, graph).await
+    schedule_alarm(env, db, alarm, graph.cell()).await
 }
 
 /// `POST /tasks/run-update` — the webhook's `in_progress` delivery for
@@ -748,8 +755,8 @@ async fn apply_task_run_update(
     db: DurableDb,
     Json(update): Json<stow_types::api::TaskRunUpdate>,
 ) -> Result<Json<OkResponse>> {
-    ensure_graph(&env, &db, &graph).await?;
-    let outcome = routes::task_run_update(&graph, &db, &update, now_ms())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let outcome = routes::task_run_update(graph, &db, &update, now_ms())
         .await
         .map_err(route_error)?;
     match outcome {
@@ -768,7 +775,7 @@ async fn status(
     env: WasmEnv,
     db: DurableDb,
 ) -> Result<Json<stow_types::api::SchedulerStatus>> {
-    ensure_graph(&env, &db, &graph).await?;
+    let graph = ensure_graph(&env, &db, &graph).await?;
     let counts = graph.with(|graph| graph.status_counts());
     let count =
         |label: &str| u32::try_from(counts.get(label).copied().unwrap_or(0)).unwrap_or(u32::MAX);
@@ -789,7 +796,7 @@ async fn admin_status(
     env: WasmEnv,
     db: DurableDb,
 ) -> Result<Json<stow_types::api::AdminStatus>> {
-    ensure_graph(&env, &db, &graph).await?;
+    let graph = ensure_graph(&env, &db, &graph).await?;
     let status = graph
         .with(|graph| graph.admin_status(now_ms()))
         .map_err(to_error)?;
@@ -805,7 +812,7 @@ async fn list_tasks(
     db: DurableDb,
     skyzen::extract::Query(selector): skyzen::extract::Query<stow_types::api::QueueSelector>,
 ) -> Result<Json<Vec<stow_types::api::QueueTask>>> {
-    ensure_graph(&env, &db, &graph).await?;
+    let graph = ensure_graph(&env, &db, &graph).await?;
     let tasks = graph
         .with(|graph| graph.list(&selector, now_ms()))
         .map_err(to_error)?;
@@ -826,16 +833,18 @@ async fn apply_queue_mutation(
     op: stow_types::api::MutationKind,
     selector: stow_types::api::QueueSelector,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
-    ensure_graph(&env, &db, graph).await?;
+    let graph = ensure_graph(&env, &db, graph).await?;
     let affected = routes::mutate(graph, &db, op, &selector, now_ms())
         .await
         .map_err(route_error)?;
     if affected > 0 && op != stow_types::api::MutationKind::Purge {
-        dispatch_pending(&env, &db, graph).await.map_err(|error| {
-            tracing::error!(%error, "scheduler mutation dispatch_pending failed");
-            error
-        })?;
-        schedule_alarm(&env, &db, &alarm, graph)
+        dispatch_pending(&env, &db, graph.cell())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "scheduler mutation dispatch_pending failed");
+                error
+            })?;
+        schedule_alarm(&env, &db, &alarm, graph.cell())
             .await
             .map_err(|error| {
                 tracing::error!(%error, "scheduler mutation schedule_alarm failed");
@@ -926,12 +935,13 @@ async fn admit_request(
     db: DurableDb,
     Json(admission): Json<stow_types::api::RequestAdmission>,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
     let settings = scheduler_settings(&env)?;
     // `Date::now()` returns whole milliseconds well below 2^53; the
     // payload's `dispatched_at` wants unix seconds.
     #[allow(clippy::cast_possible_truncation)]
     let dispatched_at = (js_sys::Date::now() / 1_000.0) as i64;
-    admit_request_pass(&graph, &env, &db, &settings, &admission, dispatched_at)
+    admit_request_pass(graph, &env, &db, &settings, &admission, dispatched_at)
         .await
         .map(Json)
 }
@@ -949,7 +959,7 @@ async fn admit_request(
 /// refuses admission outright: a cost trip means no new dispatches, and
 /// a resolve run is one.
 pub(super) async fn admit_request_pass(
-    graph: &graph::GraphCell,
+    graph: graph::LoadedGraph<'_>,
     env: &WasmEnv,
     db: &DurableDb,
     settings: &SchedulerSettings,
@@ -1054,7 +1064,7 @@ async fn read_request(
     params: Params,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
     let request_id = request_id_param(&params)?;
-    ensure_graph(&env, &db, &graph).await?;
+    let graph = ensure_graph(&env, &db, &graph).await?;
     graph
         .with(|graph| queue::crate_request_status(graph, request_id))
         .map_err(to_error)?
@@ -1079,14 +1089,14 @@ async fn apply_request_outcome(
     Json(report): Json<stow_types::api::RequestOutcomeReport>,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
     let request_id = request_id_param(&params)?;
-    ensure_graph(&env, &db, &graph).await?;
-    let status = routes::request_outcome(&graph, &db, request_id, &report, now_ms())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let status = routes::request_outcome(graph, &db, request_id, &report, now_ms())
         .await
         .map_err(route_error)?;
     // Same handoff as submit: the report answers once the rows land, and
     // the alarm's dispatch pass — not this request — fans them out. An
     // outcome whose task is fully gated arms nothing (stow#444).
-    schedule_alarm(&env, &db, &alarm, &graph).await?;
+    schedule_alarm(&env, &db, &alarm, graph.cell()).await?;
     Ok(Json(status))
 }
 
@@ -1105,8 +1115,8 @@ async fn apply_request_run_update(
     Json(update): Json<stow_types::api::RequestRunUpdate>,
 ) -> Result<Json<OkResponse>> {
     let request_id = request_id_param(&params)?;
-    ensure_graph(&env, &db, &graph).await?;
-    routes::request_run_update(&graph, &db, request_id, &update, now_ms())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::request_run_update(graph, &db, request_id, &update, now_ms())
         .await
         .map_err(route_error)?;
     Ok(Json(OkResponse { ok: true }))
@@ -1128,12 +1138,12 @@ async fn read_dispatch_freeze(
     env: WasmEnv,
     db: DurableDb,
 ) -> Result<Json<stow_types::api::DispatchFreeze>> {
-    ensure_graph(&env, &db, &graph).await?;
-    Ok(Json(freeze_view(&graph)))
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(freeze_view(graph)))
 }
 
 /// The freeze flag, record and transition history the graph holds.
-fn freeze_view(graph: &graph::GraphCell) -> stow_types::api::DispatchFreeze {
+fn freeze_view(graph: graph::LoadedGraph<'_>) -> stow_types::api::DispatchFreeze {
     graph.with(|graph| {
         let record = graph.freeze().cloned();
         stow_types::api::DispatchFreeze {
@@ -1170,7 +1180,7 @@ async fn write_dispatch_freeze(
     alarm: Alarm,
     Json(switch): Json<stow_types::api::DispatchFreeze>,
 ) -> Result<Json<stow_types::api::DispatchFreeze>> {
-    ensure_graph(&env, &db, &graph).await?;
+    let graph = ensure_graph(&env, &db, &graph).await?;
     let sink = EdgeAlerter::new(env.as_js());
     let action = if switch.enabled {
         freeze::FreezeAction::Freeze
@@ -1180,7 +1190,7 @@ async fn write_dispatch_freeze(
     // The freeze gates `claim` on the graph — the transition applies
     // its `Freeze` event there and the route appends it (stow#878).
     let now = now_ms();
-    let store = graph::GraphFreezeStore::new(&graph, iso_now(), now);
+    let store = graph::GraphFreezeStore::new(graph, iso_now(), now);
     let transition = freeze::apply_transition(
         &store,
         &sink,
@@ -1195,7 +1205,7 @@ async fn write_dispatch_freeze(
         freeze::FreezeTransition::Engaged(record) => {
             // While frozen the wake plan is a delete — a live alarm
             // would only spin dispatch passes the gate would eat.
-            schedule_alarm(&env, &db, &alarm, &graph)
+            schedule_alarm(&env, &db, &alarm, graph.cell())
                 .await
                 .map_err(|error| {
                     tracing::error!(%error, "scheduler freeze schedule_alarm failed");
@@ -1205,11 +1215,13 @@ async fn write_dispatch_freeze(
         }
         freeze::FreezeTransition::Cleared(_) => {
             // Misses that queued during the freeze dispatch first now.
-            dispatch_pending(&env, &db, &graph).await.map_err(|error| {
-                tracing::error!(%error, "scheduler unfreeze dispatch_pending failed");
-                error
-            })?;
-            schedule_alarm(&env, &db, &alarm, &graph)
+            dispatch_pending(&env, &db, graph.cell())
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "scheduler unfreeze dispatch_pending failed");
+                    error
+                })?;
+            schedule_alarm(&env, &db, &alarm, graph.cell())
                 .await
                 .map_err(|error| {
                     tracing::error!(%error, "scheduler unfreeze schedule_alarm failed");
@@ -1219,7 +1231,7 @@ async fn write_dispatch_freeze(
         }
         freeze::FreezeTransition::Unchanged => {}
     }
-    Ok(Json(freeze_view(&graph)))
+    Ok(Json(freeze_view(graph)))
 }
 
 /// `Date#toISOString` — the timestamp format the record and alert
@@ -1239,7 +1251,7 @@ fn iso_now() -> String {
 /// without rewriting the record or resending the alert. The alert's
 /// outcome only ever lands on the record.
 async fn evaluate_dispatch_freeze(
-    graph: &graph::GraphCell,
+    graph: graph::LoadedGraph<'_>,
     env: &WasmEnv,
     db: &DurableDb,
     settings: &FreezeSettings,
@@ -1292,6 +1304,14 @@ pub(super) async fn settle_meter(
     env: &WasmEnv,
     multiplier: f64,
 ) {
+    // A reset leaves the graph empty; settling wakes it first.
+    let graph = match ensure_graph(env, db, graph).await {
+        Ok(graph) => graph,
+        Err(error) => {
+            tracing::error!(%error, "do meter settle: graph wake failed");
+            return;
+        }
+    };
     let sink = EdgeAlerter::new(env.as_js());
     let now = now_ms();
     let store = graph::GraphFreezeStore::new(graph, iso_now(), now);
@@ -1350,18 +1370,20 @@ async fn record_published_index(
     Json(slice): Json<stow_types::api::PublishedSlice>,
 ) -> Result<Json<OkResponse>> {
     let _settings = scheduler_settings(&env)?;
-    ensure_graph(&env, &db, &graph).await?;
+    let graph = ensure_graph(&env, &db, &graph).await?;
     // The slice report is one appended event; its flip lands on the
     // same turn (stow#878 — no generation fencing: reports apply to
     // in-memory masks, deltas stay idempotent on re-application).
-    routes::slice_report(&graph, &db, &slice, now_ms())
+    routes::slice_report(graph, &db, &slice, now_ms())
         .await
         .map_err(route_error)?;
-    dispatch_pending(&env, &db, &graph).await.map_err(|error| {
-        tracing::error!(%error, "scheduler published-index dispatch_pending failed");
-        error
-    })?;
-    schedule_alarm(&env, &db, &alarm, &graph)
+    dispatch_pending(&env, &db, graph.cell())
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "scheduler published-index dispatch_pending failed");
+            error
+        })?;
+    schedule_alarm(&env, &db, &alarm, graph.cell())
         .await
         .map_err(|error| {
             tracing::error!(%error, "scheduler published-index schedule_alarm failed");
@@ -1447,7 +1469,7 @@ pub fn loopback_url(binding: &str, url: &str) -> Result<String> {
 }
 
 async fn dispatch_pending(env: &WasmEnv, db: &DurableDb, graph: &graph::GraphCell) -> Result<()> {
-    ensure_graph(env, db, graph).await?;
+    let graph = ensure_graph(env, db, graph).await?;
     // The dispatch freeze gates here and inside `claim`
     // — the enqueue side never consults it, so misses keep arriving and
     // stay pending for the first pass after a human lifts the freeze. It
@@ -1458,14 +1480,16 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb, graph: &graph::GraphCel
         return Ok(());
     }
     let settings = scheduler_settings(env)?;
-    dispatch_pass(graph, env, db, &settings).await.map(|_| ())
+    dispatch_pass(graph.cell(), env, db, &settings)
+        .await
+        .map(|_| ())
 }
 
 /// The CI interface one pass resolves — same credential arm as
 /// `dispatch_pass`.
 async fn ci_interface(
     env: &WasmEnv,
-    graph: &graph::GraphCell,
+    graph: graph::LoadedGraph<'_>,
 ) -> Result<dispatch::CiInterface<dispatch::CfTransport>> {
     let pool = crate::fetch_guard::OutboundPool::new();
     match credential_source(env)? {
@@ -1519,7 +1543,7 @@ pub(super) async fn dispatch_pass(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) -> Result<Vec<String>> {
-    ensure_graph(env, db, graph).await?;
+    let graph = ensure_graph(env, db, graph).await?;
     // The breaker is evaluated every pass: the outcome ring it reads is
     // window-filtered in memory, so the check costs no row.
     let freeze = freeze_settings(env)?;
@@ -1637,7 +1661,7 @@ pub(super) fn now_ms() -> i64 {
 /// matched to its task. The queue writes then apply sequentially:
 /// `&DurableDb` is not `Send`, so it never enters a concurrent future.
 async fn dispatch_claims(
-    graph: &graph::GraphCell,
+    graph: graph::LoadedGraph<'_>,
     db: &DurableDb,
     backend: &dispatch::CiInterface<dispatch::CfTransport>,
     claims: Vec<graph::Claimed>,
@@ -1695,7 +1719,7 @@ async fn schedule_alarm(
     graph: &graph::GraphCell,
 ) -> Result<()> {
     let (now_ms, settings) = alarm_inputs(env)?;
-    ensure_graph(env, db, graph).await?;
+    let graph = ensure_graph(env, db, graph).await?;
     let plan = routes::wake_plan(graph, &settings, now_ms);
     queue::arm_alarm(alarm, plan).await.map_err(|error| {
         let error = to_error(error);

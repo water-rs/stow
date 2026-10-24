@@ -2967,7 +2967,10 @@ impl Graph {
 /// `.await`, so the DO input gate's serialization holds either way.
 #[derive(Clone, Default)]
 pub struct GraphCell {
-    graph: std::sync::Arc<std::sync::Mutex<Option<Graph>>>,
+    graph: std::sync::Arc<std::sync::Mutex<Graph>>,
+    /// Whether `graph` holds the woken state rather than the empty
+    /// placeholder a reset leaves behind.
+    loaded: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by the wake, cleared by the one request that runs the
     /// post-wake CI status reconcile.
     reconcile_due: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2981,26 +2984,55 @@ impl std::fmt::Debug for GraphCell {
     }
 }
 
+/// Proof that the graph is loaded this isolate: the only way to read or
+/// mutate it. A [`GraphCell`] hands one out from [`GraphCell::loaded`]
+/// once the wake has installed the graph, so touching the graph before
+/// loading it does not compile.
+#[derive(Clone, Copy)]
+pub struct LoadedGraph<'a> {
+    cell: &'a GraphCell,
+}
+
+impl<'a> LoadedGraph<'a> {
+    /// Mutate the in-memory graph — never across an `.await` and never
+    /// re-entrant (a nested `with` would deadlock on the mutex).
+    pub(crate) fn with<R>(self, f: impl FnOnce(&mut Graph) -> R) -> R {
+        f(&mut self.cell.graph.lock().expect("graph cell poisoned"))
+    }
+    /// The isolate's installation-token cache.
+    pub(crate) const fn tokens(self) -> &'a crate::github_app::TokenCache {
+        &self.cell.tokens
+    }
+    /// The cell this handle proves loaded.
+    pub(crate) const fn cell(self) -> &'a GraphCell {
+        self.cell
+    }
+}
+
 impl GraphCell {
-    /// Whether the graph is already loaded this isolate.
-    pub(crate) fn loaded(&self) -> bool {
-        self.graph.lock().expect("graph cell poisoned").is_some()
+    /// The loaded-graph handle, or `None` while the graph is not yet
+    /// loaded this isolate (before the wake, or after a reset).
+    pub(crate) fn loaded(&self) -> Option<LoadedGraph<'_>> {
+        self.loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then_some(LoadedGraph { cell: self })
     }
     /// Install the freshly loaded graph — the wake. When another
     /// request installed one while this wake awaited the store, the
     /// loser is dropped: its replay saw a log the winner has since
-    /// appended to. Returns whether this graph won, in which case the
-    /// post-wake reconcile falls due.
-    pub(crate) fn install(&self, graph: Graph) -> bool {
+    /// appended to. The winner's install makes the post-wake reconcile
+    /// fall due. Returns the proof that the graph is now loaded.
+    pub(crate) fn install(&self, graph: Graph) -> LoadedGraph<'_> {
         let mut slot = self.graph.lock().expect("graph cell poisoned");
-        if slot.is_some() {
-            return false;
+        if !self.loaded.load(std::sync::atomic::Ordering::Acquire) {
+            *slot = graph;
+            self.loaded
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.reconcile_due
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        *slot = Some(graph);
         drop(slot);
-        self.reconcile_due
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        true
+        LoadedGraph { cell: self }
     }
     /// Take the post-wake reconcile duty — `true` for exactly one
     /// caller per wake.
@@ -3011,22 +3043,13 @@ impl GraphCell {
     /// Drop the in-memory graph — the operator reset: the next
     /// request wakes from the (reset) store.
     pub(crate) fn clear(&self) {
-        *self.graph.lock().expect("graph cell poisoned") = None;
+        *self.graph.lock().expect("graph cell poisoned") = Graph::default();
+        self.loaded
+            .store(false, std::sync::atomic::Ordering::Release);
     }
     /// The isolate's installation-token cache.
     pub(crate) const fn tokens(&self) -> &crate::github_app::TokenCache {
         &self.tokens
-    }
-    /// Mutate the in-memory graph — never across an `.await` and never
-    /// re-entrant (a nested `with` would deadlock on the mutex where
-    /// the old cell would have panicked on the reborrow).
-    pub(crate) fn with<R>(&self, f: impl FnOnce(&mut Graph) -> R) -> R {
-        f(self
-            .graph
-            .lock()
-            .expect("graph cell poisoned")
-            .as_mut()
-            .expect("graph loaded"))
     }
 }
 
@@ -3039,7 +3062,7 @@ impl GraphCell {
 /// transitions the store itself cannot timestamp (engages take the
 /// record's own `frozen_at`).
 pub struct GraphFreezeStore<'a> {
-    cell: &'a GraphCell,
+    cell: LoadedGraph<'a>,
     at: String,
     now_ms: i64,
     staged: std::sync::Mutex<Vec<SchedulerEvent>>,
@@ -3047,12 +3070,12 @@ pub struct GraphFreezeStore<'a> {
 
 impl<'a> GraphFreezeStore<'a> {
     /// The graph this store stages transitions for.
-    pub const fn cell(&self) -> &'a GraphCell {
+    pub const fn cell(&self) -> LoadedGraph<'a> {
         self.cell
     }
 
     /// The transition's wall-clock `at` and monotonic `now_ms`.
-    pub const fn new(cell: &'a GraphCell, at: String, now_ms: i64) -> Self {
+    pub const fn new(cell: LoadedGraph<'a>, at: String, now_ms: i64) -> Self {
         Self {
             cell,
             at,

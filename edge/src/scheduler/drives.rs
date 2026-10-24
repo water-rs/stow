@@ -35,7 +35,7 @@ use stow_types::api::{
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
 use super::fixture::{self, FixtureShape};
-use super::graph::GraphCell;
+use super::graph::{GraphCell, LoadedGraph};
 use super::queue::{self, SchedulerSettings};
 use super::{feed, routes, store};
 
@@ -127,6 +127,15 @@ impl DriveContext {
             bound: Arc::new(Mutex::new(None)),
             generation: Arc::new(AtomicU64::new(Self::FIRST_GENERATION)),
         }
+    }
+
+    /// The graph the drives run against, proven loaded. Every drive but
+    /// the wake runs after the seed installed it; one that does not has
+    /// a mis-ordered gate.
+    pub fn loaded(&self) -> LoadedGraph<'_> {
+        self.graph
+            .loaded()
+            .expect("drive ordering: the seed installs the graph before any drive reads it")
     }
 
     /// Tasks claimed by the hot pass so far.
@@ -358,7 +367,7 @@ async fn commit(
     events: &[SchedulerEvent],
     at: i64,
 ) -> Result<(), String> {
-    routes::commit(&ctx.graph, db, events, at)
+    routes::commit(ctx.loaded(), db, events, at)
         .await
         .map_err(text)
 }
@@ -370,15 +379,15 @@ async fn schedule(
     db: &DurableDb,
     settings: &SchedulerSettings,
 ) -> Result<(), String> {
-    let _plan = routes::wake_plan(&ctx.graph, settings, now_ms());
-    routes::snapshot_if_due(&ctx.graph, db)
+    let _plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
+    routes::snapshot_if_due(ctx.loaded(), db)
         .await
         .map(|_| ())
         .map_err(text)
 }
 
 fn list(ctx: &DriveContext, selector: &QueueSelector) -> Result<(), String> {
-    ctx.graph
+    ctx.loaded()
         .with(|graph| graph.list(selector, now_ms()))
         .map(|_| ())
         .map_err(text)
@@ -391,7 +400,7 @@ async fn mutate(
     ids: Vec<String>,
 ) -> Result<u32, String> {
     routes::mutate(
-        &ctx.graph,
+        ctx.loaded(),
         db,
         op,
         &QueueSelector {
@@ -529,7 +538,7 @@ async fn submit(
     enforce_pending_cap: bool,
 ) -> Result<u32, String> {
     routes::submit(
-        &ctx.graph,
+        ctx.loaded(),
         db,
         settings,
         trees,
@@ -640,16 +649,17 @@ async fn admit_request_drive(
             .env
             .as_ref()
             .ok_or_else(|| "requests drive needs a Worker env".to_owned())?;
-        super::object::admit_request_pass(&ctx.graph, env, db, settings, &drive_admission(), 0)
+        super::object::admit_request_pass(ctx.loaded(), env, db, settings, &drive_admission(), 0)
             .await
             .map(|_| ())
             .map_err(text)
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let step = routes::admit_request(&ctx.graph, db, settings, &drive_admission(), 0, now_ms())
-            .await
-            .map_err(text)?;
+        let step =
+            routes::admit_request(ctx.loaded(), db, settings, &drive_admission(), 0, now_ms())
+                .await
+                .map_err(text)?;
         matches!(step, queue::RequestAdmissionStep::Dispatch { .. })
             .then_some(())
             .ok_or_else(|| "the drive's fresh request deduplicated".to_owned())
@@ -687,7 +697,7 @@ async fn pass(
     #[cfg(not(target_arch = "wasm32"))]
     {
         let now = now_ms();
-        let claims = routes::claim_pass(&ctx.graph, db, settings, now)
+        let claims = routes::claim_pass(ctx.loaded(), db, settings, now)
             .await
             .map_err(text)?;
         let bindings: Vec<DispatchBinding> = claims
@@ -699,7 +709,7 @@ async fn pass(
                 run_id: run.to_string(),
             })
             .collect();
-        routes::settle_dispatch(&ctx.graph, db, bindings, Vec::new(), now)
+        routes::settle_dispatch(ctx.loaded(), db, bindings, Vec::new(), now)
             .await
             .map_err(text)?;
         Ok(claims.into_iter().map(|claim| claim.task_id).collect())
@@ -721,10 +731,10 @@ async fn focused_claim_pass(
     settings: &SchedulerSettings,
     ctx: &DriveContext,
 ) -> Result<Vec<String>, String> {
-    let claims = routes::claim_pass(&ctx.graph, db, settings, now_ms())
+    let claims = routes::claim_pass(ctx.loaded(), db, settings, now_ms())
         .await
         .map_err(text)?;
-    let _plan = routes::wake_plan(&ctx.graph, settings, now_ms());
+    let _plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
     Ok(claims.into_iter().map(|claim| claim.task_id).collect())
 }
 
@@ -857,7 +867,7 @@ async fn complete_run_route(
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        routes::complete_run(&ctx.graph, db, &report, now_ms())
+        routes::complete_run(ctx.loaded(), db, &report, now_ms())
             .await
             .map_err(text)?;
         schedule(ctx, db, settings).await
@@ -971,7 +981,7 @@ fn feed_drive_complete_request(
 /// generation to [`FEED_DRIVE_GENERATION`].
 async fn feed_drive_begin(ctx: &DriveContext, db: &DurableDb, idx: u32) -> Result<(), String> {
     let hour = feed_drive_hour(idx);
-    routes::feed_begin(&ctx.graph, db, &hour, feed_drive_now_secs(idx))
+    routes::feed_begin(ctx.loaded(), db, &hour, feed_drive_now_secs(idx))
         .await
         .map_err(text)?;
     commit(
@@ -999,7 +1009,7 @@ async fn feed_seed_page(
     entries: FeedPageEntries,
 ) -> Result<(), String> {
     routes::feed_page(
-        &ctx.graph,
+        ctx.loaded(),
         db,
         &feed_drive_page_request(idx, page_no, count, entries)?,
         feed_drive_now_secs(idx),
@@ -1021,7 +1031,7 @@ async fn seed_feed_hour_sized(
     entries: FeedPageEntries,
 ) -> Result<(), String> {
     let hour = feed_drive_hour(idx);
-    let status = ctx.graph.with(|graph| feed::feed_status(graph));
+    let status = ctx.loaded().with(|graph| feed::feed_status(graph));
     if status
         .watermark
         .as_ref()
@@ -1029,7 +1039,7 @@ async fn seed_feed_hour_sized(
     {
         return Ok(());
     }
-    let existing = ctx.graph.with(|graph| {
+    let existing = ctx.loaded().with(|graph| {
         graph
             .feed_sessions
             .get(hour.as_str())
@@ -1051,7 +1061,7 @@ async fn seed_feed_hour_sized(
         .await?;
     }
     routes::feed_complete(
-        &ctx.graph,
+        ctx.loaded(),
         db,
         &feed_drive_complete_request(idx, counts, entries)?,
         feed_drive_now_secs(idx),
@@ -1084,7 +1094,7 @@ async fn feed_deliver_once(
     idx: u32,
 ) -> Result<stow_types::api::DemandFeedDeliverReport, String> {
     routes::feed_deliver(
-        &ctx.graph,
+        ctx.loaded(),
         db,
         &feed_drive_hour(idx),
         settings,
@@ -1224,7 +1234,7 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |_db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.graph.with(|graph| graph.status_counts());
+                ctx.loaded().with(|graph| graph.status_counts());
                 Ok(())
             })
         },
@@ -1238,7 +1248,7 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |_db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.graph
+                ctx.loaded()
                     .with(|graph| graph.admin_status(now_ms()))
                     .map(|_| ())
                     .map_err(text)
@@ -1371,7 +1381,7 @@ pub const DRIVES: &[Drive] = &[
         run: |_db, shape, _settings, ctx| {
             Box::pin(async move {
                 let tasks = ctx
-                    .graph
+                    .loaded()
                     .with(|graph| {
                         graph.list(
                             &QueueSelector {
@@ -1526,7 +1536,7 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |_db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.graph
+                ctx.loaded()
                     .with(|graph| {
                         queue::crate_request_status(
                             graph,
@@ -1560,7 +1570,7 @@ pub const DRIVES: &[Drive] = &[
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 routes::request_run_update(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     DRIVE_REQUEST_ID,
                     &run_update(stow_types::api::RequestRunAction::InProgress, None),
@@ -1582,7 +1592,7 @@ pub const DRIVES: &[Drive] = &[
         run: |db, shape, settings, ctx| {
             Box::pin(async move {
                 routes::request_outcome(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     DRIVE_REQUEST_ID,
                     &request_report(shape),
@@ -1620,7 +1630,7 @@ pub const DRIVES: &[Drive] = &[
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 routes::request_run_update(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     DRIVE_REQUEST_ID,
                     &run_update(
@@ -1647,7 +1657,7 @@ pub const DRIVES: &[Drive] = &[
                 let mut refused = *settings;
                 refused.max_queue_pending = 0;
                 match routes::submit(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &refused,
                     &submit_batch(shape, TAG_UNTRUSTED).trees,
@@ -1758,7 +1768,7 @@ pub const DRIVES: &[Drive] = &[
                         downloads: 1,
                     })
                     .collect();
-                let (promoted, unknown) = routes::submit_ids(&ctx.graph, db, &entries, now_ms())
+                let (promoted, unknown) = routes::submit_ids(ctx.loaded(), db, &entries, now_ms())
                     .await
                     .map_err(text)?;
                 (promoted == 3 && unknown.is_empty())
@@ -1840,7 +1850,7 @@ pub const DRIVES: &[Drive] = &[
                     batch_id: "costgate-demand".to_owned(),
                     entries: vec![fixture_entry(101)?],
                 };
-                let (report, plan) = routes::demand(&ctx.graph, db, &request, settings, now_ms())
+                let (report, plan) = routes::demand(ctx.loaded(), db, &request, settings, now_ms())
                     .await
                     .map_err(text)?;
                 if !(report.applied && report.touched_tasks > 0) {
@@ -1912,7 +1922,7 @@ pub const DRIVES: &[Drive] = &[
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
                 routes::slice_report(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
@@ -1945,7 +1955,7 @@ pub const DRIVES: &[Drive] = &[
                     .collect();
                 restore_claimed(ctx, db, ids).await?;
                 routes::slice_report(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
@@ -1973,7 +1983,7 @@ pub const DRIVES: &[Drive] = &[
             Box::pin(async move {
                 let (added, retired) = fixture::delta_slice_report(shape);
                 routes::slice_report(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
@@ -2006,7 +2016,7 @@ pub const DRIVES: &[Drive] = &[
                 restore_claimed(ctx, db, ids).await?;
                 let (added, retired) = fixture::delta_slice_report(shape);
                 routes::slice_report(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
@@ -2060,7 +2070,7 @@ pub const DRIVES: &[Drive] = &[
                     .collect();
                 restore_claimed(ctx, db, ids).await?;
                 // The unfloored floor goes back for the next pass.
-                ctx.graph
+                ctx.loaded()
                     .with(|graph| graph.set_floor(settings.min_dispatch_value));
                 Ok(())
             })
@@ -2080,7 +2090,7 @@ pub const DRIVES: &[Drive] = &[
             Box::pin(async move {
                 let task_ids = pass(db, settings, ctx).await?;
                 ctx.record_claimed(task_ids);
-                let _plan = routes::wake_plan(&ctx.graph, settings, now_ms());
+                let _plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
                 Ok(())
             })
         },
@@ -2107,7 +2117,7 @@ pub const DRIVES: &[Drive] = &[
                 let mut idle = *settings;
                 idle.dispatch = queue::Dispatch::Paused;
                 pass(db, &idle, ctx).await?;
-                let _plan = routes::wake_plan(&ctx.graph, &idle, now_ms());
+                let _plan = routes::wake_plan(ctx.loaded(), &idle, now_ms());
                 Ok(())
             })
         },
@@ -2159,7 +2169,7 @@ pub const DRIVES: &[Drive] = &[
             Box::pin(async move {
                 let bound = ctx.bound_run()?;
                 routes::task_run_update(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &stow_types::api::TaskRunUpdate {
                         task_id: bound.task,
@@ -2201,7 +2211,7 @@ pub const DRIVES: &[Drive] = &[
         }),
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                let (inflight, _) = ctx.graph.with(|graph| graph.inflight());
+                let (inflight, _) = ctx.loaded().with(|graph| graph.inflight());
                 let saturated = SchedulerSettings {
                     dispatch: queue::Dispatch::from_max_concurrent_jobs(inflight),
                     ..*settings
@@ -2222,7 +2232,7 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |_db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.graph.with(|graph| feed::feed_status(graph));
+                ctx.loaded().with(|graph| feed::feed_status(graph));
                 Ok(())
             })
         },
@@ -2235,10 +2245,15 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                routes::feed_begin(&ctx.graph, db, &feed_drive_hour(3), feed_drive_now_secs(3))
-                    .await
-                    .map(|_| ())
-                    .map_err(text)
+                routes::feed_begin(
+                    ctx.loaded(),
+                    db,
+                    &feed_drive_hour(3),
+                    feed_drive_now_secs(3),
+                )
+                .await
+                .map(|_| ())
+                .map_err(text)
             })
         },
         cleanup: None,
@@ -2260,10 +2275,14 @@ pub const DRIVES: &[Drive] = &[
         }),
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                let report =
-                    routes::feed_begin(&ctx.graph, db, &feed_drive_hour(4), feed_drive_now_secs(4))
-                        .await
-                        .map_err(text)?;
+                let report = routes::feed_begin(
+                    ctx.loaded(),
+                    db,
+                    &feed_drive_hour(4),
+                    feed_drive_now_secs(4),
+                )
+                .await
+                .map_err(text)?;
                 if report.generation == FEED_DRIVE_GENERATION || report.stale_pages_pending {
                     return Err(format!(
                         "rotation must mint a new generation with nothing left to retire: {report:?}"
@@ -2324,7 +2343,7 @@ pub const DRIVES: &[Drive] = &[
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 routes::feed_complete(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &feed_drive_complete_request(7, &[4; 3], feed_drive_entries)?,
                     feed_drive_now_secs(7),
@@ -2345,7 +2364,7 @@ pub const DRIVES: &[Drive] = &[
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 routes::feed_complete(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &feed_drive_complete_request(8, &[], feed_drive_entries)?,
                     feed_drive_now_secs(8),
@@ -2443,7 +2462,7 @@ pub const DRIVES: &[Drive] = &[
                     feed_seed_page(ctx, db, 3, page_no, 4, feed_drive_entries).await?;
                 }
                 routes::feed_complete(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &feed_drive_complete_request(3, &[4; 3], feed_drive_entries)?,
                     feed_drive_now_secs(3),
@@ -2460,7 +2479,7 @@ pub const DRIVES: &[Drive] = &[
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 let report = routes::feed_cleanup(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &feed_drive_hour(3),
                     feed_drive_now_secs(3),
@@ -2485,7 +2504,7 @@ pub const DRIVES: &[Drive] = &[
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
                 let report = routes::feed_cleanup(
-                    &ctx.graph,
+                    ctx.loaded(),
                     db,
                     &feed_drive_hour(4),
                     feed_drive_now_secs(4),
@@ -2570,7 +2589,7 @@ pub const DRIVES: &[Drive] = &[
         name: "snapshot write",
         setup: None,
         run: |db, _shape, _settings, ctx| {
-            Box::pin(async move { routes::snapshot(&ctx.graph, db).await.map_err(text) })
+            Box::pin(async move { routes::snapshot(ctx.loaded(), db).await.map_err(text) })
         },
         cleanup: None,
     },

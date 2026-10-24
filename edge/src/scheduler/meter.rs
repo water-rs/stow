@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use skyzen_services::durable::{DurableDb, DurableDbBackend, DurableDbError};
 use skyzen_services::{DbExecResult, DbValue, QuerySource};
 
-use super::graph::GraphCell;
+use super::graph::LoadedGraph;
 use crate::errors::QueueError;
 
 /// The Workers Paid DO allowances the meter's daily budget lines divide
@@ -197,13 +197,9 @@ impl Meter {
 
     /// Drain the pending counts into the graph's day meter at `now_ms`
     /// and answer the day's totals. `None` when the operation ran no
-    /// statements, or when no graph is loaded to carry them (a wake
-    /// that failed before installing one).
-    pub fn settle(&self, graph: &GraphCell, now_ms: i64) -> Option<MeterTotals> {
+    /// statements.
+    pub fn settle(&self, graph: LoadedGraph<'_>, now_ms: i64) -> Option<MeterTotals> {
         let (read, written) = self.pending.take();
-        if !graph.loaded() {
-            return None;
-        }
         graph.with(|graph| {
             graph.meter.roll_to(&super::graph::utc_day(now_ms));
             match &self.ledger_op {
@@ -227,7 +223,7 @@ impl Meter {
     )]
     pub fn budget_verdict(
         &self,
-        graph: &GraphCell,
+        graph: LoadedGraph<'_>,
         now_ms: i64,
         multiplier: f64,
     ) -> Option<Vec<stow_types::api::DispatchFreezeCostEntry>> {
@@ -264,7 +260,7 @@ impl Meter {
     /// transition; the while-frozen digest is the watchdog's (#450).
     pub async fn settle_and_trip(
         &self,
-        graph: &GraphCell,
+        graph: LoadedGraph<'_>,
         now_ms: i64,
         store: &(impl crate::freeze::FreezeStore + Sync),
         sink: &(impl crate::freeze::AlertSink + Sync),
@@ -327,7 +323,7 @@ pub fn ledger_op(method: &str, path: &str) -> String {
 /// Every op the day meter booked since the last reset — the
 /// `GET /budget/ledger` answer. Bounded by the number of distinct
 /// operations the object serves, never by the queue.
-pub fn ledger(graph: &GraphCell) -> stow_types::api::SchedulerLedger {
+pub fn ledger(graph: LoadedGraph<'_>) -> stow_types::api::SchedulerLedger {
     graph.with(|graph| stow_types::api::SchedulerLedger {
         ops: graph
             .meter
@@ -416,7 +412,7 @@ mod tests {
     /// the freeze store gates on.
     fn cell() -> GraphCell {
         let cell = GraphCell::default();
-        assert!(cell.install(Graph::default()));
+        cell.install(Graph::default());
         cell
     }
 
@@ -506,8 +502,9 @@ mod tests {
     #[tokio::test]
     async fn settle_books_nothing_when_nothing_ran() {
         let (_db, meter) = metered().await;
-        let cell = cell();
-        assert!(meter.settle(&cell, NOW_MS).is_none());
+        let owner = cell();
+        let cell = owner.loaded().expect("installed");
+        assert!(meter.settle(cell, NOW_MS).is_none());
         assert_eq!(cell.with(|graph| graph.meter.rows_written), 0);
     }
 
@@ -526,16 +523,17 @@ mod tests {
     #[tokio::test]
     async fn metered_statements_fold_into_the_day_meter() {
         let (db, meter) = metered().await;
-        let cell = cell();
+        let owner = cell();
+        let cell = owner.loaded().expect("installed");
         store::append_events(&db, &[mutate(), mutate()], NOW_MS)
             .await
             .expect("append");
         store::log_tail(&db, 0).await.expect("tail");
-        let totals = meter.settle(&cell, NOW_MS).expect("a settle");
+        let totals = meter.settle(cell, NOW_MS).expect("a settle");
         assert!(totals.rows_written >= 2, "two appended rows");
         assert!(totals.rows_read >= 2, "the tail read both rows back");
         // A second settle with no intervening work books nothing new.
-        let again = meter.settle(&cell, NOW_MS);
+        let again = meter.settle(cell, NOW_MS);
         assert!(again.is_none());
         assert_eq!(
             cell.with(|graph| graph.meter.rows_written),
@@ -547,14 +545,15 @@ mod tests {
     async fn the_probe_ledger_books_one_event_per_operation() {
         let (db, meter) = metered().await;
         let meter = meter.with_ledger_op("POST /tasks/retry".to_owned());
-        let cell = cell();
+        let owner = cell();
+        let cell = owner.loaded().expect("installed");
         store::append_events(&db, &[mutate()], NOW_MS)
             .await
             .expect("append");
-        meter.settle(&cell, NOW_MS);
+        meter.settle(cell, NOW_MS);
         // An operation with no statements still counts as an event.
-        meter.settle(&cell, NOW_MS);
-        let ledger = super::ledger(&cell);
+        meter.settle(cell, NOW_MS);
+        let ledger = super::ledger(cell);
         let [op] = ledger.ops.as_slice() else {
             panic!("one op row");
         };
@@ -566,15 +565,16 @@ mod tests {
     #[tokio::test]
     async fn the_day_rolls_at_utc_midnight() {
         let (db, meter) = metered().await;
-        let cell = cell();
+        let owner = cell();
+        let cell = owner.loaded().expect("installed");
         store::append_events(&db, &[mutate()], NOW_MS)
             .await
             .expect("append");
-        let first = meter.settle(&cell, NOW_MS).expect("settle");
+        let first = meter.settle(cell, NOW_MS).expect("settle");
         store::append_events(&db, &[mutate()], NOW_MS + 86_400_000)
             .await
             .expect("append");
-        let next = meter.settle(&cell, NOW_MS + 86_400_000).expect("settle");
+        let next = meter.settle(cell, NOW_MS + 86_400_000).expect("settle");
         assert!(first.rows_written >= 1);
         assert_eq!(next.rows_written, 1, "the new day starts from zero");
     }
@@ -583,7 +583,8 @@ mod tests {
     async fn crossing_the_budget_freezes_on_the_operation_that_crossed_it() {
         let (db, meter) = metered().await;
         let sink = Sink::default();
-        let cell = cell();
+        let owner = cell();
+        let cell = owner.loaded().expect("installed");
         // A burst of writes through the wrapped handle; a tiny
         // multiplier puts the write budget under the burst.
         for _ in 0..8 {
@@ -592,10 +593,10 @@ mod tests {
                 .expect("append");
         }
         let multiplier = 1.0e-9;
-        let freeze_store = GraphFreezeStore::new(&cell, "2026-09-27T01:00:00Z".to_owned(), NOW_MS);
+        let freeze_store = GraphFreezeStore::new(cell, "2026-09-27T01:00:00Z".to_owned(), NOW_MS);
         let transition = meter
             .settle_and_trip(
-                &cell,
+                cell,
                 NOW_MS,
                 &freeze_store,
                 &sink,
@@ -632,9 +633,9 @@ mod tests {
         store::log_tail(&db, 0).await.expect("tail");
         let again = meter
             .settle_and_trip(
-                &cell,
+                cell,
                 NOW_MS,
-                &GraphFreezeStore::new(&cell, "2026-09-27T01:00:00Z".to_owned(), NOW_MS),
+                &GraphFreezeStore::new(cell, "2026-09-27T01:00:00Z".to_owned(), NOW_MS),
                 &sink,
                 multiplier,
                 "2026-09-27T01:05:00Z",
@@ -650,13 +651,14 @@ mod tests {
     async fn under_budget_settles_without_a_trip() {
         let (db, meter) = metered().await;
         let sink = Sink::default();
-        let cell = cell();
+        let owner = cell();
+        let cell = owner.loaded().expect("installed");
         store::log_tail(&db, 0).await.expect("tail");
         let transition = meter
             .settle_and_trip(
-                &cell,
+                cell,
                 NOW_MS,
-                &GraphFreezeStore::new(&cell, "2026-09-27T01:00:00Z".to_owned(), NOW_MS),
+                &GraphFreezeStore::new(cell, "2026-09-27T01:00:00Z".to_owned(), NOW_MS),
                 &sink,
                 1.0,
                 "2026-09-27T01:00:00Z",

@@ -51,7 +51,7 @@ use stow_types::identity::{
 };
 use stow_types::public_cache::{ExplicitSpelling, UnitInvocation, UnitShape};
 
-use super::graph::{Graph, GraphCell};
+use super::graph::{Graph, GraphCell, LoadedGraph};
 use super::routes;
 use super::store;
 use crate::errors::QueueError;
@@ -724,7 +724,7 @@ pub async fn seed(
     .execute()
     .await
     .map_err(|error| QueueError::Sql(format!("record seed rows: {error}")))?;
-    cell.install(graph);
+    let cell = cell.install(graph);
     replay_tail(cell, db, shape, now).await?;
     let (nodes, edges, published) = cell.with(|graph| graph.sizes());
     Ok(SchedulerSeedReport {
@@ -741,7 +741,7 @@ const IN_FLIGHT_EVENTS: usize = 2;
 /// Append the seed's log tail and apply it, then mark the in-flight
 /// window running.
 async fn replay_tail(
-    cell: &GraphCell,
+    cell: LoadedGraph<'_>,
     db: &DurableDb,
     shape: FixtureShape,
     now: i64,
@@ -762,7 +762,7 @@ async fn replay_tail(
 /// `QueueError` on a failed snapshot or log append.
 pub async fn rearm(
     db: &DurableDb,
-    cell: &GraphCell,
+    cell: LoadedGraph<'_>,
     shape: FixtureShape,
     now: i64,
 ) -> Result<(), QueueError> {

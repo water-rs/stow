@@ -14,7 +14,7 @@ use stow_types::api::{
     MutationKind, QueueSelector, SchedulerEvent, SubmissionTree, SubmitTaskIdEntry,
 };
 
-use super::graph::{Claimed, FinishOutcome, Graph, GraphCell, SnapshotCursor, StartOutcome};
+use super::graph::{Claimed, FinishOutcome, Graph, LoadedGraph, SnapshotCursor, StartOutcome};
 use super::queue::{self, AlarmPlan, SchedulerSettings};
 use super::store;
 use crate::errors::QueueError;
@@ -32,7 +32,7 @@ const MUTATE_PART_IDS: usize = 4096;
 /// # Errors
 /// `QueueError::Sql` when the append fails; nothing is applied then.
 pub(super) async fn commit(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     events: &[SchedulerEvent],
     now: i64,
@@ -49,7 +49,7 @@ pub(super) async fn commit(
 /// Append `events` to the log and count their bytes toward the next
 /// snapshot's byte trigger.
 async fn append(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     events: &[SchedulerEvent],
     now: i64,
@@ -67,7 +67,7 @@ async fn append(
 /// # Errors
 /// `QueueError::Sql` when the append fails.
 pub(super) async fn flush_samples(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     now: i64,
 ) -> Result<(), QueueError> {
@@ -88,7 +88,7 @@ pub(super) async fn flush_samples(
 /// `QueueError::Sql` on a failed append, `QueueError::Invariant` when
 /// a tree is malformed.
 pub(super) async fn commit_trees(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     trees: &[SubmissionTree],
     now: i64,
@@ -124,7 +124,7 @@ pub(super) async fn commit_trees(
 /// `QueueError::QueueFull` when the cap refuses the batch, otherwise
 /// [`commit_trees`]'s.
 pub(super) async fn submit(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     settings: &SchedulerSettings,
     trees: &[SubmissionTree],
@@ -154,7 +154,7 @@ pub(super) async fn submit(
 /// # Errors
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn submit_ids(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     entries: &[SubmitTaskIdEntry],
     now: i64,
@@ -174,7 +174,7 @@ pub(super) async fn submit_ids(
 /// `QueueError::EmptySelector`/`PurgeRequiresAge` for a selector the
 /// verb refuses, `QueueError::Sql` on a failed append.
 pub(super) async fn mutate(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     op: MutationKind,
     selector: &QueueSelector,
@@ -206,7 +206,7 @@ pub(super) async fn mutate(
 /// The batch's own validation errors, `QueueError::Sql` on a failed
 /// append.
 pub(super) async fn demand(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     request: &stow_types::api::SchedulerDemandRequest,
     settings: &SchedulerSettings,
@@ -226,7 +226,7 @@ pub(super) async fn demand(
 /// # Errors
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn slice_report(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     slice: &stow_types::api::PublishedSlice,
     now: i64,
@@ -248,7 +248,7 @@ pub(super) async fn slice_report(
 /// # Errors
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn complete_run(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     report: &stow_types::api::WorkflowRunComplete,
     now: i64,
@@ -287,7 +287,7 @@ pub(super) async fn complete_run(
 /// # Errors
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn task_run_update(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     update: &stow_types::api::TaskRunUpdate,
     now: i64,
@@ -307,7 +307,11 @@ pub(super) async fn task_run_update(
 }
 
 /// The wake the graph plans — see [`Graph::wake_plan`].
-pub(super) fn wake_plan(graph: &GraphCell, settings: &SchedulerSettings, now: i64) -> AlarmPlan {
+pub(super) fn wake_plan(
+    graph: LoadedGraph<'_>,
+    settings: &SchedulerSettings,
+    now: i64,
+) -> AlarmPlan {
     graph.with(|graph| graph.wake_plan(now, settings))
 }
 
@@ -321,7 +325,10 @@ pub(super) fn wake_plan(graph: &GraphCell, settings: &SchedulerSettings, now: i6
 ///
 /// # Errors
 /// `QueueError` on a failed chunk or watermark write.
-pub(super) async fn snapshot_if_due(graph: &GraphCell, db: &DurableDb) -> Result<bool, QueueError> {
+pub(super) async fn snapshot_if_due(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+) -> Result<bool, QueueError> {
     if !graph.with(|graph| graph.snapshot_due()) {
         return Ok(false);
     }
@@ -333,7 +340,7 @@ pub(super) async fn snapshot_if_due(graph: &GraphCell, db: &DurableDb) -> Result
 ///
 /// # Errors
 /// `QueueError` on a failed chunk or watermark write.
-pub(super) async fn snapshot(graph: &GraphCell, db: &DurableDb) -> Result<(), QueueError> {
+pub(super) async fn snapshot(graph: LoadedGraph<'_>, db: &DurableDb) -> Result<(), QueueError> {
     // Freed nodes leave the arena before the image is cut.
     graph.with(Graph::compact);
     let mut cursor = SnapshotCursor::default();
@@ -357,7 +364,7 @@ pub(super) async fn snapshot(graph: &GraphCell, db: &DurableDb) -> Result<(), Qu
 /// `QueueError::Invariant` when a claimed payload cannot rebuild,
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn claim_pass(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     settings: &SchedulerSettings,
     now: i64,
@@ -398,7 +405,7 @@ pub(super) async fn claim_pass(
 /// # Errors
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn settle_dispatch(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     bindings: Vec<stow_types::api::DispatchBinding>,
     failures: Vec<(String, u64, String)>,
@@ -427,7 +434,7 @@ pub(super) async fn settle_dispatch(
 /// The record's own refusals (`UnknownRequest`,
 /// `RequestAttemptSuperseded`), `QueueError::Sql` on a failed append.
 pub(super) async fn request_outcome(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     request_id: &str,
     report: &stow_types::api::RequestOutcomeReport,
@@ -467,7 +474,7 @@ pub(super) async fn request_outcome(
 /// `UnknownRequest`/`RequestAttemptSuperseded` from the record fence,
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn request_run_update(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     request_id: &str,
     update: &stow_types::api::RequestRunUpdate,
@@ -485,7 +492,7 @@ pub(super) async fn request_run_update(
 /// `HumanDailyBudgetExhausted` when the day has no room,
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn admit_request(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     settings: &SchedulerSettings,
     admission: &stow_types::api::RequestAdmission,
@@ -506,7 +513,7 @@ pub(super) async fn admit_request(
 /// # Errors
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn fail_request_dispatch(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     request_id: &str,
     attempt: u32,
@@ -528,7 +535,7 @@ pub(super) async fn fail_request_dispatch(
 /// The feed's contract refusals (`QueueError::Invariant`), `QueueError::Sql`
 /// on a failed append.
 pub(super) async fn feed_begin(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     hour: &stow_types::api::DemandFeedHour,
     now_secs: i64,
@@ -544,7 +551,7 @@ pub(super) async fn feed_begin(
 /// # Errors
 /// The feed's contract refusals, `QueueError::Sql` on a failed append.
 pub(super) async fn feed_page(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     request: &stow_types::api::DemandFeedPageRequest,
     now_secs: i64,
@@ -561,7 +568,7 @@ pub(super) async fn feed_page(
 /// # Errors
 /// The feed's contract refusals, `QueueError::Sql` on a failed append.
 pub(super) async fn feed_complete(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     request: &stow_types::api::DemandFeedCompleteRequest,
     now_secs: i64,
@@ -576,7 +583,7 @@ pub(super) async fn feed_complete(
 /// # Errors
 /// The feed's contract refusals, `QueueError::Sql` on a failed append.
 pub(super) async fn feed_cleanup(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     hour: &stow_types::api::DemandFeedHour,
     now_secs: i64,
@@ -594,7 +601,7 @@ pub(super) async fn feed_cleanup(
 /// # Errors
 /// The feed's contract refusals, `QueueError::Sql` on a failed append.
 pub(super) async fn feed_deliver(
-    graph: &GraphCell,
+    graph: LoadedGraph<'_>,
     db: &DurableDb,
     hour: &stow_types::api::DemandFeedHour,
     settings: &SchedulerSettings,
@@ -614,6 +621,7 @@ mod eviction_tests {
     use super::*;
     use crate::scheduler::drives::HOST_NOW_MS;
     use crate::scheduler::fixture::{self, FixtureShape};
+    use crate::scheduler::graph::GraphCell;
     use crate::scheduler::test_db;
 
     const SHAPE: FixtureShape = fixture::GATE;
@@ -659,19 +667,21 @@ mod eviction_tests {
     /// next pass takes only further tasks — no double dispatch.
     #[tokio::test]
     async fn an_eviction_after_the_claim_row_never_doubles_a_dispatch() {
-        let (db, cell) = seeded().await;
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
         let settings = settings();
-        let first = claim_pass(&cell, &db, &settings, HOST_NOW_MS)
+        let first = claim_pass(cell, &db, &settings, HOST_NOW_MS)
             .await
             .expect("first pass");
         assert!(!first.is_empty(), "the fixture leaves free slots");
-        let woken = wake(&db).await;
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
         let (before, after) = (
             cell.with(|graph| graph.inflight()),
             woken.with(|graph| graph.inflight()),
         );
         assert_eq!(before, after, "the replayed graph holds the same claims");
-        let second = claim_pass(&woken, &db, &settings, HOST_NOW_MS)
+        let second = claim_pass(woken, &db, &settings, HOST_NOW_MS)
             .await
             .expect("second pass");
         let taken = ids(&first);
@@ -679,7 +689,7 @@ mod eviction_tests {
             ids(&second).iter().all(|claim| !taken.contains(claim)),
             "a claimed task was claimed again after the wake"
         );
-        let live = claim_pass(&cell, &db, &settings, HOST_NOW_MS)
+        let live = claim_pass(cell, &db, &settings, HOST_NOW_MS)
             .await
             .expect("live second pass");
         assert_eq!(
@@ -694,10 +704,12 @@ mod eviction_tests {
     /// exactly what the lost pass had — nothing is lost.
     #[tokio::test]
     async fn an_eviction_before_the_claim_row_loses_nothing() {
-        let (db, cell) = seeded().await;
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
         let settings = settings();
-        let woken = wake(&db).await;
-        let lost = claim_pass(&cell, &db, &settings, HOST_NOW_MS)
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        let lost = claim_pass(cell, &db, &settings, HOST_NOW_MS)
             .await
             .expect("pass");
         // Rewind the store to before the pass: drop the claim row.
@@ -705,7 +717,7 @@ mod eviction_tests {
             .execute()
             .await
             .expect("drop the claim row");
-        let again = claim_pass(&woken, &db, &settings, HOST_NOW_MS)
+        let again = claim_pass(woken, &db, &settings, HOST_NOW_MS)
             .await
             .expect("woken pass");
         assert!(!lost.is_empty(), "the fixture leaves free slots");
@@ -720,6 +732,7 @@ mod eviction_tests {
 mod snapshot_trigger_tests {
     use super::*;
     use crate::scheduler::fixture;
+    use crate::scheduler::graph::GraphCell;
     use crate::scheduler::test_db;
     use stow_types::api::SubmissionSource;
 
@@ -753,16 +766,16 @@ mod snapshot_trigger_tests {
     async fn the_tail_stays_under_the_byte_threshold_whatever_a_submission_weighs() {
         for nodes in [1_000, 4_096, 12_000] {
             let db = test_db::memory_db().await.expect("db");
-            let cell = GraphCell::default();
-            cell.install(Graph::default());
+            let owner = GraphCell::default();
+            let cell = owner.install(Graph::default());
             let mut snapshots = 0u32;
             let mut widest = 0u64;
             for turn in 0..40u32 {
                 let tree = tree(FIRST_ROW + turn * nodes, nodes);
-                commit_trees(&cell, &db, std::slice::from_ref(&tree), 1)
+                commit_trees(cell, &db, std::slice::from_ref(&tree), 1)
                     .await
                     .expect("submit");
-                if snapshot_if_due(&cell, &db).await.expect("snapshot") {
+                if snapshot_if_due(cell, &db).await.expect("snapshot") {
                     snapshots += 1;
                 }
                 let tail = tail_bytes(&db).await;
@@ -794,17 +807,17 @@ mod snapshot_trigger_tests {
     async fn a_wake_after_a_full_wave_submission_replays_no_wave() {
         const WAVE: u32 = 275_000;
         let db = test_db::memory_db().await.expect("db");
-        let cell = GraphCell::default();
-        cell.install(Graph::default());
+        let owner = GraphCell::default();
+        let cell = owner.install(Graph::default());
         let wave = tree(FIRST_ROW, WAVE);
-        commit_trees(&cell, &db, std::slice::from_ref(&wave), 1)
+        commit_trees(cell, &db, std::slice::from_ref(&wave), 1)
             .await
             .expect("submit the wave");
         assert!(
             cell.with(|graph| graph.log_bytes_since_snapshot) > 100 << 20,
             "the wave is over 100 MiB of log"
         );
-        assert!(snapshot_if_due(&cell, &db).await.expect("snapshot"));
+        assert!(snapshot_if_due(cell, &db).await.expect("snapshot"));
         assert_eq!(tail_bytes(&db).await, 0);
         drop(wave);
         let (woken, events) = store::load(&db).await.expect("load");
