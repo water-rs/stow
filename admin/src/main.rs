@@ -44,8 +44,8 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use stow_types::api::{
-    AdminStatus, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger, EnqueueRequest,
-    FreezeTransitionEvent, SchedulerSubmitResponse,
+    AdminStatus, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger, FreezeTransitionEvent,
+    SchedulerSubmitResponse,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -877,20 +877,28 @@ async fn submit_command(
     })
     .await
     .map_err(|error| stow_error!("submit resolver task: {error}"))??;
+    let trees = vec![stow_types::api::SubmissionTree::from_enqueue_requests(
+        stow_types::api::SubmissionSource::Operations { priority: 0 },
+        &requests,
+    )?];
     render::mutation(
         output,
-        requests,
-        |envelope: &render::Planned<Vec<EnqueueRequest>, SchedulerSubmitResponse>| {
-            let mut out = format!("{} task(s)\n", envelope.plan.len());
-            for request in &envelope.plan {
+        trees,
+        |envelope: &render::Planned<
+            Vec<stow_types::api::SubmissionTree>,
+            SchedulerSubmitResponse,
+        >| {
+            let nodes: usize = envelope.plan.iter().map(|tree| tree.nodes.len()).sum();
+            let mut out = format!("{nodes} task(s)\n");
+            for node in envelope.plan.iter().flat_map(|tree| &tree.nodes) {
                 let _ = writeln!(
                     out,
                     "  {} {} {} {} rustc={}",
-                    request.crate_name,
-                    request.version,
-                    request.target,
-                    request.features_json.raw(),
-                    request.rustc_version,
+                    node.crate_name,
+                    node.version,
+                    node.target,
+                    node.features_json.raw(),
+                    node.rustc_version,
                 );
             }
             if let Some(result) = &envelope.result {
@@ -904,7 +912,9 @@ async fn submit_command(
             out
         },
         args.yes
-            .then_some(async move |requests: &Vec<EnqueueRequest>| submit(edge, requests).await),
+            .then_some(async move |trees: &Vec<stow_types::api::SubmissionTree>| {
+                submit(edge, trees).await
+            }),
     )
     .await
 }
@@ -914,10 +924,10 @@ async fn submit_command(
 /// uses.
 pub(crate) async fn submit(
     edge: &Edge,
-    requests: &[EnqueueRequest],
+    trees: &[stow_types::api::SubmissionTree],
 ) -> stow_types::error::Result<SchedulerSubmitResponse> {
     let response: SchedulerSubmitResponse = edge
-        .post_json("/api/v1/scheduler/tasks/submit", &requests)
+        .post_json("/api/v1/scheduler/tasks/submit", &trees)
         .await?;
     tracing::info!(
         submitted = response.submitted,

@@ -26,7 +26,7 @@ use crate::render::{Output, Table, emit};
 #[derive(Debug, Args)]
 pub struct FixtureRunsArgs {
     /// Queue rows of the fixture the scheduler holds — the size the last
-    /// `scheduler budget --reset` seeded.
+    /// `scheduler budget` seeded.
     #[arg(long)]
     queue_rows: u32,
 }

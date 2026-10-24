@@ -225,9 +225,10 @@ pub struct RepoContribution {
 pub struct ProjectsPlan {
     /// The repository list the plan was built from.
     pub file: String,
-    /// Every enqueue request across every repository and target —
-    /// deduplication is the scheduler's `task_id`, not a pass here.
-    pub tasks: Vec<EnqueueRequest>,
+    /// Every submission tree across every repository and target —
+    /// deduplication is the scheduler's `task_id`, not a pass here
+    /// (stow#878).
+    pub trees: Vec<stow_types::api::SubmissionTree>,
     /// How many requests each listed repository produced.
     pub per_repo: Vec<RepoContribution>,
     /// Repositories resolution failed on, with their reasons.
@@ -427,7 +428,7 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
     let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let mut plan = ProjectsPlan {
         file: args.file.display().to_string(),
-        tasks: Vec::new(),
+        trees: Vec::new(),
         per_repo: Vec::with_capacity(repos.len()),
         skipped: Vec::new(),
         submit_failed: Vec::new(),
@@ -455,11 +456,19 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
         |_index, repo, result| match result {
             Ok(tasks) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
-                // `edge` is present exactly when the run submits.
+                // `edge` is present exactly when the run submits. One
+                // resolve is one submission tree (stow#878).
+                let tree = stow_types::api::SubmissionTree::from_enqueue_requests(
+                    stow_types::api::SubmissionSource::Preheat,
+                    &tasks,
+                )
+                .expect("resolved repo converts to a submission tree");
                 if let Some(edge) = edge
-                    && !tasks.is_empty()
+                    && !tree.nodes.is_empty()
                 {
-                    match tokio::runtime::Handle::current().block_on(submit_chunked(edge, &tasks)) {
+                    match tokio::runtime::Handle::current()
+                        .block_on(submit_chunked(edge, std::slice::from_ref(&tree)))
+                    {
                         Ok(chunk_outcome) => {
                             outcome.batches += chunk_outcome.batches;
                             outcome.submitted += chunk_outcome.submitted;
@@ -479,7 +488,7 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
                     repo: repo.clone(),
                     tasks: tasks.len(),
                 });
-                plan.tasks.extend(tasks);
+                plan.trees.push(tree);
             }
             Err(error) => {
                 tracing::warn!(%repo, reason = %error, "skipped");
@@ -506,7 +515,10 @@ fn render_projects_plan(envelope: &render::Planned<ProjectsPlan, SubmitOutcome>)
     let plan = &envelope.plan;
     let mut out = format!(
         "{} task(s) from {} repositories\nresolved {}, skipped {}",
-        plan.tasks.len(),
+        plan.trees
+            .iter()
+            .map(|tree| tree.nodes.len())
+            .sum::<usize>(),
         plan.per_repo.len(),
         plan.per_repo.len(),
         plan.skipped.len(),
@@ -954,7 +966,7 @@ pub fn resolve_project_dir(
 /// — a full wave is far over the edge's single-request bound.
 pub async fn submit_chunked(
     edge: &Edge,
-    tasks: &[EnqueueRequest],
+    trees: &[stow_types::api::SubmissionTree],
 ) -> stow_types::error::Result<SubmitOutcome> {
     let mut outcome = SubmitOutcome {
         batches: 0,
@@ -962,7 +974,7 @@ pub async fn submit_chunked(
         inserted: 0,
         dropped: 0,
     };
-    for chunk in tasks.chunks(SUBMIT_CHUNK) {
+    for chunk in trees.chunks(SUBMIT_CHUNK) {
         let response: SchedulerSubmitResponse = crate::submit(edge, chunk).await?;
         outcome.batches += 1;
         outcome.submitted += response.submitted;

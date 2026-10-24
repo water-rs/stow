@@ -36,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
-use stow_types::api::{ArtifactRecord, EnqueueRequest, SchedulerLedger};
+use stow_types::api::{ArtifactRecord, SchedulerLedger};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::local_ci::LocalCiTasks;
 use stow_types::preheat_cost::{
@@ -168,7 +168,7 @@ async fn sorted_entries(dir: &Path) -> stow_types::error::Result<Vec<PathBuf>> {
 
 /// One lane's envelope: what it planned and what its submit returned.
 struct LanePlan {
-    tasks: Vec<EnqueueRequest>,
+    tasks: Vec<stow_types::api::SubmissionTree>,
     outcome: Option<SubmitOutcome>,
     submit_failures: Vec<String>,
 }
@@ -198,7 +198,7 @@ async fn lane_plan(lane: &str, dir: &Path) -> stow_types::error::Result<LanePlan
                 .iter()
                 .map(|failed| format!("{}: {}", failed.repo, failed.reason))
                 .collect(),
-            tasks: envelope.plan.tasks,
+            tasks: envelope.plan.trees,
             outcome: envelope.result,
         })
     } else if lane == "top-binaries" {
@@ -210,11 +210,12 @@ async fn lane_plan(lane: &str, dir: &Path) -> stow_types::error::Result<LanePlan
             // submit failure; a failed submit POST fails the lane
             // itself, which the exit status above reports.
             submit_failures: Vec::new(),
-            tasks: envelope.plan.tasks,
+            tasks: envelope.plan.trees,
             outcome: envelope.result,
         })
     } else {
-        let envelope: Planned<Vec<EnqueueRequest>, SubmitOutcome> = read_json(&plan_path).await?;
+        let envelope: Planned<Vec<stow_types::api::SubmissionTree>, SubmitOutcome> =
+            read_json(&plan_path).await?;
         Ok(LanePlan {
             tasks: envelope.plan,
             outcome: envelope.result,
@@ -275,10 +276,11 @@ async fn production_lanes(lanes_dir: &Path) -> stow_types::error::Result<Vec<Pro
             tasks: plan
                 .tasks
                 .iter()
-                .map(|task| {
+                .flat_map(|tree| &tree.nodes)
+                .map(|node| {
                     Ok(ProductionTask {
-                        task_id: task.task_id()?,
-                        target: task.target.as_str().to_owned(),
+                        task_id: node.task_id.clone(),
+                        target: node.target.as_str().to_owned(),
                     })
                 })
                 .collect::<stow_types::error::Result<_>>()?,
@@ -298,7 +300,7 @@ async fn production_lanes(lanes_dir: &Path) -> stow_types::error::Result<Vec<Pro
 async fn phase(
     dir: &Path,
     seen: &mut BTreeSet<String>,
-) -> stow_types::error::Result<(PhaseObservations, Vec<EnqueueRequest>)> {
+) -> stow_types::error::Result<(PhaseObservations, Vec<stow_types::api::SubmissionTree>)> {
     let mut lanes = Vec::new();
     let mut tasks = Vec::new();
     for (name, lane_dir) in lane_dirs(&dir.join("lanes")).await? {
@@ -308,10 +310,10 @@ async fn phase(
         if let Some(outcome) = &plan.outcome {
             // The lane's tasks reached the scheduler: a first-seen task id
             // is a row it inserted and a dedup anchor for the next lane.
-            for task in &plan.tasks {
-                if seen.insert(task.task_id()?) {
+            for node in plan.tasks.iter().flat_map(|tree| &tree.nodes) {
+                if seen.insert(node.task_id.clone()) {
                     inserted += 1;
-                    inserted_edges += task.depends_on()?.len() as u64;
+                    inserted_edges += node.deps.len() as u64;
                 }
             }
             if u64::from(outcome.inserted) != inserted {
@@ -381,25 +383,26 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
 
     let mut nodes = BTreeMap::new();
     let mut spellings = BTreeMap::new();
-    for task in &wave_tasks {
-        let task_id = task.task_id()?;
-        let dependencies = task
-            .depends_on()?
-            .iter()
-            .map(stow_types::api::EnqueueDependency::task_id)
-            .collect();
-        spellings.insert(task_id.clone(), task.explicit_spelling);
-        nodes.insert(
-            task_id,
-            Node {
-                target: task.target.as_str().to_owned(),
-                dependencies,
-            },
-        );
+    for tree in &wave_tasks {
+        for node in &tree.nodes {
+            let dependencies: Vec<String> = node
+                .deps
+                .iter()
+                .map(|&dep| tree.nodes[dep as usize].task_id.clone())
+                .collect();
+            spellings.insert(node.task_id.clone(), node.explicit_spelling);
+            nodes.insert(
+                node.task_id.clone(),
+                Node {
+                    target: node.target.as_str().to_owned(),
+                    dependencies,
+                },
+            );
+        }
     }
     let targets: Vec<TargetTriple> = wave_tasks
         .iter()
-        .map(|task| task.target.clone())
+        .flat_map(|tree| tree.nodes.iter().map(|node| node.target.clone()))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();

@@ -253,7 +253,7 @@ fn solve_all(
             task_id: admission.task_id.clone(),
             challenge: admission.challenge.clone(),
             nonce,
-            request: admission.request.clone(),
+            tree: admission.tree.clone(),
         });
     }
     tickets
@@ -403,7 +403,11 @@ mod tests {
             task_id: task_id.to_owned(),
             challenge: "abcdef0123456789".to_owned(),
             difficulty,
-            request: test_request(),
+            tree: stow_types::api::SubmissionTree::from_enqueue_requests(
+                stow_types::api::SubmissionSource::CacheMiss,
+                &[test_request()],
+            )
+            .expect("test tree"),
         }
     }
 

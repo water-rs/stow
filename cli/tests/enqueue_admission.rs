@@ -32,17 +32,19 @@ const ADMISSIONS_RESPONSE: &str = r#"[{
     "task_id": "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0-d9f3a7c1",
     "challenge": "0123456789abcdef",
     "difficulty": 0,
-    "request": {
-        "crate_name": "cfg-if",
-        "version": "1.0.0",
-        "features_json": "[]",
-        "target": "x86_64-unknown-linux-gnu",
-        "rustc_version": "1.85.0",
-        "downloads": 0,
-        "source": "CacheMiss",
-        "dependency_subgraph": {"n": []},
-        "explicit_spelling": "keys-as-native",
-        "preserve_lockfile": false
+    "tree": {
+        "source": {"kind": "cache_miss"},
+        "roots": [0],
+        "nodes": [{
+            "task_id": "cfg-if-1.0.0-testtask-x86_64_unknown_linux_gnu-1_85_0-d9f3a7c1",
+            "crate_name": "cfg-if",
+            "version": "1.0.0",
+            "features_json": "[]",
+            "target": "x86_64-unknown-linux-gnu",
+            "rustc_version": "1.85.0",
+            "explicit_spelling": "keys-as-native",
+            "dependency_identity": "0000000000000000000000000000000000000000000000000000000000000000"
+        }]
     }
 }]"#;
 
@@ -301,7 +303,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
 
     let ticket: serde_json::Value =
         serde_json::from_str(&body).expect("enqueue body is valid JSON");
-    for field in ["task_id", "challenge", "nonce", "request"] {
+    for field in ["task_id", "challenge", "nonce", "tree"] {
         assert!(
             ticket.get(field).is_some(),
             "enqueue ticket missing `{field}`: {body}"
@@ -311,9 +313,9 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     assert_eq!(ticket["challenge"].as_str(), Some(ADMISSION_CHALLENGE));
     assert!(ticket["nonce"].is_u64(), "nonce must be an integer: {body}");
     assert_eq!(
-        ticket["request"]["crate_name"].as_str(),
+        ticket["tree"]["nodes"][0]["crate_name"].as_str(),
         Some("cfg-if"),
-        "the ticket must carry the admission's canonical request: {body}"
+        "the ticket must carry the admission's canonical tree: {body}"
     );
 }
 
