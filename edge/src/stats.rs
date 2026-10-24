@@ -1,5 +1,5 @@
 //! Privacy-preserving usage statistics: the public `UsageStats`
-//! aggregates are computed from the Analytics Engine SQL API — never D1
+//! aggregates are computed from the Analytics Engine SQL API
 //! — and cached at the edge by Workers Cache on the answer's own
 //! `Cache-Control` (the SQL API is billed per query, so the figure
 //! tolerates an hour of staleness).

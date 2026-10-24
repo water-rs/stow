@@ -62,14 +62,3 @@ pub const DO_PERIODIC_DIMENSIONS: &[&str] = &[
     "namespaceId",
     "objectId",
 ];
-
-/// `d1AnalyticsAdaptiveGroups` — D1 usage totals (no `scriptVersion`; the
-/// phase-2 window comparison again). Its dimension list was not
-/// introspected, so the query selects none.
-pub const D1_SUM: &[&str] = &[
-    "queryBatchResponseBytes",
-    "readQueries",
-    "rowsRead",
-    "rowsWritten",
-    "writeQueries",
-];

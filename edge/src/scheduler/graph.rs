@@ -426,6 +426,9 @@ pub struct MergeReport {
     pub inserted: u32,
     /// Nodes already present (updated or skipped).
     pub merged: u32,
+    /// Task ids of the nodes the published mask does not cover — the
+    /// miss set the submit's caller logs (stow#886).
+    pub unpublished: Vec<String>,
 }
 
 /// What one run-finished event resolved to.
@@ -974,6 +977,9 @@ impl Graph {
                 node_ixs.push(ix);
                 is_fresh.push(false);
                 report.merged += 1;
+                if self.node(ix).status != Status::Published {
+                    report.unpublished.push(sub.task_id.clone());
+                }
                 continue;
             }
             let ix = self.insert_new(sub, *keys, lane, priority, now)?;
@@ -982,6 +988,7 @@ impl Graph {
             fresh.push(ix);
             if self.node(ix).status == Status::Pending {
                 report.inserted += 1;
+                report.unpublished.push(sub.task_id.clone());
             } else {
                 report.merged += 1;
             }

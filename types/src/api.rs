@@ -562,7 +562,7 @@ impl TaskHash {
 /// GHCR artifact once the build, re-hash, validation, sign, and push have
 /// all succeeded. Nothing
 /// POSTs it anywhere — `index sync` mirrors the verified records into the
-/// edge's D1 `artifacts` table.
+/// the edge's catalog — the signed index slices in GHCR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactRecord {
     /// Stable hash of the trusted build's exact rustc invocation identity.
@@ -1201,10 +1201,10 @@ pub enum CostMetric {
     WorkerRequests,
     /// Worker CPU milliseconds consumed by `stow-edge`.
     WorkerCpuMs,
-    /// D1 `stow-prod` rows read.
-    D1RowsRead,
-    /// D1 `stow-prod` rows written.
-    D1RowsWritten,
+    /// Scheduler Durable Object SQL rows read.
+    SqlRowsRead,
+    /// Scheduler Durable Object SQL rows written.
+    SqlRowsWritten,
 }
 
 /// One route family's share of the day's Worker requests — the "top
@@ -2009,19 +2009,19 @@ pub struct SchedulerBudgetRow {
     pub write_budget: u64,
     /// Budgeted wall milliseconds.
     pub wall_budget: u64,
-    /// Σ D1 `meta.rowsRead` over statements the drive issued through
+    /// Σ `meta.rowsRead` over statements the drive issued through
     /// the counted catalog backend — the coverage lookups a claim pays
-    /// per page, carried separately because D1 bills a different
+    /// per page, carried separately because the counted backend bills a different
     /// product than the object's own rows.
-    pub d1_rows_read: u64,
-    /// Σ D1 `meta.rowsWritten` over the same statements.
-    pub d1_rows_written: u64,
+    pub sql_rows_read: u64,
+    /// Σ `meta.rowsWritten` over the same statements.
+    pub sql_rows_written: u64,
     /// Σ of the awaited durations of the counted catalog backend's
     /// own calls. A sum of operation spans, not a share of drive
     /// wall: concurrent calls overlap in real time but add up here,
     /// so it can exceed the drive's measured window. `0` on host and
     /// on drives that never touch the catalog.
-    pub d1_elapsed_ms: u64,
+    pub sql_elapsed_ms: u64,
     /// `true` when any of the three row budgets is exceeded —
     /// statements, `rowsRead`, `rowsWritten`. Wall time is not in this
     /// set; see `over_wall`.
@@ -2976,10 +2976,10 @@ pub struct PreheatPlanTarget {
 }
 
 /// Response of `GET /api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}`:
-/// the D1 catalog row plus the bundle image's OCI manifest read from GHCR.
+/// the catalog row plus the bundle image's OCI manifest read from GHCR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactInspection {
-    /// The D1 catalog row.
+    /// The catalog row.
     pub record: ArtifactRecord,
     /// The bundle image's OCI manifest (`manifests/<tag>.bundle`).
     pub manifest: OciManifest,

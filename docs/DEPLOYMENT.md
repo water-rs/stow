@@ -7,47 +7,26 @@ GitHub Actions ──records artifact (cosign-signed)──► GHCR (OCI)
      ▲                                               │
      │ workflow_dispatch                             │ reads + verifies
      │                                               ▼
-     └─── Scheduler DO ──► Edge Worker ──D1──► Cloudflare D1
+     └─── Scheduler DO ──► Edge Worker
                                ▲
      GitHub webhook ──workflow_run──┘
 ```
 
 CI is the only producer of artifacts and writes them — bundles and
-records alike — straight into GHCR; the edge owns the D1 binding and
-learns build completion from GitHub's `workflow_run` webhook; end
-users only ever talk to the edge. Detailed trust analysis lives in
+records alike — straight into GHCR; the edge learns build completion
+from GitHub's `workflow_run` webhook; end users only ever talk to the
+edge. Detailed trust analysis lives in
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries).
 
 ## One-time Cloudflare setup
 
 The production manifest is [`edge/Skyzen.toml`](../edge/Skyzen.toml). It
-declares the `STOW_DB` D1 database, the `Scheduler` Durable Object with its
+declares the `Scheduler` Durable Object with its
 `v1` class declaration, the five runtime `[[secret]]` names (never values), the
 non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 `[cloudflare.raw]` routes.
 
-1. Provision the D1 database once. `skyzen provision` creates `stow-prod`
-   and writes `database_id` back into `edge/Skyzen.toml` — commit the
-   result:
-
-   ```sh
-   skyzen provision --provider cloudflare --manifest edge/Skyzen.toml
-   ```
-
-2. Create the D1 schema. The store has one schema —
-   [`edge/schema.sql`](../edge/schema.sql); the Worker assumes it
-   exists:
-
-   ```sh
-   wrangler d1 execute stow-prod --remote --file edge/schema.sql
-   ```
-
-   To change the schema later, reset the store instead: drop the
-   tables, re-execute the same file, then resync the mirror from the
-   signed records — `stow-admin index export --out-dir <dir> --full`
-   followed by `stow-admin index sync --file <dir>/new-records.json`.
-
-3. Set the Worker secrets. Each name must be declared in `[[secret]]`
+1. Set the Worker secrets. Each name must be declared in `[[secret]]`
    first, which the manifest already does:
 
    ```sh
@@ -72,11 +51,11 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    identity, never a shared token (see
    [Trusted-endpoint authentication](#trusted-endpoint-authentication)).
 
-4. Deploys run from GitHub Actions — see below. The first deploy also
+2. Deploys run from GitHub Actions — see below. The first deploy also
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
-5. Initialize the scheduler store. The scheduler Durable Object's
+3. Initialize the scheduler store. The scheduler Durable Object's
    schema exists only through the operator reset route — once the first
    deploy is live:
 
@@ -89,7 +68,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `edge/src/scheduler/schema.sql`; the queue and recorded slices are
    destroyed and refill from the lanes that feed them.
 
-6. Give the weekly miss-promotion lane (`preheat-missed.yml`) read access
+4. Give the weekly miss-promotion lane (`preheat-missed.yml`) read access
    to the `stow_cache_misses` Analytics Engine dataset. In the Cloudflare
    dashboard (*My Profile → API Tokens → Create Custom Token*) create a
    token with *Account → Account Analytics → Read* on this account, store
@@ -97,7 +76,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `CF_ACCOUNT_ID` repository variable to the account ID shown on any
    dashboard overview page.
 
-7. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
+5. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
    the two endpoints an anonymous client can use to consume CI, and
    `/api/v1/admissions` runs the miss-derivation pass over the artifact
    catalog — but enumerating paths would leave the other anonymous
@@ -110,7 +89,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    requests per second, and a block there turns a cache hit into a
    local compile mid-build. That path is the cheap one — a Workers Cache
    hit is billed as a request but the Worker never runs: no CPU,
-   subrequests, D1 or Durable Object work — and its
+   subrequests, or Durable Object work — and its
    volume is bounded by the DDoS managed ruleset, the billing
    notifications below, and the zone maintenance rules rather than by
    this rule. The Free plan allows exactly one rate-limiting rule, which is
@@ -244,8 +223,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 The zone rule bounds request volume; usage-based billing notifications
 watch the spend itself. In the Cloudflare dashboard (*Notifications →
 Add → Billing → Usage Based Billing*) create an alert for each
-billable metric the edge consumes — Workers requests, D1 rows written,
-and Durable Object requests — with the alert threshold at $8/month; the
+billable metric the edge consumes — Workers requests and Durable
+Object requests — with the alert threshold at $8/month; the
 project budget is $10/month. See the
 [Cloudflare notifications docs](https://developers.cloudflare.com/notifications/notification-available/)
 for the alert type.
@@ -311,9 +290,8 @@ candidate values and exiting non-zero on a breach — which runs
   `deploy-promoted` wait timer: the metrics that carry no
   `scriptVersion` compare the post-promotion window against the
   equal-length window ending at the deploy start — DO cpu and rows
-  read/written per DO request from `durableObjectsPeriodicGroups`, and
-  D1 rows read/written per worker request from
-  `d1AnalyticsAdaptiveGroups`. A breach here rolls back too.
+  read/written per DO request from `durableObjectsPeriodicGroups`.
+  A breach here rolls back too.
 
 `stow-admin` comes from the deployed commit's signed toolchain image —
 `.github/actions/stow-toolchain` pulls
@@ -396,8 +374,9 @@ records artifacts into per-`(target, rustc)` slices and pushes them to
 GHCR under the same keyless identity scheme (the pinned
 `index-publish.yml` certificate identity). Its `stow_edge_url`
 dispatch input is optional: when it names a live edge the job also
-POSTs the rows to `/api/v1/admin/artifacts/sync` (the D1 `artifacts`
-catalog mirror the admission gate reads) and prints the export report;
+reports each slice's membership to the scheduler
+(`POST /api/v1/admin/index/{target}/{rustc_version}`, the report the
+scheduler's dependency gate reads) and prints the export report;
 when empty — Cloudflare down or the edge unprovisioned — the publish
 still lands. The remaining dispatch inputs shape the export pass
 itself: `rustc_version` names the rustc it scopes to (empty resolves
@@ -472,7 +451,7 @@ GitHub identity (`edge/src/github_auth.rs`). Two shapes are accepted:
 
 - **GitHub Actions OIDC JWT.** `preheat-admin.yml`'s submit step mints
   a per-run JWT (`audience=$STOW_OIDC_AUDIENCE`), and so does
-  `index-publish.yml` when it syncs the D1 catalog. The edge verifies
+  `index-publish.yml` when it reports a slice. The edge verifies
   the RS256 signature against GitHub's JWKS
   (`token.actions.githubusercontent.com/.well-known/jwks`, fetched per
   call) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
@@ -514,7 +493,7 @@ stow-admin preheat manual \
 
 The same driver takes `--projects preheat/projects.toml` for a
 repository list and `--edge-url https://stow.waterui.dev` (or
-`STOW_EDGE_URL`) when the edge is up and the D1 sync should run. It is
+`STOW_EDGE_URL`) when the edge is up and the report should run. It is
 resumable — coverage is recomputed from the published index, so a
 re-run dispatches only what is still missing — and exits non-zero with
 the failed runs' URLs when any task does not land.
@@ -555,7 +534,6 @@ pool. The library pool and the binary pool are independent.
   lanes (bundle bytes keep serving); `--scope all` takes the whole
   hostname down. `stow-admin maintenance status` prints all three
   rules' state.
-- **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
 - **GHCR storage:** the whole cache is one
   `ghcr.io/water-rs/stow-cache-<rustc>` package per rustc (every
   artifact a tag); monitor disk via the GitHub UI.

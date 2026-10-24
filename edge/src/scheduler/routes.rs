@@ -73,7 +73,7 @@ pub(super) async fn commit_trees(
     db: &DurableDb,
     trees: &[SubmissionTree],
     now: i64,
-) -> Result<u32, QueueError> {
+) -> Result<(u32, Vec<String>), QueueError> {
     let changing = graph.with(|graph| {
         trees
             .iter()
@@ -88,11 +88,14 @@ pub(super) async fn commit_trees(
         .collect();
     append(graph, db, &events, now).await?;
     graph.with(|graph| {
-        trees.iter().try_fold(0u32, |inserted, tree| {
-            graph
-                .merge(tree, now)
-                .map(|report| inserted.saturating_add(report.inserted))
-        })
+        trees
+            .iter()
+            .try_fold((0u32, Vec::new()), |(inserted, mut unpublished), tree| {
+                graph.merge(tree, now).map(|report| {
+                    unpublished.extend(report.unpublished);
+                    (inserted.saturating_add(report.inserted), unpublished)
+                })
+            })
     })
 }
 
@@ -111,7 +114,7 @@ pub(super) async fn submit(
     trees: &[SubmissionTree],
     enforce_pending_cap: bool,
     now: i64,
-) -> Result<u32, QueueError> {
+) -> Result<(u32, Vec<String>), QueueError> {
     if enforce_pending_cap {
         let incoming: u64 = trees
             .iter()

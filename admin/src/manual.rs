@@ -121,7 +121,7 @@ pub struct ManualArgs {
     #[arg(long)]
     dispatch_url: Option<String>,
     /// Edge URL forwarded to index-publish's `stow_edge_url` input —
-    /// the D1 catalog sync runs only when this names a live edge.
+    /// the slice report runs only when this names a live edge.
     /// Defaults to `STOW_EDGE_URL`.
     #[arg(long, env = "STOW_EDGE_URL")]
     edge_url: Option<String>,

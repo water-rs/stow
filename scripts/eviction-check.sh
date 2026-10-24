@@ -86,9 +86,6 @@ mv "$WORK/keys/p8.pem" "$WORK/keys/private.pem"
 openssl ec -in "$WORK/keys/private.pem" -pubout -out "$WORK/keys/public.pem" 2>/dev/null
 
 export WRANGLER_LOG_PATH="$WORK/logs"
-wrangler d1 execute stow-mock --local --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-    --persist-to "$WORK/edge-state" --file "$REPO_ROOT/edge/schema.sql" \
-    >"$WORK/logs/schema.log" 2>&1 || die "catalog schema apply failed: $(tail -5 "$WORK/logs/schema.log")"
 
 "$BIN/stow-mock-registry" serve --registry-root "$WORK/mock-registry" --listen "$REGISTRY_ADDR" \
     >"$WORK/logs/mock-registry.log" 2>&1 &

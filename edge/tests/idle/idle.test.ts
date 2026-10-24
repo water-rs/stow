@@ -37,7 +37,7 @@ import {
 	runDurableObjectAlarm,
 	runInDurableObject,
 } from "cloudflare:test";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 const TARGET = "x86_64-unknown-linux-gnu";
 const RUSTC = "1.98.1";
@@ -175,18 +175,6 @@ async function statusCounts(stub: DurableObjectStub) {
 	}
 	return counts;
 }
-
-beforeAll(async () => {
-	// `wrangler d1 execute --file` — the operator path — batches prepared
-	// statements; `D1Database.exec` splits on newlines instead, so it
-	// cannot load a file whose statements span lines and carry comments.
-	const statements = JSON.parse(
-		(env as Env2).TEST_D1_STATEMENTS,
-	) as string[];
-	await env.STOW_DB.batch(
-		statements.map((sql) => env.STOW_DB.prepare(sql)),
-	);
-});
 
 // A submit whose rows are immediately eligible arms a real alarm at
 // ~now, and workerd fires it on its own — so the dispatch cannot be

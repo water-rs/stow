@@ -24,11 +24,6 @@ STOW_STALE_DISPATCH_MINUTES = "10"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
 STOW_GITHUB_WEBHOOK_SECRET = "mock-github-webhook-secret"
 
-[[cloudflare.d1_databases]]
-binding = "STOW_DB"
-database_name = "stow-mock"
-database_id = "00000000-0000-0000-0000-000000000009"
-preview_database_id = "00000000-0000-0000-0000-000000000009"
 
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"

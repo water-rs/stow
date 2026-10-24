@@ -1,11 +1,10 @@
-//! Cloudflare Workers bootstrap: binds D1, the scheduler Durable Object,
+//! Cloudflare Workers bootstrap: binds the scheduler Durable Object,
 //! the CF cache, and GHCR config, then mounts the public API routes.
 
 use skyzen::routing::{CreateRouteNode, Route, RouteNode, Router};
 use skyzen::runtime::wasm;
 use skyzen::utils::State;
-use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
-use skyzen_services::Db;
+use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 
 use stow_types::admission;
 
@@ -13,7 +12,6 @@ use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
 use crate::{api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site, webhook};
 
-const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 const STOW_OIDC_AUDIENCE_BINDING: &str = "STOW_OIDC_AUDIENCE";
@@ -58,9 +56,6 @@ fn worker(
 ) -> crate::no_store::NoStoreOnError<
     crate::faults::OverloadFaults<Router, skyzen_cloudflare::worker::AnalyticsEngineDataset>,
 > {
-    let d1 = CfD1::from_env(env, STOW_DB_BINDING)
-        .unwrap_or_else(|error| panic!("failed to load D1 binding '{STOW_DB_BINDING}': {error}"));
-    let db = Db::new(d1);
     let scheduler = CfDurableNamespace::from_env(env, SCHEDULER_BINDING).unwrap_or_else(|error| {
         panic!("failed to load Durable Object binding '{SCHEDULER_BINDING}': {error}")
     });
@@ -147,7 +142,6 @@ fn worker(
     nodes.push("/api/v1/github/workflow-run".post(webhook::github_workflow_run));
 
     let router = Route::new(nodes)
-        .with(db)
         .with(State(scheduler))
         .with(State(cache))
         .with(State(analytics.clone()))
@@ -185,15 +179,11 @@ fn worker(
 /// the scheduler lane — each wrapped in `gate` so a rate-limited GitHub
 /// trust check answers 503 + `Retry-After` instead of the bare error
 /// envelope.
-fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
+fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 2] {
     [
         "/api/v1/admin"
             .route((
-                "/artifacts".at(api::list_artifact_records),
-                "/coverage/{crate_name}".at(api::artifact_coverage),
-                "/index/{target}/{rustc_version}"
-                    .at(api::list_artifact_index)
-                    .post(api::record_published_index),
+                "/index/{target}/{rustc_version}".post(api::record_published_index),
                 "/dispatch-freeze"
                     .at(api::get_dispatch_freeze)
                     .post(api::set_dispatch_freeze),
@@ -222,15 +212,6 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
                     "/status".at(api::admin_scheduler_demand_feed_status),
                 )),
                 "/status".at(api::admin_status),
-            ))
-            .with(gate.clone()),
-        // Split out of the admin group to stay under the router's
-        // route-tuple arity — the URLs are unchanged.
-        "/api/v1/admin/artifacts"
-            .route((
-                "/sync".post(api::sync_artifacts),
-                "/prune".post(api::prune_artifacts),
-                "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
             ))
             .with(gate.clone()),
         "/api/v1/scheduler"

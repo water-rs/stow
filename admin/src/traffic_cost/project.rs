@@ -32,7 +32,7 @@
 //! assumption). A report whose pass claimed nothing while the model
 //! projects builds is refused rather than priced at zero.
 //!
-//! Subrequests, worker-side D1 and R2 ops carry per-event constants the
+//! Subrequests and R2 ops carry per-event constants the
 //! run does not measure; they print as diagnostics and never gate. An
 //! event whose Worker CPU no lane can measure is named in the output
 //! with the reason, so the gap stays visible.
@@ -54,8 +54,8 @@ use super::cpu::WorkerCpuReport;
 use super::preheat::PreheatMonthly;
 use crate::render::{Output, Table, emit};
 use crate::watchdog::{
-    D1_ROWS_READ_MONTHLY, D1_ROWS_WRITTEN_MONTHLY, DO_DURATION_GB_S_MONTHLY, DO_REQUESTS_MONTHLY,
-    DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY, WORKER_CPU_MS_MONTHLY, WORKER_REQUESTS_MONTHLY,
+    DO_DURATION_GB_S_MONTHLY, DO_REQUESTS_MONTHLY, DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY,
+    WORKER_CPU_MS_MONTHLY, WORKER_REQUESTS_MONTHLY,
 };
 
 /// The monthly projection — `stow-admin traffic-cost project`.
@@ -109,11 +109,10 @@ struct DriveCost {
     rows_written: f64,
     /// Serialized wall milliseconds.
     wall_ms: f64,
-    /// Σ D1 `meta.rowsRead` on the counted catalog backend — the
-    /// per-page coverage lookups a claim pays.
-    d1_rows_read: f64,
-    /// Σ D1 `meta.rowsWritten` on the same backend.
-    d1_rows_written: f64,
+    /// Σ `meta.rowsRead` on the counted backend.
+    sql_rows_read: f64,
+    /// Σ `meta.rowsWritten` on the same backend.
+    sql_rows_written: f64,
 }
 
 /// Where an event's Worker CPU comes from.
@@ -133,7 +132,7 @@ enum CpuPricing {
 /// causes (only [`EventKind::Build`] — one claim each). The gated
 /// fields are structural counts (`do_requests`, `worker_requests`) or
 /// measured reads (report rows, Worker CPU lanes); the `subrequests`/
-/// `d1_rows_*`/`r2_ops` constants describe the handler's shape and print
+/// `sql_rows_*`/`r2_ops` constants describe the handler's shape and print
 /// as diagnostics only — nothing measures them, so they never gate.
 #[derive(Debug, Clone, Copy)]
 struct EventCost {
@@ -154,20 +153,14 @@ struct EventCost {
     cpu: CpuPricing,
     /// Subrequests per event — diagnostic only.
     subrequests: f64,
-    /// Worker-side D1 `rows_read` per event — diagnostic only; the
-    /// measured D1 line is the claim lane's counted coverage reads.
-    d1_rows_read: f64,
-    /// Worker-side D1 `rows_written` per event — diagnostic only.
-    d1_rows_written: f64,
     /// R2 ops per event — diagnostic only (zero today).
     r2_ops: f64,
 }
 
 /// Per-event costs, from the route handlers in `edge/src/api.rs`. The
-/// DO drives are billed per call from the measured row; D1 and subrequest
-/// counts are the handler's statement/lookup shapes (an admission's
-/// miss drain is its 64-row batch; a callback's one subrequest is its
-/// forward to the scheduler, and it touches no D1).
+/// DO drives are billed per call from the measured row; subrequest
+/// counts are the handler's lookup shapes (a callback's one subrequest
+/// is its forward to the scheduler).
 const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::CliBytePathFetch,
@@ -178,8 +171,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("bundle-fetch", 1.0)]),
         subrequests: 1.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -191,24 +182,20 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 2.0,
         cpu: CpuPricing::Lanes(&[("index-pull", 1.0)]),
         subrequests: 2.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
         kind: EventKind::Admission,
-        route: "POST /api/v1/admissions (+miss drain)",
-        // The drain is one `send_enqueue` DO call per request; the
-        // insert it carries scales with misses, so its rows are
-        // priced on `EventKind::MissNode` where the model counts them.
+        route: "POST /api/v1/admissions",
+        // The route mints for the whole candidate tree and calls no
+        // scheduler route — the merge's born-published check is the
+        // coverage.
         drives: &[],
-        do_requests: 1.0,
+        do_requests: 0.0,
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("admission", 1.0)]),
         subrequests: 2.0,
-        d1_rows_read: 64.0,
-        d1_rows_written: 3.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -226,8 +213,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("enqueue-redeem", 1.0)]),
         subrequests: 0.0,
-        d1_rows_read: 1.0,
-        d1_rows_written: 5.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -251,8 +236,6 @@ const EVENT_COSTS: &[EventCost] = &[
              stable channel manifest from static.rust-lang.org — no lane drives it off the network",
         ),
         subrequests: 3.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -266,8 +249,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("status-read", 1.0)]),
         subrequests: 0.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -279,8 +260,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("site", 1.0)]),
         subrequests: 0.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -292,8 +271,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("stats", 1.0)]),
         subrequests: 0.0,
-        d1_rows_read: 30.0,
-        d1_rows_written: 1.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -308,8 +285,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 0.0,
         cpu: CpuPricing::NoWorkerRequest,
         subrequests: 0.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -321,8 +296,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("admin-status", 1.0)]),
         subrequests: 0.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -334,8 +307,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 1.0,
         cpu: CpuPricing::Unmeasured("no lane drives POST /api/v1/admin/index/published"),
         subrequests: 2.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -347,8 +318,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 0.0,
         cpu: CpuPricing::NoWorkerRequest,
         subrequests: 0.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -360,8 +329,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 0.0,
         cpu: CpuPricing::NoWorkerRequest,
         subrequests: 0.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -378,8 +345,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("workflow-callback", 1.0)]),
         subrequests: 1.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
     EventCost {
@@ -394,8 +359,6 @@ const EVENT_COSTS: &[EventCost] = &[
         worker_requests: 0.0,
         cpu: CpuPricing::NoWorkerRequest,
         subrequests: 0.0,
-        d1_rows_read: 0.0,
-        d1_rows_written: 0.0,
         r2_ops: 0.0,
     },
 ];
@@ -430,8 +393,8 @@ impl Drives {
                         rows_read: row.rows_read as f64,
                         rows_written: row.rows_written as f64,
                         wall_ms: row.wall_ms as f64,
-                        d1_rows_read: row.d1_rows_read as f64,
-                        d1_rows_written: row.d1_rows_written as f64,
+                        sql_rows_read: row.sql_rows_read as f64,
+                        sql_rows_written: row.sql_rows_written as f64,
                     },
                 )
             })
@@ -464,8 +427,8 @@ impl Drives {
             rows_read: (hot.rows_read - idle.rows_read).max(0.0) / claimed,
             rows_written: (hot.rows_written - idle.rows_written).max(0.0) / claimed,
             wall_ms: (hot.wall_ms - idle.wall_ms).max(0.0) / claimed,
-            d1_rows_read: (hot.d1_rows_read - idle.d1_rows_read).max(0.0) / claimed,
-            d1_rows_written: (hot.d1_rows_written - idle.d1_rows_written).max(0.0) / claimed,
+            sql_rows_read: (hot.sql_rows_read - idle.sql_rows_read).max(0.0) / claimed,
+            sql_rows_written: (hot.sql_rows_written - idle.sql_rows_written).max(0.0) / claimed,
         };
         Ok(Self {
             measured,
@@ -499,8 +462,8 @@ impl DriveCost {
         self.rows_read = calls.mul_add(other.rows_read, self.rows_read);
         self.rows_written = calls.mul_add(other.rows_written, self.rows_written);
         self.wall_ms = calls.mul_add(other.wall_ms, self.wall_ms);
-        self.d1_rows_read = calls.mul_add(other.d1_rows_read, self.d1_rows_read);
-        self.d1_rows_written = calls.mul_add(other.d1_rows_written, self.d1_rows_written);
+        self.sql_rows_read = calls.mul_add(other.sql_rows_read, self.sql_rows_read);
+        self.sql_rows_written = calls.mul_add(other.sql_rows_written, self.sql_rows_written);
     }
 }
 
@@ -524,7 +487,7 @@ pub(super) fn peak_serialized_s(
 /// One product dimension's monthly projection against its allowance.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UsageLine {
-    /// The Cloudflare product: `workers`, `durable_objects`, `d1`.
+    /// The Cloudflare product: `workers`, `durable_objects`.
     pub product: &'static str,
     /// The billed dimension (e.g. `requests`, `rows_read`,
     /// `duration_gb_s`).
@@ -623,7 +586,7 @@ pub struct GateEvaluation {
     pub usage: Vec<UsageLine>,
     /// Heaviest routes by allowance share.
     pub top_routes: Vec<RouteShare>,
-    /// Diagnostic-only dimensions (subrequests, worker-side D1, R2 ops).
+    /// Diagnostic-only dimensions (subrequests, R2 ops).
     pub diagnostics: Vec<UsageLine>,
     /// Every measured Worker route's projected monthly CPU.
     pub cpu_routes: Vec<RouteCpu>,
@@ -654,17 +617,8 @@ struct Projection {
     do_rows_written: f64,
     /// Projected monthly DO wall seconds — duration is billed on this.
     do_wall_s: f64,
-    /// Projected monthly D1 rows read — the measured side only: the
-    /// claim lane's counted catalog-coverage lookups.
-    d1_read: f64,
-    /// Projected monthly D1 rows written — measured, as above.
-    d1_written: f64,
     /// Projected monthly subrequests — diagnostic, not gated.
     diag_subrequests: f64,
-    /// Projected monthly worker-side D1 reads — diagnostic, not gated.
-    diag_d1_read: f64,
-    /// Projected monthly worker-side D1 writes — diagnostic, not gated.
-    diag_d1_written: f64,
     /// Projected monthly R2 ops — diagnostic, not gated.
     diag_r2_ops: f64,
     /// One share entry per event kind, for the top-N table.
@@ -743,8 +697,6 @@ fn fold_kind(
     projection.worker_requests = monthly.mul_add(cost.worker_requests, projection.worker_requests);
     projection.do_requests = monthly.mul_add(cost.do_requests, projection.do_requests);
     projection.diag_subrequests = monthly.mul_add(cost.subrequests, projection.diag_subrequests);
-    projection.diag_d1_read = monthly.mul_add(cost.d1_rows_read, projection.diag_d1_read);
-    projection.diag_d1_written = monthly.mul_add(cost.d1_rows_written, projection.diag_d1_written);
     projection.diag_r2_ops = monthly.mul_add(cost.r2_ops, projection.diag_r2_ops);
     let kind_cpu_ms = fold_cpu(cost, cpu, monthly, projection)?;
     projection.worker_cpu_ms = monthly.mul_add(kind_cpu_ms, projection.worker_cpu_ms);
@@ -752,8 +704,6 @@ fn fold_kind(
     projection.do_rows_read = monthly.mul_add(kind.rows_read, projection.do_rows_read);
     projection.do_rows_written = monthly.mul_add(kind.rows_written, projection.do_rows_written);
     projection.do_wall_s += monthly * kind.wall_ms / 1000.0;
-    projection.d1_read = monthly.mul_add(kind.d1_rows_read, projection.d1_read);
-    projection.d1_written = monthly.mul_add(kind.d1_rows_written, projection.d1_written);
     // The route's heaviest dimension decides its allowance share — the
     // number the top-N table ranks.
     let shares = [
@@ -781,14 +731,6 @@ fn fold_kind(
         (
             "worker_cpu_ms",
             monthly * kind_cpu_ms / WORKER_CPU_MS_MONTHLY,
-        ),
-        (
-            "d1_rows_read",
-            monthly * kind.d1_rows_read / D1_ROWS_READ_MONTHLY,
-        ),
-        (
-            "d1_rows_written",
-            monthly * kind.d1_rows_written / D1_ROWS_WRITTEN_MONTHLY,
         ),
     ];
     let (dimension, share) = shares
@@ -854,13 +796,6 @@ fn usage_lines(projection: &Projection, preheat: &PreheatMonthly) -> Vec<UsageLi
             projection.do_wall_s * DO_DURATION_GB_PER_WALL_S,
             DO_DURATION_GB_S_MONTHLY,
         ),
-        line("d1", "rows_read", projection.d1_read, D1_ROWS_READ_MONTHLY),
-        line(
-            "d1",
-            "rows_written",
-            projection.d1_written,
-            D1_ROWS_WRITTEN_MONTHLY,
-        ),
     ]
 }
 
@@ -876,16 +811,6 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
     };
     vec![
         line("workers", "subrequests", projection.diag_subrequests),
-        line(
-            "d1 (worker-side, unmeasured)",
-            "rows_read",
-            projection.diag_d1_read,
-        ),
-        line(
-            "d1 (worker-side, unmeasured)",
-            "rows_written",
-            projection.diag_d1_written,
-        ),
         line("r2", "ops", projection.diag_r2_ops),
     ]
 }
@@ -899,7 +824,7 @@ fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach>
         let bound = line.allowance * ALLOWANCE_FRACTION;
         if line.total() > bound {
             // `RouteShare::dimension` keys the share dimension by
-            // product prefix — `do_`, `d1_`, `worker_`.
+            // product prefix — `do_`, `worker_`.
             let prefix = match line.product {
                 "workers" => "worker",
                 "durable_objects" => "do",

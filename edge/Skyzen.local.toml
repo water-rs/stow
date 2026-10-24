@@ -14,11 +14,6 @@ STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
 STOW_GITHUB_WEBHOOK_SECRET = "mock-github-webhook-secret"
 
-[[cloudflare.d1_databases]]
-binding = "STOW_DB"
-database_name = "stow-local"
-database_id = "00000000-0000-0000-0000-000000000001"
-preview_database_id = "00000000-0000-0000-0000-000000000001"
 
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"

@@ -11,8 +11,8 @@
 //! index workflow's identity, and pulls only the records tags missing
 //! from every slice's folded set. `--full` ignores the folded sets for
 //! the first publish of a new rustc and for disaster recovery. The delta
-//! of the pass lands in `<out-dir>/new-records.json`, which `index sync`
-//! replays into D1 rather than pulling the store again. Every
+//! of the pass lands in `<out-dir>/new-records.json` — the delta the
+//! pass folded. Every
 //! `CI_TARGET_TRIPLES` member ends a pass with a slice: an entry that
 //! got no rows and has no published pair is emitted empty at
 //! generation 1, since `--target` consumers fetch the slice whether or
@@ -51,10 +51,8 @@ const PREV_PULL_CONCURRENCY: usize = 8;
 /// Artifact records per sync request — each request lands as one
 /// edge-side batch write, so a chunk is one round trip rather than a
 /// body the worker timeout eats mid-flight.
-const SYNC_CHUNK: usize = 100;
 /// Sync chunk posts in flight — the chunks are independent writes, so
 /// the bound only limits how many edge requests the pass holds open.
-const SYNC_POST_CONCURRENCY: usize = 4;
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
@@ -79,7 +77,7 @@ pub enum IndexCommand {
     /// covers. Writes each changed slice as `index.<target>.<rustc>` and
     /// its folded set as `folded.<target>.<rustc>` under `--out-dir`,
     /// plus `slices.json` (the publish/report loop's input) and
-    /// `new-records.json` (the delta `index sync` replays). A
+    /// `new-records.json` (the delta the pass folded). A
     /// `CI_TARGET_TRIPLES` member with no new rows and no published
     /// pair is still written — an empty first-publish slice, so
     /// `--target` consumers of a deps-less lane always find the tag.
@@ -87,12 +85,6 @@ pub enum IndexCommand {
     /// Push an exported index file and its folded companion to the
     /// registry and sign both.
     Publish(IndexPublishArgs),
-    /// Mirror the records an export pass newly folded into the edge's
-    /// D1 catalog via `POST /api/v1/admin/artifacts/sync` — reads
-    /// `new-records.json` rather than pulling the store again. The edge
-    /// byte path and the miss catalog read D1; GHCR records are the
-    /// source of truth this sync replays.
-    Sync(IndexSyncArgs),
     /// Report a just-published slice's semantic membership to the edge
     /// — what the scheduler's dependency gate checks before releasing
     /// a dependent. `index-publish.yml` runs it after a successful
@@ -126,13 +118,6 @@ pub struct IndexExportArgs {
     /// longer reads.
     #[arg(long)]
     full: bool,
-}
-
-#[derive(Args)]
-pub struct IndexSyncArgs {
-    /// The `new-records.json` file `index export` wrote.
-    #[arg(long)]
-    file: std::path::PathBuf,
 }
 
 #[derive(Args)]
@@ -237,10 +222,6 @@ struct IndexReportSummary {
 pub async fn run(args: IndexArgs) -> stow_types::error::Result<()> {
     match args.command {
         IndexCommand::Export(args) => index_export(args).await,
-        IndexCommand::Sync(args) => {
-            let edge = Edge::connect().await?;
-            index_sync(&edge, args).await
-        }
         IndexCommand::Publish(args) => index_publish(args).await,
         IndexCommand::Report(args) => index_report(&Edge::connect().await?, args).await,
         IndexCommand::Targets => {
@@ -439,7 +420,7 @@ struct SliceExport {
 struct ExportPass {
     /// Slices that changed — the only ones publish needs to touch.
     slices: Vec<SliceExport>,
-    /// Every record this pass pulled — the `index sync` delta.
+    /// Every record this pass pulled — the folded delta.
     new_records: Vec<ArtifactRecord>,
     /// Records artifacts pulled — the O(change) meter the gate counts.
     pulled: usize,
@@ -710,7 +691,7 @@ fn merge_exports(
 /// One export pass over the whole registry: writes each changed slice as
 /// `index.<target>.<rustc>` plus its `folded.<target>.<rustc>` companion
 /// under `--out-dir`, `slices.json` for the publish/report loop, and
-/// `new-records.json` for `index sync`.
+/// `new-records.json` — the records the pass folded.
 async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
@@ -1083,33 +1064,6 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
     let line = serde_json::to_string(&summary)
         .map_err(|error| stow_error!("serialize index report summary: {error}"))?;
     render::emit_line(&line);
-    Ok(())
-}
-
-/// `stow-admin index sync` — replay the records this pass newly folded
-/// into D1 through the sync route, chunked so one worker timeout cannot
-/// eat a page-sized body. The file is the delta `index export` wrote:
-/// the full records, not index rows — unbundled (still-building) units
-/// sync too, so the catalog reflects every task the pass saw.
-async fn index_sync(edge: &Edge, args: IndexSyncArgs) -> stow_types::error::Result<()> {
-    let bytes = tokio::fs::read(&args.file)
-        .await
-        .map_err(|error| stow_error!("read new-records file {}: {error}", args.file.display()))?;
-    let records: Vec<ArtifactRecord> = serde_json::from_slice(&bytes)
-        .map_err(|error| stow_error!("decode new-records file {}: {error}", args.file.display()))?;
-    let total = records.len();
-    futures_util::stream::iter(records.chunks(SYNC_CHUNK))
-        .map(Ok::<_, stow_types::error::Error>)
-        .try_for_each_concurrent(SYNC_POST_CONCURRENCY, |chunk| async move {
-            edge.post_json::<_, serde_json::Value>("/api/v1/admin/artifacts/sync", &chunk.to_vec())
-                .await
-                .map(|_| ())
-        })
-        .await?;
-    tracing::info!(
-        records = total,
-        "synced new GHCR records into the edge catalog"
-    );
     Ok(())
 }
 

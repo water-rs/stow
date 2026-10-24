@@ -574,6 +574,7 @@ async fn submit(
     )
     .await
     .map_err(text)
+    .map(|(inserted, _unpublished)| inserted)
 }
 
 async fn submit_expect(

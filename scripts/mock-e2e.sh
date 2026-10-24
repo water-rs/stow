@@ -11,9 +11,8 @@
 #      completion via the local CI's `workflow_run` webhook POST
 #   4. export the signed artifact index from the registry's records
 #      artifacts, publish it back, report each slice to the scheduler
-#      gate and sync the folded records into the edge catalog
-#      (`stow-admin index export` + `index publish` + `index report` +
-#      `index sync`, as index-publish.yml runs them), then run the same
+#      gate (`stow-admin index export` + `index publish` +
+#      `index report`, as index-publish.yml runs them), then run the same
 #      wave by hand through
 #      `stow-admin preheat manual` on a crate with a real dependency
 #      (walkdir → same-file) so layering and per-layer publish are
@@ -295,8 +294,8 @@ stow_cli() {
 # artifacts (mock-key trust) in one pass, then `index publish` delegates
 # each slice's signed push to `stow-mock-registry publish-index`,
 # `index report` feeds the scheduler gate's published_slice_rows, and
-# `index sync` replays new-records.json into the D1 catalog — catalog
-# reads hold only once the sync has landed. The out-dir is fixed across
+# Each pass's `new-records.json` delta folds into the cumulative
+# catalog the assertions read. The out-dir is fixed across
 # calls because its `.prev` sidecars are what the export reads to stamp
 # each slice's next generation (a missing `.prev` is legal only at
 # generation 1). $1 tags the per-wave log files.
@@ -331,11 +330,19 @@ for s in json.load(open(sys.argv[1])):
             >>"$LOG_DIR/index-report-$tag.log" 2>&1 \
             || die "stow-admin index report failed for $index_file — see $LOG_DIR/index-report-$tag.log"
     done
-    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-        "$BIN/stow-admin" index sync \
-        --file "$WORK_DIR/index-export/new-records.json" \
-        >>"$LOG_DIR/index-sync-$tag.log" 2>&1 \
-        || die "stow-admin index sync failed — see $LOG_DIR/index-sync-$tag.log"
+    # The records the pass newly folded accumulate into the catalog
+    # file the assertions read — the e2e's view of what the signed
+    # records say, replacing the old catalog queries.
+    [ -f "$WORK_DIR/index-export/new-records.json" ] \
+        || die "index export wrote no new-records.json"
+    if [ -f "$WORK_DIR/catalog.json" ]; then
+        jq -s add "$WORK_DIR/index-export/new-records.json" \
+            "$WORK_DIR/catalog.json" >"$WORK_DIR/catalog.next.json" \
+            || die "catalog merge failed"
+        mv "$WORK_DIR/catalog.next.json" "$WORK_DIR/catalog.json"
+    else
+        cp "$WORK_DIR/index-export/new-records.json" "$WORK_DIR/catalog.json"
+    fi
 }
 
 # Throwaway-consumer warm-up shared by both scenarios: `cargo fetch`
@@ -384,14 +391,6 @@ assert_served() {
     done
 }
 
-# The catalog's D1 behind the dev edge — `wrangler d1 execute --local`
-# reads the persist dir directly; --json prints `[{results: [...]}]`.
-d1() {
-    wrangler d1 execute stow-mock --local \
-        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-        --persist-to "$WORK_DIR/edge-state" \
-        --command "$1" --json 2>/dev/null
-}
 
 require_command cargo
 require_command rustc
@@ -522,21 +521,6 @@ fg in_dir "$REPO_ROOT/edge" \
     >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
 rm -f "$MOCK_MANIFEST"
-# The edge assumes its D1 schema exists; creating it is deployment work, so
-# the local D1 gets the one schema file an operator applies.
-# Apply the one schema the same way an operator does — skipped on a
-# reused edge-state dir (STOW_E2E_WORK_DIR), where the schema already
-# exists and the file's plain CREATEs would fail.
-if ! fg wrangler d1 execute stow-mock --local \
-    --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-    --persist-to "$WORK_DIR/edge-state" \
-    --command "SELECT 1 FROM artifacts LIMIT 1" >>"$LOG_DIR/edge-schema.log" 2>&1; then
-    fg wrangler d1 execute stow-mock --local \
-        --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-        --persist-to "$WORK_DIR/edge-state" \
-        --file "$REPO_ROOT/edge/schema.sql" >>"$LOG_DIR/edge-schema.log" 2>&1 \
-        || die "edge schema apply failed — see $LOG_DIR/edge-schema.log"
-fi
 (
     cd "$REPO_ROOT/edge"
     exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
@@ -1235,9 +1219,8 @@ done
 
 # The consumer resolves artifacts through the signed local index, so the
 # slices the runs' records feed must exist in the mock registry before
-# `stow check` runs. D1's catalog is a read model of the records the
-# export folds — the miss derivation reads it, so a covered graph mints
-# no admission only once the sync has landed.
+# `stow check` runs — the scheduler's merge decides coverage, so a
+# covered graph queues no build once the slice report lands.
 fg publish_slices "itoa"
 
 # Exercise the consumer-facing commands before `check`: refresh pulls and
@@ -1442,10 +1425,13 @@ echo "[mock-e2e] digest byte path: 404 miss, 400 malformed, old route gone (expe
 
 # The hit already proved the new path end-to-end: local index resolution
 # plus a direct signed bundle pull. What remains on the edge is
-# POST /api/v1/admissions. A graph the catalog
-# covers mints nothing; one it does not cover mints a stateless
-# admission carrying a PoW challenge. itoa is covered — the scheduler
-# just built it — so its expanded graph must return empty. `entries`
+# POST /api/v1/admissions. The edge keeps no catalog (stow#886): it
+# mints one stateless admission for whatever tree a client reports,
+# and the scheduler's merge decides coverage when the ticket is
+# redeemed, so a covered node queues nothing then. itoa is covered —
+# the scheduler just built it — and the CLI never reports it; posted
+# directly, its expanded graph still mints exactly one ticket whose
+# tree is that one leaf. `entries`
 # carries the manifest's seed features (`["default"]`);
 # `expanded_entries` carries the resolved feature set, which for
 # itoa 1.0 is empty — its `default` feature declares nothing — plus
@@ -1472,12 +1458,15 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
                 explicit_spelling: "keys-as-native"
             }]
         }')")"
-[ "$(jq -r 'length' <<<"$admissions")" = "0" ] \
-    || die "covered graph minted admissions: $admissions"
-echo "[mock-e2e] covered graph: 0 admissions (expected)"
+[ "$(jq -r 'length' <<<"$admissions")" = "1" ] \
+    || die "covered graph minted $(jq -r 'length' <<<"$admissions") admissions: $admissions"
+jq -e --arg crate "$TASK_CRATE" \
+    '.[0].tree.nodes | length == 1 and .[0].crate_name == $crate' <<<"$admissions" >/dev/null \
+    || die "covered graph's admission tree is not the one leaf: $admissions"
+echo "[mock-e2e] covered graph: 1 admission for the one leaf; coverage is the merge's (expected)"
 
-# A real crate absent from the catalog must mint exactly one admission —
-# proves the coverage check + dominator + HMAC mint path live.
+# A real crate the cache never built mints exactly one admission too —
+# proves the expansion + HMAC mint path live.
 admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
     -H 'content-type: application/json' \
     --data "$(jq -nc \
@@ -1648,33 +1637,28 @@ fg publish_slices "host-deps-final"
 
 # --- catalog assertions --------------------------------------------------
 #
-# The catalog's artifacts table must register every host-side unit under
-# the host triple with its stamped unit shape — side=host (1), both
-# invocations (0=native, 1=target), linked (1): cargo links host units in
-# every phase, so check and build merge to one row each.
-heck_shapes="$(d1 "SELECT DISTINCT unit_invocation, unit_linked FROM artifacts \
-    WHERE crate_name = 'heck' AND target = '$HOST_TARGET' AND unit_side = 1")"
-echo "[mock-e2e] heck host-side shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
-[ "$(jq '.[0].results | length' <<<"$heck_shapes")" = "2" ] \
-    || die "heck host-side rows are not the two linked shapes: $(jq -c '.[0].results' <<<"$heck_shapes")"
-for want in '{"unit_invocation":0,"unit_linked":1}' '{"unit_invocation":1,"unit_linked":1}'; do
-    jq -e ".[0].results | map({unit_invocation, unit_linked}) | index($want) != null" \
-        <<<"$heck_shapes" >/dev/null \
+# The folded records must register every host-side unit under the host
+# triple with its stamped unit shape — side=host, both invocations
+# (native, target), linked: cargo links host units in every phase, so
+# check and build merge to one row each.
+catalog="$WORK_DIR/catalog.json"
+heck_shapes="$(jq -c "[.[] | select(.crate_name == \"heck\" and .target == \"$HOST_TARGET\" and .unit_shape.side == \"host\") | {invocation: .unit_shape.invocation, kind: .unit_shape.kind}] | unique" "$catalog")"
+echo "[mock-e2e] heck host-side shapes: $heck_shapes"
+[ "$(jq 'length' <<<"$heck_shapes")" = "2" ] \
+    || die "heck host-side rows are not the two linked shapes: $heck_shapes"
+for want in '{"invocation":"native","kind":"linked"}' '{"invocation":"target","kind":"linked"}'; do
+    jq -e "index($want) != null" <<<"$heck_shapes" >/dev/null \
         || die "heck host-side rows miss shape $want"
 done
 
 # A host unit must never register under the task's *target* — the pre-#349
 # bug shape that produced heck@wasm32 at the consumer's key.
-heck_wasm="$(d1 "SELECT count(*) AS n FROM artifacts \
-    WHERE crate_name = 'heck' AND target = '$CONSUMER_TARGET'")"
-[ "$(jq -r '.[0].results[0].n' <<<"$heck_wasm")" = "0" ] \
+[ "$(jq "[.[] | select(.crate_name == \"heck\" and .target == \"$CONSUMER_TARGET\")] | length" "$catalog")" = "0" ] \
     || die "heck registered under $CONSUMER_TARGET — the task-target registration bug is back"
 
 # Every host dep lands under the host triple at host side.
 for dep in "$HOST_DEPS_CRATE" proc-macro2 quote syn unicode-ident; do
-    n="$(d1 "SELECT count(DISTINCT unit_invocation || '-' || unit_linked) AS n FROM artifacts \
-        WHERE crate_name = '$dep' AND target = '$HOST_TARGET' AND unit_side = 1" \
-        | jq -r '.[0].results[0].n')"
+    n="$(jq "[.[] | select(.crate_name == \"$dep\" and .target == \"$HOST_TARGET\" and .unit_shape.side == \"host\") | {i: .unit_shape.invocation, k: .unit_shape.kind}] | unique | length" "$catalog")"
     [ "$n" = "2" ] || die "$dep covers $n host shapes under $HOST_TARGET, expected 2"
 done
 echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TARGET, none under $CONSUMER_TARGET"
@@ -1684,13 +1668,10 @@ echo "[mock-e2e] catalog: all host deps register 2 linked shapes under $HOST_TAR
 # baseline: an above-baseline row publishes but `index report` excludes
 # it, so the lanes below would find snafu-derive unservable forever.
 # Versions order numerically, not as strings (2.4 < 2.34), so the
-# highest floor is picked with `sort -V` rather than SQL's max(). The
-# floor exists only where the build linked an ELF — the sysroot runs on
-# Linux alone.
+# highest floor is picked with `sort -V`. The floor exists only where
+# the build linked an ELF — the sysroot runs on Linux alone.
 if [ "$(uname -s)" = "Linux" ]; then
-    snafu_floors="$(d1 "SELECT min_glibc FROM artifacts \
-        WHERE crate_name = '$HOST_DEPS_CRATE' AND min_glibc != ''")"
-    floor="$(jq -r '.[0].results[].min_glibc' <<<"$snafu_floors" | sort -V | tail -1)"
+    floor="$(jq -r "[.[] | select(.crate_name == \"$HOST_DEPS_CRATE\" and .min_glibc != null) | .min_glibc] | .[]" "$catalog" | sort -V | tail -1)"
     [ -n "$floor" ] \
         || die "$HOST_DEPS_CRATE's linked unit registered no glibc floor — the sysroot build did not measure it"
     [ "$(printf '%s\n2.28\n' "$floor" | sort -V | tail -1)" = "2.28" ] \

@@ -135,15 +135,11 @@ const HOURS_PER_MONTH: f64 = 720.0;
 //   25G rows read/mo, 50M rows written/mo (SQLite storage billing).
 //   `activeTime` and `cpuTime` are collected as diagnostics.
 //   <https://developers.cloudflare.com/durable-objects/platform/pricing/>
-// - D1 Paid — 25G rows read/mo, 50M rows written/mo.
-//   <https://developers.cloudflare.com/d1/platform/pricing/>
 pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY};
 pub const DO_REQUESTS_MONTHLY: f64 = 1e6;
 pub const DO_DURATION_GB_S_MONTHLY: f64 = 400e3;
 pub const WORKER_REQUESTS_MONTHLY: f64 = 10e6;
 pub const WORKER_CPU_MS_MONTHLY: f64 = 30e6;
-pub const D1_ROWS_READ_MONTHLY: f64 = 25e9;
-pub const D1_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
 
 /// One hour — the usage window. An hourly window trips a sustained burn
 /// to the monthly allowance's hourly share within an hour instead of
@@ -192,24 +188,6 @@ const SIGNALS: &[Signal] = &[
         min_sample: 0,
         threshold: DO_REQUESTS_MONTHLY / HOURS_PER_MONTH,
         unit: "requests",
-        effect: Effect::Trip,
-    },
-    Signal {
-        id: "cf.d1.rows_read",
-        label: "D1 rows read/h vs hourly share of the 25G/mo allowance",
-        window_secs: HOUR,
-        min_sample: 0,
-        threshold: D1_ROWS_READ_MONTHLY / HOURS_PER_MONTH,
-        unit: "rows",
-        effect: Effect::Trip,
-    },
-    Signal {
-        id: "cf.d1.rows_written",
-        label: "D1 rows written/h vs hourly share of the 50M/mo allowance",
-        window_secs: HOUR,
-        min_sample: 0,
-        threshold: D1_ROWS_WRITTEN_MONTHLY / HOURS_PER_MONTH,
-        unit: "rows",
         effect: Effect::Trip,
     },
     Signal {
@@ -898,7 +876,7 @@ impl Watcher<'_> {
 
         // Pick a real bundle so the GET exercises the byte path: the
         // signed index slice on GHCR — the verified pull `index export`
-        // uses, not the D1 mirror — → a row's `bundle_digest`. GET, not
+        // uses — a row's `bundle_digest`. GET, not
         // HEAD: the route registers no HEAD handler, and the probe's job
         // is the real user fetch anyway.
         match self.pick_bundle_digest().await {
@@ -966,7 +944,7 @@ impl Watcher<'_> {
     /// or `None` when none of its slices carries rows.
     /// The slice is pulled and verified off GHCR — the same signed source
     /// `index export` and `preheat manual` pull — so the probe depends on
-    /// the store the CLI itself reads, not the D1 mirror. Only the current
+    /// the store the CLI itself reads. Only the current
     /// stable rustc's `index.<target>.<rustc>` tags answer: another
     /// toolchain's slice proves nothing about what users are served.
     async fn pick_bundle_digest(
@@ -1008,7 +986,7 @@ impl Watcher<'_> {
     }
 }
 
-/// `now` minus `secs`, rendered the way D1 writes `datetime('now')` —
+/// `now` minus `secs`, rendered the way SQL writes `datetime('now')` —
 /// `YYYY-MM-DD HH:MM:SS` UTC, lexically comparable.
 fn sqlite_now_minus(now: OffsetDateTime, secs: u64) -> String {
     let at = now - time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX));
@@ -1043,13 +1021,13 @@ fn classify_one(log: &str) -> &'static str {
 // 2026-09-28 — the `workersInvocationsAdaptive` sum carries
 // `clientDisconnects cpuTimeUs duration errors requestDuration requests
 // responseBodySize subrequests wallTime`, the DO invocations sum
-// `errors requests responseBodySize wallTime`, and the DO periodic and
-// D1 sums match the uses below.
+// `errors requests responseBodySize wallTime`, and the DO periodic
+// sums match the uses below.
 
 /// The watchdog's single GraphQL request — one POST covers every
 /// dataset: DO periodic sums (usage + resource failures), DO invocations
 /// (requests), Worker invocations over the hour (usage) and grouped by
-/// invocation status over the last 15 minutes (health), and D1 rows.
+/// invocation status over the last 15 minutes (health).
 const WATCHDOG_QUERY: &str = include_str!("../queries/watchdog.graphql");
 
 /// Query variables — account tag, Worker script name, and the two
@@ -1078,8 +1056,6 @@ struct AccountGroups {
     worker: Vec<WorkerGroup>,
     #[serde(rename = "workerStatus", default)]
     worker_status: Vec<WorkerStatusGroup>,
-    #[serde(default)]
-    d1: Vec<D1Group>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -1185,21 +1161,6 @@ struct WorkerStatusSum {
     requests: f64,
 }
 
-#[derive(Debug, serde::Deserialize, Default)]
-struct D1Group {
-    #[serde(default)]
-    sum: D1Sum,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct D1Sum {
-    #[serde(default)]
-    rows_read: f64,
-    #[serde(default)]
-    rows_written: f64,
-}
-
 /// The decoded analytics snapshot the readings are built from — kept
 /// whole so diagnostics (unbilled fields) reach the report.
 #[derive(Debug, Default)]
@@ -1209,7 +1170,6 @@ struct CfSnapshot {
     worker: WorkerSum,
     /// `(status, requests)` pairs from the status-grouped query.
     worker_status: Vec<(String, f64)>,
-    d1: D1Sum,
 }
 
 impl From<AccountGroups> for CfSnapshot {
@@ -1268,17 +1228,11 @@ impl From<AccountGroups> for CfSnapshot {
                     .map(|status| (status, group.sum.requests))
             })
             .collect();
-        let d1 = groups.d1.iter().fold(D1Sum::default(), |mut acc, group| {
-            acc.rows_read += group.sum.rows_read;
-            acc.rows_written += group.sum.rows_written;
-            acc
-        });
         Self {
             do_periodic: fold(groups.do_periodic),
             do_invoke,
             worker,
             worker_status,
-            d1,
         }
     }
 }
@@ -1357,18 +1311,6 @@ impl CfSnapshot {
                     "wallTime={:.0} errors={:.0} subrequests={:.0}",
                     self.do_invoke.wall_time, self.do_invoke.errors, self.do_periodic.subrequests,
                 )],
-            },
-            Reading {
-                signal: signal("cf.d1.rows_read"),
-                sample: 1,
-                value: self.d1.rows_read,
-                evidence: vec![],
-            },
-            Reading {
-                signal: signal("cf.d1.rows_written"),
-                sample: 1,
-                value: self.d1.rows_written,
-                evidence: vec![],
             },
             Reading {
                 signal: signal("cf.worker.requests"),
@@ -3011,9 +2953,9 @@ mod tests {
     #[test]
     fn usage_over_allowance_trips() {
         let readings = vec![reading(
-            "cf.d1.rows_written",
+            "cf.do.rows_written",
             1,
-            D1_ROWS_WRITTEN_MONTHLY / HOURS_PER_MONTH * 2.0,
+            DO_ROWS_WRITTEN_MONTHLY / HOURS_PER_MONTH * 2.0,
         )];
         let decision = decide(&readings, &[]);
         assert!(decision.incident);
@@ -3024,7 +2966,7 @@ mod tests {
     /// Below threshold → clear, no incident.
     #[test]
     fn usage_below_allowance_clears() {
-        let readings = vec![reading("cf.d1.rows_written", 1, 1000.0)];
+        let readings = vec![reading("cf.do.rows_written", 1, 1000.0)];
         let decision = decide(&readings, &[]);
         assert!(!decision.incident);
     }
@@ -3079,7 +3021,7 @@ mod tests {
     #[test]
     fn collector_failure_is_an_incident() {
         let decision = decide(
-            &[reading("cf.d1.rows_read", 1, 1.0)],
+            &[reading("cf.do.rows_read", 1, 1.0)],
             &[CollectFailure {
                 scope: "pipeline",
                 error: "403".to_owned(),
@@ -3097,8 +3039,7 @@ mod tests {
             "doPeriodic":[{"sum":{"activeTime":12,"cpuTime":5,"duration":700,"exceededCpuErrors":0,"exceededMemoryErrors":0,"fatalInternalErrors":0,"rowsRead":40000000000,"rowsWritten":1000,"storageDeletes":0,"storageReadUnits":0,"storageWriteUnits":0,"subrequests":9}}],
             "doInvoke":[{"sum":{"requests":2000,"wallTime":9,"errors":0}}],
             "worker":[{"sum":{"clientDisconnects":0,"cpuTimeUs":45000000,"duration":1,"errors":0,"requestDuration":2,"requests":15000,"responseBodySize":0,"subrequests":300,"wallTime":4}}],
-            "workerStatus":[{"dimensions":{"status":"success"},"sum":{"requests":100}},{"dimensions":{"status":"scriptThrewException"},"sum":{"requests":4}}],
-            "d1":[{"sum":{"rowsRead":10,"rowsWritten":5}}]
+            "workerStatus":[{"dimensions":{"status":"success"},"sum":{"requests":100}},{"dimensions":{"status":"scriptThrewException"},"sum":{"requests":4}}]
         }]}}}"#;
         let envelope: cloudflare::Envelope<AccountGroups> = serde_json::from_str(json).unwrap();
         let account = envelope.into_account().unwrap();
@@ -3300,8 +3241,8 @@ mod tests {
     #[test]
     fn incident_body_renders() {
         let breach = BreachView {
-            id: "cf.d1.rows_written",
-            label: "D1 rows",
+            id: "cf.do.rows_written",
+            label: "DO rows",
             effect: "trip",
             window: "1h".to_owned(),
             observed: "1.4M rows".to_owned(),
@@ -3319,7 +3260,7 @@ mod tests {
         }
         .render()
         .unwrap();
-        assert!(body.contains("cf.d1.rows_written"));
+        assert!(body.contains("cf.do.rows_written"));
         assert!(body.contains("disabled build-crate.yml"));
     }
 
@@ -3812,7 +3753,7 @@ mod tests {
                     token: "test-token",
                 },
                 OffsetDateTime::now_utc(),
-                "stow incident: cf.d1.rows_written",
+                "stow incident: cf.do.rows_written",
                 &[],
                 &[],
                 &BTreeSet::new(),

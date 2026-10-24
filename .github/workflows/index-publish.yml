@@ -13,15 +13,6 @@ name: Index publish
 # cosign-signed keyless under this
 # workflow's identity on `main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
-#
-# The D1 catalog is a mirror of those records, not the source: the
-# `index sync` step replays the delta the export just folded —
-# `new-records.json`, not a re-pull — into the edge's
-# `/api/v1/admin/artifacts/sync` route. It is gated on the
-# `stow_edge_url` dispatch input — an edge URL given by configuration,
-# never probed at runtime — so a dispatch while Cloudflare is offline
-# simply publishes the index and skips the sync.
-#
 # A `schedule` or `workflow_run` trigger would run on the default branch
 # (`dev`) and sign under an identity the CLI rejects, so this workflow is
 # dispatch-only: `index-publish-cron.yml` dispatches it on `main` after
@@ -40,7 +31,7 @@ on:
   workflow_dispatch:
     inputs:
       stow_edge_url:
-        description: "Edge base URL the D1 catalog sync posts to; the sync step runs only when set"
+        description: "Edge base URL the slice report posts to; reporting runs only when set"
         required: false
         default: ""
         type: string
@@ -123,7 +114,7 @@ jobs:
       # only the records tags no folded set covers — the pass is
       # O(new work), not O(store). It writes `index.<t>.<r>` +
       # `folded.<t>.<r>` per changed slice, `slices.json` describing them,
-      # and `new-records.json` for `index sync`. The publish loop then
+      # and `new-records.json` (the folded delta). The publish loop then
       # pushes each pair (`index publish` signs both under this
       # workflow's identity) and `index report` tells the edge what the
       # live slice serves — the scheduler's dependency gate learns
@@ -195,12 +186,3 @@ jobs:
               print(f"::error::index publish incomplete: {' '.join(failed)}", flush=True)
               sys.exit(1)
           EOF
-      # D1's `artifacts` table is a read model of the same GHCR records —
-      # populated only here, and only the delta this pass folded —
-      # `new-records.json` — never written by CI itself.
-      - name: Sync the new records into the edge catalog
-        if: inputs.stow_edge_url != ''
-        env:
-          STOW_EDGE_URL: ${{ inputs.stow_edge_url }}
-          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
-        run: stow-admin index sync --file "$export_dir/new-records.json"

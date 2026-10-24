@@ -60,11 +60,6 @@ STOW_STATS_SALT_SECRET = "mock-stats-salt"
 # rule as STOW_LOCAL_CI_URL — the token rides in Authorization.
 STOW_STATS_SQL_URL = "http://127.0.0.1:28123/analytics_engine/sql"
 
-[[cloudflare.d1_databases]]
-binding = "STOW_DB"
-database_name = "stow-mock"
-database_id = "00000000-0000-0000-0000-000000000009"
-preview_database_id = "00000000-0000-0000-0000-000000000009"
 
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"
