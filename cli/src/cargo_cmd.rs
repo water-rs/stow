@@ -574,6 +574,9 @@ async fn run_original_workspace_build(
         unit_nodes: unit_nodes.as_ref(),
         prefetch_artifacts,
         servable_units: servable_units.as_ref(),
+        inexact_entries: analysis
+            .as_ref()
+            .map(|analysis| analysis.inexact_entries.as_slice()),
         // A configured build's facts came from the filesystem-only pass:
         // the full graph analysis is owed to the build while cargo runs.
         deferred_analysis: config.is_some(),
@@ -642,6 +645,9 @@ async fn run_mirrored_upgrade_build(
     let mirror_servable = mirror_analysis
         .as_ref()
         .and_then(|analysis| analysis.servable_units.clone());
+    let mirror_inexact = mirror_analysis
+        .as_ref()
+        .map(|analysis| analysis.inexact_entries.clone());
 
     let cache_policy_entries = Box::pin(prepare_build_cache_plan(
         config,
@@ -695,6 +701,7 @@ async fn run_mirrored_upgrade_build(
         unit_nodes: mirror_unit_nodes.as_ref(),
         prefetch_artifacts: mirror_prefetch.as_deref(),
         servable_units: mirror_servable.as_ref(),
+        inexact_entries: mirror_inexact.as_deref(),
         deferred_analysis: false,
         semantic_fallback_enabled: mirror_semantic_fallback,
         extra_rustflags: &[],
@@ -1245,6 +1252,10 @@ struct WorkspacePrediction {
     missing_current: Vec<ResolvedDependency>,
     prefetch_artifacts: Vec<PrefetchArtifact>,
     cache_policy_entries: Vec<CachePolicyEntry>,
+    /// Direct-dep entries above an inexactly-served node (stow#882) —
+    /// the exact chain the inexact-hit admission asks the scheduler to
+    /// build. Empty when nothing is served by a superset.
+    inexact_entries: Vec<DependencyGraphEntry>,
     /// The serve map this build's facades answer from — `None` when it
     /// could not be built and every invocation takes the plan path.
     servable_units: Option<crate::facade::ServeMap>,
@@ -1268,6 +1279,7 @@ impl WorkspacePrediction {
             candidates: Vec::new(),
             missing_current: Vec::new(),
             prefetch_artifacts: Vec::new(),
+            inexact_entries: Vec::new(),
             cache_policy_entries: Vec::new(),
             servable_units: Some(servable_units),
         }
@@ -1437,6 +1449,78 @@ async fn analyze_workspace_prediction_from(
         .await
 }
 
+/// stow#882: the inexact report's entries — the direct-dep entries
+/// above every inexactly-served node. `inexact_keys` names the nodes
+/// the analysis could only serve through a superset; the report is
+/// the exact chain, each such node and everything above it — posted
+/// as `entries` + the full expanded graph, which the edge re-derives
+/// into the enqueue set and the scheduler merge dedups against
+/// coverage.
+fn inexact_report_entries(
+    entries: &[DependencyGraphEntry],
+    expanded: &[ResolvedDependencyGraphEntry],
+    inexact_keys: &BTreeSet<(resolve::PackageKey, String)>,
+) -> stow_types::error::Result<Vec<DependencyGraphEntry>> {
+    if inexact_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let requested_features = |features_json: &str| {
+        serde_json::from_str::<Vec<String>>(features_json).map_err(|error| {
+            stow_types::stow_error!("inexact features_json `{features_json}`: {error}")
+        })
+    };
+    // Nodes whose only coverage is a superset, by expanded-graph
+    // position — then parents up to the direct-dep entries.
+    let mut inexact_at = Vec::new();
+    for (index, node) in expanded.iter().enumerate() {
+        for (pkg, features_json) in inexact_keys {
+            if pkg.crate_name == node.crate_name
+                && pkg.version == node.version
+                && requested_features(features_json)? == node.features
+            {
+                inexact_at.push(index);
+                break;
+            }
+        }
+    }
+    // Reverse dep edges, keyed like `dependencies` entries — a package
+    // may appear once per side, so host_side rides the key.
+    let mut parents = BTreeMap::<(&str, &semver::Version, bool), Vec<usize>>::new();
+    for (index, node) in expanded.iter().enumerate() {
+        for dep in &node.dependencies {
+            parents
+                .entry((dep.crate_name.as_str(), &dep.version, dep.host_side))
+                .or_default()
+                .push(index);
+        }
+    }
+    let mut roots = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut frontier = inexact_at;
+    while let Some(index) = frontier.pop() {
+        if !seen.insert(index) {
+            continue;
+        }
+        let node = &expanded[index];
+        if let Some(entry) = entries.iter().find(|entry| {
+            entry.crate_name == node.crate_name
+                && entry.version == node.version
+                && entry.features == node.features
+        }) {
+            roots.push(entry.clone());
+            continue;
+        }
+        frontier.extend(
+            parents
+                .get(&(node.crate_name.as_str(), &node.version, node.host_side))
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+    }
+    Ok(roots)
+}
+
 /// [`analyze_workspace_prediction_from`]'s synchronous half: the lockfile
 /// read, the serve map's set algebra, the dependency-graph resolve and
 /// the bookkeeping over its answer.
@@ -1516,6 +1600,11 @@ fn predict_from_inputs(
         &expanded.entries,
         project.target_given,
     ));
+    // stow#882: the inexact report carries the exact chain — each
+    // node the analysis marked superset-served plus every direct-dep
+    // entry above it (the edge re-derives the enqueue set; the
+    // scheduler merge dedups the already-published interior).
+    let inexact_entries = inexact_report_entries(&entries, &expanded_in, &analysis.inexact_keys)?;
     let mut analysis_by_key = index_analysis_entries(analysis.entries)?;
     let (current_cached, missing_current, mut candidates) =
         apply_dependency_analyses(dependencies, &mut analysis_by_key)?;
@@ -1543,6 +1632,7 @@ fn predict_from_inputs(
         missing_current,
         prefetch_artifacts,
         cache_policy_entries,
+        inexact_entries,
         servable_units,
     })
 }
@@ -1993,8 +2083,48 @@ pub async fn admit_observed_misses(
         config,
         consumer_target,
         rustc_version,
+        stow_types::api::CliAdmissionSource::CacheMiss,
         &graph.roots,
         &graph.expanded,
+    )
+    .await?;
+    let mut admissions = crate::admission::AdmissionCollector::default();
+    admissions.record(config, minted);
+    admissions.drain(config).await;
+    Ok(())
+}
+
+/// Post an inexact superset-hit report (stow#882): the direct-dep
+/// entries above the nodes the analysis could only serve through a
+/// superset, plus the build's expanded graph — minted through the same
+/// `/api/v1/admissions` proof-of-work a miss takes, carrying the
+/// `InexactHit` source the scheduler queues at very low priority.
+/// Called from the detached miss drain — the caller keeps its journal
+/// line on failure so a later drain retries it.
+pub async fn admit_inexact_report(
+    config: &StowConfig,
+    consumer_target: &str,
+    rustc_version: &str,
+    entries: &[DependencyGraphEntry],
+    expanded: &ExpandedDependencyGraph,
+) -> stow_types::error::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let Some(_family) = stow_types::api::runner_family(consumer_target) else {
+        tracing::info!(
+            target = %consumer_target,
+            "consumer target is not a CI target; not posting the inexact report"
+        );
+        return Ok(());
+    };
+    let minted = query_admissions(
+        config,
+        consumer_target,
+        rustc_version,
+        stow_types::api::CliAdmissionSource::InexactHit,
+        entries,
+        &expanded.entries,
     )
     .await?;
     let mut admissions = crate::admission::AdmissionCollector::default();
@@ -2011,6 +2141,7 @@ async fn query_admissions(
     config: &StowConfig,
     target: &str,
     rustc_version: &str,
+    source: stow_types::api::CliAdmissionSource,
     entries: &[DependencyGraphEntry],
     expanded_entries: &[ResolvedDependencyGraphEntry],
 ) -> stow_types::error::Result<Vec<EnqueueAdmission>> {
@@ -2022,6 +2153,7 @@ async fn query_admissions(
         target: stow_types::identity::TargetTriple::parse(target).wrap_err("encode target")?,
         rustc_version: stow_types::identity::WireRustcVersion::parse(rustc_version)
             .wrap_err("encode rustc_version")?,
+        source,
         entries: entries.to_vec(),
         expanded_entries: expanded_entries.to_vec(),
     };
@@ -2536,6 +2668,7 @@ async fn run_pinned_mirror_build(
     let mirror_unit_nodes = mirror_analysis.unit_nodes.clone();
     let mirror_prefetch = mirror_analysis.prefetch_artifacts.clone();
     let mirror_servable = mirror_analysis.servable_units.clone();
+    let mirror_inexact = mirror_analysis.inexact_entries.clone();
     let mirror_semantic_fallback = mirror_unit_nodes
         .as_ref()
         .is_some_and(|table| !table.nodes.is_empty());
@@ -2596,6 +2729,7 @@ async fn run_pinned_mirror_build(
         unit_nodes: mirror_unit_nodes.as_ref(),
         prefetch_artifacts: Some(&mirror_prefetch),
         servable_units: mirror_servable.as_ref(),
+        inexact_entries: Some(&mirror_inexact),
         deferred_analysis: false,
         semantic_fallback_enabled: mirror_semantic_fallback,
         extra_rustflags: &[],
@@ -2990,6 +3124,7 @@ async fn try_run_top_crate_with_cached_dependencies(
         unit_nodes: None,
         prefetch_artifacts: None,
         servable_units: None,
+        inexact_entries: None,
         deferred_analysis: false,
         semantic_fallback_enabled: false,
         extra_rustflags: &rustflags,
@@ -4349,6 +4484,11 @@ struct CargoRunPlan<'a> {
     /// The serve map the facades answer their uncovered checks from —
     /// `None` exports no map file and every invocation plans.
     servable_units: Option<&'a crate::facade::ServeMap>,
+    /// The analysis's inexact superset-hit report — the direct-dep
+    /// entries above every superset-served node (stow#882). Journaled
+    /// beside the build's misses after cargo exits; a detached drain
+    /// posts it behind the same `PoW` admission.
+    inexact_entries: Option<&'a [DependencyGraphEntry]>,
     /// The analysis deferral: `true` when the facts this build starts
     /// with came from the filesystem-only pass and the full graph
     /// analysis is owed to the build while cargo runs (stow#347).
@@ -4594,6 +4734,7 @@ async fn finish_cargo_run(
             plan.cargo_args,
             plan.current_dir,
             &handler.observations(),
+            plan.inexact_entries.unwrap_or(&[]),
             report_due,
         );
         // One supervised run is one build the install ran — counted
@@ -5458,6 +5599,7 @@ fn journal_and_drain_misses(
     cargo_args: &[OsString],
     current_dir: &Path,
     observations: &[crate::artifact_cache::ObservedUnit],
+    inexact_entries: &[DependencyGraphEntry],
     report_due: bool,
 ) {
     let target_dir = resolved_target_dir(project, cargo_args, current_dir);
@@ -5494,6 +5636,7 @@ fn journal_and_drain_misses(
         observations,
         &target_dir,
         &expanded_cache_key,
+        inexact_entries,
     );
     // An all-hit build leaves no journal for `spawn_drain` to find;
     // a due usage report forces the spawn so the day's deltas still
@@ -6455,6 +6598,7 @@ mod tests {
                 unit_nodes: None,
                 prefetch_artifacts: None,
                 servable_units: None,
+                inexact_entries: None,
                 deferred_analysis: false,
                 semantic_fallback_enabled: false,
                 extra_rustflags: &[],
@@ -7090,6 +7234,7 @@ mod tests {
             unit_nodes: Some(&table),
             prefetch_artifacts: Some(&ledger),
             servable_units: None,
+            inexact_entries: None,
             semantic_fallback_enabled: true,
             deferred_analysis: false,
             extra_rustflags: &[],

@@ -98,7 +98,7 @@ Stow is split into four main components, each with a clear trust boundary.
 
 A `rustc` wrapper installed on the user's machine, similar to sccache. When Cargo invokes `rustc`, stow intercepts the call, checks whether a prebuilt artifact is available, and either injects the cached result or falls through to normal compilation.
 
-The CLI resolves artifact identities against a locally cached, cryptographically verified index — the dependency graph is never sent anywhere for a lookup. The only graph that leaves the machine is the *miss* set posted to `/api/v1/admissions`, and only when the index could not cover it.
+The CLI resolves artifact identities against a locally cached, cryptographically verified index — the dependency graph is never sent anywhere for a lookup. A graph leaves the machine only when posted to `/api/v1/admissions`: the *miss* set when the index could not cover it, and the exact chain of a crate served from a larger feature set than the build asked for, so the cache builds that exact set next.
 
 Cached artifacts are materialized into Cargo's target directory as a reflink where the filesystem clones — APFS and other clone-capable filesystems share bytes with the local stow cache — and as a real copy where it does not.
 

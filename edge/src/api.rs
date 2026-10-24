@@ -1392,11 +1392,12 @@ pub async fn mint_miss_admissions(
     if enqueue_requests.is_empty() {
         return Ok(Json(Vec::new()));
     }
-    // One admission and one redemption per miss tree (stow#878): the
+    // One admission and one redemption per report tree (stow#878): the
     // resolved graph folds into a single submission tree the ticket's
-    // PoW binds.
+    // PoW binds, carrying the CLI kind the request claimed (stow#882) —
+    // `CliAdmissionSource` admits only miss and inexact-hit sources.
     let tree = stow_types::api::SubmissionTree::from_enqueue_requests(
-        stow_types::api::SubmissionSource::CacheMiss,
+        request.source.submission_source(),
         &enqueue_requests,
     )
     .map_err(|error| GetArtifactError::InternalWithMessage(format!("miss tree: {error}")))?;

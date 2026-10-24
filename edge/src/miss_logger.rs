@@ -137,12 +137,18 @@ pub trait MissLog: Sync {
 
 /// Write one `graph`-path point per unpublished node — the submit's
 /// `unpublished_ids` answer names the misses the merge could not cover.
+/// Only a real cache-miss tree counts: an inexact superset-hit report
+/// (stow#882) redeems through the same admission but its nodes are hits
+/// the cache already served — logging them would inflate the miss count.
 pub fn log_misses(
     log: &impl MissLog,
     consent: AnalyticsConsent,
     tree: &SubmissionTree,
     unpublished: &std::collections::BTreeSet<String>,
 ) {
+    if tree.source != stow_types::api::SubmissionSource::CacheMiss {
+        return;
+    }
     for node in &tree.nodes {
         if unpublished.contains(&node.task_id) {
             log.write_miss(consent, &Miss::graph_node(tree, node));
@@ -305,6 +311,23 @@ mod tests {
         let points = log.points.lock().expect("points").clone();
         assert_eq!(points.len(), 2);
         assert!(points.iter().all(|point| point[7] == "graph"));
+    }
+
+    /// stow#882: a redeemed inexact-hit tree reports nodes the cache
+    /// already served — none of them is a miss, so no `miss` point is
+    /// written for it.
+    #[test]
+    fn inexact_hit_trees_log_no_miss_points() {
+        let log = RecordingMissLog::default();
+        let tree = SubmissionTree::from_enqueue_requests(
+            stow_types::api::SubmissionSource::InexactHit,
+            &[enqueue_request()],
+        )
+        .expect("tree");
+        let unpublished: std::collections::BTreeSet<String> =
+            tree.nodes.iter().map(|node| node.task_id.clone()).collect();
+        super::log_misses(&log, AnalyticsConsent::ALLOWED, &tree, &unpublished);
+        assert!(log.points.lock().expect("points").is_empty());
     }
 
     /// A request carrying `x-stow-no-analytics: 1` writes no point —

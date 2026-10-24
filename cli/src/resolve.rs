@@ -123,6 +123,10 @@ pub struct GraphAnalysis {
     pub expanded_total: usize,
     /// Exact artifacts the driver should fetch to satisfy the graph.
     pub prefetch_artifacts: Vec<PrefetchArtifactRow>,
+    /// Semantic keys the build serves inexactly — covered only
+    /// through a superset candidate (stow#882). Each is a node whose
+    /// exact chain the inexact report asks the scheduler to build.
+    pub inexact_keys: BTreeSet<(PackageKey, String)>,
 }
 
 /// Whether `row`'s recorded glibc floor lets this host load it. `None` on
@@ -198,6 +202,7 @@ pub fn analyze_dependency_graph(
             expanded_cached: 0,
             expanded_total: 0,
             prefetch_artifacts: Vec::new(),
+            inexact_keys: BTreeSet::new(),
         });
     }
 
@@ -257,6 +262,7 @@ pub fn analyze_dependency_graph(
         expanded_cached: plan.expanded_cached,
         expanded_total: plan.expanded_total,
         prefetch_artifacts: plan.prefetch_artifacts,
+        inexact_keys: plan.inexact_keys,
     })
 }
 
@@ -292,6 +298,7 @@ fn expanded_scheduler_plan(
         expanded_cached,
         expanded_total,
         prefetch_artifacts: cached.prefetch_artifacts,
+        inexact_keys: cached.inexact_keys,
     })
 }
 
@@ -299,6 +306,7 @@ struct ExpandedSchedulerPlan {
     expanded_cached: usize,
     expanded_total: usize,
     prefetch_artifacts: Vec<PrefetchArtifactRow>,
+    inexact_keys: BTreeSet<(PackageKey, String)>,
 }
 
 struct ExactExpandedGraph {
@@ -490,6 +498,9 @@ fn expanded_dependency_identities(
 
 struct CachedArtifacts {
     semantic_keys: BTreeSet<(PackageKey, String)>,
+    /// Semantic keys whose only reachable coverage is a superset
+    /// candidate (stow#882) — the nodes this build serves inexactly.
+    inexact_keys: BTreeSet<(PackageKey, String)>,
     prefetch_artifacts: Vec<PrefetchArtifactRow>,
 }
 
@@ -511,6 +522,7 @@ fn cached_artifacts(
     if key_pairs.is_empty() {
         return Ok(CachedArtifacts {
             semantic_keys: BTreeSet::new(),
+            inexact_keys: BTreeSet::new(),
             prefetch_artifacts: Vec::new(),
         });
     }
@@ -519,6 +531,15 @@ fn cached_artifacts(
     let semantic_keys = reachable
         .candidates
         .iter()
+        .map(|candidate| candidate.semantic_key.clone())
+        .collect::<BTreeSet<_>>();
+    // stow#882: a key covered only through a `superset` candidate is a
+    // node served inexactly — its exact chain is the chain the inexact
+    // report asks the scheduler to build.
+    let inexact_keys = reachable
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.superset)
         .map(|candidate| candidate.semantic_key.clone())
         .collect::<BTreeSet<_>>();
     // Coverage counts the catalog as it stands: a row this host's glibc
@@ -542,6 +563,7 @@ fn cached_artifacts(
     let prefetch_artifacts = servable_reachable.closure_artifacts(&selected_prefetch_rows);
     Ok(CachedArtifacts {
         semantic_keys,
+        inexact_keys,
         prefetch_artifacts,
     })
 }

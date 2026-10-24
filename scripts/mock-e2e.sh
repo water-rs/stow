@@ -1461,6 +1461,72 @@ echo "[mock-e2e] once_cell subset serve: before={misses,local}=$superset_stats_b
 [ "$(cut -d'|' -f3 <<<"$superset_stats_after")" = "$(cut -d'|' -f2 <<<"$superset_stats_before")" ] \
     || die "subset consumer built once_cell locally ($superset_stats_after)"
 
+# --- stow#882: the inexact serve reports the exact chain ---
+#
+# The subset check served once_cell["alloc","race"] from the published
+# ["alloc","default","race","std"] set — a hit, but inexact. The CLI
+# reports the exact chain through the same PoW admission a miss takes;
+# the scheduler queues it at very low priority, local CI builds it, and
+# after republish the same consumer is served the exact artifact.
+# The admission's redemption is the enqueue POST on the edge — count it
+# before and after so the leg can prove exactly one report fired.
+inexact_enqueues_before="$(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log" 2>/dev/null || true)"
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    exact_tasks="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" 2>/dev/null \
+        | jq '[.tasks[] | select(.task_id != null and (.task_id | test("once_cell")))] | length' 2>/dev/null || echo 0)"
+    [ "${exact_tasks:-0}" -ge 2 ] && break
+    [ "$SECONDS" -ge "$deadline" ] \
+        && die "inexact report did not dispatch the exact once_cell task within ${TASK_DEADLINE}s (tasks=$exact_tasks)"
+    sleep 5
+done
+[ "$(( $(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log") - inexact_enqueues_before ))" -ge 1 ] \
+    || die "no enqueue admission redeemed after the inexact serve — the report never posted"
+echo "[mock-e2e] inexact report: exact once_cell task dispatched ($exact_tasks once_cell tasks)"
+
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    open_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq '[.tasks[] | select(.status != "completed")] | length')"
+    [ "$open_runs" -eq 0 ] && break
+    [ "$SECONDS" -ge "$deadline" ] && die "exact chain still building after ${TASK_DEADLINE}s"
+    sleep 5
+done
+fg publish_slices "inexact"
+fg stow_cli index refresh >"$LOG_DIR/index-refresh-inexact.log" 2>&1 \
+    || die "stow index refresh (inexact) failed — see $LOG_DIR/index-refresh-inexact.log"
+
+# Rebuild the consumer cold: the analysis must now serve the exact
+# ["alloc","race"] artifact — one more hit, no misses, no local builds,
+# and no second inexact report (the exact set is published).
+rm -rf "$SUPERSET_CONSUMER/target"
+enqueues_before_exact="$(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log")"
+fg in_dir "$SUPERSET_CONSUMER" stow_cli check >"$LOG_DIR/stow-check-exact.log" 2>&1 \
+    || die "stow check (exact) failed — see $LOG_DIR/stow-check-exact.log"
+exact_stats="$(sqlite3 "$WORK_DIR/stow-cache/state-v3.sqlite3" \
+    "SELECT COALESCE(SUM(hits),0), COALESCE(SUM(misses),0), COALESCE(SUM(local_dependency_builds),0) \
+     FROM crate_stats WHERE crate_name='once_cell'")"
+echo "[mock-e2e] once_cell exact serve: after={hits,misses,local}=$exact_stats"
+[ "$(cut -d'|' -f1 <<<"$exact_stats")" -ge 2 ] \
+    || die "rebuilt consumer was not served the exact once_cell set ($exact_stats)"
+[ "$(cut -d'|' -f2 <<<"$exact_stats")" = "$(cut -d'|' -f2 <<<"$superset_stats_after")" ] \
+    || die "exact serve recorded a miss ($exact_stats)"
+[ "$(cut -d'|' -f3 <<<"$exact_stats")" = "$(cut -d'|' -f3 <<<"$superset_stats_after")" ] \
+    || die "exact serve built once_cell locally ($exact_stats)"
+# A hit alone cannot tell the exact set from a superset: the absent
+# report is the proof. The report rides the detached drain, so wait for
+# every journal and drain claim to clear before counting — an exact
+# build journals nothing and passes at once.
+deadline=$((SECONDS + 60))
+while compgen -G "$SUPERSET_CONSUMER/target/stow-misses.*" >/dev/null; do
+    [ "$SECONDS" -ge "$deadline" ] && die "exact rebuild's miss journal did not drain within 60s"
+    sleep 1
+done
+[ "$(( $(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log") - enqueues_before_exact ))" -eq 0 ] \
+    || die "exact serve posted another inexact report"
+
 # --- byte path: bundles served by digest, Workers Cache in front of GHCR ---
 #
 # `stow check` already fetched itoa's bundle through
@@ -1523,6 +1589,7 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
         '{
             target: $target,
             rustc_version: $rustc,
+            source: "cache_miss",
             entries: [{crate_name: $crate, version: $version, features: ["default"]}],
             expanded_entries: [{
                 crate_name: $crate,
@@ -1550,6 +1617,7 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
         '{
             target: $target,
             rustc_version: $rustc,
+            source: "cache_miss",
             entries: [{crate_name: "libc", version: "0.2.177", features: ["default"]}],
             expanded_entries: [{
                 crate_name: "libc",
