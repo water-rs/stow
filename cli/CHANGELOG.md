@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/water-rs/stow/compare/stow-cli-v0.7.0...stow-cli-v0.8.0) - 2026-10-24
+
+### Added
+
+- [**breaking**] report inexact superset hits so the exact chain builds ([#913](https://github.com/water-rs/stow/pull/913))
+- [**breaking**] serve a contained feature set from its smallest published superset ([#910](https://github.com/water-rs/stow/pull/910))
+- [**breaking**] run the scheduler on an in-memory graph with a flat log and snapshots ([#901](https://github.com/water-rs/stow/pull/901))
+- privacy-preserving usage statistics in Analytics Engine ([#896](https://github.com/water-rs/stow/pull/896))
+
+### Fixed
+
+- *(oci)* load the Sigstore trust root through sigstore-trust-root ([#873](https://github.com/water-rs/stow/pull/873))
+
 ## [0.7.0](https://github.com/water-rs/stow/compare/stow-cli-v0.6.0...stow-cli-v0.7.0) - 2026-10-22
 
 ### Added

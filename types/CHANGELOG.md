@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/water-rs/stow/compare/stow-types-v0.7.0...stow-types-v0.8.0) - 2026-10-24
+
+### Added
+
+- *(edge)* uncached scheduler health endpoint ([#916](https://github.com/water-rs/stow/pull/916))
+- [**breaking**] rank the preheat binary lane by 90-day downloads from the db dump ([#915](https://github.com/water-rs/stow/pull/915))
+- [**breaking**] report inexact superset hits so the exact chain builds ([#913](https://github.com/water-rs/stow/pull/913))
+- [**breaking**] serve a contained feature set from its smallest published superset ([#910](https://github.com/water-rs/stow/pull/910))
+- [**breaking**] preheat reaches builds only through the scheduler ([#908](https://github.com/water-rs/stow/pull/908))
+- [**breaking**] rank scheduler work by priority times time waited ([#906](https://github.com/water-rs/stow/pull/906))
+- [**breaking**] run the scheduler on an in-memory graph with a flat log and snapshots ([#901](https://github.com/water-rs/stow/pull/901))
+- [**breaking**] one CI interface for build occupancy and task submission ([#899](https://github.com/water-rs/stow/pull/899))
+- [**breaking**] derive every cost limit from one 80% allowance line ([#897](https://github.com/water-rs/stow/pull/897))
+- privacy-preserving usage statistics in Analytics Engine ([#896](https://github.com/water-rs/stow/pull/896))
+
+### Fixed
+
+- *(admin)* settle a job row on its conclusion ([#864](https://github.com/water-rs/stow/pull/864))
+
+### Other
+
+- [**breaking**] stop using D1 ([#905](https://github.com/water-rs/stow/pull/905))
+- [**breaking**] dispatch every task as its own build-crate.yml run ([#894](https://github.com/water-rs/stow/pull/894))
+
 ## [0.7.0](https://github.com/water-rs/stow/compare/stow-types-v0.6.0...stow-types-v0.7.0) - 2026-10-22
 
 ### Added
