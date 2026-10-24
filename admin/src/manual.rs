@@ -92,7 +92,7 @@ pub async fn run(args: ManualArgs, output: Output) -> stow_types::error::Result<
     let source = SubmissionSource::Operations {
         priority: args.priority.saturating_mul(100),
     };
-    let trees = resolved
+    let mut trees = resolved
         .sources
         .iter()
         .map(|tasks| SubmissionTree::from_enqueue_requests(source, tasks))
@@ -104,6 +104,8 @@ pub async fn run(args: ManualArgs, output: Output) -> stow_types::error::Result<
         render::emit_line("no tasks resolved");
         return Ok(());
     }
+    // The plan renders the substituted ids, so substitute before it.
+    substitute_against_published(&mut trees).await?;
     render::mutation(
         output,
         trees,
@@ -577,6 +579,23 @@ pub async fn published_slices(
         }
     }
     Ok(slices)
+}
+
+/// Serve every contained feature set in `trees` from its smallest
+/// containing set (stow#881). The pool is the batch plus the published
+/// sets in the signed slices covering the batch's own (target, rustc)
+/// pairs; a host-side node's `target` is its family's host triple, so
+/// the pairs cover host slices too.
+pub async fn substitute_against_published(
+    trees: &mut [SubmissionTree],
+) -> stow_types::error::Result<()> {
+    let pairs = trees
+        .iter()
+        .flat_map(|tree| &tree.nodes)
+        .map(|node| (node.target.clone(), node.rustc_version.clone()))
+        .collect::<BTreeSet<_>>();
+    let published = published_slices(&pairs).await?;
+    SubmissionTree::substitute_contained_sets(trees, &published)
 }
 
 /// The three handles the index-slice pulls share — `pub` so the
