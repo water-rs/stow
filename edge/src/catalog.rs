@@ -5,13 +5,12 @@
 //! version picker, and feature checkboxes — so a submission is assembled
 //! from what crates.io actually publishes instead of typed free-hand. Every
 //! answer is derived from the same [`CratesIo`] boundary and the same
-//! TTL-bounded D1 caches the dependency resolver uses, so a catalog lookup
+//! TTL-bounded Workers Cache entries the dependency resolver uses, so a catalog lookup
 //! and a later graph expansion of the same version share one round trip.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use semver::Version;
-use skyzen_services::Db;
 use stow_types::api::{
     CrateFeature, CrateFeaturesResponse, CrateSearchHit, CrateSearchResponse, CrateVersionsResponse,
 };
@@ -82,11 +81,11 @@ pub async fn search_crates(
 
 /// Every published, non-yanked version of `crate_name`, newest first.
 pub async fn crate_versions(
-    db: &Db,
+    cache: &impl crate::dependency_resolver::CratesIoCache,
     crates_io: &impl CratesIo,
     crate_name: &str,
 ) -> Result<CrateVersionsResponse, ResolverError> {
-    let versions = published_versions(db, crates_io, crate_name)
+    let versions = published_versions(cache, crates_io, crate_name)
         .await?
         .into_iter()
         .map(CrateVersion)
@@ -97,12 +96,12 @@ pub async fn crate_versions(
 /// Every feature a caller may select on `crate_name@version`, `default`
 /// first and the rest alphabetical.
 pub async fn crate_features(
-    db: &Db,
+    cache: &impl crate::dependency_resolver::CratesIoCache,
     crates_io: &impl CratesIo,
     crate_name: &str,
     version: &Version,
 ) -> Result<CrateFeaturesResponse, ResolverError> {
-    let graph = version_feature_graph(db, crates_io, crate_name, version).await?;
+    let graph = version_feature_graph(cache, crates_io, crate_name, version).await?;
     Ok(CrateFeaturesResponse {
         features: describe_features(&graph.features, &graph.dependencies),
     })
@@ -280,12 +279,20 @@ mod tests {
         }
     }
 
-    async fn memory_db() -> skyzen_services::Db {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        crate::db::apply_schema(&db).await;
-        db
+    /// Every test serves a cold cache: the point under test is the
+    /// crates.io answer, not the entry the miss stored.
+    #[derive(Default)]
+    struct StubCache;
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl crate::dependency_resolver::CratesIoCache for StubCache {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>, crate::errors::ResolverError> {
+            Ok(None)
+        }
+
+        async fn put(&self, _key: &str, _body: &[u8]) -> Result<(), crate::errors::ResolverError> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -319,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn versions_come_back_newest_first() {
-        let db = memory_db().await;
+        let db = StubCache;
         let crates_io = StubCratesIo::new(BTreeMap::from([(
             "serde".to_owned(),
             vec![
@@ -343,7 +350,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unpublished_crate_has_no_version_list() {
-        let db = memory_db().await;
+        let db = StubCache;
         let crates_io = StubCratesIo::new(BTreeMap::new());
 
         let error = crate_versions(&db, &crates_io, "definitely-not-a-crate")
@@ -358,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn features_lead_with_default_and_mark_its_closure() {
-        let db = memory_db().await;
+        let db = StubCache;
         let mut crates_io = StubCratesIo::new(BTreeMap::from([(
             "serde".to_owned(),
             vec!["1.0.219".to_owned()],

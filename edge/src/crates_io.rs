@@ -33,7 +33,7 @@ const CRATES_IO_USER_AGENT: &str = concat!(
 );
 /// Index files are static content that only changes when the crate
 /// publishes; a one-hour edge TTL absorbs repeated lookups across worker
-/// invocations while staying well under the six-hour TTL the D1 graph
+/// invocations while staying well under the six-hour TTL the graph
 /// cache already tolerates.
 const INDEX_EDGE_CACHE_TTL_SECONDS: i32 = 3600;
 /// Fetch attempts before giving up: transient statuses and network errors

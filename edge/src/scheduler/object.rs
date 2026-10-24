@@ -649,9 +649,10 @@ async fn submit(
     // human lanes arrive through their own bound — and every tree's
     // Submit parts land in one turn before the merge: the single
     // transaction the ack follows.
-    let inserted = routes::submit(graph, db, &settings, trees, enforce_pending_cap, now_ms())
-        .await
-        .map_err(route_error)?;
+    let (inserted, unpublished_ids) =
+        routes::submit(graph, db, &settings, trees, enforce_pending_cap, now_ms())
+            .await
+            .map_err(route_error)?;
     // Dispatch is not this request's work: the alarm's dispatch pass
     // runs it, so the submit answers once the queue write lands instead
     // of holding the client — and burning the DO's per-request CPU
@@ -660,7 +661,10 @@ async fn submit(
     // rows all sit behind unmet gates arms nothing, while a stale
     // in-flight lease still arms at its expiry (stow#444).
     schedule_alarm(env, db, alarm, graph.cell()).await?;
-    Ok(Json(InsertedResponse { inserted }))
+    Ok(Json(InsertedResponse {
+        inserted,
+        unpublished_ids,
+    }))
 }
 
 /// The trusted submit lane refuses while the freeze is engaged — a
@@ -1837,6 +1841,9 @@ fn to_error(error: impl std::fmt::Display) -> Error {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct InsertedResponse {
     inserted: u32,
+    /// Task ids the merge found unpublished — the redemption path's
+    /// miss set (stow#886).
+    unpublished_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]

@@ -17,8 +17,6 @@ mod crates_io_fetch;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod crates_io_index;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod db;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) mod dependency_resolver;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod errors;
@@ -46,8 +44,6 @@ mod rust_channel;
 mod scheduler;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod site;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod sql_batch;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod stats;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]

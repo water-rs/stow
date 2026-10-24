@@ -85,10 +85,6 @@ STOW_ALERT_TO = "me@lexo.cool"
 # trip earlier on a shared account.
 STOW_COST_BUDGET_MULTIPLIER = "1.0"
 
-[[cloudflare.d1_databases]]
-binding = "STOW_DB"
-database_name = "stow-prod"
-database_id = "b2fefa0a-828a-4681-b6f1-4d491d5dff5e"
 
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"
@@ -129,8 +125,8 @@ name = "CF_ANALYTICS_TOKEN"
 [cloudflare.raw]
 routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "waterui.dev" }]
 
-# Cache-miss events go to Analytics Engine instead of a D1 append log; the
-# dataset is created implicitly by the first writeDataPoint.
+# Cache-miss events go to Analytics Engine; the dataset is created
+# implicitly by the first writeDataPoint.
 [[cloudflare.raw.analytics_engine_datasets]]
 binding = "STOW_ANALYTICS"
 dataset = "stow_cache_misses"
@@ -144,8 +140,8 @@ dataset = "stow_events"
 
 # Workers Cache — the platform cache that answers cacheable GETs before
 # this Worker runs. A hit is still billed as a Workers request; what it
-# saves is the Worker running — the CPU time, subrequests and D1/Durable
-# Object reads a miss would spend. Cacheability is the response's own
+# saves is the Worker running — the CPU time and subrequests a miss
+# would spend. Cacheability is the response's own
 # Cache-Control: the digest-addressed byte paths emit `public,
 # max-age=31536000, immutable`, the catalog and stats endpoints short
 # max-ages, and the point-in-time lanes and every error answer
@@ -159,8 +155,8 @@ enabled = true
 
 
 # Paid plan defaults subrequests to 10k/invocation, which a cold-closure
-# analysis can exceed — every uncached entry costs a sparse-index fetch plus
-# D1 service calls, and `max_expanded_tasks` is 4096. 100k gives headroom
+# analysis can exceed — every uncached entry costs a sparse-index fetch
+# plus scheduler service calls, and `max_expanded_tasks` is 4096. 100k gives headroom
 # while staying a hard per-invocation fuse. cpu_ms drops from the paid
 # default (30s) to 15s — the billed meter — so a runaway request is
 # cut off sooner. Skyzen has no first-class limits section, so both keys

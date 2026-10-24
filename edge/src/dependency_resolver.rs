@@ -2,24 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use semver::{Version, VersionReq};
-use skyzen_services::Db;
 use stow_types::api::{
     CrateRequestState, CrateRequestTarget, DependencyGraphEntry, EnqueueRequest, EnqueueSource,
     QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
 };
-use stow_types::identity::{
-    CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
-};
-use stow_types::public_cache::{
-    ExplicitSpelling, UnitInvocation, UnitShape, required_unit_shapes,
-    stable_c_metadata_for_compile_key,
-};
+use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
+use stow_types::public_cache::ExplicitSpelling;
 use stow_types::task_graph::{DigestEntry, TaskNodeIdentity, shared_dependency_identities};
 
 use crate::errors::ResolverError;
-use crate::sql_batch;
 
-const CACHE_TTL_SQL: &str = "-6 hours";
 const MAX_EXPANDED_TASKS: usize = 4096;
 
 /// The client-visible limit error every expanded-task cap reports:
@@ -33,8 +25,7 @@ const fn limit_exceeded(what: &'static str, got: usize) -> ResolverError {
     }
 }
 
-/// Format tag stored inside every `crate_version_graph_cache.graph_json`
-/// payload. Version 1 is the pre-tag shape — rows without this field (or
+/// Format tag stored inside every cached version-graph payload. Version 1 is the pre-tag shape — rows without this field (or
 /// with a different value) are treated as misses and re-fetched, so a
 /// stale-format row is never served.
 const VERSION_GRAPH_FORMAT: u32 = 3;
@@ -75,6 +66,37 @@ pub trait CratesIo: Sync {
         query: &str,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<CratesIoSearchHit>, ResolverError>> + Send;
+}
+
+/// Where the resolver's crates.io answers are cached — the Workers
+/// Cache API (`CfCache`) in production, a stub in host tests, the same
+/// seam [`crate::rust_channel::ChannelCache`] uses. `get` serves a
+/// still-fresh value or `None`; `put` stores under the caller's key with
+/// the shared TTL the caller's [`CACHE_TTL_SECONDS`] sets on the stored
+/// response.
+pub trait CratesIoCache: Sync {
+    /// The stored body under `key`, or `None` when absent or expired.
+    fn get(&self, key: &str)
+    -> impl Future<Output = Result<Option<Vec<u8>>, ResolverError>> + Send;
+
+    /// Store `body` under `key`.
+    fn put(&self, key: &str, body: &[u8])
+    -> impl Future<Output = Result<(), ResolverError>> + Send;
+}
+
+/// The Workers-Cache entry lifetime for crates.io answers — the same
+/// six hours the cache carried.
+pub const CACHE_TTL_SECONDS: u32 = 6 * 60 * 60;
+
+/// The cache key namespaces: `/crates-io/versions/<crate>` and
+/// `/crates-io/version-graph/<crate>/<version>` under the internal
+/// cache domain `crate::cache` prefixes.
+fn versions_key(crate_name: &str) -> String {
+    format!("versions/{crate_name}")
+}
+
+fn version_graph_key(crate_name: &str, version: &Version) -> String {
+    format!("version-graph/{crate_name}/{version}")
 }
 
 /// One published release of a crate, as the registry index reports it.
@@ -122,7 +144,7 @@ pub struct PackageKey {
     pub version: Version,
 }
 
-/// Cached per-version crates.io metadata (D1 `crate_version_graph_cache`).
+/// Cached per-version crates.io metadata (the Workers Cache `version-graph` entries).
 ///
 /// `format_version` is the cache's schema tag: [`fetch_version_graph_cached`]
 /// serves a row only when it parses *and* carries the current
@@ -201,31 +223,6 @@ pub enum CratesIoDependencyKind {
     Build,
 }
 
-#[derive(Debug, skyzen::FromRow)]
-struct CachedArtifactRow {
-    compile_key: String,
-    crate_name: String,
-    version: String,
-    features_json: String,
-    c_metadata: String,
-    dependency_c_metadata_json: String,
-    /// The Merkle dependency digest the row was built under — the
-    /// context a node must match for the row to cover it (stow#790).
-    dependency_identity: String,
-    /// The builder-recorded unit shape.
-    unit_side: i64,
-    unit_invocation: i64,
-    unit_linked: i64,
-}
-
-/// The unit shape a cached row serves, decoded from the columns the
-/// builder wrote — a corrupt triplet is the invariant error the shared
-/// decoder reports (stow#730).
-fn cached_row_unit_shape(row: &CachedArtifactRow) -> Result<UnitShape, ResolverError> {
-    crate::db::decode_unit_shape(row.unit_side, row.unit_invocation, row.unit_linked)
-        .map_err(ResolverError::Invariant)
-}
-
 /// Decode a stored canonical features-json string into the structured wire type.
 fn parse_canonical_features_json(raw: &str) -> Result<FeaturesJson, ResolverError> {
     let parsed: Vec<String> = serde_json::from_str(raw)
@@ -233,8 +230,7 @@ fn parse_canonical_features_json(raw: &str) -> Result<FeaturesJson, ResolverErro
     FeaturesJson::from_sorted(parsed).map_err(ResolverError::Identity)
 }
 
-pub async fn expand_scheduler_requests(
-    db: &Db,
+pub fn expand_scheduler_requests(
     target: &str,
     rustc_version: &str,
     roots: &[DependencyGraphEntry],
@@ -277,20 +273,10 @@ pub async fn expand_scheduler_requests(
         &target_typed,
         &rustc_version_typed,
     )?;
-    let semantic_keys = load_cached_artifacts(
-        db,
-        target,
-        rustc_version,
-        &exact_graph.feature_json_by_key,
-        &context_by_key,
-    )
-    .await?;
-
     let requests = build_enqueue_requests(
         &exact_graph.feature_json_by_key,
         &exact_graph.dependency_keys_by_key,
         &context_by_key,
-        &semantic_keys,
         &target_typed,
         &rustc_version_typed,
         EnqueueSource::CacheMiss,
@@ -301,13 +287,12 @@ pub async fn expand_scheduler_requests(
 }
 
 /// The per-node context map for `expanded_entries`: each entry's
-/// carried subgraph, its explicit-spelling flag, and its Merkle
-/// dependency digest. The digests come from one shared bottom-up pass
-/// over the subgraphs' union — a node's digest derives from its own
-/// identity and its dependencies' digests, so each distinct node is
-/// computed once (stow#790) — and the same pass is the wire's resolve
-/// check: a subgraph that does not resolve, or two declarations of one
-/// node that disagree, is refused rather than minted (stow#588).
+/// carried subgraph and its explicit-spelling flag. The shared
+/// bottom-up pass over the subgraphs' union is the wire's resolve
+/// check (stow#588): a subgraph that does not resolve, or two
+/// declarations of one node that disagree, is refused rather than
+/// minted. The digest itself is not carried — the task id recomputes
+/// it from the submitted subgraph.
 fn node_contexts(
     exact_graph: &ExactExpandedGraph,
     expanded_entries: &[ResolvedDependencyGraphEntry],
@@ -347,11 +332,11 @@ fn node_contexts(
             subgraph: &entry.dependency_subgraph,
         })
         .collect::<Vec<_>>();
-    let digests = shared_dependency_identities(&digest_entries).map_err(|error| {
+    shared_dependency_identities(&digest_entries).map_err(|error| {
         ResolverError::BadRequest(format!("dependency subgraphs do not resolve: {error}"))
     })?;
     let mut context_by_key = BTreeMap::new();
-    for (entry, dependency_identity) in expanded_entries.iter().zip(digests) {
+    for entry in expanded_entries {
         let key = ExpandedNodeKey {
             package: PackageKey {
                 crate_name: entry.crate_name.clone(),
@@ -365,7 +350,6 @@ fn node_contexts(
                 ExpandedNodeContext {
                     subgraph: entry.dependency_subgraph.clone(),
                     explicit_spelling: entry.explicit_spelling,
-                    dependency_identity,
                 },
             )
             .is_some()
@@ -403,7 +387,6 @@ fn build_enqueue_requests(
     feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
     dependency_keys_by_key: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
     context_by_key: &BTreeMap<ExpandedNodeKey, ExpandedNodeContext>,
-    cached_semantic_keys: &BTreeSet<(ExpandedNodeKey, String)>,
     target_typed: &TargetTriple,
     rustc_version_typed: &WireRustcVersion,
     source: EnqueueSource,
@@ -416,9 +399,6 @@ fn build_enqueue_requests(
                 node_key.package.crate_name, node_key.package.version
             )
         })?;
-        if cached_semantic_keys.contains(&(node_key.clone(), features_json.clone())) {
-            continue;
-        }
         let features_json_typed = parse_canonical_features_json(features_json.as_str())?;
         let context = context_by_key.get(node_key).ok_or_else(|| {
             format!(
@@ -452,21 +432,21 @@ fn build_enqueue_requests(
 /// `None` when the crate has no stable release. `*` never matches
 /// prereleases and `published_version_nums` already drops yanked releases.
 pub async fn latest_published_version(
-    db: &Db,
+    cache: &impl CratesIoCache,
     crates_io: &impl CratesIo,
     crate_name: &str,
 ) -> Result<Option<Version>, ResolverError> {
-    resolve_dependency_version(db, crates_io, crate_name, "*").await
+    resolve_dependency_version(cache, crates_io, crate_name, "*").await
 }
 
 /// `Some(version)` when `crate_name@version` is published and not yanked.
 pub async fn published_version(
-    db: &Db,
+    cache: &impl CratesIoCache,
     crates_io: &impl CratesIo,
     crate_name: &str,
     version: &Version,
 ) -> Result<Option<Version>, ResolverError> {
-    resolve_dependency_version(db, crates_io, crate_name, &format!("={version}")).await
+    resolve_dependency_version(cache, crates_io, crate_name, &format!("={version}")).await
 }
 
 /// Assemble the per-target outcome of a crate request from the artifact
@@ -556,7 +536,6 @@ struct ExactExpandedGraph {
 struct ExpandedNodeContext {
     subgraph: stow_types::api::TaskSubgraph,
     explicit_spelling: ExplicitSpelling,
-    dependency_identity: DependencyIdentity,
 }
 
 fn exact_graph_from_request(
@@ -648,483 +627,20 @@ fn exact_graph_from_request(
     })
 }
 
-async fn load_cached_artifacts(
-    db: &Db,
-    target: &str,
-    rustc_version: &str,
-    feature_json_by_key: &BTreeMap<ExpandedNodeKey, String>,
-    context_by_key: &BTreeMap<ExpandedNodeKey, ExpandedNodeContext>,
-) -> Result<BTreeSet<(ExpandedNodeKey, String)>, ResolverError> {
-    let host_triple = runner_family(target).map_or_else(|| target, |family| family.host_triple());
-    let mut cached = BTreeSet::new();
-    // A host-side node's artifacts and a target-side node's both key on
-    // the triple they compile at — for a native consumer that is the
-    // same triple — so coverage is asked per (platform, side): each side
-    // requires the unit shapes its consumers' builds look up.
-    for (platform, host_side) in [(target, false), (host_triple, true)] {
-        let mut nodes = BTreeMap::<(PackageKey, String), NodeCoverageContext>::new();
-        for (key, features_json) in feature_json_by_key
-            .iter()
-            .filter(|(key, _)| key.host_side == host_side)
-        {
-            let context = context_by_key.get(key).ok_or_else(|| {
-                format!(
-                    "missing node context for {} {}",
-                    key.package.crate_name, key.package.version
-                )
-            })?;
-            nodes.insert(
-                (key.package.clone(), features_json.clone()),
-                NodeCoverageContext {
-                    explicit_spelling: context.explicit_spelling,
-                    dependency_identity: context.dependency_identity.clone(),
-                },
-            );
-        }
-        for (package, features_json) in
-            load_cached_artifacts_for_keys(db, platform, rustc_version, &nodes, host_side).await?
-        {
-            cached.insert((ExpandedNodeKey { package, host_side }, features_json));
-        }
-    }
-    Ok(cached)
-}
-
-/// What coverage needs from one node beyond its semantic key: the
-/// invocation spelling its required unit shapes derive from, and the
-/// node's own Merkle dependency digest — an artifact published under
-/// any other dependency context does not cover it, because the
-/// dependents' edges name this digest, never the bare tuple
-/// (stow#790).
-pub struct NodeCoverageContext {
-    /// The node's explicit-`--target` spelling flag (stow#736).
-    pub explicit_spelling: ExplicitSpelling,
-    /// The node's dependency-context digest, derived from its resolved
-    /// subgraph.
-    pub dependency_identity: DependencyIdentity,
-}
-
-/// [`load_cached_artifacts`] over a set of `(key, features)` pairs —
-/// `stow-resolve`'s node space keys coverage the same way but can carry
-/// two feature sets for one `(name, version)` on a platform, which a map
-/// cannot express.
-pub async fn load_cached_artifacts_for_keys(
-    db: &Db,
-    target: &str,
-    rustc_version: &str,
-    nodes: &BTreeMap<(PackageKey, String), NodeCoverageContext>,
-    host_side: bool,
-) -> Result<BTreeSet<(PackageKey, String)>, ResolverError> {
-    if nodes.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-
-    let crate_names = nodes
-        .keys()
-        .map(|(key, _)| key.crate_name.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let mut cached_rows = Vec::<CachedArtifactRow>::new();
-    for batch in crate_names.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
-        let sql = format!(
-            "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_identity, unit_side, unit_invocation, unit_linked \
-             FROM artifacts \
-             WHERE target = ? AND rustc_version = ? AND crate_name IN ({})",
-            sql_batch::placeholders(batch.len())
-        );
-        let mut query = db.query(&sql).bind(target).bind(rustc_version);
-        for crate_name in batch {
-            query = query.bind(crate_name.as_str());
-        }
-        let mut rows = query
-            .fetch_all::<CachedArtifactRow>()
-            .await
-            .map_err(|error| format!("load cached semantic keys: {error}"))?;
-        cached_rows.append(&mut rows);
-    }
-
-    // Complete the chain universe: candidate rows reference dependency
-    // artifacts by (crate_name, c_metadata) that may not semantically match
-    // this request's graph (they came from another preheat's feature
-    // unification) yet are perfectly fetchable — the CLI resolves closure
-    // dependencies by identity, not by this request's semantic keys. Pull
-    // every referenced-but-unloaded canonical row so reachability reflects
-    // "closed within D1", not "closed within this request's candidates".
-    let cached_rows = complete_chain_rows(db, target, rustc_version, cached_rows).await?;
-
-    let candidates = resolve_reachable_cached_rows(nodes, cached_rows)?;
-    // Coverage is per unit shape, not per semantic row: the consumer's
-    // build looks up each unit at the shape its invocation computes, so
-    // a key is covered only when reachable candidates carry every shape
-    // its side requires (`required_unit_shapes`) — a `KeysApart` node's
-    // four-shape set included (stow#736).
-    let invocation = runner_family(target).map_or(UnitInvocation::Target, |family| {
-        UnitInvocation::for_task(target, family.host_triple())
-    });
-    let mut required_by_key = BTreeMap::<&(PackageKey, String), Vec<UnitShape>>::new();
-    for (key_pair, context) in nodes {
-        required_by_key.insert(
-            key_pair,
-            required_unit_shapes(host_side, invocation, context.explicit_spelling),
-        );
-    }
-    let mut shapes_by_key = BTreeMap::<&(PackageKey, String), BTreeSet<UnitShape>>::new();
-    for candidate in &candidates {
-        shapes_by_key
-            .entry(&candidate.semantic_key)
-            .or_default()
-            .insert(candidate.shape);
-    }
-    Ok(shapes_by_key
-        .into_iter()
-        .filter(|(key, shapes)| {
-            required_by_key
-                .get(key)
-                .is_some_and(|required| required.iter().all(|shape| shapes.contains(shape)))
-        })
-        .map(|(key, _)| key.clone())
-        .collect::<BTreeSet<_>>())
-}
-
-fn resolve_reachable_cached_rows(
-    nodes: &BTreeMap<(PackageKey, String), NodeCoverageContext>,
-    rows: Vec<CachedArtifactRow>,
-) -> Result<Vec<ReachableCandidateRow>, ResolverError> {
-    let IndexedRows {
-        candidates,
-        candidate_index,
-        chain_rows,
-        chain_index,
-    } = partition_cached_rows(nodes, rows)?;
-
-    // Reachability fixpoint over the union of candidates and chain rows:
-    // a node is reachable when every dependency identity it references is a
-    // reachable node. Nodes are addressed as (is_chain, index).
-    let mut reachable_candidates = BTreeSet::<usize>::new();
-    let mut reachable_chain = BTreeSet::<usize>::new();
-    let mut progressed = true;
-    while progressed {
-        progressed = false;
-        let reach_check = |identity: &DepChainIdentity,
-                           reachable_candidates: &BTreeSet<usize>,
-                           reachable_chain: &BTreeSet<usize>| {
-            let key = (
-                canonical_crate_name(&identity.crate_name),
-                identity.c_metadata.clone(),
-            );
-            candidate_index
-                .get(&key)
-                .is_some_and(|index| reachable_candidates.contains(index))
-                || chain_index
-                    .get(&key)
-                    .is_some_and(|index| reachable_chain.contains(index))
-        };
-        for (index, candidate) in candidates.iter().enumerate() {
-            if reachable_candidates.contains(&index) {
-                continue;
-            }
-            if candidate
-                .dependency_identities
-                .iter()
-                .all(|identity| reach_check(identity, &reachable_candidates, &reachable_chain))
-            {
-                reachable_candidates.insert(index);
-                progressed = true;
-            }
-        }
-        for (index, chain_row) in chain_rows.iter().enumerate() {
-            if reachable_chain.contains(&index) {
-                continue;
-            }
-            if chain_row
-                .dependency_identities
-                .iter()
-                .all(|identity| reach_check(identity, &reachable_candidates, &reachable_chain))
-            {
-                reachable_chain.insert(index);
-                progressed = true;
-            }
-        }
-    }
-
-    Ok(candidates
-        .into_iter()
-        .enumerate()
-        .filter(|(index, _)| reachable_candidates.contains(index))
-        .map(|(_, candidate)| candidate)
-        .collect())
-}
-
-/// Partition cached rows by request match: rows whose (package, features)
-/// pair is in `nodes` *and* whose recorded dependency digest equals the
-/// node's own become candidates (stow#790 — a tuple published under a
-/// different dependency context covers nothing, because dependents' edges
-/// name the node's own digest); every other canonical row is a chain row
-/// another candidate's closure may reference. Rows failing the
-/// canonical-metadata check are dropped.
-fn partition_cached_rows(
-    nodes: &BTreeMap<(PackageKey, String), NodeCoverageContext>,
-    rows: Vec<CachedArtifactRow>,
-) -> Result<IndexedRows, ResolverError> {
-    let mut candidates = Vec::<ReachableCandidateRow>::new();
-    let mut candidate_index = BTreeMap::<(String, String), usize>::new();
-    let mut chain_rows = Vec::<ChainRow>::new();
-    let mut chain_index = BTreeMap::<(String, String), usize>::new();
-
-    for row in rows {
-        if !cached_row_has_canonical_metadata(&row)? {
-            continue;
-        }
-        let dependency_identities =
-            serde_json::from_str::<Vec<DepChainIdentity>>(&row.dependency_c_metadata_json)
-                .map_err(|error| {
-                    format!(
-                        "parse cached dependency_c_metadata_json for {} {} {}: {error}",
-                        row.crate_name, row.version, row.c_metadata
-                    )
-                })?;
-        let dependency_identities = canonicalize_dependency_identities(dependency_identities);
-        let identity_key = (
-            canonical_crate_name(&row.crate_name),
-            row.c_metadata.clone(),
-        );
-
-        let version = Version::parse(&row.version)
-            .map_err(|error| format!("parse cached semver {}: {error}", row.version))?;
-        let package_key = PackageKey {
-            crate_name: CrateName::parse(row.crate_name.as_str())
-                .map_err(|error| format!("cached crate_name `{}`: {error}", row.crate_name))?,
-            version,
-        };
-        let semantic_key = (package_key, row.features_json.clone());
-        if nodes
-            .get(&semantic_key)
-            .is_some_and(|context| context.dependency_identity.as_str() == row.dependency_identity)
-        {
-            if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
-                if !deduplicate_cached_candidate(
-                    &candidates[existing_index],
-                    &semantic_key,
-                    &row,
-                    &dependency_identities,
-                ) {
-                    return Err(ResolverError::Invariant(format!(
-                        "conflicting cached artifact identity {} {}",
-                        identity_key.0, identity_key.1
-                    )));
-                }
-                continue;
-            }
-            candidate_index.insert(identity_key, candidates.len());
-            candidates.push(ReachableCandidateRow {
-                shape: cached_row_unit_shape(&row)?,
-                semantic_key,
-                row,
-                dependency_identities,
-            });
-            continue;
-        }
-
-        // Not a semantic match for this request, but still a canonical
-        // artifact another candidate's closure may reference.
-        if chain_index.contains_key(&identity_key) || candidate_index.contains_key(&identity_key) {
-            continue;
-        }
-        chain_index.insert(identity_key, chain_rows.len());
-        chain_rows.push(ChainRow {
-            dependency_identities,
-        });
-    }
-
-    Ok(IndexedRows {
-        candidates,
-        candidate_index,
-        chain_rows,
-        chain_index,
-    })
-}
-
-/// Iteratively load canonical rows referenced by already-loaded rows'
-/// dependency chains until the set is closed under chain references.
-async fn complete_chain_rows(
-    db: &Db,
-    target: &str,
-    rustc_version: &str,
-    mut rows: Vec<CachedArtifactRow>,
-) -> Result<Vec<CachedArtifactRow>, ResolverError> {
-    // Chains form a DAG over build outputs, so depth is bounded by the
-    // dependency graph's height; the cap only guards corrupted data.
-    const MAX_CHAIN_DEPTH: usize = 64;
-
-    let mut seen = rows
-        .iter()
-        .map(|row| row.c_metadata.clone())
-        .collect::<BTreeSet<_>>();
-    let mut frontier: Vec<usize> = (0..rows.len()).collect();
-    for _ in 0..MAX_CHAIN_DEPTH {
-        let mut wanted = BTreeSet::<String>::new();
-        for index in std::mem::take(&mut frontier) {
-            let identities = serde_json::from_str::<Vec<DepChainIdentity>>(
-                &rows[index].dependency_c_metadata_json,
-            )
-            .map_err(|error| {
-                format!(
-                    "parse cached dependency_c_metadata_json for {} {} {}: {error}",
-                    rows[index].crate_name, rows[index].version, rows[index].c_metadata
-                )
-            })?;
-            for identity in identities {
-                if !seen.contains(&identity.c_metadata) {
-                    wanted.insert(identity.c_metadata);
-                }
-            }
-        }
-        if wanted.is_empty() {
-            return Ok(rows);
-        }
-        let wanted = wanted.into_iter().collect::<Vec<_>>();
-        for batch in wanted.chunks(sql_batch::SQLITE_IN_CLAUSE_BATCH_SIZE) {
-            let sql = format!(
-                "SELECT compile_key, crate_name, version, features_json, c_metadata, dependency_c_metadata_json, dependency_identity, unit_side, unit_invocation, unit_linked \
-                 FROM artifacts \
-                 WHERE target = ? AND rustc_version = ? AND c_metadata IN ({})",
-                sql_batch::placeholders(batch.len())
-            );
-            let mut query = db.query(&sql).bind(target).bind(rustc_version);
-            for c_metadata in batch {
-                query = query.bind(c_metadata.as_str());
-            }
-            let fetched = query
-                .fetch_all::<CachedArtifactRow>()
-                .await
-                .map_err(|error| format!("load chain-referenced cached rows: {error}"))?;
-            for row in fetched {
-                if seen.insert(row.c_metadata.clone()) {
-                    frontier.push(rows.len());
-                    rows.push(row);
-                }
-            }
-        }
-        // Referenced rows that do not exist in D1 stay absent; their
-        // dependents are simply unreachable. Stop looking them up again.
-        for c_metadata in &wanted {
-            seen.insert(c_metadata.clone());
-        }
-        if frontier.is_empty() {
-            return Ok(rows);
-        }
-    }
-    Err(ResolverError::Invariant(
-        "dependency chain completion exceeded the maximum depth — cyclic or corrupted chain data"
-            .to_owned(),
-    ))
-}
-
-fn cached_row_has_canonical_metadata(row: &CachedArtifactRow) -> Result<bool, ResolverError> {
-    let stable_c_metadata =
-        stable_c_metadata_for_compile_key(&row.compile_key).map_err(|error| {
-            format!(
-                "compute stable c_metadata for {} {} {}: {error}",
-                row.crate_name, row.version, row.compile_key
-            )
-        })?;
-    Ok(stable_c_metadata == row.c_metadata)
-}
-
-fn canonicalize_dependency_identities(
-    mut dependency_identities: Vec<DepChainIdentity>,
-) -> Vec<DepChainIdentity> {
-    dependency_identities.sort_by(|left, right| {
-        canonical_crate_name(&left.crate_name)
-            .cmp(&canonical_crate_name(&right.crate_name))
-            .then(left.c_metadata.cmp(&right.c_metadata))
-    });
-    dependency_identities
-}
-
-fn deduplicate_cached_candidate(
-    existing: &ReachableCandidateRow,
-    semantic_key: &SemanticKey,
-    row: &CachedArtifactRow,
-    dependency_identities: &[DepChainIdentity],
-) -> bool {
-    if existing.semantic_key != *semantic_key
-        || existing.dependency_identities != dependency_identities
-    {
-        return false;
-    }
-    if row.c_metadata != existing.row.c_metadata {
-        return false;
-    }
-    true
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-struct DepChainIdentity {
-    crate_name: String,
-    c_metadata: String,
-}
-
-#[derive(Debug)]
-struct ReachableCandidateRow {
-    /// The unit shape this artifact serves — what a consumer's compile
-    /// key lookup finds it under.
-    shape: UnitShape,
-    semantic_key: (PackageKey, String),
-    row: CachedArtifactRow,
-    dependency_identities: Vec<DepChainIdentity>,
-}
-
-/// A canonical row that is not a semantic match for the current request but
-/// participates in candidates' dependency closures.
-#[derive(Debug)]
-struct ChainRow {
-    dependency_identities: Vec<DepChainIdentity>,
-}
-
-/// Cached rows partitioned by request match — semantic candidates and
-/// chain-only rows, each indexed by (canonical crate name, `c_metadata`).
-#[derive(Debug)]
-struct IndexedRows {
-    candidates: Vec<ReachableCandidateRow>,
-    candidate_index: BTreeMap<(String, String), usize>,
-    chain_rows: Vec<ChainRow>,
-    chain_index: BTreeMap<(String, String), usize>,
-}
-
-/// Semantic identity `(package, features_json)` a reachability candidate is
-/// keyed on.
-type SemanticKey = (PackageKey, String);
-
-fn canonical_crate_name(crate_name: impl AsRef<str>) -> String {
-    crate_name.as_ref().replace('-', "_")
-}
-
 async fn fetch_version_graph_cached(
-    db: &Db,
+    cache: &impl CratesIoCache,
     crates_io: &impl CratesIo,
     crate_name: &str,
     version: &Version,
 ) -> Result<VersionGraph, ResolverError> {
-    let cached_graph_json = db
-        .query(
-            "SELECT graph_json \
-             FROM crate_version_graph_cache \
-             WHERE crate_name = ? AND version = ? AND fetched_at >= datetime('now', ?)",
-        )
-        .bind(crate_name)
-        .bind(version.to_string())
-        .bind(CACHE_TTL_SQL)
-        .fetch_scalar_optional::<String>()
-        .await
-        .map_err(|error| {
-            format!("load crate_version_graph_cache {crate_name} {version}: {error}")
+    if let Some(graph_json) = cache.get(&version_graph_key(crate_name, version)).await? {
+        let graph_json = String::from_utf8(graph_json).map_err(|error| {
+            ResolverError::Json(format!("cached version graph is not UTF-8: {error}"))
         })?;
-    if let Some(graph_json) = cached_graph_json {
-        // The format tag decides whether the row is this payload shape at
-        // all; only a current-format row is parsed, and a current-format
-        // row that fails to parse is corruption, not a miss.
+        // The format tag decides whether the entry is this payload shape
+        // at all; only a current-format entry is parsed, and a
+        // current-format entry that fails to parse is corruption, not a
+        // miss.
         let tag: VersionGraphTag = serde_json::from_str(&graph_json).map_err(|error| {
             ResolverError::Json(format!(
                 "read cached version graph tag {crate_name} {version}: {error}"
@@ -1149,28 +665,12 @@ async fn fetch_version_graph_cached(
     let graph = version_graph_for(crates_io, crate_name, version).await?;
     let graph_json = serde_json::to_string(&graph)
         .map_err(|error| format!("serialize version graph {crate_name} {version}: {error}"))?;
-    // A rejected upsert costs only the cache write; the fetched graph is
-    // still the right answer, and turning a degraded cache into a 500 was
-    // the production outage this row failed to prevent.
-    if let Err(error) = db
-        .query(
-            "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
-             VALUES (?, ?, ?, datetime('now')) \
-             ON CONFLICT(crate_name, version) DO UPDATE SET graph_json = excluded.graph_json, fetched_at = excluded.fetched_at",
+    cache
+        .put(
+            &version_graph_key(crate_name, version),
+            graph_json.as_bytes(),
         )
-        .bind(crate_name)
-        .bind(version.to_string())
-        .bind(graph_json)
-        .execute()
-        .await
-    {
-        tracing::error!(
-            crate_name,
-            %version,
-            %error,
-            "version graph cache upsert failed; serving uncached graph"
-        );
-    }
+        .await?;
     Ok(graph)
 }
 
@@ -1202,7 +702,7 @@ async fn version_graph_for(
 /// `None` when nothing matches — a request whose version does not exist
 /// upstream has no canonical task to mint.
 async fn resolve_dependency_version(
-    db: &Db,
+    cache: &impl CratesIoCache,
     crates_io: &impl CratesIo,
     crate_name: &str,
     requirement: &str,
@@ -1212,29 +712,21 @@ async fn resolve_dependency_version(
             "parse dependency requirement {crate_name} {requirement}: {error}"
         ))
     })?;
-    let versions = fetch_versions_cached(db, crates_io, crate_name).await?;
+    let versions = fetch_versions_cached(cache, crates_io, crate_name).await?;
     Ok(versions
         .into_iter()
         .find(|version| version_req.matches(version)))
 }
 
 async fn fetch_versions_cached(
-    db: &Db,
+    cache: &impl CratesIoCache,
     crates_io: &impl CratesIo,
     crate_name: &str,
 ) -> Result<Vec<Version>, ResolverError> {
-    let cached_versions_json = db
-        .query(
-            "SELECT versions_json \
-             FROM crate_versions_cache \
-             WHERE crate_name = ? AND fetched_at >= datetime('now', ?)",
-        )
-        .bind(crate_name)
-        .bind(CACHE_TTL_SQL)
-        .fetch_scalar_optional::<String>()
-        .await
-        .map_err(|error| format!("load crate_versions_cache {crate_name}: {error}"))?;
-    if let Some(versions_json) = cached_versions_json {
+    if let Some(versions_json) = cache.get(&versions_key(crate_name)).await? {
+        let versions_json = String::from_utf8(versions_json).map_err(|error| {
+            ResolverError::Json(format!("cached versions list is not UTF-8: {error}"))
+        })?;
         return parse_versions_json(crate_name, &versions_json);
     }
 
@@ -1247,36 +739,20 @@ async fn fetch_versions_cached(
         .collect::<Vec<_>>();
     let versions_json = serde_json::to_string(&versions)
         .map_err(|error| format!("serialize versions cache {crate_name}: {error}"))?;
-    // Same contract as the graph cache above: a rejected cache write
-    // degrades latency, not correctness, so it must not fail the request.
-    if let Err(error) = db
-        .query(
-            "INSERT INTO crate_versions_cache (crate_name, versions_json, fetched_at) \
-             VALUES (?, ?, datetime('now')) \
-             ON CONFLICT(crate_name) DO UPDATE SET versions_json = excluded.versions_json, fetched_at = excluded.fetched_at",
-        )
-        .bind(crate_name)
-        .bind(versions_json.clone())
-        .execute()
-        .await
-    {
-        tracing::error!(
-            crate_name,
-            %error,
-            "versions cache upsert failed; serving uncached versions"
-        );
-    }
+    cache
+        .put(&versions_key(crate_name), versions_json.as_bytes())
+        .await?;
     parse_versions_json(crate_name, &versions_json)
 }
 
 /// Published, non-yanked versions of `crate_name`, newest first, served
-/// from the same TTL-bounded D1 cache the resolver uses.
+/// from the same TTL-bounded Workers Cache the resolver uses.
 pub async fn published_versions(
-    db: &Db,
+    cache: &impl CratesIoCache,
     crates_io: &impl CratesIo,
     crate_name: &str,
 ) -> Result<Vec<Version>, ResolverError> {
-    fetch_versions_cached(db, crates_io, crate_name).await
+    fetch_versions_cached(cache, crates_io, crate_name).await
 }
 
 /// One published version's `[features]` table and dependency list — what a
@@ -1288,16 +764,16 @@ pub struct VersionFeatureGraph {
     pub dependencies: Vec<CratesIoDependency>,
 }
 
-/// Fetch [`VersionFeatureGraph`] through the resolver's TTL-bounded D1
+/// Fetch [`VersionFeatureGraph`] through the resolver's TTL-bounded Workers Cache
 /// cache, so a catalog lookup and a graph expansion of the same version
 /// share one crates.io round trip.
 pub async fn version_feature_graph(
-    db: &Db,
+    cache: &impl CratesIoCache,
     crates_io: &impl CratesIo,
     crate_name: &str,
     version: &Version,
 ) -> Result<VersionFeatureGraph, ResolverError> {
-    let graph = fetch_version_graph_cached(db, crates_io, crate_name, version).await?;
+    let graph = fetch_version_graph_cached(cache, crates_io, crate_name, version).await?;
     Ok(VersionFeatureGraph {
         features: graph.features,
         dependencies: graph.dependencies,
@@ -1386,9 +862,36 @@ mod tests {
     use stow_types::identity::CrateName;
 
     use super::{
-        CachedArtifactRow, ExpandedNodeKey, PackageKey, build_enqueue_requests,
-        exact_graph_from_request, resolve_reachable_cached_rows,
+        CratesIoCache, ExpandedNodeKey, PackageKey, build_enqueue_requests,
+        exact_graph_from_request,
     };
+
+    /// The cache stub standing in for the Workers Cache API: `None` on
+    /// every `get` unless a test seeds it, `put` records what would be
+    /// stored.
+    #[derive(Default)]
+    pub(super) struct StubCache {
+        pub(super) stored: std::collections::BTreeMap<String, Vec<u8>>,
+        pub(super) puts: std::sync::Mutex<Vec<String>>,
+        pub(super) fail_put: bool,
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl CratesIoCache for StubCache {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>, crate::errors::ResolverError> {
+            Ok(self.stored.get(key).cloned())
+        }
+
+        async fn put(&self, key: &str, _body: &[u8]) -> Result<(), crate::errors::ResolverError> {
+            self.puts.lock().expect("puts").push(key.to_owned());
+            if self.fail_put {
+                return Err(crate::errors::ResolverError::Cache(
+                    "stub put rejected".to_owned(),
+                ));
+            }
+            Ok(())
+        }
+    }
 
     fn key(name: &str, version: &str) -> PackageKey {
         PackageKey {
@@ -1545,198 +1048,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reachable_rows_follow_compile_key_dependency_identities() {
-        let same_file_key = key("same-file", "1.0.6");
-        let walkdir_key = key("walkdir", "2.5.0");
-        let key_pairs = BTreeSet::from([
-            (same_file_key, "[]".to_owned()),
-            (walkdir_key, "[]".to_owned()),
-        ]);
-        let rows = vec![
-            CachedArtifactRow {
-                compile_key: "72e2ded9fa67e0a172e2ded9fa67e0a1".to_owned(),
-                crate_name: "same-file".to_owned(),
-                version: "1.0.6".to_owned(),
-                features_json: "[]".to_owned(),
-                c_metadata: "72e2ded9fa67e0a1".to_owned(),
-                dependency_identity: leaf_dependency_identity().to_string(),
-                unit_side: 0,
-                unit_invocation: 1,
-                unit_linked: 1,
-                dependency_c_metadata_json: "[]".to_owned(),
-            },
-            CachedArtifactRow {
-                compile_key: "1c0d7420b566b7a21c0d7420b566b7a2".to_owned(),
-                crate_name: "walkdir".to_owned(),
-                version: "2.5.0".to_owned(),
-                features_json: "[]".to_owned(),
-                c_metadata: "1c0d7420b566b7a2".to_owned(),
-                dependency_identity: leaf_dependency_identity().to_string(),
-                unit_side: 0,
-                unit_invocation: 1,
-                unit_linked: 1,
-                dependency_c_metadata_json:
-                    r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
-            },
-        ];
-
-        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
-
-        assert_eq!(reachable.len(), 2);
-        assert_eq!(reachable[0].row.crate_name, "same-file");
-        assert_eq!(reachable[1].row.crate_name, "walkdir");
-    }
-
-    #[test]
-    fn rows_with_uncached_dependency_identities_are_not_reachable() {
-        let walkdir_key = key("walkdir", "2.5.0");
-        let key_pairs = BTreeSet::from([(walkdir_key, "[]".to_owned())]);
-        let rows = vec![CachedArtifactRow {
-            compile_key: "1c0d7420b566b7a21c0d7420b566b7a2".to_owned(),
-            crate_name: "walkdir".to_owned(),
-            version: "2.5.0".to_owned(),
-            features_json: "[]".to_owned(),
-            c_metadata: "1c0d7420b566b7a2".to_owned(),
-            dependency_identity: leaf_dependency_identity().to_string(),
-            unit_side: 0,
-            unit_invocation: 1,
-            unit_linked: 1,
-            dependency_c_metadata_json:
-                r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
-        }];
-
-        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
-
-        assert!(reachable.is_empty());
-    }
-
-    #[test]
-    fn chain_only_rows_satisfy_reachability() {
-        // walkdir semantically matches the request; its chain references a
-        // same-file artifact whose features do NOT match this request's
-        // semantic keys (another preheat's unification). The candidate must
-        // stay reachable — the chain row covers its dependency identity.
-        let walkdir_key = key("walkdir", "2.5.0");
-        let key_pairs = BTreeSet::from([(walkdir_key, "[]".to_owned())]);
-        let rows = vec![
-            CachedArtifactRow {
-                compile_key: "1c0d7420b566b7a21c0d7420b566b7a2".to_owned(),
-                crate_name: "walkdir".to_owned(),
-                version: "2.5.0".to_owned(),
-                features_json: "[]".to_owned(),
-                c_metadata: "1c0d7420b566b7a2".to_owned(),
-                dependency_identity: leaf_dependency_identity().to_string(),
-                unit_side: 0,
-                unit_invocation: 1,
-                unit_linked: 1,
-                dependency_c_metadata_json:
-                    r#"[{"crate_name":"same_file","c_metadata":"72e2ded9fa67e0a1"}]"#.to_owned(),
-            },
-            CachedArtifactRow {
-                compile_key: "72e2ded9fa67e0a172e2ded9fa67e0a1".to_owned(),
-                crate_name: "same-file".to_owned(),
-                version: "1.0.6".to_owned(),
-                features_json: r#"["unstable"]"#.to_owned(),
-                c_metadata: "72e2ded9fa67e0a1".to_owned(),
-                dependency_identity: leaf_dependency_identity().to_string(),
-                unit_side: 0,
-                unit_invocation: 1,
-                unit_linked: 1,
-                dependency_c_metadata_json: "[]".to_owned(),
-            },
-        ];
-
-        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
-
-        assert_eq!(reachable.len(), 1);
-        assert_eq!(reachable[0].row.crate_name, "walkdir");
-    }
-
-    #[test]
-    fn candidate_dependency_names_may_differ_from_the_analyzed_graph() {
-        // A cached row may have been captured with externs that differ from
-        // the analyzed graph's manifest-level dependency list (feature-gated
-        // optionals, build-dep-only externs). As long as its chain resolves,
-        // it stays usable.
-        let bitflags_key = key("bitflags", "2.11.0");
-        let key_pairs = BTreeSet::from([(bitflags_key, "[]".to_owned())]);
-        let rows = vec![CachedArtifactRow {
-            compile_key: "aaaaaaaaaaaaaaaaffffffffffffffff".to_owned(),
-            crate_name: "bitflags".to_owned(),
-            version: "2.11.0".to_owned(),
-            features_json: "[]".to_owned(),
-            c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
-            dependency_identity: leaf_dependency_identity().to_string(),
-            unit_side: 0,
-            unit_invocation: 1,
-            unit_linked: 1,
-            dependency_c_metadata_json: "[]".to_owned(),
-        }];
-
-        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
-
-        assert_eq!(reachable.len(), 1);
-    }
-
-    #[test]
-    fn duplicate_compile_key_rows_with_same_semantics_are_deduplicated() {
-        let ignore_key = key("ignore", "0.4.25");
-        let walkdir_key = key("walkdir", "2.5.0");
-        let key_pairs = BTreeSet::from([
-            (ignore_key.clone(), "[]".to_owned()),
-            (walkdir_key.clone(), "[]".to_owned()),
-        ]);
-        let _ = (ignore_key, walkdir_key);
-        let canonical_ignore_row = || CachedArtifactRow {
-            compile_key: "aaaaaaaaaaaaaaaaffffffffffffffff".to_owned(),
-            crate_name: "ignore".to_owned(),
-            version: "0.4.25".to_owned(),
-            features_json: "[]".to_owned(),
-            c_metadata: "aaaaaaaaaaaaaaaa".to_owned(),
-            dependency_identity: leaf_dependency_identity().to_string(),
-            unit_side: 0,
-            unit_invocation: 1,
-            unit_linked: 1,
-            dependency_c_metadata_json:
-                r#"[{"crate_name":"walkdir","c_metadata":"9999999999999999"}]"#.to_owned(),
-        };
-        let rows = vec![
-            // Legacy row whose c_metadata does not match its compile_key's
-            // stable prefix: filtered by the canonical-metadata check.
-            CachedArtifactRow {
-                c_metadata: "bbbbbbbbbbbbbbbb".to_owned(),
-                dependency_identity: leaf_dependency_identity().to_string(),
-                unit_side: 0,
-                unit_invocation: 1,
-                unit_linked: 1,
-                ..canonical_ignore_row()
-            },
-            canonical_ignore_row(),
-            // Exact duplicate of the canonical row: deduplicated.
-            canonical_ignore_row(),
-            CachedArtifactRow {
-                compile_key: "9999999999999999eeeeeeeeeeeeeeee".to_owned(),
-                crate_name: "walkdir".to_owned(),
-                version: "2.5.0".to_owned(),
-                features_json: "[]".to_owned(),
-                c_metadata: "9999999999999999".to_owned(),
-                dependency_identity: leaf_dependency_identity().to_string(),
-                unit_side: 0,
-                unit_invocation: 1,
-                unit_linked: 1,
-                dependency_c_metadata_json: "[]".to_owned(),
-            },
-        ];
-
-        let reachable = resolve_reachable_cached_rows(&probes(&key_pairs), rows).unwrap();
-
-        assert_eq!(reachable.len(), 2);
-        assert_eq!(reachable[0].row.crate_name, "ignore");
-        assert_eq!(reachable[0].row.c_metadata, "aaaaaaaaaaaaaaaa");
-        assert_eq!(reachable[1].row.crate_name, "walkdir");
-    }
-
     /// `CratesIo` stub serving canned published versions, feature maps, and
     /// dependency lists, so canonicalization runs entirely off-network in
     /// tests.
@@ -1775,7 +1086,7 @@ mod tests {
             self.fetches
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let versions = self.versions.get(crate_name).ok_or_else(|| {
-                super::ResolverError::CrateNotPublished {
+                crate::errors::ResolverError::CrateNotPublished {
                     crate_name: crate_name.to_owned(),
                 }
             })?;
@@ -1858,72 +1169,24 @@ mod tests {
 
     /// Subgraphs minted off the exact graph the same way the wire
     /// carries them — each node's closure, covered nodes with their own
-    /// feature set (stow#588) — with the dependency digest each
-    /// subgraph resolves to, the same derivation `expand_scheduler_requests`
-    /// runs (stow#790).
+    /// feature set (stow#588).
     fn contexts(
         graph: &BTreeMap<ExpandedNodeKey, BTreeSet<ExpandedNodeKey>>,
         features: &BTreeMap<ExpandedNodeKey, String>,
-        target: &str,
-        rustc_version: &str,
     ) -> BTreeMap<ExpandedNodeKey, super::ExpandedNodeContext> {
-        let target_typed = super::TargetTriple::parse(target).expect("target");
-        let rustc_typed = super::WireRustcVersion::parse(rustc_version).expect("rustc");
         graph
             .keys()
             .map(|key| {
                 let subgraph = subgraph_for(key, graph, features);
-                let identity = stow_types::task_graph::TaskNodeIdentity {
-                    crate_name: key.package.crate_name.clone(),
-                    version: stow_types::identity::CrateVersion::new(key.package.version.clone()),
-                    features_json: super::parse_canonical_features_json(
-                        features.get(key).expect("node features"),
-                    )
-                    .expect("features parse"),
-                    target: super::node_target(key, &target_typed),
-                    rustc_version: rustc_typed.clone(),
-                    host_side: key.host_side,
-                };
-                let dependency_identity = subgraph
-                    .resolve(&identity, super::ExplicitSpelling::KeysAsNative)
-                    .expect("subgraph resolves")
-                    .dependency_identity(0)
-                    .expect("root digest")
-                    .clone();
                 (
                     key.clone(),
                     super::ExpandedNodeContext {
                         subgraph,
                         explicit_spelling: super::ExplicitSpelling::KeysAsNative,
-                        dependency_identity,
                     },
                 )
             })
             .collect()
-    }
-
-    /// The coverage probe `load_cached_artifacts_for_keys` consumes for
-    /// the same nodes `contexts` produces — `KeysAsNative` and the
-    /// leaf digest every default subgraph resolves to.
-    fn probes(
-        key_pairs: &BTreeSet<(PackageKey, String)>,
-    ) -> BTreeMap<(PackageKey, String), super::NodeCoverageContext> {
-        key_pairs
-            .iter()
-            .map(|key_pair| {
-                (
-                    key_pair.clone(),
-                    super::NodeCoverageContext {
-                        explicit_spelling: super::ExplicitSpelling::KeysAsNative,
-                        dependency_identity: leaf_dependency_identity(),
-                    },
-                )
-            })
-            .collect()
-    }
-
-    fn leaf_dependency_identity() -> stow_types::identity::DependencyIdentity {
-        stow_types::identity::DependencyIdentity::leaf().expect("leaf identity")
     }
 
     fn subgraph_for(
@@ -2020,8 +1283,9 @@ mod tests {
 
     /// `depends_on` names the node's own task deps — the dependent
     /// dispatches only once every dep is servable — not the node that
-    /// depends on it. A covered dep still appears: the queue gate sees
-    /// it in the published slice and releases the dependent.
+    /// depends on it. Every candidate mints a request: the merge's
+    /// born-published check is the coverage, so a dep already in the
+    /// published slice resolves at merge time and never builds.
     #[test]
     fn enqueue_requests_depend_on_their_direct_dependencies() {
         let graph = graph(&[
@@ -2032,13 +1296,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features(&graph),
             &graph,
-            &contexts(
-                &graph,
-                &features(&graph),
-                "x86_64-unknown-linux-gnu",
-                "1.98.0",
-            ),
-            &covered(&["b"]),
+            &contexts(&graph, &features(&graph)),
             &"x86_64-unknown-linux-gnu".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
             EnqueueSource::CacheMiss,
@@ -2058,12 +1316,11 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        // `b` is covered — no request is minted for it — but it still
-        // appears as a dep edge of `a` and `root`.
         assert_eq!(
             edges,
             [
                 ("a".to_owned(), vec!["b".to_owned()]),
+                ("b".to_owned(), Vec::new()),
                 ("root".to_owned(), vec!["a".to_owned(), "b".to_owned()]),
             ]
         );
@@ -2081,8 +1338,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
-            &contexts(&graph, &features, "wasm32-unknown-unknown", "1.98.0"),
-            &BTreeSet::new(),
+            &contexts(&graph, &features),
             &"wasm32-unknown-unknown".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
             EnqueueSource::CacheMiss,
@@ -2130,8 +1386,7 @@ mod tests {
         let requests = build_enqueue_requests(
             &features,
             &graph,
-            &contexts(&graph, &features, "aarch64-apple-ios", "1.98.0"),
-            &BTreeSet::new(),
+            &contexts(&graph, &features),
             &"aarch64-apple-ios".parse().expect("target"),
             &"1.98.0".parse().expect("rustc"),
             EnqueueSource::CacheMiss,
@@ -2163,18 +1418,15 @@ mod sqlite_tests {
     use std::collections::BTreeMap;
 
     use super::expand_scheduler_requests;
-    use super::tests::StubCratesIo;
+    use super::tests::{StubCache, StubCratesIo};
 
     use stow_types::api::{
-        ArtifactRecord, CrateRequestState, DependencyGraphEntry, QueueTaskStatus, RequestStatus,
+        CrateRequestState, DependencyGraphEntry, QueueTaskStatus, RequestStatus,
         ResolvedDependencyGraphDependency, ResolvedDependencyGraphEntry, TaskLane,
     };
-    use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
-        CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
-        DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
+        CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
     };
-    use stow_types::platform::{PanicStrategy, Profile, StripLevel};
     use stow_types::task_graph::TaskNodeIdentity;
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
@@ -2272,10 +1524,7 @@ mod sqlite_tests {
 
     #[tokio::test]
     async fn latest_published_version_picks_newest_stable() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        crate::db::apply_schema(&db).await;
+        let db = StubCache::default();
         let crates_io = closure_stub();
 
         let latest = super::latest_published_version(&db, &crates_io, "root")
@@ -2314,10 +1563,7 @@ mod sqlite_tests {
     /// answer 404 instead of 500.
     #[tokio::test]
     async fn unpublished_crate_yields_crate_not_published() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        crate::db::apply_schema(&db).await;
+        let db = StubCache::default();
         let crates_io = closure_stub();
 
         let error = super::latest_published_version(&db, &crates_io, "never-published")
@@ -2326,7 +1572,7 @@ mod sqlite_tests {
         assert!(
             matches!(
                 error,
-                super::ResolverError::CrateNotPublished { ref crate_name }
+                crate::errors::ResolverError::CrateNotPublished { ref crate_name }
                     if crate_name == "never-published"
             ),
             "expected CrateNotPublished, got {error:?}"
@@ -2341,7 +1587,10 @@ mod sqlite_tests {
         .await
         .expect_err("exact-version lookup of an unpublished crate must error");
         assert!(
-            matches!(error, super::ResolverError::CrateNotPublished { .. }),
+            matches!(
+                error,
+                crate::errors::ResolverError::CrateNotPublished { .. }
+            ),
             "expected CrateNotPublished, got {error:?}"
         );
     }
@@ -2351,23 +1600,14 @@ mod sqlite_tests {
     /// crates.io data is fetched (and cached) fresh.
     #[tokio::test]
     async fn old_format_graph_cache_row_is_not_served() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        crate::db::apply_schema(&db).await;
-        // The v1 row shape: no `format_version`, dependency entries the
+        let mut db = StubCache::default();
+        // The v1 entry shape: no `format_version`, dependency entries the
         // current schema would reject — but none of that is reached,
         // because the tag is checked before the payload is trusted.
-        db.query(
-            "INSERT INTO crate_version_graph_cache (crate_name, version, graph_json, fetched_at) \
-             VALUES (?, ?, ?, datetime('now'))",
-        )
-        .bind("root".to_owned())
-        .bind("1.0.0".to_owned())
-        .bind(r#"{"features":{},"dependencies":[]}"#.to_owned())
-        .execute()
-        .await
-        .expect("insert old-format row");
+        db.stored.insert(
+            super::version_graph_key("root", &semver::Version::parse("1.0.0").expect("version")),
+            r#"{"features":{},"dependencies":[]}"#.as_bytes().to_vec(),
+        );
         let crates_io = closure_stub();
 
         let graph = super::fetch_version_graph_cached(
@@ -2465,16 +1705,12 @@ mod sqlite_tests {
     /// uncovered `WaterUI`-scale request — 130 direct entries over an
     /// 830-node expanded graph — expands to one enqueue request per node.
     /// Misses go to the miss log as one Analytics Engine point per
-    /// uncovered node — D1 sees zero writes.
+    /// uncovered node.
     #[tokio::test]
-    async fn admissions_uncovered_waterui_scale_graph_logs_misses_without_d1_writes() {
+    async fn admissions_uncovered_waterui_scale_graph_logs_misses() {
         const DIRECT: usize = 130;
         const EXPANDED: usize = 830;
 
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        crate::db::apply_schema(&db).await;
         let entries = (0..DIRECT)
             .map(|index| stow_types::api::DependencyGraphEntry {
                 crate_name: CrateName::parse(format!("dep-{index:04}")).expect("name"),
@@ -2494,19 +1730,26 @@ mod sqlite_tests {
             })
             .collect::<Vec<_>>();
 
-        let outcome = expand_scheduler_requests(&db, TARGET, RUSTC, &entries, &expanded)
-            .await
-            .expect("expansion");
+        let outcome =
+            expand_scheduler_requests(TARGET, RUSTC, &entries, &expanded).expect("expansion");
 
         assert_eq!(outcome.enqueue_requests.len(), EXPANDED);
-        // Demand analytics are Analytics Engine points, not D1 rows: the
-        // handler-side write produces one `graph` point per uncovered
-        // node and the misses table sees zero writes.
+        // Demand analytics are Analytics Engine points: the redemption
+        // path writes one `graph` point per node the merge reports
+        // unpublished — here every node is a miss.
         let miss_log = crate::miss_logger::RecordingMissLog::default();
-        crate::miss_logger::log_graph_misses(
+        let tree = stow_types::api::SubmissionTree::from_enqueue_requests(
+            stow_types::api::SubmissionSource::CacheMiss,
+            &outcome.enqueue_requests,
+        )
+        .expect("miss tree");
+        let unpublished: std::collections::BTreeSet<String> =
+            tree.nodes.iter().map(|node| node.task_id.clone()).collect();
+        crate::miss_logger::log_misses(
             &miss_log,
             crate::stats::AnalyticsConsent::ALLOWED,
-            &outcome.enqueue_requests,
+            &tree,
+            &unpublished,
         );
         {
             let points = miss_log.points.lock().expect("miss points");
@@ -2517,12 +1760,6 @@ mod sqlite_tests {
             );
             drop(points);
         }
-        let miss_rows = db
-            .query("SELECT COUNT(*) FROM dependency_graph_misses")
-            .fetch_scalar::<u64>()
-            .await
-            .expect("miss count");
-        assert_eq!(miss_rows, 0);
     }
 
     /// A graph over the `MAX_EXPANDED_TASKS` cap is a client-visible limit
@@ -2547,7 +1784,7 @@ mod sqlite_tests {
             .err()
             .expect("an over-limit graph must be rejected");
         match error {
-            super::ResolverError::LimitExceeded { got, limit, .. } => {
+            crate::errors::ResolverError::LimitExceeded { got, limit, .. } => {
                 assert_eq!(got, over_limit);
                 assert_eq!(limit, super::MAX_EXPANDED_TASKS);
             }
@@ -2555,25 +1792,15 @@ mod sqlite_tests {
         }
     }
 
-    /// The production outage behind this contract: D1's write-quota
-    /// rejection made every cold graph fetch a 500 even though reads and
-    /// the upstream fetch still worked. A `RAISE` trigger reproduces the
-    /// exact shape — writes abort, reads pass — and the fetched graph
-    /// must be served uncached rather than erroring.
+    /// The Workers Cache contract is the `rust_channel` one: a rejected
+    /// write is an error, never silently served — a broken cache entry
+    /// means a bug, not a miss.
     #[tokio::test]
-    async fn rejected_graph_cache_write_still_serves_the_graph() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        crate::db::apply_schema(&db).await;
-        db.query(
-            "CREATE TRIGGER deny_graph_cache_write \
-             BEFORE INSERT ON crate_version_graph_cache \
-             BEGIN SELECT RAISE(ABORT, 'write blocked'); END",
-        )
-        .execute()
-        .await
-        .expect("deny trigger");
+    async fn rejected_graph_cache_write_fails_the_request() {
+        let db = StubCache {
+            fail_put: true,
+            ..StubCache::default()
+        };
         let crates_io = StubCratesIo {
             versions: BTreeMap::from([("cfg-if".to_owned(), vec!["1.0.4".to_owned()])]),
             features: BTreeMap::from([(
@@ -2584,262 +1811,19 @@ mod sqlite_tests {
             ..StubCratesIo::default()
         };
 
-        let graph = super::fetch_version_graph_cached(
+        let result = super::fetch_version_graph_cached(
             &db,
             &crates_io,
             "cfg-if",
             &semver::Version::parse("1.0.4").expect("version"),
         )
-        .await
-        .expect("a rejected cache write must not fail the request");
-        assert!(graph.features.contains_key("rustc-dep-of-std"));
-
-        let cached = db
-            .query("SELECT COUNT(*) FROM crate_version_graph_cache")
-            .fetch_scalar::<u64>()
-            .await
-            .expect("cache row count");
-        assert_eq!(cached, 0, "the aborted write must leave no row");
-    }
-
-    fn artifact_record(
-        crate_name: &str,
-        version: &str,
-        c_metadata: &str,
-        dependency_c_metadata_json: DependencyCMetadataJson,
-        dependency_identity: DependencyIdentity,
-        kind: stow_types::public_cache::UnitKind,
-    ) -> ArtifactRecord {
-        ArtifactRecord {
-            compile_key: format!("{c_metadata}{c_metadata}"),
-            c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
-            extra_filename: format!("-{c_metadata}"),
-            target: linux_target(),
-            rustc_version: rustc(),
-            unit_shape: stow_types::public_cache::UnitShape {
-                side: stow_types::public_cache::UnitSide::Target,
-                invocation: stow_types::public_cache::UnitInvocation::Native,
-                kind,
-            },
-            profile: Profile {
-                opt_level: "0".to_owned(),
-                debuginfo: 0,
-                debug_assertions: true,
-                overflow_checks: true,
-                panic: PanicStrategy::Unwind,
-                strip: StripLevel::None,
-            },
-            emit: match kind {
-                stow_types::public_cache::UnitKind::Linked => vec!["link".to_owned()],
-                stow_types::public_cache::UnitKind::Unlinked => {
-                    vec!["dep-info".to_owned(), "metadata".to_owned()]
-                }
-            },
-            crate_name: CrateName::parse(crate_name).expect("name"),
-            version: CrateVersion::new(semver::Version::parse(version).expect("version")),
-            features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
-            dependency_c_metadata_json,
-            dependency_identity,
-            oci_reference: format!(
-                "ghcr.io/water-rs/stow-cache-{RUSTC}:{crate_name}.{version}-x86_64-linux-{RUSTC}-abcdef012345-{c_metadata}"
-            ),
-            oci_digest: format!("sha256:{}", "0".repeat(64)),
-            has_native: false,
-            artifact_kind: ArtifactKind::Rlib,
-            crate_types: vec![RustCrateType::Rlib],
-            artifact_size: 1,
-            bundle_digest: format!("sha256:{}", "0".repeat(64)),
-            bundle_size: 1,
-            compile_millis: 1_234,
-            min_glibc: None,
-        }
-    }
-
-    /// Both unit shapes a target-side node owes at the native
-    /// invocation — the check-only and the linked row a published
-    /// context carries, each its own `c_metadata` since the artifacts
-    /// table keys rows on it.
-    fn context_records(
-        crate_name: &str,
-        version: &str,
-        c_metadata_unlinked: &str,
-        c_metadata_linked: &str,
-        dependency_c_metadata_json: &DependencyCMetadataJson,
-        dependency_identity: &DependencyIdentity,
-    ) -> Vec<ArtifactRecord> {
-        [
-            (
-                c_metadata_unlinked,
-                stow_types::public_cache::UnitKind::Unlinked,
-            ),
-            (
-                c_metadata_linked,
-                stow_types::public_cache::UnitKind::Linked,
-            ),
-        ]
-        .into_iter()
-        .map(|(c_metadata, kind)| {
-            artifact_record(
-                crate_name,
-                version,
-                c_metadata,
-                dependency_c_metadata_json.clone(),
-                dependency_identity.clone(),
-                kind,
-            )
-        })
-        .collect()
-    }
-
-    /// The request's graph for the two-context coverage test: `dep` sits
-    /// over `dep-child` — a non-leaf context the wrong-context
-    /// publication does not match — and the dependency digest the
-    /// request path derives for `dep`.
-    fn dep_over_child_fixture() -> (
-        Vec<ResolvedDependencyGraphEntry>,
-        Vec<DependencyGraphEntry>,
-        DependencyIdentity,
-    ) {
-        let one_zero = || semver::Version::parse("1.0.0").expect("version");
-        let leaf_entry = |crate_name: &str| ResolvedDependencyGraphEntry {
-            crate_name: CrateName::parse(crate_name).expect("name"),
-            version: one_zero(),
-            features: Vec::new(),
-            host_side: false,
-            dependencies: Vec::new(),
-            dependency_subgraph: stow_types::api::TaskSubgraph::default(),
-            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-        };
-        let dep_subgraph = stow_types::api::TaskSubgraph {
-            root_deps: vec![0],
-            nodes: vec![stow_types::api::SubgraphNode {
-                crate_name: CrateName::parse("dep-child").expect("name"),
-                version: CrateVersion::new(one_zero()),
-                features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
-                host_side: false,
-                keys_apart: false,
-                deps: Vec::new(),
-            }],
-        };
-        let mut dep_entry = leaf_entry("dep");
-        dep_entry.dependencies = vec![ResolvedDependencyGraphDependency {
-            crate_name: CrateName::parse("dep-child").expect("name"),
-            version: one_zero(),
-            host_side: false,
-        }];
-        dep_entry.dependency_subgraph = dep_subgraph.clone();
-        let entries = vec![DependencyGraphEntry {
-            crate_name: CrateName::parse("dep").expect("name"),
-            version: one_zero(),
-            features: Vec::new(),
-        }];
-        let dep_digest = dep_subgraph
-            .resolve(
-                &TaskNodeIdentity {
-                    crate_name: CrateName::parse("dep").expect("name"),
-                    version: CrateVersion::new(one_zero()),
-                    features_json: FeaturesJson::canonicalize(Vec::new()).expect("features"),
-                    target: linux_target(),
-                    rustc_version: rustc(),
-                    host_side: false,
-                },
-                stow_types::public_cache::ExplicitSpelling::KeysAsNative,
-            )
-            .expect("subgraph resolves")
-            .dependency_identity(0)
-            .expect("root digest")
-            .clone();
-        (
-            vec![dep_entry, leaf_entry("dep-child")],
-            entries,
-            dep_digest,
-        )
-    }
-
-    /// stow#790: the miss-admission prune keys a node on its own
-    /// dependency context, the defect #787 fixed in the claim pass.
-    /// `dep` 1.0.0 `[]` is published twice: once under another context's
-    /// digest — reachable, its chain closed — and once under the digest
-    /// the request's own subgraph resolves to. Only the same-context
-    /// publication may drop the node from the miss plan; without it the
-    /// dependents' digest-named edges could never be served.
-    #[tokio::test]
-    async fn coverage_prune_requires_the_nodes_own_dependency_context() {
-        let db = skyzen_services::Db::connect_sqlite_memory()
-            .await
-            .expect("memory db");
-        crate::db::apply_schema(&db).await;
-
-        let (expanded, entries, dep_digest) = dep_over_child_fixture();
-
-        // dep-child is covered as a leaf. `dep` is published under an
-        // unrelated context: its chain closes (it names dep-child's
-        // artifact), so reachability alone would call it covered — only
-        // the digest must separate the contexts.
-        let other_context = DependencyIdentity::parse("f".repeat(64)).expect("digest");
-        let dep_chain = DependencyCMetadataJson::canonicalize(vec![DependencyCMetadataIdentity {
-            crate_name: CrateName::parse("dep-child").expect("name"),
-            c_metadata: CMetadata::parse("bbbbbbbbbbbbbbbb").expect("c_metadata"),
-        }])
-        .expect("chain");
-        let mut records = context_records(
-            "dep-child",
-            "1.0.0",
-            "bbbbbbbbbbbbbbbb",
-            "6666666666666666",
-            &DependencyCMetadataJson::default(),
-            &DependencyIdentity::leaf().expect("leaf"),
-        );
-        records.extend(context_records(
-            "dep",
-            "1.0.0",
-            "7777777777777777",
-            "aaaaaaaaaaaaaaaa",
-            &dep_chain,
-            &other_context,
-        ));
-        crate::db::insert_artifact_records(&db, &records)
-            .await
-            .expect("insert");
-
-        let outcome = expand_scheduler_requests(&db, TARGET, RUSTC, &entries, &expanded)
-            .await
-            .expect("expansion");
-        let enqueued = outcome
-            .enqueue_requests
-            .iter()
-            .map(|request| request.crate_name.as_str().to_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            enqueued,
-            vec!["dep".to_owned()],
-            "a tuple published under another dependency context covers nothing: \
-             dep must still be minted while dep-child's leaf context is served"
-        );
-
-        // Publishing dep under its own dependency digest closes the
-        // miss: the same tuple now carries the request's context.
-        crate::db::insert_artifact_records(
-            &db,
-            &context_records(
-                "dep",
-                "1.0.0",
-                "8888888888888888",
-                "cccccccccccccccc",
-                &dep_chain,
-                &dep_digest,
-            ),
-        )
-        .await
-        .expect("insert own-context rows");
-        let outcome = expand_scheduler_requests(&db, TARGET, RUSTC, &entries, &expanded)
-            .await
-            .expect("expansion");
+        .await;
         assert!(
-            outcome.enqueue_requests.is_empty(),
-            "the same-context publication covers the node"
+            matches!(result, Err(crate::errors::ResolverError::Cache(_))),
+            "a rejected cache write must fail the request, got {result:?}"
         );
     }
+
     /// A zed-shaped admissions request at the route's
     /// `MAX_EXPANDED_TASKS` cap: mostly leaves, a band of mid-size
     /// nodes, and a few broad hubs on both sides — so most entries

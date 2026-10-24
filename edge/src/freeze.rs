@@ -272,8 +272,8 @@ pub const fn metric_label(metric: stow_types::api::CostMetric) -> &'static str {
         CostMetric::DurableObjectDurationGbS => "durable object duration (GB-s)",
         CostMetric::WorkerRequests => "worker requests",
         CostMetric::WorkerCpuMs => "worker CPU (ms)",
-        CostMetric::D1RowsRead => "d1 rows read",
-        CostMetric::D1RowsWritten => "d1 rows written",
+        CostMetric::SqlRowsRead => "sql rows read",
+        CostMetric::SqlRowsWritten => "sql rows written",
     }
 }
 
@@ -998,7 +998,7 @@ mod tests {
                     budget: 833_333_333.0,
                 },
                 DispatchFreezeCostEntry {
-                    metric: CostMetric::D1RowsWritten,
+                    metric: CostMetric::SqlRowsWritten,
                     used: 1_900_000.0,
                     budget: 1_666_667.0,
                 },
@@ -1019,7 +1019,7 @@ mod tests {
             "durable object rows read",
             "900.0M",
             "833.3M",
-            "d1 rows written",
+            "sql rows written",
             "stow-edge",
         ] {
             assert!(
@@ -1065,13 +1065,13 @@ mod tests {
     #[test]
     fn cost_trigger_summarizes_metric_used_and_budget() {
         let summary = summarize_trigger(&DispatchFreezeTrigger::Cost(DispatchFreezeCost {
-            metric: CostMetric::D1RowsWritten,
+            metric: CostMetric::SqlRowsWritten,
             used: 2_000_000.0,
             budget: 1_666_667.0,
             over: Vec::new(),
             top_routes: Vec::new(),
         }));
-        assert!(summary.contains("d1 rows written"));
+        assert!(summary.contains("sql rows written"));
         assert!(summary.contains("2.0M"));
     }
 

@@ -14,9 +14,6 @@ query StowWatchdog($accountTag: String!, $scriptName: String!, $sinceHour: Time!
         dimensions { status }
         sum { requests }
       }
-      d1: d1AnalyticsAdaptiveGroups(filter: {datetime_geq: $sinceHour, datetime_leq: $now}, limit: 100) {
-        sum { rowsRead rowsWritten }
-      }
     }
   }
 }

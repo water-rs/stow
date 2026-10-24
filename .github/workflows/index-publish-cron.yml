@@ -40,8 +40,8 @@ jobs:
     timeout-minutes: 5
     steps:
       # The edge URL rides the dispatch input: configured, the publish
-      # run syncs the D1 catalog and reports each slice; unset, it
-      # publishes the index and skips both — the workflow never probes.
+      # run reports each slice to the scheduler; unset, it publishes
+      # the index and skips reporting — the workflow never probes.
       # A `workflow_run` tick also forwards the rustc the completed run's
       # `<rustc>-<task_id>` title names; a schedule or manual tick leaves
       # the input empty and index-publish takes the stable channel.

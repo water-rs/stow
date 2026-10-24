@@ -29,9 +29,9 @@ name: deploy-edge
 # Phase 1 compares per-`scriptVersion` metrics: worker error rate and
 # cpu/wall p50+p99 (`workersInvocationsAdaptive`), DO requests/errors/wall per
 # request (`durableObjectsInvocationsAdaptiveGroups`). Phase 2 compares the
-# metrics with no version dimension — `durableObjectsPeriodicGroups` and
-# `d1AnalyticsAdaptiveGroups` — post-promotion window against the equal-length
-# window ending at the deploy start.
+# metrics with no version dimension — `durableObjectsPeriodicGroups` —
+# post-promotion window against the equal-length window ending at the
+# deploy start.
 #
 # Durable Objects under a split deployment (per the Cloudflare "With Durable
 # Objects" doc): each object is *assigned* one version per deployment config —

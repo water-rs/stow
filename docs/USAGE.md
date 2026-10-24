@@ -441,17 +441,17 @@ acting unless `--yes` is given.
   local CI server instead; `--adopt-since <RFC 3339>` (default 24 h ago)
   bounds how far back a resumed wave adopts already-dispatched runs;
   `--edge-url` (or `STOW_EDGE_URL`) is forwarded to the index-publish
-  workflow so it can sync the D1 catalog. `--source-trees` is only
+  workflow so it can report each slice to the scheduler. `--source-trees` is only
   valid with `--projects` — see [source-trees.md](source-trees.md).
 - `stow-admin index export --out-dir <dir>` /
   `index publish --file <index> --folded <folded>` /
-  `index sync --file <new-records.json>` / `index targets` — export
+  `index report --file <index>` / `index targets` — export
   every changed index slice in one pass from the registry's verified
   records artifacts (each `index.<t>.<r>` plus its `folded.<t>.<r>`
   companion; only the records tags no folded set covers are pulled),
   push both to GHCR signed under the index workflow (mock deploys
-  delegate to `stow-mock-registry publish-index`), and sync just this
-  pass's new records into the edge's D1 catalog. `index-publish.yml`
+  delegate to `stow-mock-registry publish-index`), and report each
+  slice's membership to the scheduler. `index-publish.yml`
   runs this loop after every `build-crate` run. `index targets` lists
   the `(target, rustc)` pairs a published index covers.
 

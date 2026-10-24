@@ -348,11 +348,6 @@ rm -f "$MOCK_MANIFEST"
 # Wrangler writes its own ISO-timestamped log to WRANGLER_LOG_PATH.
 mkdir -p "$LOG_DIR/wrangler"
 export WRANGLER_LOG_PATH="$LOG_DIR/wrangler"
-wrangler d1 execute stow-mock --local \
-    --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-    --persist-to "$WORK_DIR/edge-state" \
-    --file "$REPO_ROOT/edge/schema.sql" >>"$LOG_DIR/edge-schema.log" 2>&1 \
-    || die "edge schema apply failed — see $LOG_DIR/edge-schema.log"
 
 # The edge runs under `wrangler dev`, whose miniflare service graph (the
 # ProxyWorker in front of every request plus the dev-time tail and
@@ -362,7 +357,7 @@ wrangler d1 execute stow-mock --local \
 # 4.145.0). The isolates' own JS heaps stay flat, so no repo code is
 # implicated; what dies is the dev process around ~1.4GB. The peak drive
 # therefore runs in SEGMENTS fixed segments and the edge restarts
-# between them, persisting D1 and Durable Object state on disk. Lane mix,
+# between them, persisting Durable Object state on disk. Lane mix,
 # rate and total request volume are unchanged.
 EDGE_IDX=-1
 EDGE_PID=

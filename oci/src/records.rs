@@ -3,9 +3,9 @@
 //! bundles use (stow#455). Each build publishes under its own
 //! `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag, so a
 //! rebuilt task never overwrites the previous build's artifact
-//! (stow#655). Records are the registry's only record store — the
-//! edge's D1 catalog is a read replica synced off these artifacts,
-//! never a source of truth.
+//! (stow#655). Records are the registry’s only record store —
+//! catalog reads resolve against the signed index slices the
+//! records fold into — never against an edge-side replica.
 
 use std::collections::BTreeMap;
 

@@ -300,9 +300,9 @@ fn budget_row(drive: &str, measure: WindowMeasure) -> Result<SchedulerBudgetRow,
             read_budget: budget.rows_read,
             write_budget: budget.rows_written,
             wall_budget: budget.wall_ms,
-            d1_rows_read: 0,
-            d1_rows_written: 0,
-            d1_elapsed_ms: 0,
+            sql_rows_read: 0,
+            sql_rows_written: 0,
+            sql_elapsed_ms: 0,
             over_budget: budget.over_budget(totals.0, totals.1, totals.2),
             // Reported, never gated (stow#567): the local lane's wall
             // is mostly the in-window `db.sync()` durability barrier —

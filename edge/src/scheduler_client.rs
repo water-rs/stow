@@ -26,11 +26,16 @@ const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
     trees: &[stow_types::api::SubmissionTree],
-) -> Result<(), SchedulerClientError> {
-    if trees.is_empty() {
-        return Ok(());
+) -> Result<Vec<String>, SchedulerClientError> {
+    #[derive(serde::Deserialize)]
+    struct SubmitResponse {
+        unpublished_ids: Vec<String>,
     }
-    send_json(namespace, SCHEDULER_SUBMIT_URL, trees).await
+    if trees.is_empty() {
+        return Ok(Vec::new());
+    }
+    let response: SubmitResponse = post_json(namespace, SCHEDULER_SUBMIT_URL, trees).await?;
+    Ok(response.unpublished_ids)
 }
 
 /// The trusted submit channel: `/tasks/submit/trusted` skips the

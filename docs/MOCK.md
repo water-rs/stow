@@ -188,12 +188,11 @@ cargo build --release -p stow-cli -p stow-build -p stow-mock-registry -p stow-ad
 ┌──────────────────────────────┐    POST /api/v1/scheduler/tasks/submit
 │ stow-admin (host)            │────────────────────────────────────────┐
 └──────────────────────────────┘                                        │
-         │ GET /api/v1/admin/index/{target}/{rustc} (index export)       │
-         │ POST /api/v1/admin/artifacts/sync (index sync)                ▼
+         │ POST /api/v1/admin/index/{target}/{rustc} (index report)      ▼
 ┌──────────────────────────────┐  POST {STOW_LOCAL_CI_URL}/dispatch  ┌──────────────┐
 │ wrangler dev (port 8788)     │────────────────────────────────────►│ stow-build   │
 │ stow-edge wasm + miniflare   │  POST /api/v1/github/workflow-run   │ local CI     │
-│ D1, Durable Object           │◄────────────────────────────────────│ port 28124   │
+│ Durable Object               │◄────────────────────────────────────│ port 28124   │
 └──────────┬───────────────────┘                                     └─────┬────────┘
            │ GET /api/v1/bundles/{rustc_version}/{digest} (bundle bytes), POST /api/v1/admissions │ bundles + records
            ▲                                                               │ sigstore push
@@ -208,12 +207,12 @@ The trust path is unchanged from production: stow-build signs and
 pushes the bundle and the records artifact to the mock registry — it
 never calls the edge — and reports completion through the same
 `workflow_run` webhook shape GitHub sends, HMAC-signed with the
-fixture's `STOW_GITHUB_WEBHOOK_SECRET`. `stow-admin index sync` then
-mirrors the verified records into D1 behind the developer's GitHub
-token (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth token`), which the edge
-checks for push access to `water-rs/stow` — against the mock registry's
-GitHub stub (`STOW_GITHUB_API_URL`), never the real API.
-The edge owns the only D1-write credential.
+fixture's `STOW_GITHUB_WEBHOOK_SECRET`. `stow-admin index report` then
+tells the scheduler which identities each published slice serves,
+behind the developer's GitHub token (`GH_TOKEN`/`GITHUB_TOKEN`, else
+`gh auth token`), which the edge checks for push access to
+`water-rs/stow` — against the mock registry's GitHub stub
+(`STOW_GITHUB_API_URL`), never the real API.
 
 ## Bring services up
 
@@ -246,14 +245,7 @@ use the prebuilt artifacts skyzen leaves under `edge/`:
 
 ```sh
 cd edge
-# Apply the schema — the worker assumes it exists, and creating it is
-# deployment work. The file's plain CREATEs fail on a persist dir that
-# already carries the schema — drop the tables first for a reset.
 skyzen build --provider cloudflare --manifest Skyzen.mock.toml
-wrangler d1 execute stow-mock --local \
-    --config .skyzen/gen/wrangler.toml \
-    --persist-to /tmp/stow-bench/edge-state \
-    --file schema.sql
 skyzen dev --provider cloudflare --manifest Skyzen.mock.toml --port 8788 \
     --persist-to /tmp/stow-bench/edge-state
 # OR:
@@ -261,7 +253,7 @@ wrangler --config /path/to/edge/.skyzen/gen/wrangler.toml dev --local --port 878
     --persist-to /tmp/stow-bench/edge-state
 ```
 
-The D1 schema above is only half the story: the scheduler Durable Object
+The scheduler Durable Object
 keeps its own SQLite store, and request code never creates it — the
 reset is operations work. Run the same operator reset `stow-admin`
 offers, in a fourth shell once Wrangler is listening (any HTTP response
@@ -343,14 +335,9 @@ CPU.
 
 ## Verify
 
-```sh
-sqlite3 /tmp/stow-bench/edge-state/v3/d1/miniflare-D1DatabaseObject/*.sqlite \
-  "SELECT count(*) FROM artifacts; SELECT count(DISTINCT crate_name) FROM artifacts"
-```
-
-The populated rows feed the signed index the CLI resolves against —
-export the slice out of the edge catalog and publish it into the mock
-registry (mock-key mode delegates the signed push to
+The populated records feed the signed index the CLI resolves against —
+export the slice out of the registry's records artifacts and publish it
+back into the mock registry (mock-key mode delegates the signed push to
 `stow-mock-registry publish-index`):
 
 ```sh

@@ -317,16 +317,11 @@ wait_for "mock registry /v2/" 60 "$SERVICE_PID" mock_registry_ready
     skyzen build --provider cloudflare --manifest Skyzen.mock.toml
 ) >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
-wrangler d1 execute stow-mock --local \
-    --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
-    --persist-to "$WORK_DIR/edge-state" \
-    --file "$REPO_ROOT/edge/schema.sql" >"$LOG_DIR/edge-schema.log" 2>&1 \
-    || die "edge schema apply failed — see $LOG_DIR/edge-schema.log"
 
 # The edge runs under `wrangler dev`, whose dev-time service graph
 # retains native memory per request (launch-load.sh has the details);
 # the wave loop restarts it at an idle point once its tree passes
-# EDGE_RSS_MB, with D1/Durable-Object state persisted on disk. The
+# EDGE_RSS_MB, with Durable-Object state persisted on disk. The
 # production dispatch caps and cost multiplier replace the mock
 # manifest's, so an alarm pass claims what production's claims and the
 # in-edge daily cost breaker trips where production's would.

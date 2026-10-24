@@ -249,8 +249,6 @@ mod tests {
             ("durable_objects", "duration_gb_s"),
             ("workers", "requests"),
             ("workers", "cpu_ms"),
-            ("d1", "rows_read"),
-            ("d1", "rows_written"),
         ] {
             assert_eq!(preheat.monthly(product, dimension), None);
             assert_ne!(not_measured(product, dimension), "");

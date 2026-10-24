@@ -1,7 +1,7 @@
 //! Centralized typed error model for the edge worker.
 //!
 //! Every internal helper returns one of the per-module error enums below
-//! (`DbError`, `ResolverError`, `QueueError`, `SchedulerClientError`). The
+//! (`ResolverError`, `QueueError`, `SchedulerClientError`). The
 //! handler-facing `GetArtifactError` absorbs them via `From` impls so
 //! endpoints answer a single error type whose status mapping is
 //! host-testable.
@@ -10,35 +10,6 @@
 //! out in favor of these enums.
 
 use stow_types::identity::IdentityError;
-
-/// Errors raised by the D1 / artifact-catalog layer (`edge::db`).
-#[derive(Debug, thiserror::Error)]
-pub enum DbError {
-    /// A D1 query failed.
-    #[error("d1 query failed: {0}")]
-    Query(String),
-    /// A row read from D1 had a column with an invalid identity shape.
-    #[error("invalid stored identity: {0}")]
-    Identity(#[from] IdentityError),
-    /// A semver string from a stored row could not be parsed.
-    #[error("parse stored semver `{raw}`: {source}")]
-    Semver {
-        /// The raw value that failed to parse.
-        raw: String,
-        /// The underlying semver error.
-        #[source]
-        source: semver::Error,
-    },
-    /// Stored data violates an invariant (e.g. unsorted entries).
-    #[error("stored data invariant violated: {0}")]
-    Invariant(String),
-}
-
-impl From<String> for DbError {
-    fn from(message: String) -> Self {
-        Self::Query(message)
-    }
-}
 
 impl From<String> for ResolverError {
     fn from(message: String) -> Self {
@@ -58,21 +29,13 @@ impl From<IdentityError> for QueueError {
     }
 }
 
-impl From<ResolverError> for DbError {
-    fn from(error: ResolverError) -> Self {
-        match error {
-            ResolverError::Db(inner) => inner,
-            other => Self::Query(other.to_string()),
-        }
-    }
-}
-
 /// Errors raised by the dependency-resolver / graph expansion layer.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolverError {
-    /// Wraps a D1 query made from the resolver path.
-    #[error("db: {0}")]
-    Db(#[from] DbError),
+    /// The crates.io cache layer (Workers Cache API) rejected a read or
+    /// write — surfaced as an error, never silently as a miss.
+    #[error("crates.io cache: {0}")]
+    Cache(String),
     /// An upstream fetch failed — crates.io, github.com, or the
     /// rustc-data base. Handlers map this to 5xx; retrying may help.
     #[error("upstream fetch: {0}")]
@@ -445,12 +408,6 @@ impl From<SchedulerClientError> for GetArtifactError {
             }
             other => Self::InternalWithMessage(other.to_string()),
         }
-    }
-}
-
-impl From<DbError> for GetArtifactError {
-    fn from(error: DbError) -> Self {
-        Self::InternalWithMessage(error.to_string())
     }
 }
 

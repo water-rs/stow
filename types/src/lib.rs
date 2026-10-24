@@ -1,7 +1,7 @@
 //! Shared API and identity types for the stow workspace.
 //!
 //! The crate contains the wire types CI, edge, scheduler, and CLI exchange
-//! over HTTP / D1, plus the identity newtypes (`CrateName`, `CMetadata`,
+//! over HTTP, plus the identity newtypes (`CrateName`, `CMetadata`,
 //! `TargetTriple`, `WireRustcVersion`, `FeaturesJson`,
 //! `DependencyCMetadataJson`) that enforce the five-element artifact identity
 //! tuple at compile time.
