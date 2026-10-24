@@ -887,6 +887,30 @@ pub struct BuildReport {
     pub cpu_millis_saved: u64,
 }
 
+/// The submission kinds a CLI may claim through `/api/v1/admissions`
+/// (stow#882): a two-variant wire type *is* the validation — a CLI can
+/// never claim an operations, human or preheat source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CliAdmissionSource {
+    /// A cache miss — the node's chain is uncovered.
+    CacheMiss,
+    /// An inexact superset-hit report — the exact chain the cache
+    /// should build next at very low priority.
+    InexactHit,
+}
+
+impl CliAdmissionSource {
+    /// The scheduler source the admission's tree carries.
+    #[must_use]
+    pub const fn submission_source(self) -> SubmissionSource {
+        match self {
+            Self::CacheMiss => SubmissionSource::CacheMiss,
+            Self::InexactHit => SubmissionSource::InexactHit,
+        }
+    }
+}
+
 /// Request body for `POST /api/v1/admissions`: the misses a client's
 /// local index resolution found, plus the resolved graph the edge
 /// expands into enqueue tasks.
@@ -901,6 +925,9 @@ pub struct AdmissionRequest {
     pub target: TargetTriple,
     /// Stable rustc version.
     pub rustc_version: WireRustcVersion,
+    /// What the report is — a miss or an inexact superset-hit report
+    /// (stow#882), the only kinds a CLI may claim.
+    pub source: CliAdmissionSource,
     /// Direct-dep entries the local resolver found uncovered.
     pub entries: Vec<DependencyGraphEntry>,
     /// The client's resolved transitive graph.

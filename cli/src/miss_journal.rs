@@ -30,11 +30,11 @@ const DRAIN_LOG: &str = "stow-drain.log";
 /// it exists for forensics, not to grow without bound.
 const DRAIN_LOG_MAX_BYTES: u64 = 256 * 1024;
 
-/// One journaled observation: the unit, plus what a drain needs to name
-/// its build's misses — which rustc compiled it and which host the build
-/// ran on.
+/// One locally compiled unit's journal payload — the observation one
+/// miss mints from, plus what a drain needs to name its build's misses —
+/// which rustc compiled it and which host the build ran on.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct JournalEntry {
+struct UnitLine {
     /// The rustc the wrapper invoked — diagnostic only.
     rustc: String,
     /// The rustc version the unit compiled under.
@@ -60,6 +60,90 @@ struct JournalEntry {
     expanded_cache_key: String,
     /// The compile observation itself.
     unit: ObservedUnit,
+}
+
+/// An inexact superset-hit report's journal payload (stow#882): the
+/// exact chain — the direct-dep entries above the analysis's
+/// superset-served nodes — minted off the group's resolved expanded
+/// graph and posted behind the same proof-of-work admission a miss
+/// takes.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct InexactReport {
+    /// The rustc version the reporting build ran under.
+    rustc_version: String,
+    /// The build's `target_given` — the re-derivation's spelled
+    /// `--target` fact when the journal holds no unit line to prove
+    /// it (stow#367).
+    #[serde(default)]
+    consumer_spelled_target: bool,
+    /// The `lockfile_graph_cache` key naming the build's persisted
+    /// expanded graph — the group's own key (stow#588).
+    #[serde(default)]
+    expanded_cache_key: String,
+    /// The consumer's compile target — the admission's `target`.
+    target: String,
+    /// The report's direct-dep entries — each node above a
+    /// superset-served node, which the edge expands into the exact
+    /// chain.
+    entries: Vec<stow_types::api::DependencyGraphEntry>,
+}
+
+/// One journaled observation — a compiled unit the drain mints as a
+/// miss, or an inexact-hit report carrying the exact chain the scheduler
+/// should build (stow#882). Both kinds record the build's rustc and the
+/// `lockfile_graph_cache` key of the graph they expand over, so the
+/// drain groups and resolves them identically.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum JournalEntry {
+    /// One locally compiled unit — the observation one miss mints from.
+    Unit(UnitLine),
+    /// One inexact superset-hit report — the exact chain to queue.
+    Inexact(InexactReport),
+}
+
+impl JournalEntry {
+    /// The build's rustc — the group's first key part on both kinds.
+    fn rustc_version(&self) -> &str {
+        match self {
+            Self::Unit(unit) => &unit.rustc_version,
+            Self::Inexact(report) => &report.rustc_version,
+        }
+    }
+
+    /// The persisted expanded graph's key — the group's second key part.
+    fn expanded_cache_key(&self) -> &str {
+        match self {
+            Self::Unit(unit) => &unit.expanded_cache_key,
+            Self::Inexact(report) => &report.expanded_cache_key,
+        }
+    }
+
+    /// The compiling rustc's recorded `host:` — unit lines only.
+    fn recorded_build_host(&self) -> Option<&str> {
+        match self {
+            Self::Unit(unit) => Some(&unit.build_host),
+            Self::Inexact(_) => None,
+        }
+    }
+
+    /// The consumer's compile target: a unit's explicit `--target`, or
+    /// an inexact line's recorded project target.
+    fn reported_target(&self) -> Option<&str> {
+        match self {
+            Self::Unit(unit) => unit.unit.explicit_target.as_deref(),
+            Self::Inexact(report) => Some(&report.target),
+        }
+    }
+
+    /// The line's own spelled-`--target` evidence: a unit's flag or its
+    /// explicit `--target`; an inexact line's recorded `target_given`.
+    const fn spelled_evidence(&self) -> bool {
+        match self {
+            Self::Unit(unit) => unit.consumer_spelled_target || unit.unit.explicit_target.is_some(),
+            Self::Inexact(report) => report.consumer_spelled_target,
+        }
+    }
 }
 
 /// The compile observation one finished local compile leaves behind, or
@@ -403,7 +487,7 @@ pub fn record_observation(
         );
         return;
     };
-    let entry = JournalEntry {
+    let entry = JournalEntry::Unit(UnitLine {
         rustc: rustc.to_string_lossy().into_owned(),
         rustc_version: build.rustc_version.clone(),
         build_host: build_host.to_owned(),
@@ -413,7 +497,7 @@ pub fn record_observation(
         // (stow#588).
         expanded_cache_key: String::new(),
         unit,
-    };
+    });
     let journal = journal_path(&target_dir, &cargo_build());
     if let Err(error) = append_lines(&journal, &[entry]) {
         tracing::warn!(error = %error, journal = %journal.display(), "could not journal the compile observation");
@@ -445,15 +529,19 @@ pub struct JournalConsumer<'a> {
 
 /// Write the supervising build's journal: one batch append by the driver
 /// after cargo exits, then kick the drain — `stow build` returns as soon
-/// as cargo does.
+/// as cargo does. `inexact_entries` is the analysis's inexact superset-
+/// hit report — the direct-dep entries above every superset-served node —
+/// journaled as one `inexact` line so the report's admission rides the
+/// same detached drain a miss does (stow#882).
 pub fn journal_supervised(
     rustc: &OsStr,
     consumer: &JournalConsumer<'_>,
     observations: &[ObservedUnit],
     target_dir: &Path,
     expanded_cache_key: &str,
+    inexact_entries: &[stow_types::api::DependencyGraphEntry],
 ) {
-    if observations.is_empty() {
+    if observations.is_empty() && inexact_entries.is_empty() {
         return;
     }
     // The consumer's flag plus any observed explicit `--target` — the
@@ -464,17 +552,28 @@ pub fn journal_supervised(
             .iter()
             .any(|unit| unit.explicit_target.is_some());
     let build_host = recorded_build_host(observations, consumer.key.target);
-    let entries: Vec<JournalEntry> = observations
+    let mut entries: Vec<JournalEntry> = observations
         .iter()
-        .map(|unit| JournalEntry {
-            rustc: rustc.to_string_lossy().into_owned(),
-            rustc_version: consumer.key.rustc_version.to_owned(),
-            build_host: build_host.clone(),
-            consumer_spelled_target,
-            expanded_cache_key: expanded_cache_key.to_owned(),
-            unit: unit.clone(),
+        .map(|unit| {
+            JournalEntry::Unit(UnitLine {
+                rustc: rustc.to_string_lossy().into_owned(),
+                rustc_version: consumer.key.rustc_version.to_owned(),
+                build_host: build_host.clone(),
+                consumer_spelled_target,
+                expanded_cache_key: expanded_cache_key.to_owned(),
+                unit: unit.clone(),
+            })
         })
         .collect();
+    if !inexact_entries.is_empty() {
+        entries.push(JournalEntry::Inexact(InexactReport {
+            rustc_version: consumer.key.rustc_version.to_owned(),
+            consumer_spelled_target: consumer.key.target_given,
+            expanded_cache_key: expanded_cache_key.to_owned(),
+            target: consumer.key.target.to_owned(),
+            entries: inexact_entries.to_vec(),
+        }));
+    }
     let journal = journal_path(target_dir, &supervised_build());
     if let Err(error) = append_lines(&journal, &entries) {
         tracing::warn!(error = %error, journal = %journal.display(), "could not journal the build's compile observations");
@@ -708,20 +807,23 @@ async fn prepare_journal(
         let _ = std::fs::remove_file(&work);
         return None;
     }
-    // One journal is one build: every explicit `--target` in it names the
-    // same consumer, and a native build's consumer is the host it built
-    // on — both recorded at write time, so the drain never re-probes.
-    let build_host = entries[0].build_host.clone();
+    // One journal is one build: every explicit `--target` or recorded
+    // project target in it names the same consumer, and a native
+    // build's consumer is the host it built on — all recorded at write
+    // time, so the drain never re-probes. An inexact-only journal's
+    // line carries the consumer target itself (stow#882).
+    let recorded_host = entries
+        .iter()
+        .find_map(|entry| entry.recorded_build_host().map(str::to_owned));
     let consumer_target = entries
         .iter()
-        .find_map(|entry| entry.unit.explicit_target.clone())
-        .unwrap_or_else(|| build_host.clone());
+        .find_map(|entry| entry.reported_target().map(str::to_owned))
+        .or_else(|| recorded_host.clone())
+        .expect("every journal line records a build host or a reported target");
+    let build_host = recorded_host.unwrap_or_else(|| consumer_target.clone());
     // The flag covers a spelled build whose observations were all
-    // host-side; an older journal without the field still resolves via
-    // each unit's own explicit `--target`.
-    let consumer_spelled_target = entries
-        .iter()
-        .any(|entry| entry.consumer_spelled_target || entry.unit.explicit_target.is_some());
+    // host-side; each line's own recorded evidence counts too.
+    let consumer_spelled_target = entries.iter().any(JournalEntry::spelled_evidence);
     // The build's context sidecar names the consumer manifest the
     // drain re-derives its unit graph from, and — for a supervised
     // build — the inputs its expanded-graph key hashed (stow#588).
@@ -730,8 +832,8 @@ async fn prepare_journal(
     for entry in entries {
         groups
             .entry(DrainGroupKey {
-                rustc_version: entry.rustc_version.clone(),
-                expanded_cache_key: entry.expanded_cache_key.clone(),
+                rustc_version: entry.rustc_version().to_owned(),
+                expanded_cache_key: entry.expanded_cache_key().to_owned(),
             })
             .or_default()
             .push(entry);
@@ -1126,9 +1228,10 @@ async fn prepare_group(
     })
 }
 
-/// The post half of a prepared group: admit its units when it has a
-/// graph, returning the entries that stay journaled — all of them on
-/// a failed post or a graph the prepare phase could not get (stow#588).
+/// The post half of a prepared group: admit its units and post its
+/// inexact-hit reports when it has a graph, returning the entries that
+/// stay journaled — all of them on a failed post or a graph the prepare
+/// phase could not get (stow#588, stow#882).
 async fn post_group(
     config: &StowConfig,
     journal: &Path,
@@ -1149,49 +1252,105 @@ async fn post_group(
         rustc_version,
         expanded_cache_key,
     } = &key;
-    let units: Vec<ObservedUnit> = group.iter().map(|entry| entry.unit.clone()).collect();
-    let posted = match &graph {
+    let mut units: Vec<UnitLine> = Vec::new();
+    let mut reports: Vec<InexactReport> = Vec::new();
+    for entry in group {
+        match entry {
+            JournalEntry::Unit(unit) => units.push(unit),
+            JournalEntry::Inexact(report) => reports.push(report),
+        }
+    }
+    let mut unposted = Vec::new();
+    if !units.is_empty() {
+        let observations: Vec<ObservedUnit> = units.iter().map(|unit| unit.unit.clone()).collect();
         // The one keep-path that must name its cause: every other way
         // entries stay journaled already warns, and a silent failure
         // leaves the drain's own log saying nothing at all (stow#588).
-        Some(graph) => match crate::cargo_cmd::admit_observed_misses(
-            config,
-            consumer_target,
-            rustc_version,
-            build_host,
-            consumer_spelled_target,
-            &units,
-            graph,
-        )
-        .await
-        {
-            Ok(()) => true,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    journal = %journal.display(),
-                    "could not admit the miss journal's units; keeping them"
-                );
-                false
-            }
-        },
-        None => false,
-    };
-    if posted {
-        Vec::new()
-    } else {
-        group
-            .into_iter()
-            .map(|entry| JournalEntry {
-                rustc: String::new(),
-                rustc_version: rustc_version.to_owned(),
-                build_host: build_host.to_owned(),
+        let posted = match &graph {
+            Some(graph) => match crate::cargo_cmd::admit_observed_misses(
+                config,
+                consumer_target,
+                rustc_version,
+                build_host,
                 consumer_spelled_target,
-                expanded_cache_key: expanded_cache_key.to_owned(),
-                unit: entry.unit,
-            })
-            .collect()
+                &observations,
+                graph,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        journal = %journal.display(),
+                        "could not admit the miss journal's units; keeping them"
+                    );
+                    false
+                }
+            },
+            None => false,
+        };
+        if !posted {
+            unposted.extend(units.into_iter().map(|unit| {
+                JournalEntry::Unit(UnitLine {
+                    rustc: String::new(),
+                    rustc_version: rustc_version.to_owned(),
+                    build_host: build_host.to_owned(),
+                    consumer_spelled_target,
+                    expanded_cache_key: expanded_cache_key.to_owned(),
+                    unit: unit.unit,
+                })
+            }));
+        }
     }
+    unposted.extend(
+        post_inexact_reports(config, journal, graph.as_ref(), rustc_version, reports)
+            .await
+            .into_iter()
+            .map(JournalEntry::Inexact),
+    );
+    unposted
+}
+
+/// [`post_group`]'s inexact half (stow#882): each report posts off the
+/// group's resolved expanded graph — kept reports go back under the
+/// journal's name like unposted units.
+async fn post_inexact_reports(
+    config: &StowConfig,
+    journal: &Path,
+    graph: Option<&crate::ExpandedDependencyGraph>,
+    rustc_version: &str,
+    reports: Vec<InexactReport>,
+) -> Vec<InexactReport> {
+    let mut unposted = Vec::new();
+    for report in reports {
+        let posted = match graph {
+            Some(graph) => match crate::cargo_cmd::admit_inexact_report(
+                config,
+                &report.target,
+                rustc_version,
+                &report.entries,
+                graph,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        journal = %journal.display(),
+                        "could not post the journal's inexact-hit report; keeping it"
+                    );
+                    false
+                }
+            },
+            None => false,
+        };
+        if !posted {
+            unposted.push(report);
+        }
+    }
+    unposted
 }
 
 #[cfg(test)]
@@ -1214,15 +1373,23 @@ mod tests {
     }
 
     fn entry(crate_name: &str, rustc_version: &str) -> JournalEntry {
+        keyed_entry(crate_name, rustc_version, "")
+    }
+
+    fn keyed_entry(
+        crate_name: &str,
+        rustc_version: &str,
+        expanded_cache_key: &str,
+    ) -> JournalEntry {
         let unit = unit(crate_name, Some("wasm32-unknown-unknown"));
-        JournalEntry {
+        JournalEntry::Unit(UnitLine {
             rustc: "rustc".to_owned(),
             rustc_version: rustc_version.to_owned(),
             build_host: "x86_64-unknown-linux-gnu".to_owned(),
             consumer_spelled_target: unit.explicit_target.is_some(),
-            expanded_cache_key: String::new(),
+            expanded_cache_key: expanded_cache_key.to_owned(),
             unit,
-        }
+        })
     }
 
     fn test_config(cache_dir: &Path) -> StowConfig {
@@ -1281,7 +1448,10 @@ mod tests {
         let journal = journal_path(dir.path(), "stow-1");
         append_lines(&journal, &[entry("serde", "1.85.0")]).expect("append");
         let read = std::fs::read_to_string(&journal).expect("read journal");
-        let parsed: JournalEntry = serde_json::from_str(read.trim()).expect("parse entry");
+        let JournalEntry::Unit(parsed) = serde_json::from_str(read.trim()).expect("parse entry")
+        else {
+            panic!("a unit line round-trips as a unit");
+        };
         assert_eq!(parsed.unit.crate_name, "serde");
         assert_eq!(
             parsed.unit.explicit_target.as_deref(),
@@ -1428,10 +1598,7 @@ mod tests {
         // journal; a kept entry proves the drain never re-derived.
         append_lines(
             &journal,
-            &[JournalEntry {
-                expanded_cache_key: build_key.clone(),
-                ..entry("not a crate", "1.99.0")
-            }],
+            &[keyed_entry("not a crate", "1.99.0", &build_key)],
         )
         .expect("write journal");
 
@@ -1465,10 +1632,7 @@ mod tests {
         write_consumer_context(&journal, &project, Some(&key_inputs));
         append_lines(
             &journal,
-            &[JournalEntry {
-                expanded_cache_key: build_key.clone(),
-                ..entry("not a crate", "1.99.0")
-            }],
+            &[keyed_entry("not a crate", "1.99.0", &build_key)],
         )
         .expect("write journal");
         // Between the build and the drain the user edits the manifest —
@@ -1513,10 +1677,7 @@ mod tests {
         write_consumer_context(&journal, &project, Some(&key_inputs));
         append_lines(
             &journal,
-            &[JournalEntry {
-                expanded_cache_key: build_key.clone(),
-                ..entry("not a crate", "1.99.0")
-            }],
+            &[keyed_entry("not a crate", "1.99.0", &build_key)],
         )
         .expect("write journal");
         let gate_dir = dir.path().join("gate");
@@ -1558,21 +1719,15 @@ mod tests {
         let build_key = crate::lockfile_graph_cache::key_of(&key_inputs).expect("key");
         let journal = journal_path(dir.path(), "stow-1");
         write_consumer_context(&journal, &project, Some(&key_inputs));
-        let dropped = JournalEntry {
-            expanded_cache_key: build_key.clone(),
-            ..entry("not a crate", "1.99.0")
-        };
+        let dropped = keyed_entry("not a crate", "1.99.0", &build_key);
         // The kept group is a wrapper-shaped line (no recorded key):
         // the manifest edit below breaks its re-derivation, so its
         // units stay journaled exactly as they did before.
-        let postable = JournalEntry {
-            unit: ObservedUnit {
-                crate_name: "serde".to_owned(),
-                externs: Vec::new(),
-                ..unit("serde", Some("wasm32-unknown-unknown"))
-            },
-            ..entry("serde", "1.99.0")
-        };
+        let mut postable = entry("serde", "1.99.0");
+        if let JournalEntry::Unit(line) = &mut postable {
+            line.unit.crate_name = "serde".to_owned();
+            line.unit.externs = Vec::new();
+        }
         append_lines(&journal, &[dropped, postable]).expect("write journal");
         // The edited manifest no longer hashes to the recorded key and
         // no longer parses, so the keyless group's re-derivation fails.
@@ -1617,10 +1772,7 @@ mod tests {
         write_consumer_context(&journal, &project, None);
         append_lines(
             &journal,
-            &[JournalEntry {
-                expanded_cache_key: "key-never-stored".to_owned(),
-                ..entry("serde", "1.99.0")
-            }],
+            &[keyed_entry("serde", "1.99.0", "key-never-stored")],
         )
         .expect("write journal");
 
@@ -1678,18 +1830,12 @@ mod tests {
         )
         .await
         .expect("store expanded graph");
-        let broken = JournalEntry {
-            expanded_cache_key: "key-a".to_owned(),
-            ..entry("not a crate", "1.85.0")
-        };
-        let postable = JournalEntry {
-            unit: ObservedUnit {
-                crate_name: "serde".to_owned(),
-                externs: Vec::new(),
-                ..unit("serde", Some("wasm32-unknown-unknown"))
-            },
-            ..entry("serde", "1.99.0")
-        };
+        let broken = keyed_entry("not a crate", "1.85.0", "key-a");
+        let mut postable = entry("serde", "1.99.0");
+        if let JournalEntry::Unit(line) = &mut postable {
+            line.unit.crate_name = "serde".to_owned();
+            line.unit.externs = Vec::new();
+        }
         append_lines(&journal, &[broken, postable]).expect("write journal");
 
         let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
@@ -1707,5 +1853,74 @@ mod tests {
         // The claim file is gone; the restored journal is itself
         // finished, so the next drain picks it up.
         assert_eq!(finished_journals(dir.path()), vec![journal]);
+    }
+
+    /// stow#882: an inexact line rides the same journal and grouping —
+    /// serialized under its `(rustc_version, expanded_cache_key)` group,
+    /// handed the group's loaded graph for its post, and restored whole
+    /// when that post fails against the dead test edge.
+    #[tokio::test]
+    async fn an_inexact_line_round_trips_through_the_drain() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = test_config(dir.path());
+        // The group's mint graph — an empty expanded graph is loadable
+        // and lets the group reach its post (which fails at the dead
+        // edge), proving the line went through grouping (stow#588).
+        crate::lockfile_graph_cache::store(
+            &config,
+            "key-a",
+            &crate::workspace_deps::ExpandedDependencyGraph {
+                entries: Vec::new(),
+                direct_dependencies: Vec::new(),
+                local_manifests: Vec::new(),
+                raw_unit_graph: br#"{"version":1,"units":[],"roots":[]}"#.to_vec(),
+            },
+        )
+        .await
+        .expect("store expanded graph");
+        let journal = journal_path(dir.path(), "stow-1");
+        let report = stow_types::api::DependencyGraphEntry {
+            crate_name: "once_cell".parse().expect("crate name"),
+            version: semver::Version::parse("1.20.0").expect("version"),
+            features: vec!["alloc".to_owned()],
+        };
+        append_lines(
+            &journal,
+            &[JournalEntry::Inexact(InexactReport {
+                rustc_version: "1.99.0".to_owned(),
+                consumer_spelled_target: true,
+                expanded_cache_key: "key-a".to_owned(),
+                target: "wasm32-unknown-unknown".to_owned(),
+                entries: vec![report],
+            })],
+        )
+        .expect("write journal");
+
+        // The grouping pass: one group holding the inexact line, with
+        // its payload intact and the keyed graph resolved.
+        let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
+        let prepared = prepare_journal(&config, &journal, &mut gate)
+            .await
+            .expect("the journal prepares");
+        assert_eq!(prepared.groups.len(), 1);
+        assert!(prepared.groups[0].graph.is_some());
+        let JournalEntry::Inexact(report) = &prepared.groups[0].entries[0] else {
+            panic!("an inexact line groups as an inexact line");
+        };
+        assert_eq!(report.target, "wasm32-unknown-unknown");
+        assert_eq!(report.expanded_cache_key, "key-a");
+        assert_eq!(report.entries[0].crate_name.as_str(), "once_cell");
+
+        // The post fails (dead edge): the line goes back to the journal
+        // with its kind and payload preserved for the next drain.
+        post_journal(&config, prepared).await;
+        let contents = std::fs::read_to_string(&journal).expect("journal kept");
+        assert!(contents.contains("\"kind\":\"inexact\""));
+        let parsed: JournalEntry = serde_json::from_str(contents.trim()).expect("reparse");
+        let JournalEntry::Inexact(report) = parsed else {
+            panic!("the restored line stays an inexact line");
+        };
+        assert_eq!(report.target, "wasm32-unknown-unknown");
+        assert_eq!(report.entries[0].crate_name.as_str(), "once_cell");
     }
 }

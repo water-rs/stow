@@ -489,6 +489,7 @@ fn admission_body(target: &str, rustc: &str, counter: u64) -> Result<serde_json:
             .parse::<TargetTriple>()
             .map_err(|error| format!("target: {error}"))?,
         rustc_version: task.rustc_version,
+        source: stow_types::api::CliAdmissionSource::CacheMiss,
         entries: vec![DependencyGraphEntry {
             crate_name: crate_name.clone(),
             version: version.clone(),
