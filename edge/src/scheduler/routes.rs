@@ -14,7 +14,7 @@ use stow_types::api::{
     MutationKind, QueueSelector, SchedulerEvent, SubmissionTree, SubmitTaskIdEntry,
 };
 
-use super::graph::{Claimed, FinishOutcome, Graph, LoadedGraph, SnapshotCursor, StartOutcome};
+use super::graph::{Claimed, FinishOutcome, Graph, LoadedGraph, StartOutcome};
 use super::queue::{self, AlarmPlan, SchedulerSettings};
 use super::store;
 use crate::errors::QueueError;
@@ -323,12 +323,18 @@ pub(super) async fn snapshot_if_due(
 pub(super) async fn snapshot(graph: LoadedGraph<'_>, db: &DurableDb) -> Result<(), QueueError> {
     // Freed nodes leave the arena before the image is cut.
     graph.with(Graph::compact);
-    let mut cursor = SnapshotCursor::default();
-    store::write_snapshot_parts(db, || {
-        graph.with(|graph| graph.next_snapshot_chunk(&mut cursor))
+    let plan = graph.with(|graph| graph.snapshot_plan())?;
+    store::write_snapshot_parts(db, &plan, |span, encoder| {
+        graph.with(|graph| {
+            if encoder.is_none() {
+                *encoder = Some(graph.snapshot_encoder(span));
+            }
+            encoder.as_mut().expect("encoder").next_row(graph)
+        })
     })
     .await?;
     graph.with(|graph| {
+        graph.snapshot_written();
         graph.log_since_snapshot = 0;
         graph.log_bytes_since_snapshot = 0;
     });

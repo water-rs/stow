@@ -27,7 +27,9 @@ use stow_types::api::{
     SchedulerEvent, SchedulerResetReport, SubmissionNode, SubmissionSource, SubmissionTree,
 };
 
-use super::graph::{Graph, SnapshotChunk, SnapshotCursor, SnapshotLoader};
+use super::graph::{
+    ChunkSpan, Graph, SNAPSHOT_SPAN_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder,
+};
 use crate::errors::QueueError;
 
 /// Nodes per `Submit` log part — bounds a part's serialized size far
@@ -252,19 +254,33 @@ pub async fn watermark(db: &DurableDb) -> Result<i64, QueueError> {
 /// `QueueError::Sql`/`QueueError::Invariant` on a failed write.
 pub async fn write_snapshot(db: &DurableDb, graph: &mut Graph) -> Result<i64, QueueError> {
     graph.compact();
-    let mut cursor = SnapshotCursor::default();
-    write_snapshot_parts(db, || graph.next_snapshot_chunk(&mut cursor)).await
+    let plan = graph.snapshot_plan()?;
+    let graph_ref = &*graph;
+    let covered = write_snapshot_parts(db, &plan, |span, encoder| {
+        if encoder.is_none() {
+            *encoder = Some(graph_ref.snapshot_encoder(span));
+        }
+        encoder.as_mut().expect("encoder").next_row(graph_ref)
+    })
+    .await?;
+    graph.snapshot_written();
+    Ok(covered)
 }
 
-/// Write a snapshot, the rows produced one at a time by a sync
-/// provider — the Durable Object's graph lives behind a lock that
-/// cannot be held across an `.await`, so the caller encodes each row
-/// between writes. The statements are all storage operations, held
+/// Write a snapshot's dirty spans, the rows produced one at a time by
+/// a sync provider — the Durable Object's graph lives behind a lock
+/// that cannot be held across an `.await`, so the caller encodes each
+/// row between writes. The statements are all storage operations, held
 /// under the object's input gate, so no other request mutates the
-/// graph between two rows. Peak memory is one row's bytes. The
-/// watermark stamps after the rows and the covered log drops last:
-/// the drop is the commit point, a crash mid-write leaves the old
-/// watermark, so the old snapshot plus the full log still replay.
+/// graph between two rows. Peak memory is one row's bytes plus the
+/// span's own materialization.
+///
+/// Each span upserts its emitted rows (`INSERT .. ON CONFLICT`), then
+/// deletes the range's stale sub-rows — a span that shrank or emptied
+/// leaves nothing behind. An `all` plan drops every row first, which
+/// also retires the extents a compaction shrank. The watermark stamps
+/// after the rows and the covered log drops last: the drop is the
+/// commit point.
 ///
 /// Returns the watermark the snapshot covers.
 ///
@@ -272,27 +288,65 @@ pub async fn write_snapshot(db: &DurableDb, graph: &mut Graph) -> Result<i64, Qu
 /// `QueueError` on a failed storage op or the provider's own error.
 pub async fn write_snapshot_parts(
     db: &DurableDb,
-    mut next: impl FnMut() -> Result<Option<SnapshotChunk>, QueueError>,
+    plan: &SnapshotPlan,
+    mut row: impl FnMut(ChunkSpan, &mut Option<SpanEncoder>) -> Result<Option<String>, QueueError>,
 ) -> Result<i64, QueueError> {
     let covered = db
         .query("SELECT COALESCE(MAX(seq), 0) FROM event_log")
         .fetch_scalar::<i64>()
         .await
         .map_err(|error| QueueError::Sql(format!("snapshot watermark: {error}")))?;
-    db.query("DELETE FROM snapshot_chunks")
-        .execute()
-        .await
-        .map_err(|error| QueueError::Sql(format!("snapshot clear: {error}")))?;
-    let mut ix = 0i64;
-    while let Some(chunk) = next()? {
-        db.query("INSERT INTO snapshot_chunks(chunk, tag, payload) VALUES (?, ?, ?)")
-            .bind(ix)
-            .bind(chunk.tag)
-            .bind(chunk.payload)
+    if plan.all {
+        db.query("DELETE FROM snapshot_chunks")
             .execute()
             .await
-            .map_err(|error| QueueError::Sql(format!("snapshot chunk {ix}: {error}")))?;
-        ix += 1;
+            .map_err(|error| QueueError::Sql(format!("snapshot clear: {error}")))?;
+    }
+    // Rows upsert in batches — a statement's row count is what the
+    // store bills, and one multi-row UPSERT keeps a many-span plan a
+    // few statements instead of one per row. The buffer holds at most
+    // UPSERT_BATCH payloads: still one row at a time in flight, never
+    // a serialized graph.
+    let mut pending: Vec<(i64, String)> = Vec::with_capacity(UPSERT_BATCH);
+    let mut stale: Vec<(i64, i64)> = Vec::new();
+    for &span in &plan.spans {
+        let mut encoder = None;
+        let mut sub = 0i64;
+        while let Some(payload) = row(span, &mut encoder)? {
+            if sub >= SNAPSHOT_SPAN_ROWS {
+                return Err(QueueError::Invariant(format!(
+                    "snapshot span at key {} exceeded {SNAPSHOT_SPAN_ROWS} rows",
+                    span.lo_key()
+                )));
+            }
+            pending.push((span.lo_key() + sub, payload));
+            if pending.len() == UPSERT_BATCH {
+                flush_upserts(db, &mut pending).await?;
+            }
+            sub += 1;
+        }
+        // The span's emitted rows stay; anything past them is a stale
+        // sub-row of a longer previous encoding — cleared with every
+        // span's tail in one statement below, not one per span.
+        stale.push((span.lo_key() + sub, span.hi_key()));
+    }
+    flush_upserts(db, &mut pending).await?;
+    if !plan.all && !stale.is_empty() {
+        let mut clear = String::from("DELETE FROM snapshot_chunks WHERE ");
+        for at in 0..stale.len() {
+            if at != 0 {
+                clear.push_str(" OR ");
+            }
+            clear.push_str("(chunk >= ? AND chunk <= ?)");
+        }
+        let mut query = db.query(&clear);
+        for (lo, hi) in stale {
+            query = query.bind(lo).bind(hi);
+        }
+        query
+            .execute()
+            .await
+            .map_err(|error| QueueError::Sql(format!("snapshot span clear: {error}")))?;
     }
     db.query(
         "INSERT INTO store_meta(key, value) VALUES ('snapshot_seq', ?) \
@@ -314,17 +368,50 @@ pub async fn write_snapshot_parts(
     Ok(covered)
 }
 
+/// Rows one UPSERT statement carries: bounded so the in-flight
+/// payload stays a few MB — never a second copy of the graph.
+const UPSERT_BATCH: usize = 8;
+
+/// Write the buffered `(key, payload)` rows as one multi-row UPSERT.
+async fn flush_upserts(db: &DurableDb, pending: &mut Vec<(i64, String)>) -> Result<(), QueueError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let mut sql = String::from("INSERT INTO snapshot_chunks(chunk, payload) VALUES (?, ?)");
+    for _ in 1..pending.len() {
+        sql.push_str(", (?, ?)");
+    }
+    sql.push_str(" ON CONFLICT(chunk) DO UPDATE SET payload = excluded.payload");
+    let mut query = db.query(&sql);
+    for (key, payload) in pending.drain(..) {
+        query = query.bind(key).bind(payload);
+    }
+    query
+        .execute()
+        .await
+        .map_err(|error| QueueError::Sql(format!("snapshot chunk: {error}")))?;
+    Ok(())
+}
+
+/// Snapshot rows one wake statement reads. The buffer bound is
+/// `WAKE_READ_BATCH` × the ~1 MiB row cap ≈ 16 MB of payload in flight
+/// — a few percent of the 128 MiB object limit atop the arenas'
+/// measured ~50 MB at the largest fixture — while turning a ~470-row
+/// snapshot into ~30 statements instead of ~470.
+const WAKE_READ_BATCH: u32 = 16;
+
 #[derive(skyzen::FromRow)]
 struct SnapshotRow {
-    tag: String,
+    chunk: i64,
     payload: String,
 }
 
-/// Wake: read the watermark, then the snapshot one row per statement —
-/// each row decodes into the graph before the next is read, so the
-/// serialized image is never held whole — then the log tail. Returns
-/// the rebuilt graph — its meter carries the snapshot's counters — and
-/// the log tail to apply through [`apply_events`].
+/// Wake: read the watermark, then the snapshot in batches of
+/// [`WAKE_READ_BATCH`] rows per statement — each row decodes into the
+/// graph as it is read, so the serialized image is never held whole —
+/// then the log tail. Returns the rebuilt graph — its meter carries
+/// the snapshot's counters — and the log tail to apply through
+/// [`apply_events`].
 ///
 /// # Errors
 /// `QueueError::Sql`/`QueueError::Invariant` on a failed read or
@@ -332,16 +419,26 @@ struct SnapshotRow {
 pub async fn load(db: &DurableDb) -> Result<(Graph, Vec<Logged>), QueueError> {
     let seq = watermark(db).await?;
     let mut loader = SnapshotLoader::default();
-    let mut ix = 0i64;
-    while let Some(row) = db
-        .query("SELECT tag, payload FROM snapshot_chunks WHERE chunk = ?")
-        .bind(ix)
-        .fetch_optional::<SnapshotRow>()
-        .await
-        .map_err(|error| QueueError::Sql(format!("snapshot read {ix}: {error}")))?
-    {
-        loader.apply(&row.tag, &row.payload)?;
-        ix += 1;
+    let mut key = -1i64;
+    loop {
+        let batch = db
+            .query(
+                "SELECT chunk, payload FROM snapshot_chunks WHERE chunk > ? \
+                 ORDER BY chunk LIMIT ?",
+            )
+            .bind(key)
+            .bind(i64::from(WAKE_READ_BATCH))
+            .fetch_all::<SnapshotRow>()
+            .await
+            .map_err(|error| QueueError::Sql(format!("snapshot read: {error}")))?;
+        let done = batch.len() < WAKE_READ_BATCH as usize;
+        for row in batch {
+            loader.apply(row.chunk, &row.payload)?;
+            key = row.chunk;
+        }
+        if done {
+            break;
+        }
     }
     let graph = loader.finish()?;
     let tail = log_tail(db, seq).await?;
@@ -505,6 +602,13 @@ mod tests {
         test_db::memory_db().await.expect("db")
     }
 
+    /// Append `events` and apply them — the store-and-graph pair a
+    /// route's commit leaves.
+    async fn commit_to(db: &DurableDb, graph: &mut Graph, events: &[SchedulerEvent], at: i64) {
+        append_events(db, events, at).await.expect("append");
+        apply_events(graph, &logged(events, at));
+    }
+
     /// The tail a wake reads, as `apply_events` takes it.
     fn logged(events: &[SchedulerEvent], at: i64) -> Vec<Logged> {
         events
@@ -564,6 +668,174 @@ mod tests {
         assert_eq!(restored.status_counts(), graph.status_counts());
         let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
         assert_eq!(claimed[0].task_id, id("b"));
+    }
+
+    /// A wake after any mixture of incremental snapshots — each
+    /// rewriting only the spans its wave dirtied — reassembles the
+    /// live graph exactly (stow#902).
+    #[tokio::test]
+    async fn a_wake_after_mixed_incremental_snapshots_equals_the_live_graph() {
+        let db = store().await;
+        let mut graph = Graph::default();
+        // Wave 1: the merge and a claim — the first snapshot is the
+        // store's full write.
+        commit_to(
+            &db,
+            &mut graph,
+            &[
+                SchedulerEvent::Mutate {
+                    op: MutationKind::Retry,
+                    task_ids: vec![id("a")],
+                },
+                SchedulerEvent::Demand {
+                    batch_id: "wave-1".into(),
+                    input_hash: "hash-1".into(),
+                    entries: vec![stow_types::api::DemandEntry {
+                        task_id: id("b"),
+                        delta: 3,
+                    }],
+                },
+            ],
+            0,
+        )
+        .await;
+        graph.merge(&chain(), 0).expect("merge");
+        let covered = write_snapshot(&db, &mut graph).await.expect("snapshot 1");
+        // Wave 2: claim, bind, finish and publish c — node and
+        // published spans rewrite on top of the first write's rows.
+        let claims = graph.claim(45, 16, 1_000, 3_600_000).expect("claim");
+        let generation = claims[0].generation;
+        commit_to(
+            &db,
+            &mut graph,
+            &[
+                SchedulerEvent::Claims {
+                    claims: vec![DispatchClaim {
+                        task_id: claims[0].task_id.clone(),
+                        generation,
+                        attempt: 1,
+                    }],
+                },
+                SchedulerEvent::Bindings {
+                    bindings: vec![DispatchBinding {
+                        task_id: claims[0].task_id.clone(),
+                        generation,
+                        run_id: "700".into(),
+                    }],
+                },
+                SchedulerEvent::RunFinished {
+                    run_id: "700".into(),
+                    task_id: claims[0].task_id.clone(),
+                    success: true,
+                    cancelled: false,
+                    error: None,
+                },
+            ],
+            2_000,
+        )
+        .await;
+        graph.apply_slice_report(TARGET, RUSTC, &c_rows(), &[]);
+        let covered2 = write_snapshot(&db, &mut graph).await.expect("snapshot 2");
+        assert!(covered2 > covered);
+        // Wave 3: a cancellation and a fresh demand — a third
+        // incremental write over both earlier chunk sets.
+        commit_to(
+            &db,
+            &mut graph,
+            &[SchedulerEvent::Mutate {
+                op: MutationKind::Cancel,
+                task_ids: vec![id("a")],
+            }],
+            3_000,
+        )
+        .await;
+        let covered3 = write_snapshot(&db, &mut graph).await.expect("snapshot 3");
+        assert!(covered3 > covered2);
+
+        // The wake reads every chunk set and replays nothing.
+        let (mut restored, tail) = load(&db).await.expect("load");
+        assert!(tail.is_empty());
+        apply_events(&mut restored, &tail);
+        assert_eq!(restored.status_counts(), graph.status_counts());
+        assert_eq!(restored.sizes(), graph.sizes());
+        let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
+        assert_eq!(claimed[0].task_id, id("b"));
+    }
+
+    /// `snapshot write`'s rows scale with the events since the last
+    /// snapshot, never with the stored graph (stow#902): the same
+    /// event wave over a 4×-larger fixture writes the same rows.
+    #[tokio::test]
+    async fn a_snapshot_writes_rows_proportional_to_the_events_not_the_graph() {
+        let mut counts = Vec::new();
+        for queue_rows in [1_000u32, 4_000] {
+            let shape = stow_types::fixture::FixtureShape { queue_rows };
+            let (db, log) = test_db::counting_memory_db().await.expect("db");
+            let mut graph = crate::scheduler::fixture::build(shape, 0).expect("build");
+            write_snapshot(&db, &mut graph)
+                .await
+                .expect("seed snapshot");
+            log.lock().expect("log").clear();
+            // The same wave: 32 demand batches against the same node
+            // ids plus one slice report publishing into the live
+            // map — the dirty set is identical at both sizes, so the
+            // published-bucket rewrites are measured too.
+            let (added, retired) = crate::scheduler::fixture::delta_slice_report(shape);
+            let mut events: Vec<SchedulerEvent> = (0..32)
+                .map(|k| SchedulerEvent::Demand {
+                    batch_id: format!("b{k}"),
+                    input_hash: format!("h{k}"),
+                    entries: vec![stow_types::api::DemandEntry {
+                        task_id: stow_types::fixture::fixture_task_id(u64::from(
+                            stow_types::fixture::FixtureShape::HUMAN_LANE_ROWS + 1 + k,
+                        )),
+                        delta: 1,
+                    }],
+                })
+                .collect();
+            events.push(SchedulerEvent::SliceReport {
+                target: TargetTriple::parse(stow_types::api::CI_TARGET_TRIPLES[0]).expect("target"),
+                rustc_version: WireRustcVersion::parse("1.85.0").expect("rustc"),
+                base_generation: None,
+                generation: Some(1),
+                added,
+                retired,
+            });
+            for event in &events {
+                append_events(&db, std::slice::from_ref(event), 0)
+                    .await
+                    .expect("append");
+            }
+            apply_events(&mut graph, &logged(&events, 0));
+            write_snapshot(&db, &mut graph).await.expect("snapshot");
+            counts.push(
+                log.lock()
+                    .expect("log")
+                    .iter()
+                    .filter(|s| s.sql.contains("INSERT INTO snapshot_chunks"))
+                    .count(),
+            );
+            // With no new events the rewrite is the meta row alone.
+            log.lock().expect("log").clear();
+            write_snapshot(&db, &mut graph)
+                .await
+                .expect("idle snapshot");
+            let idle = log
+                .lock()
+                .expect("log")
+                .iter()
+                .filter(|s| s.sql.contains("INSERT INTO snapshot_chunks"))
+                .count();
+            assert_eq!(idle, 1, "only the meta row rides an idle snapshot");
+        }
+        assert!(
+            counts[0].abs_diff(counts[1]) <= 2,
+            "the same 32 events rewrite {counts:?} spans at 4x the graph"
+        );
+        assert!(
+            counts[0] > 1 && counts[1] <= 64,
+            "{counts:?} chunk rows ride 33 events, not the graph"
+        );
     }
 
     #[tokio::test]

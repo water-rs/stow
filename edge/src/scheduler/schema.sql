@@ -12,7 +12,6 @@ CREATE TABLE IF NOT EXISTS event_log (
 );
 CREATE TABLE IF NOT EXISTS snapshot_chunks (
     chunk INTEGER PRIMARY KEY,
-    tag TEXT NOT NULL,
     payload TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS store_meta (

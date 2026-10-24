@@ -530,6 +530,10 @@ const TAG_MERGE: u64 = 6;
 const TAG_OPS: u64 = 7;
 const TAG_PREHEAT: u64 = 8;
 const TAG_INEXACT: u64 = 9;
+const TAG_SNAPSHOT: u64 = 10;
+/// The snapshot drive's setup bindings' run ids — its own range, clear
+/// of the host pass's and the run drives'.
+const SNAPSHOT_RUN_BASE: u64 = 7_000_000_000;
 
 /// A one-node submit tree under `source` — the shape the per-entry-point
 /// drives (stow#879) measure: the `Submit` append plus the merge.
@@ -2701,21 +2705,142 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
-        // The snapshot write: one row per chunk of the graph, the
-        // watermark, and the dropped log prefix. Amortized over
-        // `SNAPSHOT_EVENT_THRESHOLD` events, it is the bulk's only
-        // recurring write.
+        // The recurring incremental snapshot (stow#902): setup writes
+        // one unmeasured snapshot — the clean slate a live pass starts
+        // from — then applies a fixed batch of events identical at
+        // every fixture size (a merge, claims, completions and a
+        // published-slice report), so the measured run rewrites only
+        // the spans the batch dirtied. Each event touches a constant
+        // number of chunks, so the snapshot's rows scale with the
+        // events since the last one, never with the stored graph.
         name: "snapshot write",
-        setup: None,
+        setup: Some(|db, shape, settings, ctx| {
+            Box::pin(async move {
+                routes::snapshot(ctx.loaded(), db).await.map_err(text)?;
+                let inserted =
+                    submit(ctx, db, settings, &[snapshot_merge_tree(shape)], false).await?;
+                if inserted != SNAPSHOT_MERGE_NODES {
+                    return Err(format!(
+                        "snapshot setup merged {inserted}, expected {SNAPSHOT_MERGE_NODES}"
+                    ));
+                }
+                // Two of the drive's own nodes claim and bind; the first
+                // completes, so the batch holds claims, a binding and a
+                // completion on nodes no other drive reads.
+                for k in 0..2 {
+                    bind_node(
+                        ctx,
+                        db,
+                        snapshot_node_id(k),
+                        SNAPSHOT_RUN_BASE + u64::from(k),
+                        now_ms(),
+                    )
+                    .await?;
+                }
+                routes::complete_run(
+                    ctx.loaded(),
+                    db,
+                    &stow_types::api::WorkflowRunComplete {
+                        task_id: snapshot_node_id(0),
+                        success: true,
+                        error: None,
+                        cancelled: false,
+                        github_run_id: Some(SNAPSHOT_RUN_BASE.to_string()),
+                    },
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                snapshot_slice_report(db, ctx, shape, false).await
+            })
+        }),
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move { routes::snapshot(ctx.loaded(), db).await.map_err(text) })
         },
-        cleanup: None,
+        cleanup: Some(|db, shape, _settings, ctx| {
+            Box::pin(async move {
+                cancel_submitted(
+                    ctx,
+                    db,
+                    (0..SNAPSHOT_MERGE_NODES).map(snapshot_node_id).collect(),
+                )
+                .await?;
+                snapshot_slice_report(db, ctx, shape, true).await
+            })
+        }),
     },
 ];
 
 /// Nodes in the merge drive's tree.
 const MERGE_NODES: u32 = 1_000;
+
+/// Nodes in the snapshot drive's setup tree.
+const SNAPSHOT_MERGE_NODES: u32 = 24;
+
+/// Task id of the snapshot drive's `k`-th own node.
+fn snapshot_node_id(k: u32) -> String {
+    stow_types::fixture::named_task_id(
+        &format!("costgate-snap-{k:04}"),
+        DRIVE_SEED + TAG_SNAPSHOT * 1_000_000 + u64::from(k),
+        stow_types::fixture::target_of(101),
+    )
+}
+
+/// The snapshot drive's setup tree: [`SNAPSHOT_MERGE_NODES`] fresh
+/// nodes on published pool leaves, a merge identical at every fixture
+/// size that dirties a constant number of spans.
+fn snapshot_merge_tree(shape: FixtureShape) -> SubmissionTree {
+    let target = stow_types::fixture::target_of(101);
+    let pool = shape.pending_end() + 3;
+    let mut nodes: Vec<_> = (0..64)
+        .map(|leaf| fixture::fixture_node(pool + leaf, Vec::new()))
+        .collect();
+    nodes.extend((0..SNAPSHOT_MERGE_NODES).map(|k| {
+        fixture::named_node(
+            &format!("costgate-snap-{k:04}"),
+            DRIVE_SEED + TAG_SNAPSHOT * 1_000_000 + u64::from(k),
+            target,
+            vec![k % 64],
+        )
+    }));
+    SubmissionTree {
+        source: SubmissionSource::CacheMiss,
+        roots: (64..64 + SNAPSHOT_MERGE_NODES).collect(),
+        nodes,
+    }
+}
+
+/// The delta slice report the snapshot batch carries, or, with `undo`,
+/// its inverse, which the cleanup applies.
+async fn snapshot_slice_report(
+    db: &DurableDb,
+    ctx: &DriveContext,
+    shape: FixtureShape,
+    undo: bool,
+) -> Result<(), String> {
+    let (added, retired) = fixture::delta_slice_report(shape);
+    let (added, retired) = if undo {
+        (retired, added)
+    } else {
+        (added, retired)
+    };
+    routes::slice_report(
+        ctx.loaded(),
+        db,
+        &PublishedSlice {
+            target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
+            rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
+            base_generation: None,
+            generation: None,
+            added,
+            retired,
+        },
+        now_ms(),
+    )
+    .await
+    .map(drop)
+    .map_err(text)
+}
 
 /// The merge drive's tree: [`MERGE_NODES`] fresh nodes, each on one of
 /// the 64 published pool leaves, so every edge answers against the
