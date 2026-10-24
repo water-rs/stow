@@ -292,12 +292,6 @@ impl Generations {
     }
 }
 
-/// Apply `event` to `graph`, then the `BuildSample` events its
-/// completion produced - what a live route appends after it.
-fn step(graph: &mut Graph, event: &SchedulerEvent, at: i64) {
-    graph.apply(event, at);
-}
-
 /// Merge `tree` and keep the merge honest: a fixture tree that fails to
 /// merge is a builder bug.
 fn merge(graph: &mut Graph, tree: &SubmissionTree, at: i64) -> Result<(), QueueError> {
@@ -369,19 +363,16 @@ fn build_completed(
                 run_id: n.to_string(),
             })
             .collect();
-        step(
-            graph,
+        graph.apply(
             &SchedulerEvent::Claims { claims },
             finished_at(now, lo - completed_first) - 30 * MINUTE_MS,
         );
-        step(
-            graph,
+        graph.apply(
             &SchedulerEvent::Bindings { bindings },
             finished_at(now, lo - completed_first) - 29 * MINUTE_MS,
         );
         for n in lo..=hi {
-            step(
-                graph,
+            graph.apply(
                 &SchedulerEvent::RunFinished {
                     run_id: n.to_string(),
                     task_id: fixture_task_id(u64::from(n)),
@@ -393,7 +384,7 @@ fn build_completed(
             );
         }
         for report in slice_reports(lo, hi) {
-            step(graph, &report, now);
+            graph.apply(&report, now);
         }
     }
     Ok(())
@@ -419,8 +410,7 @@ fn build_failed(graph: &mut Graph, shape: FixtureShape, now: i64) -> Result<(), 
                 |_| Vec::new(),
             )?;
             let ids: Vec<String> = (lo..=hi).map(|n| fixture_task_id(u64::from(n))).collect();
-            step(
-                graph,
+            graph.apply(
                 &SchedulerEvent::Mutate {
                     op: MutationKind::Cancel,
                     task_ids: ids,

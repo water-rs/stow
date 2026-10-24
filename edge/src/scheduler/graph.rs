@@ -43,7 +43,7 @@ use edges::Edges;
 use index::{Interner, IxTable, hash_of};
 use node::{Extra, Flags, Lane, NO_STATE, Node, ParkedCompletion, State, Status};
 
-pub use snapshot::{SnapshotChunk, SnapshotCursor, SnapshotLoader};
+pub use snapshot::{ChunkSpan, SNAPSHOT_SPAN_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder};
 
 /// The edge's required-shape mask, derived exactly like
 /// [`queue::dep_edge_requirements`]: host-side deps owe a linked unit
@@ -401,6 +401,14 @@ pub struct Graph {
     /// `SNAPSHOT_BYTE_THRESHOLD` reads. Zero after a snapshot (it covers
     /// the whole log), recounted from the tail rows on replay.
     pub log_bytes_since_snapshot: u64,
+    /// The chunks the next snapshot rewrites (stow#902): in memory
+    /// only — a load and a snapshot write both clear it, and the
+    /// replayed tail marks its own changes. `all` once a compaction
+    /// renumbered the arena.
+    dirty: snapshot::Dirty,
+    /// Interned strings the persisted chunks already cover — the
+    /// interner's only dirty mark, since it is append-only.
+    intern_committed: usize,
 }
 
 /// Freeze transitions the graph keeps for `GET /dispatch-freeze`.
@@ -503,6 +511,7 @@ impl Graph {
     }
 
     fn node_mut(&mut self, ix: u32) -> &mut Node {
+        self.touch(ix);
         &mut self.nodes[ix as usize]
     }
 
@@ -517,6 +526,7 @@ impl Graph {
     }
 
     fn state_mut(&mut self, ix: u32) -> &mut State {
+        self.touch(ix);
         let slot = self.node(ix).state;
         assert_ne!(
             slot, NO_STATE,
@@ -611,6 +621,7 @@ impl Graph {
     /// Move a node to `to`, keeping the per-status counters and the
     /// in-flight set.
     fn set_status(&mut self, ix: u32, to: Status) {
+        self.touch(ix);
         let node = &mut self.nodes[ix as usize];
         let from = std::mem::replace(&mut node.status, to);
         if from == to {
@@ -629,6 +640,7 @@ impl Graph {
     /// Run `edit` on the node's extra fields, creating the entry on
     /// demand and dropping it again when nothing is left set.
     fn edit_extra<R>(&mut self, ix: u32, edit: impl FnOnce(&mut Extra) -> R) -> R {
+        self.touch(ix);
         let extra = self.extras.entry(ix).or_default();
         let result = edit(extra);
         if extra.is_blank() {
@@ -732,6 +744,7 @@ impl Graph {
     fn insert_node(&mut self, new: &NewNode<'_>) -> Result<u32, QueueError> {
         let ix = u32::try_from(self.nodes.len())
             .map_err(|_| QueueError::Invariant("node count overflows u32".into()))?;
+        self.touch(ix);
         let crate_name = self.intern.intern(new.crate_name);
         let version = self.intern.intern(new.version);
         let features = self.intern.intern(new.features);
@@ -835,6 +848,8 @@ impl Graph {
         if dead == 0 {
             return;
         }
+        // Every index renumbers: the next snapshot rewrites all chunks.
+        self.dirty.all = true;
         let mut remap = vec![GONE; self.nodes.len()];
         let mut kept = 0u32;
         for (at, node) in self.nodes.iter().enumerate() {
@@ -1163,7 +1178,8 @@ impl Graph {
                     QueueError::Invariant(format!("task {} has more than 65535 edges", sub.task_id))
                 })?;
             }
-            self.edges.push(owner, dep_ix, required, met)?;
+            let edge = self.edges.push(owner, dep_ix, required, met)?;
+            self.touch_edge(edge);
             self.node_mut(dep_ix).refs += 1;
             // A fresh node is blocked when any dep is a live failed
             // node.
@@ -1238,17 +1254,15 @@ impl Graph {
         );
         let keys = IdKeys::of(&task_id);
         let bit = shape_bit(row.unit_shape);
-        let mask = {
-            let entry = self.published.entry(keys.key).or_insert(0);
-            if added {
-                *entry |= bit;
+        let old = self.published.get(&keys.key).copied().unwrap_or(0);
+        let mask = if added { old | bit } else { old & !bit };
+        if mask != old {
+            if mask == 0 {
+                self.published.remove(&keys.key);
             } else {
-                *entry &= !bit;
+                self.published.insert(keys.key, mask);
             }
-            *entry
-        };
-        if mask == 0 {
-            self.published.remove(&keys.key);
+            self.touch_published(&keys.key);
         }
         let Some(ix) = self.find_id(&task_id, keys) else {
             return 0;
@@ -1266,6 +1280,7 @@ impl Graph {
                     continue;
                 }
                 self.edges.set_met(edge, met);
+                self.touch_edge(u32::try_from(edge).expect("edge indexes fit u32"));
                 let node = self.node_mut(owner);
                 node.unmet = if met {
                     node.unmet.saturating_sub(1)
@@ -1585,6 +1600,7 @@ impl Graph {
         let target = self.node(ix).target;
         if !cancelled || success {
             let attempt = self.state(ix).attempt;
+            self.dirty.outcomes = true;
             self.attempt_outcomes.push_back(AttemptOutcome {
                 task_id: self.task_id_of(ix),
                 generation_id: self.generation_of(ix).to_string(),
@@ -2256,6 +2272,7 @@ impl Graph {
                         .map(|entry| (entry.task_id.clone(), entry.delta))
                         .collect::<Vec<_>>(),
                 );
+                self.touch_batch(batch_id);
                 self.demand_batches.insert(
                     batch_id.clone(),
                     (
@@ -2288,6 +2305,7 @@ impl Graph {
     /// `Outcome` lands on the live record's attempt check and drops.
     fn apply_request_event(&mut self, request_id: &str, kind: &stow_types::api::RequestEvent) {
         use stow_types::api::{RequestEvent, RequestRunAction};
+        self.touch_request(request_id);
         match kind {
             RequestEvent::Admitted {
                 admission,
@@ -2361,6 +2379,7 @@ impl Graph {
         use stow_types::api::FeedEvent as K;
         match kind {
             K::Begin { generation } => {
+                self.touch_feed(hour);
                 let session = self
                     .feed_sessions
                     .entry(hour.to_owned())
@@ -2394,6 +2413,7 @@ impl Graph {
                     && session.state == "staging"
                     && *page_no == session.staged_pages
                 {
+                    self.dirty.feed.insert(snapshot::feed_bucket(hour));
                     let payload =
                         stow_types::api::demand_feed_page_payload(entries).unwrap_or_default();
                     let page_hash = blake3::hash(payload.as_bytes());
@@ -2437,6 +2457,7 @@ impl Graph {
                     && session.state == "complete"
                     && session.applied_pages == session.page_count
                 {
+                    self.dirty.feed.insert(snapshot::feed_bucket(hour));
                     "delivered".clone_into(&mut session.state);
                     session.staged.clear();
                     session.page_hashes.clear();
@@ -2445,7 +2466,9 @@ impl Graph {
                 }
             }
             K::Expire => {
-                self.feed_sessions.remove(hour);
+                if self.feed_sessions.remove(hour).is_some() {
+                    self.touch_feed(hour);
+                }
             }
         }
     }
@@ -3191,6 +3214,22 @@ mod tests {
         graph.ready.values().map(BTreeSet::len).sum()
     }
 
+    /// What a wake decodes when the store holds exactly this graph's
+    /// plan — every row of every dirty span, in key order.
+    fn round_trip(graph: &Graph) -> Graph {
+        let plan = graph.snapshot_plan().expect("plan");
+        let mut loader = SnapshotLoader::default();
+        for span in plan.spans {
+            let mut encoder = graph.snapshot_encoder(span);
+            let mut sub = 0i64;
+            while let Some(payload) = encoder.next_row(graph).expect("row") {
+                loader.apply(span.lo_key() + sub, &payload).expect("apply");
+                sub += 1;
+            }
+        }
+        loader.finish().expect("load")
+    }
+
     #[test]
     fn records_keep_their_sizes() {
         assert_eq!(size_of::<Node>(), 68);
@@ -3589,12 +3628,7 @@ mod tests {
         publish(&mut graph, "c");
         graph.meter.roll_to("2026-10-23");
         graph.meter.record("test", 7, 11);
-        let mut cursor = SnapshotCursor::default();
-        let mut loader = SnapshotLoader::default();
-        while let Some(chunk) = graph.next_snapshot_chunk(&mut cursor).expect("chunk") {
-            loader.apply(chunk.tag, &chunk.payload).expect("row");
-        }
-        let mut restored = loader.finish().expect("load");
+        let mut restored = round_trip(&graph);
         assert_eq!(restored.status_counts(), graph.status_counts());
         assert_eq!(restored.meter.rows_written, 11);
         let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
@@ -3608,17 +3642,9 @@ mod tests {
         graph.merge(&solo(), 0).expect("merge");
         publish(&mut graph, "solo");
         assert_eq!(graph.counts[Status::Free.index()], 1);
-        assert!(
-            graph
-                .next_snapshot_chunk(&mut SnapshotCursor::default())
-                .is_err()
-        );
+        assert!(graph.snapshot_plan().is_err());
         graph.compact();
-        assert!(
-            graph
-                .next_snapshot_chunk(&mut SnapshotCursor::default())
-                .is_ok()
-        );
+        assert!(graph.snapshot_plan().is_ok());
     }
 
     #[test]
