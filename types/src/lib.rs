@@ -18,6 +18,7 @@ pub mod crate_info;
 pub mod do_budgets;
 pub mod env_name;
 pub mod error;
+pub mod feature_sets;
 pub mod fixture;
 pub mod glibc;
 pub mod hash;

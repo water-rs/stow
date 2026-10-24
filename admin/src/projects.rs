@@ -425,6 +425,8 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
     // name a repository this input actually lists.
     let trees =
         crate::source_trees::load_optional_source_trees(args.source_trees.as_ref(), &repos)?;
+    let published =
+        tokio::runtime::Handle::current().block_on(substitution_pool(&targets, &rustc_version))?;
     let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let mut plan = ProjectsPlan {
         file: args.file.display().to_string(),
@@ -457,12 +459,20 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
             Ok(tasks) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
                 // `edge` is present exactly when the run submits. One
-                // resolve is one submission tree (stow#878).
-                let tree = stow_types::api::SubmissionTree::from_enqueue_requests(
+                // resolve is one submission tree (stow#878); contained
+                // feature sets are served from their superset (stow#881)
+                // — this lane's pool is the one tree it submits per
+                // repo.
+                let mut tree = stow_types::api::SubmissionTree::from_enqueue_requests(
                     stow_types::api::SubmissionSource::Preheat,
                     &tasks,
                 )
                 .expect("resolved repo converts to a submission tree");
+                stow_types::api::SubmissionTree::substitute_contained_sets(
+                    std::slice::from_mut(&mut tree),
+                    &published,
+                )
+                .expect("substituting a resolved tree cannot fail");
                 if let Some(edge) = edge
                     && !tree.nodes.is_empty()
                 {
@@ -505,6 +515,29 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
         result: edge.map(|_| outcome),
     };
     render::emit(output, &envelope, render_projects_plan)
+}
+
+/// The published side of this lane's superset-serving substitution
+/// pool (stow#881): the signed `index.<target>.<rustc>` slices —
+/// the same verified rows coverage reads — for every slice a batch
+/// node's identity can key on. That is each lane target plus its
+/// runner family's host triple, where host-side nodes mint.
+async fn substitution_pool(
+    targets: &[TargetTriple],
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<Vec<stow_types::api::PublishedIndexSlice>> {
+    let mut pairs = BTreeSet::<(TargetTriple, WireRustcVersion)>::new();
+    for target in targets {
+        pairs.insert((target.clone(), rustc_version.clone()));
+        if let Some(family) = stow_types::api::runner_family(target.as_str())
+            && family.host_triple() != target.as_str()
+        {
+            let host = TargetTriple::parse(family.host_triple().to_owned())
+                .map_err(|error| stow_error!("family host triple: {error}"))?;
+            pairs.insert((host, rustc_version.clone()));
+        }
+    }
+    crate::manual::published_slices(&pairs).await
 }
 
 /// The human render of a projects-lane run: the resolved/skipped

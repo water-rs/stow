@@ -1386,6 +1386,81 @@ cat "$LOG_DIR/stow-status.log"
 
 assert_served 1 "$TASK_CRATE"
 
+# --- stow#881: a contained feature set is served from its published superset ---
+#
+# once_cell is a leaf (every dep is optional): `default = ["std"]`,
+# `std = ["alloc"]`, `alloc = ["race"]`, so submitting
+# `["default"]` resolves and publishes `["alloc","default","race","std"]`.
+# The consumer asks for `features = ["alloc"]` with `default-features
+# = false` — resolved `["alloc","race"]`, a strict subset with no row
+# of its own — and must be served from the published container. The
+# leg asserts the hit and that misses/local builds never moved.
+SUPERSET_CRATE=once_cell
+SUPERSET_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
+    'https://index.crates.io/on/ce/once_cell' \
+    | jq -rs '[.[] | select(.yanked | not) | .vers | select(test("^1\\.[0-9]+\\.[0-9]+$"))]
+              | sort_by(split(".") | map(tonumber)) | last // empty')"
+[ -n "$SUPERSET_VERSION" ] || die "no non-yanked once_cell 1.x found on crates.io"
+echo "[mock-e2e] superset task: $SUPERSET_CRATE $SUPERSET_VERSION features=[\"default\"]"
+status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+superset_completed=0
+[ -n "$status_json" ] \
+    && superset_completed="$(jq -r '.completed' <<<"$status_json")"
+
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" submit \
+    --crate-name "$SUPERSET_CRATE" \
+    --version "$SUPERSET_VERSION" \
+    --features-json '["default"]' \
+    --target "$HOST_TARGET" \
+    --rustc-version "$RUSTC_VERSION" \
+    --yes \
+    >"$LOG_DIR/admin-submit-superset.log" 2>&1 \
+    || die "stow-admin submit (superset) failed — see $LOG_DIR/admin-submit-superset.log"
+
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+    if [ -n "$status_json" ]; then
+        echo "[mock-e2e] scheduler (superset): $status_json"
+        [ "$(( $(jq -r '.failed' <<<"$status_json") - BASE_FAILED ))" -ge 1 ] \
+            && die "scheduler failed the superset task: $status_json"
+        [ "$(jq -r '.completed' <<<"$status_json")" -gt "$superset_completed" ] && break
+    fi
+    [ "$SECONDS" -ge "$deadline" ] && die "scheduler did not complete the superset task within ${TASK_DEADLINE}s"
+    sleep 5
+done
+
+fg publish_slices "superset"
+fg stow_cli index refresh >"$LOG_DIR/index-refresh-superset.log" 2>&1 \
+    || die "stow index refresh (superset) failed — see $LOG_DIR/index-refresh-superset.log"
+
+superset_stats_before="$(sqlite3 "$WORK_DIR/stow-cache/state-v3.sqlite3" \
+    "SELECT COALESCE(SUM(misses),0), COALESCE(SUM(local_dependency_builds),0) \
+     FROM crate_stats WHERE crate_name='once_cell'")"
+SUPERSET_CONSUMER="$WORK_DIR/once_cell-subset-consumer"
+isolated_env cargo new --lib --vcs none "$SUPERSET_CONSUMER" \
+    >"$LOG_DIR/consumer-new-subset.log" 2>&1 \
+    || die "cargo new failed — see $LOG_DIR/consumer-new-subset.log"
+printf 'once_cell = { version = "=%s", default-features = false, features = ["alloc"] }\n' \
+    "$SUPERSET_VERSION" >>"$SUPERSET_CONSUMER/Cargo.toml"
+fg prepare_consumer "$SUPERSET_CONSUMER" once_cell-subset
+
+fg in_dir "$SUPERSET_CONSUMER" stow_cli check >"$LOG_DIR/stow-check-subset.log" 2>&1 \
+    || die "stow check (subset) failed — see $LOG_DIR/stow-check-subset.log"
+
+superset_stats_after="$(sqlite3 "$WORK_DIR/stow-cache/state-v3.sqlite3" \
+    "SELECT COALESCE(SUM(hits),0), COALESCE(SUM(misses),0), COALESCE(SUM(local_dependency_builds),0) \
+     FROM crate_stats WHERE crate_name='once_cell'")"
+echo "[mock-e2e] once_cell subset serve: before={misses,local}=$superset_stats_before after={hits,misses,local}=$superset_stats_after"
+[ "$(cut -d'|' -f1 <<<"$superset_stats_after")" -ge 1 ] \
+    || die "subset consumer was not served once_cell from the superset ($superset_stats_after)"
+[ "$(cut -d'|' -f2 <<<"$superset_stats_after")" = "$(cut -d'|' -f1 <<<"$superset_stats_before")" ] \
+    || die "subset consumer recorded a miss — once_cell was compiled or reported ($superset_stats_after)"
+[ "$(cut -d'|' -f3 <<<"$superset_stats_after")" = "$(cut -d'|' -f2 <<<"$superset_stats_before")" ] \
+    || die "subset consumer built once_cell locally ($superset_stats_after)"
+
 # --- byte path: bundles served by digest, Workers Cache in front of GHCR ---
 #
 # `stow check` already fetched itoa's bundle through

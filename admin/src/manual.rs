@@ -534,6 +534,51 @@ pub async fn contextual_coverage(
     .await
 }
 
+/// Pull and verify the `index.<target>.<rustc>` slices the superset
+/// substitution pool reads (stow#881): the same verified rows
+/// `covered_nodes` answers coverage from, kept with their slice
+/// coordinates so a row's task identity is reconstructable.
+pub async fn published_slices(
+    pairs: &BTreeSet<(TargetTriple, WireRustcVersion)>,
+) -> stow_types::error::Result<Vec<stow_types::api::PublishedIndexSlice>> {
+    let base = crate::index_cmd::registry_base()?;
+    let http = stow_oci::RegistryHttp::new().await?;
+    let trust = crate::index_cmd::records_trust().await?;
+    // The cache repository is per-rustc; group the pull by it.
+    let mut by_rustc = BTreeMap::<&WireRustcVersion, Vec<&TargetTriple>>::new();
+    for (target, rustc_version) in pairs {
+        by_rustc.entry(rustc_version).or_default().push(target);
+    }
+    let mut slices = Vec::new();
+    for (rustc_version, targets) in by_rustc {
+        let repository = cache_repository(rustc_version);
+        let session = base.session(&repository, &http);
+        let index = Index {
+            session: &session,
+            repository: &repository,
+            trust: &trust,
+        };
+        let rows_per_target: Vec<Option<Vec<ArtifactIndexRow>>> = futures_util::stream::iter(
+            targets
+                .iter()
+                .map(|target| published_slice_rows(&index, target, rustc_version)),
+        )
+        .buffered(SLICE_PULL_CONCURRENCY)
+        .try_collect()
+        .await?;
+        for (target, rows) in targets.iter().zip(rows_per_target) {
+            if let Some(rows) = rows {
+                slices.push(stow_types::api::PublishedIndexSlice {
+                    target: (*target).clone(),
+                    rustc_version: rustc_version.clone(),
+                    rows,
+                });
+            }
+        }
+    }
+    Ok(slices)
+}
+
 /// The three handles the index-slice pulls share — `pub` so the
 /// request lane pulls the same verified slices.
 pub struct Index<'a> {

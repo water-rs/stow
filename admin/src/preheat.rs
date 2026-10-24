@@ -237,9 +237,26 @@ fn requests_table(trees: &[stow_types::api::SubmissionTree]) -> String {
 async fn submit_plan(
     edge: Option<&Edge>,
     crates_io: &crates_io::CratesIo,
-    trees: Vec<stow_types::api::SubmissionTree>,
+    mut trees: Vec<stow_types::api::SubmissionTree>,
     output: Output,
 ) -> stow_types::error::Result<()> {
+    // Contained feature sets are served from their smallest containing
+    // set rather than built (stow#881): substitute across the lane's
+    // whole batch before the plan renders and before anything submits —
+    // the plan-only output is the production wave count's input, so it
+    // must carry the substituted task ids. The pool is the batch plus
+    // the published sets in the signed index slices covering the
+    // batch's own (target, rustc) pairs — the same verified pulls
+    // coverage makes; a host-side node's `target` is its family's host
+    // triple, so the pair set covers host slices too.
+    let mut slice_pairs = std::collections::BTreeSet::<(TargetTriple, WireRustcVersion)>::new();
+    for tree in &trees {
+        for node in &tree.nodes {
+            slice_pairs.insert((node.target.clone(), node.rustc_version.clone()));
+        }
+    }
+    let published = crate::manual::published_slices(&slice_pairs).await?;
+    stow_types::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)?;
     // The fetch phase ended before this call — the count cannot change.
     let api_requests = crates_io.api_requests();
     render::mutation(

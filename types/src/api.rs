@@ -3075,7 +3075,9 @@ mod tests {
         CI_TARGET_TRIPLES, DEMAND_FEED_PAGE_MAX_BYTES, DEMAND_FEED_PAGE_MAX_ENTRIES,
         DemandFeedHour, DemandFeedPageBuilder, RunnerFamily, SchedulerDemandEntry, runner_family,
     };
-    use crate::identity::FeaturesJson;
+    use crate::artifact::ArtifactKind;
+    use crate::identity::{DependencyCMetadataJson, FeaturesJson};
+    use crate::index::ArtifactIndexRow;
 
     /// Every CI target must land in exactly one family, and the families'
     /// `targets()` lists together must be exactly `CI_TARGET_TRIPLES` —
@@ -3334,6 +3336,266 @@ mod tests {
             Some("1969-12-31T23".to_owned())
         );
     }
+
+    /// A hand-built submission node: synthetic task ids are fine as
+    /// inputs — substitution picks representatives by them — and
+    /// [`SubmissionTree::substitute_contained_sets`] recomputes real
+    /// ones on the way out.
+    fn submission_node(
+        crate_name: &str,
+        features: &[&str],
+        deps: &[u32],
+        task_id: &str,
+    ) -> crate::api::SubmissionNode {
+        crate::api::SubmissionNode {
+            task_id: task_id.to_owned(),
+            crate_name: crate_name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            )
+            .expect("features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side: false,
+            explicit_spelling: crate::public_cache::ExplicitSpelling::KeysAsNative,
+            preserve_lockfile: false,
+            dependency_identity: crate::identity::DependencyIdentity::leaf().expect("leaf digest"),
+            deps: deps.to_vec(),
+            downloads: 0,
+        }
+    }
+
+    fn tree(nodes: Vec<crate::api::SubmissionNode>) -> crate::api::SubmissionTree {
+        crate::api::SubmissionTree {
+            source: crate::api::SubmissionSource::Preheat,
+            roots: vec![0],
+            nodes,
+        }
+    }
+
+    /// The stow#881 rule across one batch: `app`'s dep on `dep@{a}` is
+    /// rewritten to the batch's `dep@{a,b}` node — the subset node
+    /// leaves the tree and the splice lands the two trees on one task
+    /// id, so the scheduler merge builds it once.
+    #[test]
+    fn substitution_serves_a_contained_set_from_its_superset() {
+        let mut trees = vec![
+            tree(vec![
+                submission_node("app", &[], &[1], "app-1.0.0-[]"),
+                submission_node("dep", &["a"], &[], "dep-1.0.0-a"),
+            ]),
+            tree(vec![submission_node(
+                "dep",
+                &["a", "b"],
+                &[],
+                "dep-1.0.0-ab",
+            )]),
+        ];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &[])
+            .expect("substitution");
+        let dep = trees[0]
+            .nodes
+            .iter()
+            .find(|node| node.crate_name.as_str() == "dep")
+            .expect("dep node");
+        assert_eq!(
+            dep.features_json.features(),
+            &["a".to_owned(), "b".to_owned()]
+        );
+        assert_eq!(
+            dep.task_id, trees[1].nodes[0].task_id,
+            "the spliced node is the superset node's task"
+        );
+        let root = &trees[0].nodes[trees[0].roots[0] as usize];
+        assert_eq!(root.crate_name.as_str(), "app");
+        assert_eq!(root.deps.len(), 1);
+        assert!(
+            root.task_id.starts_with("app-"),
+            "root id recomputed: {}",
+            root.task_id
+        );
+        assert_ne!(root.task_id, "app-1.0.0-[]");
+    }
+
+    /// `{a,d}` beside `{a,b,c}` — neither contains the other, so both
+    /// are built as themselves and nothing is rewritten.
+    #[test]
+    fn substitution_leaves_uncontained_sets_alone() {
+        let mut trees = vec![
+            tree(vec![submission_node("dep", &["a", "b", "c"], &[], "abc")]),
+            tree(vec![submission_node("dep", &["a", "d"], &[], "ad")]),
+        ];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &[])
+            .expect("substitution");
+        assert_eq!(
+            trees[1].nodes[0].features_json.features(),
+            &["a".to_owned(), "d".to_owned()]
+        );
+        assert_eq!(trees[1].nodes[0].task_id, "ad");
+    }
+
+    /// A published index row — the fields substitution reads, the rest
+    /// inert.
+    fn published_row(
+        crate_name: &str,
+        features: &[&str],
+        deps: &[(&str, &str)],
+        dependency_identity: crate::identity::DependencyIdentity,
+        c_metadata: &str,
+    ) -> ArtifactIndexRow {
+        ArtifactIndexRow {
+            crate_name: crate_name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            )
+            .expect("features"),
+            dependency_c_metadata_json: DependencyCMetadataJson::canonicalize(
+                deps.iter()
+                    .map(
+                        |(name, meta)| crate::identity::DependencyCMetadataIdentity {
+                            crate_name: name.parse().expect("dep name"),
+                            c_metadata: meta.parse().expect("c_metadata"),
+                        },
+                    )
+                    .collect(),
+            )
+            .expect("dep c_metadata"),
+            dependency_identity,
+            c_metadata: c_metadata.parse().expect("c_metadata"),
+            compile_key: format!("{c_metadata}{c_metadata}"),
+            bundle_digest: format!("sha256:{c_metadata:0>64}"),
+            bundle_size: 0,
+            artifact_kind: ArtifactKind::Rlib,
+            crate_types: vec![crate::artifact::RustCrateType::Rlib],
+            profile: crate::platform::Profile {
+                opt_level: "3".to_owned(),
+                debuginfo: 0,
+                debug_assertions: false,
+                overflow_checks: false,
+                panic: crate::platform::PanicStrategy::Unwind,
+                strip: crate::platform::StripLevel::None,
+            },
+            emit: vec!["link".to_owned()],
+            unit_shape: crate::public_cache::UnitShape {
+                side: crate::public_cache::UnitSide::Target,
+                invocation: crate::public_cache::UnitInvocation::Native,
+                kind: crate::public_cache::UnitKind::Linked,
+            },
+            min_glibc: None,
+        }
+    }
+
+    /// The published pool (stow#881, second half of the rule): `dep`'s
+    /// smallest containing set lives only in a signed index slice. The
+    /// batch's `dep@{a}` node leaves the tree, the published subtree —
+    /// `dep@{a,b}` and its own dep `d` — lands carrying the rows'
+    /// published identities, and `app`'s task id recomputes against
+    /// `dep@{a,b}`'s published `dependency_identity`.
+    #[test]
+    fn substitution_serves_from_a_published_only_container() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        let identity = |name: &str, features: &[&str]| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .expect("features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side: false,
+        };
+        // The published slice: leaf `d` and `dep@{a,b}` built against it.
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let d_task_id = identity("d", &[]).task_id(&leaf);
+        let t_dep_identity =
+            DependencyIdentity::from_task_ids([d_task_id.as_str()]).expect("digest");
+        let t_task_id = identity("dep", &["a", "b"]).task_id(&t_dep_identity);
+        let published = vec![crate::api::PublishedIndexSlice {
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![
+                published_row("d", &[], &[], leaf, "11"),
+                published_row(
+                    "dep",
+                    &["a", "b"],
+                    &[("d", "11")],
+                    t_dep_identity.clone(),
+                    "22",
+                ),
+            ],
+        }];
+        let mut trees = vec![tree(vec![
+            submission_node("app", &[], &[1], "app-sub"),
+            submission_node("dep", &["a"], &[], "dep-a-sub"),
+        ])];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        // The contained set left the batch entirely.
+        assert!(
+            tree.nodes
+                .iter()
+                .all(|node| node.crate_name.as_str() != "dep"
+                    || node.features_json.features() != ["a".to_owned()]),
+            "dep@{{a}} must leave the tree: {:?}",
+            tree.nodes
+                .iter()
+                .map(|node| node.task_id.clone())
+                .collect::<Vec<_>>()
+        );
+        // The published container and its dep land as nodes carrying
+        // their published ids — never roots, so the merge marks them
+        // satisfied instead of dispatching them.
+        let t = tree
+            .nodes
+            .iter()
+            .find(|node| node.task_id == t_task_id)
+            .expect("published dep@{a,b} node");
+        assert_eq!(t.dependency_identity, t_dep_identity);
+        let d = tree
+            .nodes
+            .iter()
+            .find(|node| node.task_id == d_task_id)
+            .expect("reconstructed dep d");
+        assert_eq!(t.deps.len(), 1);
+        let d_index = u32::try_from(
+            tree.nodes
+                .iter()
+                .position(|node| node.task_id == d_task_id)
+                .expect("d index"),
+        )
+        .expect("index fits u32");
+        assert_eq!(t.deps, vec![d_index]);
+        assert_eq!(d.deps, Vec::<u32>::new());
+        // The parent's task id is the one computed against T's
+        // published dependency identity.
+        let app = &tree.nodes[tree.roots[0] as usize];
+        let app_digest = DependencyIdentity::from_task_ids([t_task_id.as_str()]).expect("digest");
+        assert_eq!(app.task_id, identity("app", &[]).task_id(&app_digest));
+        assert_eq!(
+            app.deps,
+            vec![
+                u32::try_from(
+                    tree.nodes
+                        .iter()
+                        .position(|node| node.task_id == t_task_id)
+                        .expect("t index"),
+                )
+                .expect("index fits u32")
+            ]
+        );
+    }
 }
 /// Public aggregate usage statistics served by `GET /api/v1/stats`.
 ///
@@ -3570,6 +3832,520 @@ impl SubmissionTree {
             nodes,
         })
     }
+
+    /// Apply the superset-serving rule (stow#881): a feature set
+    /// contained in another set of the same `(crate, version, target,
+    /// rustc, side)` is never built — its node is replaced by the
+    /// containing set's node, subtree included, and every task id is
+    /// recomputed bottom-up.
+    ///
+    /// The pool is the submit call's batch **and** the published sets
+    /// in `published` — the signed `index.<target>.<rustc>` slices the
+    /// caller already pulls for coverage. A serving set present only
+    /// in the published pool is reconstructed from its rows: the
+    /// subtree is rebuilt by following each row's
+    /// `dependency_c_metadata_json` edges through the pulled slices,
+    /// and every reconstructed node carries the row's published
+    /// `dependency_identity`, so a dependent's task id commits to the
+    /// exact identity the builder published. The scheduler's merge
+    /// then treats the spliced nodes as already satisfied — they are
+    /// never dispatched — while their edges keep every dependent's
+    /// dispatch payload pinning the full closure.
+    ///
+    /// Batch-side the pool rule is unchanged: for each `(group, serving
+    /// set)` the replacement node is the smallest pre-substitution
+    /// `task_id` among the batch's nodes carrying that set. The rewrite
+    /// runs over a shared interned arena of [`ResolvedTaskNode`]s;
+    /// [`ResolvedTaskGraph::resolve`] recomputes every
+    /// `dependency_identity` and `task_id` bottom-up, each tree is
+    /// re-emitted from its substituted roots' reach, and every
+    /// reconstructed published node is checked to reproduce its
+    /// published task id — a mismatch means the pulled slices disagree
+    /// with the rows' recorded dep closures.
+    ///
+    /// # Errors
+    /// Fails as [`ResolvedTaskGraph::resolve`] does, and fails fast when
+    /// a reconstructed published subtree resolves to an id other than
+    /// the row's published one.
+    ///
+    /// # Panics
+    /// The internal lookups are inhabited by construction: every node's
+    /// group and serving set were computed from the pool itself.
+    pub fn substitute_contained_sets(
+        trees: &mut [Self],
+        published: &[PublishedIndexSlice],
+    ) -> crate::error::Result<()> {
+        // Each group's distinct feature sets over the batch ∪ the
+        // published slices, and the serving map over them: a set
+        // contained in no other is built; every other set is served by
+        // the smallest built set containing it.
+        let mut families = BTreeMap::<SubstitutionGroupKey, BTreeSet<Vec<String>>>::new();
+        for tree in trees.iter() {
+            for node in &tree.nodes {
+                families
+                    .entry(substitution_group_key(node))
+                    .or_default()
+                    .insert(node.features_json.features().to_vec());
+            }
+        }
+        for slice in published {
+            for row in &slice.rows {
+                families
+                    .entry(substitution_row_key(slice, row))
+                    .or_default()
+                    .insert(row.features_json.features().to_vec());
+            }
+        }
+        let serving = families
+            .iter()
+            .map(|(key, family)| (key.clone(), crate::feature_sets::serving_map(family)))
+            .collect::<BTreeMap<_, _>>();
+        if serving
+            .values()
+            .all(|map| map.iter().all(|(set, serve)| set == serve))
+        {
+            return Ok(());
+        }
+
+        // The canonical node a contained set is replaced by: among the
+        // batch's nodes carrying the serving set, the smallest existing
+        // task id — deterministic on both sides of the submit.
+        let mut representatives =
+            BTreeMap::<(SubstitutionGroupKey, Vec<String>), (usize, usize)>::new();
+        for (tree_index, tree) in trees.iter().enumerate() {
+            for (node_index, node) in tree.nodes.iter().enumerate() {
+                let key = substitution_group_key(node);
+                let serve = &serving[&key][node.features_json.features()];
+                if serve.as_slice() != node.features_json.features() {
+                    continue;
+                }
+                representatives
+                    .entry((key, serve.clone()))
+                    .and_modify(|rep| {
+                        if node.task_id < trees[rep.0].nodes[rep.1].task_id {
+                            *rep = (tree_index, node_index);
+                        }
+                    })
+                    .or_insert((tree_index, node_index));
+            }
+        }
+        let (published_reps, by_c_metadata) = published_pool_index(published, &serving);
+
+        let mut substitution = Substitution {
+            trees,
+            published,
+            serving: &serving,
+            representatives: &representatives,
+            published_reps: &published_reps,
+            by_c_metadata: &by_c_metadata,
+            arena: Vec::new(),
+            closure_pm: Vec::new(),
+            interned: std::collections::HashMap::new(),
+            memo: std::collections::HashMap::new(),
+            published_memo: std::collections::HashMap::new(),
+            pinned: std::collections::HashMap::new(),
+        };
+        // Substituting a node into another node's dep position can never
+        // close a cycle: the spliced subtree is the dependency closure
+        // of a real resolved node (batch) or of a published artifact's
+        // recorded chain (index), and a build graph is acyclic.
+        for (tree_index, tree) in trees.iter().enumerate() {
+            for node_index in 0..tree.nodes.len() {
+                substitution.substitute(tree_index, node_index);
+            }
+        }
+        let Substitution {
+            arena,
+            memo,
+            pinned,
+            ..
+        } = substitution;
+        let resolved = ResolvedTaskGraph::resolve(arena)?;
+        // A reconstructed published node is pinned to the id its row
+        // records — recompute reproducing it proves the pulled slices
+        // carry the row's whole dep chain verbatim.
+        for (index, expected) in &pinned {
+            let actual = resolved
+                .task_id(*index)
+                .ok_or_else(|| stow_error!("arena node {index} has no task id"))?;
+            if actual != expected.as_str() {
+                return Err(stow_error!(
+                    "published subtree reconstructed to {actual}, index records {expected}"
+                ));
+            }
+        }
+        for (tree_index, tree) in trees.iter_mut().enumerate() {
+            *tree = reemit_substituted_tree(tree, tree_index, &memo, &resolved)?;
+        }
+        Ok(())
+    }
+}
+
+/// One verified `index.<target>.<rustc>` slice as the superset
+/// substitution pool sees it (stow#881): the published rows plus the
+/// slice's coordinates, which rows do not themselves carry.
+#[derive(Debug, Clone)]
+pub struct PublishedIndexSlice {
+    /// The slice's target triple — every row's `TaskNodeIdentity.target`.
+    pub target: TargetTriple,
+    /// The slice's rustc — every row's `TaskNodeIdentity.rustc_version`.
+    pub rustc_version: WireRustcVersion,
+    /// The verified rows.
+    pub rows: Vec<ArtifactIndexRow>,
+}
+
+/// The identity group the superset-serving rule keys on (stow#881) —
+/// every field of a node's task identity except its feature set.
+type SubstitutionGroupKey = (
+    CrateName,
+    CrateVersion,
+    TargetTriple,
+    WireRustcVersion,
+    bool,
+);
+
+fn substitution_group_key(node: &SubmissionNode) -> SubstitutionGroupKey {
+    (
+        node.crate_name.clone(),
+        node.version.clone(),
+        node.target.clone(),
+        node.rustc_version.clone(),
+        node.host_side,
+    )
+}
+
+/// A published row's identity group — the slice supplies the two
+/// identity columns a row does not carry.
+fn substitution_row_key(
+    slice: &PublishedIndexSlice,
+    row: &ArtifactIndexRow,
+) -> SubstitutionGroupKey {
+    (
+        row.crate_name.clone(),
+        row.version.clone(),
+        slice.target.clone(),
+        slice.rustc_version.clone(),
+        row.unit_shape.side == crate::public_cache::UnitSide::Host,
+    )
+}
+
+/// A published row's task identity — same field split as
+/// [`substitution_row_key`].
+fn published_row_identity(slice: &PublishedIndexSlice, row: &ArtifactIndexRow) -> TaskNodeIdentity {
+    TaskNodeIdentity {
+        crate_name: row.crate_name.clone(),
+        version: row.version.clone(),
+        features_json: row.features_json.clone(),
+        target: slice.target.clone(),
+        rustc_version: slice.rustc_version.clone(),
+        host_side: row.unit_shape.side == crate::public_cache::UnitSide::Host,
+    }
+}
+
+/// The published side of the serving-pool pick (stow#881): among the
+/// rows carrying each serving set, the smallest published task id —
+/// a published row wins over a batch node because its artifact already
+/// exists, so serving from it never waits on this wave. Also the
+/// `c_metadata` → `(slice, row)` join a row's `dependency_c_metadata_json`
+/// dep edges name: one artifact per value, the first row carrying it
+/// answers.
+#[allow(clippy::type_complexity)]
+fn published_pool_index<'a>(
+    published: &'a [PublishedIndexSlice],
+    serving: &BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
+) -> (
+    BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize, String)>,
+    std::collections::HashMap<&'a str, (usize, usize)>,
+) {
+    let mut reps = BTreeMap::new();
+    let mut by_c_metadata = std::collections::HashMap::new();
+    for (slice_index, slice) in published.iter().enumerate() {
+        for (row_index, row) in slice.rows.iter().enumerate() {
+            by_c_metadata
+                .entry(row.c_metadata.as_str())
+                .or_insert((slice_index, row_index));
+            let key = substitution_row_key(slice, row);
+            let serve = &serving[&key][row.features_json.features()];
+            if serve.as_slice() != row.features_json.features() {
+                continue;
+            }
+            let task_id = published_row_identity(slice, row).task_id(&row.dependency_identity);
+            reps.entry((key, serve.clone()))
+                .and_modify(|rep: &mut (usize, usize, String)| {
+                    if task_id < rep.2 {
+                        *rep = (slice_index, row_index, task_id.clone());
+                    }
+                })
+                .or_insert((slice_index, row_index, task_id));
+        }
+    }
+    (reps, by_c_metadata)
+}
+
+/// One batch's shared rewrite state for
+/// [`SubmissionTree::substitute_contained_sets`]: the group serving
+/// maps, each serving set's canonical batch node and published row,
+/// the interned [`ResolvedTaskNode`] arena every tree re-emits from,
+/// and the memoized per-occurrence answers.
+struct Substitution<'a> {
+    trees: &'a [SubmissionTree],
+    published: &'a [PublishedIndexSlice],
+    serving: &'a BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
+    representatives: &'a BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize)>,
+    /// `(slice, row, task id)` of each serving set's published pick.
+    published_reps: &'a BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize, String)>,
+    /// `c_metadata` → `(slice, row)` across every pulled slice — the
+    /// dep-edge join a row's `dependency_c_metadata_json` names.
+    by_c_metadata: &'a std::collections::HashMap<&'a str, (usize, usize)>,
+    arena: Vec<ResolvedTaskNode>,
+    /// Parallel to `arena`: a proc-macro reaches this node's dep
+    /// closure, or the node is one itself. Only published
+    /// reconstructions read it — a published node's `KeysApart` flag is
+    /// recomputed from it.
+    closure_pm: Vec<bool>,
+    interned: std::collections::HashMap<
+        (
+            TaskNodeIdentity,
+            crate::public_cache::ExplicitSpelling,
+            Vec<usize>,
+        ),
+        usize,
+    >,
+    memo: std::collections::HashMap<(usize, usize), usize>,
+    /// `(slice, row)` → reconstructed arena index; `None` when the row's
+    /// dep chain is not fully present in the pulled slices.
+    published_memo: std::collections::HashMap<(usize, usize), Option<usize>>,
+    /// Arena index → the task id its published row records — checked
+    /// against the recompute before any tree re-emits.
+    pinned: std::collections::HashMap<usize, String>,
+}
+
+impl Substitution<'_> {
+    /// The arena node one `(tree, node)` occurrence maps to —
+    /// memoized. A node whose set is served by a containing set
+    /// resolves to that set's published row when one exists — its
+    /// artifact is already built — else to the set's canonical batch
+    /// node; a published pick whose dep chain the pulled slices do not
+    /// fully carry, or a serve with no node or row at all, leaves the
+    /// node on the chain it has.
+    fn substitute(&mut self, tree_index: usize, node_index: usize) -> usize {
+        if let Some(&index) = self.memo.get(&(tree_index, node_index)) {
+            return index;
+        }
+        let node = &self.trees[tree_index].nodes[node_index];
+        let key = substitution_group_key(node);
+        let serve = &self.serving[&key][node.features_json.features()];
+        let index = if serve.as_slice() == node.features_json.features() {
+            self.intern(tree_index, node)
+        } else {
+            let published = self
+                .published_reps
+                .get(&(key.clone(), serve.clone()))
+                .map(|&(slice_index, row_index, _)| (slice_index, row_index))
+                .and_then(|(slice_index, row_index)| self.published_node(slice_index, row_index));
+            match published {
+                Some(index) => index,
+                None => match self.representatives.get(&(key, serve.clone())) {
+                    Some(&(rep_tree, rep_node)) => self.substitute(rep_tree, rep_node),
+                    None => self.intern(tree_index, node),
+                },
+            }
+        };
+        self.memo.insert((tree_index, node_index), index);
+        index
+    }
+
+    /// Intern one uncontained node's post-substitution form — same
+    /// identity, dep positions repointed at substituted children.
+    fn intern(&mut self, tree_index: usize, node: &SubmissionNode) -> usize {
+        let mut dependencies = node
+            .deps
+            .iter()
+            .map(|&dep| self.substitute(tree_index, dep as usize))
+            .collect::<Vec<usize>>();
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        let intern_key = (
+            TaskNodeIdentity {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                target: node.target.clone(),
+                rustc_version: node.rustc_version.clone(),
+                host_side: node.host_side,
+            },
+            node.explicit_spelling,
+            dependencies,
+        );
+        if let Some(&index) = self.interned.get(&intern_key) {
+            return index;
+        }
+        let index = self.arena.len();
+        self.arena.push(ResolvedTaskNode {
+            identity: intern_key.0.clone(),
+            explicit_spelling: intern_key.1,
+            dependencies: intern_key.2.clone(),
+        });
+        self.closure_pm
+            .push(intern_key.1 == crate::public_cache::ExplicitSpelling::KeysApart);
+        self.interned.insert(intern_key, index);
+        index
+    }
+
+    /// The arena node reconstructing one published row's subtree —
+    /// memoized per `(slice, row)`. Dep edges follow
+    /// `dependency_c_metadata_json`'s `(crate, c_metadata)` pairs
+    /// through every pulled slice, so a target-side row's host deps
+    /// land on the host slice they publish to. `None` when an edge
+    /// names an artifact no pulled row carries — the chain is not
+    /// fully published, and the dependent stays on its own chain.
+    fn published_node(&mut self, slice_index: usize, row_index: usize) -> Option<usize> {
+        if let Some(&index) = self.published_memo.get(&(slice_index, row_index)) {
+            return index;
+        }
+        let slice = &self.published[slice_index];
+        let row = &slice.rows[row_index];
+        let mut dependencies = Vec::new();
+        for entry in row.dependency_c_metadata_json.entries() {
+            let Some(&(dep_slice, dep_row)) = self.by_c_metadata.get(entry.c_metadata.as_str())
+            else {
+                self.published_memo.insert((slice_index, row_index), None);
+                return None;
+            };
+            let Some(dep_index) = self.published_node(dep_slice, dep_row) else {
+                self.published_memo.insert((slice_index, row_index), None);
+                return None;
+            };
+            dependencies.push(dep_index);
+        }
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        // A proc-macro in the `--extern` closure keys a node apart —
+        // recomputed from the reconstructed children, the published
+        // rows carry no spelling flag of their own.
+        let keys_apart = dependencies.iter().any(|&dep| self.closure_pm[dep]);
+        let explicit_spelling = if keys_apart {
+            crate::public_cache::ExplicitSpelling::KeysApart
+        } else {
+            crate::public_cache::ExplicitSpelling::KeysAsNative
+        };
+        let identity = published_row_identity(slice, row);
+        let expected_task_id = identity.task_id(&row.dependency_identity);
+        let intern_key = (identity, explicit_spelling, dependencies);
+        let index = if let Some(&index) = self.interned.get(&intern_key) {
+            index
+        } else {
+            let index = self.arena.len();
+            self.arena.push(ResolvedTaskNode {
+                identity: intern_key.0.clone(),
+                explicit_spelling: intern_key.1,
+                dependencies: intern_key.2.clone(),
+            });
+            self.closure_pm
+                .push(row.artifact_kind == ArtifactKind::ProcMacro || keys_apart);
+            self.interned.insert(intern_key, index);
+            index
+        };
+        self.pinned.insert(index, expected_task_id);
+        self.published_memo
+            .insert((slice_index, row_index), Some(index));
+        Some(index)
+    }
+}
+
+/// Re-emit one tree from its substituted roots' arena reach (stow#881):
+/// contained-node subtrees no root still reaches leave the batch, and
+/// each surviving node carries a post-substitution `task_id` and
+/// `dependency_identity`.
+///
+/// A node's `downloads`/`preserve_lockfile` survive on its substituted
+/// image inside this tree — several originals collapsing to one image
+/// merge `max`/`or`; nodes no original maps to (a spliced or
+/// reconstructed interior) carry neither.
+fn reemit_substituted_tree(
+    tree: &SubmissionTree,
+    tree_index: usize,
+    memo: &std::collections::HashMap<(usize, usize), usize>,
+    resolved: &ResolvedTaskGraph,
+) -> crate::error::Result<SubmissionTree> {
+    let resolved_nodes = resolved.nodes();
+    let image_of = |index: usize| memo[&(tree_index, index)];
+    let reachable = {
+        let mut seen = BTreeSet::new();
+        let mut frontier: Vec<usize> = tree
+            .roots
+            .iter()
+            .map(|&root| image_of(root as usize))
+            .collect();
+        while let Some(index) = frontier.pop() {
+            if seen.insert(index) {
+                frontier.extend(resolved_nodes[index].dependencies.iter().copied());
+            }
+        }
+        seen
+    };
+    let local: BTreeMap<usize, u32> = reachable
+        .iter()
+        .enumerate()
+        .map(|(rank, &index)| {
+            (
+                index,
+                u32::try_from(rank).expect("submission node count fits u32"),
+            )
+        })
+        .collect();
+    let mut carried = BTreeMap::<usize, (u64, bool)>::new();
+    for (node_index, node) in tree.nodes.iter().enumerate() {
+        let image = image_of(node_index);
+        if !reachable.contains(&image) {
+            continue;
+        }
+        carried
+            .entry(image)
+            .and_modify(|(downloads, lockfile)| {
+                *downloads = (*downloads).max(node.downloads);
+                *lockfile |= node.preserve_lockfile;
+            })
+            .or_insert((node.downloads, node.preserve_lockfile));
+    }
+    let mut nodes = Vec::with_capacity(reachable.len());
+    for &index in &reachable {
+        let node = &resolved_nodes[index];
+        let dependency_identity = resolved
+            .dependency_identity(index)
+            .cloned()
+            .ok_or_else(|| stow_error!("resolved node {index} has no digest"))?;
+        let (downloads, preserve_lockfile) = carried.get(&index).copied().unwrap_or_default();
+        nodes.push(SubmissionNode {
+            task_id: resolved
+                .task_id(index)
+                .ok_or_else(|| stow_error!("resolved node {index} has no task id"))?
+                .to_owned(),
+            crate_name: node.identity.crate_name.clone(),
+            version: node.identity.version.clone(),
+            features_json: node.identity.features_json.clone(),
+            target: node.identity.target.clone(),
+            rustc_version: node.identity.rustc_version.clone(),
+            host_side: node.identity.host_side,
+            explicit_spelling: node.explicit_spelling,
+            preserve_lockfile,
+            dependency_identity,
+            deps: node.dependencies.iter().map(|dep| local[dep]).collect(),
+            downloads,
+        });
+    }
+    let mut roots = Vec::with_capacity(tree.roots.len());
+    for &root in &tree.roots {
+        let image = local[&image_of(root as usize)];
+        if !roots.contains(&image) {
+            roots.push(image);
+        }
+    }
+    Ok(SubmissionTree {
+        source: tree.source,
+        roots,
+        nodes,
+    })
 }
 
 /// One dispatch pass's claim on one task.
