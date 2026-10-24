@@ -260,9 +260,16 @@ impl DurableObject for Scheduler {
             )),
             // A nested Route under the root — the outer tuple caps at
             // 15 nodes.
-            Route::new(("/dispatch-freeze"
-                .at(read_dispatch_freeze)
-                .post(write_dispatch_freeze),)),
+            Route::new((
+                "/dispatch-freeze"
+                    .at(read_dispatch_freeze)
+                    .post(write_dispatch_freeze),
+                // The newreleases.io wake (stow#880): the edge
+                // forwards a verified `rust-lang/rust` release, and
+                // the object dispatches `preheat-admin.yml` for its
+                // claimed rustc.
+                "/preheat/release".post(preheat_release),
+            )),
         ))
         // The alarm endpoint runs without the router's middleware, so it
         // carries its own handle to the graph.
@@ -1357,6 +1364,64 @@ fn trip_trigger(
         .into_wire(settings, draft.classes, example_run_urls)
         .map(stow_types::api::DispatchFreezeTrigger::Tripped)
         .map_err(|invariant| Error::msg(format!("freeze trip evidence invariant: {invariant}")))
+}
+
+/// `POST /preheat/release` — the edge's verified newreleases.io
+/// delivery for a `rust-lang/rust` release (stow#880). The object
+/// dispatches `preheat-admin.yml` through the same credential arm the
+/// dispatch pass uses; the workflow's own manifest check is the
+/// authority on the version, so the payload is only a hint.
+///
+/// The route creates nothing: no event, no graph load — its cost is
+/// the delivery's own (binding reads, the token cache read, one
+/// `workflow_dispatch` POST), never a replay of stored data. A
+/// dispatch failure answers 502 so newreleases.io's backoff retry
+/// redelivers.
+async fn preheat_release(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    Json(request): Json<stow_types::api::PreheatReleaseRequest>,
+) -> Result<Json<OkResponse>> {
+    preheat_release_pass(&graph, &env, &request).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// The dispatch, shared with the budget probe's
+/// `POST /preheat/release` drive so the probe prices the route's whole
+/// pass — the credential resolution and the `workflow_dispatch` POST.
+pub(super) async fn preheat_release_pass(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+    request: &stow_types::api::PreheatReleaseRequest,
+) -> Result<()> {
+    let pool = crate::fetch_guard::OutboundPool::new();
+    let outcome = match credential_source(env)? {
+        CredentialSource::LocalCi(url) => {
+            dispatch::CiInterface::local_ci(&url, dispatch::CfTransport::new(pool))
+                .submit_preheat(request.rustc_version.as_str())
+                .await
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(graph.tokens(), &config).await {
+                Ok(token) => {
+                    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+                    dispatch::CiInterface::github(
+                        &github_repo,
+                        &token.token,
+                        dispatch::CfTransport::new(pool),
+                    )
+                    .submit_preheat(request.rustc_version.as_str())
+                    .await
+                }
+                Err(error) => Err(dispatch::DispatchError::TokenMint(error.to_string())),
+            }
+        }
+    };
+    outcome.map_err(|error| {
+        let error = to_error(error.to_string());
+        tracing::error!(%error, "preheat release dispatch failed");
+        error.set_status(StatusCode::BAD_GATEWAY)
+    })
 }
 
 /// `POST /index/published` — the index-publish path's report that a slice

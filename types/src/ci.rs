@@ -1,8 +1,8 @@
 //! The one privileged CI interface (stow#877).
 //!
 //! Every query of `build-crate.yml` occupancy and every task
-//! submission goes through [`CiInterface`], shared by the scheduler
-//! (host and wasm32) and `stow-admin` — including `preheat manual`. It
+//! submission goes through [`CiInterface`], the scheduler's (host and
+//! wasm32) — preheat submits trees, it never dispatches (stow#880). It
 //! is FIFO and never reorders: submission is one `workflow_dispatch`
 //! of `build-crate.yml` per task, in the caller's own order, and
 //! priority stays the scheduler's concern.
@@ -11,7 +11,7 @@
 //! GitHub under an App installation token, or the local CI server the
 //! mock stack runs on the same contract) and the caller's transport
 //! ([`CiTransport`]) are the whole context. The edge drives it through
-//! `CfFetch`, `stow-admin` through zenwave; request construction, the
+//! `CfFetch`; request construction, the
 //! GitHub-shaped paths, run-title attribution and every answer decode
 //! live here once.
 
@@ -335,6 +335,49 @@ impl<T: CiTransport> CiInterface<T> {
                 attempt = dispatch.attempt,
                 "submitted resolve run"
             );
+        })
+    }
+
+    /// `workflow_dispatch` of `preheat-admin.yml` for a new stable
+    /// rustc (stow#880): the newreleases.io delivery's claimed version
+    /// is the run's `rustc_version` input; the workflow confirms it
+    /// against the channel manifest before resolving, so a wrong or
+    /// forged version costs one manifest check. The dispatch needs
+    /// only its HTTP status — no run-details body is read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError`] for the call's refusal kinds —
+    /// `RateLimited`/`Api` provably did not happen, `Network` may
+    /// have landed.
+    pub async fn submit_preheat(&self, rustc_version: &str) -> Result<(), DispatchError> {
+        let inputs = serde_json::json!({ "rustc_version": rustc_version });
+        let request = match &self.endpoint {
+            CiEndpoint::GitHub { repo, .. } => {
+                let payload = serde_json::json!({
+                    "ref": crate::trusted_builder::BRANCH,
+                    "inputs": inputs,
+                });
+                let url = self.resolve(&workflow_dispatch_path(
+                    repo,
+                    crate::trusted_builder::PREHEAT_WORKFLOW_FILE,
+                ))?;
+                let body = serde_json::to_vec(&payload)
+                    .map_err(|error| DispatchError::Network(error.to_string()))?;
+                self.api_request("POST", &url, Some(body))
+            }
+            CiEndpoint::Local { base } => {
+                let payload = serde_json::json!({
+                    "event_type": "preheat",
+                    "client_payload": inputs,
+                });
+                let body = serde_json::to_vec(&payload)
+                    .map_err(|error| DispatchError::Network(error.to_string()))?;
+                self.api_request("POST", &format!("{base}/dispatch"), Some(body))
+            }
+        };
+        self.send_checked(request).await.map(|_| ()).inspect(|()| {
+            tracing::info!(rustc_version, "submitted preheat run");
         })
     }
 

@@ -439,6 +439,24 @@ artifact its publish job pushed (tagged by run id and attempt)
 exists and verifies in GHCR, so a spoofed success cannot mint a catalog
 entry.
 
+### newreleases.io webhook — `rust` releases
+
+A new stable rustc wakes the preheat wave through newreleases.io's
+release feed (stow#880), replacing the cron poll: subscribe a webhook
+on the `rust-lang/rust` project in the newreleases.io settings, posting
+to `https://stow.waterui.dev/api/v1/newreleases/release`, then copy the
+webhook's signing key into the `STOW_NEWRELEASES_WEBHOOK_SECRET`
+secret. Each delivery carries `X-Newreleases-Timestamp` and
+`X-Newreleases-Signature` — the hex HMAC-SHA256 of
+`<timestamp>.<body>` under that key — and the edge refuses anything
+unsigned, stale (±300 s) or naming another project. A verified
+`rust-lang/rust` release forwards its claimed version to the
+scheduler, which dispatches `preheat-admin.yml` through the same
+GitHub App arm the build dispatch uses; the workflow itself confirms
+the version against `channel-rust-stable.toml` before resolving, so a
+forged delivery costs one manifest check. A dispatch failure answers
+502 and newreleases.io's retry redelivers.
+
 ## Trusted-endpoint authentication
 
 Every authenticated endpoint — the whole `/api/v1/admin/*` surface
@@ -477,26 +495,25 @@ recorded in the worker log on each write.
 ## Initial cache population
 
 The cache preheats itself — `preheat-cron.yml` dispatches a wave
-daily and on every new stable rustc. To seed it by hand — including
-while Cloudflare is fully offline — `preheat manual` needs only a
-GitHub credential with push access to `water-rs/stow` and network to
-crates.io and GHCR; it resolves the graph, dispatches
-`build-batch.yml` runs itself, and publishes each index slice as its
-layer lands:
+daily, and the newreleases.io webhook wakes one on every new stable
+rustc. To seed a wave by hand, `preheat manual` resolves the graph
+on the operator's machine and submits one dependency tree per source
+to the scheduler's operations lane at the caller's `--priority`
+(stow#880 — the scheduler owns dispatch from there, so it needs a
+reachable edge):
 
 ```sh
-GH_TOKEN=<operator token> \
+STOW_EDGE_URL=https://stow.waterui.dev GH_TOKEN=<operator token> \
 stow-admin preheat manual \
-    --crates crates.txt \        # one `name` or `name@version` per line
-    --rustc-version 1.91.1     --in-flight 45                # default; stays under the 60-runner pool
+    --crates crates.txt \          # one `name` or `name@version` per line
+    --rustc-version 1.91.1 \
+    --yes
 ```
 
-The same driver takes `--projects preheat/projects.toml` for a
-repository list and `--edge-url https://stow.waterui.dev` (or
-`STOW_EDGE_URL`) when the edge is up and the report should run. It is
-resumable — coverage is recomputed from the published index, so a
-re-run dispatches only what is still missing — and exits non-zero with
-the failed runs' URLs when any task does not land.
+The same command takes `--projects preheat/projects.toml` for a
+repository list. It is resumable — the scheduler deduplicates on task
+identity, so a re-run inserts only what is still missing — and exits
+non-zero naming every `--projects` repository that failed to resolve.
 
 The scheduler-driven lanes still work the same way when the edge is up —
 from a machine that has `STOW_EDGE_URL` exported and the same GitHub

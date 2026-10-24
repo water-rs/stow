@@ -10,7 +10,9 @@ use stow_types::admission;
 
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
-use crate::{api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site, webhook};
+use crate::{
+    api, env_binding, ghcr, github_auth, release_hook, runtime_settings, scheduler, site, webhook,
+};
 
 const SCHEDULER_BINDING: &str = "SCHEDULER";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
@@ -34,6 +36,7 @@ const STOW_STATS_SQL_URL_BINDING: &str = "STOW_STATS_SQL_URL";
 const STOW_STATS_BINDING: &str = "STOW_STATS";
 const STOW_STATS_SALT_SECRET_BINDING: &str = "STOW_STATS_SALT_SECRET";
 const STOW_GITHUB_WEBHOOK_SECRET_BINDING: &str = "STOW_GITHUB_WEBHOOK_SECRET";
+const STOW_NEWRELEASES_WEBHOOK_SECRET_BINDING: &str = "STOW_NEWRELEASES_WEBHOOK_SECRET";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -140,6 +143,9 @@ fn worker(
     // caller credential nor the zone WAF rules' shedding (completions
     // must drain during a partial reopen).
     nodes.push("/api/v1/github/workflow-run".post(webhook::github_workflow_run));
+    // Same shape: the newreleases.io delivery's authentication is its
+    // `X-Newreleases-Signature` HMAC under the webhook's own secret.
+    nodes.push("/api/v1/newreleases/release".post(release_hook::newreleases_release));
 
     let router = Route::new(nodes)
         .with(State(scheduler))
@@ -165,6 +171,9 @@ fn worker(
             env,
             STOW_GITHUB_WEBHOOK_SECRET_BINDING,
         ))))
+        .with(State(release_hook::NewreleasesSecret(
+            env_binding::required_string(env, STOW_NEWRELEASES_WEBHOOK_SECRET_BINDING),
+        )))
         .build();
 
     // The outermost response boundary — every error answer leaves here,

@@ -354,10 +354,9 @@ impl Fleet {
     }
 }
 
-/// A listing row's `(rustc, task_id)` — `parse_run_title` under
-/// `manual::bound_run_state`'s rule (§2.4): a title still reading
-/// `WORKFLOW_NAME` is `run-name` not rendered yet, and anything else
-/// unparseable fails fast.
+/// A listing row's `(rustc, task_id)` — `parse_run_title` with the
+/// rule that a title still reading `WORKFLOW_NAME` is `run-name` not
+/// rendered yet, and anything else unparseable fails fast.
 fn row_task(row: &WorkflowRunRow) -> stow_types::error::Result<Option<(String, String)>> {
     if row.display_title == WORKFLOW_NAME {
         return Ok(None);
@@ -527,8 +526,8 @@ pub struct FailureView {
 }
 // ===== The watch loop (stow#853 §3) =====
 
-/// One tick every [`TICK_INTERVAL`] — the same 30 s cadence
-/// `manual::RUN_POLL_SECONDS` and the cost model hold.
+/// One tick every [`TICK_INTERVAL`] — the 30 s cadence the cost
+/// model holds.
 const TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The scheduler half of each tick — the queue's own status route.
@@ -805,7 +804,6 @@ mod tests {
         WorkflowRunRow {
             id,
             display_title: display_title.to_owned(),
-            head_sha: "sha".to_owned(),
             status: status.to_owned(),
             conclusion: conclusion.map(str::to_owned),
             html_url: format!("https://github.com/water-rs/stow/actions/runs/{id}"),

@@ -69,6 +69,13 @@ pub const INDEX_WORKFLOW_FILE: &str = index_workflow_file!();
 /// workflow on exactly [`BRANCH`] — the same arm [`WORKFLOW_FILE`] has
 /// for build tasks.
 pub const RESOLVE_WORKFLOW_FILE: &str = resolve_workflow_file!();
+/// Workflow file under `.github/workflows/` that resolves a preheat
+/// wave and submits its trees (stow#880).
+///
+/// The scheduler dispatches a new stable rustc's preheat to exactly
+/// this workflow on exactly [`BRANCH`]; the workflow confirms the
+/// version against the official channel manifest before resolving.
+pub const PREHEAT_WORKFLOW_FILE: &str = "preheat-admin.yml";
 /// Subject Alternative Name Fulcio issues to the index-publish workflow.
 ///
 /// The certificate identity under which published artifact indexes are

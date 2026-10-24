@@ -61,10 +61,10 @@ pub enum PreheatCommand {
     /// one crate request — the tasks a dispatch wave would enqueue per
     /// target. Nothing is enqueued.
     Plan(PlanArgs),
-    /// Drive a wave without the edge at all: resolve in-process, layer
-    /// the graph, dispatch `build-crate.yml` straight through the GitHub
-    /// API (or the local CI server under `--dispatch-url`), publish the
-    /// index between layers, and report failures at the end.
+    /// Resolve a wave on the operator's machine and submit one
+    /// dependency tree per source to the scheduler's operations entry
+    /// point at the caller's `--priority` (stow#880). The scheduler
+    /// owns dispatch from there — no second dispatcher remains.
     Manual(crate::manual::ManualArgs),
     /// The stars-ranked lane: `generate` rebuilds the reviewed
     /// `preheat/projects.toml` list from GitHub, `submit` resolves every

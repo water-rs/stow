@@ -420,28 +420,18 @@ acting unless `--yes` is given.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
 - `stow-admin preheat manual --crates <file>|--projects <file>
-  --rustc-version <v> [--targets a,b] [--in-flight 45]
-  [--source-trees <file>]` — the
-  edge-free wave: resolve the input in-process, layer it against the
-  published index, dispatch `build-crate.yml` — one run per
-  task — straight through GitHub's
-  `workflow_dispatch`, and publish each index slice as its layer lands.
-  `--in-flight` bounds the runs in flight — one task is one run.
-  `--dry-run` prints each task's dispatch input and its encoded size —
-  nothing is dispatched.
-  Works while Cloudflare is down. Resumable by index, exits non-zero
-  with the failed runs' URLs. A run whose failed step is outside the
-  build and publish stages — runner setup, toolchain install, artifact
-  transfer — is infrastructure, not the crate's verdict: its failed
-  jobs are rerun in place (up to three attempts) and the report lists
-  every rerun. A `--projects` repository that fails to
-  resolve is reported and the wave dispatches the rest, exiting
+  --rustc-version <v> [--targets a,b] [--priority 30]
+  [--source-trees <file>] [--yes]` — the
+  operator-driven wave (stow#880): resolve the input in-process and
+  submit one dependency tree per source to the scheduler's operations
+  lane at `--priority` — the same operand `stow-admin submit` takes.
+  The scheduler owns dispatch from there; without `--yes` the plan
+  prints and nothing is submitted. Resumable — the scheduler merges on
+  task identity, so a re-run inserts only what is still missing.
+  A `--projects` repository that fails to
+  resolve is reported after the wave submits the rest, exiting
   non-zero naming it; a `--crates` or `--dirs` failure still aborts
-  before dispatch. `--dispatch-url` aims it at the mock's
-  local CI server instead; `--adopt-since <RFC 3339>` (default 24 h ago)
-  bounds how far back a resumed wave adopts already-dispatched runs;
-  `--edge-url` (or `STOW_EDGE_URL`) is forwarded to the index-publish
-  workflow so it can report each slice to the scheduler. `--source-trees` is only
+  before submission. `--source-trees` is only
   valid with `--projects` — see [source-trees.md](source-trees.md).
 - `stow-admin index export --out-dir <dir>` /
   `index publish --file <index> --folded <folded>` /
@@ -467,8 +457,7 @@ wave builds only what is missing or previously failed.
 
 `stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
 access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
-The exceptions never touch the edge: `preheat manual` needs only the
-GitHub credential (plus crates.io and GHCR), `preheat projects generate`
+The exceptions never touch the edge: `preheat projects generate`
 touches only GitHub, `index export`/`publish`/`targets` touch only
 the registry, and a preheat lane (`top`, `top-binaries`, `binary`,
 `missed`, `projects submit`, `plan`) run without `--yes` only plans and

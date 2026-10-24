@@ -83,54 +83,7 @@ pub enum Conditional<T> {
     Unmodified,
 }
 
-/// `GET` one API path under `/repos/{REPO}/` as a conditional request:
-/// `etag` rides `If-None-Match`, a 304 answers [`Conditional::Unmodified`]
-/// without parsing the (empty) body, and a 200 answers the decoded body
-/// plus the response's `ETag` to carry forward.
-pub async fn get_conditional<T: serde::de::DeserializeOwned>(
-    token: &str,
-    path: &str,
-    etag: Option<&str>,
-    backoff: Backoff,
-) -> stow_types::error::Result<Conditional<T>> {
-    get_conditional_result(token, path, etag, backoff)
-        .await
-        .map_err(|error| stow_error!("GET {API_BASE}/repos/{REPO}/{path}: {error}"))
-}
-
-/// Like [`get_conditional`], but the raw transport error escapes so the
-/// caller can read the status itself — a 404 on a just-dispatched run id
-/// is the run not materialized yet, a fact about timing, not a failure.
-pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
-    token: &str,
-    path: &str,
-    etag: Option<&str>,
-    backoff: Backoff,
-) -> std::result::Result<Conditional<T>, zenwave::Error> {
-    let url = format!("{API_BASE}/repos/{REPO}/{path}");
-    let response = send_get(
-        Some(token),
-        &url,
-        Some("application/vnd.github+json"),
-        etag,
-        backoff,
-    )
-    .await?;
-    if response.status().as_u16() == 304 {
-        drop(response);
-        return Ok(Conditional::Unmodified);
-    }
-    let response = response.error_for_status().await?;
-    let etag = response
-        .headers()
-        .get("etag")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let body = response.into_json().await?;
-    Ok(Conditional::Modified { body, etag })
-}
-
-/// [`get_conditional_result`] on an absolute URL — the same 200/304
+/// The 200/304
 /// contract for callers holding a full URL rather than a repo path:
 /// paginated endpoints, whose `Link` walk addresses page URLs
 /// directly. The answer's own `Link: rel="next"` comes back alongside
@@ -427,19 +380,6 @@ pub enum WriteFailure {
     Ambiguous(String),
 }
 
-impl WriteFailure {
-    /// The wait a rate-limited answer named — `Retry-After`, or the
-    /// reset-derived wait — `None` for every other kind and for a
-    /// hintless 429.
-    #[must_use]
-    pub const fn hint(&self) -> Option<Duration> {
-        match self {
-            Self::RateLimited { hint, .. } => *hint,
-            _ => None,
-        }
-    }
-}
-
 impl std::fmt::Display for WriteFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message = match self {
@@ -641,28 +581,6 @@ async fn delete_at(api_base: &str, token: &str, path: &str) -> stow_types::error
     delete_url(token, &format!("{api_base}/repos/{REPO}/{path}")).await
 }
 
-/// `POST` one API path under `/repos/{REPO}/` with a JSON body whose
-/// 2xx answer carries no body of interest — the `workflow_dispatch`
-/// calls `preheat manual` drives, which answer 204.
-///
-/// # Errors
-/// The typed [`WriteFailure`], exactly like [`post`].
-pub async fn post_empty(
-    token: &str,
-    path: &str,
-    body: &serde_json::Value,
-) -> Result<(), WriteFailure> {
-    let response = send_write(
-        token,
-        zenwave::Method::POST,
-        &format!("{API_BASE}/repos/{REPO}/{path}"),
-        Some(body),
-    )
-    .await?;
-    drop(response);
-    Ok(())
-}
-
 // ===== workflow-run enumeration =====
 
 /// The Actions `runs` listing's hard cap on one filtered query: page 11
@@ -702,8 +620,6 @@ pub struct WorkflowRunRow {
     pub id: u64,
     /// The rendered `run-name` — `<rustc>-<task_id>` for a run.
     pub display_title: String,
-    /// The commit the run builds.
-    pub head_sha: String,
     /// `queued`/`in_progress`/`completed` as GitHub serves it.
     pub status: String,
     /// The run's conclusion — `None` until it completes.
@@ -713,13 +629,12 @@ pub struct WorkflowRunRow {
     /// GitHub's attempt counter — `rerun-failed-jobs` bumps it, and the
     /// jobs read is pinned to it (stow#852).
     pub run_attempt: u64,
-    /// GitHub's creation time for the run — the preheat driver's
-    /// unresolved-dispatch resolution accepts a run only at or after
-    /// its node's attempt, minus the clock allowance.
+    /// GitHub's creation time for the run — the watch's staleness
+    /// reads anchor on it.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
     /// Who dispatched the run — the App's `[bot]` login on
-    /// scheduler-dispatched runs, the operator's on `preheat manual`.
+    /// scheduler-dispatched runs, the operator's on operations submits.
     /// The watch renders it.
     pub actor: Actor,
 }

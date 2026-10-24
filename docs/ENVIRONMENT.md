@@ -59,7 +59,7 @@ JSON) and sends nothing.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `scheduler demand-feed` (the `/api/v1/admin/scheduler/demand-feed/*` input lane — see the demand-feed runbook below), `dispatch-freeze status\|clear` (the `/api/v1/admin/dispatch-freeze` recovery path) and `index report` (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `preheat manual` and `index export`/`publish` never read it — they run against GitHub and GHCR only. The preheat lanes (`top`, `top-binaries`, `binary`, `missed`, `projects submit`, `plan`) read it only under `--yes`, when they submit: a plan-only run needs neither it nor an edge credential. |
+| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `scheduler demand-feed` (the `/api/v1/admin/scheduler/demand-feed/*` input lane — see the demand-feed runbook below), `dispatch-freeze status\|clear` (the `/api/v1/admin/dispatch-freeze` recovery path) and `index report` (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `index export`/`publish` never read it — they run against GHCR only. `preheat manual` and the preheat lanes (`top`, `top-binaries`, `binary`, `missed`, `projects submit`, `plan`) read it only under `--yes`, when they submit: a plan-only run needs neither it nor an edge credential. |
 | `STOW_EDGE_VERSION_OVERRIDE` | _optional_ | Verbatim `Cloudflare-Workers-Version-Overrides` header value (e.g. `stow-edge="<version-id>"`) pinned onto every edge call — `deploy-edge.yml` sets it so trusted calls run on the uploaded candidate before traffic shifts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints and the GitHub REST calls (`runs`, `builds`, `cache`, `preheat projects generate`); the owner must have push access to `water-rs/stow`. |
 | `CF_ACCOUNT_ID` | _required for `preheat missed` and `watchdog`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
@@ -92,23 +92,17 @@ scheduler.
 publish of a new rustc and for disaster recovery.
 
 `stow-admin preheat manual --crates|--projects <file> --rustc-version <v>
-[--targets a,b] [--in-flight 45] [--edge-url <url>] [--dispatch-url
-<url>]` is the operator-driven wave of stow#455: it resolves the graph
-in-process for every CI target, layers it so each layer's deps sit in
-the published index, dispatches `build-crate.yml` — one run per
-task, `--in-flight` bounding the runs in flight —
-through GitHub's `workflow_dispatch` API under the operator token, dispatches
-`index-publish.yml` between layers, and resumes by re-reading the
-published index — no edge, no local state. A run that fails outside
-the build and publish steps — runner setup, toolchain install,
-artifact transfer — is infrastructure rather than the crate's verdict:
-its failed jobs are rerun in place, up to three attempts, and the
-report lists each rerun. A `--projects` repository
-that fails to resolve is reported while the wave dispatches the rest,
-and the run exits non-zero naming it; a `--crates` or `--dirs` failure
-still aborts before dispatch. `--dispatch-url` points the
-wave at the mock's local CI server (`GET /tasks` polling, in-process
-index publish) for `scripts/mock-e2e.sh`.
+[--targets a,b] [--priority 30] [--yes]` is the operator-driven wave
+(stow#880): it resolves the graph in-process for every CI target and
+submits one dependency tree per source to the scheduler's operations
+entry point at the caller's `--priority` — the same operand
+`stow-admin submit` takes — through
+`/api/v1/scheduler/tasks/submit`. The scheduler owns dispatch, rerun and
+index publishing from there; a `--projects` repository that fails to
+resolve is reported after the wave submits the rest, and the run exits
+non-zero naming it, while a `--crates` or `--dirs` failure still
+aborts before submission. Without `--yes` the plan prints and nothing
+is submitted.
 
 ## stow-build (CI runner)
 
@@ -140,6 +134,7 @@ task from the dispatch event file `GITHUB_EVENT_PATH` names
 | `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT` | publish | Actions run identity the records artifact's per-build tag carries — `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`. Both must be numeric; the Actions runner injects them into every job's environment. Required. |
 | `STOW_EDGE_URL` | serve | Edge base URL the local server's `workflow_run` webhook POSTs to. Required. |
 | `STOW_GITHUB_WEBHOOK_SECRET` | serve | HMAC key the webhook signature is computed with — the same value the edge verifies `X-Hub-Signature-256` against. Required. |
+| `STOW_NEWRELEASES_WEBHOOK_SECRET` | serve | Signing secret of the newreleases.io webhook on `rust-lang/rust` releases (stow#880) — the value the subscription's *Key* shows, which the edge verifies `X-Newreleases-Signature` (hex HMAC-SHA256 of `<X-Newreleases-Timestamp>.<body>`, timestamp inside ±300 s) against on `POST /api/v1/newreleases/release`. Required. |
 | `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` for the edge OIDC token minted when a publish step calls a trusted edge route (the publish's `index report`); unused when the run only pushes GHCR artifacts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | serve (falls back to `gh auth token`) | Developer GitHub credential the edge's trusted endpoints accept outside Actions. |
 | `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign signing key and mock registry root the local dispatcher populates. Required. |

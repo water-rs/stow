@@ -360,6 +360,17 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 400,
     },
     DriveBudget {
+        // The newreleases.io forward: signature already verified at the
+        // edge, so the object only reads its bindings and posts one
+        // `workflow_dispatch` — no store access; the rows are the
+        // meter's own settle.
+        name: "POST /preheat/release",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
+        wall_ms: 500,
+    },
+    DriveBudget {
         name: "POST /tasks/submit (inexact-hit)",
         statements: 3,
         rows_read: 5,
