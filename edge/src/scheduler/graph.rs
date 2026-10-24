@@ -372,6 +372,12 @@ pub struct Graph {
     /// When the run listing last reconciled — memory only: a wake
     /// reconciles at once.
     reconciled_at: i64,
+    /// The instant the last `workflow_run` delivery was accepted —
+    /// the event's own `at` (stow#860). `None` until the first
+    /// delivery; every delivery event's apply stamps it (`RunFinished`,
+    /// `ExternalRunStarted`, `Request` `RunUpdated`, and the bare
+    /// `RunUpdate` marker the own-run `in_progress` channel appends).
+    pub last_run_update_ms: Option<i64>,
     /// The request lane's records — the `requests` table's rows,
     /// replayed by `Request` events (stow#878 stage 7).
     pub requests: std::collections::BTreeMap<String, RequestRecord>,
@@ -1963,6 +1969,46 @@ impl Graph {
         (inserted, unknown)
     }
 
+    /// The longest a `running` run may go without a `workflow_run`
+    /// delivery before the health check calls deliveries stopped
+    /// (stow#860): a started `build-crate.yml` run must have delivered
+    /// `completed` within its jobs' enforced timeouts. An idle
+    /// scheduler, or one whose runs are only dispatched/queued, is
+    /// never unhealthy on this rule.
+    const DELIVERY_STALE_MS: i64 = stow_types::api::BUILD_CRATE_RUN_TIMEOUT_MINUTES * 60_000;
+
+    /// `GET /api/v1/scheduler/health`'s body (stow#860): reads only
+    /// state the graph already holds. The scheduler is unhealthy when
+    /// the dispatch freeze is engaged, or when a run is `running` (its
+    /// `workflow_run` `in_progress` was accepted) and no delivery has
+    /// been accepted within [`Self::DELIVERY_STALE_MS`] — including a
+    /// running run with no delivery ever recorded, whose `running`
+    /// state a post-wake reconcile restored.
+    pub fn health(&self, now: i64) -> stow_types::api::SchedulerHealth {
+        let age_seconds = self
+            .last_run_update_ms
+            .map(|at| u64::try_from((now - at).max(0) / 1_000).unwrap_or(u64::MAX));
+        let deliveries_stale = self.counts[Status::Running.index()] > 0
+            && self
+                .last_run_update_ms
+                .is_none_or(|at| now - at > Self::DELIVERY_STALE_MS);
+        let scheduler = if self.freeze.is_some() || deliveries_stale {
+            stow_types::api::HealthState::Unhealthy
+        } else {
+            stow_types::api::HealthState::Ok
+        };
+        stow_types::api::SchedulerHealth {
+            worker: stow_types::api::HealthState::Ok,
+            scheduler,
+            dispatch_frozen: self.freeze.is_some(),
+            freeze_trigger: self
+                .freeze
+                .as_ref()
+                .map(|record| record.trigger.kind().to_owned()),
+            last_run_update_age_seconds: age_seconds,
+        }
+    }
+
     /// `GET /status` counts — computed from the arena, no trigger.
     pub fn status_counts(&self) -> BTreeMap<&'static str, u64> {
         let mut counts = BTreeMap::new();
@@ -2239,7 +2285,11 @@ impl Graph {
                     }
                 }
             }
+            SchedulerEvent::RunUpdate => {
+                self.last_run_update_ms = Some(now);
+            }
             SchedulerEvent::ExternalRunStarted { run_id, family } => {
+                self.last_run_update_ms = Some(now);
                 if let Ok(run_id) = run_id.parse::<u64>() {
                     self.external_runs.insert(run_id, 1u8 << (*family as u8));
                 }
@@ -2251,6 +2301,7 @@ impl Graph {
                 cancelled,
                 error,
             } => {
+                self.last_run_update_ms = Some(now);
                 if let Ok(run_id) = run_id.parse::<u64>() {
                     self.run_finished(task_id, run_id, *success, *cancelled, error.clone(), now);
                 }
@@ -2292,7 +2343,7 @@ impl Graph {
             // events land with the request-lane cutover (stage 7).
             SchedulerEvent::Submit { .. } => {}
             SchedulerEvent::Request { request_id, kind } => {
-                self.apply_request_event(request_id, kind);
+                self.apply_request_event(request_id, kind, now);
             }
             SchedulerEvent::Feed { hour, kind } => self.apply_feed_event(hour, kind),
         }
@@ -2303,8 +2354,19 @@ impl Graph {
     /// One request-lane lifecycle step (stow#878 stage 7). Attempt
     /// fencing replays cleanly: a superseded attempt's `RunUpdated` or
     /// `Outcome` lands on the live record's attempt check and drops.
-    fn apply_request_event(&mut self, request_id: &str, kind: &stow_types::api::RequestEvent) {
+    fn apply_request_event(
+        &mut self,
+        request_id: &str,
+        kind: &stow_types::api::RequestEvent,
+        now: i64,
+    ) {
         use stow_types::api::{RequestEvent, RequestRunAction};
+        // A `RunUpdated` request event is the `workflow_run` webhook's
+        // resolve-run delivery — it stamps the health check's
+        // last-delivery instant like a build run's own events do.
+        if matches!(kind, RequestEvent::RunUpdated { .. }) {
+            self.last_run_update_ms = Some(now);
+        }
         self.touch_request(request_id);
         match kind {
             RequestEvent::Admitted {
@@ -3764,5 +3826,106 @@ mod tests {
             0,
         );
         assert_eq!(graph.claim(45, 16, 0, 3_600_000).expect("claim").len(), 1);
+    }
+
+    /// A `solo` node claimed and moved to `running` by its accepted
+    /// `in_progress` delivery, stamped at `now` — the state the
+    /// delivery-staleness rule reads (stow#860).
+    fn running_graph(now: i64) -> Graph {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), now).expect("merge");
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 1, now);
+        assert_eq!(
+            graph.run_started(&id("solo"), 42, stow_types::api::RunnerFamily::Linux, now),
+            StartOutcome::Applied
+        );
+        graph
+    }
+
+    /// A frozen scheduler is unhealthy whatever its deliveries look
+    /// like, and the body names the trigger the record carries.
+    #[test]
+    fn health_frozen_scheduler_is_unhealthy() {
+        use stow_types::api::{
+            ChannelOutcome, DispatchFreezeRecord, DispatchFreezeTrigger, HealthState,
+        };
+        let mut graph = Graph::default();
+        graph.apply(
+            &SchedulerEvent::Freeze {
+                at: "2026-10-24T00:00:00Z".to_owned(),
+                trigger: DispatchFreezeTrigger::Manual,
+                record: Some(Box::new(DispatchFreezeRecord {
+                    frozen_at: "2026-10-24T00:00:00Z".to_owned(),
+                    trigger: DispatchFreezeTrigger::Manual,
+                    notify: ChannelOutcome::Disabled {
+                        reason: "test".to_owned(),
+                    },
+                })),
+            },
+            0,
+        );
+        let health = graph.health(1_000);
+        assert_eq!(health.scheduler, HealthState::Unhealthy);
+        assert_eq!(health.worker, HealthState::Ok);
+        assert!(health.dispatch_frozen);
+        assert_eq!(health.freeze_trigger.as_deref(), Some("manual"));
+    }
+
+    /// A `running` run whose last accepted delivery aged past
+    /// `build-crate.yml`'s job-timeout bound means deliveries stopped.
+    #[test]
+    fn health_stale_deliveries_with_a_running_run_is_unhealthy() {
+        use stow_types::api::HealthState;
+        let t0 = 1_000_000i64;
+        let graph = {
+            let mut graph = running_graph(t0);
+            graph.apply(&SchedulerEvent::RunUpdate, t0);
+            graph
+        };
+        assert_eq!(
+            graph.health(t0 + Graph::DELIVERY_STALE_MS).scheduler,
+            HealthState::Ok,
+            "the bound itself is still inside it"
+        );
+        let health = graph.health(t0 + Graph::DELIVERY_STALE_MS + 1);
+        assert_eq!(health.scheduler, HealthState::Unhealthy);
+        assert_eq!(
+            health.last_run_update_age_seconds,
+            Some(u64::try_from(Graph::DELIVERY_STALE_MS + 1).expect("positive") / 1_000)
+        );
+    }
+
+    /// Deliveries may be arbitrarily old when nothing runs — an idle
+    /// scheduler is healthy however stale the last one is.
+    #[test]
+    fn health_idle_with_an_old_delivery_is_healthy() {
+        use stow_types::api::HealthState;
+        let mut graph = Graph::default();
+        graph.apply(&SchedulerEvent::RunUpdate, 1_000);
+        let health = graph.health(1_000 + Graph::DELIVERY_STALE_MS * 10);
+        assert_eq!(health.scheduler, HealthState::Ok);
+        assert!(!health.dispatch_frozen);
+        assert_eq!(health.freeze_trigger, None);
+        assert_eq!(
+            health.last_run_update_age_seconds,
+            Some(u64::try_from(Graph::DELIVERY_STALE_MS * 10).expect("positive") / 1_000)
+        );
+    }
+
+    /// A queue that only dispatched — no `in_progress` accepted yet —
+    /// is healthy: a claimed-but-not-running run is not owed a
+    /// `completed` delivery.
+    #[test]
+    fn health_dispatched_only_is_healthy() {
+        use stow_types::api::HealthState;
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 1_000).expect("merge");
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 1, 1_000);
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Dispatched));
+        let health = graph.health(1_000 + Graph::DELIVERY_STALE_MS * 10);
+        assert_eq!(health.scheduler, HealthState::Ok);
+        assert_eq!(health.last_run_update_age_seconds, None);
     }
 }

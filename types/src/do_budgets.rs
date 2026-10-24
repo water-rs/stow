@@ -185,6 +185,13 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 100,
     },
     DriveBudget {
+        name: "GET /health",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
+        wall_ms: 100,
+    },
+    DriveBudget {
         name: "GET /admin/status",
         statements: 2,
         rows_read: 4,

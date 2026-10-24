@@ -554,6 +554,25 @@ echo "[mock-e2e] $(cat "$WORK_DIR/scheduler-reset.log")"
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
 
+# stow#860: the uncached health probe answers 200 with its documented
+# shape and `cache-control: no-store`; the status read carries
+# `no-store` too, so neither can be replayed by Workers Cache.
+curl -fsS -D "$WORK_DIR/health.headers" -o "$WORK_DIR/health.json" \
+    "$SCHEDULER_URL/health" \
+    || die "scheduler health did not answer 200"
+jq -e '
+    .worker == "ok" and .scheduler == "ok" and
+    (.dispatch_frozen | type) == "boolean" and
+    has("freeze_trigger") and has("last_run_update_age_seconds")
+' "$WORK_DIR/health.json" >/dev/null \
+    || die "scheduler health answer misses its shape: $(cat "$WORK_DIR/health.json")"
+grep -qi '^cache-control:[[:space:]]*no-store' "$WORK_DIR/health.headers" \
+    || die "scheduler health lacks cache-control: no-store"
+curl -fsS -D "$WORK_DIR/status.headers" -o /dev/null "$SCHEDULER_URL/status" \
+    || die "scheduler status did not answer 200"
+grep -qi '^cache-control:[[:space:]]*no-store' "$WORK_DIR/status.headers" \
+    || die "scheduler status lacks cache-control: no-store"
+
 # --- stow#523: hourly demand feed ------------------------------------
 # The real admin -> authenticated workerd -> scheduler DO -> #522
 # demand backend the hourly GitHub cron runs. The mock registry's

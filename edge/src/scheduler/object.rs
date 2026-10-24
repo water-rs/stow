@@ -264,6 +264,9 @@ impl DurableObject for Scheduler {
                 "/dispatch-freeze"
                     .at(read_dispatch_freeze)
                     .post(write_dispatch_freeze),
+                // The edge's health probe (stow#860): one read of held
+                // state, reached from `GET /api/v1/scheduler/health`.
+                "/health".at(health),
                 // The newreleases.io wake (stow#880): the edge
                 // forwards a verified `rust-lang/rust` release, and
                 // the object dispatches `preheat-admin.yml` for its
@@ -776,6 +779,19 @@ async fn apply_task_run_update(
         | graph::StartOutcome::External => {}
     }
     Ok(Json(OkResponse { ok: true }))
+}
+
+/// `GET /health` — the edge's `GET /api/v1/scheduler/health` body
+/// (stow#860): one request reading state the graph already holds, no
+/// store access past the wake. The edge turns a `scheduler: unhealthy`
+/// body into the public route's 503.
+async fn health(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::SchedulerHealth>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(graph.with(|graph| graph.health(now_ms()))))
 }
 
 async fn status(

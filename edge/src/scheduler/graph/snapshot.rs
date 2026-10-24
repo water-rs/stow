@@ -261,6 +261,9 @@ struct SnapshotHead {
     rustcs: Vec<String>,
     /// The trailing-day outcome tally by hour and target.
     outcome_hours: Vec<((i64, u8), (u32, u32))>,
+    /// The instant the last `workflow_run` delivery was accepted
+    /// (stow#860) — the health check's last-delivery age reads it.
+    last_run_update_ms: Option<i64>,
     lens: SectionLens,
 }
 
@@ -833,6 +836,7 @@ impl Graph {
                 .iter()
                 .map(|(&key, &tally)| (key, tally))
                 .collect(),
+            last_run_update_ms: self.last_run_update_ms,
             lens: self.section_lens(),
         }
     }
@@ -1031,6 +1035,7 @@ impl SnapshotLoader {
             }
         }
         graph.outcome_hours = head.outcome_hours.into_iter().collect();
+        graph.last_run_update_ms = head.last_run_update_ms;
         graph.intern.reserve_exact(head.lens.intern);
         graph.nodes.reserve_exact(head.lens.nodes);
         graph.states.reserve(head.lens.nodes);

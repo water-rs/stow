@@ -1273,6 +1273,19 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
+        // The health probe (stow#860): one read of state the graph
+        // already holds — the same shape as `GET /status`.
+        name: "GET /health",
+        setup: None,
+        run: |_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.loaded().with(|graph| graph.health(now_ms()));
+                Ok(())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
         // Bounded by held quantities: the outcome ring is capped, and
         // the in-flight section by the dispatch cap — neither tracks the
         // stored node bulk.
