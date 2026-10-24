@@ -527,6 +527,33 @@ const TAG_RESUBMIT: u64 = 3;
 const TAG_ACCEPT: u64 = 4;
 const TAG_UNTRUSTED: u64 = 5;
 const TAG_MERGE: u64 = 6;
+const TAG_OPS: u64 = 7;
+const TAG_PREHEAT: u64 = 8;
+const TAG_INEXACT: u64 = 9;
+
+/// A one-node submit tree under `source` — the shape the per-entry-point
+/// drives (stow#879) measure: the `Submit` append plus the merge.
+fn source_tree(source: SubmissionSource, name: &str, tag: u64) -> SubmissionTree {
+    SubmissionTree {
+        source,
+        roots: vec![0],
+        nodes: vec![fixture::named_node(
+            name,
+            DRIVE_SEED + tag * 1_000,
+            stow_types::fixture::target_of(101),
+            Vec::new(),
+        )],
+    }
+}
+
+/// The task id `source_tree` mints for `name` — its cleanup's cancel.
+fn source_node_id(name: &str, tag: u64) -> String {
+    stow_types::fixture::named_task_id(
+        name,
+        DRIVE_SEED + tag * 1_000,
+        stow_types::fixture::target_of(101),
+    )
+}
 
 /// Land `trees` the way the trusted lane does, returning the fresh node
 /// count.
@@ -1403,7 +1430,7 @@ pub const DRIVES: &[Drive] = &[
                         .find(|task| task.task_id == id_of(n))
                         .map(|task| task.value.clone())
                 };
-                for (n, expected) in [(1993, "36893574046765009"), (1994, "36893574046765010")] {
+                for (n, expected) in [(1993, "3000"), (1994, "3000")] {
                     let actual =
                         value_of(n).ok_or_else(|| format!("task {n} missing from the listing"))?;
                     if actual != expected {
@@ -1541,6 +1568,7 @@ pub const DRIVES: &[Drive] = &[
                         queue::crate_request_status(
                             graph,
                             stow_types::fixture::REQUEST_FIXTURE_ENQUEUED,
+                            now_ms(),
                         )
                     })
                     .map_err(text)?
@@ -1822,6 +1850,97 @@ pub const DRIVES: &[Drive] = &[
             })
         }),
     },
+    // One drive per submission entry point (stow#879): the source's
+    // priority is what the node's `priority × waited` rank reads, so
+    // each lane that sets it is measured through the same submit core.
+    Drive {
+        name: "POST /tasks/submit (operations)",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                submit_expect(
+                    ctx,
+                    db,
+                    settings,
+                    &[source_tree(
+                        SubmissionSource::Operations { priority: 200 },
+                        "costgate-ops",
+                        TAG_OPS,
+                    )],
+                    1,
+                    "operations submit",
+                )
+                .await
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                cancel_submitted(ctx, db, vec![source_node_id("costgate-ops", TAG_OPS)]).await
+            })
+        }),
+    },
+    Drive {
+        name: "POST /tasks/submit (preheat)",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                submit_expect(
+                    ctx,
+                    db,
+                    settings,
+                    &[source_tree(
+                        SubmissionSource::Preheat,
+                        "costgate-preheat",
+                        TAG_PREHEAT,
+                    )],
+                    1,
+                    "preheat submit",
+                )
+                .await
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                cancel_submitted(
+                    ctx,
+                    db,
+                    vec![source_node_id("costgate-preheat", TAG_PREHEAT)],
+                )
+                .await
+            })
+        }),
+    },
+    Drive {
+        name: "POST /tasks/submit (inexact-hit)",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                submit_expect(
+                    ctx,
+                    db,
+                    settings,
+                    &[source_tree(
+                        SubmissionSource::InexactHit,
+                        "costgate-inexact",
+                        TAG_INEXACT,
+                    )],
+                    1,
+                    "inexact-hit submit",
+                )
+                .await
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                cancel_submitted(
+                    ctx,
+                    db,
+                    vec![source_node_id("costgate-inexact", TAG_INEXACT)],
+                )
+                .await
+            })
+        }),
+    },
     Drive {
         name: "POST /demand",
         setup: Some(|_db, _shape, _settings, ctx| {
@@ -2035,9 +2154,9 @@ pub const DRIVES: &[Drive] = &[
     },
     Drive {
         // One focused claim over a *floored* queue (stow#525): the
-        // floor sits at one band, so the under-floor miss bulk stays out
-        // of the ready set while the one-band Windows family of the
-        // planted window remains claimable. The claim and its `Claims`
+        // floor sits at the window's stored demand, so the under-floor
+        // miss bulk stays out of the ready set while the planted
+        // window's rows remain claimable. The claim and its `Claims`
         // append are priced; the claimed ids never enter
         // `claimed_tasks` (the launch gate's marginal divisor counts
         // only the hot pass's claims), and the cleanup restores them.
@@ -2046,7 +2165,7 @@ pub const DRIVES: &[Drive] = &[
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
                 let floored = SchedulerSettings {
-                    min_dispatch_value: queue::VALUE_BAND,
+                    min_dispatch_value: fixture::WINDOW_DEMAND,
                     ..*settings
                 };
                 let claimed = focused_claim_pass(db, &floored, ctx).await?;

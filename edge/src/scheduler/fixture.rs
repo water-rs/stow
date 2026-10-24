@@ -62,13 +62,9 @@ use crate::errors::QueueError;
 #[cfg(test)]
 pub const GATE: FixtureShape = FixtureShape { queue_rows: 10_000 };
 
-/// The stored `demand` every window node carries — the demand fold's
-/// own unit of accumulated work. Production bounds `priority + demand
-/// <= PRIORITY_MAX`, so a window node (priority `n % 7 <= 6`) stays
-/// inside the band a real fold could write; the term still prices the
-/// window's Windows rows at `VALUE_BAND + priority + 1000`, ahead of
-/// every bulk Windows row (`VALUE_BAND + priority <= VALUE_BAND + 6`)
-/// whatever the bulk row's age (stow#833).
+/// The stored `demand` every window node carries — folded straight
+/// onto the node's rank operand (stow#879), so a window node sits at
+/// `MISS_PRIORITY + 1000` while the bulk stays at `MISS_PRIORITY`.
 pub const WINDOW_DEMAND: i64 = 1_000;
 
 /// Nodes one submission tree carries while the builder merges — bounded
@@ -300,9 +296,6 @@ impl Generations {
 /// completion produced - what a live route appends after it.
 fn step(graph: &mut Graph, event: &SchedulerEvent, at: i64) {
     graph.apply(event, at);
-    for sample in graph.take_samples() {
-        graph.apply(&sample, at);
-    }
 }
 
 /// Merge `tree` and keep the merge honest: a fixture tree that fails to

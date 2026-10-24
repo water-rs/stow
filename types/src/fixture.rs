@@ -71,11 +71,10 @@ impl FixtureShape {
     /// behind `not_before` and no longer count — which must (a) exceed
     /// the most tasks a pass can claim — one per free slot, so the
     /// slots the in-flight rows leave free — and (b) feed that bound,
-    /// not just exceed it. The floored pass admits only miss rows
-    /// whose value clears `VALUE_BAND` — within production's
-    /// `priority + demand <= PRIORITY_MAX` rule that is the Windows
-    /// family alone — so the window must hold more than one full pass
-    /// of Windows rows (`n % 9 ∈ {6,7}`), not merely of rows overall.
+    /// not just exceed it. The floored pass admits only rows whose
+    /// operand (its priority, stow#879) clears the floor — the
+    /// window's stored demand is what lifts its rows past it — so the
+    /// window must hold more than one full pass of claimable rows.
     /// At 640 the family spread gives the window about 142 Windows
     /// rows, of which the `n % 20 = 1` park leaves ~135 claimable —
     /// every one ahead of every bulk Windows row on the window's

@@ -103,9 +103,6 @@ async fn ensure_graph<'a>(
                     })
                     .collect();
                 loaded.with(|graph| graph.reconcile_runs(&listed, now_ms()));
-                routes::flush_samples(loaded, db, now_ms())
-                    .await
-                    .map_err(to_error)?;
             }
             Err(error) => {
                 tracing::warn!(%error, "post-wake CI status reconcile failed — keeping replayed state");
@@ -973,7 +970,7 @@ pub(super) async fn admit_request_pass(
     let queue::RequestAdmissionStep::Dispatch { attempt } = step else {
         // A live record already serves this request — answer it.
         return graph
-            .with(|graph| queue::crate_request_status(graph, &admission.request_id))
+            .with(|graph| queue::crate_request_status(graph, &admission.request_id, now_ms()))
             .map_err(to_error)?
             .ok_or_else(|| {
                 Error::msg(format!(
@@ -1046,7 +1043,7 @@ pub(super) async fn admit_request_pass(
         return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
     }
     graph
-        .with(|graph| queue::crate_request_status(graph, &admission.request_id))
+        .with(|graph| queue::crate_request_status(graph, &admission.request_id, now_ms()))
         .map_err(to_error)?
         .ok_or_else(|| {
             Error::msg(format!(
@@ -1066,7 +1063,7 @@ async fn read_request(
     let request_id = request_id_param(&params)?;
     let graph = ensure_graph(&env, &db, &graph).await?;
     graph
-        .with(|graph| queue::crate_request_status(graph, request_id))
+        .with(|graph| queue::crate_request_status(graph, request_id, now_ms()))
         .map_err(to_error)?
         .map(Json)
         .ok_or_else(|| {
@@ -1600,9 +1597,6 @@ pub(super) async fn dispatch_pass(
                     })
                     .collect();
                 graph.with(|graph| graph.reconcile_runs(&listed, now_ms()));
-                routes::flush_samples(graph, db, now_ms())
-                    .await
-                    .map_err(route_error)?;
             }
             Err(error) => {
                 tracing::warn!(%error, "CI status reconcile failed — keeping delivery-tracked external occupancy");

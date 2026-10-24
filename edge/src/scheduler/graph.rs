@@ -21,19 +21,18 @@
 //! counters) is rebuilt on load; the snapshot carries only the
 //! irreducible state.
 
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use stow_types::api::{
     BuildTaskPayload, PublishedSliceRow, RunnerFamily, SchedulerEvent, SubgraphNode,
-    SubmissionNode, SubmissionSource, SubmissionTree, SubmitTaskIdEntry, TaskSubgraph,
-    runner_family,
+    SubmissionNode, SubmissionTree, SubmitTaskIdEntry, TaskSubgraph, runner_family,
 };
 use stow_types::public_cache::{ExplicitSpelling, UnitShape};
 use stow_types::task_graph::canonical_task_id;
 
 use crate::errors::QueueError;
-use crate::scheduler::{queue, rank};
+use crate::scheduler::queue;
 
 mod edges;
 mod index;
@@ -115,8 +114,7 @@ struct TargetInfo {
     name: Box<str>,
     /// The runner family the target builds on.
     family: Option<RunnerFamily>,
-    /// The `dispatch_family` label the rank prices.
-    dispatch: &'static str,
+
     /// The unit shapes a node of this target must publish, indexed by
     /// `[host_side][explicit_spelling]`.
     own_masks: [[u8; 2]; 2],
@@ -138,7 +136,6 @@ impl TargetInfo {
         Self {
             name: name.into(),
             family: runner_family(name),
-            dispatch: rank::dispatch_family(name),
             own_masks: [
                 [mask(false, false), mask(false, true)],
                 [mask(true, false), mask(true, true)],
@@ -147,36 +144,10 @@ impl TargetInfo {
     }
 }
 
-/// A (crate, target) pair's recent build durations and their median —
-/// the rank's cost operand.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct CostWindow {
-    /// The newest [`SAMPLE_WINDOW`] durations, oldest first.
-    samples: Vec<u32>,
-    /// The median of `samples`, kept so a rank never sorts.
-    #[serde(skip)]
-    median: u32,
-}
-
-impl CostWindow {
-    fn push(&mut self, duration_ms: u32) {
-        if self.samples.len() >= SAMPLE_WINDOW {
-            self.samples.remove(0);
-        }
-        self.samples.push(duration_ms.max(1));
-        self.refresh();
-    }
-
-    fn refresh(&mut self) {
-        let mut sorted = self.samples.clone();
-        sorted.sort_unstable();
-        self.median = sorted[sorted.len() / 2];
-    }
-}
-
-/// A claimed node's place in the claim heap: ascending order is claim
-/// order — rank, then first request, then arrival.
-type Candidate = std::cmp::Reverse<(rank::Rank, i64, u32)>;
+/// One operand class's candidate in a claim's k-way merge: its claim
+/// key (rank, then request instant, then arrival — descending) and the
+/// node index.
+type Candidate = ((i128, std::cmp::Reverse<i64>, std::cmp::Reverse<u32>), u32);
 
 /// The class a failed attempt is counted under — the error's first
 /// line, capped so a stack dump cannot explode the class list, or
@@ -370,9 +341,14 @@ pub struct Graph {
     edges: Edges,
     /// Published unit-shape mask per task id.
     published: HashMap<IdKey, u8>,
-    /// Dispatchable pending nodes. The claim orders them; the set
-    /// itself holds node indexes only.
-    ready: BTreeSet<u32>,
+    /// Dispatchable pending nodes, one age-ordered queue per rank
+    /// operand (the node's priority, stow#879): `operand →
+    /// BTreeSet<(first_requested, ix)>`. Within a class the oldest
+    /// node ranks highest, so a claim reads only each class's oldest
+    /// eligible entry — O(classes) per pick instead of an O(ready)
+    /// re-rank, and the operand re-keys only when a merge raises the
+    /// priority.
+    ready: BTreeMap<i64, BTreeSet<(i64, u32)>>,
     /// Dispatched and running nodes.
     inflight: BTreeSet<u32>,
     /// Nodes per [`Status`].
@@ -386,16 +362,11 @@ pub struct Graph {
     freeze_history: std::collections::VecDeque<stow_types::api::DispatchFreezeTransition>,
     /// The admission floor (`min_dispatch_value`).
     floor: i64,
-    /// Per-(crate, target) expected build cost (stow#524), keyed by
-    /// the interned crate and the target byte.
-    build_stats: HashMap<(u32, u8), CostWindow>,
+
     /// Completions and failures per UTC hour and target byte — the
     /// admin status's trailing-day tally, since a published node keeps
     /// no state to count.
     outcome_hours: BTreeMap<(i64, u8), (u32, u32)>,
-    /// `BuildSample` events a completion produced and the caller has
-    /// yet to append and apply; see [`Self::take_samples`].
-    samples: Vec<SchedulerEvent>,
     /// The next claim generation — monotonic, snapshot-carried.
     next_generation: u64,
     /// When the run listing last reconciled — memory only: a wake
@@ -481,9 +452,6 @@ pub enum StartOutcome {
     /// A repeated or unknown delivery.
     Stale,
 }
-
-/// The window a (crate, target) build-cost stat keeps.
-const SAMPLE_WINDOW: usize = queue::BUILD_SAMPLE_WINDOW;
 
 /// The 32 bytes a dependency identity's 64 hex digits spell.
 fn digest_bytes(identity: &stow_types::identity::DependencyIdentity) -> [u8; 32] {
@@ -585,40 +553,17 @@ impl Graph {
         owners
     }
 
-    /// A node's rank operand: the raw value its lane, family and
-    /// priority operands price — what the admission floor compares and
-    /// the admin listing renders.
-    fn raw_value(&self, ix: u32) -> i64 {
-        let node = self.node(ix);
-        let state = self.state(ix);
-        rank::raw_value(
-            node.flags.lane().sql_lane(),
-            self.targets[usize::from(node.target)].dispatch,
-            state.priority,
-            state.demand,
-        )
+    /// A node's rank operand: its priority — what the rank multiplies
+    /// by time waited and what the admission floor compares (stow#879).
+    fn operand_of(&self, ix: u32) -> i64 {
+        self.state(ix).priority
     }
 
-    /// The node's claim rank: human lane first, then the exact ratio
-    /// of its raw value to the expected build cost of its crate and
-    /// target.
-    fn rank_of(&self, ix: u32) -> rank::Rank {
-        let node = self.node(ix);
-        rank::Rank::new(
-            node.flags.lane() == Lane::Human,
-            self.raw_value(ix),
-            self.expected_cost(node.crate_name, node.target),
-        )
-    }
-
-    /// Per-(crate, target) expected build cost: the median of the
-    /// sample window, `UNMEASURED_COST` before any sample — the rank's
-    /// cost operand.
-    fn expected_cost(&self, crate_name: u32, target: u8) -> std::num::NonZero<i64> {
-        self.build_stats
-            .get(&(crate_name, target))
-            .and_then(|window| std::num::NonZero::new(i64::from(window.median)))
-            .unwrap_or(rank::UNMEASURED_COST)
+    /// The node's claim rank: `operand × (now − first_requested)`,
+    /// exact in i128 (stow#879).
+    fn rank_at(&self, ix: u32, now: i64) -> i128 {
+        i128::from(self.operand_of(ix))
+            * i128::from(now.saturating_sub(self.state(ix).first_requested).max(0))
     }
 
     /// Whether a node may dispatch apart from its age/backoff gate.
@@ -627,15 +572,36 @@ impl Graph {
         node.status == Status::Pending
             && node.unmet == 0
             && !node.flags.blocked()
-            && (node.flags.lane() == Lane::Human || self.raw_value(ix) >= self.floor)
+            && (node.flags.lane() == Lane::Human || self.operand_of(ix) >= self.floor)
     }
 
-    /// Re-evaluate a node's ready-set membership.
+    /// Drop a node's ready-set entry, whatever class it sits in.
+    /// Call before mutating `priority` — the entry keys on
+    /// the operand, so the old key must come out while the operand is
+    /// still the one it was inserted under.
+    fn remove_ready(&mut self, ix: u32) {
+        if !self.node(ix).status.has_state() {
+            return;
+        }
+        let operand = self.operand_of(ix);
+        let key = (self.state(ix).first_requested, ix);
+        if let Some(class) = self.ready.get_mut(&operand) {
+            class.remove(&key);
+            if class.is_empty() {
+                self.ready.remove(&operand);
+            }
+        }
+    }
+
+    /// Re-evaluate a node's ready-set membership: enters it under its
+    /// current operand when dispatchable, leaves it otherwise.
     fn refresh_ready(&mut self, ix: u32) {
         if self.dispatchable(ix) {
-            self.ready.insert(ix);
+            let operand = self.operand_of(ix);
+            let first = self.state(ix).first_requested;
+            self.ready.entry(operand).or_default().insert((first, ix));
         } else {
-            self.ready.remove(&ix);
+            self.remove_ready(ix);
         }
     }
 
@@ -819,11 +785,11 @@ impl Graph {
         if !self.node(ix).status.has_state() {
             return;
         }
+        self.remove_ready(ix);
         self.set_status(ix, Status::Published);
         let slot = std::mem::replace(&mut self.node_mut(ix).state, NO_STATE);
         self.free_states.push(slot);
         self.extras.remove(&ix);
-        self.ready.remove(&ix);
         if self.node(ix).refs == 0 {
             self.release(ix);
         }
@@ -894,11 +860,18 @@ impl Graph {
             write += 1;
         }
         self.nodes.truncate(write);
-        self.ready = self
-            .ready
-            .iter()
-            .map(|&ix| remap[ix as usize])
-            .collect::<BTreeSet<_>>();
+        self.ready = std::mem::take(&mut self.ready)
+            .into_iter()
+            .map(|(operand, class)| {
+                (
+                    operand,
+                    class
+                        .into_iter()
+                        .map(|(first, ix)| (first, remap[ix as usize]))
+                        .collect(),
+                )
+            })
+            .collect();
         self.inflight = self
             .inflight
             .iter()
@@ -980,19 +953,19 @@ impl Graph {
     pub fn merge(&mut self, tree: &SubmissionTree, now: i64) -> Result<MergeReport, QueueError> {
         let ids = Self::validate_tree(tree)?;
         let lane = Lane::from_source(tree.source);
-        let op_priority = match tree.source {
-            SubmissionSource::Operations { priority } => priority,
-            _ => 0,
-        };
+        let priority = queue::source_priority(tree.source);
         let mut report = MergeReport::default();
         // Pass 1: find or insert every node by task id.
         let mut node_ixs = Vec::with_capacity(tree.nodes.len());
         let mut is_fresh = Vec::with_capacity(tree.nodes.len());
         let mut fresh = Vec::new();
         for (sub, keys) in tree.nodes.iter().zip(&ids) {
-            let priority = op_priority + queue::compute_priority(sub.downloads, 0)?;
             if let Some(ix) = self.find_id(&sub.task_id, *keys) {
                 if self.node(ix).status.has_state() {
+                    // A node reached from several entry points takes
+                    // the highest priority; its first-requested instant
+                    // never moves (stow#879).
+                    self.remove_ready(ix);
                     let state = self.state_mut(ix);
                     state.downloads = state.downloads.max(sub.downloads);
                     state.priority = state.priority.max(priority);
@@ -1126,10 +1099,7 @@ impl Graph {
     /// [`Graph::merge`] refuses.
     pub fn merge_changes(&self, tree: &SubmissionTree) -> Result<bool, QueueError> {
         let ids = Self::validate_tree(tree)?;
-        let op_priority = match tree.source {
-            SubmissionSource::Operations { priority } => priority,
-            _ => 0,
-        };
+        let priority = queue::source_priority(tree.source);
         for (sub, keys) in tree.nodes.iter().zip(&ids) {
             let Some(ix) = self.find_id(&sub.task_id, *keys) else {
                 return Ok(true);
@@ -1138,9 +1108,7 @@ impl Graph {
                 continue;
             }
             let state = self.state(ix);
-            if sub.downloads > state.downloads
-                || state.priority < op_priority + queue::compute_priority(sub.downloads, 0)?
-            {
+            if sub.downloads > state.downloads || state.priority < priority {
                 return Ok(true);
             }
         }
@@ -1373,19 +1341,36 @@ impl Graph {
         if self.freeze.is_some() {
             return Ok(Vec::new());
         }
-        // The ready set holds indexes only; the order is computed
-        // here, over the candidates past their backoff.
-        let mut heap: BinaryHeap<Candidate> = self
-            .ready
-            .iter()
-            .copied()
-            .filter(|&ix| self.not_before_of(ix) <= now)
-            .map(|ix| std::cmp::Reverse((self.rank_of(ix), self.state(ix).first_requested, ix)))
-            .collect();
+        // The rank is `operand × time waited` (stow#879): within one
+        // operand class the oldest entry ranks highest, so the best
+        // node of each class is its oldest eligible one and the claim
+        // is a k-way merge over class heads — O(classes) per pick,
+        // never a re-rank of the ready bulk.
+        let mut skipped: BTreeSet<(i64, u32)> = BTreeSet::new();
         let mut claimed = Vec::new();
         let mut macos_taken = 0u32;
         while claimed.len() < total_free as usize {
-            let Some(std::cmp::Reverse((_, _, ix))) = heap.pop() else {
+            let mut best: Option<Candidate> = None;
+            for (&operand, class) in &self.ready {
+                let candidate = class
+                    .iter()
+                    .copied()
+                    .find(|key| !skipped.contains(key) && self.not_before_of(key.1) <= now);
+                let Some((first, ix)) = candidate else {
+                    continue;
+                };
+                // Higher rank first; ties fall to the older
+                // first_requested, then the earlier arrival (stow#879).
+                let key = (
+                    i128::from(operand) * i128::from(now - first),
+                    std::cmp::Reverse(first),
+                    std::cmp::Reverse(ix),
+                );
+                if best.is_none_or(|(top, _)| key > top) {
+                    best = Some((key, ix));
+                }
+            }
+            let Some((_, ix)) = best else {
                 break;
             };
             let target = &self.targets[usize::from(self.node(ix).target)];
@@ -1397,6 +1382,7 @@ impl Graph {
                 ))
             })?;
             if family == RunnerFamily::MacOs && macos_taken >= macos_free {
+                skipped.insert((self.state(ix).first_requested, ix));
                 continue;
             }
             let generation = self.next_generation + 1;
@@ -1429,7 +1415,7 @@ impl Graph {
             extra.run_id = 0;
             extra.parked = None;
         });
-        self.ready.remove(&ix);
+        self.remove_ready(ix);
     }
 
     /// Bind a dispatch response's run id to a claim's generation, and
@@ -1618,18 +1604,6 @@ impl Graph {
         if success {
             self.set_status(ix, Status::Completed);
             self.tally_outcome(now, target, true);
-            let elapsed = now.saturating_sub(self.claimed_at_of(ix));
-            self.samples.push(SchedulerEvent::BuildSample {
-                crate_name: stow_types::identity::CrateName::parse(
-                    self.intern.at(self.node(ix).crate_name),
-                )
-                .expect("graph crate names were typed at merge"),
-                target: stow_types::identity::TargetTriple::parse(
-                    &*self.targets[usize::from(target)].name,
-                )
-                .expect("graph targets were typed at merge"),
-                duration_ms: u64::try_from(elapsed).unwrap_or(0),
-            });
             return;
         }
         let state = self.state_mut(ix);
@@ -1673,28 +1647,6 @@ impl Graph {
             entry.remove();
         }
     }
-
-    /// The `BuildSample` events completions produced since the last
-    /// call — the caller appends them to the log and applies them.
-    /// Replay discards them: the log already carries its own.
-    pub fn take_samples(&mut self) -> Vec<SchedulerEvent> {
-        std::mem::take(&mut self.samples)
-    }
-
-    /// Fold one successful build's duration into its (crate, target)
-    /// window. A name or target the graph has not seen cannot be
-    /// ranked, so its sample is dropped.
-    fn record_sample(&mut self, crate_name: &str, target: &str, duration_ms: u64) {
-        let (Some(crate_id), Some(target_id)) =
-            (self.intern.get(crate_name), self.target_lookup(target))
-        else {
-            return;
-        };
-        self.build_stats
-            .entry((crate_id, target_id))
-            .or_default()
-            .push(u32::try_from(duration_ms).unwrap_or(u32::MAX));
-    }
 }
 
 /// Trailing hours the outcome tally keeps — a day for the admin
@@ -1710,12 +1662,11 @@ impl Graph {
     ///
     /// # Errors
     /// `QueueError::Overflow` on a delta sum, `QueueError::Invariant`
-    /// when a delta exceeds a task's priority-band headroom — checked
-    /// for every task before anything folds, naming the offenders.
+    /// when a delta would overflow a task's demand — checked for every
+    /// task before anything folds, naming the offenders.
     pub fn demand_contributions(
         &self,
         deltas: &BTreeMap<[String; 5], i64>,
-        priority_max: i64,
     ) -> Result<Vec<(String, i64)>, QueueError> {
         let mut contributions: BTreeMap<u32, i64> = BTreeMap::new();
         for (identity, delta) in deltas {
@@ -1766,13 +1717,8 @@ impl Graph {
         let mut offending = Vec::new();
         let mut out = Vec::with_capacity(contributions.len());
         for (ix, delta) in contributions {
-            let state = self.state(ix);
             let task_id = self.task_id_of(ix);
-            if delta
-                > priority_max
-                    .saturating_sub(state.priority.max(0))
-                    .saturating_sub(state.demand.max(0))
-            {
+            if self.state(ix).demand.checked_add(delta).is_none() {
                 offending.push(task_id);
             } else {
                 out.push((task_id, delta));
@@ -1780,7 +1726,7 @@ impl Graph {
         }
         if !offending.is_empty() {
             return Err(QueueError::Invariant(format!(
-                "demand would overflow the priority band on {} task(s): {}",
+                "demand would overflow {} task(s): {}",
                 offending.len(),
                 offending.join(", ")
             )));
@@ -1797,7 +1743,6 @@ impl Graph {
             {
                 let state = self.state_mut(ix);
                 state.demand = state.demand.saturating_add(*delta);
-                self.refresh_ready(ix);
             }
         }
     }
@@ -1851,7 +1796,12 @@ impl Graph {
                 MutationKind::Promote
                     if status == Status::Pending && self.node(ix).flags.lane() != Lane::Human =>
                 {
+                    self.remove_ready(ix);
                     self.node_mut(ix).flags.set_lane(Lane::Human);
+                    // The verb's raise is the website class's operand —
+                    // what a request someone asked for by name carries.
+                    self.state_mut(ix).priority =
+                        self.state(ix).priority.max(queue::REQUEST_PRIORITY);
                     (true, false, false)
                 }
                 MutationKind::Purge if matches!(status, Status::Completed | Status::Failed) => {
@@ -1863,7 +1813,7 @@ impl Graph {
                 continue;
             }
             self.state_mut(ix).updated = now;
-            self.ready.remove(&ix);
+            self.remove_ready(ix);
             // A dep entering or leaving `failed` flips its dependents'
             // blocked flag.
             if rose || fell {
@@ -1977,11 +1927,12 @@ impl Graph {
                 continue;
             };
             if self.node(ix).status.has_state() {
+                self.remove_ready(ix);
                 let state = self.state_mut(ix);
                 state.downloads = state.downloads.max(entry.downloads);
-                if let Ok(priority) = queue::compute_priority(entry.downloads, 0) {
-                    state.priority = state.priority.max(priority);
-                }
+                // A re-requested id is miss-class demand (stow#879):
+                // the lane's source priority, never a computed one.
+                state.priority = state.priority.max(queue::MISS_PRIORITY);
                 self.refresh_ready(ix);
             }
             inserted += 1;
@@ -2058,7 +2009,7 @@ impl Graph {
         let (free, macos_free) = self.free_slots(settings);
         let mut wake: Option<i64> = None;
         if free > 0 {
-            for &ix in &self.ready {
+            for &(_, ix) in self.ready.values().flatten() {
                 let node = self.node(ix);
                 let macos =
                     self.targets[usize::from(node.target)].family == Some(RunnerFamily::MacOs);
@@ -2183,7 +2134,8 @@ impl Graph {
             + self.states.capacity() * size_of::<State>()
             + self.edges.heap_bytes()
             + self.published.capacity() * (size_of::<IdKey>() + 1)
-            + self.ready.len() * size_of::<u32>() * 2
+            + self.ready.len() * (size_of::<i64>() + size_of::<BTreeSet<(i64, u32)>>())
+            + self.ready.values().map(BTreeSet::len).sum::<usize>() * (size_of::<(i64, u32)>() + 32)
     }
 }
 
@@ -2310,11 +2262,7 @@ impl Graph {
                 at,
                 trigger,
             } => self.apply_freeze(record.as_deref(), at, trigger),
-            SchedulerEvent::BuildSample {
-                crate_name,
-                target,
-                duration_ms,
-            } => self.record_sample(crate_name.as_str(), target.as_str(), *duration_ms),
+
             // `Submit` parts are reassembled by the replay loop in
             // `store.rs` before this is reached; `Request` lifecycle
             // events land with the request-lane cutover (stage 7).
@@ -2611,8 +2559,14 @@ impl Graph {
     /// 1-based position of a pending human node in dispatch order: the
     /// pending human nodes that rank ahead of it, plus one. The order is
     /// the claim order — rank, then request instant, then arrival.
-    fn human_position(&self, ix: u32) -> u32 {
-        let order = |ix: u32| (self.rank_of(ix), self.state(ix).first_requested, ix);
+    fn human_position(&self, ix: u32, now: i64) -> u32 {
+        let order = |ix: u32| {
+            (
+                std::cmp::Reverse(self.rank_at(ix, now)),
+                self.state(ix).first_requested,
+                ix,
+            )
+        };
         let mine = order(ix);
         let ahead = (0..u32::try_from(self.nodes.len()).expect("node indexes fit u32"))
             .filter(|&other| {
@@ -2627,7 +2581,11 @@ impl Graph {
 
     /// A node's queue status for the request lane — the operator-facing
     /// fields `RequestStatus` carries.
-    pub fn request_status(&self, task_id: &str) -> Option<stow_types::api::RequestStatus> {
+    pub fn request_status(
+        &self,
+        task_id: &str,
+        now: i64,
+    ) -> Option<stow_types::api::RequestStatus> {
         let ix = self.node_ix(task_id)?;
         let node = self.node(ix);
         let identity = self
@@ -2646,7 +2604,7 @@ impl Graph {
             rustc_version: identity.rustc_version,
             lane,
             status,
-            human_lane_position: human_pending.then(|| self.human_position(ix)),
+            human_lane_position: human_pending.then(|| self.human_position(ix, now)),
             blocked_by: self.blocked_by(ix),
             preserve_lockfile: node.flags.preserve(),
         })
@@ -2655,11 +2613,14 @@ impl Graph {
     /// What the graph says about a request's root ids: the queue
     /// status of the ones it holds and which ones are published (a
     /// published node with no dependents is freed and holds no status).
-    pub fn probe_roots(&self, ids: &[String]) -> RootProbe {
+    pub fn probe_roots(&self, ids: &[String], now: i64) -> RootProbe {
         RootProbe {
             statuses: ids
                 .iter()
-                .filter_map(|id| self.request_status(id).map(|status| (id.clone(), status)))
+                .filter_map(|id| {
+                    self.request_status(id, now)
+                        .map(|status| (id.clone(), status))
+                })
                 .collect(),
             published: self.published_of(ids),
         }
@@ -2816,7 +2777,7 @@ impl Graph {
                     updated_at: format_utc(state.updated),
                     blocked_by: self.blocked_by(ix),
                     host_side: node.flags.host(),
-                    value: self.raw_value(ix).to_string(),
+                    value: self.operand_of(ix).to_string(),
                 })
             })
             .collect()
@@ -2946,9 +2907,6 @@ impl Graph {
             if status.in_flight() {
                 self.inflight.insert(ix);
             }
-        }
-        for window in self.build_stats.values_mut() {
-            window.refresh();
         }
         self.rebuild_indexes_over_nodes();
         for ix in 0..u32::try_from(self.nodes.len()).expect("node indexes fit u32") {
@@ -3135,7 +3093,7 @@ impl crate::freeze::FreezeStore for GraphFreezeStore<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stow_types::api::MutationKind;
+    use stow_types::api::{MutationKind, SubmissionSource};
     use stow_types::identity::{
         CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
     };
@@ -3220,6 +3178,11 @@ mod tests {
         graph.node_ix(&id(name)).map(|ix| graph.node(ix).status)
     }
 
+    /// Nodes in the ready set — the operand-class map's total entries.
+    fn ready_count(graph: &Graph) -> usize {
+        graph.ready.values().map(BTreeSet::len).sum()
+    }
+
     #[test]
     fn records_keep_their_sizes() {
         assert_eq!(size_of::<Node>(), 68);
@@ -3267,7 +3230,7 @@ mod tests {
         let mut graph = Graph::default();
         graph.merge(&chain(), 0).expect("merge");
         // Only the leaf is ready; a and b sit behind unmet edges.
-        assert_eq!(graph.ready.len(), 1);
+        assert_eq!(ready_count(&graph), 1);
         let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].task_id, id("c"));
@@ -3332,7 +3295,7 @@ mod tests {
             (0, 3),
             "everything the index serves is born published"
         );
-        assert!(graph.ready.is_empty());
+        assert_eq!(ready_count(&graph), 0);
         assert_eq!(graph.pending_depth(), 0);
         // Born published and unreferenced: nothing stays.
         graph.compact();
@@ -3363,7 +3326,7 @@ mod tests {
             )
             .expect("merge d");
         assert_eq!(status_of(&graph, "c"), Some(Status::Published));
-        assert_eq!(graph.ready.len(), 1, "d's only edge is met");
+        assert_eq!(ready_count(&graph), 1, "d's only edge is met");
         let claimed = graph.claim(45, 16, 10_000_000, 3_600_000).expect("claim d");
         assert_eq!(claimed[0].task_id, id("d"));
         assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);
@@ -3413,10 +3376,10 @@ mod tests {
             );
             assert_eq!(graph.edges.owners_of(leaf), vec![dependent]);
         }
-        assert_eq!(graph.ready.len(), 1_000, "the unpublished leaves");
+        assert_eq!(ready_count(&graph), 1_000, "the unpublished leaves");
         // The renumbered graph still flips edges.
         assert_eq!(publish(&mut graph, "l1500"), 1);
-        assert_eq!(graph.ready.len(), 1_000, "l1500 left, d1500 joined");
+        assert_eq!(ready_count(&graph), 1_000, "l1500 left, d1500 joined");
     }
 
     #[test]
@@ -3443,7 +3406,7 @@ mod tests {
             .expect("merge");
         let flips = publish(&mut graph, "shared");
         assert_eq!(flips as usize, dependents);
-        assert_eq!(graph.ready.len(), dependents);
+        assert_eq!(ready_count(&graph), dependents);
     }
 
     /// Edges onto one leaf: more than the reverse index's rebuild floor.
@@ -3459,42 +3422,101 @@ mod tests {
         assert_eq!(outcome, FinishOutcome::Parked);
         assert!(graph.bind(&id("solo"), generation, 4242, 11_000));
         assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
-        let samples = graph.take_samples();
-        assert_eq!(samples.len(), 1, "the completion produced a build sample");
     }
 
+    /// One named node under `source`, the tree shape `merge` takes.
+    fn single(name: &str, source: SubmissionSource) -> SubmissionTree {
+        SubmissionTree {
+            source,
+            roots: vec![0],
+            nodes: vec![sub(name)],
+        }
+    }
+
+    /// stow#879: the rank is `priority × time waited`. A 30× request
+    /// waiting 2 minutes ties a 1× miss waiting an hour — the tie
+    /// falls to the older `first_requested` (the miss), and a second
+    /// later the request leads.
     #[test]
-    fn build_samples_fold_into_the_expected_cost() {
+    fn claim_rank_is_priority_times_waited() {
         let mut graph = Graph::default();
-        graph.merge(&solo(), 0).expect("merge");
-        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
-        graph.bind(&id("solo"), claimed[0].generation, 7, 1_000);
-        graph.run_finished(&id("solo"), 7, true, false, None, 61_000);
-        let samples = graph.take_samples();
-        assert!(graph.take_samples().is_empty(), "taken once");
-        for sample in &samples {
-            graph.apply(sample, 61_000);
-        }
-        let ix = graph.node_ix(&id("solo")).expect("node");
-        let node = *graph.node(ix);
+        graph
+            .merge(&single("missed", SubmissionSource::CacheMiss), 0)
+            .expect("miss merge");
+        graph
+            .merge(
+                &single("asked", SubmissionSource::HumanRequest),
+                58 * 60_000,
+            )
+            .expect("request merge");
+        // At +60 min: miss 100 × 60min == request 3000 × 2min; the
+        // miss's earlier first_requested wins the tie.
+        let claimed = graph.claim(2, 16, 60 * 60_000, 3_600_000).expect("claim");
+        let ids: Vec<_> = claimed.iter().map(|claim| claim.task_id.clone()).collect();
         assert_eq!(
-            graph.expected_cost(node.crate_name, node.target).get(),
-            61_000,
-            "claim-to-completion, folded by the event"
+            ids,
+            vec![id("missed"), id("asked")],
+            "tied rank, older first"
         );
-        // The sample window rides the snapshot.
-        let mut cursor = SnapshotCursor::default();
-        let mut loader = SnapshotLoader::default();
-        while let Some(chunk) = graph.next_snapshot_chunk(&mut cursor).expect("chunk") {
-            loader.apply(chunk.tag, &chunk.payload).expect("row");
-        }
-        let restored = loader.finish().expect("load");
-        let ix = restored.node_ix(&id("solo")).expect("node");
-        let node = *restored.node(ix);
-        assert_eq!(
-            restored.expected_cost(node.crate_name, node.target).get(),
-            61_000
-        );
+    }
+
+    /// stow#879: waited time is uncapped — a preheat node (operand 10)
+    /// eventually outranks misses (operand 100) submitted after it.
+    #[test]
+    fn a_waited_preheat_outranks_fresh_misses() {
+        let mut graph = Graph::default();
+        graph
+            .merge(&single("low", SubmissionSource::Preheat), 0)
+            .expect("preheat merge");
+        graph
+            .merge(&single("fresh", SubmissionSource::CacheMiss), 10_000_000)
+            .expect("miss merge");
+        // At +11M ms: preheat 10 × 11M = 110M outranks the miss's
+        // 100 × 1M = 100M — the waited node wins eventually (stow#879).
+        let claimed = graph.claim(2, 16, 11_000_000, 3_600_000).expect("claim");
+        let ids: Vec<_> = claimed.iter().map(|claim| claim.task_id.clone()).collect();
+        assert_eq!(ids, vec![id("low"), id("fresh")]);
+    }
+
+    /// stow#879: a node reached from a higher-priority entry point
+    /// merges to the max priority and keeps its first-requested time.
+    #[test]
+    fn a_remerge_takes_the_highest_priority() {
+        let mut graph = Graph::default();
+        graph
+            .merge(&single("shared", SubmissionSource::Preheat), 0)
+            .expect("preheat merge");
+        graph
+            .merge(&single("shared", SubmissionSource::HumanRequest), 1_000)
+            .expect("request remerge");
+        graph
+            .merge(&single("rival", SubmissionSource::HumanRequest), 1_000)
+            .expect("rival merge");
+        let ix = graph.node_ix(&id("shared")).expect("node");
+        assert_eq!(graph.state(ix).priority, queue::REQUEST_PRIORITY);
+        assert_eq!(graph.state(ix).first_requested, 0);
+        // Same class as the rival, but twice the wait — it leads.
+        let claimed = graph.claim(2, 16, 2_000, 3_600_000).expect("claim");
+        let ids: Vec<_> = claimed.iter().map(|claim| claim.task_id.clone()).collect();
+        assert_eq!(ids, vec![id("shared"), id("rival")]);
+    }
+
+    /// stow#879: operations submissions carry the caller's operand.
+    #[test]
+    fn operations_carry_the_callers_priority() {
+        let mut graph = Graph::default();
+        graph
+            .merge(
+                &single("ops", SubmissionSource::Operations { priority: 500 }),
+                0,
+            )
+            .expect("ops merge");
+        graph
+            .merge(&single("miss", SubmissionSource::CacheMiss), 0)
+            .expect("miss merge");
+        // 500 vs 100 at equal waits — the operations node leads.
+        let claimed = graph.claim(1, 16, 1_000, 3_600_000).expect("claim");
+        assert_eq!(claimed[0].task_id, id("ops"));
     }
 
     #[test]
@@ -3516,7 +3538,7 @@ mod tests {
         assert_eq!(status_of(&graph, "c"), Some(Status::Failed));
         let b = graph.node_ix(&id("b")).expect("b");
         assert!(graph.node(b).flags.blocked());
-        assert_eq!(graph.ready.len(), 0);
+        assert_eq!(ready_count(&graph), 0);
         let affected = graph.mutate(MutationKind::Retry, &[id("c")], 6_000);
         assert_eq!(affected, 1);
         assert!(!graph.node(b).flags.blocked());
@@ -3617,24 +3639,18 @@ mod tests {
     #[test]
     fn claim_order_is_rank_then_arrival() {
         let mut graph = Graph::default();
-        let mut cheap = sub("cheap");
-        cheap.downloads = 1_000;
-        let mut dear = sub("dear");
-        dear.downloads = 9_000_000;
-        let first = sub("first");
+        let mut first = sub("first");
+        first.downloads = 1_000;
         graph
-            .merge(
-                &SubmissionTree {
-                    source: SubmissionSource::CacheMiss,
-                    roots: vec![],
-                    nodes: vec![cheap, dear, first],
-                },
-                0,
-            )
-            .expect("merge");
-        let claimed = graph.claim(2, 16, 0, 3_600_000).expect("claim");
-        let ids: Vec<_> = claimed.iter().map(|claim| claim.task_id.clone()).collect();
-        assert_eq!(ids, vec![id("dear"), id("cheap")]);
+            .merge(&single("older", SubmissionSource::CacheMiss), 0)
+            .expect("older merge");
+        graph
+            .merge(&single("newer", SubmissionSource::CacheMiss), 1_000)
+            .expect("newer merge");
+        // Same operand class: the rank reduces to time waited — the
+        // older node leads regardless of downloads (stow#879).
+        let claimed = graph.claim(1, 16, 2_000, 3_600_000).expect("claim");
+        assert_eq!(claimed[0].task_id, id("older"));
     }
 
     /// The record's presence is the flag: the `Freeze` event sets it,

@@ -59,25 +59,6 @@ async fn append(
     Ok(())
 }
 
-/// Append the `BuildSample` events the graph's completions produced and
-/// apply them: the sample window is graph state carried by the log and
-/// the snapshot. The outbox is empty on every call that finished
-/// nothing, so the common path appends nothing.
-///
-/// # Errors
-/// `QueueError::Sql` when the append fails.
-pub(super) async fn flush_samples(
-    graph: LoadedGraph<'_>,
-    db: &DurableDb,
-    now: i64,
-) -> Result<(), QueueError> {
-    let samples = graph.with(Graph::take_samples);
-    if samples.is_empty() {
-        return Ok(());
-    }
-    commit(graph, db, &samples, now).await
-}
-
 /// Append the `Submit` parts of every tree that changes the graph in
 /// one turn, then merge each into it; returns the brand-new nodes. A
 /// tree that would change nothing — a resubmission of nodes already
@@ -276,7 +257,6 @@ pub(super) async fn complete_run(
             now,
         )
     });
-    flush_samples(graph, db, now).await?;
     Ok(outcome)
 }
 
@@ -413,9 +393,6 @@ pub(super) async fn settle_dispatch(
 ) -> Result<(), QueueError> {
     if !bindings.is_empty() {
         commit(graph, db, &[SchedulerEvent::Bindings { bindings }], now).await?;
-        // A binding can apply a completion that beat its dispatch
-        // response.
-        flush_samples(graph, db, now).await?;
     }
     graph.with(|graph| {
         for (task_id, generation, error) in failures {
@@ -454,7 +431,10 @@ pub(super) async fn request_outcome(
                 .iter()
                 .filter_map(|root| root.task_id.clone())
                 .collect();
-            (queued_before, graph.with(|graph| graph.probe_roots(&ids)))
+            (
+                queued_before,
+                graph.with(|graph| graph.probe_roots(&ids, now)),
+            )
         } else {
             Default::default()
         };
