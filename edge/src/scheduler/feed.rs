@@ -294,6 +294,33 @@ pub fn feed_complete(
     })
 }
 
+/// Whether `hour` is already delivered. `deliver` only ever stamps the
+/// canonical successor, so the watermark is a contiguous cursor: an
+/// hour at or below it was delivered — and its session may already be
+/// expired, `cleanup`'s `Expire` removing the `feed_sessions` entry
+/// wholesale. The watermark is the delivered proof that survives
+/// expiry, so replay answers consult it rather than the session.
+fn already_delivered(graph: &Graph, hour: &DemandFeedHour) -> bool {
+    graph
+        .feed_watermark
+        .as_deref()
+        .is_some_and(|watermark| hour.as_str() <= watermark)
+}
+
+/// The terminal no-op a delivered hour answers to a `deliver` replay —
+/// whether the session still sits `delivered` or `cleanup` already
+/// expired it.
+fn delivered_report(hour: &DemandFeedHour) -> DemandFeedDeliverReport {
+    DemandFeedDeliverReport {
+        hour: hour.to_string(),
+        state: "delivered".to_owned(),
+        delivered_page: None,
+        applied: false,
+        touched_tasks: 0,
+        remaining_pages: 0,
+    }
+}
+
 /// `POST /demand-feed/deliver` — one bounded page of work: the next
 /// unapplied page replays verbatim into the demand ledger as batch
 /// `demand-feed/{hour}/{page_no}`, its `applied` cursor advancing with
@@ -316,9 +343,17 @@ pub fn feed_deliver(
         .map_err(QueueError::Invariant)?;
     let plan = |graph: &Graph| graph.wake_plan(now_ms, settings);
     let Some(session) = graph.feed_sessions.get(hour.as_str()) else {
-        return Err(QueueError::Invariant(format!(
-            "demand feed hour {hour} was never staged"
-        )));
+        // A session absent at or below the watermark was delivered and
+        // expired: the replay answers the same no-op a still-present
+        // `delivered` session does — the contract the lost-ack retry
+        // needs. Anything else is a genuine never-staged refusal.
+        return if already_delivered(graph, hour) {
+            Ok((delivered_report(hour), Vec::new(), plan(graph)))
+        } else {
+            Err(QueueError::Invariant(format!(
+                "demand feed hour {hour} was never staged"
+            )))
+        };
     };
     if session.state == "staging" {
         return Err(QueueError::Invariant(format!(
@@ -326,18 +361,7 @@ pub fn feed_deliver(
         )));
     }
     if session.state == "delivered" {
-        return Ok((
-            DemandFeedDeliverReport {
-                hour: hour.to_string(),
-                state: "delivered".to_owned(),
-                delivered_page: None,
-                applied: false,
-                touched_tasks: 0,
-                remaining_pages: 0,
-            },
-            Vec::new(),
-            plan(graph),
-        ));
+        return Ok((delivered_report(hour), Vec::new(), plan(graph)));
     }
     require_canonical_successor(graph, hour)?;
     if let Some((older, _)) = graph
@@ -421,6 +445,19 @@ pub fn feed_cleanup(
     hour.ensure_closed(now_unix_secs)
         .map_err(QueueError::Invariant)?;
     let Some(session) = graph.feed_sessions.get(hour.as_str()) else {
+        // A replayed cleanup of a delivered-and-expired hour has
+        // nothing left to retire — the watermark proves the delivery
+        // the session row no longer records.
+        if already_delivered(graph, hour) {
+            return Ok((
+                DemandFeedCleanupReport {
+                    hour: hour.clone(),
+                    retired: 0,
+                    remaining: false,
+                },
+                None,
+            ));
+        }
         return Err(QueueError::Invariant(format!(
             "demand feed hour {hour} was never staged"
         )));
@@ -969,7 +1006,23 @@ mod tests {
         assert!(!g.feed_sessions.contains_key(H2));
         assert_eq!(watermark(&g).as_deref(), Some(H2), "the cursor survives");
         begin(&mut g, &h2).expect_err("an expired hour never re-materializes");
-        feed_cleanup(&g, &h2, NOW_SECS).expect_err("an expired hour has no session");
+        // The lost-ack replays still answer from the watermark: a
+        // redelivered `deliver` is the delivered no-op, a redelivered
+        // `cleanup` retires nothing.
+        let replay = deliver(&mut g, &h2).expect("delivered replay after expire");
+        assert_eq!(replay.state, "delivered");
+        assert_eq!(replay.delivered_page, None);
+        assert!(!replay.applied);
+        assert_eq!(replay.touched_tasks, 0);
+        assert_eq!(replay.remaining_pages, 0);
+        let (report, event) = feed_cleanup(&g, &h2, NOW_SECS).expect("cleanup replay");
+        assert_eq!(report.retired, 0);
+        assert!(!report.remaining);
+        assert!(event.is_none(), "an expired hour retires nothing again");
+        // A never-staged hour still refuses both calls.
+        let h9 = hour("2026-01-01T09");
+        deliver(&mut g, &h9).expect_err("a never-staged hour never delivers");
+        feed_cleanup(&g, &h9, NOW_SECS).expect_err("a never-staged hour cleans nothing");
         assert!(feed_status(&g).unfinished.is_none());
     }
 

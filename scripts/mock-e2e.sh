@@ -43,6 +43,10 @@
 #   STOW_E2E_TOOLCHAIN       rustup toolchain for the run (default: stable)
 #   STOW_E2E_READY_DEADLINE  seconds to wait for each service (default: 600)
 #   STOW_E2E_TASK_DEADLINE   seconds to wait for the scheduler (default: 1200)
+#   STOW_E2E_EDGE_PORT       port `wrangler dev` binds (default: 8788)
+#   STOW_E2E_INSPECTOR_PORT  port the workerd inspector binds (default: 9229)
+#   STOW_E2E_REGISTRY_PORT   port `stow-mock-registry serve` binds (default: 28123)
+#   STOW_E2E_LOCAL_CI_PORT   port `stow-build serve` binds (default: 28124)
 set -euo pipefail
 # Job control gives every background service its own process group, so the
 # cleanup trap can kill whole trees — including grandchildren like
@@ -51,14 +55,16 @@ set -m
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-EDGE_PORT=8788
-# Fixed ports sit below every OS's ephemeral range (Linux 32768-60999,
+EDGE_PORT="${STOW_E2E_EDGE_PORT:-8788}"
+INSPECTOR_PORT="${STOW_E2E_INSPECTOR_PORT:-9229}"
+# Default ports sit below every OS's ephemeral range (Linux 32768-60999,
 # macOS and Windows 49152-65535): inside it, any outbound socket on the
 # runner can hold the port, and a loopback connect to a port nobody
 # listens on can self-connect, so the in-use check below fired on a
-# fresh runner.
-REGISTRY_ADDR=127.0.0.1:28123
-LOCAL_CI_ADDR=127.0.0.1:28124
+# fresh runner. The overrides exist so two gates can run side by side
+# on one machine; shifted runs should keep the same property.
+REGISTRY_ADDR="127.0.0.1:${STOW_E2E_REGISTRY_PORT:-28123}"
+LOCAL_CI_ADDR="127.0.0.1:${STOW_E2E_LOCAL_CI_PORT:-28124}"
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
 # The trusted edge endpoints authenticate GitHub identity — no shared
@@ -120,8 +126,12 @@ descendants() {
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
+    [ -n "${MOCK_MANIFEST:-}" ] && rm -f "$MOCK_MANIFEST"
     local all_pids=() pid kids
-    for pid in ${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}; do
+    # The command `fg` is currently waiting on (or a substitution's
+    # subshell) is a direct child too — kill it with the services so a
+    # trap that fires mid-command tears down what it interrupted.
+    for pid in $(pgrep -P $$ 2>/dev/null) ${FG_PID:-} ${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}; do
         # Process-group kill reaches grandchildren reparented after their
         # supervisor died; the descendant walk below is the fallback.
         kill -- "-$pid" 2>/dev/null || true
@@ -164,6 +174,28 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT INT TERM
+
+# Process-group leader of the long command the script is waiting on.
+# Bash defers a trapped signal until the current foreground child
+# returns, so a TERM landing during a minutes-long build or drive would
+# never run the trap before the follow-up KILL. `fg` runs such commands
+# as a background job and `wait`s on them — `wait` is interruptible, so
+# the trap fires at once while the child is still alive for cleanup to
+# kill (each `&` job is its own process group under `set -m`).
+FG_PID=
+fg() {
+    "$@" &
+    FG_PID=$!
+    wait "$FG_PID"
+}
+
+# `fg` takes one command; a step that must run in another directory cds
+# inside the job subshell first.
+in_dir() {
+    local dir="$1"
+    shift
+    ( cd "$dir" && "$@" )
+}
 
 # PID of the most recently started service.
 SERVICE_PID=""
@@ -241,6 +273,13 @@ isolated_env() {
 # Every stow-cli call carries the full mock env — config, cache, verify
 # mode, the run's edge URL, and the mock registry as the OCI base — so
 # nothing falls back to the developer's real stow config.toml or to GHCR.
+# `stow_cli check` inside the consumer crate dir with the index refresh
+# interval disabled — the run's own publish pass just landed. Invoked
+# through `fg` like the other long commands.
+consumer_check() {
+    ( cd "$CONSUMER" && STOW_INDEX_REFRESH_SECS=0 stow_cli check "$@" )
+}
+
 stow_cli() {
     isolated_env \
         STOW_EDGE_URL="$EDGE_URL" \
@@ -416,10 +455,10 @@ done
 
 cd "$REPO_ROOT"
 echo "[mock-e2e] building stow-cli, stow-build, stow-mock-registry, stow-admin"
-cargo build --release -p stow-cli --features mock-verify -p stow-build -p stow-mock-registry -p stow-admin \
+fg cargo build --release -p stow-cli --features mock-verify -p stow-build -p stow-mock-registry -p stow-admin \
     >"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build failed — see $LOG_DIR/cargo-build.log"
-cargo build --release -p stow-mock-registry --example demand_feed_fixture \
+fg cargo build --release -p stow-mock-registry --example demand_feed_fixture \
     >>"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build (demand_feed_fixture example) failed — see $LOG_DIR/cargo-build.log"
 BIN="$REPO_ROOT/target/release"
@@ -429,7 +468,7 @@ BIN="$REPO_ROOT/target/release"
 # freeze bodies and the 512 KiB boundary pages the feed harness
 # serves and posts below. `T05` starts hidden: the missing-fixture
 # leg serves it back later.
-"$BIN/examples/demand_feed_fixture" "$WORK_DIR/demand-fixtures" \
+fg "$BIN/examples/demand_feed_fixture" "$WORK_DIR/demand-fixtures" \
     || die "demand-feed fixture generation failed"
 mv "$WORK_DIR/demand-fixtures/hours/2020-01-01T05.json" \
     "$WORK_DIR/demand-fixtures/2020-01-01T05.json"
@@ -446,7 +485,7 @@ mkdir -p "$WORK_DIR/mock-registry" "$WORK_DIR/edge-state" "$WORK_DIR/local-ci" "
 
 # Nothing may already hold our ports: a stale listener would make every
 # readiness probe pass against the wrong service.
-for port in "$EDGE_PORT" "${REGISTRY_ADDR##*:}" "${LOCAL_CI_ADDR##*:}"; do
+for port in "$EDGE_PORT" "$INSPECTOR_PORT" "${REGISTRY_ADDR##*:}" "${LOCAL_CI_ADDR##*:}"; do
     if (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
         die "port $port is already in use — refusing to probe a foreign service"
     fi
@@ -462,27 +501,37 @@ mock_registry_ready() {
 }
 wait_for "mock registry /v2/" 60 "$SERVICE_PID" mock_registry_ready
 
+# The mock manifest's loopback URLs (the registry and the local-CI
+# dispatcher) bake into the edge bundle at `skyzen build` time, so a
+# shifted port set needs a manifest rendered for it: a copy of
+# Skyzen.mock.toml with the two port strings rewritten, living only
+# for the build.
+MOCK_MANIFEST="$REPO_ROOT/edge/Skyzen.mock.e2e-$$.toml"
+sed -e "s/127\.0\.0\.1:28123/127.0.0.1:${REGISTRY_ADDR##*:}/g" \
+    -e "s/127\.0\.0\.1:28124/127.0.0.1:${LOCAL_CI_ADDR##*:}/g" \
+    "$REPO_ROOT/edge/Skyzen.mock.toml" >"$MOCK_MANIFEST"
+
 # Build the edge bundle once, then run `wrangler dev --local` (workerd)
 # directly — the same command `skyzen dev` would supervise, minus its
 # file watcher. The watcher is unusable here: on Linux inotify reports
 # every open of the watched Cargo.toml/src files as a change, so each
 # rebuild re-triggers itself and readiness never arrives; this lane
 # never edits sources, so watching buys nothing.
-(
-    cd "$REPO_ROOT/edge"
-    skyzen build --provider cloudflare --manifest Skyzen.mock.toml
-) >"$LOG_DIR/edge-build.log" 2>&1 \
+fg in_dir "$REPO_ROOT/edge" \
+    skyzen build --provider cloudflare --manifest "$(basename "$MOCK_MANIFEST")" \
+    >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
+rm -f "$MOCK_MANIFEST"
 # The edge assumes its D1 schema exists; creating it is deployment work, so
 # the local D1 gets the one schema file an operator applies.
 # Apply the one schema the same way an operator does — skipped on a
 # reused edge-state dir (STOW_E2E_WORK_DIR), where the schema already
 # exists and the file's plain CREATEs would fail.
-if ! wrangler d1 execute stow-mock --local \
+if ! fg wrangler d1 execute stow-mock --local \
     --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
     --persist-to "$WORK_DIR/edge-state" \
     --command "SELECT 1 FROM artifacts LIMIT 1" >>"$LOG_DIR/edge-schema.log" 2>&1; then
-    wrangler d1 execute stow-mock --local \
+    fg wrangler d1 execute stow-mock --local \
         --config "$REPO_ROOT/edge/.skyzen/gen/wrangler.toml" \
         --persist-to "$WORK_DIR/edge-state" \
         --file "$REPO_ROOT/edge/schema.sql" >>"$LOG_DIR/edge-schema.log" 2>&1 \
@@ -491,7 +540,8 @@ fi
 (
     cd "$REPO_ROOT/edge"
     exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
-        --port "$EDGE_PORT" --persist-to "$WORK_DIR/edge-state"
+        --port "$EDGE_PORT" --inspector-port "$INSPECTOR_PORT" \
+        --persist-to "$WORK_DIR/edge-state"
 ) >"$LOG_DIR/edge.log" 2>&1 &
 SERVICE_PID=$!
 CHILD_PIDS+=("$SERVICE_PID")
@@ -505,10 +555,10 @@ echo "[mock-e2e] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
 # takes the route's response code as its ready signal.
 wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
     http_listening "$SCHEDULER_URL/status"
-reset_out="$(isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-    "$BIN/stow-admin" scheduler reset --yes 2>&1)" \
-    || die "stow-admin scheduler reset failed: $reset_out"
-echo "[mock-e2e] $reset_out"
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" scheduler reset --yes >"$WORK_DIR/scheduler-reset.log" 2>&1 \
+    || die "stow-admin scheduler reset failed — see $WORK_DIR/scheduler-reset.log"
+echo "[mock-e2e] $(cat "$WORK_DIR/scheduler-reset.log")"
 wait_for "edge scheduler status" "$READY_DEADLINE" "$SERVICE_PID" \
     curl -fsS "$SCHEDULER_URL/status"
 
@@ -728,10 +778,14 @@ assert_values_unchanged() { # before-map
 }
 
 # 1) Real queue tasks through the authenticated submit route: every
-# distinct base dep the consumers reference — each parked on an
-# absent `fixture-anchor-*` dep so deps_met stays 0 forever — plus
-# 520 consumers sharing them as a real DAG. Nothing fixture-side can
-# dispatch under the ordinary gate; no dispatch setting changes.
+# distinct base dep the consumers reference plus 520 consumers sharing
+# them as a real DAG. Under the in-memory graph every unpublished tree
+# node is dispatchable work, so the `fixture-anchor-*` leaves the bases
+# wait on are failed through the admin cancel route the moment the tree
+# lands — terminal failures that park every dependent `blocked` (or
+# pending behind a blocked base), the hold the old absent-dep rows had.
+# Nothing fixture-side can dispatch under the ordinary gate; no dispatch
+# setting changes.
 echo "[mock-e2e] demand feed: submitting fixture queue tasks"
 submit_code="$(curl -s -o "$LOG_DIR/submit-fixture.json" -w '%{http_code}' \
     -H "Authorization: Bearer $EDGE_BEARER" -H "Content-Type: application/json" \
@@ -739,6 +793,21 @@ submit_code="$(curl -s -o "$LOG_DIR/submit-fixture.json" -w '%{http_code}' \
     "$EDGE_URL/api/v1/scheduler/tasks/submit")"
 [ "$submit_code" -ge 200 ] && [ "$submit_code" -lt 300 ] \
     || die "fixture submit failed ($submit_code): $(cat "$LOG_DIR/submit-fixture.json")"
+cancel_out="$(curl -s -o "$LOG_DIR/cancel-anchors.json" -w '%{http_code}' \
+    -H "Authorization: Bearer $EDGE_BEARER" -H "Content-Type: application/json" \
+    -X POST --data-binary @"$FIXTURES/anchor-selector.json" \
+    "$EDGE_URL/api/v1/admin/queue/cancel")"
+[ "$cancel_out" -ge 200 ] && [ "$cancel_out" -lt 300 ] \
+    || die "anchor cancel failed ($cancel_out): $(cat "$LOG_DIR/cancel-anchors.json")"
+anchor_count="$(jq '.task_ids | length' "$FIXTURES/anchor-selector.json")"
+[ "$(jq -r '.affected' "$LOG_DIR/cancel-anchors.json")" = "$anchor_count" ] \
+    || die "anchor cancel touched $(cat "$LOG_DIR/cancel-anchors.json"), expected $anchor_count"
+# The anchors sit in `failed` for the rest of the run: every
+# `failed`-count poll below measures a delta over this baseline, never
+# the absolute.
+BASE_FAILED="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" | jq -r '.failed')"
+[ "$BASE_FAILED" = "$anchor_count" ] \
+    || die "status reports $BASE_FAILED failed tasks, expected the $anchor_count cancelled anchors"
 fixture_rows "$WORK_DIR/fixture-rows.jsonl"
 assert_fixture_rows
 jq -s 'map({key: .task_id, value: (.value | tonumber)}) | from_entries' \
@@ -758,7 +827,7 @@ expect_unfinished 2020-01-01T04 complete 3
 echo "[mock-e2e] demand feed: canonical T01/T02/T03 fill under frozen T04"
 q="$(query_count)"
 feed_out="$LOG_DIR/demand-feed-01.json"
-feed_cli "$feed_out" || die "demand-feed T01 failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T01 failed -- see $feed_out"
 [ "$(jq -r '.hour' "$feed_out")" = "2020-01-01T01" ] \
     && [ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
     || die "demand-feed T01 unexpected report: $(cat "$feed_out")"
@@ -766,7 +835,7 @@ expect_watermark 2020-01-01T01
 expect_unfinished 2020-01-01T04 complete 3
 expect_query_delta $((q + 1)) 2020-01-01T01
 feed_out="$LOG_DIR/demand-feed-02.json"
-feed_cli "$feed_out" || die "demand-feed T02 failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T02 failed -- see $feed_out"
 expect_watermark 2020-01-01T02
 expect_unfinished 2020-01-01T04 complete 3
 expect_query_delta $((q + 2)) 2020-01-01T02
@@ -774,7 +843,7 @@ expect_query_delta $((q + 2)) 2020-01-01T02
 # Explicit leap past the canonical gap refuses before any query/write.
 values_checkpoint
 feed_out="$LOG_DIR/demand-feed-04-leap.json"
-if feed_cli "$feed_out" --hour 2020-01-01T04; then
+if fg feed_cli "$feed_out" --hour 2020-01-01T04; then
     die "demand-feed T04 should refuse while T03 is the canonical cursor"
 fi
 expect_query_delta $((q + 2)) 2020-01-01T02
@@ -782,13 +851,13 @@ expect_watermark 2020-01-01T02
 assert_values_unchanged "$WORK_DIR/values-prev.json"
 
 feed_out="$LOG_DIR/demand-feed-03.json"
-feed_cli "$feed_out" || die "demand-feed T03 failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T03 failed -- see $feed_out"
 expect_watermark 2020-01-01T03
 expect_query_delta $((q + 3)) 2020-01-01T03
 
 q="$(query_count)"
 feed_out="$LOG_DIR/demand-feed-04.json"
-feed_cli "$feed_out" || die "demand-feed T04 resume failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T04 resume failed -- see $feed_out"
 [ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
     || die "demand-feed T04: expected delivered, got $(cat "$feed_out")"
 expect_watermark 2020-01-01T04
@@ -827,7 +896,7 @@ assert_values_unchanged "$WORK_DIR/values-prev.json"
 # page, queries, and fails — demand values stay put.
 q="$(query_count)"
 feed_out="$LOG_DIR/demand-feed-05-missing.json"
-if feed_cli "$feed_out"; then
+if fg feed_cli "$feed_out"; then
     die "demand-feed T05 should fail while its fixture file is absent"
 fi
 expect_query_delta $((q + 1)) 2020-01-01T05
@@ -836,7 +905,7 @@ expect_unfinished 2020-01-01T05 staging
 assert_values_unchanged "$WORK_DIR/values-prev.json"
 mv "$FIXTURES/2020-01-01T05.json" "$FIXTURES/hours/2020-01-01T05.json"
 feed_out="$LOG_DIR/demand-feed-05.json"
-feed_cli "$feed_out" || die "demand-feed T05 retry failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T05 retry failed -- see $feed_out"
 expect_watermark 2020-01-01T05
 expect_query_delta $((q + 2)) 2020-01-01T05
 
@@ -852,7 +921,7 @@ size="$(wc -c <"$valid06")"
 q="$(query_count)"
 head -c $((size / 2)) "$valid06" >"$FIXTURES/hours/2020-01-01T06.json"
 feed_out="$LOG_DIR/demand-feed-06-truncated.json"
-if feed_cli "$feed_out"; then
+if fg feed_cli "$feed_out"; then
     die "demand-feed T06 should fail on a truncated document"
 fi
 expect_query_delta $((q + 1)) 2020-01-01T06
@@ -864,7 +933,7 @@ assert_values_unchanged "$WORK_DIR/values-prev.json"
 # a genuine partial stage (exactly one page), never a freeze.
 jq '.data[300].demand = "not-a-number"' "$valid06" >"$FIXTURES/hours/2020-01-01T06.json"
 feed_out="$LOG_DIR/demand-feed-06-badrow.json"
-if feed_cli "$feed_out"; then
+if fg feed_cli "$feed_out"; then
     die "demand-feed T06 should fail on a late-invalid row"
 fi
 expect_query_delta $((q + 2)) 2020-01-01T06
@@ -876,7 +945,7 @@ assert_values_unchanged "$WORK_DIR/values-prev.json"
 # document are already staged when the mismatch fails the run.
 jq '.rows = 9999' "$valid06" >"$FIXTURES/hours/2020-01-01T06.json"
 feed_out="$LOG_DIR/demand-feed-06-rowcount.json"
-if feed_cli "$feed_out"; then
+if fg feed_cli "$feed_out"; then
     die "demand-feed T06 should fail on a declared-rows mismatch"
 fi
 expect_query_delta $((q + 3)) 2020-01-01T06
@@ -917,7 +986,7 @@ retired="$(feed_cleanup 2020-01-01T06)"
 
 cp "$valid06" "$FIXTURES/hours/2020-01-01T06.json"
 feed_out="$LOG_DIR/demand-feed-06.json"
-feed_cli "$feed_out" || die "demand-feed T06 retry failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T06 retry failed -- see $feed_out"
 expect_watermark 2020-01-01T06
 expect_query_delta $((q + 4)) 2020-01-01T06
 expect_unfinished null null
@@ -928,19 +997,19 @@ echo "[mock-e2e] demand feed: T07 + T08 empty hours"
 values_checkpoint
 q="$(query_count)"
 feed_out="$LOG_DIR/demand-feed-07.json"
-feed_cli "$feed_out" || die "demand-feed T07 failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T07 failed -- see $feed_out"
 expect_watermark 2020-01-01T07
 expect_query_delta $((q + 1)) 2020-01-01T07
 assert_values_unchanged "$WORK_DIR/values-prev.json"
 
 # Leap refusal before any query, then the canonical fill.
 feed_out="$LOG_DIR/demand-feed-09-leap.json"
-if feed_cli "$feed_out" --hour 2020-01-01T09; then
+if fg feed_cli "$feed_out" --hour 2020-01-01T09; then
     die "demand-feed T09 should refuse while T08 is canonical"
 fi
 expect_query_delta $((q + 1)) 2020-01-01T07
 feed_out="$LOG_DIR/demand-feed-08.json"
-feed_cli "$feed_out" || die "demand-feed T08 failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T08 failed -- see $feed_out"
 expect_watermark 2020-01-01T08
 expect_query_delta $((q + 2)) 2020-01-01T08
 
@@ -950,7 +1019,7 @@ cp "$FIXTURES/hours/2020-01-01T09.json" "$WORK_DIR/t09-valid.json"
 jq '.meta = [{"bogus": true}]' "$WORK_DIR/t09-valid.json" \
     >"$FIXTURES/hours/2020-01-01T09.json"
 feed_out="$LOG_DIR/demand-feed-09-broken.json"
-if feed_cli "$feed_out"; then
+if fg feed_cli "$feed_out"; then
     die "demand-feed T09 should refuse a schema-broken meta"
 fi
 expect_query_delta $((q + 3)) 2020-01-01T09
@@ -959,7 +1028,7 @@ expect_unfinished 2020-01-01T09 staging
 assert_values_unchanged "$WORK_DIR/values-prev.json"
 mv "$WORK_DIR/t09-valid.json" "$FIXTURES/hours/2020-01-01T09.json"
 feed_out="$LOG_DIR/demand-feed-09.json"
-feed_cli "$feed_out" || die "demand-feed T09 retry failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T09 retry failed -- see $feed_out"
 expect_watermark 2020-01-01T09
 expect_query_delta $((q + 4)) 2020-01-01T09
 expect_unfinished null null
@@ -991,7 +1060,7 @@ assert_all_deltas "$WORK_DIR/values-t10-before.json" "$WORK_DIR/values-t10-page0
 q="$(query_count)"
 echo 'CORRUPTED upstream document' >"$FIXTURES/hours/2020-01-01T10.json"
 feed_out="$LOG_DIR/demand-feed-10.json"
-feed_cli "$feed_out" || die "demand-feed T10 resume failed -- see $feed_out"
+fg feed_cli "$feed_out" || die "demand-feed T10 resume failed -- see $feed_out"
 [ "$(jq -r '.state' "$feed_out")" = "delivered" ] \
     && [ "$(jq -r '.staged_pages' "$feed_out")" = "0" ] \
     && [ "$(jq -r '.delivered_pages' "$feed_out")" = "2" ] \
@@ -1000,6 +1069,9 @@ expect_watermark 2020-01-01T10
 [ "$(query_count)" = "$q" ] \
     || die "frozen T10 resume must not query the (now corrupt) provider"
 values_checkpoint
+# The delivered hour's session is already expired by the resume's own
+# cleanup — the replay still answers the terminal no-op, decided from
+# the watermark the expiry leaves behind.
 reply="$(feed_post deliver <(jq -nc '{hour:"2020-01-01T10"}'))" \
     || die "T10 delivered replay must be an accepted no-op"
 echo "$reply" >>"$LOG_DIR/feed-deliver-10-first.json"
@@ -1134,7 +1206,7 @@ TASK_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
 [ -n "$TASK_VERSION" ] || die "no non-yanked itoa 1.0.x found on crates.io"
 echo "[mock-e2e] submitting $TASK_CRATE $TASK_VERSION features=$TASK_FEATURES target=$HOST_TARGET rustc=$RUSTC_VERSION"
 
-isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     "$BIN/stow-admin" submit \
     --crate-name "$TASK_CRATE" \
     --version "$TASK_VERSION" \
@@ -1152,7 +1224,7 @@ while :; do
     status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
     if [ -n "$status_json" ]; then
         completed="$(jq -r '.completed' <<<"$status_json")"
-        failed="$(jq -r '.failed' <<<"$status_json")"
+        failed="$(( $(jq -r '.failed' <<<"$status_json") - BASE_FAILED ))"
         echo "[mock-e2e] scheduler: $status_json"
         [ "$completed" -ge 1 ] && break
         [ "$failed" -ge 1 ] && die "scheduler reported the task failed: $status_json"
@@ -1166,14 +1238,14 @@ done
 # `stow check` runs. D1's catalog is a read model of the records the
 # export folds — the miss derivation reads it, so a covered graph mints
 # no admission only once the sync has landed.
-publish_slices "itoa"
+fg publish_slices "itoa"
 
 # Exercise the consumer-facing commands before `check`: refresh pulls and
 # verifies the signed slice, status reports the cached row set the
 # resolver will read.
-stow_cli index refresh >"$LOG_DIR/index-refresh.log" 2>&1 \
+fg stow_cli index refresh >"$LOG_DIR/index-refresh.log" 2>&1 \
     || die "stow index refresh failed — see $LOG_DIR/index-refresh.log"
-stow_cli index status >"$LOG_DIR/index-status.log" 2>&1 \
+fg stow_cli index status >"$LOG_DIR/index-status.log" 2>&1 \
     || die "stow index status failed — see $LOG_DIR/index-status.log"
 cat "$LOG_DIR/index-status.log"
 grep -q "target: $HOST_TARGET" "$LOG_DIR/index-status.log" \
@@ -1190,7 +1262,7 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 # sees the runs' webhook completions. walkdir carries one unix dep
 # (same-file), so the wave lands in two layers.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
-isolated_env \
+fg isolated_env \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
@@ -1264,7 +1336,7 @@ status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || tr
 completed_before=0
 [ -n "$status_json" ] && completed_before="$(jq -r '.completed' <<<"$status_json")"
 
-isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     "$BIN/stow-admin" submit \
     --crate-name "unicode-ident" \
     --version "$UNICODE_VERSION" \
@@ -1296,7 +1368,7 @@ while :; do
     status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
     if [ -n "$status_json" ]; then
         echo "[mock-e2e] scheduler (dual): $status_json"
-        [ "$(jq -r '.failed' <<<"$status_json")" -ge 1 ] \
+        [ "$(( $(jq -r '.failed' <<<"$status_json") - BASE_FAILED ))" -ge 1 ] \
             && die "scheduler failed the dual task: $status_json"
         [ "$(jq -r '.completed' <<<"$status_json")" -gt "$completed_before" ] && break
     fi
@@ -1320,18 +1392,12 @@ CONSUMER="$WORK_DIR/itoa-consumer"
 isolated_env cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new-itoa.log" 2>&1 \
     || die "cargo new failed — see $LOG_DIR/consumer-new-itoa.log"
 printf 'itoa = "=%s"\n' "$TASK_VERSION" >>"$CONSUMER/Cargo.toml"
-prepare_consumer "$CONSUMER" itoa
+fg prepare_consumer "$CONSUMER" itoa
 
-(
-    cd "$CONSUMER"
-    stow_cli check
-) >"$LOG_DIR/stow-check.log" 2>&1 \
+fg in_dir "$CONSUMER" stow_cli check >"$LOG_DIR/stow-check.log" 2>&1 \
     || die "stow check failed — see $LOG_DIR/stow-check.log"
 
-(
-    cd "$CONSUMER"
-    stow_cli status
-) >"$LOG_DIR/stow-status.log" 2>&1 \
+fg in_dir "$CONSUMER" stow_cli status >"$LOG_DIR/stow-status.log" 2>&1 \
     || die "stow status failed — see $LOG_DIR/stow-status.log"
 cat "$LOG_DIR/stow-status.log"
 
@@ -1434,7 +1500,7 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
     || die "uncovered graph minted $(jq -r 'length' <<<"$admissions") admissions: $admissions"
 jq -e '.[0].challenge | length > 0' <<<"$admissions" >/dev/null \
     || die "admission carries no PoW challenge: $admissions"
-jq -e '.[0].request.crate_name == "libc"' <<<"$admissions" >/dev/null \
+jq -e '.[0].tree.nodes[.[0].tree.roots[0]].crate_name == "libc"' <<<"$admissions" >/dev/null \
     || die "admission request does not echo the miss: $admissions"
 echo "[mock-e2e] uncovered graph: 1 admission with PoW challenge (expected)"
 
@@ -1451,7 +1517,17 @@ echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache via
 # mock public key as the signature trust (stow#774: without them the
 # coverage pull goes to the real GHCR and dies on the token exchange).
 # wasm32 is the failing task's target spelling.
-isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+#
+# The section is Linux-only: the wasm32 plan mints host-side tasks on
+# the x86_64-linux-gnu runner family, and a linux-gnu task pins
+# `-fuse-ld=mold` on its host-side links (the pin is part of the
+# compile key). mold is ELF-only — a non-Linux local CI cannot link a
+# linux-gnu task's host units, so the section is bounded to the
+# platform the release gate's `mock-e2e` job runs on. The wasm32
+# consumer repro at the end is chained on these waves' published
+# artifacts, so it skips with them.
+if [ "$(uname -s)" = "Linux" ]; then
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     "$BIN/stow-admin" --json preheat plan \
@@ -1485,8 +1561,8 @@ jq -e ".[] | select(.crate_name == \"$HOST_DEPS_CRATE\")" <<<"$plan_tasks" >/dev
     || die "plan has no $HOST_DEPS_CRATE task"
 echo "[mock-e2e] heck version resolved by the plan: $HECK_VERSION"
 
-# The demand-feed fixtures park on absent anchors for the rest of the
-# run — pending counts them forever — so the wave loop measures the
+# The demand-feed fixtures park on their failed anchors for the rest of
+# the run — pending counts them forever — so the wave loop measures the
 # batch as a delta over the status counts taken the moment before
 # submit.
 status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")" \
@@ -1495,11 +1571,20 @@ read -r base_pending base_inflight base_completed base_failed <<<"$(jq -r \
     '[.pending, .dispatched + .running, .completed, .failed] | map(tostring) | join(" ")' \
     <<<"$status_json")"
 
-submit_json="$(curl -fsS --max-time 60 -X POST "$SCHEDULER_URL/tasks/submit" \
-    -H "Authorization: Bearer $EDGE_BEARER" \
-    -H 'content-type: application/json' \
-    --data "$plan_tasks")"
-echo "[mock-e2e] host-deps submit: $submit_json"
+# The submit route takes `Vec<SubmissionTree>`, so the batch goes
+# through the trusted admin path — it resolves the same crate, target
+# and rustc and runs `SubmissionTree::from_enqueue_requests` itself.
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    "$BIN/stow-admin" submit \
+    --crate-name "$HOST_DEPS_CRATE" \
+    --version "$HOST_DEPS_VERSION" \
+    --features-json '[]' \
+    --target "$CONSUMER_TARGET" \
+    --rustc-version "$RUSTC_VERSION" \
+    --yes \
+    >"$LOG_DIR/admin-submit-host-deps.log" 2>&1 \
+    || die "stow-admin submit (host-deps) failed — see $LOG_DIR/admin-submit-host-deps.log"
+echo "[mock-e2e] host-deps submit: $(tail -3 "$LOG_DIR/admin-submit-host-deps.log")"
 
 # --- build waves --------------------------------------------------------
 #
@@ -1544,7 +1629,7 @@ while :; do
         # missed wake.
         wave=$((wave + 1))
         echo "[mock-e2e] publishing slices (host-deps wave $wave)"
-        publish_slices "host-deps-wave-$wave"
+        fg publish_slices "host-deps-wave-$wave"
         last_completed="$completed_n"
         last_publish=$SECONDS
     fi
@@ -1559,7 +1644,7 @@ echo "[mock-e2e] all $task_count host-deps tasks completed — the own-node chec
 # every CI_TARGET_TRIPLES member ends an export pass with a slice, so
 # the wasm32 tag `index refresh --target` pulls exists even though no
 # target-side node ever ran.
-publish_slices "host-deps-final"
+fg publish_slices "host-deps-final"
 
 # --- catalog assertions --------------------------------------------------
 #
@@ -1624,7 +1709,7 @@ fi
 # Nothing refreshes the host slice by hand: this lane would mask a
 # consumer that never fetches it (stow#367). `index status` asserts the
 # fetch happened once the builds ran.
-stow_cli index refresh --target "$CONSUMER_TARGET" >"$LOG_DIR/index-refresh-wasm32.log" 2>&1 \
+fg stow_cli index refresh --target "$CONSUMER_TARGET" >"$LOG_DIR/index-refresh-wasm32.log" 2>&1 \
     || die "stow index refresh ($CONSUMER_TARGET) failed — see $LOG_DIR/index-refresh-wasm32.log"
 
 # A consumer pinned to the exact versions the scheduler just built —
@@ -1640,32 +1725,26 @@ isolated_env cargo new --lib --vcs none "$CONSUMER" >"$LOG_DIR/consumer-new-snaf
 printf 'snafu-derive = "=%s"\n\n[build-dependencies]\nheck = "=%s"\n' "$HOST_DEPS_VERSION" "$HECK_VERSION" \
     >>"$CONSUMER/Cargo.toml"
 printf 'fn main() {}\n' >"$CONSUMER/build.rs"
-prepare_consumer "$CONSUMER" snafu
+fg prepare_consumer "$CONSUMER" snafu
 
 # The host slice this run already cached for itoa is still inside the
 # CLI's refresh interval, and it predates every host-deps record: both
 # consumer checks revalidate the tag's digest so they see the slices the
 # host-deps waves just published. They still fetch the slices themselves.
 # Native consumer: host units at the native invocation spelling.
-(
-    cd "$CONSUMER"
-    STOW_INDEX_REFRESH_SECS=0 stow_cli check
-) >"$LOG_DIR/stow-check-native.log" 2>&1 \
+fg consumer_check >"$LOG_DIR/stow-check-native.log" 2>&1 \
     || die "native stow check failed — see $LOG_DIR/stow-check-native.log"
 assert_served 1 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
 
 # wasm32 consumer: the production spelling — host units at the --target
 # invocation's own key. The served artifacts land in the same build's own
 # target dir, so the second check re-serves them, not re-compiles.
-(
-    cd "$CONSUMER"
-    STOW_INDEX_REFRESH_SECS=0 stow_cli check --target "$CONSUMER_TARGET"
-) >"$LOG_DIR/stow-check-wasm32.log" 2>&1 \
+fg consumer_check --target "$CONSUMER_TARGET" >"$LOG_DIR/stow-check-wasm32.log" 2>&1 \
     || die "wasm32 stow check failed — see $LOG_DIR/stow-check-wasm32.log"
 assert_served 2 "$HOST_DEPS_CRATE" heck proc-macro2 quote syn unicode-ident
 
 # The wasm32 check had to fetch the host slice itself — assert it landed.
-stow_cli index status >"$LOG_DIR/index-status-host-deps.log" 2>&1 \
+fg stow_cli index status >"$LOG_DIR/index-status-host-deps.log" 2>&1 \
     || die "stow index status failed — see $LOG_DIR/index-status-host-deps.log"
 cat "$LOG_DIR/index-status-host-deps.log"
 grep -q "target: $HOST_TARGET" "$LOG_DIR/index-status-host-deps.log" \
@@ -1674,3 +1753,6 @@ grep -q "target: $CONSUMER_TARGET" "$LOG_DIR/index-status-host-deps.log" \
     || die "index status lists no slice for $CONSUMER_TARGET"
 
 echo "[mock-e2e] OK — $HOST_DEPS_CRATE $HOST_DEPS_VERSION's host deps built as host-side nodes, gated on published shapes, and served a native and a $CONSUMER_TARGET consumer with the own-node check passing on every task"
+else
+echo "[mock-e2e] skipping stow#774 host-side node legs on $(uname -s) — linux-gnu host units need mold"
+fi

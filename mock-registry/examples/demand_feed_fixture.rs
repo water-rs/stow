@@ -2,13 +2,23 @@
 //!
 //! Writes, under the output directory given as the first argument:
 //!   enqueue.json
-//!       Vec<EnqueueRequest>: every distinct base dep the consumers
+//!       Vec<SubmissionTree>: the one tree `POST
+//!       /api/v1/scheduler/tasks/submit` takes, merged by
+//!       `SubmissionTree::from_enqueue_requests` from the
+//!       `EnqueueRequest` batch — every distinct base dep the consumers
 //!       actually reference (one per realized (target, rustc,
 //!       host-side) combination) plus 520 consumers sharing them as a
-//!       real DAG. Every base itself waits on a `fixture-anchor-*`
-//!       identity that is never enqueued — a legitimate unresolved
-//!       dependency, so every base and consumer holds `deps_met`=0 and
-//!       nothing in the fixture can dispatch under the ordinary gate.
+//!       real DAG. Every base waits on a `fixture-anchor-*` node whose
+//!       build can never succeed — under the in-memory graph every
+//!       unpublished tree node is dispatchable work, so the harness
+//!       cancels the anchors right after the submit: their terminal
+//!       failure parks every dependent `blocked` (the base rows) or
+//!       `pending` behind them (the consumers), and nothing in the
+//!       fixture can dispatch under the ordinary gate.
+//!   anchor-selector.json
+//!       The typed `QueueSelector` naming every `fixture-anchor-*`
+//!       task id — the body the harness POSTs to
+//!       `/api/v1/admin/queue/cancel` to fail the anchors.
 //!   expectations.json
 //!       Per submitted task: `{task_id, crate_name, expected_delta}` —
 //!       the demand delta each queue row must show after every
@@ -37,7 +47,8 @@ use std::path::PathBuf;
 use stow_types::api::{
     DEMAND_FEED_BATCH_PREFIX, DemandFeedCompleteRequest, DemandFeedHour, DemandFeedPageBuilder,
     DemandFeedPageRequest, EnqueueRequest, EnqueueSource, QueueSelector, SchedulerDemandEntry,
-    SchedulerDemandRequest, demand_feed_manifest, demand_feed_page_hash,
+    SchedulerDemandRequest, SubmissionSource, SubmissionTree, demand_feed_manifest,
+    demand_feed_page_hash,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
 
@@ -402,9 +413,28 @@ fn main() {
         .map(|(index, combo)| base_dep_request(index, *combo))
         .collect();
     enqueues.extend((0..CONSUMERS).map(|n| enqueue_request(n, &combos)));
+    // The tree merge every submitter runs at its submission boundary —
+    // the anchor deps arrive as real nodes, so the harness fails them
+    // itself through the admin cancel route (see anchor-selector.json).
+    let tree = SubmissionTree::from_enqueue_requests(SubmissionSource::CacheMiss, &enqueues)
+        .expect("fixture submission tree");
+    let anchor_ids: Vec<String> = tree
+        .nodes
+        .iter()
+        .filter(|node| node.crate_name.as_str().starts_with("fixture-anchor-"))
+        .map(|node| node.task_id.clone())
+        .collect();
     write_json(
         &out.join("enqueue.json"),
-        &serde_json::to_value(&enqueues).expect("enqueue bodies"),
+        &serde_json::to_value(&[tree]).expect("submission body"),
+    );
+    write_json(
+        &out.join("anchor-selector.json"),
+        &serde_json::to_value(&QueueSelector {
+            task_ids: anchor_ids,
+            ..QueueSelector::default()
+        })
+        .expect("anchor selector"),
     );
 
     // Provider documents for the CLI-materialize legs: T01 carries

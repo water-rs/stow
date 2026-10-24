@@ -31,7 +31,12 @@ scripts/mock-e2e.sh
 ```
 
 The script prints its log directory at the end and dumps every log on
-failure. CI runs it in the release gate (`mock-e2e` in
+failure. Every port it binds is an environment override —
+`STOW_E2E_EDGE_PORT`, `STOW_E2E_INSPECTOR_PORT`,
+`STOW_E2E_REGISTRY_PORT`, `STOW_E2E_LOCAL_CI_PORT` — with the recipe's
+values as defaults, so a second run can share the machine by shifting
+the set (the edge bundle's loopback URLs are rendered to match at
+`skyzen build` time). CI runs it in the release gate (`mock-e2e` in
 `.github/workflows/release-gate.yml`) — on demand, nightly on `dev`,
 and on every pull request and merge group into `main` — which is what
 keeps the trusted build path — dispatch → build → publish → CLI cache
