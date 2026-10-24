@@ -29,13 +29,15 @@
 #   6. `stow-admin preheat cost report` reads the probe ledger snapshots
 #      taken at every lane and round boundary, the local CI's runs and
 #      the final published slices, writes
-#      $WORK_DIR/preheat-cost-report.json and fails on any check: wave or
-#      resubmit total over the preheat budget (types/src/do_budgets.rs),
+#      $WORK_DIR/preheat-cost-report.json and fails on any check:
 #      per-event cost growing first → last layer past the stow#433
 #      tolerance, a fixed-size event over its drive budget, a node
 #      dispatched before its dependencies were published, a submitted
 #      node never published, an `overloaded` answer, a failed submit, or
-#      a resubmit that rebuilt anything
+#      a resubmit that rebuilt anything. The wave and resubmit totals it
+#      reports are bounded by the monthly projection — scaled to the
+#      production wave's node count against the preheat budget
+#      (types/src/do_budgets.rs)
 #
 # The monthly projection (`stow-admin traffic-cost project`, the release
 # gate's `Monthly projection` job) also needs the production wave's node
