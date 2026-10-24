@@ -443,15 +443,16 @@ type RowsByIdentity = BTreeMap<(String, UnitShape, DependencyIdentity), Artifact
 /// `(c_metadata, unit_shape, dependency_identity)` key — a rebuilt unit
 /// replaces its node's row, a second node publishing the same unit adds
 /// a row beside it.
-fn fold_row(rows: &mut RowsByIdentity, row: ArtifactIndexRow) {
+fn fold_row(rows: &mut RowsByIdentity, row: ArtifactIndexRow) -> stow_types::error::Result<()> {
     rows.insert(
         (
             row.c_metadata.as_str().to_owned(),
             row.unit_shape,
-            row.dependency_identity.clone(),
+            row.dependency_identity()?,
         ),
         row,
     );
+    Ok(())
 }
 
 /// The `(target, rustc)` an `index.*` tag names — the same suffix shape
@@ -557,7 +558,7 @@ where
             let key = (record.target.clone(), record.rustc_version.clone());
             named.insert(key.clone());
             let row = record_to_index_row(record);
-            fold_row(new_rows.entry(key).or_default(), row);
+            fold_row(new_rows.entry(key).or_default(), row)?;
         }
         for key in named {
             new_folded.entry(key).or_default().insert((*tag).to_owned());
@@ -592,22 +593,18 @@ fn merge_exports(
     let published: BTreeSet<(TargetTriple, WireRustcVersion)> = prev.keys().cloned().collect();
     let mut push_slice = |key: &(TargetTriple, WireRustcVersion)| {
         let prev_slice = prev.remove(key);
-        let mut merged: RowsByIdentity = prev_slice
-            .as_ref()
-            .map(|slice| {
-                let mut rows = RowsByIdentity::new();
-                for row in &slice.index.rows {
-                    fold_row(&mut rows, row.clone());
-                }
-                rows
-            })
-            .unwrap_or_default();
+        let mut merged = RowsByIdentity::new();
+        if let Some(slice) = prev_slice.as_ref() {
+            for row in &slice.index.rows {
+                fold_row(&mut merged, row.clone())?;
+            }
+        }
         // New rows fold on top of the slice's own: a re-run task
         // rebuilding the same unit under the same node replaces its
         // row, and the sibling rule holds across the pass boundary.
         if let Some(rows) = new_rows.get(key) {
             for row in rows.values() {
-                fold_row(&mut merged, row.clone());
+                fold_row(&mut merged, row.clone())?;
             }
         }
         let mut folded: BTreeSet<String> = prev_slice
@@ -623,14 +620,15 @@ fn merge_exports(
             folded.into_iter().collect(),
             prev_slice,
         ));
+        Ok::<(), stow_types::error::Error>(())
     };
     // A slice appears once whether rows, marks, or both routed to it;
     // the sort below makes iteration order moot.
     for key in new_rows.keys() {
-        push_slice(key);
+        push_slice(key)?;
     }
     for key in new_folded.keys().filter(|key| !new_rows.contains_key(*key)) {
-        push_slice(key);
+        push_slice(key)?;
     }
     // A CI target the pass has no slice for at all — nothing routed to
     // it and no published pair to extend — still emits: consumers fetch
@@ -649,7 +647,7 @@ fn merge_exports(
             && !new_folded.contains_key(&key)
             && !published.contains(&key)
         {
-            push_slice(&key);
+            push_slice(&key)?;
         }
     }
     slices.sort_by(|(a, _, _, _), (b, _, _, _)| a.cmp(b));
@@ -847,7 +845,7 @@ async fn read_prev_sidecar(
 /// publishes in the index but a baseline host cannot load it, so it
 /// releases no dependent — the same rule the catalog's coverage oracle
 /// applies (stow#336).
-fn semantic_rows(index: &ArtifactIndex) -> Vec<PublishedSliceRow> {
+fn semantic_rows(index: &ArtifactIndex) -> stow_types::error::Result<Vec<PublishedSliceRow>> {
     let mut seen = std::collections::BTreeSet::new();
     index
         .rows
@@ -856,14 +854,17 @@ fn semantic_rows(index: &ArtifactIndex) -> Vec<PublishedSliceRow> {
             row.min_glibc
                 .is_none_or(|floor| floor <= stow_types::glibc::GLIBC_BASELINE)
         })
-        .map(|row| PublishedSliceRow {
-            crate_name: row.crate_name.clone(),
-            version: row.version.clone(),
-            features_json: row.features_json.clone(),
-            unit_shape: row.unit_shape,
-            dependency_identity: row.dependency_identity.clone(),
+        .map(|row| {
+            Ok(PublishedSliceRow {
+                crate_name: row.crate_name.clone(),
+                version: row.version.clone(),
+                features_json: row.features_json.clone(),
+                unit_shape: row.unit_shape,
+                dependency_identity: row.dependency_identity()?,
+            })
         })
         .filter(|row| {
+            let Ok(row) = row else { return true };
             seen.insert((
                 row.crate_name.as_str().to_owned(),
                 row.version.to_string(),
@@ -983,7 +984,7 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
         .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
     let target = index.header.target.clone();
     let rustc_version = index.header.rustc_version.clone();
-    let rows = semantic_rows(&index);
+    let rows = semantic_rows(&index)?;
 
     // The delta base is the `.prev` sidecar `index export` captured
     // while the tag still named the previous index — resolved exactly,
@@ -995,7 +996,7 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
     let (base_generation, added, retired) = if args.full {
         (None, rows.clone(), Vec::new())
     } else if let Some(prev) = read_prev_sidecar(&args.file, index.header.generation).await? {
-        let prev_rows = semantic_rows(&prev);
+        let prev_rows = semantic_rows(&prev)?;
         let current: std::collections::BTreeSet<_> = rows.iter().map(row_key).collect();
         let previous: std::collections::BTreeSet<_> = prev_rows.iter().map(row_key).collect();
         let added: Vec<PublishedSliceRow> = rows
@@ -1355,8 +1356,7 @@ mod tests {
     fn record(task_id: &str) -> ArtifactRecord {
         let c_metadata = CMetadata::parse(task_id).expect("c_metadata");
         ArtifactRecord {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("fixture leaf"),
+            dependency_task_ids: Vec::new(),
             compile_key: format!("key-{task_id}"),
             c_metadata,
             extra_filename: String::new(),
@@ -1829,9 +1829,7 @@ mod tests {
     /// nodes differing only in context compile to the same unit.
     fn shared_unit_record(deps: &[&str]) -> ArtifactRecord {
         let mut record = record("aaaa1111");
-        record.dependency_identity =
-            stow_types::identity::DependencyIdentity::from_task_ids(deps.iter().copied())
-                .expect("dependency identity");
+        record.dependency_task_ids = deps.iter().map(|dep| (*dep).to_owned()).collect();
         record
     }
 
@@ -1873,13 +1871,16 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let identities: Vec<_> = rows
             .iter()
-            .map(|row| row.dependency_identity.clone())
+            .map(|row| row.dependency_identity().expect("row digest"))
             .collect();
         assert_eq!(
             identities.iter().collect::<BTreeSet<_>>(),
-            [&left.dependency_identity, &right.dependency_identity]
-                .into_iter()
-                .collect(),
+            [
+                left.dependency_identity().expect("record digest"),
+                right.dependency_identity().expect("record digest"),
+            ]
+            .iter()
+            .collect::<BTreeSet<_>>(),
             "both nodes keep a row"
         );
         assert!(
@@ -1929,14 +1930,14 @@ mod tests {
         let left = record_to_index_row(&shared_unit_record(&["dep-left"]));
         let right = record_to_index_row(&shared_unit_record(&["dep-right"]));
         let index = prev_index(vec![left.clone(), right.clone()], 3);
-        let rows = semantic_rows(&index);
+        let rows = semantic_rows(&index).expect("semantic rows");
         assert_eq!(rows.len(), 2);
         let identities: BTreeSet<_> = rows
             .iter()
             .map(|row| row.dependency_identity.clone())
             .collect();
-        assert!(identities.contains(&left.dependency_identity));
-        assert!(identities.contains(&right.dependency_identity));
+        assert!(identities.contains(&left.dependency_identity().expect("row digest")));
+        assert!(identities.contains(&right.dependency_identity().expect("row digest")));
     }
 
     /// The publish delta already diffs on the dependency identity: a
@@ -1947,9 +1948,9 @@ mod tests {
     fn a_second_nodes_row_reports_as_a_pure_addition() {
         let left = record_to_index_row(&shared_unit_record(&["dep-left"]));
         let right = record_to_index_row(&shared_unit_record(&["dep-right"]));
-        let right_identity = right.dependency_identity.clone();
-        let previous = semantic_rows(&prev_index(vec![left.clone()], 7));
-        let current = semantic_rows(&prev_index(vec![left, right], 8));
+        let right_identity = right.dependency_identity().expect("row digest");
+        let previous = semantic_rows(&prev_index(vec![left.clone()], 7)).expect("semantic rows");
+        let current = semantic_rows(&prev_index(vec![left, right], 8)).expect("semantic rows");
         assert_eq!(previous.len(), 1);
         assert_eq!(current.len(), 2);
         let current_keys: std::collections::BTreeSet<_> = current.iter().map(row_key).collect();

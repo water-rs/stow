@@ -652,8 +652,7 @@ mod tests {
         side: UnitSide,
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity"),
+            dependency_task_ids: Vec::new(),
             crate_name: CrateName::parse(name).unwrap(),
             version: CrateVersion::new(semver::Version::parse(version).unwrap()),
             features_json: FeaturesJson::canonicalize(

@@ -233,7 +233,7 @@ pub fn record_to_index_row(record: &ArtifactRecord) -> ArtifactIndexRow {
         version: record.version.clone(),
         features_json: record.features_json.clone(),
         dependency_c_metadata_json: record.dependency_c_metadata_json.clone(),
-        dependency_identity: record.dependency_identity.clone(),
+        dependency_task_ids: record.dependency_task_ids.clone(),
         c_metadata: record.c_metadata.clone(),
         compile_key: record.compile_key.clone(),
         bundle_digest: record.bundle_digest.clone(),

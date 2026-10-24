@@ -28,7 +28,7 @@ use crate::object_arch::{self, ExpectedArch};
 pub async fn build_upload_plan(
     scanned: &[ScannedArtifact],
     consumed: &[ConsumedArtifact],
-    dependency_identity: &stow_types::identity::DependencyIdentity,
+    dependency_task_ids: &[String],
 ) -> stow_types::error::Result<Vec<PlannedArtifact>> {
     validate_dependency_graph(scanned, consumed)?;
     let mut plans_by_compile_key =
@@ -65,7 +65,7 @@ pub async fn build_upload_plan(
         // another machine produced them (stow#708).
         let expected = expected_object_arch(artifact)?;
         let plan = PlannedArtifact {
-            dependency_identity: dependency_identity.clone(),
+            dependency_task_ids: dependency_task_ids.to_vec(),
             compile_key: artifact.captured_compile_key.clone(),
             crate_name,
             crate_version: crate_version_typed,
@@ -608,13 +608,12 @@ mod tests {
         ParsedFileKind, ScannedArtifact, ScannedArtifactDependency, ScannedArtifactOutput,
     };
     use stow_types::artifact::{ArtifactKind, RustCrateType};
-    use stow_types::identity::DependencyIdentity;
     use stow_types::platform::{PanicStrategy, Profile};
 
-    /// The leaf digest — these tests assert plan assembly, not the
+    /// The leaf preimage — these tests assert plan assembly, not the
     /// build-stage context verification that feeds the real value in.
-    fn dependency_identity() -> DependencyIdentity {
-        DependencyIdentity::leaf().expect("leaf digest")
+    fn dependency_task_ids() -> Vec<String> {
+        Vec::new()
     }
 
     #[tokio::test]
@@ -636,7 +635,7 @@ mod tests {
             "[\"default\",\"derive\",\"serde_derive\",\"std\"]".to_owned();
         let scanned = vec![serde_artifact];
 
-        let planned = build_upload_plan(&scanned, &[], &dependency_identity())
+        let planned = build_upload_plan(&scanned, &[], &dependency_task_ids())
             .await
             .expect("build upload plan");
         let plan = planned.first().expect("planned artifact");
@@ -671,7 +670,7 @@ mod tests {
             scanned_bitflags_artifact("dba7ec857b47436d", stable_output_path.clone(), 29),
         ];
 
-        let planned = build_upload_plan(&scanned, &[], &dependency_identity())
+        let planned = build_upload_plan(&scanned, &[], &dependency_task_ids())
             .await
             .expect("build upload plan");
 
@@ -796,7 +795,7 @@ mod tests {
             rand_core,
         ];
 
-        let planned = build_upload_plan(&scanned, &[], &dependency_identity())
+        let planned = build_upload_plan(&scanned, &[], &dependency_task_ids())
             .await
             .expect("build upload plan");
         let rand_core = planned
@@ -861,13 +860,13 @@ mod tests {
             rustc_version: "1.91.1".to_owned(),
             emit: vec!["link".to_owned()],
         }];
-        build_upload_plan(&scanned, &served, &dependency_identity())
+        build_upload_plan(&scanned, &served, &dependency_task_ids())
             .await
             .expect("consumed dependency resolves the plan");
 
         let mut mismatched = served.clone();
         mismatched[0].c_metadata = "ffffffffffffffff".to_owned();
-        let error = build_upload_plan(&scanned, &mismatched, &dependency_identity())
+        let error = build_upload_plan(&scanned, &mismatched, &dependency_task_ids())
             .await
             .expect_err("an identity the claim does not carry must not satisfy the edge");
         assert!(
@@ -917,7 +916,7 @@ mod tests {
             original_out_dir: out_dir,
         });
 
-        let error = build_upload_plan(&[artifact], &[], &dependency_identity())
+        let error = build_upload_plan(&[artifact], &[], &dependency_task_ids())
             .await
             .expect_err("an x86-64 object must not publish under an arm64 task");
         let message = error.to_string();
