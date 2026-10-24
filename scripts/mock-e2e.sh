@@ -723,10 +723,10 @@ fixture_rows() { # out-file: one merged JSON array of QueueTask rows
         jq -c '.[]' "$WORK_DIR/queue-part-$chunk.json" >>"$out"
     done
 }
-# task_id -> value map for the fixture set.
+# task_id -> folded demand map for the fixture set.
 fixture_values() { # out-file: {task_id: number}
     fixture_rows "$WORK_DIR/fixture-rows.jsonl"
-    jq -s 'map({key: .task_id, value: (.value | tonumber)}) | from_entries' \
+    jq -s 'map({key: .task_id, value: .demand}) | from_entries' \
         "$WORK_DIR/fixture-rows.jsonl" >"$1"
 }
 # Assert the whole fixture set: every expected task present exactly
@@ -810,7 +810,7 @@ BASE_FAILED="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" | jq -r '.failed'
     || die "status reports $BASE_FAILED failed tasks, expected the $anchor_count cancelled anchors"
 fixture_rows "$WORK_DIR/fixture-rows.jsonl"
 assert_fixture_rows
-jq -s 'map({key: .task_id, value: (.value | tonumber)}) | from_entries' \
+jq -s 'map({key: .task_id, value: .demand}) | from_entries' \
     "$WORK_DIR/fixture-rows.jsonl" >"$WORK_DIR/values-init.json"
 
 # 5) Bootstrap gap scenario: freeze future T04 (3 pages) AND T00 with

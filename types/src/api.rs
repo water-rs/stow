@@ -2794,6 +2794,9 @@ pub struct QueueTask {
     /// Carried as text so a listing never loses precision however the
     /// operand's units evolve.
     pub value: String,
+    /// The demand the hourly feed has folded into the node. It does
+    /// not enter the rank.
+    pub demand: i64,
 }
 
 /// One in-flight (dispatched/running) queue row in [`AdminStatus`].

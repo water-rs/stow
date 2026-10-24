@@ -2778,6 +2778,7 @@ impl Graph {
                     blocked_by: self.blocked_by(ix),
                     host_side: node.flags.host(),
                     value: self.operand_of(ix).to_string(),
+                    demand: state.demand,
                 })
             })
             .collect()
