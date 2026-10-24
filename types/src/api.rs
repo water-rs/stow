@@ -840,11 +840,11 @@ pub struct EnqueueAdmission {
     /// `/enqueue` to accept the ticket. `0` means the queue is shallow
     /// enough that admission is free.
     pub difficulty: u32,
-    /// The canonical enqueue request this admission authorizes. The edge is
-    /// stateless: the client echoes `request` back in its ticket and
-    /// `/api/v1/enqueue` forwards it to the scheduler after verifying the
-    /// challenge binds it.
-    pub request: EnqueueRequest,
+    /// The submission tree this admission authorizes (stow#878). The
+    /// edge is stateless: the client echoes `tree` back in its ticket
+    /// and `/api/v1/enqueue` forwards it to the scheduler after
+    /// verifying the challenge binds it.
+    pub tree: SubmissionTree,
 }
 
 /// Request body for `POST /api/v1/enqueue`: the redemption of an
@@ -859,10 +859,10 @@ pub struct EnqueueTicket {
     /// `blake3(task_id ‖ challenge ‖ nonce)` has at least the required
     /// number of leading zero bits.
     pub nonce: u64,
-    /// The canonical enqueue request from the admission. The edge
-    /// recomputes the challenge HMAC over this payload and forwards it to
-    /// the scheduler — no server-side request lookup.
-    pub request: EnqueueRequest,
+    /// The submission tree from the admission (stow#878). The edge
+    /// recomputes the challenge HMAC over this payload and forwards it
+    /// to the scheduler — no server-side tree lookup.
+    pub tree: SubmissionTree,
 }
 
 /// Request body for `POST /api/v1/build-report`: the install's usage
@@ -1683,8 +1683,9 @@ pub enum RequestOutcome {
     /// target's closure — forwarded to the trusted enqueue verbatim —
     /// plus the per-target root facts in [`CI_TARGET_TRIPLES`] order.
     Resolved {
-        /// The uncovered human-lane tasks across every target's closure.
-        tasks: Vec<EnqueueRequest>,
+        /// The uncovered human-lane dependency trees across every
+        /// target's closure (stow#878) — one tree per source graph.
+        trees: Vec<SubmissionTree>,
         /// Per-target root facts in [`CI_TARGET_TRIPLES`] order.
         roots: Vec<RequestRootOutcome>,
     },
@@ -1948,41 +1949,19 @@ pub struct SchedulerSeedRequest {
     /// Queue rows to seed; absent means the production-shaped 100k.
     #[serde(default)]
     pub queue_rows: Option<u32>,
-    /// Clear the seeded tables first — the probe re-runs against a
-    /// persistent local DO store without an operator cleanup in between.
-    /// Restarting clears chunk by chunk, so the first `reset` call only
-    /// begins the wipe; keep calling until `done`.
-    #[serde(default)]
-    pub reset: Option<bool>,
-    /// Rows one call may seed at most; absent means the server's
-    /// bounded default.
-    #[serde(default)]
-    pub batch: Option<u32>,
 }
 
-/// What the seed reports back. A request carries one chunk of work, so
-/// the caller loops until `done` — `seeded` says whether this call
-/// wrote fixture rows, and `(phase, n)` is its progress witness.
+/// What the seed reports back: the graph the call built, snapshotted
+/// and installed. One call seeds the whole fixture — the store wipe,
+/// the snapshot chunks and the log tail run inside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerSeedReport {
-    /// Rows `queue` holds now.
-    pub queue_rows: u64,
-    /// Rows `queue_dependencies` holds now.
-    pub dependency_rows: u64,
-    /// Rows `published_slice_rows` holds now.
-    pub slice_rows: u64,
-    /// Whether this call wrote fixture rows (false once the seed is
-    /// already `done` and no `reset` was passed).
-    pub seeded: bool,
-    /// Whether the fixture is fully seeded (or was already populated).
-    pub done: bool,
-    /// The seed cursor's phase after this call (`queue`, `edges_*`,
-    /// `nodes`, `slices`, `deps`, `feed_*`, `reset`, `done`) — with
-    /// `n`, the caller's progress witness: a call that returns the same
-    /// `(phase, n)` twice advanced nothing.
-    pub phase: String,
-    /// The phase's position after this call.
-    pub n: u64,
+    /// Nodes the graph holds now.
+    pub nodes: u64,
+    /// Dependency edges the graph holds now.
+    pub edges: u64,
+    /// Published identities the graph holds now.
+    pub published: u64,
 }
 
 /// One statement's real Durable Object cursor counters — the units
@@ -2757,10 +2736,6 @@ pub struct DemandFeedUnfinished {
 pub const DEMAND_FEED_PAGE_MAX_ENTRIES: usize = 256;
 /// Serialized `entries` byte ceiling per page.
 pub const DEMAND_FEED_PAGE_MAX_BYTES: usize = 512 * 1024;
-/// Page rows one `cleanup` call physically retires — payload
-/// retirement is bounded indexed event work, never a one-statement
-/// wipe of a huge hour (stow#523).
-pub const DEMAND_FEED_RETIRE_CHUNK: i64 = 256;
 /// `batch_id` prefix the feed derives per page —
 /// `demand-feed/{hour}/{page_no}` — so a page's delivery replays the
 /// same frozen payload under a stable identity.
@@ -2791,8 +2766,6 @@ pub struct QueueTask {
     pub error: String,
     /// crates.io download count captured at enqueue time.
     pub downloads: u64,
-    /// Cache misses this row is responsible for.
-    pub miss_count: u32,
     /// Dispatches attempted against this row.
     pub dispatch_attempts: u32,
     /// Whether the row builds against its checked-in lockfile.
@@ -2929,10 +2902,10 @@ pub struct SubmitTaskIdsRequest {
 pub struct SubmitTaskIdsResponse {
     /// Ids accepted for submission.
     pub submitted: u32,
-    /// Brand-new queue rows inserted; the rest of `submitted` updated or
-    /// merged into existing rows.
+    /// Ids the graph held and promoted in place (this lane creates no
+    /// node).
     pub inserted: u32,
-    /// Ids the node store does not hold — reported, never re-minted.
+    /// Ids the graph does not hold — reported, never re-minted.
     pub unknown: Vec<String>,
 }
 
@@ -3522,6 +3495,72 @@ pub struct SubmissionTree {
     pub nodes: Vec<SubmissionNode>,
 }
 
+impl SubmissionTree {
+    /// One dependency tree from an enqueue batch — the converter every
+    /// submitter runs at its submission boundary: each request's own
+    /// resolved subgraph unfolds into `nodes`, unioned by task id, and
+    /// `deps` re-point at tree indexes. Nodes a request names only as
+    /// dependencies (already published) still enter the tree so their
+    /// edges carry a real node; `roots` keeps one index per request,
+    /// in request order.
+    ///
+    /// # Errors
+    /// `Error` when a request's subgraph cannot resolve or a dep index
+    /// is unmapped — resolver bugs, never accepted data.
+    pub fn from_enqueue_requests(
+        source: SubmissionSource,
+        requests: &[EnqueueRequest],
+    ) -> crate::error::Result<Self> {
+        let mut nodes = Vec::new();
+        let mut index = std::collections::HashMap::new();
+        let mut roots = Vec::with_capacity(requests.len());
+        for request in requests {
+            let graph = request.resolved_dependency_graph()?;
+            let graph_nodes = graph.nodes();
+            let mut map = vec![0u32; graph_nodes.len()];
+            for (ix, node) in graph_nodes.iter().enumerate() {
+                let dependency_identity =
+                    graph.dependency_identity(ix).cloned().ok_or_else(|| {
+                        stow_error!("resolved dependency graph yields no digest for node {ix}")
+                    })?;
+                let task_id = node.identity.task_id(&dependency_identity);
+                if let Some(&existing) = index.get(&task_id) {
+                    map[ix] = existing;
+                    continue;
+                }
+                let next = u32::try_from(nodes.len())
+                    .map_err(|_| stow_error!("submission node count overflows u32"))?;
+                index.insert(task_id.clone(), next);
+                map[ix] = next;
+                nodes.push(SubmissionNode {
+                    task_id,
+                    crate_name: node.identity.crate_name.clone(),
+                    version: node.identity.version.clone(),
+                    features_json: node.identity.features_json.clone(),
+                    target: node.identity.target.clone(),
+                    rustc_version: node.identity.rustc_version.clone(),
+                    host_side: node.identity.host_side,
+                    explicit_spelling: node.explicit_spelling,
+                    preserve_lockfile: request.preserve_lockfile && ix == 0,
+                    dependency_identity,
+                    deps: Vec::new(),
+                    downloads: if ix == 0 { request.downloads } else { 0 },
+                });
+            }
+            for (ix, node) in graph_nodes.iter().enumerate() {
+                nodes[map[ix] as usize].deps =
+                    node.dependencies.iter().map(|&dep| map[dep]).collect();
+            }
+            roots.push(map[0]);
+        }
+        Ok(Self {
+            source,
+            roots,
+            nodes,
+        })
+    }
+}
+
 /// One dispatch pass's claim on one task.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct DispatchClaim {
@@ -3602,6 +3641,51 @@ pub enum RequestEvent {
         /// The failure reason (present when failed).
         error: Option<String>,
     },
+}
+
+/// One `Feed` event's payload — the `demand_feed_hours` /
+/// `demand_feed_pages` rows' lifecycle (stow#878 stage 7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FeedEvent {
+    /// `feed_begin`: open a staging generation (or rotate an abandoned
+    /// one — the monotonically bumped generation is the attempt's id).
+    Begin {
+        /// The generation stamp.
+        generation: i64,
+    },
+    /// `feed_page`: one staged page — the wire request's bounded entry
+    /// list, carried verbatim so replay restages it.
+    Page {
+        /// The generation the page lands under.
+        generation: i64,
+        /// In-order page number (`= staged_pages`).
+        page_no: u32,
+        /// The page's demand contributions.
+        entries: Vec<SchedulerDemandEntry>,
+    },
+    /// `feed_complete`: the staged manifest verified — the hour
+    /// accepts for delivery.
+    Complete {
+        /// The generation being accepted.
+        generation: i64,
+    },
+    /// `feed_deliver`: one staged page's `Demand` batch acknowledged
+    /// — `applied_pages` advances; the fold itself rides the paired
+    /// `Demand` event.
+    ApplyPage {
+        /// The page this ack covered.
+        page_no: u32,
+    },
+    /// `feed_deliver`: the terminal transition — `applied_pages ==
+    /// page_count`, the hour becomes the new watermark.
+    Deliver {
+        /// The generation being delivered.
+        generation: i64,
+    },
+    /// `feed_cleanup` expiry — the session is retired; a staging
+    /// session's pages go with it.
+    Expire,
 }
 
 /// One accepted event in the scheduler's flat append-only log (stow#878).
@@ -3690,6 +3774,12 @@ pub enum SchedulerEvent {
         /// The tasks it applied to.
         task_ids: Vec<String>,
     },
+    /// A submit-by-id promotion: the missed lane re-requests tasks the
+    /// graph already holds, raising their downloads and priority.
+    SubmitIds {
+        /// The promoted tasks.
+        entries: Vec<SubmitTaskIdEntry>,
+    },
     /// A human request lane lifecycle step.
     Request {
         /// The record the step applies to.
@@ -3701,21 +3791,35 @@ pub enum SchedulerEvent {
     Demand {
         /// The batch's durable identity (replays dedupe on it).
         batch_id: String,
+        /// The canonical fingerprint the replay guard compares —
+        /// the `demand_batches` row's `input_hash` (stow#878 stage 7).
+        input_hash: String,
         /// The folded contributions.
         entries: Vec<DemandEntry>,
+    },
+    /// One demand-feed hour's lifecycle step — staging, completion,
+    /// delivery and expiry replay identically (stow#878 stage 7).
+    Feed {
+        /// The hour the step belongs to (`YYYY-MM-DDTHH`).
+        hour: String,
+        /// The step.
+        kind: FeedEvent,
     },
     /// The dispatch freeze's transition record (`None` = cleared).
     Freeze {
         /// The serialized record while engaged.
         record: Option<Box<crate::api::DispatchFreezeRecord>>,
-    },
-    /// The admission floor the operator reset stamped.
-    Floor {
-        /// `min_dispatch_value`.
-        value: i64,
+        /// When the transition happened — the log carries it so the
+        /// transition history survives a cleared record (stow#878).
+        at: String,
+        /// What triggered it — on clears it echoes the cleared
+        /// record's trigger for the history read.
+        trigger: crate::api::DispatchFreezeTrigger,
     },
     /// One successful build's claim-to-completion duration — folded
-    /// into the per-(crate, target) expected-cost stats.
+    /// into the per-(crate, target) expected-cost stats (decision Q7:
+    /// the samples stay graph state; #879 decides whether the rank
+    /// reads them).
     BuildSample {
         /// The built crate.
         crate_name: CrateName,

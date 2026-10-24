@@ -986,7 +986,7 @@ mod tests {
     }
 
     /// A three-layer chain a → b → c, one build run per node:
-    /// each layer runs 10 events per kind and one completion at 20 rows
+    /// each layer runs 10 events per kind and one completion at 2 rows
     /// each; `completion_growth` adds that many reads to each later
     /// layer's completion in total.
     fn chain(completion_growth: u64) -> WaveObservations {
@@ -1016,13 +1016,13 @@ mod tests {
         let start = snapshot(0, SchedulerLedger::default());
         let rounds: Vec<Round> = (1..=3u64)
             .map(|layer| Round {
-                before_report: snapshot(layer * 100 - 10, ledger(layer * 10, layer - 1, 20, 0)),
+                before_report: snapshot(layer * 100 - 10, ledger(layer * 10, layer - 1, 2, 0)),
                 end: snapshot(
                     layer * 100,
                     ledger(
                         layer * 10,
                         layer,
-                        20,
+                        2,
                         completion_growth * (layer - 1) * layer / 2,
                     ),
                 ),
@@ -1039,7 +1039,7 @@ mod tests {
             inserted_edges: 2,
             submit_failures: vec![],
             before: start.clone(),
-            after: snapshot(5, ledger(1, 0, 20, 0)),
+            after: snapshot(5, ledger(1, 0, 2, 0)),
         };
         WaveObservations {
             rustc_version: "1.99.1".to_owned(),
@@ -1163,7 +1163,7 @@ mod tests {
 
     #[test]
     fn a_ledger_that_went_backwards_is_refused() {
-        assert!(ledger_delta(&ledger(10, 1, 20, 0), &ledger(5, 1, 20, 0)).is_err());
+        assert!(ledger_delta(&ledger(10, 1, 2, 0), &ledger(5, 1, 2, 0)).is_err());
     }
 
     #[test]

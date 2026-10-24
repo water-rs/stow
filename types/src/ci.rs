@@ -138,6 +138,10 @@ pub fn family_of_task_id(task_id: &str) -> Option<RunnerFamily> {
 pub struct CiRunListing {
     /// The Actions run id.
     pub workflow_run_id: u64,
+    /// The run's `display_title` — `<rustc>-<task_id>` for stow's own
+    /// dispatches; the post-wake reconcile binds unbound claims by it
+    /// (stow#878, review Q6).
+    pub title: String,
     /// The family its run-name attributed.
     pub family: Option<RunnerFamily>,
 }
@@ -376,6 +380,7 @@ impl<T: CiTransport> CiInterface<T> {
                     }
                     CiRunListing {
                         workflow_run_id: run.id,
+                        title: run.display_title.clone(),
                         family,
                     }
                 }));
