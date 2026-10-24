@@ -4,10 +4,10 @@
 //! minted on the edge: the App's private key PEM is converted to PKCS#8
 //! DER, wrapped in an RS256 JWT signed through `WebCrypto` (`crypto.subtle`
 //! — Workers has no Node `crypto`), and exchanged at the GitHub API for a
-//! one-hour installation token. The minted token is cached in the Durable
-//! Object's SQL storage (`github_app_token`) and reused while more than
-//! five minutes of validity remain, so a Durable Object restart does not
-//! mint again.
+//! one-hour installation token. The minted token is cached in the
+//! isolate's memory ([`TokenCache`]) and reused while more than five
+//! minutes of validity remain; an eviction costs one mint, and no
+//! credential is ever written to storage.
 //!
 //! PEM decoding and JWT header/claims encoding are pure functions
 //! unit-tested on the host; `WebCrypto` signing and the token-exchange POST
@@ -18,19 +18,33 @@
 use base64::Engine as _;
 use serde::Serialize;
 
-#[cfg(target_arch = "wasm32")]
-use skyzen_services::durable::DurableDb;
-
-use crate::errors::QueueError;
-
-/// A GitHub App installation token, either freshly minted or loaded from
-/// the Durable Object cache.
+/// A GitHub App installation token, either freshly minted or read from
+/// the isolate's [`TokenCache`].
+#[derive(Clone)]
 pub struct InstallationToken {
     /// The bearer credential for `workflow_dispatch` requests.
     pub token: String,
-    /// GitHub's `expires_at` (RFC 3339), stored verbatim in DO storage and
-    /// compared there with `strftime('%s', ...)`.
+    /// GitHub's `expires_at`, RFC 3339.
     pub expires_at: String,
+}
+
+/// Minimum validity a cached token must still have to be reused: it
+/// lives an hour, and a five-minute floor keeps a dispatch from riding
+/// a token that dies mid-flight.
+#[cfg(target_arch = "wasm32")]
+const TOKEN_MIN_REMAINING_MS: f64 = 300_000.0;
+
+/// The isolate's installation-token cache — one slot, shared by every
+/// handler of the object through [`crate::scheduler::graph::GraphCell`].
+#[derive(Clone, Default)]
+pub struct TokenCache(std::sync::Arc<std::sync::Mutex<Option<InstallationToken>>>);
+
+impl TokenCache {
+    /// Install `token` as the cached credential — the budget probe's
+    /// stand-in for a mint, which the local-CI dispatcher never needs.
+    pub fn store(&self, token: InstallationToken) {
+        *self.0.lock().expect("token cache") = Some(token);
+    }
 }
 
 impl std::fmt::Debug for InstallationToken {
@@ -92,9 +106,6 @@ pub enum GitHubAppError {
         /// Response body for diagnostics.
         body: String,
     },
-    /// The Durable Object token cache could not be read or written.
-    #[error("token cache: {0}")]
-    Storage(#[from] QueueError),
 }
 
 /// Decode a GitHub App private-key PEM into PKCS#8 DER for `WebCrypto`'s
@@ -193,26 +204,28 @@ pub fn encode_jwt(signing_input: &str, signature: &[u8]) -> String {
 
 /// Load the cached installation token or mint and cache a fresh one.
 ///
-/// The cache row in DO storage is reused while more than five minutes of
-/// validity remain; otherwise a new token is minted from `config` and
-/// stored over the singleton row.
+/// The cached token is reused while more than five minutes of validity
+/// remain; otherwise a new token is minted from `config` and replaces
+/// the slot.
 ///
 /// # Errors
 ///
-/// Returns [`GitHubAppError::Storage`] when DO storage cannot be read or
-/// written, or the mint errors ([`GitHubAppError::PrivateKey`],
+/// Returns the mint errors ([`GitHubAppError::PrivateKey`],
 /// [`GitHubAppError::Sign`], [`GitHubAppError::Exchange`],
 /// [`GitHubAppError::ExchangeStatus`]).
 #[cfg(target_arch = "wasm32")]
 pub async fn installation_token(
-    db: &DurableDb,
+    cache: &TokenCache,
     config: &AppConfig,
 ) -> Result<InstallationToken, GitHubAppError> {
-    if let Some(cached) = crate::scheduler::queue::github_app_token(db).await? {
+    let cached = cache.0.lock().expect("token cache").clone();
+    if let Some(cached) = cached
+        && js_sys::Date::parse(&cached.expires_at) - js_sys::Date::now() > TOKEN_MIN_REMAINING_MS
+    {
         return Ok(cached);
     }
     let minted = mint_installation_token(config).await?;
-    crate::scheduler::queue::store_github_app_token(db, &minted).await?;
+    *cache.0.lock().expect("token cache") = Some(minted.clone());
     tracing::info!(
         expires_at = %minted.expires_at,
         "minted GitHub App installation token"
@@ -221,9 +234,8 @@ pub async fn installation_token(
 }
 
 /// Build the JWT from the App key and exchange it for an installation
-/// token — uncached; callers with a `DurableDb` should use
-/// [`installation_token`], which caches. The Worker's scheduled
-/// handler uses this directly (the token cache lives in DO storage).
+/// token — uncached; callers holding a [`TokenCache`] should use
+/// [`installation_token`], which caches.
 #[cfg(target_arch = "wasm32")]
 pub async fn mint_installation_token(
     config: &AppConfig,

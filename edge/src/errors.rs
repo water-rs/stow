@@ -130,27 +130,6 @@ pub enum QueueError {
     /// Underlying durable-object SQL access failed.
     #[error("queue sql: {0}")]
     Sql(String),
-    /// A completion report referenced a task the queue has no row for.
-    #[error("completion report for unknown task `{0}`")]
-    UnknownTask(String),
-    /// A completion report named a real task but not its live attempt or
-    /// an in-flight status — a stale report for a superseded attempt or a
-    /// duplicate of one already applied. Handlers map this to `409
-    /// Conflict`: the report applied to nothing and retrying it unchanged
-    /// can never succeed.
-    #[error(
-        "completion report for task `{task_id}` attempt {attempt} conflicts with the row's live state (attempt {row_attempt}, status `{row_status}`)"
-    )]
-    StaleCompletion {
-        /// The task id the report named.
-        task_id: String,
-        /// The attempt the report claimed.
-        attempt: u32,
-        /// The attempt the queue row is currently on.
-        row_attempt: u32,
-        /// The row's current status.
-        row_status: String,
-    },
     /// A request-lane report or update named a request id the scheduler
     /// has no record for.
     #[error("request report for unknown request `{0}`")]
@@ -188,21 +167,6 @@ pub enum QueueError {
         attempted: u64,
         /// Configured `STOW_HUMAN_DAILY_TASK_BUDGET`.
         budget: u64,
-    },
-    /// A delta slice report's `base_generation` no longer matches the
-    /// slice's live applied generation — the delta was computed on a
-    /// stale base (another report landed first, or the slice was never
-    /// reported). Handlers map this to `409 Conflict`: the reporter must
-    /// resync with a full report; retrying the same delta can never
-    /// succeed.
-    #[error(
-        "slice report base generation {base_generation} conflicts with the live generation {live_generation}"
-    )]
-    SliceGenerationConflict {
-        /// The `base_generation` the report claimed.
-        base_generation: i64,
-        /// The generation the slice is actually on.
-        live_generation: i64,
     },
     /// A queue mutation selector named no rows: empty `task_ids` and a
     /// filter with no predicates would touch every row in the queue.

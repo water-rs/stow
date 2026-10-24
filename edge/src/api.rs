@@ -206,16 +206,23 @@ fn now_minute() -> u64 {
 /// echoes back.
 fn mint_admissions(
     admission: &PowAdmission,
-    requests: Vec<stow_types::api::EnqueueRequest>,
+    trees: Vec<stow_types::api::SubmissionTree>,
     difficulty: u32,
 ) -> Result<Vec<EnqueueAdmission>, GetArtifactError> {
     let minute = now_minute();
-    let mut admissions = Vec::with_capacity(requests.len());
-    for request in requests {
-        let task_id = request.task_id().map_err(|error| {
-            GetArtifactError::BadRequestWithMessage(format!("enqueue task id: {error}"))
-        })?;
-        let request_json = serde_json::to_vec(&request)
+    let mut admissions = Vec::with_capacity(trees.len());
+    for tree in trees {
+        // The challenge binds the tree's first root — the miss the
+        // admission minted — to the whole tree's canonical JSON.
+        let task_id = tree
+            .roots
+            .first()
+            .and_then(|&root| tree.nodes.get(root as usize))
+            .map(|node| node.task_id.clone())
+            .ok_or_else(|| {
+                GetArtifactError::BadRequestWithMessage("submission tree names no roots".to_owned())
+            })?;
+        let request_json = serde_json::to_vec(&tree)
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
         let challenge = admission::issue_challenge(
             &admission.challenge_secret,
@@ -227,7 +234,7 @@ fn mint_admissions(
             task_id,
             challenge,
             difficulty,
-            request,
+            tree,
         });
     }
     Ok(admissions)
@@ -897,19 +904,20 @@ pub async fn prune_artifacts(
 /// arbitrary body without a trusted GitHub credential.
 pub async fn submit_scheduler_tasks(
     SchedulerCaller(caller): SchedulerCaller,
-    Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
+    Json(trees): Json<Vec<stow_types::api::SubmissionTree>>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::SchedulerSubmitResponse>, GetArtifactError> {
     // The edge resolves nothing (stow#429): every lane that posts here
-    // already submits resolver-canonical requests, so they land verbatim —
+    // already submits resolver-canonical trees, so they land verbatim —
     // `Json` deserialization itself is the only check (`FeaturesJson`
     // rejects a non-canonical feature list there).
     // Repo-writer submissions are exempt from the pending-depth cap — the
     // credential check is the bound on this path.
-    let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &requests).await?;
-    tracing::info!(tasks = requests.len(), %caller, "submitted scheduler tasks");
+    let nodes: usize = trees.iter().map(|tree| tree.nodes.len()).sum();
+    let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &trees).await?;
+    tracing::info!(tasks = nodes, %caller, "submitted scheduler tasks");
     Ok(Json(stow_types::api::SchedulerSubmitResponse {
-        submitted: u32::try_from(requests.len()).map_err(|_| {
+        submitted: u32::try_from(nodes).map_err(|_| {
             GetArtifactError::TooLarge("submitted task count exceeds u32".to_owned())
         })?,
         inserted,
@@ -1687,12 +1695,19 @@ pub async fn mint_miss_admissions(
     if enqueue_requests.is_empty() {
         return Ok(Json(Vec::new()));
     }
+    // One admission and one redemption per miss tree (stow#878): the
+    // resolved graph folds into a single submission tree the ticket's
+    // PoW binds.
+    let tree = stow_types::api::SubmissionTree::from_enqueue_requests(
+        stow_types::api::SubmissionSource::CacheMiss,
+        &enqueue_requests,
+    )
+    .map_err(|error| GetArtifactError::InternalWithMessage(format!("miss tree: {error}")))?;
     let difficulty = admission::difficulty(admission.min_bits);
-    let admissions =
-        mint_admissions(&admission, enqueue_requests, difficulty).map_err(|error| {
-            tracing::error!(%error, "failed to mint dependency-graph miss admissions");
-            GetArtifactError::InternalWithMessage(error.to_string())
-        })?;
+    let admissions = mint_admissions(&admission, vec![tree], difficulty).map_err(|error| {
+        tracing::error!(%error, "failed to mint dependency-graph miss admissions");
+        GetArtifactError::InternalWithMessage(error.to_string())
+    })?;
     drain_admitted_misses(&db, &scheduler).await;
     Ok(Json(admissions))
 }
@@ -1722,7 +1737,7 @@ async fn drain_admitted_misses(db: &Db, scheduler: &CfDurableNamespace) {
             "miss drain skipped rows it could not re-mint"
         );
     }
-    let drained = drain.requests;
+    let drained = drain.trees;
     if drained.is_empty() {
         return;
     }
@@ -1746,14 +1761,14 @@ async fn drain_admitted_misses(db: &Db, scheduler: &CfDurableNamespace) {
 /// the request the ticket carries, check the client's proof-of-work against
 /// the queue depth current at redemption time (one bit lenient — the queue
 /// may have grown since the miss response), then forward that request to
-/// the scheduler. Replay is safe — the scheduler deduplicates on task id.
-pub async fn enqueue_admitted_task(
-    Json(ticket): Json<EnqueueTicket>,
-    db: Db,
-    State(scheduler): State<CfDurableNamespace>,
-    State(admission): State<PowAdmission>,
-) -> Result<Response, GetArtifactError> {
-    let request_json = serde_json::to_vec(&ticket.request)
+/// The admission gate of `POST /api/v1/enqueue`: challenge + tree-id
+/// binding, extracted so the handler stays under the size lint
+/// (stow#878's tree ticket reuses the same gate).
+fn verify_enqueue_ticket(
+    ticket: &EnqueueTicket,
+    admission: &PowAdmission,
+) -> Result<(), GetArtifactError> {
+    let request_json = serde_json::to_vec(&ticket.tree)
         .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
     if !admission::verify_challenge(
         &admission.challenge_secret,
@@ -1765,26 +1780,51 @@ pub async fn enqueue_admitted_task(
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: invalid challenge");
         return Err(GetArtifactError::Unauthorized);
     }
-    // The challenge binds task_id to the request's canonical identity;
-    // recompute it so a verified ticket always forwards what it minted.
-    let derived_task_id = ticket.request.task_id().map_err(|error| {
-        GetArtifactError::BadRequestWithMessage(format!("enqueue task id: {error}"))
-    })?;
+    // The challenge binds the ticket's task id to the tree's first
+    // root; recompute it so a verified ticket always forwards what it
+    // minted.
+    let derived_task_id = ticket
+        .tree
+        .roots
+        .first()
+        .and_then(|&root| ticket.tree.nodes.get(root as usize))
+        .map(|node| node.task_id.clone())
+        .ok_or_else(|| {
+            GetArtifactError::BadRequestWithMessage("submission tree names no roots".to_owned())
+        })?;
     if derived_task_id != ticket.task_id {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
         return Err(GetArtifactError::Unauthorized);
     }
+    Ok(())
+}
+
+/// `POST /api/v1/enqueue` — verify the ticket, record the miss and
+/// forward the tree to the scheduler. Replay is safe — the scheduler
+/// deduplicates on task id.
+pub async fn enqueue_admitted_task(
+    Json(ticket): Json<EnqueueTicket>,
+    db: Db,
+    State(scheduler): State<CfDurableNamespace>,
+    State(admission): State<PowAdmission>,
+) -> Result<Response, GetArtifactError> {
+    verify_enqueue_ticket(&ticket, &admission)?;
     // A client builds for whatever host it runs on, and plenty of those are
     // machines this cache has no runner for. Refuse before the ticket can
     // become a dispatch that cannot run.
-    if !stow_types::api::is_ci_target(ticket.request.target.as_str()) {
+    if let Some(node) = ticket
+        .tree
+        .nodes
+        .iter()
+        .find(|node| !stow_types::api::is_ci_target(node.target.as_str()))
+    {
         tracing::info!(
             task_id = %ticket.task_id,
-            target = %ticket.request.target,
+            target = %node.target,
             "rejected enqueue ticket: no CI runner builds this target"
         );
         return Err(GetArtifactError::UnsupportedTarget {
-            target: ticket.request.target.to_string(),
+            target: node.target.to_string(),
             supported: CI_TARGET_TRIPLES.join(", "),
         });
     }
@@ -1826,10 +1866,10 @@ pub async fn enqueue_admitted_task(
     // The ticket is verified: upsert the miss row (born `admitted_at`) so
     // the internal drain may retry the scheduler send, then deliver the
     // canonical request.
-    if let Err(error) = db::record_admitted_miss(&db, &ticket.request).await {
+    if let Err(error) = db::record_admitted_miss(&db, &ticket.tree).await {
         tracing::error!(%error, "failed to record admitted miss");
     }
-    match scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.request)).await {
+    match scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.tree)).await {
         Ok(()) => {}
         // The edge check raced another submit wave: the Durable Object's
         // own pending-depth cap refused this one.
@@ -1846,8 +1886,7 @@ pub async fn enqueue_admitted_task(
         Err(error) => return Err(error.into()),
     }
     if let Err(error) =
-        db::set_dependency_graph_misses_queued(&db, std::slice::from_ref(&ticket.request), true)
-            .await
+        db::set_dependency_graph_misses_queued(&db, std::slice::from_ref(&ticket.tree), true).await
     {
         tracing::error!(%error, "failed to mark dependency-graph miss queued");
     }

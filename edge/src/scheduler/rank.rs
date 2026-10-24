@@ -1,63 +1,22 @@
 //! The scheduler's exact dispatch rank — the one Rust abstraction
-//! every `value`/`dispatch_key` writer derives from (stow#524,
-//! coordinator value-stack contract).
+//! every node's claim order derives from (stow#524, stow#878).
 //!
-//! `queue.value` stays the persisted I6 integer: precedence bands
-//! over the nonnegative priority plus accumulated demand
-//! (`bands × VALUE_BAND + MAX(0, priority) + MAX(0, demand)`, human
-//! contributing two bands and Windows one — stow#522). `dispatch_key`
-//! orders on the exact rational `value / expected_cost`: the leading
-//! field is a lane prefix (`0` human / `1` other — human sorts first
-//! under any cost) followed by the fixed-width lowercase hex of
-//! `U256::MAX - q`, so ascending text order is descending ratio, then
-//! the FIFO tuple `first_requested_at | created_at | task_id`.
+//! A node's raw value is the precedence bands over the nonnegative
+//! priority plus accumulated demand (`bands × VALUE_BAND +
+//! MAX(0, priority) + MAX(0, demand)`, human contributing two bands and
+//! Windows one — stow#522). The claim order is the exact rational
+//! `value / expected_cost` behind a lane precedence (human first under
+//! any cost), compared by [`Rank`].
 
+use std::cmp::Ordering;
 use std::num::NonZero;
 
-use crypto_bigint::{NonZero as UintNonZero, U256};
 use stow_types::api::RunnerFamily;
-
-use crate::errors::QueueError;
 
 /// The cost a `(crate_name, target)` pair carries while no sample has
 /// ever priced it — `1`, so an unmeasured build ranks on its raw
-/// value alone. A row's stored median only enters the rank through
-/// [`checked_cost`]; a present stat that fails that check is
-/// corruption, never silently this constant.
+/// value alone.
 pub const UNMEASURED_COST: NonZero<i64> = NonZero::new(1).unwrap();
-
-/// The positive cost the rank requires, decoded from a stored
-/// `median_ms` text: a present stat that is not a positive integer is
-/// corruption — fail loudly instead of clamping it toward 1.
-pub fn checked_cost(median_ms: &str) -> Result<NonZero<i64>, QueueError> {
-    let parsed = median_ms
-        .parse::<i64>()
-        .map_err(|_| QueueError::Invariant(format!("median_ms {median_ms:?} is not an integer")))?;
-    NonZero::new(parsed)
-        .filter(|cost| cost.get() > 0)
-        .ok_or_else(|| QueueError::Invariant(format!("median_ms {median_ms:?} is not positive")))
-}
-
-/// `q = floor((v << 128) / c)` for a nonnegative `i64`-range raw value
-/// `v` and a positive `i64`-range cost `c`, computed in U256.
-///
-/// Exactness, not approximation: two distinct ratios `v1/c1 != v2/c2`
-/// differ by at least `1/(c1·c2)`, and `c1·c2 < 2^126` inside the
-/// `i64` range, so the gap exceeds `2^-126`. Scaling by `2^128` makes
-/// every distinct pair more than `4` apart, so `floor` can never merge
-/// them — the quotient preserves the full rational order at every
-/// supported magnitude, with no REAL, clamp, ceiling or tie horizon.
-/// The numerator is at most `2^191`, safely inside `U256`; equal
-/// ratios still yield equal `q` and fall through to the key's FIFO
-/// fields. `cost` is `>= 1` by contract, so `NonZero::new` cannot
-/// fail.
-fn rank_quotient(value: u64, cost: NonZero<i64>) -> U256 {
-    let numerator = U256::from_u64(value).shl_vartime(128);
-    let divisor =
-        UintNonZero::new(U256::from_u64(cost.get().cast_unsigned())).expect("positive cost");
-    let (quotient, _remainder) = numerator.div_rem(&divisor);
-    quotient
-}
 
 /// `queue.value` for one row — the persisted band/priority integer a
 /// writer stores alongside the key (stow#442 I6): precedence bands
@@ -89,69 +48,71 @@ pub fn dispatch_family(target: &str) -> &'static str {
     "linux"
 }
 
-/// The leading score field of a `dispatch_key`: the lane prefix plus
-/// the fixed-64-digit lowercase hex of `U256::MAX - q`. Inverting the
-/// quotient makes the text sort the numeric `DESC` — ascending key,
-/// descending exact ratio — and the fixed width keeps the comparison
-/// byte-stable at every magnitude. `U256`'s `LowerHex` pads each of
-/// its four `u64` limbs to 16 digits, so the field is always exactly
-/// 64 hex characters.
-pub fn rank_prefix(lane: &str, value: i64, cost_ms: NonZero<i64>) -> String {
-    debug_assert!(
-        value >= 0,
-        "raw value bands over clamped priority and demand"
-    );
-    debug_assert!(cost_ms.get() > 0, "invalid costs fail at checked_cost");
-    let inverted = U256::MAX.wrapping_sub(&rank_quotient(value.cast_unsigned(), cost_ms));
-    let lane_prefix = u8::from(lane != "human");
-    format!("{lane_prefix}{inverted:x}")
+/// One node's claim rank: its lane and the exact ratio of its raw
+/// value to its expected build cost. Ascending order is claim order —
+/// the human lane first, then the larger ratio first.
+///
+/// Exactness, not approximation: ratios compare by cross-multiplying in
+/// `u128` (`v1·c2` against `v2·c1`). Both operands are inside the
+/// nonnegative `i64` range, so each product is below `2^126`: it cannot
+/// overflow, and distinct ratios never compare equal. Equal ratios
+/// compare equal and fall through to the caller's FIFO fields.
+#[derive(Debug, Clone, Copy)]
+pub struct Rank {
+    human: bool,
+    value: u64,
+    cost: NonZero<i64>,
 }
 
-/// The row operands a dispatch key derives from — one value so no
-/// caller can silently drop `demand` (stow#522) or misorder the FIFO
-/// fields.
-pub struct KeyOperands<'a> {
-    /// The row's lane — `'human'` or `'miss'`.
-    pub lane: &'a str,
-    /// The row's `dispatch_family` label.
-    pub family: &'a str,
-    /// The row's persisted baseline priority.
-    pub priority: i64,
-    /// The row's accumulated demand — the post-fold value on the
-    /// demand path.
-    pub demand: i64,
-    /// The keyed expected build cost — `UNMEASURED_COST` (1) absent a
-    /// stats row.
-    pub cost_ms: NonZero<i64>,
-    /// FIFO tie-breakers, in stored order.
-    pub first_requested_at: &'a str,
-    pub created_at: &'a str,
-    pub task_id: &'a str,
+impl Rank {
+    /// The rank of a node with raw `value` (nonnegative, see
+    /// [`raw_value`]) and expected build `cost` in milliseconds.
+    pub fn new(human: bool, value: i64, cost: NonZero<i64>) -> Self {
+        debug_assert!(
+            value >= 0,
+            "raw value bands over clamped priority and demand"
+        );
+        Self {
+            human,
+            value: value.cast_unsigned(),
+            cost,
+        }
+    }
 }
 
-/// The full `dispatch_key` text a writer binds: `[rank_prefix] |
-/// first_requested_at | created_at | task_id` — exact ratio descent
-/// inside each lane, then the queue's existing FIFO tie-breakers.
-pub fn dispatch_key(operands: &KeyOperands<'_>) -> String {
-    let prefix = rank_prefix(
-        operands.lane,
-        raw_value(
-            operands.lane,
-            operands.family,
-            operands.priority,
-            operands.demand,
-        ),
-        operands.cost_ms,
-    );
-    format!(
-        "{prefix}|{}|{}|{}",
-        operands.first_requested_at, operands.created_at, operands.task_id
-    )
+impl Ord for Rank {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.human.cmp(&self.human).then_with(|| {
+            // self before other when self.value/self.cost is larger:
+            // other.value·self.cost compared against self.value·other.cost.
+            let mine = u128::from(self.value) * u128::from(other.cost.get().cast_unsigned());
+            let theirs = u128::from(other.value) * u128::from(self.cost.get().cast_unsigned());
+            theirs.cmp(&mine)
+        })
+    }
 }
+
+impl PartialOrd for Rank {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Rank {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Rank {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rank_key(human: bool, value: i64, cost: NonZero<i64>) -> Rank {
+        Rank::new(human, value, cost)
+    }
 
     /// The contract's exactness check against `u128` cross-products —
     /// `v1·c2` vs `v2·c1` is the exact rational comparison (products of
@@ -166,11 +127,11 @@ mod tests {
                     .cmp(&(u128::from(v2.cast_unsigned()) * u128::from(c1.cast_unsigned())));
                 let cost1 = NonZero::new(c1).expect("positive test cost");
                 let cost2 = NonZero::new(c2).expect("positive test cost");
-                let ranked = rank_prefix("miss", v1, cost1).cmp(&rank_prefix("miss", v2, cost2));
+                let ranked = rank_key(false, v1, cost1).cmp(&rank_key(false, v2, cost2));
                 assert_eq!(
                     ranked,
                     exact.reverse(),
-                    "key order != exact rational order for {v1}/{c1} vs {v2}/{c2}"
+                    "rank order != exact rational order for {v1}/{c1} vs {v2}/{c2}"
                 );
             }
         }
@@ -184,8 +145,8 @@ mod tests {
         let near = 9_007_199_254_740_992;
         let pairs = [(near, 1_048_576), (near + 1, 1_048_576)];
         assert_ne!(
-            rank_prefix("miss", near, NonZero::new(1_048_576).unwrap()),
-            rank_prefix("miss", near + 1, NonZero::new(1_048_576).unwrap())
+            rank_key(false, near, NonZero::new(1_048_576).unwrap()),
+            rank_key(false, near + 1, NonZero::new(1_048_576).unwrap())
         );
         assert_rational_order(&pairs);
     }
@@ -207,21 +168,21 @@ mod tests {
         assert_rational_order(&pairs);
     }
 
-    /// Equal ratios produce equal quotients — the key falls through
-    /// to the FIFO fields byte-for-byte.
+    /// Equal ratios compare equal — the order falls through to the
+    /// caller's FIFO fields.
     #[test]
     fn equal_fractions_share_the_prefix() {
         assert_eq!(
-            rank_prefix("miss", 2, NonZero::new(6).unwrap()),
-            rank_prefix(
-                "miss",
+            rank_key(false, 2, NonZero::new(6).unwrap()),
+            rank_key(
+                false,
                 1_000_000_000_000_000,
                 NonZero::new(3_000_000_000_000_000).unwrap()
             ),
         );
         assert_eq!(
-            rank_prefix("miss", 0, UNMEASURED_COST),
-            rank_prefix("miss", 0, NonZero::new(i64::MAX).unwrap()),
+            rank_key(false, 0, UNMEASURED_COST),
+            rank_key(false, 0, NonZero::new(i64::MAX).unwrap()),
         );
     }
 
@@ -231,18 +192,13 @@ mod tests {
     #[test]
     fn human_lane_prefix_sorts_first() {
         assert!(
-            rank_prefix("human", 1, NonZero::new(i64::MAX).unwrap())
-                < rank_prefix("miss", i64::MAX, UNMEASURED_COST)
+            rank_key(true, 1, NonZero::new(i64::MAX).unwrap())
+                < rank_key(false, i64::MAX, UNMEASURED_COST)
         );
-        for key in [
-            rank_prefix("human", 0, UNMEASURED_COST),
-            rank_prefix("miss", 0, UNMEASURED_COST),
-        ] {
-            // 1-char lane prefix + 64 lowercase hex digits.
-            assert_eq!(key.len(), 65);
-            assert!(key[1..].chars().all(|c| c.is_ascii_hexdigit()));
-            assert_eq!(key, key.to_lowercase());
-        }
+        assert!(
+            rank_key(true, 0, UNMEASURED_COST) < rank_key(false, 0, UNMEASURED_COST),
+            "the lane prefix decides before the ratio"
+        );
     }
 
     /// With every cost unknown (`1`), the rank reduces to raw `value`
@@ -257,7 +213,11 @@ mod tests {
                         lane,
                         family,
                         priority,
-                        rank_prefix(lane, raw_value(lane, family, priority, 0), UNMEASURED_COST),
+                        rank_key(
+                            lane == "human",
+                            raw_value(lane, family, priority, 0),
+                            UNMEASURED_COST,
+                        ),
                     ));
                 }
             }

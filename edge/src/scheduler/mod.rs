@@ -12,23 +12,22 @@ pub mod feed;
 /// The in-memory dependency graph the flat store persists (stow#878):
 /// nodes, edges, per-node state and the ready set, interned — merged
 /// by task id, gated by published-shape masks, dispatching in rank
-/// order. Not yet part of the wasm32 build: stage 4 wires the submit
-/// routes and `object.rs`'s dispatch pass into it and drops this cfg —
-/// until then a wasm32 reference would be dead code, not wiring.
-#[cfg(not(target_arch = "wasm32"))]
+/// order. `object.rs`'s submit routes, delivery routes and dispatch
+/// pass consume it (stow#878 stage 4–6).
 pub mod graph;
 pub mod meter;
 pub mod queue;
 /// The exact `value`/`dispatch_key` rank — one shared Rust derivation
 /// every queue writer binds from (stow#524).
 pub mod rank;
+/// The graph-and-store cores of the routes, shared by the Durable
+/// Object handlers and the cost harness.
+pub mod routes;
 /// The flat persistence substrate — `event_log`, chunked
 /// `snapshot_chunks`, `store_meta` — plus the wake/replay half and the
-/// in-memory billed-row counting. Same staging as `graph`: stage 4's
-/// `object.rs` constructor calls `ensure_schema`, its submit and
-/// delivery routes call `append_events`, and its wake calls `load` +
-/// `apply_events`; this cfg drops with that wiring.
-#[cfg(not(target_arch = "wasm32"))]
+/// in-memory billed-row counting. `object.rs` calls `ensure_schema` at
+/// construction, `append_events` per accepted event, and `load` +
+/// `apply_events` on wake (stow#878 stage 4–6).
 pub mod store;
 
 /// The production-shaped fixture: host tests and the workerd budget
@@ -47,11 +46,6 @@ pub mod test_db;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod cost_gate;
-
-/// The workerd budget table — data only, compiled wherever either the
-/// probe or the host drift test needs it.
-#[cfg(any(test, target_arch = "wasm32"))]
-pub mod do_budgets;
 
 #[cfg(target_arch = "wasm32")]
 pub mod budget;
