@@ -30,6 +30,64 @@ const DRAIN_LOG: &str = "stow-drain.log";
 /// it exists for forensics, not to grow without bound.
 const DRAIN_LOG_MAX_BYTES: u64 = 256 * 1024;
 
+/// One locally compiled unit's journal payload — the observation one
+/// miss mints from, plus what a drain needs to name its build's misses —
+/// which rustc compiled it and which host the build ran on.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct UnitLine {
+    /// The rustc the wrapper invoked — diagnostic only.
+    rustc: String,
+    /// The rustc version the unit compiled under.
+    rustc_version: String,
+    /// The compiling rustc's probed `host:` triple, recorded at write
+    /// time — drains never re-probe, so a toolchain swap between the
+    /// build and the drain cannot relabel it (stow#317).
+    build_host: String,
+    /// Whether the consumer's cargo invocation spelled `--target` —
+    /// including the `--target <host-triple>` spelling whose target
+    /// units are the only ones that carry the flag. When every
+    /// observed unit lacks `--target` this is the only evidence left
+    /// that splits a spelled build's host units from a native build's
+    /// target ones (stow#367).
+    #[serde(default)]
+    consumer_spelled_target: bool,
+    /// The `lockfile_graph_cache` key naming the build's persisted
+    /// expanded graph — the drain mints each miss's dependency subgraph
+    /// from its unit graph (stow#588). Empty on wrapper-journaled
+    /// lines, whose builds carry no expanded graph — their units
+    /// cannot mint a real subgraph and stay journaled until one can.
+    #[serde(default)]
+    expanded_cache_key: String,
+    /// The compile observation itself.
+    unit: ObservedUnit,
+}
+
+/// An inexact superset-hit report's journal payload (stow#882): the
+/// exact chain — the direct-dep entries above the analysis's
+/// superset-served nodes — minted off the group's resolved expanded
+/// graph and posted behind the same proof-of-work admission a miss
+/// takes.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct InexactReport {
+    /// The rustc version the reporting build ran under.
+    rustc_version: String,
+    /// The build's `target_given` — the re-derivation's spelled
+    /// `--target` fact when the journal holds no unit line to prove
+    /// it (stow#367).
+    #[serde(default)]
+    consumer_spelled_target: bool,
+    /// The `lockfile_graph_cache` key naming the build's persisted
+    /// expanded graph — the group's own key (stow#588).
+    #[serde(default)]
+    expanded_cache_key: String,
+    /// The consumer's compile target — the admission's `target`.
+    target: String,
+    /// The report's direct-dep entries — each node above a
+    /// superset-served node, which the edge expands into the exact
+    /// chain.
+    entries: Vec<stow_types::api::DependencyGraphEntry>,
+}
+
 /// One journaled observation — a compiled unit the drain mints as a
 /// miss, or an inexact-hit report carrying the exact chain the scheduler
 /// should build (stow#882). Both kinds record the build's rustc and the
@@ -39,91 +97,33 @@ const DRAIN_LOG_MAX_BYTES: u64 = 256 * 1024;
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum JournalEntry {
     /// One locally compiled unit — the observation one miss mints from.
-    Unit {
-        /// The rustc the wrapper invoked — diagnostic only.
-        rustc: String,
-        /// The rustc version the unit compiled under.
-        rustc_version: String,
-        /// The compiling rustc's probed `host:` triple, recorded at write
-        /// time — drains never re-probe, so a toolchain swap between the
-        /// build and the drain cannot relabel it (stow#317).
-        build_host: String,
-        /// Whether the consumer's cargo invocation spelled `--target` —
-        /// including the `--target <host-triple>` spelling whose target
-        /// units are the only ones that carry the flag. When every
-        /// observed unit lacks `--target` this is the only evidence left
-        /// that splits a spelled build's host units from a native build's
-        /// target ones (stow#367).
-        #[serde(default)]
-        consumer_spelled_target: bool,
-        /// The `lockfile_graph_cache` key naming the build's persisted
-        /// expanded graph — the drain mints each miss's dependency subgraph
-        /// from its unit graph (stow#588). Empty on wrapper-journaled
-        /// lines, whose builds carry no expanded graph — their units
-        /// cannot mint a real subgraph and stay journaled until one can.
-        #[serde(default)]
-        expanded_cache_key: String,
-        /// The compile observation itself.
-        unit: ObservedUnit,
-    },
-    /// An inexact superset-hit report (stow#882): the exact chain — the
-    /// direct-dep entries above the analysis's superset-served nodes —
-    /// minted off the group's resolved expanded graph and posted behind
-    /// the same proof-of-work admission a miss takes.
-    Inexact {
-        /// The rustc version the reporting build ran under.
-        rustc_version: String,
-        /// The build's `target_given` — the re-derivation's spelled
-        /// `--target` fact when the journal holds no unit line to prove
-        /// it (stow#367).
-        #[serde(default)]
-        consumer_spelled_target: bool,
-        /// The `lockfile_graph_cache` key naming the build's persisted
-        /// expanded graph — the group's own key (stow#588).
-        #[serde(default)]
-        expanded_cache_key: String,
-        /// The consumer's compile target — the admission's `target`.
-        target: String,
-        /// The report's direct-dep entries — each node above a
-        /// superset-served node, which the edge expands into the exact
-        /// chain.
-        entries: Vec<stow_types::api::DependencyGraphEntry>,
-    },
+    Unit(UnitLine),
+    /// One inexact superset-hit report — the exact chain to queue.
+    Inexact(InexactReport),
 }
 
 impl JournalEntry {
     /// The build's rustc — the group's first key part on both kinds.
     fn rustc_version(&self) -> &str {
         match self {
-            Self::Unit { rustc_version, .. } | Self::Inexact { rustc_version, .. } => rustc_version,
+            Self::Unit(unit) => &unit.rustc_version,
+            Self::Inexact(report) => &report.rustc_version,
         }
     }
 
     /// The persisted expanded graph's key — the group's second key part.
     fn expanded_cache_key(&self) -> &str {
         match self {
-            Self::Unit {
-                expanded_cache_key, ..
-            }
-            | Self::Inexact {
-                expanded_cache_key, ..
-            } => expanded_cache_key,
+            Self::Unit(unit) => &unit.expanded_cache_key,
+            Self::Inexact(report) => &report.expanded_cache_key,
         }
     }
 
     /// The compiling rustc's recorded `host:` — unit lines only.
     fn recorded_build_host(&self) -> Option<&str> {
         match self {
-            Self::Unit { build_host, .. } => Some(build_host),
-            Self::Inexact { .. } => None,
-        }
-    }
-
-    /// The compile observation — `None` for inexact lines.
-    const fn unit(&self) -> Option<&ObservedUnit> {
-        match self {
-            Self::Unit { unit, .. } => Some(unit),
-            Self::Inexact { .. } => None,
+            Self::Unit(unit) => Some(&unit.build_host),
+            Self::Inexact(_) => None,
         }
     }
 
@@ -131,8 +131,8 @@ impl JournalEntry {
     /// an inexact line's recorded project target.
     fn reported_target(&self) -> Option<&str> {
         match self {
-            Self::Unit { unit, .. } => unit.explicit_target.as_deref(),
-            Self::Inexact { target, .. } => Some(target),
+            Self::Unit(unit) => unit.unit.explicit_target.as_deref(),
+            Self::Inexact(report) => Some(&report.target),
         }
     }
 
@@ -140,15 +140,8 @@ impl JournalEntry {
     /// explicit `--target`; an inexact line's recorded `target_given`.
     const fn spelled_evidence(&self) -> bool {
         match self {
-            Self::Unit {
-                consumer_spelled_target,
-                unit,
-                ..
-            } => *consumer_spelled_target || unit.explicit_target.is_some(),
-            Self::Inexact {
-                consumer_spelled_target,
-                ..
-            } => *consumer_spelled_target,
+            Self::Unit(unit) => unit.consumer_spelled_target || unit.unit.explicit_target.is_some(),
+            Self::Inexact(report) => report.consumer_spelled_target,
         }
     }
 }
@@ -494,7 +487,7 @@ pub fn record_observation(
         );
         return;
     };
-    let entry = JournalEntry::Unit {
+    let entry = JournalEntry::Unit(UnitLine {
         rustc: rustc.to_string_lossy().into_owned(),
         rustc_version: build.rustc_version.clone(),
         build_host: build_host.to_owned(),
@@ -504,7 +497,7 @@ pub fn record_observation(
         // (stow#588).
         expanded_cache_key: String::new(),
         unit,
-    };
+    });
     let journal = journal_path(&target_dir, &cargo_build());
     if let Err(error) = append_lines(&journal, &[entry]) {
         tracing::warn!(error = %error, journal = %journal.display(), "could not journal the compile observation");
@@ -561,23 +554,25 @@ pub fn journal_supervised(
     let build_host = recorded_build_host(observations, consumer.key.target);
     let mut entries: Vec<JournalEntry> = observations
         .iter()
-        .map(|unit| JournalEntry::Unit {
-            rustc: rustc.to_string_lossy().into_owned(),
-            rustc_version: consumer.key.rustc_version.to_owned(),
-            build_host: build_host.clone(),
-            consumer_spelled_target,
-            expanded_cache_key: expanded_cache_key.to_owned(),
-            unit: unit.clone(),
+        .map(|unit| {
+            JournalEntry::Unit(UnitLine {
+                rustc: rustc.to_string_lossy().into_owned(),
+                rustc_version: consumer.key.rustc_version.to_owned(),
+                build_host: build_host.clone(),
+                consumer_spelled_target,
+                expanded_cache_key: expanded_cache_key.to_owned(),
+                unit: unit.clone(),
+            })
         })
         .collect();
     if !inexact_entries.is_empty() {
-        entries.push(JournalEntry::Inexact {
+        entries.push(JournalEntry::Inexact(InexactReport {
             rustc_version: consumer.key.rustc_version.to_owned(),
             consumer_spelled_target: consumer.key.target_given,
             expanded_cache_key: expanded_cache_key.to_owned(),
             target: consumer.key.target.to_owned(),
             entries: inexact_entries.to_vec(),
-        });
+        }));
     }
     let journal = journal_path(target_dir, &supervised_build());
     if let Err(error) = append_lines(&journal, &entries) {
@@ -824,7 +819,7 @@ async fn prepare_journal(
         .iter()
         .find_map(|entry| entry.reported_target().map(str::to_owned))
         .or_else(|| recorded_host.clone())
-        .unwrap_or_default();
+        .expect("every journal line records a build host or a reported target");
     let build_host = recorded_host.unwrap_or_else(|| consumer_target.clone());
     // The flag covers a spelled build whose observations were all
     // host-side; each line's own recorded evidence counts too.
@@ -1257,20 +1252,17 @@ async fn post_group(
         rustc_version,
         expanded_cache_key,
     } = &key;
-    let mut units = Vec::new();
-    let mut reports = Vec::new();
+    let mut units: Vec<UnitLine> = Vec::new();
+    let mut reports: Vec<InexactReport> = Vec::new();
     for entry in group {
         match entry {
-            unit @ JournalEntry::Unit { .. } => units.push(unit),
-            report @ JournalEntry::Inexact { .. } => reports.push(report),
+            JournalEntry::Unit(unit) => units.push(unit),
+            JournalEntry::Inexact(report) => reports.push(report),
         }
     }
     let mut unposted = Vec::new();
     if !units.is_empty() {
-        let units_flat: Vec<ObservedUnit> = units
-            .iter()
-            .filter_map(|entry| entry.unit().cloned())
-            .collect();
+        let observations: Vec<ObservedUnit> = units.iter().map(|unit| unit.unit.clone()).collect();
         // The one keep-path that must name its cause: every other way
         // entries stay journaled already warns, and a silent failure
         // leaves the drain's own log saying nothing at all (stow#588).
@@ -1281,7 +1273,7 @@ async fn post_group(
                 rustc_version,
                 build_host,
                 consumer_spelled_target,
-                &units_flat,
+                &observations,
                 graph,
             )
             .await
@@ -1299,51 +1291,45 @@ async fn post_group(
             None => false,
         };
         if !posted {
-            unposted.extend(units.into_iter().map(|unit| match unit {
-                JournalEntry::Unit { unit, .. } => JournalEntry::Unit {
+            unposted.extend(units.into_iter().map(|unit| {
+                JournalEntry::Unit(UnitLine {
                     rustc: String::new(),
                     rustc_version: rustc_version.to_owned(),
                     build_host: build_host.to_owned(),
                     consumer_spelled_target,
                     expanded_cache_key: expanded_cache_key.to_owned(),
-                    unit,
-                },
-                JournalEntry::Inexact { .. } => unreachable!("units holds unit lines only"),
+                    unit: unit.unit,
+                })
             }));
         }
     }
     unposted.extend(
-        post_inexact_reports(config, journal, graph.as_ref(), rustc_version, reports).await,
+        post_inexact_reports(config, journal, graph.as_ref(), rustc_version, reports)
+            .await
+            .into_iter()
+            .map(JournalEntry::Inexact),
     );
     unposted
 }
 
 /// [`post_group`]'s inexact half (stow#882): each report posts off the
-/// group's resolved expanded graph — kept lines go back under the
+/// group's resolved expanded graph — kept reports go back under the
 /// journal's name like unposted units.
 async fn post_inexact_reports(
     config: &StowConfig,
     journal: &Path,
     graph: Option<&crate::ExpandedDependencyGraph>,
     rustc_version: &str,
-    reports: Vec<JournalEntry>,
-) -> Vec<JournalEntry> {
+    reports: Vec<InexactReport>,
+) -> Vec<InexactReport> {
     let mut unposted = Vec::new();
     for report in reports {
-        let JournalEntry::Inexact {
-            target,
-            entries: report_entries,
-            ..
-        } = &report
-        else {
-            unreachable!("reports holds inexact lines only")
-        };
         let posted = match graph {
             Some(graph) => match crate::cargo_cmd::admit_inexact_report(
                 config,
-                target,
+                &report.target,
                 rustc_version,
-                report_entries,
+                &report.entries,
                 graph,
             )
             .await
@@ -1396,14 +1382,14 @@ mod tests {
         expanded_cache_key: &str,
     ) -> JournalEntry {
         let unit = unit(crate_name, Some("wasm32-unknown-unknown"));
-        JournalEntry::Unit {
+        JournalEntry::Unit(UnitLine {
             rustc: "rustc".to_owned(),
             rustc_version: rustc_version.to_owned(),
             build_host: "x86_64-unknown-linux-gnu".to_owned(),
             consumer_spelled_target: unit.explicit_target.is_some(),
             expanded_cache_key: expanded_cache_key.to_owned(),
             unit,
-        }
+        })
     }
 
     fn test_config(cache_dir: &Path) -> StowConfig {
@@ -1462,21 +1448,17 @@ mod tests {
         let journal = journal_path(dir.path(), "stow-1");
         append_lines(&journal, &[entry("serde", "1.85.0")]).expect("append");
         let read = std::fs::read_to_string(&journal).expect("read journal");
-        let JournalEntry::Unit {
-            unit: parsed,
-            build_host,
-            ..
-        } = serde_json::from_str(read.trim()).expect("parse entry")
+        let JournalEntry::Unit(parsed) = serde_json::from_str(read.trim()).expect("parse entry")
         else {
             panic!("a unit line round-trips as a unit");
         };
-        assert_eq!(parsed.crate_name, "serde");
+        assert_eq!(parsed.unit.crate_name, "serde");
         assert_eq!(
-            parsed.explicit_target.as_deref(),
+            parsed.unit.explicit_target.as_deref(),
             Some("wasm32-unknown-unknown")
         );
-        assert_eq!(build_host, "x86_64-unknown-linux-gnu");
-        assert_eq!(parsed.externs.len(), 1);
+        assert_eq!(parsed.build_host, "x86_64-unknown-linux-gnu");
+        assert_eq!(parsed.unit.externs.len(), 1);
     }
 
     #[test]
@@ -1742,9 +1724,9 @@ mod tests {
         // the manifest edit below breaks its re-derivation, so its
         // units stay journaled exactly as they did before.
         let mut postable = entry("serde", "1.99.0");
-        if let JournalEntry::Unit { unit, .. } = &mut postable {
-            unit.crate_name = "serde".to_owned();
-            unit.externs = Vec::new();
+        if let JournalEntry::Unit(line) = &mut postable {
+            line.unit.crate_name = "serde".to_owned();
+            line.unit.externs = Vec::new();
         }
         append_lines(&journal, &[dropped, postable]).expect("write journal");
         // The edited manifest no longer hashes to the recorded key and
@@ -1850,9 +1832,9 @@ mod tests {
         .expect("store expanded graph");
         let broken = keyed_entry("not a crate", "1.85.0", "key-a");
         let mut postable = entry("serde", "1.99.0");
-        if let JournalEntry::Unit { unit, .. } = &mut postable {
-            unit.crate_name = "serde".to_owned();
-            unit.externs = Vec::new();
+        if let JournalEntry::Unit(line) = &mut postable {
+            line.unit.crate_name = "serde".to_owned();
+            line.unit.externs = Vec::new();
         }
         append_lines(&journal, &[broken, postable]).expect("write journal");
 
@@ -1904,13 +1886,13 @@ mod tests {
         };
         append_lines(
             &journal,
-            &[JournalEntry::Inexact {
+            &[JournalEntry::Inexact(InexactReport {
                 rustc_version: "1.99.0".to_owned(),
                 consumer_spelled_target: true,
                 expanded_cache_key: "key-a".to_owned(),
                 target: "wasm32-unknown-unknown".to_owned(),
                 entries: vec![report],
-            }],
+            })],
         )
         .expect("write journal");
 
@@ -1922,18 +1904,12 @@ mod tests {
             .expect("the journal prepares");
         assert_eq!(prepared.groups.len(), 1);
         assert!(prepared.groups[0].graph.is_some());
-        let JournalEntry::Inexact {
-            target,
-            entries,
-            expanded_cache_key,
-            ..
-        } = &prepared.groups[0].entries[0]
-        else {
+        let JournalEntry::Inexact(report) = &prepared.groups[0].entries[0] else {
             panic!("an inexact line groups as an inexact line");
         };
-        assert_eq!(target, "wasm32-unknown-unknown");
-        assert_eq!(expanded_cache_key, "key-a");
-        assert_eq!(entries[0].crate_name.as_str(), "once_cell");
+        assert_eq!(report.target, "wasm32-unknown-unknown");
+        assert_eq!(report.expanded_cache_key, "key-a");
+        assert_eq!(report.entries[0].crate_name.as_str(), "once_cell");
 
         // The post fails (dead edge): the line goes back to the journal
         // with its kind and payload preserved for the next drain.
@@ -1941,13 +1917,10 @@ mod tests {
         let contents = std::fs::read_to_string(&journal).expect("journal kept");
         assert!(contents.contains("\"kind\":\"inexact\""));
         let parsed: JournalEntry = serde_json::from_str(contents.trim()).expect("reparse");
-        let JournalEntry::Inexact {
-            target, entries, ..
-        } = parsed
-        else {
+        let JournalEntry::Inexact(report) = parsed else {
             panic!("the restored line stays an inexact line");
         };
-        assert_eq!(target, "wasm32-unknown-unknown");
-        assert_eq!(entries[0].crate_name.as_str(), "once_cell");
+        assert_eq!(report.target, "wasm32-unknown-unknown");
+        assert_eq!(report.entries[0].crate_name.as_str(), "once_cell");
     }
 }
