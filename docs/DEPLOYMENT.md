@@ -540,8 +540,8 @@ exponential backoff, and a task whose lease expires after
 resolves as if the webhook had arrived, still-running extends the
 lease, unbound requeues).
 
-For first-time bring-up, also run `preheat top` for the library base
-pool. The library pool and the binary pool are independent.
+
+
 
 ## Operating
 

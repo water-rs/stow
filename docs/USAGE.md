@@ -356,14 +356,6 @@ acting unless `--yes` is given.
   any missing rule disabled (`ensure`/`on`/`off` are mutations).
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
-- `stow-admin preheat top --target ... --rustc-version ... [--limit 100] --yes`
-  — submit the top-N most-downloaded **library** crates' canonical
-  feature/version selections. Standalone builds; intended for the base
-  library pool. A ranked crate whose newest release ships no library
-  target (a bin-only crate that slipped into the ranking) is resolved
-  as a name source instead: stow-admin fetches its `.crate` tarball and
-  resolves its crates.io graph in-process, exactly like
-  `preheat binary`.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
   — preheat one named **binary** crate's dependency graph from
   crates.io: stow-admin fetches the `.crate` tarball and runs cargo's
@@ -376,14 +368,18 @@ acting unless `--yes` is given.
   only as yanked/git admission. `preserve_lockfile` stays `false` on
   every derived task — on the runner it names the task crate's own
   lockfile, not the source binary's. A crate with no binary target is
-  refused and pointed at
-  `preheat top`. `--rustc-version` defaults to the scheduler's current
+  refused. `--rustc-version` defaults to the scheduler's current
   stable channel version, `--targets` to every CI target.
 - `stow-admin preheat top-binaries --rustc-version ... [--targets a,b] [--limit 100] --yes`
-  — resolve the top-N most-downloaded **binary** crates exactly the way
+  — the popularity lane (stow#891): the top-N crates whose *default*
+  version ships a binary target — library or not — ranked by the last
+  90 days of `version_downloads`. Both answers come from one fetch of
+  the crates.io daily database dump (`default_versions` →
+  `versions.bin_names` for the binary check); no categories and no
+  per-crate API calls. Each candidate resolves exactly the way
   `preheat binary` resolves one: name sources, never tasks of their
-  own. The emitted tasks carry each binary's download count as their
-  queue priority. A binary that fails to resolve is reported and
+  own. The emitted tasks carry the crate's 90-day download count as
+  their queue priority. A binary that fails to resolve is reported and
   skipped; `--targets` defaults to every CI target.
 - `stow-admin preheat missed --rustc-version ... [--limit 50] [--since-days 7] [--targets a,b] --yes`
   — promote the top-K most-missed `(crate, version, features)` identities
@@ -446,7 +442,7 @@ acting unless `--yes` is given.
   the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
-whole wave — `preheat top`, `preheat top-binaries`, and
+whole wave — `preheat top-binaries` and
 `preheat projects submit` — once per
 UTC day and immediately whenever the stable channel moves, since the
 cache identity pins the exact stable `rustc_version` and every release
@@ -459,6 +455,6 @@ wave builds only what is missing or previously failed.
 access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
 The exceptions never touch the edge: `preheat projects generate`
 touches only GitHub, `index export`/`publish`/`targets` touch only
-the registry, and a preheat lane (`top`, `top-binaries`, `binary`,
+the registry, and a preheat lane (`top-binaries`, `binary`,
 `missed`, `projects submit`, `plan`) run without `--yes` only plans and
 needs no edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).

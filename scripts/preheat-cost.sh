@@ -10,8 +10,8 @@
 #      caps and cost multiplier) and `stow-build serve` (28124); reset
 #      the scheduler the way a deploy does
 #   3. run the production preheat lanes against the mock edge, in the
-#      order preheat-admin.yml runs them — `preheat top`, `preheat
-#      top-binaries`, `preheat projects submit` over the reviewed
+#      order preheat-admin.yml runs them — `preheat top-binaries` and
+#      `preheat projects submit` over the reviewed
 #      preheat/projects.toml — while the wave runs, as it does in
 #      production: the scheduler dispatches what the lanes have already
 #      submitted
@@ -54,9 +54,9 @@
 #
 # Tunables (env):
 #   STOW_PREHEAT_COST_WORK_DIR     work dir instead of a fresh mktemp
-#   STOW_PREHEAT_COST_LIMIT        --limit of `preheat top` and `preheat
-#                                  top-binaries` (default 100 — the
-#                                  production preheat-admin.yml value)
+#   STOW_PREHEAT_COST_LIMIT        --limit of `preheat top-binaries`
+#                                  (default 100 — the production
+#                                  preheat-admin.yml value)
 #   STOW_PREHEAT_COST_PROJECTS     submit only the first N repositories of
 #                                  preheat/projects.toml (default: all)
 #   STOW_PREHEAT_COST_TARGETS      comma-separated targets for every lane
@@ -279,7 +279,7 @@ if [ -n "$TARGETS" ]; then
 fi
 
 log "work dir: $WORK_DIR"
-log "rustc $RUSTC_VERSION; top/top-binaries limit $LIMIT; projects ${PROJECTS:-all}; targets ${TARGETS:-every CI target}"
+log "rustc $RUSTC_VERSION; top-binaries limit $LIMIT; projects ${PROJECTS:-all}; targets ${TARGETS:-every CI target}"
 log "dispatch caps: $MAX_JOBS ($MAX_MACOS_JOBS macOS)"
 
 cd "$REPO_ROOT"
@@ -440,13 +440,10 @@ PROJECT_ARGS=()
 
 run_lanes() {
     local phase="$1"
-    run_lane "$phase" 01 top top \
+    run_lane "$phase" 01 top-binaries top-binaries \
         ${LANE_TARGET_ARGS[@]+"${LANE_TARGET_ARGS[@]}"} \
         --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
-    run_lane "$phase" 02 top-binaries top-binaries \
-        ${LANE_TARGET_ARGS[@]+"${LANE_TARGET_ARGS[@]}"} \
-        --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
-    run_lane "$phase" 03 projects projects submit \
+    run_lane "$phase" 02 projects projects submit \
         --file "$REPO_ROOT/preheat/projects.toml" \
         ${LANE_TARGET_ARGS[@]+"${LANE_TARGET_ARGS[@]}"} \
         --rustc-version "$RUSTC_VERSION" \

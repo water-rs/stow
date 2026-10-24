@@ -297,7 +297,7 @@ fn cron_cache_miss_dispatches_admin_once() {
     );
 
     // Exactly one dispatch: preheat-admin.yml with the same rustc and
-    // both lanes enabled.
+    // the projects lane enabled.
     let gh = scn.calls_of("gh");
     assert_eq!(gh.len(), 1, "{gh:?}");
     let args = gh_dispatch_args(&gh[0]);
@@ -310,7 +310,6 @@ fn cron_cache_miss_dispatches_admin_once() {
                 "rustc_version".to_owned(),
                 CHANNEL_FIXTURE_VERSION.to_owned()
             ),
-            ("top_binaries".to_owned(), "true".to_owned()),
             ("projects".to_owned(), "true".to_owned()),
         ])
     );
@@ -402,8 +401,8 @@ fn admin_runner(scn: &Scenario, ctx: Val, env: BTreeMap<String, String>) -> supp
     run_job(scn, &wf, "preheat", ctx, env)
 }
 
-/// The admin lane's `preheat`/`preheat top-binaries`/`projects submit`
-/// argv tails, grouped by subcommand.
+/// The admin lane's `preheat top-binaries`/`projects submit` argv
+/// tails, grouped by subcommand.
 fn admin_calls(scn: &Scenario, sub: &str) -> Vec<Vec<String>> {
     scn.calls_of("stow-admin")
         .into_iter()
@@ -451,7 +450,6 @@ fn admin_declarations() {
     let inputs = dispatch_inputs(&wf);
     assert_eq!(inputs.get("limit"), Some(&Some(Val::Str("100".to_owned()))));
     assert_eq!(inputs.get("rustc_version"), Some(&None));
-    assert_eq!(inputs.get("top_binaries"), Some(&Some(Val::Bool(true))));
     assert_eq!(inputs.get("projects"), Some(&Some(Val::Bool(true))));
     let targets_default = match inputs.get("targets") {
         Some(Some(Val::Str(s))) => s.clone(),
@@ -493,28 +491,25 @@ fn admin_declarations() {
 }
 
 #[test]
-fn admin_all_nine_targets_both_lanes() {
+fn admin_all_nine_targets_every_lane() {
     let scn = Scenario::new();
     let runner = admin_runner(&scn, admin_ctx("1.98.1", &[]), base_env(&[]));
     assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
 
     let want = expected_targets();
-    for sub in ["top", "top-binaries"] {
-        let calls = admin_calls(&scn, sub);
-        assert_eq!(calls.len(), 1, "{sub}: {calls:?}");
-        let argv = &calls[0];
-        assert_eq!(
-            flag_value(argv, "--targets").as_deref(),
-            Some(want.as_str()),
-            "{sub}"
-        );
-        assert_eq!(
-            flag_value(argv, "--rustc-version").as_deref(),
-            Some("1.98.1")
-        );
-        assert_eq!(flag_value(argv, "--limit").as_deref(), Some("100"));
-        assert!(argv.iter().any(|a| a == "--yes"));
-    }
+    let calls = admin_calls(&scn, "top-binaries");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let argv = &calls[0];
+    assert_eq!(
+        flag_value(argv, "--targets").as_deref(),
+        Some(want.as_str())
+    );
+    assert_eq!(
+        flag_value(argv, "--rustc-version").as_deref(),
+        Some("1.98.1")
+    );
+    assert_eq!(flag_value(argv, "--limit").as_deref(), Some("100"));
+    assert!(argv.iter().any(|a| a == "--yes"));
     let submits = admin_calls(&scn, "projects");
     assert_eq!(submits.len(), 1, "{submits:?}");
     assert_eq!(submits[0][0], "submit");
@@ -544,7 +539,7 @@ fn admin_explicit_target_override() {
     );
     let runner = admin_runner(&scn, ctx, base_env(&[]));
     assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
-    for argv in admin_calls(&scn, "top") {
+    for argv in admin_calls(&scn, "top-binaries") {
         assert_eq!(
             flag_value(&argv, "--targets").as_deref(),
             Some("x86_64-unknown-linux-gnu,aarch64-apple-darwin")
@@ -553,42 +548,25 @@ fn admin_explicit_target_override() {
 }
 
 #[test]
-fn admin_library_lane_failure_still_runs_binary_lane() {
+fn admin_binary_lane_failure_still_runs_projects() {
     let scn = Scenario::new();
-    // `preheat top ` (trailing space) fails the library lane only —
-    // `preheat top-binaries` must still execute, and the step exits
-    // nonzero because a lane failed.
-    let env = base_env(&[("STUB_FAIL_RE", "preheat top ")]);
+    // A top-binaries failure fails its step, but is not a reason to
+    // drop the projects lane — only a real cancellation is
+    // (`!cancelled() && inputs.projects`).
+    let env = base_env(&[("STUB_FAIL_RE", "preheat top-binaries")]);
     let runner = admin_runner(&scn, admin_ctx("1.98.1", &[]), env);
 
-    let outcome = runner.outcome_of("Enqueue the top crates and the top binaries");
+    let outcome = runner.outcome_of("Enqueue the top binary crates");
     assert!(
         matches!(outcome, Outcome::Ran(code) if *code != 0),
         "{outcome:?}"
     );
     assert_eq!(runner.status(), Status::Failed);
-    assert_eq!(admin_calls(&scn, "top").len(), 1);
     assert_eq!(admin_calls(&scn, "top-binaries").len(), 1);
-    // A top-lane failure is not a reason to drop the projects lane —
-    // only a real cancellation is (`!cancelled() && inputs.projects`).
     assert_eq!(
         runner.outcome_of("Enqueue the projects lane"),
         &Outcome::Ran(0)
     );
-    assert_eq!(admin_calls(&scn, "projects").len(), 1);
-}
-
-#[test]
-fn admin_top_binaries_off_skips_only_that_lane() {
-    let scn = Scenario::new();
-    let runner = admin_runner(
-        &scn,
-        admin_ctx("1.98.1", &[("top_binaries", Val::Bool(false))]),
-        base_env(&[]),
-    );
-    assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
-    assert_eq!(admin_calls(&scn, "top").len(), 1);
-    assert_eq!(admin_calls(&scn, "top-binaries"), Vec::<Vec<String>>::new());
     assert_eq!(admin_calls(&scn, "projects").len(), 1);
 }
 

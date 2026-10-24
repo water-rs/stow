@@ -9,8 +9,8 @@
 #      resolver pins to the stable version is installed
 #   2. read the `limit` and `targets` input defaults of
 #      .github/workflows/preheat-admin.yml — the wave production runs
-#   3. run the three lanes preheat-admin.yml runs — `preheat top`,
-#      `preheat top-binaries`, `preheat projects submit` over the
+#   3. run the two lanes preheat-admin.yml runs — `preheat
+#      top-binaries` and `preheat projects submit` over the
 #      reviewed preheat/projects.toml — plan-only and concurrently (they
 #      are independent): without `--yes` a lane resolves and prints the
 #      tasks it would submit and never connects to an edge, so there is
@@ -20,10 +20,10 @@
 #      $WORK_DIR/production-wave.json; it fails when a lane exited
 #      non-zero or planned nothing, because either understates the wave
 #
-# Why its own job: the resolve takes 10-17 minutes for the two download
-# lanes and up to 100 for the projects lane in production, and beside the
-# Preheat cost job's wave it competed for the runner's CPUs until that
-# job's timeout. Here nothing else runs.
+# Why its own job: the dump download plus the resolve takes minutes for
+# the binaries lane and up to 100 for the projects lane in production,
+# and beside the Preheat cost job's wave it competed for the runner's
+# CPUs until that job's timeout. Here nothing else runs.
 #
 # Every child is bounded by a deadline and killed with its process
 # group on exit; a lane that passes its deadline exits 124, which the
@@ -32,9 +32,9 @@
 # Tunables (env):
 #   STOW_PRODUCTION_WAVE_WORK_DIR  work dir instead of a fresh mktemp
 #                                  (must be empty)
-#   STOW_PRODUCTION_WAVE_LIMIT     --limit of `preheat top` and `preheat
-#                                  top-binaries` (default: the `limit`
-#                                  input's default in preheat-admin.yml)
+#   STOW_PRODUCTION_WAVE_LIMIT     --limit of `preheat top-binaries`
+#                                  (default: the `limit` input's default
+#                                  in preheat-admin.yml)
 #   STOW_PRODUCTION_WAVE_TARGETS   comma-separated --targets of every lane
 #                                  (default: the `targets` input's
 #                                  default in preheat-admin.yml)
@@ -139,8 +139,7 @@ require_command yq
 
 # The production wave is the one preheat-admin.yml runs, so its defaults
 # come from that file rather than a copy here. preheat-cron.yml
-# dispatches it with the binaries and projects lanes on, so all three
-# lanes count.
+# dispatches it with the projects lane on, so both lanes count.
 workflow_default() {
     yq ".on.workflow_dispatch.inputs.$1.default" "$PREHEAT_ADMIN_WORKFLOW"
 }
@@ -198,11 +197,9 @@ start_lane() {
     log "started lane $2 (pid $!)"
 }
 
-start_lane 01 top top \
+start_lane 01 top-binaries top-binaries \
     --targets "$TARGETS" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
-start_lane 02 top-binaries top-binaries \
-    --targets "$TARGETS" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
-start_lane 03 projects projects submit \
+start_lane 02 projects projects submit \
     --file "$REPO_ROOT/preheat/projects.toml" \
     --targets "$TARGETS" --rustc-version "$RUSTC_VERSION"
 

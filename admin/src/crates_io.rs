@@ -10,10 +10,10 @@
 //! delay it asks for rather than retried under the crawler window.
 //!
 //! Version and dependency data come from the sparse index wherever the
-//! API is not needed. The API serves only what the index cannot: the
-//! `sort=downloads` rankings, the per-version download counts a version
-//! line is measured by, and the `has_lib` flag that picks a ranked
-//! crate's lane.
+//! API is not needed; rankings and the binary check come from the daily
+//! database dump ([`crate::dump`]), never the API. The API serves only
+//! what neither has: the per-crate detail envelope the `binary`/`plan`
+//! lanes read.
 
 use std::time::{Duration, Instant};
 
@@ -219,21 +219,6 @@ async fn fetch_once(url: &str, timeout: Duration) -> FetchOutcome {
 
 // ===== lane-facing fetchers =====
 
-/// The `GET /crates` list element — an id and its all-time downloads,
-/// which is the only ranking signal the API serves.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct CrateSummary {
-    /// The crate name.
-    pub id: String,
-    /// All-time downloads across every release.
-    pub downloads: u64,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct CratesResponse {
-    crates: Vec<CrateSummary>,
-}
-
 /// One published release as the crate detail endpoint reports it.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct CrateVersion {
@@ -241,15 +226,6 @@ pub struct CrateVersion {
     pub num: String,
     /// Whether crates.io yanked the release.
     pub yanked: bool,
-    /// All-time downloads of this exact version, which is how a version
-    /// line's share of the crate's use is measured.
-    #[serde(default)]
-    pub downloads: u64,
-    /// Whether the release publishes a library target, as crates.io's
-    /// version record reports it. `None` on records that predate the
-    /// field — an absent field is an old record, not a bin-only crate.
-    #[serde(default)]
-    pub has_lib: Option<bool>,
 }
 
 /// What a crate detail call answers: the full non-yanked version list
@@ -283,20 +259,8 @@ struct CrateDetailNode {
 }
 
 impl CratesIo {
-    /// The top-N crates by downloads — the one ranking only the API
-    /// serves.
-    pub async fn fetch_top_crates(
-        &mut self,
-        limit: usize,
-    ) -> stow_types::error::Result<Vec<CrateSummary>> {
-        let per_page = limit.min(100);
-        let url = format!("{API_BASE}?page=1&per_page={per_page}&sort=downloads");
-        let response = self.get_json::<CratesResponse>(&url).await?;
-        Ok(response.crates.into_iter().take(limit).collect())
-    }
-
     /// One `GET /crates/{name}` — versions, features, `has_lib`,
-    /// downloads. Everything the top and named-binary lanes need is in
+    /// downloads. Everything the named-binary and plan lanes need is in
     /// this envelope, so a crate never costs a second API call for its
     /// version list.
     pub async fn fetch_crate_detail(
@@ -335,70 +299,6 @@ impl CratesIo {
             downloads: response.krate.downloads,
         })
     }
-
-    /// The top-N binary crates: the `command-line-utilities` category
-    /// list is the ranking (API), while each candidate's newest release
-    /// comes from the sparse index — version data, which is exactly what
-    /// the index is for, so this lane spends one API call total plus the
-    /// list.
-    pub async fn fetch_top_binary_crates(
-        &mut self,
-        limit: usize,
-    ) -> stow_types::error::Result<Vec<BinaryCandidate>> {
-        let mut binaries = Vec::with_capacity(limit);
-        let mut page: u32 = 1;
-        let scan_per_page: usize = 100;
-        let max_scan_pages: u32 = 20;
-        while binaries.len() < limit && page <= max_scan_pages {
-            let url = format!(
-                "{API_BASE}?category=command-line-utilities&page={page}&per_page={scan_per_page}&sort=downloads"
-            );
-            let response: CratesResponse = self.get_json(&url).await?;
-            if response.crates.is_empty() {
-                break;
-            }
-            for summary in response.crates {
-                let latest = match index_releases(&summary.id)
-                    .await
-                    .map(|releases| latest_version(&releases))
-                {
-                    Ok(Some(latest)) => latest,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        tracing::warn!(
-                            crate = %summary.id,
-                            %error,
-                            "skipping candidate; failed to read the index"
-                        );
-                        continue;
-                    }
-                };
-                binaries.push(BinaryCandidate {
-                    id: summary.id.clone(),
-                    latest_version: latest,
-                    downloads: summary.downloads,
-                });
-                if binaries.len() >= limit {
-                    break;
-                }
-            }
-            page += 1;
-        }
-        binaries.truncate(limit);
-        Ok(binaries)
-    }
-}
-
-/// A `command-line-utilities` candidate: the crate name, its newest
-/// non-yanked release, and the downloads the scheduler orders by.
-#[derive(Debug, Clone)]
-pub struct BinaryCandidate {
-    /// The crate name.
-    pub id: String,
-    /// Newest non-yanked release.
-    pub latest_version: String,
-    /// All-time downloads.
-    pub downloads: u64,
 }
 
 // ===== the sparse index =====
@@ -437,6 +337,83 @@ fn index_url_at(index_base: &str, crate_name: &str) -> String {
         _ => format!("{}/{}/{name}", &name[0..2], &name[2..4]),
     };
     format!("{index_base}/{path}")
+}
+
+/// `GET` a crates.io URL and answer the response for the caller to
+/// stream the body itself — [`CratesIo::fetch`] buffers, which the ~2 GB
+/// database dump cannot pay. The retry classification is `fetch_once`'s;
+/// the retried unit is the request alone, so a body that breaks mid-read
+/// is the caller's signal to restart the transfer.
+pub async fn fetch_stream(url: &str) -> stow_types::error::Result<zenwave::Response> {
+    let mut backoff = Backoff::new();
+    loop {
+        match stream_once(url).await {
+            FetchOutcome::Body(response) => return Ok(response),
+            FetchOutcome::Retryable { error, retry_after } => {
+                let Some(wait) = backoff.next_wait(retry_after) else {
+                    return Err(error);
+                };
+                tracing::warn!(url, %error, "crates.io request failed; retrying");
+                tokio::time::sleep(wait).await;
+            }
+            FetchOutcome::Fatal(error) => return Err(error),
+        }
+    }
+}
+
+/// One `GET` of a crates.io URL, answered as soon as the status is
+/// known — the body stays a stream the caller reads.
+async fn stream_once(url: &str) -> FetchOutcome {
+    let mut client = zenwave::client();
+    let request = match client
+        .get(url)
+        .and_then(|request| request.header("User-Agent", USER_AGENT))
+    {
+        Ok(request) => request,
+        Err(error) => {
+            return FetchOutcome::Retryable {
+                error: stow_error!("build crates.io request for {url}: {error}"),
+                retry_after: None,
+            };
+        }
+    };
+    // The bound covers only the request's head — the response future
+    // resolves at headers and the body streams past it.
+    let read = tokio::time::timeout(TIMEOUT, request).await;
+    let (status, retry_after, error) = match read {
+        Ok(Err(error)) => {
+            let Some(response) = error.response() else {
+                return FetchOutcome::Retryable {
+                    error: stow_error!("fetch crates.io {url}: {error}"),
+                    retry_after: None,
+                };
+            };
+            (
+                response.status().as_u16(),
+                retry_after_hint(response.headers()),
+                stow_error!("fetch crates.io {url}: {error}"),
+            )
+        }
+        Ok(Ok(response)) if response.status().is_success() => {
+            return FetchOutcome::Body(response);
+        }
+        Ok(Ok(response)) => (
+            response.status().as_u16(),
+            retry_after_hint(response.headers()),
+            stow_error!("crates.io {url} returned HTTP {}", response.status()),
+        ),
+        Err(_) => {
+            return FetchOutcome::Retryable {
+                error: stow_error!("fetch crates.io {url}: timed out"),
+                retry_after: None,
+            };
+        }
+    };
+    if is_transient_status(status) {
+        FetchOutcome::Retryable { error, retry_after }
+    } else {
+        FetchOutcome::Fatal(error)
+    }
 }
 
 /// The crate's index URL at the production root — the shape tests pin

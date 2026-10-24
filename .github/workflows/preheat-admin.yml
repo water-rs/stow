@@ -18,15 +18,6 @@ on:
           Stable rustc the tasks target. Must match the channel the
           scheduler resolves, or the artifacts serve nothing.
         required: true
-      top_binaries:
-        description: >-
-          Also seed the top-N binary crates' resolves: stow-admin
-          fetches each `.crate` tarball and runs cargo's resolver
-          in-process per target — every crates.io node an ordinary
-          crate task carrying its crates.io edges as `depends_on`.
-        type: boolean
-        required: false
-        default: true
       targets:
         description: >-
           Space-separated target triples to enqueue. Defaults to
@@ -115,38 +106,21 @@ jobs:
       # ~10-minute lifetime. The JWT shape is how the edge tells the OIDC
       # caller apart, and the RepoWriter policy admits any workflow
       # inside the trusted repo.
-      - name: Enqueue the top crates and the top binaries
+      - name: Enqueue the top binary crates
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           LIMIT: ${{ inputs.limit }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
-          TOP_BINARIES: ${{ inputs.top_binaries }}
           TARGETS: ${{ inputs.targets }}
-        # The ranked list and each crate's detail are walked once for the
-        # whole matrix — one crates.io pass at the crawler's pace rather
-        # than nine.
+        # The lane fetches the crates.io database dump once — the
+        # ranking and the binary check come from it — then resolves one
+        # `.crate` tarball per binary for the whole matrix, so the lane
+        # is one invocation rather than nine.
         run: |
-          set -uo pipefail
-          failed=""
-          if ! ./target/release/stow-admin preheat top \
-            --targets "${TARGETS// /,}" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
-            echo "::error::preheat top failed"
-            failed="$failed (top)"
-          fi
-          # One tarball per binary resolves the whole matrix, so this
-          # lane is one invocation rather than nine.
-          if [ "$TOP_BINARIES" = "true" ]; then
-            if ! ./target/release/stow-admin preheat top-binaries \
-              --targets "${TARGETS// /,}" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes; then
-              echo "::error::preheat top-binaries failed"
-              failed="$failed (top-binaries)"
-            fi
-          fi
-          if [ -n "$failed" ]; then
-            echo "::error::preheat incomplete:$failed"
-            exit 1
-          fi
+          set -euo pipefail
+          ./target/release/stow-admin preheat top-binaries \
+            --targets "${TARGETS// /,}" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT" --yes
       - name: Enqueue the projects lane
         # A top-lane failure is a skip signal for that step, not a reason
         # to drop this lane — the top step's own contract is that one
