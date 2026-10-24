@@ -59,7 +59,7 @@ JSON) and sends nothing.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `scheduler demand-feed` (the `/api/v1/admin/scheduler/demand-feed/*` input lane — see the demand-feed runbook below), `dispatch-freeze status\|clear` (the `/api/v1/admin/dispatch-freeze` recovery path) and `index report` (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `index export`/`publish` never read it — they run against GHCR only. `preheat manual` and the preheat lanes (`top`, `top-binaries`, `binary`, `missed`, `projects submit`, `plan`) read it only under `--yes`, when they submit: a plan-only run needs neither it nor an edge credential. |
+| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `scheduler demand-feed` (the `/api/v1/admin/scheduler/demand-feed/*` input lane — see the demand-feed runbook below), `dispatch-freeze status\|clear` (the `/api/v1/admin/dispatch-freeze` recovery path) and `index report` (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `index export`/`publish` never read it — they run against GHCR only. `preheat manual` and the preheat lanes (`top-binaries`, `binary`, `missed`, `projects submit`, `plan`) read it only under `--yes`, when they submit: a plan-only run needs neither it nor an edge credential. |
 | `STOW_EDGE_VERSION_OVERRIDE` | _optional_ | Verbatim `Cloudflare-Workers-Version-Overrides` header value (e.g. `stow-edge="<version-id>"`) pinned onto every edge call — `deploy-edge.yml` sets it so trusted calls run on the uploaded candidate before traffic shifts. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | falls back to `gh auth token` | Operator GitHub credential for the edge's trusted endpoints and the GitHub REST calls (`runs`, `builds`, `cache`, `preheat projects generate`); the owner must have push access to `water-rs/stow`. |
 | `CF_ACCOUNT_ID` | _required for `preheat missed` and `watchdog`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
@@ -150,7 +150,7 @@ billed rows. `docs/MOCK.md` describes the run.
 | Variable | Default | Purpose |
 |---|---|---|
 | `STOW_PREHEAT_COST_WORK_DIR` | fresh `mktemp -d` | Work dir for keys, registry, edge state, logs, ledger snapshots and `preheat-cost-report.json`. Must be empty. |
-| `STOW_PREHEAT_COST_LIMIT` | `100` | `--limit` of `preheat top` and `preheat top-binaries` — the production `preheat-admin.yml` value. |
+| `STOW_PREHEAT_COST_LIMIT` | `100` | `--limit` of `preheat top-binaries` — the production `preheat-admin.yml` value. |
 | `STOW_PREHEAT_COST_PROJECTS` | every listed repository | `preheat projects submit --limit`: resolve only the first N repositories of `preheat/projects.toml`. |
 | `STOW_PREHEAT_COST_TARGETS` | every `CI_TARGET_TRIPLES` entry | Comma-separated `--targets` for every lane. |
 | `STOW_PREHEAT_COST_MAX_JOBS` / `STOW_PREHEAT_COST_MAX_MACOS_JOBS` | `45` / `16` | The scheduler's dispatch caps for the run — `edge/Skyzen.toml`'s production values, replacing the mock manifest's. |
@@ -168,7 +168,7 @@ credential is involved (`docs/MOCK.md`).
 | Variable | Default | Purpose |
 |---|---|---|
 | `STOW_PRODUCTION_WAVE_WORK_DIR` | fresh `mktemp -d` | Work dir for `logs/`, `lanes/<NN>-<lane>/` and `production-wave.json`. Must be empty. |
-| `STOW_PRODUCTION_WAVE_LIMIT` | the `limit` input's default in `.github/workflows/preheat-admin.yml` | `--limit` of `preheat top` and `preheat top-binaries`. |
+| `STOW_PRODUCTION_WAVE_LIMIT` | the `limit` input's default in `.github/workflows/preheat-admin.yml` | `--limit` of `preheat top-binaries`. |
 | `STOW_PRODUCTION_WAVE_TARGETS` | the `targets` input's default in `.github/workflows/preheat-admin.yml` | Comma-separated `--targets` of every lane. |
 | `STOW_PRODUCTION_WAVE_DEADLINE` | `3300` | Seconds each lane may run before it is killed; the count then refuses the lane. |
 | `STOW_RESOLVE_CARGO_HOME` | `$WORK_DIR/resolve-cargo` | The shared resolve root the script exports to each lane as `<root>/<NN>-<lane>` — separate per lane because the lanes run concurrently and a worker's resolve holds cargo's exclusive package-cache lock. Point it at a cache-restored directory so warm runs skip the cold index/`.crate` fetch. |

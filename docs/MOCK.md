@@ -90,8 +90,8 @@ or a real consumer project instead of the throwaway one.
 
 `scripts/preheat-cost.sh` runs a whole preheat wave on the same three
 services and prices it in the rows the scheduler Durable Object is
-billed for (stow#773). The production lanes — `preheat top`, `preheat
-top-binaries`, `preheat projects submit` over `preheat/projects.toml`
+billed for (stow#773). The production lanes — `preheat
+top-binaries` and `preheat projects submit` over `preheat/projects.toml`
 — submit the real resolved graph across every CI target while the
 wave runs; every dispatch is a real `stow-build build` and publish
 validation whose rustc invocations a mock compiler answers with empty
@@ -126,7 +126,7 @@ STOW_PREHEAT_COST_LIMIT=3 STOW_PREHEAT_COST_PROJECTS=2 \
 
 The monthly projection needs the production wave's size, and counting
 it needs no mock stack. `scripts/production-wave.sh` runs the three
-production lanes — `preheat top`, `preheat top-binaries` and `preheat
+production lanes — `preheat top-binaries` and `preheat
 projects submit` — at `preheat-admin.yml`'s default limit and targets,
 concurrently and plan-only: without `--yes` a lane resolves and prints
 the tasks it would submit and never connects to an edge, so nothing is
@@ -302,24 +302,16 @@ asked for admissions only when the index reports a miss.
 
 ## Populate the cache
 
-Two preheat shapes are useful:
-
-**Library base pool** — top-N popular libraries with default features:
-
-```sh
-STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
-target/release/stow-admin preheat top \
-  --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
-```
-
-**Top binaries** — the top-N binary crates resolved as name sources through
-the crate lane (each one's bundled `Cargo.lock` is dropped like every
-lane's, so tasks land on the latest semver-compatible versions):
+**Top binaries** — the top-N crates whose default version ships a binary
+target, ranked by the last 90 days of `version_downloads` in the crates.io
+database dump (fetched once), each resolved as a name source through the
+crate lane (each one's bundled `Cargo.lock` is dropped like every lane's,
+so tasks land on the latest semver-compatible versions):
 
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
 target/release/stow-admin preheat top-binaries \
-  --target aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
+  --targets aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
 
 Watch the queue drain:
@@ -364,12 +356,12 @@ rustup run stable stow check --silent-compatible-upgrades \
 stow status   # rust-cache: hits=N misses=M errors=0
 ```
 
-If you only ran `preheat top` you'll typically see hits=0 because
-standalone-built libraries produce different `dependency_c_metadata_json`
-than ripgrep's own lockfile resolution. That's expected — this is what
-`preheat top-binaries` solves. After `preheat top-binaries --limit 100`,
-many real-project lockfiles overlap enough with the binary closures that
-the wrapper's exact-key path starts hitting.
+A row only hits when the cached artifact's `dependency_c_metadata_json`
+matches the consumer's resolved graph — which is why the wave preheats
+binary closures rather than standalone-built libraries. After `preheat
+top-binaries --limit 100`, many real-project lockfiles overlap enough
+with the binary closures that the wrapper's exact-key path starts
+hitting.
 
 ## Forced eviction
 

@@ -104,7 +104,7 @@ pub struct Round {
 /// One preheat lane's run: its submit and the ledger around it.
 #[derive(Debug, Clone)]
 pub struct LaneRun {
-    /// `top`, `top-binaries` or `projects`.
+    /// `top-binaries` or `projects`.
     pub lane: String,
     /// Tasks the lane posted.
     pub submitted: u64,
@@ -159,7 +159,7 @@ pub struct ProductionTask {
 /// One production preheat lane's plan-only output.
 #[derive(Debug, Clone)]
 pub struct ProductionLane {
-    /// `top`, `top-binaries` or `projects`.
+    /// `top-binaries` or `projects`.
     pub lane: String,
     /// Every task the lane planned, duplicates included.
     pub tasks: Vec<ProductionTask>,
@@ -1033,7 +1033,7 @@ mod tests {
             .collect();
         let end = rounds.last().unwrap().end.clone();
         let lane = LaneRun {
-            lane: "top".to_owned(),
+            lane: "top-binaries".to_owned(),
             submitted: 3,
             inserted: 3,
             inserted_edges: 2,
@@ -1171,30 +1171,26 @@ mod tests {
         let wave = count_production(&[
             // `a` twice inside the lane: two targets' resolves of the
             // same shared node land on one task id.
-            production_lane("top", &[("a", "t1"), ("b", "t1"), ("a", "t1")]),
-            production_lane("top-binaries", &[("b", "t1"), ("c", "t2"), ("d", "t2")]),
-            production_lane("projects", &[("a", "t1"), ("d", "t2"), ("e", "t1")]),
+            production_lane("top-binaries", &[("a", "t1"), ("b", "t1"), ("a", "t1")]),
+            production_lane("projects", &[("a", "t1"), ("b", "t1"), ("c", "t2")]),
         ]);
-        assert_eq!(wave.nodes, 5);
-        assert_eq!(wave.nodes_per_target["t1"], 3);
-        assert_eq!(wave.nodes_per_target["t2"], 2);
+        assert_eq!(wave.nodes, 3);
+        assert_eq!(wave.nodes_per_target["t1"], 2);
+        assert_eq!(wave.nodes_per_target["t2"], 1);
         let counts: Vec<(&str, u64, u64)> = wave
             .lanes
             .iter()
             .map(|lane| (lane.lane.as_str(), lane.planned, lane.new_nodes))
             .collect();
-        assert_eq!(
-            counts,
-            [("top", 3, 2), ("top-binaries", 3, 2), ("projects", 3, 1)]
-        );
+        assert_eq!(counts, [("top-binaries", 3, 2), ("projects", 3, 1)]);
     }
 
     #[test]
     fn a_lane_that_planned_nothing_is_refused() {
-        let planned = count_production(&[production_lane("top", &[("a", "t1")])]);
+        let planned = count_production(&[production_lane("top-binaries", &[("a", "t1")])]);
         planned.require_planned().expect("every lane planned");
         let empty = count_production(&[
-            production_lane("top", &[("a", "t1")]),
+            production_lane("top-binaries", &[("a", "t1")]),
             production_lane("projects", &[]),
         ]);
         let error = empty.require_planned().expect_err("an empty lane");

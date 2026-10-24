@@ -487,7 +487,6 @@ fn a_submit_without_an_edge_fails_before_it_resolves() {
     // `--yes` run stops at the missing edge before any crates.io or
     // resolver work.
     for lane in [
-        vec!["top", "--rustc-version", "1.98.1"],
         vec!["top-binaries", "--rustc-version", "1.98.1"],
         vec!["binary", "serde"],
         vec![

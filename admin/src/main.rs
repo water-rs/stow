@@ -16,6 +16,7 @@ mod coverage;
 mod crates_io;
 mod demand_feed;
 mod deploy;
+mod dump;
 mod github;
 mod index_cmd;
 mod launch_model;

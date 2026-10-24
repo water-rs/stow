@@ -189,7 +189,8 @@ demand rather than inferred demand.
 This overlay may introduce candidates outside both:
 
 - the `default/full` base feature policy
-- the top-library or top-binary popularity windows
+- the top-binary popularity window (stow#891 merged the popularity lanes:
+  the dump-driven top-binaries ranking is the only popularity seed)
 
 However, user feedback is still budgeted. A miss does not automatically imply
 permanent admission into the pool.

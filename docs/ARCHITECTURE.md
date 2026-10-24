@@ -678,9 +678,11 @@ release invalidates the whole pool and it has to be re-heated from zero.
 Four workflows keep it warm:
 
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
-  shared base pool directly against the scheduler: `preheat top` for
-  the top-N library crates and `preheat top-binaries` for the top-N
-  binaries — each `.crate` tarball resolved in-process by
+  shared base pool directly against the scheduler: `preheat
+  top-binaries` for the top-N crates whose default version ships a
+  binary target, ranked by the last 90 days of `version_downloads` —
+  the ranking and the binary check read once from the crates.io daily
+  database dump — each `.crate` tarball resolved in-process by
   `stow-resolver` into ordinary crate tasks
   carrying `depends_on` edges, exactly the way the projects lane
   resolves a repository's codeload tarball — plus the projects lane
