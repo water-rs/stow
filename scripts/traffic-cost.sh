@@ -58,15 +58,20 @@
 #                               (default 1.0)
 #   STOW_TRAFFIC_RUSTC          rustc the lanes request and the index
 #                               slice publishes under (default 1.85.0)
+#   STOW_TRAFFIC_EDGE_PORT      port `wrangler dev` binds (default 8788)
+#   STOW_TRAFFIC_INSPECTOR_PORT port the workerd inspector binds (default 9230)
+#   STOW_TRAFFIC_REGISTRY_PORT  port `stow-mock-registry serve` binds
+#                               (default 28123)
+#   STOW_TRAFFIC_LOCAL_CI_PORT  port `stow-build serve` binds (default 28124)
 set -euo pipefail
 set -m
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-EDGE_PORT=8788
-INSPECTOR_PORT=9230
-REGISTRY_ADDR=127.0.0.1:28123
-LOCAL_CI_ADDR=127.0.0.1:28124
+EDGE_PORT="${STOW_TRAFFIC_EDGE_PORT:-8788}"
+INSPECTOR_PORT="${STOW_TRAFFIC_INSPECTOR_PORT:-9230}"
+REGISTRY_ADDR="127.0.0.1:${STOW_TRAFFIC_REGISTRY_PORT:-28123}"
+LOCAL_CI_ADDR="127.0.0.1:${STOW_TRAFFIC_LOCAL_CI_PORT:-28124}"
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
 INSPECTOR_URL="ws://127.0.0.1:${INSPECTOR_PORT}/ws"
@@ -151,7 +156,14 @@ stop_tree() {
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
-    local i
+    [ -n "${MOCK_MANIFEST:-}" ] && rm -f "$MOCK_MANIFEST"
+    local i pid
+    # The command `fg` is currently waiting on (or a substitution's
+    # subshell) is a direct child too — stop it with the services so a
+    # trap that fires mid-command tears down what it interrupted.
+    for pid in $(pgrep -P $$ 2>/dev/null) ${FG_PID:-}; do
+        stop_tree "$pid"
+    done
     for ((i = ${#CHILD_PIDS[@]} - 1; i >= 0; i--)); do
         stop_tree "${CHILD_PIDS[$i]}"
     done
@@ -170,6 +182,29 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT INT TERM
+
+# Process-group leader of the long command the script is waiting on.
+# Bash defers a trapped signal until the current foreground child
+# returns, so a TERM landing during a minutes-long build or the peak
+# drive would never run the trap before the follow-up KILL. `fg` runs
+# such commands as a background job and `wait`s on them — `wait` is
+# interruptible, so the trap fires at once while the child is still
+# alive for cleanup to kill (each `&` job is its own process group
+# under `set -m`).
+FG_PID=
+fg() {
+    "$@" &
+    FG_PID=$!
+    wait "$FG_PID"
+}
+
+# `fg` takes one command; a step that must run in another directory cds
+# inside the job subshell first.
+in_dir() {
+    local dir="$1"
+    shift
+    ( cd "$dir" && "$@" )
+}
 
 require_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found on PATH: $1"
@@ -246,7 +281,7 @@ fi
 
 cd "$REPO_ROOT"
 echo "[traffic] building stow-admin, stow-mock-registry and stow-build"
-cargo build --release -p stow-admin -p stow-mock-registry -p stow-build \
+fg cargo build --release -p stow-admin -p stow-mock-registry -p stow-build \
     >"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build failed — see $LOG_DIR/cargo-build.log"
 BIN="$REPO_ROOT/target/release"
@@ -296,11 +331,20 @@ jq --arg rustc "$RUSTC_VERSION" --arg digest "$BUNDLE_DIGEST" --argjson size "$B
     || die "index-from-records failed — see $LOG_DIR/mock-registry-cli.log"
 echo "[traffic] published bundle $BUNDLE_DIGEST and its index slice (x86_64-unknown-linux-gnu / $RUSTC_VERSION)"
 
-(
-    cd "$REPO_ROOT/edge"
-    skyzen build --provider cloudflare --manifest Skyzen.mock.toml
-) >"$LOG_DIR/edge-build.log" 2>&1 \
+# The mock manifest's loopback URLs (the registry and the local-CI
+# dispatcher) bake into the edge bundle at `skyzen build` time, so a
+# shifted port set needs a manifest rendered for it: a copy of
+# Skyzen.mock.toml with the two port strings rewritten, living only
+# for the build.
+MOCK_MANIFEST="$REPO_ROOT/edge/Skyzen.mock.traffic-$$.toml"
+sed -e "s/127\.0\.0\.1:28123/127.0.0.1:${REGISTRY_ADDR##*:}/g" \
+    -e "s/127\.0\.0\.1:28124/127.0.0.1:${LOCAL_CI_ADDR##*:}/g" \
+    "$REPO_ROOT/edge/Skyzen.mock.toml" >"$MOCK_MANIFEST"
+fg in_dir "$REPO_ROOT/edge" \
+    skyzen build --provider cloudflare --manifest "$(basename "$MOCK_MANIFEST")" \
+    >"$LOG_DIR/edge-build.log" 2>&1 \
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
+rm -f "$MOCK_MANIFEST"
 # Wrangler writes its own ISO-timestamped log to WRANGLER_LOG_PATH.
 mkdir -p "$LOG_DIR/wrangler"
 export WRANGLER_LOG_PATH="$LOG_DIR/wrangler"
@@ -377,9 +421,9 @@ wait_for "local CI dispatch endpoint" 60 "$!" \
 
 # Same deploy order as deploy-edge.yml: the operator reset runs before
 # the scheduler takes traffic.
-reset_out="$(admin scheduler reset --yes 2>&1)" \
-    || die "stow-admin scheduler reset failed: $reset_out"
-echo "[traffic] $reset_out"
+fg admin scheduler reset --yes >"$WORK_DIR/scheduler-reset.log" 2>&1 \
+    || die "stow-admin scheduler reset failed — see $WORK_DIR/scheduler-reset.log"
+echo "[traffic] $(cat "$WORK_DIR/scheduler-reset.log")"
 
 # One budget pass: $1 is the label, the rest the `scheduler budget`
 # arguments. `--json` keeps the per-statement detail; the command exits
@@ -388,7 +432,7 @@ budget_pass() {
     local label="$1"
     shift
     echo "[traffic] budget pass: $label"
-    admin --json scheduler budget --dispatch-limit "$DISPATCH_LIMIT" "$@" \
+    fg admin --json scheduler budget --dispatch-limit "$DISPATCH_LIMIT" "$@" \
         >"$REPORT_DIR/budget-$label.json" 2>"$LOG_DIR/budget-$label.log" \
         || { cat "$LOG_DIR/budget-$label.log" >&2; \
              die "budget pass $label over budget — see $REPORT_DIR/budget-$label.json"; }
@@ -414,7 +458,7 @@ budget_pass "small" --queue-rows "$SMALL"
 # the task's records artifact under the run's per-build tag
 # `records-<rustc>-<hash>-<run id>-1`, at the task's own rustc.
 # `traffic-cost fixture-runs` owns the shape math.
-admin --json traffic-cost fixture-runs --queue-rows "$SMALL" \
+fg admin --json traffic-cost fixture-runs --queue-rows "$SMALL" \
     >"$WORK_DIR/fixture-runs.json" 2>"$LOG_DIR/fixture-runs.log" \
     || die "traffic-cost fixture-runs failed — see $LOG_DIR/fixture-runs.log"
 curl -sf --max-time 60 -X POST -H 'Content-Type: application/json' \
@@ -433,7 +477,7 @@ LANE_ARGS=(
 )
 
 echo "[traffic] Worker CPU per lane"
-admin --json traffic-cost cpu "${LANE_ARGS[@]}" \
+fg admin --json traffic-cost cpu "${LANE_ARGS[@]}" \
     --bundle-digest "$BUNDLE_DIGEST" \
     --inspector-url "$INSPECTOR_URL" \
     >"$REPORT_DIR/worker-cpu.json" 2>"$LOG_DIR/worker-cpu.log" \
@@ -455,7 +499,7 @@ for ((seg = 1; seg <= SEGMENTS; seg++)); do
         start_edge
     fi
     echo "[traffic] segment $seg/$SEGMENTS: ${seg_secs}s"
-    admin --json traffic-cost peak "${LANE_ARGS[@]}" \
+    fg admin --json traffic-cost peak "${LANE_ARGS[@]}" \
         --duration-secs "$seg_secs" \
         --rate-scale "$RATE_SCALE" \
         >"$REPORT_DIR/peak-seg${seg}.json" 2>"$LOG_DIR/peak-seg${seg}.log" \
@@ -470,7 +514,7 @@ drain_builds "after the peak drive"
 # The loaded fixture, measured again — no reseed.
 budget_pass "after" --queue-rows "$SMALL"
 
-admin traffic-cost verdict \
+fg admin traffic-cost verdict \
     --small "$REPORT_DIR/budget-small.json" \
     --large "$REPORT_DIR/budget-large.json" \
     --after "$REPORT_DIR/budget-after.json" \

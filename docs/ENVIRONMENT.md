@@ -179,6 +179,23 @@ credential is involved (`docs/MOCK.md`).
 | `STOW_RESOLVE_CARGO_HOME` | `$WORK_DIR/resolve-cargo` | The shared resolve root the script exports to each lane as `<root>/<NN>-<lane>` — separate per lane because the lanes run concurrently and a worker's resolve holds cargo's exclusive package-cache lock. Point it at a cache-restored directory so warm runs skip the cold index/`.crate` fetch. |
 | `STOW_E2E_TOOLCHAIN` | `stable` | The rustup toolchain whose version the lanes resolve for (`RUSTUP_TOOLCHAIN`). |
 
+## scripts/mock-e2e.sh
+
+The mock end-to-end run (`docs/MOCK.md`). Every variable is optional
+except the GitHub credential (`GH_TOKEN` / `GITHUB_TOKEN`, else `gh
+auth token`).
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STOW_E2E_WORK_DIR` | fresh `mktemp -d` under `TMPDIR` | Work directory: keys, mock registry, edge state, stow cache, `logs/`, the local-CI dispatch tree. Must be empty when given. |
+| `STOW_E2E_TOOLCHAIN` | `stable` | rustup toolchain the run builds with (`RUSTUP_TOOLCHAIN`); must be a release — the build stage re-pins the task's rustc version as a toolchain name. |
+| `STOW_E2E_READY_DEADLINE` | `600` | Seconds to wait for each service to listen. |
+| `STOW_E2E_TASK_DEADLINE` | `1200` | Seconds to wait for a scheduler graph to drain. |
+| `STOW_E2E_EDGE_PORT` | `8788` | Port `wrangler dev` binds the edge on. |
+| `STOW_E2E_INSPECTOR_PORT` | `9229` | Port the workerd inspector binds. |
+| `STOW_E2E_REGISTRY_PORT` | `28123` | Port `stow-mock-registry serve` binds; the edge bundle's `GHCR_BASE_URL` / `STOW_GITHUB_API_URL` / `STOW_STATS_SQL_URL` are rendered to match at `skyzen build` time. |
+| `STOW_E2E_LOCAL_CI_PORT` | `28124` | Port `stow-build serve` binds; the edge bundle's `STOW_LOCAL_CI_URL` is rendered to match at `skyzen build` time. |
+
 ## stow-mock-registry
 
 | Variable | Default | Purpose |
@@ -214,6 +231,10 @@ The release gate's `Traffic cost` job runs this script on the mock stack
 | `STOW_TRAFFIC_SEGMENTS` | `4` | Segments the drive runs in; the edge restarts between them to bound `wrangler dev`'s per-request memory retention. |
 | `STOW_TRAFFIC_RATE_SCALE` | `1.0` | Multiplier over the launch model's peak rates. |
 | `STOW_TRAFFIC_RUSTC` | `1.85.0` | rustc version the lanes request and the index slice is published under. |
+| `STOW_TRAFFIC_EDGE_PORT` | `8788` | Port `wrangler dev` binds the edge on. |
+| `STOW_TRAFFIC_INSPECTOR_PORT` | `9230` | Port the workerd inspector binds — the CPU pass samples it through DevTools. |
+| `STOW_TRAFFIC_REGISTRY_PORT` | `28123` | Port `stow-mock-registry serve` binds; the edge bundle's `GHCR_BASE_URL` / `STOW_GITHUB_API_URL` / `STOW_STATS_SQL_URL` are rendered to match at `skyzen build` time. |
+| `STOW_TRAFFIC_LOCAL_CI_PORT` | `28124` | Port `stow-build serve` binds; the edge bundle's `STOW_LOCAL_CI_URL` is rendered to match at `skyzen build` time. |
 
 ## edge worker (Cloudflare bindings, set in `wrangler.toml`/`Skyzen.toml`)
 
