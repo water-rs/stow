@@ -229,6 +229,7 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 2] {
                 "/tasks/submit-ids".post(api::submit_task_ids),
                 "/requests/{request_id}/outcome".post(api::scheduler_request_outcome),
                 "/status".at(api::scheduler_status),
+                "/health".at(api::scheduler_health),
             ))
             .with(gate.clone()),
     ]

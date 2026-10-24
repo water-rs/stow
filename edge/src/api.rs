@@ -655,9 +655,28 @@ pub async fn submit_task_ids(
 /// GET /api/v1/scheduler/status
 pub async fn scheduler_status(
     State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<stow_types::api::SchedulerStatus>, GetArtifactError> {
+) -> Result<Response, GetArtifactError> {
     let status = scheduler_client::get_status(&scheduler).await?;
-    Ok(Json(status))
+    cacheable_json(&status, POINT_IN_TIME_NO_STORE)
+}
+
+/// GET /api/v1/scheduler/health
+///
+/// The unauthenticated liveness probe (stow#860): one scheduler request
+/// reading state the object already holds — no D1, no GHCR, no GitHub
+/// call. `no-store` so Workers Cache never replays a stale answer.
+/// An `unhealthy` scheduler component answers 503 — the status the
+/// edge already gives an unavailable dependency — so a plain HTTP
+/// uptime check needs no JSON parsing.
+pub async fn scheduler_health(
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Response, GetArtifactError> {
+    let health = scheduler_client::get_health(&scheduler).await?;
+    let mut response = cacheable_json(&health, POINT_IN_TIME_NO_STORE)?;
+    if health.scheduler != stow_types::api::HealthState::Ok {
+        *response.status_mut() = skyzen::StatusCode::SERVICE_UNAVAILABLE;
+    }
+    Ok(response)
 }
 
 /// POST /api/v1/requests

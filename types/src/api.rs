@@ -1096,6 +1096,15 @@ pub struct DispatchFreeze {
 /// (#450) and the edge agree.
 pub const DISPATCH_FREEZE_INCIDENT_KEY: &str = "dispatch-freeze";
 
+/// The longest a started `build-crate.yml` run lasts.
+///
+/// Its `build` job's `timeout-minutes` plus its `publish` job's, both
+/// enforced by GitHub, so the run's `completed` delivery lands within
+/// it. The scheduler's
+/// health check (stow#860) calls deliveries stopped past it; the admin
+/// workflow tests pin it to the workflow file.
+pub const BUILD_CRATE_RUN_TIMEOUT_MINUTES: i64 = 120 + 60;
+
 /// One line of the dispatch-freeze transition log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct DispatchFreezeTransition {
@@ -1149,6 +1158,20 @@ pub enum DispatchFreezeTrigger {
     Tripped(DispatchFreezeTrip),
     /// The scheduler object's own SQL meter crossed a daily budget.
     Cost(DispatchFreezeCost),
+}
+
+impl DispatchFreezeTrigger {
+    /// The one-word trigger summary — the serde `kind` tag the stored
+    /// record serializes under, which `GET /api/v1/scheduler/health`'s
+    /// `freeze_trigger` echoes (stow#860).
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Tripped(_) => "tripped",
+            Self::Cost(_) => "cost",
+        }
+    }
 }
 
 /// The observed window that tripped a dispatch freeze — the numbers the
@@ -1328,6 +1351,43 @@ pub enum ChannelOutcome {
         /// Why the channel is off (names the missing binding/var).
         reason: String,
     },
+}
+
+/// One component's health as `GET /api/v1/scheduler/health` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthState {
+    /// Serving within its contract.
+    Ok,
+    /// Outside its contract — the route answers 503 so a plain HTTP
+    /// uptime check sees it without parsing the body.
+    Unhealthy,
+}
+
+/// The uncached health answer of `GET /api/v1/scheduler/health`
+/// (stow#860) — one scheduler request reading state it already holds:
+/// no D1, no GHCR, no GitHub call.
+///
+/// The serving Worker is `ok` by construction (answering the request
+/// is the proof); the scheduler is `unhealthy` while the dispatch
+/// freeze is engaged or while a run is `running` with no
+/// `workflow_run` delivery accepted inside `build-crate.yml`'s
+/// job-timeout bound.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerHealth {
+    /// The serving Worker — always `ok`.
+    pub worker: HealthState,
+    /// The scheduler Durable Object's verdict on itself.
+    pub scheduler: HealthState,
+    /// Whether the dispatch freeze is engaged.
+    pub dispatch_frozen: bool,
+    /// One-word summary of the freeze's trigger as the freeze already
+    /// records it (`manual` / `tripped` / `cost`) — `null` while not
+    /// frozen.
+    pub freeze_trigger: Option<String>,
+    /// Seconds since the scheduler last accepted a `workflow_run`
+    /// delivery — `null` before the first one.
+    pub last_run_update_age_seconds: Option<u64>,
 }
 
 /// Scheduler DO queue status for monitoring.
@@ -4565,6 +4625,14 @@ pub enum SchedulerEvent {
         /// The run's runner family.
         family: RunnerFamily,
     },
+    /// A `workflow_run` delivery the scheduler accepted that appended
+    /// nothing else — the `in_progress` channel's own-run and stale
+    /// outcomes (stow#860). The log row's `at` is the acceptance
+    /// instant the health check's last-delivery age reads; deliveries
+    /// that already append an event (`RunFinished`,
+    /// `ExternalRunStarted`, `Request` `RunUpdated`) mark it from
+    /// their own rows instead.
+    RunUpdate,
     /// A `workflow_run` `completed` delivery — applies to a bound run,
     /// parks until the binding lands, or just consumes an external run.
     RunFinished {

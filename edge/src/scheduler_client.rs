@@ -12,6 +12,7 @@ const SCHEDULER_COMPLETE_RUN_URL: &str = "https://scheduler.internal/tasks/compl
 const SCHEDULER_RUN_UPDATE_URL: &str = "https://scheduler.internal/tasks/run-update";
 const SCHEDULER_REQUESTS_URL: &str = "https://scheduler.internal/requests";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
+const SCHEDULER_HEALTH_URL: &str = "https://scheduler.internal/health";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
@@ -93,6 +94,14 @@ pub async fn get_status(
     namespace: &CfDurableNamespace,
 ) -> Result<stow_types::api::SchedulerStatus, SchedulerClientError> {
     get_json(namespace, SCHEDULER_STATUS_URL).await
+}
+
+/// The `GET /api/v1/scheduler/health` body's read (stow#860) — one
+/// request on state the object already holds.
+pub async fn get_health(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::SchedulerHealth, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_HEALTH_URL).await
 }
 
 /// Admit a human request: the object dedupes on the deterministic

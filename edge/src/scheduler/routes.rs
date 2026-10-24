@@ -264,8 +264,11 @@ pub(super) async fn complete_run(
 }
 
 /// `POST /tasks/run-update`: an own run's `in_progress` delivery
-/// changes nothing persistent (the post-wake reconcile restores running
-/// state); a run the scheduler did not dispatch appends its occupancy.
+/// changes nothing persistent but the health check's last-delivery
+/// instant (stow#860) — `RunUpdate` marks the acceptance so a wake
+/// replays it (the post-wake reconcile restores running state); a run
+/// the scheduler did not dispatch appends its occupancy instead, whose
+/// apply marks the same instant.
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed append.
@@ -279,13 +282,14 @@ pub(super) async fn task_run_update(
     let family = stow_types::ci::family_of_task_id(&update.task_id)
         .unwrap_or(stow_types::api::RunnerFamily::Linux);
     let outcome = graph.with(|graph| graph.run_started(&update.task_id, run_id, family, now));
-    if outcome == StartOutcome::External {
-        let event = SchedulerEvent::ExternalRunStarted {
+    let event = match outcome {
+        StartOutcome::External => SchedulerEvent::ExternalRunStarted {
             run_id: update.github_run_id.clone(),
             family,
-        };
-        append(graph, db, std::slice::from_ref(&event), now).await?;
-    }
+        },
+        StartOutcome::Applied | StartOutcome::Stale => SchedulerEvent::RunUpdate,
+    };
+    append(graph, db, std::slice::from_ref(&event), now).await?;
     Ok(outcome)
 }
 
