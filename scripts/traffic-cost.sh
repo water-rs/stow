@@ -112,6 +112,8 @@ export RUSTUP_TOOLCHAIN="${STOW_E2E_TOOLCHAIN:-stable}"
 if [ -n "${STOW_TRAFFIC_WORK_DIR:-}" ]; then
     WORK_DIR="$STOW_TRAFFIC_WORK_DIR"
     mkdir -p "$WORK_DIR"
+    # Later steps run from other directories; pin a relative value.
+    WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 else
     WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/stow-traffic.XXXXXX")"
 fi

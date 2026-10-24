@@ -99,6 +99,14 @@ if [ -n "${STOW_E2E_WORK_DIR:-}" ]; then
         exit 1
     fi
     mkdir -p "$WORK_DIR"
+    # Later steps run from other directories; pin a relative value.
+    WORK_DIR="$(cd "$WORK_DIR" && pwd)"
+    # The consumers are standalone projects: `cargo new` inside another
+    # workspace joins it and rewrites that workspace's members.
+    if (cd "$WORK_DIR" && cargo locate-project --workspace >/dev/null 2>&1); then
+        echo "[mock-e2e] STOW_E2E_WORK_DIR $WORK_DIR is inside a cargo workspace" >&2
+        exit 1
+    fi
 else
     WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/stow-mock-e2e.XXXXXX")"
 fi
