@@ -1923,4 +1923,135 @@ mod tests {
         assert_eq!(report.target, "wasm32-unknown-unknown");
         assert_eq!(report.entries[0].crate_name.as_str(), "once_cell");
     }
+
+    /// The admission a stub edge mints for the drain's report: difficulty
+    /// 0, so its redemption is exactly the enqueue post's status.
+    fn minted_admission() -> stow_types::api::EnqueueAdmission {
+        let request = stow_types::api::EnqueueRequest {
+            crate_name: "once_cell".parse().expect("crate name"),
+            version: "1.20.0".parse().expect("version"),
+            features_json: stow_types::identity::FeaturesJson::canonicalize(vec![
+                "alloc".to_owned(),
+            ])
+            .expect("features"),
+            target: "wasm32-unknown-unknown".parse().expect("target"),
+            rustc_version: "1.99.0".parse().expect("rustc"),
+            downloads: 0,
+            source: stow_types::api::EnqueueSource::CacheMiss,
+            dependency_subgraph: stow_types::api::TaskSubgraph {
+                root_deps: Vec::new(),
+                nodes: Vec::new(),
+            },
+            preserve_lockfile: false,
+            host_side: false,
+            explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+        };
+        stow_types::api::EnqueueAdmission {
+            task_id: "once_cell-task".to_owned(),
+            challenge: "abcdef0123456789".to_owned(),
+            difficulty: 0,
+            tree: stow_types::api::SubmissionTree::from_enqueue_requests(
+                stow_types::api::SubmissionSource::InexactHit,
+                &[request],
+            )
+            .expect("tree"),
+        }
+    }
+
+    /// A stub edge: `POST /api/v1/admissions` mints `admissions` and
+    /// `POST /api/v1/enqueue` answers `enqueue_status`.
+    fn stub_edge(
+        admissions: &[stow_types::api::EnqueueAdmission],
+        enqueue_status: &'static str,
+    ) -> crate::test_edge::StubEdge {
+        crate::test_edge::serve(vec![
+            crate::test_edge::Route {
+                path: "/api/v1/admissions",
+                status: "200 OK",
+                body: serde_json::to_vec(admissions).expect("serialize admissions"),
+            },
+            crate::test_edge::Route {
+                path: "/api/v1/enqueue",
+                status: enqueue_status,
+                body: Vec::new(),
+            },
+        ])
+    }
+
+    /// The inexact-line fixture `stub_edge`'s tests share: a keyed graph
+    /// the group resolves, and the journal carrying the report.
+    async fn inexact_journal(config: &StowConfig, dir: &Path) -> PathBuf {
+        crate::lockfile_graph_cache::store(
+            config,
+            "key-a",
+            &crate::workspace_deps::ExpandedDependencyGraph {
+                entries: Vec::new(),
+                direct_dependencies: Vec::new(),
+                local_manifests: Vec::new(),
+                raw_unit_graph: br#"{"version":1,"units":[],"roots":[]}"#.to_vec(),
+            },
+        )
+        .await
+        .expect("store expanded graph");
+        let journal = journal_path(dir, "stow-1");
+        let report = stow_types::api::DependencyGraphEntry {
+            crate_name: "once_cell".parse().expect("crate name"),
+            version: semver::Version::parse("1.20.0").expect("version"),
+            features: vec!["alloc".to_owned()],
+        };
+        append_lines(
+            &journal,
+            &[JournalEntry::Inexact(InexactReport {
+                rustc_version: "1.99.0".to_owned(),
+                consumer_spelled_target: true,
+                expanded_cache_key: "key-a".to_owned(),
+                target: "wasm32-unknown-unknown".to_owned(),
+                entries: vec![report],
+            })],
+        )
+        .expect("write journal");
+        journal
+    }
+
+    /// stow#929: an admission the drain could not redeem — here, an
+    /// enqueue post the edge answered 503 — is not a posted report: the
+    /// journal line goes back for a later drain's fresh challenge.
+    #[tokio::test]
+    async fn an_unredeemed_inexact_report_stays_journaled() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let edge = stub_edge(&[minted_admission()], "503 Service Unavailable");
+        let mut config = test_config(dir.path());
+        config.edge_url = edge.url().to_owned();
+        let journal = inexact_journal(&config, dir.path()).await;
+
+        let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
+        drain_journal(&config, &journal, &mut gate).await;
+
+        let contents = std::fs::read_to_string(&journal).expect("journal kept");
+        assert!(
+            contents.contains("\"kind\":\"inexact\""),
+            "the unredeemed report stayed journaled"
+        );
+        assert_eq!(finished_journals(dir.path()), vec![journal]);
+    }
+
+    /// stow#929: a redeemed admission drains the report — the enqueue
+    /// post's 2xx is the redemption, and nothing goes back.
+    #[tokio::test]
+    async fn a_redeemed_inexact_report_clears_the_journal() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let edge = stub_edge(&[minted_admission()], "200 OK");
+        let mut config = test_config(dir.path());
+        config.edge_url = edge.url().to_owned();
+        let journal = inexact_journal(&config, dir.path()).await;
+
+        let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
+        drain_journal(&config, &journal, &mut gate).await;
+
+        assert!(
+            !journal.exists(),
+            "the redeemed report left nothing journaled"
+        );
+        assert_eq!(finished_journals(dir.path()), [] as [std::path::PathBuf; 0]);
+    }
 }

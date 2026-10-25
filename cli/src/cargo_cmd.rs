@@ -1985,8 +1985,9 @@ async fn cached_consumer_slices(
 /// Mint this build's locally-compiled units as misses: resolve each
 /// unit's `--extern` deps to their recorded identities, post the
 /// observed graph to `/api/v1/admissions` and drain what the edge mints.
-/// The caller's journal keeps the observations on failure so a later
-/// drain retries them (stow#317).
+/// The caller's journal keeps the observations on failure — including
+/// an admission the drain could not redeem — so a later drain retries
+/// them with a fresh challenge (stow#317, stow#929).
 pub async fn admit_observed_misses(
     config: &StowConfig,
     consumer_target: &str,
@@ -2088,9 +2089,28 @@ pub async fn admit_observed_misses(
         &graph.expanded,
     )
     .await?;
+    redeem_minted(config, minted).await
+}
+
+/// Redeem every admission `/api/v1/admissions` minted, failing when any
+/// was not redeemed — refused over the difficulty cap, unsolved before
+/// the attempt budget ran out, cancelled, or whose enqueue post failed
+/// or was not answered with a success status. The caller's journal
+/// keeps the entries behind them (stow#929).
+async fn redeem_minted(
+    config: &StowConfig,
+    minted: Vec<EnqueueAdmission>,
+) -> stow_types::error::Result<()> {
     let mut admissions = crate::admission::AdmissionCollector::default();
     admissions.record(config, minted);
-    admissions.drain(config).await;
+    let unredeemed = admissions.drain(config).await;
+    if !unredeemed.is_empty() {
+        return Err(stow_types::stow_error!(
+            "{} enqueue admission(s) were not redeemed: {}",
+            unredeemed.len(),
+            unredeemed.join(", ")
+        ));
+    }
     Ok(())
 }
 
@@ -2100,7 +2120,8 @@ pub async fn admit_observed_misses(
 /// `/api/v1/admissions` proof-of-work a miss takes, carrying the
 /// `InexactHit` source the scheduler queues at very low priority.
 /// Called from the detached miss drain — the caller keeps its journal
-/// line on failure so a later drain retries it.
+/// line on failure, including an admission the drain could not redeem,
+/// so a later drain retries it (stow#929).
 pub async fn admit_inexact_report(
     config: &StowConfig,
     consumer_target: &str,
@@ -2127,10 +2148,7 @@ pub async fn admit_inexact_report(
         &expanded.entries,
     )
     .await?;
-    let mut admissions = crate::admission::AdmissionCollector::default();
-    admissions.record(config, minted);
-    admissions.drain(config).await;
-    Ok(())
+    redeem_minted(config, minted).await
 }
 
 /// Post the graph to `/api/v1/admissions` and return the enqueue
