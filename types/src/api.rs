@@ -2208,6 +2208,11 @@ pub struct SchedulerRearmReport {
 /// cost` lane (stow#773) snapshots it between layers and diffs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerLedger {
+    /// When the object last loaded its graph, unix ms. The ledger lives
+    /// on that graph and persists only through its snapshot, so a
+    /// reload drops every booking since the snapshot: two reads that
+    /// answer different values are not comparable.
+    pub woken_at_ms: i64,
     /// One row per operation the object ran, in `op` order.
     pub ops: Vec<SchedulerLedgerOp>,
 }

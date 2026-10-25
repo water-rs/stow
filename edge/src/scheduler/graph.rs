@@ -400,6 +400,10 @@ pub struct Graph {
     pub feed_watermark: Option<String>,
     /// The in-memory billed-row counters.
     pub meter: Meter,
+    /// When this graph was loaded — the wake that built it, unix ms. In
+    /// memory only: the probe ledger reports it so a reader can tell a
+    /// reload, which drops every ledger booking since the snapshot.
+    pub woken_at_ms: i64,
     /// Log rows appended — or replayed — since the last snapshot; the
     /// trigger `SNAPSHOT_EVENT_THRESHOLD` reads.
     pub log_since_snapshot: u64,
