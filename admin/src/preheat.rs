@@ -44,11 +44,11 @@ pub enum PreheatCommand {
     /// not the source binary's.
     Binary(BinaryArgs),
     /// The top-binary lane (stow#891): the top-N crates whose default
-    /// version ships a binary target — library or not — ranked by the
-    /// last 90 days of `version_downloads`, all read from the crates.io
-    /// daily database dump in a single fetch. Each candidate resolves
-    /// exactly the way `preheat binary` resolves one — name sources,
-    /// never tasks of their own.
+    /// version ships a binary target and no library (stow#918), ranked
+    /// by the last 90 days of `version_downloads`, all read from the
+    /// crates.io daily database dump in a single fetch. Each candidate
+    /// resolves exactly the way `preheat binary` resolves one — name
+    /// sources, never tasks of their own.
     TopBinaries(TopBinariesArgs),
     /// Promote the most-missed `(crate, version, features)` identities in
     /// the Analytics Engine dataset into scheduler tasks.
@@ -466,7 +466,8 @@ async fn resolve_named_release(
 /// way `preheat binary` resolves one: cargo's resolver per target,
 /// crates.io nodes as ordinary crate tasks. The candidates come from
 /// the crates.io database dump, fetched once — the 100 crates whose
-/// default version ships a binary target, ranked by 90-day downloads.
+/// default version ships a binary target and no library (stow#918),
+/// ranked by 90-day downloads.
 /// One binary that fails to resolve is reported and skipped — the
 /// rest of the wave still lands.
 async fn top_binaries(
