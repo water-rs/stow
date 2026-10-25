@@ -103,7 +103,6 @@ pub async fn scan_artifacts(
     // archives must agree on what rustc wrote before the merged halves
     // can be treated as one unit's captures.
     verify_rlib_pairs_agree(&selected.rlib_pairs).await?;
-    reject_foreign_compiled_units(task, &selected.artifacts)?;
     let plan_eligible_captures = restorable_captures - selected.absorbed_duplicates;
     let selected = selected.artifacts;
     let consumed_captures =
@@ -124,6 +123,14 @@ pub async fn scan_artifacts(
     )
     .await?;
     let output_owners = output_owner_index(&selected, &consumed_captures)?;
+    let own_units = phase_own_units(task, built.unit_graphs(), built.run_dir())?;
+    reject_foreign_compiled_units(
+        task,
+        &selected,
+        &consumed_captures,
+        &output_owners,
+        &own_units,
+    )?;
     reject_unflagged_proc_macro_extern(task, &selected, &consumed_captures, &output_owners)?;
     let phase_units = phase_feature_sets(task, built)?;
     let mut resolved = BTreeMap::<usize, ResolvedArtifact>::new();
@@ -198,9 +205,21 @@ pub fn consumable_packages(
 ) -> Vec<ConsumablePackage> {
     entries
         .iter()
+        // Only the task's own node is never consumable — it is the one
+        // unit the task exists to produce. An outcome-3 host task
+        // legitimately serves its crate's target-side twin: same name,
+        // version and features, the other side (stow#723).
         .filter(|entry| {
             entry.crate_name.as_str() != task.crate_name.as_str()
                 || &entry.version != task.version.as_semver()
+                || entry.host_side != task.host_side
+                || entry.features.iter().cloned().collect::<BTreeSet<_>>()
+                    != task
+                        .features_json
+                        .features()
+                        .iter()
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
         })
         .map(|entry| ConsumablePackage {
             crate_name: entry.crate_name.as_str().to_owned(),
@@ -680,12 +699,213 @@ fn stable_output_name<'a>(
     }
 }
 
+/// One phase×invocation's view of the task's own unit: the crates.io
+/// lib units of that phase's graph (for dep-owner attribution) and the
+/// own unit's lib-dep keys — the unit the wrapper's own-crate edge
+/// names on the task's side (stow#723).
+#[derive(Debug)]
+pub struct PhaseOwnUnit {
+    pub units: Vec<stow_types::unit_graph::TaskUnit>,
+    pub own_deps: BTreeSet<stow_types::unit_graph::TaskUnitKey>,
+}
+
+/// The `target_dir` → [`PhaseOwnUnit`] map for every phase×invocation.
+///
+/// The own unit is the one the generated wrapper's own-crate dep edge
+/// names on the task's side. That edge leaves the wrapper unit
+/// `wrapper_manifest` declares the task crate on: a target task is a
+/// `[dependencies]` entry, so the edge leaves the wrapper's lib unit;
+/// a host task is a `[build-dependencies]` entry, so the edge leaves
+/// the wrapper's build-script *compile* unit — cargo never gives the
+/// wrapper lib unit a build-dependency edge, in any phase or spelling.
+/// Any other unit of the same package — the outcome-3 target twin the
+/// wrapper also pins, on the lib unit's edges — is a dependency like
+/// any other: served, never compiled (stow#723).
+pub fn phase_own_units(
+    task: &BuildTaskPayload,
+    graphs: &[crate::task::PhaseUnitGraph],
+    run_dir: &Path,
+) -> stow_types::error::Result<BTreeMap<PathBuf, PhaseOwnUnit>> {
+    use stow_types::unit_graph::{TaskUnitKind, TaskUnitSide};
+    let host_triple = crate::task::runner_host_triple(task)?;
+    let (own_side, declaring_kind) = if task.host_side {
+        (TaskUnitSide::Host, TaskUnitKind::BuildScript)
+    } else {
+        (TaskUnitSide::Target, TaskUnitKind::Lib)
+    };
+    let mut phases = BTreeMap::new();
+    for graph in graphs {
+        let units = graph.task_units(host_triple).map_err(|error| {
+            stow_types::stow_error!("{} unit graph does not convert: {error}", graph.label())
+        })?;
+        // The wrapper is the graph's only non-registry package, and it
+        // has one unit of each kind.
+        let mut declaring = units
+            .iter()
+            .filter(|unit| unit.key.kind == declaring_kind && !unit.is_crates_io);
+        let wrapper = declaring.next().ok_or_else(|| {
+            stow_types::stow_error!(
+                "{} unit graph has no wrapper {declaring_kind:?} unit",
+                graph.label()
+            )
+        })?;
+        if let Some(other) = declaring.next() {
+            return Err(stow_types::stow_error!(
+                "{} unit graph has two non-registry {declaring_kind:?} units, {} and {}",
+                graph.label(),
+                wrapper.key.pkg,
+                other.key.pkg,
+            ));
+        }
+        let own = wrapper
+            .deps
+            .iter()
+            .find(|dep| {
+                dep.key.kind == TaskUnitKind::Lib
+                    && dep.key.side == own_side
+                    && dep.name == task.crate_name.as_str()
+                    && dep.version == task.version.as_semver().to_string()
+            })
+            .and_then(|dep| units.iter().find(|unit| unit.key == dep.key))
+            .ok_or_else(|| {
+                stow_types::stow_error!(
+                    "{} unit graph's wrapper names no {}-side unit of the task crate {} {}",
+                    graph.label(),
+                    if task.host_side { "host" } else { "target" },
+                    task.crate_name.as_str(),
+                    task.version.as_semver(),
+                )
+            })?;
+        let own_deps = own
+            .deps
+            .iter()
+            .filter(|dep| dep.key.kind == TaskUnitKind::Lib)
+            .map(|dep| dep.key.clone())
+            .collect();
+        phases.insert(graph.target_dir(run_dir), PhaseOwnUnit { units, own_deps });
+    }
+    Ok(phases)
+}
+
+/// Whether `artifact` is a capture of the task's own unit — the lib
+/// unit the wrapper root's own-crate edge names in the phase×invocation
+/// graph `artifact.target_dir` ran under. The answer is decided by
+/// dependency sets: the own unit's externs resolve to its graph dep
+/// units, and a same-package twin's resolve to different ones — a
+/// compiled outcome-3 twin names a dep its host sibling never links
+/// (stow#723).
+///
+/// A dep owner is attributed to a graph unit by package and version,
+/// narrowed by the record's feature scan when two units of one package
+/// share the graph — the only shape a kept-apart twin pair takes. An
+/// owner that matches several units counts as matching whichever is in
+/// the own unit's deps, so a shared dep's two identical twin units
+/// never convict the own unit.
+fn own_unit_record(
+    task: &BuildTaskPayload,
+    artifact: &SelectedCapturedArtifact,
+    selected: &[SelectedCapturedArtifact],
+    consumed: &[ConsumedCapture],
+    output_owners: &BTreeMap<PathBuf, OutputOwner>,
+    own_units: &BTreeMap<PathBuf, PhaseOwnUnit>,
+) -> stow_types::error::Result<bool> {
+    use stow_types::unit_graph::{TaskUnitKey, TaskUnitKind};
+    let Some(phase) = own_units.get(&artifact.captured.target_dir) else {
+        return Err(stow_types::stow_error!(
+            "dep_scan capture of {} {} recorded target dir {}, which is no phase of this build",
+            artifact.package.name,
+            artifact.package.version,
+            artifact.captured.target_dir.display(),
+        ));
+    };
+    let mut possible = BTreeSet::<&TaskUnitKey>::new();
+    for dependency in &artifact.captured.dependencies {
+        let Some(owner) = output_owners.get(&dependency.path) else {
+            return Ok(false);
+        };
+        let (name, version, features) = match owner {
+            OutputOwner::Compiled(index) => {
+                let dep = selected.get(*index).ok_or_else(|| {
+                    stow_types::stow_error!("dep_scan owner index {index} is out of bounds")
+                })?;
+                (
+                    dep.package.name.as_str(),
+                    dep.package.version.to_string(),
+                    &dep.captured.features,
+                )
+            }
+            OutputOwner::Consumed(index) => {
+                let capture = consumed.get(*index).ok_or_else(|| {
+                    stow_types::stow_error!("dep_scan consumed index {index} is out of bounds")
+                })?;
+                let record = capture.records.first().ok_or_else(|| {
+                    stow_types::stow_error!(
+                        "dep_scan consumed capture {} carries no records",
+                        capture.artifact.crate_name,
+                    )
+                })?;
+                (
+                    capture.artifact.crate_name.as_str(),
+                    capture.artifact.crate_version.clone(),
+                    &record.features,
+                )
+            }
+        };
+        // The task's package is never a dep of its own unit — a record
+        // claiming one is not the own unit.
+        if name == task.crate_name.as_str() && version == task.version.as_semver().to_string() {
+            return Ok(false);
+        }
+        let mut candidates = phase
+            .units
+            .iter()
+            .filter(|unit| {
+                unit.key.kind == TaskUnitKind::Lib
+                    && unit.is_crates_io
+                    && unit.name == name
+                    && unit.version == version
+            })
+            .map(|unit| &unit.key)
+            .collect::<Vec<_>>();
+        if candidates.len() > 1 {
+            // Two units of one package in one graph are a kept-apart
+            // twin pair; their feature sets differ.
+            let matching: Vec<&TaskUnitKey> = phase
+                .units
+                .iter()
+                .filter(|unit| {
+                    candidates.contains(&&unit.key)
+                        && unit.features.iter().cloned().collect::<BTreeSet<String>>() == *features
+                })
+                .map(|unit| &unit.key)
+                .collect();
+            if !matching.is_empty() {
+                candidates = matching;
+            }
+        }
+        if candidates.is_empty() || !candidates.iter().any(|key| phase.own_deps.contains(*key)) {
+            return Ok(false);
+        }
+        possible.extend(candidates);
+    }
+    Ok(phase.own_deps.iter().all(|key| possible.contains(&key)))
+}
+
 /// The build's half of the graph contract: this task compiles its own
-/// crate and is *served* every other node. A restorable record attributed
+/// unit and is *served* every other node. A restorable record attributed
 /// to any other package means cargo compiled a unit the consume store was
 /// supposed to provide — the serve missed it, or the build order broke —
 /// and registering its bytes would publish an artifact this task never
 /// owned. Fail and name every such unit; none of it is salvage.
+///
+/// The task's own identity is a *unit*, not a package (stow#723): an
+/// outcome-3 host task's unit graph carries the same package twice —
+/// its own host unit and the target-side twin the self-twin edge pins,
+/// which it is served like every other dependency. A record of the
+/// task's package is the own unit only when its dependency owners are
+/// the own unit's lib deps of the phase×invocation it compiled under
+/// — the twin's dep set differs, so a compiled twin fails here instead
+/// of registering under the task's rows.
 ///
 /// Only restorable records reach this check — the selected set — so the
 /// generated wrapper package, build-script compiles and binaries are out
@@ -694,11 +914,16 @@ fn stable_output_name<'a>(
 fn reject_foreign_compiled_units(
     task: &BuildTaskPayload,
     selected: &[SelectedCapturedArtifact],
+    consumed: &[ConsumedCapture],
+    output_owners: &BTreeMap<PathBuf, OutputOwner>,
+    own_units: &BTreeMap<PathBuf, PhaseOwnUnit>,
 ) -> stow_types::error::Result<()> {
     let mut units = Vec::new();
     for artifact in selected {
         let package = &artifact.package;
-        if package.name == task.crate_name.as_str() && package.version == *task.version.as_semver()
+        if package.name == task.crate_name.as_str()
+            && package.version == *task.version.as_semver()
+            && own_unit_record(task, artifact, selected, consumed, output_owners, own_units)?
         {
             continue;
         }
@@ -1634,6 +1859,7 @@ mod tests {
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::platform::{PanicStrategy, Profile};
     use stow_types::public_cache::UnitInvocation;
+    use stow_types::unit_graph::{TaskUnitKind, TaskUnitSide};
 
     use super::{
         ConsumedCapture, IndexedPackage, ResolvedArtifact, RlibPair, SelectedCapturedArtifact,
@@ -2373,11 +2599,21 @@ mod tests {
         foreign_proc_macro.captured.target = None;
         foreign_proc_macro.captured.compile_key = foreign_proc_macro.captured.c_metadata.clone();
 
-        let error = super::reject_foreign_compiled_units(
-            &task,
-            &[own, foreign, wrong_version, foreign_proc_macro],
-        )
-        .expect_err("compiled foreign units fail the build");
+        let leaf_output = PathBuf::from(
+            "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-raw.rmeta",
+        );
+        let consumed = vec![consumed_capture("itoa", "1.0.18", &[], &leaf_output)];
+        let itoa = lib_unit("itoa", "1.0.18", TaskUnitSide::Target, &[]);
+        let selected = vec![own, foreign, wrong_version, foreign_proc_macro];
+        let (owners, own_units) = own_unit_context(
+            &selected,
+            &consumed,
+            std::slice::from_ref(&itoa),
+            std::slice::from_ref(&itoa),
+        );
+        let error =
+            super::reject_foreign_compiled_units(&task, &selected, &consumed, &owners, &own_units)
+                .expect_err("compiled foreign units fail the build");
         let message = error.to_string();
         assert!(message.contains("3 unit(s)"), "{message}");
         assert!(message.contains("itoa 1.0.18"), "{message}");
@@ -2418,16 +2654,192 @@ mod tests {
         link_capture.c_metadata = "bd2c39b1e4a05d77".to_owned();
         link_capture.compile_key = "cd".repeat(32);
         link_capture.emit = vec!["dep-info".to_owned(), "link".to_owned()];
+        link_capture.outputs = vec![CapturedRustcOutput {
+            kind: CapturedRustcOutputKind::Rlib,
+            path: PathBuf::from(
+                "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libserde_json-bd2c.rlib",
+            ),
+            snapshot_path: None,
+            sha256: "00".repeat(32),
+        }];
         let link_unit = SelectedCapturedArtifact {
             package: check_unit.package.clone(),
             artifact_kind: ArtifactKind::Rlib,
             captured: link_capture,
             dependency_aliases: Vec::new(),
         };
-        super::reject_foreign_compiled_units(&task, &[check_unit, link_unit])
+        let leaf_output = PathBuf::from(
+            "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-raw.rmeta",
+        );
+        let consumed = vec![consumed_capture("itoa", "1.0.18", &[], &leaf_output)];
+        let itoa = lib_unit("itoa", "1.0.18", TaskUnitSide::Target, &[]);
+        let selected = vec![check_unit, link_unit];
+        let (owners, own_units) = own_unit_context(
+            &selected,
+            &consumed,
+            std::slice::from_ref(&itoa),
+            std::slice::from_ref(&itoa),
+        );
+        super::reject_foreign_compiled_units(&task, &selected, &consumed, &owners, &own_units)
             .expect("a build compiling only the task's own crate is legal");
-        super::reject_foreign_compiled_units(&task, &[])
+        super::reject_foreign_compiled_units(&task, &[], &consumed, &owners, &own_units)
             .expect("an empty compiled set carries no foreign unit");
+    }
+
+    /// stow#723: the task's own identity is a unit, not a package — a
+    /// host task's same-package target twin is a served dependency like
+    /// any other. A compiled unit of the task's package whose dep set is
+    /// the twin's fails as foreign; the own unit passes.
+    #[test]
+    fn a_compiled_same_package_twin_fails_as_foreign() {
+        let mut task = consumer_task();
+        task.host_side = true;
+        let dep_path = PathBuf::from(
+            "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-leaf.rmeta",
+        );
+        let twin_dep_path = PathBuf::from(
+            "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-std.rmeta",
+        );
+        let make = |dep_path: &Path, output_name: &str| {
+            let package = indexed("serde_json", "1.0.149");
+            let mut captured = raw_lib_capture(
+                "serde_json",
+                "twin-raw",
+                vec![CapturedDependencyIdentity {
+                    crate_name: "itoa".to_owned(),
+                    path: dep_path.to_owned(),
+                    compile_key: "served".to_owned(),
+                    stable_c_metadata: "served-meta".to_owned(),
+                }],
+                PathBuf::from(format!(
+                    "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/{output_name}"
+                )),
+            );
+            captured.features = ["default".to_owned(), "std".to_owned()]
+                .into_iter()
+                .collect();
+            captured.target = None;
+            SelectedCapturedArtifact {
+                package,
+                artifact_kind: ArtifactKind::Rlib,
+                captured,
+                dependency_aliases: Vec::new(),
+            }
+        };
+        let mut twin = make(&twin_dep_path, "libserde_json-twin.rlib");
+        twin.captured.c_metadata = "twin-meta".to_owned();
+        twin.captured.compile_key = "ef".repeat(32);
+        // The dep owners: two served `itoa` units, the own side's `[]`
+        // leaf and the twin's `["std"]` one.
+        let consumed = vec![
+            consumed_capture("itoa", "1.0.18", &[], &dep_path),
+            consumed_capture("itoa", "1.0.18", &["std"], &twin_dep_path),
+        ];
+        let itoa_host = lib_unit("itoa", "1.0.18", TaskUnitSide::Host, &[]);
+        let itoa_target = lib_unit("itoa", "1.0.18", TaskUnitSide::Target, &["std"]);
+        let (owners, own_units) = own_unit_context(
+            &[make(&dep_path, "libserde_json-own.rlib"), twin],
+            &consumed,
+            &[itoa_host.clone(), itoa_target],
+            &[itoa_host],
+        );
+        let error = super::reject_foreign_compiled_units(
+            &task,
+            &[
+                make(&dep_path, "libserde_json-own.rlib"),
+                make(&twin_dep_path, "libserde_json-twin.rlib"),
+            ],
+            &consumed,
+            &owners,
+            &own_units,
+        )
+        .expect_err("a compiled twin unit is foreign");
+        assert!(error.to_string().contains("serde_json"), "{error}");
+        super::reject_foreign_compiled_units(
+            &task,
+            &[make(&dep_path, "libserde_json-own.rlib")],
+            &consumed,
+            &owners,
+            &own_units,
+        )
+        .expect("the own unit passes");
+    }
+
+    /// A lib `TaskUnit` for own-unit context fabrication.
+    fn lib_unit(
+        name: &str,
+        version: &str,
+        side: TaskUnitSide,
+        features: &[&str],
+    ) -> stow_types::unit_graph::TaskUnit {
+        stow_types::unit_graph::TaskUnit {
+            key: stow_types::unit_graph::TaskUnitKey {
+                pkg: format!(
+                    "registry+https://github.com/rust-lang/crates.io-index#{name}@{version}"
+                ),
+                platform: "aarch64-apple-darwin".to_owned(),
+                side,
+                kind: TaskUnitKind::Lib,
+            },
+            name: name.to_owned(),
+            version: version.to_owned(),
+            features: features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+            is_crates_io: true,
+            deps: Vec::new(),
+        }
+    }
+
+    /// A served dep's consumed capture: one record owning `path`.
+    fn consumed_capture(
+        name: &str,
+        version: &str,
+        features: &[&str],
+        path: &Path,
+    ) -> super::ConsumedCapture {
+        let mut record = raw_lib_capture(name, "served-meta", Vec::new(), path.to_owned());
+        record.features = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
+        record.consumed = true;
+        super::ConsumedCapture {
+            artifact: super::ConsumedArtifact {
+                crate_name: name.to_owned(),
+                crate_version: version.to_owned(),
+                compile_key: "served".to_owned(),
+                c_metadata: "served-meta".to_owned(),
+                target: "aarch64-apple-darwin".to_owned(),
+                rustc_version: "1.91.1".to_owned(),
+                emit: vec!["dep-info".to_owned(), "link".to_owned()],
+            },
+            records: vec![record],
+        }
+    }
+
+    /// The `(output_owners, own_units)` pair `reject_foreign_compiled_units`
+    /// runs on, for records under `/tmp/workspace/target`: `units` is the
+    /// phase graph's lib units, `own_deps` the own unit's dep units.
+    fn own_unit_context(
+        selected: &[SelectedCapturedArtifact],
+        consumed: &[super::ConsumedCapture],
+        units: &[stow_types::unit_graph::TaskUnit],
+        own_deps: &[stow_types::unit_graph::TaskUnit],
+    ) -> (
+        BTreeMap<PathBuf, super::OutputOwner>,
+        BTreeMap<PathBuf, super::PhaseOwnUnit>,
+    ) {
+        let owners = super::output_owner_index(selected, consumed).expect("output owner index");
+        let own_units = BTreeMap::from([(
+            PathBuf::from("/tmp/workspace/target"),
+            super::PhaseOwnUnit {
+                units: units.to_vec(),
+                own_deps: own_deps.iter().map(|unit| unit.key.clone()).collect(),
+            },
+        )]);
+        (owners, own_units)
     }
 
     fn indexed(name: &str, version: &str) -> super::IndexedPackage {
@@ -3119,6 +3531,16 @@ mod tests {
                 ),
                 ("host-dep", "3.1.0".to_owned(), vec![], true),
                 ("transitive-dep", "0.4.0".to_owned(), vec![], false),
+                // stow#723: only the task's own *node* — name, version,
+                // side and feature set — is never consumable. The
+                // task's package at another feature set is a different
+                // node and is served like any other.
+                (
+                    "task-crate",
+                    "1.2.3".to_owned(),
+                    vec!["std".to_owned()],
+                    false
+                ),
             ]),
             "the whole closure — build-script deps host-side, transitives target-side — is consumable at activated features"
         );
