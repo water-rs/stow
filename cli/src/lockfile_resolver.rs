@@ -896,8 +896,7 @@ mod tests {
         deps: &[(&str, &str)],
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity"),
+            dependency_task_ids: Vec::new(),
             crate_name: CrateName::parse(crate_name).expect("name"),
             version: CrateVersion::new(Version::parse(version).expect("version")),
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])

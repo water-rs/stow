@@ -589,9 +589,11 @@ pub struct ArtifactRecord {
     /// JSON-encoded dependency `c_metadata` identities captured from rustc
     /// --extern inputs; sorted by `(crate_name, c_metadata)`.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
-    /// The Merkle dependency digest of the dependency subgraph the
-    /// artifact was built under (stow#588) — the node's context key.
-    pub dependency_identity: DependencyIdentity,
+    /// The node's direct child task ids — the sorted, deduplicated
+    /// preimage [`Self::dependency_identity`] hashes (stow#919). They
+    /// are the node's task-graph edges: build-dependency libs and shadow
+    /// twins included, which the `--extern` list never names.
+    pub dependency_task_ids: Vec<String>,
     /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache-<rustc>:serde.1.0.0-...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
@@ -627,6 +629,19 @@ pub struct ArtifactRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub min_glibc: Option<GlibcVersion>,
+}
+
+impl ArtifactRecord {
+    /// The Merkle dependency digest of the dependency subgraph the
+    /// artifact was built under (stow#588) — the node's context key,
+    /// derived from the carried child task ids so a record can never
+    /// hold a digest disagreeing with its edges (stow#919).
+    ///
+    /// # Errors
+    /// Mirrors [`DependencyIdentity::from_task_ids`].
+    pub fn dependency_identity(&self) -> crate::error::Result<DependencyIdentity> {
+        DependencyIdentity::from_task_ids(self.dependency_task_ids.iter().map(String::as_str))
+    }
 }
 
 /// Request body for scheduler task submission.
@@ -3526,13 +3541,16 @@ mod tests {
     }
 
     /// A published index row — the fields substitution reads, the rest
-    /// inert.
+    /// inert. `dependency_task_ids` is the row's task-graph edge list:
+    /// the sorted direct child task ids its dependency digest commits
+    /// to (stow#919).
     fn published_row(
         crate_name: &str,
         features: &[&str],
         deps: &[(&str, &str)],
-        dependency_identity: crate::identity::DependencyIdentity,
+        dependency_task_ids: Vec<String>,
         c_metadata: &str,
+        host_side: bool,
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
             crate_name: crate_name.parse().expect("crate name"),
@@ -3555,7 +3573,7 @@ mod tests {
                     .collect(),
             )
             .expect("dep c_metadata"),
-            dependency_identity,
+            dependency_task_ids,
             c_metadata: c_metadata.parse().expect("c_metadata"),
             compile_key: format!("{c_metadata}{c_metadata}"),
             bundle_digest: format!("sha256:{c_metadata:0>64}"),
@@ -3572,7 +3590,11 @@ mod tests {
             },
             emit: vec!["link".to_owned()],
             unit_shape: crate::public_cache::UnitShape {
-                side: crate::public_cache::UnitSide::Target,
+                side: if host_side {
+                    crate::public_cache::UnitSide::Host
+                } else {
+                    crate::public_cache::UnitSide::Target
+                },
                 invocation: crate::public_cache::UnitInvocation::Native,
                 kind: crate::public_cache::UnitKind::Linked,
             },
@@ -3612,13 +3634,14 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             rows: vec![
-                published_row("d", &[], &[], leaf, "11"),
+                published_row("d", &[], &[], Vec::new(), "11", false),
                 published_row(
                     "dep",
                     &["a", "b"],
                     &[("d", "11")],
-                    t_dep_identity.clone(),
+                    vec![d_task_id.clone()],
                     "22",
+                    false,
                 ),
             ],
         }];
@@ -3681,6 +3704,245 @@ mod tests {
                 )
                 .expect("index fits u32")
             ]
+        );
+    }
+
+    /// A published row's task-graph edges name a build-dependency lib —
+    /// a host-side child no `--extern` list of the parent ever carries
+    /// (stow#919). The row's `dependency_c_metadata_json` names only
+    /// `lib`; its `dependency_task_ids` names `lib` and the host
+    /// slice's `version_check`. The task-id join finds both, where the
+    /// `--extern` reconstruction minted a digest the row never
+    /// recorded.
+    #[test]
+    fn substitution_joins_a_build_dependency_from_the_host_slice() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        const TARGET: &str = "wasm32-unknown-unknown";
+        const HOST: &str = "aarch64-apple-darwin";
+        let identity = |name: &str, features: &[&str], host_side: bool| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .expect("features"),
+            target: if host_side {
+                HOST.parse().expect("host")
+            } else {
+                TARGET.parse().expect("target")
+            },
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side,
+        };
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let lib_task_id = identity("lib", &[], false).task_id(&leaf);
+        let vc_task_id = identity("version_check", &[], true).task_id(&leaf);
+        let dep_identity =
+            DependencyIdentity::from_task_ids([lib_task_id.as_str(), vc_task_id.as_str()])
+                .expect("digest");
+        let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
+        let published = vec![
+            crate::api::PublishedIndexSlice {
+                target: TARGET.parse().expect("target"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![
+                    published_row("lib", &[], &[], Vec::new(), "11", false),
+                    published_row(
+                        "dep",
+                        &["a", "b"],
+                        &[("lib", "11")],
+                        vec![lib_task_id.clone(), vc_task_id.clone()],
+                        "22",
+                        false,
+                    ),
+                ],
+            },
+            crate::api::PublishedIndexSlice {
+                target: HOST.parse().expect("host"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![published_row(
+                    "version_check",
+                    &[],
+                    &[],
+                    Vec::new(),
+                    "33",
+                    true,
+                )],
+            },
+        ];
+        let mut tree = tree(vec![
+            submission_node("app", &[], &[1], "app-sub"),
+            submission_node("dep", &["a"], &[], "dep-a-sub"),
+        ]);
+        for node in &mut tree.nodes {
+            node.target = TARGET.parse().expect("target");
+        }
+        let mut trees = vec![tree];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        for task_id in [&dep_task_id, &lib_task_id, &vc_task_id] {
+            assert!(
+                tree.nodes.iter().any(|node| node.task_id == *task_id),
+                "reconstructed node {task_id} lands in the tree"
+            );
+        }
+    }
+
+    /// A shadow twin edge (stow#506/#722): the row's children include
+    /// the host lib and its same-features target twin — two tasks no
+    /// `--extern` list names together (stow#919). The task-id join
+    /// reconstructs both.
+    #[test]
+    fn substitution_joins_a_shadow_twin_edge() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        const TARGET: &str = "wasm32-unknown-unknown";
+        const HOST: &str = "aarch64-apple-darwin";
+        let identity = |name: &str, features: &[&str], host_side: bool| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .expect("features"),
+            target: if host_side {
+                HOST.parse().expect("host")
+            } else {
+                TARGET.parse().expect("target")
+            },
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side,
+        };
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let helper_host_id = identity("helper", &[], true).task_id(&leaf);
+        let helper_twin_id = identity("helper", &[], false).task_id(&leaf);
+        let dep_identity =
+            DependencyIdentity::from_task_ids([helper_host_id.as_str(), helper_twin_id.as_str()])
+                .expect("digest");
+        let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
+        let published = vec![
+            crate::api::PublishedIndexSlice {
+                target: TARGET.parse().expect("target"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![
+                    published_row("helper", &[], &[], Vec::new(), "33", false),
+                    published_row(
+                        "dep",
+                        &["a", "b"],
+                        &[("helper", "33")],
+                        vec![helper_host_id.clone(), helper_twin_id.clone()],
+                        "22",
+                        false,
+                    ),
+                ],
+            },
+            crate::api::PublishedIndexSlice {
+                target: HOST.parse().expect("host"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![published_row("helper", &[], &[], Vec::new(), "33", true)],
+            },
+        ];
+        let mut tree = tree(vec![
+            submission_node("app", &[], &[1], "app-sub"),
+            submission_node("dep", &["a"], &[], "dep-a-sub"),
+        ]);
+        for node in &mut tree.nodes {
+            node.target = TARGET.parse().expect("target");
+        }
+        let mut trees = vec![tree];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        for task_id in [&dep_task_id, &helper_host_id, &helper_twin_id] {
+            assert!(
+                tree.nodes.iter().any(|node| node.task_id == *task_id),
+                "reconstructed node {task_id} lands in the tree"
+            );
+        }
+    }
+
+    /// One `c_metadata` carried by a host row and a target row at once
+    /// (stow#919): the `--extern` join picked whichever row sorted
+    /// first — here the wrong one — while the task-id join names the
+    /// host child the row's digest actually commits to.
+    #[test]
+    fn substitution_joins_the_row_the_task_id_names() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        const TARGET: &str = "wasm32-unknown-unknown";
+        const HOST: &str = "aarch64-apple-darwin";
+        let identity = |name: &str, features: &[&str], host_side: bool| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .expect("features"),
+            target: if host_side {
+                HOST.parse().expect("host")
+            } else {
+                TARGET.parse().expect("target")
+            },
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side,
+        };
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let helper_host_id = identity("helper", &[], true).task_id(&leaf);
+        let helper_target_id = identity("helper", &[], false).task_id(&leaf);
+        let dep_identity =
+            DependencyIdentity::from_task_ids([helper_host_id.as_str()]).expect("digest");
+        let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
+        // The ambiguous row orders first in the pulled slices: a
+        // `c_metadata` join binds it, the task-id join cannot.
+        let published = vec![
+            crate::api::PublishedIndexSlice {
+                target: TARGET.parse().expect("target"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![
+                    published_row("helper", &[], &[], Vec::new(), "33", false),
+                    published_row(
+                        "dep",
+                        &["a", "b"],
+                        &[("helper", "33")],
+                        vec![helper_host_id.clone()],
+                        "22",
+                        false,
+                    ),
+                ],
+            },
+            crate::api::PublishedIndexSlice {
+                target: HOST.parse().expect("host"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![published_row("helper", &[], &[], Vec::new(), "33", true)],
+            },
+        ];
+        let mut tree = tree(vec![
+            submission_node("app", &[], &[1], "app-sub"),
+            submission_node("dep", &["a"], &[], "dep-a-sub"),
+        ]);
+        for node in &mut tree.nodes {
+            node.target = TARGET.parse().expect("target");
+        }
+        let mut trees = vec![tree];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        for task_id in [&dep_task_id, &helper_host_id] {
+            assert!(
+                tree.nodes.iter().any(|node| node.task_id == *task_id),
+                "reconstructed node {task_id} lands in the tree"
+            );
+        }
+        assert!(
+            tree.nodes
+                .iter()
+                .all(|node| node.task_id != helper_target_id),
+            "the ambiguous target row is not the named child"
         );
     }
 }
@@ -3930,11 +4192,12 @@ impl SubmissionTree {
     /// in `published` — the signed `index.<target>.<rustc>` slices the
     /// caller already pulls for coverage. A serving set present only
     /// in the published pool is reconstructed from its rows: the
-    /// subtree is rebuilt by following each row's
-    /// `dependency_c_metadata_json` edges through the pulled slices,
-    /// and every reconstructed node carries the row's published
-    /// `dependency_identity`, so a dependent's task id commits to the
-    /// exact identity the builder published. The scheduler's merge
+    /// subtree is rebuilt by following each row's `dependency_task_ids`
+    /// edges through the pulled slices (stow#919 — the `--extern` list
+    /// is a different relation and cannot rebuild them), and every
+    /// reconstructed node carries the row's published dependency
+    /// digest, so a dependent's task id commits to the exact identity
+    /// the builder published. The scheduler's merge
     /// then treats the spliced nodes as already satisfied — they are
     /// never dispatched — while their edges keep every dependent's
     /// dispatch payload pinning the full closure.
@@ -4016,7 +4279,21 @@ impl SubmissionTree {
                     .or_insert((tree_index, node_index));
             }
         }
-        let (published_reps, by_c_metadata) = published_pool_index(published, &serving);
+        let (published_reps, row_task_ids) = published_pool_index(published, &serving)?;
+        // `task id` → `(slice, row)` across every pulled slice — the
+        // join a row's `dependency_task_ids` edges name (stow#919). A
+        // target node's host children live in the host slice, so the
+        // index spans all pulled slices. Task ids are unique by
+        // construction; two rows minting one id are interchangeable
+        // here, so the first answers.
+        let mut by_task_id = std::collections::HashMap::new();
+        for (slice_index, ids) in row_task_ids.iter().enumerate() {
+            for (row_index, id) in ids.iter().enumerate() {
+                by_task_id
+                    .entry(id.as_str())
+                    .or_insert((slice_index, row_index));
+            }
+        }
 
         let mut substitution = Substitution {
             trees,
@@ -4024,7 +4301,8 @@ impl SubmissionTree {
             serving: &serving,
             representatives: &representatives,
             published_reps: &published_reps,
-            by_c_metadata: &by_c_metadata,
+            row_task_ids: &row_task_ids,
+            by_task_id: &by_task_id,
             arena: Vec::new(),
             closure_pm: Vec::new(),
             interned: std::collections::HashMap::new(),
@@ -4055,7 +4333,7 @@ impl SubmissionTree {
             let actual = resolved
                 .task_id(*index)
                 .ok_or_else(|| stow_error!("arena node {index} has no task id"))?;
-            if actual != expected.as_str() {
+            if actual != *expected {
                 return Err(stow_error!(
                     "published subtree reconstructed to {actual}, index records {expected}"
                 ));
@@ -4132,31 +4410,29 @@ fn published_row_identity(slice: &PublishedIndexSlice, row: &ArtifactIndexRow) -
 /// The published side of the serving-pool pick (stow#881): among the
 /// rows carrying each serving set, the smallest published task id —
 /// a published row wins over a batch node because its artifact already
-/// exists, so serving from it never waits on this wave. Also the
-/// `c_metadata` → `(slice, row)` join a row's `dependency_c_metadata_json`
-/// dep edges name: one artifact per value, the first row carrying it
-/// answers.
+/// exists, so serving from it never waits on this wave. Also every
+/// row's own minted task id — the join key a row's
+/// `dependency_task_ids` edges name (stow#919).
 #[allow(clippy::type_complexity)]
-fn published_pool_index<'a>(
-    published: &'a [PublishedIndexSlice],
+fn published_pool_index(
+    published: &[PublishedIndexSlice],
     serving: &BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
-) -> (
+) -> crate::error::Result<(
     BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize, String)>,
-    std::collections::HashMap<&'a str, (usize, usize)>,
-) {
+    Vec<Vec<String>>,
+)> {
     let mut reps = BTreeMap::new();
-    let mut by_c_metadata = std::collections::HashMap::new();
+    let mut task_ids = Vec::with_capacity(published.len());
     for (slice_index, slice) in published.iter().enumerate() {
+        let mut slice_ids = Vec::with_capacity(slice.rows.len());
         for (row_index, row) in slice.rows.iter().enumerate() {
-            by_c_metadata
-                .entry(row.c_metadata.as_str())
-                .or_insert((slice_index, row_index));
+            let task_id = published_row_identity(slice, row).task_id(&row.dependency_identity()?);
+            slice_ids.push(task_id.clone());
             let key = substitution_row_key(slice, row);
             let serve = &serving[&key][row.features_json.features()];
             if serve.as_slice() != row.features_json.features() {
                 continue;
             }
-            let task_id = published_row_identity(slice, row).task_id(&row.dependency_identity);
             reps.entry((key, serve.clone()))
                 .and_modify(|rep: &mut (usize, usize, String)| {
                     if task_id < rep.2 {
@@ -4165,8 +4441,9 @@ fn published_pool_index<'a>(
                 })
                 .or_insert((slice_index, row_index, task_id));
         }
+        task_ids.push(slice_ids);
     }
-    (reps, by_c_metadata)
+    Ok((reps, task_ids))
 }
 
 /// One batch's shared rewrite state for
@@ -4181,9 +4458,12 @@ struct Substitution<'a> {
     representatives: &'a BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize)>,
     /// `(slice, row, task id)` of each serving set's published pick.
     published_reps: &'a BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize, String)>,
-    /// `c_metadata` → `(slice, row)` across every pulled slice — the
-    /// dep-edge join a row's `dependency_c_metadata_json` names.
-    by_c_metadata: &'a std::collections::HashMap<&'a str, (usize, usize)>,
+    /// Every pulled row's own minted task id, indexed `(slice, row)` —
+    /// the id a reconstructed node is pinned to reproduce.
+    row_task_ids: &'a [Vec<String>],
+    /// `task id` → `(slice, row)` across every pulled slice — the
+    /// dep-edge join a row's `dependency_task_ids` names (stow#919).
+    by_task_id: &'a std::collections::HashMap<&'a str, (usize, usize)>,
     arena: Vec<ResolvedTaskNode>,
     /// Parallel to `arena`: a proc-macro reaches this node's dep
     /// closure, or the node is one itself. Only published
@@ -4204,7 +4484,7 @@ struct Substitution<'a> {
     published_memo: std::collections::HashMap<(usize, usize), Option<usize>>,
     /// Arena index → the task id its published row records — checked
     /// against the recompute before any tree re-emits.
-    pinned: std::collections::HashMap<usize, String>,
+    pinned: std::collections::HashMap<usize, &'a str>,
 }
 
 impl Substitution<'_> {
@@ -4281,11 +4561,11 @@ impl Substitution<'_> {
 
     /// The arena node reconstructing one published row's subtree —
     /// memoized per `(slice, row)`. Dep edges follow
-    /// `dependency_c_metadata_json`'s `(crate, c_metadata)` pairs
-    /// through every pulled slice, so a target-side row's host deps
-    /// land on the host slice they publish to. `None` when an edge
-    /// names an artifact no pulled row carries — the chain is not
-    /// fully published, and the dependent stays on its own chain.
+    /// `dependency_task_ids`' child task ids through every pulled
+    /// slice, so a target-side row's host deps land on the host slice
+    /// they publish to (stow#919). `None` when an edge names a task no
+    /// pulled row mints — the chain is not fully published, and the
+    /// dependent stays on its own chain.
     fn published_node(&mut self, slice_index: usize, row_index: usize) -> Option<usize> {
         if let Some(&index) = self.published_memo.get(&(slice_index, row_index)) {
             return index;
@@ -4293,9 +4573,8 @@ impl Substitution<'_> {
         let slice = &self.published[slice_index];
         let row = &slice.rows[row_index];
         let mut dependencies = Vec::new();
-        for entry in row.dependency_c_metadata_json.entries() {
-            let Some(&(dep_slice, dep_row)) = self.by_c_metadata.get(entry.c_metadata.as_str())
-            else {
+        for child_id in &row.dependency_task_ids {
+            let Some(&(dep_slice, dep_row)) = self.by_task_id.get(child_id.as_str()) else {
                 self.published_memo.insert((slice_index, row_index), None);
                 return None;
             };
@@ -4317,7 +4596,7 @@ impl Substitution<'_> {
             crate::public_cache::ExplicitSpelling::KeysAsNative
         };
         let identity = published_row_identity(slice, row);
-        let expected_task_id = identity.task_id(&row.dependency_identity);
+        let expected_task_id = self.row_task_ids[slice_index][row_index].as_str();
         let intern_key = (identity, explicit_spelling, dependencies);
         let index = if let Some(&index) = self.interned.get(&intern_key) {
             index

@@ -227,8 +227,7 @@ mod tests {
 
     fn planned(path: PathBuf, bytes: &[u8]) -> PlannedArtifact {
         PlannedArtifact {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
+            dependency_task_ids: Vec::new(),
             compile_key: "0".repeat(64),
             crate_name: CrateName::parse("demo").unwrap(),
             crate_version: CrateVersion::new(semver::Version::new(1, 0, 0)),

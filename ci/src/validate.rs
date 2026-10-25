@@ -81,11 +81,12 @@ pub fn validate_plan(
         // an artifact built under a different dependency context is a
         // different artifact the cache must never serve under this
         // task's id.
-        if artifact.dependency_identity != *closure.dependency_identity() {
+        let artifact_identity = artifact.dependency_identity()?;
+        if artifact_identity != *closure.dependency_identity() {
             return Err(stow_types::stow_error!(
                 "planned artifact {} claims dependency_identity {} but the publisher verified {} for task {}",
                 artifact.oci_reference,
-                artifact.dependency_identity,
+                artifact_identity,
                 closure.dependency_identity(),
                 task.task_id,
             ));
@@ -333,8 +334,7 @@ mod tests {
 
     fn planned(crate_name: &str, version: &str) -> PlannedArtifact {
         let mut artifact = PlannedArtifact {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
+            dependency_task_ids: Vec::new(),
             compile_key: "0".repeat(64),
             crate_name: CrateName::parse(crate_name).unwrap(),
             crate_version: CrateVersion::new(semver::Version::parse(version).unwrap()),
@@ -401,9 +401,7 @@ mod tests {
     #[test]
     fn rejects_a_plan_whose_dependency_identity_differs() {
         let mut artifact = planned("demo", "1.0.0");
-        artifact.dependency_identity =
-            stow_types::identity::DependencyIdentity::from_task_ids(["foreign-dep-1.0.0-x"])
-                .expect("foreign digest");
+        artifact.dependency_task_ids = vec!["foreign-dep-1.0.0-x".to_owned()];
         let error = validate_plan(
             &task(),
             &task(),

@@ -225,11 +225,11 @@ async fn lane_plan(lane: &str, dir: &Path) -> stow_types::error::Result<LanePlan
 }
 
 /// Every task id a round's `index export` carried records for.
-fn published_task_ids(records: &[ArtifactRecord]) -> BTreeSet<String> {
+fn published_task_ids(records: &[ArtifactRecord]) -> stow_types::error::Result<BTreeSet<String>> {
     records
         .iter()
         .map(|record| {
-            TaskNodeIdentity {
+            Ok(TaskNodeIdentity {
                 crate_name: record.crate_name.clone(),
                 version: record.version.clone(),
                 features_json: record.features_json.clone(),
@@ -237,7 +237,7 @@ fn published_task_ids(records: &[ArtifactRecord]) -> BTreeSet<String> {
                 rustc_version: record.rustc_version.clone(),
                 host_side: record.unit_shape.side == UnitSide::Host,
             }
-            .task_id(&record.dependency_identity)
+            .task_id(&record.dependency_identity()?))
         })
         .collect()
 }
@@ -343,7 +343,7 @@ async fn phase(
         rounds.push(Round {
             before_report: read_json(&round_dir.join("before-report.json")).await?,
             end: read_json(&round_dir.join("end.json")).await?,
-            published: published_task_ids(&records),
+            published: published_task_ids(&records)?,
         });
     }
     Ok((

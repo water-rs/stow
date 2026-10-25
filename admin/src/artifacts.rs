@@ -61,6 +61,7 @@ async fn inspect(args: InspectArgs, output: Output) -> stow_types::error::Result
         .iter()
         .find(|row| row.c_metadata == c_metadata)
         .ok_or_else(|| stow_error!("index.{target}.{rustc_version} has no row for {c_metadata}"))?;
+    let dependency_identity = row.dependency_identity()?;
     render::emit(output, row, |row| {
         let mut out = String::new();
         let _ = writeln!(
@@ -79,7 +80,7 @@ async fn inspect(args: InspectArgs, output: Output) -> stow_types::error::Result
         let _ = writeln!(
             out,
             "  kind        {:?}  dep_identity {}",
-            row.artifact_kind, row.dependency_identity
+            row.artifact_kind, dependency_identity
         );
         out
     })

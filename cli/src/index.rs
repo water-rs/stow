@@ -733,15 +733,14 @@ pub fn index_test_row(c_metadata: &str) -> stow_types::index::ArtifactIndexRow {
     use semver::Version;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
-        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, DependencyIdentity,
-        FeaturesJson,
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson,
     };
     use stow_types::index::ArtifactIndexRow;
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
 
     ArtifactIndexRow {
-        dependency_identity: DependencyIdentity::leaf().expect("leaf identity"),
+        dependency_task_ids: Vec::new(),
         crate_name: CrateName::parse("serde").expect("crate name"),
         version: CrateVersion::new(Version::new(1, 0, 219)),
         features_json: FeaturesJson::canonicalize(vec!["default".to_owned()]).expect("features"),

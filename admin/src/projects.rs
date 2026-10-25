@@ -441,6 +441,10 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
         inserted: 0,
         dropped: 0,
     };
+    // A substitution failure is the lane's error, not one repo's: the
+    // pulled slices are internally inconsistent, so the run reports it
+    // after the pool drains rather than panicking mid-lane (stow#919).
+    let mut substitution_error = None;
     // Results stream out of the pool in completion order: a repo's
     // batch submits the moment its resolve returns — the crash-safety
     // property the sequential loop had.
@@ -463,16 +467,13 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
                 // feature sets are served from their superset (stow#881)
                 // — this lane's pool is the one tree it submits per
                 // repo.
-                let mut tree = stow_types::api::SubmissionTree::from_enqueue_requests(
-                    stow_types::api::SubmissionSource::Preheat,
-                    &tasks,
-                )
-                .expect("resolved repo converts to a submission tree");
-                stow_types::api::SubmissionTree::substitute_contained_sets(
-                    std::slice::from_mut(&mut tree),
-                    &published,
-                )
-                .expect("substituting a resolved tree cannot fail");
+                let tree = match substituted_tree(&tasks, &published) {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        substitution_error.get_or_insert(error);
+                        return;
+                    }
+                };
                 if let Some(edge) = edge
                     && !tree.nodes.is_empty()
                 {
@@ -509,12 +510,35 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
             }
         },
     )?;
+    if let Some(error) = substitution_error {
+        return Err(error);
+    }
     let envelope = render::Planned {
         dry_run: edge.is_none(),
         plan,
         result: edge.map(|_| outcome),
     };
     render::emit(output, &envelope, render_projects_plan)
+}
+
+/// One resolved repo's submission tree with its contained feature sets
+/// served from the published pool (stow#881). A substitution failure is
+/// the lane's error — the pulled slices are internally inconsistent
+/// (stow#919) — so it propagates, it does not panic.
+fn substituted_tree(
+    tasks: &[stow_types::api::EnqueueRequest],
+    published: &[stow_types::api::PublishedIndexSlice],
+) -> stow_types::error::Result<stow_types::api::SubmissionTree> {
+    let mut tree = stow_types::api::SubmissionTree::from_enqueue_requests(
+        stow_types::api::SubmissionSource::Preheat,
+        tasks,
+    )
+    .expect("resolved repo converts to a submission tree");
+    stow_types::api::SubmissionTree::substitute_contained_sets(
+        std::slice::from_mut(&mut tree),
+        published,
+    )?;
+    Ok(tree)
 }
 
 /// The published side of this lane's superset-serving substitution

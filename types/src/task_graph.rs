@@ -229,6 +229,22 @@ impl ResolvedTaskGraph {
         self.task_ids.get(index).map(String::as_str)
     }
 
+    /// The sorted, deduplicated task ids of `index`'s direct
+    /// dependencies — the preimage [`Self::dependency_identity`] hashes
+    /// (stow#919). `None` when `index` is out of range.
+    #[must_use]
+    pub fn dependency_task_ids(&self, index: usize) -> Option<Vec<String>> {
+        let node = self.nodes.get(index)?;
+        let mut ids = node
+            .dependencies
+            .iter()
+            .map(|&dep| self.task_ids[dep].clone())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
+    }
+
     /// The computed dependency digest of the node at `index`, `None`
     /// when `index` is out of range.
     #[must_use]

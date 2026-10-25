@@ -745,11 +745,15 @@ fn partition_cached_rows<'a>(
             version: row.version.as_semver().clone(),
         };
         let semantic_key = (package_key, row.features_json.raw());
-        if key_pairs.contains(&semantic_key)
-            && dependency_identity_by_key
+        let context_matches = if key_pairs.contains(&semantic_key) {
+            let digest = row.dependency_identity()?;
+            dependency_identity_by_key
                 .get(&semantic_key.0)
-                .is_some_and(|digest| *digest == row.dependency_identity)
-        {
+                .is_some_and(|expected| *expected == digest)
+        } else {
+            false
+        };
+        if context_matches {
             if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
                 if !deduplicate_cached_candidate(
                     &candidates[existing_index],
@@ -1482,8 +1486,7 @@ mod tests {
         deps: &[(&str, &str)],
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity"),
+            dependency_task_ids: Vec::new(),
             crate_name: CrateName::parse(crate_name).expect("name"),
             version: CrateVersion::new(Version::parse(version).expect("version")),
             features_json: FeaturesJson::canonicalize(
@@ -2150,8 +2153,9 @@ mod tests {
         }];
         dep_a_entry.dependency_subgraph = dep_subgraph.clone();
         let expanded_entries = vec![dep_a_entry, leaf_entry(&dep_b)];
-        // dep-a's own digest — the same resolve the analysis runs.
-        let dep_digest = dep_subgraph
+        // dep-a's own child task ids — the preimage the published row
+        // carries under this dependency context (stow#919).
+        let dep_task_ids = dep_subgraph
             .resolve(
                 &stow_types::task_graph::TaskNodeIdentity {
                     crate_name: dep_a.crate_name.clone(),
@@ -2165,9 +2169,8 @@ mod tests {
                 stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             )
             .expect("subgraph resolves")
-            .dependency_identity(0)
-            .expect("root digest")
-            .clone();
+            .dependency_task_ids(0)
+            .expect("root children");
 
         let mut dep_a_row = row(
             "dep-a",
@@ -2176,8 +2179,7 @@ mod tests {
             &[],
             &[("dep-b", "bbbbbbbbbbbbbbbb")],
         );
-        dep_a_row.dependency_identity =
-            stow_types::identity::DependencyIdentity::parse("f".repeat(64)).expect("digest");
+        dep_a_row.dependency_task_ids = vec!["foreign-dep-1.0.0-x".to_owned()];
         let rows = vec![
             dep_a_row.clone(),
             row("dep-b", "1.0.0", "bbbbbbbbbbbbbbbb", &[], &[]),
@@ -2196,7 +2198,7 @@ mod tests {
             "the wrong-context row never joins the prefetch set"
         );
 
-        dep_a_row.dependency_identity = dep_digest;
+        dep_a_row.dependency_task_ids = dep_task_ids;
         let rows = vec![
             dep_a_row,
             row("dep-b", "1.0.0", "bbbbbbbbbbbbbbbb", &[], &[]),

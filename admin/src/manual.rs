@@ -471,7 +471,7 @@ fn covered_slice_nodes(
     let mut shapes = HashMap::<_, BTreeSet<_>>::new();
     for row in rows {
         let shape = row.unit_shape;
-        let dependency_identity = &row.dependency_identity;
+        let dependency_identity = row.dependency_identity()?;
         let host_side = shape.side == stow_types::public_cache::UnitSide::Host;
         if host_side && host_triple(target) != target.as_str() {
             return Err(stow_error!("host row reported in non-host slice {target}"));
