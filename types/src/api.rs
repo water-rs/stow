@@ -2208,6 +2208,11 @@ pub struct SchedulerRearmReport {
 /// cost` lane (stow#773) snapshots it between layers and diffs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerLedger {
+    /// When the object last loaded its graph, unix ms. The ledger lives
+    /// on that graph and persists only through its snapshot, so a
+    /// reload drops every booking since the snapshot: two reads that
+    /// answer different values are not comparable.
+    pub woken_at_ms: i64,
     /// One row per operation the object ran, in `op` order.
     pub ops: Vec<SchedulerLedgerOp>,
 }
@@ -3945,6 +3950,122 @@ mod tests {
             "the ambiguous target row is not the named child"
         );
     }
+
+    /// stow#723: the self-twin edge — a host node deping on its
+    /// same-feature target twin — pins both endpoints. A published
+    /// superset on the host side alone serves neither.
+    #[test]
+    fn a_self_twin_pair_moves_together_or_not_at_all() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        let mut x_h = submission_node("x", &[], &[1], "x-h");
+        x_h.host_side = true;
+        let x_t = submission_node("x", &[], &[], "x-t");
+        let published = vec![crate::api::PublishedIndexSlice {
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![published_row("x", &["std"], &[], Vec::new(), "33", true)],
+        }];
+        let mut trees = vec![tree(vec![x_h, x_t])];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        for (index, side) in [(0usize, "host"), (1usize, "target")] {
+            let node = &trees[0].nodes[index];
+            assert!(
+                node.features_json.features().is_empty(),
+                "the {side} endpoint stays at its own set when only one side has a superset"
+            );
+        }
+
+        // A serving set published on both sides is a real superset the
+        // pair can move to — both endpoints land on it.
+        let identity = |host_side: bool| TaskNodeIdentity {
+            crate_name: "x".parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(vec!["std".to_owned()]).expect("features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side,
+        };
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let target_id = identity(false).task_id(&leaf);
+        let host_dep_identity =
+            DependencyIdentity::from_task_ids([target_id.as_str()]).expect("host dep digest");
+        let host_id = identity(true).task_id(&host_dep_identity);
+        let published = vec![crate::api::PublishedIndexSlice {
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![
+                // The host row's own chain names its target twin —
+                // a real published superset carries its real dep list.
+                published_row("x", &["std"], &[], vec![target_id.clone()], "44", true),
+                published_row("x", &["std"], &[], Vec::new(), "55", false),
+            ],
+        }];
+        let mut x_h = submission_node("x", &[], &[1], "x-h");
+        x_h.host_side = true;
+        let mut trees = vec![tree(vec![x_h, submission_node("x", &[], &[], "x-t")])];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let host = trees[0]
+            .nodes
+            .iter()
+            .find(|node| node.crate_name.as_str() == "x" && node.host_side)
+            .expect("host endpoint");
+        let target = trees[0]
+            .nodes
+            .iter()
+            .find(|node| node.crate_name.as_str() == "x" && !node.host_side)
+            .expect("target endpoint");
+        assert_eq!(host.features_json.features(), &["std".to_owned()]);
+        assert_eq!(target.features_json.features(), &["std".to_owned()]);
+        assert_eq!(
+            host.task_id, host_id,
+            "host endpoint serves the published set"
+        );
+        assert_eq!(
+            target.task_id, target_id,
+            "target endpoint serves the same published set"
+        );
+    }
+
+    /// stow#723: the shadow pair — a dependent holding the same-feature
+    /// host and target units of one package as two children — is bound
+    /// by the same rule: one side's published superset moves neither.
+    #[test]
+    fn a_shadow_pair_moves_together_or_not_at_all() {
+        let mut x_h = submission_node("x", &[], &[], "x-h");
+        x_h.host_side = true;
+        let x_t = submission_node("x", &[], &[], "x-t");
+        let parent = submission_node("p", &[], &[1, 2], "p");
+        let published = vec![crate::api::PublishedIndexSlice {
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![published_row("x", &["std"], &[], Vec::new(), "66", false)],
+        }];
+        let mut trees = vec![tree(vec![parent, x_h, x_t])];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let target = trees[0]
+            .nodes
+            .iter()
+            .find(|node| node.crate_name.as_str() == "x" && !node.host_side)
+            .expect("target endpoint");
+        assert!(
+            target.features_json.features().is_empty(),
+            "the target endpoint cannot move alone to the superset"
+        );
+        let host = trees[0]
+            .nodes
+            .iter()
+            .find(|node| node.crate_name.as_str() == "x" && node.host_side)
+            .expect("host endpoint");
+        assert!(
+            host.features_json.features().is_empty(),
+            "the host endpoint stays too"
+        );
+    }
 }
 /// Public aggregate usage statistics served by `GET /api/v1/stats`.
 ///
@@ -4221,6 +4342,7 @@ impl SubmissionTree {
     /// # Panics
     /// The internal lookups are inhabited by construction: every node's
     /// group and serving set were computed from the pool itself.
+    #[allow(clippy::too_many_lines)] // the rewrite orchestrates one pass; splitting hides it
     pub fn substitute_contained_sets(
         trees: &mut [Self],
         published: &[PublishedIndexSlice],
@@ -4246,10 +4368,30 @@ impl SubmissionTree {
                     .insert(row.features_json.features().to_vec());
             }
         }
-        let serving = families
+        let mut serving = families
             .iter()
             .map(|(key, family)| (key.clone(), crate::feature_sets::serving_map(family)))
             .collect::<BTreeMap<_, _>>();
+        // Every pulled row's own minted task id — the join a row's
+        // `dependency_task_ids` edges name (stow#919) — is needed here to
+        // find twin pairs in the published pool.
+        let mut row_task_ids = Vec::with_capacity(published.len());
+        for slice in published {
+            let mut ids = Vec::with_capacity(slice.rows.len());
+            for row in &slice.rows {
+                ids.push(published_row_identity(slice, row).task_id(&row.dependency_identity()?));
+            }
+            row_task_ids.push(ids);
+        }
+        let mut by_task_id = std::collections::HashMap::new();
+        for (slice_index, ids) in row_task_ids.iter().enumerate() {
+            for (row_index, id) in ids.iter().enumerate() {
+                by_task_id
+                    .entry(id.as_str())
+                    .or_insert((slice_index, row_index));
+            }
+        }
+        patch_twin_pair_serving(trees, published, &by_task_id, &mut serving);
         if serving
             .values()
             .all(|map| map.iter().all(|(set, serve)| set == serve))
@@ -4280,20 +4422,6 @@ impl SubmissionTree {
             }
         }
         let (published_reps, row_task_ids) = published_pool_index(published, &serving)?;
-        // `task id` → `(slice, row)` across every pulled slice — the
-        // join a row's `dependency_task_ids` edges name (stow#919). A
-        // target node's host children live in the host slice, so the
-        // index spans all pulled slices. Task ids are unique by
-        // construction; two rows minting one id are interchangeable
-        // here, so the first answers.
-        let mut by_task_id = std::collections::HashMap::new();
-        for (slice_index, ids) in row_task_ids.iter().enumerate() {
-            for (row_index, id) in ids.iter().enumerate() {
-                by_task_id
-                    .entry(id.as_str())
-                    .or_insert((slice_index, row_index));
-            }
-        }
 
         let mut substitution = Substitution {
             trees,
@@ -4377,6 +4505,173 @@ fn substitution_group_key(node: &SubmissionNode) -> SubstitutionGroupKey {
         node.rustc_version.clone(),
         node.host_side,
     )
+}
+
+/// The `(crate, version, target, rustc)` a twin pair shares — the
+/// group key with the side stripped (stow#723).
+type TwinPairKey = (CrateName, CrateVersion, TargetTriple, WireRustcVersion);
+
+/// stow#723: the two endpoints of a twin pair move to the same serving
+/// set or neither. A pair is named wherever an edge binds the
+/// same-feature host and target units of one package — a host node's
+/// self-twin edge, or a dependent holding both as children (the shadow
+/// pair the dedup pin emits). Moving one side alone would hand a
+/// dependent's pins `X_h[F]` and `X_t[S]` with `F ≠ S`, breaking the
+/// equal-features premise cargo's sharing probe needs — and minting
+/// wrong ids, as a substituted shadow edge already did.
+///
+/// For each paired feature set `F` the joint serve is the smallest
+/// strictly-containing set that is itself unserved (a *built* set) on
+/// BOTH sides; with none, both endpoints stay at `F`. The answer is
+/// written back into `serving` on both side-keys, so every later
+/// serve lookup — batch representatives, published reps and the
+/// substitution walk — sees it.
+#[allow(clippy::too_many_lines)] // one pass over both pools; split hurts the shape
+fn patch_twin_pair_serving(
+    trees: &[SubmissionTree],
+    published: &[PublishedIndexSlice],
+    by_task_id: &std::collections::HashMap<&str, (usize, usize)>,
+    serving: &mut BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
+) {
+    type PairKeyAndSet = (TwinPairKey, Vec<String>);
+    let mut paired = BTreeSet::<PairKeyAndSet>::new();
+    // `deps` is a parent identity plus its dep identities — the two
+    // shapes a twin reference takes, on either pool.
+    let mut record = |parent: &TaskNodeIdentity, deps: &[TaskNodeIdentity]| {
+        let parent_key = (
+            parent.crate_name.clone(),
+            parent.version.clone(),
+            parent.target.clone(),
+            parent.rustc_version.clone(),
+        );
+        if parent.host_side {
+            for dep in deps {
+                if !dep.host_side
+                    && dep.crate_name == parent.crate_name
+                    && dep.version == parent.version
+                    && dep.target == parent.target
+                    && dep.rustc_version == parent.rustc_version
+                    && dep.features_json == parent.features_json
+                {
+                    paired.insert((parent_key.clone(), parent.features_json.features().to_vec()));
+                }
+            }
+        }
+        // The shadow pair: one parent's two children at the same
+        // features, one per side.
+        let mut by_set = BTreeMap::<PairKeyAndSet, (bool, bool)>::new();
+        for dep in deps {
+            let entry = by_set
+                .entry((
+                    (
+                        dep.crate_name.clone(),
+                        dep.version.clone(),
+                        dep.target.clone(),
+                        dep.rustc_version.clone(),
+                    ),
+                    dep.features_json.features().to_vec(),
+                ))
+                .or_default();
+            if dep.host_side {
+                entry.0 = true;
+            } else {
+                entry.1 = true;
+            }
+        }
+        paired.extend(
+            by_set
+                .into_iter()
+                .filter(|(_, sides)| sides.0 && sides.1)
+                .map(|(key, _)| key),
+        );
+    };
+    for tree in trees {
+        for node in &tree.nodes {
+            let parent = TaskNodeIdentity {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                target: node.target.clone(),
+                rustc_version: node.rustc_version.clone(),
+                host_side: node.host_side,
+            };
+            let deps: Vec<TaskNodeIdentity> = node
+                .deps
+                .iter()
+                .map(|&dep| {
+                    let dep = &tree.nodes[dep as usize];
+                    TaskNodeIdentity {
+                        crate_name: dep.crate_name.clone(),
+                        version: dep.version.clone(),
+                        features_json: dep.features_json.clone(),
+                        target: dep.target.clone(),
+                        rustc_version: dep.rustc_version.clone(),
+                        host_side: dep.host_side,
+                    }
+                })
+                .collect();
+            record(&parent, &deps);
+        }
+    }
+    for (slice_index, slice) in published.iter().enumerate() {
+        for (row_index, row) in slice.rows.iter().enumerate() {
+            let parent = published_row_identity(slice, row);
+            let mut deps = Vec::with_capacity(row.dependency_task_ids.len());
+            for child_id in &row.dependency_task_ids {
+                // A dep chain the pulled slices do not fully carry
+                // never reconstructs; its edges name no pair either.
+                let Some(&(dep_slice, dep_row)) = by_task_id.get(child_id.as_str()) else {
+                    continue;
+                };
+                deps.push(published_row_identity(
+                    &published[dep_slice],
+                    &published[dep_slice].rows[dep_row],
+                ));
+            }
+            let _ = (slice_index, row_index);
+            record(&parent, &deps);
+        }
+    }
+
+    for (key, features) in paired {
+        // The sets each side would serve, restricted to built sets —
+        // moving an endpoint must land it on a set that stays.
+        let built = |host_side: bool| -> BTreeSet<Vec<String>> {
+            serving
+                .get(&(
+                    key.0.clone(),
+                    key.1.clone(),
+                    key.2.clone(),
+                    key.3.clone(),
+                    host_side,
+                ))
+                .map(|map| {
+                    map.iter()
+                        .filter(|(set, serve)| set == serve)
+                        .map(|(set, _)| set.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let joint = built(true)
+            .intersection(&built(false))
+            .filter(|set| **set != features && crate::feature_sets::contains_all(set, &features))
+            .min()
+            .cloned()
+            .unwrap_or_else(|| features.clone());
+        for host_side in [true, false] {
+            if let Some(map) = serving.get_mut(&(
+                key.0.clone(),
+                key.1.clone(),
+                key.2.clone(),
+                key.3.clone(),
+                host_side,
+            )) && map.contains_key(&features)
+            {
+                map.insert(features.clone(), joint.clone());
+            }
+        }
+    }
 }
 
 /// A published row's identity group — the slice supplies the two

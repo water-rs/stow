@@ -22,6 +22,15 @@
 //! <phase>/end.json                      ledger when the phase ended
 //! ```
 //!
+//! and, across both phases, every restart of the dev edge (the probe
+//! ledger lives in the edge's memory past its last snapshot, so the
+//! report carries every later read across each restart):
+//!
+//! ```text
+//! restarts/<NNN>/before.json  ledger right before the edge stopped
+//! restarts/<NNN>/after.json   ledger once the restarted edge answered
+//! ```
+//!
 //! The production wave's size comes from a lanes directory
 //! `scripts/production-wave.sh` fills with the production lanes'
 //! plan-only runs (no `--yes`, nothing enqueued), laid out like a
@@ -40,8 +49,9 @@ use stow_types::api::{ArtifactRecord, SchedulerLedger};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::local_ci::LocalCiTasks;
 use stow_types::preheat_cost::{
-    LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport, ProductionLane,
-    ProductionTask, ProductionWave, Round, WaveObservations, analyse, count_production,
+    EdgeRestart, LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport,
+    ProductionLane, ProductionTask, ProductionWave, Round, WaveObservations, analyse,
+    count_production,
 };
 use stow_types::public_cache::UnitSide;
 use stow_types::stow_error;
@@ -357,6 +367,18 @@ async fn phase(
     ))
 }
 
+/// The run's edge restarts, in the order the script numbered them.
+async fn restarts(dir: &Path) -> stow_types::error::Result<Vec<EdgeRestart>> {
+    let mut restarts = Vec::new();
+    for restart_dir in sorted_entries(dir).await? {
+        restarts.push(EdgeRestart {
+            before: read_json(&restart_dir.join("before.json")).await?,
+            after: read_json(&restart_dir.join("after.json")).await?,
+        });
+    }
+    Ok(restarts)
+}
+
 /// Every line of `paths` that mentions an overload.
 async fn overload_sightings(paths: &[PathBuf]) -> stow_types::error::Result<Vec<String>> {
     let mut sightings = Vec::new();
@@ -419,6 +441,7 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
         nodes,
         wave,
         resubmit,
+        restarts: restarts(&args.work_dir.join("restarts")).await?,
         runs: runs.tasks,
         covered,
         overload_sightings: overload_sightings(&args.scan).await?,

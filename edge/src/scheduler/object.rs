@@ -75,6 +75,7 @@ async fn ensure_graph<'a>(
     } else {
         let (mut graph, events) = store::load(db).await.map_err(to_error)?;
         store::apply_events(&mut graph, &events);
+        graph.woken_at_ms = now_ms();
         cell.install(graph)
     };
     // The admission floor is a deploy binding, never persisted: every

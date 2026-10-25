@@ -102,7 +102,9 @@ host-side nodes as its runner would; publish rounds release the graph layer by
 layer; then the same lists are resubmitted the way the daily cron
 does. The edge runs the budget-probe manifest at production's
 dispatch caps and cost multiplier, and its probe ledger (`stow-admin
-preheat cost ledger`) is read at every lane and round boundary.
+preheat cost ledger`) is read at every lane and round boundary and on
+both sides of every edge restart, so the report carries the ledger
+across a restart.
 
 `stow-admin preheat cost report` turns the run into
 `preheat-cost-report.json` — per event kind (submit, alarm dispatch,
@@ -111,7 +113,8 @@ per target, wall time — and fails when a resubmit rebuilds anything, a
 per-event cost grows from the first layer to the last past the
 scheduler-budget tolerance, a fixed-size event exceeds its drive
 budget, a node is dispatched before its dependencies are published, a
-submitted node never publishes, the object answers `overloaded`, or a
+submitted node never publishes, the object answers `overloaded`, a
+build is dispatched while the edge restarts, or a
 lane's submit fails. The wave and resubmit totals are bounded where the
 production node count exists: the monthly projection scales them to
 `production-wave.json` against the preheat budget in

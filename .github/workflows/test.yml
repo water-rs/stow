@@ -32,8 +32,10 @@ env:
   # workspace `cargo test --no-run` is 11 GB with it and 3.4 GB without,
   # and compiles in 128 s instead of 174 s. The per-job caches held the full
   # size, filled the repository's 10 GB cache allowance and evicted each
-  # other.
-  CARGO_PROFILE_DEV_DEBUG: 0
+  # other. It is passed as `--config` rather than `CARGO_PROFILE_DEV_DEBUG`
+  # so the cargo a test spawns keeps the default profile a consumer's build
+  # has (stow#723).
+  NO_DEBUGINFO: --config=profile.dev.debug=0
 
 jobs:
   # Documentation cannot change what a compiler or a test observes, so the
@@ -115,8 +117,8 @@ jobs:
           # a per-PR copy of every job's cache duplicated the whole set
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
-      - run: cargo nextest run --workspace --no-fail-fast
-      - run: cargo test --doc --workspace
+      - run: cargo nextest run ${{ env.NO_DEBUGINFO }} --workspace --no-fail-fast
+      - run: cargo test ${{ env.NO_DEBUGINFO }} --doc --workspace
 
   lint:
     needs: changes
@@ -143,8 +145,8 @@ jobs:
           # under the PR ref and evicted the build-crate caches (#177).
           save-if: ${{ github.ref == 'refs/heads/dev' }}
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p stow-edge --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy ${{ env.NO_DEBUGINFO }} --workspace --all-targets -- -D warnings
+      - run: cargo clippy ${{ env.NO_DEBUGINFO }} -p stow-edge --target wasm32-unknown-unknown -- -D warnings
 
   # The scheduler idle proof (stow#593): the real workerd build under
   # @cloudflare/vitest-plugin, proving an empty scheduler deletes its
@@ -155,6 +157,10 @@ jobs:
     if: github.event_name == 'schedule' || needs.changes.outputs.code == 'true'
     name: Edge idle suite
     runs-on: ubuntu-latest
+    # The profile release-gate builds the mock-e2e cache under, which
+    # rust-cache folds into the key this job restores.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
