@@ -339,13 +339,15 @@ back into the mock registry (mock-key mode delegates the signed push to
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
 target/release/stow-admin index export \
-  --target aarch64-apple-darwin --rustc-version 1.91.1 \
-  --out /tmp/stow-bench/index.bin
+  --out-dir /tmp/stow-bench/index-export --rustc-version 1.91.1
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
 target/release/stow-admin index publish \
-  --file /tmp/stow-bench/index.bin \
-  --target aarch64-apple-darwin --rustc-version 1.91.1
+  --file /tmp/stow-bench/index-export/index.aarch64-apple-darwin.1.91.1 \
+  --folded /tmp/stow-bench/index-export/folded.aarch64-apple-darwin.1.91.1
+STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
+target/release/stow-admin index report \
+  --file /tmp/stow-bench/index-export/index.aarch64-apple-darwin.1.91.1
 ```
 
 Then refresh the consumer-side cache and run `stow check` against a
