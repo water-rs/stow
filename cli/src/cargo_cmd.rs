@@ -6973,7 +6973,7 @@ mod tests {
     /// constants.
     fn slice_for(rows: Vec<stow_types::index::ArtifactIndexRow>) -> crate::index::IndexSlice {
         crate::index::IndexSlice {
-            manifest_digest: "sha256:deadbeef".to_owned(),
+            manifest_digest: Some("sha256:deadbeef".to_owned()),
             index: stow_types::index::ArtifactIndex {
                 header: stow_types::index::ArtifactIndexHeader {
                     format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,

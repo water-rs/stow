@@ -142,6 +142,13 @@ async fn exchange_token(
     let status = response.get_ref().status_code();
     let body = body_text(response).await;
     if !(200..300).contains(&status) {
+        // GHCR refuses the anonymous exchange for a package that does
+        // not exist (or is not public) with `403 DENIED` — the pull's
+        // answer is "the index is empty", the same `NotFound` a missing
+        // tag carries.
+        if stow_types::registry::package_missing(status, &body) {
+            return Err(FetchError::NotFound);
+        }
         return Err(FetchError::TokenExchange { status, body });
     }
     let parsed: TokenResponse =
@@ -228,10 +235,18 @@ async fn classify_status<B: FetchedResponse>(
     let status = response.get_ref().status_code();
     match status {
         200..=299 => Ok(response.into_inner()),
-        401 | 403 => Err(FetchError::Unauthorized {
-            status,
-            body: body_text(response).await,
-        }),
+        401 | 403 => {
+            let body = body_text(response).await;
+            // A `403 DENIED` answer names a package that does not exist
+            // (or went private — GHCR refuses to say which): the pull's
+            // answer is the empty index, the same `NotFound` a missing
+            // tag carries. Any other `401`/`403` stays an auth failure.
+            if stow_types::registry::package_missing(status, &body) {
+                Err(FetchError::NotFound)
+            } else {
+                Err(FetchError::Unauthorized { status, body })
+            }
+        }
         404 => Err(FetchError::NotFound),
         429 | 500..=599 => Err(FetchError::Unavailable),
         _ => Err(FetchError::UnexpectedStatus(status)),
@@ -273,6 +288,9 @@ pub enum FetchError {
         body: String,
     },
     #[error("artifact not found in GHCR")]
+    /// The tag — or its whole package — does not exist. A missing
+    /// package is GHCR's `403 DENIED`, classified to the same `NotFound`
+    /// a missing tag answers, so every reader serves an empty index.
     NotFound,
     #[error("GHCR returned unexpected HTTP status {0}")]
     UnexpectedStatus(u16),
