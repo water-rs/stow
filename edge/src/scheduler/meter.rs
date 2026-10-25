@@ -325,6 +325,7 @@ pub fn ledger_op(method: &str, path: &str) -> String {
 /// operations the object serves, never by the queue.
 pub fn ledger(graph: LoadedGraph<'_>) -> stow_types::api::SchedulerLedger {
     graph.with(|graph| stow_types::api::SchedulerLedger {
+        woken_at_ms: graph.woken_at_ms,
         ops: graph
             .meter
             .ops
@@ -547,6 +548,7 @@ mod tests {
         let meter = meter.with_ledger_op("POST /tasks/retry".to_owned());
         let owner = cell();
         let cell = owner.loaded().expect("installed");
+        cell.with(|graph| graph.woken_at_ms = NOW_MS - 5);
         store::append_events(&db, &[mutate()], NOW_MS)
             .await
             .expect("append");
@@ -554,6 +556,8 @@ mod tests {
         // An operation with no statements still counts as an event.
         meter.settle(cell, NOW_MS);
         let ledger = super::ledger(cell);
+        // The reader tells this graph's ledger from a reloaded one's.
+        assert_eq!(ledger.woken_at_ms, NOW_MS - 5);
         let [op] = ledger.ops.as_slice() else {
             panic!("one op row");
         };

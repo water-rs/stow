@@ -50,6 +50,8 @@ mod sandbox;
 mod state_db;
 mod stats;
 mod supervisor;
+#[cfg(test)]
+mod test_edge;
 mod unit_node;
 mod verify;
 mod workspace_deps;

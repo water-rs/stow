@@ -27,7 +27,8 @@
 #   5. resubmit the same lists, as the daily preheat-cron does, and
 #      drive whatever that releases
 #   6. `stow-admin preheat cost report` reads the probe ledger snapshots
-#      taken at every lane and round boundary, the local CI's runs and
+#      taken at every lane and round boundary and around every edge
+#      restart, the local CI's runs and
 #      the final published slices, writes
 #      $WORK_DIR/preheat-cost-report.json and fails on any check:
 #      per-event cost growing first → last layer past the stow#433
@@ -72,7 +73,7 @@
 #                                  run fails (default 21600)
 #   STOW_PREHEAT_COST_EDGE_RSS_MB  restart the dev edge at an idle point
 #                                  once its process tree passes this RSS
-#                                  (default 1200; see launch-load.sh)
+#                                  (default 1200; see traffic-cost.sh)
 #   STOW_E2E_TOOLCHAIN             rustup toolchain for the run (default:
 #                                  stable)
 #   STOW_E2E_READY_DEADLINE        seconds to wait for each service
@@ -323,9 +324,10 @@ wait_for "mock registry /v2/" 60 "$SERVICE_PID" mock_registry_ready
     || die "skyzen build failed — see $LOG_DIR/edge-build.log"
 
 # The edge runs under `wrangler dev`, whose dev-time service graph
-# retains native memory per request (launch-load.sh has the details);
+# retains native memory per request (traffic-cost.sh has the details);
 # the wave loop restarts it at an idle point once its tree passes
-# EDGE_RSS_MB, with Durable-Object state persisted on disk. The
+# EDGE_RSS_MB, with Durable-Object state persisted on disk and the
+# probe ledger read on both sides of the restart (`restart_edge`). The
 # production dispatch caps and cost multiplier replace the mock
 # manifest's, so an alarm pass claims what production's claims and the
 # in-edge daily cost breaker trips where production's would.
@@ -481,6 +483,22 @@ local_ci_counts() {
 }
 
 ROUND=0
+RESTART=0
+
+# Restart the dev edge, bracketed by ledger reads. The probe ledger lives
+# on the scheduler graph and persists only through its snapshot, so the
+# restarted edge answers its last snapshot's ledger; the report carries
+# every later read across the restart from these two (stow#928).
+restart_edge() {
+    RESTART=$((RESTART + 1))
+    local dir
+    dir="$COST_DIR/restarts/$(printf '%03d' "$RESTART")"
+    mkdir -p "$dir"
+    snapshot "$dir/before.json"
+    stop_edge
+    start_edge
+    snapshot "$dir/after.json"
+}
 
 # One publish round — the loop index-publish.yml drives: export the
 # records the registry gained, publish each changed slice, and report
@@ -552,8 +570,7 @@ drive_phase() {
                 # lanes are done and no build is running.
                 if [ "$lanes_done" -eq 1 ] && [ "$(($(edge_rss_kb) / 1024))" -gt "$EDGE_RSS_MB" ]; then
                     log "edge tree rss $(($(edge_rss_kb) / 1024)) MB — restarting before the round"
-                    stop_edge
-                    start_edge
+                    restart_edge
                 fi
                 PUBLISHED_SUCCESSES="$succeeded"
                 log "$phase: $tasks task runs so far"

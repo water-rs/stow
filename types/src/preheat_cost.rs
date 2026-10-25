@@ -123,6 +123,25 @@ pub struct LaneRun {
     pub after: LedgerSnapshot,
 }
 
+/// One restart of the dev edge the harness made mid-run.
+///
+/// The probe ledger lives on the scheduler graph and persists only
+/// through its snapshot, so a restarted edge answers the ledger of its
+/// last snapshot: every booking since then is gone. The harness reads
+/// the ledger right before it stops the edge and right after the new
+/// one answers; [`analyse`] carries every later read across the
+/// restart as `before + (read − after)`. Nothing but those two reads
+/// and the readiness polls may reach the scheduler in between — a build
+/// dispatched there is a booking neither read holds, and the report
+/// fails on it.
+#[derive(Debug, Clone)]
+pub struct EdgeRestart {
+    /// The ledger read right before the edge stopped.
+    pub before: LedgerSnapshot,
+    /// The ledger read once the restarted edge answered.
+    pub after: LedgerSnapshot,
+}
+
 /// One submitted node.
 #[derive(Debug, Clone)]
 pub struct Node {
@@ -260,6 +279,8 @@ pub struct WaveObservations {
     pub wave: PhaseObservations,
     /// The daily resubmit of the same lists.
     pub resubmit: PhaseObservations,
+    /// Every edge restart across both phases, in the order they ran.
+    pub restarts: Vec<EdgeRestart>,
     /// Every run the local CI was dispatched, both phases.
     pub runs: Vec<LocalCiRun>,
     /// Task ids the final published slices serve — the gate's own
@@ -402,8 +423,8 @@ impl PreheatCostReport {
     }
 }
 
-/// `later − earlier`, per operation. An operation missing from
-/// `earlier` started at zero.
+/// `later − earlier`, per operation. An operation missing from either
+/// side is at zero there.
 ///
 /// # Errors
 /// An operation's counters went backwards — the ledger was reset under
@@ -412,8 +433,28 @@ pub fn ledger_delta(
     earlier: &SchedulerLedger,
     later: &SchedulerLedger,
 ) -> crate::error::Result<Vec<SchedulerLedgerOp>> {
+    if earlier.woken_at_ms != later.woken_at_ms {
+        return Err(crate::stow_error!(
+            "probe ledger reloaded between two reads (graph woken at {} ms, then at {} ms) \
+             with no edge restart recorded around it: every booking since its last snapshot \
+             was dropped — the ledger was reset mid-run",
+            earlier.woken_at_ms,
+            later.woken_at_ms
+        ));
+    }
     let before: BTreeMap<&str, &SchedulerLedgerOp> =
         earlier.ops.iter().map(|op| (op.op.as_str(), op)).collect();
+    if let Some(lost) = earlier
+        .ops
+        .iter()
+        .find(|op| op.events > 0 && !later.ops.iter().any(|later| later.op == op.op))
+    {
+        return Err(crate::stow_error!(
+            "probe ledger {} went from {} events to none: the ledger was reset mid-run",
+            lost.op,
+            lost.events
+        ));
+    }
     later
         .ops
         .iter()
@@ -438,6 +479,175 @@ pub fn ledger_delta(
         })
         .filter(|op| op.as_ref().map_or(true, |op| op.events > 0))
         .collect()
+}
+
+/// `base + delta`, per operation.
+fn ledger_sum(base: &SchedulerLedger, delta: &[SchedulerLedgerOp]) -> SchedulerLedger {
+    let mut ops: BTreeMap<&str, SchedulerLedgerOp> = base
+        .ops
+        .iter()
+        .map(|op| (op.op.as_str(), op.clone()))
+        .collect();
+    for op in delta {
+        let sum = ops
+            .entry(op.op.as_str())
+            .or_insert_with(|| SchedulerLedgerOp {
+                op: op.op.clone(),
+                events: 0,
+                rows_read: 0,
+                rows_written: 0,
+            });
+        sum.events += op.events;
+        sum.rows_read += op.rows_read;
+        sum.rows_written += op.rows_written;
+    }
+    SchedulerLedger {
+        woken_at_ms: base.woken_at_ms,
+        ops: ops.into_values().collect(),
+    }
+}
+
+/// The run's ledger reads on one continuous timeline: each read after
+/// an [`EdgeRestart`] is carried across it, so the run reports the
+/// totals it would have without the restart. A carried read answers the
+/// first graph's `woken_at_ms`, so [`ledger_delta`] still refuses any
+/// pair of reads a reload separates that no recorded restart explains.
+struct Timeline<'a> {
+    restarts: &'a [EdgeRestart],
+    /// Per restart, its `before` read already carried across every
+    /// earlier restart — what the edge had booked when it stopped.
+    carried: Vec<SchedulerLedger>,
+}
+
+impl<'a> Timeline<'a> {
+    /// # Errors
+    /// The restarts are out of order or overlap, or a restart's `before`
+    /// read went backwards against an earlier restart's `after`.
+    fn new(restarts: &'a [EdgeRestart]) -> crate::error::Result<Self> {
+        let mut timeline = Self {
+            restarts,
+            carried: Vec::with_capacity(restarts.len()),
+        };
+        for (index, restart) in restarts.iter().enumerate() {
+            if restart.after.taken_at_ms <= restart.before.taken_at_ms {
+                return Err(crate::stow_error!(
+                    "edge restart {}: its after read ({} ms) does not follow its before read ({} ms)",
+                    index + 1,
+                    restart.after.taken_at_ms,
+                    restart.before.taken_at_ms
+                ));
+            }
+            if let Some(previous) = index.checked_sub(1).map(|previous| &restarts[previous])
+                && restart.before.taken_at_ms <= previous.after.taken_at_ms
+            {
+                return Err(crate::stow_error!(
+                    "edge restart {} began ({} ms) before restart {index} ended ({} ms)",
+                    index + 1,
+                    restart.before.taken_at_ms,
+                    previous.after.taken_at_ms
+                ));
+            }
+            let carried = timeline.carry(&restart.before, index)?;
+            timeline.carried.push(carried);
+        }
+        Ok(timeline)
+    }
+
+    /// `snapshot`'s ledger carried across the first `restarts` restarts.
+    fn carry(
+        &self,
+        snapshot: &LedgerSnapshot,
+        restarts: usize,
+    ) -> crate::error::Result<SchedulerLedger> {
+        let at = snapshot.taken_at_ms;
+        let last = self.restarts[..restarts]
+            .iter()
+            .rposition(|restart| restart.before.taken_at_ms < at);
+        let Some(last) = last else {
+            return Ok(snapshot.ledger.clone());
+        };
+        let restart = &self.restarts[last];
+        if at < restart.after.taken_at_ms {
+            return Err(crate::stow_error!(
+                "a ledger read at {at} ms fell inside edge restart {} ({} → {} ms)",
+                last + 1,
+                restart.before.taken_at_ms,
+                restart.after.taken_at_ms
+            ));
+        }
+        Ok(ledger_sum(
+            &self.carried[last],
+            &ledger_delta(&restart.after.ledger, &snapshot.ledger)?,
+        ))
+    }
+
+    /// `snapshot` on the continuous timeline.
+    fn snapshot(&self, snapshot: &LedgerSnapshot) -> crate::error::Result<LedgerSnapshot> {
+        Ok(LedgerSnapshot {
+            taken_at_ms: snapshot.taken_at_ms,
+            ledger: self.carry(snapshot, self.restarts.len())?,
+        })
+    }
+
+    /// Every ledger read of `phase` on the continuous timeline.
+    fn phase(&self, phase: &PhaseObservations) -> crate::error::Result<PhaseObservations> {
+        Ok(PhaseObservations {
+            start: self.snapshot(&phase.start)?,
+            rounds: phase
+                .rounds
+                .iter()
+                .map(|round| {
+                    Ok(Round {
+                        before_report: self.snapshot(&round.before_report)?,
+                        end: self.snapshot(&round.end)?,
+                        published: round.published.clone(),
+                    })
+                })
+                .collect::<crate::error::Result<_>>()?,
+            lanes: phase
+                .lanes
+                .iter()
+                .map(|lane| {
+                    Ok(LaneRun {
+                        before: self.snapshot(&lane.before)?,
+                        after: self.snapshot(&lane.after)?,
+                        ..lane.clone()
+                    })
+                })
+                .collect::<crate::error::Result<_>>()?,
+            end: self.snapshot(&phase.end)?,
+        })
+    }
+}
+
+/// No build was dispatched while the edge restarted: the dispatch's
+/// alarm booked into a ledger neither of the restart's reads holds.
+fn restart_check(observed: &WaveObservations) -> Check {
+    let dispatched: Vec<String> = observed
+        .restarts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, restart)| {
+            let builds = build_tasks_between(
+                &observed.runs,
+                restart.before.taken_at_ms,
+                restart.after.taken_at_ms,
+            );
+            (builds > 0).then(|| format!("restart {}: {builds} build runs", index + 1))
+        })
+        .collect();
+    check(
+        "No build dispatched during an edge restart",
+        dispatched.is_empty(),
+        if dispatched.is_empty() {
+            format!(
+                "{} edge restarts, each with nothing dispatched",
+                observed.restarts.len()
+            )
+        } else {
+            dispatched.join("; ")
+        },
+    )
 }
 
 fn kind_costs(ops: &[SchedulerLedgerOp]) -> Vec<KindCost> {
@@ -884,11 +1094,14 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
     for node in observed.nodes.values() {
         *nodes_per_target.entry(node.target.clone()).or_default() += 1;
     }
-    let wave = phase_cost(&observed.wave, &observed.runs)?;
-    let resubmit = phase_cost(&observed.resubmit, &observed.runs)?;
-    let layers = layers(&observed.wave, &observed.runs)?;
-    let mut lanes = lane_costs("wave", &observed.wave)?;
-    lanes.extend(lane_costs("resubmit", &observed.resubmit)?);
+    let timeline = Timeline::new(&observed.restarts)?;
+    let wave_reads = timeline.phase(&observed.wave)?;
+    let resubmit_reads = timeline.phase(&observed.resubmit)?;
+    let wave = phase_cost(&wave_reads, &observed.runs)?;
+    let resubmit = phase_cost(&resubmit_reads, &observed.runs)?;
+    let layers = layers(&wave_reads, &observed.runs)?;
+    let mut lanes = lane_costs("wave", &wave_reads)?;
+    lanes.extend(lane_costs("resubmit", &resubmit_reads)?);
 
     let mut checks = vec![
         check(
@@ -907,6 +1120,7 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
     checks.extend(growth_checks(&layers));
     checks.push(submit_growth_check(&lanes));
     checks.extend(drive_checks(&layers));
+    checks.push(restart_check(observed));
     checks.push(order_check(observed));
     checks.push(published_check(observed));
     checks.push(overload_check(observed));
@@ -941,6 +1155,7 @@ mod tests {
     /// completions.
     fn ledger(events: u64, completions: u64, rate: u64, completion_extra: u64) -> SchedulerLedger {
         SchedulerLedger {
+            woken_at_ms: 0,
             ops: EventKind::ALL
                 .iter()
                 .map(|kind| {
@@ -1058,10 +1273,109 @@ mod tests {
             },
             // a dispatches before round 1; b after round 1's report
             // began; c after round 2's.
+            restarts: vec![],
             runs: vec![run("a", 10), run("b", 95), run("c", 195)],
             covered: BTreeSet::from(["a".to_owned(), "b".to_owned(), "c".to_owned()]),
             overload_sightings: vec![],
         }
+    }
+
+    /// One edge restart a test replays: it stops right after `stop_at`,
+    /// when the never-restarted ledger stood at `truth`, and the new
+    /// edge's first ledger read, at `after_at`, answers `reloaded` — its
+    /// last snapshot plus the readiness poll that woke it.
+    struct Replayed {
+        stop_at: u64,
+        after_at: u64,
+        truth: SchedulerLedger,
+        reloaded: SchedulerLedger,
+    }
+
+    /// What the restarted edge answers at `at` for the never-restarted
+    /// `truth`: the last restart's reloaded ledger plus everything
+    /// booked since it stopped.
+    fn answered(truth: &SchedulerLedger, at: u64, restarts: &[Replayed]) -> SchedulerLedger {
+        restarts
+            .iter()
+            .rev()
+            .find(|restart| restart.after_at <= at)
+            .map_or_else(
+                || truth.clone(),
+                |restart| {
+                    super::ledger_sum(
+                        &restart.reloaded,
+                        &ledger_delta(&restart.truth, truth).expect("truth only grows"),
+                    )
+                },
+            )
+    }
+
+    /// `observed` as the restarted edge would have answered it, with the
+    /// restarts recorded the way `scripts/preheat-cost.sh` records them.
+    fn restarted(mut observed: WaveObservations, restarts: &[Replayed]) -> WaveObservations {
+        let answer = |read: &mut LedgerSnapshot| {
+            read.ledger = answered(&read.ledger, read.taken_at_ms, restarts);
+        };
+        for phase in [&mut observed.wave, &mut observed.resubmit] {
+            answer(&mut phase.start);
+            answer(&mut phase.end);
+            for round in &mut phase.rounds {
+                answer(&mut round.before_report);
+                answer(&mut round.end);
+            }
+            for lane in &mut phase.lanes {
+                answer(&mut lane.before);
+                answer(&mut lane.after);
+            }
+        }
+        observed.restarts = restarts
+            .iter()
+            .map(|restart| super::EdgeRestart {
+                before: snapshot(
+                    restart.stop_at,
+                    answered(&restart.truth, restart.stop_at, restarts),
+                ),
+                after: snapshot(restart.after_at, restart.reloaded.clone()),
+            })
+            .collect();
+        observed
+    }
+
+    /// The edge's last snapshot `ledger` as the graph woken at
+    /// `woken_at_ms` holds it, plus the readiness poll and the ledger
+    /// read that woke it.
+    fn reloaded(mut ledger: SchedulerLedger, woken_at_ms: i64) -> SchedulerLedger {
+        ledger.woken_at_ms = woken_at_ms;
+        for op in ["GET /budget/ledger", "GET /status"] {
+            ledger.ops.push(SchedulerLedgerOp {
+                op: op.to_owned(),
+                events: 1,
+                rows_read: 500,
+                rows_written: 0,
+            });
+        }
+        ledger.ops.sort_by(|a, b| a.op.cmp(&b.op));
+        ledger
+    }
+
+    /// Two restarts — one mid-wave, after layer 1; one between the
+    /// wave's end and the resubmit's — each reloading a snapshot older
+    /// than the ledger it stopped with.
+    fn two_restarts(observed: &WaveObservations) -> Vec<Replayed> {
+        vec![
+            Replayed {
+                stop_at: 150,
+                after_at: 160,
+                truth: observed.wave.rounds[0].end.ledger.clone(),
+                reloaded: reloaded(ledger(4, 0, 2, 0), 158),
+            },
+            Replayed {
+                stop_at: 330,
+                after_at: 340,
+                truth: observed.wave.end.ledger.clone(),
+                reloaded: reloaded(ledger(25, 1, 2, 0), 338),
+            },
+        ]
     }
 
     fn production_lane(lane: &str, tasks: &[(&str, &str)]) -> ProductionLane {
@@ -1164,6 +1478,104 @@ mod tests {
     #[test]
     fn a_ledger_that_went_backwards_is_refused() {
         assert!(ledger_delta(&ledger(10, 1, 2, 0), &ledger(5, 1, 2, 0)).is_err());
+        // An operation that vanished went back to zero.
+        let mut vanished = ledger(10, 1, 2, 0);
+        vanished
+            .ops
+            .retain(|op| op.op != EventKind::SliceReport.ledger_op());
+        let error = ledger_delta(&ledger(10, 1, 2, 0), &vanished).unwrap_err();
+        assert!(error.to_string().contains("reset mid-run"), "{error}");
+        // A reload whose counters all grew past the earlier read's is
+        // still a reset: the graph's wake tells it.
+        let mut reloaded = ledger(20, 2, 2, 0);
+        reloaded.woken_at_ms = 7;
+        let error = ledger_delta(&ledger(10, 1, 2, 0), &reloaded).unwrap_err();
+        assert!(error.to_string().contains("reset mid-run"), "{error}");
+    }
+
+    /// stow#928: a run whose edge restarted reports exactly the totals,
+    /// layers and lanes of the same run without the restarts.
+    #[test]
+    fn edge_restarts_report_the_totals_of_a_run_without_them() {
+        let baseline = chain(0);
+        let restarts = two_restarts(&baseline);
+        let observed = restarted(baseline.clone(), &restarts);
+        assert_ne!(
+            observed.wave.end.ledger, baseline.wave.end.ledger,
+            "the restarted edge answers a different ledger"
+        );
+        let expected = analyse(&baseline).expect("baseline");
+        let report = analyse(&observed).expect("restarted");
+        assert_eq!(report.wave, expected.wave);
+        assert_eq!(report.resubmit, expected.resubmit);
+        assert_eq!(report.layers, expected.layers);
+        assert_eq!(report.lanes, expected.lanes);
+        let restart_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "No build dispatched during an edge restart")
+            .expect("the restart check");
+        assert!(restart_check.passed, "{}", restart_check.detail);
+        assert!(
+            restart_check.detail.starts_with("2 edge restarts"),
+            "{}",
+            restart_check.detail
+        );
+    }
+
+    /// A reset no recorded restart accounts for still fails the report.
+    #[test]
+    fn a_reset_no_restart_accounts_for_is_refused() {
+        let baseline = chain(0);
+        let mut observed = restarted(baseline.clone(), &two_restarts(&baseline));
+        observed.restarts.remove(0);
+        let error = analyse(&observed).unwrap_err();
+        assert!(error.to_string().contains("reset mid-run"), "{error}");
+        // Nor does a recorded restart excuse a second reset after it.
+        let mut observed = restarted(baseline.clone(), &two_restarts(&baseline));
+        observed.wave.rounds[2].end.ledger = ledger(1, 0, 2, 0);
+        assert!(analyse(&observed).is_err());
+    }
+
+    /// A build dispatched while the edge restarted booked an alarm pass
+    /// neither restart read holds: the report fails on it.
+    #[test]
+    fn a_build_dispatched_during_a_restart_fails_the_report() {
+        let baseline = chain(0);
+        let mut observed = restarted(baseline.clone(), &two_restarts(&baseline));
+        observed.runs.push(run("c", 155));
+        let report = analyse(&observed).expect("analysed");
+        let restart_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "No build dispatched during an edge restart")
+            .expect("the restart check");
+        assert!(!restart_check.passed);
+        assert_eq!(restart_check.detail, "restart 1: 1 build runs");
+    }
+
+    /// Restart records that overlap or run backwards, and a ledger read
+    /// taken inside a restart, are refused.
+    #[test]
+    fn malformed_restart_records_are_refused() {
+        let baseline = chain(0);
+        let restarts = two_restarts(&baseline);
+
+        let mut observed = restarted(baseline.clone(), &restarts);
+        observed.restarts[0].after.taken_at_ms = 150;
+        assert!(analyse(&observed).is_err(), "after not following before");
+
+        let mut observed = restarted(baseline.clone(), &restarts);
+        observed.restarts[1].before.taken_at_ms = 155;
+        assert!(analyse(&observed).is_err(), "overlapping restarts");
+
+        let mut observed = restarted(baseline, &restarts);
+        observed.wave.rounds[1].before_report.taken_at_ms = 155;
+        let error = analyse(&observed).unwrap_err();
+        assert!(
+            error.to_string().contains("inside edge restart 1"),
+            "{error}"
+        );
     }
 
     #[test]

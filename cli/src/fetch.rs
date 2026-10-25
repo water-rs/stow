@@ -675,42 +675,13 @@ mod tests {
         validate_oci_manifest, validate_output_entries_present, validate_semantic_bundle_version,
     };
 
-    /// One canned answer from the stub edge: the request line is captured,
-    /// `status`/`body` are written back.
-    fn serve_once(status: &str, body: &[u8]) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
-        use std::io::{BufRead as _, BufReader, Write as _};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub edge");
-        let url = format!("http://{}", listener.local_addr().expect("local addr"));
-        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-        let seen = std::sync::Arc::clone(&captured);
-        let response = format!(
-            "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-            body.len()
-        );
-        let body = body.to_vec();
-        std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let mut request_line = String::new();
-            reader
-                .read_line(&mut request_line)
-                .expect("read request line");
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).expect("read header");
-                if line == "\r\n" {
-                    break;
-                }
-            }
-            *seen.lock().expect("captured lock") = request_line;
-            stream.write_all(response.as_bytes()).expect("write head");
-            stream.write_all(&body).expect("write body");
-            stream.flush().expect("flush");
-        });
-        (url, captured)
+    /// One canned answer from the stub edge for any request it serves.
+    fn serve_once(status: &'static str, body: &[u8]) -> crate::test_edge::StubEdge {
+        crate::test_edge::serve(vec![crate::test_edge::Route {
+            path: "",
+            status,
+            body: body.to_vec(),
+        }])
     }
 
     fn stub_config(edge_url: String) -> crate::config::StowConfig {
@@ -754,13 +725,15 @@ mod tests {
         runtime.block_on(async {
             let body = b"the bundle bytes the stub edge serves".to_vec();
             let digest = sha256_prefixed(&body);
-            let (edge_url, captured) = serve_once("200 OK", &body);
-            let bytes =
-                super::download_bundle_bytes(&stub_config(edge_url), &test_bundle_ref(&digest))
-                    .await
-                    .expect("bundle downloads");
+            let edge = serve_once("200 OK", &body);
+            let bytes = super::download_bundle_bytes(
+                &stub_config(edge.url().to_owned()),
+                &test_bundle_ref(&digest),
+            )
+            .await
+            .expect("bundle downloads");
             assert_eq!(bytes, body);
-            let request_line = captured.lock().expect("captured lock").clone();
+            let request_line = edge.requests().into_iter().next().expect("a request");
             assert_eq!(
                 request_line.trim_end(),
                 format!("GET /api/v1/bundles/1.85.0/{digest} HTTP/1.1"),
@@ -778,18 +751,22 @@ mod tests {
             .expect("tokio runtime");
         runtime.block_on(async {
             let digest = sha256_prefixed(b"the promised bytes");
-            let (edge_url, _captured) = serve_once("200 OK", b"other bytes");
-            let error =
-                super::download_bundle_bytes(&stub_config(edge_url), &test_bundle_ref(&digest))
-                    .await
-                    .expect_err("mismatched bytes are rejected");
+            let edge = serve_once("200 OK", b"other bytes");
+            let error = super::download_bundle_bytes(
+                &stub_config(edge.url().to_owned()),
+                &test_bundle_ref(&digest),
+            )
+            .await
+            .expect_err("mismatched bytes are rejected");
             assert!(matches!(error, super::FetchError::Digest { .. }), "{error}");
 
-            let (edge_url, _captured) = serve_once("404 Not Found", b"");
-            let error =
-                super::download_bundle_bytes(&stub_config(edge_url), &test_bundle_ref(&digest))
-                    .await
-                    .expect_err("a missing blob is a miss");
+            let edge = serve_once("404 Not Found", b"");
+            let error = super::download_bundle_bytes(
+                &stub_config(edge.url().to_owned()),
+                &test_bundle_ref(&digest),
+            )
+            .await
+            .expect_err("a missing blob is a miss");
             assert!(matches!(error, super::FetchError::NotFound), "{error}");
         });
     }
