@@ -37,7 +37,7 @@ use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, 
 use super::fixture::{self, FixtureShape};
 use super::graph::{GraphCell, LoadedGraph};
 use super::queue::{self, SchedulerSettings};
-use super::{feed, routes, store};
+use super::{feed, routes};
 
 /// What a [`Drive`] runs: the route's graph-and-store calls exactly once
 /// against `db`. `FixtureShape` is copied — four bytes.
@@ -279,6 +279,15 @@ pub struct DriveOutcome {
 /// cleans up. `mark` fires at each phase boundary — where a probe
 /// reads its clock — and is synchronous: it must not await, so it
 /// cannot refresh the worker clock or move the span it measures.
+/// stow#931: an `event_log` append is `INSERT .. RETURNING seq` and
+/// bills exactly one read row plus one written row — the re-count a
+/// wake's replay books must bill identically. The host cost gate and
+/// the workerd probe share this one predicate.
+#[must_use]
+pub fn append_bills_replay_cost(sql: &str, rows_read: u64, rows_written: u64) -> bool {
+    !sql.starts_with("INSERT INTO event_log") || (rows_read == 1 && rows_written == 1)
+}
+
 pub async fn drive_lifecycle(
     drive: &Drive,
     db: &DurableDb,
@@ -380,7 +389,7 @@ async fn schedule(
     settings: &SchedulerSettings,
 ) -> Result<(), String> {
     let _plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
-    routes::snapshot_if_due(ctx.loaded(), db)
+    routes::snapshot_if_due(ctx.loaded(), db, now_ms())
         .await
         .map(|_| ())
         .map_err(text)
@@ -1932,8 +1941,8 @@ pub const DRIVES: &[Drive] = &[
         // The newreleases.io forward's object half (stow#880): on
         // wasm the real `preheat_release_pass` — credential arm plus
         // the `workflow_dispatch` POST to the local-CI dispatcher; on
-        // host there is no store work, so the drive measures nothing
-        // but the meter's own settle.
+        // host the arm is a no-op `Ok(())` — no store work runs and
+        // there is nothing to measure.
         name: "POST /preheat/release",
         setup: None,
         run: |_db, _shape, _settings, ctx| {
@@ -2747,9 +2756,9 @@ pub const DRIVES: &[Drive] = &[
         }),
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                let (mut graph, events) = store::load(db).await.map_err(text)?;
-                store::apply_events(&mut graph, &events);
-                ctx.graph.install(graph);
+                routes::wake_graph(db, &ctx.graph, now_ms())
+                    .await
+                    .map_err(text)?;
                 Ok(())
             })
         },
@@ -2767,7 +2776,9 @@ pub const DRIVES: &[Drive] = &[
         name: "snapshot write",
         setup: Some(|db, shape, settings, ctx| {
             Box::pin(async move {
-                routes::snapshot(ctx.loaded(), db).await.map_err(text)?;
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)?;
                 let inserted =
                     submit(ctx, db, settings, &[snapshot_merge_tree(shape)], false).await?;
                 if inserted != SNAPSHOT_MERGE_NODES {
@@ -2806,7 +2817,11 @@ pub const DRIVES: &[Drive] = &[
             })
         }),
         run: |db, _shape, _settings, ctx| {
-            Box::pin(async move { routes::snapshot(ctx.loaded(), db).await.map_err(text) })
+            Box::pin(async move {
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)
+            })
         },
         cleanup: Some(|db, shape, _settings, ctx| {
             Box::pin(async move {

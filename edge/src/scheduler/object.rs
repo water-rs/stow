@@ -70,14 +70,9 @@ async fn ensure_graph<'a>(
     db: &DurableDb,
     cell: &'a graph::GraphCell,
 ) -> Result<graph::LoadedGraph<'a>> {
-    let loaded = if let Some(loaded) = cell.loaded() {
-        loaded
-    } else {
-        let (mut graph, events) = store::load(db).await.map_err(to_error)?;
-        store::apply_events(&mut graph, &events);
-        graph.woken_at_ms = now_ms();
-        cell.install(graph)
-    };
+    let loaded = routes::wake_graph(db, cell, now_ms())
+        .await
+        .map_err(to_error)?;
     // The admission floor is a deploy binding, never persisted: every
     // wake plan and claim reads the one stamped here.
     let floor = scheduler_settings(env)?.min_dispatch_value;
@@ -287,7 +282,7 @@ impl DurableObject for Scheduler {
         // time that every extractor's provider sits on its route.
         .with(State(self.graph.clone()))
         .build()
-        .layer(MeterGuard)
+        .layer(MeterGuard::new(self.graph.clone()))
     }
 }
 
@@ -356,12 +351,13 @@ async fn scheduler_budget_rearm(
                 .set_status(StatusCode::NOT_FOUND),
         );
     }
-    let seeded = fixture::seeded_rows(&db)
-        .await
-        .map_err(to_error)?
-        .ok_or_else(|| {
-            Error::msg("no fixture was seeded — nothing to re-arm").set_status(StatusCode::CONFLICT)
-        })?;
+    // The seeded shape rides the snapshot head — the graph answers it
+    // without a store statement, keeping the probe inside the
+    // appends-only-between-checkpoints rule (stow#931).
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let seeded = graph.with(|graph| graph.seeded_rows).ok_or_else(|| {
+        Error::msg("no fixture was seeded — nothing to re-arm").set_status(StatusCode::CONFLICT)
+    })?;
     if seeded != request.queue_rows {
         return Err(Error::msg(format!(
             "re-arm names a {}-row fixture, but the store was seeded at {seeded} rows",
@@ -372,7 +368,6 @@ async fn scheduler_budget_rearm(
     // Re-arming reopens the resolved runs and rebinds them: the
     // graph binds all thirty in-flight runs again with no
     // completion recorded.
-    let graph = ensure_graph(&env, &db, &graph).await?;
     fixture::rearm(
         &db,
         graph,
@@ -1179,22 +1174,6 @@ fn freeze_view(graph: graph::LoadedGraph<'_>) -> stow_types::api::DispatchFreeze
     })
 }
 
-/// Append the `Freeze` events a transition staged — the graph already
-/// applied them, so only the log write remains.
-async fn persist_freeze(
-    db: &DurableDb,
-    store: &graph::GraphFreezeStore<'_>,
-    now: i64,
-) -> Result<()> {
-    let appended = store::append_events(db, &store.take_events(), now)
-        .await
-        .map_err(to_error)?;
-    store
-        .cell()
-        .with(|graph| graph.log_appended(appended.bytes));
-    Ok(())
-}
-
 /// `POST /dispatch-freeze` — the manual transition that is also the
 /// only recovery path. Each direction sends exactly one alert, and
 /// writing the state already held is a no-op so alerts never repeat.
@@ -1225,7 +1204,9 @@ async fn write_dispatch_freeze(
     )
     .await
     .map_err(to_error)?;
-    persist_freeze(&db, &store, now).await?;
+    routes::persist_freeze(&db, &store, now)
+        .await
+        .map_err(to_error)?;
     match transition {
         freeze::FreezeTransition::Engaged(record) => {
             // While frozen the wake plan is a delete — a live alarm
@@ -1300,7 +1281,9 @@ async fn evaluate_dispatch_freeze(
     )
     .await
     .map_err(to_error)?;
-    persist_freeze(db, &store, now).await?;
+    routes::persist_freeze(db, &store, now)
+        .await
+        .map_err(to_error)?;
     if let freeze::FreezeTransition::Engaged(record) = transition {
         if freeze::notify_reached(&record.notify) {
             tracing::warn!(trigger = ?record.trigger, notify = %freeze::summarize_notify(&record.notify), "dispatch freeze tripped");
@@ -1318,10 +1301,10 @@ async fn evaluate_dispatch_freeze(
 /// `MeterGuard`'s and `run_alarm`'s shared tail: settle the
 /// operation's row counts into the graph's day meter and — when it
 /// just crossed the budget — engage the freeze on this operation, not
-/// a later poll (`settle_and_trip` owns the verdict→freeze→email
-/// sequence), appending the staged `Freeze` event through `db` (the
-/// unmetered handle). A settle failure is logged, never raised: a
-/// metering bug must not take dispatch down with it.
+/// a later poll (`meter::trip_and_persist` owns the
+/// settle→verdict→freeze-append→settle sequence, on the metered
+/// handle). A settle failure is logged, never raised: a metering bug
+/// must not take dispatch down with it.
 pub(super) async fn settle_meter(
     graph: &graph::GraphCell,
     db: &DurableDb,
@@ -1329,8 +1312,11 @@ pub(super) async fn settle_meter(
     env: &WasmEnv,
     multiplier: f64,
 ) {
-    // A reset leaves the graph empty; settling wakes it first.
-    let graph = match ensure_graph(env, db, graph).await {
+    // A reset leaves the graph empty; settling wakes it first — on a
+    // metered handle: the wake's reads and the freeze append below are
+    // booked into the same settle (stow#931).
+    let (metered_db, aux_meter) = Meter::wrap(db.clone(), graph);
+    let graph = match ensure_graph(env, &metered_db, graph).await {
         Ok(graph) => graph,
         Err(error) => {
             tracing::error!(%error, "do meter settle: graph wake failed");
@@ -1338,14 +1324,17 @@ pub(super) async fn settle_meter(
         }
     };
     let sink = EdgeAlerter::new(env.as_js());
-    let now = now_ms();
-    let store = graph::GraphFreezeStore::new(graph, iso_now(), now);
-    let result = meter
-        .settle_and_trip(graph, now, &store, &sink, multiplier, &iso_now())
-        .await;
-    if let Err(error) = persist_freeze(db, &store, now).await {
-        tracing::error!(%error, "persist cost-trip freeze failed");
-    }
+    let result = meter::trip_and_persist(
+        &aux_meter,
+        &metered_db,
+        meter,
+        graph,
+        &sink,
+        multiplier,
+        now_ms(),
+        &iso_now(),
+    )
+    .await;
     match result {
         Ok(Some(freeze::FreezeTransition::Engaged(record))) => {
             if freeze::notify_reached(&record.notify) {
@@ -1490,7 +1479,7 @@ async fn run_alarm(
     alarm: Alarm,
 ) -> Result<&'static str> {
     let multiplier = cost_budget_multiplier(&env)?;
-    let (metered, meter) = Meter::wrap(db.clone());
+    let (metered, meter) = Meter::wrap(db.clone(), &graph);
     let meter = if budget_probe_enabled(&env) {
         meter.with_ledger_op(stow_types::do_budgets::LEDGER_OP_ALARM.to_owned())
     } else {
@@ -1810,7 +1799,7 @@ async fn schedule_alarm(
     // crosses the threshold, this turn writes the chunked snapshot —
     // covered prefix dropped — before the next wake plans against the
     // same graph.
-    routes::snapshot_if_due(graph, db)
+    routes::snapshot_if_due(graph, db, now_ms)
         .await
         .map_err(route_error)?;
     Ok(())

@@ -166,11 +166,16 @@ pub async fn run(
         queue::Dispatch::Paused => 0,
     };
     // The drives address nodes positionally inside the layout the seed
-    // wrote; the seed record is the shape, and a store nobody seeded
-    // has none to measure.
-    let queue_rows = fixture::seeded_rows(db).await?.ok_or_else(|| {
-        QueueError::Invariant("no fixture was seeded — seed before measuring".to_owned())
-    })?;
+    // wrote; the seed record rides the snapshot head, and a store
+    // nobody seeded has none to measure — wake the graph rather than
+    // read `store_meta`, a billed statement outside every checkpoint
+    // (stow#931).
+    let queue_rows = super::routes::wake_graph(db, graph, super::object::now_ms())
+        .await?
+        .with(|graph| graph.seeded_rows)
+        .ok_or_else(|| {
+            QueueError::Invariant("no fixture was seeded — seed before measuring".to_owned())
+        })?;
     let shape = FixtureShape { queue_rows };
     // Every run starts from the canonical graph: reseeding restores
     // what earlier runs, passes and the callback lane moved.
@@ -279,6 +284,15 @@ impl WindowMeasure<'_> {
 /// The report row a finished window produces, or the budget table's
 /// own error.
 fn budget_row(drive: &str, measure: WindowMeasure) -> Result<SchedulerBudgetRow, String> {
+    for metric in &measure.statements {
+        if !drives::append_bills_replay_cost(&metric.sql, metric.rows_read, metric.rows_written) {
+            return Err(format!(
+                "drive {drive}: event_log append billed {} R + {} W — \
+                 the replay re-count is 1 R + 1 W",
+                metric.rows_read, metric.rows_written
+            ));
+        }
+    }
     let totals = (
         measure.statements.len() as u64,
         measure.statements.iter().map(|s| s.rows_read).sum::<u64>(),

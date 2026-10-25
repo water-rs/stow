@@ -663,8 +663,11 @@ pub fn mark_running(graph: &mut Graph, shape: FixtureShape, now: i64) {
     }
 }
 
-/// Empty the three store tables — the probe's wipe. A `DELETE`, never
-/// DDL: the schema belongs to `POST /reset`.
+/// Empty the store's graph tables — the probe's wipe. A `DELETE`,
+/// never DDL: the schema belongs to `POST /reset`. The fourth table,
+/// `meter`, deliberately stays: the seed's own snapshot checkpoint
+/// rewrites it (`seq = 0`, the fresh graph's totals plus the isolate's
+/// unsettled counts), so the probe's day totals restart at the seed.
 ///
 /// # Errors
 /// `QueueError::Sql` when a delete fails.
@@ -680,7 +683,11 @@ pub async fn wipe(db: &DurableDb) -> Result<(), QueueError> {
 
 /// Seed the fixture: wipe the store, build the graph, write its
 /// snapshot, append the log tail and install the post-tail graph in
-/// `cell` — a wake of this store replays to exactly this graph.
+/// `cell` — a wake of this store replays to exactly this graph. The
+/// seeded shape is recorded on the graph itself (`seeded_rows`), so
+/// it rides the snapshot head instead of a `store_meta` row — a
+/// billed non-append statement outside a checkpoint is one the
+/// meter's replay cannot re-count (stow#931).
 ///
 /// # Errors
 /// `QueueError` when the build or any store write fails.
@@ -697,16 +704,9 @@ pub async fn seed(
     tracing::info!(rows = shape.queue_rows, "fixture seed: store wiped");
     let mut graph = build(shape, now)?;
     tracing::info!(nodes = graph.sizes().0, "fixture seed: graph built");
-    store::write_snapshot(db, &mut graph).await?;
+    graph.seeded_rows = Some(shape.queue_rows);
+    store::write_snapshot(db, &mut graph, cell, now).await?;
     tracing::info!("fixture seed: snapshot written");
-    db.query(
-        "INSERT INTO store_meta(key, value) VALUES ('budget_seed_rows', ?) \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(i64::from(shape.queue_rows))
-    .execute()
-    .await
-    .map_err(|error| QueueError::Sql(format!("record seed rows: {error}")))?;
     let cell = cell.install(graph);
     replay_tail(cell, db, shape, now).await?;
     let (nodes, edges, published) = cell.with(|graph| graph.sizes());
@@ -754,30 +754,12 @@ pub async fn rearm(
             graph.reopen_completed(&shape.in_flight_run(k).task_id);
         }
     });
-    routes::snapshot(cell, db).await?;
+    routes::snapshot(cell, db, now).await?;
     for (at, event) in tail(shape, now).into_iter().take(IN_FLIGHT_EVENTS) {
         routes::commit(cell, db, std::slice::from_ref(&event), at).await?;
     }
     cell.with(|graph| mark_running(graph, shape, now));
     Ok(())
-}
-
-/// The row count the store was last seeded at — the shape the drives
-/// address positionally. `None` for a store nobody seeded.
-///
-/// # Errors
-/// `QueueError::Sql` on a failed read.
-pub async fn seeded_rows(db: &DurableDb) -> Result<Option<u32>, QueueError> {
-    let rows = db
-        .query("SELECT value FROM store_meta WHERE key = 'budget_seed_rows'")
-        .fetch_scalar_optional::<i64>()
-        .await
-        .map_err(|error| QueueError::Sql(format!("read seed rows: {error}")))?;
-    rows.map(|rows| {
-        u32::try_from(rows)
-            .map_err(|_| QueueError::Invariant(format!("seed rows {rows} out of range")))
-    })
-    .transpose()
 }
 
 /// The full-report drive's slice: a held-size membership (100 rows) on

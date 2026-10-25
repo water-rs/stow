@@ -2203,7 +2203,7 @@ pub struct SchedulerRearmReport {
 ///
 /// The scheduler Durable Object's billed `rowsRead`/`rowsWritten` booked
 /// per operation since the store was reset — the per-event view of the
-/// cost `do_meter` holds per day. The object books it only on deploys
+/// cost the one-row `meter` checkpoint holds per day. The object books it only on deploys
 /// carrying `STOW_SCHEDULER_BUDGET=1` (the mock stack); the `Preheat
 /// cost` lane (stow#773) snapshots it between layers and diffs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]

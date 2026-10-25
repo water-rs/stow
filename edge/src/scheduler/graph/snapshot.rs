@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use super::index::hash_of;
 use super::node::{Extra, Flags, NO_STATE, Node, State, Status};
-use super::{AttemptOutcome, FeedSession, Graph, IdKey, Meter, RequestRecord};
+use super::{AttemptOutcome, FeedSession, Graph, IdKey, RequestRecord};
 use crate::errors::QueueError;
 
 /// The payload text one row carries, about: a range's row closes once
@@ -246,7 +246,16 @@ pub(super) fn feed_bucket(hour: &str) -> u32 {
 #[derive(Serialize, Deserialize)]
 struct SnapshotHead {
     next_generation: u64,
-    meter: Meter,
+    /// The probe-only per-operation ledger. The day totals stay out of
+    /// the head (stow#931): the `meter` row is their single durable
+    /// source — totals written here could not account for the
+    /// snapshot's own statements. `ops` cannot be re-counted on
+    /// replay, so it still rides the snapshot.
+    meter_ops: BTreeMap<String, (u64, u64, u64)>,
+    /// The budget probe's seeded fixture size (`Graph::seeded_rows`) —
+    /// probe state a `store_meta` row cannot hold without a billed
+    /// statement the replay cannot re-count.
+    seeded_rows: Option<u32>,
     freeze: Option<stow_types::api::DispatchFreezeRecord>,
     external_runs: Vec<(u64, u8)>,
     human_budget: (i64, i64),
@@ -802,7 +811,8 @@ impl Graph {
     fn snapshot_head(&self) -> SnapshotHead {
         SnapshotHead {
             next_generation: self.next_generation,
-            meter: self.meter.clone(),
+            meter_ops: self.meter.ops.clone(),
+            seeded_rows: self.seeded_rows,
             freeze: self.freeze.clone(),
             external_runs: self.external_runs.iter().map(|(&k, &v)| (k, v)).collect(),
             human_budget: self.human_budget,
@@ -1013,7 +1023,8 @@ impl SnapshotLoader {
         }
         let head: SnapshotHead = serde_json::from_str(payload).map_err(|e| encode_error(&e))?;
         graph.next_generation = head.next_generation;
-        graph.meter = head.meter;
+        graph.meter.ops = head.meter_ops;
+        graph.seeded_rows = head.seeded_rows;
         graph.freeze = head.freeze;
         graph.external_runs = head.external_runs.into_iter().collect();
         graph.human_budget = head.human_budget;

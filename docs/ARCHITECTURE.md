@@ -886,7 +886,8 @@ volume). The cost trip is self-metered: `MeteringBackend`, a `DurableDbBackend`
 wrapper the middleware installs in place of the request's `DurableDb`,
 reads `rowsRead`/`rowsWritten` off every statement's cursor — the exact
 counters Cloudflare bills on — and a per-request settle folds them into
-the `do_meter` day row; the moment a UTC day's totals pass (80% of the monthly
+the graph's in-memory day meter, checkpointed to the one-row `meter`
+table at each wake and snapshot; the moment a UTC day's totals pass (80% of the monthly
 included allowance / 30 × `STOW_COST_BUDGET_MULTIPLIER`), dispatch
 freezes on the operation that crossed it. On a trip the
 object writes a `dispatch_freeze` record into `settings` — a different

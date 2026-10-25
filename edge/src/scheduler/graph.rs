@@ -23,7 +23,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
 use stow_types::api::{
     BuildTaskPayload, PublishedSliceRow, RunnerFamily, SchedulerEvent, SubgraphNode,
     SubmissionNode, SubmissionTree, SubmitTaskIdEntry, TaskSubgraph, runner_family,
@@ -169,11 +168,12 @@ fn failure_class_of(success: bool, error: Option<&str>) -> Option<String> {
             ),
     )
 }
-/// The scheduler's self-counted billed rows (stow#878 review): no
-/// `do_meter`/`probe_meter` table counts itself. `store.rs` books every
-/// row it reads and writes here; the snapshot carries the counters and
-/// replay re-counts the log tail it reads.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// The scheduler's self-counted billed rows (stow#931): the one-row
+/// `meter` table checkpoints the day totals at each wake and snapshot;
+/// this is the in-memory copy the metering backend's settle folds
+/// into. `seq` is the last `event_log` seq whose append cost the
+/// totals already cover — replay re-counts only rows past it.
+#[derive(Debug, Default, Clone)]
 pub struct Meter {
     /// UTC day (`YYYY-MM-DD`) the counters apply to.
     pub day: String,
@@ -181,17 +181,24 @@ pub struct Meter {
     pub rows_read: u64,
     /// Rows the DO wrote today.
     pub rows_written: u64,
+    /// The last `event_log` seq the totals cover — the checkpoint's
+    /// `seq` column.
+    pub seq: i64,
     /// Per-operation ledger for the budget probe — `ops` carries
-    /// `(statements, rows_read, rows_written)`.
-    #[serde(default)]
+    /// `(statements, rows_read, rows_written)`. It rides the snapshot
+    /// head alone: per-op counts cannot be re-counted on replay
+    /// (stow#928).
     pub ops: BTreeMap<String, (u64, u64, u64)>,
 }
 
 impl Meter {
     /// Roll the counters at a UTC-day boundary — the daily budget the
-    /// breaker evaluates is per UTC day.
+    /// breaker evaluates is per UTC day. Forward only: an event or a
+    /// settle stamped on an earlier day than the meter's belongs to a
+    /// day the meter no longer tracks, and rolling back would zero
+    /// today's restored totals (stow#931).
     pub fn roll_to(&mut self, day: &str) {
-        if self.day != day {
+        if self.day.as_str() < day {
             day.clone_into(&mut self.day);
             self.rows_read = 0;
             self.rows_written = 0;
@@ -213,13 +220,24 @@ impl Meter {
         slot.2 += rows_written;
     }
 
-    /// Re-count one replayed log row: the row was written at `at_ms`,
-    /// on that UTC day's meter. The snapshot carries the counters up
-    /// to its cut; the tail's writes since then died with the isolate
-    /// that booked them, so the wake books them again.
-    pub fn replayed(&mut self, at_ms: i64) {
-        self.roll_to(&utc_day(at_ms));
-        self.rows_written += 1;
+    /// Re-count one replayed log row at its append's billed cost — one
+    /// written row plus the `RETURNING seq` read (stow#931). Rows at or
+    /// under `seq` are already inside the checkpointed totals; rows
+    /// past it died with the isolate that booked them, so the wake
+    /// books them again. A row stamped on an earlier day than the
+    /// meter's was still billed after the checkpoint that set `seq` —
+    /// its append ran on or after the restored day — so it books on
+    /// the meter's current day, the same convention `settle` uses,
+    /// and `roll_to` keeps the restored day from ever moving
+    /// backwards.
+    pub fn replayed(&mut self, at_ms: i64, seq: i64) {
+        if seq <= self.seq {
+            return;
+        }
+        self.seq = seq;
+        let day = utc_day(at_ms);
+        self.roll_to(&day);
+        self.add(1, 1);
     }
 }
 
@@ -404,6 +422,12 @@ pub struct Graph {
     /// memory only: the probe ledger reports it so a reader can tell a
     /// reload, which drops every ledger booking since the snapshot.
     pub woken_at_ms: i64,
+    /// The fixture size the budget probe last seeded this store at —
+    /// `None` until a seed runs. It rides the snapshot head so `rearm`
+    /// and the probe read it from the graph: a `store_meta` row would
+    /// bill a statement outside every checkpoint, which the meter's
+    /// replay cannot re-count (stow#931).
+    pub seeded_rows: Option<u32>,
     /// Log rows appended — or replayed — since the last snapshot; the
     /// trigger `SNAPSHOT_EVENT_THRESHOLD` reads.
     pub log_since_snapshot: u64,
@@ -2237,9 +2261,14 @@ impl Graph {
     }
 
     /// Count `bytes` appended to (or replayed from) the log since the
-    /// last snapshot.
-    pub const fn log_appended(&mut self, bytes: u64) {
+    /// last snapshot, and lift the meter's covered `seq`: the append's
+    /// cost is already in the operation's unsettled counts, so a
+    /// checkpoint folding those in covers this row too.
+    pub const fn log_appended(&mut self, bytes: u64, seq: i64) {
         self.log_bytes_since_snapshot += bytes;
+        if seq > self.meter.seq {
+            self.meter.seq = seq;
+        }
     }
 
     /// Whether the log tail a wake would replay has crossed a snapshot
@@ -3031,11 +3060,52 @@ pub struct GraphCell {
     reconcile_due: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The isolate's cached GitHub App installation token.
     tokens: crate::github_app::TokenCache,
+    /// The isolate's billed-but-unsettled row counts — see [`Unsettled`].
+    unsettled: std::sync::Arc<Unsettled>,
 }
 
 impl std::fmt::Debug for GraphCell {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("GraphCell").finish_non_exhaustive()
+    }
+}
+
+/// The isolate's billed-but-unsettled row counts (stow#931): the
+/// metering backend adds every statement's counters to it and
+/// `Meter::settle` subtracts what it folds into the day meter, so a
+/// meter checkpoint covering `graph.meter + unsettled` accounts for
+/// every operation in flight, not only the one that writes it. It
+/// lives on the cell — outside `Graph` — because the backend books
+/// without the graph lock, and neither the wake's `install` nor the
+/// reset's `clear` may drop counts a billed statement already paid.
+#[derive(Debug, Default)]
+pub struct Unsettled {
+    rows_read: std::sync::atomic::AtomicU64,
+    rows_written: std::sync::atomic::AtomicU64,
+}
+
+impl Unsettled {
+    /// Book a statement's billed rows.
+    pub(crate) fn add(&self, rows_read: u64, rows_written: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.rows_read.fetch_add(rows_read, Relaxed);
+        self.rows_written.fetch_add(rows_written, Relaxed);
+    }
+
+    /// Subtract what a settle folded into the day meter.
+    pub(crate) fn sub(&self, rows_read: u64, rows_written: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.rows_read.fetch_sub(rows_read, Relaxed);
+        self.rows_written.fetch_sub(rows_written, Relaxed);
+    }
+
+    /// The running totals a checkpoint folds into the stored row.
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.rows_read.load(Relaxed),
+            self.rows_written.load(Relaxed),
+        )
     }
 }
 
@@ -3105,6 +3175,12 @@ impl GraphCell {
     /// The isolate's installation-token cache.
     pub(crate) const fn tokens(&self) -> &crate::github_app::TokenCache {
         &self.tokens
+    }
+    /// The isolate's unsettled billed counts — the metering backend's
+    /// `Arc` clone books into it, `Meter::settle` subtracts, and a
+    /// meter checkpoint folds the running totals in (stow#931).
+    pub(crate) const fn unsettled(&self) -> &std::sync::Arc<Unsettled> {
+        &self.unsettled
     }
 }
 
@@ -3694,9 +3770,15 @@ mod tests {
         publish(&mut graph, "c");
         graph.meter.roll_to("2026-10-23");
         graph.meter.record("test", 7, 11);
+        graph.seeded_rows = Some(10_000);
         let mut restored = round_trip(&graph);
         assert_eq!(restored.status_counts(), graph.status_counts());
-        assert_eq!(restored.meter.rows_written, 11);
+        // stow#931: the head carries only the probe ledger — the day
+        // totals live in the `meter` table row alone.
+        assert_eq!(restored.meter.rows_read, 0);
+        assert_eq!(restored.meter.rows_written, 0);
+        assert_eq!(restored.meter.ops.get("test"), Some(&(1, 7, 11)));
+        assert_eq!(restored.seeded_rows, Some(10_000));
         let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
         assert_eq!(claimed[0].task_id, id("b"));
         assert_eq!(claimed[0].payload.dependency_subgraph.nodes.len(), 1);

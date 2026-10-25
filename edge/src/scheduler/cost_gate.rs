@@ -202,6 +202,19 @@ async fn run_one_drive(
         _ => Ok(()),
     };
     let statements = log.lock().expect("statement log")[base..].to_vec();
+    for statement in &statements {
+        assert!(
+            drives::append_bills_replay_cost(
+                &statement.sql,
+                statement.rows_read,
+                statement.rows_written,
+            ),
+            "{} appended event_log at {} R + {} W — the replay re-count is 1 R + 1 W",
+            drive.name,
+            statement.rows_read,
+            statement.rows_written,
+        );
+    }
     let after = claimable_surface(ctx.loaded());
     match (run_result, cleanup_result) {
         (Ok(()), Ok(())) => {
