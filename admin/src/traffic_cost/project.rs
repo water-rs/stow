@@ -964,9 +964,9 @@ impl ProjectionReport {
 /// wave's node count, against its [`PREHEAT_BUDGET`] share of the
 /// allowance — a breach per over-budget dimension. `per-node × prod`
 /// versus `share × monthly` is the same bound the per-run totals check
-/// enforced through `nodes / FULL_WAVE_NODES`; only the denominator
-/// changed from the checked-in constant to the measured production
-/// wave (stow#883).
+/// enforced at a checked-in wave-size constant; only the denominator
+/// changed from that constant to the measured production wave
+/// (stow#883).
 #[allow(
     clippy::cast_precision_loss,
     reason = "node counts stay far below f64's exact-integer range"

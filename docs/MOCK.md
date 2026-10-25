@@ -107,12 +107,16 @@ preheat cost ledger`) is read at every lane and round boundary.
 `stow-admin preheat cost report` turns the run into
 `preheat-cost-report.json` — per event kind (submit, alarm dispatch,
 completion, slice report) per layer, wave and resubmit totals, nodes
-per target, wall time — and fails when the wave or resubmit totals
-pass the preheat budget in `types/src/do_budgets.rs`, a per-event cost
-grows from the first layer to the last past the scheduler-budget
-tolerance, a node is dispatched before its dependencies are
-published, a submitted node never publishes, or the object answers
-`overloaded`. The full wave is CI-sized; locally, reduce it:
+per target, wall time — and fails when a resubmit rebuilds anything, a
+per-event cost grows from the first layer to the last past the
+scheduler-budget tolerance, a fixed-size event exceeds its drive
+budget, a node is dispatched before its dependencies are published, a
+submitted node never publishes, the object answers `overloaded`, or a
+lane's submit fails. The wave and resubmit totals are bounded where the
+production node count exists: the monthly projection scales them to
+`production-wave.json` against the preheat budget in
+`types/src/do_budgets.rs`. The full wave is CI-sized; locally, reduce
+it:
 
 ```sh
 STOW_PREHEAT_COST_TARGETS="$(rustc -vV | sed -n 's/^host: //p')" \
@@ -148,7 +152,7 @@ report's wave and resubmit totals by the reduced wave's node count and
 multiplies by the production count: one wave per stable rustc release
 (`[cadence]` in `launch-model.toml`, counted from Rust's release
 history by `stow-admin launch-model export`) plus one resubmit per day,
-added to each product's traffic before comparing with half its
+added to each product's traffic before comparing with 80% of its
 allowance. `stow-admin traffic-cost project` takes the report as
 `--preheat` and the count as `--production`. Only the scheduler Durable
 Object's billed calls and rows are measured; the table marks every
@@ -336,13 +340,15 @@ back into the mock registry (mock-key mode delegates the signed push to
 ```sh
 STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
 target/release/stow-admin index export \
-  --target aarch64-apple-darwin --rustc-version 1.91.1 \
-  --out /tmp/stow-bench/index.bin
+  --out-dir /tmp/stow-bench/index-export --rustc-version 1.91.1
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
 STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
 target/release/stow-admin index publish \
-  --file /tmp/stow-bench/index.bin \
-  --target aarch64-apple-darwin --rustc-version 1.91.1
+  --file /tmp/stow-bench/index-export/index.aarch64-apple-darwin.1.91.1 \
+  --folded /tmp/stow-bench/index-export/folded.aarch64-apple-darwin.1.91.1
+STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
+target/release/stow-admin index report \
+  --file /tmp/stow-bench/index-export/index.aarch64-apple-darwin.1.91.1
 ```
 
 Then refresh the consumer-side cache and run `stow check` against a

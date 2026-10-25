@@ -20,7 +20,7 @@
 #      answers with empty outputs, its records land in the mock registry
 #      and its completion reaches the edge as a signed workflow_run
 #      webhook; whenever nothing is in flight and new records exist, run
-#      one publish round — index export → publish → report → sync, the
+#      one publish round — index export → publish → report, the
 #      loop index-publish.yml drives — which releases the next layer.
 #      The wave is over when the lanes are done and nothing is pending
 #      or in flight
@@ -29,13 +29,15 @@
 #   6. `stow-admin preheat cost report` reads the probe ledger snapshots
 #      taken at every lane and round boundary, the local CI's runs and
 #      the final published slices, writes
-#      $WORK_DIR/preheat-cost-report.json and fails on any check: wave or
-#      resubmit total over the preheat budget (types/src/do_budgets.rs),
+#      $WORK_DIR/preheat-cost-report.json and fails on any check:
 #      per-event cost growing first → last layer past the stow#433
 #      tolerance, a fixed-size event over its drive budget, a node
 #      dispatched before its dependencies were published, a submitted
 #      node never published, an `overloaded` answer, a failed submit, or
-#      a resubmit that rebuilt anything
+#      a resubmit that rebuilt anything. The wave and resubmit totals it
+#      reports are bounded by the monthly projection — scaled to the
+#      production wave's node count against the preheat budget
+#      (types/src/do_budgets.rs)
 #
 # The monthly projection (`stow-admin traffic-cost project`, the release
 # gate's `Monthly projection` job) also needs the production wave's node
@@ -481,9 +483,9 @@ local_ci_counts() {
 ROUND=0
 
 # One publish round — the loop index-publish.yml drives: export the
-# records the registry gained, publish each changed slice, report each
-# to the scheduler (which dispatches the dependents it releases), and
-# sync the catalog. The ledger is read right before the first report
+# records the registry gained, publish each changed slice, and report
+# each to the scheduler (which dispatches the dependents it releases).
+# The ledger is read right before the first report
 # (the earliest a released dependent may dispatch) and after the last.
 publish_round() {
     local phase="$1"
@@ -517,9 +519,6 @@ publish_round() {
             || die "index report failed for $index_file — see $LOG_DIR/index-report.log"
     done <<<"$pairs"
     snapshot "$dir/end.json"
-    admin index sync --file "$WORK_DIR/index-export/new-records.json" \
-        >>"$LOG_DIR/index-sync.log" 2>&1 \
-        || die "index sync failed — see $LOG_DIR/index-sync.log"
     log "$phase round $tag: $(jq length "$dir/new-records.json") records, $(jq length "$WORK_DIR/index-export/slices.json") slices"
 }
 

@@ -566,48 +566,48 @@ fn completions_check(name: &str, cost: &PhaseCost) -> Check {
     )
 }
 
-/// Per-event growth first → last layer for the kinds a layer
-/// normalises: alarm passes, completions and slice reports.
+/// Per-event growth first → last layer for the kinds whose events
+/// scale with what they carry: completions and slice reports. The
+/// alarm pass is fixed-size and held to its drive budget in every layer
+/// instead ([`drive_checks`]); since the in-memory scheduler a slice
+/// report dispatches the dependents it releases in its own turn
+/// (stow#878), so the alarm may dispatch in the first layer alone.
 fn growth_checks(layers: &[LayerCost]) -> Vec<Check> {
-    [
-        EventKind::Dispatch,
-        EventKind::Completion,
-        EventKind::SliceReport,
-    ]
-    .iter()
-    .map(|&event| {
-        let measured: Vec<(usize, (f64, f64))> = layers
-            .iter()
-            .filter_map(|layer| {
-                kind(&layer.kinds, event)
-                    .per_event()
-                    .map(|rate| (layer.layer, rate))
-            })
-            .collect();
-        let name = format!("{event:?} per-event cost flat across layers");
-        match (measured.first(), measured.last()) {
-            (Some(&(first, (r0, w0))), Some(&(last, (r1, w1)))) if first != last => {
-                let passed = !grew(r0, r1) && !grew(w0, w1);
-                check(
-                    name,
-                    passed,
-                    format!(
-                        "layer {first}: {r0:.1} read / {w0:.1} written per event; \
+    [EventKind::Completion, EventKind::SliceReport]
+        .iter()
+        .map(|&event| {
+            let measured: Vec<(usize, (f64, f64))> = layers
+                .iter()
+                .filter_map(|layer| {
+                    kind(&layer.kinds, event)
+                        .per_event()
+                        .map(|rate| (layer.layer, rate))
+                })
+                .collect();
+            let name = format!("{event:?} per-event cost flat across layers");
+            match (measured.first(), measured.last()) {
+                (Some(&(first, (r0, w0))), Some(&(last, (r1, w1)))) if first != last => {
+                    let passed = !grew(r0, r1) && !grew(w0, w1);
+                    check(
+                        name,
+                        passed,
+                        format!(
+                            "layer {first}: {r0:.1} read / {w0:.1} written per event; \
                          layer {last}: {r1:.1} read / {w1:.1} written (tolerance 10% + 50 rows)"
+                        ),
+                    )
+                }
+                _ => check(
+                    name,
+                    false,
+                    format!(
+                        "{event:?} events landed in {} layer(s); flatness needs two",
+                        measured.len()
                     ),
-                )
-            }
-            _ => check(
-                name,
-                false,
-                format!(
-                    "{event:?} events landed in {} layer(s); flatness needs two",
-                    measured.len()
                 ),
-            ),
-        }
-    })
-    .collect()
+            }
+        })
+        .collect()
 }
 
 /// Submit cost per inserted unit — a queue row or a dependency edge —

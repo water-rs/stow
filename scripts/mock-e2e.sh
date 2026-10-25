@@ -1726,9 +1726,20 @@ echo "[mock-e2e] heck version resolved by the plan: $HECK_VERSION"
 # submit.
 status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")" \
     || die "scheduler status read before the host-deps submit failed"
-read -r base_pending base_inflight base_completed base_failed <<<"$(jq -r \
-    '[.pending, .dispatched + .running, .completed, .failed] | map(tostring) | join(" ")' \
+read -r base_pending base_inflight base_failed <<<"$(jq -r \
+    '[.pending, .dispatched + .running, .failed] | map(tostring) | join(" ")' \
     <<<"$status_json")"
+
+# `/status` counts are the graph's current state: a node leaves it once
+# its slice is published and reported, so the publish waves below drain
+# `completed` as they land — it is not a cumulative counter. The batch's
+# real completion record is the local CI's `GET /tasks`: every dispatch
+# leaves a row keyed by its task id there for the rest of the run.
+# Snapshot the ids present before the submit so the loop picks the
+# batch out as the new ones.
+pre_task_ids="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+    | jq -c '[.tasks[].task_id | select(. != null)]')" \
+    || die "local CI /tasks read before the host-deps submit failed"
 
 # The submit route takes `Vec<SubmissionTree>`, so the batch goes
 # through the trusted admin path — it resolves the same crate, target
@@ -1751,35 +1762,45 @@ echo "[mock-e2e] host-deps submit: $(tail -3 "$LOG_DIR/admin-submit-host-deps.lo
 # shape its edge requires — host-side deps of a host-side owner need all
 # four (both invocations, both kinds). Publish waves release the queue
 # depth-first: each round drains the unblocked tasks, then runs the
-# export/publish/report/sync pass so the next layer can go.
+# export/publish/report pass so the next layer can go.
 deadline=$((SECONDS + TASK_DEADLINE))
 wave=0
-last_completed=-1
+last_succeeded=-1
 last_publish=0
 while :; do
     check_children_alive
     status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
-    if [ -z "$status_json" ]; then
+    runs_json="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" 2>/dev/null || true)"
+    if [ -z "$status_json" ] || [ -z "$runs_json" ]; then
         sleep 5
         continue
     fi
-    read -r pending_n inflight_n completed_n failed_n <<<"$(jq -r \
-        '[.pending, .dispatched + .running, .completed, .failed] | map(tostring) | join(" ")' \
+    read -r pending_n inflight_n failed_n <<<"$(jq -r \
+        '[.pending, .dispatched + .running, .failed] | map(tostring) | join(" ")' \
         <<<"$status_json")"
     waiting=$((pending_n - base_pending))
     inflight=$((inflight_n - base_inflight))
-    completed_n=$((completed_n - base_completed))
     failed_n=$((failed_n - base_failed))
-    echo "[mock-e2e] host-deps: $completed_n/$task_count completed, $waiting gated, $inflight in flight, $failed_n failed ($status_json)"
+    # The batch's cumulative progress: the task ids the submit's runs
+    # carry beyond the pre-submit snapshot, and how many of them a
+    # successful run already covers. One task is one task id, however
+    # many times it dispatched — the publish waves cannot drain this.
+    read -r batch_n succeeded_n <<<"$(jq -r --argjson pre "$pre_task_ids" '
+        [.tasks[] | .task_id | select(. != null) | select(. as $id | $pre | index($id) | not)] as $batch
+        | [.tasks[] | select(.conclusion == "success") | .task_id
+           | select(. as $id | $pre | index($id) | not)] as $done
+        | "\($batch | unique | length) \($done | unique | length)"' \
+        <<<"$runs_json")"
+    echo "[mock-e2e] host-deps: $succeeded_n/$task_count succeeded, $batch_n dispatched, $waiting gated, $inflight in flight, $failed_n failed ($status_json)"
     [ "$failed_n" -eq 0 ] \
         || die "scheduler reported a failed host-deps task: $status_json"
-    if [ "$waiting" -eq 0 ] && [ "$inflight" -eq 0 ]; then
-        [ "$completed_n" -eq "$task_count" ] \
-            || die "host-deps graph drained at $completed_n completed tasks, expected $task_count"
+    if [ "$waiting" -le 0 ] && [ "$inflight" -le 0 ]; then
+        [ "$succeeded_n" -eq "$task_count" ] \
+            || die "host-deps graph drained at $succeeded_n succeeded of $batch_n dispatched tasks, expected $task_count"
         break
     fi
-    if [ "$waiting" -gt 0 ] && [ "$inflight" -eq 0 ] \
-        && { [ "$completed_n" -gt "$last_completed" ] || [ "$last_publish" -lt "$((SECONDS - 30))" ]; }; then
+    if [ "$waiting" -gt 0 ] && [ "$inflight" -le 0 ] \
+        && { [ "$succeeded_n" -gt "$last_succeeded" ] || [ "$last_publish" -lt "$((SECONDS - 30))" ]; }; then
         # Every dispatched task reported; the pending set is gated on
         # the index — publish the slices so the next wave releases. The
         # second arm republishes while the queue sits idle-but-pending:
@@ -1789,7 +1810,7 @@ while :; do
         wave=$((wave + 1))
         echo "[mock-e2e] publishing slices (host-deps wave $wave)"
         fg publish_slices "host-deps-wave-$wave"
-        last_completed="$completed_n"
+        last_succeeded="$succeeded_n"
         last_publish=$SECONDS
     fi
     [ "$SECONDS" -ge "$deadline" ] \
