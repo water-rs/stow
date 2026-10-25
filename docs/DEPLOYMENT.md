@@ -397,7 +397,12 @@ anonymous `GET /token` exchange that `edge/src/ghcr.rs` drives on every
 `401` challenge. A rustc's package is created by the first
 `build-crate.yml` push that lands on it: the package links to the
 public `water-rs/stow` repository and inherits its visibility, so no
-manual step ever opens one.
+manual step ever opens one. Until it exists, GHCR answers an anonymous
+pull — the token exchange or an asset request — with `403 DENIED`
+rather than `404` (a package made private answers the same way), and
+every index reader classifies that answer as the package's absence: the
+empty index, exactly the result a missing `index.<target>.<rustc>` tag
+gives (stow#844).
 
 The edge authenticates `workflow_dispatch` with a GitHub App
 installation token minted on the Worker: the `GITHUB_APP_ID`

@@ -609,13 +609,14 @@ pub async fn check_artifact(
                 row.crate_name.as_str(),
                 row.version.as_semver(),
                 row.bundle_digest,
-                slice.manifest_digest,
+                slice.manifest_digest.as_deref().unwrap_or("none"),
             ))?;
         }
         None => {
             write_stdout(&format!(
                 "status: absent\nc-metadata: {}\nindex-manifest: {}\n",
-                args.c_metadata, slice.manifest_digest,
+                args.c_metadata,
+                slice.manifest_digest.as_deref().unwrap_or("none"),
             ))?;
         }
     }
@@ -680,7 +681,7 @@ pub async fn index_refresh(
         target,
         rustc_version,
         slice.index.rows.len(),
-        slice.manifest_digest,
+        slice.manifest_digest.as_deref().unwrap_or("none"),
     ))?;
     Ok(())
 }

@@ -325,6 +325,35 @@ pub(crate) fn sanitize_oci_tag_component(value: &str) -> String {
         .collect()
 }
 
+/// Whether `status`/`body` is the registry answering "the package does
+/// not exist".
+///
+/// GHCR refuses an anonymous pull of a package that does
+/// not exist (or is not public — it refuses to say which) with a `403`
+/// carrying the OCI `DENIED` code, on the token exchange or the asset
+/// request alike; a spec registry answers `404`/`NAME_UNKNOWN` for an
+/// unknown repository. A `403` with any other body is a real
+/// authorization failure, and `401` and every other status stay errors.
+#[must_use]
+pub fn package_missing(status: u16, body: &str) -> bool {
+    let code = match status {
+        403 => "DENIED",
+        404 => "NAME_UNKNOWN",
+        _ => return false,
+    };
+    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    envelope
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| {
+            errors
+                .iter()
+                .any(|entry| entry.get("code").and_then(serde_json::Value::as_str) == Some(code))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -758,5 +787,36 @@ mod tests {
 
         let beta = cache_repository(&WireRustcVersion::parse("1.93.0-beta.5").expect("beta"));
         assert_eq!(beta.as_str(), "water-rs/stow-cache-1.93.0-beta.5");
+    }
+
+    /// stow#844: GHCR's `403 DENIED` envelope — on the token exchange or
+    /// an asset request — and a spec registry's `404 NAME_UNKNOWN` both
+    /// name a package that does not exist; every other status or body is
+    /// a refusal, never absence.
+    #[test]
+    fn package_missing_reads_only_the_denied_answers() {
+        let denied = r#"{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}"#;
+        assert!(package_missing(403, denied));
+        assert!(package_missing(
+            404,
+            r#"{"errors":[{"code":"NAME_UNKNOWN","message":"repository name not known"}]}"#
+        ));
+        for (status, body) in [
+            (
+                403,
+                r#"{"errors":[{"code":"TOOMANYREQUESTS","message":"slow down"}]}"#,
+            ),
+            (403, "plain text refusal"),
+            (403, ""),
+            (401, denied),
+            (404, denied),
+            (
+                404,
+                r#"{"errors":[{"code":"MANIFEST_UNKNOWN","message":"manifest unknown"}]}"#,
+            ),
+            (500, denied),
+        ] {
+            assert!(!package_missing(status, body), "{status} {body}");
+        }
     }
 }

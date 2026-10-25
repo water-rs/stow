@@ -352,7 +352,11 @@ unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). A new
 rustc's package is created by its first `build-crate.yml` push: it links
 to the public `water-rs/stow` repository and inherits its visibility, so
 no manual step ever opens one, and a retired rustc's package is deleted
-whole.
+whole. Before it exists — or after a deletion — GHCR answers an
+anonymous pull of it with `403 DENIED` rather than `404`; every index
+reader treats that answer as the empty index, the same result a missing
+tag gives, so a fresh rustc's first builds can start it and a deleted
+package reads as reset (stow#844).
 
 Each artifact is two OCI images on that package. The signed image is the
 tag above: its config is the `ArtifactBlobConfig` and it carries one
