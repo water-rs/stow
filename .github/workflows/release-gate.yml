@@ -187,7 +187,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Preheat cost
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The binaries-only top two pull in ~1,750 tasks: a cold build plus
+    # the wave measured 30 minutes before the resubmit (stow#926).
+    timeout-minutes: 40
     permissions:
       # The local edge authenticates its trusted endpoints against the
       # credential's own repo permissions — GITHUB_TOKEN needs push
