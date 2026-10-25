@@ -561,8 +561,8 @@ impl TaskHash {
 /// into the signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
 /// GHCR artifact once the build, re-hash, validation, sign, and push have
 /// all succeeded. Nothing
-/// POSTs it anywhere — `index sync` mirrors the verified records into the
-/// the edge's catalog — the signed index slices in GHCR.
+/// POSTs it anywhere else — `index export` folds the verified records
+/// into the signed index slices in GHCR every reader resolves against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactRecord {
     /// Stable hash of the trusted build's exact rustc invocation identity.
