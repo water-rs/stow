@@ -303,8 +303,9 @@ asked for admissions only when the index reports a miss.
 ## Populate the cache
 
 **Top binaries** — the top-N crates whose default version ships a binary
-target, ranked by the last 90 days of `version_downloads` in the crates.io
-database dump (fetched once), each resolved as a name source through the
+target and no library, ranked by the last 90 days of
+`version_downloads` in the crates.io database dump (fetched once), each
+resolved as a name source through the
 crate lane (each one's bundled `Cargo.lock` is dropped like every lane's,
 so tasks land on the latest semver-compatible versions):
 

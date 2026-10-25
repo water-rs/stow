@@ -680,7 +680,8 @@ Four workflows keep it warm:
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
   shared base pool directly against the scheduler: `preheat
   top-binaries` for the top-N crates whose default version ships a
-  binary target, ranked by the last 90 days of `version_downloads` —
+  binary target and no library, ranked by the last 90 days of
+  `version_downloads` —
   the ranking and the binary check read once from the crates.io daily
   database dump — each `.crate` tarball resolved in-process by
   `stow-resolver` into ordinary crate tasks
