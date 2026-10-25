@@ -267,6 +267,43 @@ pub struct DriveOutcome {
     pub cleanup: Option<Result<(), String>>,
 }
 
+/// `Some` when `sql` is a statement whose billed cost the metering
+/// predicts and its counters differ from the prediction — carrying
+/// the statement's label and its predicted (`rows_read`,
+/// `rows_written`) — `None` when it bills the prediction or carries
+/// none. The host cost gate and the workerd probe share this one
+/// table, so a statement billed other than predicted fails the gate
+/// instead of only logging.
+///
+/// stow#931: an `event_log` append is `INSERT .. RETURNING seq` and
+/// bills exactly one read row plus one written row — the re-count a
+/// wake's replay books must bill identically. The meter checkpoint's
+/// `UPDATE meter .. RETURNING` — the edge's only UPDATE — bills
+/// [`store::METER_CHECKPOINT_BILL`]: workerd reads one row for the
+/// row it changes plus one for the RETURNING row (release gate run
+/// 40186665163's statement log: `rows_returned 1`, `rows_read 2`,
+/// `rows_written 1`), and the checkpoint folds the same cost into the
+/// stored totals.
+#[must_use]
+pub fn predicted_bill_mismatch(
+    sql: &str,
+    rows_read: u64,
+    rows_written: u64,
+) -> Option<(&'static str, u64, u64)> {
+    let predicted = if sql.starts_with("INSERT INTO event_log") {
+        ("event_log append", 1, 1)
+    } else if sql.starts_with("UPDATE meter") {
+        (
+            "meter checkpoint UPDATE",
+            store::METER_CHECKPOINT_BILL.0,
+            store::METER_CHECKPOINT_BILL.1,
+        )
+    } else {
+        return None;
+    };
+    ((rows_read, rows_written) != (predicted.1, predicted.2)).then_some(predicted)
+}
+
 /// The drive lifecycle every harness shares — the workerd probe's
 /// `budget::run_drive` and the host gate's `cost_gate::run_one_drive`
 /// call this one orchestration so the ordering contract exists once:
@@ -380,7 +417,7 @@ async fn schedule(
     settings: &SchedulerSettings,
 ) -> Result<(), String> {
     let _plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
-    routes::snapshot_if_due(ctx.loaded(), db)
+    routes::snapshot_if_due(ctx.loaded(), db, now_ms())
         .await
         .map(|_| ())
         .map_err(text)
@@ -1932,8 +1969,8 @@ pub const DRIVES: &[Drive] = &[
         // The newreleases.io forward's object half (stow#880): on
         // wasm the real `preheat_release_pass` — credential arm plus
         // the `workflow_dispatch` POST to the local-CI dispatcher; on
-        // host there is no store work, so the drive measures nothing
-        // but the meter's own settle.
+        // host the arm is a no-op `Ok(())` — no store work runs and
+        // there is nothing to measure.
         name: "POST /preheat/release",
         setup: None,
         run: |_db, _shape, _settings, ctx| {
@@ -2747,9 +2784,9 @@ pub const DRIVES: &[Drive] = &[
         }),
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                let (mut graph, events) = store::load(db).await.map_err(text)?;
-                store::apply_events(&mut graph, &events);
-                ctx.graph.install(graph);
+                routes::wake_graph(db, &ctx.graph, now_ms())
+                    .await
+                    .map_err(text)?;
                 Ok(())
             })
         },
@@ -2767,7 +2804,9 @@ pub const DRIVES: &[Drive] = &[
         name: "snapshot write",
         setup: Some(|db, shape, settings, ctx| {
             Box::pin(async move {
-                routes::snapshot(ctx.loaded(), db).await.map_err(text)?;
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)?;
                 let inserted =
                     submit(ctx, db, settings, &[snapshot_merge_tree(shape)], false).await?;
                 if inserted != SNAPSHOT_MERGE_NODES {
@@ -2806,7 +2845,11 @@ pub const DRIVES: &[Drive] = &[
             })
         }),
         run: |db, _shape, _settings, ctx| {
-            Box::pin(async move { routes::snapshot(ctx.loaded(), db).await.map_err(text) })
+            Box::pin(async move {
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)
+            })
         },
         cleanup: Some(|db, shape, _settings, ctx| {
             Box::pin(async move {
@@ -2994,5 +3037,32 @@ mod lifecycle_tests {
         assert!(matches!(outcome.run, Some(Err(_))));
         assert!(matches!(outcome.post_sync, Some(Ok(()))));
         assert!(matches!(outcome.cleanup, Some(Ok(()))));
+    }
+
+    /// The predicted-bill predicate: the append and the checkpoint
+    /// UPDATE hold their constants, and anything else passes
+    /// unpriced.
+    #[test]
+    fn predicted_bill_mismatch_covers_the_priced_statements() {
+        const APPEND: &str = "INSERT INTO event_log(at, event) VALUES (?, ?) RETURNING seq";
+        const CHECKPOINT: &str = "UPDATE meter SET day = ? RETURNING id";
+        assert_eq!(predicted_bill_mismatch(APPEND, 1, 1), None);
+        assert_eq!(
+            predicted_bill_mismatch(APPEND, 2, 1),
+            Some(("event_log append", 1, 1))
+        );
+        assert_eq!(predicted_bill_mismatch(CHECKPOINT, 2, 1), None);
+        assert_eq!(
+            predicted_bill_mismatch(CHECKPOINT, 1, 1),
+            Some(("meter checkpoint UPDATE", 2, 1))
+        );
+        assert_eq!(
+            predicted_bill_mismatch("SELECT seq FROM event_log", 0, 0),
+            None
+        );
+        assert_eq!(
+            predicted_bill_mismatch("SELECT seq FROM event_log", 9, 9),
+            None
+        );
     }
 }

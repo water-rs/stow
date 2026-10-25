@@ -14,7 +14,7 @@ use stow_types::api::{
     MutationKind, QueueSelector, SchedulerEvent, SubmissionTree, SubmitTaskIdEntry,
 };
 
-use super::graph::{Claimed, FinishOutcome, Graph, LoadedGraph, StartOutcome};
+use super::graph::{Claimed, FinishOutcome, Graph, GraphCell, LoadedGraph, StartOutcome};
 use super::queue::{self, AlarmPlan, SchedulerSettings};
 use super::store;
 use crate::errors::QueueError;
@@ -55,7 +55,7 @@ async fn append(
     now: i64,
 ) -> Result<(), QueueError> {
     let appended = store::append_events(db, events, now).await?;
-    graph.with(|graph| graph.log_appended(appended.bytes));
+    graph.with(|graph| graph.log_appended(appended.bytes, appended.seq));
     Ok(())
 }
 
@@ -315,36 +315,95 @@ pub(super) fn wake_plan(
 pub(super) async fn snapshot_if_due(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
+    now_ms: i64,
 ) -> Result<bool, QueueError> {
     if !graph.with(|graph| graph.snapshot_due()) {
         return Ok(false);
     }
-    snapshot(graph, db).await?;
+    snapshot(graph, db, now_ms).await?;
     Ok(true)
 }
 
-/// Write the snapshot now.
+/// Write the snapshot now. The meter checkpoint lands inside the same
+/// storage-only turn, covering every append the snapshot serialized
+/// plus the isolate's unsettled counts the cell still holds.
 ///
 /// # Errors
 /// `QueueError` on a failed chunk or watermark write.
-pub(super) async fn snapshot(graph: LoadedGraph<'_>, db: &DurableDb) -> Result<(), QueueError> {
+pub(super) async fn snapshot(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    now_ms: i64,
+) -> Result<(), QueueError> {
     // Freed nodes leave the arena before the image is cut.
     graph.with(Graph::compact);
     let plan = graph.with(|graph| graph.snapshot_plan())?;
-    store::write_snapshot_parts(db, &plan, |span, encoder| {
-        graph.with(|graph| {
-            if encoder.is_none() {
-                *encoder = Some(graph.snapshot_encoder(span));
-            }
-            encoder.as_mut().expect("encoder").next_row(graph)
-        })
-    })
+    let meter = graph.with(|graph| graph.meter.clone());
+    store::write_snapshot_parts(
+        db,
+        &plan,
+        |span, encoder| {
+            graph.with(|graph| {
+                if encoder.is_none() {
+                    *encoder = Some(graph.snapshot_encoder(span));
+                }
+                encoder.as_mut().expect("encoder").next_row(graph)
+            })
+        },
+        &meter,
+        graph.cell(),
+        now_ms,
+    )
     .await?;
     graph.with(|graph| {
         graph.snapshot_written();
         graph.log_since_snapshot = 0;
         graph.log_bytes_since_snapshot = 0;
     });
+    Ok(())
+}
+
+/// The wake half of `object::ensure_graph`, platform-free so host
+/// tests and the `wake` drive run the same sequence (stow#931):
+/// [`store::wake`] loads the snapshot plus log tail, replays it and
+/// writes the meter checkpoint — covering the wake's own reads and
+/// every in-flight operation's unsettled counts — then `woken_at_ms`
+/// stamps and the graph installs, all before any non-storage await.
+/// `ensure_graph` adds the admission floor and the post-wake CI
+/// reconcile on top.
+///
+/// # Errors
+/// `QueueError` on a failed read or checkpoint write.
+pub(super) async fn wake_graph<'a>(
+    db: &DurableDb,
+    cell: &'a GraphCell,
+    now_ms: i64,
+) -> Result<LoadedGraph<'a>, QueueError> {
+    if let Some(loaded) = cell.loaded() {
+        return Ok(loaded);
+    }
+    let mut graph = store::wake(db, cell, now_ms).await?;
+    graph.woken_at_ms = now_ms;
+    Ok(cell.install(graph))
+}
+
+/// Append the `Freeze` events a transition staged — the graph already
+/// applied them, so only the log write remains. `db` is the
+/// operation's metered handle: the append's rows must book like every
+/// other statement so a later checkpoint covers the row's seq and a
+/// wake replays it exactly once (stow#931).
+///
+/// # Errors
+/// `QueueError::Sql` on a failed append.
+pub(super) async fn persist_freeze(
+    db: &DurableDb,
+    store: &super::graph::GraphFreezeStore<'_>,
+    now: i64,
+) -> Result<(), QueueError> {
+    let appended = store::append_events(db, &store.take_events(), now).await?;
+    store
+        .cell()
+        .with(|graph| graph.log_appended(appended.bytes, appended.seq));
     Ok(())
 }
 
@@ -724,6 +783,7 @@ mod eviction_tests {
 #[cfg(test)]
 mod snapshot_trigger_tests {
     use super::*;
+    use crate::scheduler::drives::HOST_NOW_MS;
     use crate::scheduler::fixture;
     use crate::scheduler::graph::GraphCell;
     use crate::scheduler::test_db;
@@ -768,7 +828,10 @@ mod snapshot_trigger_tests {
                 commit_trees(cell, &db, std::slice::from_ref(&tree), 1)
                     .await
                     .expect("submit");
-                if snapshot_if_due(cell, &db).await.expect("snapshot") {
+                if snapshot_if_due(cell, &db, HOST_NOW_MS)
+                    .await
+                    .expect("snapshot")
+                {
                     snapshots += 1;
                 }
                 let tail = tail_bytes(&db).await;
@@ -810,7 +873,11 @@ mod snapshot_trigger_tests {
             cell.with(|graph| graph.log_bytes_since_snapshot) > 100 << 20,
             "the wave is over 100 MiB of log"
         );
-        assert!(snapshot_if_due(cell, &db).await.expect("snapshot"));
+        assert!(
+            snapshot_if_due(cell, &db, HOST_NOW_MS)
+                .await
+                .expect("snapshot")
+        );
         assert_eq!(tail_bytes(&db).await, 0);
         drop(wave);
         let (woken, events) = store::load(&db).await.expect("load");

@@ -368,13 +368,17 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
     },
     DriveBudget {
         // The newreleases.io forward: signature already verified at the
-        // edge, so the object only reads its bindings and posts one
-        // `workflow_dispatch` — no store access; the rows are the
-        // meter's own settle.
+        // edge, so the object only resolves its credential arm and
+        // posts one `workflow_dispatch` — `preheat_release_pass` takes
+        // no `DurableDb`, so the route bills no store row and the
+        // settle writes none either (stow#931). The 0/0/0 is a code
+        // read: the host drive's arm is a no-op, so its zero measures
+        // nothing. The old 2/4/4 row was the removed `do_meter`
+        // settle's, not this route's.
         name: "POST /preheat/release",
-        statements: 2,
-        rows_read: 4,
-        rows_written: 4,
+        statements: 0,
+        rows_read: 0,
+        rows_written: 0,
         wall_ms: 500,
     },
     DriveBudget {
@@ -546,17 +550,31 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 5000,
     },
     DriveBudget {
+        // stow#931 added the meter row's read and the wake
+        // checkpoint's `UPDATE .. RETURNING` — +2 statements, +3
+        // billed reads (the UPDATE reads the row it changes plus the
+        // RETURNING row on workerd, release gate run 40186665163; the
+        // host backend bills it identically), +1 billed write over
+        // the pre-#931 row by construction. The workerd-scale absolute
+        // stands for a mock-stack `stow-admin scheduler budget` run to
+        // confirm.
         name: "wake (snapshot + log replay)",
-        statements: 60,
-        rows_read: 476,
-        rows_written: 4,
+        statements: 62,
+        rows_read: 478,
+        rows_written: 5,
         wall_ms: 5000,
     },
     DriveBudget {
+        // stow#931 added the snapshot checkpoint's `UPDATE ..
+        // RETURNING` after the covered-log drop — +1 statement, +2
+        // billed reads (the changed row plus the RETURNING row,
+        // release gate run 40186665163), +1 billed write by
+        // construction; the host delta matches. The workerd-scale
+        // absolute awaits the same mock-stack probe run.
         name: "snapshot write",
-        statements: 66,
-        rows_read: 480,
-        rows_written: 532,
+        statements: 67,
+        rows_read: 481,
+        rows_written: 533,
         wall_ms: 5000,
     },
 ];

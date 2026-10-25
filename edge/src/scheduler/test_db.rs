@@ -79,8 +79,9 @@ pub struct LoggedStatement {
     pub sql: String,
     /// The parameters bound to it, in bind order.
     pub params: Vec<DbValue>,
-    /// Rows the statement returned (its result cardinality — not the
-    /// rows its plan touched; the plan is what bounds those).
+    /// Rows the statement billed as read: its result cardinality, plus
+    /// for an `UPDATE` the rows it changed — workerd's bill, mirrored
+    /// (stow#931).
     pub rows_read: u64,
     /// Rows the statement wrote (`changes()`/`total_changes()` per
     /// statement).
@@ -507,10 +508,23 @@ impl DurableDbBackend for SqliteBackend {
             .iter()
             .map(row_to_json)
             .collect::<Result<Vec<_>, _>>()?;
+        let returned = u64::try_from(rows.len()).map_err(backend_error)?;
+        let changed = u64::try_from(after.saturating_sub(before)).map_err(backend_error)?;
+        // workerd bills an UPDATE one read per row it changes plus one
+        // per row its RETURNING clause returns — the meter checkpoint
+        // measured `rows_returned 1`, `rows_read 2`, `rows_written 1`
+        // on release gate run 40186665163's statement log (stow#931).
+        // The host backend reports the same bill so host tests
+        // exercise production's accounting; `execute` keeps the
+        // engine's own.
+        let update = query
+            .split_whitespace()
+            .next()
+            .is_some_and(|head| head.eq_ignore_ascii_case("update"));
         Ok(DbExecResult {
-            rows_read: u64::try_from(rows.len()).map_err(backend_error)?,
+            rows_read: if update { returned + changed } else { returned },
             rows,
-            rows_written: u64::try_from(after.saturating_sub(before)).map_err(backend_error)?,
+            rows_written: changed,
         })
     }
 
