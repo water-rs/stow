@@ -627,7 +627,7 @@ mod tests {
     /// ones the `candidates` matching tests exercise.
     fn index_slice(rows: Vec<ArtifactIndexRow>) -> stow_cli::build_consume::IndexSlice {
         stow_cli::build_consume::IndexSlice {
-            manifest_digest: "sha256:".to_owned() + &"cd".repeat(32),
+            manifest_digest: Some("sha256:".to_owned() + &"cd".repeat(32)),
             index: ArtifactIndex {
                 header: ArtifactIndexHeader {
                     format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,

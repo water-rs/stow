@@ -1408,7 +1408,7 @@ struct MockRegistryState {
 /// because the map dies with the process anyway.
 #[derive(Debug, Default)]
 struct TokenState {
-    issued: HashMap<String, Instant>,
+    issued: HashMap<String, IssuedToken>,
     /// Monotonic salt so back-to-back mints never collide.
     next: u64,
 }
@@ -1421,15 +1421,80 @@ async fn v2_ping(State(state): State<MockRegistryState>) -> Response<Body> {
     unauthorized(&state.token_realm, None)
 }
 
+/// Whether `repository`'s package exists — the `manifests/<repo>` dir the
+/// first manifest push creates, mirroring GHCR creating a package on its
+/// first `build-crate.yml` publish. Blobs alone do not make one.
+fn package_exists(registry_root: &Path, repository: &str) -> bool {
+    registry_root.join("manifests").join(repository).is_dir()
+}
+
+/// GHCR's answer to an anonymous pull against a package that does not
+/// exist — or is not public; it refuses to say which: `403` carrying
+/// the OCI `DENIED` code, on the token exchange and the asset request
+/// alike.
+fn package_denied() -> Response<Body> {
+    let mut response = Response::new(Body::from(
+        serde_json::json!({
+            "errors": [{
+                "code": "DENIED",
+                "message": "requested access to the resource is denied",
+            }],
+        })
+        .to_string(),
+    ));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// A minted bearer: its expiry, and whether its exchange was anonymous —
+/// GHCR answers an anonymous read against a package that does not exist
+/// `403 DENIED`, while a credentialed one (a publish's) reads it as absent.
+#[derive(Debug)]
+struct IssuedToken {
+    expires_at: Instant,
+    anonymous: bool,
+}
+
+/// What a request's bearer is: missing, unknown or expired, or a live
+/// token minted anonymously or with credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bearer {
+    Unauthorized,
+    Anonymous,
+    Credentialed,
+}
+
 /// `GET /token?service=…&scope=…` — mints an anonymous bearer exactly the
 /// way GHCR does for public packages. The mock grants every requested
-/// scope; the token is recorded with its expiry and later `/v2/` requests
-/// are served only when they present it.
+/// scope whose package exists; the token is recorded with its expiry and
+/// later `/v2/` requests are served only when they present it. Like GHCR,
+/// an anonymous (no `Authorization`) exchange for a package that does not
+/// exist is refused `403 DENIED`, while a credentialed exchange mints —
+/// pushing creates the package.
 async fn issue_token(
     State(state): State<MockRegistryState>,
+    headers: HeaderMap,
     Query(params): Query<BTreeMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Response<Body> {
     state.record(&Method::GET, "/token");
+    // A `repository:<path>:<actions>` scope names the package; an
+    // anonymous exchange for a package that does not exist is GHCR's
+    // `403 DENIED`. Credentialed exchanges (any `Authorization` header)
+    // mint — a publish creates the package.
+    if !headers.contains_key(header::AUTHORIZATION)
+        && let Some(repository) = params
+            .get("scope")
+            .and_then(|scope| scope.strip_prefix("repository:"))
+            .and_then(|rest| rest.rsplit_once(':'))
+            .map(|(repository, _actions)| repository)
+        && !package_exists(&state.registry_root, repository)
+    {
+        return package_denied();
+    }
     let mut tokens = state
         .tokens
         .lock()
@@ -1445,7 +1510,10 @@ async fn issue_token(
     );
     tokens.issued.insert(
         token.clone(),
-        Instant::now() + Duration::from_secs(TOKEN_TTL_SECS),
+        IssuedToken {
+            expires_at: Instant::now() + Duration::from_secs(TOKEN_TTL_SECS),
+            anonymous: !headers.contains_key(header::AUTHORIZATION),
+        },
     );
     tracing::info!(
         service = params.get("service"),
@@ -1456,6 +1524,7 @@ async fn issue_token(
         "token": token,
         "expires_in": TOKEN_TTL_SECS,
     }))
+    .into_response()
 }
 
 async fn serve_v2(
@@ -1475,8 +1544,26 @@ async fn serve_v2(
         tracing::warn!(path = %rest, %error, "invalid mock registry path");
         StatusCode::BAD_REQUEST
     })?;
-    if !state.bearer_authorized(&headers) {
+    let bearer = state.bearer(&headers);
+    if matches!(bearer, Bearer::Unauthorized) {
         return Ok(unauthorized(&state.token_realm, Some(asset.repository())));
+    }
+    // GHCR answers an anonymous read against a package that does not
+    // exist with `403 DENIED`, not `404` — an anonymous bearer for it can
+    // only be a stale one minted before the package went. A credentialed
+    // read (a publish's blob HEAD before its first push) sees the plain
+    // absence, and writes create the package.
+    if matches!(bearer, Bearer::Anonymous)
+        && matches!(method, Method::GET | Method::HEAD)
+        && matches!(
+            asset,
+            RegistryAsset::Manifest { .. }
+                | RegistryAsset::Blob { .. }
+                | RegistryAsset::TagsList { .. }
+        )
+        && !package_exists(&state.registry_root, asset.repository())
+    {
+        return Ok(package_denied());
     }
     match (method.clone(), asset) {
         (
@@ -2203,27 +2290,34 @@ impl MockRegistryState {
         Some(response)
     }
 
-    /// `Authorization: Bearer` presents a token this server minted that
-    /// has not expired. Expired entries are evicted on sight.
-    fn bearer_authorized(&self, headers: &HeaderMap) -> bool {
+    /// What `Authorization: Bearer` presents: a token this server minted
+    /// that has not expired, and how it was minted. Expired entries are
+    /// evicted on sight.
+    fn bearer(&self, headers: &HeaderMap) -> Bearer {
         let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
         else {
-            return false;
+            return Bearer::Unauthorized;
         };
         let mut tokens = self
             .tokens
             .lock()
             .expect("mock registry token map poisoned");
         match tokens.issued.get(token) {
-            Some(expires_at) if *expires_at > Instant::now() => true,
+            Some(issued) if issued.expires_at > Instant::now() => {
+                if issued.anonymous {
+                    Bearer::Anonymous
+                } else {
+                    Bearer::Credentialed
+                }
+            }
             Some(_) => {
                 tokens.issued.remove(token);
-                false
+                Bearer::Unauthorized
             }
-            None => false,
+            None => Bearer::Unauthorized,
         }
     }
 }
@@ -2504,6 +2598,148 @@ mod tests {
             .await
             .expect("forged response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// stow#844: a package that was never published answers the way GHCR
+    /// answers — the anonymous token exchange gets `403` carrying the OCI
+    /// `DENIED` code, while a credentialed exchange still mints (a publish
+    /// creates the package) and its reads see the plain `404`.
+    #[tokio::test]
+    async fn a_missing_package_denies_the_anonymous_exchange() {
+        let root = tempfile::tempdir().expect("registry root");
+        let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
+        let scope = "repository:water-rs/stow-cache-9.99.9:pull";
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/token?service=mock-registry&scope={scope}"))
+                    .body(Body::empty())
+                    .expect("token request builds"),
+            )
+            .await
+            .expect("token response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("denied body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("denied json");
+        assert_eq!(body["errors"][0]["code"], "DENIED");
+
+        // A credentialed exchange mints — a publish creates the package.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/token?service=mock-registry&scope={scope}"))
+                    .header(header::AUTHORIZATION, "Basic dGVzdDp0ZXN0")
+                    .body(Body::empty())
+                    .expect("credentialed token request builds"),
+            )
+            .await
+            .expect("credentialed token response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("token body");
+        let token =
+            serde_json::from_slice::<serde_json::Value>(&body).expect("token json")["token"]
+                .as_str()
+                .expect("token field")
+                .to_owned();
+
+        // A credentialed read — a publish's HEAD before its first push —
+        // sees the plain absence, never DENIED: only anonymous reads of a
+        // missing package are refused.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/water-rs/stow-cache-9.99.9/tags/list")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("tags request builds"),
+            )
+            .await
+            .expect("tags response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// stow#844: every index reader on `stow-oci` treats a missing
+    /// package as the empty index — the manifest pull classifies as
+    /// absent and `list_tags` yields no tags — while a `403` with any
+    /// other body and a `401` stay refusals.
+    #[tokio::test]
+    async fn a_missing_package_reads_as_the_empty_index() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        let base =
+            stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let repository =
+            cache_repository(&WireRustcVersion::parse("9.99.9").expect("rustc version"));
+        let session = base.session(&repository, &http);
+
+        // The token exchange's 403 DENIED is the package's absence —
+        // both classifications agree.
+        let reference = session
+            .reference("index.x86_64-unknown-linux-gnu.9.99.9")
+            .expect("reference");
+        let error = session
+            .pull_manifest(&reference)
+            .await
+            .expect_err("a missing package is a refusal, not a manifest");
+        assert!(error.is_package_missing(), "{error}");
+        assert!(error.is_not_found(), "{error}");
+
+        // `index export`'s tag listing reads the same emptiness.
+        let tags = session
+            .list_tags()
+            .await
+            .expect("a missing package lists no tags");
+        assert!(tags.is_empty());
+
+        // A 403 that is not DENIED — and a 401 — are refusals, not
+        // absence. They must reach the manifest pull, so this session
+        // opens on a package that exists: the exchange mints and the
+        // scripted refusals answer the asset requests.
+        std::fs::create_dir_all(root.path().join("manifests").join(REPOSITORY))
+            .expect("package dir");
+        let session = base.session(&test_cache_repository(), &http);
+        let reference = session.reference("forged-tag").expect("reference");
+        probe.refuse(
+            Method::GET,
+            "/manifests/",
+            1,
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"errors": [{"code": "TOOMANYREQUESTS", "message": "slow down"}]}),
+        );
+        let error = session
+            .pull_manifest(&reference)
+            .await
+            .expect_err("a non-DENIED 403 must fail");
+        assert!(
+            !error.is_not_found() && !error.is_package_missing(),
+            "{error}"
+        );
+        // A 401 triggers one bearer re-mint before the refusal is final;
+        // script the retried request too.
+        probe.refuse(
+            Method::GET,
+            "/manifests/",
+            2,
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"errors": [{"code": "UNAUTHORIZED", "message": "bad token"}]}),
+        );
+        let error = session
+            .pull_manifest(&reference)
+            .await
+            .expect_err("a persistent 401 must fail");
+        assert!(
+            !error.is_not_found() && !error.is_package_missing(),
+            "{error}"
+        );
     }
 
     /// The GitHub trust stub (stow#793): `/user` and
@@ -3280,6 +3516,10 @@ mod tests {
     async fn a_published_signature_that_is_absent_is_not_retried() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let root = tempfile::tempdir().expect("registry root");
+        // The package exists — only the signature is absent; a missing
+        // package is GHCR's anonymous `403 DENIED` instead (stow#844).
+        std::fs::create_dir_all(root.path().join("manifests").join(REPOSITORY))
+            .expect("package dir");
         let (listen, probe) = serve_probe_registry(root.path()).await;
         let digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let signature_tag = sigstore_signature_tag(digest);

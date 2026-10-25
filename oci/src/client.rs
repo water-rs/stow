@@ -117,15 +117,20 @@ impl RegistryError {
     }
 
     /// Whether this refusal is the registry reporting the object absent.
-    /// Only a `404` may read as absent — a refusal at any other status is an
-    /// error whatever its body says — and a `404` carrying the OCI error
-    /// envelope only counts when a `code` says so; a bare `404` (no
-    /// envelope, e.g. a `HEAD` body) is absent outright.
+    /// A `404` carrying the OCI error envelope only counts when a `code`
+    /// says so; a bare `404` (no envelope, e.g. a `HEAD` body) is absent
+    /// outright. The object's whole package being absent
+    /// ([`Self::is_package_missing`]) is an absence too — a `403`/`DENIED`
+    /// or `404`/`NAME_UNKNOWN` is not an error for a reader that asks
+    /// "does the index hold this", it is the answer "no".
     #[must_use]
     pub fn is_not_found(&self) -> bool {
         let RegistryErrorKind::Refused { status, body } = &self.kind else {
             return false;
         };
+        if self.is_package_missing() {
+            return true;
+        }
         if *status != StatusCode::NOT_FOUND {
             return false;
         }
@@ -141,6 +146,21 @@ impl RegistryError {
                 .and_then(serde_json::Value::as_str)
                 .is_some_and(|code| NOT_FOUND_CODES.contains(&code))
         })
+    }
+
+    /// Whether this refusal is the registry reporting the object's whole
+    /// package absent — GHCR answers an anonymous pull of a package that
+    /// does not exist (or is not public — it refuses to say which) with a
+    /// `403` carrying the OCI `DENIED` code, on the token exchange or the
+    /// asset request alike; a spec registry answers `404`/`NAME_UNKNOWN`
+    /// for an unknown repository. A `403` with any other body stays a
+    /// refusal, and so do `401` and every other status.
+    #[must_use]
+    pub fn is_package_missing(&self) -> bool {
+        let RegistryErrorKind::Refused { status, body } = &self.kind else {
+            return false;
+        };
+        stow_types::registry::package_missing(status.as_u16(), body)
     }
 }
 
@@ -573,12 +593,20 @@ impl RegistrySession {
                 || format!("{url}?n={PAGE_SIZE}"),
                 |last| format!("{url}?n={PAGE_SIZE}&last={last}"),
             );
-            let response = self
+            let response = match self
                 .send(
                     "list tags",
                     SessionRequest::authenticated(Method::GET, url.clone()),
                 )
-                .await?;
+                .await
+            {
+                Ok(response) => response,
+                // A package that does not exist yet holds no tags — its
+                // first publish creates it, and every index reader treats
+                // the missing package as the empty index.
+                Err(error) if error.is_not_found() => return Ok(tags),
+                Err(error) => return Err(error),
+            };
             response.ensure_success("list tags", &url)?;
             let page: TagsList =
                 serde_json::from_slice(&response.body).map_err(|error| RegistryError {
@@ -885,19 +913,18 @@ impl RegistrySession {
         // GHCR answers the anonymous exchange for a package that does not
         // exist or is not public with `403 DENIED` — a bare envelope that
         // reads like an auth failure. Name the real cause so a refused
-        // pull against a rustc nothing has been built for is legible;
-        // still a hard refusal, never a retry or a fallback.
+        // pull against a rustc nothing has been built for is legible, and
+        // keep the answer verbatim in `body` so `is_package_missing` reads
+        // the same envelope a refused asset request carries.
         if !response.status.is_success() && matches!(self.credential, SessionCredential::Anonymous)
         {
             return Err(RegistryError {
-                what: format!("exchange bearer token {url}"),
+                what: format!(
+                    "exchange bearer token {url} — the package does not exist yet or is not public"
+                ),
                 kind: RegistryErrorKind::Refused {
                     status: response.status,
-                    body: format!(
-                        "registry refused anonymous pull of {}: the package does not exist yet or is not public (registry's answer: {})",
-                        self.repository,
-                        String::from_utf8_lossy(&response.body)
-                    ),
+                    body: String::from_utf8_lossy(&response.body).into_owned(),
                 },
             });
         }

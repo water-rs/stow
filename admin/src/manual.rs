@@ -711,4 +711,56 @@ mod tests {
             serde_json::json!({ "kind": "operations", "priority": 3000 })
         );
     }
+
+    /// stow#844: `published_slice_rows` treats a package that does not
+    /// exist as the empty index — GHCR's `403 DENIED` on the anonymous
+    /// token exchange reads `None`, the same answer a missing tag gives.
+    #[tokio::test]
+    async fn published_slice_rows_reads_a_missing_package_as_none() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = crate::test_server::Loopback::start_on(
+            listener,
+            base.clone(),
+            vec![
+                crate::test_server::Step::RespondWith {
+                    status: 401,
+                    retry_after: None,
+                    headers: vec![(
+                        "www-authenticate".to_owned(),
+                        format!("Bearer realm=\"{base}/token\",service=\"mock-registry\""),
+                    )],
+                    body: "",
+                },
+                crate::test_server::Step::Respond {
+                    status: 403,
+                    retry_after: None,
+                    body: r#"{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}"#,
+                },
+            ],
+        );
+        let base = stow_oci::RegistryBase::parse(&server.url).expect("registry base");
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let rustc_version = WireRustcVersion::parse("9.99.9").expect("rustc");
+        let repository = cache_repository(&rustc_version);
+        let session = base.session(&repository, &http);
+        let trust = stow_oci::verify::Trust::MockKey(std::path::PathBuf::from("/unused"));
+        let index = Index {
+            session: &session,
+            repository: &repository,
+            trust: &trust,
+        };
+
+        let rows = published_slice_rows(
+            &index,
+            &TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target"),
+            &rustc_version,
+        )
+        .await
+        .expect("a missing package is the empty index");
+        assert!(rows.is_none());
+        let _ = server.join().await;
+    }
 }

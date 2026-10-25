@@ -5795,8 +5795,9 @@ mod tests {
             slice
                 .expect("the slice the fetch landed is served")
                 .slice
-                .manifest_digest,
-            digest
+                .manifest_digest
+                .as_deref(),
+            Some(digest.as_str())
         );
         assert!(
             !fetch_pending,
@@ -5880,8 +5881,12 @@ mod tests {
         .expect("read the cached slice");
         let (slice, fetch_pending) = memo.read();
         assert_eq!(
-            slice.expect("the stale slice serves").slice.manifest_digest,
-            digest
+            slice
+                .expect("the stale slice serves")
+                .slice
+                .manifest_digest
+                .as_deref(),
+            Some(digest.as_str())
         );
         assert!(
             fetch_pending,
