@@ -389,6 +389,15 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
     // (package, version, features) per side and platform — an alias
     // collision inside a section is a real error, not an ambiguity to
     // disambiguate.
+    //
+    // The one exception is a pin of the task's own package: cargo
+    // requires every declaration from one package to one dependency
+    // package to use the same name across all dependency kinds
+    // (`Resolve::extern_crate_name_and_dep_name`), so it keys on the
+    // task entry's own name. Only an outcome-3 host task's self-twin
+    // edge (stow#723) puts its own package in its subgraph — on the
+    // other side, in the other section; the same side would collide
+    // with the task entry below and fail.
     for node in &task.dependency_subgraph.nodes {
         let selection = TaskFeatureSelection::from_features_json(&node.features_json);
         let pinned = Dependency {
@@ -402,7 +411,11 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         } else {
             &mut dependencies
         };
-        let alias = pin_alias(node.crate_name.as_str(), &node.version.to_string());
+        let alias = if node.crate_name == task.crate_name && node.version == task.version {
+            task.crate_name.as_str().to_owned()
+        } else {
+            pin_alias(node.crate_name.as_str(), &node.version.to_string())
+        };
         if section.insert(alias.clone(), pinned).is_some() {
             return Err(stow_types::stow_error!(
                 "dep pin alias {alias} collides with an earlier entry in the wrapper manifest"
@@ -701,6 +714,12 @@ impl PhaseUnitGraph {
         self.phase
     }
 
+    /// The target spelling cargo was given (`None` native).
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
     /// This graph's units in the shared task-unit model — the resolved
     /// feature set the scan labels each captured unit's row with
     /// (stow#611).
@@ -709,6 +728,18 @@ impl PhaseUnitGraph {
         host_triple: &str,
     ) -> stow_types::error::Result<Vec<stow_types::unit_graph::TaskUnit>> {
         self.graph.task_units(self.target.as_deref(), host_triple)
+    }
+
+    /// [`task_units`] annotated with the cargo unit each task unit was
+    /// projected from — twins re-split out of one both-reachable cargo
+    /// unit share the origin, which is cargo's native host/target
+    /// sharing verdict made visible (stow#723).
+    pub(crate) fn task_units_with_origins(
+        &self,
+        host_triple: &str,
+    ) -> stow_types::error::Result<Vec<(stow_types::unit_graph::TaskUnit, u32)>> {
+        self.graph
+            .task_units_with_origins(self.target.as_deref(), host_triple)
     }
 }
 
@@ -862,16 +893,62 @@ pub fn verify_dependency_context(
     let expected = task.verified_dependency_graph()?;
     let host_triple = runner_host_triple(task)?;
     for unit_graph in unit_graphs {
-        let units = unit_graph.task_units(host_triple).map_err(|error| {
-            stow_types::stow_error!(
-                "task {} {} ({}): {} {} unit graph does not convert: {error}",
-                task.crate_name.as_str(),
-                task.version,
-                task.target,
-                unit_graph.phase.as_str(),
-                unit_graph.invocation.spelling(),
-            )
-        })?;
+        let units = if unit_graph.target.is_none() && unit_graph.phase != CargoSubcommand::Check {
+            // stow#723: under the native spelling cargo itself decides
+            // whether a same-feature host/target twin pair merges — a
+            // pair re-split out of one cargo unit shared, a pair
+            // projected from two units stayed apart. That verdict must
+            // equal the `self_twin_edges` predicate the task ids were
+            // minted on; a divergence is a probe field this builder does
+            // not model (rustflags, links overrides, is_std) deciding
+            // differently, and any id minted past it mislabels the
+            // cache. Under an explicit `--target` spelling cargo never
+            // shares, and in the check phase a target-side lib is a
+            // check-mode unit while a host-side lib is build-mode — the
+            // probe and the interned unit both carry the mode
+            // (`traverse_and_share`), so no pair can merge there and the
+            // predicate, which answers for build-mode pairs, does not
+            // apply. The ids still agree: the predicate reads only the
+            // projected dependency structure, which both phases share.
+            let with_origins =
+                unit_graph
+                    .task_units_with_origins(host_triple)
+                    .map_err(|error| {
+                        stow_types::stow_error!(
+                            "task {} {} ({}): {} {} unit graph does not convert: {error}",
+                            task.crate_name.as_str(),
+                            task.version,
+                            task.target,
+                            unit_graph.phase.as_str(),
+                            unit_graph.invocation.spelling(),
+                        )
+                    })?;
+            assert_native_sharing_verdicts(&with_origins).map_err(|error| {
+                stow_types::stow_error!(
+                    "task {} {} ({}): {} {} unit graph: {error}",
+                    task.crate_name.as_str(),
+                    task.version,
+                    task.target,
+                    unit_graph.phase.as_str(),
+                    unit_graph.invocation.spelling(),
+                )
+            })?;
+            with_origins
+                .into_iter()
+                .map(|(unit, _)| unit)
+                .collect::<Vec<_>>()
+        } else {
+            unit_graph.task_units(host_triple).map_err(|error| {
+                stow_types::stow_error!(
+                    "task {} {} ({}): {} {} unit graph does not convert: {error}",
+                    task.crate_name.as_str(),
+                    task.version,
+                    task.target,
+                    unit_graph.phase.as_str(),
+                    unit_graph.invocation.spelling(),
+                )
+            })?
+        };
         let actual = stow_types::unit_graph::resolved_task_graph(&units, &task.rustc_version)
             .map_err(|error| {
                 stow_types::stow_error!(
@@ -922,6 +999,72 @@ pub fn verify_dependency_context(
             unit_graph.phase.as_str(),
             unit_graph.invocation.spelling(),
         ));
+    }
+    Ok(())
+}
+
+/// stow#723: cargo's own sharing verdict on every same-feature
+/// host/target twin pair in a native-spelled unit graph — a pair
+/// re-split out of one cargo unit shared, a pair emitted from two did
+/// not — must equal the `self_twin_edges` predicate the resolver's ids
+/// were minted on. A divergence fails the build naming the crate.
+fn assert_native_sharing_verdicts(
+    units: &[(stow_types::unit_graph::TaskUnit, u32)],
+) -> stow_types::error::Result<()> {
+    use stow_types::unit_graph::{TaskUnitKey, TaskUnitKind, TaskUnitSide};
+    let task_units: Vec<stow_types::unit_graph::TaskUnit> =
+        units.iter().map(|(unit, _)| unit.clone()).collect();
+    let by_key: std::collections::BTreeMap<&TaskUnitKey, (&stow_types::unit_graph::TaskUnit, u32)> =
+        units
+            .iter()
+            .map(|(unit, origin)| (&unit.key, (unit, *origin)))
+            .collect();
+    let kept_apart: std::collections::BTreeSet<TaskUnitKey> =
+        stow_types::unit_graph::self_twin_edges(&task_units)
+            .map_err(|error| stow_types::stow_error!("evaluate the sharing predicate: {error}"))?
+            .into_iter()
+            .map(|(host, _)| host.key.clone())
+            .collect();
+    for (unit, origin) in units {
+        if unit.key.kind != TaskUnitKind::Lib
+            || unit.key.side != TaskUnitSide::Host
+            || !unit.is_crates_io
+        {
+            continue;
+        }
+        let target_key = TaskUnitKey {
+            side: TaskUnitSide::Target,
+            ..unit.key.clone()
+        };
+        let Some((twin, twin_origin)) = by_key.get(&target_key) else {
+            continue;
+        };
+        if twin
+            .features
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            != unit
+                .features
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        {
+            continue;
+        }
+        let cargo_shared = origin == twin_origin;
+        let predicate_shared = !kept_apart.contains(&unit.key);
+        if cargo_shared != predicate_shared {
+            return Err(stow_types::stow_error!(
+                "cargo {} the `{}` {} host/target twin pair but the sharing predicate {} — a probe input the builder does not model disagreed",
+                if cargo_shared { "shared" } else { "kept apart" },
+                unit.name,
+                unit.version,
+                if predicate_shared {
+                    "shared"
+                } else {
+                    "kept them apart"
+                },
+            ));
+        }
     }
     Ok(())
 }
@@ -2981,6 +3124,43 @@ mod tests {
             deps["itoa"]["version"].as_str(),
             Some("=1.0.15"),
             "the task crate's own declaration is untouched"
+        );
+    }
+
+    /// stow#723: an outcome-3 host task pins its own target twin. Cargo
+    /// rejects one package declared under two names across dependency
+    /// kinds, so the twin's `[dependencies]` pin keys on the task entry's
+    /// own `[build-dependencies]` name.
+    #[test]
+    fn wrapper_manifest_pins_the_self_twin_under_the_task_crate_name() {
+        let mut task = task_with_features(&["std"]);
+        task.host_side = true;
+        task.dependency_subgraph = leaf_pins(vec![SubgraphNode {
+            crate_name: task.crate_name.clone(),
+            version: task.version.clone(),
+            features_json: task.features_json.clone(),
+            host_side: false,
+            keys_apart: false,
+            deps: Vec::new(),
+        }]);
+        let manifest: toml::Table =
+            toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
+                .expect("generated manifest parses");
+        assert_eq!(
+            manifest["build-dependencies"]["itoa"]["version"].as_str(),
+            Some("=1.0.15"),
+            "the task crate is the wrapper's build-dependency"
+        );
+        let twin = manifest["dependencies"]["itoa"]
+            .as_table()
+            .expect("the target twin pins under the task crate's own name");
+        assert_eq!(twin["version"].as_str(), Some("=1.0.15"));
+        assert_eq!(twin["package"].as_str(), Some("itoa"));
+        assert!(
+            manifest["dependencies"]
+                .as_table()
+                .is_some_and(|deps| deps.len() == 1),
+            "no aliased second name for the task's own package"
         );
     }
 

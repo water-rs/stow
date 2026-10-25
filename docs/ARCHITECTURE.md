@@ -274,6 +274,20 @@ graph under the build-override profile and the two spellings hand it
 different flags; the gate serves a dependent's host edge only when the
 side it needs has published.
 
+A same-package unit can also exist on both sides at one feature set —
+the host/target twin pair cargo's native build either merges into one
+unit (sharing) or keeps as two. When cargo keeps them apart the host
+unit compiles `debuginfo=2` over its own host dependencies under an
+explicit `--target` spelling while the task's plain identity still
+names the shared shape, so a third node names the host unit: the
+host node carries a self-twin edge onto its target twin (`task_graph`
+in `types/src/unit_graph.rs` adds `X_h → X_t` exactly when cargo's
+`traverse_and_share` interning rule — the recursive comparison of the
+two sides' lib dependency sets — keeps the pair apart), which re-mints
+the host node's task id and pins the target twin in its wrapper. The
+builder asserts cargo's native unit-graph verdict equals the predicate
+for every such pair.
+
 A minted task always builds at the latest semver-compatible version —
 within a range the latest is unique and a strict improvement, so a
 project's own version pins are dropped — unless the task's source asked

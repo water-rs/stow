@@ -77,6 +77,25 @@ impl ExpandedDependencyGraph {
         target: Option<&str>,
         host_triple: &str,
     ) -> stow_types::error::Result<Vec<stow_types::unit_graph::TaskUnit>> {
+        Ok(self
+            .task_units_with_origins(target, host_triple)?
+            .into_iter()
+            .map(|(unit, _)| unit)
+            .collect())
+    }
+
+    /// [`task_units`] annotated with the index of the cargo unit that
+    /// emitted each task unit — a both-reachable lib's re-split host
+    /// and target twins carry the same index, which is cargo's
+    /// host/target sharing verdict made visible (stow#723).
+    ///
+    /// # Errors
+    /// As [`ExpandedDependencyGraph::task_units`].
+    pub fn task_units_with_origins(
+        &self,
+        target: Option<&str>,
+        host_triple: &str,
+    ) -> stow_types::error::Result<Vec<(stow_types::unit_graph::TaskUnit, u32)>> {
         if self.raw_unit_graph.is_empty() {
             return Err(stow_types::stow_error!(
                 "expanded dependency graph carries no raw unit graph (a pre-588 cached row) — cannot derive task units"
@@ -744,11 +763,14 @@ fn unit_sides(graph: &UnitGraph<'_>, target: Option<&str>) -> stow_types::error:
 /// host triple, run units take their owning lib's side and platform,
 /// and a lib reachable only from host-kinded units is host-side while a
 /// both-reachable lib is target-side (the shadow-twin dedup shape).
+/// The emitted units paired with the index of the cargo unit each was
+/// projected from — twins re-split out of one both-reachable unit
+/// share the index.
 fn unit_graph_task_units(
     graph: &UnitGraph<'_>,
     target: Option<&str>,
     host_triple: &str,
-) -> stow_types::error::Result<Vec<stow_types::unit_graph::TaskUnit>> {
+) -> stow_types::error::Result<Vec<(stow_types::unit_graph::TaskUnit, u32)>> {
     use stow_types::unit_graph::{TaskUnit, TaskUnitDep, TaskUnitKey, TaskUnitKind, TaskUnitSide};
     let sides = unit_sides(graph, target)?;
     // Under the native spelling (`--target` not given) cargo dedups a
@@ -872,7 +894,10 @@ fn unit_graph_task_units(
                     proc_macro: dep_unit.target.kind.contains(&"proc-macro"),
                 });
             }
-            units.push(TaskUnit { deps, ..base });
+            units.push((
+                TaskUnit { deps, ..base },
+                u32::try_from(index).map_err(|error| stow_types::stow_error!("{error}"))?,
+            ));
         }
     }
     Ok(units)
@@ -1131,7 +1156,10 @@ fn emit_expanded_graph(
     // (stow#588). The node's explicit-spelling flag is derived on the
     // same pass — the shared projection computes it bottom-up from the
     // dep edges' proc-macro flags (stow#736).
-    let task_units = unit_graph_task_units(graph, target, host_triple)?;
+    let task_units: Vec<_> = unit_graph_task_units(graph, target, host_triple)?
+        .into_iter()
+        .map(|(unit, _)| unit)
+        .collect();
     let resolved = stow_types::unit_graph::resolved_task_graph(&task_units, rustc_version)?;
     for entry in entries.values_mut() {
         let (subgraph, spelling) = node_subgraph(&resolved, entry)?;

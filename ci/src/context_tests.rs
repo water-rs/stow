@@ -8,6 +8,7 @@
 //! The toolchain pin is the test binary's own rustc release:
 /// `RUSTUP_TOOLCHAIN=<release>` resolves it through the real rustup
 /// home the sandbox already grants.
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -740,18 +741,138 @@ async fn wrapper_workspace(reg: &Path, task: &BuildTaskPayload) -> (TempDir, Bui
     (root, workspace)
 }
 
-/// The real build-stage check: fetch the wrapper's deps out of the
-/// local registry, then every `check`-phase unit graph must mint
-/// `task.task_id` — `verify_dependency_context` verbatim.
+/// The real build-stage checks: fetch the wrapper's deps out of the
+/// local registry, then every phase×spelling unit graph the builder's
+/// default `build` subcommand plans (`check` and `build`) must mint
+/// `task.task_id` — `verify_dependency_context` verbatim — and must
+/// name the task's own unit, which the scan's foreign-unit check keys
+/// on (`dep_scan::phase_own_units` verbatim). The own units come back
+/// keyed by each graph's phase×spelling label.
 async fn verify(
     cargo_home: &Path,
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<BTreeMap<String, crate::dep_scan::PhaseOwnUnit>> {
     task::fetch_workspace_dependencies(cargo_home, task, workspace).await?;
     let graphs =
-        task::phase_unit_graphs(cargo_home, task, workspace, CargoSubcommand::Check).await?;
-    task::verify_dependency_context(task, &graphs)
+        task::phase_unit_graphs(cargo_home, task, workspace, CargoSubcommand::Build).await?;
+    task::verify_dependency_context(task, &graphs)?;
+    // The run dir only names each phase's target dir; nothing is read
+    // from it.
+    let run_dir = Path::new("/stow-run");
+    let mut own_units = crate::dep_scan::phase_own_units(task, &graphs, run_dir)?;
+    Ok(graphs
+        .iter()
+        .map(|graph| {
+            let own = own_units
+                .remove(&graph.target_dir(run_dir))
+                .expect("phase_own_units answers for every graph");
+            (graph.label(), own)
+        })
+        .collect())
+}
+
+/// The own unit's lib deps as `name [features] Side`, resolved through
+/// the phase graph's units.
+fn own_dep_summary(own: &crate::dep_scan::PhaseOwnUnit) -> BTreeSet<String> {
+    own.own_deps
+        .iter()
+        .map(|key| {
+            let unit = own
+                .units
+                .iter()
+                .find(|unit| &unit.key == key)
+                .expect("an own dep is a unit of its graph");
+            format!("{} [{}] {:?}", unit.name, unit.features.join(","), key.side)
+        })
+        .collect()
+}
+
+/// The scan's own-unit lookup (`dep_scan::phase_own_units`) on real
+/// wrapper graphs, for every plain task shape under every phase and
+/// spelling its builder runs: a target leaf, a target lib with a lib
+/// dep, a target lib with a build script, and the same three on the
+/// host side (`[build-dependencies]` of the consumer), plus the host
+/// build-tool leaf. A host task's own crate is a build-dependency of
+/// the wrapper, so its own-crate edge leaves the wrapper's build-script
+/// compile unit; a target task's leaves the wrapper lib (stow#723).
+#[test]
+fn the_own_unit_is_named_for_every_task_shape() {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    let plain = |name: &'static str| Fixture {
+        name,
+        version: "1.0.0",
+        deps: vec![],
+        build_deps: vec![],
+        features: &[],
+        proc_macro: false,
+    };
+    for name in ["tool", "tleaf", "hleaf"] {
+        publish(&reg, &plain(name));
+    }
+    for (name, dep) in [("tmid", "tleaf"), ("hmid", "hleaf")] {
+        publish(
+            &reg,
+            &Fixture {
+                deps: vec![(dep, "1", &[])],
+                ..plain(name)
+            },
+        );
+    }
+    for name in ["tbs", "hbs"] {
+        publish(
+            &reg,
+            &Fixture {
+                build_deps: vec![("tool", "1", &[])],
+                ..plain(name)
+            },
+        );
+    }
+    let manifest = consumer_project(
+        &scratch.path().join("consumer"),
+        &json!({ "tleaf": "1", "tmid": "1", "tbs": "1" }),
+        &json!({ "hleaf": "1", "hmid": "1", "hbs": "1" }),
+    );
+    let requests = resolve_requests(cargo_home.path(), &manifest);
+    // (crate, host side, the own unit's lib deps)
+    let shapes: [(&str, bool, &[&str]); 7] = [
+        ("tleaf", false, &[]),
+        ("tmid", false, &["tleaf [] Target"]),
+        ("tbs", false, &[]),
+        ("hleaf", true, &[]),
+        ("hmid", true, &["hleaf [] Host"]),
+        ("hbs", true, &[]),
+        ("tool", true, &[]),
+    ];
+    smol::block_on(async {
+        for (name, host_side, own_deps) in shapes {
+            let request = requests
+                .iter()
+                .find(|request| request.crate_name.as_str() == name)
+                .unwrap_or_else(|| panic!("a {name} request"));
+            assert_eq!(request.host_side, host_side, "{name}'s side");
+            let task = payload_for(request);
+            let (_root, workspace) = wrapper_workspace(&reg, &task).await;
+            let own_units = verify(cargo_home.path(), &task, &workspace)
+                .await
+                .unwrap_or_else(|error| panic!("{name} verifies: {error}"));
+            // A host task runs both spellings; a plain target task one.
+            assert_eq!(
+                own_units.len(),
+                if host_side { 4 } else { 2 },
+                "{name}: check and build × its spellings: {:?}",
+                own_units.keys().collect::<Vec<_>>()
+            );
+            let expected = own_deps
+                .iter()
+                .map(|dep| (*dep).to_owned())
+                .collect::<BTreeSet<_>>();
+            for (phase, own) in &own_units {
+                assert_eq!(own_dep_summary(own), expected, "{name} {phase}");
+            }
+        }
+    });
 }
 
 /// Fixture: the `alloc-stdlib` shape — `a-stdlib` needs `a-nostd`, and
@@ -1630,5 +1751,330 @@ fn a_build_edge_out_of_a_scriptless_package_mints_no_units() {
                 "cargo plans no rustc_version unit: {set:?}"
             );
         }
+    });
+}
+
+/// The `md` lib unit a native `build` unit graph links into the root
+/// package's build script — the host-side unit, whether cargo shared it
+/// with the target side or kept it apart — as its `debuginfo` and its
+/// lib dependency units, each `pkg [features] debuginfo`, after the
+/// graph's count of `md` lib units (1 shared or host-only, 2 apart). The root is
+/// the only path package; `md`'s own build script is a registry unit.
+fn host_reached_md(raw: &[u8]) -> (usize, Option<u64>, Vec<String>) {
+    let graph: Value = serde_json::from_slice(raw).expect("unit graph json");
+    let units = graph["units"].as_array().expect("units");
+    let is_kind = |unit: &Value, kind: &str| {
+        unit["target"]["kind"]
+            .as_array()
+            .is_some_and(|kinds| kinds.iter().any(|entry| entry == kind))
+    };
+    let pkg = |unit: &Value| {
+        let id = unit["pkg_id"].as_str().expect("pkg_id");
+        id.rsplit_once('#').map_or(id, |(_, name)| name).to_owned()
+    };
+    let mut scripts = units.iter().filter(|unit| {
+        unit["mode"] == "build"
+            && is_kind(unit, "custom-build")
+            && unit["pkg_id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("path+"))
+    });
+    let script = scripts
+        .next()
+        .expect("the root's build-script compile unit");
+    assert!(
+        scripts.next().is_none(),
+        "one root build-script compile unit"
+    );
+    let md = script["dependencies"]
+        .as_array()
+        .expect("dependencies")
+        .iter()
+        .map(|dep| &units[usize::try_from(dep["index"].as_u64().expect("index")).unwrap()])
+        .find(|unit| pkg(unit).starts_with("md@"))
+        .expect("the root's build script links md");
+    let mut deps: Vec<String> = md["dependencies"]
+        .as_array()
+        .expect("dependencies")
+        .iter()
+        .map(|dep| &units[usize::try_from(dep["index"].as_u64().expect("index")).unwrap()])
+        .filter(|unit| is_kind(unit, "lib"))
+        .map(|unit| {
+            format!(
+                "{} {} {}",
+                pkg(unit),
+                unit["features"],
+                unit["profile"]["debuginfo"]
+            )
+        })
+        .collect();
+    deps.sort();
+    let md_units = units
+        .iter()
+        .filter(|unit| {
+            unit["mode"] == "build" && is_kind(unit, "lib") && pkg(unit).starts_with("md@")
+        })
+        .count();
+    (md_units, md["profile"]["debuginfo"].as_u64(), deps)
+}
+
+/// stow#723 end to end: one fixture trio exercises cargo's three
+/// native sharing verdicts for a same-feature host/target pair, and
+/// each outcome's task id and wrapper compile what the consumer's own
+/// `cargo build` does.
+///
+/// `flags` is the dep whose feature set the context decides; `md`
+/// build-depends on `flags` (its host dep) and also sees it as a normal
+/// dep in the o2/o3 contexts; `leaf` is a shared leaf. In context o1
+/// `md` is only a build-dep — its host unit is weakened (no full
+/// debuginfo, no twin). In o2 `md` is both a build and a normal dep
+/// with identical dep sets — cargo shares it (one unit, full
+/// debuginfo). In o3 the consumer additionally depends on `flags[std]`,
+/// so `md`'s host unit links `flags[]` while its target unit links
+/// `flags[std]` — cargo keeps them apart, and the host `md` unit
+/// retains `debuginfo=2` as a distinct unit. The o3 host task's id
+/// must differ from o1's (the self-twin edge re-mints it), its wrapper
+/// must pin the target twin, and in o1 and o3 the host task's compiled
+/// md unit — debuginfo and linked dependency units — must be the one
+/// the consumer's graph computes. In o2 the consumer's build reads the
+/// shared target unit, and the host task keeps o1's id.
+#[test]
+#[allow(clippy::too_many_lines)] // one scenario per outcome; splitting hides the comparison
+fn outcome3_host_task_mints_a_distinct_id_and_verifies() {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    publish(
+        &reg,
+        &Fixture {
+            name: "flags",
+            version: "1.0.0",
+            deps: vec![],
+            build_deps: vec![],
+            features: &[("std", &[])],
+            proc_macro: false,
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "leaf",
+            version: "1.0.0",
+            deps: vec![],
+            build_deps: vec![],
+            features: &[],
+            proc_macro: false,
+        },
+    );
+    publish(
+        &reg,
+        &Fixture {
+            name: "md",
+            version: "1.0.0",
+            deps: vec![("flags", "1", &[]), ("leaf", "1", &[])],
+            build_deps: vec![("flags", "1", &[])],
+            features: &[],
+            proc_macro: false,
+        },
+    );
+    let host = host_triple();
+    let rustc = pinned_rustc_version();
+    // Context 1: `md` only ever reaches the host side — no target twin.
+    // Its deps' target twins (`flags []`, `leaf []`) are in the resolve,
+    // as in o2: the host node's stow#506 shadow edges then match o2's,
+    // so the two contexts differ only in `md`'s own twin, the variable
+    // under test. Context 2: `md` is a build-dep and a normal dep, flags
+    // at `[]` on both — the pair shares. Context 3: the consumer also
+    // depends on `flags[std]`, so `md`'s two sides resolve different dep
+    // sets.
+    let manifests = [
+        consumer_project(
+            &scratch.path().join("o1"),
+            &json!({ "flags": "1", "leaf": "1" }),
+            &json!({ "md": "1" }),
+        ),
+        consumer_project(
+            &scratch.path().join("o2"),
+            &json!({ "md": "1" }),
+            &json!({ "md": "1" }),
+        ),
+        consumer_project(
+            &scratch.path().join("o3"),
+            &json!({ "md": "1", "flags": { "version": "1", "features": ["std"] } }),
+            &json!({ "md": "1" }),
+        ),
+    ];
+
+    smol::block_on(async {
+        let mut host_task_ids = Vec::new();
+        for (label, manifest) in ["o1", "o2", "o3"].iter().zip(&manifests) {
+            let requests = resolve_requests(cargo_home.path(), manifest);
+            let md_host = requests
+                .iter()
+                .find(|request| request.crate_name.as_str() == "md" && request.host_side)
+                .unwrap_or_else(|| panic!("{label} mints a host-side md request"));
+            host_task_ids.push(
+                md_host
+                    .task_id()
+                    .unwrap_or_else(|_| panic!("{label} host md task id")),
+            );
+            let status = async_process::Command::new("cargo")
+                .args(["fetch", "--manifest-path"])
+                .arg(manifest)
+                .env("CARGO_HOME", cargo_home.path())
+                .env("RUSTUP_TOOLCHAIN", active_toolchain())
+                .status()
+                .await
+                .expect("cargo fetch");
+            assert!(status.success(), "{label} cargo fetch failed");
+            let native = stow_cli::resolve_exact_dependency_graph(
+                manifest,
+                "build",
+                &[],
+                None,
+                manifest.parent().unwrap(),
+                host.as_str(),
+                rustc,
+                Some(cargo_home.path()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label} native build unit graph: {error}"));
+            let consumer = host_reached_md(&native.raw_unit_graph);
+            let (md_units, debuginfo, _) = &consumer;
+            match *label {
+                // o1: no twin — the host md unit is weakened by cargo.
+                "o1" => assert_eq!(
+                    (*md_units, *debuginfo),
+                    (1, Some(0)),
+                    "o1: one host md unit, weakened"
+                ),
+                // o2: shared — one unit at full debuginfo.
+                "o2" => assert_eq!(
+                    (*md_units, *debuginfo),
+                    (1, Some(2)),
+                    "o2: one shared md unit at debuginfo=2"
+                ),
+                // o3: kept apart — the host md unit retains debuginfo=2
+                // as a distinct unit.
+                "o3" => assert_eq!(
+                    (*md_units, *debuginfo),
+                    (2, Some(2)),
+                    "o3: a distinct host md unit at debuginfo=2"
+                ),
+                _ => unreachable!(),
+            }
+
+            // The owning host task's wrapper compiles the same shape
+            // cargo does, and every phase×spelling resolves the
+            // dispatched context.
+            let task = payload_for(md_host);
+            let (_root, workspace) = wrapper_workspace(&reg, &task).await;
+            task::fetch_workspace_dependencies(cargo_home.path(), &task, &workspace)
+                .await
+                .unwrap_or_else(|error| panic!("{label} fetch deps: {error}"));
+            let wrapper_native = stow_cli::resolve_exact_dependency_graph(
+                workspace.manifest_path(),
+                "build",
+                &[],
+                None,
+                workspace.manifest_path().parent().unwrap(),
+                host.as_str(),
+                rustc,
+                Some(cargo_home.path()),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label} wrapper native build unit graph: {error}"));
+            let wrapper = host_reached_md(&wrapper_native.raw_unit_graph);
+            if *label == "o2" {
+                // Outcome 2: the consumer's build-phase md is the shared
+                // unit the target task publishes; the host task compiles
+                // the weakened unit its check phase and no-twin consumers
+                // need, under the same id as o1.
+                assert_eq!(
+                    (wrapper.0, wrapper.1),
+                    (1, Some(0)),
+                    "o2: the host task compiles the weakened host md unit"
+                );
+            } else {
+                // Outcomes 1 and 3: the host task's own md unit is the
+                // consumer's — same sharing verdict, debuginfo and linked
+                // dependency units.
+                assert_eq!(
+                    wrapper, consumer,
+                    "{label}: the host task compiles the consumer's host md unit"
+                );
+            }
+            let graphs = task::phase_unit_graphs(
+                cargo_home.path(),
+                &task,
+                &workspace,
+                CargoSubcommand::Build,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{label} phase unit graphs: {error}"));
+            let native_graph = graphs
+                .iter()
+                .find(|graph| graph.phase() == CargoSubcommand::Build && graph.target().is_none())
+                .unwrap_or_else(|| panic!("{label} emits a native build graph"));
+            let units = native_graph
+                .task_units(host.as_str())
+                .unwrap_or_else(|error| panic!("{label} units: {error}"));
+            let md_host_units = units
+                .iter()
+                .filter(|unit| {
+                    unit.name == "md"
+                        && unit.is_crates_io
+                        && unit.key.side == stow_types::unit_graph::TaskUnitSide::Host
+                        && unit.key.kind == stow_types::unit_graph::TaskUnitKind::Lib
+                })
+                .count();
+            assert_eq!(
+                md_host_units, 1,
+                "{label}: one host md task unit in the wrapper graph"
+            );
+            let edges = stow_types::unit_graph::self_twin_edges(&units).expect("sharing predicate");
+            if *label == "o3" {
+                assert_eq!(
+                    edges.len(),
+                    1,
+                    "o3: the wrapper graph's md pair is kept apart by the predicate"
+                );
+            } else {
+                assert!(
+                    edges.is_empty(),
+                    "{label}: the md pair shares — no self-twin edge"
+                );
+            }
+            // The builder's own gate over every build-subcommand phase ×
+            // spelling, including the native build phase's
+            // cargo-verdict-equals-predicate assertion.
+            task::verify_dependency_context(&task, &graphs)
+                .unwrap_or_else(|error| panic!("{label} build phases verify: {error}"));
+            let own_units = verify(cargo_home.path(), &task, &workspace)
+                .await
+                .unwrap_or_else(|error| panic!("{label} task verifies: {error}"));
+            // The own unit is the host md in every phase×spelling — in o3
+            // never the pinned target twin, whose lib deps are
+            // target-side and carry `flags [std]`.
+            assert_eq!(
+                own_units.len(),
+                4,
+                "{label}: check and build × two spellings"
+            );
+            for (phase, own) in &own_units {
+                assert_eq!(
+                    own_dep_summary(own),
+                    BTreeSet::from(["flags [] Host".to_owned(), "leaf [] Host".to_owned()]),
+                    "{label} {phase}: the own unit is the host md"
+                );
+            }
+        }
+        assert_eq!(
+            host_task_ids[0], host_task_ids[1],
+            "o1 and o2 mint the same host task id — outcome 2 keeps the plain identity"
+        );
+        assert_ne!(
+            host_task_ids[0], host_task_ids[2],
+            "the outcome-3 self-twin edge re-mints the host task id"
+        );
     });
 }
