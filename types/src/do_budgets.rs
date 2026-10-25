@@ -551,12 +551,13 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
     },
     DriveBudget {
         // stow#931 added the meter row's read and the wake
-        // checkpoint's `UPDATE .. RETURNING` — +2 statements, +2
-        // billed reads, +1 billed write over the pre-#931 row by
-        // construction, and the host gate's measured delta matches
-        // (it counts sqlx's returned rows, not the cursor's examined
-        // rows). The workerd-scale absolute stands for a mock-stack
-        // `stow-admin scheduler budget` run to confirm.
+        // checkpoint's `UPDATE .. RETURNING` — +2 statements, +3
+        // billed reads (the UPDATE reads the row it changes plus the
+        // RETURNING row on workerd, release gate run 40186665163; the
+        // host backend bills it identically), +1 billed write over
+        // the pre-#931 row by construction. The workerd-scale absolute
+        // stands for a mock-stack `stow-admin scheduler budget` run to
+        // confirm.
         name: "wake (snapshot + log replay)",
         statements: 62,
         rows_read: 478,
@@ -565,10 +566,11 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
     },
     DriveBudget {
         // stow#931 added the snapshot checkpoint's `UPDATE ..
-        // RETURNING` after the covered-log drop — +1 statement, +1
-        // billed read, +1 billed write by construction; the host
-        // delta matches. The workerd-scale absolute awaits the same
-        // mock-stack probe run.
+        // RETURNING` after the covered-log drop — +1 statement, +2
+        // billed reads (the changed row plus the RETURNING row,
+        // release gate run 40186665163), +1 billed write by
+        // construction; the host delta matches. The workerd-scale
+        // absolute awaits the same mock-stack probe run.
         name: "snapshot write",
         statements: 67,
         rows_read: 481,

@@ -285,10 +285,12 @@ impl WindowMeasure<'_> {
 /// own error.
 fn budget_row(drive: &str, measure: WindowMeasure) -> Result<SchedulerBudgetRow, String> {
     for metric in &measure.statements {
-        if !drives::append_bills_replay_cost(&metric.sql, metric.rows_read, metric.rows_written) {
+        if let Some((statement, read, written)) =
+            drives::predicted_bill_mismatch(&metric.sql, metric.rows_read, metric.rows_written)
+        {
             return Err(format!(
-                "drive {drive}: event_log append billed {} R + {} W — \
-                 the replay re-count is 1 R + 1 W",
+                "drive {drive}: {statement} billed {} R + {} W — \
+                 predicted {read} R + {written} W",
                 metric.rows_read, metric.rows_written
             ));
         }

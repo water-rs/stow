@@ -267,13 +267,24 @@ struct MeterRow {
     seq: i64,
 }
 
+/// The billed cost of the meter checkpoint's `UPDATE meter ..
+/// RETURNING` — the edge's only UPDATE — as `(rows_read,
+/// rows_written)`. workerd bills an UPDATE one read per row it
+/// changes plus one per row its RETURNING clause returns, so the
+/// one-row primary-key update costs 2 reads + 1 written: release
+/// gate run 40186665163's statement log measured `rows_returned 1`,
+/// `rows_read 2`, `rows_written 1` on it (stow#931). Named once and
+/// shared: [`checkpoint_meter`] folds it into the stored totals and
+/// [`super::drives::predicted_bill_mismatch`] gates the statement on
+/// it.
+pub const METER_CHECKPOINT_BILL: (u64, u64) = (2, 1);
+
 /// Write the meter checkpoint — the row's day totals are the restored
 /// in-memory meter plus the isolate's unsettled counts (`cell`'s
 /// `unsettled`: every billed statement no settle has folded in yet —
 /// the wake's reads, the snapshot turn's appends and every snapshot
 /// statement, and any other in-flight operation's counts — stow#931),
-/// plus the UPDATE's own cost, which a primary-key
-/// `UPDATE .. RETURNING` bills at 1 written + 1 read. `seq` is the
+/// plus the UPDATE's own cost, [`METER_CHECKPOINT_BILL`]. `seq` is the
 /// last `event_log` seq the totals cover — `covered` at a snapshot,
 /// the meter's own `seq` at a wake.
 ///
@@ -285,11 +296,11 @@ struct MeterRow {
 /// is an append; the budget probe's seed record rides the snapshot
 /// head for the same reason (stow#931).
 ///
-/// The statement's real counters are compared with the 1 R + 1 W
-/// folded in: a mismatch is a metering defect — logged, its actual
-/// counts already booked by the metering backend, never a dispatch
-/// failure. An UPDATE landing on no row means the store was never
-/// reset: `QueueError::Invariant`.
+/// The statement's real counters are compared with
+/// [`METER_CHECKPOINT_BILL`]: a mismatch is a metering defect —
+/// logged, its actual counts already booked by the metering backend,
+/// never a dispatch failure. An UPDATE landing on no row means the
+/// store was never reset: `QueueError::Invariant`.
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed statement, `QueueError::Invariant`
@@ -306,8 +317,8 @@ pub async fn checkpoint_meter(
     value.roll_to(&utc_day(now_ms));
     value.seq = seq;
     let (unsettled_read, unsettled_written) = cell.unsettled().counts();
-    value.rows_read += unsettled_read + 1;
-    value.rows_written += unsettled_written + 1;
+    value.rows_read += unsettled_read + METER_CHECKPOINT_BILL.0;
+    value.rows_written += unsettled_written + METER_CHECKPOINT_BILL.1;
     let mut source: &DurableDb = db;
     let result = QuerySource::query(
         &mut source,
@@ -334,12 +345,14 @@ pub async fn checkpoint_meter(
             "scheduler meter row missing — the store was never reset".into(),
         ));
     }
-    if result.rows_read != 1 || result.rows_written != 1 {
+    if (result.rows_read, result.rows_written) != METER_CHECKPOINT_BILL {
         tracing::error!(
             rows_read = result.rows_read,
             rows_written = result.rows_written,
-            "meter checkpoint billed other than the predicted 1 R + 1 W — the actual \
-             counts are already booked"
+            "meter checkpoint billed other than the predicted {} R + {} W — the actual \
+             counts are already booked",
+            METER_CHECKPOINT_BILL.0,
+            METER_CHECKPOINT_BILL.1
         );
     }
     Ok(())
@@ -1571,6 +1584,33 @@ mod tests {
         assert_eq!(
             u64::try_from(row.rows_written).expect("written"),
             prior.1 + written,
+        );
+    }
+
+    /// The checkpoint's `UPDATE meter .. RETURNING` bills exactly
+    /// [`METER_CHECKPOINT_BILL`] through the counting backend — the
+    /// workerd bill (release gate run 40186665163: `rows_returned 1`,
+    /// `rows_read 2`, `rows_written 1`) the host backend mirrors.
+    #[tokio::test]
+    async fn the_checkpoint_update_bills_its_predicted_cost() {
+        let (db, log) = test_db::counting_memory_db().await.expect("db");
+        let base = log.lock().expect("log").len();
+        checkpoint_meter(&db, &Meter::default(), &GraphCell::default(), 0, NOW_MS)
+            .await
+            .expect("checkpoint");
+        let statement = {
+            let log = log.lock().expect("log");
+            assert_eq!(log.len() - base, 1, "the checkpoint is one statement");
+            log[base].clone()
+        };
+        assert!(
+            statement.sql.starts_with("UPDATE meter"),
+            "the checkpoint statement: {}",
+            statement.sql
+        );
+        assert_eq!(
+            (statement.rows_read, statement.rows_written),
+            METER_CHECKPOINT_BILL
         );
     }
 }

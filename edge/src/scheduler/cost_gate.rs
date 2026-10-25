@@ -1,8 +1,9 @@
 //! The stow#433 host-side cost gate — a fast pre-check that runs in
 //! `cargo test -p stow-edge`. The scheduler's store is a flat log and
-//! snapshot (stow#878), so the host backend's statement results are the
-//! same rows the Durable Object bills: `rows_read` is the rows the
-//! statements returned and `rows_written` their `changes()`. The billed
+//! snapshot (stow#878), and the host backend reports the bill workerd
+//! meters: `rows_read` is the rows a statement returned — plus, for an
+//! UPDATE, the rows it changed (stow#931) — and `rows_written` its
+//! `changes()`. The billed
 //! gate is still the workerd harness (`budget.rs` +
 //! `scripts/traffic-cost.sh`), which replays this same [`drives`] list
 //! on the production fixture inside the Durable Object and reports the
@@ -203,17 +204,16 @@ async fn run_one_drive(
     };
     let statements = log.lock().expect("statement log")[base..].to_vec();
     for statement in &statements {
-        assert!(
-            drives::append_bills_replay_cost(
-                &statement.sql,
-                statement.rows_read,
-                statement.rows_written,
-            ),
-            "{} appended event_log at {} R + {} W — the replay re-count is 1 R + 1 W",
-            drive.name,
+        if let Some((label, read, written)) = drives::predicted_bill_mismatch(
+            &statement.sql,
             statement.rows_read,
             statement.rows_written,
-        );
+        ) {
+            panic!(
+                "{}: {label} billed {} R + {} W — predicted {read} R + {written} W",
+                drive.name, statement.rows_read, statement.rows_written,
+            );
+        }
     }
     let after = claimable_surface(ctx.loaded());
     match (run_result, cleanup_result) {
