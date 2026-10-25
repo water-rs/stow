@@ -163,6 +163,17 @@ cleanup() {
     for pid in ${CHILD_PIDS[@]+"${CHILD_PIDS[@]}"}; do
         kill -9 -- "-$pid" 2>/dev/null || true
     done
+    # The detached miss drain logs beside each consumer's target dir,
+    # not into LOG_DIR — pull it in so the uploaded artifact carries it
+    # (stow#929).
+    local drain_log drain_name consumer_dir
+    for drain_log in "$WORK_DIR"/*/target/stow-drain.log*; do
+        [ -f "$drain_log" ] || continue
+        consumer_dir="$(basename "$(dirname "$(dirname "$drain_log")")")"
+        drain_name="$(basename "$drain_log")"
+        cp "$drain_log" "$LOG_DIR/${drain_name/stow-drain/stow-drain-$consumer_dir}" 2>/dev/null \
+            || true
+    done
     if [ "$status" -ne 0 ]; then
         # When the trap fires while a command's `>"$LOG_DIR/x.log" 2>&1`
         # redirect is still bound, stderr *is* one of the files below —
@@ -1474,6 +1485,11 @@ printf 'once_cell = { version = "=%s", default-features = false, features = ["al
     "$SUPERSET_VERSION" >>"$SUPERSET_CONSUMER/Cargo.toml"
 fg prepare_consumer "$SUPERSET_CONSUMER" once_cell-subset
 
+# The inexact leg's redemption evidence is the enqueue POST on the
+# edge. The detached drain redeems the moment `stow check` exits, so the
+# baseline is sampled before it — sampling after the check could already
+# count the report's own POST (stow#929).
+inexact_enqueues_before="$(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log" 2>/dev/null || true)"
 fg in_dir "$SUPERSET_CONSUMER" stow_cli check >"$LOG_DIR/stow-check-subset.log" 2>&1 \
     || die "stow check (subset) failed — see $LOG_DIR/stow-check-subset.log"
 
@@ -1495,9 +1511,9 @@ echo "[mock-e2e] once_cell subset serve: before={misses,local}=$superset_stats_b
 # reports the exact chain through the same PoW admission a miss takes;
 # the scheduler queues it at very low priority, local CI builds it, and
 # after republish the same consumer is served the exact artifact.
-# The admission's redemption is the enqueue POST on the edge — count it
-# before and after so the leg can prove exactly one report fired.
-inexact_enqueues_before="$(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log" 2>/dev/null || true)"
+# The admission's redemption is the enqueue POST on the edge — the
+# baseline was sampled before `stow check`, so the count after the leg
+# proves exactly one report fired.
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
