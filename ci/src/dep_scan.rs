@@ -123,7 +123,7 @@ pub async fn scan_artifacts(
     )
     .await?;
     let output_owners = output_owner_index(&selected, &consumed_captures)?;
-    let own_units = phase_own_units(task, built)?;
+    let own_units = phase_own_units(task, built.unit_graphs(), built.run_dir())?;
     reject_foreign_compiled_units(
         task,
         &selected,
@@ -701,44 +701,63 @@ fn stable_output_name<'a>(
 
 /// One phase×invocation's view of the task's own unit: the crates.io
 /// lib units of that phase's graph (for dep-owner attribution) and the
-/// own unit's lib-dep keys — the unit the wrapper root's own-crate edge
+/// own unit's lib-dep keys — the unit the wrapper's own-crate edge
 /// names on the task's side (stow#723).
-struct PhaseOwnUnit {
-    units: Vec<stow_types::unit_graph::TaskUnit>,
-    own_deps: BTreeSet<stow_types::unit_graph::TaskUnitKey>,
+#[derive(Debug)]
+pub struct PhaseOwnUnit {
+    pub units: Vec<stow_types::unit_graph::TaskUnit>,
+    pub own_deps: BTreeSet<stow_types::unit_graph::TaskUnitKey>,
 }
 
 /// The `target_dir` → [`PhaseOwnUnit`] map for every phase×invocation.
 ///
 /// The own unit is the one the generated wrapper's own-crate dep edge
-/// names: the wrapper root's `--extern` on the task's package at the
-/// task's side — a build-dependency edge for a host task, the normal
-/// edge for a target one. Any other unit of the same package — the
-/// outcome-3 target twin the wrapper also pins — is a dependency like
+/// names on the task's side. That edge leaves the wrapper unit
+/// `wrapper_manifest` declares the task crate on: a target task is a
+/// `[dependencies]` entry, so the edge leaves the wrapper's lib unit;
+/// a host task is a `[build-dependencies]` entry, so the edge leaves
+/// the wrapper's build-script *compile* unit — cargo never gives the
+/// wrapper lib unit a build-dependency edge, in any phase or spelling.
+/// Any other unit of the same package — the outcome-3 target twin the
+/// wrapper also pins, on the lib unit's edges — is a dependency like
 /// any other: served, never compiled (stow#723).
-fn phase_own_units(
+pub fn phase_own_units(
     task: &BuildTaskPayload,
-    built: &BuiltWorkspace,
+    graphs: &[crate::task::PhaseUnitGraph],
+    run_dir: &Path,
 ) -> stow_types::error::Result<BTreeMap<PathBuf, PhaseOwnUnit>> {
     use stow_types::unit_graph::{TaskUnitKind, TaskUnitSide};
     let host_triple = crate::task::runner_host_triple(task)?;
-    let own_side = if task.host_side {
-        TaskUnitSide::Host
+    let (own_side, declaring_kind) = if task.host_side {
+        (TaskUnitSide::Host, TaskUnitKind::BuildScript)
     } else {
-        TaskUnitSide::Target
+        (TaskUnitSide::Target, TaskUnitKind::Lib)
     };
     let mut phases = BTreeMap::new();
-    for graph in built.unit_graphs() {
+    for graph in graphs {
         let units = graph.task_units(host_triple).map_err(|error| {
             stow_types::stow_error!("{} unit graph does not convert: {error}", graph.label())
         })?;
-        let root = units
+        // The wrapper is the graph's only non-registry package, and it
+        // has one unit of each kind.
+        let mut declaring = units
             .iter()
-            .find(|unit| unit.key.kind == TaskUnitKind::Lib && !unit.is_crates_io)
-            .ok_or_else(|| {
-                stow_types::stow_error!("{} unit graph has no wrapper lib unit", graph.label())
-            })?;
-        let own = root
+            .filter(|unit| unit.key.kind == declaring_kind && !unit.is_crates_io);
+        let wrapper = declaring.next().ok_or_else(|| {
+            stow_types::stow_error!(
+                "{} unit graph has no wrapper {declaring_kind:?} unit",
+                graph.label()
+            )
+        })?;
+        if let Some(other) = declaring.next() {
+            return Err(stow_types::stow_error!(
+                "{} unit graph has two non-registry {declaring_kind:?} units, {} and {}",
+                graph.label(),
+                wrapper.key.pkg,
+                other.key.pkg,
+            ));
+        }
+        let own = wrapper
             .deps
             .iter()
             .find(|dep| {
@@ -763,10 +782,7 @@ fn phase_own_units(
             .filter(|dep| dep.key.kind == TaskUnitKind::Lib)
             .map(|dep| dep.key.clone())
             .collect();
-        phases.insert(
-            graph.target_dir(built.run_dir()),
-            PhaseOwnUnit { units, own_deps },
-        );
+        phases.insert(graph.target_dir(run_dir), PhaseOwnUnit { units, own_deps });
     }
     Ok(phases)
 }

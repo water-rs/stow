@@ -8,6 +8,7 @@
 //! The toolchain pin is the test binary's own rustc release:
 /// `RUSTUP_TOOLCHAIN=<release>` resolves it through the real rustup
 /// home the sandbox already grants.
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -740,18 +741,138 @@ async fn wrapper_workspace(reg: &Path, task: &BuildTaskPayload) -> (TempDir, Bui
     (root, workspace)
 }
 
-/// The real build-stage check: fetch the wrapper's deps out of the
-/// local registry, then every `check`-phase unit graph must mint
-/// `task.task_id` — `verify_dependency_context` verbatim.
+/// The real build-stage checks: fetch the wrapper's deps out of the
+/// local registry, then every phase×spelling unit graph the builder's
+/// default `build` subcommand plans (`check` and `build`) must mint
+/// `task.task_id` — `verify_dependency_context` verbatim — and must
+/// name the task's own unit, which the scan's foreign-unit check keys
+/// on (`dep_scan::phase_own_units` verbatim). The own units come back
+/// keyed by each graph's phase×spelling label.
 async fn verify(
     cargo_home: &Path,
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<BTreeMap<String, crate::dep_scan::PhaseOwnUnit>> {
     task::fetch_workspace_dependencies(cargo_home, task, workspace).await?;
     let graphs =
-        task::phase_unit_graphs(cargo_home, task, workspace, CargoSubcommand::Check).await?;
-    task::verify_dependency_context(task, &graphs)
+        task::phase_unit_graphs(cargo_home, task, workspace, CargoSubcommand::Build).await?;
+    task::verify_dependency_context(task, &graphs)?;
+    // The run dir only names each phase's target dir; nothing is read
+    // from it.
+    let run_dir = Path::new("/stow-run");
+    let mut own_units = crate::dep_scan::phase_own_units(task, &graphs, run_dir)?;
+    Ok(graphs
+        .iter()
+        .map(|graph| {
+            let own = own_units
+                .remove(&graph.target_dir(run_dir))
+                .expect("phase_own_units answers for every graph");
+            (graph.label(), own)
+        })
+        .collect())
+}
+
+/// The own unit's lib deps as `name [features] Side`, resolved through
+/// the phase graph's units.
+fn own_dep_summary(own: &crate::dep_scan::PhaseOwnUnit) -> BTreeSet<String> {
+    own.own_deps
+        .iter()
+        .map(|key| {
+            let unit = own
+                .units
+                .iter()
+                .find(|unit| &unit.key == key)
+                .expect("an own dep is a unit of its graph");
+            format!("{} [{}] {:?}", unit.name, unit.features.join(","), key.side)
+        })
+        .collect()
+}
+
+/// The scan's own-unit lookup (`dep_scan::phase_own_units`) on real
+/// wrapper graphs, for every plain task shape under every phase and
+/// spelling its builder runs: a target leaf, a target lib with a lib
+/// dep, a target lib with a build script, and the same three on the
+/// host side (`[build-dependencies]` of the consumer), plus the host
+/// build-tool leaf. A host task's own crate is a build-dependency of
+/// the wrapper, so its own-crate edge leaves the wrapper's build-script
+/// compile unit; a target task's leaves the wrapper lib (stow#723).
+#[test]
+fn the_own_unit_is_named_for_every_task_shape() {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    let plain = |name: &'static str| Fixture {
+        name,
+        version: "1.0.0",
+        deps: vec![],
+        build_deps: vec![],
+        features: &[],
+        proc_macro: false,
+    };
+    for name in ["tool", "tleaf", "hleaf"] {
+        publish(&reg, &plain(name));
+    }
+    for (name, dep) in [("tmid", "tleaf"), ("hmid", "hleaf")] {
+        publish(
+            &reg,
+            &Fixture {
+                deps: vec![(dep, "1", &[])],
+                ..plain(name)
+            },
+        );
+    }
+    for name in ["tbs", "hbs"] {
+        publish(
+            &reg,
+            &Fixture {
+                build_deps: vec![("tool", "1", &[])],
+                ..plain(name)
+            },
+        );
+    }
+    let manifest = consumer_project(
+        &scratch.path().join("consumer"),
+        &json!({ "tleaf": "1", "tmid": "1", "tbs": "1" }),
+        &json!({ "hleaf": "1", "hmid": "1", "hbs": "1" }),
+    );
+    let requests = resolve_requests(cargo_home.path(), &manifest);
+    // (crate, host side, the own unit's lib deps)
+    let shapes: [(&str, bool, &[&str]); 7] = [
+        ("tleaf", false, &[]),
+        ("tmid", false, &["tleaf [] Target"]),
+        ("tbs", false, &[]),
+        ("hleaf", true, &[]),
+        ("hmid", true, &["hleaf [] Host"]),
+        ("hbs", true, &[]),
+        ("tool", true, &[]),
+    ];
+    smol::block_on(async {
+        for (name, host_side, own_deps) in shapes {
+            let request = requests
+                .iter()
+                .find(|request| request.crate_name.as_str() == name)
+                .unwrap_or_else(|| panic!("a {name} request"));
+            assert_eq!(request.host_side, host_side, "{name}'s side");
+            let task = payload_for(request);
+            let (_root, workspace) = wrapper_workspace(&reg, &task).await;
+            let own_units = verify(cargo_home.path(), &task, &workspace)
+                .await
+                .unwrap_or_else(|error| panic!("{name} verifies: {error}"));
+            // A host task runs both spellings; a plain target task one.
+            assert_eq!(
+                own_units.len(),
+                if host_side { 4 } else { 2 },
+                "{name}: check and build × its spellings: {:?}",
+                own_units.keys().collect::<Vec<_>>()
+            );
+            let expected = own_deps
+                .iter()
+                .map(|dep| (*dep).to_owned())
+                .collect::<BTreeSet<_>>();
+            for (phase, own) in &own_units {
+                assert_eq!(own_dep_summary(own), expected, "{name} {phase}");
+            }
+        }
+    });
 }
 
 /// Fixture: the `alloc-stdlib` shape — `a-stdlib` needs `a-nostd`, and
@@ -1928,9 +2049,24 @@ fn outcome3_host_task_mints_a_distinct_id_and_verifies() {
             // cargo-verdict-equals-predicate assertion.
             task::verify_dependency_context(&task, &graphs)
                 .unwrap_or_else(|error| panic!("{label} build phases verify: {error}"));
-            verify(cargo_home.path(), &task, &workspace)
+            let own_units = verify(cargo_home.path(), &task, &workspace)
                 .await
                 .unwrap_or_else(|error| panic!("{label} task verifies: {error}"));
+            // The own unit is the host md in every phase×spelling — in o3
+            // never the pinned target twin, whose lib deps are
+            // target-side and carry `flags [std]`.
+            assert_eq!(
+                own_units.len(),
+                4,
+                "{label}: check and build × two spellings"
+            );
+            for (phase, own) in &own_units {
+                assert_eq!(
+                    own_dep_summary(own),
+                    BTreeSet::from(["flags [] Host".to_owned(), "leaf [] Host".to_owned()]),
+                    "{label} {phase}: the own unit is the host md"
+                );
+            }
         }
         assert_eq!(
             host_task_ids[0], host_task_ids[1],
