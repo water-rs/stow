@@ -216,16 +216,6 @@ fn validate_consumed_claims(
                 task.rustc_version
             ));
         }
-        if canonical_crate_name(claim.crate_name.as_str())
-            == canonical_crate_name(task.crate_name.as_str())
-            && claim.crate_version == task.version.to_string()
-        {
-            return Err(stow_types::stow_error!(
-                "consumed artifact claims the task crate {} {} itself — each build must compile its own crate",
-                claim.crate_name,
-                claim.crate_version
-            ));
-        }
         let claim_version = semver::Version::parse(&claim.crate_version).map_err(|_| {
             stow_types::stow_error!(
                 "consumed artifact {} carries an unparseable version {}",
@@ -243,11 +233,11 @@ fn validate_consumed_claims(
                 closure.package_count()
             ));
         }
-        let vouched = index_slices
+        let vouching: Vec<&stow_types::index::ArtifactIndexRow> = index_slices
             .iter()
             .filter(|slice| slice.index.header.target.as_str() == claim.target)
             .flat_map(|slice| slice.index.rows.iter())
-            .any(|row| {
+            .filter(|row| {
                 canonical_crate_name(row.crate_name.as_str())
                     == canonical_crate_name(claim.crate_name.as_str())
                     && row.version.as_semver() == &claim_version
@@ -260,8 +250,9 @@ fn validate_consumed_claims(
                     // and present it as `link` coverage for a crate whose
                     // rlib the index does not have.
                     && row.emit == claim.emit
-            });
-        if !vouched {
+            })
+            .collect();
+        if vouching.is_empty() {
             return Err(stow_types::stow_error!(
                 "consumed artifact {} {} (compile_key {}, c_metadata {}, target {}) matches no row of the signed index — a cache hit the index does not vouch for is a dropped compile",
                 claim.crate_name,
@@ -269,6 +260,24 @@ fn validate_consumed_claims(
                 claim.compile_key,
                 claim.c_metadata,
                 claim.target
+            ));
+        }
+        // A claim may name the task's package only when the vouched row
+        // is the other side's — the outcome-3 twin is a served
+        // dependency like any other (stow#723). A claim for the task's
+        // own unit means its artifact never compiled, so the plan has
+        // nothing to publish.
+        if canonical_crate_name(claim.crate_name.as_str())
+            == canonical_crate_name(task.crate_name.as_str())
+            && claim.crate_version == task.version.to_string()
+            && vouching.iter().any(|row| {
+                (row.unit_shape.side == stow_types::public_cache::UnitSide::Host) == task.host_side
+            })
+        {
+            return Err(stow_types::stow_error!(
+                "consumed artifact claims the task's own unit {} {} — each build must compile its own unit",
+                claim.crate_name,
+                claim.crate_version
             ));
         }
     }
