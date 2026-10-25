@@ -372,11 +372,11 @@ acting unless `--yes` is given.
   stable channel version, `--targets` to every CI target.
 - `stow-admin preheat top-binaries --rustc-version ... [--targets a,b] [--limit 100] --yes`
   — the popularity lane (stow#891): the top-N crates whose *default*
-  version ships a binary target — library or not — ranked by the last
-  90 days of `version_downloads`. Both answers come from one fetch of
-  the crates.io daily database dump (`default_versions` →
-  `versions.bin_names` for the binary check); no categories and no
-  per-crate API calls. Each candidate resolves exactly the way
+  version ships a binary target and no library (stow#918), ranked by
+  the last 90 days of `version_downloads`. Both answers come from one
+  fetch of the crates.io daily database dump (`default_versions` →
+  `versions.bin_names`/`has_lib` for the binary check); no categories
+  and no per-crate API calls. Each candidate resolves exactly the way
   `preheat binary` resolves one: name sources, never tasks of their
   own. The emitted tasks carry the crate's 90-day download count as
   their queue priority. A binary that fails to resolve is reported and

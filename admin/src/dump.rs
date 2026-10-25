@@ -12,9 +12,13 @@
 //! - `crates.csv` — `id` → `name`;
 //! - `default_versions.csv` — `crate_id` → `version_id`, the release
 //!   crates.io hands a bare `cargo add`;
-//! - `versions.csv` — `id` → (`crate_id`, `num`, `bin_names`); the
-//!   binary check reads `bin_names`, a Postgres array literal —
-//!   `{a,b}`, `{}` or NULL (empty field) for none;
+//! - `versions.csv` — `id` → (`crate_id`, `num`, `bin_names`,
+//!   `has_lib`); the binary check reads `bin_names`, a Postgres array
+//!   literal — `{a,b}`, `{}` or NULL (empty field) for none — and
+//!   `has_lib`, a Postgres boolean exported as `t`/`f`, or NULL (empty
+//!   field) for a version crates.io has not analysed: a crate counts
+//!   only when its default version ships a binary and no library
+//!   (stow#918);
 //! - `version_downloads.csv` — `version_id`, `downloads`, `date`: the
 //!   ranking. The dump already trims the table to the last 90 days
 //!   (rust-lang/crates.io#3611, documented in the dump's own
@@ -207,6 +211,10 @@ struct VersionRow {
     num_len: u32,
     /// Whether `bin_names` listed a binary target.
     has_bin: bool,
+    /// Whether `has_lib` says the release ships a library — a binary
+    /// counts only when there is none (stow#918). `None` is NULL: the
+    /// version was never analysed.
+    has_lib: Option<bool>,
 }
 
 /// The four tables, accumulated as they stream past in whatever order
@@ -421,10 +429,10 @@ fn read_default_versions(reader: impl Read, tables: &mut Tables) -> stow_types::
 
 fn read_versions(reader: impl Read, tables: &mut Tables) -> stow_types::error::Result<()> {
     let mut csv = csv::Reader::from_reader(reader);
-    let [id, crate_id, num, bin_names] = <[usize; 4]>::try_from(columns(
+    let [id, crate_id, num, bin_names, has_lib] = <[usize; 5]>::try_from(columns(
         csv.byte_headers().map_err(columns_err("versions.csv"))?,
         "versions.csv",
-        &["id", "crate_id", "num", "bin_names"],
+        &["id", "crate_id", "num", "bin_names", "has_lib"],
     )?)
     .expect("columns returns one index per needed name");
     for record in csv.byte_records() {
@@ -456,6 +464,19 @@ fn read_versions(reader: impl Read, tables: &mut Tables) -> stow_types::error::R
                 ));
             }
         };
+        let lib = field(&record, has_lib, "versions.csv", "has_lib")?;
+        // A Postgres `boolean` exports as `t` or `f`, NULL as empty.
+        let has_lib = match lib {
+            b"t" => Some(true),
+            b"f" => Some(false),
+            b"" => None,
+            _ => {
+                return Err(stow_error!(
+                    "versions.csv id {version_id}: malformed has_lib `{}`",
+                    String::from_utf8_lossy(lib)
+                ));
+            }
+        };
         let num_off = u32::try_from(tables.num_arena.len())
             .map_err(|_| stow_error!("versions.csv: the num arena overflows u32"))?;
         tables.num_arena.extend_from_slice(num.as_bytes());
@@ -465,6 +486,7 @@ fn read_versions(reader: impl Read, tables: &mut Tables) -> stow_types::error::R
             num_off,
             num_len,
             has_bin,
+            has_lib,
         };
     }
     Ok(())
@@ -499,7 +521,8 @@ fn read_version_downloads(reader: impl Read, tables: &mut Tables) -> stow_types:
 impl Tables {
     /// Fold the streamed tables into the ranked candidates: per-crate
     /// 90-day downloads through `versions.crate_id`, then the binary
-    /// check through `default_versions` → `versions.bin_names`.
+    /// check through `default_versions` → `versions.bin_names`, keeping
+    /// only defaults with a binary and no library (`has_lib` false).
     fn finish(self, limit: usize) -> stow_types::error::Result<Vec<BinaryCandidate>> {
         if !self.pending.is_empty() {
             return Err(stow_error!(
@@ -559,6 +582,18 @@ impl Tables {
                         "default_versions.csv names crate {crate_id} absent from crates.csv"
                     )
                 })?;
+            // crates.io's one analysis fills `bin_names` and `has_lib`
+            // together, so a listed binary with a NULL `has_lib` is a
+            // dump this parser does not understand.
+            match row.has_lib {
+                Some(false) => {}
+                Some(true) => continue,
+                None => {
+                    return Err(stow_error!(
+                        "crate {name}: its default version lists a binary but has_lib is NULL"
+                    ));
+                }
+            }
             let num = self
                 .num_arena
                 .get(row.num_off as usize..row.num_off as usize + row.num_len as usize)
@@ -605,13 +640,13 @@ mod tests {
     /// ahead of `version_downloads.csv`, matching the real entry order.
     ///
     /// ```text
-    /// crate          default version   bin_names   90d downloads
-    /// lib-only       1.0.0             {}          9000  (excluded: no bin)
-    /// bin-a          2.0.0             {bin_a}     50+60 = 110
-    /// bin-b          3.0.0             {bin_b}     400
-    /// bin-c          4.0.0             {bin_c,other} 110
-    /// lib-popular    5.0.0             {}          999999 (excluded: no bin)
-    /// lib-with-bin   6.0.0             {bin_d}     80    (library AND binary — included)
+    /// crate          default version   bin_names      has_lib   90d downloads
+    /// lib-only       1.0.0             {}             t         9000   (excluded: no bin)
+    /// bin-a          2.0.0             {bin_a}        f         50+60 = 110
+    /// bin-b          3.0.0             {bin_b}        f         400
+    /// bin-c          4.0.0             {bin_c,other}  f         110
+    /// lib-popular    5.0.0             {}             t         999999 (excluded: no bin)
+    /// lib-with-bin   6.0.0             {bin_d}        t         80     (excluded: library AND binary)
     /// ```
     fn fixture() -> Vec<u8> {
         tarball(&[
@@ -621,13 +656,13 @@ mod tests {
             ),
             (
                 "2026-10-24-020018/data/versions.csv",
-                "id,crate_id,num,bin_names,yanked\n\
-                 10,1,1.0.0,{},f\n\
-                 20,2,2.0.0,{bin_a},f\n\
-                 30,3,3.0.0,{bin_b},f\n\
-                 40,4,4.0.0,\"{bin_c,other}\",f\n\
-                 50,5,5.0.0,{},f\n\
-                 60,6,6.0.0,{bin_d},f\n",
+                "id,crate_id,num,bin_names,has_lib,yanked\n\
+                 10,1,1.0.0,{},t,f\n\
+                 20,2,2.0.0,{bin_a},f,f\n\
+                 30,3,3.0.0,{bin_b},f,f\n\
+                 40,4,4.0.0,\"{bin_c,other}\",f,f\n\
+                 50,5,5.0.0,{},t,f\n\
+                 60,6,6.0.0,{bin_d},t,f\n",
             ),
             (
                 "2026-10-24-020018/data/default_versions.csv",
@@ -651,19 +686,19 @@ mod tests {
         parse(std::io::Cursor::new(fixture()), limit).expect("fixture parses")
     }
 
-    /// The binary check runs `default_versions` → `versions.bin_names`:
-    /// a library+binary crate is in, a library-only crate is out however
+    /// The binary check runs `default_versions` → `versions.bin_names`
+    /// plus `versions.has_lib` (stow#918): a binary-only crate is in, a
+    /// library+binary crate and a library-only crate are out however
     /// popular, and the ranking is the 90-day window's sum across a
     /// version's days.
     #[test]
     fn ranking_is_90d_downloads_of_binary_defaults() {
         let candidates = parse_fixture(100);
         let names: Vec<&str> = candidates.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(names, ["bin-b", "bin-a", "bin-c", "lib-with-bin"]);
+        assert_eq!(names, ["bin-b", "bin-a", "bin-c"]);
         let by_name = |name: &str| candidates.iter().find(|c| c.id == name).unwrap();
         assert_eq!(by_name("bin-a").downloads, 110);
         assert_eq!(by_name("bin-a").version, "2.0.0");
-        assert_eq!(by_name("lib-with-bin").downloads, 80);
     }
 
     /// The cut keeps the `limit` highest-ranked and the tie order is
@@ -724,7 +759,7 @@ mod tests {
             ),
             (
                 "2026-10-24-020018/data/versions.csv",
-                "id,crate_id,num,bin_names\n1,1,1.0.0,{}\n",
+                "id,crate_id,num,bin_names,has_lib\n1,1,1.0.0,{},t\n",
             ),
             (
                 "2026-10-24-020018/data/version_downloads.csv",
@@ -732,5 +767,56 @@ mod tests {
             ),
         ]);
         assert!(parse(std::io::Cursor::new(gz), 100).is_err());
+    }
+
+    /// `has_lib` is a Postgres boolean — anything but `t`, `f` or NULL
+    /// fails like a malformed `bin_names`.
+    #[test]
+    fn a_malformed_has_lib_fails() {
+        let gz = tarball(&[
+            ("2026-10-24-020018/data/crates.csv", "id,name\n1,only\n"),
+            (
+                "2026-10-24-020018/data/default_versions.csv",
+                "crate_id,version_id\n1,1\n",
+            ),
+            (
+                "2026-10-24-020018/data/versions.csv",
+                "id,crate_id,num,bin_names,has_lib\n1,1,1.0.0,{bin},yes\n",
+            ),
+            (
+                "2026-10-24-020018/data/version_downloads.csv",
+                "version_id,downloads\n1,5\n",
+            ),
+        ]);
+        let error = parse(std::io::Cursor::new(gz), 100).expect_err("malformed has_lib fails");
+        assert!(error.to_string().contains("has_lib"), "{error}");
+    }
+
+    /// A version crates.io never analysed exports both columns NULL and
+    /// is no candidate; a listed binary with a NULL `has_lib` fails.
+    #[test]
+    fn a_null_has_lib_is_skipped_without_a_binary_and_fails_with_one() {
+        let dump = |bin_names: &str| {
+            tarball(&[
+                ("2026-10-24-020018/data/crates.csv", "id,name\n1,only\n"),
+                (
+                    "2026-10-24-020018/data/default_versions.csv",
+                    "crate_id,version_id\n1,1\n",
+                ),
+                (
+                    "2026-10-24-020018/data/versions.csv",
+                    &format!("id,crate_id,num,bin_names,has_lib\n1,1,1.0.0,{bin_names},\n"),
+                ),
+                (
+                    "2026-10-24-020018/data/version_downloads.csv",
+                    "version_id,downloads\n1,5\n",
+                ),
+            ])
+        };
+        let candidates = parse(std::io::Cursor::new(dump("")), 100).expect("unanalysed parses");
+        assert!(candidates.is_empty());
+        let error = parse(std::io::Cursor::new(dump("{bin}")), 100)
+            .expect_err("a binary without has_lib fails");
+        assert!(error.to_string().contains("has_lib is NULL"), "{error}");
     }
 }
