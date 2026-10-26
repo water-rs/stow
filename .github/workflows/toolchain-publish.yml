@@ -4,14 +4,15 @@ name: toolchain-publish
 # the runner that also builds the task's crate — up to ~17 minutes per
 # run, once per target leg of the wave. This workflow compiles them once
 # per main commit per host platform and publishes the toolchain (stow-build,
-# stow-cli, and on Linux stow-admin) to GHCR as a digest-addressed,
+# stow-cli, and on Linux and macOS stow-admin) to GHCR as a digest-addressed,
 # cosign-signed OCI artifact; build-crate and the deploy/watchdog jobs pull it
 # by `github.sha` instead of compiling or hunting Test-run artifacts
 # (stow#431).
 #
-# stow-admin ships only in the Linux toolchain: every job that pulls it runs
-# on ubuntu, and it is the one binary that links stow-resolver — cargo itself
-# — which dominated the Windows and macOS legs' cold release build.
+# stow-admin ships in the Linux toolchain for the jobs that pull it on
+# ubuntu, and in the macOS one for the operator, who runs it from a Mac. It
+# is the one binary that links stow-resolver — cargo itself — which
+# dominates a cold release build, so the Windows leg leaves it out.
 #
 # It runs on `merge_group`, not `push`: GitHub fast-forwards `main` to the
 # merge-group head it tested, so `github.sha` here is exactly the future
@@ -60,7 +61,7 @@ jobs:
         include:
           - { os: ubuntu-24.04, key: linux-x64, bins: stow-build stow-cli stow-admin }
           - { os: windows-latest, key: windows-x64, bins: stow-build stow-cli }
-          - { os: macos-14, key: macos-arm64, bins: stow-build stow-cli }
+          - { os: macos-14, key: macos-arm64, bins: stow-build stow-cli stow-admin }
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
