@@ -10,9 +10,7 @@ use stow_types::admission;
 
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
-use crate::{
-    api, env_binding, ghcr, github_auth, release_hook, runtime_settings, scheduler, site, webhook,
-};
+use crate::{api, env_binding, ghcr, github_auth, release_hook, runtime_settings, site, webhook};
 
 const SCHEDULER_BINDING: &str = "SCHEDULER";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
@@ -23,9 +21,9 @@ const STOW_GITHUB_API_URL_BINDING: &str = "STOW_GITHUB_API_URL";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
+const GITHUB_APP_SLUG_BINDING: &str = "GITHUB_APP_SLUG";
 const STOW_POW_CHALLENGE_SECRET_BINDING: &str = "STOW_POW_CHALLENGE_SECRET";
 const STOW_POW_MIN_BITS_BINDING: &str = "STOW_POW_MIN_BITS";
-const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const TURNSTILE_SECRET_KEY_BINDING: &str = "TURNSTILE_SECRET_KEY";
 const TURNSTILE_HOSTNAME_BINDING: &str = "TURNSTILE_HOSTNAME";
 const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
@@ -97,6 +95,13 @@ fn worker(
         env_binding::required_string(env, GITHUB_APP_INSTALLATION_ID_BINDING);
         env_binding::required_string(env, GITHUB_APP_PRIVATE_KEY_BINDING);
     }
+    // The webhook's `in_progress` filter needs the App's bot login in
+    // every deployment — under `STOW_LOCAL_CI_URL` the mock CI stamps
+    // the same `<slug>[bot]` on its dispatches (stow#940).
+    let app_bot_login = format!(
+        "{}[bot]",
+        env_binding::required_string(env, GITHUB_APP_SLUG_BINDING)
+    );
     // The bearer check's GitHub probes: `STOW_LOCAL_CI_URL` marks the
     // mock stack, where they must resolve inside it — a mock manifest
     // that forgets `STOW_GITHUB_API_URL` fails startup rather than
@@ -124,8 +129,6 @@ fn worker(
         challenge_secret: env_binding::required_string(env, STOW_POW_CHALLENGE_SECRET_BINDING),
         min_bits: env_binding::optional_u32(env, STOW_POW_MIN_BITS_BINDING)
             .unwrap_or(admission::DEFAULT_POW_MIN_BITS),
-        max_queue_pending: env_binding::optional_u32(env, STOW_MAX_QUEUE_PENDING_BINDING)
-            .unwrap_or(scheduler::queue::DEFAULT_MAX_QUEUE_PENDING),
     };
 
     let site = site::SiteConfig {
@@ -171,6 +174,7 @@ fn worker(
             env,
             STOW_GITHUB_WEBHOOK_SECRET_BINDING,
         ))))
+        .with(State(webhook::AppBotLogin(app_bot_login)))
         .with(State(release_hook::NewreleasesSecret(
             env_binding::required_string(env, STOW_NEWRELEASES_WEBHOOK_SECRET_BINDING),
         )))
@@ -192,7 +196,7 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 2] {
     [
         "/api/v1/admin"
             .route((
-                "/index/{target}/{rustc_version}".post(api::record_published_index),
+                "/index/published".post(api::record_published_index),
                 "/dispatch-freeze"
                     .at(api::get_dispatch_freeze)
                     .post(api::set_dispatch_freeze),

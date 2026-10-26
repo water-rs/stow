@@ -7,6 +7,12 @@ workers_dev = false
 [cloudflare.vars]
 GITHUB_APP_ID = "4985635"
 GITHUB_APP_INSTALLATION_ID = "162649982"
+# The App's slug — its bot login (`<slug>[bot]`) is the
+# `triggering_actor` a scheduler-dispatched run carries, which is how
+# the webhook tells own runs from external ones (stow#940). A wrong
+# value only re-adds own runs' `in_progress` forwards — the cost, not
+# a correctness break.
+GITHUB_APP_SLUG = "stow-ci"
 GITHUB_REPO = "water-rs/stow"
 GHCR_BASE_URL = "https://ghcr.io"
 STOW_DISPATCH_MIN_AGE_MINUTES = "5"

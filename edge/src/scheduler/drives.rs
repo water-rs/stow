@@ -640,6 +640,18 @@ async fn submit_expect(
 /// path rather than a dedup hit.
 const DRIVE_REQUEST_ID: &str = "req-costgate-drive";
 
+/// The outcome-(dispatching) drive's own request record — the
+/// canonical one is settled `enqueued` by the time this drive runs,
+/// and an outcome never applies over a settled record.
+const DISPATCH_REQUEST_ID: &str = "req-costgate-dispatch";
+
+fn dispatch_admission() -> stow_types::api::RequestAdmission {
+    stow_types::api::RequestAdmission {
+        request_id: DISPATCH_REQUEST_ID.to_owned(),
+        ..drive_admission()
+    }
+}
+
 fn drive_admission() -> stow_types::api::RequestAdmission {
     stow_types::api::RequestAdmission {
         request_id: DRIVE_REQUEST_ID.to_owned(),
@@ -754,9 +766,16 @@ async fn pass(
             .as_ref()
             .ok_or_else(|| "dispatch pass drive needs a Worker env".to_owned())?;
         let started_ms = super::budget::clock_ms();
-        let task_ids = super::object::dispatch_pass(&ctx.graph, env, db, settings)
-            .await
-            .map_err(text)?;
+        let task_ids = super::object::dispatch_pass(
+            &ctx.graph,
+            env,
+            db,
+            settings,
+            u32::MAX,
+            super::object::PassReconcile::Due,
+        )
+        .await
+        .map_err(text)?;
         tracing::info!(
             "budget span pass=dispatch_pass elapsed_ms={}",
             super::budget::clock_ms() - started_ms
@@ -766,7 +785,7 @@ async fn pass(
     #[cfg(not(target_arch = "wasm32"))]
     {
         let now = now_ms();
-        let claims = routes::claim_pass(ctx.loaded(), db, settings, now)
+        let claims = routes::claim_pass(ctx.loaded(), db, settings, now, u32::MAX)
             .await
             .map_err(text)?;
         let bindings: Vec<DispatchBinding> = claims
@@ -800,7 +819,7 @@ async fn focused_claim_pass(
     settings: &SchedulerSettings,
     ctx: &DriveContext,
 ) -> Result<Vec<String>, String> {
-    let claims = routes::claim_pass(ctx.loaded(), db, settings, now_ms())
+    let claims = routes::claim_pass(ctx.loaded(), db, settings, now_ms(), u32::MAX)
         .await
         .map_err(text)?;
     let _plan = routes::wake_plan(ctx.loaded(), settings, now_ms());
@@ -814,6 +833,10 @@ async fn focused_claim_pass(
 /// transitions, and the stale sweep reads only the clock.
 pub const RUN_DRIVE_RUN_ID: u64 = 9_000_000_001;
 
+/// The run id the run-update drive's seeded external run carries —
+/// its own namespace, disjoint from the ids runs bind.
+const RUN_UPDATE_RUN_ID: u64 = 9_000_100_000;
+
 /// Seed families of the run drives' own nodes. Each drive lands one
 /// fresh node in setup and claims it, so the claimable surface nets out
 /// to what it was: the node leaves `pending` again by completing or by
@@ -822,6 +845,8 @@ const TAG_RUN_SUCCESS: u64 = 10;
 const TAG_RUN_FAILURE: u64 = 11;
 const TAG_RUN_UPDATE: u64 = 12;
 const TAG_RUN_STALE: u64 = 13;
+/// The dispatching complete-run drive's own node.
+const TAG_RUN_DISPATCH: u64 = 14;
 
 fn run_node_id(tag: u64) -> String {
     stow_types::fixture::named_task_id(
@@ -916,7 +941,7 @@ async fn complete_run_route(
         success,
         error: (!success).then(|| "failure".to_owned()),
         cancelled: false,
-        github_run_id: Some(bound.run.to_string()),
+        github_run_id: bound.run.to_string(),
     };
     #[cfg(target_arch = "wasm32")]
     {
@@ -932,6 +957,7 @@ async fn complete_run_route(
         let _ = settings;
         super::object::complete_run_pass(&ctx.graph, env, db, alarm, &report)
             .await
+            .map(|_| ())
             .map_err(text)
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -2132,17 +2158,17 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                routes::slice_report(
+                routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &PublishedSlice {
+                    &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.86.0").map_err(text)?,
                         base_generation: None,
                         generation: None,
                         added: fixture::full_slice_report(),
                         retired: Vec::new(),
-                    },
+                    }],
                     now_ms(),
                 )
                 .await
@@ -2165,17 +2191,17 @@ pub const DRIVES: &[Drive] = &[
                     .map(str::to_owned)
                     .collect();
                 restore_claimed(ctx, db, ids).await?;
-                routes::slice_report(
+                routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &PublishedSlice {
+                    &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.86.0").map_err(text)?,
                         base_generation: None,
                         generation: None,
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
-                    },
+                    }],
                     now_ms(),
                 )
                 .await
@@ -2193,17 +2219,17 @@ pub const DRIVES: &[Drive] = &[
         run: |db, shape, settings, ctx| {
             Box::pin(async move {
                 let (added, retired) = fixture::delta_slice_report(shape);
-                routes::slice_report(
+                routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &PublishedSlice {
+                    &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
                         base_generation: None,
                         generation: None,
                         added,
                         retired,
-                    },
+                    }],
                     now_ms(),
                 )
                 .await
@@ -2226,17 +2252,17 @@ pub const DRIVES: &[Drive] = &[
                     .collect();
                 restore_claimed(ctx, db, ids).await?;
                 let (added, retired) = fixture::delta_slice_report(shape);
-                routes::slice_report(
+                routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &PublishedSlice {
+                    &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
                         base_generation: None,
                         generation: None,
                         added: retired,
                         retired: added,
-                    },
+                    }],
                     now_ms(),
                 )
                 .await
@@ -2368,23 +2394,23 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
-        // The webhook's `in_progress` forward: an own run changes
-        // nothing persistent — the graph moves the bound node
-        // `dispatched` -> `running` in memory, and the post-wake
-        // reconcile restores it (review).
+        // The webhook's `in_progress` forward serves external runs
+        // only (stow#940): a run the scheduler never dispatched —
+        // its task id attributes to a runner family but names no live
+        // node — appends `ExternalRunStarted` occupancy. Own runs'
+        // running state comes from the CI listing's reconcile instead.
+        // The cleanup settles the run as an external completion does,
+        // returning the occupancy the drive added.
         name: "POST /tasks/run-update (in_progress)",
-        setup: Some(|db, _shape, settings, ctx| {
-            Box::pin(async move { bind_fresh(ctx, db, settings, TAG_RUN_UPDATE, now_ms()).await })
-        }),
+        setup: None,
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                let bound = ctx.bound_run()?;
                 routes::task_run_update(
                     ctx.loaded(),
                     db,
                     &stow_types::api::TaskRunUpdate {
-                        task_id: bound.task,
-                        github_run_id: bound.run.to_string(),
+                        task_id: run_node_id(TAG_RUN_UPDATE),
+                        github_run_id: RUN_UPDATE_RUN_ID.to_string(),
                     },
                     now_ms(),
                 )
@@ -2394,9 +2420,23 @@ pub const DRIVES: &[Drive] = &[
             })
         },
         cleanup: Some(|db, _shape, _settings, ctx| {
-            Box::pin(
-                async move { cancel_submitted(ctx, db, vec![run_node_id(TAG_RUN_UPDATE)]).await },
-            )
+            Box::pin(async move {
+                routes::complete_run(
+                    ctx.loaded(),
+                    db,
+                    &stow_types::api::WorkflowRunComplete {
+                        task_id: run_node_id(TAG_RUN_UPDATE),
+                        success: true,
+                        error: None,
+                        cancelled: false,
+                        github_run_id: RUN_UPDATE_RUN_ID.to_string(),
+                    },
+                    now_ms(),
+                )
+                .await
+                .map(|_| ())
+                .map_err(text)
+            })
         }),
     },
     Drive {
@@ -2434,6 +2474,327 @@ pub const DRIVES: &[Drive] = &[
             Box::pin(
                 async move { cancel_submitted(ctx, db, vec![run_node_id(TAG_RUN_STALE)]).await },
             )
+        }),
+    },
+    // The stow#940 dispatching request shapes: the request that frees a
+    // slot or releases work runs the dispatch pass itself, so each is
+    // priced at its own row — the route's append plus the pass's claim
+    // and fan-out.
+    Drive {
+        // `complete-run` with free capacity: the `RunFinished` +
+        // `Claims` append in one, the `MAX_OUTBOUND_INFLIGHT`-bounded
+        // fan-out and the `Bindings` row — on wasm the real
+        // `complete_run_pass`, on host the same store half with
+        // synthetic bindings. The claimed ids ride `bound` home for the
+        // cleanup, which returns them to `pending`.
+        name: "POST /tasks/complete-run (dispatching)",
+        setup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move { bind_fresh(ctx, db, settings, TAG_RUN_DISPATCH, now_ms()).await })
+        }),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                let bound = ctx.bound_run()?;
+                let report = stow_types::api::WorkflowRunComplete {
+                    task_id: bound.task,
+                    success: true,
+                    error: None,
+                    cancelled: false,
+                    github_run_id: bound.run.to_string(),
+                };
+                #[cfg(target_arch = "wasm32")]
+                let claimed = {
+                    let env = ctx.env.as_ref().ok_or_else(|| {
+                        "complete-run dispatching drive needs a Worker env".to_owned()
+                    })?;
+                    let alarm = ctx.alarm.as_ref().ok_or_else(|| {
+                        "complete-run dispatching drive needs the alarm".to_owned()
+                    })?;
+                    let _ = settings;
+                    super::object::complete_run_pass(&ctx.graph, env, db, alarm, &report)
+                        .await
+                        .map_err(text)?
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                let claimed = {
+                    let now = now_ms();
+                    let outcome = routes::complete_run(ctx.loaded(), db, &report, now)
+                        .await
+                        .map_err(text)?;
+                    debug_assert_eq!(outcome, super::graph::FinishOutcome::Applied);
+                    let claims = routes::claim_pass(
+                        ctx.loaded(),
+                        db,
+                        settings,
+                        now,
+                        u32::try_from(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
+                            .expect("the outbound bound fits u32"),
+                    )
+                    .await
+                    .map_err(text)?;
+                    let bindings: Vec<DispatchBinding> = claims
+                        .iter()
+                        .zip(HOST_RUN_BASE..)
+                        .map(|(claim, run)| DispatchBinding {
+                            task_id: claim.task_id.clone(),
+                            generation: claim.generation,
+                            run_id: run.to_string(),
+                        })
+                        .collect();
+                    routes::settle_dispatch(ctx.loaded(), db, bindings, Vec::new(), now)
+                        .await
+                        .map_err(text)?;
+                    let _plan = routes::wake_plan(ctx.loaded(), settings, now);
+                    claims
+                        .into_iter()
+                        .map(|claim| claim.task_id)
+                        .collect::<Vec<_>>()
+                };
+                ctx.set_bound(BoundRun {
+                    task: claimed.join(","),
+                    run: 0,
+                });
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let claimed = ctx.bound_run()?.task;
+                let ids = claimed
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                restore_claimed(ctx, db, ids).await
+            })
+        }),
+    },
+    Drive {
+        // `index/published` with claimable work behind it: the report's
+        // append plus the inline pass over every free slot — on wasm
+        // the real `published_index_pass`, on host the same store half
+        // with synthetic bindings.
+        name: "POST /index/published (dispatching)",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                let slice = PublishedSlice {
+                    target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
+                    rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
+                    base_generation: None,
+                    generation: None,
+                    added: fixture::full_slice_report(),
+                    retired: Vec::new(),
+                };
+                #[cfg(target_arch = "wasm32")]
+                let claimed = {
+                    let env = ctx
+                        .env
+                        .as_ref()
+                        .ok_or_else(|| "index dispatching drive needs a Worker env".to_owned())?;
+                    let alarm = ctx
+                        .alarm
+                        .as_ref()
+                        .ok_or_else(|| "index dispatching drive needs the alarm".to_owned())?;
+                    // The pass reads the deploy's settings itself.
+                    let _ = settings;
+                    super::object::published_index_pass(
+                        &ctx.graph,
+                        env,
+                        db,
+                        alarm,
+                        std::slice::from_ref(&slice),
+                    )
+                    .await
+                    .map_err(text)?
+                };
+                #[cfg(not(target_arch = "wasm32"))]
+                let claimed = {
+                    let now = now_ms();
+                    routes::slice_reports(ctx.loaded(), db, std::slice::from_ref(&slice), now)
+                        .await
+                        .map_err(text)?;
+                    let claims = routes::claim_pass(ctx.loaded(), db, settings, now, u32::MAX)
+                        .await
+                        .map_err(text)?;
+                    let bindings: Vec<DispatchBinding> = claims
+                        .iter()
+                        .zip(HOST_RUN_BASE..)
+                        .map(|(claim, run)| DispatchBinding {
+                            task_id: claim.task_id.clone(),
+                            generation: claim.generation,
+                            run_id: run.to_string(),
+                        })
+                        .collect();
+                    routes::settle_dispatch(ctx.loaded(), db, bindings, Vec::new(), now)
+                        .await
+                        .map_err(text)?;
+                    claims
+                        .into_iter()
+                        .map(|claim| claim.task_id)
+                        .collect::<Vec<_>>()
+                };
+                ctx.set_bound(BoundRun {
+                    task: claimed.join(","),
+                    run: 0,
+                });
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let claimed = ctx.bound_run()?.task;
+                let ids = claimed
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                restore_claimed(ctx, db, ids).await?;
+                routes::slice_reports(
+                    ctx.loaded(),
+                    db,
+                    &[PublishedSlice {
+                        target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
+                        rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
+                        base_generation: None,
+                        generation: None,
+                        added: Vec::new(),
+                        retired: fixture::full_slice_report(),
+                    }],
+                    now_ms(),
+                )
+                .await
+                .map_err(text)
+            })
+        }),
+    },
+    Drive {
+        // `requests outcome` on a live record: the report's merge plus
+        // the inline pass over every free slot — on wasm the real
+        // `request_outcome_pass`, on host the same store half with
+        // synthetic bindings.
+        name: "POST /requests/{id}/outcome (dispatching)",
+        setup: Some(|db, _shape, settings, ctx| {
+            Box::pin(async move {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let env = ctx
+                        .env
+                        .as_ref()
+                        .ok_or_else(|| "outcome dispatching setup needs a Worker env".to_owned())?;
+                    super::object::admit_request_pass(
+                        ctx.loaded(),
+                        env,
+                        db,
+                        settings,
+                        &dispatch_admission(),
+                        0,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(text)?;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                routes::admit_request(
+                    ctx.loaded(),
+                    db,
+                    settings,
+                    &dispatch_admission(),
+                    0,
+                    now_ms(),
+                )
+                .await
+                .map(|_| ())
+                .map_err(text)?;
+                routes::request_run_update(
+                    ctx.loaded(),
+                    db,
+                    DISPATCH_REQUEST_ID,
+                    &run_update(stow_types::api::RequestRunAction::InProgress, None),
+                    now_ms(),
+                )
+                .await
+                .map_err(text)
+            })
+        }),
+        run: |db, shape, settings, ctx| {
+            Box::pin(async move {
+                let report = request_report(shape);
+                #[cfg(target_arch = "wasm32")]
+                let claimed =
+                    {
+                        let env = ctx.env.as_ref().ok_or_else(|| {
+                            "outcome dispatching drive needs a Worker env".to_owned()
+                        })?;
+                        let alarm = ctx.alarm.as_ref().ok_or_else(|| {
+                            "outcome dispatching drive needs the alarm".to_owned()
+                        })?;
+                        // The pass reads the deploy's settings itself.
+                        let _ = settings;
+                        super::object::request_outcome_pass(
+                            &ctx.graph,
+                            env,
+                            db,
+                            alarm,
+                            DISPATCH_REQUEST_ID,
+                            &report,
+                        )
+                        .await
+                        .map_err(text)?
+                        .1
+                    };
+                #[cfg(not(target_arch = "wasm32"))]
+                let claimed = {
+                    let now = now_ms();
+                    routes::request_outcome(ctx.loaded(), db, DISPATCH_REQUEST_ID, &report, now)
+                        .await
+                        .map_err(text)?;
+                    let claims = routes::claim_pass(ctx.loaded(), db, settings, now, u32::MAX)
+                        .await
+                        .map_err(text)?;
+                    let bindings: Vec<DispatchBinding> = claims
+                        .iter()
+                        .zip(HOST_RUN_BASE..)
+                        .map(|(claim, run)| DispatchBinding {
+                            task_id: claim.task_id.clone(),
+                            generation: claim.generation,
+                            run_id: run.to_string(),
+                        })
+                        .collect();
+                    routes::settle_dispatch(ctx.loaded(), db, bindings, Vec::new(), now)
+                        .await
+                        .map_err(text)?;
+                    claims
+                        .into_iter()
+                        .map(|claim| claim.task_id)
+                        .collect::<Vec<_>>()
+                };
+                ctx.set_bound(BoundRun {
+                    task: claimed.join(","),
+                    run: 0,
+                });
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let claimed = ctx.bound_run()?.task;
+                let ids: Vec<String> = claimed
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                restore_claimed(ctx, db, ids).await?;
+                cancel_submitted(
+                    ctx,
+                    db,
+                    vec![stow_types::fixture::named_task_id(
+                        "costgate-request-root",
+                        DRIVE_SEED + TAG_UNTRUSTED * 1_000 + 500,
+                        CI_TARGET_TRIPLES[0],
+                    )],
+                )
+                .await
+            })
         }),
     },
     Drive {
@@ -2835,7 +3196,7 @@ pub const DRIVES: &[Drive] = &[
                         success: true,
                         error: None,
                         cancelled: false,
-                        github_run_id: Some(SNAPSHOT_RUN_BASE.to_string()),
+                        github_run_id: SNAPSHOT_RUN_BASE.to_string(),
                     },
                     now_ms(),
                 )
@@ -2918,17 +3279,17 @@ async fn snapshot_slice_report(
     } else {
         (added, retired)
     };
-    routes::slice_report(
+    routes::slice_reports(
         ctx.loaded(),
         db,
-        &PublishedSlice {
+        &[PublishedSlice {
             target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
             rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
             base_generation: None,
             generation: None,
             added,
             retired,
-        },
+        }],
         now_ms(),
     )
     .await

@@ -333,6 +333,9 @@ publish_slices() {
 for s in json.load(open(sys.argv[1])):
     print(s["index_file"], s["folded_file"])' "$WORK_DIR/index-export/slices.json")" \
         || die "reading $WORK_DIR/index-export/slices.json failed"
+    # Every slice publishes and signs on its own; the scheduler report
+    # is ONE call per run carrying the run's slices (stow#940).
+    local report_files=()
     echo "$pairs" | while read -r index_file folded_file; do
         [ -n "$index_file" ] || continue
         isolated_env \
@@ -343,12 +346,14 @@ for s in json.load(open(sys.argv[1])):
             --folded "$WORK_DIR/index-export/$folded_file" \
             >>"$LOG_DIR/index-publish-$tag.log" 2>&1 \
             || die "stow-admin index publish failed for $index_file — see $LOG_DIR/index-publish-$tag.log"
-        isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
-            "$BIN/stow-admin" index report \
-            --file "$WORK_DIR/index-export/$index_file" \
-            >>"$LOG_DIR/index-report-$tag.log" 2>&1 \
-            || die "stow-admin index report failed for $index_file — see $LOG_DIR/index-report-$tag.log"
     done
+    while read -r index_file _; do
+        [ -n "$index_file" ] && report_files+=(--file "$WORK_DIR/index-export/$index_file")
+    done <<<"$pairs"
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+        "$BIN/stow-admin" index report "${report_files[@]}" \
+        >>"$LOG_DIR/index-report-$tag.log" 2>&1 \
+        || die "stow-admin index report failed — see $LOG_DIR/index-report-$tag.log"
     # The records the pass newly folded accumulate into the catalog
     # file the assertions read — the e2e's view of what the signed
     # records say, replacing the old catalog queries.
@@ -1206,6 +1211,7 @@ fi
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
         STOW_GITHUB_WEBHOOK_SECRET="mock-github-webhook-secret" \
+        GITHUB_APP_SLUG="mock-stow-ci" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
         STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \

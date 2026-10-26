@@ -20,6 +20,7 @@ pub mod env_name;
 pub mod error;
 pub mod feature_sets;
 pub mod fixture;
+pub mod forwards;
 pub mod glibc;
 pub mod hash;
 pub mod identity;

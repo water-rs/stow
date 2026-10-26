@@ -50,6 +50,7 @@ const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
 const STOW_GITHUB_WEBHOOK_SECRET_ENV: &str = "STOW_GITHUB_WEBHOOK_SECRET";
+const GITHUB_APP_SLUG_ENV: &str = "GITHUB_APP_SLUG";
 /// `mock_compile::STOW_BUILD_MOCK_COMPILE_ENV`, named here for the refusal
 /// a build without the feature makes.
 #[cfg(not(feature = "mock-compile"))]
@@ -470,6 +471,7 @@ async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<
         env_required(STOW_GITHUB_WEBHOOK_SECRET_ENV)?,
         env_required(STOW_MOCK_PRIVATE_KEY_PATH_ENV)?,
         env_required(STOW_MOCK_REGISTRY_ROOT_ENV)?,
+        env_required(GITHUB_APP_SLUG_ENV)?,
     );
     local_server::serve(listen, state).await
 }

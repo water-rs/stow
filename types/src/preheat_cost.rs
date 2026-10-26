@@ -35,18 +35,23 @@ pub enum EventKind {
     /// A build run's `workflow_run` completion — one per
     /// `build-crate.yml` run, so one per task.
     Completion,
-    /// An `index-publish` slice report, which also dispatches the
-    /// dependents it releases.
+    /// An `index-publish` run's slice report, which also dispatches
+    /// the dependents it releases — one per publish run (stow#940).
     SliceReport,
+    /// A build run's `in_progress` — forwarded only for a run the
+    /// scheduler did not dispatch (stow#940), so a wave of its own runs
+    /// books none.
+    ExternalRunUpdate,
 }
 
 impl EventKind {
     /// Every kind, in the order a wave meets them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Submit,
         Self::Dispatch,
         Self::Completion,
         Self::SliceReport,
+        Self::ExternalRunUpdate,
     ];
 
     /// The probe-ledger operation this kind books under.
@@ -57,6 +62,7 @@ impl EventKind {
             Self::Dispatch => LEDGER_OP_ALARM,
             Self::Completion => LEDGER_OP_TASK_COMPLETE,
             Self::SliceReport => "POST /index/published",
+            Self::ExternalRunUpdate => "POST /tasks/run-update",
         }
     }
 
@@ -69,7 +75,7 @@ impl EventKind {
     pub const fn drive(self) -> Option<&'static str> {
         match self {
             Self::Dispatch => Some("alarm pass"),
-            Self::Submit | Self::Completion | Self::SliceReport => None,
+            Self::Submit | Self::Completion | Self::SliceReport | Self::ExternalRunUpdate => None,
         }
     }
 }
@@ -776,6 +782,44 @@ fn completions_check(name: &str, cost: &PhaseCost) -> Check {
     )
 }
 
+/// The webhook forwards a build run's `in_progress` only when the
+/// scheduler did not dispatch the run (stow#940): the phase's
+/// `POST /tasks/run-update` events are at most its external build runs
+/// — on the local CI, the runs seeded under
+/// [`crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN`] rather than
+/// dispatched through it. More means own runs' deliveries reach the
+/// scheduler again, a DO request per node the projection does not
+/// price.
+fn external_run_updates_check(
+    name: &str,
+    cost: &PhaseCost,
+    phase: &PhaseObservations,
+    runs: &[LocalCiRun],
+) -> Check {
+    let updates = kind(&cost.kinds, EventKind::ExternalRunUpdate).events;
+    let path = format!(
+        ".github/workflows/{}",
+        crate::trusted_builder::WORKFLOW_FILE
+    );
+    let external = runs
+        .iter()
+        .filter(|run| {
+            run.path == path
+                && run.triggering_actor_login == crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN
+                && run.dispatched_at_ms > phase.start.taken_at_ms
+                && run.dispatched_at_ms <= phase.end.taken_at_ms
+        })
+        .count() as u64;
+    check(
+        name,
+        updates <= external,
+        format!(
+            "{updates} `{}` events, {external} external build runs",
+            EventKind::ExternalRunUpdate.ledger_op()
+        ),
+    )
+}
+
 /// Per-event growth first → last layer for the kinds whose events
 /// scale with what they carry: completions and slice reports. The
 /// alarm pass is fixed-size and held to its drive budget in every layer
@@ -1111,6 +1155,18 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
         ),
         completions_check("Wave completions equal its build runs", &wave),
         completions_check("Resubmit completions equal its build runs", &resubmit),
+        external_run_updates_check(
+            "Wave run updates come from external runs only",
+            &wave,
+            &wave_reads,
+            &observed.runs,
+        ),
+        external_run_updates_check(
+            "Resubmit run updates come from external runs only",
+            &resubmit,
+            &resubmit_reads,
+            &observed.runs,
+        ),
         check(
             "Wave ran in at least three layers",
             layers.len() >= 3,
@@ -1159,10 +1215,12 @@ mod tests {
             ops: EventKind::ALL
                 .iter()
                 .map(|kind| {
-                    let (events, extra) = if *kind == EventKind::Completion {
-                        (completions, completion_extra)
-                    } else {
-                        (events, 0)
+                    let (events, extra) = match kind {
+                        EventKind::Completion => (completions, completion_extra),
+                        // The scheduler dispatched every run, so no
+                        // `in_progress` reaches it.
+                        EventKind::ExternalRunUpdate => (0, 0),
+                        _ => (events, 0),
                     };
                     SchedulerLedgerOp {
                         op: kind.ledger_op().to_owned(),
@@ -1197,6 +1255,9 @@ mod tests {
             error: None,
             delivery_errors: Vec::new(),
             task_id: Some(task_id.to_owned()),
+            // Dispatched through the local CI, which stamps the App's
+            // bot login on its runs.
+            triggering_actor_login: "stow-ci[bot]".to_owned(),
         }
     }
 
@@ -1613,9 +1674,58 @@ mod tests {
     #[test]
     fn a_phase_bills_every_counted_operation_as_a_request() {
         let report = analyse(&chain(0)).expect("analyse");
-        // Three kinds at 30 events each over the three layers, and one
-        // completion per build run.
+        // Three kinds at 30 events each over the three layers, one
+        // completion per build run, and no run update.
         assert_eq!(report.wave.requests(), 3 * 30 + 3);
+    }
+
+    /// `chain(0)` with `updates` `in_progress` forwards booked by the
+    /// wave's last round, carried into every later read.
+    fn with_run_updates(updates: u64) -> WaveObservations {
+        let mut observed = chain(0);
+        let book = |read: &mut LedgerSnapshot| {
+            for op in &mut read.ledger.ops {
+                if op.op == EventKind::ExternalRunUpdate.ledger_op() {
+                    op.events += updates;
+                    op.rows_read += updates;
+                    op.rows_written += updates;
+                }
+            }
+        };
+        book(&mut observed.wave.rounds[2].end);
+        book(&mut observed.wave.end);
+        book(&mut observed.resubmit.start);
+        book(&mut observed.resubmit.end);
+        observed
+    }
+
+    /// A wave of runs the scheduler dispatched forwards no
+    /// `in_progress` (stow#940); one that books them fails the gate,
+    /// since the projection prices none.
+    #[test]
+    fn own_runs_book_no_run_update() {
+        let name = "Wave run updates come from external runs only";
+        let clean = analyse(&chain(0)).expect("analyse");
+        assert!(!failed(&clean).contains(&name), "{:?}", clean.checks);
+        let forwarded = analyse(&with_run_updates(3)).expect("analyse");
+        assert!(failed(&forwarded).contains(&name), "{:?}", forwarded.checks);
+        // The forwards are still billed: the phase's requests carry them.
+        assert_eq!(forwarded.wave.requests(), clean.wave.requests() + 3);
+    }
+
+    /// An external run's `in_progress` is the forward the route still
+    /// serves — one per external run passes.
+    #[test]
+    fn an_external_run_may_book_its_run_update() {
+        let mut observed = with_run_updates(1);
+        observed.runs[2].triggering_actor_login =
+            crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN.to_owned();
+        let report = analyse(&observed).expect("analyse");
+        assert!(
+            !failed(&report).contains(&"Wave run updates come from external runs only"),
+            "{:?}",
+            report.checks
+        );
     }
 
     #[test]

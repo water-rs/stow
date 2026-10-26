@@ -459,6 +459,38 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 300,
     },
     DriveBudget {
+        // stow#940 provisional: the completion's `RunFinished` append
+        // (durable before the pass), then the inline pass's `Claims`
+        // and `Bindings` — the host gate measured 3/3/3; the workerd
+        // absolute awaits a mock-stack `stow-admin scheduler budget`
+        // run.
+        name: "POST /tasks/complete-run (dispatching)",
+        statements: 5,
+        rows_read: 7,
+        rows_written: 7,
+        wall_ms: 500,
+    },
+    DriveBudget {
+        // stow#940 provisional: the slice append plus the inline
+        // pass's `Claims` and `Bindings` — host-measured 3/3/3; the
+        // workerd absolute awaits the same probe run.
+        name: "POST /index/published (dispatching)",
+        statements: 5,
+        rows_read: 7,
+        rows_written: 7,
+        wall_ms: 500,
+    },
+    DriveBudget {
+        // stow#940 provisional: the outcome's merge rows plus the
+        // inline pass's `Claims` and `Bindings` — host-measured 3/3/3;
+        // the workerd absolute awaits the same probe run.
+        name: "POST /requests/{id}/outcome (dispatching)",
+        statements: 5,
+        rows_read: 7,
+        rows_written: 7,
+        wall_ms: 500,
+    },
+    DriveBudget {
         name: "GET /scheduler/demand-feed/status",
         statements: 2,
         rows_read: 4,

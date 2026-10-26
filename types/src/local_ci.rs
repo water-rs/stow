@@ -13,6 +13,15 @@ pub struct LocalCiTasks {
     pub tasks: Vec<LocalCiRun>,
 }
 
+/// The `triggering_actor.login` of a seeded — external — run.
+///
+/// A run that exists upstream without a dispatch through the server
+/// stands in for one an operator dispatched (`gh workflow run`, a
+/// rerun), so its actor is this login, not the App's bot (stow#940).
+/// The traffic-cost callback lane signs its `workflow_run` deliveries
+/// for those runs under the same login.
+pub const SEEDED_RUN_OPERATOR_LOGIN: &str = "mock-operator";
+
 /// One dispatched run — the local stand-in for a GitHub Actions
 /// workflow run, with the fields the API spells the same way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +67,11 @@ pub struct LocalCiRun {
     /// built once (stow#877).
     #[serde(default)]
     pub built: bool,
+    /// `triggering_actor.login` — who dispatched the run: the App's
+    /// `<slug>[bot]` login on a dispatch through this server,
+    /// [`SEEDED_RUN_OPERATOR_LOGIN`] on a seeded run (stow#940).
+    #[serde(default)]
+    pub triggering_actor_login: String,
 }
 
 /// `POST /seeded-runs`: `build-crate.yml` runs that exist upstream

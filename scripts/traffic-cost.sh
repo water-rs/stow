@@ -105,6 +105,7 @@ manifest_var() {
 }
 DISPATCH_LIMIT="$(manifest_var Skyzen.toml STOW_MAX_CONCURRENT_JOBS)"
 WEBHOOK_SECRET="$(manifest_var Skyzen.mock.toml STOW_GITHUB_WEBHOOK_SECRET)"
+APP_SLUG="$(manifest_var Skyzen.mock.toml GITHUB_APP_SLUG)"
 POW_SECRET="$(manifest_var Skyzen.mock.toml STOW_POW_CHALLENGE_SECRET)"
 
 export RUSTUP_TOOLCHAIN="${STOW_E2E_TOOLCHAIN:-stable}"
@@ -404,6 +405,7 @@ mkdir -p "$WORK_DIR/local-ci"
     exec env \
         STOW_EDGE_URL="$EDGE_URL" \
         STOW_GITHUB_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
+        GITHUB_APP_SLUG="$APP_SLUG" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
         STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \

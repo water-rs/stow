@@ -204,26 +204,79 @@ pub(super) async fn demand(
     Ok((report, plan))
 }
 
-/// `POST /index/published`: one `SliceReport` event; the apply flips
-/// the matched dependency edges.
+/// `POST /index/published`: one `SliceReport` event per slice of the
+/// publish run, committed in ONE append (stow#940); each apply flips
+/// its matched dependency edges.
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed append.
-pub(super) async fn slice_report(
+pub(super) async fn slice_reports(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
-    slice: &stow_types::api::PublishedSlice,
+    slices: &[stow_types::api::PublishedSlice],
     now: i64,
 ) -> Result<(), QueueError> {
-    let event = SchedulerEvent::SliceReport {
-        target: slice.target.clone(),
-        rustc_version: slice.rustc_version.clone(),
-        base_generation: slice.base_generation,
-        generation: slice.generation,
-        added: slice.added.clone(),
-        retired: slice.retired.clone(),
+    let events: Vec<SchedulerEvent> = slices
+        .iter()
+        .map(|slice| SchedulerEvent::SliceReport {
+            target: slice.target.clone(),
+            rustc_version: slice.rustc_version.clone(),
+            base_generation: slice.base_generation,
+            generation: slice.generation,
+            added: slice.added.clone(),
+            retired: slice.retired.clone(),
+        })
+        .collect();
+    commit(graph, db, &events, now).await
+}
+
+/// The `RunFinished` event a completion carries, with its parsed run
+/// id. A malformed run id fails here — before any apply or append —
+/// rather than persisting a row whose replay never applies.
+///
+/// # Errors
+/// `QueueError::Invariant` on an unparseable run id.
+fn run_finished_event(
+    report: &stow_types::api::WorkflowRunComplete,
+) -> Result<(SchedulerEvent, u64), QueueError> {
+    let run_id = report.github_run_id.parse::<u64>().map_err(|error| {
+        QueueError::Invariant(format!(
+            "complete-run github_run_id {:?}: {error}",
+            report.github_run_id
+        ))
+    })?;
+    let event = SchedulerEvent::RunFinished {
+        run_id: report.github_run_id.clone(),
+        task_id: report.task_id.clone(),
+        success: report.success,
+        cancelled: report.cancelled,
+        error: report.error.clone(),
     };
-    commit(graph, db, &[event], now).await
+    Ok((event, run_id))
+}
+
+/// The completion's in-memory apply — split from the append so the
+/// inline dispatch pass can fold the `RunFinished` row into its
+/// `Claims` append: the finish frees the slot the claim then reads,
+/// and both rows land in one append before any `workflow_dispatch`
+/// POST and before the ack (stow#940).
+fn apply_run_finished(
+    graph: LoadedGraph<'_>,
+    report: &stow_types::api::WorkflowRunComplete,
+    run_id: u64,
+    now: i64,
+) -> FinishOutcome {
+    graph.with(|graph| {
+        graph.last_run_update_ms = Some(now);
+        graph.run_finished(
+            &report.task_id,
+            run_id,
+            report.success,
+            report.cancelled,
+            report.error.clone(),
+            now,
+        )
+    })
 }
 
 /// `POST /tasks/complete-run`: one `RunFinished` row per delivery,
@@ -237,51 +290,45 @@ pub(super) async fn complete_run(
     report: &stow_types::api::WorkflowRunComplete,
     now: i64,
 ) -> Result<FinishOutcome, QueueError> {
-    let event = SchedulerEvent::RunFinished {
-        run_id: report.github_run_id.clone().unwrap_or_default(),
-        task_id: report.task_id.clone(),
-        success: report.success,
-        cancelled: report.cancelled,
-        error: report.error.clone(),
-    };
+    let (event, run_id) = run_finished_event(report)?;
     append(graph, db, std::slice::from_ref(&event), now).await?;
-    let run_id = report
-        .github_run_id
-        .as_deref()
-        .and_then(|id| id.parse::<u64>().ok())
-        .unwrap_or(0);
-    let outcome = graph.with(|graph| {
-        graph.run_finished(
-            &report.task_id,
-            run_id,
-            report.success,
-            report.cancelled,
-            report.error.clone(),
-            now,
-        )
-    });
-    Ok(outcome)
+    Ok(apply_run_finished(graph, report, run_id, now))
 }
 
-/// `POST /tasks/run-update`: an own run's `in_progress` delivery
-/// changes nothing persistent but the health check's last-delivery
-/// instant (stow#860) — `RunUpdate` marks the acceptance so a wake
-/// replays it (the post-wake reconcile restores running state); a run
-/// the scheduler did not dispatch appends its occupancy instead, whose
-/// apply marks the same instant.
+/// `POST /tasks/run-update`: the route serves external runs only —
+/// the webhook forwards `in_progress` just for a run the scheduler did
+/// not dispatch (stow#940), whose delivery appends its occupancy
+/// (`ExternalRunStarted`) and stamps the health check's last-delivery
+/// instant (stow#860). An own run's `in_progress` still lands through
+/// the same path when one arrives — replayed events, or a run whose
+/// actor a misnamed slug binding could not classify — `RunUpdate`
+/// marks the acceptance so a wake replays it.
 ///
 /// # Errors
-/// `QueueError::Sql` on a failed append.
+/// `QueueError::Sql` on a failed append, `QueueError::Invariant` on a
+/// malformed run id or a task id attributing to no runner family.
 pub(super) async fn task_run_update(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     update: &stow_types::api::TaskRunUpdate,
     now: i64,
 ) -> Result<StartOutcome, QueueError> {
-    let run_id = update.github_run_id.parse::<u64>().unwrap_or(0);
-    let family = stow_types::ci::family_of_task_id(&update.task_id)
-        .unwrap_or(stow_types::api::RunnerFamily::Linux);
-    let outcome = graph.with(|graph| graph.run_started(&update.task_id, run_id, family, now));
+    let run_id = update.github_run_id.parse::<u64>().map_err(|error| {
+        QueueError::Invariant(format!(
+            "run-update github_run_id {:?}: {error}",
+            update.github_run_id
+        ))
+    })?;
+    let family = stow_types::ci::family_of_task_id(&update.task_id).ok_or_else(|| {
+        QueueError::Invariant(format!(
+            "run-update task {} attributes to no runner family",
+            update.task_id
+        ))
+    })?;
+    let outcome = graph.with(|graph| {
+        graph.last_run_update_ms = Some(now);
+        graph.run_started(&update.task_id, run_id, family, now)
+    });
     let event = match outcome {
         StartOutcome::External => SchedulerEvent::ExternalRunStarted {
             run_id: update.github_run_id.clone(),
@@ -410,6 +457,8 @@ pub(super) async fn persist_freeze(
 /// A dispatch pass's claim half: free slots from the dispatch caps and
 /// the external occupancy, then the graph's claim in rank order, with
 /// ONE `Claims` event appended before any `workflow_dispatch` posts.
+/// `bound` caps the claim count — a completion's inline pass claims at
+/// most one concurrent POST round (`u32::MAX` claims every free slot).
 /// An empty claim set appends nothing.
 ///
 /// # Errors
@@ -420,13 +469,14 @@ pub(super) async fn claim_pass(
     db: &DurableDb,
     settings: &SchedulerSettings,
     now: i64,
+    bound: u32,
 ) -> Result<Vec<Claimed>, QueueError> {
     graph.with(|graph| graph.set_floor(settings.min_dispatch_value));
     let claims = graph.with(|graph| {
         let (total_free, macos_free) = graph.free_slots(settings);
         graph.claim(
-            total_free,
-            macos_free,
+            total_free.min(bound),
+            macos_free.min(bound),
             now,
             i64::from(settings.stale_dispatch_minutes) * 60_000,
         )
@@ -722,7 +772,7 @@ mod eviction_tests {
         let (db, owner) = seeded().await;
         let cell = owner.loaded().expect("seeded");
         let settings = settings();
-        let first = claim_pass(cell, &db, &settings, HOST_NOW_MS)
+        let first = claim_pass(cell, &db, &settings, HOST_NOW_MS, u32::MAX)
             .await
             .expect("first pass");
         assert!(!first.is_empty(), "the fixture leaves free slots");
@@ -733,7 +783,7 @@ mod eviction_tests {
             woken.with(|graph| graph.inflight()),
         );
         assert_eq!(before, after, "the replayed graph holds the same claims");
-        let second = claim_pass(woken, &db, &settings, HOST_NOW_MS)
+        let second = claim_pass(woken, &db, &settings, HOST_NOW_MS, u32::MAX)
             .await
             .expect("second pass");
         let taken = ids(&first);
@@ -741,7 +791,7 @@ mod eviction_tests {
             ids(&second).iter().all(|claim| !taken.contains(claim)),
             "a claimed task was claimed again after the wake"
         );
-        let live = claim_pass(cell, &db, &settings, HOST_NOW_MS)
+        let live = claim_pass(cell, &db, &settings, HOST_NOW_MS, u32::MAX)
             .await
             .expect("live second pass");
         assert_eq!(
@@ -761,7 +811,7 @@ mod eviction_tests {
         let settings = settings();
         let woken_owner = wake(&db).await;
         let woken = woken_owner.loaded().expect("woken");
-        let lost = claim_pass(cell, &db, &settings, HOST_NOW_MS)
+        let lost = claim_pass(cell, &db, &settings, HOST_NOW_MS, u32::MAX)
             .await
             .expect("pass");
         // Rewind the store to before the pass: drop the claim row.
@@ -769,11 +819,405 @@ mod eviction_tests {
             .execute()
             .await
             .expect("drop the claim row");
-        let again = claim_pass(woken, &db, &settings, HOST_NOW_MS)
+        let again = claim_pass(woken, &db, &settings, HOST_NOW_MS, u32::MAX)
             .await
             .expect("woken pass");
         assert!(!lost.is_empty(), "the fixture leaves free slots");
         assert_eq!(ids(&lost), ids(&again));
+    }
+}
+
+/// The stow#940 inline-dispatch contract: the request that frees a
+/// slot or releases work runs the pass itself — a completion claims at
+/// most one `MAX_OUTBOUND_INFLIGHT` round, `index/published` and the
+/// request outcome claim every free slot — and the `RunFinished` row
+/// folds into the `Claims` append. Anything claimable past the
+/// completion's bound arms the alarm at `now`.
+#[cfg(test)]
+mod inline_dispatch_tests {
+    use super::*;
+    use crate::scheduler::drives::HOST_NOW_MS;
+    use crate::scheduler::fixture::{self, FixtureShape};
+    use crate::scheduler::graph::GraphCell;
+    use crate::scheduler::test_db;
+    use stow_types::api::WorkflowRunComplete;
+
+    const SHAPE: FixtureShape = fixture::GATE;
+
+    /// A completion's inline claim bound: one concurrent POST round.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "MAX_OUTBOUND_INFLIGHT is the small constant 4"
+    )]
+    const BOUND: u32 = crate::fetch_guard::MAX_OUTBOUND_INFLIGHT as u32;
+
+    /// The production dispatch cap: the fixture holds 30 in flight, so
+    /// 15 slots are free.
+    fn settings() -> SchedulerSettings {
+        SchedulerSettings {
+            dispatch: queue::Dispatch::Limited(std::num::NonZeroU32::new(45).expect("45")),
+            ..SchedulerSettings::default()
+        }
+    }
+
+    async fn seeded() -> (DurableDb, GraphCell) {
+        let db = test_db::memory_db().await.expect("memory db");
+        let cell = GraphCell::default();
+        fixture::seed(&db, &cell, SHAPE, HOST_NOW_MS)
+            .await
+            .expect("seed");
+        (db, cell)
+    }
+
+    /// What a woken Durable Object holds: the store replayed.
+    async fn wake(db: &DurableDb) -> GraphCell {
+        let (mut graph, tail) = store::load(db).await.expect("load");
+        store::apply_events(&mut graph, &tail);
+        let cell = GraphCell::default();
+        cell.install(graph);
+        cell
+    }
+
+    async fn log_rows(db: &DurableDb) -> i64 {
+        db.query("SELECT COUNT(*) FROM event_log")
+            .fetch_scalar::<i64>()
+            .await
+            .expect("row count")
+    }
+
+    /// A completion for the fixture's `k`-th bound in-flight run.
+    fn report(k: u32) -> WorkflowRunComplete {
+        let run = SHAPE.in_flight_run(k);
+        WorkflowRunComplete {
+            task_id: run.task_id,
+            success: true,
+            error: None,
+            cancelled: false,
+            github_run_id: run.run_id.to_string(),
+        }
+    }
+
+    /// A completion whose freed slot is all the pass can take: the cap
+    /// leaves exactly the round's bound free, the claim takes them in
+    /// the same turn the finish lands — `RunFinished` and `Claims` in
+    /// ONE append — and nothing claimable remains, so the wake plan
+    /// arms no immediate re-fire.
+    #[tokio::test]
+    async fn a_completion_claims_inline_and_arms_no_immediate_wake() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let settings = SchedulerSettings {
+            dispatch: queue::Dispatch::Limited(std::num::NonZeroU32::new(33).expect("33")),
+            ..settings()
+        };
+        // A finished reconcile marks `reconcile_attempted_at`, so only the
+        // lease clocks arm the plan.
+        cell.with(|graph| graph.reconcile_runs(&[], HOST_NOW_MS));
+        let before = log_rows(&db).await;
+        let report = report(0);
+        assert_eq!(
+            complete_run(cell, &db, &report, HOST_NOW_MS)
+                .await
+                .expect("completion"),
+            FinishOutcome::Applied
+        );
+        let claims = claim_pass(cell, &db, &settings, HOST_NOW_MS, BOUND)
+            .await
+            .expect("inline pass");
+        assert_eq!(
+            claims.len(),
+            usize::try_from(BOUND).expect("bound"),
+            "the pass claims the freed slot plus the three left by the cap"
+        );
+        assert_eq!(
+            log_rows(&db).await - before,
+            2,
+            "`RunFinished` lands before the pass, then `Claims`"
+        );
+        match wake_plan(cell, &settings, HOST_NOW_MS) {
+            AlarmPlan::At(at) => assert!(
+                at > HOST_NOW_MS,
+                "nothing remains claimable, so no immediate re-fire"
+            ),
+            AlarmPlan::Delete => {}
+        }
+    }
+
+    /// A completion with more claimable than one round: the pass
+    /// dispatches the bound and the wake plan arms the alarm at `now`
+    /// for the remainder.
+    #[tokio::test]
+    async fn a_completion_past_the_round_arms_the_alarm_at_now() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let settings = settings();
+        let report = report(0);
+        assert_eq!(
+            complete_run(cell, &db, &report, HOST_NOW_MS)
+                .await
+                .expect("completion"),
+            FinishOutcome::Applied
+        );
+        let claims = claim_pass(cell, &db, &settings, HOST_NOW_MS, BOUND)
+            .await
+            .expect("inline pass");
+        assert_eq!(
+            claims.len(),
+            usize::try_from(BOUND).expect("bound"),
+            "the bound holds at one concurrent round"
+        );
+        assert_eq!(
+            wake_plan(cell, &settings, HOST_NOW_MS),
+            AlarmPlan::At(HOST_NOW_MS),
+            "the claimable remainder arms the alarm at now"
+        );
+    }
+
+    /// A failed `workflow_dispatch` POST in an inline pass re-queues
+    /// its claim under the dispatch backoff: the row returns to
+    /// `pending`, no pass at the same instant reclaims it, and the
+    /// wake plan arms at the `not_before`, not sooner.
+    #[tokio::test]
+    async fn a_failed_post_in_an_inline_pass_takes_the_backoff() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let settings = settings();
+        cell.with(|graph| graph.reconcile_runs(&[], HOST_NOW_MS));
+        let claims = claim_pass(cell, &db, &settings, HOST_NOW_MS, BOUND)
+            .await
+            .expect("inline pass");
+        let failed_ids: std::collections::BTreeSet<&str> =
+            claims.iter().map(|claim| claim.task_id.as_str()).collect();
+        let failures = claims
+            .iter()
+            .map(|claim| (claim.task_id.clone(), claim.generation, "boom".to_owned()))
+            .collect();
+        settle_dispatch(cell, &db, Vec::new(), failures, HOST_NOW_MS)
+            .await
+            .expect("settle");
+        let status = cell.with(|graph| {
+            graph
+                .list(
+                    &stow_types::api::QueueSelector {
+                        task_ids: vec![claims[0].task_id.clone()],
+                        ..stow_types::api::QueueSelector::default()
+                    },
+                    HOST_NOW_MS,
+                )
+                .map(|tasks| tasks[0].status)
+        });
+        assert_eq!(
+            status.expect("listed"),
+            stow_types::api::QueueTaskStatus::Pending,
+            "a failed claim re-queues to pending"
+        );
+        let second = claim_pass(cell, &db, &settings, HOST_NOW_MS, u32::MAX)
+            .await
+            .expect("same-instant pass");
+        assert!(
+            second
+                .iter()
+                .all(|claim| !failed_ids.contains(claim.task_id.as_str())),
+            "a claim under its not_before is not reclaimed"
+        );
+        match wake_plan(cell, &settings, HOST_NOW_MS) {
+            AlarmPlan::At(armed) => assert!(
+                armed > HOST_NOW_MS,
+                "the backoff arms the alarm at not_before"
+            ),
+            plan @ AlarmPlan::Delete => {
+                panic!("a backed-off claim arms a wake: {plan:?}");
+            }
+        }
+    }
+
+    /// A frozen dispatch claims nothing inline — the folded
+    /// `RunFinished` still lands, alone, in one append.
+    #[tokio::test]
+    async fn a_frozen_dispatch_claims_nothing_inline() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let settings = SchedulerSettings {
+            dispatch: queue::Dispatch::Paused,
+            ..settings()
+        };
+        let before = log_rows(&db).await;
+        let report = report(0);
+        assert_eq!(
+            complete_run(cell, &db, &report, HOST_NOW_MS)
+                .await
+                .expect("completion"),
+            FinishOutcome::Applied
+        );
+        let claims = claim_pass(cell, &db, &settings, HOST_NOW_MS, BOUND)
+            .await
+            .expect("frozen pass");
+        assert!(claims.is_empty(), "a frozen dispatch claims nothing");
+        assert_eq!(
+            log_rows(&db).await - before,
+            1,
+            "the completion still lands its `RunFinished` row"
+        );
+    }
+
+    /// The slice-report pass claims every free slot — the release
+    /// route's bound is the dispatch cap, never the completion round.
+    #[tokio::test]
+    async fn a_slice_report_claims_every_free_slot() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let settings = settings();
+        let free = cell.with(|graph| graph.free_slots(&settings)).0;
+        let claims = claim_pass(cell, &db, &settings, HOST_NOW_MS, u32::MAX)
+            .await
+            .expect("slice-report pass");
+        assert_eq!(
+            claims.len(),
+            usize::try_from(free).expect("free slots"),
+            "every free slot claimed in one pass"
+        );
+        assert!(
+            claims.len() > usize::try_from(BOUND).expect("bound"),
+            "the pass is not held to the completion's round"
+        );
+    }
+
+    /// A bounded claim is a prefix of the unbounded claim — the bound
+    /// never reorders the rank.
+    #[tokio::test]
+    async fn a_bounded_claim_keeps_the_rank_order() {
+        let (db_bound, owner_bound) = seeded().await;
+        let bound_cell = owner_bound.loaded().expect("seeded");
+        let (db_free, owner_free) = seeded().await;
+        let free_cell = owner_free.loaded().expect("seeded");
+        let settings = settings();
+        let bounded = claim_pass(bound_cell, &db_bound, &settings, HOST_NOW_MS, BOUND)
+            .await
+            .expect("bounded pass");
+        let unbounded = claim_pass(free_cell, &db_free, &settings, HOST_NOW_MS, u32::MAX)
+            .await
+            .expect("unbounded pass");
+        let bounded_ids: Vec<&str> = bounded.iter().map(|c| c.task_id.as_str()).collect();
+        let prefix: Vec<&str> = unbounded
+            .iter()
+            .take(bounded.len())
+            .map(|c| c.task_id.as_str())
+            .collect();
+        assert_eq!(bounded_ids, prefix, "the bound truncates, never reorders");
+    }
+
+    /// Evicted after the completion's combined append and before the
+    /// `Bindings` row: the woken graph replays the finish and the
+    /// claims as dispatched-unbound — its next pass takes only fresh
+    /// tasks, and the completion that arrives for one binds that
+    /// replayed claim exactly once.
+    #[tokio::test]
+    async fn an_eviction_between_the_combined_append_and_bindings_builds_once() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let settings = settings();
+        let report = report(0);
+        assert_eq!(
+            complete_run(cell, &db, &report, HOST_NOW_MS)
+                .await
+                .expect("completion"),
+            FinishOutcome::Applied
+        );
+        let claims = claim_pass(cell, &db, &settings, HOST_NOW_MS, BOUND)
+            .await
+            .expect("inline pass");
+        assert!(!claims.is_empty());
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        // The replayed claims stay claimed: the woken pass takes only
+        // the tasks the first pass left.
+        let second = claim_pass(woken, &db, &settings, HOST_NOW_MS, u32::MAX)
+            .await
+            .expect("woken pass");
+        let taken: std::collections::BTreeSet<&str> =
+            claims.iter().map(|claim| claim.task_id.as_str()).collect();
+        assert!(
+            second
+                .iter()
+                .all(|claim| !taken.contains(claim.task_id.as_str())),
+            "a replayed claim was claimed again"
+        );
+        // The completion for one of the replayed claims binds and
+        // finishes it — one build, once.
+        let again = woken.with(|graph| {
+            graph.run_finished(&claims[0].task_id, 9_999, true, false, None, HOST_NOW_MS)
+        });
+        assert!(
+            matches!(again, FinishOutcome::Applied),
+            "the replayed claim binds its completion once: {again:?}"
+        );
+    }
+
+    /// The finish is durable before the pass can fail: `RunFinished`
+    /// lands alone, so even a pass that never runs leaves a row a
+    /// woken object replays into a finished node (stow#940).
+    #[tokio::test]
+    async fn a_completion_is_durable_before_any_pass() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let before = log_rows(&db).await;
+        let report = report(0);
+        assert_eq!(
+            complete_run(cell, &db, &report, HOST_NOW_MS)
+                .await
+                .expect("completion"),
+            FinishOutcome::Applied
+        );
+        assert_eq!(
+            log_rows(&db).await - before,
+            1,
+            "the finish appends alone, before the pass"
+        );
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        let status = woken.with(|graph| {
+            graph
+                .list(
+                    &stow_types::api::QueueSelector {
+                        task_ids: vec![report.task_id.clone()],
+                        ..stow_types::api::QueueSelector::default()
+                    },
+                    HOST_NOW_MS,
+                )
+                .map(|tasks| tasks[0].status)
+        });
+        assert_eq!(
+            status.expect("listed"),
+            stow_types::api::QueueTaskStatus::Completed,
+            "a wake replays the completion even without a pass"
+        );
+    }
+
+    /// A completion's inline pass never reconciles: the run listing
+    /// stays undone and `wake_plan` arms the alarm for it, so the
+    /// webhook answers inside GitHub's delivery window (stow#940).
+    #[tokio::test]
+    async fn a_due_reconcile_arms_the_alarm_for_a_completion() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let settings = settings();
+        let report = report(0);
+        assert_eq!(
+            complete_run(cell, &db, &report, HOST_NOW_MS)
+                .await
+                .expect("completion"),
+            FinishOutcome::Applied
+        );
+        claim_pass(cell, &db, &settings, HOST_NOW_MS, BOUND)
+            .await
+            .expect("inline pass");
+        // The seeded graph never reconciled, so the listing is due and
+        // the completion's skipped reconcile arms the alarm at now.
+        assert_eq!(
+            wake_plan(cell, &settings, HOST_NOW_MS),
+            AlarmPlan::At(HOST_NOW_MS),
+            "a due reconcile arms the alarm, not the webhook"
+        );
     }
 }
 

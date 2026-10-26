@@ -46,6 +46,17 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Debug, Clone)]
 pub struct WebhookSecret(pub String);
 
+/// The `GITHUB_APP_SLUG` binding rendered into the
+/// `triggering_actor.login` a scheduler-dispatched run carries —
+/// `<slug>[bot]`. A `build-crate.yml` `in_progress` delivery whose run
+/// carries it forwards nothing: the CI listing's reconcile reports own
+/// runs' running state instead (stow#940). Required at worker startup
+/// in every deployment — the mock stack sets it to the slug the local
+/// CI stamps.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct AppBotLogin(pub String);
+
 /// The webhook's signing headers and the raw body they cover, pulled off
 /// the request by [`SignedDelivery`]'s extractor.
 struct SignedDelivery {
@@ -146,6 +157,17 @@ struct WorkflowRunFields {
     html_url: Option<String>,
     /// The repo the head commit lives in — a fork's run names its fork.
     head_repository: RepoRef,
+    /// `triggering_actor` — whose dispatch started the run: the App's
+    /// `<slug>[bot]` login on a scheduler dispatch, an operator's login
+    /// on one dispatched by hand (stow#940). A delivery without it
+    /// fails the parse — GitHub always sends it.
+    triggering_actor: RunActor,
+}
+
+/// `triggering_actor` — only `login` is read.
+#[derive(Debug, serde::Deserialize)]
+struct RunActor {
+    login: String,
 }
 
 /// `full_name` (`owner/name`) of a repo the payload carries.
@@ -307,30 +329,53 @@ pub async fn github_workflow_run(
     delivery: VerifiedDelivery,
     State(ghcr): State<crate::api::GhcrConfig>,
     State(scheduler): State<CfDurableNamespace>,
+    State(app_bot_login): State<AppBotLogin>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let Some((action, event)) = decode_delivery(&delivery)? else {
+    consume_delivery(&delivery, &ghcr, &scheduler, &app_bot_login.0).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// The route's whole decision for one verified delivery: what it
+/// checks and which scheduler requests it forwards. Host-compiled over
+/// the outbound seams so the tests drive every `workflow_run` action
+/// through it and count the forwards against `stow_types::forwards` —
+/// the counts the traffic projection prices (stow#937).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+async fn consume_delivery(
+    delivery: &VerifiedDelivery,
+    records: &impl RecordsCheck,
+    forward: &(impl TaskRunForward + RequestRunForward),
+    app_bot_login: &str,
+) -> Result<(), GetArtifactError> {
+    let Some((action, event)) = decode_delivery(delivery)? else {
         tracing::debug!(event = %delivery.event, "ignoring non-workflow_run delivery");
-        return Ok(Json(OkResponse { ok: true }));
+        return Ok(());
     };
     let Some((run, subject)) = authorized_run(&event)? else {
         tracing::debug!("ignoring workflow_run outside the authority boundary");
-        return Ok(Json(OkResponse { ok: true }));
+        return Ok(());
     };
     match subject {
+        // A build run's `completed` forwards for every run — the
+        // slot-freeing channel the scheduler cannot learn elsewhere;
+        // its `in_progress` only for a run the scheduler did not
+        // dispatch (stow#940): own runs' running state comes from the
+        // CI listing's reconcile, so their deliveries would only spend
+        // a DO request each.
         RunSubject::Task {
             rustc_version,
             task_id,
         } if action == "completed" => {
-            complete_build_task(&ghcr, &scheduler, run, rustc_version, task_id).await?;
+            complete_build_task(records, forward, run, rustc_version, task_id).await?;
         }
         RunSubject::Task { task_id, .. } if action == "in_progress" => {
-            update_task_run(&scheduler, run, task_id).await?;
+            update_external_task_run(forward, app_bot_login, run, task_id).await?;
         }
         RunSubject::Request {
             attempt,
             request_id,
         } if action == "in_progress" || action == "completed" => {
-            update_request_run(&scheduler, run, &action, attempt, request_id).await?;
+            update_request_run(forward, run, &action, attempt, request_id).await?;
         }
         // A build run's `requested`/`waiting` and a resolve run's
         // `requested`/`waiting`: neither event carries anything to
@@ -338,7 +383,51 @@ pub async fn github_workflow_run(
         // `in_progress` (dispatched → running) and `completed`.
         _ => {}
     }
-    Ok(Json(OkResponse { ok: true }))
+    Ok(())
+}
+
+/// The check a build run's `completed` makes before it forwards: the
+/// run's signed records artifact is in GHCR. `GhcrConfig` carries it on
+/// wasm; tests stub it.
+trait RecordsCheck: Sync {
+    /// A registry fetch that failed — transient, so the delivery
+    /// answers 500 for GitHub to retry.
+    type Error: std::fmt::Display;
+
+    /// Whether GHCR holds the records artifact this `build` of the task
+    /// published — the tag names the run, so the check matches the
+    /// artifact this run pushed and no other build's.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn records_artifact_exists<'a>(
+        &'a self,
+        rustc_version: &'a str,
+        task_id: &'a str,
+        build: stow_types::records::BuildRun,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send + 'a;
+}
+
+#[cfg(target_arch = "wasm32")]
+impl RecordsCheck for crate::api::GhcrConfig {
+    type Error = crate::ghcr::FetchError;
+
+    fn records_artifact_exists<'a>(
+        &'a self,
+        rustc_version: &'a str,
+        task_id: &'a str,
+        build: stow_types::records::BuildRun,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send + 'a {
+        async move {
+            crate::ghcr::records_artifact_exists(
+                self,
+                rustc_version,
+                task_id,
+                build,
+                &crate::fetch_guard::OutboundPool::new(),
+            )
+            .await
+        }
+        .into_send()
+    }
 }
 
 /// The outbound channel a `build-crate.yml` delivery uses: the
@@ -377,10 +466,58 @@ impl TaskRunForward for CfDurableNamespace {
     }
 }
 
-/// `build-crate.yml` `in_progress` — the bound row moves `dispatched`
-/// → `running` through `POST /tasks/run-update` (stow#876). An unknown
-/// task or a run the row is not bound to is a stale generation's event
-/// — the object's 404/409 is logged, never an error back to GitHub.
+/// The outbound channel a `resolve-request.yml` delivery uses: the
+/// forward to the object's `POST /requests/{id}/run-update`.
+/// `CfDurableNamespace` carries it on wasm; tests stub it to count
+/// what the handler sends.
+trait RequestRunForward: Sync {
+    /// Forward `update` to `POST /requests/{id}/run-update`.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn send_request_run_update<'a>(
+        &'a self,
+        request_id: &'a str,
+        update: &'a stow_types::api::RequestRunUpdate,
+    ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a;
+}
+
+#[cfg(target_arch = "wasm32")]
+impl RequestRunForward for CfDurableNamespace {
+    fn send_request_run_update<'a>(
+        &'a self,
+        request_id: &'a str,
+        update: &'a stow_types::api::RequestRunUpdate,
+    ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a {
+        scheduler_client::send_request_run_update(self, request_id, update).into_send()
+    }
+}
+
+/// `build-crate.yml` `in_progress` — `POST /tasks/run-update` serves
+/// external runs only (stow#940): a run the scheduler dispatched
+/// carries the App's bot login and its running state arrives through
+/// the CI listing's reconcile instead, so the delivery is consumed
+/// without a forward.
+async fn update_external_task_run(
+    forward: &impl TaskRunForward,
+    app_bot_login: &str,
+    run: &WorkflowRunFields,
+    task_id: &str,
+) -> Result<(), GetArtifactError> {
+    if run.triggering_actor.login == app_bot_login {
+        tracing::debug!(
+            task_id,
+            run_id = run.id,
+            "own run's in_progress — the CI listing's reconcile reports it"
+        );
+        return Ok(());
+    }
+    update_task_run(forward, run, task_id).await
+}
+
+/// `build-crate.yml` `in_progress` of a run the scheduler did not
+/// dispatch — the external run's occupancy record lands through
+/// `POST /tasks/run-update` (stow#940). An unknown task or a run the
+/// row is not bound to is a stale generation's event — the object's
+/// 404/409 is logged, never an error back to GitHub.
 async fn update_task_run(
     forward: &impl TaskRunForward,
     run: &WorkflowRunFields,
@@ -415,9 +552,8 @@ async fn update_task_run(
 /// `POST /tasks/complete-run` (stow#876). An unknown task is an orphan
 /// run from an abandoned dispatch — the object's 404 is logged, never
 /// an error back to GitHub.
-#[cfg(target_arch = "wasm32")]
 async fn complete_build_task(
-    ghcr: &crate::api::GhcrConfig,
+    records: &impl RecordsCheck,
     forward: &impl TaskRunForward,
     run: &WorkflowRunFields,
     rustc_version: &str,
@@ -430,7 +566,10 @@ async fn complete_build_task(
             run_id: run.id,
             run_attempt: run.run_attempt.get(),
         };
-        match records_artifact_exists(ghcr, rustc_version, task_id, build).await {
+        match records
+            .records_artifact_exists(rustc_version, task_id, build)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 success = false;
@@ -459,6 +598,22 @@ async fn complete_build_task(
         ));
     }
 
+    forward_run_complete(forward, run, task_id, success, error).await
+}
+
+/// Forward the settled outcome to `POST /tasks/complete-run` — every
+/// `completed` delivery forwards, whether the run was dispatched by
+/// the scheduler or not: the delivery is what frees the slot or the
+/// external run's occupancy (stow#940). An unknown task is an orphan
+/// run from an abandoned dispatch — the object's 404 is logged, never
+/// an error back to GitHub.
+async fn forward_run_complete(
+    forward: &impl TaskRunForward,
+    run: &WorkflowRunFields,
+    task_id: &str,
+    success: bool,
+    error: Option<String>,
+) -> Result<(), GetArtifactError> {
     let completion = WorkflowRunComplete {
         task_id: task_id.to_owned(),
         success,
@@ -467,7 +622,7 @@ async fn complete_build_task(
         // superseded duplicate — the scheduler re-queues the task instead
         // of recording a failure (stow#877).
         cancelled: run.conclusion.as_deref() == Some("cancelled"),
-        github_run_id: Some(run.id.to_string()),
+        github_run_id: run.id.to_string(),
     };
     match forward.send_run_complete(&completion).await {
         Ok(()) => {
@@ -491,37 +646,29 @@ async fn complete_build_task(
     Ok(())
 }
 
-/// Whether GHCR holds the records artifact this `build` of the task
-/// published — the tag names the run, so the check matches the artifact
-/// this run pushed and no other build's.
-#[cfg(target_arch = "wasm32")]
-async fn records_artifact_exists(
-    config: &crate::api::GhcrConfig,
-    rustc_version: &str,
-    task_id: &str,
-    build: stow_types::records::BuildRun,
-) -> Result<bool, crate::ghcr::FetchError> {
-    crate::ghcr::records_artifact_exists(
-        config,
-        rustc_version,
-        task_id,
-        build,
-        &crate::fetch_guard::OutboundPool::new(),
-    )
-    .await
-}
-
 /// `resolve-request.yml` `in_progress`/`completed` — the request
 /// record's lifecycle channel (`accepted` → `resolving`, and the
-/// backstop that fails a run which finished without an outcome).
-#[cfg(target_arch = "wasm32")]
+/// backstop that fails a run which finished without an outcome). The
+/// backstop only fires when it is needed: a `success` conclusion means
+/// the run's "Resolve the request and submit its outcome" step already
+/// posted the outcome — the workflow fails the step, and so the run,
+/// when the post does not land — so that `completed` forwards nothing
+/// (stow#940).
 async fn update_request_run(
-    scheduler: &CfDurableNamespace,
+    forward: &impl RequestRunForward,
     run: &WorkflowRunFields,
     action: &str,
     attempt: u32,
     request_id: &str,
 ) -> Result<(), GetArtifactError> {
+    if action == "completed" && run.conclusion.as_deref() == Some("success") {
+        tracing::debug!(
+            request_id,
+            attempt,
+            "resolve run completed successfully — its outcome already posted"
+        );
+        return Ok(());
+    }
     let update = stow_types::api::RequestRunUpdate {
         attempt,
         action: if action == "completed" {
@@ -533,7 +680,7 @@ async fn update_request_run(
         run_id: Some(run.id.to_string()),
         run_url: run.html_url.clone(),
     };
-    match scheduler_client::send_request_run_update(scheduler, request_id, &update).await {
+    match forward.send_request_run_update(request_id, &update).await {
         Ok(()) => {
             tracing::info!(request_id, attempt, %action, "request run update applied");
         }
@@ -596,6 +743,14 @@ mod tests {
         VerifiedDelivery::extract(&mut request).await
     }
 
+    /// The `triggering_actor.login` a run dispatched through the CI
+    /// interface carries — `<slug>[bot]`, the App's bot login.
+    const APP_BOT_LOGIN: &str = "stow-ci[bot]";
+
+    /// An operator's login — what every run the scheduler did not
+    /// dispatch carries.
+    const OPERATOR_LOGIN: &str = "mock-operator";
+
     fn completed_event(over: impl Fn(&mut serde_json::Value)) -> Vec<u8> {
         let mut event = serde_json::json!({
             "action": "completed",
@@ -610,6 +765,7 @@ mod tests {
                 "run_attempt": 1,
                 "html_url": "https://github.com/water-rs/stow/actions/runs/987654321",
                 "head_repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
+                "triggering_actor": {"login": OPERATOR_LOGIN},
             },
         });
         over(&mut event);
@@ -777,6 +933,124 @@ mod tests {
         }
     }
 
+    /// A resolve run's `completed` forwards only as the backstop:
+    /// `success` means the outcome already posted inside the run, so
+    /// the delivery sends nothing; every other conclusion forwards
+    /// the `RequestRunUpdate` (stow#940).
+    #[tokio::test]
+    async fn a_successful_resolve_completion_forwards_nothing() {
+        let body = completed_event(|event| {
+            event["workflow_run"]["path"] = serde_json::json!(format!(
+                ".github/workflows/{}",
+                stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE
+            ));
+            event["workflow_run"]["display_title"] =
+                serde_json::json!("resolve-a2-req-serde-1.0.0-ab12");
+        });
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let (_action, event) = decode_delivery(&delivery)
+            .expect("decodes")
+            .expect("completed action");
+        let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+        let RunSubject::Request {
+            attempt,
+            request_id,
+        } = subject
+        else {
+            panic!("resolve-request.yml decodes a request subject");
+        };
+        let forward = CountingForward::default();
+        update_request_run(&forward, run, "completed", attempt, request_id)
+            .await
+            .expect("consumed");
+        assert!(
+            forward
+                .request_updates
+                .lock()
+                .expect("request updates")
+                .is_empty(),
+            "a success conclusion posts nothing — the outcome already landed"
+        );
+    }
+
+    /// Any conclusion but `success` means the outcome never posted, so
+    /// the `completed` backstop forwards the update as today.
+    #[tokio::test]
+    async fn a_failed_resolve_completion_forwards_the_update() {
+        let body = completed_event(|event| {
+            event["workflow_run"]["path"] = serde_json::json!(format!(
+                ".github/workflows/{}",
+                stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE
+            ));
+            event["workflow_run"]["display_title"] =
+                serde_json::json!("resolve-a2-req-serde-1.0.0-ab12");
+            event["workflow_run"]["conclusion"] = serde_json::json!("failure");
+        });
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let (_action, event) = decode_delivery(&delivery)
+            .expect("decodes")
+            .expect("completed action");
+        let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+        let RunSubject::Request {
+            attempt,
+            request_id,
+        } = subject
+        else {
+            panic!("resolve-request.yml decodes a request subject");
+        };
+        let forward = CountingForward::default();
+        update_request_run(&forward, run, "completed", attempt, request_id)
+            .await
+            .expect("forwarded");
+        let sent = forward.request_updates.lock().expect("request updates");
+        assert_eq!(sent.len(), 1, "the backstop forwards once");
+        assert_eq!(sent[0].action, stow_types::api::RequestRunAction::Completed);
+        assert_eq!(sent[0].conclusion.as_deref(), Some("failure"));
+    }
+
+    /// The `in_progress` delivery is unaffected — `accepted` →
+    /// `resolving` is the visible progress a user waits on.
+    #[tokio::test]
+    async fn a_resolve_run_in_progress_still_forwards() {
+        let body = completed_event(|event| {
+            event["action"] = serde_json::json!("in_progress");
+            event["workflow_run"]["path"] = serde_json::json!(format!(
+                ".github/workflows/{}",
+                stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE
+            ));
+            event["workflow_run"]["display_title"] =
+                serde_json::json!("resolve-a2-req-serde-1.0.0-ab12");
+        });
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let (_action, event) = decode_delivery(&delivery)
+            .expect("decodes")
+            .expect("in_progress action");
+        let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+        let RunSubject::Request {
+            attempt,
+            request_id,
+        } = subject
+        else {
+            panic!("resolve-request.yml decodes a request subject");
+        };
+        let forward = CountingForward::default();
+        update_request_run(&forward, run, "in_progress", attempt, request_id)
+            .await
+            .expect("forwarded");
+        let sent = forward.request_updates.lock().expect("request updates");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].action,
+            stow_types::api::RequestRunAction::InProgress
+        );
+    }
+
     /// A pinned resolve run whose title is not
     /// `resolve-a<attempt>-<request_id>` is a 400 — same rule as a
     /// build run's.
@@ -901,23 +1175,50 @@ mod tests {
         }
     }
 
-    /// The task forward's test double: records the updates —
-    /// `send_task_run_update` is the `in_progress` arm's only outbound
-    /// channel, so this log is the whole of what the handler can do out.
+    /// The task forward's test double: records both channels —
+    /// `send_task_run_update` and `send_run_complete` are the task
+    /// arm's only outbound calls, so these logs are the whole of what
+    /// the handler can send.
     #[derive(Default)]
     struct CountingForward {
         updates: std::sync::Mutex<Vec<TaskRunUpdate>>,
+        completions: std::sync::Mutex<Vec<WorkflowRunComplete>>,
+        request_updates: std::sync::Mutex<Vec<stow_types::api::RequestRunUpdate>>,
         /// Scripted status — when `Some`, the stub answers
         /// `SchedulerClientError::Http` with it.
         status: Option<u16>,
     }
 
+    impl RequestRunForward for CountingForward {
+        fn send_request_run_update<'a>(
+            &'a self,
+            _request_id: &'a str,
+            update: &'a stow_types::api::RequestRunUpdate,
+        ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a {
+            self.request_updates
+                .lock()
+                .expect("request updates")
+                .push(update.clone());
+            std::future::ready(Ok(()))
+        }
+    }
+
     impl TaskRunForward for CountingForward {
         fn send_run_complete<'a>(
             &'a self,
-            _report: &'a WorkflowRunComplete,
+            report: &'a WorkflowRunComplete,
         ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a {
-            std::future::ready(Ok(()))
+            self.completions
+                .lock()
+                .expect("completions")
+                .push(report.clone());
+            std::future::ready(self.status.map_or(Ok(()), |status| {
+                Err(SchedulerClientError::Http {
+                    url: "https://scheduler.internal/tasks/complete-run".to_owned(),
+                    status,
+                    body: "{\"error\":\"unknown task\"}".to_owned(),
+                })
+            }))
         }
 
         fn send_task_run_update<'a>(
@@ -979,5 +1280,216 @@ mod tests {
             .await
             .expect_err("a DO failure propagates as a 500");
         assert!(matches!(error, GetArtifactError::InternalWithMessage(_)));
+    }
+
+    /// The `in_progress` gate (stow#940): a run the scheduler
+    /// dispatched — `triggering_actor.login` is the App's bot login —
+    /// forwards nothing, since the CI listing's reconcile reports its
+    /// running state. An operator's run still forwards to
+    /// `POST /tasks/run-update`.
+    #[tokio::test]
+    async fn an_own_run_in_progress_forwards_nothing_an_external_ones_does() {
+        for (actor, forwards) in [(APP_BOT_LOGIN, 0_usize), (OPERATOR_LOGIN, 1)] {
+            let body = task_completed_event(|event| {
+                event["action"] = serde_json::json!("in_progress");
+                event["workflow_run"]["triggering_actor"]["login"] = serde_json::json!(actor);
+            });
+            let delivery = verified("workflow_run", &body)
+                .await
+                .expect("signed delivery verifies");
+            let (_action, event) = decode_delivery(&delivery)
+                .expect("decodes")
+                .expect("in_progress action");
+            let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+            let RunSubject::Task { task_id, .. } = subject else {
+                panic!("build-crate.yml decodes a task subject");
+            };
+            let forward = CountingForward::default();
+            update_external_task_run(&forward, APP_BOT_LOGIN, run, task_id)
+                .await
+                .expect("handled");
+            assert_eq!(
+                forward.updates.lock().expect("updates").len(),
+                forwards,
+                "{actor}"
+            );
+        }
+    }
+
+    /// `completed` forwards for every run — the actor never gates the
+    /// slot-freeing channel (stow#940).
+    #[tokio::test]
+    async fn a_completed_run_forwards_regardless_of_actor() {
+        for actor in [APP_BOT_LOGIN, OPERATOR_LOGIN] {
+            let body = task_completed_event(|event| {
+                event["workflow_run"]["triggering_actor"]["login"] = serde_json::json!(actor);
+            });
+            let delivery = verified("workflow_run", &body)
+                .await
+                .expect("signed delivery verifies");
+            let (_action, event) = decode_delivery(&delivery)
+                .expect("decodes")
+                .expect("completed action");
+            let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+            let RunSubject::Task { task_id, .. } = subject else {
+                panic!("build-crate.yml decodes a task subject");
+            };
+            let forward = CountingForward::default();
+            forward_run_complete(&forward, run, task_id, true, None)
+                .await
+                .expect("forwarded");
+            let completions = forward.completions.lock().expect("completions");
+            assert_eq!(completions.len(), 1, "{actor}");
+            assert_eq!(completions[0].task_id, task_id);
+            assert_eq!(completions[0].github_run_id, "987654321");
+        }
+    }
+
+    /// A `workflow_run` delivery without `triggering_actor` is not
+    /// the shape GitHub documents — rejected like any other missing
+    /// field (stow#940).
+    #[tokio::test]
+    async fn a_delivery_without_triggering_actor_is_a_400() {
+        let body = completed_event(|event| {
+            let _ = event["workflow_run"]
+                .as_object_mut()
+                .expect("workflow_run object")
+                .remove("triggering_actor");
+        });
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let error = decode_delivery(&delivery).expect_err("missing triggering_actor rejects");
+        assert!(matches!(error, GetArtifactError::BadRequestWithMessage(_)));
+    }
+
+    /// The records check's test double: every artifact is in GHCR, so
+    /// a successful `completed` forwards a success.
+    struct RecordsPresent;
+
+    impl RecordsCheck for RecordsPresent {
+        type Error = std::convert::Infallible;
+
+        fn records_artifact_exists<'a>(
+            &'a self,
+            _rustc_version: &'a str,
+            _task_id: &'a str,
+            _build: stow_types::records::BuildRun,
+        ) -> impl Future<Output = Result<bool, Self::Error>> + Send + 'a {
+            std::future::ready(Ok(true))
+        }
+    }
+
+    /// One run of `workflow` (its file under `.github/workflows/`)
+    /// titled `title`, started by `actor` and concluding `conclusion`,
+    /// delivered as `action`: GitHub sends no conclusion before
+    /// `completed`.
+    fn run_delivery(
+        action: &str,
+        workflow: &str,
+        title: &str,
+        actor: &str,
+        conclusion: &str,
+    ) -> Vec<u8> {
+        completed_event(|event| {
+            event["action"] = serde_json::json!(action);
+            event["workflow_run"]["path"] =
+                serde_json::json!(format!(".github/workflows/{workflow}"));
+            event["workflow_run"]["display_title"] = serde_json::json!(title);
+            event["workflow_run"]["triggering_actor"]["login"] = serde_json::json!(actor);
+            event["workflow_run"]["conclusion"] = if action == "completed" {
+                serde_json::json!(conclusion)
+            } else {
+                serde_json::Value::Null
+            };
+        })
+    }
+
+    /// Scheduler requests the handler forwarded for one delivery,
+    /// across every outbound channel it has.
+    async fn forwards_for(body: &[u8]) -> u32 {
+        let delivery = verified("workflow_run", body)
+            .await
+            .expect("signed delivery verifies");
+        let forward = CountingForward::default();
+        consume_delivery(&delivery, &RecordsPresent, &forward, APP_BOT_LOGIN)
+            .await
+            .expect("consumed");
+        let sent = forward.updates.lock().expect("updates").len()
+            + forward.completions.lock().expect("completions").len()
+            + forward
+                .request_updates
+                .lock()
+                .expect("request updates")
+                .len();
+        u32::try_from(sent).expect("a delivery forwards a handful")
+    }
+
+    /// Every lifecycle the traffic projection prices, delivered action
+    /// by action through the real handler: what it forwards is the
+    /// `stow_types::forwards` row the projection reads (stow#937). A
+    /// handler change that forwards another delivery fails here until
+    /// the row — and with it the projected bill — moves too.
+    #[tokio::test]
+    async fn each_lifecycle_forwards_what_the_projection_prices() {
+        use stow_types::forwards::{
+            EXTERNAL_BUILD_RUN, FAILED_RESOLVE_RUN, INDEX_PUBLISH_RUN, OWN_BUILD_RUN,
+            SUCCESSFUL_RESOLVE_RUN, WORKFLOW_RUN_ACTIONS,
+        };
+        let build = stow_types::trusted_builder::WORKFLOW_FILE;
+        let resolve = stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE;
+        let build_title = "1.99.0-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let resolve_title = "resolve-a2-req-serde-1.0.0-ab12";
+        for (name, forwards, workflow, title, actor, conclusion) in [
+            (
+                "own build run",
+                OWN_BUILD_RUN,
+                build,
+                build_title,
+                APP_BOT_LOGIN,
+                "success",
+            ),
+            (
+                "external build run",
+                EXTERNAL_BUILD_RUN,
+                build,
+                build_title,
+                OPERATOR_LOGIN,
+                "success",
+            ),
+            (
+                "successful resolve run",
+                SUCCESSFUL_RESOLVE_RUN,
+                resolve,
+                resolve_title,
+                APP_BOT_LOGIN,
+                "success",
+            ),
+            (
+                "failed resolve run",
+                FAILED_RESOLVE_RUN,
+                resolve,
+                resolve_title,
+                APP_BOT_LOGIN,
+                "failure",
+            ),
+            (
+                "index-publish run",
+                INDEX_PUBLISH_RUN,
+                "index-publish.yml",
+                "index publish",
+                APP_BOT_LOGIN,
+                "success",
+            ),
+        ] {
+            for action in WORKFLOW_RUN_ACTIONS {
+                let body = run_delivery(action, workflow, title, actor, conclusion);
+                assert_eq!(
+                    forwards_for(&body).await,
+                    forwards.on(action).expect("a delivered action"),
+                    "{name} {action}"
+                );
+            }
+        }
     }
 }

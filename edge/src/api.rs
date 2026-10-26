@@ -134,19 +134,17 @@ impl Extractor for CfConnectingIp {
 }
 
 /// Enqueue-admission parameters carried via `State<PowAdmission>`: the HMAC
-/// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`), the
-/// proof-of-work bits every admission carries (`STOW_POW_MIN_BITS`), and
-/// the pending-queue depth at which `/api/v1/enqueue` stops accepting
-/// tickets (`STOW_MAX_QUEUE_PENDING`).
+/// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`) and the
+/// proof-of-work bits every admission carries (`STOW_POW_MIN_BITS`). The
+/// pending-depth refusal lives in the scheduler's own cap
+/// (`STOW_MAX_QUEUE_PENDING`), whose 429 this handler maps — the edge
+/// reads no depth of its own (stow#940).
 #[derive(Debug, Clone)]
 pub struct PowAdmission {
     pub challenge_secret: String,
     /// Leading-zero bits minted into every admission and required of
     /// every ticket — an enqueue is never free.
     pub min_bits: u32,
-    /// Pending-queue depth that refuses miss-lane tickets with 429. This,
-    /// not the proof-of-work, is what says "the queue is under pressure".
-    pub max_queue_pending: u32,
 }
 
 /// `Retry-After` for a queue-depth refusal: ten minutes of drain time.
@@ -265,49 +263,32 @@ pub async fn set_dispatch_freeze(
     Ok(Json(stored))
 }
 
-/// POST /`api/v1/admin/index/{target}/{rustc_version}`
+/// POST /`api/v1/admin/index/published`
 ///
-/// The index-publish path's report that this slice went live, carrying
-/// the semantic identities the signed index serves — recorded inside the
-/// scheduler as the membership the dependency gate checks a dependent's
-/// edges against. Same `SchedulerCaller` (repo-writer) trust as the page
-/// reads: the index-publish workflow mints its token inside the trusted
-/// repo.
+/// The index-publish path's report that this run's slices went live,
+/// carrying the semantic identities the signed index serves — recorded
+/// inside the scheduler as the membership the dependency gate checks a
+/// dependent's edges against. One report per publish run: the object
+/// applies the slices in one append and one dispatch pass (stow#940).
+/// Same `SchedulerCaller` (repo-writer) trust as the page reads: the
+/// index-publish workflow mints its token inside the trusted repo.
 pub async fn record_published_index(
     SchedulerCaller(caller): SchedulerCaller,
-    params: Params,
     State(scheduler): State<CfDurableNamespace>,
-    Json(report): Json<stow_types::api::PublishedSliceReport>,
+    Json(report): Json<stow_types::api::PublishedRunReport>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let target = params
-        .get("target")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<TargetTriple>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let rustc_version = params
-        .get("rustc_version")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<WireRustcVersion>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let rows = report.added.len() + report.retired.len();
-    scheduler_client::record_published_index(
-        &scheduler,
-        &stow_types::api::PublishedSlice {
-            target: target.clone(),
-            rustc_version: rustc_version.clone(),
-            base_generation: report.base_generation,
-            generation: report.generation,
-            added: report.added,
-            retired: report.retired,
-        },
-    )
-    .await?;
+    let slices = report.slices.len();
+    let rows: usize = report
+        .slices
+        .iter()
+        .map(|slice| slice.added.len() + slice.retired.len())
+        .sum();
+    scheduler_client::record_published_index(&scheduler, &report).await?;
     tracing::info!(
+        slices,
         rows,
         %caller,
-        %target,
-        %rustc_version,
-        "recorded a published index slice"
+        "recorded a publish run's slices"
     );
     Ok(Json(OkResponse { ok: true }))
 }
@@ -1502,28 +1483,11 @@ pub async fn enqueue_admitted_task(
             supported: CI_TARGET_TRIPLES.join(", "),
         });
     }
-    let status = scheduler_client::get_status(&scheduler).await?;
-    // The depth cap refuses miss-lane tickets once the queue is full; the
-    // Durable Object repeats the check at submit time so a wave of
-    // concurrent redemptions cannot overshoot by more than one batch.
-    if status.pending >= admission.max_queue_pending {
-        tracing::warn!(
-            task_id = %ticket.task_id,
-            pending = status.pending,
-            cap = admission.max_queue_pending,
-            "refusing enqueue ticket: scheduler queue is full"
-        );
-        let mut response = rate_limited_response(
-            "scheduler queue is full; retry after it drains",
-            QUEUE_FULL_RETRY_AFTER_SECS,
-        )?;
-        // The shed itself is the overload signal the watchdog counts —
-        // mark the reply so the outer fault recorder writes it (stow#888).
-        response
-            .extensions_mut()
-            .insert(crate::faults::OverloadFault);
-        return Ok(response);
-    }
+    // The proof of work is pure CPU, so it verifies before the one
+    // forward — the Durable Object's own pending-depth cap refuses a
+    // full queue at submit and the handler maps that 429 below
+    // (stow#940: the `GET /status` pre-check cost a scheduler request
+    // to save none).
     let required = admission::difficulty(admission.min_bits);
     let solved =
         stow_types::pow::enqueue_pow_zero_bits(&ticket.task_id, &ticket.challenge, ticket.nonce);
@@ -1548,8 +1512,8 @@ pub async fn enqueue_admitted_task(
                 unpublished_ids.into_iter().collect();
             miss_logger::log_misses(&analytics, consent, &ticket.tree, &unpublished);
         }
-        // The edge check raced another submit wave: the Durable Object's
-        // own pending-depth cap refused this one.
+        // The Durable Object's own pending-depth cap refused this
+        // redemption — the queue filled between ticket and submit.
         Err(crate::errors::SchedulerClientError::Http { status: 429, .. }) => {
             let mut response = rate_limited_response(
                 "scheduler queue is full; retry after it drains",

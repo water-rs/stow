@@ -357,8 +357,8 @@ OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`,
 one per task) to GHCR, cosign-signing both
 (keyless, `id-token: write`). The job never calls the edge — GitHub's
 `workflow_run` webhook delivery reports the outcome instead, and the
-scheduler's alarm pass checks the records artifact each successful task
-published exists before completing it. See
+edge checks the records artifact each successful task published exists
+in GHCR before it forwards the completion. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
 publisher checks.
 
@@ -436,15 +436,13 @@ in the repo settings:
 - **Events:** *Workflow runs* only
 - **Active:** on
 
-The route accepts a delivery only when the run is `completed` for
-`build-crate.yml` on `main`; it parses `display_title` into the run's
-rustc and task id and forwards the run's identity to the scheduler's
-`POST /tasks/complete-run`. The alarm pass then resolves the
-task from the run's attempt-jobs page, and the task completes
-only after the records
-artifact its publish job pushed (tagged by run id and attempt)
-exists and verifies in GHCR, so a spoofed success cannot mint a catalog
-entry.
+The route acts only on `build-crate.yml` and `resolve-request.yml` runs
+on `main`, and forwards only the deliveries the scheduler consumes (see
+`AGENTS.md`, Architecture). On a build run's `completed` it parses
+`display_title` into the run's rustc and task id and forwards the run's outcome to the scheduler's
+`POST /tasks/complete-run`. A `success` conclusion counts only once the
+records artifact its publish job pushed (tagged by run id and attempt)
+exists in GHCR, so a spoofed success cannot mint a catalog entry.
 
 ### newreleases.io webhook — `rust` releases
 

@@ -88,19 +88,10 @@ async fn ensure_graph<'a>(
         };
         match listed {
             Ok(runs) => {
-                let listed: Vec<(u64, String, stow_types::api::RunnerFamily)> = runs
-                    .iter()
-                    .map(|run| {
-                        (
-                            run.workflow_run_id,
-                            run.title.clone(),
-                            run.family.unwrap_or(stow_types::api::RunnerFamily::Linux),
-                        )
-                    })
-                    .collect();
-                loaded.with(|graph| graph.reconcile_runs(&listed, now_ms()));
+                loaded.with(|graph| graph.reconcile_runs(&runs, now_ms()));
             }
             Err(error) => {
+                loaded.with(|graph| graph.reconcile_failed(now_ms()));
                 tracing::warn!(%error, "post-wake CI status reconcile failed — keeping replayed state");
             }
         }
@@ -208,9 +199,11 @@ impl DurableObject for Scheduler {
             )),
             // The build run's lifecycle channel (stow#876): the
             // webhook forwards a `build-crate.yml` run's verified
-            // `completed` delivery to `complete-run` and its
-            // `in_progress` delivery to `run-update`; both fence on
-            // the queue row's bound generation.
+            // `completed` delivery to `complete-run`, and to
+            // `run-update` the `in_progress` delivery of a run the
+            // scheduler did not dispatch — external occupancy is
+            // delivery-tracked (stow#940); both fence on the queue
+            // row's bound generation.
             "/tasks/complete-run".post(complete_run),
             "/tasks/run-update".post(apply_task_run_update),
             // The human request lane (stow#428): admit deduplicates on
@@ -624,7 +617,9 @@ async fn submit_tasks_by_id(
             "submit-by-id: node store misses"
         );
     }
-    // Same hand-off as submit: the alarm pass owns dispatch.
+    // Same hand-off as submit: the promoted rows sit behind the
+    // dispatch age gate, so the first pass after a submit stays the
+    // alarm's (stow#940).
     schedule_alarm(&env, &db, &alarm, graph.cell()).await?;
     Ok(Json(stow_types::api::SubmitTaskIdsResponse {
         submitted: u32::try_from(body.tasks.len()).map_err(|_| {
@@ -656,13 +651,14 @@ async fn submit(
         routes::submit(graph, db, &settings, trees, enforce_pending_cap, now_ms())
             .await
             .map_err(route_error)?;
-    // Dispatch is not this request's work: the alarm's dispatch pass
-    // runs it, so the submit answers once the queue write lands instead
-    // of holding the client — and burning the DO's per-request CPU
-    // budget — through claim plus a fan-out of GitHub calls. `next_alarm`
-    // decides whether a wake can make progress at all: a submit whose
-    // rows all sit behind unmet gates arms nothing, while a stale
-    // in-flight lease still arms at its expiry (stow#444).
+    // The first pass after a submit stays the alarm's (stow#940):
+    // submitted rows sit behind the dispatch min-age gate, so an
+    // inline pass would claim nothing now — the submit answers once
+    // the queue write lands instead of holding the client through a
+    // pass that cannot make progress. `next_alarm` decides whether a
+    // wake can make progress at all: a submit whose rows all sit
+    // behind unmet gates arms nothing, while a stale in-flight lease
+    // still arms at its expiry (stow#444).
     schedule_alarm(env, db, alarm, graph.cell()).await?;
     Ok(Json(InsertedResponse {
         inserted,
@@ -708,50 +704,94 @@ async fn complete_run(
     Ok(Json(OkResponse { ok: true }))
 }
 
+/// The claims one completion's inline pass may take: one concurrent
+/// `workflow_dispatch` round — `MAX_OUTBOUND_INFLIGHT` — so the
+/// webhook's answer lands inside GitHub's 10 s delivery timeout.
+/// Anything still claimable past it arms the alarm at `now`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MAX_OUTBOUND_INFLIGHT is the small constant 4"
+)]
+const COMPLETION_CLAIM_BOUND: u32 = crate::fetch_guard::MAX_OUTBOUND_INFLIGHT as u32;
+
 /// The completion's work, shared with the budget probe's
 /// `complete-run` drives so they price the route's whole pass.
+/// Returns the task ids the inline pass claimed.
+///
+/// The completion frees a slot, so this request — not the alarm —
+/// runs the dispatch pass (stow#940): the `RunFinished` row and the
+/// pass's `Claims` row land in ONE append before the fan-out, the
+/// POSTs run as one bounded round under the outbound pool, the
+/// bindings settle, and only then does the response go out — nothing
+/// outlives it (stow#444). The freeze, the breaker and every claim
+/// rule apply exactly as in the alarm's pass — it is the same code.
 pub(super) async fn complete_run_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
     db: &DurableDb,
     alarm: &Alarm,
     report: &stow_types::api::WorkflowRunComplete,
-) -> Result<()> {
-    let freeze = freeze_settings(env)?;
+) -> Result<Vec<String>> {
+    let settings = scheduler_settings(env)?;
     let graph = ensure_graph(env, db, graph).await?;
     let now = now_ms();
+    // The finish is durable before anything fallible: parse, append
+    // and apply `RunFinished` ahead of every binding read, mint,
+    // listing and POST — a webhook has no redelivery, so a failure
+    // before this row lands loses the completion (stow#940).
     let outcome = routes::complete_run(graph, db, report, now)
         .await
         .map_err(route_error)?;
     match outcome {
-        graph::FinishOutcome::Applied | graph::FinishOutcome::Parked => {}
-        graph::FinishOutcome::External | graph::FinishOutcome::Stale => {
+        // An external run's finish frees its runner-family occupancy
+        // just as an own run's frees its slot, so both claim inline.
+        graph::FinishOutcome::Applied
+        | graph::FinishOutcome::Parked
+        | graph::FinishOutcome::External => {}
+        graph::FinishOutcome::Stale => {
             tracing::info!(
                 task_id = %report.task_id,
-                run_id = ?report.github_run_id,
-                "workflow_run completion resolved an external run"
+                run_id = %report.github_run_id,
+                "workflow_run completion names a run no row or external record holds"
             );
-            return Ok(());
+            schedule_alarm(env, db, alarm, graph.cell()).await?;
+            return Ok(Vec::new());
         }
     }
-    // A failed attempt may have closed the window's trip condition —
-    // evaluate while this request still holds the outcome row's write
-    // context. The freeze then eats the dispatch the alarm was about
-    // to run.
-    if !report.success {
-        evaluate_dispatch_freeze(graph, env, db, &freeze).await?;
+    // The completion freed a slot, so this request claims one
+    // concurrent round inline — never the status reconcile: its
+    // listing calls plus a POST round could carry the webhook past
+    // GitHub's 10 s delivery window, and a due reconcile arms the
+    // alarm via `wake_plan` instead. A pass failure here loses
+    // nothing durable — log it, arm the alarm to retry, and still
+    // answer 200 (stow#940).
+    match dispatch_pass(
+        graph.cell(),
+        env,
+        db,
+        &settings,
+        COMPLETION_CLAIM_BOUND,
+        PassReconcile::Never,
+    )
+    .await
+    {
+        Ok(claimed) => {
+            schedule_alarm(env, db, alarm, graph.cell()).await?;
+            Ok(claimed)
+        }
+        Err(error) => {
+            tracing::error!(%error, "complete-run inline dispatch pass failed — the alarm retries it");
+            schedule_alarm(env, db, alarm, graph.cell()).await?;
+            Ok(Vec::new())
+        }
     }
-    // Same handoff as submit: the run's report is acknowledged as soon
-    // as the queue row lands, and the alarm's dispatch pass — not this
-    // request — runs claim plus the GitHub fan-out. The completion may
-    // leave nothing dispatchable (a failure with an empty queue, a
-    // finished backlog): `schedule_alarm` arms no wake then (stow#444).
-    schedule_alarm(env, db, alarm, graph.cell()).await
 }
 
-/// `POST /tasks/run-update` — the webhook's `in_progress` delivery for
-/// a bound `build-crate.yml` run: the row moves `dispatched` to
-/// `running` under the bound generation's run id (stow#876).
+/// `POST /tasks/run-update` — the webhook's `in_progress` delivery,
+/// which since stow#940 only a run the scheduler did not dispatch
+/// sends: its occupancy records here. An own run's `dispatched` →
+/// `running` transition arrives through the post-wake CI-listing
+/// reconcile instead.
 ///
 /// A task the queue never held answers 404; a report naming a run the
 /// row is not bound to — or a row that already moved past it —
@@ -1096,10 +1136,10 @@ async fn read_request(
 
 /// `POST /requests/{request_id}/outcome` — the resolve job's report
 /// channel (stow#428): the trusted enqueue, the per-target roots and
-/// the `enqueued`/`failed` transition apply in one call, then the
-/// alarm handoff runs the dispatch pass the new tasks wait on. A report
-/// for an unknown record answers 404; one naming a superseded attempt,
-/// 409 — the webhook logs both rather than propagating them.
+/// the `enqueued`/`failed` transition apply in one call, then this
+/// request runs the dispatch pass the new tasks wait on (stow#940).
+/// A report for an unknown record answers 404; one naming a superseded
+/// attempt, 409 — the webhook logs both rather than propagating them.
 async fn apply_request_outcome(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
@@ -1109,15 +1149,39 @@ async fn apply_request_outcome(
     Json(report): Json<stow_types::api::RequestOutcomeReport>,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
     let request_id = request_id_param(&params)?;
-    let graph = ensure_graph(&env, &db, &graph).await?;
-    let status = routes::request_outcome(graph, &db, request_id, &report, now_ms())
+    let (status, _claimed) =
+        request_outcome_pass(&graph, &env, &db, &alarm, request_id, &report).await?;
+    Ok(Json(status))
+}
+
+/// The outcome's work, shared with the budget probe's
+/// `outcome (dispatching)` drive: the report lands, then the inline
+/// pass claims every free slot — the resolve job released a layer,
+/// which is when slots sit idle (stow#940). Returns the record's
+/// status and the claimed task ids.
+pub(super) async fn request_outcome_pass(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+    db: &DurableDb,
+    alarm: &Alarm,
+    request_id: &str,
+    report: &stow_types::api::RequestOutcomeReport,
+) -> Result<(stow_types::api::CrateRequestStatus, Vec<String>)> {
+    let graph = ensure_graph(env, db, graph).await?;
+    let status = routes::request_outcome(graph, db, request_id, report, now_ms())
         .await
         .map_err(route_error)?;
-    // Same handoff as submit: the report answers once the rows land, and
-    // the alarm's dispatch pass — not this request — fans them out. An
-    // outcome whose task is fully gated arms nothing (stow#444).
-    schedule_alarm(&env, &db, &alarm, graph.cell()).await?;
-    Ok(Json(status))
+    // The enqueue's human-lane rows are eligible at once, so this
+    // request fans them out itself; the pass ends before the response
+    // (stow#444).
+    let claimed = dispatch_pending(env, db, graph.cell())
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "scheduler request-outcome dispatch_pending failed");
+            error
+        })?;
+    schedule_alarm(env, db, alarm, graph.cell()).await?;
+    Ok((status, claimed))
 }
 
 /// `POST /requests/{request_id}/run-update` — the `workflow_run`
@@ -1430,38 +1494,55 @@ pub(super) async fn preheat_release_pass(
     })
 }
 
-/// `POST /index/published` — the index-publish path's report that a slice
-/// went live, carrying the semantic identities it serves. Recording it
-/// before the dispatch pass lets a dependent the report just released
-/// claim in the same turn.
+/// `POST /index/published` — the index-publish path's report that a
+/// run's slices went live, carrying the semantic identities they
+/// serve. Recording them before the dispatch pass lets a dependent the
+/// report just released claim in the same turn (stow#940: one report
+/// per publish run).
 async fn record_published_index(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
-    Json(slice): Json<stow_types::api::PublishedSlice>,
+    Json(report): Json<stow_types::api::PublishedRunReport>,
 ) -> Result<Json<OkResponse>> {
-    let _settings = scheduler_settings(&env)?;
-    let graph = ensure_graph(&env, &db, &graph).await?;
-    // The slice report is one appended event; its flip lands on the
+    published_index_pass(&graph, &env, &db, &alarm, &report.slices).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// The slice report's work, shared with the budget probe's
+/// `index/published (dispatching)` drive: the report's append, then
+/// the inline pass claiming every free slot — a publish releases a
+/// dependency layer, which is when slots sit idle (stow#940). Returns
+/// the claimed task ids.
+pub(super) async fn published_index_pass(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+    db: &DurableDb,
+    alarm: &Alarm,
+    slices: &[stow_types::api::PublishedSlice],
+) -> Result<Vec<String>> {
+    let _settings = scheduler_settings(env)?;
+    let graph = ensure_graph(env, db, graph).await?;
+    // The run's slices append in one commit; their flips land on the
     // same turn (stow#878 — no generation fencing: reports apply to
     // in-memory masks, deltas stay idempotent on re-application).
-    routes::slice_report(graph, &db, &slice, now_ms())
+    routes::slice_reports(graph, db, slices, now_ms())
         .await
         .map_err(route_error)?;
-    dispatch_pending(&env, &db, graph.cell())
+    let claimed = dispatch_pending(env, db, graph.cell())
         .await
         .map_err(|error| {
             tracing::error!(%error, "scheduler published-index dispatch_pending failed");
             error
         })?;
-    schedule_alarm(&env, &db, &alarm, graph.cell())
+    schedule_alarm(env, db, alarm, graph.cell())
         .await
         .map_err(|error| {
             tracing::error!(%error, "scheduler published-index schedule_alarm failed");
             error
         })?;
-    Ok(Json(OkResponse { ok: true }))
+    Ok(claimed)
 }
 
 /// The dispatch freeze stops the scheduler as well as the work-submitting
@@ -1540,7 +1621,11 @@ pub fn loopback_url(binding: &str, url: &str) -> Result<String> {
     }
 }
 
-async fn dispatch_pending(env: &WasmEnv, db: &DurableDb, graph: &graph::GraphCell) -> Result<()> {
+async fn dispatch_pending(
+    env: &WasmEnv,
+    db: &DurableDb,
+    graph: &graph::GraphCell,
+) -> Result<Vec<String>> {
     let graph = ensure_graph(env, db, graph).await?;
     // The dispatch freeze gates here and inside `claim`
     // — the enqueue side never consults it, so misses keep arriving and
@@ -1549,12 +1634,18 @@ async fn dispatch_pending(env: &WasmEnv, db: &DurableDb, graph: &graph::GraphCel
     // dispatch pass at all, not even its failures.
     if graph.with(|graph| graph.freeze().is_some()) {
         tracing::info!("dispatch frozen — skipping dispatch pass");
-        return Ok(());
+        return Ok(Vec::new());
     }
     let settings = scheduler_settings(env)?;
-    dispatch_pass(graph.cell(), env, db, &settings)
-        .await
-        .map(|_| ())
+    dispatch_pass(
+        graph.cell(),
+        env,
+        db,
+        &settings,
+        u32::MAX,
+        PassReconcile::Due,
+    )
+    .await
 }
 
 /// The CI interface one pass resolves — same credential arm as
@@ -1599,27 +1690,38 @@ fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
     )
 }
 
-/// `status` reconciles the delivery-tracked external set at most once
-/// per this many minutes — ≤2 listing calls each, ≤12 calls/hour while
-/// the queue has work (stow#877).
-const STATUS_RECONCILE_MS: i64 = 10 * 60 * 1000;
+/// Whether a dispatch pass may run the CI status reconcile.
+pub(super) enum PassReconcile {
+    /// The reconcile rides the pass when due — the alarm's pass and
+    /// the passes of requests that release work (mutations, unfreeze,
+    /// the slice report, the request outcome): CI-job callers, not
+    /// webhooks.
+    Due,
+    /// A completion's bounded pass never reconciles: the listing
+    /// calls plus a POST round could carry the webhook past GitHub's
+    /// 10 s delivery window, so a due reconcile is left to the alarm,
+    /// which `wake_plan` arms (stow#940).
+    Never,
+}
 
-/// The claim-plus-fan-out half of a dispatch pass, shared with the
-/// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
-/// `wall_ms` covers the concurrent `dispatch` fan-out a real wake
-/// pays. Returns the claimed task ids — the probe's claim record and
-/// the launch gate's claim count both derive from the pass's own set.
+/// The claim-plus-fan-out half of a dispatch pass, shared by the
+/// alarm's pass, the inline passes the slot-freeing and work-releasing
+/// requests run (stow#940), and the budget probe's `"alarm pass"`
+/// drive (`drives.rs`) so the probe's `wall_ms` covers the concurrent
+/// `dispatch` fan-out a real wake pays. `bound` caps the claim set —
+/// a completion claims at most one concurrent POST round, every other
+/// pass `u32::MAX`. `completion` folds a finish into the pass.
+/// Returns the claimed task ids — the probe's claim record and the
+/// launch gate's claim count both derive from the pass's own set.
 pub(super) async fn dispatch_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
     db: &DurableDb,
     settings: &SchedulerSettings,
+    bound: u32,
+    reconcile: PassReconcile,
 ) -> Result<Vec<String>> {
     let graph = ensure_graph(env, db, graph).await?;
-    // The breaker is evaluated every pass: the outcome ring it reads is
-    // window-filtered in memory, so the check costs no row.
-    let freeze = freeze_settings(env)?;
-    evaluate_dispatch_freeze(graph, env, db, &freeze).await?;
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
@@ -1658,28 +1760,25 @@ pub(super) async fn dispatch_pass(
     // so an idle scheduler costs zero calls. A reconcile failure is
     // not worth burning the pass over — the delivery-tracked set is
     // the primary source; `status` only corrects its drift.
-    if graph.with(|graph| graph.reconcile_due(now_ms(), STATUS_RECONCILE_MS)) {
+    if matches!(reconcile, PassReconcile::Due)
+        && graph.with(|graph| graph.reconcile_due(now_ms(), settings))
+    {
         match interface.status_runs().await {
             Ok(listed) => {
-                let listed: Vec<(u64, String, stow_types::api::RunnerFamily)> = listed
-                    .iter()
-                    .map(|run| {
-                        (
-                            run.workflow_run_id,
-                            run.title.clone(),
-                            run.family.unwrap_or(stow_types::api::RunnerFamily::Linux),
-                        )
-                    })
-                    .collect();
                 graph.with(|graph| graph.reconcile_runs(&listed, now_ms()));
             }
             Err(error) => {
+                graph.with(|graph| graph.reconcile_failed(now_ms()));
                 tracing::warn!(%error, "CI status reconcile failed — keeping delivery-tracked external occupancy");
             }
         }
     }
     let now = now_ms();
-    let claims = routes::claim_pass(graph, db, settings, now)
+    // The breaker is evaluated every pass: the outcome ring it reads
+    // is window-filtered in memory, so the check costs no row.
+    let freeze = freeze_settings(env)?;
+    evaluate_dispatch_freeze(graph, env, db, &freeze).await?;
+    let claims = routes::claim_pass(graph, db, settings, now, bound)
         .await
         .map_err(route_error)?;
     let task_ids: Vec<String> = claims.iter().map(|claim| claim.task_id.clone()).collect();
