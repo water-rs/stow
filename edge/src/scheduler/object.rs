@@ -1493,18 +1493,19 @@ pub(super) async fn preheat_release_pass(
     })
 }
 
-/// `POST /index/published` — the index-publish path's report that a slice
-/// went live, carrying the semantic identities it serves. Recording it
-/// before the dispatch pass lets a dependent the report just released
-/// claim in the same turn.
+/// `POST /index/published` — the index-publish path's report that a
+/// run's slices went live, carrying the semantic identities they
+/// serve. Recording them before the dispatch pass lets a dependent the
+/// report just released claim in the same turn (stow#940: one report
+/// per publish run).
 async fn record_published_index(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
-    Json(slice): Json<stow_types::api::PublishedSlice>,
+    Json(report): Json<stow_types::api::PublishedRunReport>,
 ) -> Result<Json<OkResponse>> {
-    published_index_pass(&graph, &env, &db, &alarm, &slice).await?;
+    published_index_pass(&graph, &env, &db, &alarm, &report.slices).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -1518,14 +1519,14 @@ pub(super) async fn published_index_pass(
     env: &WasmEnv,
     db: &DurableDb,
     alarm: &Alarm,
-    slice: &stow_types::api::PublishedSlice,
+    slices: &[stow_types::api::PublishedSlice],
 ) -> Result<Vec<String>> {
     let _settings = scheduler_settings(env)?;
     let graph = ensure_graph(env, db, graph).await?;
-    // The slice report is one appended event; its flip lands on the
+    // The run's slices append in one commit; their flips land on the
     // same turn (stow#878 — no generation fencing: reports apply to
     // in-memory masks, deltas stay idempotent on re-application).
-    routes::slice_report(graph, db, slice, now_ms())
+    routes::slice_reports(graph, db, slices, now_ms())
         .await
         .map_err(route_error)?;
     let claimed = dispatch_pending(env, db, graph.cell())

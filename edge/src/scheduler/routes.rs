@@ -204,26 +204,30 @@ pub(super) async fn demand(
     Ok((report, plan))
 }
 
-/// `POST /index/published`: one `SliceReport` event; the apply flips
-/// the matched dependency edges.
+/// `POST /index/published`: one `SliceReport` event per slice of the
+/// publish run, committed in ONE append (stow#940); each apply flips
+/// its matched dependency edges.
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed append.
-pub(super) async fn slice_report(
+pub(super) async fn slice_reports(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
-    slice: &stow_types::api::PublishedSlice,
+    slices: &[stow_types::api::PublishedSlice],
     now: i64,
 ) -> Result<(), QueueError> {
-    let event = SchedulerEvent::SliceReport {
-        target: slice.target.clone(),
-        rustc_version: slice.rustc_version.clone(),
-        base_generation: slice.base_generation,
-        generation: slice.generation,
-        added: slice.added.clone(),
-        retired: slice.retired.clone(),
-    };
-    commit(graph, db, &[event], now).await
+    let events: Vec<SchedulerEvent> = slices
+        .iter()
+        .map(|slice| SchedulerEvent::SliceReport {
+            target: slice.target.clone(),
+            rustc_version: slice.rustc_version.clone(),
+            base_generation: slice.base_generation,
+            generation: slice.generation,
+            added: slice.added.clone(),
+            retired: slice.retired.clone(),
+        })
+        .collect();
+    commit(graph, db, &events, now).await
 }
 
 /// The `RunFinished` event a completion carries, with its parsed run

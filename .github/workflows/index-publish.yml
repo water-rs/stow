@@ -166,22 +166,35 @@ jobs:
           out = sys.argv[1]
           slices = json.load(open(os.path.join(out, "slices.json")))
           failed = []
+          report = []
           for s in slices:
               print(f"::group::{s['tag']}", flush=True)
               file = os.path.join(out, s["index_file"])
               folded = os.path.join(out, s["folded_file"])
-              steps = [["stow-admin", "index", "publish",
-                        "--file", file, "--folded", folded]]
-              if os.environ.get("STOW_EDGE_URL"):
-                  report = ["stow-admin", "index", "report", "--file", file]
-                  if os.environ.get("INPUT_FULL") == "true":
-                      report.append("--full")
-                  steps.append(report)
-              ok = all(subprocess.run(step).returncode == 0 for step in steps)
+              ok = subprocess.run(["stow-admin", "index", "publish",
+                                   "--file", file, "--folded", folded]).returncode == 0
+              # The report gathers every slice the run published into
+              # ONE `index report` call — one edge post, one scheduler
+              # append, one dispatch pass (stow#940). A slice whose
+              # publish failed is left out of the report, not failed
+              # into it.
+              if ok and os.environ.get("STOW_EDGE_URL"):
+                  report += ["--file", file]
               print("::endgroup::", flush=True)
               if not ok:
                   print(f"::error::index publish failed for {s['tag']}", flush=True)
                   failed.append(s["tag"])
+          # Slices are independent: publish failures are reported, but
+          # every slice that did go live is still reported.
+          if report:
+              step = ["stow-admin", "index", "report"] + report
+              if os.environ.get("INPUT_FULL") == "true":
+                  step.append("--full")
+              print(f"::group::report {' '.join(s['tag'] for s in slices)}", flush=True)
+              ok = subprocess.run(step).returncode == 0
+              print("::endgroup::", flush=True)
+              if not ok:
+                  print("::error::index report failed", flush=True)
           if failed:
               print(f"::error::index publish incomplete: {' '.join(failed)}", flush=True)
               sys.exit(1)

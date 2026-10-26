@@ -18,9 +18,9 @@
 //!    because it leaves no other trace in the code, and reading this
 //!    module without knowing it exists leads straight to the conclusion
 //!    that `PoW` is all there is.
-//! 2. **`max_queue_pending`** in the `/api/v1/enqueue` handler: once the
-//!    scheduler queue is full, miss-lane tickets are refused with 429 and
-//!    a `Retry-After`. This is the precise, honest form of "the queue is
+//! 2. **`STOW_MAX_QUEUE_PENDING`** in the scheduler's own submit cap: once
+//!    the queue is full, miss-lane tickets are refused with 429 and a
+//!    `Retry-After`. This is the precise, honest form of "the queue is
 //!    under pressure" — it says so instead of making everyone mine.
 //! 3. **Identity canonicalization and deduplication**: the queue's
 //!    `UNIQUE(crate_name, version, features_json, target, rustc_version)`,

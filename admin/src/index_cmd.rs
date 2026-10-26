@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use clap::{Args, Subcommand};
 use futures_util::{StreamExt as _, TryStreamExt as _};
-use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceReport, PublishedSliceRow};
+use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceRow};
 use stow_types::identity::{DependencyIdentity, TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
@@ -193,9 +193,11 @@ struct IndexPublishSummary {
 /// conflict asks for.
 #[derive(Args)]
 pub struct IndexReportArgs {
-    /// The encoded index file (`index export --out-dir` wrote it).
-    #[arg(long)]
-    file: std::path::PathBuf,
+    /// The encoded index files (`index export --out-dir` wrote them) —
+    /// repeatable, one per slice the run published; the whole set posts
+    /// as ONE report per publish run (stow#940).
+    #[arg(long, required = true)]
+    file: Vec<std::path::PathBuf>,
     /// Send the explicit full report (`base_generation` unset) — the
     /// resync path for a slice whose optimistic-lock check failed, and
     /// the automatic shape of a first publish.
@@ -203,19 +205,21 @@ pub struct IndexReportArgs {
     full: bool,
 }
 
-/// The JSON line `index report` prints on stdout.
+/// The JSON line `index report` prints on stdout — one line for the
+/// run's whole report.
 #[derive(Debug, serde::Serialize)]
 struct IndexReportSummary {
-    /// Rows the report added to the slice — the whole membership on a
-    /// full report.
+    /// Slices the report carried.
+    slices: usize,
+    /// Rows the report added across every slice — each slice's whole
+    /// membership on a full report.
     added: usize,
     /// Rows the report retired — `0` on a full report.
     retired: usize,
-    /// `true` when the report took the explicit full path (`--full`, a
-    /// first publish with no `.prev` sidecar, or the resync a 409'd
+    /// `true` when the report took the explicit full path (`--full`,
+    /// first publishes with no `.prev` sidecar, or the resync a 409'd
     /// delta triggers).
     full: bool,
-    tag: String,
 }
 
 /// Dispatch one `index` subcommand.
@@ -969,33 +973,96 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
     Ok(())
 }
 
-/// `stow-admin index report` — post the slice's semantic membership to
-/// the edge admin route so the scheduler's dependency gate can release
-/// dependents whose edges the published index now serves. The set sent
-/// is the servable subset of the export: a row whose measured glibc
-/// floor exceeds the builder baseline publishes in the index but a
-/// baseline host cannot load it, so it releases no dependent — the same
-/// rule the catalog's coverage oracle applies.
+/// `stow-admin index report` — post every slice the run published to
+/// the edge admin route in ONE report per publish run (stow#940), so
+/// the scheduler applies them in one append and one dispatch pass.
+/// Each slice's set is the servable subset of its export: a row whose
+/// measured glibc floor exceeds the builder baseline publishes in the
+/// index but a baseline host cannot load it, so it releases no
+/// dependent — the same rule the catalog's coverage oracle applies.
 async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::Result<()> {
-    let bytes = tokio::fs::read(&args.file)
+    let mut report = stow_types::api::PublishedRunReport {
+        slices: Vec::with_capacity(args.file.len()),
+    };
+    for file in &args.file {
+        report.slices.push(slice_report_for(file, args.full).await?);
+    }
+    let path = "/api/v1/admin/index/published";
+    let url = format!("{}{path}", edge.base());
+    match edge.post_unchecked(path, &report).await? {
+        Ok(response) => {
+            response
+                .into_json::<serde_json::Value>()
+                .await
+                .map_err(|error| stow_error!("decode {url}: {error}"))?;
+        }
+        // A refused delta resyncs once with every slice sent as the
+        // explicit full shape — the resync a per-slice 409 asked for;
+        // a refused full report is an error.
+        Err(zenwave::Error::Http {
+            status, message, ..
+        }) if status == zenwave::StatusCode::CONFLICT
+            && report
+                .slices
+                .iter()
+                .any(|slice| slice.base_generation.is_some()) =>
+        {
+            tracing::warn!(
+                answer = %message,
+                "slice report refused — resyncing with a full report"
+            );
+            report.slices.clear();
+            for file in &args.file {
+                report.slices.push(slice_report_for(file, true).await?);
+            }
+            edge.post_json::<_, serde_json::Value>(path, &report)
+                .await
+                .map_err(|error| error.wrap_err("full slice report"))?;
+        }
+        Err(error) => return Err(stow_error!("POST {url}: {error}")),
+    }
+    let summary = IndexReportSummary {
+        slices: report.slices.len(),
+        added: report.slices.iter().map(|slice| slice.added.len()).sum(),
+        retired: report.slices.iter().map(|slice| slice.retired.len()).sum(),
+        full: report
+            .slices
+            .iter()
+            .all(|slice| slice.base_generation.is_none()),
+    };
+    tracing::info!(
+        slices = summary.slices,
+        added = summary.added,
+        retired = summary.retired,
+        full = summary.full,
+        "reported the publish run's slices to the edge"
+    );
+    let line = serde_json::to_string(&summary)
+        .map_err(|error| stow_error!("serialize index report summary: {error}"))?;
+    render::emit_line(&line);
+    Ok(())
+}
+
+/// One file's [`stow_types::api::PublishedSlice`]: the header's
+/// `(target, rustc_version)` pair and, per `full`, the whole servable
+/// membership or the delta against the `.prev` sidecar `index export`
+/// captured while the tag still named the previous index.
+async fn slice_report_for(
+    file: &std::path::Path,
+    full: bool,
+) -> stow_types::error::Result<stow_types::api::PublishedSlice> {
+    let bytes = tokio::fs::read(file)
         .await
-        .map_err(|error| stow_error!("read index file {}: {error}", args.file.display()))?;
+        .map_err(|error| stow_error!("read index file {}: {error}", file.display()))?;
     let index = ArtifactIndex::decode(&bytes)
-        .map_err(|error| stow_error!("decode index file {}: {error}", args.file.display()))?;
-    let target = index.header.target.clone();
-    let rustc_version = index.header.rustc_version.clone();
+        .map_err(|error| stow_error!("decode index file {}: {error}", file.display()))?;
     let rows = semantic_rows(&index)?;
 
-    // The delta base is the `.prev` sidecar `index export` captured
-    // while the tag still named the previous index — resolved exactly,
-    // never silently: `--full` or a first publish takes the explicit
-    // full path. A delta the DO refuses on a stale `base_generation`
-    // (409 — its live generation moved, or was never reported) resyncs
-    // below with the full report, once; nothing retries a refused
-    // delta, and a refused full report is an error.
-    let (base_generation, added, retired) = if args.full {
+    // The delta base is the `.prev` sidecar — resolved exactly, never
+    // silently: `full` or a first publish takes the explicit full path.
+    let (base_generation, added, retired) = if full {
         (None, rows.clone(), Vec::new())
-    } else if let Some(prev) = read_prev_sidecar(&args.file, index.header.generation).await? {
+    } else if let Some(prev) = read_prev_sidecar(file, index.header.generation).await? {
         let prev_rows = semantic_rows(&prev)?;
         let current: std::collections::BTreeSet<_> = rows.iter().map(row_key).collect();
         let previous: std::collections::BTreeSet<_> = prev_rows.iter().map(row_key).collect();
@@ -1012,60 +1079,14 @@ async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::
     } else {
         (None, rows.clone(), Vec::new())
     };
-    let mut report = PublishedSliceReport {
+    Ok(stow_types::api::PublishedSlice {
+        target: index.header.target,
+        rustc_version: index.header.rustc_version,
         base_generation,
         generation: Some(index.header.generation),
         added,
         retired,
-    };
-    let path = format!("/api/v1/admin/index/{target}/{rustc_version}");
-    let url = format!("{}{path}", edge.base());
-    let tag = index_tag(target.as_str(), rustc_version.as_str());
-    match edge.post_unchecked(&path, &report).await? {
-        Ok(response) => {
-            response
-                .into_json::<serde_json::Value>()
-                .await
-                .map_err(|error| stow_error!("decode {url}: {error}"))?;
-        }
-        Err(zenwave::Error::Http {
-            status, message, ..
-        }) if status == zenwave::StatusCode::CONFLICT && base_generation.is_some() => {
-            tracing::warn!(
-                %tag,
-                base_generation = base_generation.expect("a conflicted report is a delta"),
-                answer = %message,
-                "delta slice report refused — resyncing with a full report"
-            );
-            report = PublishedSliceReport {
-                base_generation: None,
-                generation: Some(index.header.generation),
-                added: rows,
-                retired: Vec::new(),
-            };
-            edge.post_json::<_, serde_json::Value>(&path, &report)
-                .await
-                .map_err(|error| error.wrap_err("full slice report"))?;
-        }
-        Err(error) => return Err(stow_error!("POST {url}: {error}")),
-    }
-    let summary = IndexReportSummary {
-        added: report.added.len(),
-        retired: report.retired.len(),
-        full: report.base_generation.is_none(),
-        tag: tag.clone(),
-    };
-    tracing::info!(
-        %tag,
-        added = summary.added,
-        retired = summary.retired,
-        full = summary.full,
-        "reported published index slice to the edge"
-    );
-    let line = serde_json::to_string(&summary)
-        .map_err(|error| stow_error!("serialize index report summary: {error}"))?;
-    render::emit_line(&line);
-    Ok(())
+    })
 }
 
 /// The registry base the anonymous bundle pulls go through —
@@ -2059,9 +2080,14 @@ mod tests {
         (dir, file)
     }
 
-    /// The report body one captured request carried.
+    /// The one slice inside the report body a captured request
+    /// carried — the tests post single-file reports.
     fn posted_report(request: &crate::test_server::CapturedRequest) -> serde_json::Value {
-        serde_json::from_slice(&request.body).expect("the report posts JSON")
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("the report posts JSON");
+        let slices = body["slices"].as_array().expect("a slices array");
+        assert_eq!(slices.len(), 1, "a single-file report carries one slice");
+        slices[0].clone()
     }
 
     /// stow#780: a delta report refused with the scheduler's 409 —
@@ -2087,7 +2113,10 @@ mod tests {
         let (_dir, file) = report_fixture();
         index_report(
             &Edge::for_test(server.url.clone()),
-            IndexReportArgs { file, full: false },
+            IndexReportArgs {
+                file: vec![file],
+                full: false,
+            },
         )
         .await
         .expect("the resynced report succeeds");
@@ -2130,7 +2159,10 @@ mod tests {
         let (_dir, file) = report_fixture();
         index_report(
             &Edge::for_test(server.url.clone()),
-            IndexReportArgs { file, full: false },
+            IndexReportArgs {
+                file: vec![file],
+                full: false,
+            },
         )
         .await
         .expect_err("a refused resync is an error");
@@ -2151,7 +2183,10 @@ mod tests {
         let (_dir, file) = report_fixture();
         index_report(
             &Edge::for_test(server.url.clone()),
-            IndexReportArgs { file, full: false },
+            IndexReportArgs {
+                file: vec![file],
+                full: false,
+            },
         )
         .await
         .expect_err("a non-conflict refusal is an error");

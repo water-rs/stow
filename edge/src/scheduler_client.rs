@@ -167,14 +167,15 @@ pub async fn send_request_run_update(
     .await
 }
 
-/// The index-publish path's report that a `(target, rustc_version)`
-/// slice went live — the semantic identities it serves, which become the
-/// membership the scheduler's dependency gate checks.
+/// The index-publish path's report that a run's slices went live —
+/// the semantic identities they serve, which become the membership
+/// the scheduler's dependency gate checks (stow#940: one report per
+/// publish run).
 pub async fn record_published_index(
     namespace: &CfDurableNamespace,
-    slice: &stow_types::api::PublishedSlice,
+    report: &stow_types::api::PublishedRunReport,
 ) -> Result<(), SchedulerClientError> {
-    send_json(namespace, SCHEDULER_PUBLISHED_INDEX_URL, slice).await
+    send_json(namespace, SCHEDULER_PUBLISHED_INDEX_URL, report).await
 }
 
 /// Reset the scheduler store — the operator endpoint behind

@@ -2158,17 +2158,17 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |db, _shape, settings, ctx| {
             Box::pin(async move {
-                routes::slice_report(
+                routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &PublishedSlice {
+                    &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.86.0").map_err(text)?,
                         base_generation: None,
                         generation: None,
                         added: fixture::full_slice_report(),
                         retired: Vec::new(),
-                    },
+                    }],
                     now_ms(),
                 )
                 .await
@@ -2191,17 +2191,17 @@ pub const DRIVES: &[Drive] = &[
                     .map(str::to_owned)
                     .collect();
                 restore_claimed(ctx, db, ids).await?;
-                routes::slice_report(
+                routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &PublishedSlice {
+                    &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.86.0").map_err(text)?,
                         base_generation: None,
                         generation: None,
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
-                    },
+                    }],
                     now_ms(),
                 )
                 .await
@@ -2219,17 +2219,17 @@ pub const DRIVES: &[Drive] = &[
         run: |db, shape, settings, ctx| {
             Box::pin(async move {
                 let (added, retired) = fixture::delta_slice_report(shape);
-                routes::slice_report(
+                routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &PublishedSlice {
+                    &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
                         base_generation: None,
                         generation: None,
                         added,
                         retired,
-                    },
+                    }],
                     now_ms(),
                 )
                 .await
@@ -2252,17 +2252,17 @@ pub const DRIVES: &[Drive] = &[
                     .collect();
                 restore_claimed(ctx, db, ids).await?;
                 let (added, retired) = fixture::delta_slice_report(shape);
-                routes::slice_report(
+                routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &PublishedSlice {
+                    &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
                         base_generation: None,
                         generation: None,
                         added: retired,
                         retired: added,
-                    },
+                    }],
                     now_ms(),
                 )
                 .await
@@ -2597,14 +2597,20 @@ pub const DRIVES: &[Drive] = &[
                         .ok_or_else(|| "index dispatching drive needs the alarm".to_owned())?;
                     // The pass reads the deploy's settings itself.
                     let _ = settings;
-                    super::object::published_index_pass(&ctx.graph, env, db, alarm, &slice)
-                        .await
-                        .map_err(text)?
+                    super::object::published_index_pass(
+                        &ctx.graph,
+                        env,
+                        db,
+                        alarm,
+                        std::slice::from_ref(&slice),
+                    )
+                    .await
+                    .map_err(text)?
                 };
                 #[cfg(not(target_arch = "wasm32"))]
                 let claimed = {
                     let now = now_ms();
-                    routes::slice_report(ctx.loaded(), db, &slice, now)
+                    routes::slice_reports(ctx.loaded(), db, std::slice::from_ref(&slice), now)
                         .await
                         .map_err(text)?;
                     let claims = routes::claim_pass(ctx.loaded(), db, settings, now, u32::MAX)
@@ -2643,17 +2649,17 @@ pub const DRIVES: &[Drive] = &[
                     .map(str::to_owned)
                     .collect();
                 restore_claimed(ctx, db, ids).await?;
-                routes::slice_report(
+                routes::slice_reports(
                     ctx.loaded(),
                     db,
-                    &PublishedSlice {
+                    &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
                         base_generation: None,
                         generation: None,
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
-                    },
+                    }],
                     now_ms(),
                 )
                 .await
@@ -3273,17 +3279,17 @@ async fn snapshot_slice_report(
     } else {
         (added, retired)
     };
-    routes::slice_report(
+    routes::slice_reports(
         ctx.loaded(),
         db,
-        &PublishedSlice {
+        &[PublishedSlice {
             target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
             rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
             base_generation: None,
             generation: None,
             added,
             retired,
-        },
+        }],
         now_ms(),
     )
     .await

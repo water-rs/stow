@@ -534,12 +534,14 @@ publish_round() {
             || die "index publish failed for $index_file — see $LOG_DIR/index-publish.log"
     done <<<"$pairs"
     snapshot "$dir/before-report.json"
+    # One report per publish run carries the run's slices (stow#940).
+    local report_args=()
     while read -r index_file _; do
-        [ -n "$index_file" ] || continue
-        admin index report --file "$WORK_DIR/index-export/$index_file" \
-            >>"$LOG_DIR/index-report.log" 2>&1 \
-            || die "index report failed for $index_file — see $LOG_DIR/index-report.log"
+        [ -n "$index_file" ] && report_args+=(--file "$WORK_DIR/index-export/$index_file")
     done <<<"$pairs"
+    admin index report "${report_args[@]}" \
+        >>"$LOG_DIR/index-report.log" 2>&1 \
+        || die "index report failed — see $LOG_DIR/index-report.log"
     snapshot "$dir/end.json"
     log "$phase round $tag: $(jq length "$dir/new-records.json") records, $(jq length "$WORK_DIR/index-export/slices.json") slices"
 }

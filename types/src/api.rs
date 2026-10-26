@@ -1869,25 +1869,11 @@ pub struct RequestStatus {
     pub blocked_by: Option<String>,
 }
 
-/// Response body for `GET /api/v1/admin/index/{target}/{rustc_version}`.
-///
-/// One keyset page of the slice's servable artifact rows — the data
-/// `stow-admin index export` assembles into the published
-/// [`crate::index::ArtifactIndex`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ArtifactIndexPage {
-    /// Rows ordered by `c_metadata`, every one strictly after the
-    /// request's `after` cursor and carrying a published bundle.
-    pub rows: Vec<ArtifactIndexRow>,
-    /// The `after` cursor for the next page — the last row's `c_metadata`
-    /// when this page was full, `None` once the slice is exhausted.
-    pub next_after: Option<String>,
-}
-
 /// The index-publish path's report of what a slice serves.
 ///
-/// Request body for `POST /api/v1/admin/index/{target}/{rustc_version}`,
-/// sent after the slice goes live. The scheduler stores the set as the
+/// One slice of a [`PublishedRunReport`], the body of
+/// `POST /api/v1/admin/index/published`, sent after the run's slices go
+/// live. The scheduler stores the set as the
 /// membership the dependency gate checks a dependent's edges against —
 /// a dependent dispatches only when every dependency resolves to a row
 /// the latest report for that dependency's own `(target, rustc_version)`
@@ -1974,6 +1960,15 @@ pub struct PublishedSlice {
     /// Rows leaving the slice — always empty on a full report.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<PublishedSliceRow>,
+}
+/// A publish run's one report: every slice the run published, carried
+/// in a single `POST /api/v1/admin/index/published` so the scheduler
+/// applies them in one append and one inline pass (stow#940).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedRunReport {
+    /// The run's slices — each a [`PublishedSlice`]: the
+    /// `(target, rustc_version)` pair, the delta or full membership.
+    pub slices: Vec<PublishedSlice>,
 }
 
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====

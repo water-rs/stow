@@ -203,12 +203,11 @@ const EVENT_COSTS: &[EventCost] = &[
         route: "POST /api/v1/enqueue",
         // A redemption forwards a single request: its insert is one
         // third of the accept drive's three-task batch, priced on the
-        // accept path — an accepted redemption pays the insert.
-        drives: &[
-            ("GET /status", 1.0),
-            ("POST /enqueue (untrusted accept)", 1.0 / SUBMIT_BATCH_TASKS),
-        ],
-        do_requests: 2.0,
+        // accept path — an accepted redemption pays the insert. The
+        // `GET /status` pre-check is gone (stow#940): the object's own
+        // pending-depth cap answers 429 on the same request.
+        drives: &[("POST /enqueue (untrusted accept)", 1.0 / SUBMIT_BATCH_TASKS)],
+        do_requests: 1.0,
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("enqueue-redeem", 1.0)]),
