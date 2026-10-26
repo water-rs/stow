@@ -214,11 +214,12 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    **disabled** and the `http_request_firewall_custom` entrypoint itself
    when the phase has never had a ruleset (the API answers error 10003),
    matching rules by `description`, so they exist before anyone needs
-   them and a redeploy never stomps a live toggle. Toggle by hand:
-   `stow-admin maintenance on|off --scope anonymous|lanes|all --yes`,
-   with `CLOUDFLARE_API_TOKEN` (needs *Zone WAF → Edit* on
-   `waterui.dev`), `CF_ZONE_ID` and `STOW_EDGE_URL` exported;
-   `stow-admin maintenance status` prints the current state.
+   them and a redeploy never stomps a live toggle. Toggle by hand by
+   dispatching `maintenance.yml`
+   (`gh workflow run maintenance.yml -f action=on|off|status -f scope=anonymous|lanes|all`):
+   it runs `stow-admin maintenance` with the repository's
+   `CLOUDFLARE_API_TOKEN`, so no operator holds a WAF token and every
+   toggle is recorded under the GitHub account that dispatched it.
 
 ### Billing notifications
 
@@ -483,9 +484,12 @@ GitHub identity (`edge/src/github_auth.rs`). Two shapes are accepted:
   `job_workflow_ref`. `tasks/submit` accepts any workflow running inside
   the trusted repo. Nothing is stored or rotated — a leaked run token
   dies with the run.
-- **Repo-push credential.** `stow-admin` and the local dev loop send the
-  operator's own credential (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth
-  token`). The edge probes push capability directly — a GET on the repo's
+- **Repo-push credential.** Outside Actions, `stow-admin` sends the
+  token `stow-admin login` stored: a `stow-ci` App user token from
+  GitHub's device flow, bound to the operator's account and expiring
+  after eight hours, kept in the OS credential store. A job or the local
+  dev loop may stage `GH_TOKEN`/`GITHUB_TOKEN` instead; `stow-admin`
+  never forwards `gh auth token` to the edge. The edge probes push capability directly — a GET on the repo's
   `git-receive-pack` ref advertisement answers 200 only when GitHub would
   accept a push from that credential — which works uniformly for user
   tokens, fine-grained PATs, and installation tokens like the mock-e2e
@@ -509,8 +513,7 @@ to the scheduler's operations lane at the caller's `--priority`
 reachable edge):
 
 ```sh
-STOW_EDGE_URL=https://stow.waterui.dev GH_TOKEN=<operator token> \
-stow-admin preheat manual \
+STOW_EDGE_URL=https://stow.waterui.dev stow-admin preheat manual \
     --crates crates.txt \          # one `name` or `name@version` per line
     --rustc-version 1.91.1 \
     --yes
@@ -549,8 +552,9 @@ lease, unbound requeues).
 ## Operating
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
-- **Under attack:** `stow-admin maintenance on --scope anonymous`, watch
-  the request graph, `stow-admin maintenance off --scope anonymous`. The
+- **Under attack:** `gh workflow run maintenance.yml -f action=on -f
+  scope=anonymous`, watch the request graph, then the same with
+  `action=off`. The
   rule lives on the `waterui.dev` zone's `http_request_firewall_custom`
   phase — blocked requests never invoke the Worker — and the trusted CI
   endpoints keep working. `--scope lanes` sheds only the scheduler-backed

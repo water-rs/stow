@@ -451,8 +451,8 @@ the scheduler deduplicates on task identity, leaves completed tasks
 completed, and retires pending tasks the catalog already covers, so each
 wave builds only what is missing or previously failed.
 
-`stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
-access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
+`stow-admin` requires `STOW_EDGE_URL` and a GitHub account with push
+access to `water-rs/stow`, signed in with `stow-admin login`.
 The exceptions never touch the edge: `preheat projects generate`
 touches only GitHub, `index export`/`publish`/`targets` touch only
 the registry, and a preheat lane (`top-binaries`, `binary`,

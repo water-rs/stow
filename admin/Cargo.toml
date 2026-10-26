@@ -51,6 +51,7 @@ jiff = { version = "0.2.37", default-features = false, features = ["std", "tz-sy
 hmac = "0.13"
 sha2 = "0.11"
 hex.workspace = true
+keyring-core = { version = "1.0.1", default-features = false }
 
 [dev-dependencies]
 # `#[tokio::test]` + `start_paused` for the pacing loop's boundary tests.
@@ -71,3 +72,12 @@ serde_yml = "0.0.12"
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", default-features = false, features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = { version = "1.0.0", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1.1.0", default-features = false }
