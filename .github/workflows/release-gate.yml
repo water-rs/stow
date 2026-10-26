@@ -128,7 +128,7 @@ jobs:
   traffic-cost:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Traffic cost
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 110
     permissions:
       # The local edge authenticates its trusted endpoints against the
@@ -186,7 +186,7 @@ jobs:
   preheat-cost:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Preheat cost
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # The binaries-only top two pull in ~1,750 tasks: a cold build plus
     # the wave measured 30 minutes before the resubmit (stow#926).
     timeout-minutes: 40
@@ -246,7 +246,7 @@ jobs:
   production-wave:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Production wave
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Measured 37 minutes (the projects lane dominates), plus half.
     timeout-minutes: 55
     steps:
@@ -317,7 +317,7 @@ jobs:
       - preheat-cost
       - production-wave
     name: Monthly projection
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -367,7 +367,7 @@ jobs:
       - projection
     if: always()
     name: Release gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -408,7 +408,7 @@ jobs:
       - gate
     if: always() && github.event_name == 'schedule'
     name: Nightly report
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       issues: write
     steps:
