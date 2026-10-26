@@ -7,6 +7,10 @@ workers_dev = false
 [cloudflare.vars]
 GHCR_BASE_URL = "http://127.0.0.1:28123"
 GITHUB_REPO = "water-rs/stow"
+# Mock value for the App's slug — the local CI stamps `<slug>[bot]` as
+# `triggering_actor` on the runs it was dispatched, which is what the
+# webhook's `in_progress` filter reads (stow#940).
+GITHUB_APP_SLUG = "mock-stow-ci"
 # Any value works locally — trusted calls use the developer's GitHub
 # user token; the audience pin only binds OIDC credentials.
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"

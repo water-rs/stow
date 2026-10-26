@@ -1005,9 +1005,10 @@ pub struct WorkflowRunComplete {
     #[serde(default)]
     pub cancelled: bool,
     /// The GitHub Actions run id, stamped onto the queue row so
-    /// `stow-admin status` surfaces the run URL.
-    #[serde(default)]
-    pub github_run_id: Option<String>,
+    /// `stow-admin status` surfaces the run URL. Required — the
+    /// `workflow_run` delivery always carries the run's `id`, so a
+    /// report without one is not the webhook's shape.
+    pub github_run_id: String,
 }
 
 /// The `workflow_run` `in_progress` delivery for a `build-crate.yml`

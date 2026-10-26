@@ -237,19 +237,22 @@ pub(super) async fn complete_run(
     report: &stow_types::api::WorkflowRunComplete,
     now: i64,
 ) -> Result<FinishOutcome, QueueError> {
+    // A malformed run id fails before the row lands — appending first
+    // would persist a `RunFinished` whose replay never applies.
+    let run_id = report.github_run_id.parse::<u64>().map_err(|error| {
+        QueueError::Invariant(format!(
+            "complete-run github_run_id {:?}: {error}",
+            report.github_run_id
+        ))
+    })?;
     let event = SchedulerEvent::RunFinished {
-        run_id: report.github_run_id.clone().unwrap_or_default(),
+        run_id: report.github_run_id.clone(),
         task_id: report.task_id.clone(),
         success: report.success,
         cancelled: report.cancelled,
         error: report.error.clone(),
     };
     append(graph, db, std::slice::from_ref(&event), now).await?;
-    let run_id = report
-        .github_run_id
-        .as_deref()
-        .and_then(|id| id.parse::<u64>().ok())
-        .unwrap_or(0);
     let outcome = graph.with(|graph| {
         graph.last_run_update_ms = Some(now);
         graph.run_finished(
@@ -264,15 +267,18 @@ pub(super) async fn complete_run(
     Ok(outcome)
 }
 
-/// `POST /tasks/run-update`: an own run's `in_progress` delivery
-/// changes nothing persistent but the health check's last-delivery
-/// instant (stow#860) — `RunUpdate` marks the acceptance so a wake
-/// replays it (the post-wake reconcile restores running state); a run
-/// the scheduler did not dispatch appends its occupancy instead, whose
-/// apply marks the same instant.
+/// `POST /tasks/run-update`: the route serves external runs only —
+/// the webhook forwards `in_progress` just for a run the scheduler did
+/// not dispatch (stow#940), whose delivery appends its occupancy
+/// (`ExternalRunStarted`) and stamps the health check's last-delivery
+/// instant (stow#860). An own run's `in_progress` still lands through
+/// the same path when one arrives — replayed events, or a run whose
+/// actor a misnamed slug binding could not classify — `RunUpdate`
+/// marks the acceptance so a wake replays it.
 ///
 /// # Errors
-/// `QueueError::Sql` on a failed append.
+/// `QueueError::Sql` on a failed append, `QueueError::Invariant` on a
+/// malformed run id or a task id attributing to no runner family.
 pub(super) async fn task_run_update(
     graph: LoadedGraph<'_>,
     db: &DurableDb,

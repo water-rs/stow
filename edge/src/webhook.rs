@@ -46,6 +46,17 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Debug, Clone)]
 pub struct WebhookSecret(pub String);
 
+/// The `GITHUB_APP_SLUG` binding rendered into the
+/// `triggering_actor.login` a scheduler-dispatched run carries —
+/// `<slug>[bot]`. A `build-crate.yml` `in_progress` delivery whose run
+/// carries it forwards nothing: the CI listing's reconcile reports own
+/// runs' running state instead (stow#940). Required at worker startup
+/// in every deployment — the mock stack sets it to the slug the local
+/// CI stamps.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub struct AppBotLogin(pub String);
+
 /// The webhook's signing headers and the raw body they cover, pulled off
 /// the request by [`SignedDelivery`]'s extractor.
 struct SignedDelivery {
@@ -146,6 +157,17 @@ struct WorkflowRunFields {
     html_url: Option<String>,
     /// The repo the head commit lives in — a fork's run names its fork.
     head_repository: RepoRef,
+    /// `triggering_actor` — whose dispatch started the run: the App's
+    /// `<slug>[bot]` login on a scheduler dispatch, an operator's login
+    /// on one dispatched by hand (stow#940). A delivery without it
+    /// fails the parse — GitHub always sends it.
+    triggering_actor: RunActor,
+}
+
+/// `triggering_actor` — only `login` is read.
+#[derive(Debug, serde::Deserialize)]
+struct RunActor {
+    login: String,
 }
 
 /// `full_name` (`owner/name`) of a repo the payload carries.
@@ -307,6 +329,7 @@ pub async fn github_workflow_run(
     delivery: VerifiedDelivery,
     State(ghcr): State<crate::api::GhcrConfig>,
     State(scheduler): State<CfDurableNamespace>,
+    State(app_bot_login): State<AppBotLogin>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
     let Some((action, event)) = decode_delivery(&delivery)? else {
         tracing::debug!(event = %delivery.event, "ignoring non-workflow_run delivery");
@@ -317,6 +340,12 @@ pub async fn github_workflow_run(
         return Ok(Json(OkResponse { ok: true }));
     };
     match subject {
+        // A build run's `completed` forwards for every run — the
+        // slot-freeing channel the scheduler cannot learn elsewhere;
+        // its `in_progress` only for a run the scheduler did not
+        // dispatch (stow#940): own runs' running state comes from the
+        // CI listing's reconcile, so their deliveries would only spend
+        // a DO request each.
         RunSubject::Task {
             rustc_version,
             task_id,
@@ -324,7 +353,7 @@ pub async fn github_workflow_run(
             complete_build_task(&ghcr, &scheduler, run, rustc_version, task_id).await?;
         }
         RunSubject::Task { task_id, .. } if action == "in_progress" => {
-            update_task_run(&scheduler, run, task_id).await?;
+            update_external_task_run(&scheduler, &app_bot_login.0, run, task_id).await?;
         }
         RunSubject::Request {
             attempt,
@@ -377,10 +406,33 @@ impl TaskRunForward for CfDurableNamespace {
     }
 }
 
-/// `build-crate.yml` `in_progress` — the bound row moves `dispatched`
-/// → `running` through `POST /tasks/run-update` (stow#876). An unknown
-/// task or a run the row is not bound to is a stale generation's event
-/// — the object's 404/409 is logged, never an error back to GitHub.
+/// `build-crate.yml` `in_progress` — `POST /tasks/run-update` serves
+/// external runs only (stow#940): a run the scheduler dispatched
+/// carries the App's bot login and its running state arrives through
+/// the CI listing's reconcile instead, so the delivery is consumed
+/// without a forward.
+async fn update_external_task_run(
+    forward: &impl TaskRunForward,
+    app_bot_login: &str,
+    run: &WorkflowRunFields,
+    task_id: &str,
+) -> Result<(), GetArtifactError> {
+    if run.triggering_actor.login == app_bot_login {
+        tracing::debug!(
+            task_id,
+            run_id = run.id,
+            "own run's in_progress — the CI listing's reconcile reports it"
+        );
+        return Ok(());
+    }
+    update_task_run(forward, run, task_id).await
+}
+
+/// `build-crate.yml` `in_progress` of a run the scheduler did not
+/// dispatch — the external run's occupancy record lands through
+/// `POST /tasks/run-update` (stow#940). An unknown task or a run the
+/// row is not bound to is a stale generation's event — the object's
+/// 404/409 is logged, never an error back to GitHub.
 async fn update_task_run(
     forward: &impl TaskRunForward,
     run: &WorkflowRunFields,
@@ -459,6 +511,22 @@ async fn complete_build_task(
         ));
     }
 
+    forward_run_complete(forward, run, task_id, success, error).await
+}
+
+/// Forward the settled outcome to `POST /tasks/complete-run` — every
+/// `completed` delivery forwards, whether the run was dispatched by
+/// the scheduler or not: the delivery is what frees the slot or the
+/// external run's occupancy (stow#940). An unknown task is an orphan
+/// run from an abandoned dispatch — the object's 404 is logged, never
+/// an error back to GitHub.
+async fn forward_run_complete(
+    forward: &impl TaskRunForward,
+    run: &WorkflowRunFields,
+    task_id: &str,
+    success: bool,
+    error: Option<String>,
+) -> Result<(), GetArtifactError> {
     let completion = WorkflowRunComplete {
         task_id: task_id.to_owned(),
         success,
@@ -467,7 +535,7 @@ async fn complete_build_task(
         // superseded duplicate — the scheduler re-queues the task instead
         // of recording a failure (stow#877).
         cancelled: run.conclusion.as_deref() == Some("cancelled"),
-        github_run_id: Some(run.id.to_string()),
+        github_run_id: run.id.to_string(),
     };
     match forward.send_run_complete(&completion).await {
         Ok(()) => {
@@ -596,6 +664,14 @@ mod tests {
         VerifiedDelivery::extract(&mut request).await
     }
 
+    /// The `triggering_actor.login` a run dispatched through the CI
+    /// interface carries — `<slug>[bot]`, the App's bot login.
+    const APP_BOT_LOGIN: &str = "stow-ci[bot]";
+
+    /// An operator's login — what every run the scheduler did not
+    /// dispatch carries.
+    const OPERATOR_LOGIN: &str = "mock-operator";
+
     fn completed_event(over: impl Fn(&mut serde_json::Value)) -> Vec<u8> {
         let mut event = serde_json::json!({
             "action": "completed",
@@ -610,6 +686,7 @@ mod tests {
                 "run_attempt": 1,
                 "html_url": "https://github.com/water-rs/stow/actions/runs/987654321",
                 "head_repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
+                "triggering_actor": {"login": OPERATOR_LOGIN},
             },
         });
         over(&mut event);
@@ -901,12 +978,14 @@ mod tests {
         }
     }
 
-    /// The task forward's test double: records the updates —
-    /// `send_task_run_update` is the `in_progress` arm's only outbound
-    /// channel, so this log is the whole of what the handler can do out.
+    /// The task forward's test double: records both channels —
+    /// `send_task_run_update` and `send_run_complete` are the task
+    /// arm's only outbound calls, so these logs are the whole of what
+    /// the handler can send.
     #[derive(Default)]
     struct CountingForward {
         updates: std::sync::Mutex<Vec<TaskRunUpdate>>,
+        completions: std::sync::Mutex<Vec<WorkflowRunComplete>>,
         /// Scripted status — when `Some`, the stub answers
         /// `SchedulerClientError::Http` with it.
         status: Option<u16>,
@@ -915,9 +994,19 @@ mod tests {
     impl TaskRunForward for CountingForward {
         fn send_run_complete<'a>(
             &'a self,
-            _report: &'a WorkflowRunComplete,
+            report: &'a WorkflowRunComplete,
         ) -> impl Future<Output = Result<(), SchedulerClientError>> + Send + 'a {
-            std::future::ready(Ok(()))
+            self.completions
+                .lock()
+                .expect("completions")
+                .push(report.clone());
+            std::future::ready(self.status.map_or(Ok(()), |status| {
+                Err(SchedulerClientError::Http {
+                    url: "https://scheduler.internal/tasks/complete-run".to_owned(),
+                    status,
+                    body: "{\"error\":\"unknown task\"}".to_owned(),
+                })
+            }))
         }
 
         fn send_task_run_update<'a>(
@@ -979,5 +1068,86 @@ mod tests {
             .await
             .expect_err("a DO failure propagates as a 500");
         assert!(matches!(error, GetArtifactError::InternalWithMessage(_)));
+    }
+
+    /// The `in_progress` gate (stow#940): a run the scheduler
+    /// dispatched — `triggering_actor.login` is the App's bot login —
+    /// forwards nothing, since the CI listing's reconcile reports its
+    /// running state. An operator's run still forwards to
+    /// `POST /tasks/run-update`.
+    #[tokio::test]
+    async fn an_own_run_in_progress_forwards_nothing_an_external_ones_does() {
+        for (actor, forwards) in [(APP_BOT_LOGIN, 0_usize), (OPERATOR_LOGIN, 1)] {
+            let body = task_completed_event(|event| {
+                event["action"] = serde_json::json!("in_progress");
+                event["workflow_run"]["triggering_actor"]["login"] = serde_json::json!(actor);
+            });
+            let delivery = verified("workflow_run", &body)
+                .await
+                .expect("signed delivery verifies");
+            let (_action, event) = decode_delivery(&delivery)
+                .expect("decodes")
+                .expect("in_progress action");
+            let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+            let RunSubject::Task { task_id, .. } = subject else {
+                panic!("build-crate.yml decodes a task subject");
+            };
+            let forward = CountingForward::default();
+            update_external_task_run(&forward, APP_BOT_LOGIN, run, task_id)
+                .await
+                .expect("handled");
+            assert_eq!(
+                forward.updates.lock().expect("updates").len(),
+                forwards,
+                "{actor}"
+            );
+        }
+    }
+
+    /// `completed` forwards for every run — the actor never gates the
+    /// slot-freeing channel (stow#940).
+    #[tokio::test]
+    async fn a_completed_run_forwards_regardless_of_actor() {
+        for actor in [APP_BOT_LOGIN, OPERATOR_LOGIN] {
+            let body = task_completed_event(|event| {
+                event["workflow_run"]["triggering_actor"]["login"] = serde_json::json!(actor);
+            });
+            let delivery = verified("workflow_run", &body)
+                .await
+                .expect("signed delivery verifies");
+            let (_action, event) = decode_delivery(&delivery)
+                .expect("decodes")
+                .expect("completed action");
+            let (run, subject) = authorized_run(&event).expect("checks").expect("authorized");
+            let RunSubject::Task { task_id, .. } = subject else {
+                panic!("build-crate.yml decodes a task subject");
+            };
+            let forward = CountingForward::default();
+            forward_run_complete(&forward, run, task_id, true, None)
+                .await
+                .expect("forwarded");
+            let completions = forward.completions.lock().expect("completions");
+            assert_eq!(completions.len(), 1, "{actor}");
+            assert_eq!(completions[0].task_id, task_id);
+            assert_eq!(completions[0].github_run_id, "987654321");
+        }
+    }
+
+    /// A `workflow_run` delivery without `triggering_actor` is not
+    /// the shape GitHub documents — rejected like any other missing
+    /// field (stow#940).
+    #[tokio::test]
+    async fn a_delivery_without_triggering_actor_is_a_400() {
+        let body = completed_event(|event| {
+            let _ = event["workflow_run"]
+                .as_object_mut()
+                .expect("workflow_run object")
+                .remove("triggering_actor");
+        });
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let error = decode_delivery(&delivery).expect_err("missing triggering_actor rejects");
+        assert!(matches!(error, GetArtifactError::BadRequestWithMessage(_)));
     }
 }

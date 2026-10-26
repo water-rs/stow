@@ -23,6 +23,7 @@ const STOW_GITHUB_API_URL_BINDING: &str = "STOW_GITHUB_API_URL";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
+const GITHUB_APP_SLUG_BINDING: &str = "GITHUB_APP_SLUG";
 const STOW_POW_CHALLENGE_SECRET_BINDING: &str = "STOW_POW_CHALLENGE_SECRET";
 const STOW_POW_MIN_BITS_BINDING: &str = "STOW_POW_MIN_BITS";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
@@ -97,6 +98,13 @@ fn worker(
         env_binding::required_string(env, GITHUB_APP_INSTALLATION_ID_BINDING);
         env_binding::required_string(env, GITHUB_APP_PRIVATE_KEY_BINDING);
     }
+    // The webhook's `in_progress` filter needs the App's bot login in
+    // every deployment — under `STOW_LOCAL_CI_URL` the mock CI stamps
+    // the same `<slug>[bot]` on its dispatches (stow#940).
+    let app_bot_login = format!(
+        "{}[bot]",
+        env_binding::required_string(env, GITHUB_APP_SLUG_BINDING)
+    );
     // The bearer check's GitHub probes: `STOW_LOCAL_CI_URL` marks the
     // mock stack, where they must resolve inside it — a mock manifest
     // that forgets `STOW_GITHUB_API_URL` fails startup rather than
@@ -171,6 +179,7 @@ fn worker(
             env,
             STOW_GITHUB_WEBHOOK_SECRET_BINDING,
         ))))
+        .with(State(webhook::AppBotLogin(app_bot_login)))
         .with(State(release_hook::NewreleasesSecret(
             env_binding::required_string(env, STOW_NEWRELEASES_WEBHOOK_SECRET_BINDING),
         )))

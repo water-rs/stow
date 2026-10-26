@@ -77,6 +77,11 @@ pub struct LocalServerState {
     pub mock_private_key_path: String,
     /// Root directory the mock OCI registry serves out of.
     pub mock_registry_root: String,
+    /// The App's slug — the `GITHUB_APP_SLUG` the edge deploys under.
+    /// Every run dispatched through this server reports
+    /// `triggering_actor.login` = `<slug>[bot]`; seeded runs report
+    /// [`stow_types::local_ci::SEEDED_RUN_OPERATOR_LOGIN`] (stow#940).
+    pub app_slug: String,
     /// Every dispatched run's state, served by `GET /tasks`.
     pub runs: Arc<Mutex<BTreeMap<String, LocalCiRun>>>,
     /// Every run's job rows by run id — the rows GitHub's jobs
@@ -131,12 +136,14 @@ impl LocalServerState {
         webhook_secret: String,
         mock_private_key_path: String,
         mock_registry_root: String,
+        app_slug: String,
     ) -> Self {
         Self {
             edge_url,
             webhook_secret,
             mock_private_key_path,
             mock_registry_root,
+            app_slug,
             runs: Arc::new(Mutex::new(BTreeMap::new())),
             jobs: Arc::new(Mutex::new(BTreeMap::new())),
             cancels: Arc::new(Mutex::new(BTreeSet::new())),
@@ -151,6 +158,12 @@ impl LocalServerState {
             )),
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         }
+    }
+
+    /// The `triggering_actor.login` a run dispatched through this
+    /// server reports — the App's bot login, `<slug>[bot]`.
+    fn app_bot_login(&self) -> String {
+        format!("{}[bot]", self.app_slug)
     }
 
     /// A fresh run or job id — GitHub assigns every dispatch and every
@@ -189,6 +202,7 @@ impl LocalServerState {
                 delivery_errors: Vec::new(),
                 task_id: None,
                 built: false,
+                triggering_actor_login: self.app_bot_login(),
             });
         status.clone_into(&mut entry.status);
         entry.conclusion = conclusion.map(str::to_owned);
@@ -543,6 +557,10 @@ impl LocalServerState {
                 delivery_errors: Vec::new(),
                 task_id: Some(seeded.task_id.clone()),
                 built: false,
+                // A run that exists without a dispatch through this
+                // server is an external run — its actor is the
+                // operator who dispatched it, not the App (stow#940).
+                triggering_actor_login: stow_types::local_ci::SEEDED_RUN_OPERATOR_LOGIN.to_owned(),
             },
         );
         let build = self.begin_job(run_id, format!("build {}", seeded.task_id), BUILD_JOB_STEPS);
@@ -800,6 +818,7 @@ fn run_response(state: &LocalServerState, run_id: u64) -> Response {
             "path": run.path,
             "event": "workflow_dispatch",
             "head_branch": stow_types::trusted_builder::BRANCH,
+            "triggering_actor": {"login": run.triggering_actor_login},
         }),
         StatusCode::OK,
     )
@@ -870,6 +889,7 @@ async fn list_workflow_runs(
                 "path": run.path,
                 "event": "workflow_dispatch",
                 "head_branch": stow_types::trusted_builder::BRANCH,
+                "triggering_actor": {"login": run.triggering_actor_login},
             })
         })
         .collect();
@@ -1390,6 +1410,7 @@ fn dispatch_resolve(state: LocalServerState, dispatch: RequestDispatch) -> Respo
         action: "in_progress",
         conclusion: None,
         html_url: format!("http://{}/tasks/{workflow_run_id}", state.listen),
+        triggering_actor_login: state.app_bot_login(),
         error: None,
     };
     let response = dispatch_response(&report);
@@ -1877,6 +1898,9 @@ struct WorkflowRunReport {
     conclusion: Option<&'static str>,
     /// The run's link — the mock's own `GET /tasks` page.
     html_url: String,
+    /// `triggering_actor.login` — every run this server was dispatched
+    /// reports the App's bot login (stow#940).
+    triggering_actor_login: String,
     /// Failure detail worth logging alongside the report.
     error: Option<String>,
 }
@@ -1903,6 +1927,7 @@ fn task_workflow_run(
         action,
         conclusion,
         html_url: format!("http://{}/tasks/{workflow_run_id}", state.listen),
+        triggering_actor_login: state.app_bot_login(),
         error,
     }
 }
@@ -1937,6 +1962,7 @@ async fn post_workflow_run(
             "conclusion": run.conclusion,
             "html_url": run.html_url,
             "head_repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
+            "triggering_actor": {"login": run.triggering_actor_login},
         },
     });
     let body = serde_json::to_vec(&payload)?;
@@ -1998,7 +2024,13 @@ mod tests {
     };
 
     fn state() -> LocalServerState {
-        LocalServerState::new(String::new(), String::new(), String::new(), String::new())
+        LocalServerState::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "mock-stow-ci".to_owned(),
+        )
     }
 
     fn task() -> BuildTaskPayload {
@@ -2016,6 +2048,7 @@ mod tests {
             action: "completed",
             conclusion: None,
             html_url: String::new(),
+            triggering_actor_login: state.app_bot_login(),
             error: None,
         };
         let first_response = dispatch_response(&first);
@@ -2035,6 +2068,7 @@ mod tests {
             action: first.action,
             conclusion: None,
             html_url: String::new(),
+            triggering_actor_login: state.app_bot_login(),
             error: None,
         };
         let second_response = dispatch_response(&second);

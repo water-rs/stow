@@ -94,6 +94,9 @@ EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
 LOCAL_CI_URL="http://${LOCAL_CI_ADDR}"
 WEBHOOK_SECRET="mock-github-webhook-secret"
+# The App slug the local CI stamps as `triggering_actor` (`<slug>[bot]`)
+# — the same value the edge's mock manifest deploys (stow#940).
+APP_SLUG="mock-stow-ci"
 EDGE_BEARER="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 if [ -z "$EDGE_BEARER" ]; then
     if command -v gh >/dev/null 2>&1; then
@@ -400,6 +403,7 @@ log "$reset_out"
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
         STOW_GITHUB_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
+        GITHUB_APP_SLUG="$APP_SLUG" \
         STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
         STOW_CACHE_DIR="$WORK_DIR/ci-cache" \
         STOW_VERIFY_MODE="mock-key" \

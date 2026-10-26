@@ -358,6 +358,13 @@ fn workflow_run_body(task: &InFlightRun) -> String {
             "head_repository": {
                 "full_name": stow_types::trusted_builder::REPOSITORY
             },
+            // The fixture's runs are external — seeded on the local CI
+            // without a dispatch through it — so their actor is the
+            // operator login the mock stamps, not the App's bot
+            // (stow#940).
+            "triggering_actor": {
+                "login": stow_types::local_ci::SEEDED_RUN_OPERATOR_LOGIN
+            },
         },
     })
     .to_string()

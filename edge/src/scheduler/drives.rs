@@ -814,6 +814,10 @@ async fn focused_claim_pass(
 /// transitions, and the stale sweep reads only the clock.
 pub const RUN_DRIVE_RUN_ID: u64 = 9_000_000_001;
 
+/// The run id the run-update drive's seeded external run carries —
+/// its own namespace, disjoint from the ids runs bind.
+const RUN_UPDATE_RUN_ID: u64 = 9_000_100_000;
+
 /// Seed families of the run drives' own nodes. Each drive lands one
 /// fresh node in setup and claims it, so the claimable surface nets out
 /// to what it was: the node leaves `pending` again by completing or by
@@ -916,7 +920,7 @@ async fn complete_run_route(
         success,
         error: (!success).then(|| "failure".to_owned()),
         cancelled: false,
-        github_run_id: Some(bound.run.to_string()),
+        github_run_id: bound.run.to_string(),
     };
     #[cfg(target_arch = "wasm32")]
     {
@@ -2368,23 +2372,23 @@ pub const DRIVES: &[Drive] = &[
         }),
     },
     Drive {
-        // The webhook's `in_progress` forward: an own run changes
-        // nothing persistent — the graph moves the bound node
-        // `dispatched` -> `running` in memory, and the post-wake
-        // reconcile restores it (review).
+        // The webhook's `in_progress` forward serves external runs
+        // only (stow#940): a run the scheduler never dispatched —
+        // its task id attributes to a runner family but names no live
+        // node — appends `ExternalRunStarted` occupancy. Own runs'
+        // running state comes from the CI listing's reconcile instead.
+        // The cleanup settles the run as an external completion does,
+        // returning the occupancy the drive added.
         name: "POST /tasks/run-update (in_progress)",
-        setup: Some(|db, _shape, settings, ctx| {
-            Box::pin(async move { bind_fresh(ctx, db, settings, TAG_RUN_UPDATE, now_ms()).await })
-        }),
+        setup: None,
         run: |db, _shape, _settings, ctx| {
             Box::pin(async move {
-                let bound = ctx.bound_run()?;
                 routes::task_run_update(
                     ctx.loaded(),
                     db,
                     &stow_types::api::TaskRunUpdate {
-                        task_id: bound.task,
-                        github_run_id: bound.run.to_string(),
+                        task_id: run_node_id(TAG_RUN_UPDATE),
+                        github_run_id: RUN_UPDATE_RUN_ID.to_string(),
                     },
                     now_ms(),
                 )
@@ -2394,9 +2398,23 @@ pub const DRIVES: &[Drive] = &[
             })
         },
         cleanup: Some(|db, _shape, _settings, ctx| {
-            Box::pin(
-                async move { cancel_submitted(ctx, db, vec![run_node_id(TAG_RUN_UPDATE)]).await },
-            )
+            Box::pin(async move {
+                routes::complete_run(
+                    ctx.loaded(),
+                    db,
+                    &stow_types::api::WorkflowRunComplete {
+                        task_id: run_node_id(TAG_RUN_UPDATE),
+                        success: true,
+                        error: None,
+                        cancelled: false,
+                        github_run_id: RUN_UPDATE_RUN_ID.to_string(),
+                    },
+                    now_ms(),
+                )
+                .await
+                .map(|_| ())
+                .map_err(text)
+            })
         }),
     },
     Drive {
@@ -2835,7 +2853,7 @@ pub const DRIVES: &[Drive] = &[
                         success: true,
                         error: None,
                         cancelled: false,
-                        github_run_id: Some(SNAPSHOT_RUN_BASE.to_string()),
+                        github_run_id: SNAPSHOT_RUN_BASE.to_string(),
                     },
                     now_ms(),
                 )

@@ -73,6 +73,7 @@ trap cleanup EXIT
 manifest_var() { sed -n "s/^$2 *= *\"\([^\"]*\)\".*/\1/p" "$REPO_ROOT/edge/$1"; }
 DISPATCH_LIMIT="$(manifest_var Skyzen.toml STOW_MAX_CONCURRENT_JOBS)"
 WEBHOOK_SECRET="$(manifest_var Skyzen.mock.toml STOW_GITHUB_WEBHOOK_SECRET)"
+APP_SLUG="$(manifest_var Skyzen.mock.toml GITHUB_APP_SLUG)"
 BEARER="${GH_TOKEN:-$(gh auth token 2>/dev/null)}"
 [ -n "$DISPATCH_LIMIT" ] && [ -n "$WEBHOOK_SECRET" ] || die "edge manifests carry no dispatch cap or webhook secret"
 for tool in jq curl wrangler openssl; do
@@ -93,6 +94,7 @@ export WRANGLER_LOG_PATH="$WORK/logs"
     >"$WORK/logs/mock-registry.log" 2>&1 &
 PIDS+=($!)
 (cd "$WORK/local-ci" && exec env STOW_EDGE_URL="$EDGE_URL" STOW_GITHUB_WEBHOOK_SECRET="$WEBHOOK_SECRET" \
+    GITHUB_APP_SLUG="$APP_SLUG" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK/keys/public.pem" STOW_MOCK_PRIVATE_KEY_PATH="$WORK/keys/private.pem" \
     STOW_MOCK_REGISTRY_ROOT="$WORK/mock-registry" STOW_LOCAL_CI_STUB=1 \
     "$BIN/stow-build" serve --listen "$LOCAL_CI") >"$WORK/logs/local-ci.log" 2>&1 &

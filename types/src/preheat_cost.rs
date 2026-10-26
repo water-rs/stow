@@ -1197,6 +1197,7 @@ mod tests {
             error: None,
             delivery_errors: Vec::new(),
             task_id: Some(task_id.to_owned()),
+            triggering_actor_login: crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN.to_owned(),
         }
     }
 

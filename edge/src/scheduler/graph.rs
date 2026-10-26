@@ -1532,9 +1532,10 @@ impl Graph {
         self.refresh_ready(ix);
     }
 
-    /// A `workflow_run` `in_progress` delivery. A delivery naming a
-    /// dispatched-but-unbound claim binds it — the run's own record is
-    /// the authoritative binding (review Q6's delivery-side leg).
+    /// A `workflow_run` `in_progress` delivery — forwarded only for a
+    /// run the scheduler did not dispatch (stow#940). A delivery naming
+    /// a dispatched-but-unbound claim binds it — the run's own record
+    /// is the authoritative binding (review Q6's delivery-side leg).
     pub fn run_started(
         &mut self,
         task_id: &str,

@@ -1206,6 +1206,7 @@ fi
         SCHEDULER_URL="$SCHEDULER_URL" \
         STOW_EDGE_URL="$EDGE_URL" \
         STOW_GITHUB_WEBHOOK_SECRET="mock-github-webhook-secret" \
+        GITHUB_APP_SLUG="mock-stow-ci" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
         STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \

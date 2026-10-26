@@ -198,9 +198,11 @@ impl DurableObject for Scheduler {
             )),
             // The build run's lifecycle channel (stow#876): the
             // webhook forwards a `build-crate.yml` run's verified
-            // `completed` delivery to `complete-run` and its
-            // `in_progress` delivery to `run-update`; both fence on
-            // the queue row's bound generation.
+            // `completed` delivery to `complete-run`, and to
+            // `run-update` the `in_progress` delivery of a run the
+            // scheduler did not dispatch — external occupancy is
+            // delivery-tracked (stow#940); both fence on the queue
+            // row's bound generation.
             "/tasks/complete-run".post(complete_run),
             "/tasks/run-update".post(apply_task_run_update),
             // The human request lane (stow#428): admit deduplicates on
@@ -718,7 +720,7 @@ pub(super) async fn complete_run_pass(
         graph::FinishOutcome::External | graph::FinishOutcome::Stale => {
             tracing::info!(
                 task_id = %report.task_id,
-                run_id = ?report.github_run_id,
+                run_id = %report.github_run_id,
                 "workflow_run completion resolved an external run"
             );
             return Ok(());
@@ -739,9 +741,11 @@ pub(super) async fn complete_run_pass(
     schedule_alarm(env, db, alarm, graph.cell()).await
 }
 
-/// `POST /tasks/run-update` — the webhook's `in_progress` delivery for
-/// a bound `build-crate.yml` run: the row moves `dispatched` to
-/// `running` under the bound generation's run id (stow#876).
+/// `POST /tasks/run-update` — the webhook's `in_progress` delivery,
+/// which since stow#940 only a run the scheduler did not dispatch
+/// sends: its occupancy records here. An own run's `dispatched` →
+/// `running` transition arrives through the post-wake CI-listing
+/// reconcile instead.
 ///
 /// A task the queue never held answers 404; a report naming a run the
 /// row is not bound to — or a row that already moved past it —
