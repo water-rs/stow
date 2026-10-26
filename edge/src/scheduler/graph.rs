@@ -2267,9 +2267,9 @@ impl Graph {
     }
 
     /// `status` reconciles the delivery-tracked external set at most
-    /// once per this many minutes — ≤2 listing calls each, ≤12
-    /// calls/hour while the queue has work (stow#877).
-    pub(super) const STATUS_RECONCILE_MS: i64 = 10 * 60 * 1000;
+    /// once per [`stow_types::api::STATUS_RECONCILE_MS`] — ≤2 listing
+    /// calls each, ≤12 calls/hour while the queue has work (stow#877).
+    pub(super) const STATUS_RECONCILE_MS: i64 = stow_types::api::STATUS_RECONCILE_MS;
 
     /// Whether the run listing is due for another reconcile: the graph
     /// holds dispatchable or in-flight work and `interval_ms` passed

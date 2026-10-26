@@ -331,13 +331,29 @@ pub async fn github_workflow_run(
     State(scheduler): State<CfDurableNamespace>,
     State(app_bot_login): State<AppBotLogin>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let Some((action, event)) = decode_delivery(&delivery)? else {
+    consume_delivery(&delivery, &ghcr, &scheduler, &app_bot_login.0).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// The route's whole decision for one verified delivery: what it
+/// checks and which scheduler requests it forwards. Host-compiled over
+/// the outbound seams so the tests drive every `workflow_run` action
+/// through it and count the forwards against `stow_types::forwards` —
+/// the counts the traffic projection prices (stow#937).
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+async fn consume_delivery(
+    delivery: &VerifiedDelivery,
+    records: &impl RecordsCheck,
+    forward: &(impl TaskRunForward + RequestRunForward),
+    app_bot_login: &str,
+) -> Result<(), GetArtifactError> {
+    let Some((action, event)) = decode_delivery(delivery)? else {
         tracing::debug!(event = %delivery.event, "ignoring non-workflow_run delivery");
-        return Ok(Json(OkResponse { ok: true }));
+        return Ok(());
     };
     let Some((run, subject)) = authorized_run(&event)? else {
         tracing::debug!("ignoring workflow_run outside the authority boundary");
-        return Ok(Json(OkResponse { ok: true }));
+        return Ok(());
     };
     match subject {
         // A build run's `completed` forwards for every run — the
@@ -350,16 +366,16 @@ pub async fn github_workflow_run(
             rustc_version,
             task_id,
         } if action == "completed" => {
-            complete_build_task(&ghcr, &scheduler, run, rustc_version, task_id).await?;
+            complete_build_task(records, forward, run, rustc_version, task_id).await?;
         }
         RunSubject::Task { task_id, .. } if action == "in_progress" => {
-            update_external_task_run(&scheduler, &app_bot_login.0, run, task_id).await?;
+            update_external_task_run(forward, app_bot_login, run, task_id).await?;
         }
         RunSubject::Request {
             attempt,
             request_id,
         } if action == "in_progress" || action == "completed" => {
-            update_request_run(&scheduler, run, &action, attempt, request_id).await?;
+            update_request_run(forward, run, &action, attempt, request_id).await?;
         }
         // A build run's `requested`/`waiting` and a resolve run's
         // `requested`/`waiting`: neither event carries anything to
@@ -367,7 +383,51 @@ pub async fn github_workflow_run(
         // `in_progress` (dispatched → running) and `completed`.
         _ => {}
     }
-    Ok(Json(OkResponse { ok: true }))
+    Ok(())
+}
+
+/// The check a build run's `completed` makes before it forwards: the
+/// run's signed records artifact is in GHCR. `GhcrConfig` carries it on
+/// wasm; tests stub it.
+trait RecordsCheck: Sync {
+    /// A registry fetch that failed — transient, so the delivery
+    /// answers 500 for GitHub to retry.
+    type Error: std::fmt::Display;
+
+    /// Whether GHCR holds the records artifact this `build` of the task
+    /// published — the tag names the run, so the check matches the
+    /// artifact this run pushed and no other build's.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn records_artifact_exists<'a>(
+        &'a self,
+        rustc_version: &'a str,
+        task_id: &'a str,
+        build: stow_types::records::BuildRun,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send + 'a;
+}
+
+#[cfg(target_arch = "wasm32")]
+impl RecordsCheck for crate::api::GhcrConfig {
+    type Error = crate::ghcr::FetchError;
+
+    fn records_artifact_exists<'a>(
+        &'a self,
+        rustc_version: &'a str,
+        task_id: &'a str,
+        build: stow_types::records::BuildRun,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send + 'a {
+        async move {
+            crate::ghcr::records_artifact_exists(
+                self,
+                rustc_version,
+                task_id,
+                build,
+                &crate::fetch_guard::OutboundPool::new(),
+            )
+            .await
+        }
+        .into_send()
+    }
 }
 
 /// The outbound channel a `build-crate.yml` delivery uses: the
@@ -492,9 +552,8 @@ async fn update_task_run(
 /// `POST /tasks/complete-run` (stow#876). An unknown task is an orphan
 /// run from an abandoned dispatch — the object's 404 is logged, never
 /// an error back to GitHub.
-#[cfg(target_arch = "wasm32")]
 async fn complete_build_task(
-    ghcr: &crate::api::GhcrConfig,
+    records: &impl RecordsCheck,
     forward: &impl TaskRunForward,
     run: &WorkflowRunFields,
     rustc_version: &str,
@@ -507,7 +566,10 @@ async fn complete_build_task(
             run_id: run.id,
             run_attempt: run.run_attempt.get(),
         };
-        match records_artifact_exists(ghcr, rustc_version, task_id, build).await {
+        match records
+            .records_artifact_exists(rustc_version, task_id, build)
+            .await
+        {
             Ok(true) => {}
             Ok(false) => {
                 success = false;
@@ -582,26 +644,6 @@ async fn forward_run_complete(
         }
     }
     Ok(())
-}
-
-/// Whether GHCR holds the records artifact this `build` of the task
-/// published — the tag names the run, so the check matches the artifact
-/// this run pushed and no other build's.
-#[cfg(target_arch = "wasm32")]
-async fn records_artifact_exists(
-    config: &crate::api::GhcrConfig,
-    rustc_version: &str,
-    task_id: &str,
-    build: stow_types::records::BuildRun,
-) -> Result<bool, crate::ghcr::FetchError> {
-    crate::ghcr::records_artifact_exists(
-        config,
-        rustc_version,
-        task_id,
-        build,
-        &crate::fetch_guard::OutboundPool::new(),
-    )
-    .await
 }
 
 /// `resolve-request.yml` `in_progress`/`completed` — the request
@@ -1319,5 +1361,135 @@ mod tests {
             .expect("signed delivery verifies");
         let error = decode_delivery(&delivery).expect_err("missing triggering_actor rejects");
         assert!(matches!(error, GetArtifactError::BadRequestWithMessage(_)));
+    }
+
+    /// The records check's test double: every artifact is in GHCR, so
+    /// a successful `completed` forwards a success.
+    struct RecordsPresent;
+
+    impl RecordsCheck for RecordsPresent {
+        type Error = std::convert::Infallible;
+
+        fn records_artifact_exists<'a>(
+            &'a self,
+            _rustc_version: &'a str,
+            _task_id: &'a str,
+            _build: stow_types::records::BuildRun,
+        ) -> impl Future<Output = Result<bool, Self::Error>> + Send + 'a {
+            std::future::ready(Ok(true))
+        }
+    }
+
+    /// One run of `workflow` (its file under `.github/workflows/`)
+    /// titled `title`, started by `actor` and concluding `conclusion`,
+    /// delivered as `action`: GitHub sends no conclusion before
+    /// `completed`.
+    fn run_delivery(
+        action: &str,
+        workflow: &str,
+        title: &str,
+        actor: &str,
+        conclusion: &str,
+    ) -> Vec<u8> {
+        completed_event(|event| {
+            event["action"] = serde_json::json!(action);
+            event["workflow_run"]["path"] =
+                serde_json::json!(format!(".github/workflows/{workflow}"));
+            event["workflow_run"]["display_title"] = serde_json::json!(title);
+            event["workflow_run"]["triggering_actor"]["login"] = serde_json::json!(actor);
+            event["workflow_run"]["conclusion"] = if action == "completed" {
+                serde_json::json!(conclusion)
+            } else {
+                serde_json::Value::Null
+            };
+        })
+    }
+
+    /// Scheduler requests the handler forwarded for one delivery,
+    /// across every outbound channel it has.
+    async fn forwards_for(body: &[u8]) -> u32 {
+        let delivery = verified("workflow_run", body)
+            .await
+            .expect("signed delivery verifies");
+        let forward = CountingForward::default();
+        consume_delivery(&delivery, &RecordsPresent, &forward, APP_BOT_LOGIN)
+            .await
+            .expect("consumed");
+        let sent = forward.updates.lock().expect("updates").len()
+            + forward.completions.lock().expect("completions").len()
+            + forward
+                .request_updates
+                .lock()
+                .expect("request updates")
+                .len();
+        u32::try_from(sent).expect("a delivery forwards a handful")
+    }
+
+    /// Every lifecycle the traffic projection prices, delivered action
+    /// by action through the real handler: what it forwards is the
+    /// `stow_types::forwards` row the projection reads (stow#937). A
+    /// handler change that forwards another delivery fails here until
+    /// the row — and with it the projected bill — moves too.
+    #[tokio::test]
+    async fn each_lifecycle_forwards_what_the_projection_prices() {
+        use stow_types::forwards::{
+            EXTERNAL_BUILD_RUN, FAILED_RESOLVE_RUN, INDEX_PUBLISH_RUN, OWN_BUILD_RUN,
+            SUCCESSFUL_RESOLVE_RUN, WORKFLOW_RUN_ACTIONS,
+        };
+        let build = stow_types::trusted_builder::WORKFLOW_FILE;
+        let resolve = stow_types::trusted_builder::RESOLVE_WORKFLOW_FILE;
+        let build_title = "1.99.0-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let resolve_title = "resolve-a2-req-serde-1.0.0-ab12";
+        for (name, forwards, workflow, title, actor, conclusion) in [
+            (
+                "own build run",
+                OWN_BUILD_RUN,
+                build,
+                build_title,
+                APP_BOT_LOGIN,
+                "success",
+            ),
+            (
+                "external build run",
+                EXTERNAL_BUILD_RUN,
+                build,
+                build_title,
+                OPERATOR_LOGIN,
+                "success",
+            ),
+            (
+                "successful resolve run",
+                SUCCESSFUL_RESOLVE_RUN,
+                resolve,
+                resolve_title,
+                APP_BOT_LOGIN,
+                "success",
+            ),
+            (
+                "failed resolve run",
+                FAILED_RESOLVE_RUN,
+                resolve,
+                resolve_title,
+                APP_BOT_LOGIN,
+                "failure",
+            ),
+            (
+                "index-publish run",
+                INDEX_PUBLISH_RUN,
+                "index-publish.yml",
+                "index publish",
+                APP_BOT_LOGIN,
+                "success",
+            ),
+        ] {
+            for action in WORKFLOW_RUN_ACTIONS {
+                let body = run_delivery(action, workflow, title, actor, conclusion);
+                assert_eq!(
+                    forwards_for(&body).await,
+                    forwards.on(action).expect("a delivered action"),
+                    "{name} {action}"
+                );
+            }
+        }
     }
 }

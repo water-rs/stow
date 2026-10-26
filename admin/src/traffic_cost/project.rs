@@ -46,6 +46,7 @@ use std::path::PathBuf;
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
 use stow_types::do_budgets::{ALLOWANCE_FRACTION, PREHEAT_BUDGET, WORKER_CPU_BUDGETS};
+use stow_types::forwards::{self, RunForwards};
 use stow_types::launch_model::{EventKind, LaunchModel};
 use stow_types::preheat_cost::{PreheatCostReport, ProductionWave};
 use stow_types::stow_error;
@@ -127,24 +128,48 @@ enum CpuPricing {
     Unmeasured(&'static str),
 }
 
-/// One traffic kind's cost vector. `drives` names the report rows the
-/// event invokes; `claims` the dispatches inside the pass lane it
-/// causes (only [`EventKind::Build`] — one claim each). The gated
-/// fields are structural counts (`do_requests`, `worker_requests`) or
-/// measured reads (report rows, Worker CPU lanes); the `subrequests`/
-/// `sql_rows_*`/`r2_ops` constants describe the handler's shape and print
-/// as diagnostics only — nothing measures them, so they never gate.
+/// One scheduler call an event pays: the Durable Object requests it is
+/// billed and the share of the call's measured report row it pays.
+///
+/// A whole request is billed one DO request and pays its whole row
+/// ([`call`]); an event whose rows ride inside another event's request
+/// pays a share of that row and is billed no request of its own.
+#[derive(Debug, Clone, Copy)]
+struct Forward {
+    /// The budget-report row that measures the call.
+    row: &'static str,
+    /// Billed DO invocations per event — Cloudflare's request billing
+    /// counts alarm invocations too, so an alarm pass is one.
+    requests: f64,
+    /// The share of the row's measured rows and wall one event pays.
+    share: f64,
+}
+
+/// `calls` whole requests to the route `row` measures.
+const fn call(row: &'static str, calls: u32) -> Forward {
+    Forward {
+        row,
+        requests: calls as f64,
+        share: calls as f64,
+    }
+}
+
+/// One traffic kind's cost vector. `forwards` names the scheduler calls
+/// the event makes — its billed DO requests are their sum, never a
+/// separate count — and `claims` the dispatches inside a pass it causes
+/// (only [`EventKind::Build`] — one claim each). The gated fields are
+/// structural counts (`forwards`, `worker_requests`) or measured reads
+/// (report rows, Worker CPU lanes); the `subrequests`/`r2_ops`
+/// constants describe the handler's shape and print as diagnostics
+/// only — nothing measures them, so they never gate.
 #[derive(Debug, Clone, Copy)]
 struct EventCost {
     /// The traffic kind this prices.
     kind: EventKind,
     /// The route label the report table prints.
     route: &'static str,
-    /// (report row, calls per event).
-    drives: &'static [(&'static str, f64)],
-    /// Billed DO invocations per event — Cloudflare's request billing
-    /// counts alarm invocations too, so the alarm lane carries 1.0.
-    do_requests: f64,
+    /// The scheduler calls one event makes.
+    forwards: &'static [Forward],
     /// Dispatches the event causes inside a scheduler pass.
     claims: f64,
     /// Billed worker requests per event (index pulls are two).
@@ -157,16 +182,29 @@ struct EventCost {
     r2_ops: f64,
 }
 
-/// Per-event costs, from the route handlers in `edge/src/api.rs`. The
-/// DO drives are billed per call from the measured row; subrequest
-/// counts are the handler's lookup shapes (a callback's one subrequest
-/// is its forward to the scheduler).
+impl EventCost {
+    /// Billed DO invocations per event: one per whole scheduler call.
+    fn do_requests(&self) -> f64 {
+        self.forwards.iter().map(|forward| forward.requests).sum()
+    }
+}
+
+/// Worker requests one build run's `workflow_run` deliveries bill.
+const RUN_DELIVERIES: f64 = RunForwards::DELIVERIES as f64;
+
+/// Per-event costs, from the route handlers in `edge/src/api.rs` and
+/// the webhook in `edge/src/webhook.rs`. A route handler that is one
+/// scheduler call names it in its comment; the webhook's and the human
+/// request's counts come from `stow_types::forwards`, which the edge's
+/// handler tests hold to what the handler sends. The DO drives are
+/// billed per call from the measured row; subrequest counts are the
+/// handler's lookup shapes (a callback's one subrequest is its forward
+/// to the scheduler).
 const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::CliBytePathFetch,
         route: "GET /api/v1/bundles/{rustc_version}/{digest}",
-        drives: &[],
-        do_requests: 0.0,
+        forwards: &[],
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("bundle-fetch", 1.0)]),
@@ -176,8 +214,7 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::IndexPull,
         route: "GET /api/v1/index/* (pointer + slice)",
-        drives: &[],
-        do_requests: 0.0,
+        forwards: &[],
         claims: 0.0,
         worker_requests: 2.0,
         cpu: CpuPricing::Lanes(&[("index-pull", 1.0)]),
@@ -190,8 +227,7 @@ const EVENT_COSTS: &[EventCost] = &[
         // The route mints for the whole candidate tree and calls no
         // scheduler route — the merge's born-published check is the
         // coverage.
-        drives: &[],
-        do_requests: 0.0,
+        forwards: &[],
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("admission", 1.0)]),
@@ -201,13 +237,17 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::EnqueueRedemption,
         route: "POST /api/v1/enqueue",
-        // A redemption forwards a single request: its insert is one
-        // third of the accept drive's three-task batch, priced on the
-        // accept path — an accepted redemption pays the insert. The
-        // `GET /status` pre-check is gone (stow#940): the object's own
-        // pending-depth cap answers 429 on the same request.
-        drives: &[("POST /enqueue (untrusted accept)", 1.0 / SUBMIT_BATCH_TASKS)],
-        do_requests: 1.0,
+        // `api::enqueue_admitted_task` makes one scheduler call, the
+        // `send_enqueue` — the `GET /status` pre-check is gone
+        // (stow#940): the object's own pending-depth cap answers 429 on
+        // the same request. Its insert is one third of the accept
+        // drive's three-task batch, priced on the accept path — an
+        // accepted redemption pays the insert.
+        forwards: &[Forward {
+            row: "POST /enqueue (untrusted accept)",
+            requests: 1.0,
+            share: 1.0 / SUBMIT_BATCH_TASKS,
+        }],
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("enqueue-redeem", 1.0)]),
@@ -217,22 +257,36 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::HumanRequest,
         route: "POST /api/v1/requests",
-        // The request's whole DO lifecycle per event: the admit call
-        // (dedup + budget probe + resolve dispatch), the run's two
-        // webhook-driven updates, and the outcome post whose
-        // `enqueue_trusted` writes the task rows.
-        drives: &[
-            ("POST /requests", 1.0),
-            ("POST /requests/{id}/run-update (in_progress)", 1.0),
-            ("POST /requests/{id}/outcome", 1.0),
-            ("POST /requests/{id}/run-update (completed)", 1.0),
+        // The request's whole lifecycle per event: the admit (dedup +
+        // budget probe + resolve dispatch), the resolve run's webhook
+        // forwards, and the outcome post whose `enqueue_trusted` writes
+        // the task rows and dispatches them inline. A run that fails
+        // trades the outcome for the `completed` backstop at the same
+        // request count (`human_request_forwards`), so the success path
+        // prices both — its outcome is the heavier row. Worker
+        // requests: the `POST /api/v1/requests`, the resolve run's
+        // deliveries and the outcome post.
+        forwards: &[
+            call("POST /requests", forwards::HUMAN_REQUEST_ADMIT),
+            call(
+                "POST /requests/{id}/run-update (in_progress)",
+                forwards::SUCCESSFUL_RESOLVE_RUN.in_progress,
+            ),
+            call(
+                "POST /requests/{id}/run-update (completed)",
+                forwards::SUCCESSFUL_RESOLVE_RUN.completed,
+            ),
+            call(
+                "POST /requests/{id}/outcome",
+                forwards::HUMAN_REQUEST_OUTCOME,
+            ),
         ],
-        do_requests: 1.0,
         claims: 0.0,
-        worker_requests: 1.0,
+        worker_requests: forwards::human_request_worker_requests(true) as f64,
         cpu: CpuPricing::Unmeasured(
             "POST /api/v1/requests verifies Turnstile at challenges.cloudflare.com and reads the \
-             stable channel manifest from static.rust-lang.org — no lane drives it off the network",
+             stable channel manifest from static.rust-lang.org — no lane drives it off the \
+             network, nor the resolve run's deliveries and outcome post",
         ),
         subrequests: 3.0,
         r2_ops: 0.0,
@@ -240,10 +294,10 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::RequestStatusRead,
         route: "GET /api/v1/requests/{id}",
-        // One `crate_request_status` read: the row plus the stored-roots
+        // `api::crate_request_status` makes one scheduler call, the
+        // `crate_request_status` read: the row plus the stored-roots
         // re-probe against the live queue.
-        drives: &[("GET /requests/{id}", 1.0)],
-        do_requests: 1.0,
+        forwards: &[call("GET /requests/{id}", 1)],
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("status-read", 1.0)]),
@@ -253,8 +307,7 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::SiteView,
         route: "GET /|install|requests/{id} (site)",
-        drives: &[],
-        do_requests: 0.0,
+        forwards: &[],
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("site", 1.0)]),
@@ -264,8 +317,7 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::StatsView,
         route: "GET /stats (+/api/v1/stats)",
-        drives: &[],
-        do_requests: 0.0,
+        forwards: &[],
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("stats", 1.0)]),
@@ -278,8 +330,12 @@ const EVENT_COSTS: &[EventCost] = &[
         // Every miss node is one task in an admission's drain batch —
         // one third of the accept drive's three-task enqueue, priced
         // on the accept path so a growing miss volume grows the bill.
-        drives: &[("POST /enqueue (untrusted accept)", 1.0 / SUBMIT_BATCH_TASKS)],
-        do_requests: 0.0,
+        // It rides inside the enqueue's request, so it bills none.
+        forwards: &[Forward {
+            row: "POST /enqueue (untrusted accept)",
+            requests: 0.0,
+            share: 1.0 / SUBMIT_BATCH_TASKS,
+        }],
         claims: 0.0,
         worker_requests: 0.0,
         cpu: CpuPricing::NoWorkerRequest,
@@ -289,8 +345,8 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::AdminOperation,
         route: "stow-admin operations",
-        drives: &[("GET /admin/status", 1.0)],
-        do_requests: 1.0,
+        // `api::admin_status` makes one scheduler call.
+        forwards: &[call("GET /admin/status", 1)],
         claims: 0.0,
         worker_requests: 1.0,
         cpu: CpuPricing::Lanes(&[("admin-status", 1.0)]),
@@ -300,19 +356,38 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::IndexPublish,
         route: "POST /api/v1/admin/index/published",
-        drives: &[("POST /index/published (full)", 1.0)],
-        do_requests: 1.0,
+        // One report per publish run (stow#940):
+        // `api::record_published_index` makes one scheduler call, which
+        // applies the run's slices and dispatches what they release
+        // inline. Worker requests: the report plus the
+        // `index-publish.yml` run's own deliveries, which the webhook
+        // consumes without a forward (`forwards::INDEX_PUBLISH_RUN`).
+        forwards: &[call("POST /index/published (full)", 1)],
+        claims: 0.0,
+        worker_requests: 1.0 + RUN_DELIVERIES,
+        cpu: CpuPricing::Unmeasured(
+            "no lane drives POST /api/v1/admin/index/published or the publish run's deliveries",
+        ),
+        subrequests: 2.0,
+        r2_ops: 0.0,
+    },
+    EventCost {
+        kind: EventKind::HealthProbe,
+        route: "GET /api/v1/scheduler/health",
+        // `api::scheduler_health` makes one scheduler call, the
+        // `GET /health` read of state the object already holds —
+        // `no-store`, so no cache answers it in the object's place.
+        forwards: &[call("GET /health", 1)],
         claims: 0.0,
         worker_requests: 1.0,
-        cpu: CpuPricing::Unmeasured("no lane drives POST /api/v1/admin/index/published"),
-        subrequests: 2.0,
+        cpu: CpuPricing::Unmeasured("no lane drives GET /api/v1/scheduler/health"),
+        subrequests: 1.0,
         r2_ops: 0.0,
     },
     EventCost {
         kind: EventKind::HumanTask,
         route: "human-lane tasks (inside a claim)",
-        drives: &[],
-        do_requests: 0.0,
+        forwards: &[],
         claims: 0.0,
         worker_requests: 0.0,
         cpu: CpuPricing::NoWorkerRequest,
@@ -322,8 +397,7 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::Build,
         route: "dispatched builds (claim marginal)",
-        drives: &[],
-        do_requests: 0.0,
+        forwards: &[],
         claims: 1.0,
         worker_requests: 0.0,
         cpu: CpuPricing::NoWorkerRequest,
@@ -333,27 +407,36 @@ const EVENT_COSTS: &[EventCost] = &[
     EventCost {
         kind: EventKind::BuildCallback,
         route: "POST /api/v1/github/workflow-run",
-        // One task is one `build-crate.yml` run: each task pays its
-        // `in_progress` update once and its completion route once.
-        drives: &[
-            ("POST /tasks/run-update (in_progress)", 1.0),
-            ("POST /tasks/complete-run (success)", 1.0),
+        // One task is one `build-crate.yml` run the scheduler
+        // dispatched: GitHub delivers each of its actions to the
+        // Worker, and the webhook forwards what `OWN_BUILD_RUN` says —
+        // the `completed` alone (stow#940). The completion's inline
+        // dispatch is the build's claim, priced under `Build`. Worker
+        // CPU is priced at the `completed` delivery's measured cost for
+        // every delivery — the heaviest of the three, so an upper bound.
+        forwards: &[
+            call(
+                "POST /tasks/run-update (in_progress)",
+                forwards::OWN_BUILD_RUN.in_progress,
+            ),
+            call(
+                "POST /tasks/complete-run (success)",
+                forwards::OWN_BUILD_RUN.completed,
+            ),
         ],
-        do_requests: 1.0,
         claims: 0.0,
-        worker_requests: 1.0,
-        cpu: CpuPricing::Lanes(&[("workflow-callback", 1.0)]),
+        worker_requests: RUN_DELIVERIES,
+        cpu: CpuPricing::Lanes(&[("workflow-callback", RUN_DELIVERIES)]),
         subrequests: 1.0,
         r2_ops: 0.0,
     },
     EventCost {
         kind: EventKind::AlarmPass,
         route: "scheduler alarm pass",
-        drives: &[("alarm pass (idle)", 1.0)],
         // Cloudflare's DO request billing explicitly includes alarm
         // invocations (HTTP requests, RPC sessions, WebSocket messages,
         // alarm invocations) — the pass is a billed request.
-        do_requests: 1.0,
+        forwards: &[call("alarm pass (idle)", 1)],
         claims: 0.0,
         worker_requests: 0.0,
         cpu: CpuPricing::NoWorkerRequest,
@@ -443,12 +526,13 @@ impl Drives {
             .ok_or_else(|| format!("budget report carries no row for `{name}`"))
     }
 
-    /// What one event of `cost`'s kind costs the scheduler: its drives'
-    /// rows times their calls, plus the claim price times its claims.
+    /// What one event of `cost`'s kind costs the scheduler: its
+    /// forwards' rows times their share, plus the claim price times its
+    /// claims.
     fn event(&self, cost: &EventCost) -> Result<DriveCost, String> {
         let mut total = DriveCost::default();
-        for (name, calls) in cost.drives {
-            total.add(*calls, &self.drive(name)?);
+        for forward in cost.forwards {
+            total.add(forward.share, &self.drive(forward.row)?);
         }
         total.add(cost.claims, &self.claim_marginal);
         Ok(total)
@@ -694,7 +778,7 @@ fn fold_kind(
 ) -> Result<(), String> {
     let monthly = model.monthly_events(cost.kind);
     projection.worker_requests = monthly.mul_add(cost.worker_requests, projection.worker_requests);
-    projection.do_requests = monthly.mul_add(cost.do_requests, projection.do_requests);
+    projection.do_requests = monthly.mul_add(cost.do_requests(), projection.do_requests);
     projection.diag_subrequests = monthly.mul_add(cost.subrequests, projection.diag_subrequests);
     projection.diag_r2_ops = monthly.mul_add(cost.r2_ops, projection.diag_r2_ops);
     let kind_cpu_ms = fold_cpu(cost, cpu, monthly, projection)?;
@@ -708,7 +792,7 @@ fn fold_kind(
     let shares = [
         (
             "do_requests",
-            monthly * cost.do_requests / DO_REQUESTS_MONTHLY,
+            monthly * cost.do_requests() / DO_REQUESTS_MONTHLY,
         ),
         (
             "do_duration_gb_s",
@@ -1536,15 +1620,148 @@ mod tests {
     }
 
     #[test]
-    fn every_event_cost_drive_has_a_report_row() {
+    fn every_event_cost_forward_has_a_report_row() {
         let report = fixture_report(100_000, |_| 0.5);
         let names: std::collections::BTreeSet<&str> =
             report.rows.iter().map(|row| row.name.as_str()).collect();
         for cost in super::EVENT_COSTS {
-            for (name, _) in cost.drives {
-                assert!(names.contains(name), "no report row for `{name}`");
+            for forward in cost.forwards {
+                assert!(
+                    names.contains(forward.row),
+                    "no report row for `{}`",
+                    forward.row
+                );
             }
         }
+    }
+
+    fn cost_of(kind: stow_types::launch_model::EventKind) -> &'static super::EventCost {
+        super::EVENT_COSTS
+            .iter()
+            .find(|cost| cost.kind == kind)
+            .expect("every priced kind has a cost row")
+    }
+
+    /// A build run bills the Worker one request per `workflow_run`
+    /// delivery and the object what the webhook forwards for a run the
+    /// scheduler dispatched — the `completed` alone (stow#937,
+    /// stow#940). Both come from `OWN_BUILD_RUN`, which the edge's
+    /// webhook test holds to the handler, so a handler that forwards
+    /// another delivery moves this price with it.
+    #[test]
+    fn a_build_run_prices_its_forwards_and_its_deliveries() {
+        use stow_types::forwards::{OWN_BUILD_RUN, RunForwards};
+        let cost = cost_of(stow_types::launch_model::EventKind::BuildCallback);
+        assert!((cost.do_requests() - f64::from(OWN_BUILD_RUN.total())).abs() < 1e-12);
+        assert!((cost.do_requests() - 1.0).abs() < 1e-12);
+        assert!((cost.worker_requests - f64::from(RunForwards::DELIVERIES)).abs() < 1e-12);
+        assert!((cost.worker_requests - 3.0).abs() < 1e-12);
+        // Each forwarded action is a whole call to the route that
+        // serves it; the `requested` delivery has no route.
+        assert_eq!(OWN_BUILD_RUN.requested, 0);
+        let row = |name: &str| {
+            cost.forwards
+                .iter()
+                .find(|forward| forward.row == name)
+                .expect("forward row")
+                .requests
+        };
+        assert!(
+            (row("POST /tasks/run-update (in_progress)") - f64::from(OWN_BUILD_RUN.in_progress))
+                .abs()
+                < 1e-12
+        );
+        assert!(
+            (row("POST /tasks/complete-run (success)") - f64::from(OWN_BUILD_RUN.completed)).abs()
+                < 1e-12
+        );
+    }
+
+    /// A human request's lifecycle is three scheduler calls whether its
+    /// resolve run succeeds or fails, and five Worker requests on the
+    /// success path the projection prices.
+    #[test]
+    fn a_human_request_prices_its_whole_lifecycle() {
+        use stow_types::forwards::{human_request_forwards, human_request_worker_requests};
+        let cost = cost_of(stow_types::launch_model::EventKind::HumanRequest);
+        for success in [true, false] {
+            assert!(
+                (cost.do_requests() - f64::from(human_request_forwards(success))).abs() < 1e-12,
+                "success = {success}"
+            );
+        }
+        assert!((cost.do_requests() - 3.0).abs() < 1e-12);
+        assert!(
+            (cost.worker_requests - f64::from(human_request_worker_requests(true))).abs() < 1e-12
+        );
+        assert!((cost.worker_requests - 5.0).abs() < 1e-12);
+    }
+
+    /// The per-request counts of the events whose handler is a single
+    /// scheduler call, and of the alarm pass.
+    #[test]
+    fn single_call_events_bill_one_scheduler_request() {
+        use stow_types::launch_model::EventKind;
+        for (kind, do_requests, worker_requests) in [
+            (EventKind::EnqueueRedemption, 1.0, 1.0),
+            (EventKind::RequestStatusRead, 1.0, 1.0),
+            (EventKind::AdminOperation, 1.0, 1.0),
+            (EventKind::IndexPublish, 1.0, 4.0),
+            (EventKind::HealthProbe, 1.0, 1.0),
+            (EventKind::AlarmPass, 1.0, 0.0),
+            (EventKind::Admission, 0.0, 1.0),
+            (EventKind::MissNode, 0.0, 0.0),
+        ] {
+            let cost = cost_of(kind);
+            assert!(
+                (cost.do_requests() - do_requests).abs() < 1e-12,
+                "{kind:?}: {}",
+                cost.do_requests()
+            );
+            assert!(
+                (cost.worker_requests - worker_requests).abs() < 1e-12,
+                "{kind:?}: {}",
+                cost.worker_requests
+            );
+        }
+    }
+
+    /// The health probe is priced at the once-a-minute cadence stow#940
+    /// set: 43,200 DO and Worker requests a month on the checked-in
+    /// model.
+    #[test]
+    fn the_health_probe_costs_43_200_requests_a_month() {
+        let model = model();
+        let probes = model.monthly_events(stow_types::launch_model::EventKind::HealthProbe);
+        assert!((probes - 43_200.0).abs() < 1e-9, "{probes}");
+        let cost = cost_of(stow_types::launch_model::EventKind::HealthProbe);
+        assert!(probes.mul_add(cost.do_requests(), -43_200.0).abs() < 1e-9);
+        assert!(probes.mul_add(cost.worker_requests, -43_200.0).abs() < 1e-9);
+    }
+
+    /// The DO request line is the sum over every event of its monthly
+    /// count times its forwards — so removing a priced forward lowers
+    /// it by exactly that event's volume.
+    #[test]
+    fn the_do_request_line_sums_every_events_forwards() {
+        let report = fixture_report(100_000, |_| 0.5);
+        let evaluation =
+            evaluate(&model(), &report, &fixture_cpu(|_| 0.5), &no_preheat()).expect("evaluate");
+        let expected: f64 = super::EVENT_COSTS
+            .iter()
+            .map(|cost| model().monthly_events(cost.kind) * cost.do_requests())
+            .sum();
+        let line = usage(&evaluation, "durable_objects", "requests");
+        assert!((line.traffic - expected).abs() < 1e-6, "{}", line.traffic);
+        // Every event kind the model counts is priced exactly once.
+        let mut kinds: Vec<String> = super::EVENT_COSTS
+            .iter()
+            .map(|cost| format!("{:?}", cost.kind))
+            .collect();
+        let total = kinds.len();
+        kinds.sort();
+        kinds.dedup();
+        assert_eq!(kinds.len(), total, "an event kind priced twice");
     }
 
     /// Every lane the projection prices has a CPU budget row.

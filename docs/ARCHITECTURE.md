@@ -500,11 +500,9 @@ The build job never calls the edge: records live only in GHCR, and the
 scheduler learns the outcome from GitHub's `workflow_run` webhook — the
 edge verifies `X-Hub-Signature-256`, parses `display_title`
 (`<rustc>-<task_id>`) into its rustc and task id, and forwards the
-run's identity to the scheduler's `POST /tasks/complete-run`.
-The alarm pass then resolves the task: it reads the run's
-attempt-jobs page, classifies the task, and completes it
-only after the records artifact its publish job pushed verifies in
-GHCR. `stow-admin index export` rebuilds each index slice
+run's outcome to the scheduler's `POST /tasks/complete-run`. A
+`success` conclusion counts only once the records artifact its publish
+job pushed exists in GHCR; the edge checks that before it forwards. `stow-admin index export` rebuilds each index slice
 from those signed records — the slices are the only catalog.
 
 What each hop is allowed to do:

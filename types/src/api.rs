@@ -1121,6 +1121,15 @@ pub const DISPATCH_FREEZE_INCIDENT_KEY: &str = "dispatch-freeze";
 /// workflow tests pin it to the workflow file.
 pub const BUILD_CRATE_RUN_TIMEOUT_MINUTES: i64 = 120 + 60;
 
+/// How often, at most, the scheduler reconciles its run set against the
+/// CI listing.
+///
+/// It reconciles only while the graph holds work: at most 2 listing
+/// calls each, at most 12 calls an hour (stow#877). The completion's inline pass skips it and leaves it to the alarm, so
+/// it is also the floor on the alarm's timer wakes under steady build
+/// traffic, which the traffic projection prices from it (stow#940).
+pub const STATUS_RECONCILE_MS: i64 = 10 * 60 * 1000;
+
 /// One line of the dispatch-freeze transition log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct DispatchFreezeTransition {

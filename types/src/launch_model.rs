@@ -93,17 +93,25 @@ pub struct LaunchRates {
     /// window's own operations show a handful a day; fifty leaves the
     /// launch fleet room and stays well under any allowance line.
     pub admin_operations_per_day: f64,
-    /// Index slice publishes (full or delta) — fleet cadence, not
-    /// install-scaled. Slices republish as coverage lands; four a day
-    /// is the recorded pre-freeze cadence.
+    /// Index publish reports — fleet cadence, not install-scaled. The
+    /// window counted one `POST /api/v1/admin/index/*` per slice; a
+    /// publish run now reports all of its slices in one request
+    /// (stow#940), so the recorded four a day bounds the runs from
+    /// above.
     pub index_publishes_per_day: f64,
+    /// `GET /api/v1/scheduler/health` probes — the external uptime
+    /// monitor's flat cadence, not install-scaled. The cadence is the
+    /// operator's decision, not a measurement: once a minute
+    /// (stow#940).
+    pub health_probes_per_day: f64,
 }
 
 /// Ratios the event chain needs rather than per-install rates.
 ///
-/// A miss only builds once its ticket is redeemed and dispatched, and
-/// each build reports through the `workflow_run` webhook (retries and
-/// redeliveries push the callback count above the build count).
+/// A miss only builds once its ticket is redeemed and dispatched. Each
+/// build is its own `build-crate.yml` run (stow#876), so its webhook
+/// deliveries are a fixed shape per build ([`EventKind::BuildCallback`]),
+/// not a ratio.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LaunchRatios {
     /// Builds dispatched per miss node minted. Bounded at 1 by
@@ -111,14 +119,6 @@ pub struct LaunchRatios {
     /// lower: missed nodes are deduplicated upstream and not every
     /// admission is redeemed.
     pub builds_per_miss: f64,
-    /// `POST /api/v1/github/workflow-run` deliveries per build —
-    /// the run's `in_progress` and `completed` plus retried
-    /// deliveries.
-    ///
-    /// A build is its own `build-crate.yml` run (stow#876): each run
-    /// earns one `in_progress` and one `completed` delivery, so the
-    /// ratio's model value is 2 before retries.
-    pub callbacks_per_build: f64,
     /// Queue rows a single human request submits — the request's whole
     /// dependency closure. The submit itself is one scheduler call; the
     /// row count sets how many builds the human lane causes.
@@ -172,15 +172,33 @@ pub enum EventKind {
     HumanTask,
     /// Dispatched builds — `miss_node × builds_per_miss + HumanTask`.
     Build,
-    /// `workflow_run` webhook deliveries — `Build × callbacks_per_build`.
-    /// Each is priced as a build run's delivery, the one the webhook
-    /// forwards to the scheduler.
+    /// Build runs reporting through the `workflow_run` webhook — one
+    /// per [`EventKind::Build`]: one task is one `build-crate.yml` run.
+    /// Each is priced as the run's whole delivery set
+    /// ([`crate::forwards::OWN_BUILD_RUN`]).
     BuildCallback,
-    /// Scheduler alarm passes. One armed event causes one pass; passes
-    /// coalesce while the alarm is already armed, so this is an upper
-    /// bound: submit calls + completions + index publishes.
+    /// [`LaunchRates::health_probes_per_day`]
+    HealthProbe,
+    /// Scheduler alarm passes — the wakes only a timer can cause, since
+    /// a completion, a slice report and a request outcome dispatch
+    /// inside their own request (stow#940): one age-gated wake per
+    /// enqueue redemption (an upper bound; wakes that coalesce only
+    /// lower it), plus the status reconcile the completion's pass leaves
+    /// to the alarm, at most one per
+    /// [`crate::api::STATUS_RECONCILE_MS`] while builds are live.
     AlarmPass,
 }
+
+/// Alarm wakes a day the status reconcile can cause while the graph
+/// holds work every minute of it — the launch fleet's steady state.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a day's reconcile count is a small exact integer"
+)]
+pub const RECONCILE_WAKES_PER_DAY: f64 = (MS_PER_DAY / crate::api::STATUS_RECONCILE_MS) as f64;
+
+/// Milliseconds in a day.
+const MS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
 
 impl LaunchModel {
     /// Parse a `launch-model.toml` document.
@@ -225,6 +243,7 @@ impl LaunchModel {
             EventKind::MissNode => self.rates.miss_node * self.scale.installs as f64,
             EventKind::AdminOperation => self.rates.admin_operations_per_day,
             EventKind::IndexPublish => self.rates.index_publishes_per_day,
+            EventKind::HealthProbe => self.rates.health_probes_per_day,
             EventKind::HumanTask => {
                 self.daily_events(EventKind::HumanRequest) * self.ratios.tasks_per_human_request
             }
@@ -232,20 +251,15 @@ impl LaunchModel {
                 self.ratios.builds_per_miss,
                 self.daily_events(EventKind::HumanTask),
             ),
-            EventKind::BuildCallback => {
-                self.daily_events(EventKind::Build) * self.ratios.callbacks_per_build
-            }
+            EventKind::BuildCallback => self.daily_events(EventKind::Build),
             EventKind::AlarmPass => {
-                // One arming event causes one pass: enqueues (redemption
-                // plus the miss drain every admission runs), human
-                // submits and completions arm the dispatch alarm, and
-                // an index publish schedules one. Passes that coalesce
-                // inside an already-armed alarm only lower this.
-                self.daily_events(EventKind::Admission)
-                    + self.daily_events(EventKind::EnqueueRedemption)
-                    + self.daily_events(EventKind::HumanRequest)
-                    + self.daily_events(EventKind::BuildCallback)
-                    + self.daily_events(EventKind::IndexPublish)
+                // An enqueued miss waits out the dispatch age gate, so
+                // its submit arms a wake for when the gate passes. An
+                // admission calls no scheduler route; a human outcome,
+                // a slice report and a completion claim inside their
+                // own request. The reconcile is the timer work the
+                // completion's bounded pass leaves to the alarm.
+                self.daily_events(EventKind::EnqueueRedemption) + RECONCILE_WAKES_PER_DAY
             }
         }
     }
@@ -289,7 +303,9 @@ impl LaunchModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{LaunchCadence, LaunchModel, LaunchRates, LaunchRatios, LaunchScale, LaunchWindow};
+    use super::{
+        EventKind, LaunchCadence, LaunchModel, LaunchRates, LaunchRatios, LaunchScale, LaunchWindow,
+    };
 
     fn model(stable_releases: u32, period_days: u32, days_per_month: u32) -> LaunchModel {
         LaunchModel {
@@ -319,10 +335,10 @@ mod tests {
                 miss_node: 0.0,
                 admin_operations_per_day: 0.0,
                 index_publishes_per_day: 0.0,
+                health_probes_per_day: 0.0,
             },
             ratios: LaunchRatios {
                 builds_per_miss: 0.0,
-                callbacks_per_build: 0.0,
                 tasks_per_human_request: 0.0,
             },
         }
@@ -340,6 +356,55 @@ mod tests {
     #[test]
     fn the_cron_resubmits_every_day_of_the_month() {
         assert!((model(14, 365, 30).monthly_resubmits() - 30.0).abs() < 1e-12);
+    }
+
+    /// Alarm passes are the timer's work alone (stow#940): one age-gated
+    /// wake per enqueue redemption plus the reconcile cadence. An
+    /// admission, a human request, a build's completion and an index
+    /// publish dispatch inside their own request, so they add none.
+    #[test]
+    fn alarm_passes_are_enqueue_wakes_plus_the_reconcile_cadence() {
+        let mut model = model(14, 365, 30);
+        assert!(
+            (model.daily_events(EventKind::AlarmPass) - super::RECONCILE_WAKES_PER_DAY).abs()
+                < 1e-12
+        );
+        assert!((super::RECONCILE_WAKES_PER_DAY - 144.0).abs() < 1e-12);
+        model.rates.enqueue_redemption = 0.5;
+        let idle = model.daily_events(EventKind::AlarmPass);
+        model.rates.admission = 3.0;
+        model.rates.human_request = 2.0;
+        model.rates.miss_node = 4.0;
+        model.ratios.builds_per_miss = 1.0;
+        model.rates.index_publishes_per_day = 9.0;
+        assert!((model.daily_events(EventKind::AlarmPass) - idle).abs() < 1e-9);
+        assert!((idle - (5_000.0 + 144.0)).abs() < 1e-9, "{idle}");
+    }
+
+    /// One build is one `build-crate.yml` run, so a run's delivery set
+    /// is counted once per build.
+    #[test]
+    fn every_build_reports_as_one_run() {
+        let mut model = model(14, 365, 30);
+        model.rates.miss_node = 0.2;
+        model.ratios.builds_per_miss = 0.5;
+        model.rates.human_request = 0.01;
+        model.ratios.tasks_per_human_request = 5.0;
+        // 2,000 misses × 0.5 + 100 requests × 5 tasks.
+        let builds = model.daily_events(EventKind::Build);
+        assert!((builds - 1_500.0).abs() < 1e-9, "{builds}");
+        assert!((model.daily_events(EventKind::BuildCallback) - builds).abs() < 1e-12);
+    }
+
+    /// The health probe is a flat cadence: 1,440 a day is 43,200 in a
+    /// 30-day month, whatever the install count.
+    #[test]
+    fn the_health_probe_is_a_flat_cadence() {
+        let mut model = model(14, 365, 30);
+        model.rates.health_probes_per_day = 1_440.0;
+        assert!((model.monthly_events(EventKind::HealthProbe) - 43_200.0).abs() < 1e-9);
+        model.scale.installs = 1;
+        assert!((model.monthly_events(EventKind::HealthProbe) - 43_200.0).abs() < 1e-9);
     }
 
     #[test]
