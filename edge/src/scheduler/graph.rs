@@ -2154,6 +2154,12 @@ impl Graph {
         if self.freeze.is_some() {
             return queue::AlarmPlan::Delete;
         }
+        // A due run-listing reconcile is timer work of its own: the
+        // request passes that skip it — the completion's bounded pass
+        // (stow#940) — leave it to the alarm.
+        if self.reconcile_due(now, Self::STATUS_RECONCILE_MS) {
+            return queue::AlarmPlan::At(now);
+        }
         let min_age = i64::from(settings.dispatch_min_age_minutes) * 60_000;
         let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
         let (free, macos_free) = self.free_slots(settings);
@@ -2259,6 +2265,11 @@ impl Graph {
             u32::try_from(macos).unwrap_or(u32::MAX),
         )
     }
+
+    /// `status` reconciles the delivery-tracked external set at most
+    /// once per this many minutes — ≤2 listing calls each, ≤12
+    /// calls/hour while the queue has work (stow#877).
+    pub(super) const STATUS_RECONCILE_MS: i64 = 10 * 60 * 1000;
 
     /// Whether the run listing is due for another reconcile: the graph
     /// holds dispatchable or in-flight work and `interval_ms` passed
