@@ -104,8 +104,13 @@ jobs:
         run: |
           set -euo pipefail
           target_key="$(echo "$TASK_TARGET" | tr 'a-z-' 'A-Z_')"
+          # Every Linux leg writes the sysroot shims, which exec the
+          # native GCC 12 driver pair (stow#693) — the 26.04 image ships
+          # GCC 13–15 only, so each Linux arm installs it (stow#946).
           case "$TASK_TARGET" in
             *-linux-android*)
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends gcc-12 g++-12
               # The API level in the NDK clang wrapper name is WaterUI's
               # android-min-api-level floor.
               ndk_bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
@@ -126,7 +131,7 @@ jobs:
               # pkg-config — the image ships only some (stow#729). The
               # script also refreshes the apt index.
               ci/glibc-sysroot/system-libs.sh "$TASK_TARGET"
-              sudo apt-get install -y --no-install-recommends mold
+              sudo apt-get install -y --no-install-recommends mold gcc-12 g++-12
               ;;
             aarch64-unknown-linux-gnu)
               # Both architectures' system libraries come from the
@@ -137,13 +142,13 @@ jobs:
               # aarch64-linux-gnu-pkg-config, not pkgconf:arm64.
               ci/system-libs/install.sh "$TASK_TARGET" \
                 "$HOME/stow-system-debs" "$HOME/stow-system-libs"
-              # The sysroot shims drive GCC 12 (stow#693); the runner image
-              # ships the native drivers and not the cross ones — still
-              # the apt path until stow#862's B1 locks the toolchain too.
+              # The sysroot shims drive GCC 12 (stow#693), native and
+              # cross — still the apt path until stow#862's B1 locks the
+              # toolchain too.
               sudo apt-get update -qq
               sudo apt-get install -y --no-install-recommends \
                 gcc-aarch64-linux-gnu g++-aarch64-linux-gnu mold \
-                gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu
+                gcc-12 g++-12 gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu
               # `-fuse-ld=mold` asks collect2 for `ld.mold` on the cross
               # toolchain's own search path, which /usr/bin does not reach
               # — link the apt install's `ld.mold` in where it looks.
@@ -157,6 +162,10 @@ jobs:
                 # keeps the native pkg-config.
                 echo "PKG_CONFIG_aarch64_unknown_linux_gnu=aarch64-linux-gnu-pkg-config"
               } >> "$GITHUB_ENV"
+              ;;
+            wasm32-unknown-unknown)
+              sudo apt-get update -qq
+              sudo apt-get install -y --no-install-recommends gcc-12 g++-12
               ;;
             aarch64-apple-ios)
               echo "SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
