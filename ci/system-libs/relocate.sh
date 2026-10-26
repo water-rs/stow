@@ -13,7 +13,7 @@
 # keeps for its repointed symlinks).
 #
 # The rewrite keys on the assignment, not the variable name —
-# prefix=/usr is not the only spelling: noble's arm64 alsa.pc carries
+# prefix=/usr is not the only spelling: the arm64 alsa.pc carries
 # a literal exec_prefix=/usr, which is what the self-check's "still
 # names /usr" failure caught (run 39878359623). Single script both
 # lock.sh and install.sh call, so the transform cannot drift.

@@ -49,7 +49,7 @@ jobs:
   mock-e2e:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Mock end-to-end
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       # The local edge authenticates its write endpoints against the
       # credential's own repo permissions — GITHUB_TOKEN needs push

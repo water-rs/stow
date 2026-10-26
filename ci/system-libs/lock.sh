@@ -23,7 +23,7 @@ export LC_ALL=C
 T="${1:?usage: lock.sh <snapshot-T> [<output>]}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 out="${2:-$here/lock.txt}"
-suite=noble
+suite=resolute
 mirror="https://snapshot.ubuntu.com/ubuntu/$T"
 keyring=/usr/share/keyrings/ubuntu-archive-keyring.gpg
 
