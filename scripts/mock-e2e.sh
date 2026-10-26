@@ -1176,14 +1176,14 @@ if [ "$(uname -s)" = "Linux" ]; then
         "${XDG_CACHE_HOME:-$HOME/.cache}/stow/system-debs-$(sha256sum \
             "$REPO_ROOT/ci/system-libs/lock.txt" | cut -d' ' -f1)" \
         "$SYS_LIBS" || die "system-libs install failed"
-    # The aarch64 shim needs the cross drivers the image lacks — the
-    # same apt set the aarch64 build installs until stow#862's B1 locks the
-    # toolchain too.
-    if [ ! -x /usr/bin/aarch64-linux-gnu-gcc-12 ]; then
+    # The shims exec the GCC 12 pair, native and cross, which the
+    # 26.04 image lacks — the same apt set the aarch64 build installs
+    # until stow#862's B1 locks the toolchain too.
+    if [ ! -x /usr/bin/aarch64-linux-gnu-gcc-12 ] || [ ! -x /usr/bin/gcc-12 ]; then
         sudo apt-get update -qq
         sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
-            gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu mold \
+            gcc-12 g++-12 gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu mold \
             || die "cross toolchain install failed"
         sudo ln -sf /usr/bin/ld.mold /usr/aarch64-linux-gnu/bin/ld.mold
     fi
