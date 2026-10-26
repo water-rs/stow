@@ -307,7 +307,7 @@ pub async fn run(args: ProjectsArgs, output: Output) -> stow_types::error::Resul
             generate(&token, &args, output).await
         }
         ProjectsCommand::Submit(args) => {
-            let edge = crate::Edge::connect_to_submit(args.yes).await?;
+            let edge = crate::Edge::connect_to_submit(args.yes)?;
             tokio::task::spawn_blocking(move || submit(edge.as_ref(), &args, output))
                 .await
                 .expect("projects submit panicked")

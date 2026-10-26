@@ -33,7 +33,7 @@ const ACCOUNT: &str = "operator";
 const EXPIRY_MARGIN_SECS: i64 = 300;
 
 #[derive(Args)]
-pub(crate) struct LoginArgs {
+pub struct LoginArgs {
     /// Forget the stored token instead of signing in.
     #[arg(long)]
     logout: bool,
@@ -53,7 +53,7 @@ struct DeviceCodeRequest<'a> {
 }
 
 #[derive(Deserialize)]
-struct DeviceCode {
+struct DeviceAuthorization {
     device_code: String,
     user_code: String,
     verification_uri: String,
@@ -79,7 +79,7 @@ struct AccessTokenResponse {
     interval: Option<u64>,
 }
 
-pub(crate) async fn run(args: LoginArgs) -> stow_types::error::Result<()> {
+pub async fn run(args: LoginArgs) -> stow_types::error::Result<()> {
     let entry = entry()?;
     if args.logout {
         return match entry.delete_credential() {
@@ -87,7 +87,7 @@ pub(crate) async fn run(args: LoginArgs) -> stow_types::error::Result<()> {
             Err(error) => Err(stow_error!("delete the stored operator token: {error}")),
         };
     }
-    let code: DeviceCode = post(
+    let code: DeviceAuthorization = post(
         DEVICE_CODE_URL,
         &DeviceCodeRequest {
             client_id: CLIENT_ID,
@@ -157,7 +157,7 @@ pub(crate) async fn run(args: LoginArgs) -> stow_types::error::Result<()> {
 
 /// The stored operator token, or an error naming `stow-admin login`
 /// when there is none or it has expired.
-pub(crate) fn stored_token() -> stow_types::error::Result<String> {
+pub fn stored_token() -> stow_types::error::Result<String> {
     let json = match entry()?.get_password() {
         Ok(json) => json,
         Err(keyring_core::Error::NoEntry) => {

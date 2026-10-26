@@ -250,9 +250,9 @@ fn run<F: std::future::Future>(future: F) -> stow_types::error::Result<F::Output
 
 async fn dispatch(command: Command, output: Output) -> stow_types::error::Result<()> {
     match command {
-        Command::Status(args) => status(&Edge::connect().await?, args, output).await,
-        Command::Queue(args) => queue::run(&Edge::connect().await?, args, output).await,
-        Command::Scheduler(args) => scheduler::run(&Edge::connect().await?, args, output).await,
+        Command::Status(args) => status(&Edge::connect()?, args, output).await,
+        Command::Queue(args) => queue::run(&Edge::connect()?, args, output).await,
+        Command::Scheduler(args) => scheduler::run(&Edge::connect()?, args, output).await,
         Command::Coverage(args) => coverage::run(args, output).await,
         Command::Preheat(args) => preheat::run(args, output).await,
         Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
@@ -260,15 +260,15 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         Command::Artifacts(args) => artifacts::run(args, output).await,
         Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
         Command::Maintenance(args) => maintenance::run(args, output).await,
-        Command::Watchdog(args) => watchdog::run(&Edge::connect().await?, args, output).await,
+        Command::Watchdog(args) => watchdog::run(&Edge::connect()?, args, output).await,
         Command::DispatchFreeze(args) => {
-            dispatch_freeze_switch(&Edge::connect().await?, args, output).await
+            dispatch_freeze_switch(&Edge::connect()?, args, output).await
         }
         Command::Index(args) => index_cmd::run(args).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
         Command::TrafficCost(args) => traffic_cost::run(args, output).await,
         Command::Request(args) => request::run(args, output).await,
-        Command::Submit(args) => submit_command(&Edge::connect().await?, args, output).await,
+        Command::Submit(args) => submit_command(&Edge::connect()?, args, output).await,
         Command::Deploy(args) => deploy::run(args, output).await,
         Command::Login(args) => login::run(args).await,
     }
@@ -296,7 +296,7 @@ pub(crate) struct Edge {
 impl Edge {
     /// Resolve `STOW_EDGE_URL` and the credential source: Actions OIDC
     /// when the runtime advertises it, else [`edge_token`].
-    pub(crate) async fn connect() -> stow_types::error::Result<Self> {
+    pub(crate) fn connect() -> stow_types::error::Result<Self> {
         let base = std::env::var(STOW_EDGE_URL_ENV)
             .map_err(|_| stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
         let token = if actions_oidc_available() {
@@ -316,9 +316,9 @@ impl Edge {
     /// The edge for a lane whose plan needs none: connected only when
     /// the lane will submit (`yes`), so a plan-only run needs neither
     /// `STOW_EDGE_URL` nor a credential.
-    pub(crate) async fn connect_to_submit(yes: bool) -> stow_types::error::Result<Option<Self>> {
+    pub(crate) fn connect_to_submit(yes: bool) -> stow_types::error::Result<Option<Self>> {
         if yes {
-            Self::connect().await.map(Some)
+            Self::connect().map(Some)
         } else {
             Ok(None)
         }
