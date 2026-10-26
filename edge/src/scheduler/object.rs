@@ -91,6 +91,7 @@ async fn ensure_graph<'a>(
                 loaded.with(|graph| graph.reconcile_runs(&runs, now_ms()));
             }
             Err(error) => {
+                loaded.with(|graph| graph.reconcile_failed(now_ms()));
                 tracing::warn!(%error, "post-wake CI status reconcile failed — keeping replayed state");
             }
         }
@@ -1760,13 +1761,14 @@ pub(super) async fn dispatch_pass(
     // not worth burning the pass over — the delivery-tracked set is
     // the primary source; `status` only corrects its drift.
     if matches!(reconcile, PassReconcile::Due)
-        && graph.with(|graph| graph.reconcile_due(now_ms(), graph::Graph::STATUS_RECONCILE_MS))
+        && graph.with(|graph| graph.reconcile_due(now_ms(), settings))
     {
         match interface.status_runs().await {
             Ok(listed) => {
                 graph.with(|graph| graph.reconcile_runs(&listed, now_ms()));
             }
             Err(error) => {
+                graph.with(|graph| graph.reconcile_failed(now_ms()));
                 tracing::warn!(%error, "CI status reconcile failed — keeping delivery-tracked external occupancy");
             }
         }

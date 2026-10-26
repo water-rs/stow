@@ -388,9 +388,11 @@ pub struct Graph {
     outcome_hours: BTreeMap<(i64, u8), (u32, u32)>,
     /// The next claim generation — monotonic, snapshot-carried.
     next_generation: u64,
-    /// When the run listing last reconciled — memory only: a wake
-    /// reconciles at once.
-    reconciled_at: i64,
+    /// When the run listing was last attempted, succeeded or not —
+    /// memory only: a wake reconciles at once. A failed attempt counts
+    /// too, so a failing listing waits out the interval instead of
+    /// re-arming the alarm at once (stow#940).
+    reconcile_attempted_at: i64,
     /// Generations this isolate's dispatch pass claimed but has not
     /// yet settled (stow#940) — in memory only, so a woken graph
     /// parks nothing: a completion for a replayed dispatched-unbound
@@ -1576,7 +1578,7 @@ impl Graph {
     /// counts toward the total budget only, `Occupancy::add_unknown`'s
     /// convention.
     pub fn reconcile_runs(&mut self, runs: &[CiRunListing], now: i64) {
-        self.reconciled_at = now;
+        self.reconcile_attempted_at = now;
         self.external_runs.clear();
         for run in runs {
             let task_id = run
@@ -2157,7 +2159,7 @@ impl Graph {
         // A due run-listing reconcile is timer work of its own: the
         // request passes that skip it — the completion's bounded pass
         // (stow#940) — leave it to the alarm.
-        if self.reconcile_due(now, Self::STATUS_RECONCILE_MS) {
+        if self.reconcile_due(now, settings) {
             return queue::AlarmPlan::At(now);
         }
         let min_age = i64::from(settings.dispatch_min_age_minutes) * 60_000;
@@ -2271,12 +2273,23 @@ impl Graph {
     /// calls each, ≤12 calls/hour while the queue has work (stow#877).
     pub(super) const STATUS_RECONCILE_MS: i64 = stow_types::api::STATUS_RECONCILE_MS;
 
-    /// Whether the run listing is due for another reconcile: the graph
-    /// holds dispatchable or in-flight work and `interval_ms` passed
-    /// since the last one. An idle scheduler never asks.
-    pub fn reconcile_due(&self, now: i64, interval_ms: i64) -> bool {
-        now - self.reconciled_at >= interval_ms
-            && (!self.ready.is_empty() || !self.inflight.is_empty())
+    /// Whether the run listing is due for another reconcile:
+    /// [`Self::STATUS_RECONCILE_MS`] passed since the last attempt and
+    /// the listing can change what a pass does — in-flight work, or
+    /// dispatchable work while dispatch is not paused (a paused
+    /// scheduler claims nothing whatever the occupancy). An idle or
+    /// paused-and-drained scheduler never asks.
+    pub fn reconcile_due(&self, now: i64, settings: &queue::SchedulerSettings) -> bool {
+        now - self.reconcile_attempted_at >= Self::STATUS_RECONCILE_MS
+            && (!self.inflight.is_empty()
+                || (!self.ready.is_empty()
+                    && !matches!(settings.dispatch, queue::Dispatch::Paused)))
+    }
+
+    /// A listing attempt that failed: the next one waits the interval
+    /// like a successful one, and the delivery-tracked state stands.
+    pub const fn reconcile_failed(&mut self, now: i64) {
+        self.reconcile_attempted_at = now;
     }
 
     /// External occupancy (runs the scheduler did not dispatch).
@@ -3705,6 +3718,41 @@ mod tests {
         graph.reconcile_runs(&[listing(11, &title, CiRunStatus::InProgress)], 2_000);
         assert_eq!(status_of(&graph, "solo"), Some(Status::Running));
         assert_eq!(graph.last_run_update_ms, Some(2_000));
+    }
+
+    /// stow#940: a failed listing counts as an attempt — the plan goes
+    /// back to the lease clock instead of re-arming at once, so a
+    /// failing listing cannot spin the alarm.
+    #[test]
+    fn a_failed_reconcile_waits_out_the_interval() {
+        let settings = queue::SchedulerSettings::default();
+        let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 7, 0);
+        let now = Graph::STATUS_RECONCILE_MS;
+        assert!(now < stale);
+        assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::At(now));
+        graph.reconcile_failed(now);
+        assert!(!graph.reconcile_due(now, &settings));
+        assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::At(stale));
+    }
+
+    /// stow#940: a paused scheduler holding only queued work has
+    /// nothing a listing could release, so it asks for none and plans
+    /// no wake.
+    #[test]
+    fn a_paused_queue_plans_no_reconcile_wake() {
+        let settings = queue::SchedulerSettings {
+            dispatch: queue::Dispatch::Paused,
+            ..queue::SchedulerSettings::default()
+        };
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let now = Graph::STATUS_RECONCILE_MS;
+        assert!(!graph.reconcile_due(now, &settings));
+        assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::Delete);
     }
 
     /// stow#940: a `running` state the reconcile restored stamps its

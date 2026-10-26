@@ -910,7 +910,7 @@ mod inline_dispatch_tests {
             dispatch: queue::Dispatch::Limited(std::num::NonZeroU32::new(33).expect("33")),
             ..settings()
         };
-        // A finished reconcile marks `reconciled_at`, so only the
+        // A finished reconcile marks `reconcile_attempted_at`, so only the
         // lease clocks arm the plan.
         cell.with(|graph| graph.reconcile_runs(&[], HOST_NOW_MS));
         let before = log_rows(&db).await;
