@@ -259,13 +259,7 @@ while :; do
     # against the unrelocated prefix, so values come out as the /usr
     # paths the debs ship (e.g. wayland-scanner.pc's /usr/bin/
     # wayland-scanner, shipped by M-A:foreign libwayland-bin:amd64).
-    # A library glibc provides (-lm, -lpthread, …) is not in the root: the
-# §5 filter leaves glibc to the leg's glibc-2.28 sysroot, which links
-# it, so -l resolves against that same pinned sysroot too.
-glibc="$work/glibc"
-"$here/../glibc-sysroot/install.sh" "$glibc"
-
-pc_libdir="$(find "$merged" -type d -name pkgconfig | paste -sd:)"
+    pc_libdir="$(find "$merged" -type d -name pkgconfig | paste -sd:)"
     while IFS= read -r pc; do
         mod="$(basename "$pc" .pc)"
         vars="$(PKG_CONFIG_PATH='' PKG_CONFIG_SYSROOT_DIR='' \
@@ -330,6 +324,12 @@ done < <(comm -12 "$work/paths-amd64" "$work/paths-arm64")
 # resolve inside it. One script — relocate.sh — does it for the
 # generator's check and the leg alike, so the two cannot drift.
 "$here/relocate.sh" "$merged"
+
+# A library glibc provides (-lm, -lpthread, …) is not in the root: the
+# §5 filter leaves glibc to the leg's glibc-2.28 sysroot, which links
+# it, so -l resolves against that same pinned sysroot too.
+glibc="$work/glibc"
+"$here/../glibc-sysroot/install.sh" "$glibc"
 
 pc_libdir="$(find "$merged" -type d -name pkgconfig | paste -sd:)"
 while IFS= read -r pc; do
