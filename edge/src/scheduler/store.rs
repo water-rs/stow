@@ -700,6 +700,7 @@ mod tests {
         DispatchBinding, DispatchClaim, MutationKind, PublishedSliceRow, RunnerFamily,
         SubmissionNode, SubmissionSource,
     };
+    use stow_types::ci::{CiRunListing, CiRunStatus};
     use stow_types::identity::{
         CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
     };
@@ -1086,12 +1087,19 @@ mod tests {
         // The claim replays as dispatched-unbound — no dispatch is lost
         // and nothing re-dispatches.
         assert_eq!(restored.status_counts()["dispatched"], 1);
-        // The post-wake status reconcile binds by run title.
+        // The post-wake status reconcile binds by run title, and a
+        // run listed `in_progress` moves the claim to `running`
+        // (stow#940).
         restored.reconcile_runs(
-            &[(4242, format!("{RUSTC}-{}", id("solo")), RunnerFamily::Linux)],
+            &[CiRunListing {
+                workflow_run_id: 4242,
+                title: format!("{RUSTC}-{}", id("solo")),
+                family: Some(RunnerFamily::Linux),
+                status: CiRunStatus::InProgress,
+            }],
             200,
         );
-        assert_eq!(restored.status_counts()["dispatched"], 1);
+        assert_eq!(restored.status_counts()["running"], 1);
         let outcome = restored.run_finished(&id("solo"), 4242, true, false, None, 300);
         assert_eq!(outcome, super::super::graph::FinishOutcome::Applied);
         assert_eq!(restored.status_counts()["completed"], 1);

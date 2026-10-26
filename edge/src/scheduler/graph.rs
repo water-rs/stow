@@ -27,6 +27,7 @@ use stow_types::api::{
     BuildTaskPayload, PublishedSliceRow, RunnerFamily, SchedulerEvent, SubgraphNode,
     SubmissionNode, SubmissionTree, SubmitTaskIdEntry, TaskSubgraph, runner_family,
 };
+use stow_types::ci::{CiRunListing, CiRunStatus};
 use stow_types::public_cache::{ExplicitSpelling, UnitShape};
 use stow_types::task_graph::canonical_task_id;
 
@@ -390,6 +391,11 @@ pub struct Graph {
     /// When the run listing last reconciled — memory only: a wake
     /// reconciles at once.
     reconciled_at: i64,
+    /// Generations this isolate's dispatch pass claimed but has not
+    /// yet settled (stow#940) — in memory only, so a woken graph
+    /// parks nothing: a completion for a replayed dispatched-unbound
+    /// claim binds the run and finishes the claim outright.
+    settling: HashSet<u64>,
     /// The instant the last `workflow_run` delivery was accepted —
     /// the event's own `at` (stow#860). `None` until the first
     /// delivery; every delivery event's apply stamps it (`RunFinished`,
@@ -1443,6 +1449,7 @@ impl Graph {
             }
             let generation = self.next_generation + 1;
             self.mark_claimed(ix, generation, now);
+            self.settling.insert(generation);
             if family == RunnerFamily::MacOs {
                 macos_taken += 1;
             }
@@ -1484,6 +1491,7 @@ impl Graph {
         if !self.node(ix).status.in_flight() || self.generation_of(ix) != generation {
             return false;
         }
+        self.settling.remove(&generation);
         self.state_mut(ix).updated = now;
         let parked = self.edit_extra(ix, |extra| {
             extra.run_id = run_id;
@@ -1509,6 +1517,7 @@ impl Graph {
         {
             return;
         }
+        self.settling.remove(&generation);
         self.set_status(ix, Status::Pending);
         let state = self.state_mut(ix);
         state.updated = now;
@@ -1555,27 +1564,56 @@ impl Graph {
         }
     }
 
-    /// Reconcile the run set after a wake (#877, review Q6): the
-    /// `status` listing is the truth for occupancy, and a run title
+    /// Reconcile the run set after a wake (#877, review Q6) and at
+    /// most every `STATUS_RECONCILE_MS` while work lives: the `status`
+    /// listing is the truth for occupancy — a run title
     /// (`<rustc>-<task_id>`) that names an unbound dispatched claim
-    /// re-lands its binding.
-    pub fn reconcile_runs(&mut self, runs: &[(u64, String, RunnerFamily)], now: i64) {
+    /// re-lands its binding, and a listed own run found `in_progress`
+    /// moves to `Running` (stow#940; the listing takes over what the
+    /// own-run `in_progress` delivery did). A listed run no live claim
+    /// matches is external; a run whose title attributes to no family
+    /// counts toward the total budget only, `Occupancy::add_unknown`'s
+    /// convention.
+    pub fn reconcile_runs(&mut self, runs: &[CiRunListing], now: i64) {
         self.reconciled_at = now;
         self.external_runs.clear();
-        for (run_id, title, family) in runs {
-            let task_id = title
+        for run in runs {
+            let task_id = run
+                .title
                 .split_once('-')
                 .map(|(_, task_id)| task_id)
                 .unwrap_or_default();
             if let Some(ix) = self.node_ix(task_id)
                 && self.node(ix).status.in_flight()
-                && self.run_id_of(ix) == 0
             {
-                let generation = self.generation_of(ix);
-                self.bind(task_id, generation, *run_id, now);
-                continue;
+                let bound = self.run_id_of(ix);
+                if bound == 0 {
+                    let generation = self.generation_of(ix);
+                    self.bind(task_id, generation, run.workflow_run_id, now);
+                }
+                if bound == 0 || bound == run.workflow_run_id {
+                    // A parked completion the binding consumed may
+                    // already have ended the claim; a listed run that
+                    // still holds it moves `in_progress` to `Running`.
+                    if self.node(ix).status.in_flight()
+                        && self.node(ix).status != Status::Running
+                        && run.status == CiRunStatus::InProgress
+                    {
+                        self.set_status(ix, Status::Running);
+                        self.state_mut(ix).updated = now;
+                        // First sight of the run holding a runner —
+                        // the instant the health rule's staleness
+                        // measures from, in place of the `in_progress`
+                        // delivery's stamp.
+                        self.last_run_update_ms = Some(now);
+                    }
+                    continue;
+                }
             }
-            self.external_runs.insert(*run_id, 1u8 << (*family as u8));
+            self.external_runs.insert(
+                run.workflow_run_id,
+                run.family.map_or(0, |family| 1u8 << (family as u8)),
+            );
         }
     }
 
@@ -1603,15 +1641,29 @@ impl Graph {
         }
         let bound = self.run_id_of(ix);
         if bound == 0 {
-            self.edit_extra(ix, |extra| {
-                extra.parked = Some(ParkedCompletion {
-                    run_id,
-                    success,
-                    cancelled,
-                    error,
+            if self.settling.contains(&self.generation_of(ix)) {
+                // The claim's pass is between its `Claims` row and its
+                // settle — the binding lands in this isolate, so the
+                // completion waits on it.
+                self.edit_extra(ix, |extra| {
+                    extra.parked = Some(ParkedCompletion {
+                        run_id,
+                        success,
+                        cancelled,
+                        error,
+                    });
                 });
-            });
-            return FinishOutcome::Parked;
+                return FinishOutcome::Parked;
+            }
+            // No pass is settling this claim — the `Bindings` row
+            // never landed (an eviction replayed the claim
+            // dispatched-unbound, or the dispatch answer was lost
+            // after GitHub created the run). The completion binds the
+            // run itself, exactly as `run_started`'s `bound == 0`
+            // path does (stow#940).
+            self.edit_extra(ix, |extra| extra.run_id = run_id);
+            self.finish_run_inner(ix, success, cancelled, error, now);
+            return FinishOutcome::Applied;
         }
         if bound != run_id {
             return FinishOutcome::Stale;
@@ -3610,6 +3662,106 @@ mod tests {
         let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
         assert_eq!(outcome, FinishOutcome::Parked);
         assert!(graph.bind(&id("solo"), generation, 4242, 11_000));
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
+    }
+
+    /// One `status`-listing row for `title`.
+    fn listing(run_id: u64, title: &str, status: CiRunStatus) -> CiRunListing {
+        CiRunListing {
+            workflow_run_id: run_id,
+            title: title.to_owned(),
+            family: Some(RunnerFamily::Linux),
+            status,
+        }
+    }
+
+    /// stow#940: a claim replayed `dispatched`-unbound binds by title
+    /// on the post-wake reconcile; a `queued` listing keeps it
+    /// `dispatched`, and the `in_progress` listing moves it to
+    /// `running` — the job the own-run `in_progress` delivery did.
+    #[test]
+    fn a_reconcile_restores_running_from_the_listing() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 7, 0);
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Dispatched));
+        let title = format!("{RUSTC}-{}", id("solo"));
+        graph.reconcile_runs(&[listing(11, &title, CiRunStatus::Queued)], 1_000);
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Dispatched));
+        assert_eq!(graph.run_id_of(ix), 11);
+        graph.reconcile_runs(&[listing(11, &title, CiRunStatus::InProgress)], 2_000);
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Running));
+        assert_eq!(graph.last_run_update_ms, Some(2_000));
+    }
+
+    /// stow#940: a `running` state the reconcile restored stamps its
+    /// sighting — the staleness rule trips once the bound runs out
+    /// with no delivery, exactly as it did for a delivered
+    /// `in_progress`.
+    #[test]
+    fn health_reconciled_running_goes_unhealthy_after_the_bound() {
+        use stow_types::api::HealthState;
+        let t0 = 1_000_000i64;
+        let mut graph = Graph::default();
+        graph.merge(&solo(), t0).expect("merge");
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 1, t0);
+        graph.reconcile_runs(
+            &[listing(
+                42,
+                &format!("{RUSTC}-{}", id("solo")),
+                CiRunStatus::InProgress,
+            )],
+            t0,
+        );
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Running));
+        assert_eq!(
+            graph.health(t0 + Graph::DELIVERY_STALE_MS).scheduler,
+            HealthState::Ok
+        );
+        assert_eq!(
+            graph.health(t0 + Graph::DELIVERY_STALE_MS + 1).scheduler,
+            HealthState::Unhealthy
+        );
+    }
+
+    /// stow#940: a completion for an unbound claim no pass is settling
+    /// — the dispatched-unbound state a wake's replay leaves — binds
+    /// the run and finishes the claim, where it used to park forever.
+    #[test]
+    fn a_completion_binds_a_replayed_unbound_claim() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 7, 0);
+        let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
+        assert_eq!(outcome, FinishOutcome::Applied);
+        assert_eq!(graph.run_id_of(ix), 4242);
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
+    }
+
+    /// stow#940: a dispatch POST that failed after GitHub created the
+    /// run re-queues the claim; the re-claim's binding never lands,
+    /// and the orphaned run's completion binds and finishes the claim.
+    #[test]
+    fn a_completion_binds_after_a_failed_dispatch() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        graph.mark_dispatch_failed(&id("solo"), claimed[0].generation, "POST failed", 1_000);
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        assert_eq!(graph.node(ix).status, Status::Pending);
+        graph.edit_extra(ix, |extra| extra.not_before = 0);
+        graph.refresh_ready(ix);
+        let reclaimed = graph.claim(45, 16, 2_000, 3_600_000).expect("reclaim");
+        assert_eq!(reclaimed.len(), 1);
+        // The reclaim pass's settle never lands (an eviction, a lost
+        // answer): a woken graph carries no settling set.
+        graph.settling.clear();
+        let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
+        assert_eq!(outcome, FinishOutcome::Applied);
+        assert_eq!(graph.run_id_of(ix), 4242);
         assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
     }
 

@@ -131,9 +131,23 @@ pub fn family_of_task_id(task_id: &str) -> Option<RunnerFamily> {
     })
 }
 
-/// One `build-crate.yml` run the `status` listing reports — its id
-/// and the runner family its title attributed (`None` when the title
-/// parses to no family's target).
+/// Which side of the `?status=` split a listed run came back under.
+///
+/// `queued` waits on a runner, `in_progress` holds one. The scheduler
+/// moves its own runs `dispatched` → `running` on this, in place of the
+/// `in_progress` delivery (stow#940).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CiRunStatus {
+    /// `?status=queued` — accepted by GitHub, not yet holding a runner.
+    Queued,
+    /// `?status=in_progress` — holding a runner.
+    InProgress,
+}
+
+/// One `build-crate.yml` run the `status` listing reports — its id,
+/// the runner family its title attributed (`None` when the title
+/// parses to no family's target), and which `?status=` query returned
+/// it.
 #[derive(Debug)]
 pub struct CiRunListing {
     /// The Actions run id.
@@ -144,6 +158,8 @@ pub struct CiRunListing {
     pub title: String,
     /// The family its run-name attributed.
     pub family: Option<RunnerFamily>,
+    /// Which `?status=` listing the run came back under.
+    pub status: CiRunStatus,
 }
 
 /// The run identity a successful submission returns.
@@ -402,9 +418,12 @@ impl<T: CiTransport> CiInterface<T> {
     /// origin.
     pub async fn status_runs(&self) -> Result<Vec<CiRunListing>, DispatchError> {
         let mut runs = Vec::new();
-        for status in ["queued", "in_progress"] {
+        for (status, query) in [
+            (CiRunStatus::Queued, "queued"),
+            (CiRunStatus::InProgress, "in_progress"),
+        ] {
             let mut url = self.resolve(&format!(
-                "repos/{}/actions/workflows/{}/runs?status={status}&per_page=100",
+                "repos/{}/actions/workflows/{}/runs?status={query}&per_page=100",
                 self.repo(),
                 crate::trusted_builder::WORKFLOW_FILE,
             ))?;
@@ -425,6 +444,7 @@ impl<T: CiTransport> CiInterface<T> {
                         workflow_run_id: run.id,
                         title: run.display_title.clone(),
                         family,
+                        status,
                     }
                 }));
                 let Some(next) = crate::runs::link_next(response.header("link")) else {

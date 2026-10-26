@@ -251,6 +251,7 @@ pub(super) async fn complete_run(
         .and_then(|id| id.parse::<u64>().ok())
         .unwrap_or(0);
     let outcome = graph.with(|graph| {
+        graph.last_run_update_ms = Some(now);
         graph.run_finished(
             &report.task_id,
             run_id,
@@ -278,10 +279,22 @@ pub(super) async fn task_run_update(
     update: &stow_types::api::TaskRunUpdate,
     now: i64,
 ) -> Result<StartOutcome, QueueError> {
-    let run_id = update.github_run_id.parse::<u64>().unwrap_or(0);
-    let family = stow_types::ci::family_of_task_id(&update.task_id)
-        .unwrap_or(stow_types::api::RunnerFamily::Linux);
-    let outcome = graph.with(|graph| graph.run_started(&update.task_id, run_id, family, now));
+    let run_id = update.github_run_id.parse::<u64>().map_err(|error| {
+        QueueError::Invariant(format!(
+            "run-update github_run_id {:?}: {error}",
+            update.github_run_id
+        ))
+    })?;
+    let family = stow_types::ci::family_of_task_id(&update.task_id).ok_or_else(|| {
+        QueueError::Invariant(format!(
+            "run-update task {} attributes to no runner family",
+            update.task_id
+        ))
+    })?;
+    let outcome = graph.with(|graph| {
+        graph.last_run_update_ms = Some(now);
+        graph.run_started(&update.task_id, run_id, family, now)
+    });
     let event = match outcome {
         StartOutcome::External => SchedulerEvent::ExternalRunStarted {
             run_id: update.github_run_id.clone(),

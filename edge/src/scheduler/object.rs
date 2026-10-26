@@ -88,17 +88,7 @@ async fn ensure_graph<'a>(
         };
         match listed {
             Ok(runs) => {
-                let listed: Vec<(u64, String, stow_types::api::RunnerFamily)> = runs
-                    .iter()
-                    .map(|run| {
-                        (
-                            run.workflow_run_id,
-                            run.title.clone(),
-                            run.family.unwrap_or(stow_types::api::RunnerFamily::Linux),
-                        )
-                    })
-                    .collect();
-                loaded.with(|graph| graph.reconcile_runs(&listed, now_ms()));
+                loaded.with(|graph| graph.reconcile_runs(&runs, now_ms()));
             }
             Err(error) => {
                 tracing::warn!(%error, "post-wake CI status reconcile failed — keeping replayed state");
@@ -1661,16 +1651,6 @@ pub(super) async fn dispatch_pass(
     if graph.with(|graph| graph.reconcile_due(now_ms(), STATUS_RECONCILE_MS)) {
         match interface.status_runs().await {
             Ok(listed) => {
-                let listed: Vec<(u64, String, stow_types::api::RunnerFamily)> = listed
-                    .iter()
-                    .map(|run| {
-                        (
-                            run.workflow_run_id,
-                            run.title.clone(),
-                            run.family.unwrap_or(stow_types::api::RunnerFamily::Linux),
-                        )
-                    })
-                    .collect();
                 graph.with(|graph| graph.reconcile_runs(&listed, now_ms()));
             }
             Err(error) => {
