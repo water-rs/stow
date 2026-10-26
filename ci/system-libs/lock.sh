@@ -156,15 +156,18 @@ done
 marks="$work/marks"; : > "$marks"   # "<set>\t<deb basename>"
 
 # The toolchain sets keep by package name (§6 step 3): the closure of
-# the cross compilers is mostly the image's base system; only the
-# packages that are the cross toolchain itself are locked.
+# the compilers is mostly the image's base system; only the packages
+# that are the cross toolchain itself, and the native GCC 12 the shims
+# exec (stow#693) that the 26.04 image no longer ships (stow#946), are
+# locked.
 for d in res-tc-x86_64 res-tc-aarch64; do
     set_name="toolchain-${d#res-tc-}-unknown-linux-gnu"
     n=0
     for deb in "$work/$d"/*.deb; do
         base="$(basename "$deb")"
         case "${pkg_of[$base]}" in
-            *-aarch64-linux-gnu | *-aarch64-linux-gnu-base | *-arm64-cross | *-cross-base | mold)
+            *-aarch64-linux-gnu | *-aarch64-linux-gnu-base | *-arm64-cross | *-cross-base | mold \
+                | *-12 | *-12-*)
                 printf '%s\t%s\n' "$set_name" "$base" >> "$marks"
                 n=$((n + 1));;
         esac
