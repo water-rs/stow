@@ -16,7 +16,8 @@
 # none of the host's apt configuration, and an empty dpkg status, so
 # every resolve is the full dependency closure from nothing and does
 # not depend on what the runner image happens to have installed. Needs
-# apt-get, dpkg-deb, pkg-config and GNU coreutils — any Ubuntu host.
+# apt-get, dpkg-deb, pkg-config, curl and GNU coreutils — any Ubuntu
+# host.
 set -euo pipefail
 export LC_ALL=C
 
@@ -31,7 +32,7 @@ fail() { echo "lock.sh: $*" >&2; exit 1; }
 
 [[ "$T" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] \
     || fail "'$T' is not a snapshot.ubuntu.com instant (want e.g. 20261022T200000Z)"
-for c in apt-get dpkg-deb pkg-config; do
+for c in apt-get dpkg-deb pkg-config curl; do
     command -v "$c" > /dev/null || fail "needs $c — run on an Ubuntu $suite host"
 done
 [ -f "$keyring" ] || fail "$keyring missing — run on an Ubuntu host"
@@ -258,7 +259,13 @@ while :; do
     # against the unrelocated prefix, so values come out as the /usr
     # paths the debs ship (e.g. wayland-scanner.pc's /usr/bin/
     # wayland-scanner, shipped by M-A:foreign libwayland-bin:amd64).
-    pc_libdir="$(find "$merged" -type d -name pkgconfig | paste -sd:)"
+    # A library glibc provides (-lm, -lpthread, …) is not in the root: the
+# §5 filter leaves glibc to the leg's glibc-2.28 sysroot, which links
+# it, so -l resolves against that same pinned sysroot too.
+glibc="$work/glibc"
+"$here/../glibc-sysroot/install.sh" "$glibc"
+
+pc_libdir="$(find "$merged" -type d -name pkgconfig | paste -sd:)"
     while IFS= read -r pc; do
         mod="$(basename "$pc" .pc)"
         vars="$(PKG_CONFIG_PATH='' PKG_CONFIG_SYSROOT_DIR='' \
@@ -337,7 +344,7 @@ while IFS= read -r pc; do
         PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1 PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 \
         pkg-config --cflags --libs "$mod")" \
         || fail "$mod: pkg-config --cflags --libs failed under $pc_libdir"
-    ldirs=("$merged/usr/lib" "$merged/usr/lib/"*/)
+    ldirs=("$merged/usr/lib" "$merged/usr/lib/"*/ "$glibc"/*/usr/lib/*/)
     for tok in $flags; do
         case "$tok" in
             -L*)
