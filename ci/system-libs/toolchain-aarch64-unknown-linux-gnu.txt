@@ -5,6 +5,8 @@
 # line.
 gcc-aarch64-linux-gnu
 g++-aarch64-linux-gnu
+gcc-12
+g++-12
 gcc-12-aarch64-linux-gnu
 g++-12-aarch64-linux-gnu
 mold

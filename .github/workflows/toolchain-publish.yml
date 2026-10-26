@@ -58,7 +58,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, key: linux-x64, bins: stow-build stow-cli stow-admin }
+          - { os: ubuntu-24.04, key: linux-x64, bins: stow-build stow-cli stow-admin }
           - { os: windows-latest, key: windows-x64, bins: stow-build stow-cli }
           - { os: macos-14, key: macos-arm64, bins: stow-build stow-cli }
     runs-on: ${{ matrix.os }}
