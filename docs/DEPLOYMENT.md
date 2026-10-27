@@ -541,10 +541,10 @@ scheduler dispatches them to GitHub Actions in parallel as
 in-flight run — the per-family
 `STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and
 `STOW_DISPATCH_MIN_AGE_MINUTES`; failed dispatches retry with
-exponential backoff, and a task whose lease expires after
-`STOW_STALE_DISPATCH_MINUTES`, default 60, has its run read: completed
-resolves as if the webhook had arrived, still-running extends the
-lease, unbound requeues).
+exponential backoff, and a task's lease — renewed by each `status`
+reconcile that lists its run queued or in progress — expires after
+`STOW_STALE_DISPATCH_MINUTES`, default 60, returning the task to
+pending for re-dispatch).
 
 
 

@@ -703,6 +703,16 @@ impl Graph {
         self.extras.get(&ix).map_or(0, |extra| extra.claimed_at)
     }
 
+    /// The instant the claim's lease measures from — its own stamp,
+    /// pushed forward by each `status` reconcile that lists its run
+    /// (stow#943). `claimed_at` alone stays the claim time the admin
+    /// status shows; every lease check goes through here.
+    fn lease_since_of(&self, ix: u32) -> i64 {
+        self.extras
+            .get(&ix)
+            .map_or(0, |extra| extra.claimed_at.max(extra.lease_at))
+    }
+
     fn not_before_of(&self, ix: u32) -> i64 {
         self.extras.get(&ix).map_or(0, |extra| extra.not_before)
     }
@@ -1390,13 +1400,14 @@ impl Graph {
             .inflight
             .iter()
             .copied()
-            .filter(|&ix| self.claimed_at_of(ix) + stale_ms <= now)
+            .filter(|&ix| self.lease_since_of(ix) + stale_ms <= now)
             .collect();
         for ix in stale {
             self.set_status(ix, Status::Pending);
             self.state_mut(ix).updated = now;
             self.edit_extra(ix, |extra| {
                 extra.claimed_at = 0;
+                extra.lease_at = 0;
                 extra.run_id = 0;
                 extra.parked = None;
             });
@@ -1477,6 +1488,7 @@ impl Graph {
         self.edit_extra(ix, |extra| {
             extra.generation = generation;
             extra.claimed_at = now;
+            extra.lease_at = 0;
             extra.run_id = 0;
             extra.parked = None;
         });
@@ -1573,10 +1585,14 @@ impl Graph {
     /// (`<rustc>-<task_id>`) that names an unbound dispatched claim
     /// re-lands its binding, and a listed own run found `in_progress`
     /// moves to `Running` (stow#940; the listing takes over what the
-    /// own-run `in_progress` delivery did). A listed run no live claim
-    /// matches is external; a run whose title attributes to no family
-    /// counts toward the total budget only, `Occupancy::add_unknown`'s
-    /// convention.
+    /// own-run `in_progress` delivery did). A listed own run also
+    /// renews the claim's lease (stow#943): the listing only carries
+    /// `queued` and `in_progress` runs, so a claim keeps its dispatch
+    /// for as long as its run is known to live — a build may outlast
+    /// `STOW_STALE_DISPATCH_MINUTES` without being re-dispatched. A
+    /// listed run no live claim matches is external; a run whose
+    /// title attributes to no family counts toward the total budget
+    /// only, `Occupancy::add_unknown`'s convention.
     pub fn reconcile_runs(&mut self, runs: &[CiRunListing], now: i64) {
         self.reconcile_attempted_at = now;
         self.external_runs.clear();
@@ -1597,18 +1613,21 @@ impl Graph {
                 if bound == 0 || bound == run.workflow_run_id {
                     // A parked completion the binding consumed may
                     // already have ended the claim; a listed run that
-                    // still holds it moves `in_progress` to `Running`.
-                    if self.node(ix).status.in_flight()
-                        && self.node(ix).status != Status::Running
-                        && run.status == CiRunStatus::InProgress
-                    {
-                        self.set_status(ix, Status::Running);
-                        self.state_mut(ix).updated = now;
-                        // First sight of the run holding a runner —
-                        // the instant the health rule's staleness
-                        // measures from, in place of the `in_progress`
-                        // delivery's stamp.
-                        self.last_run_update_ms = Some(now);
+                    // still holds it renews the lease and moves
+                    // `in_progress` to `Running`.
+                    if self.node(ix).status.in_flight() {
+                        self.edit_extra(ix, |extra| extra.lease_at = now);
+                        if self.node(ix).status != Status::Running
+                            && run.status == CiRunStatus::InProgress
+                        {
+                            self.set_status(ix, Status::Running);
+                            self.state_mut(ix).updated = now;
+                            // First sight of the run holding a runner —
+                            // the instant the health rule's staleness
+                            // measures from, in place of the
+                            // `in_progress` delivery's stamp.
+                            self.last_run_update_ms = Some(now);
+                        }
                     }
                     continue;
                 }
@@ -1709,6 +1728,7 @@ impl Graph {
             self.edit_extra(ix, |extra| {
                 extra.run_id = 0;
                 extra.claimed_at = 0;
+                extra.lease_at = 0;
             });
             self.refresh_ready(ix);
             return;
@@ -2190,7 +2210,7 @@ impl Graph {
             }
         }
         for &ix in &self.inflight {
-            let expiry = self.claimed_at_of(ix) + stale;
+            let expiry = self.lease_since_of(ix) + stale;
             if expiry > now && wake.is_none_or(|w| expiry < w) {
                 wake = Some(expiry);
             }
@@ -3718,6 +3738,109 @@ mod tests {
         graph.reconcile_runs(&[listing(11, &title, CiRunStatus::InProgress)], 2_000);
         assert_eq!(status_of(&graph, "solo"), Some(Status::Running));
         assert_eq!(graph.last_run_update_ms, Some(2_000));
+    }
+
+    /// stow#943: an own run listed `in_progress` at t0+50min renews the
+    /// lease — the claim pass at t0+70min, past the 60-minute lease
+    /// `claimed_at` alone would give, keeps it `running` with its run
+    /// id instead of re-dispatching.
+    #[test]
+    fn an_in_progress_listing_renews_the_lease() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        graph.bind(&id("solo"), claimed[0].generation, 11, 1_000);
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.reconcile_runs(
+            &[listing(
+                11,
+                &format!("{RUSTC}-{}", id("solo")),
+                CiRunStatus::InProgress,
+            )],
+            50 * 60_000,
+        );
+        let reclaimed = graph
+            .claim(45, 16, 70 * 60_000, 3_600_000)
+            .expect("claim pass");
+        assert!(reclaimed.is_empty(), "the living run is not re-dispatched");
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Running));
+        assert_eq!(graph.run_id_of(ix), 11);
+    }
+
+    /// stow#943: an own run still listed `queued` renews the lease the
+    /// same way — a run waiting on a runner outlives the lease as a
+    /// running one does.
+    #[test]
+    fn a_queued_listing_renews_the_lease() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        // The claim is unbound; the listing binds it by title and
+        // renews the lease in the same pass.
+        graph.reconcile_runs(
+            &[listing(
+                11,
+                &format!("{RUSTC}-{}", id("solo")),
+                CiRunStatus::Queued,
+            )],
+            50 * 60_000,
+        );
+        assert_eq!(graph.run_id_of(ix), 11);
+        let reclaimed = graph
+            .claim(45, 16, 70 * 60_000, 3_600_000)
+            .expect("claim pass");
+        assert!(reclaimed.is_empty(), "the queued run is not re-dispatched");
+        assert_eq!(status_of(&graph, "solo"), Some(Status::Dispatched));
+        assert_eq!(graph.run_id_of(ix), 11);
+    }
+
+    /// stow#943: a run absent from the listing renews nothing — the
+    /// claim's lease lapses at `claimed_at + stale` and the pass
+    /// re-dispatches it, exactly as before the renewal.
+    #[test]
+    fn an_unlisted_own_run_lets_the_lease_lapse() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        graph.bind(&id("solo"), claimed[0].generation, 11, 1_000);
+        graph.reconcile_runs(&[], 50 * 60_000);
+        let reclaimed = graph
+            .claim(45, 16, 70 * 60_000, 3_600_000)
+            .expect("claim pass");
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].task_id, id("solo"));
+        assert!(reclaimed[0].generation > claimed[0].generation);
+    }
+
+    /// stow#943: the wake plan's in-flight expiry moves with the
+    /// renewal — a claim renewed at t0+50min wakes at t0+110min, not
+    /// the t0+60min its claim stamp alone gives.
+    #[test]
+    fn the_wake_plan_tracks_a_renewed_lease() {
+        let settings = queue::SchedulerSettings::default();
+        let stale = i64::from(settings.stale_dispatch_minutes) * 60_000;
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 7, 0);
+        let renewed = 50 * 60_000;
+        graph.reconcile_runs(
+            &[listing(
+                11,
+                &format!("{RUSTC}-{}", id("solo")),
+                CiRunStatus::InProgress,
+            )],
+            renewed,
+        );
+        // Inside the reconcile interval: the plan reads the renewed
+        // lease rather than asking for another listing.
+        let now = renewed + 5 * 60_000;
+        assert!(!graph.reconcile_due(now, &settings));
+        assert_eq!(
+            graph.wake_plan(now, &settings),
+            queue::AlarmPlan::At(renewed + stale)
+        );
     }
 
     /// stow#940: a failed listing counts as an attempt — the plan goes
