@@ -307,9 +307,6 @@ pub async fn try_compile(
     }
 
     if cache_path.exists() {
-        let object = async_fs::read(&cache_path)
-            .await
-            .wrap_err_with(|| format!("read cached object {}", cache_path.display()))?;
         if let Some(parent) = parsed.output_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -317,9 +314,9 @@ pub async fn try_compile(
                 .await
                 .wrap_err_with(|| format!("create C output directory {}", parent.display()))?;
         }
-        async_fs::write(&parsed.output_path, object)
-            .await
-            .wrap_err_with(|| format!("write cached object {}", parsed.output_path.display()))?;
+        let source = cache_path.clone();
+        let output = parsed.output_path.clone();
+        smol::unblock(move || serve_cached_object_blocking(&source, &output)).await?;
         return Ok(CcOutcome::Hit {
             cache_key,
             output_path: parsed.output_path,
@@ -376,16 +373,115 @@ fn expand_response_arg(
     Ok(())
 }
 
+/// Store a freshly compiled object under its cache key: clone it into a
+/// uniquely named file beside the key, then rename that into place, so a
+/// concurrent lookup sees either no object or a complete one (stow#837).
+/// The first writer wins; a later store of the same key leaves it alone.
 pub async fn store_compiled_object(
     cache_path: &Path,
     output_path: &Path,
 ) -> stow_types::error::Result<()> {
-    let object = async_fs::read(output_path)
+    let cache_path = cache_path.to_path_buf();
+    let output_path = output_path.to_path_buf();
+    smol::unblock(move || stage_compiled_object_blocking(&cache_path, &output_path)?.publish())
         .await
-        .wrap_err_with(|| format!("read compiled object {}", output_path.display()))?;
-    async_fs::write(cache_path, object)
-        .await
-        .wrap_err_with(|| format!("write compiled object cache {}", cache_path.display()))
+}
+
+/// How a file reached its destination: a copy-on-write clone sharing the
+/// source's blocks, or a byte copy on a filesystem that cannot clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    Cloned,
+    Copied,
+}
+
+/// Clone `source` to the not-yet-existing `destination` (APFS
+/// `clonefile`, Linux `FICLONE`), copying only where the filesystem cannot
+/// clone.
+fn clone_or_copy(source: &Path, destination: &Path) -> std::io::Result<Placement> {
+    let placement = match reflink::reflink_or_copy(source, destination)? {
+        None => Placement::Cloned,
+        Some(_) => Placement::Copied,
+    };
+    if placement == Placement::Copied {
+        tracing::debug!(
+            source = %source.display(),
+            destination = %destination.display(),
+            "filesystem cannot clone; copied C/C++ object bytes"
+        );
+    }
+    Ok(placement)
+}
+
+/// A compiled object cloned into the cache directory under a temporary
+/// name, not yet visible at its cache key.
+struct StagedObject {
+    staged: tempfile::NamedTempFile<Placement>,
+    cache_path: PathBuf,
+}
+
+impl StagedObject {
+    /// Rename the staged object onto its cache key unless another writer
+    /// got there first; either way the key then holds a complete object.
+    fn publish(self) -> stow_types::error::Result<()> {
+        match self.staged.persist_noclobber(&self.cache_path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(
+                stow_types::error::Error::from(error.error).wrap_err(format!(
+                    "move compiled object into cache at {}",
+                    self.cache_path.display()
+                )),
+            ),
+        }
+    }
+}
+
+fn stage_compiled_object_blocking(
+    cache_path: &Path,
+    output_path: &Path,
+) -> stow_types::error::Result<StagedObject> {
+    let cache_dir = cache_path.parent().ok_or_else(|| {
+        stow_types::stow_error!("C object cache path {} has no parent", cache_path.display())
+    })?;
+    let staged = tempfile::Builder::new()
+        .prefix(".stage-")
+        .suffix(".o")
+        .make_in(cache_dir, |staged| clone_or_copy(output_path, staged))
+        .wrap_err_with(|| {
+            format!(
+                "stage compiled object {} in C object cache {}",
+                output_path.display(),
+                cache_dir.display()
+            )
+        })?;
+    Ok(StagedObject {
+        staged,
+        cache_path: cache_path.to_path_buf(),
+    })
+}
+
+/// Serve a cached object: replace whatever sits at `output_path` with a
+/// clone of the cache entry.
+fn serve_cached_object_blocking(
+    cache_path: &Path,
+    output_path: &Path,
+) -> stow_types::error::Result<Placement> {
+    match std::fs::remove_file(output_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(stow_types::error::Error::from(error)
+                .wrap_err(format!("remove stale object {}", output_path.display())));
+        }
+    }
+    clone_or_copy(cache_path, output_path).wrap_err_with(|| {
+        format!(
+            "serve cached object {} into {}",
+            cache_path.display(),
+            output_path.display()
+        )
+    })
 }
 
 fn cc_cache_path(config: &StowConfig, cache_key: &str) -> PathBuf {
@@ -916,6 +1012,69 @@ mod tests {
             let parsed = ParsedCcInvocation::parse(&args(&argv)).expect("parse should succeed");
             assert!(parsed.is_none(), "expected passthrough for {argv:?}");
         }
+    }
+
+    /// A store is invisible at its key until it is complete: the staged
+    /// clone sits under a temporary name, so a lookup in that window
+    /// misses instead of reading a partial object, and publishing a second
+    /// store of the same key keeps the first (stow#837).
+    #[test]
+    fn a_staged_object_is_invisible_until_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("key.o");
+        let first_output = dir.path().join("first.o");
+        let second_output = dir.path().join("second.o");
+        std::fs::write(&first_output, b"first object").expect("write first object");
+        std::fs::write(&second_output, b"second object").expect("write second object");
+
+        let first = super::stage_compiled_object_blocking(&cache_path, &first_output)
+            .expect("stage first object");
+        let second = super::stage_compiled_object_blocking(&cache_path, &second_output)
+            .expect("stage second object");
+        assert!(!cache_path.exists(), "a staged object must not be visible");
+
+        first.publish().expect("publish first object");
+        second.publish().expect("a losing store is not an error");
+        assert_eq!(
+            std::fs::read(&cache_path).expect("read cached object"),
+            b"first object"
+        );
+        let leftovers = std::fs::read_dir(dir.path())
+            .expect("list cache dir")
+            .map(|entry| entry.expect("cache dir entry").file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".stage-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "staged files left behind: {leftovers:?}"
+        );
+    }
+
+    /// On a copy-on-write filesystem — APFS here — both directions clone:
+    /// the store shares the compiled object's blocks and the serve shares
+    /// the cache entry's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_and_serve_clone_on_apfs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("key.o");
+        let compiled = dir.path().join("compiled.o");
+        let served = dir.path().join("served.o");
+        std::fs::write(&compiled, b"object bytes").expect("write compiled object");
+        std::fs::write(&served, b"stale object").expect("write stale output");
+
+        let staged = super::stage_compiled_object_blocking(&cache_path, &compiled)
+            .expect("stage compiled object");
+        assert_eq!(*staged.staged.as_file(), super::Placement::Cloned);
+        staged.publish().expect("publish compiled object");
+
+        let placement =
+            super::serve_cached_object_blocking(&cache_path, &served).expect("serve object");
+        assert_eq!(placement, super::Placement::Cloned);
+        assert_eq!(
+            std::fs::read(&served).expect("read served"),
+            b"object bytes"
+        );
     }
 
     #[cfg(unix)]
