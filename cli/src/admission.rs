@@ -710,7 +710,7 @@ mod tests {
     async fn a_redeemed_ticket_reports_nothing_unredeemed() {
         let edge = stub_edge("200 OK");
         let mut config = test_config();
-        config.edge_url = edge.url().to_owned();
+        edge.configure(&mut config);
         let mut collector = AdmissionCollector::default();
 
         collector.record(&config, [test_admission("task-1", 0)]);
@@ -725,7 +725,7 @@ mod tests {
     async fn a_non_success_enqueue_answer_is_unredeemed() {
         let edge = stub_edge("503 Service Unavailable");
         let mut config = test_config();
-        config.edge_url = edge.url().to_owned();
+        edge.configure(&mut config);
         let mut collector = AdmissionCollector::default();
 
         collector.record(&config, [test_admission("task-1", 0)]);
