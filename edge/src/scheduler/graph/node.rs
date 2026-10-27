@@ -214,13 +214,20 @@ pub(super) struct ParkedCompletion {
 }
 
 /// The fields few nodes carry: a claim's generation and bound run, its
-/// lease stamp, a retry backoff, the last error, a parked completion.
-/// A node has an entry only while one of them is set.
+/// claim and lease-renewal stamps, a retry backoff, the last error, a
+/// parked completion. A node has an entry only while one of them is
+/// set.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub(super) struct Extra {
     pub(super) generation: u64,
     pub(super) run_id: u64,
     pub(super) claimed_at: i64,
+    /// The last instant a `status` reconcile listed this claim's own
+    /// run (stow#943) — in memory only: a wake re-derives it from the
+    /// load-time reconcile, so it rides neither the log nor the
+    /// snapshot.
+    #[serde(skip)]
+    pub(super) lease_at: i64,
     pub(super) not_before: i64,
     pub(super) error: Option<Box<str>>,
     pub(super) parked: Option<ParkedCompletion>,
@@ -232,6 +239,7 @@ impl Extra {
         self.generation == 0
             && self.run_id == 0
             && self.claimed_at == 0
+            && self.lease_at == 0
             && self.not_before == 0
             && self.error.is_none()
             && self.parked.is_none()
