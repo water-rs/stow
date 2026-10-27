@@ -225,9 +225,10 @@ pub struct RepoContribution {
 pub struct ProjectsPlan {
     /// The repository list the plan was built from.
     pub file: String,
-    /// Every enqueue request across every repository and target —
-    /// deduplication is the scheduler's `task_id`, not a pass here.
-    pub tasks: Vec<EnqueueRequest>,
+    /// Every submission tree across every repository and target —
+    /// deduplication is the scheduler's `task_id`, not a pass here
+    /// (stow#878).
+    pub trees: Vec<stow_types::api::SubmissionTree>,
     /// How many requests each listed repository produced.
     pub per_repo: Vec<RepoContribution>,
     /// Repositories resolution failed on, with their reasons.
@@ -306,7 +307,7 @@ pub async fn run(args: ProjectsArgs, output: Output) -> stow_types::error::Resul
             generate(&token, &args, output).await
         }
         ProjectsCommand::Submit(args) => {
-            let edge = crate::Edge::connect_to_submit(args.yes).await?;
+            let edge = crate::Edge::connect_to_submit(args.yes)?;
             tokio::task::spawn_blocking(move || submit(edge.as_ref(), &args, output))
                 .await
                 .expect("projects submit panicked")
@@ -424,10 +425,12 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
     // name a repository this input actually lists.
     let trees =
         crate::source_trees::load_optional_source_trees(args.source_trees.as_ref(), &repos)?;
+    let published =
+        tokio::runtime::Handle::current().block_on(substitution_pool(&targets, &rustc_version))?;
     let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
     let mut plan = ProjectsPlan {
         file: args.file.display().to_string(),
-        tasks: Vec::new(),
+        trees: Vec::new(),
         per_repo: Vec::with_capacity(repos.len()),
         skipped: Vec::new(),
         submit_failed: Vec::new(),
@@ -438,6 +441,10 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
         inserted: 0,
         dropped: 0,
     };
+    // A substitution failure is the lane's error, not one repo's: the
+    // pulled slices are internally inconsistent, so the run reports it
+    // after the pool drains rather than panicking mid-lane (stow#919).
+    let mut substitution_error = None;
     // Results stream out of the pool in completion order: a repo's
     // batch submits the moment its resolve returns — the crash-safety
     // property the sequential loop had.
@@ -455,11 +462,24 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
         |_index, repo, result| match result {
             Ok(tasks) => {
                 tracing::info!(%repo, tasks = tasks.len(), "resolved");
-                // `edge` is present exactly when the run submits.
+                // `edge` is present exactly when the run submits. One
+                // resolve is one submission tree (stow#878); contained
+                // feature sets are served from their superset (stow#881)
+                // — this lane's pool is the one tree it submits per
+                // repo.
+                let tree = match substituted_tree(&tasks, &published) {
+                    Ok(tree) => tree,
+                    Err(error) => {
+                        substitution_error.get_or_insert(error);
+                        return;
+                    }
+                };
                 if let Some(edge) = edge
-                    && !tasks.is_empty()
+                    && !tree.nodes.is_empty()
                 {
-                    match tokio::runtime::Handle::current().block_on(submit_chunked(edge, &tasks)) {
+                    match tokio::runtime::Handle::current()
+                        .block_on(submit_chunked(edge, std::slice::from_ref(&tree)))
+                    {
                         Ok(chunk_outcome) => {
                             outcome.batches += chunk_outcome.batches;
                             outcome.submitted += chunk_outcome.submitted;
@@ -479,7 +499,7 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
                     repo: repo.clone(),
                     tasks: tasks.len(),
                 });
-                plan.tasks.extend(tasks);
+                plan.trees.push(tree);
             }
             Err(error) => {
                 tracing::warn!(%repo, reason = %error, "skipped");
@@ -489,13 +509,59 @@ fn submit(edge: Option<&Edge>, args: &SubmitArgs, output: Output) -> stow_types:
                 });
             }
         },
-    );
+    )?;
+    if let Some(error) = substitution_error {
+        return Err(error);
+    }
     let envelope = render::Planned {
         dry_run: edge.is_none(),
         plan,
         result: edge.map(|_| outcome),
     };
     render::emit(output, &envelope, render_projects_plan)
+}
+
+/// One resolved repo's submission tree with its contained feature sets
+/// served from the published pool (stow#881). A substitution failure is
+/// the lane's error — the pulled slices are internally inconsistent
+/// (stow#919) — so it propagates, it does not panic.
+fn substituted_tree(
+    tasks: &[stow_types::api::EnqueueRequest],
+    published: &[stow_types::api::PublishedIndexSlice],
+) -> stow_types::error::Result<stow_types::api::SubmissionTree> {
+    let mut tree = stow_types::api::SubmissionTree::from_enqueue_requests(
+        stow_types::api::SubmissionSource::Preheat,
+        tasks,
+    )
+    .expect("resolved repo converts to a submission tree");
+    stow_types::api::SubmissionTree::substitute_contained_sets(
+        std::slice::from_mut(&mut tree),
+        published,
+    )?;
+    Ok(tree)
+}
+
+/// The published side of this lane's superset-serving substitution
+/// pool (stow#881): the signed `index.<target>.<rustc>` slices —
+/// the same verified rows coverage reads — for every slice a batch
+/// node's identity can key on. That is each lane target plus its
+/// runner family's host triple, where host-side nodes mint.
+async fn substitution_pool(
+    targets: &[TargetTriple],
+    rustc_version: &WireRustcVersion,
+) -> stow_types::error::Result<Vec<stow_types::api::PublishedIndexSlice>> {
+    let mut pairs = BTreeSet::<(TargetTriple, WireRustcVersion)>::new();
+    for target in targets {
+        pairs.insert((target.clone(), rustc_version.clone()));
+        if let Some(family) = stow_types::api::runner_family(target.as_str())
+            && family.host_triple() != target.as_str()
+        {
+            let host = TargetTriple::parse(family.host_triple().to_owned())
+                .map_err(|error| stow_error!("family host triple: {error}"))?;
+            pairs.insert((host, rustc_version.clone()));
+        }
+    }
+    crate::manual::published_slices(&pairs).await
 }
 
 /// The human render of a projects-lane run: the resolved/skipped
@@ -506,7 +572,10 @@ fn render_projects_plan(envelope: &render::Planned<ProjectsPlan, SubmitOutcome>)
     let plan = &envelope.plan;
     let mut out = format!(
         "{} task(s) from {} repositories\nresolved {}, skipped {}",
-        plan.tasks.len(),
+        plan.trees
+            .iter()
+            .map(|tree| tree.nodes.len())
+            .sum::<usize>(),
         plan.per_repo.len(),
         plan.per_repo.len(),
         plan.skipped.len(),
@@ -954,7 +1023,7 @@ pub fn resolve_project_dir(
 /// — a full wave is far over the edge's single-request bound.
 pub async fn submit_chunked(
     edge: &Edge,
-    tasks: &[EnqueueRequest],
+    trees: &[stow_types::api::SubmissionTree],
 ) -> stow_types::error::Result<SubmitOutcome> {
     let mut outcome = SubmitOutcome {
         batches: 0,
@@ -962,7 +1031,7 @@ pub async fn submit_chunked(
         inserted: 0,
         dropped: 0,
     };
-    for chunk in tasks.chunks(SUBMIT_CHUNK) {
+    for chunk in trees.chunks(SUBMIT_CHUNK) {
         let response: SchedulerSubmitResponse = crate::submit(edge, chunk).await?;
         outcome.batches += 1;
         outcome.submitted += response.submitted;

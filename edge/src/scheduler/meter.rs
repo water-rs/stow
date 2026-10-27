@@ -7,16 +7,31 @@
 //! statement through [`QuerySource`] and books the returned
 //! [`DbExecResult`]'s `rows_read`/`rows_written` — which `CfDurableDb`
 //! reads off the `SqlStorageCursor` — into a per-operation `pending`
-//! counter. Handlers keep extracting a plain `DurableDb` (the
+//! counter and the isolate-wide `unsettled` accumulator on the
+//! [`GraphCell`]. Handlers keep extracting a plain `DurableDb` (the
 //! middleware re-inserts the wrapped handle under the same type), so
 //! `queue.rs` never knows it is metered. [`Meter::settle`] folds the
-//! pending counts into a per-UTC-day `do_meter` row once per request
-//! (and once per alarm pass) — the DO bills `rowsRead` and
-//! `rowsWritten`, so the meter measures exactly what costs money.
+//! pending counts into the graph's per-UTC-day meter once per request
+//! (and once per alarm pass) and subtracts them from `unsettled` — the
+//! DO bills `rowsRead` and `rowsWritten`, so the meter measures
+//! exactly what costs money. The one-row `meter` table checkpoints
+//! `graph.meter + unsettled` at each wake and snapshot (stow#931), so
+//! the stored row covers every operation in flight: the snapshot head
+//! can never contain the cost of its own statements, and the durable
+//! row is the single source a wake restores.
 //!
-//! The day the meter crosses `monthly allowance / 30 *
-//! STOW_COST_BUDGET_MULTIPLIER`, dispatch freezes on the operation that
-//! crossed it — not on a later poll. The `incident` issue record and
+//! Exactness rests on one rule the schema cannot enforce: between two
+//! checkpoints the only billed statements are `event_log` appends —
+//! the wake's replay re-counts each append at its billed 1 R + 1 W,
+//! so a settled read or write after the last checkpoint would die
+//! with the isolate, uncounted. Every statement outside a wake or
+//! snapshot is an append; the budget probe's seed record rides the
+//! snapshot head instead of a `store_meta` row for the same reason.
+//!
+//! The day the meter crosses `80% of the monthly allowance / 30 *
+//! STOW_COST_BUDGET_MULTIPLIER` — one day of the stow#883 cost line —
+//! dispatch freezes on the operation that crossed it — not on a later
+//! poll. The `incident` issue record and
 //! the while-frozen digest stay the watchdog's (#450); the edge sends
 //! only the transition email.
 
@@ -27,12 +42,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use skyzen_services::durable::{DurableDb, DurableDbBackend, DurableDbError};
 use skyzen_services::{DbExecResult, DbValue, QuerySource};
 
+use super::graph::{GraphCell, LoadedGraph, Unsettled};
 use crate::errors::QueueError;
 
 /// The Workers Paid DO allowances the meter's daily budget lines divide
 /// — one table in `stow-types`, shared with the watchdog and the
-/// `Preheat cost` lane.
-pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY};
+/// `Preheat cost` lane — and the daily derivation of the stow#883 line
+/// they are checked against.
+pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY, daily_budget};
 
 /// `STOW_COST_BUDGET_MULTIPLIER`'s default — scales every daily
 /// budget, so a shared account can trip earlier by lowering it.
@@ -47,15 +64,8 @@ pub fn parse_f64_binding(binding_name: &str, raw: &str) -> Result<f64, QueueErro
     })
 }
 
-/// The per-day budget is the included month spread over thirty days —
-/// the same convention the deleted GraphQL probe used, now applied to
-/// what the DO itself measured instead of what analytics reported.
-const fn daily_budget(monthly: f64, multiplier: f64) -> f64 {
-    monthly / 30.0 * multiplier
-}
-
-/// The day's meter row after the pending counts folded in — the values
-/// the budget comparison and the cost-trip alert both read.
+/// The day's meter after the pending counts folded in — the values the
+/// budget comparison and the cost-trip alert both read.
 #[derive(Debug, Clone, Copy)]
 pub struct MeterTotals {
     /// `rowsRead` billed to the DO today (UTC).
@@ -79,7 +89,7 @@ impl Pending {
     }
 
     /// Read-and-clear — a settled operation's counts must not ride
-    /// into the next settle's write.
+    /// into the next settle.
     fn take(&self) -> (u64, u64) {
         (
             self.rows_read.swap(0, Ordering::Relaxed),
@@ -89,7 +99,10 @@ impl Pending {
 }
 
 /// The metering seam: a [`DurableDbBackend`] that forwards to the real
-/// backend and accumulates each statement's row counts. `DurableDb`'s
+/// backend and accumulates each statement's row counts — once into the
+/// operation's `pending` (what `settle` drains) and once into the
+/// cell's `unsettled` (what a checkpoint folds in, so it covers every
+/// operation in flight, not only the one that writes it). `DurableDb`'s
 /// `query().bind().fetch_*` builder reaches this through `QuerySource`,
 /// so the placeholder counting, `LIMIT 1` append and row decode stay
 /// skyzen's — nothing is re-implemented here.
@@ -97,12 +110,14 @@ impl Pending {
 pub struct MeteringBackend {
     inner: Arc<DurableDb>,
     pending: Arc<Pending>,
+    unsettled: Arc<Unsettled>,
 }
 
 impl MeteringBackend {
     async fn counted(
         inner: &Arc<DurableDb>,
         pending: &Arc<Pending>,
+        unsettled: &Arc<Unsettled>,
         sql: String,
         params: Vec<DbValue>,
         write: bool,
@@ -114,6 +129,7 @@ impl MeteringBackend {
             QuerySource::query(&mut source, &sql, &params).await?
         };
         pending.add(result.rows_read, result.rows_written);
+        unsettled.add(result.rows_read, result.rows_written);
         Ok(result)
     }
 }
@@ -127,6 +143,7 @@ impl DurableDbBackend for MeteringBackend {
         Self::counted(
             &self.inner,
             &self.pending,
+            &self.unsettled,
             query.to_owned(),
             params.to_vec(),
             false,
@@ -141,6 +158,7 @@ impl DurableDbBackend for MeteringBackend {
         Self::counted(
             &self.inner,
             &self.pending,
+            &self.unsettled,
             query.to_owned(),
             params.to_vec(),
             true,
@@ -160,96 +178,70 @@ impl DurableDbBackend for MeteringBackend {
 
 /// One operation's metering session: [`Meter::wrap`] returns the
 /// wrapped `DurableDb` the handler runs on, and the `Meter` itself
-/// settles the operation's counts afterward — through the unwrapped
-/// inner handle, since metering the meter's own write would recurse
-/// (and charge its row to a request that already ended).
+/// settles the operation's counts into the graph's day meter afterward.
+/// The day's durable copy is the `meter` row's checkpoint, written at
+/// each wake and snapshot — settling itself costs no storage row.
 #[derive(Clone)]
 pub struct Meter {
-    inner: Arc<DurableDb>,
     pending: Arc<Pending>,
-    /// The `probe_meter` row this operation also books under — set only
+    /// The cell's isolate-wide accumulator this meter's backend also
+    /// books into — `settle` subtracts what it takes so `graph.meter +
+    /// unsettled` stays the exact billed total (stow#931).
+    unsettled: Arc<Unsettled>,
+    /// The probe-ledger op this operation also books under — set only
     /// on the budget-probe deploy (`STOW_SCHEDULER_BUDGET=1`), where the
     /// `Preheat cost` lane reads cost per event kind.
     ledger_op: Option<String>,
 }
 
-#[derive(skyzen::FromRow)]
-struct MeterRow {
-    rows_read: u64,
-    rows_written: u64,
-}
-
 impl Meter {
-    /// Wrap `db` in the metering backend: the returned `DurableDb` is
-    /// what handlers and queue functions see; the returned `Meter`
-    /// settles and trips once the operation's work is done.
-    pub fn wrap(db: DurableDb) -> (DurableDb, Self) {
-        let inner = Arc::new(db);
+    /// Wrap `db` in the metering backend, bound to `cell`'s unsettled
+    /// accumulator: the returned `DurableDb` is what handlers and store
+    /// functions see; the returned `Meter` settles and trips once the
+    /// operation's work is done.
+    pub fn wrap(db: DurableDb, cell: &GraphCell) -> (DurableDb, Self) {
         let pending = Arc::new(Pending::default());
         let metered = DurableDb::new(MeteringBackend {
-            inner: Arc::clone(&inner),
+            inner: Arc::new(db),
             pending: Arc::clone(&pending),
+            unsettled: Arc::clone(cell.unsettled()),
         });
         (
             metered,
             Self {
-                inner,
                 pending,
+                unsettled: Arc::clone(cell.unsettled()),
                 ledger_op: None,
             },
         )
     }
 
     /// Also book this operation's counts under `op` in the probe ledger
-    /// (`probe_meter`) when it settles. Only the budget-probe deploy
-    /// asks for it.
+    /// when it settles. Only the budget-probe deploy asks for it.
     #[must_use]
     pub fn with_ledger_op(mut self, op: String) -> Self {
         self.ledger_op = Some(op);
         self
     }
 
-    /// The unmetered handle — the meter row's own write and the freeze
-    /// trip's bookkeeping go through it.
-    pub fn unmetered(&self) -> &DurableDb {
-        &self.inner
-    }
-
-    /// Drain the pending counts into today's `do_meter` row and answer
-    /// the totals. `Ok(None)` when the operation ran no statements (the
-    /// row write would itself cost a write — skipped, not metered).
-    ///
-    /// The merge is one upsert keyed on the UTC day so a request that
-    /// straddles midnight books its work to the day it ended in — a
-    /// boundary skew of a few requests is acceptable and keeps the
-    /// write single-statement.
-    pub async fn settle(&self) -> Result<Option<MeterTotals>, QueueError> {
+    /// Drain the pending counts into the graph's day meter at `now_ms`
+    /// and answer the day's totals. `None` when the operation ran no
+    /// statements.
+    pub fn settle(&self, graph: LoadedGraph<'_>, now_ms: i64) -> Option<MeterTotals> {
         let (read, written) = self.pending.take();
-        if let Some(op) = &self.ledger_op {
-            book_ledger(&self.inner, op, read, written).await?;
-        }
-        if read == 0 && written == 0 {
-            return Ok(None);
-        }
-        let totals = self
-            .inner
-            .query(
-                "INSERT INTO do_meter (day, rows_read, rows_written) \
-                 VALUES (strftime('%Y-%m-%d', 'now'), ?, ?) \
-                 ON CONFLICT(day) DO UPDATE SET \
-                   rows_read = do_meter.rows_read + excluded.rows_read, \
-                   rows_written = do_meter.rows_written + excluded.rows_written \
-                 RETURNING rows_read, rows_written",
-            )
-            .bind(i64::try_from(read).unwrap_or(i64::MAX))
-            .bind(i64::try_from(written).unwrap_or(i64::MAX))
-            .fetch_one::<MeterRow>()
-            .await
-            .map_err(|error| format!("settle do meter: {error}"))?;
-        Ok(Some(MeterTotals {
-            rows_read: totals.rows_read,
-            rows_written: totals.rows_written,
-        }))
+        self.unsettled.sub(read, written);
+        graph.with(|graph| {
+            graph.meter.roll_to(&super::graph::utc_day(now_ms));
+            match &self.ledger_op {
+                Some(op) => graph.meter.record(op, read, written),
+                None if read == 0 && written == 0 => return None,
+                None => graph.meter.add(read, written),
+            }
+            Some(MeterTotals {
+                rows_read: graph.meter.rows_read,
+                rows_written: graph.meter.rows_written,
+            })
+        })
     }
 
     /// The settled totals versus the budgets — the over-budget entries
@@ -259,13 +251,13 @@ impl Meter {
         clippy::cast_precision_loss,
         reason = "row counts fit f64 exactly to 2^53"
     )]
-    pub async fn budget_verdict(
+    pub fn budget_verdict(
         &self,
+        graph: LoadedGraph<'_>,
+        now_ms: i64,
         multiplier: f64,
-    ) -> Result<Option<Vec<stow_types::api::DispatchFreezeCostEntry>>, QueueError> {
-        let Some(totals) = self.settle().await? else {
-            return Ok(None);
-        };
+    ) -> Option<Vec<stow_types::api::DispatchFreezeCostEntry>> {
+        let totals = self.settle(graph, now_ms)?;
         let mut over = Vec::new();
         let read_budget = daily_budget(DO_ROWS_READ_MONTHLY, multiplier);
         let write_budget = daily_budget(DO_ROWS_WRITTEN_MONTHLY, multiplier);
@@ -283,31 +275,29 @@ impl Meter {
                 budget: write_budget,
             });
         }
-        if over.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(over))
-        }
+        (!over.is_empty()).then_some(over)
     }
 
     /// The whole event-driven cost trip, platform-free so host tests
     /// exercise what `settle_meter` wires: settle the operation's
     /// counts, and if the day just crossed budget engage the freeze
     /// with one transition email via `sink`. `store`/`sink` are seams:
-    /// the wasm callers pass the DO's `DbStore` and `EdgeAlerter`, the
-    /// tests fake both.
+    /// the wasm callers pass the graph-backed store and `EdgeAlerter`,
+    /// the tests fake the sink.
     ///
     /// A live freeze returns `Unchanged` — the meter keeps accruing
     /// (statements still cost), but the alert went out on the first
     /// transition; the while-frozen digest is the watchdog's (#450).
     pub async fn settle_and_trip(
         &self,
+        graph: LoadedGraph<'_>,
+        now_ms: i64,
         store: &(impl crate::freeze::FreezeStore + Sync),
         sink: &(impl crate::freeze::AlertSink + Sync),
         multiplier: f64,
         now: &str,
     ) -> Result<Option<crate::freeze::FreezeTransition>, QueueError> {
-        let Some(over) = self.budget_verdict(multiplier).await? else {
+        let Some(over) = self.budget_verdict(graph, now_ms, multiplier) else {
             return Ok(None);
         };
         let trigger =
@@ -337,7 +327,7 @@ impl Meter {
 /// collapsed to [`LEDGER_OP_BATCH_COMPLETE`], so every record's reads
 /// and every batch's completion land on one row each.
 ///
-/// [`LEDGER_OP_BATCH_COMPLETE`]: stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE
+/// [`LEDGER_OP_BATCH_COMPLETE`]: stow_types::do_budgets::LEDGER_OP_TASK_COMPLETE
 #[must_use]
 pub fn ledger_op(method: &str, path: &str) -> String {
     if method == "POST"
@@ -346,7 +336,7 @@ pub fn ledger_op(method: &str, path: &str) -> String {
             .and_then(|rest| rest.strip_suffix("/complete"))
             .is_some_and(|batch_id| !batch_id.is_empty() && !batch_id.contains('/'))
     {
-        return stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE.to_owned();
+        return stow_types::do_budgets::LEDGER_OP_TASK_COMPLETE.to_owned();
     }
     let route = path.strip_prefix("/requests/").map_or_else(
         || path.to_owned(),
@@ -360,59 +350,24 @@ pub fn ledger_op(method: &str, path: &str) -> String {
     format!("{method} {route}")
 }
 
-/// Book one settled operation into `probe_meter` — one upsert through
-/// the unmetered handle, so the ledger's own write is never charged to
-/// the operation it records. An operation with no statements still
-/// counts as an event.
-async fn book_ledger(db: &DurableDb, op: &str, read: u64, written: u64) -> Result<(), QueueError> {
-    db.query(
-        "INSERT INTO probe_meter (op, events, rows_read, rows_written) VALUES (?, 1, ?, ?) \
-         ON CONFLICT(op) DO UPDATE SET \
-           events = probe_meter.events + 1, \
-           rows_read = probe_meter.rows_read + excluded.rows_read, \
-           rows_written = probe_meter.rows_written + excluded.rows_written",
-    )
-    .bind(op.to_owned())
-    .bind(
-        i64::try_from(read)
-            .map_err(|_| format!("probe ledger {op}: rowsRead {read} overflows i64"))?,
-    )
-    .bind(
-        i64::try_from(written)
-            .map_err(|_| format!("probe ledger {op}: rowsWritten {written} overflows i64"))?,
-    )
-    .execute()
-    .await
-    .map_err(|error| format!("book probe ledger {op}: {error}"))?;
-    Ok(())
-}
-
-#[derive(skyzen::FromRow)]
-struct LedgerRow {
-    op: String,
-    events: u64,
-    rows_read: u64,
-    rows_written: u64,
-}
-
-/// Every `probe_meter` row — the `GET /budget/ledger` answer. Bounded by
-/// the number of distinct operations the object serves, never by the
-/// queue.
-pub async fn ledger(db: &DurableDb) -> Result<stow_types::api::SchedulerLedger, QueueError> {
-    let rows = db
-        .query("SELECT op, events, rows_read, rows_written FROM probe_meter ORDER BY op")
-        .fetch_all::<LedgerRow>()
-        .await
-        .map_err(|error| format!("read probe ledger: {error}"))?;
-    Ok(stow_types::api::SchedulerLedger {
-        ops: rows
-            .into_iter()
-            .map(|row| stow_types::api::SchedulerLedgerOp {
-                op: row.op,
-                events: row.events,
-                rows_read: row.rows_read,
-                rows_written: row.rows_written,
-            })
+/// Every op the day meter booked since the last reset — the
+/// `GET /budget/ledger` answer. Bounded by the number of distinct
+/// operations the object serves, never by the queue.
+pub fn ledger(graph: LoadedGraph<'_>) -> stow_types::api::SchedulerLedger {
+    graph.with(|graph| stow_types::api::SchedulerLedger {
+        woken_at_ms: graph.woken_at_ms,
+        ops: graph
+            .meter
+            .ops
+            .iter()
+            .map(
+                |(op, &(events, rows_read, rows_written))| stow_types::api::SchedulerLedgerOp {
+                    op: op.clone(),
+                    events,
+                    rows_read,
+                    rows_written,
+                },
+            )
             .collect(),
     })
 }
@@ -421,9 +376,22 @@ pub async fn ledger(db: &DurableDb) -> Result<stow_types::api::SchedulerLedger, 
 /// `DurableDb` extension for the metered wrapper before the handler
 /// runs, then settles the operation's counts and — when the day
 /// crossed the budget — engages the freeze on this request, not a
-/// later poll.
+/// later poll. The wrap binds to the object's `GraphCell`: every
+/// statement books into the cell's isolate-wide `unsettled`, so a
+/// wake's or a snapshot's meter checkpoint covers every operation in
+/// flight, not only the checkpointing one (stow#931).
 #[cfg(target_arch = "wasm32")]
-pub struct MeterGuard;
+pub struct MeterGuard {
+    graph: GraphCell,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl MeterGuard {
+    /// The object's graph cell — the wraps bind to its `unsettled`.
+    pub const fn new(graph: GraphCell) -> Self {
+        Self { graph }
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
 impl skyzen::middleware::Middleware for MeterGuard {
@@ -435,7 +403,7 @@ impl skyzen::middleware::Middleware for MeterGuard {
         let Some(db) = request.extensions().get::<DurableDb>().cloned() else {
             return next.run(request).await;
         };
-        let (metered, meter) = Meter::wrap(db);
+        let (metered, meter) = Meter::wrap(db.clone(), &self.graph);
         request.extensions_mut().insert(metered);
         let env = request
             .extensions()
@@ -455,10 +423,48 @@ impl skyzen::middleware::Middleware for MeterGuard {
         };
         let response = next.run(request).await;
         if let Some(env) = env {
-            super::object::settle_meter(&meter, &env, multiplier).await;
+            super::object::settle_meter(&self.graph, &db, &meter, &env, multiplier).await;
         }
         response
     }
+}
+
+/// `object::settle_meter`'s measured tail, platform-free so host tests
+/// run the real freeze-append wiring (stow#931): settle `aux` — whose
+/// metered `db` the caller already woke the graph on, so the wake's
+/// own reads are in the verdict's totals — evaluate the cost trip,
+/// append whatever `Freeze` events the transition staged **on the
+/// metered handle** (booking the append, so a later checkpoint covers
+/// its seq and a wake replays the row exactly once), then settle `aux`
+/// again. `at` is the transition's ISO timestamp.
+///
+/// # Errors
+/// `QueueError` from the trip evaluation; a failed freeze append is
+/// logged, never raised — a metering bug must not take dispatch down.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "settle_meter's whole context: the two meters, both handles, the sink and the stamps"
+)]
+pub async fn trip_and_persist(
+    aux: &Meter,
+    metered_db: &DurableDb,
+    meter: &Meter,
+    graph: LoadedGraph<'_>,
+    sink: &(impl crate::freeze::AlertSink + Sync),
+    multiplier: f64,
+    now_ms: i64,
+    at: &str,
+) -> Result<Option<crate::freeze::FreezeTransition>, QueueError> {
+    aux.settle(graph, now_ms);
+    let store = super::graph::GraphFreezeStore::new(graph, at.to_owned(), now_ms);
+    let transition = meter
+        .settle_and_trip(graph, now_ms, &store, sink, multiplier, at)
+        .await?;
+    if let Err(error) = super::routes::persist_freeze(metered_db, &store, now_ms).await {
+        tracing::error!(%error, "persist cost-trip freeze failed");
+    }
+    aux.settle(graph, now_ms);
+    Ok(transition)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -466,37 +472,23 @@ mod tests {
     use std::future::Future;
     use std::sync::Mutex;
 
-    use stow_types::api::{ChannelOutcome, DispatchFreezeRecord};
+    use stow_types::api::{ChannelOutcome, SchedulerEvent};
 
     use skyzen_services::durable::DurableDb;
 
     use super::{DO_ROWS_WRITTEN_MONTHLY, Meter, daily_budget};
-    use crate::errors::QueueError;
-    use crate::freeze::{AlertDraft, AlertSink, FreezeStore, FreezeTransition};
-    use crate::scheduler::queue;
-    use crate::scheduler::test_db::memory_db;
+    use crate::freeze::{AlertDraft, AlertSink, FreezeTransition};
+    use crate::scheduler::graph::{Graph, GraphCell, GraphFreezeStore};
+    use crate::scheduler::{store, test_db};
 
-    /// The `settings`-row freeze store the DO hands `settle_and_trip`,
-    /// over the meter's unmetered inner handle.
-    struct Store<'a>(&'a DurableDb);
+    const NOW_MS: i64 = 1_790_000_000_000;
 
-    impl FreezeStore for Store<'_> {
-        fn record(
-            &self,
-        ) -> impl Future<Output = Result<Option<DispatchFreezeRecord>, QueueError>> + Send {
-            queue::freeze_record(self.0)
-        }
-
-        fn set(
-            &self,
-            record: &DispatchFreezeRecord,
-        ) -> impl Future<Output = Result<(), QueueError>> + Send {
-            queue::set_freeze(self.0, record)
-        }
-
-        fn delete(&self) -> impl Future<Output = Result<(), QueueError>> + Send {
-            queue::delete_freeze(self.0)
-        }
+    /// A loaded graph cell — the substrate the meter settles into and
+    /// the freeze store gates on.
+    fn cell() -> GraphCell {
+        let cell = GraphCell::default();
+        cell.install(Graph::default());
+        cell
     }
 
     /// The email sink, faked: records `(verb, subject)` per send.
@@ -529,10 +521,18 @@ mod tests {
         }
     }
 
-    /// A metered handle plus its settle meter over the in-memory
-    /// backend — the same `Meter::wrap` shape production installs.
-    async fn metered() -> Result<(DurableDb, Meter), QueueError> {
-        Ok(Meter::wrap(memory_db().await?))
+    /// A metered handle over the in-memory store plus its meter — the
+    /// same `Meter::wrap` shape production installs, bound to `cell`'s
+    /// unsettled accumulator.
+    async fn metered(cell: &GraphCell) -> (DurableDb, Meter) {
+        Meter::wrap(test_db::memory_db().await.expect("db"), cell)
+    }
+
+    fn mutate() -> SchedulerEvent {
+        SchedulerEvent::Mutate {
+            op: stow_types::api::MutationKind::Retry,
+            task_ids: vec!["t".to_owned()],
+        }
     }
 
     /// Every request record books under one op per route.
@@ -554,7 +554,7 @@ mod tests {
     /// `/batches/` collapses into it.
     #[test]
     fn a_batch_completion_collapses_to_the_shared_ledger_op() {
-        let completion = stow_types::do_budgets::LEDGER_OP_BATCH_COMPLETE;
+        let completion = stow_types::do_budgets::LEDGER_OP_TASK_COMPLETE;
         assert_eq!(
             super::ledger_op("POST", "/batches/00000000000000000000000000000001/complete"),
             completion
@@ -576,17 +576,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settle_skips_the_write_when_nothing_ran() {
-        let (_db, meter) = metered().await.expect("db");
-        assert!(meter.settle().await.expect("settle").is_none());
-        // An unmetered check: the do_meter row must not exist.
-        let row = meter
-            .unmetered()
-            .query("SELECT 1 FROM do_meter")
-            .fetch_optional::<skyzen_services::Row>()
-            .await
-            .expect("meter row");
-        assert!(row.is_none());
+    async fn settle_books_nothing_when_nothing_ran() {
+        let owner = cell();
+        let (_db, meter) = metered(&owner).await;
+        let cell = owner.loaded().expect("installed");
+        assert!(meter.settle(cell, NOW_MS).is_none());
+        assert_eq!(cell.with(|graph| graph.meter.rows_written), 0);
     }
 
     /// `STOW_COST_BUDGET_MULTIPLIER` parses like every other binding: a
@@ -602,57 +597,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn metered_statements_fold_into_the_day_row() {
-        let (db, meter) = metered().await.expect("db");
-        // A handful of real statements through the wrapped handle.
-        db.query("INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version, dependency_identity, explicit_spelling) \
-                  VALUES ('t1', 'serde', '1.0.0', '[]', 'x86_64-unknown-linux-gnu', '1.98.1', 'd1', 0)")
-            .execute()
+    async fn metered_statements_fold_into_the_day_meter() {
+        let owner = cell();
+        let (db, meter) = metered(&owner).await;
+        let cell = owner.loaded().expect("installed");
+        store::append_events(&db, &[mutate(), mutate()], NOW_MS)
             .await
-            .expect("insert");
-        db.query("SELECT COUNT(*) AS n FROM queue")
-            .fetch_all::<skyzen_services::Row>()
-            .await
-            .expect("count");
-        let totals = meter.settle().await.expect("settle").expect("a settle");
-        assert!(totals.rows_read >= 1, "the SELECT read ≥1 row");
-        assert!(totals.rows_written >= 1, "the INSERT wrote ≥1 row");
-        // A second settle with no intervening work writes nothing.
-        assert!(meter.settle().await.expect("settle again").is_none());
+            .expect("append");
+        store::log_tail(&db, 0).await.expect("tail");
+        let totals = meter.settle(cell, NOW_MS).expect("a settle");
+        assert!(totals.rows_written >= 2, "two appended rows");
+        assert!(totals.rows_read >= 2, "the tail read both rows back");
+        // A second settle with no intervening work books nothing new.
+        let again = meter.settle(cell, NOW_MS);
+        assert!(again.is_none());
+        assert_eq!(
+            cell.with(|graph| graph.meter.rows_written),
+            totals.rows_written
+        );
     }
 
     #[tokio::test]
-    async fn the_write_is_the_only_meter_cost_per_request() {
-        let (db, meter) = metered().await.expect("db");
-        db.query("SELECT 1")
-            .fetch_all::<skyzen_services::Row>()
+    async fn the_probe_ledger_books_one_event_per_operation() {
+        let owner = cell();
+        let (db, meter) = metered(&owner).await;
+        let meter = meter.with_ledger_op("POST /tasks/retry".to_owned());
+        let cell = owner.loaded().expect("installed");
+        cell.with(|graph| graph.woken_at_ms = NOW_MS - 5);
+        store::append_events(&db, &[mutate()], NOW_MS)
             .await
-            .expect("select");
-        meter.settle().await.expect("settle");
-        // Settle's own upsert is unmetered: pending stays empty.
-        assert_eq!(meter.pending.take(), (0, 0));
-        drop(db);
+            .expect("append");
+        meter.settle(cell, NOW_MS);
+        // An operation with no statements still counts as an event.
+        meter.settle(cell, NOW_MS);
+        let ledger = super::ledger(cell);
+        // The reader tells this graph's ledger from a reloaded one's.
+        assert_eq!(ledger.woken_at_ms, NOW_MS - 5);
+        let [op] = ledger.ops.as_slice() else {
+            panic!("one op row");
+        };
+        assert_eq!(op.op, "POST /tasks/retry");
+        assert_eq!(op.events, 2);
+        assert!(op.rows_written >= 1);
+    }
+
+    #[tokio::test]
+    async fn the_day_rolls_at_utc_midnight() {
+        let owner = cell();
+        let (db, meter) = metered(&owner).await;
+        let cell = owner.loaded().expect("installed");
+        store::append_events(&db, &[mutate()], NOW_MS)
+            .await
+            .expect("append");
+        let first = meter.settle(cell, NOW_MS).expect("settle");
+        store::append_events(&db, &[mutate()], NOW_MS + 86_400_000)
+            .await
+            .expect("append");
+        let next = meter.settle(cell, NOW_MS + 86_400_000).expect("settle");
+        assert!(first.rows_written >= 1);
+        assert_eq!(next.rows_written, 1, "the new day starts from zero");
     }
 
     #[tokio::test]
     async fn crossing_the_budget_freezes_on_the_operation_that_crossed_it() {
-        let (db, meter) = metered().await.expect("db");
+        let owner = cell();
+        let (db, meter) = metered(&owner).await;
         let sink = Sink::default();
+        let cell = owner.loaded().expect("installed");
         // A burst of writes through the wrapped handle; a tiny
         // multiplier puts the write budget under the burst.
-        for index in 0..8 {
-            db.query("INSERT INTO queue (task_id, crate_name, version, features_json, target, rustc_version, dependency_identity, explicit_spelling) \
-                      VALUES (?, ?, '1.0.0', '[]', 'x86_64-unknown-linux-gnu', '1.98.1', 'd1', 0)")
-                .bind(format!("t{index}"))
-                .bind(format!("serde-{index}"))
-                .execute()
+        for _ in 0..8 {
+            store::append_events(&db, &[mutate()], NOW_MS)
                 .await
-                .expect("insert");
+                .expect("append");
         }
         let multiplier = 1.0e-9;
+        let freeze_store = GraphFreezeStore::new(cell, "2026-09-27T01:00:00Z".to_owned(), NOW_MS);
         let transition = meter
             .settle_and_trip(
-                &Store(meter.unmetered()),
+                cell,
+                NOW_MS,
+                &freeze_store,
                 &sink,
                 multiplier,
                 "2026-09-27T01:00:00Z",
@@ -667,27 +692,29 @@ mod tests {
             record.trigger,
             stow_types::api::DispatchFreezeTrigger::Cost(_)
         ));
-        // The operation froze dispatch on its own settle — no poll.
-        assert!(queue::freeze_enabled(&db).await.expect("enabled"));
+        // The operation froze dispatch on its own settle — no poll —
+        // and staged the `Freeze` event for the log.
+        assert!(cell.with(|g| g.freeze().is_some()));
+        assert_eq!(freeze_store.take_events().len(), 1);
         assert_eq!(
             sink.0.lock().expect("sink").as_slice(),
             [(
                 "opened",
-                "[stow] dispatch frozen — durable object rows written over daily budget".to_owned()
+                "[stow] dispatch frozen — durable object rows read over daily budget".to_owned()
             )],
-            "exactly one transition email"
+            "exactly one transition email, naming the first metric over (an append's RETURNING \
+             row reads one)"
         );
 
         // More metered work while frozen: the meter still accrues, the
         // trip re-evaluates, and the store answers Unchanged — the email
         // count stays at one.
-        db.query("SELECT COUNT(*) AS n FROM queue")
-            .fetch_all::<skyzen_services::Row>()
-            .await
-            .expect("count");
+        store::log_tail(&db, 0).await.expect("tail");
         let again = meter
             .settle_and_trip(
-                &Store(meter.unmetered()),
+                cell,
+                NOW_MS,
+                &GraphFreezeStore::new(cell, "2026-09-27T01:00:00Z".to_owned(), NOW_MS),
                 &sink,
                 multiplier,
                 "2026-09-27T01:05:00Z",
@@ -701,15 +728,16 @@ mod tests {
 
     #[tokio::test]
     async fn under_budget_settles_without_a_trip() {
-        let (db, meter) = metered().await.expect("db");
+        let owner = cell();
+        let (db, meter) = metered(&owner).await;
         let sink = Sink::default();
-        db.query("SELECT 1")
-            .fetch_all::<skyzen_services::Row>()
-            .await
-            .expect("select");
+        let cell = owner.loaded().expect("installed");
+        store::log_tail(&db, 0).await.expect("tail");
         let transition = meter
             .settle_and_trip(
-                &Store(meter.unmetered()),
+                cell,
+                NOW_MS,
+                &GraphFreezeStore::new(cell, "2026-09-27T01:00:00Z".to_owned(), NOW_MS),
                 &sink,
                 1.0,
                 "2026-09-27T01:00:00Z",
@@ -718,20 +746,17 @@ mod tests {
             .expect("trip check");
         assert!(transition.is_none());
         assert!(sink.0.lock().expect("sink").is_empty());
-        // The settle itself landed in do_meter under today's key.
-        let day = meter
-            .unmetered()
-            .query("SELECT day FROM do_meter")
-            .fetch_scalar::<String>()
-            .await
-            .expect("meter day");
-        assert_eq!(day.len(), 10, "YYYY-MM-DD");
+        assert_eq!(
+            cell.with(|graph| graph.meter.day.clone()),
+            super::super::graph::utc_day(NOW_MS)
+        );
     }
 
     #[tokio::test]
     async fn budget_scales_with_the_multiplier() {
         let budget = daily_budget(DO_ROWS_WRITTEN_MONTHLY, 1.0);
-        assert!((budget - DO_ROWS_WRITTEN_MONTHLY / 30.0).abs() < f64::EPSILON);
-        assert!((daily_budget(30.0, 2.0) - 2.0).abs() < f64::EPSILON);
+        let expected = DO_ROWS_WRITTEN_MONTHLY * stow_types::do_budgets::DAILY_SHARE;
+        assert!((budget - expected).abs() < f64::EPSILON);
+        assert!((daily_budget(30.0, 2.0) - 1.6).abs() < f64::EPSILON);
     }
 }

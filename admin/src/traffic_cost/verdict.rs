@@ -322,7 +322,7 @@ mod tests {
             .iter_mut()
             .find(|row| row.name == "GET /tasks")
             .expect("row");
-        row.rows_read *= 10;
+        row.rows_read += 1_000;
         let rows = growth(&small, &grown).expect("growth");
         let rising: Vec<&str> = rows
             .iter()

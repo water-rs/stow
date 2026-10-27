@@ -1,15 +1,16 @@
-//! `stow-admin traffic-cost fixture-runs` — the `build-batch.yml` runs
-//! the seeded fixture's in-flight batches are bound to, in the shape the
-//! local CI's `POST /seeded-runs` records.
+//! `stow-admin traffic-cost fixture-runs` — the `build-crate.yml`
+//! runs the seeded fixture's in-flight tasks are bound to, in the
+//! shape the local CI's `POST /seeded-runs` records.
 //!
-//! The fixture binds each in-flight row's one-leg batch to a run id
-//! that no dispatch through the mock ever allocated, so without these
-//! runs the alarm's leg resolution reads a 404 jobs page for every
-//! batch the callback lane completes and defers it until its ceiling —
-//! a loop production never runs. `scripts/traffic-cost.sh` posts them to
-//! the local CI, which publishes each leg's records artifact under the
-//! run's tag and records the run; the shape math stays in
-//! `stow_types::fixture`, never in the script.
+//! The fixture binds each in-flight row's task to a run id that no
+//! dispatch through the mock ever allocated, so without these runs
+//! the alarm's pending completions find no run to settle and the
+//! `workflow_run` webhook reads a 404 jobs page for every task the
+//! callback lane completes — a loop production never runs.
+//! `scripts/traffic-cost.sh` posts them to the local CI, which
+//! publishes each task's records artifact under the run's tag and
+//! records the run; the shape math stays in `stow_types::fixture`,
+//! never in the script.
 
 use clap::Args;
 use stow_types::fixture::FixtureShape;
@@ -25,22 +26,21 @@ use crate::render::{Output, Table, emit};
 #[derive(Debug, Args)]
 pub struct FixtureRunsArgs {
     /// Queue rows of the fixture the scheduler holds — the size the last
-    /// `scheduler budget --reset` seeded.
+    /// `scheduler budget` seeded.
     #[arg(long)]
     queue_rows: u32,
 }
 
-/// Every in-flight fixture batch as a finished, successful run.
+/// Every in-flight fixture task as a finished, successful run.
 fn seeded_runs(shape: FixtureShape) -> stow_types::error::Result<LocalCiSeededRuns> {
     let runs = (0..FixtureShape::IN_FLIGHT_ROWS)
         .map(|k| {
-            let batch = shape.in_flight_batch(k);
+            let task = shape.in_flight_run(k);
             Ok(LocalCiSeededRun {
-                workflow_run_id: Some(batch.run_id),
-                rustc_version: WireRustcVersion::parse(batch.rustc_version.to_owned())
+                workflow_run_id: Some(task.run_id),
+                rustc_version: WireRustcVersion::parse(task.rustc_version.to_owned())
                     .map_err(|error| stow_error!("fixture rustc: {error}"))?,
-                batch_id: batch.batch_id,
-                legs: vec![batch.task_id],
+                task_id: task.task_id,
                 status: LocalCiSeededStatus::Completed {
                     conclusion: LocalCiSeededConclusion::Success,
                 },
@@ -56,14 +56,13 @@ pub fn run(args: &FixtureRunsArgs, output: Output) -> stow_types::error::Result<
         queue_rows: args.queue_rows,
     })?;
     emit(output, &runs, |runs| {
-        let mut table = Table::new(&["run", "rustc", "batch", "leg 0"]);
+        let mut table = Table::new(&["run", "rustc", "task"]);
         for run in &runs.runs {
             table.push([
                 run.workflow_run_id
                     .map_or_else(|| "allocated".to_owned(), |id| id.to_string()),
                 run.rustc_version.as_str().to_owned(),
-                run.batch_id.to_string(),
-                run.legs.join(" "),
+                run.task_id.clone(),
             ]);
         }
         table.render()
@@ -76,25 +75,23 @@ mod tests {
 
     use super::seeded_runs;
 
-    /// One run per in-flight row, each the row's own bound batch with
-    /// the row as its single leg.
+    /// One run per in-flight row, each the row's own bound task.
     #[test]
-    fn every_in_flight_batch_is_one_seeded_run() {
+    fn every_in_flight_task_is_one_seeded_run() {
         let shape = FixtureShape::PRODUCTION;
         let runs = seeded_runs(shape).unwrap().runs;
         assert_eq!(runs.len(), FixtureShape::IN_FLIGHT_ROWS as usize);
         for (k, run) in (0..).zip(&runs) {
-            let batch = shape.in_flight_batch(k);
-            assert_eq!(run.workflow_run_id, Some(batch.run_id));
+            let task = shape.in_flight_run(k);
+            assert_eq!(run.workflow_run_id, Some(task.run_id));
             assert_eq!(
                 run.status,
                 stow_types::local_ci::LocalCiSeededStatus::Completed {
                     conclusion: stow_types::local_ci::LocalCiSeededConclusion::Success
                 }
             );
-            assert_eq!(run.batch_id, batch.batch_id);
-            assert_eq!(run.rustc_version.as_str(), batch.rustc_version);
-            assert_eq!(run.legs, [batch.task_id]);
+            assert_eq!(run.task_id, task.task_id);
+            assert_eq!(run.rustc_version.as_str(), task.rustc_version);
         }
     }
 }

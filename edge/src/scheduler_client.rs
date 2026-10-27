@@ -8,9 +8,11 @@ const SCHEDULER_SINGLETON_NAME: &str = "scheduler";
 const SCHEDULER_SUBMIT_URL: &str = "https://scheduler.internal/tasks/submit";
 const SCHEDULER_SUBMIT_TRUSTED_URL: &str = "https://scheduler.internal/tasks/submit/trusted";
 const SCHEDULER_SUBMIT_IDS_URL: &str = "https://scheduler.internal/tasks/submit/ids";
-const SCHEDULER_BATCHES_URL: &str = "https://scheduler.internal/batches";
+const SCHEDULER_COMPLETE_RUN_URL: &str = "https://scheduler.internal/tasks/complete-run";
+const SCHEDULER_RUN_UPDATE_URL: &str = "https://scheduler.internal/tasks/run-update";
 const SCHEDULER_REQUESTS_URL: &str = "https://scheduler.internal/requests";
 const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
+const SCHEDULER_HEALTH_URL: &str = "https://scheduler.internal/health";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
@@ -21,15 +23,21 @@ const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
 const SCHEDULER_BUDGET_LEDGER_URL: &str = "https://scheduler.internal/budget/ledger";
 const SCHEDULER_BUDGET_REARM_URL: &str = "https://scheduler.internal/budget/rearm";
 const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
+const SCHEDULER_PREHEAT_RELEASE_URL: &str = "https://scheduler.internal/preheat/release";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
-    requests: &[stow_types::api::EnqueueRequest],
-) -> Result<(), SchedulerClientError> {
-    if requests.is_empty() {
-        return Ok(());
+    trees: &[stow_types::api::SubmissionTree],
+) -> Result<Vec<String>, SchedulerClientError> {
+    #[derive(serde::Deserialize)]
+    struct SubmitResponse {
+        unpublished_ids: Vec<String>,
     }
-    send_json(namespace, SCHEDULER_SUBMIT_URL, requests).await
+    if trees.is_empty() {
+        return Ok(Vec::new());
+    }
+    let response: SubmitResponse = post_json(namespace, SCHEDULER_SUBMIT_URL, trees).await?;
+    Ok(response.unpublished_ids)
 }
 
 /// The trusted submit channel: `/tasks/submit/trusted` skips the
@@ -37,17 +45,17 @@ pub async fn send_enqueue(
 /// repo-writer credential check. Anonymous callers keep `send_enqueue`.
 pub async fn send_enqueue_trusted(
     namespace: &CfDurableNamespace,
-    requests: &[stow_types::api::EnqueueRequest],
+    trees: &[stow_types::api::SubmissionTree],
 ) -> Result<u32, SchedulerClientError> {
     #[derive(serde::Deserialize)]
     struct InsertedResponse {
         inserted: u32,
     }
-    if requests.is_empty() {
+    if trees.is_empty() {
         return Ok(0);
     }
     let response: InsertedResponse =
-        post_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, requests).await?;
+        post_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, trees).await?;
     Ok(response.inserted)
 }
 
@@ -62,27 +70,38 @@ pub async fn send_task_ids(
 }
 
 /// The `workflow_run` webhook's completion channel for a
-/// `build-batch.yml` run (stow#833 §3.2): `POST
-/// /batches/{batch_id}/complete` carries the run's identity verbatim —
-/// one forward per batch — and the object's alarm pass resolves the
-/// legs from it.
-pub async fn send_batch_complete(
+/// `build-crate.yml` run (stow#876): `POST /tasks/complete-run`
+/// carries the verified outcome — one forward per task, one task per
+/// run.
+pub async fn send_run_complete(
     namespace: &CfDurableNamespace,
-    batch_id: &stow_types::api::BatchId,
-    report: &stow_types::api::BatchRunComplete,
+    report: &stow_types::api::WorkflowRunComplete,
 ) -> Result<(), SchedulerClientError> {
-    send_json(
-        namespace,
-        &format!("{SCHEDULER_BATCHES_URL}/{batch_id}/complete"),
-        report,
-    )
-    .await
+    send_json(namespace, SCHEDULER_COMPLETE_RUN_URL, report).await
+}
+
+/// The `workflow_run` webhook's `in_progress` channel for a
+/// `build-crate.yml` run: `POST /tasks/run-update` moves the bound row
+/// `dispatched` → `running` (stow#876).
+pub async fn send_task_run_update(
+    namespace: &CfDurableNamespace,
+    update: &stow_types::api::TaskRunUpdate,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_RUN_UPDATE_URL, update).await
 }
 
 pub async fn get_status(
     namespace: &CfDurableNamespace,
 ) -> Result<stow_types::api::SchedulerStatus, SchedulerClientError> {
     get_json(namespace, SCHEDULER_STATUS_URL).await
+}
+
+/// The `GET /api/v1/scheduler/health` body's read (stow#860) — one
+/// request on state the object already holds.
+pub async fn get_health(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::SchedulerHealth, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_HEALTH_URL).await
 }
 
 /// Admit a human request: the object dedupes on the deterministic
@@ -148,14 +167,15 @@ pub async fn send_request_run_update(
     .await
 }
 
-/// The index-publish path's report that a `(target, rustc_version)`
-/// slice went live — the semantic identities it serves, which become the
-/// membership the scheduler's dependency gate checks.
+/// The index-publish path's report that a run's slices went live —
+/// the semantic identities they serve, which become the membership
+/// the scheduler's dependency gate checks (stow#940: one report per
+/// publish run).
 pub async fn record_published_index(
     namespace: &CfDurableNamespace,
-    slice: &stow_types::api::PublishedSlice,
+    report: &stow_types::api::PublishedRunReport,
 ) -> Result<(), SchedulerClientError> {
-    send_json(namespace, SCHEDULER_PUBLISHED_INDEX_URL, slice).await
+    send_json(namespace, SCHEDULER_PUBLISHED_INDEX_URL, report).await
 }
 
 /// Reset the scheduler store — the operator endpoint behind
@@ -260,6 +280,17 @@ const SCHEDULER_DEMAND_FEED_COMPLETE_URL: &str = "https://scheduler.internal/dem
 const SCHEDULER_DEMAND_FEED_CLEANUP_URL: &str = "https://scheduler.internal/demand-feed/cleanup";
 const SCHEDULER_DEMAND_FEED_DELIVER_URL: &str = "https://scheduler.internal/demand-feed/deliver";
 const SCHEDULER_DEMAND_FEED_STATUS_URL: &str = "https://scheduler.internal/demand-feed/status";
+
+/// `POST /preheat/release` — the verified newreleases.io delivery's
+/// claimed stable rustc (stow#880). The object dispatches
+/// `preheat-admin.yml` through the CI interface; a dispatch failure is
+/// the caller's 502, which newreleases.io's retry redelivers.
+pub async fn send_preheat_release(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::api::PreheatReleaseRequest,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_PREHEAT_RELEASE_URL, request).await
+}
 
 /// `POST /demand-feed/begin` — open or rotate the hour's staging
 /// attempt (stow#523); a resume answers a fresh generation.
@@ -415,19 +446,37 @@ async fn fetch(
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     }
-    let response = stub
-        .fetch(request)
-        .await
-        .map_err(|error| SchedulerClientError::Fetch {
-            url: url.to_owned(),
-            message: error.to_string(),
-        })?;
+    let response = stub.fetch(request).await.map_err(|error| {
+        let message = error.to_string();
+        // A "Durable Object is overloaded" rejection is the platform's
+        // own shed signal — classified apart so the error response can
+        // carry the fault marker the watchdog counts (stow#888).
+        if message.contains("overloaded") {
+            SchedulerClientError::Overloaded {
+                url: url.to_owned(),
+                status: None,
+                message,
+            }
+        } else {
+            SchedulerClientError::Fetch {
+                url: url.to_owned(),
+                message,
+            }
+        }
+    })?;
     if !response.status().is_success() {
         let status = response.status().as_u16();
         let body = response.into_body().into_string().await.map_or_else(
             |error| format!("read scheduler error body: {error}"),
             |body| body.to_string(),
         );
+        if body.contains("overloaded") {
+            return Err(SchedulerClientError::Overloaded {
+                url: url.to_owned(),
+                status: Some(status),
+                message: body,
+            });
+        }
         return Err(SchedulerClientError::Http {
             url: url.to_owned(),
             status,

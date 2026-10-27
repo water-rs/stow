@@ -1,7 +1,7 @@
 //! Centralized typed error model for the edge worker.
 //!
 //! Every internal helper returns one of the per-module error enums below
-//! (`DbError`, `ResolverError`, `QueueError`, `SchedulerClientError`). The
+//! (`ResolverError`, `QueueError`, `SchedulerClientError`). The
 //! handler-facing `GetArtifactError` absorbs them via `From` impls so
 //! endpoints answer a single error type whose status mapping is
 //! host-testable.
@@ -10,35 +10,6 @@
 //! out in favor of these enums.
 
 use stow_types::identity::IdentityError;
-
-/// Errors raised by the D1 / artifact-catalog layer (`edge::db`).
-#[derive(Debug, thiserror::Error)]
-pub enum DbError {
-    /// A D1 query failed.
-    #[error("d1 query failed: {0}")]
-    Query(String),
-    /// A row read from D1 had a column with an invalid identity shape.
-    #[error("invalid stored identity: {0}")]
-    Identity(#[from] IdentityError),
-    /// A semver string from a stored row could not be parsed.
-    #[error("parse stored semver `{raw}`: {source}")]
-    Semver {
-        /// The raw value that failed to parse.
-        raw: String,
-        /// The underlying semver error.
-        #[source]
-        source: semver::Error,
-    },
-    /// Stored data violates an invariant (e.g. unsorted entries).
-    #[error("stored data invariant violated: {0}")]
-    Invariant(String),
-}
-
-impl From<String> for DbError {
-    fn from(message: String) -> Self {
-        Self::Query(message)
-    }
-}
 
 impl From<String> for ResolverError {
     fn from(message: String) -> Self {
@@ -58,21 +29,13 @@ impl From<IdentityError> for QueueError {
     }
 }
 
-impl From<ResolverError> for DbError {
-    fn from(error: ResolverError) -> Self {
-        match error {
-            ResolverError::Db(inner) => inner,
-            other => Self::Query(other.to_string()),
-        }
-    }
-}
-
 /// Errors raised by the dependency-resolver / graph expansion layer.
 #[derive(Debug, thiserror::Error)]
 pub enum ResolverError {
-    /// Wraps a D1 query made from the resolver path.
-    #[error("db: {0}")]
-    Db(#[from] DbError),
+    /// The crates.io cache layer (Workers Cache API) rejected a read or
+    /// write — surfaced as an error, never silently as a miss.
+    #[error("crates.io cache: {0}")]
+    Cache(String),
     /// An upstream fetch failed — crates.io, github.com, or the
     /// rustc-data base. Handlers map this to 5xx; retrying may help.
     #[error("upstream fetch: {0}")]
@@ -130,33 +93,6 @@ pub enum QueueError {
     /// Underlying durable-object SQL access failed.
     #[error("queue sql: {0}")]
     Sql(String),
-    /// A completion report referenced a task the queue has no row for.
-    #[error("completion report for unknown task `{0}`")]
-    UnknownTask(String),
-    /// A batch completion named a `build_batches` row the store does
-    /// not hold — an orphan run from an abandoned dispatch, or a
-    /// delivery for a batch already resolved. Handlers map this to
-    /// `404 Not Found`.
-    #[error("completion report for unknown batch `{0}`")]
-    UnknownBatch(String),
-    /// A completion report named a real task but not its live attempt or
-    /// an in-flight status — a stale report for a superseded attempt or a
-    /// duplicate of one already applied. Handlers map this to `409
-    /// Conflict`: the report applied to nothing and retrying it unchanged
-    /// can never succeed.
-    #[error(
-        "completion report for task `{task_id}` attempt {attempt} conflicts with the row's live state (attempt {row_attempt}, status `{row_status}`)"
-    )]
-    StaleCompletion {
-        /// The task id the report named.
-        task_id: String,
-        /// The attempt the report claimed.
-        attempt: u32,
-        /// The attempt the queue row is currently on.
-        row_attempt: u32,
-        /// The row's current status.
-        row_status: String,
-    },
     /// A request-lane report or update named a request id the scheduler
     /// has no record for.
     #[error("request report for unknown request `{0}`")]
@@ -194,21 +130,6 @@ pub enum QueueError {
         attempted: u64,
         /// Configured `STOW_HUMAN_DAILY_TASK_BUDGET`.
         budget: u64,
-    },
-    /// A delta slice report's `base_generation` no longer matches the
-    /// slice's live applied generation — the delta was computed on a
-    /// stale base (another report landed first, or the slice was never
-    /// reported). Handlers map this to `409 Conflict`: the reporter must
-    /// resync with a full report; retrying the same delta can never
-    /// succeed.
-    #[error(
-        "slice report base generation {base_generation} conflicts with the live generation {live_generation}"
-    )]
-    SliceGenerationConflict {
-        /// The `base_generation` the report claimed.
-        base_generation: i64,
-        /// The generation the slice is actually on.
-        live_generation: i64,
     },
     /// A queue mutation selector named no rows: empty `task_ids` and a
     /// filter with no predicates would touch every row in the queue.
@@ -285,6 +206,20 @@ pub enum SchedulerClientError {
         /// URL that was being fetched.
         url: String,
         /// Underlying error message.
+        message: String,
+    },
+    /// The platform shed the call — a "Durable Object is overloaded"
+    /// rejection, thrown by `stub.fetch` or returned in a non-2xx body.
+    /// Kept distinct: the fault recorder keys on this variant to mark
+    /// the error response the watchdog counts (stow#888).
+    #[error("scheduler {url} shed the call as overloaded: {message}")]
+    Overloaded {
+        /// URL that was being fetched.
+        url: String,
+        /// HTTP status when the rejection arrived as a response;
+        /// `None` when the runtime threw before answering.
+        status: Option<u16>,
+        /// The thrown error's text or the response body.
         message: String,
     },
     /// HTTP non-2xx response.
@@ -416,9 +351,23 @@ pub enum GetArtifactError {
     /// `error` names the stored trigger so the operator sees why.
     #[error("{0}", status = SERVICE_UNAVAILABLE)]
     DispatchFrozen(String),
+    /// The platform shed the scheduler call — the DO's own `overloaded`
+    /// rejection. Transient like the freeze refusal, so it answers the
+    /// same 503; the fault recorder marks its envelope with the
+    /// `OverloadFault` extension (stow#888). The [`OVERLOADED_PREFIX`]
+    /// in its display is the marker that survives the router's
+    /// `Box<dyn HttpError>` erasure — the detail is redacted from the
+    /// 5xx body anyway, so clients never see it.
+    #[error("overloaded: {0}", status = SERVICE_UNAVAILABLE)]
+    SchedulerOverloaded(String),
     #[error("internal server error: {0}")]
     InternalWithMessage(String),
 }
+
+/// The [`GetArtifactError::SchedulerOverloaded`] display prefix — the
+/// boundary the router's `Box<dyn HttpError>` preserves for the fault
+/// recorder.
+pub const OVERLOADED_PREFIX: &str = "overloaded:";
 
 impl From<SchedulerClientError> for GetArtifactError {
     fn from(error: SchedulerClientError) -> Self {
@@ -448,17 +397,17 @@ impl From<SchedulerClientError> for GetArtifactError {
             // submit naming a task the queue never held — and the body
             // is the scheduler's own client-safe message, so it reaches
             // the caller verbatim instead of as a bare 500.
+            // The platform's own overload rejection — distinct from a
+            // queue refusal because the fault recorder tags its answer
+            // with the marker the watchdog counts.
+            SchedulerClientError::Overloaded { message, .. } => {
+                Self::SchedulerOverloaded(scheduler_error_message(&message).to_owned())
+            }
             SchedulerClientError::Http { status, body, .. } if (400..500).contains(&status) => {
                 Self::BadRequestWithMessage(format!("scheduler rejected the request: {body}"))
             }
             other => Self::InternalWithMessage(other.to_string()),
         }
-    }
-}
-
-impl From<DbError> for GetArtifactError {
-    fn from(error: DbError) -> Self {
-        Self::InternalWithMessage(error.to_string())
     }
 }
 

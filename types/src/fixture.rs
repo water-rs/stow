@@ -2,7 +2,7 @@
 //!
 //! The seed SQL lives in `edge/src/scheduler/fixture.rs`; what lives
 //! here is the *shape* — which queue-order `n` is pending, completed,
-//! failed or in-flight, and the `%064x` task id it carries — so every
+//! failed or in-flight, and the canonical task id it carries — so every
 //! consumer computes the same row: the edge's seeders and drives, the
 //! host drift gate, and `stow-admin traffic-cost`'s lanes (which
 //! name seeded ids directly). A shape that exists in two places drifts —
@@ -32,11 +32,10 @@ impl FixtureShape {
     };
     /// The in-flight set — `dispatched`/`running` rows — capped so the
     /// dispatch limit still leaves slots for the claim pass to fill.
-    /// Each row is a one-slot batch leg (the seed writes its
-    /// `build_batches` row too), so the set holds exactly this many
-    /// runner slots. Held constant across fixture sizes: the alarm's
-    /// claim is bounded by this plus the dispatch cap, not by the
-    /// queue.
+    /// Each row binds one `build-crate.yml` run, so the set holds
+    /// exactly this many runner slots. Held constant across fixture
+    /// sizes: the alarm's claim is bounded by this plus the dispatch
+    /// cap, not by the queue.
     pub const IN_FLIGHT_ROWS: u32 = 30;
     /// Pending rows on the human lane — held constant so a lane-position
     /// probe reads the same depth at every fixture size.
@@ -49,8 +48,8 @@ impl FixtureShape {
     /// `not_before`: they stay `pending`, unblocked and
     /// `dispatch_eligible = 1`, but the claim's page predicate refuses
     /// them — a human pin would rank first and fill the pass with
-    /// one-slot legs, hiding the miss-batch claim the gate exists to
-    /// price (stow#833).
+    /// one-slot tasks, hiding the miss-row claim the gate exists to
+    /// price.
     pub const HUMAN_PROBE_ROWS: u32 = 16;
     /// Rows `updated_at` inside the last 24 h — held constant: an
     /// `/admin/status` outcome count is legitimately bounded by 24 h
@@ -66,27 +65,24 @@ impl FixtureShape {
     /// purge or a dep expansion walks — a function of stored bulk
     /// instead of the claim's own bound (stow#588).
     ///
-    /// Sized so one batched pass cannot drain it and so the pass can
+    /// Sized so one dispatch pass cannot drain it and so the pass can
     /// reach its own bound: the claimable population is the window
     /// minus its parked `n % 20 = 1` rows — the human pins are parked
     /// behind `not_before` and no longer count — which must (a) exceed
-    /// the most legs a pass can claim on the slots the in-flight rows
-    /// leave free (`(free slots / STOW_BATCH_PARALLELISM) ×
-    /// STOW_BATCH_MAX_TASKS` = 3 × 40 = 120 on the defaults), and
-    /// (b) feed that bound, not just exceed it. The floored pass
-    /// admits only miss rows whose value clears `VALUE_BAND` — within
-    /// production's `priority + demand <= PRIORITY_MAX` rule that is
-    /// the Windows family alone — so the window must hold more than
-    /// one full pass of Windows rows (`n % 9 ∈ {6,7}`), not merely of
-    /// rows overall. At 640 the family spread gives the window about
-    /// 142 Windows rows, of which the `n % 20 = 1` park leaves ~135
-    /// claimable — every one ahead of every bulk Windows row on the
-    /// window's stored demand — so a pass's three 40-leg miss batches
-    /// fill from the window alone at any size. A window a pass can
-    /// empty would let the claim reach rows an earlier drive left
-    /// claimable, and the walk would then move with the drives' order
-    /// instead of the fixture's shape. The edge's
-    /// `planted_window_exceeds_one_full_batched_pass` test holds the
+    /// the most tasks a pass can claim — one per free slot, so the
+    /// slots the in-flight rows leave free — and (b) feed that bound,
+    /// not just exceed it. The floored pass admits only rows whose
+    /// operand (its priority, stow#879) clears the floor — the
+    /// window's stored demand is what lifts its rows past it — so the
+    /// window must hold more than one full pass of claimable rows.
+    /// At 640 the family spread gives the window about 142 Windows
+    /// rows, of which the `n % 20 = 1` park leaves ~135 claimable —
+    /// every one ahead of every bulk Windows row on the window's
+    /// stored demand — so a pass fills from the window alone at any
+    /// size. A window a pass can empty would let the claim reach rows
+    /// an earlier drive left claimable, and the walk would then move
+    /// with the drives' order instead of the fixture's shape. The
+    /// edge's `planted_window_exceeds_one_full_pass` test holds the
     /// bound against the scheduler's defaults.
     pub const DISPATCH_ELIGIBLE_ROWS: u32 = 640;
 
@@ -151,27 +147,18 @@ impl FixtureShape {
         self.failed_end() + first + (k % (Self::IN_FLIGHT_ROWS / 2)) * 2
     }
 
-    /// The bound batch the `k`-th in-flight row is leg 0 of — `k`
-    /// indexes the in-flight group like [`Self::in_flight_row`]. The
-    /// seed gives every in-flight row its own one-leg `build_batches`
-    /// row (`in_flight_batches_upsert_sql` in the edge fixture): the
-    /// batch id is the low 32 hex of the row's task id, the bound run is
-    /// the row number, and the rustc is the row's own.
-    ///
-    /// # Panics
-    ///
-    /// Never: the low half of a `%064x` task id is 32 lowercase hex.
+    /// The bound run of the `k`-th in-flight row — `k` indexes the
+    /// in-flight group like [`Self::in_flight_row`]. The seed binds
+    /// every in-flight row to its own `build-crate.yml` run
+    /// (`in_flight_runs_update_sql` in the edge fixture): the run id is
+    /// the row number and the rustc is the row's own.
     #[must_use]
-    pub fn in_flight_batch(self, k: u32) -> InFlightBatch {
+    pub fn in_flight_run(self, k: u32) -> InFlightRun {
         let n = u64::from(self.in_flight_row(k));
-        let task_id = task_hex_id(n);
-        InFlightBatch {
+        InFlightRun {
             run_id: n,
-            batch_id: task_id[32..]
-                .parse()
-                .expect("the low half of a %064x task id is 32 lowercase hex"),
             rustc_version: seeded_rustc(n),
-            task_id,
+            task_id: fixture_task_id(n),
         }
     }
 
@@ -207,20 +194,17 @@ impl FixtureShape {
     }
 }
 
-/// One seeded in-flight batch: a bound, undelivered `build-batch.yml`
-/// run with a single leg — what a production batch looks like between
-/// its dispatch and its run's `completed` delivery.
+/// One seeded in-flight run: a bound, undelivered `build-crate.yml`
+/// run for one task — what a production dispatch looks like between
+/// the run's creation and its `completed` delivery.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InFlightBatch {
-    /// The run the batch is bound to (`build_batches.github_run_id`).
+pub struct InFlightRun {
+    /// The run the task is bound to (`queue.github_run_id`).
     pub run_id: u64,
-    /// The batch's id — the run title's `b<batch_id>` and the
-    /// completion route's path segment.
-    pub batch_id: crate::api::BatchId,
-    /// The batch's rustc — the run title's lead and the records tag's
+    /// The run's rustc — the run title's lead and the records tag's
     /// namespace.
     pub rustc_version: &'static str,
-    /// Leg 0's task id.
+    /// The task's id.
     pub task_id: String,
 }
 
@@ -236,11 +220,79 @@ fn target_count() -> u32 {
     u32::try_from(CI_TARGET_TRIPLES.len()).expect("target count fits u32")
 }
 
-/// A seeded queue row's task id — `printf('%064x', n)` in the seed SQL.
+/// Nodes one crate name covers — the fixture's pinned per-name bound.
+///
+/// `'crate' || (n / CRATE_NAME_ROWS)` bounds every name to at most
+/// `CRATE_NAME_ROWS` nodes at any `queue_rows`, so a `crate_name =`
+/// selector reads a size-invariant cardinality at every size.
+pub const CRATE_NAME_ROWS: u32 = 50;
+
+/// A fixture node's crate name and version. `(crate, version)` is
+/// injective in `n` at any size — `n / 20000` carries the quotient in
+/// the version and `n % 500` its low digits.
 #[must_use]
-pub fn task_hex_id(n: u64) -> String {
+pub fn crate_identity(n: u32) -> (String, String) {
+    (
+        format!("crate{}", n / CRATE_NAME_ROWS),
+        format!("1.{}.{}", n / 20000, n % 500),
+    )
+}
+
+/// A fixture node's target — the `n % len` spread over
+/// [`CI_TARGET_TRIPLES`].
+#[must_use]
+pub const fn target_of(n: u32) -> &'static str {
+    CI_TARGET_TRIPLES[n as usize % CI_TARGET_TRIPLES.len()]
+}
+
+/// A seeded node's dependency digest — its own number as 64 hex
+/// digits, the formula the edges and slice rows agree on.
+#[must_use]
+pub fn digest_hex(n: u64) -> String {
     format!("{n:064x}")
 }
+
+/// The canonical task id of fixture node `n`.
+///
+/// The identity [`crate_identity`], [`target_of`] and [`seeded_rustc`] spread over
+/// the row, host-side on every tenth, with [`digest_hex`] as its
+/// dependency digest — the id the scheduler re-mints from the node.
+///
+/// # Panics
+/// When `n` exceeds the fixture's `u32` row range.
+#[must_use]
+pub fn fixture_task_id(n: u64) -> String {
+    let row = u32::try_from(n).expect("fixture rows fit u32");
+    let (crate_name, version) = crate_identity(row);
+    crate::task_graph::canonical_task_id(
+        &crate_name,
+        &version,
+        &crate::identity::FeaturesJson::default().raw(),
+        target_of(row),
+        seeded_rustc(n),
+        &digest_hex(n),
+        row.is_multiple_of(10),
+    )
+}
+
+/// The canonical task id of a drive-owned node outside the fixture's
+/// row range: crate `name` at `1.0.0` on `target` under rustc `1.86.0`,
+/// `seed` as its dependency digest.
+#[must_use]
+pub fn named_task_id(name: &str, seed: u64, target: &str) -> String {
+    crate::task_graph::canonical_task_id(
+        name,
+        "1.0.0",
+        &crate::identity::FeaturesJson::default().raw(),
+        target,
+        NAMED_RUSTC,
+        &digest_hex(seed),
+        false,
+    )
+}
+
+/// The rustc every drive-owned node compiles under.
+pub const NAMED_RUSTC: &str = "1.86.0";
 
 /// The `enqueued` fixture request record's id.
 ///
@@ -258,29 +310,23 @@ pub const REQUEST_FIXTURE_FAILED: &str = "req-fixture-failed";
 mod tests {
     use super::{FixtureShape, seeded_rustc};
 
-    /// Every in-flight row names its own batch under the run it is
-    /// bound to, and the k-th batch is the k-th in-flight row's.
+    /// Every in-flight row names its own bound run, and the k-th run
+    /// is the k-th in-flight row's.
     #[test]
-    fn each_in_flight_row_is_its_own_bound_batch() {
+    fn each_in_flight_row_is_its_own_bound_run() {
         let shape = FixtureShape::PRODUCTION;
-        let batches: Vec<_> = (0..FixtureShape::IN_FLIGHT_ROWS)
-            .map(|k| shape.in_flight_batch(k))
+        let runs: Vec<_> = (0..FixtureShape::IN_FLIGHT_ROWS)
+            .map(|k| shape.in_flight_run(k))
             .collect();
-        for (k, batch) in (0..).zip(&batches) {
+        for (k, run) in (0..).zip(&runs) {
             let n = u64::from(shape.in_flight_row(k));
-            assert_eq!(batch.run_id, n);
-            assert_eq!(batch.task_id, format!("{n:064x}"));
-            assert_eq!(batch.batch_id.to_string(), format!("{n:032x}"));
-            assert_eq!(batch.rustc_version, seeded_rustc(n));
+            assert_eq!(run.run_id, n);
+            assert_eq!(run.task_id, super::fixture_task_id(n));
+            assert_eq!(run.rustc_version, seeded_rustc(n));
         }
-        let distinct: std::collections::BTreeSet<_> = batches
-            .iter()
-            .map(|batch| batch.batch_id.to_string())
-            .collect();
-        assert_eq!(distinct.len(), batches.len());
         // Both rustc arms are in flight, so a lane that titled every
         // run with one rustc would misname a third of them.
-        assert!(batches.iter().any(|batch| batch.rustc_version == "1.86.0"));
-        assert!(batches.iter().any(|batch| batch.rustc_version == "1.85.0"));
+        assert!(runs.iter().any(|run| run.rustc_version == "1.86.0"));
+        assert!(runs.iter().any(|run| run.rustc_version == "1.85.0"));
     }
 }

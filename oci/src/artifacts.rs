@@ -407,7 +407,9 @@ fn artifact_config(plan: &PlannedArtifact) -> ArtifactBlobConfig {
         rustc_version: plan.rustc_version.clone(),
         features_json: plan.features_json.clone(),
         dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
-        dependency_identity: plan.dependency_identity.clone(),
+        dependency_identity: plan
+            .dependency_identity()
+            .expect("dependency task ids always hash"),
         dependency_compile_keys_json: plan.dependency_compile_keys_json.clone(),
         profile: plan.profile.clone(),
         emit: plan.emit.clone(),

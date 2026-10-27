@@ -1,13 +1,12 @@
 //! Cache-miss demand logging: every miss becomes one Analytics Engine
-//! data point — never a D1 row — so anonymous traffic costs no billed
-//! row writes.
+//! data point — anonymous traffic never writes a billed row.
 //!
 //! [`MissLog`] is the writer boundary: the worker implements it over the
 //! `STOW_ANALYTICS` dataset binding, and host tests drive the call sites
 //! with a recording stub. A point carries artifact identity only — never
 //! an IP, a request id, a dependency graph, or a lockfile hash.
 
-use stow_types::api::EnqueueRequest;
+use stow_types::api::{EnqueueDependency, SubmissionNode, SubmissionTree};
 
 use crate::stats::AnalyticsConsent;
 
@@ -63,26 +62,40 @@ pub struct Miss {
 }
 
 impl Miss {
-    /// An uncovered node of a dependency-graph analysis.
-    pub fn graph(request: &EnqueueRequest) -> Self {
+    /// An unpublished node of a redeemed submission tree (stow#886) —
+    /// the merge's born-published check is the coverage, so the submit's
+    /// `unpublished_ids` answer names the misses.
+    pub fn graph_node(tree: &SubmissionTree, node: &SubmissionNode) -> Self {
+        let depends_on: Vec<EnqueueDependency> = node
+            .deps
+            .iter()
+            .map(|&dep| {
+                let dep = &tree.nodes[dep as usize];
+                EnqueueDependency {
+                    crate_name: dep.crate_name.clone(),
+                    version: dep.version.clone(),
+                    features_json: dep.features_json.clone(),
+                    target: dep.target.clone(),
+                    rustc_version: dep.rustc_version.clone(),
+                    host_side: dep.host_side,
+                    dependency_identity: dep.dependency_identity.clone(),
+                    explicit_spelling: dep.explicit_spelling,
+                }
+            })
+            .collect();
         Self {
-            crate_name: request.crate_name.as_str().to_owned(),
-            version: request.version.to_string(),
-            features_json: request.features_json.raw(),
-            target: request.target.as_str().to_owned(),
-            rustc_version: request.rustc_version.as_str().to_owned(),
+            crate_name: node.crate_name.as_str().to_owned(),
+            version: node.version.to_string(),
+            features_json: node.features_json.raw(),
+            target: node.target.as_str().to_owned(),
+            rustc_version: node.rustc_version.as_str().to_owned(),
             kind: String::new(),
             path: MissPath::Graph,
-            depends_on_json: serde_json::to_string(
-                &request.depends_on().expect("subgraph resolves"),
-            )
-            .expect("enqueue dependencies serialize"),
-            dependency_identity: request
-                .dependency_identity()
-                .expect("derived digest")
-                .to_string(),
-            host_side: request.host_side,
-            task_id: request.task_id().expect("derived task id"),
+            depends_on_json: serde_json::to_string(&depends_on)
+                .expect("enqueue dependencies serialize"),
+            dependency_identity: node.dependency_identity.to_string(),
+            host_side: node.host_side,
+            task_id: node.task_id.clone(),
         }
     }
 
@@ -122,15 +135,24 @@ pub trait MissLog: Sync {
     fn write_miss(&self, consent: AnalyticsConsent, miss: &Miss);
 }
 
-/// Write one `graph`-path point per uncovered node — each enqueue
-/// request the analysis produced is a miss the cache could not cover.
-pub fn log_graph_misses(
+/// Write one `graph`-path point per unpublished node — the submit's
+/// `unpublished_ids` answer names the misses the merge could not cover.
+/// Only a real cache-miss tree counts: an inexact superset-hit report
+/// (stow#882) redeems through the same admission but its nodes are hits
+/// the cache already served — logging them would inflate the miss count.
+pub fn log_misses(
     log: &impl MissLog,
     consent: AnalyticsConsent,
-    requests: &[EnqueueRequest],
+    tree: &SubmissionTree,
+    unpublished: &std::collections::BTreeSet<String>,
 ) {
-    for request in requests {
-        log.write_miss(consent, &Miss::graph(request));
+    if tree.source != stow_types::api::SubmissionSource::CacheMiss {
+        return;
+    }
+    for node in &tree.nodes {
+        if unpublished.contains(&node.task_id) {
+            log.write_miss(consent, &Miss::graph_node(tree, node));
+        }
     }
 }
 
@@ -177,7 +199,7 @@ impl MissLog for RecordingMissLog {
 
 #[cfg(test)]
 mod tests {
-    use stow_types::api::EnqueueRequest;
+    use stow_types::api::{EnqueueRequest, SubmissionTree};
     use stow_types::identity::{CrateName, CrateVersion, FeaturesJson};
 
     use super::{Miss, MissLog, RecordingMissLog};
@@ -187,6 +209,10 @@ mod tests {
     const RUSTC: &str = "1.85.0";
 
     fn enqueue_request() -> EnqueueRequest {
+        enqueue_request_inner()
+    }
+
+    fn enqueue_request_inner() -> EnqueueRequest {
         EnqueueRequest {
             crate_name: CrateName::parse("serde").expect("name"),
             version: CrateVersion::new(semver::Version::parse("1.0.5").expect("version")),
@@ -205,12 +231,23 @@ mod tests {
         }
     }
 
+    /// The one-node tree the request's submission boundary produces —
+    /// `graph_node` reads the same identity `graph` derived before.
+    fn submission_tree() -> SubmissionTree {
+        SubmissionTree::from_enqueue_requests(
+            stow_types::api::SubmissionSource::CacheMiss,
+            &[enqueue_request()],
+        )
+        .expect("tree")
+    }
+
     /// A graph miss names the uncovered package node; the enqueue
     /// request carries no artifact kind, so the slot stays empty.
     #[test]
     fn graph_miss_point_shape() {
         let request = enqueue_request();
-        let miss = Miss::graph(&request);
+        let tree = submission_tree();
+        let miss = Miss::graph_node(&tree, &tree.nodes[0]);
         assert_eq!(
             miss.blobs(),
             [
@@ -247,7 +284,12 @@ mod tests {
                 deps: Vec::new(),
             }],
         };
-        let miss = Miss::graph(&request);
+        let tree = SubmissionTree::from_enqueue_requests(
+            stow_types::api::SubmissionSource::CacheMiss,
+            std::slice::from_ref(&request),
+        )
+        .expect("tree");
+        let miss = Miss::graph_node(&tree, &tree.nodes[0]);
         let blobs = miss.blobs();
         let deps: Vec<stow_types::api::EnqueueDependency> =
             serde_json::from_str(blobs[8]).expect("depends_on blob parses");
@@ -257,11 +299,35 @@ mod tests {
     #[test]
     fn recording_stub_captures_rendered_points() {
         let log = RecordingMissLog::default();
-        log.write_miss(AnalyticsConsent::ALLOWED, &Miss::graph(&enqueue_request()));
-        log.write_miss(AnalyticsConsent::ALLOWED, &Miss::graph(&enqueue_request()));
+        let tree = submission_tree();
+        log.write_miss(
+            AnalyticsConsent::ALLOWED,
+            &Miss::graph_node(&tree, &tree.nodes[0]),
+        );
+        log.write_miss(
+            AnalyticsConsent::ALLOWED,
+            &Miss::graph_node(&tree, &tree.nodes[0]),
+        );
         let points = log.points.lock().expect("points").clone();
         assert_eq!(points.len(), 2);
         assert!(points.iter().all(|point| point[7] == "graph"));
+    }
+
+    /// stow#882: a redeemed inexact-hit tree reports nodes the cache
+    /// already served — none of them is a miss, so no `miss` point is
+    /// written for it.
+    #[test]
+    fn inexact_hit_trees_log_no_miss_points() {
+        let log = RecordingMissLog::default();
+        let tree = SubmissionTree::from_enqueue_requests(
+            stow_types::api::SubmissionSource::InexactHit,
+            &[enqueue_request()],
+        )
+        .expect("tree");
+        let unpublished: std::collections::BTreeSet<String> =
+            tree.nodes.iter().map(|node| node.task_id.clone()).collect();
+        super::log_misses(&log, AnalyticsConsent::ALLOWED, &tree, &unpublished);
+        assert!(log.points.lock().expect("points").is_empty());
     }
 
     /// A request carrying `x-stow-no-analytics: 1` writes no point —
@@ -270,7 +336,11 @@ mod tests {
     #[test]
     fn denied_consent_writes_nothing() {
         let log = RecordingMissLog::default();
-        log.write_miss(AnalyticsConsent::DENIED, &Miss::graph(&enqueue_request()));
+        let tree = submission_tree();
+        log.write_miss(
+            AnalyticsConsent::DENIED,
+            &Miss::graph_node(&tree, &tree.nodes[0]),
+        );
         assert!(log.points.lock().expect("points").is_empty());
     }
 }

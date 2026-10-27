@@ -164,6 +164,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "apple-native-keyring-store"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b350bfd03649e07aa05c0a81b3e15934374e585c98204a57e20b9d49f49bb9a"
+dependencies = [
+ "keyring-core",
+ "log",
+ "security-framework",
+]
+
+[[package]]
 name = "ar_archive_writer"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -414,17 +425,6 @@ dependencies = [
  "event-listener",
  "futures-lite",
  "rustix",
-]
-
-[[package]]
-name = "async-recursion"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b43422f69d8ff38f95f1b2bb76517c91589a924d1559a0e935d7c8ce0274c11"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -1682,6 +1682,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "ct-codecs"
 version = "1.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2016,6 +2037,15 @@ dependencies = [
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
  "ctutils",
+]
+
+[[package]]
+name = "directories"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16f5094c54661b38d03bd7e50df373292118db60b585c08a411c6d840017fe7d"
+dependencies = [
+ "dirs-sys",
 ]
 
 [[package]]
@@ -4573,6 +4603,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyring-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29fbf4b551298c67925f38cf341a1ada797a75f1837bdf8ae1fc8e2ebc6efb59"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4746,6 +4785,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "linux-keyutils"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83270a18e9f90d0707c41e9f35efada77b64c0e6f3f1810e71c8368a864d5590"
+dependencies = [
+ "bitflags 2.13.2",
+ "libc",
+]
+
+[[package]]
+name = "linux-keyutils-keyring-store"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "39fbed79f71dc21eb21d3d07c0e908a3c58ff9a1fdbf5cf44230fb3deb6d994b"
+dependencies = [
+ "keyring-core",
+ "linux-keyutils",
 ]
 
 [[package]]
@@ -7241,8 +7300,6 @@ dependencies = [
  "const-oid 0.9.6",
  "crypto_secretbox",
  "digest 0.10.7",
- "futures",
- "futures-util",
  "hex",
  "hex-literal",
  "oci-client 0.17.0",
@@ -7265,12 +7322,29 @@ dependencies = [
  "tls_codec",
  "tokio",
  "tokio-util",
- "tough",
  "tracing",
  "url",
  "webbrowser",
  "x509-cert",
  "zeroize",
+]
+
+[[package]]
+name = "sigstore-crypto"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cf3186b87f0bfbe7e2968e844d5e8053d36e9106601a0fe988aa5be928c314a"
+dependencies = [
+ "aws-lc-rs",
+ "const-oid 0.9.6",
+ "der",
+ "futures-io",
+ "jiff",
+ "rustls-pki-types",
+ "sigstore-types",
+ "spki",
+ "thiserror 2.0.21",
+ "x509-cert",
 ]
 
 [[package]]
@@ -7281,6 +7355,58 @@ checksum = "80baa401f274093f7bb27d7a69d6139cbc11f1b97624e9a61a9b3ea32c776a35"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "sigstore-trust-root"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28c383bc3d087db8c7bad0fbc04b4e6744f9c08adabb233eb7c8166caa6a9fb2"
+dependencies = [
+ "directories",
+ "jiff",
+ "serde",
+ "serde_json",
+ "sigstore-crypto",
+ "sigstore-tuf",
+ "sigstore-types",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "sigstore-tuf"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eccbde8af5f8f613444a0c9d83a9ff8df2bd0c180215f69d9d40169344d1dca3"
+dependencies = [
+ "glob",
+ "hex",
+ "jiff",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sigstore-crypto",
+ "sigstore-types",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+ "url",
+]
+
+[[package]]
+name = "sigstore-types"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "24f58ba2ce9de6e912d5e4043eeb8baa1aeee7ddf9ea19c950a20ee6e0973979"
+dependencies = [
+ "base64 0.23.1",
+ "hex",
+ "jiff",
+ "pem 4.0.0",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -7528,29 +7654,6 @@ dependencies = [
  "futures-io",
  "hyper",
  "pin-project-lite",
-]
-
-[[package]]
-name = "snafu"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
-dependencies = [
- "futures-core",
- "pin-project",
- "snafu-derive",
-]
-
-[[package]]
-name = "snafu-derive"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.119",
 ]
 
 [[package]]
@@ -7809,13 +7912,16 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stow-admin"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
+ "apple-native-keyring-store",
  "askama 0.14.0",
  "axum",
  "blake3",
  "bytes",
  "clap",
+ "crossterm",
+ "csv",
  "dirs 7.0.0",
  "flate2",
  "futures-util",
@@ -7826,6 +7932,9 @@ dependencies = [
  "humantime",
  "hyper",
  "hyper-util",
+ "jiff",
+ "keyring-core",
+ "linux-keyutils-keyring-store",
  "oci-client 0.16.1",
  "rustls",
  "semver",
@@ -7846,12 +7955,13 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "windows-native-keyring-store",
  "zenwave",
 ]
 
 [[package]]
 name = "stow-build"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-fs",
  "async-net",
@@ -7898,7 +8008,7 @@ dependencies = [
 
 [[package]]
 name = "stow-cli"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-fs",
  "async-process",
@@ -7961,14 +8071,13 @@ dependencies = [
 
 [[package]]
 name = "stow-edge"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "askama 0.14.0",
  "async-lock",
  "base64 0.23.1",
  "blake3",
- "crypto-bigint",
  "flate2",
  "futures-util",
  "getrandom 0.2.17",
@@ -7979,6 +8088,7 @@ dependencies = [
  "pem 4.0.0",
  "pkcs1",
  "pkcs8",
+ "rmp-serde",
  "rsa",
  "ruzstd",
  "semver",
@@ -8008,7 +8118,7 @@ dependencies = [
 
 [[package]]
 name = "stow-mock-registry"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-fs",
  "axum",
@@ -8037,7 +8147,7 @@ dependencies = [
 
 [[package]]
 name = "stow-oci"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "async-fs",
  "async-process",
@@ -8056,6 +8166,8 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sigstore",
+ "sigstore-trust-root",
+ "sigstore_protobuf_specs",
  "smol",
  "stow-shim",
  "stow-types",
@@ -8095,7 +8207,7 @@ dependencies = [
 
 [[package]]
 name = "stow-shim"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "dirs 7.0.0",
  "same-file",
@@ -8105,9 +8217,10 @@ dependencies = [
 
 [[package]]
 name = "stow-types"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "blake3",
+ "futures-lite",
  "hex",
  "hmac 0.13.0",
  "http",
@@ -8617,40 +8730,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
-name = "tough"
-version = "0.22.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8031cff0872dd1c6312370515a6be8098f6ea5512f1bad725016046fc725f272"
-dependencies = [
- "async-recursion",
- "async-trait",
- "aws-lc-rs",
- "bytes",
- "chrono",
- "dyn-clone",
- "futures",
- "futures-core",
- "globset",
- "hex",
- "log",
- "olpc-cjson",
- "pem 3.0.6",
- "percent-encoding",
- "rustls",
- "serde",
- "serde_json",
- "serde_plain",
- "snafu",
- "tempfile",
- "tokio",
- "tokio-util",
- "typed-path",
- "untrusted 0.7.1",
- "url",
- "walkdir",
-]
-
-[[package]]
 name = "tower"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8836,12 +8915,6 @@ name = "twox-hash"
 version = "2.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5283634e518fe9e82c7b20520bb4bc209009fd16c82077c802f8111ecbb0117a"
-
-[[package]]
-name = "typed-path"
-version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82205ffd44a9697e34fc145491aa47310f9871540bb7909eaa9365e0a9a46607"
 
 [[package]]
 name = "typeid"
@@ -9404,6 +9477,18 @@ name = "windows-link"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
+
+[[package]]
+name = "windows-native-keyring-store"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "063426e76fdec7438d56bb777f67e318a84a25c707b07e575cb8b78e10c028f8"
+dependencies = [
+ "byteorder",
+ "keyring-core",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
 
 [[package]]
 name = "windows-numerics"

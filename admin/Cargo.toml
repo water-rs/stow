@@ -24,6 +24,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 flate2.workspace = true
 tar.workspace = true
+# The db-dump CSV tables are quoted Postgres exports — fields embed
+# commas and newlines (readmes), so a real CSV reader parses them.
+csv = { version = "1.4", default-features = false }
 humantime = "2"
 serde_html_form = "0.4"
 semver.workspace = true
@@ -36,10 +39,19 @@ dirs = "7"
 oci-client = { version = "0.16.1", default-features = false }
 futures-util = "0.3"
 tempfile.workspace = true
-tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+# The live view's repaint needs only cursor and clear commands —
+# nothing pulls crossterm's platform extras (stow#853).
+crossterm = { version = "0.29", default-features = false }
+# `time` cannot read the local offset under a multi-thread runtime, so
+# the watch's header clock resolves the zone through jiff: `tz-system`
+# (pulls `std`) finds the zone, `tzdb-zoneinfo` reads the system's own
+# TZif files for its DST rules (stow#853).
+jiff = { version = "0.2.37", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 hmac = "0.13"
 sha2 = "0.11"
 hex.workspace = true
+keyring-core = { version = "1.0.1", default-features = false }
 
 [dev-dependencies]
 # `#[tokio::test]` + `start_paused` for the pacing loop's boundary tests.
@@ -60,3 +72,12 @@ serde_yml = "0.0.12"
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", default-features = false, features = ["keychain"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+linux-keyutils-keyring-store = { version = "1.0.0", default-features = false }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1.1.0", default-features = false }

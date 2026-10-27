@@ -1,7 +1,7 @@
 //! Shared API and identity types for the stow workspace.
 //!
 //! The crate contains the wire types CI, edge, scheduler, and CLI exchange
-//! over HTTP / D1, plus the identity newtypes (`CrateName`, `CMetadata`,
+//! over HTTP, plus the identity newtypes (`CrateName`, `CMetadata`,
 //! `TargetTriple`, `WireRustcVersion`, `FeaturesJson`,
 //! `DependencyCMetadataJson`) that enforce the five-element artifact identity
 //! tuple at compile time.
@@ -13,11 +13,14 @@ pub mod artifact;
 pub mod bundle;
 pub mod bundle_schema;
 pub mod capture;
+pub mod ci;
 pub mod crate_info;
 pub mod do_budgets;
 pub mod env_name;
 pub mod error;
+pub mod feature_sets;
 pub mod fixture;
+pub mod forwards;
 pub mod glibc;
 pub mod hash;
 pub mod identity;

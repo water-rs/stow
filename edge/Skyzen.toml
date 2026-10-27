@@ -7,6 +7,12 @@ workers_dev = false
 [cloudflare.vars]
 GITHUB_APP_ID = "4985635"
 GITHUB_APP_INSTALLATION_ID = "162649982"
+# The App's slug — its bot login (`<slug>[bot]`) is the
+# `triggering_actor` a scheduler-dispatched run carries, which is how
+# the webhook tells own runs from external ones (stow#940). A wrong
+# value only re-adds own runs' `in_progress` forwards — the cost, not
+# a correctness break.
+GITHUB_APP_SLUG = "stow-ci"
 GITHUB_REPO = "water-rs/stow"
 GHCR_BASE_URL = "https://ghcr.io"
 STOW_DISPATCH_MIN_AGE_MINUTES = "5"
@@ -16,10 +22,6 @@ STOW_DISPATCH_MIN_AGE_MINUTES = "5"
 # 4 macOS runners free.
 STOW_MAX_CONCURRENT_JOBS = "45"
 STOW_MAX_CONCURRENT_MACOS_JOBS = "16"
-# Batch shape (stow#833): each build-batch.yml matrix holds k runner
-# slots (max-parallel) and up to B legs — eight rounds at the defaults.
-STOW_BATCH_PARALLELISM = "5"
-STOW_BATCH_MAX_TASKS = "40"
 STOW_STALE_DISPATCH_MINUTES = "60"
 # Enqueue-admission scaling: one extra proof-of-work bit per 50 pending
 # tasks, floored at STOW_POW_MIN_BITS and capped at 24 bits.
@@ -82,17 +84,13 @@ STOW_FREEZE_FAIL_PERCENT = "50"
 # `issues` grant, deliberately.
 STOW_ALERT_FROM = "alerts@stow.waterui.dev"
 STOW_ALERT_TO = "me@lexo.cool"
-# Scales the scheduler DO's per-day SQL budget (monthly included
-# allowance / 30): the object self-meters rowsRead/rowsWritten off its
+# Scales the scheduler DO's per-day SQL budget (80% of the monthly included
+# allowance / 30 — the stow#883 line's daily share): the object self-meters rowsRead/rowsWritten off its
 # own cursors and freezes dispatch the moment a day crosses budget —
 # no scheduled probe, so nothing here costs while idle. Lower it to
 # trip earlier on a shared account.
 STOW_COST_BUDGET_MULTIPLIER = "1.0"
 
-[[cloudflare.d1_databases]]
-binding = "STOW_DB"
-database_name = "stow-prod"
-database_id = "b2fefa0a-828a-4681-b6f1-4d491d5dff5e"
 
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"
@@ -115,9 +113,18 @@ name = "STOW_POW_CHALLENGE_SECRET"
 [[secret]]
 name = "STOW_GITHUB_WEBHOOK_SECRET"
 
+# HMAC secret verifying newreleases.io deliveries to
+# /api/v1/newreleases/release — the new-stable-release wake for preheat.
+[[secret]]
+name = "STOW_NEWRELEASES_WEBHOOK_SECRET"
+
 [[secret]]
 name = "TURNSTILE_SECRET_KEY"
 
+
+# Daily-salted install-hash key for the usage-statistics indexes.
+[[secret]]
+name = "STOW_STATS_SALT_SECRET"
 
 # API token with Analytics Engine read on the account — queried by
 # /api/v1/stats for the public usage page.
@@ -129,16 +136,23 @@ name = "CF_ANALYTICS_TOKEN"
 [cloudflare.raw]
 routes = [{ pattern = "stow.waterui.dev", custom_domain = true, zone_name = "waterui.dev" }]
 
-# Cache-miss events go to Analytics Engine instead of a D1 append log; the
-# dataset is created implicitly by the first writeDataPoint.
+# Cache-miss events go to Analytics Engine; the dataset is created
+# implicitly by the first writeDataPoint.
 [[cloudflare.raw.analytics_engine_datasets]]
 binding = "STOW_ANALYTICS"
 dataset = "stow_cache_misses"
 
+# Usage statistics — byte-path hit points (edge-observed undercount by
+# design) and the CLI's per-day build reports. The index is a
+# daily-salted install hash, never an IP.
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_STATS"
+dataset = "stow_events"
+
 # Workers Cache — the platform cache that answers cacheable GETs before
 # this Worker runs. A hit is still billed as a Workers request; what it
-# saves is the Worker running — the CPU time, subrequests and D1/Durable
-# Object reads a miss would spend. Cacheability is the response's own
+# saves is the Worker running — the CPU time and subrequests a miss
+# would spend. Cacheability is the response's own
 # Cache-Control: the digest-addressed byte paths emit `public,
 # max-age=31536000, immutable`, the catalog and stats endpoints short
 # max-ages, and the point-in-time lanes and every error answer
@@ -152,8 +166,8 @@ enabled = true
 
 
 # Paid plan defaults subrequests to 10k/invocation, which a cold-closure
-# analysis can exceed — every uncached entry costs a sparse-index fetch plus
-# D1 service calls, and `max_expanded_tasks` is 4096. 100k gives headroom
+# analysis can exceed — every uncached entry costs a sparse-index fetch
+# plus scheduler service calls, and `max_expanded_tasks` is 4096. 100k gives headroom
 # while staying a hard per-invocation fuse. cpu_ms drops from the paid
 # default (30s) to 15s — the billed meter — so a runaway request is
 # cut off sooner. Skyzen has no first-class limits section, so both keys

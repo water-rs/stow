@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use futures_lite::StreamExt as _;
 use serde::{Deserialize, Serialize};
 use stow_types::error::Context;
-use stow_types::identity::WireRustcVersion;
+use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::index::{ArtifactIndex, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::registry::{CacheRepository, cache_repository};
 
@@ -53,8 +53,10 @@ struct SlicePointer {
 /// carried them, so callers can report what they resolved against.
 #[derive(Debug, Clone)]
 pub struct IndexSlice {
-    /// `sha256:…` of the OCI manifest the blob came from.
-    pub manifest_digest: String,
+    /// `sha256:…` of the OCI manifest the blob came from — `None` when the
+    /// slice is the empty index of a package that does not exist yet,
+    /// which has no manifest to name.
+    pub manifest_digest: Option<String>,
     /// The decoded index — header identity already checked against the
     /// requested `(target, rustc_version)`.
     pub index: ArtifactIndex,
@@ -281,6 +283,12 @@ async fn fetch_slice(
     // fetch (stow#347).
     if pointer.is_some() {
         match session.fetch_manifest_digest(&reference).await {
+            // The package itself is absent — the registry's definitive
+            // answer is an empty index; even a cached slice names
+            // artifacts a package reset took away.
+            Err(error) if error.is_package_missing() => {
+                return empty_slice(target, rustc_version);
+            }
             Ok(remote_digest) => {
                 if let Some((pointer, blob)) =
                     write_slice(&dir, move |slice| slice.confirm(&remote_digest)).await?
@@ -313,7 +321,7 @@ async fn fetch_slice(
         }
     }
 
-    let (blob, manifest_digest, index) = download_verified_slice(
+    let Some((blob, manifest_digest, index)) = download_verified_slice(
         config,
         &session,
         &repository,
@@ -322,11 +330,38 @@ async fn fetch_slice(
         target,
         rustc_version,
     )
-    .await?;
+    .await?
+    else {
+        return empty_slice(target, rustc_version);
+    };
     commit_slice(&dir, &manifest_digest, blob, index.rows.len() as u64).await?;
     Ok(IndexSlice {
-        manifest_digest,
+        manifest_digest: Some(manifest_digest),
         index,
+    })
+}
+
+/// The slice a missing `stow-cache-<rustc>` package resolves to: no
+/// published manifest, zero rows — every lookup misses, which is exactly
+/// what a rustc nothing has published for means. `stow-cache-<rustc>`
+/// deleted and rebuilt reads the same until the first publish lands.
+fn empty_slice(target: &str, rustc_version: &str) -> stow_types::error::Result<IndexSlice> {
+    Ok(IndexSlice {
+        manifest_digest: None,
+        index: ArtifactIndex {
+            header: stow_types::index::ArtifactIndexHeader {
+                format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
+                target: TargetTriple::parse(target)
+                    .map_err(|error| stow_types::stow_error!("index target {target}: {error}"))?,
+                rustc_version: WireRustcVersion::parse(rustc_version).map_err(|error| {
+                    stow_types::stow_error!("rustc version {rustc_version}: {error}")
+                })?,
+                generated_at: String::new(),
+                generation: 0,
+                row_count: 0,
+            },
+            rows: Vec::new(),
+        },
     })
 }
 
@@ -347,9 +382,22 @@ async fn download_verified_slice(
     tag: &str,
     target: &str,
     rustc_version: &str,
-) -> stow_types::error::Result<(Vec<u8>, String, ArtifactIndex)> {
+) -> stow_types::error::Result<Option<(Vec<u8>, String, ArtifactIndex)>> {
     let trust = verify::spawn_trust(config);
-    let (manifest_digest, manifest) = stow_oci::pull_tagged_manifest(session, reference).await?;
+    // A package that does not exist is the registry's answer of "empty
+    // index", not a pull failure — the same `None` every other index
+    // reader gives; a missing tag on an existing package stays an error.
+    let (bytes, manifest_digest) = match session.pull_manifest(reference).await {
+        Ok(pulled) => pulled,
+        Err(error) if error.is_package_missing() => return Ok(None),
+        Err(error) => {
+            return Err(stow_types::stow_error!(
+                "pull manifest {reference}: {error}"
+            ));
+        }
+    };
+    let manifest: oci_client::manifest::OciImageManifest = serde_json::from_slice(&bytes)
+        .wrap_err_with(|| format!("parse manifest for {reference}"))?;
     let [layer] = manifest.layers.as_slice() else {
         return Err(stow_types::stow_error!(
             "index manifest {reference} carries {} layers, expected exactly one",
@@ -396,7 +444,7 @@ async fn download_verified_slice(
             index.header.rustc_version.as_str()
         ));
     }
-    Ok((blob, manifest_digest, index))
+    Ok(Some((blob, manifest_digest, index)))
 }
 
 /// What a refresh writes once its download verified, under the slice's
@@ -444,7 +492,7 @@ async fn decode_cached(
 ) -> stow_types::error::Result<Option<IndexSlice>> {
     match smol::unblock(move || ArtifactIndex::decode(&blob)).await {
         Ok(index) => Ok(Some(IndexSlice {
-            manifest_digest,
+            manifest_digest: Some(manifest_digest),
             index,
         })),
         Err(stow_types::index::IndexDecodeError::Format { .. }) => Ok(None),
@@ -733,15 +781,14 @@ pub fn index_test_row(c_metadata: &str) -> stow_types::index::ArtifactIndexRow {
     use semver::Version;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::identity::{
-        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, DependencyIdentity,
-        FeaturesJson,
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson,
     };
     use stow_types::index::ArtifactIndexRow;
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
 
     ArtifactIndexRow {
-        dependency_identity: DependencyIdentity::leaf().expect("leaf identity"),
+        dependency_task_ids: Vec::new(),
         crate_name: CrateName::parse("serde").expect("crate name"),
         version: CrateVersion::new(Version::new(1, 0, 219)),
         features_json: FeaturesJson::canonicalize(vec!["default".to_owned()]).expect("features"),
@@ -887,7 +934,7 @@ mod tests {
             .await
             .expect("load cached")
             .expect("readable format");
-        assert_eq!(loaded.manifest_digest, digest);
+        assert_eq!(loaded.manifest_digest.as_deref(), Some(digest.as_str()));
         assert_eq!(loaded.index, index);
     }
 
@@ -1123,7 +1170,7 @@ mod tests {
         let refreshed = refresh_slice(&config, TARGET, RUSTC)
             .await
             .expect("refresh serves the cached slice");
-        assert_eq!(refreshed.manifest_digest, "sha256:aaaa");
+        assert_eq!(refreshed.manifest_digest.as_deref(), Some("sha256:aaaa"));
         let error = confirmed_slice(&config, TARGET, RUSTC)
             .await
             .expect_err("the build path takes only the registry's answer");
@@ -1134,6 +1181,66 @@ mod tests {
             )),
             "names the slice: {error}"
         );
+    }
+
+    /// stow#844: a registry whose `stow-cache-<rustc>` package does not
+    /// exist answers the anonymous token exchange `403 DENIED` — the
+    /// slice it resolves to is the empty index, not an error, on every
+    /// pull path.
+    #[tokio::test]
+    async fn a_missing_package_serves_the_empty_index() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        // A registry that answers the challenge then refuses the token
+        // exchange the way GHCR does for a package that does not exist.
+        let registry = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = registry.local_addr().expect("local addr");
+        let realm = format!("http://{address}/token");
+        std::thread::spawn(move || {
+            for stream in registry.incoming() {
+                let mut stream = stream.expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 1024];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let read = std::io::Read::read(&mut stream, &mut buffer).expect("read");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let path = request
+                    .split(|byte| *byte == b' ')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_vec();
+                let response = if path == b"/v2/" {
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"{realm}\",service=\"mock\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                } else {
+                    let body = r#"{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}"#;
+                    format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                };
+                stream.write_all(response.as_bytes()).expect("respond");
+            }
+        });
+        let config = StowConfig {
+            registry_base_url: format!("http://{address}"),
+            ..test_config(tempdir.path())
+        };
+
+        let slice = refresh_slice(&config, TARGET, RUSTC)
+            .await
+            .expect("a missing package serves the empty index");
+        assert_eq!(slice.index.rows.len(), 0);
+        assert_eq!(slice.manifest_digest, None);
+        let slice = confirmed_slice(&config, TARGET, RUSTC)
+            .await
+            .expect("the build path takes the registry's empty answer");
+        assert_eq!(slice.index.rows.len(), 0);
     }
 
     fn generation_digest(generation: usize) -> String {
@@ -1175,11 +1282,11 @@ mod tests {
             )),
             Ok(Some(slice)) => {
                 let served = usize::try_from(slice.index.header.generation).expect("generation");
-                (slice.manifest_digest != generation_digest(served)
+                (slice.manifest_digest.as_deref() != Some(generation_digest(served).as_str())
                     || !(generation - 1..=generation).contains(&served))
                 .then(|| {
                     format!(
-                        "read during generation {generation} served generation {served} under pointer {}",
+                        "read during generation {generation} served generation {served} under pointer {:?}",
                         slice.manifest_digest
                     )
                 })

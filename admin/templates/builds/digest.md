@@ -1,19 +1,19 @@
 <!-- stow-builds-digest -->
-**{{ failed_legs }} failed leg(s) across {{ failed_runs }} failed `build-batch.yml` run(s)** — {{ since }} → {{ until }} UTC
+**{{ failed_tasks }} failed task(s) across {{ failed_runs }} failed `build-crate.yml` run(s)** — {{ since }} → {{ until }} UTC
 
-| class | legs |
+| class | tasks |
 | --- | --- |
 {% for row in class_counts -%}
-| {{ row.name }} | {{ row.legs }} |
+| {{ row.name }} | {{ row.tasks }} |
 {% endfor %}
 
-| target | legs |
+| target | tasks |
 | --- | --- |
 {% for row in target_counts -%}
-| `{{ row.name }}` | {{ row.legs }} |
+| `{{ row.name }}` | {{ row.tasks }} |
 {% endfor %}
 {% for group in groups %}
-## {{ group.label }} — {{ group.legs }} leg(s)
+## {{ group.label }} — {{ group.tasks }} task(s)
 
 {% for krate in group.crates -%}
 - **{{ krate.crate_name }} {{ krate.version }}**

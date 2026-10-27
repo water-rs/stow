@@ -389,6 +389,15 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
     // (package, version, features) per side and platform — an alias
     // collision inside a section is a real error, not an ambiguity to
     // disambiguate.
+    //
+    // The one exception is a pin of the task's own package: cargo
+    // requires every declaration from one package to one dependency
+    // package to use the same name across all dependency kinds
+    // (`Resolve::extern_crate_name_and_dep_name`), so it keys on the
+    // task entry's own name. Only an outcome-3 host task's self-twin
+    // edge (stow#723) puts its own package in its subgraph — on the
+    // other side, in the other section; the same side would collide
+    // with the task entry below and fail.
     for node in &task.dependency_subgraph.nodes {
         let selection = TaskFeatureSelection::from_features_json(&node.features_json);
         let pinned = Dependency {
@@ -402,7 +411,11 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         } else {
             &mut dependencies
         };
-        let alias = pin_alias(node.crate_name.as_str(), &node.version.to_string());
+        let alias = if node.crate_name == task.crate_name && node.version == task.version {
+            task.crate_name.as_str().to_owned()
+        } else {
+            pin_alias(node.crate_name.as_str(), &node.version.to_string())
+        };
         if section.insert(alias.clone(), pinned).is_some() {
             return Err(stow_types::stow_error!(
                 "dep pin alias {alias} collides with an earlier entry in the wrapper manifest"
@@ -701,6 +714,12 @@ impl PhaseUnitGraph {
         self.phase
     }
 
+    /// The target spelling cargo was given (`None` native).
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+
     /// This graph's units in the shared task-unit model — the resolved
     /// feature set the scan labels each captured unit's row with
     /// (stow#611).
@@ -709,6 +728,18 @@ impl PhaseUnitGraph {
         host_triple: &str,
     ) -> stow_types::error::Result<Vec<stow_types::unit_graph::TaskUnit>> {
         self.graph.task_units(self.target.as_deref(), host_triple)
+    }
+
+    /// [`task_units`] annotated with the cargo unit each task unit was
+    /// projected from — twins re-split out of one both-reachable cargo
+    /// unit share the origin, which is cargo's native host/target
+    /// sharing verdict made visible (stow#723).
+    pub(crate) fn task_units_with_origins(
+        &self,
+        host_triple: &str,
+    ) -> stow_types::error::Result<Vec<(stow_types::unit_graph::TaskUnit, u32)>> {
+        self.graph
+            .task_units_with_origins(self.target.as_deref(), host_triple)
     }
 }
 
@@ -770,6 +801,7 @@ pub async fn compile_host(task: &BuildTaskPayload) -> stow_types::error::Result<
 /// whole resolved closure, build-script deps and transitives included,
 /// at the identities cargo will actually compile them at.
 pub async fn phase_unit_graphs(
+    cargo_home: &Path,
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
     cargo_subcommand: CargoSubcommand,
@@ -812,7 +844,7 @@ pub async fn phase_unit_graphs(
                 workspace.workspace_root(),
                 runner_host_triple(task)?,
                 &task.rustc_version,
-                None,
+                Some(cargo_home),
             )
             .await?;
             graphs.push(PhaseUnitGraph {
@@ -861,16 +893,62 @@ pub fn verify_dependency_context(
     let expected = task.verified_dependency_graph()?;
     let host_triple = runner_host_triple(task)?;
     for unit_graph in unit_graphs {
-        let units = unit_graph.task_units(host_triple).map_err(|error| {
-            stow_types::stow_error!(
-                "task {} {} ({}): {} {} unit graph does not convert: {error}",
-                task.crate_name.as_str(),
-                task.version,
-                task.target,
-                unit_graph.phase.as_str(),
-                unit_graph.invocation.spelling(),
-            )
-        })?;
+        let units = if unit_graph.target.is_none() && unit_graph.phase != CargoSubcommand::Check {
+            // stow#723: under the native spelling cargo itself decides
+            // whether a same-feature host/target twin pair merges — a
+            // pair re-split out of one cargo unit shared, a pair
+            // projected from two units stayed apart. That verdict must
+            // equal the `self_twin_edges` predicate the task ids were
+            // minted on; a divergence is a probe field this builder does
+            // not model (rustflags, links overrides, is_std) deciding
+            // differently, and any id minted past it mislabels the
+            // cache. Under an explicit `--target` spelling cargo never
+            // shares, and in the check phase a target-side lib is a
+            // check-mode unit while a host-side lib is build-mode — the
+            // probe and the interned unit both carry the mode
+            // (`traverse_and_share`), so no pair can merge there and the
+            // predicate, which answers for build-mode pairs, does not
+            // apply. The ids still agree: the predicate reads only the
+            // projected dependency structure, which both phases share.
+            let with_origins =
+                unit_graph
+                    .task_units_with_origins(host_triple)
+                    .map_err(|error| {
+                        stow_types::stow_error!(
+                            "task {} {} ({}): {} {} unit graph does not convert: {error}",
+                            task.crate_name.as_str(),
+                            task.version,
+                            task.target,
+                            unit_graph.phase.as_str(),
+                            unit_graph.invocation.spelling(),
+                        )
+                    })?;
+            assert_native_sharing_verdicts(&with_origins).map_err(|error| {
+                stow_types::stow_error!(
+                    "task {} {} ({}): {} {} unit graph: {error}",
+                    task.crate_name.as_str(),
+                    task.version,
+                    task.target,
+                    unit_graph.phase.as_str(),
+                    unit_graph.invocation.spelling(),
+                )
+            })?;
+            with_origins
+                .into_iter()
+                .map(|(unit, _)| unit)
+                .collect::<Vec<_>>()
+        } else {
+            unit_graph.task_units(host_triple).map_err(|error| {
+                stow_types::stow_error!(
+                    "task {} {} ({}): {} {} unit graph does not convert: {error}",
+                    task.crate_name.as_str(),
+                    task.version,
+                    task.target,
+                    unit_graph.phase.as_str(),
+                    unit_graph.invocation.spelling(),
+                )
+            })?
+        };
         let actual = stow_types::unit_graph::resolved_task_graph(&units, &task.rustc_version)
             .map_err(|error| {
                 stow_types::stow_error!(
@@ -921,6 +999,72 @@ pub fn verify_dependency_context(
             unit_graph.phase.as_str(),
             unit_graph.invocation.spelling(),
         ));
+    }
+    Ok(())
+}
+
+/// stow#723: cargo's own sharing verdict on every same-feature
+/// host/target twin pair in a native-spelled unit graph — a pair
+/// re-split out of one cargo unit shared, a pair emitted from two did
+/// not — must equal the `self_twin_edges` predicate the resolver's ids
+/// were minted on. A divergence fails the build naming the crate.
+fn assert_native_sharing_verdicts(
+    units: &[(stow_types::unit_graph::TaskUnit, u32)],
+) -> stow_types::error::Result<()> {
+    use stow_types::unit_graph::{TaskUnitKey, TaskUnitKind, TaskUnitSide};
+    let task_units: Vec<stow_types::unit_graph::TaskUnit> =
+        units.iter().map(|(unit, _)| unit.clone()).collect();
+    let by_key: std::collections::BTreeMap<&TaskUnitKey, (&stow_types::unit_graph::TaskUnit, u32)> =
+        units
+            .iter()
+            .map(|(unit, origin)| (&unit.key, (unit, *origin)))
+            .collect();
+    let kept_apart: std::collections::BTreeSet<TaskUnitKey> =
+        stow_types::unit_graph::self_twin_edges(&task_units)
+            .map_err(|error| stow_types::stow_error!("evaluate the sharing predicate: {error}"))?
+            .into_iter()
+            .map(|(host, _)| host.key.clone())
+            .collect();
+    for (unit, origin) in units {
+        if unit.key.kind != TaskUnitKind::Lib
+            || unit.key.side != TaskUnitSide::Host
+            || !unit.is_crates_io
+        {
+            continue;
+        }
+        let target_key = TaskUnitKey {
+            side: TaskUnitSide::Target,
+            ..unit.key.clone()
+        };
+        let Some((twin, twin_origin)) = by_key.get(&target_key) else {
+            continue;
+        };
+        if twin
+            .features
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            != unit
+                .features
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        {
+            continue;
+        }
+        let cargo_shared = origin == twin_origin;
+        let predicate_shared = !kept_apart.contains(&unit.key);
+        if cargo_shared != predicate_shared {
+            return Err(stow_types::stow_error!(
+                "cargo {} the `{}` {} host/target twin pair but the sharing predicate {} — a probe input the builder does not model disagreed",
+                if cargo_shared { "shared" } else { "kept apart" },
+                unit.name,
+                unit.version,
+                if predicate_shared {
+                    "shared"
+                } else {
+                    "kept them apart"
+                },
+            ));
+        }
     }
     Ok(())
 }
@@ -1012,7 +1156,8 @@ pub async fn build(
     };
     let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
 
-    fetch_workspace_dependencies(task, &workspace).await?;
+    let cargo_home = cargo_home()?;
+    fetch_workspace_dependencies(&cargo_home, task, &workspace).await?;
 
     let cargo_subcommand = cargo_subcommand()?;
     // Cargo's own unit graphs are computed once for the whole build:
@@ -1020,7 +1165,7 @@ pub async fn build(
     // and spelling will compile (stow#588), and consumption reads the
     // same answers — a graph that cannot be produced fails the build,
     // not just the cache path.
-    let unit_graphs = phase_unit_graphs(task, &workspace, cargo_subcommand).await?;
+    let unit_graphs = phase_unit_graphs(&cargo_home, task, &workspace, cargo_subcommand).await?;
     verify_dependency_context(task, &unit_graphs)?;
     let (_consume_store_dir, consume_store) = stage_consumption_store(task, &unit_graphs).await?;
 
@@ -1054,6 +1199,7 @@ pub async fn build(
 
     let setup = PhaseSetup {
         workspace: &workspace,
+        cargo_home: &cargo_home,
         wrappers: &wrappers,
         runtime_wrapper: &runtime_wrapper,
         capture_wrapper: &capture_wrapper,
@@ -1165,6 +1311,7 @@ pub fn verified_run_toolchain(task: &BuildTaskPayload) -> stow_types::error::Res
 /// flags don't exist on `fetch`: it downloads the full dependency closure
 /// for every feature and every target.
 pub async fn fetch_workspace_dependencies(
+    cargo_home: &Path,
     task: &BuildTaskPayload,
     workspace: &BuildWorkspace,
 ) -> stow_types::error::Result<()> {
@@ -1172,7 +1319,8 @@ pub async fn fetch_workspace_dependencies(
     fetch
         .arg("fetch")
         .arg("--manifest-path")
-        .arg(workspace.manifest_path());
+        .arg(workspace.manifest_path())
+        .env("CARGO_HOME", path_arg(cargo_home)?);
     // Fetch never takes `--locked`: the generated wrapper's seeded lockfile
     // is not one cargo can be held to — it must still prune bundled entries
     // the wrapper graph cannot reach and fill in the dep edges. Under
@@ -1210,6 +1358,10 @@ pub async fn fetch_workspace_dependencies(
 /// The per-run state every sandboxed phase shares.
 pub struct PhaseSetup<'a> {
     pub workspace: &'a BuildWorkspace,
+    /// The cargo home the sandboxed phases see: its caches are granted
+    /// read-only and it is exported to them as `CARGO_HOME`. Callers pass
+    /// [`cargo_home`]'s answer; a test passes the home its fixture built.
+    pub cargo_home: &'a Path,
     pub wrappers: &'a wrapper_shim::WrapperShimPaths,
     pub runtime_wrapper: &'a Path,
     pub capture_wrapper: &'a Path,
@@ -1288,7 +1440,7 @@ pub async fn run_sandboxed_phase(
             path_arg(setup.workspace.capture_dir())?,
         )
         .env(STOW_BUILD_CAPTURE_IPC_ENV, path_arg(run.ipc_endpoint)?)
-        .env("CARGO_HOME", path_arg(&cargo_home()?)?)
+        .env("CARGO_HOME", path_arg(run.setup.cargo_home)?)
         .env("RUSTUP_HOME", path_arg(&rustup_home()?)?)
         .current_dir(setup.workspace.workspace_root());
     if let Some(store_dir) = setup.consume_store {
@@ -1541,6 +1693,7 @@ pub async fn phase_sandbox(
         ));
 
     for (path, access, reason) in sandbox_grants(
+        setup.cargo_home,
         workspace,
         run_dir,
         wrappers,
@@ -1565,7 +1718,9 @@ pub async fn phase_sandbox(
 /// The filesystem grant set for one phase — nothing else on the host is
 /// reachable. Every entry names the tool that needs it and why, because each
 /// one is a hole in the boundary this task exists to close.
+#[allow(clippy::too_many_arguments)]
 fn sandbox_grants(
+    cargo_home: &Path,
     workspace: &BuildWorkspace,
     run_dir: &Path,
     wrappers: &wrapper_shim::WrapperShimPaths,
@@ -1574,9 +1729,8 @@ fn sandbox_grants(
     consume_store: Option<&Path>,
     target: &str,
 ) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
-    let cargo_home = cargo_home()?;
     let rustup_home = rustup_home()?;
-    ensure_package_cache_lock(&cargo_home)?;
+    ensure_package_cache_lock(cargo_home)?;
 
     let tools_dir = wrappers
         .rustc_wrapper
@@ -1634,7 +1788,7 @@ fn sandbox_grants(
         ));
     }
 
-    conditional_grants(&cargo_home, &rustup_home, target, &mut grants);
+    conditional_grants(cargo_home, &rustup_home, target, &mut grants);
 
     grants.extend(compiler_search_grants());
     grants.extend(msvc.grants());
@@ -1882,6 +2036,12 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         // passthrough is what `toolchain_grant_dirs` keys on to grant
         // the whole tree (its bin/ holds the PATH-resolved driver shims).
         "STOW_GLIBC_SYSROOT",
+        // The lock-extracted system-library root (stow#850): the
+        // sandbox passes it through and `toolchain_grant_dirs` grants
+        // read+exec on the tree. `CMAKE_PREFIX_PATH` is how CMake's
+        // find_* modules reach the same root.
+        "STOW_SYSTEM_LIBS",
+        "CMAKE_PREFIX_PATH",
         // The MSVC developer environment. `LIB` and `INCLUDE` are how the
         // linker and the `cc` crate find the CRT and the Windows SDK; the
         // install-root variables are how a build script locates the same
@@ -1909,6 +2069,9 @@ fn toolchain_env_names(target: &str, names: impl Iterator<Item = String>) -> Vec
         "CPPFLAGS_",
         "LDFLAGS_",
         "PKG_CONFIG_",
+        // bindgen's extra clang args, global and per-target spellings —
+        // they carry the system-library root's -isystem include dirs.
+        "BINDGEN_EXTRA_CLANG_ARGS",
     ];
     let android = targets_android(target);
     names
@@ -1942,6 +2105,10 @@ fn toolchain_grant_dirs(
         // runner's home: sandboxed compiles read its headers and link
         // inputs through it.
         "STOW_GLIBC_SYSROOT",
+        // The system-library root extracted from the lock's debs
+        // (stow#850): sandboxed pkg-config, compile and link probes
+        // read its headers, .pc files and libraries.
+        "STOW_SYSTEM_LIBS",
     ];
     const TOOLCHAIN_EXE_PREFIXES: &[&str] = &["CARGO_TARGET_", "CC_", "CXX_", "AR_", "RANLIB_"];
     let android = targets_android(target);
@@ -2594,24 +2761,11 @@ mod tests {
         }
     }
 
-    /// Point the consumption config at a registry no slice can be read
-    /// from, without any network: the scheme is refused before a request.
-    fn unreadable_registry(cache_dir: &Path) {
-        // SAFETY: nextest runs each test in its own process, and every
-        // test that sets these sets the same values.
-        unsafe {
-            std::env::set_var("STOW_CACHE_DIR", cache_dir);
-            std::env::set_var("STOW_REGISTRY_BASE_URL", "ftp://127.0.0.1");
-        }
-    }
-
     /// stow#817: a task with published dependencies that cannot read its
     /// slice fails with the slice error — building on would compile the
     /// closure the scheduler promised it would be served.
     #[test]
     fn a_task_whose_slice_cannot_be_read_fails_naming_the_slice() {
-        let cache_dir = TempDir::new().expect("cache dir");
-        unreadable_registry(cache_dir.path());
         let mut task = task_with_features(&[]);
         task.dependency_subgraph = TaskSubgraph {
             root_deps: vec![0],
@@ -2625,8 +2779,14 @@ mod tests {
             }],
         };
 
-        let error = smol::block_on(super::stage_consumption_store(&task, &[]))
-            .expect_err("an unreadable slice fails the build");
+        let error = smol::block_on(crate::consume::slices_for_task_with(&task, |_, _| {
+            Box::pin(async {
+                Err(stow_types::stow_error!(
+                    "ftp://127.0.0.1 is not a supported registry scheme"
+                ))
+            })
+        }))
+        .expect_err("an unreadable slice fails the build");
         let text = format!("{error:#}");
         assert!(
             text.contains("index slice for aarch64-apple-darwin"),
@@ -2640,7 +2800,6 @@ mod tests {
     #[test]
     fn a_task_without_dependencies_consumes_nothing() {
         let cache_dir = TempDir::new().expect("cache dir");
-        unreadable_registry(cache_dir.path());
         let (store, path) = smol::block_on(super::stage_consumption_store(
             &task_with_features(&[]),
             &[],
@@ -2968,6 +3127,43 @@ mod tests {
         );
     }
 
+    /// stow#723: an outcome-3 host task pins its own target twin. Cargo
+    /// rejects one package declared under two names across dependency
+    /// kinds, so the twin's `[dependencies]` pin keys on the task entry's
+    /// own `[build-dependencies]` name.
+    #[test]
+    fn wrapper_manifest_pins_the_self_twin_under_the_task_crate_name() {
+        let mut task = task_with_features(&["std"]);
+        task.host_side = true;
+        task.dependency_subgraph = leaf_pins(vec![SubgraphNode {
+            crate_name: task.crate_name.clone(),
+            version: task.version.clone(),
+            features_json: task.features_json.clone(),
+            host_side: false,
+            keys_apart: false,
+            deps: Vec::new(),
+        }]);
+        let manifest: toml::Table =
+            toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
+                .expect("generated manifest parses");
+        assert_eq!(
+            manifest["build-dependencies"]["itoa"]["version"].as_str(),
+            Some("=1.0.15"),
+            "the task crate is the wrapper's build-dependency"
+        );
+        let twin = manifest["dependencies"]["itoa"]
+            .as_table()
+            .expect("the target twin pins under the task crate's own name");
+        assert_eq!(twin["version"].as_str(), Some("=1.0.15"));
+        assert_eq!(twin["package"].as_str(), Some("itoa"));
+        assert!(
+            manifest["dependencies"]
+                .as_table()
+                .is_some_and(|deps| deps.len() == 1),
+            "no aliased second name for the task's own package"
+        );
+    }
+
     #[test]
     fn host_side_task_runs_each_phase_under_both_invocations() {
         let mut task = task_with_features(&["std"]);
@@ -3283,6 +3479,7 @@ checksum = "33"
         msvc: &super::MsvcToolchain,
         target: &str,
         extra_env: &[(String, String)],
+        cargo_home: &Path,
     ) {
         let capture_dir = root.join(".stow-rustc-capture");
         std::fs::create_dir_all(&capture_dir).expect("capture dir");
@@ -3307,6 +3504,7 @@ checksum = "33"
             heel::NetworkAuditLog::file(root.join("network-audit.jsonl")).expect("audit log");
         let setup = super::PhaseSetup {
             workspace: &workspace,
+            cargo_home,
             wrappers: &wrappers,
             runtime_wrapper: &wrapper,
             capture_wrapper: &wrapper,
@@ -3334,7 +3532,7 @@ checksum = "33"
             )
             .env(
                 "CARGO_HOME",
-                super::path_arg(&cargo_home().expect("cargo home")).expect("utf8 cargo home"),
+                super::path_arg(cargo_home).expect("utf8 cargo home"),
             )
             .env(
                 "RUSTUP_HOME",
@@ -3389,7 +3587,8 @@ checksum = "33"
             let target_dir = TempDir::new().expect("target dir");
             let host = host_triple();
             let msvc = super::MsvcToolchain::resolve(&host).expect("MSVC toolchain");
-            cargo_build_probe(root, target_dir.path(), &msvc, &host, &[]).await;
+            let cargo_home = cargo_home().expect("cargo home");
+            cargo_build_probe(root, target_dir.path(), &msvc, &host, &[], &cargo_home).await;
         });
     }
 
@@ -3461,6 +3660,7 @@ checksum = "33"
             let probe_object = target_dir.path().join("probe.obj");
             let msvc = super::MsvcToolchain::resolve("aarch64-pc-windows-msvc")
                 .expect("resolve the arm64 MSVC toolchain");
+            let cargo_home = cargo_home().expect("cargo home");
             cargo_build_probe(
                 root,
                 target_dir.path(),
@@ -3470,6 +3670,7 @@ checksum = "33"
                     "STOW_PROBE_OBJECT".to_owned(),
                     super::path_arg(&probe_object).expect("utf8 probe path"),
                 )],
+                &cargo_home,
             )
             .await;
             let bytes = std::fs::read(&probe_object).expect("read the probe object");
@@ -3478,6 +3679,49 @@ checksum = "33"
                 "probe.obj must be an ARM64 COFF object; its first bytes are {bytes:02x?}"
             );
         });
+    }
+
+    /// The sandbox starts with no environment, so a sandboxed `env` may
+    /// print only the names the builder passes through — `PATH`, the
+    /// probe hook, the toolchain set for the task's target — and what
+    /// heel itself injects: its IPC endpoint, the temp dir it points at
+    /// the working directory, and the proxy config it forwards when
+    /// network access is on.
+    #[cfg(unix)]
+    fn assert_sandbox_env_is_isolated(env_text: &str, target: &str) {
+        let mut allowed: std::collections::BTreeSet<String> = [
+            "PATH",
+            STOW_PROBE_FORBIDDEN_PATH_ENV,
+            "HEEL_IPC_ENDPOINT",
+            "TMPDIR",
+            "TEMP",
+            "TMP",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ]
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+        allowed.extend(toolchain_env_names(
+            target,
+            std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+        ));
+        let leaked: Vec<String> = env_text
+            .lines()
+            .filter_map(|line| line.split('=').next())
+            .filter(|name| !name.is_empty() && !allowed.contains(*name))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            leaked.is_empty() && env_text.lines().any(|line| line.starts_with("PATH=")),
+            "sandboxed process saw the parent environment ({leaked:?}):\n{env_text}"
+        );
     }
 
     /// A process inside the phase sandbox must not be able to read the host
@@ -3489,10 +3733,6 @@ checksum = "33"
     #[test]
     fn sandboxed_process_cannot_read_host_checkout_or_parent_env() {
         smol::block_on(async {
-            // A sentinel only the parent environment carries: it must be
-            // invisible inside the sandbox.
-            const SENTINEL: &str = "STOW_SANDBOX_PROBE_SENTINEL";
-
             let workspace_root = TempDir::new().expect("workspace root");
             let target_dir = TempDir::new().expect("target dir");
             let tools_dir = TempDir::new().expect("tools dir");
@@ -3522,6 +3762,7 @@ checksum = "33"
             let host = host_triple();
             let msvc = super::MsvcToolchain::resolve(&host).expect("MSVC toolchain");
             let grants = sandbox_grants(
+                &cargo_home,
                 &workspace,
                 target_dir.path(),
                 &wrappers,
@@ -3549,13 +3790,10 @@ checksum = "33"
             // manifest — the host checkout a build script must not reach.
             let host_checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
             assert!(host_checkout.exists());
-            unsafe {
-                std::env::set_var(SENTINEL, "stow-probe-secret");
-                std::env::set_var(STOW_PROBE_FORBIDDEN_PATH_ENV, &host_checkout);
-            }
 
             let setup = super::PhaseSetup {
                 workspace: &workspace,
+                cargo_home: &cargo_home,
                 wrappers: &wrappers,
                 runtime_wrapper: &wrapper,
                 capture_wrapper: &wrapper,
@@ -3582,11 +3820,7 @@ checksum = "33"
             );
 
             let env_output = sandbox.command("env").output().await.expect("env output");
-            let env_text = String::from_utf8_lossy(&env_output.stdout);
-            assert!(
-                !env_text.contains("stow-probe-secret"),
-                "sandboxed process saw the parent environment:\n{env_text}"
-            );
+            assert_sandbox_env_is_isolated(&String::from_utf8_lossy(&env_output.stdout), &host);
 
             // A connection attempt — allowed or not — must land in the audit
             // log. Port 1 refuses everywhere, so this probe is offline-safe.
@@ -3602,11 +3836,6 @@ checksum = "33"
                 audit.contains("127.0.0.1"),
                 "audit log recorded no decision for the probe: {audit}"
             );
-
-            unsafe {
-                std::env::remove_var(SENTINEL);
-                std::env::remove_var(STOW_PROBE_FORBIDDEN_PATH_ENV);
-            }
         });
     }
 
@@ -3671,6 +3900,7 @@ checksum = "33"
     fn the_job_s_own_toolchain_variables_reach_every_task() {
         let sysroot = TempDir::new().expect("sysroot dir");
         let sdkroot = TempDir::new().expect("sdkroot dir");
+        let syslibs = TempDir::new().expect("system-libs dir");
         let linker_dir = TempDir::new().expect("linker dir");
         let linker = linker_dir.path().join("aarch64-linux-gnu-ld");
         std::fs::write(&linker, b"#!/bin/sh\n").expect("linker file");
@@ -3686,6 +3916,10 @@ checksum = "33"
                     sdkroot.path().as_os_str().to_owned(),
                 ),
                 (
+                    OsString::from("STOW_SYSTEM_LIBS"),
+                    syslibs.path().as_os_str().to_owned(),
+                ),
+                (
                     OsString::from("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"),
                     linker.as_os_str().to_owned(),
                 ),
@@ -3693,7 +3927,12 @@ checksum = "33"
             .into_iter()
         };
         let dirs = toolchain_grant_dirs("x86_64-unknown-linux-gnu", vars());
-        for dir in [sysroot.path(), sdkroot.path(), linker_dir.path()] {
+        for dir in [
+            sysroot.path(),
+            sdkroot.path(),
+            syslibs.path(),
+            linker_dir.path(),
+        ] {
             assert!(
                 dirs.contains(&dir.to_path_buf()),
                 "{} must be granted to a non-Android task",
@@ -3711,12 +3950,21 @@ checksum = "33"
             [
                 "PKG_CONFIG_aarch64_unknown_linux_gnu".to_owned(),
                 "PKG_CONFIG_PATH".to_owned(),
+                "STOW_SYSTEM_LIBS".to_owned(),
+                "CMAKE_PREFIX_PATH".to_owned(),
+                "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu".to_owned(),
             ]
             .into_iter(),
         );
         assert_eq!(
             passed,
-            ["PKG_CONFIG_aarch64_unknown_linux_gnu", "PKG_CONFIG_PATH"]
+            [
+                "PKG_CONFIG_aarch64_unknown_linux_gnu",
+                "PKG_CONFIG_PATH",
+                "STOW_SYSTEM_LIBS",
+                "CMAKE_PREFIX_PATH",
+                "BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu",
+            ]
         );
         for target in ["x86_64-unknown-linux-gnu", "aarch64-linux-android"] {
             assert!(

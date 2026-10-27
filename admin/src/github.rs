@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
+use stow_types::runs::link_next;
 use stow_types::stow_error;
 use stow_types::transient::{
     Backoff, RateLimit, is_transient_status, rate_limit, retry_after_hint,
@@ -22,7 +23,7 @@ pub const USER_AGENT: &str = "stow-admin";
 /// watchdog's pipeline signals inspect — the batch workflow, whose
 /// runs carry every leg (stow#833). Spelled once in `stow_types` with
 /// the identity the scheduler dispatches to and certificates assert.
-pub use stow_types::trusted_builder::BATCH_WORKFLOW_FILE as BUILD_WORKFLOW;
+pub use stow_types::trusted_builder::WORKFLOW_FILE as BUILD_WORKFLOW;
 
 /// `GET` one API path under `/repos/{REPO}/` and decode the JSON body.
 /// The response body rides zenwave errors, so a rejection carries
@@ -82,34 +83,20 @@ pub enum Conditional<T> {
     Unmodified,
 }
 
-/// `GET` one API path under `/repos/{REPO}/` as a conditional request:
-/// `etag` rides `If-None-Match`, a 304 answers [`Conditional::Unmodified`]
-/// without parsing the (empty) body, and a 200 answers the decoded body
-/// plus the response's `ETag` to carry forward.
-pub async fn get_conditional<T: serde::de::DeserializeOwned>(
-    token: &str,
-    path: &str,
+/// The 200/304
+/// contract for callers holding a full URL rather than a repo path:
+/// paginated endpoints, whose `Link` walk addresses page URLs
+/// directly. The answer's own `Link: rel="next"` comes back alongside
+/// — the cursor [`ConditionalPages`] caches with the page.
+pub async fn get_url_conditional<T: serde::de::DeserializeOwned>(
+    token: Option<&str>,
+    url: &str,
     etag: Option<&str>,
     backoff: Backoff,
-) -> stow_types::error::Result<Conditional<T>> {
-    get_conditional_result(token, path, etag, backoff)
-        .await
-        .map_err(|error| stow_error!("GET {API_BASE}/repos/{REPO}/{path}: {error}"))
-}
-
-/// Like [`get_conditional`], but the raw transport error escapes so the
-/// caller can read the status itself — a 404 on a just-dispatched run id
-/// is the run not materialized yet, a fact about timing, not a failure.
-pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
-    token: &str,
-    path: &str,
-    etag: Option<&str>,
-    backoff: Backoff,
-) -> std::result::Result<Conditional<T>, zenwave::Error> {
-    let url = format!("{API_BASE}/repos/{REPO}/{path}");
+) -> std::result::Result<(Conditional<T>, Option<String>), zenwave::Error> {
     let response = send_get(
-        Some(token),
-        &url,
+        token,
+        url,
         Some("application/vnd.github+json"),
         etag,
         backoff,
@@ -117,7 +104,7 @@ pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
     .await?;
     if response.status().as_u16() == 304 {
         drop(response);
-        return Ok(Conditional::Unmodified);
+        return Ok((Conditional::Unmodified, None));
     }
     let response = response.error_for_status().await?;
     let etag = response
@@ -125,8 +112,87 @@ pub async fn get_conditional_result<T: serde::de::DeserializeOwned>(
         .get("etag")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let next = link_next(
+        response
+            .headers()
+            .get("link")
+            .and_then(|value| value.to_str().ok()),
+    )
+    .map(str::to_owned);
     let body = response.into_json().await?;
-    Ok(Conditional::Modified { body, etag })
+    Ok((Conditional::Modified { body, etag }, next))
+}
+
+/// A paginated endpoint's conditional cache — one entry per page URL:
+/// the `ETag` its last 200 carried, the decoded page and the
+/// `Link: rel="next"` the same answer served. Revalidating sends each
+/// URL's own validator: a 304 serves the cached page and its cached
+/// `next`, a 200 replaces all three. A repeated reader — the watch's
+/// per-tick listings and jobs pages — pays a full body only for a
+/// page that actually changed; an authorized 304 is free under
+/// GitHub's primary rate budget.
+pub struct ConditionalPages<T> {
+    pages: BTreeMap<String, ConditionalPage<T>>,
+}
+
+/// One page URL's cached answer.
+struct ConditionalPage<T> {
+    /// The validator the page's last 200 carried — `None` for an
+    /// endpoint that sends none, which then revalidates as a full
+    /// GET every time.
+    etag: Option<String>,
+    /// The decoded page.
+    page: T,
+    /// The `Link: rel="next"` the same answer carried — revalidated
+    /// with the page, so a walk keeps the chain it cached.
+    next: Option<String>,
+}
+
+impl<T: serde::de::DeserializeOwned> ConditionalPages<T> {
+    /// An empty cache — every URL's first read is an unconditional GET.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            pages: BTreeMap::new(),
+        }
+    }
+
+    /// The page `url` serves, revalidating a cached copy on its own
+    /// `ETag`: a 304 answers the cached page and its cached `next`, a
+    /// 200 replaces them. Returns the page and its `next` link.
+    ///
+    /// # Errors
+    /// The failure `send_get` ended on — a terminal status, a dead
+    /// body or an exhausted retry budget — named with the URL.
+    pub async fn get(
+        &mut self,
+        token: Option<&str>,
+        url: &str,
+        backoff: Backoff,
+    ) -> stow_types::error::Result<(&T, Option<&str>)> {
+        let etag = self.pages.get(url).and_then(|page| page.etag.as_deref());
+        match get_url_conditional(token, url, etag, backoff).await {
+            Ok((Conditional::Modified { body, etag }, next)) => {
+                self.pages.insert(
+                    url.to_owned(),
+                    ConditionalPage {
+                        etag,
+                        page: body,
+                        next,
+                    },
+                );
+            }
+            Ok((Conditional::Unmodified, _)) => {}
+            Err(error) => return Err(stow_error!("GET {url}: {error}")),
+        }
+        // A 304 is only an answer to the validator a cached page sent;
+        // one for a URL the cache never held is GitHub misbehaving.
+        let cached = self
+            .pages
+            .get(url)
+            .ok_or_else(|| stow_error!("GET {url}: 304 for a page never cached"))?;
+        Ok((&cached.page, cached.next.as_deref()))
+    }
 }
 
 /// `GET` an absolute URL and decode the JSON body under the same
@@ -312,19 +378,6 @@ pub enum WriteFailure {
     /// A 5xx, or a transport failure from the send or the response-body
     /// read: nobody knows whether the write happened.
     Ambiguous(String),
-}
-
-impl WriteFailure {
-    /// The wait a rate-limited answer named — `Retry-After`, or the
-    /// reset-derived wait — `None` for every other kind and for a
-    /// hintless 429.
-    #[must_use]
-    pub const fn hint(&self) -> Option<Duration> {
-        match self {
-            Self::RateLimited { hint, .. } => *hint,
-            _ => None,
-        }
-    }
 }
 
 impl std::fmt::Display for WriteFailure {
@@ -528,28 +581,6 @@ async fn delete_at(api_base: &str, token: &str, path: &str) -> stow_types::error
     delete_url(token, &format!("{api_base}/repos/{REPO}/{path}")).await
 }
 
-/// `POST` one API path under `/repos/{REPO}/` with a JSON body whose
-/// 2xx answer carries no body of interest — the `workflow_dispatch`
-/// calls `preheat manual` drives, which answer 204.
-///
-/// # Errors
-/// The typed [`WriteFailure`], exactly like [`post`].
-pub async fn post_empty(
-    token: &str,
-    path: &str,
-    body: &serde_json::Value,
-) -> Result<(), WriteFailure> {
-    let response = send_write(
-        token,
-        zenwave::Method::POST,
-        &format!("{API_BASE}/repos/{REPO}/{path}"),
-        Some(body),
-    )
-    .await?;
-    drop(response);
-    Ok(())
-}
-
 // ===== workflow-run enumeration =====
 
 /// The Actions `runs` listing's hard cap on one filtered query: page 11
@@ -557,8 +588,9 @@ pub async fn post_empty(
 /// window at the cap subdivides rather than pages past it (stow#555).
 pub const RUNS_LISTING_CAP: usize = 1000;
 /// Concurrent independent range reads while enumerating — the same
-/// explicit bound every read fan-out in this crate uses.
-const RANGE_READ_CONCURRENCY: usize = 8;
+/// explicit bound every read fan-out in this crate uses (the watch's
+/// per-run jobs and log reads included, stow#853).
+pub const RANGE_READ_CONCURRENCY: usize = 8;
 
 /// The `runs` listing's page shape — `total_count` is what makes the cap
 /// visible before page 11 silently empties.
@@ -575,6 +607,50 @@ pub struct RunsPage<Row> {
 /// and the cap decision live on it.
 pub trait RunRow {
     fn run_id(&self) -> u64;
+}
+
+/// One run row as both `workflow_runs` listings and `actions/runs/{id}`
+/// serve it — every field the crate's run readers share: identity and
+/// `run_attempt` for the jobs reads, `display_title` for the task
+/// binding, `head_sha`/`created_at` for staleness and dispatch
+/// resolution, `actor` for who dispatched.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct WorkflowRunRow {
+    /// The run's id.
+    pub id: u64,
+    /// The rendered `run-name` — `<rustc>-<task_id>` for a run.
+    pub display_title: String,
+    /// `queued`/`in_progress`/`completed` as GitHub serves it.
+    pub status: String,
+    /// The run's conclusion — `None` until it completes.
+    pub conclusion: Option<String>,
+    /// The run's Actions URL.
+    pub html_url: String,
+    /// GitHub's attempt counter — `rerun-failed-jobs` bumps it, and the
+    /// jobs read is pinned to it (stow#852).
+    pub run_attempt: u64,
+    /// GitHub's creation time for the run — the watch's staleness
+    /// reads anchor on it.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+    /// Who dispatched the run — the App's `[bot]` login on
+    /// scheduler-dispatched runs, the operator's on operations submits.
+    /// The watch renders it.
+    pub actor: Actor,
+}
+
+/// The `actor` object a run row carries — only the login is read, and
+/// only by the watch.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Actor {
+    /// The actor's login — the watch renders it.
+    pub login: String,
+}
+
+impl RunRow for WorkflowRunRow {
+    fn run_id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// One closed `created` window, `[start..end]` inclusive at the second
@@ -1408,6 +1484,107 @@ mod send_get_tests {
             "\"v1\""
         );
         assert_eq!(response.status().as_u16(), 304);
+    }
+}
+
+#[cfg(test)]
+mod conditional_pages_tests {
+    use super::{Backoff, ConditionalPages};
+    use crate::test_server;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Page {
+        n: u64,
+    }
+
+    /// A URL's cached entry revalidates on the `ETag` its last 200
+    /// sent: a 304 serves the cached page, a 200 replaces the entry,
+    /// and the next read sends the new validator.
+    #[tokio::test]
+    async fn conditional_pages_revalidate_on_their_own_etags() {
+        let server = test_server::Loopback::start(vec![
+            test_server::Step::RespondWith {
+                status: 200,
+                retry_after: None,
+                headers: vec![("etag".to_owned(), "\"p1\"".to_owned())],
+                body: r#"{"n":1}"#,
+            },
+            test_server::Step::Respond {
+                status: 304,
+                retry_after: None,
+                body: "",
+            },
+            test_server::Step::RespondWith {
+                status: 200,
+                retry_after: None,
+                headers: vec![("etag".to_owned(), "\"p2\"".to_owned())],
+                body: r#"{"n":2}"#,
+            },
+            test_server::Step::Respond {
+                status: 304,
+                retry_after: None,
+                body: "",
+            },
+        ])
+        .await;
+        let mut pages = ConditionalPages::<Page>::new();
+        for expected in [1u64, 1, 2, 2] {
+            let (page, _) = pages
+                .get(None, &server.url, Backoff::new())
+                .await
+                .expect("the read answers");
+            assert_eq!(page.n, expected);
+        }
+        let heads = server.join().await;
+        assert_eq!(heads.len(), 4);
+        assert!(heads[0].head.headers.get("if-none-match").is_none());
+        assert_eq!(
+            heads[1].head.headers.get("if-none-match").expect("etag"),
+            "\"p1\""
+        );
+        assert_eq!(
+            heads[2].head.headers.get("if-none-match").expect("etag"),
+            "\"p1\""
+        );
+        assert_eq!(
+            heads[3].head.headers.get("if-none-match").expect("etag"),
+            "\"p2\""
+        );
+    }
+
+    /// The cached `next` is revalidated with its page: a 304 answers
+    /// the link the page's last 200 carried, a 200 replaces it.
+    #[tokio::test]
+    async fn conditional_pages_revalidate_the_cached_next_link() {
+        let server = test_server::Loopback::start(vec![
+            test_server::Step::RespondWith {
+                status: 200,
+                retry_after: None,
+                headers: vec![
+                    ("etag".to_owned(), "\"p1\"".to_owned()),
+                    (
+                        "link".to_owned(),
+                        "<https://api.github.com/page2>; rel=\"next\"".to_owned(),
+                    ),
+                ],
+                body: r#"{"n":1}"#,
+            },
+            test_server::Step::Respond {
+                status: 304,
+                retry_after: None,
+                body: "",
+            },
+        ])
+        .await;
+        let mut pages = ConditionalPages::<Page>::new();
+        for _ in 0..2 {
+            let (_, next) = pages
+                .get(None, &server.url, Backoff::new())
+                .await
+                .expect("the read answers");
+            assert_eq!(next, Some("https://api.github.com/page2"));
+        }
+        server.join().await;
     }
 }
 

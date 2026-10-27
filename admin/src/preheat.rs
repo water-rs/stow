@@ -15,17 +15,11 @@ use stow_types::stow_error;
 use zenwave::{Client, ResponseExt};
 
 use crate::Edge;
-use crate::crates_io::{self, CrateVersion};
+use crate::crates_io;
 use crate::render::{self, Output, Table};
 
 const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_ENV: &str = "CF_ANALYTICS_TOKEN";
-const CF_ANALYTICS_SQL_BASE: &str = "https://api.cloudflare.com/client/v4";
-/// Test-only seam (stow#593): the Analytics Engine base URL. Production
-/// never sets it and the const below stays the only live endpoint; the
-/// workflow-entrypoint e2e points it at a loopback fixture so a
-/// `preheat missed` run can be asserted end to end without Cloudflare.
-const CF_ANALYTICS_SQL_BASE_ENV: &str = "STOW_CF_ANALYTICS_SQL_BASE";
 // The SQL API itself times queries out at 30 s; the client bound sits just
 // above that so a slow query reports the server's error, not a local cutoff.
 const CF_ANALYTICS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
@@ -38,13 +32,6 @@ pub struct PreheatArgs {
 
 #[derive(Subcommand)]
 pub enum PreheatCommand {
-    /// Submit tasks for the top-N most-downloaded crates — every selected
-    /// version line on the target, each with the default feature set. A
-    /// ranked crate whose newest release ships no library target is a
-    /// name source like any binary: its dependency graph resolves
-    /// through cargo's resolver in the edge and its crates.io
-    /// nodes are enqueued in its place.
-    Top(TopArgs),
     /// Preheat one named crates.io binary crate's dependency graph: its
     /// `.crate` tarball is fetched and resolved once
     /// runs once per CI target — every crates.io node an ordinary crate
@@ -56,9 +43,12 @@ pub enum PreheatCommand {
     /// `false`: on the runner it names the task crate's own lockfile,
     /// not the source binary's.
     Binary(BinaryArgs),
-    /// The download-ranked binary lane: resolve each of the top-N
-    /// most-downloaded *binary* crates exactly the way `preheat binary`
-    /// resolves one — name sources, never tasks of their own.
+    /// The top-binary lane (stow#891): the top-N crates whose default
+    /// version ships a binary target and no library (stow#918), ranked
+    /// by the last 90 days of `version_downloads`, all read from the
+    /// crates.io daily database dump in a single fetch. Each candidate
+    /// resolves exactly the way `preheat binary` resolves one — name
+    /// sources, never tasks of their own.
     TopBinaries(TopBinariesArgs),
     /// Promote the most-missed `(crate, version, features)` identities in
     /// the Analytics Engine dataset into scheduler tasks.
@@ -67,10 +57,10 @@ pub enum PreheatCommand {
     /// one crate request — the tasks a dispatch wave would enqueue per
     /// target. Nothing is enqueued.
     Plan(PlanArgs),
-    /// Drive a wave without the edge at all: resolve in-process, layer
-    /// the graph, dispatch `build-crate.yml` straight through the GitHub
-    /// API (or the local CI server under `--dispatch-url`), publish the
-    /// index between layers, and report failures at the end.
+    /// Resolve a wave on the operator's machine and submit one
+    /// dependency tree per source to the scheduler's operations entry
+    /// point at the caller's `--priority` (stow#880). The scheduler
+    /// owns dispatch from there — no second dispatcher remains.
     Manual(crate::manual::ManualArgs),
     /// The stars-ranked lane: `generate` rebuilds the reviewed
     /// `preheat/projects.toml` list from GitHub, `submit` resolves every
@@ -80,26 +70,6 @@ pub enum PreheatCommand {
     /// The `Preheat cost` lane's ledger snapshots and report (stow#773)
     /// — mock-stack only: the ledger exists on budget-probe deploys.
     Cost(crate::preheat_cost::CostArgs),
-}
-
-#[derive(Args)]
-pub struct TopArgs {
-    /// Comma-separated CI target triples to enqueue for. Defaults to
-    /// every triple `stow_types::api::CI_TARGET_TRIPLES` covers — the
-    /// ranked crates.io list is walked once and the same resolve serves
-    /// every target, so the lane is one invocation rather than nine.
-    #[arg(long, value_delimiter = ',')]
-    targets: Option<Vec<String>>,
-    /// Rustc version the tasks build for.
-    #[arg(long)]
-    rustc_version: String,
-    /// How many top-downloaded crates to enqueue per target.
-    #[arg(long, default_value_t = 100)]
-    limit: usize,
-    /// Submit the batch. Without it the command prints the plan and exits
-    /// 0 without enqueuing.
-    #[arg(long)]
-    yes: bool,
 }
 
 #[derive(Args)]
@@ -191,20 +161,16 @@ pub async fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result
         PreheatCommand::Manual(manual) => crate::manual::run(manual, output).await,
         PreheatCommand::Projects(args) => crate::projects::run(args, output).await,
         PreheatCommand::Cost(args) => crate::preheat_cost::run(args, output).await,
-        PreheatCommand::Top(args) => {
-            let edge = Edge::connect_to_submit(args.yes).await?;
-            top(edge.as_ref(), &mut crates_io::CratesIo::new(), args, output).await
-        }
         PreheatCommand::Binary(args) => {
-            let edge = Edge::connect_to_submit(args.yes).await?;
+            let edge = Edge::connect_to_submit(args.yes)?;
             binary(edge.as_ref(), &mut crates_io::CratesIo::new(), args, output).await
         }
         PreheatCommand::TopBinaries(args) => {
-            let edge = Edge::connect_to_submit(args.yes).await?;
-            top_binaries(edge.as_ref(), &mut crates_io::CratesIo::new(), args, output).await
+            let edge = Edge::connect_to_submit(args.yes)?;
+            top_binaries(edge.as_ref(), args, output).await
         }
         PreheatCommand::Missed(args) => {
-            let edge = Edge::connect_to_submit(args.yes).await?;
+            let edge = Edge::connect_to_submit(args.yes)?;
             missed(edge.as_ref(), args, output).await
         }
         PreheatCommand::Plan(args) => plan(&mut crates_io::CratesIo::new(), args, output).await,
@@ -213,24 +179,26 @@ pub async fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result
 
 /// The human table for a batch of enqueue requests — the plan every
 /// `preheat` submit previews.
-fn requests_table(requests: &[EnqueueRequest]) -> String {
+fn requests_table(trees: &[stow_types::api::SubmissionTree]) -> String {
     let mut table = Table::new(&[
         "crate", "version", "target", "features", "rustc", "source", "lockfile",
     ]);
-    for request in requests {
-        table.push([
-            request.crate_name.as_str().to_owned(),
-            request.version.to_string(),
-            request.target.as_str().to_owned(),
-            request.features_json.raw(),
-            request.rustc_version.as_str().to_owned(),
-            format!("{:?}", request.source),
-            if request.preserve_lockfile {
-                "source".to_owned()
-            } else {
-                "latest".to_owned()
-            },
-        ]);
+    for tree in trees {
+        for node in &tree.nodes {
+            table.push([
+                node.crate_name.as_str().to_owned(),
+                node.version.to_string(),
+                node.target.as_str().to_owned(),
+                node.features_json.raw(),
+                node.rustc_version.as_str().to_owned(),
+                format!("{:?}", tree.source),
+                if node.preserve_lockfile {
+                    "source".to_owned()
+                } else {
+                    "latest".to_owned()
+                },
+            ]);
+        }
     }
     table.render()
 }
@@ -241,16 +209,26 @@ fn requests_table(requests: &[EnqueueRequest]) -> String {
 async fn submit_plan(
     edge: Option<&Edge>,
     crates_io: &crates_io::CratesIo,
-    requests: Vec<EnqueueRequest>,
+    mut trees: Vec<stow_types::api::SubmissionTree>,
     output: Output,
 ) -> stow_types::error::Result<()> {
+    // Contained feature sets are served from their smallest containing
+    // set rather than built (stow#881): substitute across the lane's
+    // whole batch before the plan renders and before anything submits —
+    // the plan-only output is the production wave count's input, so it
+    // must carry the substituted task ids.
+    crate::manual::substitute_against_published(&mut trees).await?;
     // The fetch phase ended before this call — the count cannot change.
     let api_requests = crates_io.api_requests();
     render::mutation(
         output,
-        requests,
-        move |envelope: &render::Planned<Vec<EnqueueRequest>, crate::projects::SubmitOutcome>| {
-            let mut out = format!("{} task(s)\n", envelope.plan.len());
+        trees,
+        move |envelope: &render::Planned<
+            Vec<stow_types::api::SubmissionTree>,
+            crate::projects::SubmitOutcome,
+        >| {
+            let nodes: usize = envelope.plan.iter().map(|tree| tree.nodes.len()).sum();
+            let mut out = format!("{nodes} task(s)\n");
             if !envelope.plan.is_empty() {
                 let _ = write!(out, "{}", requests_table(&envelope.plan));
             }
@@ -268,146 +246,25 @@ async fn submit_plan(
             out
         },
         edge.map(|edge| {
-            async move |requests: &Vec<EnqueueRequest>| {
-                crate::projects::submit_chunked(edge, requests).await
+            async move |trees: &Vec<stow_types::api::SubmissionTree>| {
+                crate::projects::submit_chunked(edge, trees).await
             }
         }),
     )
     .await
 }
 
-async fn top(
-    edge: Option<&Edge>,
-    crates_io: &mut crates_io::CratesIo,
-    args: TopArgs,
-    output: Output,
-) -> stow_types::error::Result<()> {
-    let targets = typed_targets(args.targets)?;
-    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
-        .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
-
-    // The ranking and the per-crate metadata are walked once — every
-    // target draws from the same answers, so the lane spends one
-    // crates.io pass total rather than one per target.
-    let crates = crates_io.fetch_top_crates(args.limit).await?;
-    let mut jobs = Vec::new();
-    for krate in crates {
-        // The newest published release's `has_lib` decides which lane
-        // the ranked crate takes — the publish shape is a property of
-        // the release, not of the ranking, and crates.io's version
-        // record already carries it, so no tarball is fetched to find
-        // out. A library resolves its version lines through the edge —
-        // proc-macro crates land on the runner-family host and every
-        // node carries its dependency edges; a crate with no library
-        // target is a name source like any binary, resolved through the
-        // same lane, never enqueued itself.
-        let detail = crates_io.fetch_crate_detail(&krate.id).await?;
-        let Some(latest) = detail.latest_version else {
-            tracing::warn!(krate = %krate.id, "no published release; skipped");
-            continue;
-        };
-        if !latest.has_lib.unwrap_or(true) {
-            let version = semver::Version::parse(&latest.num).map_err(|error| {
-                stow_error!(
-                    "parse crates.io version `{}` for `{}`: {error}",
-                    latest.num,
-                    krate.id
-                )
-            })?;
-            jobs.push(CrateJob {
-                name: krate.id,
-                version,
-                downloads: krate.downloads,
-                bin_only: true,
-            });
-            continue;
-        }
-        let selected = select_version_lines(&detail.versions)?;
-        for version in selected {
-            jobs.push(CrateJob {
-                version: semver::Version::parse(&version).map_err(|error| {
-                    stow_error!(
-                        "parse crates.io version `{version}` for `{}`: {error}",
-                        krate.id
-                    )
-                })?,
-                name: krate.id.clone(),
-                downloads: krate.downloads,
-                bin_only: false,
-            });
-        }
-    }
-
-    // Every job resolves in-process on the pool's workers; results
-    // drain back in submission order so the batch reads exactly like
-    // today's sequential loop.
-    let targets_for_pool = targets.clone();
-    let (jobs, slots) = tokio::task::spawn_blocking(move || {
-        let pool = crate::resolve::ResolvePool::new(&rustc_version)?;
-        let mut slots: Vec<Option<Result<stow_resolver::SourceResolve, String>>> =
-            jobs.iter().map(|_| None).collect();
-        pool.run(
-            &jobs,
-            |resolver, runtime, job| {
-                crate::resolve::resolve_crate(
-                    resolver,
-                    runtime,
-                    &job.name,
-                    &job.version,
-                    &targets_for_pool,
-                    &rustc_version,
-                    job.downloads,
-                )
-            },
-            |index, _job, result| slots[index] = Some(result),
-        );
-        Ok::<_, stow_types::error::Error>((jobs, slots))
-    })
-    .await
-    .expect("resolve pool panicked")?;
-    let mut requests = Vec::new();
-    for (job, slot) in jobs.iter().zip(slots) {
-        let resolved = slot
-            .expect("the pool produces one result per job")
-            .map_err(|error| stow_error!("{error}"))?;
-        if job.bin_only {
-            if resolved.has_library {
-                tracing::warn!(
-                    krate = %job.name,
-                    version = %job.version,
-                    "crates.io reports has_lib=false but the tarball declares a library"
-                );
-            }
-            tracing::info!(
-                krate = %job.name,
-                version = %job.version,
-                "ranked crate ships no library — resolved as a name source"
-            );
-        }
-        requests.extend(flatten_source(resolved));
-    }
-    tracing::info!(
-        api_requests = crates_io.api_requests(),
-        tasks = requests.len(),
-        targets = targets.len(),
-        "planned top preheat tasks"
-    );
-    submit_plan(edge, crates_io, requests, output).await
-}
-
-/// One crate resolve the `top` lane queues — a ranked crate's selected
-/// version line, or (`bin_only`) the newest release of a crate whose
-/// latest declares no library: a name source like any binary, resolved
-/// for its crates.io graph and never enqueued itself.
+/// One crate resolve the `top-binaries` lane queues — a ranked
+/// binary's default version, resolved for its crates.io graph and
+/// never enqueued itself.
 struct CrateJob {
     /// crates.io name.
     name: String,
     /// The selected release.
     version: semver::Version,
-    /// crates.io download count — the scheduler's queue ordering.
+    /// The crate's 90-day download count — the scheduler's queue
+    /// ordering.
     downloads: u64,
-    /// Whether the name-source branch of `top` produced this job.
-    bin_only: bool,
 }
 
 /// A resolved lane batch's flat task list — per-target batches
@@ -418,6 +275,17 @@ fn flatten_source(resolved: stow_resolver::SourceResolve) -> Vec<EnqueueRequest>
         .into_iter()
         .flat_map(|(_target, tasks)| tasks)
         .collect()
+}
+
+/// One submission tree per resolved source (stow#878): every
+/// `flatten_source` output folds into the tree the scheduler merges by
+/// task id — the per-task embedded subgraph shape is gone.
+fn source_tree(resolved: stow_resolver::SourceResolve) -> stow_types::api::SubmissionTree {
+    stow_types::api::SubmissionTree::from_enqueue_requests(
+        stow_types::api::SubmissionSource::Preheat,
+        &flatten_source(resolved),
+    )
+    .expect("resolved source converts to a submission tree")
 }
 
 /// `preheat binary <crate>[@version]` — cache the whole dependency
@@ -468,20 +336,21 @@ async fn binary(
     .await
     .expect("resolve pool panicked")?;
     let requests = match resolved.map_err(|error| stow_error!("{error}"))? {
-        BinaryResolve::Tasks { tasks } => {
+        BinaryResolve::Tasks { trees } => {
+            let node_count: usize = trees.iter().map(|tree| tree.nodes.len()).sum();
             tracing::info!(
                 %crate_name,
                 version = %release.version,
                 targets = targets.len(),
-                tasks = tasks.len(),
+                tasks = node_count,
                 %rustc_version,
                 "planned named-binary preheat tasks"
             );
-            tasks
+            trees
         }
         BinaryResolve::NoBinary => {
             return Err(stow_error!(
-                "{crate_name} {} ships no binary target — `preheat top` is the library lane",
+                "{crate_name} {} ships no binary target — the lane only applies to crates with one",
                 release.version
             ));
         }
@@ -505,10 +374,10 @@ fn typed_targets(targets: Option<Vec<String>>) -> stow_types::error::Result<Vec<
 /// dependency graph yields, or the answer that this lane does not
 /// apply — the crate ships no binary target.
 enum BinaryResolve {
-    /// The crates.io graph resolved into tasks.
+    /// The crates.io graph resolved into one submission tree.
     Tasks {
-        /// Every enqueue request the resolve produced.
-        tasks: Vec<EnqueueRequest>,
+        /// The tree the resolve produced (stow#878).
+        trees: Vec<stow_types::api::SubmissionTree>,
     },
     /// The crate has no `[[bin]]` — a name source this lane skips.
     NoBinary,
@@ -550,7 +419,7 @@ fn resolve_binary_crate(
         return Ok(BinaryResolve::NoBinary);
     }
     Ok(BinaryResolve::Tasks {
-        tasks: flatten_source(source),
+        trees: vec![source_tree(source)],
     })
 }
 
@@ -593,18 +462,16 @@ async fn resolve_named_release(
     })
 }
 
-/// The stable `rustc` a lane resolves for when the caller did not name
-/// one — read straight from the release channel manifest
-/// (`channel-rust-stable.toml`), the same source the workflows use.
-///
 /// `preheat top-binaries` — every top-downloaded binary resolved the
-/// way `preheat binary` resolves one: the edge unpacks the tarball and
-/// runs cargo's resolver per target, crates.io nodes as ordinary crate
-/// tasks. One binary that fails to resolve is reported and skipped —
-/// the rest of the wave still lands.
+/// way `preheat binary` resolves one: cargo's resolver per target,
+/// crates.io nodes as ordinary crate tasks. The candidates come from
+/// the crates.io database dump, fetched once — the 100 crates whose
+/// default version ships a binary target and no library (stow#918),
+/// ranked by 90-day downloads.
+/// One binary that fails to resolve is reported and skipped — the
+/// rest of the wave still lands.
 async fn top_binaries(
     edge: Option<&Edge>,
-    crates_io: &mut crates_io::CratesIo,
     args: TopBinariesArgs,
     output: Output,
 ) -> stow_types::error::Result<()> {
@@ -612,13 +479,22 @@ async fn top_binaries(
         .map_err(|error| stow_error!("preheat rustc_version: {error}"))?;
     let targets = typed_targets(args.targets)?;
 
-    let candidates = crates_io.fetch_top_binary_crates(args.limit).await?;
+    let candidates = crate::dump::top_binary_crates(args.limit).await?;
     if candidates.is_empty() {
         return Err(stow_error!(
-            "no binary crates discovered from crates.io top-{} download list",
+            "the db-dump ranks no binary crates in its top-{} window",
             args.limit
         ));
     }
+    tracing::info!(
+        binaries = candidates.len(),
+        "db-dump top binary crates: {}",
+        candidates
+            .iter()
+            .map(|candidate| candidate.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let plan = tokio::task::spawn_blocking({
         let targets = targets.clone();
@@ -629,13 +505,12 @@ async fn top_binaries(
     .expect("resolve pool panicked")?;
     tracing::info!(
         binaries = plan.per_binary.len(),
-        tasks = plan.tasks.len(),
+        tasks = plan.trees.iter().map(|tree| tree.nodes.len()).sum::<usize>(),
         skipped = plan.skipped.len(),
         targets = targets.len(),
         %rustc_version,
         "planned top-binaries preheat tasks"
     );
-    let api_requests = crates_io.api_requests();
     render::mutation(
         output,
         plan,
@@ -643,7 +518,10 @@ async fn top_binaries(
             let plan = &envelope.plan;
             let mut out = format!(
                 "{} task(s) from {} binaries\n",
-                plan.tasks.len(),
+                plan.trees
+                    .iter()
+                    .map(|tree| tree.nodes.len())
+                    .sum::<usize>(),
                 plan.per_binary.len()
             );
             if !plan.per_binary.is_empty() {
@@ -660,9 +538,6 @@ async fn top_binaries(
                 }
                 let _ = write!(out, "\nskipped\n{}", table.render());
             }
-            if api_requests > 0 {
-                let _ = write!(out, "\ncrates.io API requests: {api_requests}");
-            }
             if let Some(result) = &envelope.result {
                 let _ = write!(
                     out,
@@ -675,7 +550,7 @@ async fn top_binaries(
         },
         edge.map(|edge| {
             async move |plan: &BinariesPlan| {
-                crate::projects::submit_chunked(edge, &plan.tasks).await
+                crate::projects::submit_chunked(edge, &plan.trees).await
             }
         }),
     )
@@ -688,7 +563,7 @@ async fn top_binaries(
 /// resolution, or simply ships no binary) is recorded in `skipped` and
 /// the rest of the wave proceeds.
 fn resolve_binaries(
-    candidates: &[crates_io::BinaryCandidate],
+    candidates: &[crate::dump::BinaryCandidate],
     targets: &[TargetTriple],
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<BinariesPlan> {
@@ -696,15 +571,14 @@ fn resolve_binaries(
     for binary in candidates {
         jobs.push(CrateJob {
             name: binary.id.clone(),
-            version: semver::Version::parse(&binary.latest_version).map_err(|error| {
+            version: semver::Version::parse(&binary.version).map_err(|error| {
                 stow_error!(
                     "parse crates.io version `{}` for `{}`: {error}",
-                    binary.latest_version,
+                    binary.version,
                     binary.id
                 )
             })?,
             downloads: binary.downloads,
-            bin_only: false,
         });
     }
     let pool = crate::resolve::ResolvePool::new(rustc_version)?;
@@ -723,21 +597,22 @@ fn resolve_binaries(
             )
         },
         |index, _job, result| slots[index] = Some(result),
-    );
+    )?;
     let mut plan = BinariesPlan {
-        tasks: Vec::new(),
+        trees: Vec::new(),
         per_binary: Vec::with_capacity(candidates.len()),
         skipped: Vec::new(),
     };
     for (job, slot) in jobs.iter().zip(slots) {
         match slot.expect("the pool produces one result per job") {
-            Ok(BinaryResolve::Tasks { tasks }) => {
-                tracing::info!(binary = %job.name, tasks = tasks.len(), "resolved");
+            Ok(BinaryResolve::Tasks { trees }) => {
+                let node_count: usize = trees.iter().map(|tree| tree.nodes.len()).sum();
+                tracing::info!(binary = %job.name, tasks = node_count, "resolved");
                 plan.per_binary.push(BinaryContribution {
                     binary: job.name.clone(),
-                    tasks: tasks.len(),
+                    tasks: node_count,
                 });
-                plan.tasks.extend(tasks);
+                plan.trees.extend(trees);
             }
             Ok(BinaryResolve::NoBinary) => {
                 let reason = format!("{} {} ships no binary target", job.name, job.version);
@@ -781,8 +656,8 @@ pub struct SkippedBinary {
 /// binary produced, plus per-binary outcomes.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct BinariesPlan {
-    /// Every enqueue request across every binary and target.
-    pub tasks: Vec<EnqueueRequest>,
+    /// Every submission tree across every binary and target (stow#878).
+    pub trees: Vec<stow_types::api::SubmissionTree>,
     /// How many requests each binary produced.
     pub per_binary: Vec<BinaryContribution>,
     /// Binaries resolution failed on, with their reasons.
@@ -856,26 +731,6 @@ struct TopMissedRow {
     top_missed: Vec<String>,
 }
 
-/// The `STOW_CF_ANALYTICS_SQL_BASE` override, pinned to loopback: the
-/// request carries `CF_ANALYTICS_TOKEN` in `Authorization`, so a remote
-/// override would hand the token to whoever it names.
-fn loopback_sql_base(base: &str) -> stow_types::error::Result<String> {
-    let parsed = url::Url::parse(base)
-        .map_err(|error| stow_error!("{CF_ANALYTICS_SQL_BASE_ENV} {base:?}: {error}"))?;
-    let loopback = match parsed.host() {
-        Some(url::Host::Domain(domain)) => domain == "localhost",
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
-    };
-    if !loopback {
-        return Err(stow_error!(
-            "{CF_ANALYTICS_SQL_BASE_ENV} must name a loopback host, got {base:?}"
-        ));
-    }
-    Ok(base.trim_end_matches('/').to_owned())
-}
-
 /// Run the top-missed query against the Analytics Engine SQL API.
 /// `CF_ACCOUNT_ID` and `CF_ANALYTICS_TOKEN` (an API token with
 /// `Account Analytics: Read`) are both required.
@@ -884,10 +739,7 @@ async fn fetch_top_missed(query: &str) -> stow_types::error::Result<Vec<TopMisse
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
     let token = std::env::var(CF_ANALYTICS_TOKEN_ENV)
         .map_err(|_| stow_error!("missing {CF_ANALYTICS_TOKEN_ENV}"))?;
-    let base = match std::env::var(CF_ANALYTICS_SQL_BASE_ENV) {
-        Ok(base) => loopback_sql_base(&base)?,
-        Err(_) => CF_ANALYTICS_SQL_BASE.to_owned(),
-    };
+    let base = crate::cloudflare::analytics_sql_base()?;
     let url = format!("{base}/accounts/{account_id}/analytics_engine/sql");
     let mut client = zenwave::client().timeout(CF_ANALYTICS_TIMEOUT);
     let response = client
@@ -1165,175 +1017,11 @@ async fn plan(
     })
 }
 
-/// How many semver-compatible lines of one crate a wave preheats.
-const MAX_VERSION_LINES: usize = 3;
-
-/// The smallest share of a crate's downloads a version line must hold to be
-/// worth a build, in percent.
-const MIN_LINE_DOWNLOAD_PERCENT: u128 = 1;
-
-/// A semver-compatible line: everything a `^` requirement would unify.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
-struct VersionLine(u64, u64);
-
-impl VersionLine {
-    const fn of(version: &semver::Version) -> Self {
-        if version.major >= 1 {
-            Self(version.major, u64::MAX)
-        } else {
-            Self(0, version.minor)
-        }
-    }
-}
-
-/// The version lines of one crate worth preheating, most-used first.
-///
-/// Lines are ranked by how much they are actually downloaded, never by
-/// version number. `rand`'s three most-used lines are 0.8, 0.9 and 0.7
-/// (46%, 25%, 12% of its downloads) while its three highest-numbered are
-/// 0.10, 0.9 and 0.8 — ranking by number spends a build wave on 0.10, which
-/// holds 8%, and never builds 0.7, which holds more.
-///
-/// A line under [`MIN_LINE_DOWNLOAD_PERCENT`] is dropped even when the cap
-/// would have room for it. Abandoned early lines — `errno` 0.1 at 0.11% of
-/// downloads, `ppv-lite86` 0.1 at less than 0.005% — do not compile under a
-/// current rustc and never will again, so each one enqueued is a build that
-/// fails, a failure row that is retried, and a queue slot taken from a line
-/// somebody uses.
-///
-/// Within a line the newest release is the one built, since that is what a
-/// `^` requirement resolves to.
-fn select_version_lines(versions: &[CrateVersion]) -> stow_types::error::Result<Vec<String>> {
-    let mut newest = std::collections::BTreeMap::<VersionLine, (semver::Version, String)>::new();
-    let mut downloads = std::collections::BTreeMap::<VersionLine, u128>::new();
-    for version in versions {
-        let parsed = semver::Version::parse(&version.num)?;
-        let line = VersionLine::of(&parsed);
-        *downloads.entry(line).or_default() += u128::from(version.downloads);
-        match newest.get(&line) {
-            Some((current, _)) if *current >= parsed => {}
-            _ => {
-                newest.insert(line, (parsed, version.num.clone()));
-            }
-        }
-    }
-
-    let total: u128 = downloads.values().sum();
-    let mut ranked: Vec<(u128, VersionLine, String)> = newest
-        .into_iter()
-        .map(|(line, (_, num))| (downloads.get(&line).copied().unwrap_or_default(), line, num))
-        .collect();
-    // Downloads descending; the line itself breaks a tie so the answer does
-    // not depend on map iteration order, and so a crate whose versions
-    // report no downloads at all still yields its newest lines.
-    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
-    ranked.retain(|(line_downloads, _, _)| {
-        total == 0 || line_downloads * 100 >= total * MIN_LINE_DOWNLOAD_PERCENT
-    });
-    ranked.truncate(MAX_VERSION_LINES);
-    Ok(ranked.into_iter().map(|(_, _, num)| num).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::{ci_targets, missed_task_id_entry, top_missed_query};
 
-    #[test]
-    fn analytics_sql_base_override_is_loopback_only() {
-        assert_eq!(
-            super::loopback_sql_base("http://127.0.0.1:9000/").unwrap(),
-            "http://127.0.0.1:9000"
-        );
-        super::loopback_sql_base("http://localhost:1").unwrap();
-        super::loopback_sql_base("http://[::1]:1").unwrap();
-        for remote in [
-            "https://api.cloudflare.com/client/v4",
-            "http://10.0.0.1",
-            "not a url",
-        ] {
-            super::loopback_sql_base(remote).expect_err(remote);
-        }
-    }
     use stow_types::identity::WireRustcVersion;
-
-    fn version(num: &str, downloads: u64) -> super::CrateVersion {
-        super::CrateVersion {
-            num: num.to_owned(),
-            yanked: false,
-            downloads,
-            has_lib: Some(true),
-        }
-    }
-
-    fn lines(versions: &[super::CrateVersion]) -> Vec<String> {
-        super::select_version_lines(versions).expect("select version lines")
-    }
-
-    /// `rand`'s real shape on crates.io: the three most-downloaded lines are
-    /// 0.8, 0.9 and 0.7, while the three highest-numbered are 0.10, 0.9 and
-    /// 0.8. Ranking by number builds 0.10 and never builds 0.7, which more
-    /// people use.
-    #[test]
-    fn version_lines_rank_by_downloads_not_by_version_number() {
-        let versions = [
-            version("0.10.3", 8_000),
-            version("0.9.5", 24_000),
-            version("0.8.8", 46_000),
-            version("0.7.3", 12_000),
-            version("0.4.6", 4_000),
-        ];
-        assert_eq!(lines(&versions), ["0.8.8", "0.9.5", "0.7.3"]);
-    }
-
-    /// `errno`'s real shape: 0.3 holds 95%, 0.2 holds 4.9%, 0.1 holds 0.11%.
-    /// The cap alone would have taken all three; the 0.1 line does not build
-    /// on a current rustc, so it is dropped on its share instead.
-    #[test]
-    fn an_abandoned_line_is_dropped_even_when_the_cap_has_room() {
-        let versions = [
-            version("0.3.14", 94_980),
-            version("0.2.8", 4_910),
-            version("0.1.8", 110),
-        ];
-        assert_eq!(lines(&versions), ["0.3.14", "0.2.8"]);
-    }
-
-    /// Within a line the newest release is what a `^` requirement resolves
-    /// to, and so what is worth building — whatever order they arrive in.
-    #[test]
-    fn the_newest_release_of_a_line_is_the_one_selected() {
-        let versions = [
-            version("1.2.0", 10),
-            version("1.10.0", 10),
-            version("1.3.0", 10),
-        ];
-        assert_eq!(lines(&versions), ["1.10.0"]);
-    }
-
-    /// A major line is one line however many minors it has, and 0.x minors
-    /// are lines of their own — the split a `^` requirement makes.
-    #[test]
-    fn major_releases_share_a_line_and_zero_minors_do_not() {
-        let versions = [
-            version("2.1.0", 50),
-            version("2.0.0", 50),
-            version("0.9.1", 30),
-            version("0.8.0", 20),
-        ];
-        assert_eq!(lines(&versions), ["2.1.0", "0.9.1", "0.8.0"]);
-    }
-
-    /// A crate whose versions report no downloads at all still yields its
-    /// newest lines rather than nothing.
-    #[test]
-    fn lines_without_download_counts_fall_back_to_the_newest() {
-        let versions = [
-            version("0.3.1", 0),
-            version("0.2.0", 0),
-            version("0.1.0", 0),
-        ];
-        assert_eq!(lines(&versions), ["0.3.1", "0.2.0", "0.1.0"]);
-    }
 
     /// The rendered query substitutes the three validated values into the
     /// template and nothing else — the golden text is the whole contract.

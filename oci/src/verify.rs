@@ -21,8 +21,9 @@ use sigstore::cosign::payload::SimpleSigning;
 #[cfg(feature = "mock-verify")]
 use sigstore::crypto::SigningScheme;
 use sigstore::crypto::{CosignVerificationKey, Signature};
+#[cfg(test)]
 use sigstore::trust::TrustRoot;
-use sigstore::trust::sigstore::SigstoreTrustRoot;
+use sigstore_trust_root::{TrustedRoot, TufConfig};
 use stow_types::error::Context;
 use x509_cert::Certificate;
 use x509_cert::der::{DecodePem, Encode};
@@ -63,6 +64,19 @@ pub fn verify_material(
             oci_digest,
         ),
     }
+}
+
+/// The `docker_reference` a cosign `SimpleSigning` payload binds.
+///
+/// `None` when the bytes are not a `SimpleSigning` payload. Callers
+/// that verify a manifest aliased under several tags (a `built-`
+/// marker on a records manifest, stow#877) read which reference a
+/// layer binds before pinning it.
+#[must_use]
+pub fn payload_docker_reference(payload_bytes: &[u8]) -> Option<String> {
+    serde_json::from_slice::<SimpleSigning>(payload_bytes)
+        .ok()
+        .map(|payload| payload.critical.identity.docker_reference)
 }
 
 /// Verify `materials` — every signature layer the artifact's
@@ -214,51 +228,109 @@ pub struct TrustMaterial {
 
 /// Load the Sigstore trust root once, for the whole process.
 ///
+/// The TUF refresh (`sigstore-trust-root`, stow#869) propagates transport
+/// failures instead of surfacing them as metadata expiry, and writes every
+/// verified metadata file plus the targets through to the cache dir — a
+/// warm cache is re-verified against the pinned root and serves the load
+/// without re-walking the chain online.
+///
 /// # Errors
 ///
-/// A sigstore cache directory that cannot be created, a TUF root that
-/// cannot be loaded, and a root that carries no Rekor key.
+/// A TUF refresh or target fetch that fails, and a root that carries no
+/// Rekor key.
 pub async fn load_trust_material(
     cache_dir: &std::path::Path,
 ) -> stow_types::error::Result<TrustMaterial> {
-    let cache_dir = cache_dir.join("sigstore");
-    async_fs::create_dir_all(&cache_dir)
-        .await
-        .wrap_err_with(|| format!("create sigstore cache dir {}", cache_dir.display()))?;
     // The span is attached to the future rather than entered around the
     // await: an entered guard is not `Send`, and this future crosses a
     // task boundary.
-    let trust_root = tracing::Instrument::instrument(
-        SigstoreTrustRoot::new(Some(&cache_dir)),
+    let trusted_root = tracing::Instrument::instrument(
+        TrustedRoot::from_tuf(TufConfig::production().with_cache_dir(cache_dir.join("sigstore"))),
         tracing::info_span!("stow.sigstore.trust_root.refresh"),
     )
     .await
     .wrap_err("load sigstore trust root")?;
-    TrustMaterial::from_trust_root(&trust_root)
+    TrustMaterial::from_trusted_root(&trusted_root)
 }
 
 impl TrustMaterial {
-    fn from_trust_root(trust_root: &SigstoreTrustRoot) -> stow_types::error::Result<Self> {
-        let fulcio_anchors = trust_root
+    /// The production builder: the TUF-verified `trusted_root.json`
+    /// `sigstore-trust-root` returns. Keeps the retired loader's selection —
+    /// Fulcio anchors from every CA that has started (expired ones kept,
+    /// since certificates issued while they were valid still verify) and
+    /// Rekor keys inside their validity window, keyed by hex log id.
+    fn from_trusted_root(trusted_root: &TrustedRoot) -> stow_types::error::Result<Self> {
+        let fulcio_certs = trusted_root
+            .fulcio_certs()
+            .into_iter()
+            .map(|certificate| rustls_pki_types::CertificateDer::from(certificate.into_bytes()))
+            .collect::<Vec<_>>();
+        let rekor_keys = trusted_root
+            .tlogs
+            .iter()
+            .filter(|tlog| {
+                tlog.public_key
+                    .valid_for
+                    .is_none_or(|range| range.is_valid())
+            })
+            .map(|tlog| {
+                (
+                    hex::encode(tlog.log_id.key_id.as_bytes()),
+                    tlog.public_key.raw_bytes.as_bytes().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        Self::from_parts(&fulcio_certs, &rekor_keys)
+    }
+
+    /// The retired loader's entry point, kept for the parity test: the
+    /// `TrustRoot` trait is ungated in `sigstore` 0.14, so a
+    /// `ManualTrustRoot` populated by its extraction feeds the same
+    /// assembly the production builder uses.
+    #[cfg(test)]
+    fn from_trust_root(trust_root: &dyn TrustRoot) -> stow_types::error::Result<Self> {
+        let fulcio_certs = trust_root
             .fulcio_certs()?
             .into_iter()
+            .map(rustls_pki_types::CertificateDer::into_owned)
+            .collect::<Vec<_>>();
+        let rekor_keys = trust_root
+            .rekor_keys()?
+            .into_iter()
+            .map(|(key_id, key_bytes)| (key_id, key_bytes.to_vec()))
+            .collect::<Vec<_>>();
+        Self::from_parts(&fulcio_certs, &rekor_keys)
+    }
+
+    /// Assemble the material from the pieces every trust-root source
+    /// provides: Fulcio anchor certificates and Rekor keys (hex log id,
+    /// SPKI DER).
+    fn from_parts(
+        fulcio_certs: &[rustls_pki_types::CertificateDer<'static>],
+        rekor_keys: &[(String, Vec<u8>)],
+    ) -> stow_types::error::Result<Self> {
+        let fulcio_anchors = fulcio_certs
+            .iter()
             .map(|certificate| {
-                webpki::anchor_from_trusted_cert(&certificate).map(|anchor| anchor.to_owned())
+                webpki::anchor_from_trusted_cert(certificate).map(|anchor| anchor.to_owned())
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| stow_types::stow_error!("convert Fulcio trust anchors: {error}"))?;
-        let mut rekor_keys = std::collections::BTreeMap::new();
-        for (key_id, key_bytes) in trust_root.rekor_keys()? {
-            rekor_keys.insert(key_id, CosignVerificationKey::try_from_der(key_bytes)?);
+        let mut keys = std::collections::BTreeMap::new();
+        for (key_id, key_bytes) in rekor_keys {
+            keys.insert(
+                key_id.clone(),
+                CosignVerificationKey::try_from_der(key_bytes)?,
+            );
         }
-        if rekor_keys.is_empty() {
+        if keys.is_empty() {
             return Err(stow_types::stow_error!(
                 "sigstore trust root carries no Rekor public key; github-ci verification cannot check transparency-log entries"
             ));
         }
         Ok(Self {
             fulcio_anchors,
-            rekor_keys,
+            rekor_keys: keys,
         })
     }
 }
@@ -1022,5 +1094,147 @@ mod tests {
         .expect_err("a signature naming another tag must not satisfy this one");
         let message = error.to_string();
         assert!(message.contains(other), "{message}");
+    }
+
+    use sigstore_protobuf_specs::dev::sigstore::common::v1::TimeRange as ProtoTimeRange;
+    use sigstore_protobuf_specs::dev::sigstore::trustroot::v1::TrustedRoot as ProtoTrustedRoot;
+
+    /// `sigstore` 0.14's `is_timerange_valid`, verbatim: the current time
+    /// is not before `start`, and — unless `allow_expired` — not after
+    /// `end`.
+    fn is_timerange_valid(range: Option<&ProtoTimeRange>, allow_expired: bool) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .cast_signed();
+        let start = range.and_then(|r| r.start.as_ref()).map(|t| t.seconds);
+        let end = range.and_then(|r| r.end.as_ref()).map(|t| t.seconds);
+        match (start, end) {
+            (None, _) => true,
+            (Some(start), _) if now < start => false,
+            _ if allow_expired => true,
+            (_, None) => true,
+            (_, Some(end)) => now <= end,
+        }
+    }
+
+    /// The material the retired loader produced over `json`: parse with
+    /// the same protobuf-specs `TrustedRoot`
+    /// `SigstoreTrustRoot::from_trusted_root_json_unchecked` used, replay
+    /// its `ca_keys(allow_expired = true)` and `tlog_keys` selections into
+    /// a `ManualTrustRoot`, and run it through `from_trust_root`.
+    fn reference_trust_material(json: &str) -> TrustMaterial {
+        let proto: ProtoTrustedRoot = serde_json::from_str(json).unwrap();
+        let mut manual = sigstore::trust::ManualTrustRoot::default();
+        for ca in &proto.certificate_authorities {
+            if !is_timerange_valid(ca.valid_for.as_ref(), true) {
+                continue;
+            }
+            if let Some(chain) = &ca.cert_chain {
+                for certificate in &chain.certificates {
+                    manual
+                        .fulcio_certs
+                        .push(rustls_pki_types::CertificateDer::from(
+                            certificate.raw_bytes.clone(),
+                        ));
+                }
+            }
+        }
+        for tlog in &proto.tlogs {
+            let Some(public_key) = &tlog.public_key else {
+                continue;
+            };
+            if !is_timerange_valid(public_key.valid_for.as_ref(), false) {
+                continue;
+            }
+            if let (Some(log_id), Some(raw_bytes)) = (&tlog.log_id, &public_key.raw_bytes) {
+                manual
+                    .rekor_keys
+                    .insert(hex::encode(&log_id.key_id), raw_bytes.clone());
+            }
+        }
+        TrustMaterial::from_trust_root(&manual).unwrap()
+    }
+
+    /// stow#869: the material `sigstore-trust-root` 0.15's `TrustedRoot`
+    /// produces is identical to what the retired `SigstoreTrustRoot`
+    /// extraction produced. The two crates' embedded production roots
+    /// differ (0.15 adds the Rekor v2 log), so both paths run over the
+    /// same bytes — the new crate's own embedded root.
+    #[test]
+    fn trust_material_matches_the_retired_sigstore_extraction() {
+        let json = sigstore_trust_root::SIGSTORE_PRODUCTION_TRUSTED_ROOT;
+        let reference = reference_trust_material(json);
+        let trusted_root = sigstore_trust_root::TrustedRoot::from_json(json).unwrap();
+        let material = TrustMaterial::from_trusted_root(&trusted_root).unwrap();
+        assert_eq!(
+            format!("{:?}", reference.fulcio_anchors),
+            format!("{:?}", material.fulcio_anchors),
+            "Fulcio anchors differ"
+        );
+        assert_eq!(
+            reference.rekor_keys.len(),
+            material.rekor_keys.len(),
+            "Rekor key sets differ: {:?} vs {:?}",
+            reference.rekor_keys.keys().collect::<Vec<_>>(),
+            material.rekor_keys.keys().collect::<Vec<_>>(),
+        );
+        for (key_id, key) in &reference.rekor_keys {
+            assert_eq!(
+                format!("{key:?}"),
+                format!(
+                    "{:?}",
+                    material
+                        .rekor_keys
+                        .get(key_id)
+                        .unwrap_or_else(|| panic!("missing Rekor key {key_id}"))
+                ),
+                "Rekor key {key_id} differs"
+            );
+        }
+    }
+
+    /// stow#869: a transport failure during the TUF root walk is reported
+    /// as a transport failure — the retired loader's `tough` broke the
+    /// walk on any fetch error and surfaced it as `root metadata is
+    /// expired`.
+    #[tokio::test]
+    async fn tuf_transport_failure_is_not_reported_as_expiry() {
+        // The binaries install `ring` as the process-level rustls provider;
+        // `HttpRepository::new` builds its reqwest client eagerly and
+        // resolves it the same way.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0_u8; 2048];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                let _ = std::io::Write::write_all(
+                    &mut stream,
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        });
+        let config = sigstore_trust_root::TufConfig::custom(
+            format!("http://127.0.0.1:{port}"),
+            sigstore_trust_root::TufBootstrap::trusted(
+                sigstore_trust_root::SigstoreInstance::PublicGood.tuf_root(),
+            ),
+        )
+        .without_cache();
+        let error = sigstore_trust_root::TrustedRoot::from_tuf(config)
+            .await
+            .expect_err("a 500 on the root walk must fail the load");
+        let message = error.to_string();
+        assert!(
+            message.contains("500"),
+            "expected a transport error carrying the status, got: {message}"
+        );
+        assert!(
+            !message.contains("expired"),
+            "transport failure must not surface as expiry: {message}"
+        );
     }
 }

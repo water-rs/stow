@@ -21,6 +21,10 @@ pub const NO_ANALYTICS_ENV: &str = "STOW_NO_ANALYTICS";
 /// [`NO_ANALYTICS_ENV`] is `1`.
 const NO_ANALYTICS_HEADER: &str = "x-stow-no-analytics";
 
+/// Header the edge's telemetry extractor reads into the `environment`
+/// usage dimension — sent as `1` when `CI` is set in the environment.
+const CI_HEADER: &str = "x-stow-ci";
+
 /// Build the edge HTTP client: configured request timeout plus the
 /// [`EdgeHeaders`] middleware that stamps identity and opt-out headers on
 /// every request.
@@ -50,6 +54,7 @@ fn analytics_opted_out_in(env: impl Fn(&str) -> Option<String>) -> bool {
 struct EdgeHeaders {
     user_agent: String,
     no_analytics: bool,
+    ci: bool,
 }
 
 impl EdgeHeaders {
@@ -61,6 +66,7 @@ impl EdgeHeaders {
                 std::env::consts::OS
             ),
             no_analytics: analytics_opted_out(),
+            ci: std::env::var_os("CI").is_some(),
         }
     }
 }
@@ -85,6 +91,9 @@ impl Middleware for EdgeHeaders {
                 NO_ANALYTICS_HEADER,
                 "1".parse().expect("valid header value"),
             );
+        }
+        if self.ci {
+            headers.insert(CI_HEADER, "1".parse().expect("valid header value"));
         }
         next.respond(request)
             .await

@@ -1,19 +1,17 @@
-//! Cloudflare Workers bootstrap: binds D1, the scheduler Durable Object,
+//! Cloudflare Workers bootstrap: binds the scheduler Durable Object,
 //! the CF cache, and GHCR config, then mounts the public API routes.
 
 use skyzen::routing::{CreateRouteNode, Route, RouteNode, Router};
 use skyzen::runtime::wasm;
 use skyzen::utils::State;
-use skyzen_cloudflare::{CfCache, CfD1, CfDurableNamespace};
-use skyzen_services::Db;
+use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 
 use stow_types::admission;
 
 use crate::api::GhcrConfig;
 use crate::stats::StatsContext;
-use crate::{api, env_binding, ghcr, github_auth, runtime_settings, scheduler, site, webhook};
+use crate::{api, env_binding, ghcr, github_auth, release_hook, runtime_settings, site, webhook};
 
-const STOW_DB_BINDING: &str = "STOW_DB";
 const SCHEDULER_BINDING: &str = "SCHEDULER";
 const GITHUB_REPO_BINDING: &str = "GITHUB_REPO";
 const STOW_OIDC_AUDIENCE_BINDING: &str = "STOW_OIDC_AUDIENCE";
@@ -23,9 +21,9 @@ const STOW_GITHUB_API_URL_BINDING: &str = "STOW_GITHUB_API_URL";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
+const GITHUB_APP_SLUG_BINDING: &str = "GITHUB_APP_SLUG";
 const STOW_POW_CHALLENGE_SECRET_BINDING: &str = "STOW_POW_CHALLENGE_SECRET";
 const STOW_POW_MIN_BITS_BINDING: &str = "STOW_POW_MIN_BITS";
-const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const TURNSTILE_SECRET_KEY_BINDING: &str = "TURNSTILE_SECRET_KEY";
 const TURNSTILE_HOSTNAME_BINDING: &str = "TURNSTILE_HOSTNAME";
 const TURNSTILE_SITE_KEY_BINDING: &str = "TURNSTILE_SITE_KEY";
@@ -33,7 +31,10 @@ const STOW_ANALYTICS_BINDING: &str = "STOW_ANALYTICS";
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 const CF_ANALYTICS_TOKEN_BINDING: &str = "CF_ANALYTICS_TOKEN";
 const STOW_STATS_SQL_URL_BINDING: &str = "STOW_STATS_SQL_URL";
+const STOW_STATS_BINDING: &str = "STOW_STATS";
+const STOW_STATS_SALT_SECRET_BINDING: &str = "STOW_STATS_SALT_SECRET";
 const STOW_GITHUB_WEBHOOK_SECRET_BINDING: &str = "STOW_GITHUB_WEBHOOK_SECRET";
+const STOW_NEWRELEASES_WEBHOOK_SECRET_BINDING: &str = "STOW_NEWRELEASES_WEBHOOK_SECRET";
 
 /// `WinterCG` `fetch` export the generated Worker shim calls.
 ///
@@ -51,10 +52,11 @@ pub async fn fetch(
     wasm::launch(|env| async move { worker(&env) }, request, env, ctx).await
 }
 
-fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
-    let d1 = CfD1::from_env(env, STOW_DB_BINDING)
-        .unwrap_or_else(|error| panic!("failed to load D1 binding '{STOW_DB_BINDING}': {error}"));
-    let db = Db::new(d1);
+fn worker(
+    env: &wasm::Env,
+) -> crate::no_store::NoStoreOnError<
+    crate::faults::OverloadFaults<Router, skyzen_cloudflare::worker::AnalyticsEngineDataset>,
+> {
     let scheduler = CfDurableNamespace::from_env(env, SCHEDULER_BINDING).unwrap_or_else(|error| {
         panic!("failed to load Durable Object binding '{SCHEDULER_BINDING}': {error}")
     });
@@ -62,6 +64,8 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
     let analytics = env_binding::required_analytics_dataset(env, STOW_ANALYTICS_BINDING);
     let account_id = env_binding::required_string(env, CF_ACCOUNT_ID_BINDING);
     let stats = StatsContext {
+        dataset: env_binding::required_analytics_dataset(env, STOW_STATS_BINDING),
+        salt_secret: env_binding::required_string(env, STOW_STATS_SALT_SECRET_BINDING),
         analytics_token: env_binding::required_string(env, CF_ANALYTICS_TOKEN_BINDING),
         // `STOW_STATS_SQL_URL` is the mock manifest's override; it is
         // absent in production, where the route always posts the account's
@@ -91,6 +95,13 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
         env_binding::required_string(env, GITHUB_APP_INSTALLATION_ID_BINDING);
         env_binding::required_string(env, GITHUB_APP_PRIVATE_KEY_BINDING);
     }
+    // The webhook's `in_progress` filter needs the App's bot login in
+    // every deployment — under `STOW_LOCAL_CI_URL` the mock CI stamps
+    // the same `<slug>[bot]` on its dispatches (stow#940).
+    let app_bot_login = format!(
+        "{}[bot]",
+        env_binding::required_string(env, GITHUB_APP_SLUG_BINDING)
+    );
     // The bearer check's GitHub probes: `STOW_LOCAL_CI_URL` marks the
     // mock stack, where they must resolve inside it — a mock manifest
     // that forgets `STOW_GITHUB_API_URL` fails startup rather than
@@ -118,8 +129,6 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
         challenge_secret: env_binding::required_string(env, STOW_POW_CHALLENGE_SECRET_BINDING),
         min_bits: env_binding::optional_u32(env, STOW_POW_MIN_BITS_BINDING)
             .unwrap_or(admission::DEFAULT_POW_MIN_BITS),
-        max_queue_pending: env_binding::optional_u32(env, STOW_MAX_QUEUE_PENDING_BINDING)
-            .unwrap_or(scheduler::queue::DEFAULT_MAX_QUEUE_PENDING),
     };
 
     let site = site::SiteConfig {
@@ -137,12 +146,14 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
     // caller credential nor the zone WAF rules' shedding (completions
     // must drain during a partial reopen).
     nodes.push("/api/v1/github/workflow-run".post(webhook::github_workflow_run));
+    // Same shape: the newreleases.io delivery's authentication is its
+    // `X-Newreleases-Signature` HMAC under the webhook's own secret.
+    nodes.push("/api/v1/newreleases/release".post(release_hook::newreleases_release));
 
     let router = Route::new(nodes)
-        .with(db)
         .with(State(scheduler))
         .with(State(cache))
-        .with(State(analytics))
+        .with(State(analytics.clone()))
         .with(State(stats))
         .with(State(ghcr))
         .with(State(resolver_settings))
@@ -163,27 +174,29 @@ fn worker(env: &wasm::Env) -> crate::no_store::NoStoreOnError<Router> {
             env,
             STOW_GITHUB_WEBHOOK_SECRET_BINDING,
         ))))
+        .with(State(webhook::AppBotLogin(app_bot_login)))
+        .with(State(release_hook::NewreleasesSecret(
+            env_binding::required_string(env, STOW_NEWRELEASES_WEBHOOK_SECRET_BINDING),
+        )))
         .build();
 
     // The outermost response boundary — every error answer leaves here,
     // so `Cache-Control: no-store` is stamped in one place rather than
-    // per handler (`no_store` module docs).
-    crate::no_store::NoStoreOnError::new(router)
+    // per handler (`no_store` module docs). Inside it, the fault
+    // recorder counts each overload-marked answer into the bound
+    // Analytics Engine dataset (stow#888; `faults` module docs).
+    crate::no_store::NoStoreOnError::new(crate::faults::OverloadFaults::new(router, analytics))
 }
 
 /// Every route that requires a trusted caller — the admin surface and
 /// the scheduler lane — each wrapped in `gate` so a rate-limited GitHub
 /// trust check answers 503 + `Retry-After` instead of the bare error
 /// envelope.
-fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
+fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 2] {
     [
         "/api/v1/admin"
             .route((
-                "/artifacts".at(api::list_artifact_records),
-                "/coverage/{crate_name}".at(api::artifact_coverage),
-                "/index/{target}/{rustc_version}"
-                    .at(api::list_artifact_index)
-                    .post(api::record_published_index),
+                "/index/published".post(api::record_published_index),
                 "/dispatch-freeze"
                     .at(api::get_dispatch_freeze)
                     .post(api::set_dispatch_freeze),
@@ -214,21 +227,13 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 3] {
                 "/status".at(api::admin_status),
             ))
             .with(gate.clone()),
-        // Split out of the admin group to stay under the router's
-        // route-tuple arity — the URLs are unchanged.
-        "/api/v1/admin/artifacts"
-            .route((
-                "/sync".post(api::sync_artifacts),
-                "/prune".post(api::prune_artifacts),
-                "/{target}/{rustc_version}/{c_metadata}".at(api::inspect_artifact),
-            ))
-            .with(gate.clone()),
         "/api/v1/scheduler"
             .route((
                 "/tasks/submit".post(api::submit_scheduler_tasks),
                 "/tasks/submit-ids".post(api::submit_task_ids),
                 "/requests/{request_id}/outcome".post(api::scheduler_request_outcome),
                 "/status".at(api::scheduler_status),
+                "/health".at(api::scheduler_health),
             ))
             .with(gate.clone()),
     ]
@@ -261,6 +266,7 @@ fn anonymous_nodes() -> Vec<RouteNode> {
             "/{target}/{rustc_version}/{digest}".at(api::get_index_slice),
         )),
         lanes::ADMISSIONS.post(api::mint_miss_admissions),
+        "/api/v1/build-report".post(api::build_report),
         "/api/v1/stats".at(api::usage_stats),
         lanes::ENQUEUE.post(api::enqueue_admitted_task),
         lanes::REQUESTS.post(api::submit_crate_request),

@@ -7,47 +7,26 @@ GitHub Actions ──records artifact (cosign-signed)──► GHCR (OCI)
      ▲                                               │
      │ workflow_dispatch                             │ reads + verifies
      │                                               ▼
-     └─── Scheduler DO ──► Edge Worker ──D1──► Cloudflare D1
+     └─── Scheduler DO ──► Edge Worker
                                ▲
      GitHub webhook ──workflow_run──┘
 ```
 
 CI is the only producer of artifacts and writes them — bundles and
-records alike — straight into GHCR; the edge owns the D1 binding and
-learns build completion from GitHub's `workflow_run` webhook; end
-users only ever talk to the edge. Detailed trust analysis lives in
+records alike — straight into GHCR; the edge learns build completion
+from GitHub's `workflow_run` webhook; end users only ever talk to the
+edge. Detailed trust analysis lives in
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries).
 
 ## One-time Cloudflare setup
 
 The production manifest is [`edge/Skyzen.toml`](../edge/Skyzen.toml). It
-declares the `STOW_DB` D1 database, the `Scheduler` Durable Object with its
-`v1` class declaration, the five runtime `[[secret]]` names (never values), the
+declares the `Scheduler` Durable Object with its
+`v1` class declaration, the seven runtime `[[secret]]` names (never values), the
 non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 `[cloudflare.raw]` routes.
 
-1. Provision the D1 database once. `skyzen provision` creates `stow-prod`
-   and writes `database_id` back into `edge/Skyzen.toml` — commit the
-   result:
-
-   ```sh
-   skyzen provision --provider cloudflare --manifest edge/Skyzen.toml
-   ```
-
-2. Create the D1 schema. The store has one schema —
-   [`edge/schema.sql`](../edge/schema.sql); the Worker assumes it
-   exists:
-
-   ```sh
-   wrangler d1 execute stow-prod --remote --file edge/schema.sql
-   ```
-
-   To change the schema later, reset the store instead: drop the
-   tables, re-execute the same file, then resync the mirror from the
-   signed records — `stow-admin index export --out-dir <dir> --full`
-   followed by `stow-admin index sync --file <dir>/new-records.json`.
-
-3. Set the Worker secrets. Each name must be declared in `[[secret]]`
+1. Set the Worker secrets. Each name must be declared in `[[secret]]`
    first, which the manifest already does:
 
    ```sh
@@ -56,6 +35,8 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    skyzen secret set TURNSTILE_SECRET_KEY       # Turnstile secret key paired with the TURNSTILE_SITE_KEY var
    skyzen secret set CF_ANALYTICS_TOKEN         # API token with Analytics Engine read, used by GET /api/v1/stats
    skyzen secret set STOW_GITHUB_WEBHOOK_SECRET # HMAC key verifying GitHub's workflow_run webhook (below)
+   skyzen secret set STOW_NEWRELEASES_WEBHOOK_SECRET # HMAC key verifying newreleases.io deliveries (below)
+   skyzen secret set STOW_STATS_SALT_SECRET     # key for the daily install-hash salt of the usage statistics
    ```
 
    `CF_ANALYTICS_TOKEN` is an account-level API token (dashboard: *My
@@ -72,11 +53,11 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    identity, never a shared token (see
    [Trusted-endpoint authentication](#trusted-endpoint-authentication)).
 
-4. Deploys run from GitHub Actions — see below. The first deploy also
+2. Deploys run from GitHub Actions — see below. The first deploy also
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
    DNS record in the `waterui.dev` zone automatically).
 
-5. Initialize the scheduler store. The scheduler Durable Object's
+3. Initialize the scheduler store. The scheduler Durable Object's
    schema exists only through the operator reset route — once the first
    deploy is live:
 
@@ -89,7 +70,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `edge/src/scheduler/schema.sql`; the queue and recorded slices are
    destroyed and refill from the lanes that feed them.
 
-6. Give the weekly miss-promotion lane (`preheat-missed.yml`) read access
+4. Give the weekly miss-promotion lane (`preheat-missed.yml`) read access
    to the `stow_cache_misses` Analytics Engine dataset. In the Cloudflare
    dashboard (*My Profile → API Tokens → Create Custom Token*) create a
    token with *Account → Account Analytics → Read* on this account, store
@@ -97,7 +78,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `CF_ACCOUNT_ID` repository variable to the account ID shown on any
    dashboard overview page.
 
-7. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
+5. Rate-limit the edge API. `/api/v1/enqueue` and `/api/v1/requests` are
    the two endpoints an anonymous client can use to consume CI, and
    `/api/v1/admissions` runs the miss-derivation pass over the artifact
    catalog — but enumerating paths would leave the other anonymous
@@ -110,7 +91,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    requests per second, and a block there turns a cache hit into a
    local compile mid-build. That path is the cheap one — a Workers Cache
    hit is billed as a request but the Worker never runs: no CPU,
-   subrequests, D1 or Durable Object work — and its
+   subrequests, or Durable Object work — and its
    volume is bounded by the DDoS managed ruleset, the billing
    notifications below, and the zone maintenance rules rather than by
    this rule. The Free plan allows exactly one rate-limiting rule, which is
@@ -233,19 +214,20 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    **disabled** and the `http_request_firewall_custom` entrypoint itself
    when the phase has never had a ruleset (the API answers error 10003),
    matching rules by `description`, so they exist before anyone needs
-   them and a redeploy never stomps a live toggle. Toggle by hand:
-   `stow-admin maintenance on|off --scope anonymous|lanes|all --yes`,
-   with `CLOUDFLARE_API_TOKEN` (needs *Zone WAF → Edit* on
-   `waterui.dev`), `CF_ZONE_ID` and `STOW_EDGE_URL` exported;
-   `stow-admin maintenance status` prints the current state.
+   them and a redeploy never stomps a live toggle. Toggle by hand by
+   dispatching `maintenance.yml`
+   (`gh workflow run maintenance.yml -f action=on|off|status -f scope=anonymous|lanes|all`):
+   it runs `stow-admin maintenance` with the repository's
+   `CLOUDFLARE_API_TOKEN`, so no operator holds a WAF token and every
+   toggle is recorded under the GitHub account that dispatched it.
 
 ### Billing notifications
 
 The zone rule bounds request volume; usage-based billing notifications
 watch the spend itself. In the Cloudflare dashboard (*Notifications →
 Add → Billing → Usage Based Billing*) create an alert for each
-billable metric the edge consumes — Workers requests, D1 rows written,
-and Durable Object requests — with the alert threshold at $8/month; the
+billable metric the edge consumes — Workers requests and Durable
+Object requests — with the alert threshold at $8/month; the
 project budget is $10/month. See the
 [Cloudflare notifications docs](https://developers.cloudflare.com/notifications/notification-available/)
 for the alert type.
@@ -311,9 +293,8 @@ candidate values and exiting non-zero on a breach — which runs
   `deploy-promoted` wait timer: the metrics that carry no
   `scriptVersion` compare the post-promotion window against the
   equal-length window ending at the deploy start — DO cpu and rows
-  read/written per DO request from `durableObjectsPeriodicGroups`, and
-  D1 rows read/written per worker request from
-  `d1AnalyticsAdaptiveGroups`. A breach here rolls back too.
+  read/written per DO request from `durableObjectsPeriodicGroups`.
+  A breach here rolls back too.
 
 `stow-admin` comes from the deployed commit's signed toolchain image —
 `.github/actions/stow-toolchain` pulls
@@ -359,13 +340,11 @@ skyzen deploy --provider cloudflare --manifest edge/Skyzen.toml
 
 ## CI runner (GitHub Actions)
 
-Trusted builds are `.github/workflows/build-batch.yml` on `main` of
+Trusted builds are `.github/workflows/build-crate.yml` on `main` of
 `water-rs/stow`. The scheduler dispatches it with `workflow_dispatch`
-(`ref: main`, one `batch` input carrying the JSON `BuildBatchPayload`),
-and the run's matrix calls `build-crate.yml` once per leg — the called
-workflow stays the signing identity, so batching changes nothing a
-client verifies;
-the runner is picked from the leg's target (`ubuntu-latest`,
+(`ref: main`, one `task` input carrying the JSON `BuildTaskPayload`) —
+one task is one run — and the workflow stays the signing identity;
+the runner is picked from the task's target (`ubuntu-latest`,
 `macos-14`, `windows-latest`). Add a target by extending the
 `runs-on` map in `build-crate.yml`.
 
@@ -376,17 +355,17 @@ its output directory as a workflow artifact. `publish` runs only when
 task and an independently resolved dependency closure, and only then
 pushes the bundle plus the build's `Vec<ArtifactRecord>` (as one signed
 OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`,
-one per leg) to GHCR, cosign-signing both
+one per task) to GHCR, cosign-signing both
 (keyless, `id-token: write`). The job never calls the edge — GitHub's
 `workflow_run` webhook delivery reports the outcome instead, and the
-scheduler's alarm pass checks the records artifact each successful leg
-published exists before completing its task. See
+edge checks the records artifact each successful task published exists
+in GHCR before it forwards the completion. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
 publisher checks.
 
-`build-batch.yml` reads no repository variables — `run-name` carries
-`<rustc>-b<batch_id>` so the webhook's `display_title` parses back into
-the run's rustc and batch id.
+`build-crate.yml` reads no repository variables — `run-name` carries
+`<rustc>-<task_id>` so the webhook's `display_title` parses back into
+the run's rustc and task id.
 
 `GHCR_TOKEN` is the job's own `GITHUB_TOKEN` (`packages: write`), and
 cosign signs with the job's OIDC identity, so the certificate subject is
@@ -398,8 +377,9 @@ records artifacts into per-`(target, rustc)` slices and pushes them to
 GHCR under the same keyless identity scheme (the pinned
 `index-publish.yml` certificate identity). Its `stow_edge_url`
 dispatch input is optional: when it names a live edge the job also
-POSTs the rows to `/api/v1/admin/artifacts/sync` (the D1 `artifacts`
-catalog mirror the admission gate reads) and prints the export report;
+reports each slice's membership to the scheduler
+(`POST /api/v1/admin/index/{target}/{rustc_version}`, the report the
+scheduler's dependency gate reads) and prints the export report;
 when empty — Cloudflare down or the edge unprovisioned — the publish
 still lands. The remaining dispatch inputs shape the export pass
 itself: `rustc_version` names the rustc it scopes to (empty resolves
@@ -418,7 +398,12 @@ anonymous `GET /token` exchange that `edge/src/ghcr.rs` drives on every
 `401` challenge. A rustc's package is created by the first
 `build-crate.yml` push that lands on it: the package links to the
 public `water-rs/stow` repository and inherits its visibility, so no
-manual step ever opens one.
+manual step ever opens one. Until it exists, GHCR answers an anonymous
+pull — the token exchange or an asset request — with `403 DENIED`
+rather than `404` (a package made private answers the same way), and
+every index reader classifies that answer as the package's absence: the
+empty index, exactly the result a missing `index.<target>.<rustc>` tag
+gives (stow#844).
 
 The edge authenticates `workflow_dispatch` with a GitHub App
 installation token minted on the Worker: the `GITHUB_APP_ID`
@@ -440,7 +425,7 @@ call is a GitHub identity, verified as described below.
 ### GitHub webhook — `workflow_run`
 
 Task completion reaches the scheduler through GitHub's webhook, not
-through CI: `build-batch.yml` sets `run-name` to `<rustc>-b<batch_id>` and a
+through CI: `build-crate.yml` sets `run-name` to `<rustc>-<task_id>` and a
 repository webhook POSTs `workflow_run` `completed` events to
 `https://stow.waterui.dev/api/v1/github/workflow-run`. Configure it once
 in the repo settings:
@@ -452,15 +437,32 @@ in the repo settings:
 - **Events:** *Workflow runs* only
 - **Active:** on
 
-The route accepts a delivery only when the run is `completed` for
-`build-batch.yml` on `main`; it parses `display_title` into the run's
-rustc and batch id and forwards the run's identity to the scheduler's
-`POST /batches/{batch_id}/complete`. The alarm pass then resolves the
-batch from the run's attempt-jobs page, and a leg's task completes
-only after the records
-artifact its publish job pushed (tagged by run id and attempt)
-exists and verifies in GHCR, so a spoofed success cannot mint a catalog
-entry.
+The route acts only on `build-crate.yml` and `resolve-request.yml` runs
+on `main`, and forwards only the deliveries the scheduler consumes (see
+`AGENTS.md`, Architecture). On a build run's `completed` it parses
+`display_title` into the run's rustc and task id and forwards the run's outcome to the scheduler's
+`POST /tasks/complete-run`. A `success` conclusion counts only once the
+records artifact its publish job pushed (tagged by run id and attempt)
+exists in GHCR, so a spoofed success cannot mint a catalog entry.
+
+### newreleases.io webhook — `rust` releases
+
+A new stable rustc wakes the preheat wave through newreleases.io's
+release feed (stow#880), replacing the cron poll: subscribe a webhook
+on the `rust-lang/rust` project in the newreleases.io settings, posting
+to `https://stow.waterui.dev/api/v1/newreleases/release`, then copy the
+webhook's signing key into the `STOW_NEWRELEASES_WEBHOOK_SECRET`
+repository secret, which `deploy-edge.yml` uploads as the Worker secret
+of the same name. Each delivery carries `X-Newreleases-Timestamp` and
+`X-Newreleases-Signature` — the hex HMAC-SHA256 of
+`<timestamp>.<body>` under that key — and the edge refuses anything
+unsigned, stale (±300 s) or naming another project. A verified
+`rust-lang/rust` release forwards its claimed version to the
+scheduler, which dispatches `preheat-admin.yml` through the same
+GitHub App arm the build dispatch uses; the workflow itself confirms
+the version against `channel-rust-stable.toml` before resolving, so a
+forged delivery costs one manifest check. A dispatch failure answers
+502 and newreleases.io's retry redelivers.
 
 ## Trusted-endpoint authentication
 
@@ -474,7 +476,7 @@ GitHub identity (`edge/src/github_auth.rs`). Two shapes are accepted:
 
 - **GitHub Actions OIDC JWT.** `preheat-admin.yml`'s submit step mints
   a per-run JWT (`audience=$STOW_OIDC_AUDIENCE`), and so does
-  `index-publish.yml` when it syncs the D1 catalog. The edge verifies
+  `index-publish.yml` when it reports a slice. The edge verifies
   the RS256 signature against GitHub's JWKS
   (`token.actions.githubusercontent.com/.well-known/jwks`, fetched per
   call) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
@@ -482,9 +484,12 @@ GitHub identity (`edge/src/github_auth.rs`). Two shapes are accepted:
   `job_workflow_ref`. `tasks/submit` accepts any workflow running inside
   the trusted repo. Nothing is stored or rotated — a leaked run token
   dies with the run.
-- **Repo-push credential.** `stow-admin` and the local dev loop send the
-  operator's own credential (`GH_TOKEN`/`GITHUB_TOKEN`, else `gh auth
-  token`). The edge probes push capability directly — a GET on the repo's
+- **Repo-push credential.** Outside Actions, `stow-admin` sends the
+  token `stow-admin login` stored: a `stow-ci` App user token from
+  GitHub's device flow, bound to the operator's account and expiring
+  after eight hours, kept in the OS credential store. A job or the local
+  dev loop may stage `GH_TOKEN`/`GITHUB_TOKEN` instead; `stow-admin`
+  never forwards `gh auth token` to the edge. The edge probes push capability directly — a GET on the repo's
   `git-receive-pack` ref advertisement answers 200 only when GitHub would
   accept a push from that credential — which works uniformly for user
   tokens, fine-grained PATs, and installation tokens like the mock-e2e
@@ -500,26 +505,24 @@ recorded in the worker log on each write.
 ## Initial cache population
 
 The cache preheats itself — `preheat-cron.yml` dispatches a wave
-daily and on every new stable rustc. To seed it by hand — including
-while Cloudflare is fully offline — `preheat manual` needs only a
-GitHub credential with push access to `water-rs/stow` and network to
-crates.io and GHCR; it resolves the graph, dispatches
-`build-batch.yml` runs itself, and publishes each index slice as its
-layer lands:
+daily, and the newreleases.io webhook wakes one on every new stable
+rustc. To seed a wave by hand, `preheat manual` resolves the graph
+on the operator's machine and submits one dependency tree per source
+to the scheduler's operations lane at the caller's `--priority`
+(stow#880 — the scheduler owns dispatch from there, so it needs a
+reachable edge):
 
 ```sh
-GH_TOKEN=<operator token> \
-stow-admin preheat manual \
-    --crates crates.txt \        # one `name` or `name@version` per line
-    --rustc-version 1.91.1     --in-flight 45                # default; stays under the 60-runner pool
+STOW_EDGE_URL=https://stow.waterui.dev stow-admin preheat manual \
+    --crates crates.txt \          # one `name` or `name@version` per line
+    --rustc-version 1.91.1 \
+    --yes
 ```
 
-The same driver takes `--projects preheat/projects.toml` for a
-repository list and `--edge-url https://stow.waterui.dev` (or
-`STOW_EDGE_URL`) when the edge is up and the D1 sync should run. It is
-resumable — coverage is recomputed from the published index, so a
-re-run dispatches only what is still missing — and exits non-zero with
-the failed runs' URLs when any task does not land.
+The same command takes `--projects preheat/projects.toml` for a
+repository list. It is resumable — the scheduler deduplicates on task
+identity, so a re-run inserts only what is still missing — and exits
+non-zero naming every `--projects` repository that failed to resolve.
 
 The scheduler-driven lanes still work the same way when the edge is up —
 from a machine that has `STOW_EDGE_URL` exported and the same GitHub
@@ -533,31 +536,31 @@ stow-admin preheat top-binaries \
 
 Each invocation enqueues the resolved crate tasks and returns immediately. The
 scheduler dispatches them to GitHub Actions in parallel as
-`build-batch.yml` runs (subject to
-`STOW_MAX_CONCURRENT_JOBS`, default 45 — runner slots, the sum of
-in-flight batches' `parallelism` — the per-family
+`build-crate.yml` runs (subject to
+`STOW_MAX_CONCURRENT_JOBS`, default 45 — runner slots, one per
+in-flight run — the per-family
 `STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and
 `STOW_DISPATCH_MIN_AGE_MINUTES`; failed dispatches retry with
-exponential backoff, and a batch whose lease expires after
+exponential backoff, and a task whose lease expires after
 `STOW_STALE_DISPATCH_MINUTES`, default 60, has its run read: completed
 resolves as if the webhook had arrived, still-running extends the
-lease, unbound requeues its legs).
+lease, unbound requeues).
 
-For first-time bring-up, also run `preheat top` for the library base
-pool. The library pool and the binary pool are independent.
+
+
 
 ## Operating
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
-- **Under attack:** `stow-admin maintenance on --scope anonymous`, watch
-  the request graph, `stow-admin maintenance off --scope anonymous`. The
+- **Under attack:** `gh workflow run maintenance.yml -f action=on -f
+  scope=anonymous`, watch the request graph, then the same with
+  `action=off`. The
   rule lives on the `waterui.dev` zone's `http_request_firewall_custom`
   phase — blocked requests never invoke the Worker — and the trusted CI
   endpoints keep working. `--scope lanes` sheds only the scheduler-backed
   lanes (bundle bytes keep serving); `--scope all` takes the whole
   hostname down. `stow-admin maintenance status` prints all three
   rules' state.
-- **D1 row count:** `wrangler d1 execute stow-prod --command "SELECT count(*) FROM artifacts"`
 - **GHCR storage:** the whole cache is one
   `ghcr.io/water-rs/stow-cache-<rustc>` package per rustc (every
   artifact a tag); monitor disk via the GitHub UI.

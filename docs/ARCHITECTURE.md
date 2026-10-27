@@ -22,9 +22,9 @@ anyone integrating with or modifying the trust-critical paths.
   Durable Object. `api.rs` serves the digest-addressed bundle byte path,
   the admissions/enqueue endpoints, the Turnstile-admitted request lane
   and the trusted admin routes; `dependency_resolver.rs` holds the
-  edge's crates.io reads; `db.rs` is the D1 catalog (schema at
-  `edge/schema.sql`); `scheduler/` is the DO — queue, dispatch, miss
-  draining and request records (schema at `edge/src/scheduler/schema.sql`).
+  edge's crates.io reads; `scheduler/` is the DO — queue, dispatch
+  and request records (schema at
+  `edge/src/scheduler/schema.sql`).
   The crate is split by target: pure catalog/scheduler logic compiles
   and unit-tests on the host, Cloudflare-bound modules are
   `wasm32`-gated, and crates.io access goes through the
@@ -44,7 +44,7 @@ anyone integrating with or modifying the trust-critical paths.
   the lanes share.
 - `admin/` (`stow-admin`): the operations CLI — index
   export/publish/sync, preheat lanes (`preheat manual` resolves
-  in-process and dispatches a whole wave), `request resolve` (the
+  in-process and submits a whole wave to the scheduler), `request resolve` (the
   Actions half of the request lane), queue mutations and the scheduler
   reset. Every lane resolves in-process with `stow-resolver`.
 - `mock-registry/` (`stow-mock-registry`): the local mock OCI registry
@@ -65,7 +65,7 @@ boundary rather than by ad-hoc validators in each handler.
 |---|---|---|---|
 | Crate name | `CrateName` | `types/src/identity.rs` | ASCII alnum + `-`, `_`; 1–128 chars |
 | Crate version | `CrateVersion` | `types/src/identity.rs` | strict `semver::Version` |
-| Features | `FeaturesJson` | `types/src/identity.rs` | strictly sorted, deduplicated; serialized as JSON-encoded string for D1 column compatibility |
+| Features | `FeaturesJson` | `types/src/identity.rs` | strictly sorted, deduplicated; serialized as JSON-encoded string for SQL column compatibility |
 | Target triple | `TargetTriple` | `types/src/identity.rs` | ASCII alnum + `-`, `_`; 1–128 chars |
 | Rustc version | `WireRustcVersion` | `types/src/identity.rs` | ASCII alnum + `.`, `-`, `_`; 1–64 chars |
 
@@ -109,45 +109,11 @@ stated or relied on — it is target- and rustc-version-dependent), and a
 Linux build without mold does not start — a fallback would produce
 artifacts keyed for a linker the cache does not publish.
 
-## D1 schema
-
-### `artifacts`
-
-The edge worker upserts rows here from the `POST /api/v1/admin/artifacts/sync`
-endpoint (`edge/src/db.rs::insert_artifact_record`) — the D1 table is a
-mirror of GHCR's signed records artifacts, populated by
-`stow-admin index sync` inside `index-publish.yml`. The table's schema
-lives in `edge/schema.sql`; the SQL template the upsert runs lives at
-`edge/src/sql/insert_artifact.sql`, and a column change means editing
-both plus the matching `bind` calls in `insert_artifact_record` — then
-applying the schema change as an operator reset (see below). Column list
-(in INSERT order):
-
-`compile_key`, `c_metadata`, `extra_filename`, `target`, `rustc_version`,
-`crate_name`, `version`, `features_json`, `dependency_c_metadata_json`,
-`oci_reference`, `oci_digest`, `has_native`,
-`artifact_kind`, `crate_types_json`, `profile_json`, `emit_json`,
-`artifact_size`, `bundle_digest`, `bundle_size`, `compile_millis`,
-`unit_side`, `unit_invocation`, `unit_linked`, `min_glibc`,
-`created_at`.
-
-`compile_millis` is the wall-clock milliseconds the CI capture wrapper
-measured for the rustc invocation that produced the artifact; the usage
-statistics sum it to estimate CPU time the cache saved. `unit_side` /
-`unit_invocation` / `unit_linked` record the unit shape the builder
-reported (which side of the host/target boundary the unit compiled for,
-the cargo invocation spelling that produced it, and whether it links);
-`min_glibc` is the glibc floor a hosted artifact needs, measured at
-publish from the bundle's ELF version-needed entries.
-
-The composite uniqueness key is `(c_metadata, target, rustc_version)`.
-
-### `dependency_graph_misses`
+## Misses
 
 Every observed miss is logged as one data point in the
 `stow_cache_misses` Analytics Engine dataset (binding
-`STOW_ANALYTICS`), never as a D1 row: anonymous traffic cannot spend
-billed row writes. A point's blobs are `(event, crate_name, version,
+`STOW_ANALYTICS`) — anonymous traffic never spends billed writes. A point's blobs are `(event, crate_name, version,
 features_json, target, rustc_version, kind, path)` with `event = "miss"`,
 its doubles are `[1]`, and the crate name is the index. Every miss is a
 `graph` point carrying the full request identity, written by the
@@ -157,12 +123,10 @@ and writes nothing. A point carries artifact identity only — no IP, no
 request id, no dependency graph, no lockfile hash. Semantic misses never
 reach the edge: the CLI resolves them locally against the index slice.
 
-A D1 row exists only for a miss whose admission was redeemed: when
-`POST /api/v1/enqueue` verifies the challenge and proof-of-work it
-inserts-or-updates the row with `admitted_at = now`, then forwards the
-request to the scheduler and stamps `queued_at`. Each subsequent
-`POST /api/v1/admissions` request drains a batch of admitted rows whose
-`queued_at IS NULL`, re-sends them to the scheduler as a retry channel
+A miss whose admission is redeemed enters the scheduler directly:
+`POST /api/v1/enqueue` verifies the challenge and proof-of-work, then
+forwards the tree — a failed send is the request's own error, not a row
+a drain would retry
 for failed sends (restoring the marker if the send fails again). Rows
 queued more than 7 days ago are pruned opportunistically, as are
 never-admitted rows older than 30 days (left over from when analysis
@@ -185,10 +149,10 @@ The client solves `blake3(task_id ‖ challenge ‖ nonce)` and posts an
 `EnqueueTicket` — the same request plus its nonce — to
 `POST /api/v1/enqueue`, which recomputes the challenge over the carried
 request (accepted during its issue minute and the minute after), checks
-the proof-of-work, upserts the miss's `dependency_graph_misses` row as
-admitted, and forwards the request to the scheduler. An unauthenticated
-miss therefore leaves no D1 or scheduler trace at all — only the
-Analytics Engine point — and a forged or tampered request cannot verify.
+the proof-of-work, and forwards the request to the scheduler. An
+unauthenticated miss therefore leaves no scheduler trace at all — only
+the Analytics Engine point — and a forged or tampered request cannot
+verify.
 
 The miss lane is also depth-capped: once the scheduler reports
 `pending >= STOW_MAX_QUEUE_PENDING` the handler refuses tickets with 429
@@ -208,23 +172,18 @@ right cost; burning CPU minutes on a blake3 puzzle would only punish the
 person the lane exists for, while the miss path's PoW stays sized for
 scripted CLI redemption and is unchanged.
 
-Accepted work lands in the scheduler's `human` lane, which dispatches
-ahead of the `miss` lane: `claim_dispatchable_tasks` orders by a
-persisted dispatch key — an explicit human-lane prefix, then an exact
-rational rank of the row's whole `value` (precedence and family bands
-plus `priority` and accumulated demand) divided by the
-`(crate_name, target)` expected build cost
-(`crate_build_stats.median_ms`, the bounded-window median of real
-claim-to-completion durations; a positive measured cost, with
-unmeasured crates dividing by 1 and keeping full demand value) — with
-`first_requested_at`, `created_at` and `task_id`
-as stable FIFO tie-breakers at equal rank, so no miss queueing
-ahead of time can starve a human request, and human rows are exempt
-from `STOW_DISPATCH_MIN_AGE_MINUTES` (the coalescing hold exists to
-batch identical misses; a human already said exactly what they want).
-Re-requesting a queued crate through this API promotes its row to the
-human lane; the miss path never demotes a human row — the `lane` column
-only ever moves `'miss' → 'human'`.
+Accepted work lands in the scheduler's `human` lane at 30× the CLI
+miss's priority. Every ready node ranks by its priority times the time
+it has waited since it was first requested, with first-requested FIFO
+ties, so a request typed here overtakes misses that have waited less
+than 30 times as long while old preheat or miss work is never starved.
+Human nodes are exempt from `STOW_DISPATCH_MIN_AGE_MINUTES` (the
+coalescing hold exists to batch identical misses; a human already said
+exactly what they want) and from the `STOW_MIN_DISPATCH_VALUE` floor.
+Re-requesting a queued crate through this API promotes it to the human
+lane and raises its priority to the human class; a node reached from
+several entry points keeps the highest priority and its first-requested
+time.
 
 The crate named in the request is itself only a name source: the
 expansion drops any package crates.io's version record marks
@@ -250,14 +209,14 @@ Dispatch is additionally capped per GitHub Actions runner family —
 `stow_types::api::runner_family` maps each `CI_TARGET_TRIPLES` member
 onto the pool its `runs-on` entry in `build-crate.yml` resolves to
 (Linux, macOS, or Windows). `STOW_MAX_CONCURRENT_JOBS` bounds total
-in-flight runner slots — the sum of each claimed `build-batch.yml`
-batch's `parallelism`, the matrix's `max-parallel` — against the org's
+in-flight runner slots — one per claimed `build-crate.yml`
+run — against the org's
 60-runner fleet (`0` pauses dispatch
 entirely — see `DEPLOYMENT.md`), and
 `STOW_MAX_CONCURRENT_MACOS_JOBS` bounds macOS-family slots so a
 full wave cannot occupy the whole 20-runner macOS pool. Within a lane,
 Windows-family rows claim first regardless of request age because the
-Windows legs are the slowest in a wave; rows whose family is saturated
+Windows tasks are the slowest in a wave; rows whose family is saturated
 stay pending, and the alarm then wakes at the earliest in-flight lease
 expiry rather than re-firing immediately.
 
@@ -266,7 +225,7 @@ non-yanked release when the body omits it) and the current stable rustc,
 then hands the request to the scheduler's `POST /requests` — the
 request record (`requests` table) is born `accepted` and dispatched
 there to `resolve-request.yml` on `main` through the same GitHub App
-`workflow_dispatch` arm `dispatch_batch` uses for `build-batch.yml`.
+`workflow_dispatch` arm `dispatch_task` uses for `build-crate.yml`.
 `resolve-request.yml` runs `stow-admin request resolve`: `stow-resolver`
 expands the crate's dependency closure over crates.io metadata — normal
 and build edges, optional-dependency feature activation, `cfg(...)`
@@ -315,6 +274,20 @@ graph under the build-override profile and the two spellings hand it
 different flags; the gate serves a dependent's host edge only when the
 side it needs has published.
 
+A same-package unit can also exist on both sides at one feature set —
+the host/target twin pair cargo's native build either merges into one
+unit (sharing) or keeps as two. When cargo keeps them apart the host
+unit compiles `debuginfo=2` over its own host dependencies under an
+explicit `--target` spelling while the task's plain identity still
+names the shared shape, so a third node names the host unit: the
+host node carries a self-twin edge onto its target twin (`task_graph`
+in `types/src/unit_graph.rs` adds `X_h → X_t` exactly when cargo's
+`traverse_and_share` interning rule — the recursive comparison of the
+two sides' lib dependency sets — keeps the pair apart), which re-mints
+the host node's task id and pins the target twin in its wrapper. The
+builder asserts cargo's native unit-graph verdict equals the predicate
+for every such pair.
+
 A minted task always builds at the latest semver-compatible version —
 within a range the latest is unique and a strict improvement, so a
 project's own version pins are dropped — unless the task's source asked
@@ -328,7 +301,8 @@ its source's resolved feature set verbatim.
 Between mint and claim a row may become redundant — an artifact covering
 its exact `(crate, version, features_json, target, rustc_version)`
 identity published in the window. `claim_dispatchable_tasks` asks the
-artifact catalog (D1 `artifacts`, servable rows only) which of the
+scheduler's published mask — the membership `index report` feeds —
+which of the
 candidate rows' identities exist and retires those rows as `completed`
 without a build. Only plain crates.io tasks are asked about — a
 project-source task shares nothing with the catalog's keys, and a
@@ -356,12 +330,6 @@ plus publish) releases them back to `pending`.
 Every store has exactly one schema, and the code is written against it
 alone — nothing reads an older shape of a store.
 
-- The D1 catalog's schema is `edge/schema.sql`. An operator creates or
-  changes it by resetting the store: drop the tables, then apply the
-  file with `wrangler d1 execute stow-prod --remote --file edge/schema.sql`,
-  and resync the mirror from the signed records with
-  `stow-admin index export --out-dir <dir> --full` followed by
-  `stow-admin index sync --file <dir>/new-records.json`.
 - The scheduler Durable Object's schema is `edge/src/scheduler/schema.sql`,
   created by the operator reset route — `stow-admin scheduler reset
   --yes` (→ `POST /api/v1/admin/scheduler/reset` → the object's `/reset`)
@@ -384,7 +352,11 @@ unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). A new
 rustc's package is created by its first `build-crate.yml` push: it links
 to the public `water-rs/stow` repository and inherits its visibility, so
 no manual step ever opens one, and a retired rustc's package is deleted
-whole.
+whole. Before it exists — or after a deletion — GHCR answers an
+anonymous pull of it with `403 DENIED` rather than `404`; every index
+reader treats that answer as the empty index, the same result a missing
+tag gives, so a fresh rustc's first builds can start it and a deleted
+package reads as reset (stow#844).
 
 Each artifact is two OCI images on that package. The signed image is the
 tag above: its config is the `ArtifactBlobConfig` and it carries one
@@ -435,11 +407,11 @@ foreign version — and a `row_count` checked against the decoded body.
 `.github/workflows/index-publish.yml` is dispatch-only: scheduled and
 `workflow_run` workflows run on the default branch (`dev`), whose
 identity the CLI rejects, so `index-publish-cron.yml` dispatches it on
-`main` after every completed `build-batch` run (a ten-minute schedule is
+`main` after every completed `build-crate` run (a ten-minute schedule is
 the backstop; GitHub delivers those ticks hours apart), and its first
 step refuses any other ref. A run does one `stow-admin index export
 --out-dir --rustc-version` pass scoped to one rustc — the completed
-run's `<rustc>-b<batch_id>` title names it, and the pass pulls and
+run's `<rustc>-<task_id>` title names it, and the pass pulls and
 verifies the published `index`/`folded` pair per `(target, rustc)`
 slice of that rustc and then only the `records-<rustc>-*` artifacts no
 folded set covers, all from GHCR with no edge round-trip — and emits an
@@ -514,7 +486,7 @@ charges whoever arrives next for a backlog everyone built — which is why
                                            └─┬────────────────────────────┘
                                              │
                                              ▼
-  GitHub ──workflow_run webhook──►  edge worker (skyzen) ──► CF D1 (catalog mirror)
+  GitHub ──workflow_run webhook──►  edge worker (skyzen)
         ▲                              │ CfFetch
         │                              ▼
   client (cli)  ──── zenwave ──►  GHCR (OCI): bundles, records, index slices
@@ -527,25 +499,22 @@ charges whoever arrives next for a backlog everyone built — which is why
 The build job never calls the edge: records live only in GHCR, and the
 scheduler learns the outcome from GitHub's `workflow_run` webhook — the
 edge verifies `X-Hub-Signature-256`, parses `display_title`
-(`<rustc>-b<batch_id>`) into its rustc and batch id, and forwards the
-run's identity to the scheduler's `POST /batches/{batch_id}/complete`.
-The alarm pass then resolves the batch: it reads the run's
-attempt-jobs page, classifies each leg, and completes a leg's task
-only after the records artifact its publish job pushed verifies in
-GHCR. `stow-admin index export` rebuilds each index slice
-from those signed records, and the `artifacts` D1 table is a mirror
-populated by `index sync`, not the write target.
+(`<rustc>-<task_id>`) into its rustc and task id, and forwards the
+run's outcome to the scheduler's `POST /tasks/complete-run`. A
+`success` conclusion counts only once the records artifact its publish
+job pushed exists in GHCR; the edge checks that before it forwards. `stow-admin index export` rebuilds each index slice
+from those signed records — the slices are the only catalog.
 
 What each hop is allowed to do:
 
 | Hop | Reads | Writes |
 |---|---|---|
 | stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{rustc_version}/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
-| edge worker (`edge/`) | crates.io, D1, GHCR, Analytics Engine SQL API | D1 `artifacts` rows (only via `/api/v1/admin/artifacts/sync`, gated by repo push users and bound to records already published in GHCR); scheduler queue; `dependency_graph_misses` (admitted misses only); `stow_cache_misses` Analytics Engine points (every miss) |
-| scheduler DO | D1 queue tables | D1 queue tables; GitHub `workflow_dispatch` of `build-batch.yml` on `main` |
+| edge worker (`edge/`) | crates.io, GHCR, Analytics Engine SQL API | scheduler queue (enqueue submits only); `stow_cache_misses` Analytics Engine points (every miss) |
+| scheduler DO | its SQLite store | its SQLite store; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml` or `preheat manual`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the D1 `artifacts` mirror via `/api/v1/admin/artifacts/sync` when its `stow_edge_url` input is set |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/{target}/{rustc_version}` when its `stow_edge_url` input is set |
 
 The edge's remaining crates.io reads are the request route's version and
 rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,
@@ -561,9 +530,8 @@ token that Fulcio would sign for. Everything it hands over is
 attacker-influenced, so the publisher (`ci/src/stage.rs`, `ci/src/closure.rs`,
 `ci/src/validate.rs`) establishes what it believes on its own:
 
-- the task comes from the batch the `workflow_dispatch` event file
-  carries (`GITHUB_EVENT_PATH`'s `inputs.batch`), leg `--leg` of it, not
-  from the build job;
+- the task comes from the `workflow_dispatch` event file
+  (`GITHUB_EVENT_PATH`'s `inputs.task`), not from the build job;
   the build output's copy must equal it;
 - every blob is content-addressed and re-hashed against the digest the plan
   records for it;
@@ -616,10 +584,9 @@ attested "built by the pipeline for task T", and that is what it still
 attests — but it can neither interfere with other crates' compilations and
 sources nor edit or forge the evidence the scan and the publisher rely on.
 
-CI no longer holds a Cloudflare D1 credential. The edge worker owns the only
-write path to `artifacts` (`stow-admin index sync` behind
-`/api/v1/admin/artifacts/sync`) and authorizes it via GitHub identity on the
-`Authorization: Bearer` header — an Actions OIDC token minted inside the
+CI holds no Cloudflare credential. The edge's trusted routes authorize
+by GitHub identity on the `Authorization: Bearer` header — an Actions
+OIDC token minted inside the
 repo (signature verified against GitHub's JWKS, with `iss`/`aud`/`repository`/
 `job_workflow_ref`/`exp` pinned), or any credential GitHub would accept a
 push from on the repo (probed via the `git-receive-pack` ref
@@ -644,20 +611,19 @@ certificate therefore cannot sign anything after that certificate expires.
 > **Records binding.** CI never calls the edge to record builds — each
 > build's records land in GHCR as a cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
 > artifact under the pinned `build-crate.yml` identity, and every reader
-> (`index export`, the batch-leg resolution's manifest check) verifies
+> (`index export`, the task-resolution's manifest check) verifies
 > that signature
-> before trusting the rows. The D1 `artifacts` table is a mirror: the
-> `sync` endpoint only accepts rows identical to what the registry's
-> verified records carry, so the catalog can lag or be rebuilt wholesale
-> without ever becoming the source of truth.
+> before trusting the rows. Every catalog read resolves against the
+> signed `index.*` slices the records fold into — the registry is the
+> only catalog, so nothing can become a second source of truth.
 >
 > **Completion binding.** GitHub's `workflow_run` webhook is HMAC-signed
 > with `STOW_GITHUB_WEBHOOK_SECRET`, which only GitHub and the edge hold;
-> the edge accepts a completion only for a `build-batch.yml` run on `main`
-> whose `display_title` parses as `<rustc>-b<batch_id>`, and the
-> scheduler resolves each leg only after
+> the edge accepts a completion only for a `build-crate.yml` run on `main`
+> whose `display_title` parses as `<rustc>-<task_id>`, and the
+> scheduler resolves the task only after
 > the records artifact
-> that leg's publish job pushed verifies in GHCR — a forged "success" cannot mint catalog rows.
+> its publish job pushed verifies in GHCR — a forged "success" cannot mint catalog rows.
 
 ## Local artifact cache
 
@@ -728,9 +694,12 @@ release invalidates the whole pool and it has to be re-heated from zero.
 Four workflows keep it warm:
 
 - `preheat-admin.yml` (manual, Actions-OIDC authenticated) seeds the
-  shared base pool directly against the scheduler: `preheat top` for
-  the top-N library crates and `preheat top-binaries` for the top-N
-  binaries — each `.crate` tarball resolved in-process by
+  shared base pool directly against the scheduler: `preheat
+  top-binaries` for the top-N crates whose default version ships a
+  binary target and no library, ranked by the last 90 days of
+  `version_downloads` —
+  the ranking and the binary check read once from the crates.io daily
+  database dump — each `.crate` tarball resolved in-process by
   `stow-resolver` into ordinary crate tasks
   carrying `depends_on` edges, exactly the way the projects lane
   resolves a repository's codeload tarball — plus the projects lane
@@ -793,23 +762,38 @@ Four workflows keep it warm:
 
 ## Usage statistics
 
-Anonymous usage events go to the `stow_cache_misses` Analytics Engine
-dataset (binding `STOW_ANALYTICS`), never to D1 — anonymous traffic
-cannot spend billed row writes. The one live shape is the `graph` miss
-the admissions handler writes per uncovered node. Every write is gated
-on the `x-stow-no-analytics: 1` request header, which the CLI sends on
-every request when `STOW_NO_ANALYTICS=1` is set (`edge/src/stats.rs`'s
-`AnalyticsConsent` extractor — every write takes the consent as an
-argument, so the opt-out is honoured by construction).
+Anonymous usage events go to two Analytics Engine datasets
+(`edge/src/stats.rs`). `stow_cache_misses` (binding `STOW_ANALYTICS`)
+holds the `graph` miss the admissions handler writes per uncovered
+node. `stow_events` (binding `STOW_STATS`) holds two point kinds:
+
+- `hit` — one point per bundle fetch the platform cache lets through
+  to the Worker. The digest-addressed byte path knows only the bundle
+  digest, so the point carries the digest plus request dimensions
+  (rustc, CLI version, OS, country, CI/local) and the daily-salted
+  install hash as its index. Most fetches never reach the Worker, so
+  the count is an edge-observed lower bound used for ranking only —
+  `stow-admin index join` resolves the digests to crate identities
+  offline from the public signed index slices.
+- `build` — one point per accepted `POST /api/v1/build-report`. The
+  CLI accumulates builds, cache-served artifacts, locally compiled
+  artifacts and `cpu_millis_saved` locally and posts the deltas at
+  most once per UTC day per install — one Worker request and one
+  point, with the same install hash and dimensions. The edge keeps no
+  identity store, so the report carries no crate names or digests.
+
+Every write is gated on the `x-stow-no-analytics: 1` request header,
+which the CLI sends on every request when `STOW_NO_ANALYTICS=1` is set
+(`edge/src/stats.rs`'s `AnalyticsConsent` extractor — every write takes
+the consent as an argument, so the opt-out is honoured by construction).
+The CLI sends no build report at all under the opt-out, and the edge
+drops any report that arrives with the header regardless.
 
 `GET /api/v1/stats` answers `UsageStats` by running the
 `edge/src/sql/stats_*.sql` queries against the Analytics Engine SQL API
 (`POST …/accounts/{CF_ACCOUNT_ID}/analytics_engine/sql`, authorized by
 the `CF_ANALYTICS_TOKEN` secret); the answer's one-hour `Cache-Control`
-lets Workers Cache replay it between runs. The hit-side queries read `stow_events`, the
-retired hit dataset: the digest-addressed byte path carries no artifact
-identity and writes nothing, so its points drain under the 90-day
-retention and the derived figures decay to zero. `GET /stats`
+lets Workers Cache replay it between runs. `GET /stats`
 renders the same numbers as a public page. The full data contract —
 fields, retention, opt-out — is documented in
 [`PRIVACY.md`](../PRIVACY.md).
@@ -827,11 +811,10 @@ deserialization.
 | GET `/` | none | — | HTML | Landing page: numbers from the acceleration audit, how it works, and the crate request form (askama template in `edge/templates/`, Turnstile site key from `TURNSTILE_SITE_KEY`) |
 | GET `/stats` | none | — | HTML | Public usage-statistics page — the `GET /api/v1/stats` numbers rendered in the site's style |
 | GET `/api/v1/stats` | none | — | `UsageStats` | Anonymous usage statistics from the Analytics Engine SQL API, Workers-Cached for one hour |
+| POST `/api/v1/build-report` | none | `BuildReport` | 204 | One install's daily usage counters — at most one report per install per UTC day, one `stow_events` `build` point per accepted report |
 | GET `/api/v1/bundles/{rustc_version}/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Byte fetch — the only artifact-serving route; the `{rustc_version}` segment names the artifact's GHCR package and the `sha256:<64 hex>` segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
-| POST `/api/v1/admin/artifacts/sync` | Bearer: repo push user | `Vec<ArtifactRecord>` chunk | `OkResponse` | Mirror the GHCR records into the D1 catalog — `stow-admin index sync` inside `index-publish.yml` |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
-| POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|clear`) |
-| GET `/api/v1/admin/index/{target}/{rustc_version}?after=<c_metadata>&limit=N` | Bearer: repo-workflow OIDC or push user | — | `ArtifactIndexPage` | Keyset page of the slice's servable rows, for `stow-admin index export` |
+| POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: repo-workflow OIDC or push user | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
@@ -839,7 +822,7 @@ deserialization.
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
 | POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows; GHCR tags are not deleted — `artifacts prune` |
-| POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for the posted graph's uncovered nodes — the only call that ships the dependency graph off the machine |
+| POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for a posted miss or inexact-hit report (`source`) — the only call that ships the dependency graph off the machine |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestStatus` | Human request: admit and dispatch a `resolve-request.yml` run that enqueues the crate's closure on every CI target in the human lane |
 | GET `/api/v1/requests/{request_id}` | none | — | `CrateRequestStatus` | Live request record: `accepted` → `resolving` → `enqueued`/`failed` plus per-target states |
@@ -849,8 +832,9 @@ deserialization.
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
 | POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
-| POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-batch.yml` run completed; the edge parses `display_title` (`<rustc>-b<batch_id>`) → batch id and forwards the run's identity to the scheduler's `POST /batches/{batch_id}/complete`; the alarm's resolution completes each leg only once the records artifact its publish job pushed verifies in GHCR |
-| GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection |
+| POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-crate.yml` run completed; the edge parses `display_title` (`<rustc>-<task_id>`) → task id and forwards the run's identity to the scheduler's `POST /tasks/complete-run`; the alarm's resolution completes the task only once the records artifact its publish job pushed verifies in GHCR |
+| GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection — lane depths for `stow-admin status --watch` (stow#853); `Cache-Control: no-store` |
+| GET `/api/v1/scheduler/health` | none | — | `SchedulerHealth` | Uncached liveness for uptime monitors (stow#860): worker/scheduler verdict, dispatch-freeze state and last `workflow_run` delivery age; any unhealthy component answers 503, all under `Cache-Control: no-store` |
 
 Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed.
 
@@ -862,10 +846,10 @@ its closure at the CLI's prefetch concurrency and the per-`rustc` wrapper
 fetches on demand under cargo's job parallelism, so one address
 legitimately sends tens of bundle requests a second, and a Workers Cache
 hit there spends only the billed request itself — no Worker CPU,
-subrequests, D1 or Durable Object work. The trusted
-write endpoints (`admin/artifacts/sync`, `scheduler/tasks/submit`,
+subrequests or Durable Object work. The trusted
+write endpoints (`scheduler/tasks/submit`,
 `github/workflow-run`) are inside the limited prefix, which is fine at
-their request rate: a wave makes one sync batch per slice and GitHub
+their request rate: a wave submits per slice and GitHub
 delivers one webhook per run.
 
 When even that is too much — Cloudflare has no spend cap — the zone's
@@ -891,8 +875,8 @@ flowing and the operator can always flip the rule back off.
 The zone's WAF maintenance rules protect the worker; the **dispatch freeze** protects the
 runner allowance and the Cloudflare bill. The object is event-driven —
 nothing polls, nothing wakes on a timer: two trips evaluate on the events
-that change their inputs. A leg's completion — applied when the
-batch's resolution settles it — upserts one
+that change their inputs. A task's completion — applied when the
+task's resolution settles it — upserts one
 five-minute bucket in `attempt_outcome_buckets` per target — retried
 attempts keep counting — and the object sums the trailing window's
 buckets (at most `window / 5min` per target whatever the traffic) and
@@ -904,7 +888,8 @@ volume). The cost trip is self-metered: `MeteringBackend`, a `DurableDbBackend`
 wrapper the middleware installs in place of the request's `DurableDb`,
 reads `rowsRead`/`rowsWritten` off every statement's cursor — the exact
 counters Cloudflare bills on — and a per-request settle folds them into
-the `do_meter` day row; the moment a UTC day's totals pass (the monthly
+the graph's in-memory day meter, checkpointed to the one-row `meter`
+table at each wake and snapshot; the moment a UTC day's totals pass (80% of the monthly
 included allowance / 30 × `STOW_COST_BUDGET_MULTIPLIER`), dispatch
 freezes on the operation that crossed it. On a trip the
 object writes a `dispatch_freeze` record into `settings` — a different
@@ -912,7 +897,7 @@ flag, storage key, and purpose from the WAF maintenance rules — and `dispatch_
 gates on it, so the queue keeps accepting misses while nothing more is
 handed to runners. While frozen, the work-submitting routes
 (`scheduler/tasks/submit`, `scheduler/requests/{id}/outcome`) answer 503
-naming the trigger; the `github/workflow-run` webhook and the batch
+naming the trigger; the `github/workflow-run` webhook and the task
 completion it forwards stay open so
 in-flight builds still land. Recovery is manual only:
 `POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
@@ -937,7 +922,7 @@ read from Actions, never from the edge.
 Which builds failed is a third channel neither of those owns: the
 failure *rate* alerts, an alert per build would be noise. Once a day
 `build-failure-digest.yml` runs `stow-admin builds digest` — it lists
-the `build-batch.yml` legs that failed in the previous 24 hours,
+the `build-crate.yml` tasks that failed in the previous 24 hours,
 classifies each by the step it died in (the manual driver's
 verdict/infrastructure classes), and posts one comment on the single
 open `incident`-labelled issue `Daily failed builds` — opened on the
@@ -953,7 +938,6 @@ is unset or malformed.
 | Binding | Default | Purpose |
 |---|---|---|
 | `STOW_MAX_EXPANDED_TASKS` | 4096 | Cap on the size of an expanded transitive graph |
-| `STOW_DB` (D1 binding) | required | Artifact catalog database |
 | `SCHEDULER` (Durable Object binding) | required | Build scheduler |
 | `GITHUB_REPO` | `water-rs/stow` | Repo every trusted credential must resolve inside (OIDC `repository` claim / push-permission check) |
 | `STOW_OIDC_AUDIENCE` | `https://stow.waterui.dev` | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests |
@@ -967,7 +951,7 @@ is unset or malformed.
 | `STOW_FREEZE_WINDOW_MINUTES` | `60` | Trailing window the dispatch-freeze trip counts terminal outcomes over; long enough to see the measured failure-wave rate decisively, short enough that a stale burst cannot haunt the next day |
 | `STOW_FREEZE_MIN_OUTCOMES` | `50` | Sample floor for the trip condition: a stream (fleet aggregate or one target) must record this many terminal outcomes in the window before its failure ratio is read — below it nothing trips however bad the ratio |
 | `STOW_FREEZE_FAIL_PERCENT` | `50` | Failure ratio (percent) a sufficiently-sampled stream must reach to freeze dispatch; the trip needs both the sample floor and this ratio, never either alone |
-| `STOW_COST_BUDGET_MULTIPLIER` | `1.0` | Scales the scheduler object's self-metered daily SQL budget (Workers Paid monthly allowances / 30) — the trip fires on the operation that crosses it |
+| `STOW_COST_BUDGET_MULTIPLIER` | `1.0` | Scales the scheduler object's self-metered daily SQL budget (80% of the Workers Paid monthly allowances / 30 — the stow#883 line's daily share) — the trip fires on the operation that crosses it |
 | `STOW_ALERT_FROM` | `alerts@stow.waterui.dev` | Sender address of freeze-transition alert emails; must live on a domain onboarded and Enabled under Compute → Email Service → Email Sending (`E_SENDER_NOT_VERIFIED` otherwise) |
 | `STOW_ALERT_TO` | `me@lexo.cool` | Recipient of the freeze + clear transition emails |
 | `STOW_ALERT_EMAIL` (`send_email` binding) | declared in `Skyzen.toml` only | Email Service send binding the transition alerts go through; the mock/local manifests deliberately omit it so their alert path resolves to `Disabled` and can never reach Cloudflare's sending API |

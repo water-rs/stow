@@ -29,9 +29,9 @@ name: deploy-edge
 # Phase 1 compares per-`scriptVersion` metrics: worker error rate and
 # cpu/wall p50+p99 (`workersInvocationsAdaptive`), DO requests/errors/wall per
 # request (`durableObjectsInvocationsAdaptiveGroups`). Phase 2 compares the
-# metrics with no version dimension — `durableObjectsPeriodicGroups` and
-# `d1AnalyticsAdaptiveGroups` — post-promotion window against the equal-length
-# window ending at the deploy start.
+# metrics with no version dimension — `durableObjectsPeriodicGroups` —
+# post-promotion window against the equal-length window ending at the
+# deploy start.
 #
 # Durable Objects under a split deployment (per the Cloudflare "With Durable
 # Objects" doc): each object is *assigned* one version per deployment config —
@@ -165,6 +165,8 @@ jobs:
             STOW_POW_CHALLENGE_SECRET:STOW_POW_CHALLENGE_SECRET \
             TURNSTILE_SECRET_KEY:STOW_TURNSTILE_SECRET_KEY \
             STOW_GITHUB_WEBHOOK_SECRET:STOW_GITHUB_WEBHOOK_SECRET \
+            STOW_NEWRELEASES_WEBHOOK_SECRET:STOW_NEWRELEASES_WEBHOOK_SECRET \
+            STOW_STATS_SALT_SECRET:STOW_STATS_SALT_SECRET \
             CF_ANALYTICS_TOKEN:CF_ANALYTICS_TOKEN; do
             name=${pair%%:*}
             repo_secret=${pair##*:}
@@ -181,6 +183,8 @@ jobs:
           STOW_POW_CHALLENGE_SECRET: ${{ secrets.STOW_POW_CHALLENGE_SECRET }}
           TURNSTILE_SECRET_KEY: ${{ secrets.STOW_TURNSTILE_SECRET_KEY }}
           STOW_GITHUB_WEBHOOK_SECRET: ${{ secrets.STOW_GITHUB_WEBHOOK_SECRET }}
+          STOW_NEWRELEASES_WEBHOOK_SECRET: ${{ secrets.STOW_NEWRELEASES_WEBHOOK_SECRET }}
+          STOW_STATS_SALT_SECRET: ${{ secrets.STOW_STATS_SALT_SECRET }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
 
       - name: Read the baseline and candidate version ids

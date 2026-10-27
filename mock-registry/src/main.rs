@@ -79,6 +79,7 @@ async fn async_main() -> stow_types::error::Result<()> {
         Command::PublishIndex(request) => publish_index(request).await,
         Command::IndexFromRecords(request) => index_from_records(request).await,
         Command::PushRecords(request) => push_records(request).await,
+        Command::RetagRecords(request) => retag_records(request).await,
         Command::PutBlob(request) => put_blob(request).await,
         Command::Serve(request) => serve_registry(request).await,
     }
@@ -184,7 +185,7 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
             version: record.version,
             features_json: record.features_json,
             dependency_c_metadata_json: record.dependency_c_metadata_json,
-            dependency_identity: record.dependency_identity,
+            dependency_task_ids: record.dependency_task_ids,
             c_metadata: record.c_metadata,
             compile_key: record.compile_key,
             bundle_digest: record.bundle_digest,
@@ -318,12 +319,69 @@ async fn push_records(request: PushRecordsArgs) -> stow_types::error::Result<()>
     .await?;
     // Tagged only once signed, as `stow_oci::put_signed_manifest` pushes.
     write_manifest(&request.registry_root, &repo, &tag, &manifest_bytes).await?;
+    // The `built-<rustc>-<task_id hash>` marker `push_records` also
+    // points at the same manifest (stow#877): a run checking whether
+    // the task's signed records already exist reads one tag, and a
+    // superseding run's early exit re-tags what this marker names.
+    write_manifest(
+        &request.registry_root,
+        &repo,
+        &stow_types::records::published_tag(rustc.as_str(), &request.task_id),
+        &manifest_bytes,
+    )
+    .await?;
     tracing::info!(
         oci_reference = %oci_reference,
         digest = %manifest_digest,
         task_id = %request.task_id,
         records = records.len(),
         "pushed mock records artifact"
+    );
+    Ok(())
+}
+
+/// `retag-records` — the early-exited run's publish: the `built-`
+/// marker's manifest is re-tagged under this run's `records-` tag AND
+/// signed for it, so the `sha256-<digest>.sig` bundle gains a layer
+/// binding this tag alongside the original run's (stow#877).
+async fn retag_records(request: RetagRecordsArgs) -> stow_types::error::Result<()> {
+    let rustc = WireRustcVersion::parse(&request.rustc_version)
+        .map_err(|error| stow_types::stow_error!("--rustc-version: {error}"))?;
+    let repository = cache_repository(&rustc);
+    let repo = repository.path().to_string();
+    let marker_path = request.registry_root.join("manifests").join(&repo).join(
+        stow_types::records::published_tag(rustc.as_str(), &request.task_id),
+    );
+    let manifest_bytes = read(&marker_path).await.map_err(|error| {
+        stow_types::stow_error!("read built- marker {}: {error}", marker_path.display())
+    })?;
+    let manifest_digest = sha256_digest(&manifest_bytes);
+    let oci_reference = repository.reference(&records_tag(
+        rustc.as_str(),
+        &request.task_id,
+        BuildRun {
+            run_id: request.run_id,
+            run_attempt: request.run_attempt,
+        },
+    ));
+    let key_pair = load_key_pair(&request.private_key_path).await?;
+    let signer = key_pair
+        .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
+        .map_err(|error| stow_types::stow_error!("create mock signer from private key: {error}"))?;
+    write_mock_signature(
+        &request.registry_root,
+        &signer,
+        &oci_reference,
+        &manifest_digest,
+    )
+    .await?;
+    let (_, tag) = split_reference(&oci_reference)?;
+    write_manifest(&request.registry_root, &repo, &tag, &manifest_bytes).await?;
+    tracing::info!(
+        oci_reference = %oci_reference,
+        digest = %manifest_digest,
+        task_id = %request.task_id,
+        "re-tagged and re-signed mock records artifact"
     );
     Ok(())
 }
@@ -485,6 +543,10 @@ fn registry_app_with_probe(
             get(serve_edge_bundle).head(serve_edge_bundle),
         )
         .route("/analytics_engine/sql", post(analytics_engine_sql))
+        .route(
+            "/accounts/{account}/analytics_engine/sql",
+            post(analytics_engine_sql_account),
+        )
         .route("/user", get(github_user))
         .route("/{owner}/{repo}/info/refs", get(github_info_refs))
         .with_state(MockRegistryState {
@@ -776,7 +838,7 @@ async fn write_mock_registry_entry(
         rustc_version: plan.rustc_version.clone(),
         features_json: plan.features_json.clone(),
         dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
-        dependency_identity: plan.dependency_identity.clone(),
+        dependency_identity: plan.dependency_identity()?,
         dependency_compile_keys_json: plan.dependency_compile_keys_json.clone(),
         profile: plan.profile.clone(),
         emit: plan.emit.clone(),
@@ -1203,6 +1265,12 @@ enum Command {
     /// mock signature — the write the production publish stage performs
     /// on GHCR once a build's records live there (stow#455).
     PushRecords(PushRecordsArgs),
+    /// Re-tag the `built-` marker's manifest under another run's
+    /// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag AND
+    /// sign it — production's early-exited run re-signs via
+    /// `put_signed_manifest`, since every reader binds the signature
+    /// to the tag it pulled (stow#877).
+    RetagRecords(RetagRecordsArgs),
     /// Store one deterministic blob of `--size` bytes and print its
     /// digest — a bundle-sized body the edge's byte path can stream,
     /// for the traffic-cost CPU measurement (`scripts/traffic-cost.sh`).
@@ -1234,6 +1302,26 @@ struct PushRecordsArgs {
     #[arg(long = "run-id")]
     run_id: u64,
     /// The run's attempt — the tag's last leg.
+    #[arg(long = "run-attempt")]
+    run_attempt: u32,
+    #[arg(long = "registry-root")]
+    registry_root: PathBuf,
+    #[arg(long = "private-key")]
+    private_key_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Args)]
+struct RetagRecordsArgs {
+    /// The task whose `built-` marker points at the manifest.
+    #[arg(long = "task-id")]
+    task_id: String,
+    /// The rustc the task ran under.
+    #[arg(long = "rustc-version")]
+    rustc_version: String,
+    /// The run the re-tag publishes under.
+    #[arg(long = "run-id")]
+    run_id: u64,
+    /// The run's attempt.
     #[arg(long = "run-attempt")]
     run_attempt: u32,
     #[arg(long = "registry-root")]
@@ -1320,7 +1408,7 @@ struct MockRegistryState {
 /// because the map dies with the process anyway.
 #[derive(Debug, Default)]
 struct TokenState {
-    issued: HashMap<String, Instant>,
+    issued: HashMap<String, IssuedToken>,
     /// Monotonic salt so back-to-back mints never collide.
     next: u64,
 }
@@ -1333,15 +1421,80 @@ async fn v2_ping(State(state): State<MockRegistryState>) -> Response<Body> {
     unauthorized(&state.token_realm, None)
 }
 
+/// Whether `repository`'s package exists — the `manifests/<repo>` dir the
+/// first manifest push creates, mirroring GHCR creating a package on its
+/// first `build-crate.yml` publish. Blobs alone do not make one.
+fn package_exists(registry_root: &Path, repository: &str) -> bool {
+    registry_root.join("manifests").join(repository).is_dir()
+}
+
+/// GHCR's answer to an anonymous pull against a package that does not
+/// exist — or is not public; it refuses to say which: `403` carrying
+/// the OCI `DENIED` code, on the token exchange and the asset request
+/// alike.
+fn package_denied() -> Response<Body> {
+    let mut response = Response::new(Body::from(
+        serde_json::json!({
+            "errors": [{
+                "code": "DENIED",
+                "message": "requested access to the resource is denied",
+            }],
+        })
+        .to_string(),
+    ));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// A minted bearer: its expiry, and whether its exchange was anonymous —
+/// GHCR answers an anonymous read against a package that does not exist
+/// `403 DENIED`, while a credentialed one (a publish's) reads it as absent.
+#[derive(Debug)]
+struct IssuedToken {
+    expires_at: Instant,
+    anonymous: bool,
+}
+
+/// What a request's bearer is: missing, unknown or expired, or a live
+/// token minted anonymously or with credentials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bearer {
+    Unauthorized,
+    Anonymous,
+    Credentialed,
+}
+
 /// `GET /token?service=…&scope=…` — mints an anonymous bearer exactly the
 /// way GHCR does for public packages. The mock grants every requested
-/// scope; the token is recorded with its expiry and later `/v2/` requests
-/// are served only when they present it.
+/// scope whose package exists; the token is recorded with its expiry and
+/// later `/v2/` requests are served only when they present it. Like GHCR,
+/// an anonymous (no `Authorization`) exchange for a package that does not
+/// exist is refused `403 DENIED`, while a credentialed exchange mints —
+/// pushing creates the package.
 async fn issue_token(
     State(state): State<MockRegistryState>,
+    headers: HeaderMap,
     Query(params): Query<BTreeMap<String, String>>,
-) -> Json<serde_json::Value> {
+) -> Response<Body> {
     state.record(&Method::GET, "/token");
+    // A `repository:<path>:<actions>` scope names the package; an
+    // anonymous exchange for a package that does not exist is GHCR's
+    // `403 DENIED`. Credentialed exchanges (any `Authorization` header)
+    // mint — a publish creates the package.
+    if !headers.contains_key(header::AUTHORIZATION)
+        && let Some(repository) = params
+            .get("scope")
+            .and_then(|scope| scope.strip_prefix("repository:"))
+            .and_then(|rest| rest.rsplit_once(':'))
+            .map(|(repository, _actions)| repository)
+        && !package_exists(&state.registry_root, repository)
+    {
+        return package_denied();
+    }
     let mut tokens = state
         .tokens
         .lock()
@@ -1357,7 +1510,10 @@ async fn issue_token(
     );
     tokens.issued.insert(
         token.clone(),
-        Instant::now() + Duration::from_secs(TOKEN_TTL_SECS),
+        IssuedToken {
+            expires_at: Instant::now() + Duration::from_secs(TOKEN_TTL_SECS),
+            anonymous: !headers.contains_key(header::AUTHORIZATION),
+        },
     );
     tracing::info!(
         service = params.get("service"),
@@ -1368,6 +1524,7 @@ async fn issue_token(
         "token": token,
         "expires_in": TOKEN_TTL_SECS,
     }))
+    .into_response()
 }
 
 async fn serve_v2(
@@ -1387,8 +1544,26 @@ async fn serve_v2(
         tracing::warn!(path = %rest, %error, "invalid mock registry path");
         StatusCode::BAD_REQUEST
     })?;
-    if !state.bearer_authorized(&headers) {
+    let bearer = state.bearer(&headers);
+    if matches!(bearer, Bearer::Unauthorized) {
         return Ok(unauthorized(&state.token_realm, Some(asset.repository())));
+    }
+    // GHCR answers an anonymous read against a package that does not
+    // exist with `403 DENIED`, not `404` — an anonymous bearer for it can
+    // only be a stale one minted before the package went. A credentialed
+    // read (a publish's blob HEAD before its first push) sees the plain
+    // absence, and writes create the package.
+    if matches!(bearer, Bearer::Anonymous)
+        && matches!(method, Method::GET | Method::HEAD)
+        && matches!(
+            asset,
+            RegistryAsset::Manifest { .. }
+                | RegistryAsset::Blob { .. }
+                | RegistryAsset::TagsList { .. }
+        )
+        && !package_exists(&state.registry_root, asset.repository())
+    {
+        return Ok(package_denied());
     }
     match (method.clone(), asset) {
         (
@@ -1778,6 +1953,27 @@ async fn analytics_engine_sql(
     State(state): State<MockRegistryState>,
     body: String,
 ) -> Response<Body> {
+    analytics_engine_sql_answer(&state, None, &body).await
+}
+
+/// `POST /accounts/{account}/analytics_engine/sql` — the account-scoped
+/// shape `stow-admin` posts (the watchdog, `preheat missed`, the launch
+/// model). The account id carries the scripting knob: names containing
+/// `overloaded` answer a breaching fault count, names containing
+/// `empty` a dead dataset, anything else the live-clear answer.
+async fn analytics_engine_sql_account(
+    State(state): State<MockRegistryState>,
+    AxumPath(account): AxumPath<String>,
+    body: String,
+) -> Response<Body> {
+    analytics_engine_sql_answer(&state, Some(&account), &body).await
+}
+
+async fn analytics_engine_sql_answer(
+    state: &MockRegistryState,
+    account: Option<&str>,
+    body: &str,
+) -> Response<Body> {
     // Fixture mode (stow#523 harness): the optional `--demand-fixtures`
     // directory carries one verbatim document per requested hour —
     // `YYYY-MM-DDTHH.json` — so the harness edits a file between runs
@@ -1790,7 +1986,7 @@ async fn analytics_engine_sql(
     if let Some(fixtures) = &state.demand_fixtures
         && body.contains("stow_cache_misses")
     {
-        match demand_query_hour(&body) {
+        match demand_query_hour(body) {
             // A demand query whose bound is malformed or ambiguous is a
             // provider-side failure, never a guess.
             Err(message) => {
@@ -1895,15 +2091,38 @@ async fn analytics_engine_sql(
         }))
         .into_response();
     }
+    // The watchdog's overload query (stow#888): `index1='#fault'`
+    // points in `stow_cache_misses`. The account path selects the
+    // scripted answer — `overloaded` breaches, `empty` is the
+    // dead-dataset case, anything else is live and clear — so a
+    // harness drives all three by setting `CF_ACCOUNT_ID`.
+    if body.contains("stow_cache_misses") && body.contains("'#fault'") {
+        let (events, points) = match account {
+            Some(account) if account.contains("overloaded") => ("3", "17"),
+            Some(account) if account.contains("empty") => ("0", "0"),
+            _ => ("0", "42"),
+        };
+        return Json(serde_json::json!({
+            "meta": [
+                {"name": "events", "type": "Float64"},
+                {"name": "points", "type": "UInt64"}
+            ],
+            "data": [{"events": events, "points": points}],
+            "rows": 1
+        }))
+        .into_response();
+    }
     Json(serde_json::json!({
         "success": true,
         "errors": [],
         "messages": [],
         "data": [{
+            "builds_24h": 42.0,
             "hits_24h": 420.0,
-            "hit_compile_millis_30d": 3_600_000.0,
+            "misses_24h": 30.0,
+            "cpu_millis_saved_30d": 3_600_000.0,
             "install_days_7d": "140",
-            "misses_24h": "30",
+            "install_days": "30",
             "name": "mock-crate",
             "hits": 420.0
         }]
@@ -2071,27 +2290,34 @@ impl MockRegistryState {
         Some(response)
     }
 
-    /// `Authorization: Bearer` presents a token this server minted that
-    /// has not expired. Expired entries are evicted on sight.
-    fn bearer_authorized(&self, headers: &HeaderMap) -> bool {
+    /// What `Authorization: Bearer` presents: a token this server minted
+    /// that has not expired, and how it was minted. Expired entries are
+    /// evicted on sight.
+    fn bearer(&self, headers: &HeaderMap) -> Bearer {
         let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.strip_prefix("Bearer "))
         else {
-            return false;
+            return Bearer::Unauthorized;
         };
         let mut tokens = self
             .tokens
             .lock()
             .expect("mock registry token map poisoned");
         match tokens.issued.get(token) {
-            Some(expires_at) if *expires_at > Instant::now() => true,
+            Some(issued) if issued.expires_at > Instant::now() => {
+                if issued.anonymous {
+                    Bearer::Anonymous
+                } else {
+                    Bearer::Credentialed
+                }
+            }
             Some(_) => {
                 tokens.issued.remove(token);
-                false
+                Bearer::Unauthorized
             }
-            None => false,
+            None => Bearer::Unauthorized,
         }
     }
 }
@@ -2264,9 +2490,9 @@ mod tests {
 
     use super::{
         Arc, Body, MockRegistryState, Mutex, Path, RegistryProbe, SigStoreKeyPair, SigningScheme,
-        TokenState, analytics_engine_sql, create_dir_all, demand_query_hour, log_demand_query,
-        manifest_file_name, registry_app_with_probe, split_reference, write, write_blob,
-        write_manifest, write_mock_signature,
+        TokenState, analytics_engine_sql, analytics_engine_sql_answer, create_dir_all,
+        demand_query_hour, log_demand_query, manifest_file_name, registry_app_with_probe,
+        split_reference, write, write_blob, write_manifest, write_mock_signature,
     };
 
     const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-1.98.0/manifests/latest";
@@ -2372,6 +2598,148 @@ mod tests {
             .await
             .expect("forged response");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// stow#844: a package that was never published answers the way GHCR
+    /// answers — the anonymous token exchange gets `403` carrying the OCI
+    /// `DENIED` code, while a credentialed exchange still mints (a publish
+    /// creates the package) and its reads see the plain `404`.
+    #[tokio::test]
+    async fn a_missing_package_denies_the_anonymous_exchange() {
+        let root = tempfile::tempdir().expect("registry root");
+        let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
+        let scope = "repository:water-rs/stow-cache-9.99.9:pull";
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/token?service=mock-registry&scope={scope}"))
+                    .body(Body::empty())
+                    .expect("token request builds"),
+            )
+            .await
+            .expect("token response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("denied body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("denied json");
+        assert_eq!(body["errors"][0]["code"], "DENIED");
+
+        // A credentialed exchange mints — a publish creates the package.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/token?service=mock-registry&scope={scope}"))
+                    .header(header::AUTHORIZATION, "Basic dGVzdDp0ZXN0")
+                    .body(Body::empty())
+                    .expect("credentialed token request builds"),
+            )
+            .await
+            .expect("credentialed token response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("token body");
+        let token =
+            serde_json::from_slice::<serde_json::Value>(&body).expect("token json")["token"]
+                .as_str()
+                .expect("token field")
+                .to_owned();
+
+        // A credentialed read — a publish's HEAD before its first push —
+        // sees the plain absence, never DENIED: only anonymous reads of a
+        // missing package are refused.
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v2/water-rs/stow-cache-9.99.9/tags/list")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .expect("tags request builds"),
+            )
+            .await
+            .expect("tags response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// stow#844: every index reader on `stow-oci` treats a missing
+    /// package as the empty index — the manifest pull classifies as
+    /// absent and `list_tags` yields no tags — while a `403` with any
+    /// other body and a `401` stay refusals.
+    #[tokio::test]
+    async fn a_missing_package_reads_as_the_empty_index() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        let base =
+            stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
+        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let repository =
+            cache_repository(&WireRustcVersion::parse("9.99.9").expect("rustc version"));
+        let session = base.session(&repository, &http);
+
+        // The token exchange's 403 DENIED is the package's absence —
+        // both classifications agree.
+        let reference = session
+            .reference("index.x86_64-unknown-linux-gnu.9.99.9")
+            .expect("reference");
+        let error = session
+            .pull_manifest(&reference)
+            .await
+            .expect_err("a missing package is a refusal, not a manifest");
+        assert!(error.is_package_missing(), "{error}");
+        assert!(error.is_not_found(), "{error}");
+
+        // `index export`'s tag listing reads the same emptiness.
+        let tags = session
+            .list_tags()
+            .await
+            .expect("a missing package lists no tags");
+        assert!(tags.is_empty());
+
+        // A 403 that is not DENIED — and a 401 — are refusals, not
+        // absence. They must reach the manifest pull, so this session
+        // opens on a package that exists: the exchange mints and the
+        // scripted refusals answer the asset requests.
+        std::fs::create_dir_all(root.path().join("manifests").join(REPOSITORY))
+            .expect("package dir");
+        let session = base.session(&test_cache_repository(), &http);
+        let reference = session.reference("forged-tag").expect("reference");
+        probe.refuse(
+            Method::GET,
+            "/manifests/",
+            1,
+            StatusCode::FORBIDDEN,
+            serde_json::json!({"errors": [{"code": "TOOMANYREQUESTS", "message": "slow down"}]}),
+        );
+        let error = session
+            .pull_manifest(&reference)
+            .await
+            .expect_err("a non-DENIED 403 must fail");
+        assert!(
+            !error.is_not_found() && !error.is_package_missing(),
+            "{error}"
+        );
+        // A 401 triggers one bearer re-mint before the refusal is final;
+        // script the retried request too.
+        probe.refuse(
+            Method::GET,
+            "/manifests/",
+            2,
+            StatusCode::UNAUTHORIZED,
+            serde_json::json!({"errors": [{"code": "UNAUTHORIZED", "message": "bad token"}]}),
+        );
+        let error = session
+            .pull_manifest(&reference)
+            .await
+            .expect_err("a persistent 401 must fail");
+        assert!(
+            !error.is_not_found() && !error.is_package_missing(),
+            "{error}"
+        );
     }
 
     /// The GitHub trust stub (stow#793): `/user` and
@@ -2484,8 +2852,7 @@ mod tests {
                 version: "1.0.0".parse().expect("version"),
                 features_json: FeaturesJson::default(),
                 dependency_c_metadata_json: DependencyCMetadataJson::default(),
-                dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                    .expect("leaf identity"),
+                dependency_task_ids: Vec::new(),
                 c_metadata: CMetadata::parse(C_METADATA).expect("c_metadata"),
                 compile_key: format!("{C_METADATA}{C_METADATA}"),
                 bundle_digest,
@@ -2656,8 +3023,7 @@ mod tests {
             crate_name: CrateName::parse("serde").expect("name"),
             crate_version: "1.0.0".parse().expect("version"),
             c_metadata: CMetadata::parse(C_METADATA).expect("c_metadata"),
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf digest"),
+            dependency_task_ids: Vec::new(),
             extra_filename: format!("-{C_METADATA}"),
             features_json: FeaturesJson::default(),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
@@ -3150,6 +3516,10 @@ mod tests {
     async fn a_published_signature_that_is_absent_is_not_retried() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let root = tempfile::tempdir().expect("registry root");
+        // The package exists — only the signature is absent; a missing
+        // package is GHCR's anonymous `403 DENIED` instead (stow#844).
+        std::fs::create_dir_all(root.path().join("manifests").join(REPOSITORY))
+            .expect("package dir");
         let (listen, probe) = serve_probe_registry(root.path()).await;
         let digest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
         let signature_tag = sigstore_signature_tag(digest);
@@ -3307,6 +3677,43 @@ mod tests {
             let log = tokio::fs::read_to_string(&log_path).await.expect("log");
             assert_eq!(log.lines().count(), 2);
             assert!(log.contains("\"served\":false"));
+        });
+    }
+
+    /// The watchdog's overload query (`stow_cache_misses` +
+    /// `index1='#fault'`, stow#888) gets the three scripted answers its
+    /// cases need, keyed on the account the SQL base path carries:
+    /// `overloaded` breaches, `empty` is the dead dataset, and anything
+    /// else — including the unscoped route — is live and clear.
+    #[test]
+    fn watchdog_fault_query_answers_the_three_scripted_cases() {
+        let root = tempfile::TempDir::new().expect("temp dir");
+        let state = MockRegistryState {
+            registry_root: root.path().to_path_buf(),
+            token_realm: "http://127.0.0.1/token".to_owned(),
+            tokens: Arc::new(Mutex::new(TokenState::default())),
+            requests: None,
+            refusals: None,
+            toggles: None,
+            demand_fixtures: None,
+        };
+        let sql = "SELECT sumIf(_sample_interval * double1, index1 = '#fault' AND blob1 = 'overloaded') AS events, count() AS points FROM stow_cache_misses WHERE timestamp >= NOW() - INTERVAL '1' HOUR FORMAT JSON";
+        block_on(async move {
+            for (account, events, points) in [
+                (Some("mock-overloaded-account"), "3", "17"),
+                (Some("mock-empty-account"), "0", "0"),
+                (Some("mock-live-account"), "0", "42"),
+                (None, "0", "42"),
+            ] {
+                let response = analytics_engine_sql_answer(&state, account, sql).await;
+                assert_eq!(response.status(), StatusCode::OK, "{account:?}");
+                let bytes = to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+                assert_eq!(json["data"][0]["events"], events, "{account:?}");
+                assert_eq!(json["data"][0]["points"], points, "{account:?}");
+            }
         });
     }
 }

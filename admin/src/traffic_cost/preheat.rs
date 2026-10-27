@@ -16,12 +16,9 @@
 //! reduced wave's node count. That scaling is valid because the same
 //! report proves per-event cost does not grow across layers.
 //!
-//! A batch's completion and its alarm passes are paid once per batch
-//! run, so their per-node share is `1/b̄` of a batch's, where `b̄` is the
-//! legs per batch the measured wave achieved. That `b̄` is set by how
-//! many nodes each reduced layer releases per runner family, not by
-//! production's, so the projection carries it ([`Batching`]) beside the
-//! per-node costs it shaped.
+//! A run's completion is paid once per task — one task is one
+//! `build-crate.yml` run — so the measured per-node cost already
+//! carries the completion its node pays.
 //!
 //! Only the scheduler Durable Object is measured: its billed calls and
 //! rows. Every other product dimension is reported as not measured and
@@ -57,24 +54,6 @@ impl PerNode {
     }
 }
 
-/// How a phase's legs were packed into batch runs.
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub struct Batching {
-    /// `build-batch.yml` runs the phase dispatched.
-    pub batches: u64,
-    /// Legs per batch run, the achieved `b̄`; `None` without a batch.
-    pub legs_per_batch: Option<f64>,
-}
-
-impl Batching {
-    const fn of(phase: &PhaseCost) -> Self {
-        Self {
-            batches: phase.batches,
-            legs_per_batch: phase.legs_per_batch,
-        }
-    }
-}
-
 /// What preheat adds to a month.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct PreheatMonthly {
@@ -91,10 +70,11 @@ pub struct PreheatMonthly {
     pub wave: PerNode,
     /// One resubmit's cost per node.
     pub resubmit: PerNode,
-    /// The measured wave's batch packing.
-    pub wave_batching: Batching,
-    /// The measured resubmit's batch packing.
-    pub resubmit_batching: Batching,
+    /// `build-crate.yml` runs the measured wave dispatched — one per
+    /// task.
+    pub wave_tasks: u64,
+    /// `build-crate.yml` runs the measured resubmit dispatched.
+    pub resubmit_tasks: u64,
 }
 
 impl PreheatMonthly {
@@ -124,8 +104,8 @@ impl PreheatMonthly {
             resubmits_per_month: model.monthly_resubmits(),
             wave: PerNode::of(&report.wave, report.nodes),
             resubmit: PerNode::of(&report.resubmit, report.nodes),
-            wave_batching: Batching::of(&report.wave),
-            resubmit_batching: Batching::of(&report.resubmit),
+            wave_tasks: report.wave.tasks,
+            resubmit_tasks: report.resubmit.tasks,
         })
     }
 
@@ -173,7 +153,7 @@ pub(super) const fn test_production(nodes: u64) -> ProductionWave {
 
 /// A report of `nodes` measured nodes whose wave and resubmit each cost
 /// 100 calls, 1000 rows read and 500 rows written per phase, over 100
-/// batch runs of 20 legs.
+/// `build-crate.yml` runs — one per task.
 #[cfg(test)]
 pub(super) fn test_report(nodes: u64) -> PreheatCostReport {
     use std::collections::BTreeMap;
@@ -190,11 +170,7 @@ pub(super) fn test_report(nodes: u64) -> PreheatCostReport {
         other_ops: Vec::new(),
         rows_read: 1_000,
         rows_written: 500,
-        budget_rows_read: f64::INFINITY,
-        budget_rows_written: f64::INFINITY,
-        batches: 100,
-        legs: 2_000,
-        legs_per_batch: Some(20.0),
+        tasks: 100,
         wall_ms: 0,
     };
     PreheatCostReport {
@@ -226,8 +202,8 @@ mod tests {
         assert!((preheat.wave.requests - 2.0).abs() < 1e-12);
         assert!((preheat.wave.rows_read - 20.0).abs() < 1e-12);
         assert!((preheat.resubmit.rows_written - 10.0).abs() < 1e-12);
-        assert_eq!(preheat.wave_batching.batches, 100);
-        assert_eq!(preheat.resubmit_batching.legs_per_batch, Some(20.0));
+        assert_eq!(preheat.wave_tasks, 100);
+        assert_eq!(preheat.resubmit_tasks, 100);
     }
 
     /// The monthly usage is releases × wave + days × resubmit, each at
@@ -273,8 +249,6 @@ mod tests {
             ("durable_objects", "duration_gb_s"),
             ("workers", "requests"),
             ("workers", "cpu_ms"),
-            ("d1", "rows_read"),
-            ("d1", "rows_written"),
         ] {
             assert_eq!(preheat.monthly(product, dimension), None);
             assert_ne!(not_measured(product, dimension), "");

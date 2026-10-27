@@ -22,6 +22,15 @@
 //! <phase>/end.json                      ledger when the phase ended
 //! ```
 //!
+//! and, across both phases, every restart of the dev edge (the probe
+//! ledger lives in the edge's memory past its last snapshot, so the
+//! report carries every later read across each restart):
+//!
+//! ```text
+//! restarts/<NNN>/before.json  ledger right before the edge stopped
+//! restarts/<NNN>/after.json   ledger once the restarted edge answered
+//! ```
+//!
 //! The production wave's size comes from a lanes directory
 //! `scripts/production-wave.sh` fills with the production lanes'
 //! plan-only runs (no `--yes`, nothing enqueued), laid out like a
@@ -36,12 +45,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
-use stow_types::api::{ArtifactRecord, EnqueueRequest, SchedulerLedger};
+use stow_types::api::{ArtifactRecord, SchedulerLedger};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::local_ci::LocalCiTasks;
 use stow_types::preheat_cost::{
-    LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport, ProductionLane,
-    ProductionTask, ProductionWave, Round, WaveObservations, analyse, count_production,
+    EdgeRestart, LaneRun, LedgerSnapshot, Node, PhaseObservations, PreheatCostReport,
+    ProductionLane, ProductionTask, ProductionWave, Round, WaveObservations, analyse,
+    count_production,
 };
 use stow_types::public_cache::UnitSide;
 use stow_types::stow_error;
@@ -127,7 +137,7 @@ fn unix_millis() -> stow_types::error::Result<u64> {
 }
 
 async fn ledger(args: &LedgerArgs) -> stow_types::error::Result<()> {
-    let edge = crate::Edge::connect().await?;
+    let edge = crate::Edge::connect()?;
     let ledger: SchedulerLedger = edge
         .get_json("/api/v1/admin/scheduler/budget/ledger")
         .await?;
@@ -168,7 +178,7 @@ async fn sorted_entries(dir: &Path) -> stow_types::error::Result<Vec<PathBuf>> {
 
 /// One lane's envelope: what it planned and what its submit returned.
 struct LanePlan {
-    tasks: Vec<EnqueueRequest>,
+    tasks: Vec<stow_types::api::SubmissionTree>,
     outcome: Option<SubmitOutcome>,
     submit_failures: Vec<String>,
 }
@@ -198,7 +208,7 @@ async fn lane_plan(lane: &str, dir: &Path) -> stow_types::error::Result<LanePlan
                 .iter()
                 .map(|failed| format!("{}: {}", failed.repo, failed.reason))
                 .collect(),
-            tasks: envelope.plan.tasks,
+            tasks: envelope.plan.trees,
             outcome: envelope.result,
         })
     } else if lane == "top-binaries" {
@@ -210,11 +220,12 @@ async fn lane_plan(lane: &str, dir: &Path) -> stow_types::error::Result<LanePlan
             // submit failure; a failed submit POST fails the lane
             // itself, which the exit status above reports.
             submit_failures: Vec::new(),
-            tasks: envelope.plan.tasks,
+            tasks: envelope.plan.trees,
             outcome: envelope.result,
         })
     } else {
-        let envelope: Planned<Vec<EnqueueRequest>, SubmitOutcome> = read_json(&plan_path).await?;
+        let envelope: Planned<Vec<stow_types::api::SubmissionTree>, SubmitOutcome> =
+            read_json(&plan_path).await?;
         Ok(LanePlan {
             tasks: envelope.plan,
             outcome: envelope.result,
@@ -224,11 +235,11 @@ async fn lane_plan(lane: &str, dir: &Path) -> stow_types::error::Result<LanePlan
 }
 
 /// Every task id a round's `index export` carried records for.
-fn published_task_ids(records: &[ArtifactRecord]) -> BTreeSet<String> {
+fn published_task_ids(records: &[ArtifactRecord]) -> stow_types::error::Result<BTreeSet<String>> {
     records
         .iter()
         .map(|record| {
-            TaskNodeIdentity {
+            Ok(TaskNodeIdentity {
                 crate_name: record.crate_name.clone(),
                 version: record.version.clone(),
                 features_json: record.features_json.clone(),
@@ -236,7 +247,7 @@ fn published_task_ids(records: &[ArtifactRecord]) -> BTreeSet<String> {
                 rustc_version: record.rustc_version.clone(),
                 host_side: record.unit_shape.side == UnitSide::Host,
             }
-            .task_id(&record.dependency_identity)
+            .task_id(&record.dependency_identity()?))
         })
         .collect()
 }
@@ -275,10 +286,11 @@ async fn production_lanes(lanes_dir: &Path) -> stow_types::error::Result<Vec<Pro
             tasks: plan
                 .tasks
                 .iter()
-                .map(|task| {
+                .flat_map(|tree| &tree.nodes)
+                .map(|node| {
                     Ok(ProductionTask {
-                        task_id: task.task_id()?,
-                        target: task.target.as_str().to_owned(),
+                        task_id: node.task_id.clone(),
+                        target: node.target.as_str().to_owned(),
                     })
                 })
                 .collect::<stow_types::error::Result<_>>()?,
@@ -298,7 +310,7 @@ async fn production_lanes(lanes_dir: &Path) -> stow_types::error::Result<Vec<Pro
 async fn phase(
     dir: &Path,
     seen: &mut BTreeSet<String>,
-) -> stow_types::error::Result<(PhaseObservations, Vec<EnqueueRequest>)> {
+) -> stow_types::error::Result<(PhaseObservations, Vec<stow_types::api::SubmissionTree>)> {
     let mut lanes = Vec::new();
     let mut tasks = Vec::new();
     for (name, lane_dir) in lane_dirs(&dir.join("lanes")).await? {
@@ -308,10 +320,10 @@ async fn phase(
         if let Some(outcome) = &plan.outcome {
             // The lane's tasks reached the scheduler: a first-seen task id
             // is a row it inserted and a dedup anchor for the next lane.
-            for task in &plan.tasks {
-                if seen.insert(task.task_id()?) {
+            for node in plan.tasks.iter().flat_map(|tree| &tree.nodes) {
+                if seen.insert(node.task_id.clone()) {
                     inserted += 1;
-                    inserted_edges += task.depends_on()?.len() as u64;
+                    inserted_edges += node.deps.len() as u64;
                 }
             }
             if u64::from(outcome.inserted) != inserted {
@@ -341,7 +353,7 @@ async fn phase(
         rounds.push(Round {
             before_report: read_json(&round_dir.join("before-report.json")).await?,
             end: read_json(&round_dir.join("end.json")).await?,
-            published: published_task_ids(&records),
+            published: published_task_ids(&records)?,
         });
     }
     Ok((
@@ -353,6 +365,18 @@ async fn phase(
         },
         tasks,
     ))
+}
+
+/// The run's edge restarts, in the order the script numbered them.
+async fn restarts(dir: &Path) -> stow_types::error::Result<Vec<EdgeRestart>> {
+    let mut restarts = Vec::new();
+    for restart_dir in sorted_entries(dir).await? {
+        restarts.push(EdgeRestart {
+            before: read_json(&restart_dir.join("before.json")).await?,
+            after: read_json(&restart_dir.join("after.json")).await?,
+        });
+    }
+    Ok(restarts)
 }
 
 /// Every line of `paths` that mentions an overload.
@@ -381,25 +405,26 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
 
     let mut nodes = BTreeMap::new();
     let mut spellings = BTreeMap::new();
-    for task in &wave_tasks {
-        let task_id = task.task_id()?;
-        let dependencies = task
-            .depends_on()?
-            .iter()
-            .map(stow_types::api::EnqueueDependency::task_id)
-            .collect();
-        spellings.insert(task_id.clone(), task.explicit_spelling);
-        nodes.insert(
-            task_id,
-            Node {
-                target: task.target.as_str().to_owned(),
-                dependencies,
-            },
-        );
+    for tree in &wave_tasks {
+        for node in &tree.nodes {
+            let dependencies: Vec<String> = node
+                .deps
+                .iter()
+                .map(|&dep| tree.nodes[dep as usize].task_id.clone())
+                .collect();
+            spellings.insert(node.task_id.clone(), node.explicit_spelling);
+            nodes.insert(
+                node.task_id.clone(),
+                Node {
+                    target: node.target.as_str().to_owned(),
+                    dependencies,
+                },
+            );
+        }
     }
     let targets: Vec<TargetTriple> = wave_tasks
         .iter()
-        .map(|task| task.target.clone())
+        .flat_map(|tree| tree.nodes.iter().map(|node| node.target.clone()))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
@@ -416,6 +441,7 @@ async fn report(args: &ReportArgs, output: Output) -> stow_types::error::Result<
         nodes,
         wave,
         resubmit,
+        restarts: restarts(&args.work_dir.join("restarts")).await?,
         runs: runs.tasks,
         covered,
         overload_sightings: overload_sightings(&args.scan).await?,
@@ -467,41 +493,21 @@ fn render_production(wave: &ProductionWave) -> String {
     )
 }
 
-/// An achieved `b̄` cell — `-` for a phase that dispatched no batch.
-pub fn legs_per_batch(value: Option<f64>) -> String {
-    value.map_or_else(|| "-".to_owned(), |value| format!("{value:.2}"))
-}
-
 fn render_report(report: &PreheatCostReport) -> String {
-    let mut phases = Table::new(&[
-        "phase",
-        "rows read",
-        "budget",
-        "rows written",
-        "budget",
-        "batches",
-        "legs",
-        "legs/batch",
-        "wall s",
-    ]);
+    let mut phases = Table::new(&["phase", "rows read", "rows written", "runs", "wall s"]);
     for (name, phase) in [("wave", &report.wave), ("resubmit", &report.resubmit)] {
         phases.push([
             name.to_owned(),
             phase.rows_read.to_string(),
-            format!("{:.0}", phase.budget_rows_read),
             phase.rows_written.to_string(),
-            format!("{:.0}", phase.budget_rows_written),
-            phase.batches.to_string(),
-            phase.legs.to_string(),
-            legs_per_batch(phase.legs_per_batch),
+            phase.tasks.to_string(),
             (phase.wall_ms / 1000).to_string(),
         ]);
     }
     let mut layers = Table::new(&[
         "layer",
         "published",
-        "batches",
-        "legs",
+        "runs",
         "kind",
         "events",
         "read/event",
@@ -515,8 +521,7 @@ fn render_report(report: &PreheatCostReport) -> String {
             layers.push([
                 layer.layer.to_string(),
                 layer.published.to_string(),
-                layer.batches.to_string(),
-                layer.legs.to_string(),
+                layer.tasks.to_string(),
                 format!("{:?}", kind.kind),
                 kind.events.to_string(),
                 format!("{read:.1}"),

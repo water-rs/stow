@@ -34,8 +34,9 @@ pub struct PlannedArtifact {
     pub features_json: FeaturesJson,
     /// Sorted dependency identities driving the cache key.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
-    /// Build-stage claim of the task's resolved dependency context.
-    pub dependency_identity: DependencyIdentity,
+    /// The task node's direct child task ids — the sorted, deduplicated
+    /// preimage [`Self::dependency_identity`] hashes (stow#919).
+    pub dependency_task_ids: Vec<String>,
     /// JSON-encoded compile keys of dependencies.
     pub dependency_compile_keys_json: String,
     /// Compilation target triple.
@@ -68,6 +69,18 @@ pub struct PlannedArtifact {
     /// after `outputs`.
     #[serde(default)]
     pub native_archive: Option<PlannedArtifactOutput>,
+}
+
+impl PlannedArtifact {
+    /// The build-stage claim of the task's resolved dependency context —
+    /// the Merkle digest of the carried child task ids, derived so the
+    /// plan can never hold a digest disagreeing with its edges (stow#919).
+    ///
+    /// # Errors
+    /// Mirrors [`DependencyIdentity::from_task_ids`].
+    pub fn dependency_identity(&self) -> crate::error::Result<DependencyIdentity> {
+        DependencyIdentity::from_task_ids(self.dependency_task_ids.iter().map(String::as_str))
+    }
 }
 
 /// One output file from a planned artifact.
@@ -140,7 +153,7 @@ pub fn build_artifact_records(
             version: plan.crate_version.clone(),
             features_json: plan.features_json.clone(),
             dependency_c_metadata_json: plan.dependency_c_metadata_json.clone(),
-            dependency_identity: plan.dependency_identity.clone(),
+            dependency_task_ids: plan.dependency_task_ids.clone(),
             oci_reference: plan.oci_reference.clone(),
             oci_digest: published.oci_digest.clone(),
             has_native: plan.native.is_some(),

@@ -21,82 +21,94 @@ pub const DO_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
 /// scheduler route as `<METHOD> <path>`.
 pub const LEDGER_OP_ALARM: &str = "alarm";
 
-/// The probe ledger's key for a batch run's completion.
+/// The probe ledger's key for a build run's completion — the scheduler
+/// route `POST /tasks/complete-run`, whose task id rides the body, so
+/// every run's completion lands on one row.
+pub const LEDGER_OP_TASK_COMPLETE: &str = "POST /tasks/complete-run";
+
+/// The one cost line every allowance consumer derives from (stow#883):
+/// each metered Cloudflare resource stays under 80% of its monthly
+/// Workers Paid allowance (AGENTS.md).
 ///
-/// It is the scheduler route `POST /batches/{batch_id}/complete` with
-/// the batch id collapsed, so every batch's completion lands on one row
-/// the way a request record's id does.
-pub const LEDGER_OP_BATCH_COMPLETE: &str = "POST /batches/{batch_id}/complete";
+/// The release gate's monthly projection bounds each product's total —
+/// user traffic plus preheat — at this fraction of its allowance
+/// (`stow-admin traffic-cost project`); the in-edge breaker and the
+/// preheat budget derive from it through [`DAILY_SHARE`].
+pub const ALLOWANCE_FRACTION: f64 = 0.8;
+
+/// One UTC day's share of the line — `ALLOWANCE_FRACTION / 30`.
+///
+/// The in-edge cost breaker freezes dispatch once a UTC day's billed
+/// rows pass this share of the monthly allowance
+/// (`edge/src/scheduler/meter.rs`, [`daily_budget`]), so a sustained
+/// burn at the line's pace trips within a day; and one preheat wave's
+/// share is one day of the line (`PREHEAT_BUDGET`) — a wave must
+/// complete inside a day.
+pub const DAILY_SHARE: f64 = ALLOWANCE_FRACTION / 30.0;
+
+/// The in-edge breaker's daily budget on `monthly`: one thirtieth of
+/// the line, scaled by `STOW_COST_BUDGET_MULTIPLIER` so a shared
+/// account can trip earlier.
+#[must_use]
+pub const fn daily_budget(monthly: f64, multiplier: f64) -> f64 {
+    monthly * DAILY_SHARE * multiplier
+}
 
 /// The scheduler cost one preheat wave and one daily resubmit may spend
-/// — the `Preheat cost` lane's (stow#773) totals gate.
+/// — the totals bound the monthly projection enforces at the measured
+/// production wave's node count (stow#773, stow#883).
 ///
-/// Derived from the Workers Paid allowance above and the two mechanisms
-/// that already divide it:
+/// - **The wave** may spend one day of the line — [`DAILY_SHARE`] of the
+///   monthly allowance — because a wave must complete inside a day;
+///   spreading one over several days is not an option. A wave that does
+///   not fit is a scheduler spending too many rows per node. User
+///   traffic rides the same day's budget, so a wave plus a day of
+///   line-pace traffic can cross the in-edge breaker's daily threshold:
+///   the measured traffic share is far below the line, and the breaker
+///   is the runtime guard for the day that stops being true.
+/// - **The daily resubmit** (`preheat-cron.yml` fires every day) lands
+///   on a graph that is already built: its work is recognising that, so
+///   it is held to a hundredth of a wave — room to read its own runs,
+///   none to rebuild or rewrite the graph.
 ///
-/// - **The in-edge cost breaker** freezes dispatch once a UTC day's
-///   billed rows pass a thirtieth of the monthly allowance
-///   (`edge/src/scheduler/meter.rs`, `daily_budget`, at the production
-///   multiplier of 1). A wave that crosses it stops itself mid-graph.
-/// - **The launch gate** (stow#452) holds projected user traffic at half
-///   of every allowance — half of each day's thirtieth.
-///
-/// So a wave gets the other half of one day: `1/30 × 1/2 = 1/60` of the
-/// monthly allowance, and a full wave completes inside it in one go —
-/// spreading a wave over several days is not an option. A wave that
-/// does not fit is a scheduler spending too many rows per node. The daily resubmit (`preheat-cron.yml` fires every day)
-/// lands on a graph that is already built: its work is recognising
-/// that, so it is held to a hundredth of a wave — room to read its own
-/// batches, none to rebuild or rewrite the graph.
-///
-/// Both shares are per node, over [`Self::FULL_WAVE_NODES`]: a run of
-/// `n` nodes is held to `n / FULL_WAVE_NODES` of the share, so a
-/// per-node cost that would overrun the full wave fails a reduced-scale
-/// run too.
+/// The bound is evaluated where the measurement exists: the `Preheat
+/// cost` report carries the measured per-node costs and the monthly
+/// projection scales them to `production-wave.json`'s node count — a
+/// per-node cost that would overrun the production wave fails there,
+/// not against a checked-in wave size.
 #[derive(Debug, Clone, Copy)]
 pub struct PreheatBudget {
-    /// Fraction of each monthly allowance one full wave may spend.
+    /// Fraction of each monthly allowance one full production wave may
+    /// spend.
     pub wave_share: f64,
     /// Fraction of the wave's share one resubmit may spend.
     pub resubmit_of_wave: f64,
 }
 
 impl PreheatBudget {
-    /// Nodes in a full production wave: the top-100 crates, the
-    /// top-100 binaries' and the curated projects' lockfiles, resolved
-    /// across every `CI_TARGET_TRIPLES` entry (stow#773's measured
-    /// order of magnitude). The per-node share divides by it.
-    pub const FULL_WAVE_NODES: f64 = 16_000.0;
-
-    /// The (`rowsRead`, `rowsWritten`) one wave of `nodes` may spend.
+    /// The (`rowsRead`, `rowsWritten`) one production wave may spend.
     #[must_use]
-    pub fn wave(&self, nodes: u64) -> (f64, f64) {
-        Self::share(self.wave_share, nodes)
+    pub fn wave(&self) -> (f64, f64) {
+        (
+            DO_ROWS_READ_MONTHLY * self.wave_share,
+            DO_ROWS_WRITTEN_MONTHLY * self.wave_share,
+        )
     }
 
-    /// The (`rowsRead`, `rowsWritten`) one resubmit over `nodes` may
+    /// The (`rowsRead`, `rowsWritten`) one production resubmit may
     /// spend.
     #[must_use]
-    pub fn resubmit(&self, nodes: u64) -> (f64, f64) {
-        Self::share(self.wave_share * self.resubmit_of_wave, nodes)
-    }
-
-    #[allow(
-        clippy::cast_precision_loss,
-        reason = "node counts stay far below f64's exact-integer range"
-    )]
-    fn share(share: f64, nodes: u64) -> (f64, f64) {
-        let fraction = nodes as f64 / Self::FULL_WAVE_NODES;
+    pub fn resubmit(&self) -> (f64, f64) {
         (
-            DO_ROWS_READ_MONTHLY * share * fraction,
-            DO_ROWS_WRITTEN_MONTHLY * share * fraction,
+            DO_ROWS_READ_MONTHLY * self.wave_share * self.resubmit_of_wave,
+            DO_ROWS_WRITTEN_MONTHLY * self.wave_share * self.resubmit_of_wave,
         )
     }
 }
 
 /// The preheat lane's split of the allowance — see [`PreheatBudget`].
 pub const PREHEAT_BUDGET: PreheatBudget = PreheatBudget {
-    wave_share: 1.0 / 60.0,
+    wave_share: DAILY_SHARE,
     resubmit_of_wave: 0.01,
 };
 
@@ -167,529 +179,435 @@ pub fn grew(earlier: f64, later: f64) -> bool {
 pub const DO_BUDGETS: &[DriveBudget] = &[
     DriveBudget {
         name: "GET /status",
-        statements: 4,
-        rows_read: 100,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
+        wall_ms: 100,
+    },
+    DriveBudget {
+        name: "GET /health",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 100,
     },
     DriveBudget {
         name: "GET /admin/status",
-        statements: 8,
-        rows_read: 8_000,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 200,
     },
     DriveBudget {
         name: "GET /tasks",
-        statements: 3,
-        rows_read: 2_000,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
         name: "GET /tasks?status=failed",
-        statements: 3,
-        rows_read: 2_000,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
         name: "GET /tasks?status=pending",
-        statements: 3,
-        rows_read: 2_000,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
         name: "GET /tasks?status=blocked",
-        statements: 3,
-        rows_read: 5_000,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 200,
     },
     DriveBudget {
         name: "GET /tasks?target=…",
-        statements: 3,
-        rows_read: 2_000,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
         name: "GET /tasks?crate=…",
-        statements: 3,
-        rows_read: 600,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
         name: "GET /tasks?older_than=86400",
-        statements: 3,
-        rows_read: 2_000,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 150,
     },
     DriveBudget {
         name: "GET /tasks?task_ids=…",
-        statements: 3,
-        rows_read: 100,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 100,
     },
     DriveBudget {
         name: "POST /tasks/retry",
-        statements: 4,
-        rows_read: 200,
-        rows_written: 100,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 200,
     },
     DriveBudget {
         name: "POST /tasks/cancel",
-        statements: 4,
-        rows_read: 200,
-        rows_written: 100,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 200,
     },
     DriveBudget {
         name: "POST /tasks/promote",
-        statements: 4,
-        rows_read: 200,
-        rows_written: 100,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 200,
     },
     DriveBudget {
         name: "POST /tasks/purge",
-        statements: 4,
-        rows_read: 200,
-        rows_written: 100,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 200,
     },
     DriveBudget {
-        // An `enqueued` record's read: the row select, the stored-roots
-        // parse and the live `tasks_status` re-probe — the pending human
-        // root's lane-position walk dominates, bounded by the held lane
-        // depth.
         name: "GET /requests/{id}",
-        statements: 8,
-        rows_read: 2_600,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 200,
     },
     DriveBudget {
-        // The request lane's admission: the freeze and human-budget
-        // probes, the deduping insert, the credential read and the one
-        // serialized `workflow_dispatch` hop — wall carries the HTTP.
         name: "POST /requests",
-        statements: 10,
-        rows_read: 100,
-        rows_written: 10,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 600,
     },
     DriveBudget {
-        // The row read plus the conditional `accepted -> resolving`
-        // update that stamps the run identity.
         name: "POST /requests/{id}/run-update (in_progress)",
         statements: 3,
-        rows_read: 20,
-        rows_written: 4,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 150,
     },
     DriveBudget {
-        // A `Resolved` report on a live record: the pre/post status
-        // probes, the trusted enqueue of a one-dep batch and the
-        // conditional `enqueued` write — the same insert machinery the
-        // submit drives price, at this batch's size.
         name: "POST /requests/{id}/outcome",
-        statements: 18,
-        rows_read: 2_600,
-        rows_written: 200,
+        statements: 4,
+        rows_read: 6,
+        rows_written: 6,
         wall_ms: 600,
     },
     DriveBudget {
-        // `completed` on an already-`enqueued` record — the row read plus
-        // the one conditional update that correctly writes nothing.
         name: "POST /requests/{id}/run-update (completed)",
         statements: 3,
-        rows_read: 20,
-        rows_written: 4,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 150,
     },
     DriveBudget {
-        // The pending-depth check reads the trigger-maintained
-        // `queue_status_counts` row — a handful of rows at any queue
-        // size. The human-lane position walk is bounded by the lane's
-        // depth, held at `FixtureShape::HUMAN_LANE_ROWS` across sizes.
         name: "POST /enqueue (untrusted)",
-        statements: 4,
-        rows_read: 2_200,
-        rows_written: 10,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 300,
     },
     DriveBudget {
-        // The accept half of the untrusted route — the cap is lifted so
-        // the drive measures the insert: the pending-count read, the
-        // human-lane budget charge and position walk (bounded by the
-        // lane's held depth), the task + edge writes.
         name: "POST /enqueue (untrusted accept)",
-        statements: 20,
-        rows_read: 2_500,
-        rows_written: 600,
+        statements: 4,
+        rows_read: 6,
+        rows_written: 6,
         wall_ms: 600,
     },
     DriveBudget {
         name: "POST /admin/enqueue (trusted)",
-        statements: 16,
-        rows_read: 300,
-        rows_written: 400,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 400,
     },
     DriveBudget {
-        // submit-by-id (stow#588): resync-path writes; the walk reads
-        // scale with the submitted ids' stored subgraphs.
         name: "POST /admin/enqueue (submit-ids)",
-        statements: 24,
-        rows_read: 2_000,
-        rows_written: 110,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 500,
     },
     DriveBudget {
-        // Fully deduplicated resubmit (stow#784): an update is emitted
-        // only when a request changes stored state, so the measured
-        // shape is the status probe plus the task_nodes conflict
-        // probes — and zero writes.
         name: "POST /admin/enqueue (resubmit)",
-        statements: 4,
-        rows_read: 100,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 400,
     },
     DriveBudget {
-        // The route's full statement count is apply (8) + `next_alarm`
-        // (5): the batch probes, ledger write, settings reads and the
-        // plan's freeze/active-count/wake/lease reads — 13 measured at
-        // the 100k native gate (121 reads, 17 writes).
+        name: "POST /tasks/submit (operations)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 400,
+    },
+    DriveBudget {
+        name: "POST /tasks/submit (preheat)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 400,
+    },
+    DriveBudget {
+        // The newreleases.io forward: signature already verified at the
+        // edge, so the object only resolves its credential arm and
+        // posts one `workflow_dispatch` — `preheat_release_pass` takes
+        // no `DurableDb`, so the route bills no store row and the
+        // settle writes none either (stow#931). The 0/0/0 is a code
+        // read: the host drive's arm is a no-op, so its zero measures
+        // nothing. The old 2/4/4 row was the removed `do_meter`
+        // settle's, not this route's.
+        name: "POST /preheat/release",
+        statements: 0,
+        rows_read: 0,
+        rows_written: 0,
+        wall_ms: 500,
+    },
+    DriveBudget {
+        name: "POST /tasks/submit (inexact-hit)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 400,
+    },
+    DriveBudget {
         name: "POST /demand",
-        statements: 14,
-        rows_read: 300,
-        rows_written: 120,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 500,
     },
     DriveBudget {
-        // The whole route (stow#785): the report — with the commit-time
-        // shape repair — plus the `dispatch_pending` claiming tail.
-        // Release-gate run 39690592068 on the 1M fixture measured 3439
-        // reads, 1102 writes for 175 claimed legs; the slice statements
-        // are unchanged from dev, the rest is the claim tail — scaled
-        // to the bound's 200 legs (+~440 reads, +~130 writes), plus
-        // 25%. Bound: claimed legs ≤ ⌊free slots /
-        // STOW_BATCH_PARALLELISM⌋ × STOW_BATCH_MAX_TASKS. Run
-        // 39703490802, after those fixes and with full sample rings,
-        // measured 23 statements, 3440 reads, 1102 writes at 175 legs.
         name: "POST /index/published (full)",
-        statements: 60,
-        rows_read: 4_850,
-        rows_written: 1_540,
+        statements: 4,
+        rows_read: 6,
+        rows_written: 6,
         wall_ms: 500,
     },
     DriveBudget {
-        // The delta's gate writes are the matched edges' `dep_met`
-        // flips plus their owners' `unpublished_deps` adjustments — 1 +
-        // the delta's direct dependents, never the queue or the graph
-        // (stow#521) — plus the report-time repair, which can requeue
-        // the deps the retire uncovered, and the claiming tail.
-        // Release-gate run 39690592068 on the 1M fixture measured 4013
-        // reads, 1239 writes for 175 claimed legs; the slice statements
-        // are unchanged from dev, the rest is the claim tail — scaled
-        // to the bound's 200 legs, plus 25%. Run 39703490802, after
-        // those fixes and with full sample rings, measured 26
-        // statements, 4014 reads, 1239 writes at 175 legs.
         name: "POST /index/published (delta)",
-        statements: 70,
-        rows_read: 5_570,
-        rows_written: 1_720,
+        statements: 4,
+        rows_read: 6,
+        rows_written: 6,
         wall_ms: 500,
     },
     DriveBudget {
-        // The full dispatch pass: binding reads, the claim paged at `2
-        // × open slots`, the per-page catalog coverage lookup (a
-        // counted-D1 read, not object rows), the one claim UPDATE that
-        // binds every formed leg to its batch, the `build_batches`
-        // insert and the bounded-concurrent `dispatch_batch` hop — wall
-        // includes the fan-out's slowest HTTP leg. Release-gate run
-        // 39690592068 on the 1M fixture measured 25 statements, 4231
-        // reads, 905 writes for 175 claimed legs; minus D1's 962
-        // unbounded wake-probe reads and D3's ~30, ~3,240 — the bound
-        // is claimed legs ≤ ⌊free slots / STOW_BATCH_PARALLELISM⌋ ×
-        // STOW_BATCH_MAX_TASKS (200 at the drive's 15 free slots),
-        // ~17.5 reads and ~5.2 writes per leg plus the pass's fixed
-        // part, so 200 legs ≈ 3,680 / 1,035; plus 25%. Run 39703490802,
-        // after those fixes and with full sample rings, measured 25
-        // statements, 3252 reads, 905 writes at 175 legs.
-        name: "alarm pass",
-        statements: 120,
-        rows_read: 4_600,
-        rows_written: 1_300,
-        wall_ms: 3_000,
+        name: "alarm pass (floor claim)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 3,
     },
     DriveBudget {
-        // The same pass with dispatch paused: the claim returns early,
-        // so the row measures the per-invocation floor — stale-recovery
-        // probes, the freeze and binding reads, the wake-time re-arm —
-        // that every alarm wake pays regardless of what it claims. The
-        // launch gate (stow#452) separates alarm invocations from the
-        // claims they make through this row. The `claimed_at` lease
-        // probes (re-arm MIN and the stale-recovery DELETE/UPDATE) read
-        // the in-flight set — bounded by the dispatch cap
-        // (`STOW_MAX_CONCURRENT_JOBS`), not by a stale-row range
-        // (stow#786) — and the re-arm's `idx_queue_wake` probes are one
-        // seek per dispatch family, never the eligible pending span
-        // (stow#588, stow#833).
+        name: "alarm pass",
+        statements: 4,
+        rows_read: 6,
+        rows_written: 6,
+        wall_ms: 3,
+    },
+    DriveBudget {
         name: "alarm pass (idle)",
-        statements: 20,
-        rows_read: 320,
-        rows_written: 8,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 300,
     },
     DriveBudget {
-        // One real dispatch pass over the floored queue — the same
-        // claim/dispatch/plan surface as the hot pass, priced
-        // separately so the gate sees the planner and claim walk under
-        // a positive persisted floor with under-floor bulk deferred in
-        // the flags (stow#525). Setup stamps and teardown restore live
-        // outside the metered window. The `task_nodes` walk shares the
-        // hot pass's bound — the claimed tasks' dependency closure,
-        // which the fixture pins flat (stow#588). Release-gate run
-        // 39690592068 on the 1M fixture measured 3383 reads, 1025
-        // writes at 200 legs — the bound, claimed legs ≤ ⌊free slots /
-        // STOW_BATCH_PARALLELISM⌋ × STOW_BATCH_MAX_TASKS — minus D3's
-        // ~30, plus 25%. Run 39703490802, after those fixes and with
-        // full sample rings, measured 14 statements, 3376 reads, 1025
-        // writes at 200 legs.
-        name: "alarm pass (floor claim)",
-        statements: 120,
-        rows_read: 4_200,
-        rows_written: 1_290,
-        wall_ms: 3_000,
-    },
-    // The six batch drives below (stow#833) derive from the release-gate
-    // workerd run 39690592068 on the 1M fixture, adjusted for the D1–D3
-    // plan fixes and the seeded full sample rings where each comment
-    // says so, plus 25%. The bound each names is the batch's leg count
-    // (`STOW_BATCH_MAX_TASKS`), never the queue.
-    DriveBudget {
-        // Workerd run 39690592068 measured 6 statements, 35 reads, 2
-        // writes: the completion `UPDATE` is one keyed `build_batches`
-        // write plus the `schedule_alarm` re-plan; 31 of the reads are
-        // the family-slot `GROUP BY` over `build_batches`, whose rows
-        // are ≤ `STOW_MAX_CONCURRENT_JOBS` (45) — the budget is 45 +
-        // the re-plan's probes. Run 39703490802, after those fixes,
-        // measured 6 statements, 36 reads, 2 writes.
-        name: "POST /batches/{batch_id}/complete (success)",
-        statements: 9,
-        rows_read: 60,
-        rows_written: 3,
-        wall_ms: 150,
-    },
-    DriveBudget {
-        // The conclusion is carried verbatim, so the cost is the
-        // success delivery's: workerd run 39690592068 measured 6
-        // statements, 35 reads, 2 writes — 31 reads are the family-slot
-        // `GROUP BY` over `build_batches` (≤ `STOW_MAX_CONCURRENT_JOBS`
-        // = 45 rows) plus the re-plan. Run 39703490802, after those
-        // fixes, measured 6 statements, 36 reads, 2 writes.
-        name: "POST /batches/{batch_id}/complete (failure)",
-        statements: 9,
-        rows_read: 60,
-        rows_written: 3,
-        wall_ms: 150,
-    },
-    DriveBudget {
-        // Workerd run 39703490802 on the 1M fixture, with every
-        // resolved leg's `(crate_name, target)` ring seeded at
-        // `BUILD_SAMPLE_WINDOW`, measured 415 statements, 6324 reads,
-        // 843 writes for 40 legs — about 158 reads and 21 writes a leg:
-        // the cap delete and the median `SELECT` each walk the full
-        // ring (~64 reads apiece), and the moved median rewrites the
-        // dispatch keys of the leg's own `(crate_name, target)` pending
-        // rows. Budgeted at the measurement plus 25%. Bound:
-        // `STOW_BATCH_MAX_TASKS` legs × (2 × `BUILD_SAMPLE_WINDOW` ring
-        // reads + the leg's same-crate-and-target pending rows).
-        name: "alarm pass (batch resolution)",
-        statements: 553,
-        rows_read: 7_905,
-        rows_written: 1_054,
-        wall_ms: 3_000,
-    },
-    DriveBudget {
-        // The same resolution over a one-leg batch, the price of one
-        // build's callback: workerd run 39703490802 with the leg's ring
-        // seeded at `BUILD_SAMPLE_WINDOW` measured 14 statements, 161
-        // reads, 27 writes — the two full-ring walks (~127 reads) and
-        // the dispatch-key refresh of the leg's same-crate-and-target
-        // pending rows (16 writes). Budgeted at the measurement plus
-        // 25%.
-        name: "alarm pass (batch resolution, one leg)",
-        statements: 18,
-        rows_read: 202,
-        rows_written: 34,
-        wall_ms: 3_000,
-    },
-    DriveBudget {
-        // Workerd run 39690592068 measured 285 statements, 63,521
-        // reads, 521 writes; 62,500 reads were D2's unbounded bucket
-        // read, now bounded at (window/5 + 1) × CI_TARGET_TRIPLES — ~24
-        // reads and ~13 writes per failed leg, no sample reads on
-        // failure; plus 25%. Bound: `STOW_BATCH_MAX_TASKS` legs. Run
-        // 39703490802, after those fixes, measured 285 statements, 1000
-        // reads, 521 writes.
-        name: "alarm pass (batch resolution, failure)",
-        statements: 354,
-        rows_read: 1_300,
-        rows_written: 660,
-        wall_ms: 3_000,
-    },
-    DriveBudget {
-        // Workerd run 39690592068 measured 2 statements, 4 reads, 2
-        // writes: the expired-batch seek on `idx_build_batches_lease`
-        // (≤ `EXPIRED_BATCH_LIMIT` rows, the in-flight set being
-        // bounded by the slot caps) and the keyed lease update. Run
-        // 39703490802, after those fixes, measured the same 2
-        // statements, 4 reads, 2 writes.
-        name: "alarm pass (lease check)",
+        name: "POST /tasks/complete-run (success)",
         statements: 3,
         rows_read: 5,
-        rows_written: 3,
-        wall_ms: 3_000,
+        rows_written: 5,
+        wall_ms: 400,
     },
-    // The demand-feed caps below are native-calibrated (stow#523):
-    // measured workerd billed rows on the fixture's fixed 384-task
-    // delivery event, plus stated headroom where a shared planner
-    // cost scales with the dispatch cap rather than the event. The
-    // 31 existing budgets stay unchanged.
     DriveBudget {
-        // The resume-cursor read: one watermark probe plus one
-        // unfinished-index probe — flat in retained depth.
+        name: "POST /tasks/complete-run (failure)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 300,
+    },
+    DriveBudget {
+        name: "POST /tasks/run-update (in_progress)",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
+        wall_ms: 150,
+    },
+    DriveBudget {
+        name: "alarm pass (stale recovery)",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
+        wall_ms: 300,
+    },
+    DriveBudget {
+        // stow#940 provisional: the completion's `RunFinished` append
+        // (durable before the pass), then the inline pass's `Claims`
+        // and `Bindings` — the host gate measured 3/3/3; the workerd
+        // absolute awaits a mock-stack `stow-admin scheduler budget`
+        // run.
+        name: "POST /tasks/complete-run (dispatching)",
+        statements: 5,
+        rows_read: 7,
+        rows_written: 7,
+        wall_ms: 500,
+    },
+    DriveBudget {
+        // stow#940 provisional: the slice append plus the inline
+        // pass's `Claims` and `Bindings` — host-measured 3/3/3; the
+        // workerd absolute awaits the same probe run.
+        name: "POST /index/published (dispatching)",
+        statements: 5,
+        rows_read: 7,
+        rows_written: 7,
+        wall_ms: 500,
+    },
+    DriveBudget {
+        // stow#940 provisional: the outcome's merge rows plus the
+        // inline pass's `Claims` and `Bindings` — host-measured 3/3/3;
+        // the workerd absolute awaits the same probe run.
+        name: "POST /requests/{id}/outcome (dispatching)",
+        statements: 5,
+        rows_read: 7,
+        rows_written: 7,
+        wall_ms: 500,
+    },
+    DriveBudget {
         name: "GET /scheduler/demand-feed/status",
-        statements: 4,
-        rows_read: 8,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 40,
     },
     DriveBudget {
-        // Fresh open: watermark guard, header insert, generation
-        // read-back.
         name: "POST /scheduler/demand-feed/begin (fresh)",
-        statements: 8,
-        rows_read: 8,
-        rows_written: 3,
-        wall_ms: 60,
-    },
-    DriveBudget {
-        // Restart with real debris: generation bump/counter reset
-        // plus one full 256-row obsolete retire chunk and the
-        // pending probe. Native-billed 1028 reads (the indexed
-        // retire probe reads one archived page row per deleted key)
-        // and 257 writes — flat at both fixture shapes.
-        name: "POST /scheduler/demand-feed/begin (rotation)",
-        statements: 14,
-        rows_read: 1_250,
-        rows_written: 520,
-        wall_ms: 120,
-    },
-    DriveBudget {
-        // One staged page: guards plus the payload insert whose
-        // trigger bumps counters.
-        name: "POST /scheduler/demand-feed/page (append)",
-        statements: 6,
-        rows_read: 8,
+        statements: 3,
+        rows_read: 5,
         rows_written: 5,
         wall_ms: 60,
     },
     DriveBudget {
-        // Same-bytes replay: bounded reads, zero writes.
-        name: "POST /scheduler/demand-feed/page (replay)",
-        statements: 6,
-        rows_read: 8,
-        rows_written: 0,
-        wall_ms: 50,
+        name: "POST /scheduler/demand-feed/begin (rotation)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 120,
     },
     DriveBudget {
-        // Completion barrier, populated hour: manifest verification
-        // plus the guarded freeze.
-        name: "POST /scheduler/demand-feed/complete (nonempty)",
-        statements: 8,
-        rows_read: 8,
-        rows_written: 3,
+        name: "POST /scheduler/demand-feed/page (append)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 60,
     },
     DriveBudget {
-        // The same barrier with an empty generation.
-        name: "POST /scheduler/demand-feed/complete (empty)",
-        statements: 8,
-        rows_read: 8,
-        rows_written: 3,
+        name: "POST /scheduler/demand-feed/page (replay)",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 50,
     },
     DriveBudget {
-        // One page-apply delivery at the protocol's maximum
-        // 256-entry page: the bounded next-page SELECT, the
-        // `demand_pass` closure over the entries' touched
-        // dependency graph — the drive's fixed event walks 384
-        // pending tasks on 512 edges, not merely the 256 roots —
-        // the ack flip and the wake re-plan, whose alarm probes are
-        // per-family `idx_queue_wake` seeks plus the in-flight batch
-        // MINs — bounded by the dispatch cap. Native-billed
-        // 274/7188/3078 flat at both fixture shapes; the caps
-        // carry ~22% headroom over the measured event.
+        name: "POST /scheduler/demand-feed/complete (nonempty)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 60,
+    },
+    DriveBudget {
+        name: "POST /scheduler/demand-feed/complete (empty)",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 50,
+    },
+    DriveBudget {
         name: "POST /scheduler/demand-feed/deliver (page apply)",
-        statements: 550,
-        rows_read: 8_750,
-        rows_written: 3_750,
+        statements: 4,
+        rows_read: 6,
+        rows_written: 6,
         wall_ms: 600,
     },
     DriveBudget {
-        // The terminal call — transition-only after every page has
-        // applied: its probes plus the contiguous-watermark
-        // `delivered` transition. Native-billed 11/151/2 — of which
-        // ~141 reads are the shared wake planner's re-plan: per-family
-        // `idx_queue_wake` seeks plus the batch MINs over the
-        // fixture's 30 in-flight rows — so the cap reserves explicit
-        // headroom toward the production dispatch cap of 45 rather
-        // than a native-45 measurement.
         name: "POST /scheduler/demand-feed/deliver (terminal)",
-        statements: 18,
-        rows_read: 250,
-        rows_written: 4,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 200,
     },
     DriveBudget {
-        // Delivered-hour replay: the `delivered` early-out plus the
-        // wake re-plan. Native-billed 6/143/0 — the same bounded
-        // wake-planner re-plan, so the cap carries the same
-        // dispatch-cap headroom as the terminal call.
         name: "POST /scheduler/demand-feed/deliver (replay)",
-        statements: 12,
-        rows_read: 250,
-        rows_written: 0,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 80,
     },
     DriveBudget {
-        // One full retirable chunk: `DELETE … LIMIT 256` plus its
-        // probes — flat in archive depth. Native-billed 1026 reads
-        // (the same indexed retire probe as rotation) and 256
-        // writes — flat at both fixture shapes.
         name: "POST /scheduler/demand-feed/cleanup (full chunk)",
-        statements: 8,
-        rows_read: 1_250,
-        rows_written: 260,
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
         wall_ms: 200,
     },
     DriveBudget {
-        // The retire probe on an all-live generation.
         name: "POST /scheduler/demand-feed/cleanup (none obsolete)",
-        statements: 8,
-        rows_read: 8,
-        rows_written: 2,
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
         wall_ms: 60,
+    },
+    DriveBudget {
+        name: "POST /tasks/submit (1k-node merge)",
+        statements: 4,
+        rows_read: 6,
+        rows_written: 6,
+        wall_ms: 5000,
+    },
+    DriveBudget {
+        // stow#931 added the meter row's read and the wake
+        // checkpoint's `UPDATE .. RETURNING` — +2 statements, +3
+        // billed reads (the UPDATE reads the row it changes plus the
+        // RETURNING row on workerd, release gate run 40186665163; the
+        // host backend bills it identically), +1 billed write over
+        // the pre-#931 row by construction. The workerd-scale absolute
+        // stands for a mock-stack `stow-admin scheduler budget` run to
+        // confirm.
+        name: "wake (snapshot + log replay)",
+        statements: 62,
+        rows_read: 478,
+        rows_written: 5,
+        wall_ms: 5000,
+    },
+    DriveBudget {
+        // stow#931 added the snapshot checkpoint's `UPDATE ..
+        // RETURNING` after the covered-log drop — +1 statement, +2
+        // billed reads (the changed row plus the RETURNING row,
+        // release gate run 40186665163), +1 billed write by
+        // construction; the host delta matches. The workerd-scale
+        // absolute awaits the same mock-stack probe run.
+        name: "snapshot write",
+        statements: 67,
+        rows_read: 481,
+        rows_written: 533,
+        wall_ms: 5000,
     },
 ];
 
@@ -799,7 +717,7 @@ pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
         cpu_ms: 15.0,
     },
     WorkerCpuBudget {
-        // The signed `workflow_run` callback: HMAC check, the batch
+        // The signed `workflow_run` callback: HMAC check, the
         // run's title decode and the forward to the scheduler. Run
         // 39009034210 measured 3.185 ms on the per-task path, which
         // also verified the records artifact's cosign signature.

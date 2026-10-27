@@ -330,6 +330,9 @@ acting unless `--yes` is given.
 - `stow-admin status` — lane depths, dependents blocked behind failed
   dependencies, oldest pending age, in-flight builds with their GitHub
   Actions run URLs, and per-target outcomes over the trailing 24 h.
+  `--watch` repaints a live view of the scheduler queue merged with
+  `build-crate.yml`'s in-flight runs every 30 s until Ctrl-C; under
+  `--json` each frame is one NDJSON line per tick.
 - `stow-admin queue list [--status failed] [--target T] [--rustc V] [--crate X] [--older-than 24h]`
   — filtered queue rows; `queue retry|cancel|promote|purge`
   mutate the same selection (explicit `--task-id`s or filter flags),
@@ -340,8 +343,8 @@ acting unless `--yes` is given.
   fresh `attempt`, e.g. `--status failed --rustc V --target T`.
 - `stow-admin coverage <crate>[@version] [--target T]` — which servable
   identities exist per CI target, and which targets have none.
-- `stow-admin runs failures --since 24h` — classify the failed legs of
-  `build-batch.yml` runs from their job logs, grouped by failure class.
+- `stow-admin runs failures --since 24h` — classify the failed tasks of
+  `build-crate.yml` runs from their job logs, grouped by failure class.
 - `stow-admin artifacts inspect <c_metadata> --target T --rustc-version V`
   — the catalog row plus its OCI bundle manifest;
   `artifacts prune --rustc-version V --yes` deletes a retired toolchain's
@@ -353,14 +356,6 @@ acting unless `--yes` is given.
   any missing rule disabled (`ensure`/`on`/`off` are mutations).
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
-- `stow-admin preheat top --target ... --rustc-version ... [--limit 100] --yes`
-  — submit the top-N most-downloaded **library** crates' canonical
-  feature/version selections. Standalone builds; intended for the base
-  library pool. A ranked crate whose newest release ships no library
-  target (a bin-only crate that slipped into the ranking) is resolved
-  as a name source instead: stow-admin fetches its `.crate` tarball and
-  resolves its crates.io graph in-process, exactly like
-  `preheat binary`.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
   — preheat one named **binary** crate's dependency graph from
   crates.io: stow-admin fetches the `.crate` tarball and runs cargo's
@@ -373,14 +368,18 @@ acting unless `--yes` is given.
   only as yanked/git admission. `preserve_lockfile` stays `false` on
   every derived task — on the runner it names the task crate's own
   lockfile, not the source binary's. A crate with no binary target is
-  refused and pointed at
-  `preheat top`. `--rustc-version` defaults to the scheduler's current
+  refused. `--rustc-version` defaults to the scheduler's current
   stable channel version, `--targets` to every CI target.
 - `stow-admin preheat top-binaries --rustc-version ... [--targets a,b] [--limit 100] --yes`
-  — resolve the top-N most-downloaded **binary** crates exactly the way
+  — the popularity lane (stow#891): the top-N crates whose *default*
+  version ships a binary target and no library (stow#918), ranked by
+  the last 90 days of `version_downloads`. Both answers come from one
+  fetch of the crates.io daily database dump (`default_versions` →
+  `versions.bin_names`/`has_lib` for the binary check); no categories
+  and no per-crate API calls. Each candidate resolves exactly the way
   `preheat binary` resolves one: name sources, never tasks of their
-  own. The emitted tasks carry each binary's download count as their
-  queue priority. A binary that fails to resolve is reported and
+  own. The emitted tasks carry the crate's 90-day download count as
+  their queue priority. A binary that fails to resolve is reported and
   skipped; `--targets` defaults to every CI target.
 - `stow-admin preheat missed --rustc-version ... [--limit 50] [--since-days 7] [--targets a,b] --yes`
   — promote the top-K most-missed `(crate, version, features)` identities
@@ -417,47 +416,33 @@ acting unless `--yes` is given.
 - `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
   closure expansion a request would produce; enqueues nothing.
 - `stow-admin preheat manual --crates <file>|--projects <file>
-  --rustc-version <v> [--targets a,b] [--in-flight 45]
-  [--batch-parallelism 5] [--batch-max-tasks 40]
-  [--source-trees <file>]` — the
-  edge-free wave: resolve the input in-process, layer it against the
-  published index, dispatch `build-batch.yml` — one matrix run per
-  packed batch of legs — straight through GitHub's
-  `workflow_dispatch`, and publish each index slice as its layer lands.
-  `--in-flight` counts runner slots, the sum of each in-flight batch's
-  `parallelism`; `--batch-parallelism` and `--batch-max-tasks` shape a
-  batch, defaulting to the scheduler's `STOW_BATCH_PARALLELISM` /
-  `STOW_BATCH_MAX_TASKS`. `--dry-run` packs the wave into the batches a
-  drive would send and prints each batch's legs, encoded size and fill
-  of the dispatch input cap — nothing is dispatched.
-  Works while Cloudflare is down. Resumable by index, exits non-zero
-  with the failed runs' URLs. A run whose failed step is outside the
-  build and publish stages — runner setup, toolchain install, artifact
-  transfer — is infrastructure, not the crate's verdict: its failed
-  jobs are rerun in place (up to three attempts) and the report lists
-  every rerun. A `--projects` repository that fails to
-  resolve is reported and the wave dispatches the rest, exiting
+  --rustc-version <v> [--targets a,b] [--priority 30]
+  [--source-trees <file>] [--yes]` — the
+  operator-driven wave (stow#880): resolve the input in-process and
+  submit one dependency tree per source to the scheduler's operations
+  lane at `--priority` — the same operand `stow-admin submit` takes.
+  The scheduler owns dispatch from there; without `--yes` the plan
+  prints and nothing is submitted. Resumable — the scheduler merges on
+  task identity, so a re-run inserts only what is still missing.
+  A `--projects` repository that fails to
+  resolve is reported after the wave submits the rest, exiting
   non-zero naming it; a `--crates` or `--dirs` failure still aborts
-  before dispatch. `--dispatch-url` aims it at the mock's
-  local CI server instead; `--adopt-since <RFC 3339>` (default 24 h ago)
-  bounds how far back a resumed wave adopts already-dispatched runs;
-  `--edge-url` (or `STOW_EDGE_URL`) is forwarded to the index-publish
-  workflow so it can sync the D1 catalog. `--source-trees` is only
+  before submission. `--source-trees` is only
   valid with `--projects` — see [source-trees.md](source-trees.md).
 - `stow-admin index export --out-dir <dir>` /
   `index publish --file <index> --folded <folded>` /
-  `index sync --file <new-records.json>` / `index targets` — export
+  `index report --file <index>` / `index targets` — export
   every changed index slice in one pass from the registry's verified
   records artifacts (each `index.<t>.<r>` plus its `folded.<t>.<r>`
   companion; only the records tags no folded set covers are pulled),
   push both to GHCR signed under the index workflow (mock deploys
-  delegate to `stow-mock-registry publish-index`), and sync just this
-  pass's new records into the edge's D1 catalog. `index-publish.yml`
-  runs this loop after every `build-batch` run. `index targets` lists
+  delegate to `stow-mock-registry publish-index`), and report each
+  slice's membership to the scheduler. `index-publish.yml`
+  runs this loop after every `build-crate` run. `index targets` lists
   the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
-whole wave — `preheat top`, `preheat top-binaries`, and
+whole wave — `preheat top-binaries` and
 `preheat projects submit` — once per
 UTC day and immediately whenever the stable channel moves, since the
 cache identity pins the exact stable `rustc_version` and every release
@@ -466,11 +451,10 @@ the scheduler deduplicates on task identity, leaves completed tasks
 completed, and retires pending tasks the catalog already covers, so each
 wave builds only what is missing or previously failed.
 
-`stow-admin` requires `STOW_EDGE_URL` and a GitHub credential with push
-access to `water-rs/stow` (`GH_TOKEN`/`GITHUB_TOKEN`, or `gh auth login`).
-The exceptions never touch the edge: `preheat manual` needs only the
-GitHub credential (plus crates.io and GHCR), `preheat projects generate`
+`stow-admin` requires `STOW_EDGE_URL` and a GitHub account with push
+access to `water-rs/stow`, signed in with `stow-admin login`.
+The exceptions never touch the edge: `preheat projects generate`
 touches only GitHub, `index export`/`publish`/`targets` touch only
-the registry, and a preheat lane (`top`, `top-binaries`, `binary`,
+the registry, and a preheat lane (`top-binaries`, `binary`,
 `missed`, `projects submit`, `plan`) run without `--yes` only plans and
 needs no edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).

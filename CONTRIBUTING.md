@@ -38,13 +38,6 @@ trusted GitHub-Actions builder, `admin/` is the operator CLI,
   `TargetTriple`, `WireRustcVersion`, `CMetadata`,
   `DependencyCMetadataJson`) are wire-validated by `serde::Deserialize`
   at the API boundary. Don't reinvent them with raw strings.
-- The D1 catalog has one schema — `edge/schema.sql`. New columns in
-  `artifacts` go in that file, `edge/src/sql/insert_artifact.sql`,
-  AND `edge/src/db.rs::insert_artifact_record`'s `bind` chain — keep
-  the three in sync. A schema change is an operator reset: drop the
-  tables, `wrangler d1 execute stow-prod --remote --file edge/schema.sql`,
-  then resync the mirror (`stow-admin index export --out-dir <dir>
-  --full` + `index sync --file <dir>/new-records.json`).
 - The scheduler has one schema — `edge/src/scheduler/schema.sql`. New
   queue columns go in that file, `TaskRow`, the SELECT column list in
   `claim_dispatchable_tasks`, and the INSERT in `enqueue`.

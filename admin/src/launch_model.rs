@@ -10,8 +10,11 @@
 //!   edge writes to AE.
 //! - **Zone HTTP analytics** (`httpRequestsAdaptiveGroups` grouped by
 //!   method and path) — the only production record of index pulls,
-//!   admissions, enqueues, human requests, status reads, site views and
-//!   build callbacks: the edge writes no AE point for any of them.
+//!   admissions, enqueues, human requests, status reads, site views,
+//!   index publishes and operator work: the edge writes no AE point for
+//!   any of them. Webhook deliveries, request outcomes, trusted submits
+//!   and health probes are priced from their fixed shapes instead, so
+//!   the window does not count them.
 //!
 //! - **Rust's release notes** (`RELEASES.md` in rust-lang/rust, one
 //!   `Version X.Y.Z (YYYY-MM-DD)` heading per stable release, point
@@ -133,13 +136,8 @@ enum RouteKind {
     SiteView,
     /// `/stats` and `/api/v1/stats`.
     StatsView,
-    /// `POST /api/v1/github/workflow-run`.
-    BuildCallback,
     /// `POST /api/v1/admin/index/…` — index slice publishes.
     IndexPublish,
-    /// `POST /api/v1/scheduler/tasks/submit` — trusted submits; each
-    /// carries a task batch.
-    TrustedSubmit,
     /// The rest of the trusted surface — status reads and queue
     /// mutations.
     AdminOperation,
@@ -156,9 +154,7 @@ impl RouteKind {
             Self::RequestStatusRead => "GET /api/v1/requests/*",
             Self::SiteView => "GET /site/*",
             Self::StatsView => "GET /stats",
-            Self::BuildCallback => "POST /api/v1/github/workflow-run",
             Self::IndexPublish => "POST /api/v1/admin/index/*",
-            Self::TrustedSubmit => "POST /api/v1/scheduler/tasks/submit",
             Self::AdminOperation => "* /api/v1/(admin|scheduler)/*",
         }
     }
@@ -171,8 +167,15 @@ fn classify_path(method: &str, path: &str) -> Option<RouteKind> {
         ("POST", "/api/v1/admissions") => Some(RouteKind::Admission),
         ("POST", "/api/v1/enqueue") => Some(RouteKind::EnqueueRedemption),
         ("POST", "/api/v1/requests") => Some(RouteKind::HumanRequest),
-        ("POST", "/api/v1/github/workflow-run") => Some(RouteKind::BuildCallback),
-        ("POST", "/api/v1/scheduler/tasks/submit") => Some(RouteKind::TrustedSubmit),
+        // Priced from fixed shapes, never from the window: a build
+        // run's and a resolve run's webhook deliveries and a request's
+        // outcome post by their lifecycle (`stow_types::forwards`), a
+        // trusted submit by the preheat side, the health probe at its
+        // stated cadence. Counting them here too would book them a
+        // second time as operator work under the catch-all below.
+        ("POST", "/api/v1/github/workflow-run" | "/api/v1/scheduler/tasks/submit")
+        | ("GET", "/api/v1/scheduler/health") => None,
+        ("POST", p) if p.starts_with("/api/v1/scheduler/requests/") => None,
         ("GET", "/" | "/install.sh" | "/install.ps1") => Some(RouteKind::SiteView),
         ("GET", "/stats" | "/api/v1/stats") => Some(RouteKind::StatsView),
         ("POST", p) if p.starts_with("/api/v1/admin/index/") => Some(RouteKind::IndexPublish),
@@ -319,6 +322,11 @@ const DAYS_PER_MONTH: u32 = 30;
 /// builds a request wave caused beyond the misses it redeemed.
 const TASKS_PER_HUMAN_REQUEST: f64 = 5.0;
 
+/// The external uptime monitor's `GET /api/v1/scheduler/health`
+/// cadence: once a minute, the operator's decision (stow#940), not a
+/// window measurement.
+const HEALTH_PROBES_PER_DAY: f64 = 24.0 * 60.0;
+
 /// Run one `launch-model` subcommand.
 pub async fn run(args: LaunchModelArgs, output: Output) -> stow_types::error::Result<()> {
     match args.command {
@@ -392,17 +400,23 @@ async fn gather_snapshot(
     let miss_nodes_sql = MissNodesQuery { window: &window }
         .render()
         .map_err(|error| stow_error!("render launch-model query: {error}"))?;
+    let sql_base = cloudflare::analytics_sql_base()?;
     let (install_days, cli_fetches, miss_nodes, requests, release_notes) = futures_util::try_join!(
         async {
-            cloudflare::analytics_engine_sql::<AeCountRow>(&token, &account, &install_days_sql)
-                .await
-                .map_err(|error| stow_error!("analytics engine: {error}"))?
-                .first()
-                .map(|row| row.value)
-                .ok_or_else(|| stow_error!("install-days query returned no row"))
+            cloudflare::analytics_engine_sql::<AeCountRow>(
+                &sql_base,
+                &token,
+                &account,
+                &install_days_sql,
+            )
+            .await
+            .map_err(|error| stow_error!("analytics engine: {error}"))?
+            .first()
+            .map(|row| row.value)
+            .ok_or_else(|| stow_error!("install-days query returned no row"))
         },
-        analytic_sum(&token, &account, &cli_fetches_sql, "fetch"),
-        analytic_sum(&token, &account, &miss_nodes_sql, "miss"),
+        analytic_sum(&sql_base, &token, &account, &cli_fetches_sql, "fetch"),
+        analytic_sum(&sql_base, &token, &account, &miss_nodes_sql, "miss"),
         zone_path_counts(&token, &zone, &window.since, &window.until),
         crate::rust_channel::release_notes(),
     )?;
@@ -422,12 +436,13 @@ async fn gather_snapshot(
 /// estimate — decoded at the actual column type and validated
 /// losslessly before its u64 use rather than clamped.
 async fn analytic_sum(
+    sql_base: &str,
     token: &str,
     account: &str,
     sql: &str,
     what: &'static str,
 ) -> stow_types::error::Result<u64> {
-    cloudflare::analytics_engine_sql::<AeSumRow>(token, account, sql)
+    cloudflare::analytics_engine_sql::<AeSumRow>(sql_base, token, account, sql)
         .await
         .map_err(|error| stow_error!("analytics engine: {error}"))?
         .first()
@@ -556,19 +571,8 @@ pub fn derive_model(snapshot: &WindowSnapshot) -> stow_types::error::Result<Laun
     let index_requests = count(RouteKind::IndexRequest);
     let enqueues = count(RouteKind::EnqueueRedemption);
     let human_requests = count(RouteKind::HumanRequest);
-    let callbacks = count(RouteKind::BuildCallback);
-    let trusted_submits = count(RouteKind::TrustedSubmit);
     let admin_operations = count(RouteKind::AdminOperation);
     let index_publishes = count(RouteKind::IndexPublish);
-
-    // The window's builds are the queue rows submitted: redeemed misses
-    // one row each, human requests their closures, trusted submits a
-    // batch the HTTP count cannot see — the submit call's own row count
-    // is the closest record, so trusted rows are counted as calls.
-    let window_builds = (human_requests as f64).mul_add(
-        TASKS_PER_HUMAN_REQUEST,
-        enqueues as f64 + trusted_submits as f64,
-    );
 
     Ok(LaunchModel {
         scale: LaunchScale {
@@ -600,13 +604,13 @@ pub fn derive_model(snapshot: &WindowSnapshot) -> stow_types::error::Result<Laun
             miss_node: round4(per_install_day(snapshot.miss_nodes)),
             admin_operations_per_day: round4(per_day(admin_operations)),
             index_publishes_per_day: round4(per_day(index_publishes)),
+            health_probes_per_day: HEALTH_PROBES_PER_DAY,
         },
         ratios: LaunchRatios {
             // A redeemed ticket is exactly one queue row, so this ratio
             // is the miss-to-build share — capped at 1, a miss can
             // never build twice.
             builds_per_miss: round4((enqueues as f64 / snapshot.miss_nodes.max(1) as f64).min(1.0)),
-            callbacks_per_build: round4(callbacks as f64 / window_builds.max(1.0)),
             tasks_per_human_request: TASKS_PER_HUMAN_REQUEST,
         },
     })
@@ -655,6 +659,7 @@ fn render_model(model: &LaunchModel) -> String {
         ("index publish", EventKind::IndexPublish),
         ("build", EventKind::Build),
         ("build callback", EventKind::BuildCallback),
+        ("health probe", EventKind::HealthProbe),
         ("alarm pass", EventKind::AlarmPass),
     ] {
         table.push([

@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use skyzen::extract::{Extractor, Query};
 use skyzen::header::HeaderValue;
 use skyzen::routing::Params;
@@ -9,16 +7,13 @@ use skyzen::{Body, Request, Response, StatusCode};
 use skyzen_cloudflare::worker::send::IntoSendFuture as _;
 use skyzen_cloudflare::worker::{self, AnalyticsEngineDataset};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
-use skyzen_services::Db;
 use stow_types::admission;
 use stow_types::api::{
-    AdmissionRequest, ArtifactIndexPage, ArtifactRecord, CI_TARGET_TRIPLES, CrateRequest,
-    EnqueueAdmission, EnqueueTicket,
+    AdmissionRequest, CI_TARGET_TRIPLES, CrateRequest, EnqueueAdmission, EnqueueTicket,
 };
 use stow_types::bundle::STOW_BUNDLE_MEDIA_TYPE;
-use stow_types::identity::{CMetadata, CrateName, CrateVersion, TargetTriple, WireRustcVersion};
+use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersion};
 
-use crate::db;
 use crate::errors::GetArtifactError;
 use crate::fetch_guard::OutboundPool;
 use crate::github_auth;
@@ -139,19 +134,17 @@ impl Extractor for CfConnectingIp {
 }
 
 /// Enqueue-admission parameters carried via `State<PowAdmission>`: the HMAC
-/// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`), the
-/// proof-of-work bits every admission carries (`STOW_POW_MIN_BITS`), and
-/// the pending-queue depth at which `/api/v1/enqueue` stops accepting
-/// tickets (`STOW_MAX_QUEUE_PENDING`).
+/// secret minting miss challenges (`STOW_POW_CHALLENGE_SECRET`) and the
+/// proof-of-work bits every admission carries (`STOW_POW_MIN_BITS`). The
+/// pending-depth refusal lives in the scheduler's own cap
+/// (`STOW_MAX_QUEUE_PENDING`), whose 429 this handler maps — the edge
+/// reads no depth of its own (stow#940).
 #[derive(Debug, Clone)]
 pub struct PowAdmission {
     pub challenge_secret: String,
     /// Leading-zero bits minted into every admission and required of
     /// every ticket — an enqueue is never free.
     pub min_bits: u32,
-    /// Pending-queue depth that refuses miss-lane tickets with 429. This,
-    /// not the proof-of-work, is what says "the queue is under pressure".
-    pub max_queue_pending: u32,
 }
 
 /// `Retry-After` for a queue-depth refusal: ten minutes of drain time.
@@ -206,16 +199,23 @@ fn now_minute() -> u64 {
 /// echoes back.
 fn mint_admissions(
     admission: &PowAdmission,
-    requests: Vec<stow_types::api::EnqueueRequest>,
+    trees: Vec<stow_types::api::SubmissionTree>,
     difficulty: u32,
 ) -> Result<Vec<EnqueueAdmission>, GetArtifactError> {
     let minute = now_minute();
-    let mut admissions = Vec::with_capacity(requests.len());
-    for request in requests {
-        let task_id = request.task_id().map_err(|error| {
-            GetArtifactError::BadRequestWithMessage(format!("enqueue task id: {error}"))
-        })?;
-        let request_json = serde_json::to_vec(&request)
+    let mut admissions = Vec::with_capacity(trees.len());
+    for tree in trees {
+        // The challenge binds the tree's first root — the miss the
+        // admission minted — to the whole tree's canonical JSON.
+        let task_id = tree
+            .roots
+            .first()
+            .and_then(|&root| tree.nodes.get(root as usize))
+            .map(|node| node.task_id.clone())
+            .ok_or_else(|| {
+                GetArtifactError::BadRequestWithMessage("submission tree names no roots".to_owned())
+            })?;
+        let request_json = serde_json::to_vec(&tree)
             .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
         let challenge = admission::issue_challenge(
             &admission.challenge_secret,
@@ -227,31 +227,10 @@ fn mint_admissions(
             task_id,
             challenge,
             difficulty,
-            request,
+            tree,
         });
     }
     Ok(admissions)
-}
-
-/// POST /api/v1/admin/artifacts/sync — the D1 sync step of
-/// `index-publish.yml` (stow#455).
-///
-/// GHCR's records artifacts are the only record store; `artifacts` rows
-/// exist only to serve lookups, and they are written here by the sync
-/// step replaying the verified records it pulled — never by the build
-/// itself. The caller is a repo-writer credential (the workflow's
-/// `GITHUB_TOKEN` or an operator's token), so no task binding applies:
-/// the records' provenance was already proven by cosign verification
-/// before they were ever sent here.
-pub async fn sync_artifacts(
-    _caller: SchedulerCaller,
-    Json(records): Json<Vec<ArtifactRecord>>,
-    db: Db,
-) -> Result<Json<OkResponse>, GetArtifactError> {
-    let count = records.len();
-    db::insert_artifact_records(&db, &records).await?;
-    tracing::info!(synced = count, "synced GHCR artifact records into D1");
-    Ok(Json(OkResponse { ok: true }))
 }
 
 /// GET /api/v1/admin/dispatch-freeze
@@ -284,126 +263,32 @@ pub async fn set_dispatch_freeze(
     Ok(Json(stored))
 }
 
-/// Query for `GET /api/v1/admin/index/{target}/{rustc_version}`.
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-pub struct IndexQuery {
-    /// Keyset cursor — the page starts at the first row whose
-    /// `c_metadata` is greater than this value.
-    pub after: Option<String>,
-    /// Most rows to return; defaults to [`DEFAULT_INDEX_LIMIT`].
-    pub limit: Option<usize>,
-}
-
-/// Rows one index page serves. The page walks a whole slice ordered by
-/// `c_metadata`; `limit` is the keyset window, not an arbitrary cap —
-/// [`MAX_INDEX_LIMIT`] keeps a response small enough for one worker
-/// invocation.
-const DEFAULT_INDEX_LIMIT: usize = 500;
-const MAX_INDEX_LIMIT: usize = 1000;
-
-/// GET /`api/v1/admin/index/{target}/{rustc_version}?after=c_metadata&limit=N`
+/// POST /`api/v1/admin/index/published`
 ///
-/// One keyset page of the slice's servable artifact rows — what
-/// `stow-admin index export` pages through to assemble the published
-/// [`stow_types::index::ArtifactIndex`]. `SchedulerCaller` (repo-writer):
-/// the index-publish workflow mints its token inside the trusted repo.
-pub async fn list_artifact_index(
-    SchedulerCaller(caller): SchedulerCaller,
-    params: Params,
-    Query(query): Query<IndexQuery>,
-    db: Db,
-) -> Result<Json<ArtifactIndexPage>, GetArtifactError> {
-    let target = params
-        .get("target")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<TargetTriple>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let rustc_version = params
-        .get("rustc_version")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<WireRustcVersion>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let (after, limit) = (query.after, query.limit.unwrap_or(DEFAULT_INDEX_LIMIT));
-    if limit == 0 || limit > MAX_INDEX_LIMIT {
-        return Err(GetArtifactError::BadRequestWithMessage(format!(
-            "limit must be 1..={MAX_INDEX_LIMIT}"
-        )));
-    }
-    let after = after
-        .map(|cursor| {
-            CMetadata::parse(cursor)
-                .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))
-        })
-        .transpose()?;
-    let rows = db::artifact_index_page(
-        &db,
-        target.as_str(),
-        rustc_version.as_str(),
-        after.as_ref().map(CMetadata::as_str),
-        limit,
-    )
-    .await?;
-    // A full page may continue; anything shorter means the slice is
-    // exhausted. `next_after` is the last row's key — the next page
-    // resumes strictly after it.
-    let next_after = if rows.len() == limit {
-        rows.last().map(|row| row.c_metadata.as_str().to_owned())
-    } else {
-        None
-    };
-    tracing::info!(
-        rows = rows.len(),
-        %caller,
-        %target,
-        %rustc_version,
-        "served an artifact index page"
-    );
-    Ok(Json(ArtifactIndexPage { rows, next_after }))
-}
-
-/// POST /`api/v1/admin/index/{target}/{rustc_version}`
-///
-/// The index-publish path's report that this slice went live, carrying
-/// the semantic identities the signed index serves — recorded inside the
-/// scheduler as the membership the dependency gate checks a dependent's
-/// edges against. Same `SchedulerCaller` (repo-writer) trust as the page
-/// reads: the index-publish workflow mints its token inside the trusted
-/// repo.
+/// The index-publish path's report that this run's slices went live,
+/// carrying the semantic identities the signed index serves — recorded
+/// inside the scheduler as the membership the dependency gate checks a
+/// dependent's edges against. One report per publish run: the object
+/// applies the slices in one append and one dispatch pass (stow#940).
+/// Same `SchedulerCaller` (repo-writer) trust as the page reads: the
+/// index-publish workflow mints its token inside the trusted repo.
 pub async fn record_published_index(
     SchedulerCaller(caller): SchedulerCaller,
-    params: Params,
     State(scheduler): State<CfDurableNamespace>,
-    Json(report): Json<stow_types::api::PublishedSliceReport>,
+    Json(report): Json<stow_types::api::PublishedRunReport>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
-    let target = params
-        .get("target")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<TargetTriple>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let rustc_version = params
-        .get("rustc_version")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<WireRustcVersion>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let rows = report.added.len() + report.retired.len();
-    scheduler_client::record_published_index(
-        &scheduler,
-        &stow_types::api::PublishedSlice {
-            target: target.clone(),
-            rustc_version: rustc_version.clone(),
-            base_generation: report.base_generation,
-            generation: report.generation,
-            added: report.added,
-            retired: report.retired,
-        },
-    )
-    .await?;
+    let slices = report.slices.len();
+    let rows: usize = report
+        .slices
+        .iter()
+        .map(|slice| slice.added.len() + slice.retired.len())
+        .sum();
+    scheduler_client::record_published_index(&scheduler, &report).await?;
     tracing::info!(
+        slices,
         rows,
         %caller,
-        %target,
-        %rustc_version,
-        "recorded a published index slice"
+        "recorded a publish run's slices"
     );
     Ok(Json(OkResponse { ok: true }))
 }
@@ -697,197 +582,6 @@ pub async fn admin_queue_purge(
     Ok(Json(queue_mutation(&scheduler, "purge", &selector).await?))
 }
 
-/// Query for `GET /api/v1/admin/coverage/{crate_name}`.
-#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-pub struct CoverageQuery {
-    /// Scope to one published version.
-    pub version: Option<CrateVersion>,
-    /// Scope to one CI target; absent means every `CI_TARGET_TRIPLES`
-    /// entry.
-    pub target: Option<TargetTriple>,
-}
-
-/// `GET /api/v1/admin/coverage/{crate_name}?version=&target=`
-///
-/// Per-CI-target servable identities for one crate — which artifact
-/// identities exist and which targets have none. Only rows with a
-/// published bundle count as servable.
-pub async fn artifact_coverage(
-    SchedulerCaller(_caller): SchedulerCaller,
-    params: Params,
-    Query(query): Query<CoverageQuery>,
-    db: Db,
-) -> Result<Json<stow_types::api::CrateCoverage>, GetArtifactError> {
-    let crate_name = path_crate_name(&params)?;
-    let (version, target) = (query.version, query.target);
-    if let Some(target) = &target
-        && !stow_types::api::is_ci_target(target.as_str())
-    {
-        return Err(GetArtifactError::UnsupportedTarget {
-            target: target.as_str().to_owned(),
-            supported: CI_TARGET_TRIPLES.join(", "),
-        });
-    }
-    let pairs = db::artifact_coverage(
-        &db,
-        crate_name.as_str(),
-        version.as_ref().map(ToString::to_string).as_deref(),
-    )
-    .await?;
-    let mut by_target: BTreeMap<String, Vec<stow_types::api::CoverageArtifact>> = BTreeMap::new();
-    for (target, artifact) in pairs {
-        by_target
-            .entry(target.as_str().to_owned())
-            .or_default()
-            .push(artifact);
-    }
-    let targets = match &target {
-        Some(target) => vec![target.clone()],
-        None => CI_TARGET_TRIPLES
-            .iter()
-            .map(|triple| {
-                TargetTriple::parse(*triple).map_err(|error| {
-                    GetArtifactError::InternalWithMessage(format!("CI target `{triple}`: {error}"))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    Ok(Json(stow_types::api::CrateCoverage {
-        crate_name,
-        version,
-        targets: targets
-            .into_iter()
-            .map(|target| stow_types::api::CoverageTarget {
-                artifacts: by_target.remove(target.as_str()).unwrap_or_default(),
-                target,
-            })
-            .collect(),
-    }))
-}
-
-/// Row bound for the admin artifacts listing.
-const MAX_ADMIN_ARTIFACTS_LIST: u32 = 1000;
-/// `GET /api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=`
-///
-/// Bounded catalog listing — the prune preview's data source and an
-/// ad-hoc record listing.
-pub async fn list_artifact_records(
-    SchedulerCaller(_caller): SchedulerCaller,
-    Query(query): Query<stow_types::api::ArtifactListQuery>,
-    db: Db,
-) -> Result<Json<Vec<ArtifactRecord>>, GetArtifactError> {
-    let limit = query.limit.unwrap_or(200);
-    if limit == 0 || limit > MAX_ADMIN_ARTIFACTS_LIST {
-        return Err(GetArtifactError::BadRequestWithMessage(format!(
-            "limit must be 1..={MAX_ADMIN_ARTIFACTS_LIST}"
-        )));
-    }
-    let records = db::list_artifact_records(
-        &db,
-        &query,
-        usize::try_from(limit).map_err(|_| {
-            GetArtifactError::InternalWithMessage("limit overflows usize".to_owned())
-        })?,
-    )
-    .await?;
-    Ok(Json(records))
-}
-
-/// `GET /api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}`
-///
-/// The catalog row plus the bundle image's OCI manifest read from GHCR.
-pub async fn inspect_artifact(
-    SchedulerCaller(_caller): SchedulerCaller,
-    params: Params,
-    db: Db,
-    State(ghcr): State<GhcrConfig>,
-) -> Result<Json<stow_types::api::ArtifactInspection>, GetArtifactError> {
-    let target = params
-        .get("target")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<TargetTriple>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let rustc_version = params
-        .get("rustc_version")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<WireRustcVersion>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let c_metadata = params
-        .get("c_metadata")
-        .map_err(|_| GetArtifactError::BadRequest)?
-        .parse::<CMetadata>()
-        .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
-    let record = db::artifact_record(
-        &db,
-        target.as_str(),
-        rustc_version.as_str(),
-        c_metadata.as_str(),
-    )
-    .await?
-    .ok_or(GetArtifactError::NotFound)?;
-    let bundle_reference = stow_types::registry::bundle_oci_reference(&record.oci_reference)
-        .ok_or_else(|| {
-            GetArtifactError::InternalWithMessage(format!(
-                "oci_reference `{}` cannot derive a bundle tag",
-                record.oci_reference
-            ))
-        })?;
-    let repo = stow_types::registry::repository_path(&bundle_reference).ok_or_else(|| {
-        GetArtifactError::InternalWithMessage(format!(
-            "oci_reference `{bundle_reference}` has no repository path"
-        ))
-    })?;
-    let tag = stow_types::registry::oci_reference_tag(&bundle_reference).ok_or_else(|| {
-        GetArtifactError::InternalWithMessage(format!(
-            "oci_reference `{bundle_reference}` has no tag"
-        ))
-    })?;
-    let mut response = ghcr::open_manifest(
-        &ghcr.base_url,
-        repo,
-        tag,
-        &ghcr.tokens,
-        &OutboundPool::new(),
-    )
-    .await
-    .map_err(|error| match error {
-        ghcr::FetchError::NotFound => GetArtifactError::NotFound,
-        ghcr::FetchError::Unavailable => GetArtifactError::GhcrUnavailable,
-        other => GetArtifactError::InternalWithMessage(other.to_string()),
-    })?;
-    let body = response
-        .text()
-        .into_send()
-        .await
-        .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
-    let manifest: stow_types::api::OciManifest = serde_json::from_str(&body).map_err(|error| {
-        GetArtifactError::InternalWithMessage(format!("decode bundle manifest: {error}"))
-    })?;
-    Ok(Json(stow_types::api::ArtifactInspection {
-        record,
-        manifest,
-    }))
-}
-
-/// POST /api/v1/admin/artifacts/prune
-///
-/// Delete every catalog row built by the retired toolchain. GHCR image
-/// tags are not deleted — they age out under the package's own retention.
-pub async fn prune_artifacts(
-    SchedulerCaller(caller): SchedulerCaller,
-    Json(request): Json<stow_types::api::ArtifactPruneRequest>,
-    db: Db,
-) -> Result<Json<stow_types::api::ArtifactPruneResponse>, GetArtifactError> {
-    let deleted = db::delete_artifacts_for_rustc(&db, request.rustc_version.as_str()).await?;
-    tracing::warn!(
-        %caller,
-        rustc_version = %request.rustc_version,
-        deleted,
-        "pruned artifact rows for a retired toolchain"
-    );
-    Ok(Json(stow_types::api::ArtifactPruneResponse { deleted }))
-}
-
 /// POST /api/v1/scheduler/tasks/submit
 ///
 /// Control endpoint that submits arbitrary tasks into the scheduler.
@@ -897,19 +591,20 @@ pub async fn prune_artifacts(
 /// arbitrary body without a trusted GitHub credential.
 pub async fn submit_scheduler_tasks(
     SchedulerCaller(caller): SchedulerCaller,
-    Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
+    Json(trees): Json<Vec<stow_types::api::SubmissionTree>>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::SchedulerSubmitResponse>, GetArtifactError> {
     // The edge resolves nothing (stow#429): every lane that posts here
-    // already submits resolver-canonical requests, so they land verbatim —
+    // already submits resolver-canonical trees, so they land verbatim —
     // `Json` deserialization itself is the only check (`FeaturesJson`
     // rejects a non-canonical feature list there).
     // Repo-writer submissions are exempt from the pending-depth cap — the
     // credential check is the bound on this path.
-    let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &requests).await?;
-    tracing::info!(tasks = requests.len(), %caller, "submitted scheduler tasks");
+    let nodes: usize = trees.iter().map(|tree| tree.nodes.len()).sum();
+    let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &trees).await?;
+    tracing::info!(tasks = nodes, %caller, "submitted scheduler tasks");
     Ok(Json(stow_types::api::SchedulerSubmitResponse {
-        submitted: u32::try_from(requests.len()).map_err(|_| {
+        submitted: u32::try_from(nodes).map_err(|_| {
             GetArtifactError::TooLarge("submitted task count exceeds u32".to_owned())
         })?,
         inserted,
@@ -941,9 +636,28 @@ pub async fn submit_task_ids(
 /// GET /api/v1/scheduler/status
 pub async fn scheduler_status(
     State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<stow_types::api::SchedulerStatus>, GetArtifactError> {
+) -> Result<Response, GetArtifactError> {
     let status = scheduler_client::get_status(&scheduler).await?;
-    Ok(Json(status))
+    cacheable_json(&status, POINT_IN_TIME_NO_STORE)
+}
+
+/// GET /api/v1/scheduler/health
+///
+/// The unauthenticated liveness probe (stow#860): one scheduler request
+/// reading state the object already holds — no D1, no GHCR, no GitHub
+/// call. `no-store` so Workers Cache never replays a stale answer.
+/// An `unhealthy` scheduler component answers 503 — the status the
+/// edge already gives an unavailable dependency — so a plain HTTP
+/// uptime check needs no JSON parsing.
+pub async fn scheduler_health(
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Response, GetArtifactError> {
+    let health = scheduler_client::get_health(&scheduler).await?;
+    let mut response = cacheable_json(&health, POINT_IN_TIME_NO_STORE)?;
+    if health.scheduler != stow_types::api::HealthState::Ok {
+        *response.status_mut() = skyzen::StatusCode::SERVICE_UNAVAILABLE;
+    }
+    Ok(response)
 }
 
 /// POST /api/v1/requests
@@ -961,7 +675,6 @@ pub async fn scheduler_status(
 pub async fn submit_crate_request(
     CfConnectingIp(remoteip): CfConnectingIp,
     Json(request): Json<CrateRequest>,
-    db: Db,
     State(scheduler): State<CfDurableNamespace>,
     State(cache): State<CfCache>,
     State(turnstile): State<CfTurnstileVerifier>,
@@ -994,10 +707,10 @@ pub async fn submit_crate_request(
     }
 
     let crates_io = crates_io::CfCratesIo::new(OutboundPool::new());
-    // The request's version resolve (db reads) and the stable rustc
+    // The request's version resolve (cached crates.io reads) and the stable rustc
     // resolve (a Cache API read) are independent, so they overlap.
     let (version, rustc_version) = futures_util::try_join!(
-        async { resolve_request_version(&db, &crates_io, &request).await },
+        async { resolve_request_version(&cache, &crates_io, &request).await },
         async {
             rust_channel::stable_rustc_version(&cache, &rust_channel::CfRustChannel)
                 .await
@@ -1082,14 +795,14 @@ pub async fn scheduler_request_outcome(
 /// Resolve the requested version — exact-published check when given, else
 /// the newest non-prerelease, non-yanked release.
 async fn resolve_request_version(
-    db: &Db,
+    cache: &impl dependency_resolver::CratesIoCache,
     crates_io: &crates_io::CfCratesIo,
     request: &CrateRequest,
 ) -> Result<semver::Version, GetArtifactError> {
     let resolved = match request.version.as_ref() {
         Some(version) => {
             dependency_resolver::published_version(
-                db,
+                cache,
                 crates_io,
                 request.crate_name.as_str(),
                 version.as_semver(),
@@ -1098,7 +811,7 @@ async fn resolve_request_version(
         }
         None => {
             dependency_resolver::latest_published_version(
-                db,
+                cache,
                 crates_io,
                 request.crate_name.as_str(),
             )
@@ -1205,10 +918,13 @@ pub async fn search_crates(
 ///
 /// Every published, non-yanked version, newest first — the version picker's
 /// option list.
-pub async fn crate_versions(params: Params, db: Db) -> Result<Response, GetArtifactError> {
+pub async fn crate_versions(
+    params: Params,
+    State(cache): State<CfCache>,
+) -> Result<Response, GetArtifactError> {
     let crate_name = path_crate_name(&params)?;
     let response = catalog::crate_versions(
-        &db,
+        &cache,
         &crates_io::CfCratesIo::new(OutboundPool::new()),
         crate_name.as_str(),
     )
@@ -1221,7 +937,10 @@ pub async fn crate_versions(params: Params, db: Db) -> Result<Response, GetArtif
 /// Every feature the version lets a caller select, `default` first — the
 /// feature checkboxes. Selecting `default` is what keeps cargo's default
 /// feature set on; leaving it out builds `--no-default-features`.
-pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtifactError> {
+pub async fn crate_features(
+    params: Params,
+    State(cache): State<CfCache>,
+) -> Result<Response, GetArtifactError> {
     let crate_name = path_crate_name(&params)?;
     let version = params
         .get("version")
@@ -1229,7 +948,7 @@ pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtif
         .parse::<CrateVersion>()
         .map_err(|error| GetArtifactError::BadRequestWithMessage(error.to_string()))?;
     let response = catalog::crate_features(
-        &db,
+        &cache,
         &crates_io::CfCratesIo::new(OutboundPool::new()),
         crate_name.as_str(),
         version.as_semver(),
@@ -1251,6 +970,8 @@ pub async fn crate_features(params: Params, db: Db) -> Result<Response, GetArtif
 pub async fn get_bundle(
     params: Params,
     State(ghcr): State<GhcrConfig>,
+    State(stats_ctx): State<stats::StatsContext>,
+    telemetry: stats::HitTelemetry,
 ) -> Result<Response, GetArtifactError> {
     let rustc_version = params
         .get("rustc_version")
@@ -1266,9 +987,26 @@ pub async fn get_bundle(
         )));
     }
 
-    open_bundle_stream(&ghcr, &rustc_version, digest)
+    let response = open_bundle_stream(&ghcr, &rustc_version, digest)
         .await
-        .map_err(registry_fetch_error)
+        .map_err(registry_fetch_error)?;
+    // The platform cache replays most fetches before this worker runs,
+    // so a hit point is recorded only for serves it observed — an
+    // undercount by design (stow#889): the digest is what the request
+    // already named, identity is recovered offline.
+    stats_ctx.record_hit(
+        &telemetry,
+        &stats::Hit {
+            rustc_version: rustc_version.as_str(),
+            digest,
+            bundle_size: response
+                .headers()
+                .get(skyzen::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok()),
+        },
+    );
+    Ok(response)
 }
 
 /* ---- index slices ---- */
@@ -1614,21 +1352,17 @@ pub async fn get_index_slice(
 ///
 /// The client resolved its dependency graph against the signed artifact
 /// index locally and posts the same graph here — every direct entry plus
-/// the cargo-expanded `c_metadata` edges. The edge re-derives which nodes
-/// the catalog does not cover (crates.io feature expansion plus
-/// artifact-catalog reachability), mints a stateless admission per
-/// uncovered node, and returns them for the client to redeem through the
-/// proof-of-work gated `/api/v1/enqueue`. The graph itself is never
+/// the cargo-expanded `c_metadata` edges. The edge re-derives the
+/// posted graph's candidate nodes (crates.io feature expansion plus
+/// reachability), mints one stateless admission per miss tree, and
+/// returns them for the client to redeem through the proof-of-work
+/// gated `/api/v1/enqueue`. The graph itself is never
 /// needed to *find* artifacts — the index already did that — so nothing
 /// here feeds a lookup.
 pub async fn mint_miss_admissions(
     Json(request): Json<AdmissionRequest>,
-    db: Db,
-    State(scheduler): State<CfDurableNamespace>,
     State(admission): State<PowAdmission>,
     State(settings): State<crate::runtime_settings::ResolverSettings>,
-    State(analytics): State<AnalyticsEngineDataset>,
-    consent: stats::AnalyticsConsent,
 ) -> Result<Json<Vec<EnqueueAdmission>>, GetArtifactError> {
     if request.entries.len() > settings.max_expanded_tasks {
         tracing::warn!(
@@ -1645,80 +1379,34 @@ pub async fn mint_miss_admissions(
         ));
     }
     let plan = dependency_resolver::expand_scheduler_requests(
-        &db,
         request.target.as_str(),
         request.rustc_version.as_str(),
         &request.entries,
         &request.expanded_entries,
     )
-    .await
     .map_err(|error| {
         tracing::error!(%error, "admission miss derivation failed");
         GetArtifactError::InternalWithMessage(error.to_string())
     })?;
     let enqueue_requests = plan.enqueue_requests;
-
-    // One Analytics Engine point per uncovered node — demand analytics
-    // stay off the D1 row-write meter.
-    miss_logger::log_graph_misses(&analytics, consent, &enqueue_requests);
-
-    // A fully-covered graph has no misses to mint and admits nothing new
-    // to drain, so it skips the scheduler round-trip entirely — the status
-    // fetch and misses-table scan are pure overhead on a cache hit.
     if enqueue_requests.is_empty() {
         return Ok(Json(Vec::new()));
     }
+    // One admission and one redemption per report tree (stow#878): the
+    // resolved graph folds into a single submission tree the ticket's
+    // PoW binds, carrying the CLI kind the request claimed (stow#882) —
+    // `CliAdmissionSource` admits only miss and inexact-hit sources.
+    let tree = stow_types::api::SubmissionTree::from_enqueue_requests(
+        request.source.submission_source(),
+        &enqueue_requests,
+    )
+    .map_err(|error| GetArtifactError::InternalWithMessage(format!("miss tree: {error}")))?;
     let difficulty = admission::difficulty(admission.min_bits);
-    let admissions =
-        mint_admissions(&admission, enqueue_requests, difficulty).map_err(|error| {
-            tracing::error!(%error, "failed to mint dependency-graph miss admissions");
-            GetArtifactError::InternalWithMessage(error.to_string())
-        })?;
-    drain_admitted_misses(&db, &scheduler).await;
+    let admissions = mint_admissions(&admission, vec![tree], difficulty).map_err(|error| {
+        tracing::error!(%error, "failed to mint dependency-graph miss admissions");
+        GetArtifactError::InternalWithMessage(error.to_string())
+    })?;
     Ok(Json(admissions))
-}
-
-/// Internal retry channel for verified admissions: hand misses that already
-/// passed the `/api/v1/enqueue` challenge + `PoW` gate back to the scheduler
-/// when their direct send failed. Unadmitted misses are never drainable —
-/// this is not a second minting channel, so it needs no proof-of-work of
-/// its own. Best-effort like every scheduler side-channel: a drain hiccup
-/// must not fail the analysis response.
-async fn drain_admitted_misses(db: &Db, scheduler: &CfDurableNamespace) {
-    const DRAIN_MISS_BATCH: usize = 64;
-
-    let drain = match db::take_dependency_graph_misses(db, DRAIN_MISS_BATCH).await {
-        Ok(drain) => drain,
-        Err(error) => {
-            tracing::error!(%error, "failed to drain admitted dependency-graph misses");
-            return;
-        }
-    };
-    // A row whose stored subgraph fails the drain's checks was
-    // consumed as an explicit skip, counted here, never re-minted
-    // (stow#588).
-    if drain.skipped > 0 {
-        tracing::info!(
-            skipped = drain.skipped,
-            "miss drain skipped rows it could not re-mint"
-        );
-    }
-    let drained = drain.requests;
-    if drained.is_empty() {
-        return;
-    }
-
-    if let Err(error) = scheduler_client::send_enqueue(scheduler, &drained).await {
-        tracing::error!(%error, "failed to enqueue admitted dependency-graph misses to scheduler");
-        if let Err(restore_error) =
-            db::set_dependency_graph_misses_queued(db, &drained, false).await
-        {
-            tracing::error!(
-                %restore_error,
-                "failed to restore drained dependency-graph misses after enqueue failure"
-            );
-        }
-    }
 }
 
 /// POST /api/v1/enqueue
@@ -1727,14 +1415,14 @@ async fn drain_admitted_misses(db: &Db, scheduler: &CfDurableNamespace) {
 /// the request the ticket carries, check the client's proof-of-work against
 /// the queue depth current at redemption time (one bit lenient — the queue
 /// may have grown since the miss response), then forward that request to
-/// the scheduler. Replay is safe — the scheduler deduplicates on task id.
-pub async fn enqueue_admitted_task(
-    Json(ticket): Json<EnqueueTicket>,
-    db: Db,
-    State(scheduler): State<CfDurableNamespace>,
-    State(admission): State<PowAdmission>,
-) -> Result<Response, GetArtifactError> {
-    let request_json = serde_json::to_vec(&ticket.request)
+/// The admission gate of `POST /api/v1/enqueue`: challenge + tree-id
+/// binding, extracted so the handler stays under the size lint
+/// (stow#878's tree ticket reuses the same gate).
+fn verify_enqueue_ticket(
+    ticket: &EnqueueTicket,
+    admission: &PowAdmission,
+) -> Result<(), GetArtifactError> {
+    let request_json = serde_json::to_vec(&ticket.tree)
         .map_err(|error| GetArtifactError::InternalWithMessage(error.to_string()))?;
     if !admission::verify_challenge(
         &admission.challenge_secret,
@@ -1746,45 +1434,60 @@ pub async fn enqueue_admitted_task(
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: invalid challenge");
         return Err(GetArtifactError::Unauthorized);
     }
-    // The challenge binds task_id to the request's canonical identity;
-    // recompute it so a verified ticket always forwards what it minted.
-    let derived_task_id = ticket.request.task_id().map_err(|error| {
-        GetArtifactError::BadRequestWithMessage(format!("enqueue task id: {error}"))
-    })?;
+    // The challenge binds the ticket's task id to the tree's first
+    // root; recompute it so a verified ticket always forwards what it
+    // minted.
+    let derived_task_id = ticket
+        .tree
+        .roots
+        .first()
+        .and_then(|&root| ticket.tree.nodes.get(root as usize))
+        .map(|node| node.task_id.clone())
+        .ok_or_else(|| {
+            GetArtifactError::BadRequestWithMessage("submission tree names no roots".to_owned())
+        })?;
     if derived_task_id != ticket.task_id {
         tracing::warn!(task_id = %ticket.task_id, "rejected enqueue ticket: task id mismatch");
         return Err(GetArtifactError::Unauthorized);
     }
+    Ok(())
+}
+
+/// `POST /api/v1/enqueue` — verify the ticket, record the miss and
+/// forward the tree to the scheduler. Replay is safe — the scheduler
+/// deduplicates on task id.
+pub async fn enqueue_admitted_task(
+    Json(ticket): Json<EnqueueTicket>,
+    State(scheduler): State<CfDurableNamespace>,
+    State(admission): State<PowAdmission>,
+    State(analytics): State<AnalyticsEngineDataset>,
+    consent: stats::AnalyticsConsent,
+) -> Result<Response, GetArtifactError> {
+    verify_enqueue_ticket(&ticket, &admission)?;
     // A client builds for whatever host it runs on, and plenty of those are
     // machines this cache has no runner for. Refuse before the ticket can
     // become a dispatch that cannot run.
-    if !stow_types::api::is_ci_target(ticket.request.target.as_str()) {
+    if let Some(node) = ticket
+        .tree
+        .nodes
+        .iter()
+        .find(|node| !stow_types::api::is_ci_target(node.target.as_str()))
+    {
         tracing::info!(
             task_id = %ticket.task_id,
-            target = %ticket.request.target,
+            target = %node.target,
             "rejected enqueue ticket: no CI runner builds this target"
         );
         return Err(GetArtifactError::UnsupportedTarget {
-            target: ticket.request.target.to_string(),
+            target: node.target.to_string(),
             supported: CI_TARGET_TRIPLES.join(", "),
         });
     }
-    let status = scheduler_client::get_status(&scheduler).await?;
-    // The depth cap refuses miss-lane tickets once the queue is full; the
-    // Durable Object repeats the check at submit time so a wave of
-    // concurrent redemptions cannot overshoot by more than one batch.
-    if status.pending >= admission.max_queue_pending {
-        tracing::warn!(
-            task_id = %ticket.task_id,
-            pending = status.pending,
-            cap = admission.max_queue_pending,
-            "refusing enqueue ticket: scheduler queue is full"
-        );
-        return rate_limited_response(
-            "scheduler queue is full; retry after it drains",
-            QUEUE_FULL_RETRY_AFTER_SECS,
-        );
-    }
+    // The proof of work is pure CPU, so it verifies before the one
+    // forward — the Durable Object's own pending-depth cap refuses a
+    // full queue at submit and the handler maps that 429 below
+    // (stow#940: the `GET /status` pre-check cost a scheduler request
+    // to save none).
     let required = admission::difficulty(admission.min_bits);
     let solved =
         stow_types::pow::enqueue_pow_zero_bits(&ticket.task_id, &ticket.challenge, ticket.nonce);
@@ -1798,29 +1501,30 @@ pub async fn enqueue_admitted_task(
         return Err(GetArtifactError::BadRequest);
     }
 
-    // The ticket is verified: upsert the miss row (born `admitted_at`) so
-    // the internal drain may retry the scheduler send, then deliver the
-    // canonical request.
-    if let Err(error) = db::record_admitted_miss(&db, &ticket.request).await {
-        tracing::error!(%error, "failed to record admitted miss");
-    }
-    match scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.request)).await {
-        Ok(()) => {}
-        // The edge check raced another submit wave: the Durable Object's
-        // own pending-depth cap refused this one.
+    // The ticket is verified: the miss enters the scheduler's CLI
+    // entry point directly (stow#886) — a failed send is the request's
+    // own error, not a row a drain would retry.
+    match scheduler_client::send_enqueue(&scheduler, std::slice::from_ref(&ticket.tree)).await {
+        Ok(unpublished_ids) => {
+            // The merge's born-published check is the coverage verdict:
+            // one Analytics Engine point per node it found unpublished.
+            let unpublished: std::collections::BTreeSet<String> =
+                unpublished_ids.into_iter().collect();
+            miss_logger::log_misses(&analytics, consent, &ticket.tree, &unpublished);
+        }
+        // The Durable Object's own pending-depth cap refused this
+        // redemption — the queue filled between ticket and submit.
         Err(crate::errors::SchedulerClientError::Http { status: 429, .. }) => {
-            return rate_limited_response(
+            let mut response = rate_limited_response(
                 "scheduler queue is full; retry after it drains",
                 QUEUE_FULL_RETRY_AFTER_SECS,
-            );
+            )?;
+            response
+                .extensions_mut()
+                .insert(crate::faults::OverloadFault);
+            return Ok(response);
         }
         Err(error) => return Err(error.into()),
-    }
-    if let Err(error) =
-        db::set_dependency_graph_misses_queued(&db, std::slice::from_ref(&ticket.request), true)
-            .await
-    {
-        tracing::error!(%error, "failed to mark dependency-graph miss queued");
     }
     let mut response = Response::new(
         Body::from_json(&OkResponse { ok: true })
@@ -1925,6 +1629,21 @@ pub async fn usage_stats(
 ) -> Result<Response, GetArtifactError> {
     let stats = stats::compute_usage_stats(&stats_ctx).await?;
     cacheable_json(&stats, USAGE_STATS_MAX_AGE)
+}
+
+/// POST /api/v1/build-report — the CLI's at-most-daily usage rollup
+/// (stow#889): one `build` point in `stow_events` carrying the deltas
+/// the body reports — hits, misses, builds and CPU milliseconds saved
+/// that the platform cache hides from the byte path. Anonymous and
+/// write-only: no scheduler, the consent extractor decides
+/// whether the point lands at all.
+pub async fn build_report(
+    Json(report): Json<stow_types::api::BuildReport>,
+    State(stats_ctx): State<stats::StatsContext>,
+    telemetry: stats::HitTelemetry,
+) -> Result<StatusCode, GetArtifactError> {
+    stats_ctx.record_build_report(&telemetry, &report);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 impl GetArtifactError {

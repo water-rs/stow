@@ -67,23 +67,17 @@ Every Rust developer compiles the same popular crates over and over. Stow replac
 │ stow CLI   │─admissions>│  Edge Worker      │   workflow_run│ GitHub Actions   │
 │ (rustc     │  on miss  │  (mint PoW        │<──webhook─────│ CI (stow-build): │
 │  wrapper)  │<──PoW─────│   admissions,     │   (HMAC)      │ builds, signs,   │
-└─────┬──────┘           │   D1 owner)       │               │ pushes           │
+└─────┬──────┘           │   no database)    │               │ pushes           │
       │                  └────────┬──────────┘               └──┬─────────▲─────┘
       │ inject               miss │  ^ status            push+sign     │ dispatch
       v                           v  │                    bundles +    │  (workflow_dispatch)
   cargo target/          ┌───────────────────┐       records-<r>-<id>    │
       ▲                  │  Scheduler (DO)   │<───────────────┘         │
-      │                  │  (priority queue, │    a batch leg is done   │
+      │                  │  (priority queue, │    a task is done   │
       │                  │   dedup, dispatch)│    only once its records │
       │                  └────────┬──────────┘    artifact verifies      │
-      │                           │ writes                            │
-      │                           v                                   │
-      │                       ┌──────────┐   D1 is a mirror, filled    │
-      │                       │  CF D1   │   by `index sync` from      │
-      │                       │(artifact │   verified GHCR records    │
-      │                       │ records) │                            │
-      │                       └──────────┘      ┌──────────────────┐
-      │ signed index slices, verified locally   │  GHCR (OCI):     │
+      │                           │ persists  ┌──────────────────┐
+      │                           │ its log   │  GHCR (OCI):     │
       └────────────────────────────────────────>│  signed index.*  │
         (bundles stream via the edge byte path) │  + bundle blobs  │
                                                 │  + records-*     │
@@ -104,7 +98,7 @@ Stow is split into four main components, each with a clear trust boundary.
 
 A `rustc` wrapper installed on the user's machine, similar to sccache. When Cargo invokes `rustc`, stow intercepts the call, checks whether a prebuilt artifact is available, and either injects the cached result or falls through to normal compilation.
 
-The CLI resolves artifact identities against a locally cached, cryptographically verified index — the dependency graph is never sent anywhere for a lookup. The only graph that leaves the machine is the *miss* set posted to `/api/v1/admissions`, and only when the index could not cover it.
+The CLI resolves artifact identities against a locally cached, cryptographically verified index — the dependency graph is never sent anywhere for a lookup. A graph leaves the machine only when posted to `/api/v1/admissions`: the *miss* set when the index could not cover it, and the exact chain of a crate served from a larger feature set than the build asked for, so the cache builds that exact set next.
 
 Cached artifacts are materialized into Cargo's target directory as a reflink where the filesystem clones — APFS and other clone-capable filesystems share bytes with the local stow cache — and as a real copy where it does not.
 
@@ -113,9 +107,8 @@ Cached artifacts are materialized into Cargo's target directory as a reflink whe
 A Cloudflare Worker that serves as the public HTTP layer. It is explicitly **untrusted** — it cannot write artifact records or forge cache entries.
 
 - **Byte path** — `GET /api/v1/bundles/{rustc_version}/{digest}` streams the published bundle blob from GHCR behind Workers Cache (the immutable answer is cached at the edge — a hit bills a request but never runs the Worker); the client takes the digest from its signed index and checks the bytes against it.
-- **Admission minting** — `POST /api/v1/admissions` re-derives a posted graph's uncovered nodes against the artifact catalog (D1) and mints stateless proof-of-work admissions for them.
-- **Miss logging** — when a crate has no prebuilt, records the miss and submits a build task to the scheduler.
-- **Index catalog** — the admin index endpoints serve the catalog the signed index slices are built from, the ones the CLI resolves against.
+- **Admission minting** — `POST /api/v1/admissions` re-derives a posted graph's uncovered nodes against the scheduler's coverage and mints stateless proof-of-work admissions for them.
+- **Miss submission** — when a crate has no prebuilt, the redeemed admission submits the task to the scheduler and logs the miss to Analytics Engine.
 
 ### Scheduler (`edge/src/scheduler/`)
 
@@ -128,16 +121,16 @@ A Cloudflare Durable Object that manages the build queue. It exposes two public-
 
 Task completion arrives from GitHub's `workflow_run` webhook at `POST /api/v1/github/workflow-run` — trusted CI never calls the edge.
 
-Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — it raises the request count and recomputes the priority from the latest downloads and miss count, but `first_requested_at` is untouched, so a resubmit never lets a task jump its lane's queue. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-batch.yml` on `main` — one run packs up to 40 tasks as matrix legs, each leg calling `build-crate.yml`, which stays the signing identity.
+Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — it raises the request count and recomputes the priority from the latest downloads and miss count, but `first_requested_at` is untouched, so a resubmit never lets a task jump its lane's queue. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-crate.yml` on `main` — one task is one run.
 
 ### CI (`ci/`)
 
 The trusted build runner, hosted on GitHub Actions. This is the root of trust — every workflow run is public and auditable by anyone.
 
-1. Receives the batch as a `workflow_dispatch` input from the scheduler — `build-batch.yml`'s matrix calls `build-crate.yml` once per leg, and the leg reads its task out of the dispatch event file.
+1. Receives its task as the `workflow_dispatch` `task` input from the scheduler — `build-crate.yml` reads its `BuildTaskPayload` out of the dispatch event file.
 2. `build` job (read-only token, no secrets): builds the crate with the specified features, target, and rustc version, and hands the outputs over as a workflow artifact. Third-party build scripts run here and nowhere else.
 3. `publish` job (GHCR token, OIDC): validates the build output against the task and a dependency closure it resolves itself, then pushes the artifacts to OCI storage (GHCR) and signs them with cosign.
-4. Pushes the build's artifact records to GHCR as one cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` OCI artifact, under the same `build-crate.yml` identity. GitHub's `workflow_run` webhook — not the runner — reports the completed batch run to the edge; the scheduler then resolves each leg, completing its task only once the leg's records artifact verifies in GHCR.
+4. Pushes the build's artifact records to GHCR as one cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` OCI artifact, under the same `build-crate.yml` identity. GitHub's `workflow_run` webhook — not the runner — reports the completed run to the edge; the scheduler then completes the task once its records artifact verifies in GHCR.
 
 ### Admin (`admin/`)
 
@@ -154,12 +147,12 @@ You never have to ask for a patch release specifically: a request for `1.6.8` is
 Stow does **not** rely on trusting the edge or the scheduler. Both are treated as untrusted infrastructure that could be compromised without affecting artifact integrity.
 
 - **CI is the sole producer of artifacts.** Builds run on GitHub Actions, where every workflow run is public and fully auditable.
-- **CI never calls the edge.** Records live in GHCR as cosign-signed OCI artifacts — the same keyless signature clients verify on bundles — and completion reaches the edge through GitHub's `workflow_run` webhook, HMAC-verified with a stored secret. The edge's D1 catalog is a mirror `index sync` replays from the verified records.
+- **CI never calls the edge.** Records live in GHCR as cosign-signed OCI artifacts — the same keyless signature clients verify on bundles — and completion reaches the edge through GitHub's `workflow_run` webhook, HMAC-verified with a stored secret.
 - **Artifacts are stored in OCI (GHCR).** Content-addressable storage with digest verification.
 - **Artifacts are signed, and identity is signature-bound.** Clients verify that an artifact was produced by the trusted CI pipeline before writing any bytes to disk, and additionally require the bundle's identity fields (crate name, version, target, rustc version, features, dependency identities) to byte-for-byte match the OCI config that the signature covers — a tamperer cannot relabel a validly-signed bundle as a different artifact. A record that points at a digest the attacker doesn't control fails signature verification on the client and is pruned by the edge.
-- **The edge cannot publish or forge artifacts.** It writes D1 records authorized by the `build-crate.yml` OIDC identity (or a repo push user), mints miss admissions, and relays bundle bytes from GHCR — but it cannot forge OCI bundles, index slices, or sigstore signatures: every bundle a client receives must hash to the digest the signed index pins and carry a valid signature, both checked locally.
+- **The edge cannot publish or forge artifacts.** It mints miss admissions and relays bundle bytes from GHCR — but it cannot forge OCI bundles, index slices, or sigstore signatures: every bundle a client receives must hash to the digest the signed index pins and carry a valid signature, both checked locally.
 
-Even if the edge or scheduler were fully compromised, an attacker cannot inject malicious artifacts. The worst they can do is pollute D1 with rows that point at digests they do not own — and those rows are detected and pruned the first time a client tries to fetch them.
+Even if the edge or scheduler were fully compromised, an attacker cannot inject malicious artifacts — every artifact byte a client accepts must still match the digest and signature the trusted pipeline produced.
 
 ## Project structure
 

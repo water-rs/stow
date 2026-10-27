@@ -1,6 +1,6 @@
 //! Host-only [`DurableDb`] backend over an in-memory `SQLite` database, so the
-//! scheduler's SQL (queue schema, eligibility predicates, lease arithmetic)
-//! is exercised by unit tests instead of only the pure `plan_alarm` policy.
+//! scheduler's flat store (event log, snapshot chunks, watermark) is
+//! exercised by unit tests against a real SQL engine.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,7 +11,7 @@ use skyzen_services::durable::{
 use sqlx::{Column as _, Row as _, TypeInfo as _, ValueRef as _, sqlite::SqliteRow};
 
 use crate::errors::QueueError;
-use crate::scheduler::queue::{self, SchedulerSettings};
+use crate::scheduler::store;
 
 /// `DurableDbBackend` backed by a `sqlx` `SQLite` pool.
 #[derive(Debug, Clone)]
@@ -49,10 +49,7 @@ impl SqliteBackend {
 pub async fn memory_db() -> Result<DurableDb, QueueError> {
     let backend = memory_backend().await?;
     let db = DurableDb::new(backend.clone());
-    queue::reset(&db).await?;
-    // The operator reset route stamps the configured floor right after
-    // the schema lands — the deployed store always carries the row.
-    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    store::reset(&db).await?;
     backend.close_ddl_permit();
     Ok(db)
 }
@@ -82,8 +79,9 @@ pub struct LoggedStatement {
     pub sql: String,
     /// The parameters bound to it, in bind order.
     pub params: Vec<DbValue>,
-    /// Rows the statement returned (its result cardinality — not the
-    /// rows its plan touched; the plan is what bounds those).
+    /// Rows the statement billed as read: its result cardinality, plus
+    /// for an `UPDATE` the rows it changed — workerd's bill, mirrored
+    /// (stow#931).
     pub rows_read: u64,
     /// Rows the statement wrote (`changes()`/`total_changes()` per
     /// statement).
@@ -110,8 +108,7 @@ pub async fn counting_memory_db() -> Result<(DurableDb, StatementLog), QueueErro
         inner: inner.clone(),
         log: log.clone(),
     });
-    queue::reset(&db).await?;
-    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    store::reset(&db).await?;
     inner.close_ddl_permit();
     Ok((db, log))
 }
@@ -127,8 +124,7 @@ pub async fn counting_memory_db_raw() -> Result<(DurableDb, StatementLog), Queue
         inner,
         log: log.clone(),
     });
-    queue::reset(&db).await?;
-    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    store::reset(&db).await?;
     Ok((db, log))
 }
 
@@ -213,8 +209,7 @@ pub async fn real_bind_db() -> Result<DurableDb, QueueError> {
     let db = DurableDb::new(RealBindBackend {
         inner: inner.clone(),
     });
-    queue::reset(&db).await?;
-    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    store::reset(&db).await?;
     inner.close_ddl_permit();
     Ok(db)
 }
@@ -366,8 +361,7 @@ pub async fn scripted_sync_db(
         syncs: std::sync::Arc::new(std::sync::Mutex::new(syncs.into_iter().collect())),
         events: events.clone(),
     });
-    queue::reset(&db).await?;
-    queue::apply_dispatch_floor(&db, &SchedulerSettings::default()).await?;
+    store::reset(&db).await?;
     inner.close_ddl_permit();
     Ok((db, events))
 }
@@ -399,7 +393,7 @@ const DDL_HEADS: &[&str] = &[
 /// ([`DO_ALLOWED_PRAGMAS`], applied even inside the reset path — the
 /// real DO authorizer checks the reset handler's statements too) and
 /// the ops rule that only the reset path may issue DDL or pragmas
-/// (`ddl_permitted`, set only while `queue::reset` is reachable).
+/// (`ddl_permitted`, set only while `store::reset` is reachable).
 /// Statement heads are read after `;`; string literals and
 /// `--`/`/* */` comments are skipped so a false positive cannot block a
 /// statement that merely mentions the word — and an injection
@@ -514,10 +508,23 @@ impl DurableDbBackend for SqliteBackend {
             .iter()
             .map(row_to_json)
             .collect::<Result<Vec<_>, _>>()?;
+        let returned = u64::try_from(rows.len()).map_err(backend_error)?;
+        let changed = u64::try_from(after.saturating_sub(before)).map_err(backend_error)?;
+        // workerd bills an UPDATE one read per row it changes plus one
+        // per row its RETURNING clause returns — the meter checkpoint
+        // measured `rows_returned 1`, `rows_read 2`, `rows_written 1`
+        // on release gate run 40186665163's statement log (stow#931).
+        // The host backend reports the same bill so host tests
+        // exercise production's accounting; `execute` keeps the
+        // engine's own.
+        let update = query
+            .split_whitespace()
+            .next()
+            .is_some_and(|head| head.eq_ignore_ascii_case("update"));
         Ok(DbExecResult {
-            rows_read: u64::try_from(rows.len()).map_err(backend_error)?,
+            rows_read: if update { returned + changed } else { returned },
             rows,
-            rows_written: u64::try_from(after.saturating_sub(before)).map_err(backend_error)?,
+            rows_written: changed,
         })
     }
 

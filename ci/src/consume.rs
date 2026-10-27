@@ -63,6 +63,24 @@ pub async fn slices_for_task(
     config: &ConsumeConfig,
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<Vec<IndexSlice>> {
+    slices_for_task_with(task, |target, rustc_version| {
+        Box::pin(async move { build_consume::ensure_slice(config, &target, &rustc_version).await })
+    })
+    .await
+}
+
+/// [`slices_for_task`] with the slice fetch injected, so a test answers
+/// from its own source instead of the process's config — the failure a
+/// real fetch produces needs no environment to reach the error path.
+pub async fn slices_for_task_with<'s>(
+    task: &BuildTaskPayload,
+    fetch: impl Fn(
+        String,
+        String,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = stow_types::error::Result<IndexSlice>> + Send + 's>,
+    >,
+) -> stow_types::error::Result<Vec<IndexSlice>> {
     let nodes = &task.dependency_subgraph.nodes;
     let mut targets = BTreeSet::new();
     if nodes.iter().any(|node| !node.host_side) {
@@ -71,10 +89,12 @@ pub async fn slices_for_task(
     if nodes.iter().any(|node| node.host_side) {
         targets.insert(crate::task::compile_host(task).await?);
     }
-    futures_util::future::try_join_all(targets.iter().map(|target| async move {
-        build_consume::ensure_slice(config, target, task.rustc_version.as_str())
-            .await
-            .map_err(|error| error.wrap_err(format!("index slice for {target}")))
+    let rustc_version = task.rustc_version.as_str().to_owned();
+    futures_util::future::try_join_all(targets.iter().map(|target| {
+        futures_util::TryFutureExt::map_err(
+            fetch(target.clone(), rustc_version.clone()),
+            move |error| error.wrap_err(format!("index slice for {target}")),
+        )
     }))
     .await
 }
@@ -607,7 +627,7 @@ mod tests {
     /// ones the `candidates` matching tests exercise.
     fn index_slice(rows: Vec<ArtifactIndexRow>) -> stow_cli::build_consume::IndexSlice {
         stow_cli::build_consume::IndexSlice {
-            manifest_digest: "sha256:".to_owned() + &"cd".repeat(32),
+            manifest_digest: Some("sha256:".to_owned() + &"cd".repeat(32)),
             index: ArtifactIndex {
                 header: ArtifactIndexHeader {
                     format_version: stow_types::index::ARTIFACT_INDEX_FORMAT_VERSION,
@@ -632,8 +652,7 @@ mod tests {
         side: UnitSide,
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity"),
+            dependency_task_ids: Vec::new(),
             crate_name: CrateName::parse(name).unwrap(),
             version: CrateVersion::new(semver::Version::parse(version).unwrap()),
             features_json: FeaturesJson::canonicalize(

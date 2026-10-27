@@ -8,8 +8,7 @@
 //! `deploy verdict --phase promoted` runs after promotion to 100%: the
 //! metrics with no version dimension compare the post-promotion window
 //! against the equal-length window that ended at the canary shift —
-//! DO cpu/rows per DO request from `durableObjectsPeriodicGroups`, and D1
-//! rows per worker request from `d1AnalyticsAdaptiveGroups`.
+//! DO cpu/rows per DO request from `durableObjectsPeriodicGroups`.
 //!
 //! Both phases read Cloudflare's GraphQL Analytics API with
 //! `CLOUDFLARE_API_TOKEN` (Account Analytics read); they neither deploy nor
@@ -30,10 +29,9 @@
 //! review); the tests fail if a query names anything outside them. Still
 //! not live-verified: the `scriptName`/`datetime_geq`/`datetime_leq`
 //! *filter* arguments (dimension filters are standard across these
-//! datasets), and `d1AnalyticsAdaptiveGroups` dimensions — the D1 query
-//! selects none, so it is an account total like the DO periodic one, which
-//! assumes stow-edge is the account's only DO/D1-bearing Worker during a
-//! deploy window.
+//! datasets). The `durableObjectsPeriodicGroups` query is an account
+//! total, which assumes stow-edge is the account's only DO-bearing Worker
+//! during a deploy window.
 
 #[cfg(test)]
 mod schema;
@@ -71,7 +69,7 @@ enum VerdictPhase {
     /// Traffic is split: per-`scriptVersion` worker metrics plus the
     /// versioned DO invocation metrics.
     Canary,
-    /// Post-promotion: account-total DO periodic and D1 metrics, window
+    /// Post-promotion: account-total DO periodic metrics, window
     /// over window.
     Promoted,
 }
@@ -276,28 +274,6 @@ const PROMOTED_THRESHOLDS: &[MetricSpec<PromotedSample>] = &[
             (sample.do_requests > 0.0).then(|| sample.do_rows_written / sample.do_requests)
         },
     },
-    MetricSpec {
-        name: "d1 rows read",
-        unit: "rows/req",
-        threshold: Threshold {
-            max_ratio: 1.25,
-            max_abs_delta: 1.0,
-        },
-        extract: |sample| {
-            (sample.worker_requests > 0.0).then(|| sample.d1_rows_read / sample.worker_requests)
-        },
-    },
-    MetricSpec {
-        name: "d1 rows written",
-        unit: "rows/req",
-        threshold: Threshold {
-            max_ratio: 1.25,
-            max_abs_delta: 0.5,
-        },
-        extract: |sample| {
-            (sample.worker_requests > 0.0).then(|| sample.d1_rows_written / sample.worker_requests)
-        },
-    },
 ];
 
 /// One metric's measured pair and how it landed against its threshold.
@@ -382,6 +358,7 @@ struct CanarySample {
 /// One promoted-phase window's account totals — nothing is versioned, so
 /// the window itself is the comparison axis.
 #[derive(Debug)]
+#[allow(clippy::struct_field_names)]
 struct PromotedSample {
     /// `durableObjectsInvocationsAdaptiveGroups sum.requests` — the
     /// denominator the DO periodic metrics divide by.
@@ -392,15 +369,7 @@ struct PromotedSample {
     do_rows_read: f64,
     /// `durableObjectsPeriodicGroups sum.rowsWritten`.
     do_rows_written: f64,
-    /// `workersInvocationsAdaptive sum.requests` — the denominator the D1
-    /// metrics divide by.
-    worker_requests: f64,
-    /// `d1AnalyticsAdaptiveGroups sum.rowsRead`.
-    d1_rows_read: f64,
-    /// `d1AnalyticsAdaptiveGroups sum.rowsWritten`.
-    d1_rows_written: f64,
 }
-
 // ---- GraphQL wire shapes -------------------------------------------------
 
 /// What the canary query returns.
@@ -425,13 +394,6 @@ struct PromotedData {
     /// request denominator.
     #[serde(rename = "durableObjectsInvocationsAdaptiveGroups")]
     do_requests: Vec<RequestsGroup>,
-    /// `d1AnalyticsAdaptiveGroups`.
-    #[serde(rename = "d1AnalyticsAdaptiveGroups")]
-    d1: Vec<D1Group>,
-    /// `workersInvocationsAdaptive` — used only for the request
-    /// denominator, so no dimensions are selected.
-    #[serde(rename = "workersInvocationsAdaptive")]
-    worker_requests: Vec<RequestsGroup>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -514,22 +476,6 @@ struct DoPeriodicSum {
     rows_written: f64,
 }
 
-#[derive(Debug, Deserialize)]
-struct D1Group {
-    /// Sums for the group.
-    sum: D1Sum,
-}
-
-#[derive(Debug, Deserialize)]
-struct D1Sum {
-    /// Rows read.
-    #[serde(rename = "rowsRead")]
-    rows_read: f64,
-    /// Rows written.
-    #[serde(rename = "rowsWritten")]
-    rows_written: f64,
-}
-
 /// A group carrying only `sum.requests` — the denominator rows.
 #[derive(Debug, Deserialize)]
 struct RequestsGroup {
@@ -556,13 +502,12 @@ struct WindowVars<'a> {
 /// Selecting only `dimensions { scriptVersion }` makes Cloudflare return
 /// one row per deployed version. The DO dataset is filtered by datetime
 /// alone — `scriptName` is not among its confirmed dimensions — so it is
-/// an account total like every other DO/D1 dataset (see module docs).
+/// an account total like every other DO dataset (see module docs).
 const CANARY_QUERY: &str = include_str!("../queries/deploy-canary.graphql");
 
 /// The promoted query: the unversioned datasets, account totals, one round
-/// trip — `durableObjectsPeriodicGroups` and `d1AnalyticsAdaptiveGroups`
-/// for the numerators, the invocation datasets for the request
-/// denominators.
+/// trip — `durableObjectsPeriodicGroups` for the numerators, the
+/// invocation datasets for the request denominators.
 const PROMOTED_QUERY: &str = include_str!("../queries/deploy-promoted.graphql");
 
 pub async fn run(args: DeployArgs, output: Output) -> stow_types::error::Result<()> {
@@ -674,9 +619,6 @@ async fn promoted_sample(
             .iter()
             .map(|group| group.sum.rows_written)
             .sum(),
-        worker_requests: requests(&data.worker_requests),
-        d1_rows_read: data.d1.iter().map(|group| group.sum.rows_read).sum(),
-        d1_rows_written: data.d1.iter().map(|group| group.sum.rows_written).sum(),
     })
 }
 
@@ -943,18 +885,11 @@ mod tests {
 
     /// A `data.viewer.accounts[0]` document the way `PROMOTED_QUERY`
     /// returns it: account totals.
-    fn promoted_data(
-        periodic_sum: &serde_json::Value,
-        do_requests: f64,
-        d1_sum: &serde_json::Value,
-        worker_requests: f64,
-    ) -> serde_json::Value {
+    fn promoted_data(periodic_sum: &serde_json::Value, do_requests: f64) -> serde_json::Value {
         json!({
             "viewer": { "accounts": [{
                 "durableObjectsPeriodicGroups": [{ "sum": periodic_sum.clone() }],
                 "durableObjectsInvocationsAdaptiveGroups": [{ "sum": { "requests": do_requests } }],
-                "d1AnalyticsAdaptiveGroups": [{ "sum": d1_sum.clone() }],
-                "workersInvocationsAdaptive": [{ "sum": { "requests": worker_requests } }],
             }] }
         })
     }
@@ -977,17 +912,6 @@ mod tests {
             "storageReadUnits": read,
             "storageWriteUnits": written,
             "subrequests": 0.0,
-        })
-    }
-
-    /// `d1AnalyticsAdaptiveGroups` rows.
-    fn d1_sum(read: f64, written: f64) -> serde_json::Value {
-        json!({
-            "rowsRead": read,
-            "rowsWritten": written,
-            "readQueries": read,
-            "writeQueries": written,
-            "queryBatchResponseBytes": read * 64.0,
         })
     }
 
@@ -1021,9 +945,6 @@ mod tests {
                 .iter()
                 .map(|group| group.sum.rows_written)
                 .sum(),
-            worker_requests: requests(&data.worker_requests),
-            d1_rows_read: data.d1.iter().map(|group| group.sum.rows_read).sum(),
-            d1_rows_written: data.d1.iter().map(|group| group.sum.rows_written).sum(),
         }
     }
 
@@ -1056,14 +977,10 @@ mod tests {
         let baseline = promoted_sample(&promoted_data(
             &periodic_sum(1_000_000_000.0, 5_000.0, 2_000.0),
             10_000.0,
-            &d1_sum(60_000.0, 8_000.0),
-            100_000.0,
         ));
         let candidate = promoted_sample(&promoted_data(
             &periodic_sum(1_050_000_000.0, 5_300.0, 2_100.0),
             10_200.0,
-            &d1_sum(62_000.0, 8_100.0),
-            98_000.0,
         ));
         (baseline, candidate)
     }
@@ -1146,15 +1063,6 @@ mod tests {
             assert!(
                 schema::DO_INVOCATIONS_SUM.contains(&field),
                 "{field} not in DO_INVOCATIONS_SUM"
-            );
-        }
-        for field in selected_fields(PROMOTED_QUERY, "d1AnalyticsAdaptiveGroups", "sum") {
-            assert!(schema::D1_SUM.contains(&field), "{field} not in D1_SUM");
-        }
-        for field in selected_fields(PROMOTED_QUERY, "workersInvocationsAdaptive", "sum") {
-            assert!(
-                schema::WORKERS_SUM.contains(&field),
-                "{field} not in WORKERS_SUM"
             );
         }
     }
@@ -1353,23 +1261,6 @@ mod tests {
     }
 
     #[test]
-    fn a_d1_rows_read_regression_breaches_post_promotion() {
-        let (baseline, _) = promoted_samples();
-        // D1 reads tripled per worker request: past the 1.25x + 1.0 ceiling.
-        let candidate = promoted_sample(&promoted_data(
-            &periodic_sum(1_050_000_000.0, 5_300.0, 2_100.0),
-            10_200.0,
-            &d1_sum(180_000.0, 8_100.0),
-            98_000.0,
-        ));
-        let mut promoted_args = args();
-        promoted_args.phase = VerdictPhase::Promoted;
-        let report = evaluate_promoted(&promoted_args, &baseline, &candidate);
-        assert!(!report.pass);
-        assert_eq!(report.breaches, ["d1 rows read"]);
-    }
-
-    #[test]
     fn a_do_cpu_regression_breaches_post_promotion() {
         let (baseline, _) = promoted_samples();
         // DO cpu/request doubled: 100_000µs -> 200_000µs vs ceiling
@@ -1377,8 +1268,6 @@ mod tests {
         let candidate = promoted_sample(&promoted_data(
             &periodic_sum(2_040_000_000.0, 5_300.0, 2_100.0),
             10_200.0,
-            &d1_sum(62_000.0, 8_100.0),
-            98_000.0,
         ));
         let mut promoted_args = args();
         promoted_args.phase = VerdictPhase::Promoted;
@@ -1391,12 +1280,7 @@ mod tests {
     fn an_empty_promoted_window_skips_rather_than_breaches() {
         // No DO traffic at all during the window — nothing to compare.
         let (baseline, _) = promoted_samples();
-        let candidate = promoted_sample(&promoted_data(
-            &periodic_sum(0.0, 0.0, 0.0),
-            0.0,
-            &d1_sum(62_000.0, 8_100.0),
-            98_000.0,
-        ));
+        let candidate = promoted_sample(&promoted_data(&periodic_sum(0.0, 0.0, 0.0), 0.0));
         let mut promoted_args = args();
         promoted_args.phase = VerdictPhase::Promoted;
         let report = evaluate_promoted(&promoted_args, &baseline, &candidate);
@@ -1417,7 +1301,7 @@ mod tests {
     fn threshold_tables_cover_every_phase() {
         // Keeps `apply_thresholds` honest if a spec list loses an entry.
         assert_eq!(CANARY_THRESHOLDS.len(), 7);
-        assert_eq!(PROMOTED_THRESHOLDS.len(), 5);
+        assert_eq!(PROMOTED_THRESHOLDS.len(), 3);
     }
 
     #[test]

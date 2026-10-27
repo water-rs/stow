@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/water-rs/stow/compare/stow-oci-v0.7.0...stow-oci-v0.8.0) - 2026-10-26
+
+### Added
+
+- [**breaking**] one CI interface for build occupancy and task submission ([#899](https://github.com/water-rs/stow/pull/899))
+
+### Fixed
+
+- read a missing cache package as the empty index ([#939](https://github.com/water-rs/stow/pull/939))
+- [**breaking**] record each row's direct child task ids and join substitution by task id ([#925](https://github.com/water-rs/stow/pull/925))
+- *(oci)* load the Sigstore trust root through sigstore-trust-root ([#873](https://github.com/water-rs/stow/pull/873))
+
+### Other
+
+- [**breaking**] stop using D1 ([#905](https://github.com/water-rs/stow/pull/905))
+
 ## [0.7.0](https://github.com/water-rs/stow/compare/stow-oci-v0.6.0...stow-oci-v0.7.0) - 2026-10-22
 
 ### Added

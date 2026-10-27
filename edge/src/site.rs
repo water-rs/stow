@@ -46,7 +46,7 @@ const AUDIT_URL: &str = "https://github.com/water-rs/stow/blob/main/docs/acceler
 
 /// The target the cache lookup picker selects by default — a visitor's
 /// own platform cannot be guessed reliably, so the picker defaults to
-/// the most common CI leg.
+/// the most common CI target.
 const DEFAULT_LOOKUP_TARGET: &str = "x86_64-unknown-linux-gnu";
 
 /// Page configuration probed once at worker startup.
@@ -340,13 +340,17 @@ pub struct StatsPage {
     /// Suppressed below the publication threshold — the template hides
     /// the figure entirely.
     daily_active_installs_7d: Option<String>,
+    builds_24h: String,
     hits_24h: String,
     misses_24h: String,
     hit_rate_24h: String,
     cpu_hours_saved_30d: String,
-    top_crates: Vec<StatsLeaderboardEntry>,
-    targets: Vec<StatsLeaderboardEntry>,
+    top_digests: Vec<StatsLeaderboardEntry>,
+    rustc_versions: Vec<StatsLeaderboardEntry>,
     cli_versions: Vec<StatsLeaderboardEntry>,
+    operating_systems: Vec<StatsLeaderboardEntry>,
+    countries: Vec<StatsLeaderboardEntry>,
+    environments: Vec<StatsLeaderboardEntry>,
     repository_url: &'static str,
     version: &'static str,
     css: &'static str,
@@ -392,13 +396,17 @@ impl StatsPage {
         };
         Self {
             daily_active_installs_7d: stats.daily_active_installs_7d.map(grouped),
+            builds_24h: grouped(stats.builds_24h),
             hits_24h: grouped(stats.hits_24h),
             misses_24h: grouped(stats.misses_24h),
             hit_rate_24h: format!("{:.0}%", stats.hit_rate_24h * 100.0),
             cpu_hours_saved_30d: format_cpu_hours(stats.cpu_hours_saved_30d),
-            top_crates: entries(&stats.top_crates_30d),
-            targets: entries(&stats.targets_30d),
+            top_digests: entries(&stats.top_digests_30d),
+            rustc_versions: entries(&stats.rustc_versions_30d),
             cli_versions: entries(&stats.cli_versions_30d),
+            operating_systems: entries(&stats.operating_systems_30d),
+            countries: entries(&stats.countries_30d),
+            environments: entries(&stats.environments_30d),
             repository_url: REPOSITORY_URL,
             version: env!("CARGO_PKG_VERSION"),
             css: SITE_CSS,
@@ -583,21 +591,34 @@ mod stats_page_tests {
     fn stats(daily_active_installs_7d: Option<u64>) -> UsageStats {
         UsageStats {
             daily_active_installs_7d,
+            builds_24h: 890,
             hits_24h: 1_234_567,
             misses_24h: 42,
             hit_rate_24h: 0.9667,
             cpu_hours_saved_30d: 123.4,
-            top_crates_30d: vec![UsageStatEntry {
-                name: "serde".to_owned(),
+            top_digests_30d: vec![UsageStatEntry {
+                name: "sha256:ab12".to_owned(),
                 hits: 9_999,
             }],
-            targets_30d: vec![UsageStatEntry {
-                name: "x86_64-unknown-linux-gnu".to_owned(),
+            rustc_versions_30d: vec![UsageStatEntry {
+                name: "1.99.0".to_owned(),
                 hits: 5_000,
             }],
             cli_versions_30d: vec![UsageStatEntry {
                 name: "0.5.0".to_owned(),
                 hits: 500,
+            }],
+            operating_systems_30d: vec![UsageStatEntry {
+                name: "linux".to_owned(),
+                hits: 400,
+            }],
+            countries_30d: vec![UsageStatEntry {
+                name: "US".to_owned(),
+                hits: 300,
+            }],
+            environments_30d: vec![UsageStatEntry {
+                name: "ci".to_owned(),
+                hits: 200,
             }],
         }
     }
@@ -608,10 +629,13 @@ mod stats_page_tests {
         assert!(html.contains("1,234,567"));
         assert!(html.contains("123,456"));
         assert!(html.contains("97%"));
-        assert!(html.contains("serde"));
+        assert!(html.contains("sha256:ab12"));
         assert!(html.contains("9,999"));
-        assert!(html.contains("x86_64-unknown-linux-gnu"));
+        assert!(html.contains("1.99.0"));
         assert!(html.contains("0.5.0"));
+        assert!(html.contains("linux"));
+        assert!(html.contains("US"));
+        assert!(html.contains("ci"));
         assert!(html.contains("/api/v1/stats"));
         assert!(html.contains("PRIVACY.md"));
     }
@@ -625,7 +649,7 @@ mod stats_page_tests {
     #[test]
     fn stats_page_says_no_hits_when_leaderboards_are_empty() {
         let mut empty = stats(Some(100));
-        empty.top_crates_30d.clear();
+        empty.top_digests_30d.clear();
         let html = render(&empty);
         assert!(html.contains("no hits yet"));
     }

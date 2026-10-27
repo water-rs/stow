@@ -16,9 +16,11 @@ mod coverage;
 mod crates_io;
 mod demand_feed;
 mod deploy;
+mod dump;
 mod github;
 mod index_cmd;
 mod launch_model;
+mod login;
 mod maintenance;
 mod manual;
 mod preheat;
@@ -35,6 +37,7 @@ mod source_trees;
 #[cfg(test)]
 mod test_server;
 mod traffic_cost;
+mod watch;
 mod watchdog;
 
 use std::fmt::Write as _;
@@ -42,13 +45,14 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use stow_types::api::{
-    AdminStatus, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger, EnqueueRequest,
-    FreezeTransitionEvent, SchedulerSubmitResponse,
+    AdminStatus, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger, FreezeTransitionEvent,
+    SchedulerSubmitResponse,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
 };
 use stow_types::stow_error;
+use stow_types::transient::{Backoff, is_transient_status, retry_after_hint};
 use tracing_subscriber::EnvFilter;
 use zenwave::{Client, ResponseExt};
 
@@ -90,7 +94,7 @@ enum Command {
     /// Scheduler overview: lane depths, oldest pending age, in-flight
     /// runs with their GitHub URLs, and per-target outcomes over the
     /// trailing 24 hours.
-    Status,
+    Status(StatusArgs),
     /// Inspect and mutate scheduler queue rows.
     Queue(queue::QueueArgs),
     /// Scheduler operations — the store reset and anything else that
@@ -134,17 +138,30 @@ enum Command {
     Submit(SubmitArgs),
     /// Canary deployment verdicts for the edge Worker.
     Deploy(deploy::DeployArgs),
+    /// Authorize this machine as your GitHub account: the edge
+    /// credential every operator command sends outside Actions.
+    Login(login::LoginArgs),
+}
+
+#[derive(Args)]
+struct StatusArgs {
+    /// The live build-queue view (stow#853): the scheduler's queue
+    /// merged with `build-crate.yml`'s in-flight runs, re-rendered
+    /// every 30 s until Ctrl-C. Under `--json` each frame is one
+    /// NDJSON line.
+    #[arg(long)]
+    watch: bool,
 }
 
 #[derive(Args)]
 struct DispatchFreezeArgs {
-    /// `status` reads the freeze; `clear` lifts it, resuming dispatch of
-    /// everything that queued during it. Engagement is automatic — a
-    /// systematic-failure or cost trip — or the dispatch-freeze POST.
+    /// `status` reads the freeze; `engage` stops dispatch by hand, as a
+    /// systematic-failure or cost trip does on its own; `clear` lifts
+    /// it, resuming dispatch of everything that queued during it.
     #[arg(value_enum)]
     action: DispatchFreezeAction,
-    /// Apply the clear. `status` never mutates; `clear` without `--yes`
-    /// prints the plan and exits 0.
+    /// Apply the change. `status` never mutates; `engage` and `clear`
+    /// without `--yes` print the plan and exit 0.
     #[arg(long)]
     yes: bool,
 }
@@ -152,6 +169,7 @@ struct DispatchFreezeArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DispatchFreezeAction {
     Status,
+    Engage,
     Clear,
 }
 
@@ -174,6 +192,12 @@ struct SubmitArgs {
     /// hand-submitted tasks; every resolver-emitted task carries false.
     #[arg(long, default_value_t = false)]
     preserve_lockfile: bool,
+    /// The priority the tasks enter the rank with, as a multiple of the
+    /// CLI miss's (stow#879): `--priority 30` is the website class.
+    /// Defaults to the website class — an operator submission is a named
+    /// request.
+    #[arg(long, default_value_t = 30)]
+    priority: i64,
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
@@ -226,26 +250,27 @@ fn run<F: std::future::Future>(future: F) -> stow_types::error::Result<F::Output
 
 async fn dispatch(command: Command, output: Output) -> stow_types::error::Result<()> {
     match command {
-        Command::Status => status(&Edge::connect().await?, output).await,
-        Command::Queue(args) => queue::run(&Edge::connect().await?, args, output).await,
-        Command::Scheduler(args) => scheduler::run(&Edge::connect().await?, args, output).await,
-        Command::Coverage(args) => coverage::run(&Edge::connect().await?, args, output).await,
+        Command::Status(args) => status(&Edge::connect()?, args, output).await,
+        Command::Queue(args) => queue::run(&Edge::connect()?, args, output).await,
+        Command::Scheduler(args) => scheduler::run(&Edge::connect()?, args, output).await,
+        Command::Coverage(args) => coverage::run(args, output).await,
         Command::Preheat(args) => preheat::run(args, output).await,
         Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
         Command::Builds(args) => builds::run(&github_token().await?, args, output).await,
-        Command::Artifacts(args) => artifacts::run(&Edge::connect().await?, args, output).await,
+        Command::Artifacts(args) => artifacts::run(args, output).await,
         Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
         Command::Maintenance(args) => maintenance::run(args, output).await,
-        Command::Watchdog(args) => watchdog::run(&Edge::connect().await?, args, output).await,
+        Command::Watchdog(args) => watchdog::run(&Edge::connect()?, args, output).await,
         Command::DispatchFreeze(args) => {
-            dispatch_freeze_switch(&Edge::connect().await?, args, output).await
+            dispatch_freeze_switch(&Edge::connect()?, args, output).await
         }
         Command::Index(args) => index_cmd::run(args).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
         Command::TrafficCost(args) => traffic_cost::run(args, output).await,
         Command::Request(args) => request::run(args, output).await,
-        Command::Submit(args) => submit_command(&Edge::connect().await?, args, output).await,
+        Command::Submit(args) => submit_command(&Edge::connect()?, args, output).await,
         Command::Deploy(args) => deploy::run(args, output).await,
+        Command::Login(args) => login::run(args).await,
     }
 }
 
@@ -270,14 +295,14 @@ pub(crate) struct Edge {
 
 impl Edge {
     /// Resolve `STOW_EDGE_URL` and the credential source: Actions OIDC
-    /// when the runtime advertises it, else the operator's GitHub token.
-    pub(crate) async fn connect() -> stow_types::error::Result<Self> {
+    /// when the runtime advertises it, else [`edge_token`].
+    pub(crate) fn connect() -> stow_types::error::Result<Self> {
         let base = std::env::var(STOW_EDGE_URL_ENV)
             .map_err(|_| stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
         let token = if actions_oidc_available() {
             None
         } else {
-            Some(github_token().await?)
+            Some(edge_token()?)
         };
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
@@ -291,9 +316,9 @@ impl Edge {
     /// The edge for a lane whose plan needs none: connected only when
     /// the lane will submit (`yes`), so a plan-only run needs neither
     /// `STOW_EDGE_URL` nor a credential.
-    pub(crate) async fn connect_to_submit(yes: bool) -> stow_types::error::Result<Option<Self>> {
+    pub(crate) fn connect_to_submit(yes: bool) -> stow_types::error::Result<Option<Self>> {
         if yes {
-            Self::connect().await.map(Some)
+            Self::connect().map(Some)
         } else {
             Ok(None)
         }
@@ -352,6 +377,63 @@ impl Edge {
             .into_json()
             .await
             .map_err(|error| stow_error!("decode {url}: {error}"))
+    }
+
+    /// `get_json` under `backoff` — the watch's scheduler read retries
+    /// a transient status or transport cut the way `github::send_get`
+    /// does: a bounded budget, the answer's `Retry-After` honored, and
+    /// the last refusal surfacing once the budget is spent (stow#853).
+    /// The request is rebuilt each attempt because a minted bearer is
+    /// per-request.
+    pub(crate) async fn get_json_retried<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        mut backoff: Backoff,
+    ) -> stow_types::error::Result<T> {
+        loop {
+            let url = format!("{}{path}", self.base);
+            let bearer = self.bearer().await?;
+            let mut client = zenwave::client().timeout(REQUEST_TIMEOUT);
+            let request = client
+                .get(&url)
+                .and_then(|request| request.header("Authorization", format!("Bearer {bearer}")))
+                .and_then(|request| match &self.version_override {
+                    Some(value) => request.header(VERSION_OVERRIDES_HEADER, value.clone()),
+                    None => Ok(request),
+                })
+                .map_err(|error| stow_error!("GET {url}: {error}"))?;
+            match request.await {
+                Ok(response) => {
+                    if !is_transient_status(response.status().as_u16()) {
+                        return response
+                            .error_for_status()
+                            .await
+                            .map_err(|error| stow_error!("GET {url}: {error}"))?
+                            .into_json()
+                            .await
+                            .map_err(|error| stow_error!("decode {url}: {error}"));
+                    }
+                    let retry_after = retry_after_hint(response.headers());
+                    let status = response.status();
+                    let Some(wait) = backoff.next_wait(retry_after) else {
+                        let error = response
+                            .error_for_status()
+                            .await
+                            .expect_err("a transient status is an error status");
+                        return Err(stow_error!("GET {url}: {error}"));
+                    };
+                    tracing::warn!(%status, wait = ?wait, "edge read transient; retrying");
+                    tokio::time::sleep(wait).await;
+                }
+                Err(error) => {
+                    let Some(wait) = backoff.next_wait(None) else {
+                        return Err(stow_error!("GET {url}: {error}"));
+                    };
+                    tracing::warn!(%error, wait = ?wait, "edge read cut; retrying");
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
     }
 
     /// `POST` a JSON body to an edge path and decode its JSON answer.
@@ -551,8 +633,17 @@ fn encode_uri_component(value: &str) -> String {
     out
 }
 
-/// `GET /api/v1/admin/status` rendered for the operator.
-async fn status(edge: &Edge, output: Output) -> stow_types::error::Result<()> {
+/// `GET /api/v1/admin/status` rendered for the operator — or, under
+/// `--watch`, the live build-queue view until Ctrl-C (stow#853).
+async fn status(edge: &Edge, args: StatusArgs, output: Output) -> stow_types::error::Result<()> {
+    if args.watch {
+        let token = github_token().await?;
+        let tz = jiff::tz::TimeZone::try_system()
+            .map_err(|error| stow_error!("system time zone cannot be determined: {error}"))?;
+        let mut watch = watch::Watch::new(time::OffsetDateTime::now_utc());
+        let mut screen = render::Screen::new(output, tz);
+        return watch.run(edge, &token, github::API_BASE, &mut screen).await;
+    }
     let status: AdminStatus = edge.get_json("/api/v1/admin/status").await?;
     render::emit(output, &status, |status| {
         let mut out = String::new();
@@ -639,8 +730,9 @@ async fn dispatch_freeze_switch(
         let switch: DispatchFreeze = edge.get_json("/api/v1/admin/dispatch-freeze").await?;
         return render::emit(output, &switch, render_freeze);
     }
+    let enabled = args.action == DispatchFreezeAction::Engage;
     let plan = DispatchFreeze {
-        enabled: false,
+        enabled,
         record: None,
         transitions: Vec::new(),
     };
@@ -648,7 +740,12 @@ async fn dispatch_freeze_switch(
         output,
         plan,
         |envelope: &render::Planned<DispatchFreeze, DispatchFreeze>| {
-            let mut out = "clear dispatch freeze\n".to_owned();
+            let mut out = if enabled {
+                "engage dispatch freeze\n"
+            } else {
+                "clear dispatch freeze\n"
+            }
+            .to_owned();
             if let Some(result) = &envelope.result {
                 let _ = writeln!(out, "{}", render_freeze(result));
             }
@@ -798,20 +895,30 @@ async fn submit_command(
     })
     .await
     .map_err(|error| stow_error!("submit resolver task: {error}"))??;
+    let trees = vec![stow_types::api::SubmissionTree::from_enqueue_requests(
+        stow_types::api::SubmissionSource::Operations {
+            priority: args.priority.saturating_mul(100),
+        },
+        &requests,
+    )?];
     render::mutation(
         output,
-        requests,
-        |envelope: &render::Planned<Vec<EnqueueRequest>, SchedulerSubmitResponse>| {
-            let mut out = format!("{} task(s)\n", envelope.plan.len());
-            for request in &envelope.plan {
+        trees,
+        |envelope: &render::Planned<
+            Vec<stow_types::api::SubmissionTree>,
+            SchedulerSubmitResponse,
+        >| {
+            let nodes: usize = envelope.plan.iter().map(|tree| tree.nodes.len()).sum();
+            let mut out = format!("{nodes} task(s)\n");
+            for node in envelope.plan.iter().flat_map(|tree| &tree.nodes) {
                 let _ = writeln!(
                     out,
                     "  {} {} {} {} rustc={}",
-                    request.crate_name,
-                    request.version,
-                    request.target,
-                    request.features_json.raw(),
-                    request.rustc_version,
+                    node.crate_name,
+                    node.version,
+                    node.target,
+                    node.features_json.raw(),
+                    node.rustc_version,
                 );
             }
             if let Some(result) = &envelope.result {
@@ -825,7 +932,9 @@ async fn submit_command(
             out
         },
         args.yes
-            .then_some(async move |requests: &Vec<EnqueueRequest>| submit(edge, requests).await),
+            .then_some(async move |trees: &Vec<stow_types::api::SubmissionTree>| {
+                submit(edge, trees).await
+            }),
     )
     .await
 }
@@ -835,10 +944,10 @@ async fn submit_command(
 /// uses.
 pub(crate) async fn submit(
     edge: &Edge,
-    requests: &[EnqueueRequest],
+    trees: &[stow_types::api::SubmissionTree],
 ) -> stow_types::error::Result<SchedulerSubmitResponse> {
     let response: SchedulerSubmitResponse = edge
-        .post_json("/api/v1/scheduler/tasks/submit", &requests)
+        .post_json("/api/v1/scheduler/tasks/submit", &trees)
         .await?;
     tracing::info!(
         submitted = response.submitted,
@@ -849,9 +958,24 @@ pub(crate) async fn submit(
     Ok(response)
 }
 
-/// The operator's GitHub credential for the edge's trusted endpoints and
-/// the GitHub REST calls (`runs`, `cache`): `GH_TOKEN`/`GITHUB_TOKEN`
-/// when set — the precedence `gh` itself follows — else `gh auth token`.
+/// The edge credential outside Actions: `GH_TOKEN`/`GITHUB_TOKEN` when a
+/// job stages its ephemeral token for a local mock edge, else the
+/// `stow-admin login` token. Never `gh auth token` — the edge is
+/// untrusted, and that token carries every scope gh holds (stow#953).
+fn edge_token() -> stow_types::error::Result<String> {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(token) = std::env::var(name)
+            && !token.is_empty()
+        {
+            return Ok(token);
+        }
+    }
+    login::stored_token()
+}
+
+/// The operator's GitHub credential for the GitHub REST calls (`runs`,
+/// `cache`), which go to GitHub alone: `GH_TOKEN`/`GITHUB_TOKEN` when
+/// set — the precedence `gh` itself follows — else `gh auth token`.
 pub(crate) async fn github_token() -> stow_types::error::Result<String> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(name)

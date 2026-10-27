@@ -9,8 +9,8 @@
 #      resolver pins to the stable version is installed
 #   2. read the `limit` and `targets` input defaults of
 #      .github/workflows/preheat-admin.yml — the wave production runs
-#   3. run the three lanes preheat-admin.yml runs — `preheat top`,
-#      `preheat top-binaries`, `preheat projects submit` over the
+#   3. run the two lanes preheat-admin.yml runs — `preheat
+#      top-binaries` and `preheat projects submit` over the
 #      reviewed preheat/projects.toml — plan-only and concurrently (they
 #      are independent): without `--yes` a lane resolves and prints the
 #      tasks it would submit and never connects to an edge, so there is
@@ -20,10 +20,10 @@
 #      $WORK_DIR/production-wave.json; it fails when a lane exited
 #      non-zero or planned nothing, because either understates the wave
 #
-# Why its own job: the resolve takes 10-17 minutes for the two download
-# lanes and up to 100 for the projects lane in production, and beside the
-# Preheat cost job's wave it competed for the runner's CPUs until that
-# job's timeout. Here nothing else runs.
+# Why its own job: the dump download plus the resolve takes minutes for
+# the binaries lane and up to 100 for the projects lane in production,
+# and beside the Preheat cost job's wave it competed for the runner's
+# CPUs until that job's timeout. Here nothing else runs.
 #
 # Every child is bounded by a deadline and killed with its process
 # group on exit; a lane that passes its deadline exits 124, which the
@@ -32,14 +32,22 @@
 # Tunables (env):
 #   STOW_PRODUCTION_WAVE_WORK_DIR  work dir instead of a fresh mktemp
 #                                  (must be empty)
-#   STOW_PRODUCTION_WAVE_LIMIT     --limit of `preheat top` and `preheat
-#                                  top-binaries` (default: the `limit`
-#                                  input's default in preheat-admin.yml)
+#   STOW_PRODUCTION_WAVE_LIMIT     --limit of `preheat top-binaries`
+#                                  (default: the `limit` input's default
+#                                  in preheat-admin.yml)
 #   STOW_PRODUCTION_WAVE_TARGETS   comma-separated --targets of every lane
 #                                  (default: the `targets` input's
 #                                  default in preheat-admin.yml)
 #   STOW_PRODUCTION_WAVE_DEADLINE  seconds each lane may take before it
 #                                  is killed (default 3300)
+#   STOW_RESOLVE_CARGO_HOME        the root every lane's resolve
+#                                  CARGO_HOMEs live under — lane <NN>-<name>
+#                                  resolves against <root>/<NN>-<name>, so
+#                                  the lanes stay parallel while a CI
+#                                  cache restoring the root keeps the
+#                                  index and .crate bodies warm across
+#                                  runs (default: $WORK_DIR/resolve-cargo,
+#                                  per-run scratch)
 #   STOW_E2E_TOOLCHAIN             rustup toolchain for the run (default:
 #                                  stable)
 set -euo pipefail
@@ -60,12 +68,21 @@ if [ -n "${STOW_PRODUCTION_WAVE_WORK_DIR:-}" ]; then
         exit 1
     fi
     mkdir -p "$WORK_DIR"
+    # Later steps run from other directories; pin a relative value.
+    WORK_DIR="$(cd "$WORK_DIR" && pwd)"
 else
     WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/stow-production-wave.XXXXXX")"
 fi
 LOG_DIR="$WORK_DIR/logs"
 LANES_DIR="$WORK_DIR/lanes"
-mkdir -p "$LOG_DIR" "$LANES_DIR"
+# The resolve root sits beside the lane scratch, never inside it: the
+# gate restores it from `actions/cache`, and a restored tree must not
+# trip the empty-WORK_DIR check above. Each lane gets its own
+# subdirectory — the lanes run concurrently and a worker's resolve holds
+# cargo's exclusive package-cache lock, so lanes sharing one home would
+# serialize against each other.
+RESOLVE_ROOT="${STOW_RESOLVE_CARGO_HOME:-$WORK_DIR/resolve-cargo}"
+mkdir -p "$LOG_DIR" "$LANES_DIR" "$RESOLVE_ROOT"
 
 LANE_PIDS=()
 
@@ -122,8 +139,7 @@ require_command yq
 
 # The production wave is the one preheat-admin.yml runs, so its defaults
 # come from that file rather than a copy here. preheat-cron.yml
-# dispatches it with the binaries and projects lanes on, so all three
-# lanes count.
+# dispatches it with the projects lane on, so both lanes count.
 workflow_default() {
     yq ".on.workflow_dispatch.inputs.$1.default" "$PREHEAT_ADMIN_WORKFLOW"
 }
@@ -147,6 +163,7 @@ if ! RUSTUP_TOOLCHAIN="$RUSTC_VERSION" rustc --version >/dev/null 2>&1; then
 fi
 
 log "work dir: $WORK_DIR"
+log "resolve root: $RESOLVE_ROOT"
 log "rustc $RUSTC_VERSION; limit $LIMIT; targets $TARGETS; lane deadline ${LANE_DEADLINE}s"
 
 cd "$REPO_ROOT"
@@ -163,7 +180,8 @@ plan_lane() {
     shift 2
     local dir="$LANES_DIR/$order-$lane"
     mkdir -p "$dir"
-    timeout --kill-after=30 "$LANE_DEADLINE" \
+    STOW_RESOLVE_CARGO_HOME="$RESOLVE_ROOT/$order-$lane" \
+        timeout --kill-after=30 "$LANE_DEADLINE" \
         "$BIN/stow-admin" --json preheat "$@" >"$dir/plan.json" 2>"$dir/stderr.log" || status=$?
     echo "$status" >"$dir/exit"
     log "lane $lane exited $status"
@@ -179,11 +197,9 @@ start_lane() {
     log "started lane $2 (pid $!)"
 }
 
-start_lane 01 top top \
+start_lane 01 top-binaries top-binaries \
     --targets "$TARGETS" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
-start_lane 02 top-binaries top-binaries \
-    --targets "$TARGETS" --rustc-version "$RUSTC_VERSION" --limit "$LIMIT"
-start_lane 03 projects projects submit \
+start_lane 02 projects projects submit \
     --file "$REPO_ROOT/preheat/projects.toml" \
     --targets "$TARGETS" --rustc-version "$RUSTC_VERSION"
 

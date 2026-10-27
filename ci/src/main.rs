@@ -40,7 +40,7 @@ mod workspace_mirror;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use stow_types::api::{BuildBatchPayload, BuildTaskPayload};
+use stow_types::api::BuildTaskPayload;
 use tracing_subscriber::EnvFilter;
 
 const GITHUB_EVENT_PATH_ENV: &str = "GITHUB_EVENT_PATH";
@@ -50,6 +50,7 @@ const STOW_EDGE_URL_ENV: &str = "STOW_EDGE_URL";
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
 const STOW_GITHUB_WEBHOOK_SECRET_ENV: &str = "STOW_GITHUB_WEBHOOK_SECRET";
+const GITHUB_APP_SLUG_ENV: &str = "GITHUB_APP_SLUG";
 /// `mock_compile::STOW_BUILD_MOCK_COMPILE_ENV`, named here for the refusal
 /// a build without the feature makes.
 #[cfg(not(feature = "mock-compile"))]
@@ -64,12 +65,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Stage {
-    /// Untrusted stage: compile the leg's crate and write the build output.
+    /// Untrusted stage: compile the task's crate and write the build output.
     Build {
-        /// The leg of the dispatched batch to build — its index in the
-        /// batch's `tasks`.
-        #[arg(long)]
-        leg: usize,
         /// Directory to write the build output into (created if missing).
         #[arg(long)]
         output_dir: PathBuf,
@@ -77,14 +74,15 @@ enum Stage {
     /// Trusted stage: validate a build output, then push, sign and publish
     /// its records artifact into GHCR.
     Publish {
-        /// The leg of the dispatched batch to publish — the `build`
-        /// stage's `--leg`.
-        #[arg(long)]
-        leg: usize,
         /// Directory a `build` stage wrote.
         #[arg(long)]
         input_dir: PathBuf,
     },
+    /// Print `true` or `false` — whether the dispatched task's signed
+    /// records already exist under its `built-<rustc>-<task_id hash>`
+    /// marker (stow#877). `build-crate.yml` runs this before the
+    /// untrusted stage so a duplicate dispatch exits without building.
+    RecordsExist,
     /// Dev-only local dispatch server standing in for GitHub Actions.
     Serve {
         /// Socket address to listen on.
@@ -110,13 +108,12 @@ fn main() -> stow_types::error::Result<()> {
     }
     let cli = Cli::parse();
     match cli.command {
-        Stage::Build { leg, output_dir } => smol::block_on(build_stage(leg, &output_dir)),
+        Stage::Build { output_dir } => smol::block_on(build_stage(&output_dir)),
         // `RegistrySession` drives reqwest/hyper, which needs a Tokio
         // reactor; the build stage is smol-only because cargo/rustc
         // capture never touches HTTP.
-        Stage::Publish { leg, input_dir } => {
-            tokio_runtime()?.block_on(publish_stage(leg, &input_dir))
-        }
+        Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
+        Stage::RecordsExist => tokio_runtime()?.block_on(records_exist_stage()),
         Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
     }
 }
@@ -128,7 +125,7 @@ fn tokio_runtime() -> stow_types::error::Result<tokio::runtime::Runtime> {
         .map_err(|error| stow_types::stow_error!("build tokio runtime: {error}"))
 }
 
-async fn build_stage(leg: usize, output_dir: &std::path::Path) -> stow_types::error::Result<()> {
+async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<()> {
     // The mock compiler exists only in a `mock-compile` build; a switch
     // that reaches any other build must not quietly compile for real.
     #[cfg(not(feature = "mock-compile"))]
@@ -138,17 +135,16 @@ async fn build_stage(leg: usize, output_dir: &std::path::Path) -> stow_types::er
              `mock-compile` feature"
         ));
     }
-    let task = load_task_payload(leg)?;
+    let task = load_task_payload()?;
     async_fs::create_dir_all(output_dir).await?;
     let built = task::build(&task, output_dir).await?;
     let report = dep_scan::scan_artifacts(&built, &task).await?;
-    let dependency_identity = task
+    let dependency_task_ids = task
         .verified_dependency_graph()?
-        .dependency_identity(0)
-        .ok_or_else(|| stow_types::stow_error!("verified dependency graph has no root digest"))?
-        .clone();
+        .dependency_task_ids(0)
+        .ok_or_else(|| stow_types::stow_error!("verified dependency graph has no root node"))?;
     let upload_plan =
-        plan::build_upload_plan(&report.artifacts, &report.consumed, &dependency_identity).await?;
+        plan::build_upload_plan(&report.artifacts, &report.consumed, &dependency_task_ids).await?;
     stage::write_build_output(output_dir, &task, &report, &upload_plan).await?;
     tracing::info!(
         task_id = %task.task_id,
@@ -163,8 +159,8 @@ async fn build_stage(leg: usize, output_dir: &std::path::Path) -> stow_types::er
     Ok(())
 }
 
-async fn publish_stage(leg: usize, input_dir: &std::path::Path) -> stow_types::error::Result<()> {
-    let task = load_task_payload(leg)?;
+async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result<()> {
+    let task = load_task_payload()?;
     let pushed = publish(&task, input_dir).await.map_err(|error| {
         tracing::error!(task_id = %task.task_id, %error, "publish stage failed");
         error
@@ -173,16 +169,186 @@ async fn publish_stage(leg: usize, input_dir: &std::path::Path) -> stow_types::e
     Ok(())
 }
 
+/// The `build-crate.yml` early-exit check: `true` on stdout when the
+/// task's `built-<rustc>-<task_id hash>` marker names a records
+/// manifest carrying the task-id annotation — the dispatch is a
+/// duplicate and the run exits without building (stow#877).
+async fn records_exist_stage() -> stow_types::error::Result<()> {
+    let task = load_task_payload()?;
+    let credentials = stow_oci::RegistryCredentials::from_env()?;
+    let http = stow_oci::RegistryHttp::new().await?;
+    let exists = published_manifest(&task, &credentials, &http)
+        .await?
+        .is_some();
+    println!("{exists}");
+    Ok(())
+}
+
+/// The `built-` marker's manifest bytes when they name a records
+/// artifact for `task` — `None` when no earlier run published it. The
+/// bytes are the value a re-tag puts under the run's own records tag.
+async fn published_manifest(
+    task: &BuildTaskPayload,
+    credentials: &stow_oci::RegistryCredentials,
+    http: &stow_oci::RegistryHttp,
+) -> stow_types::error::Result<Option<Vec<u8>>> {
+    let repository = stow_types::registry::cache_repository(&task.rustc_version);
+    let session =
+        stow_oci::RegistryBase::production()?.push_session(&repository, credentials, http);
+    let reference = session.reference(&stow_types::records::published_tag(
+        task.rustc_version.as_str(),
+        &task.task_id,
+    ))?;
+    let (manifest, manifest_digest) = match session.pull_manifest(&reference).await {
+        Ok(pulled) => pulled,
+        Err(error) if error.is_not_found() => return Ok(None),
+        Err(error) => {
+            return Err(stow_types::stow_error!(
+                "pull published marker {reference}: {error}"
+            ));
+        }
+    };
+    let manifest_json: serde_json::Value = serde_json::from_slice(&manifest)
+        .map_err(|error| stow_types::stow_error!("parse published marker manifest: {error}"))?;
+    let is_records = manifest_json
+        .get("artifactType")
+        .and_then(serde_json::Value::as_str)
+        == Some(stow_types::records::RECORDS_ARTIFACT_TYPE)
+        && manifest_json
+            .get("annotations")
+            .and_then(|a| a.get(stow_types::records::RECORDS_TASK_ID_ANNOTATION))
+            .and_then(serde_json::Value::as_str)
+            == Some(task.task_id.as_str());
+    if !is_records {
+        return Err(stow_types::stow_error!(
+            "published marker {reference} does not name a records artifact for {}",
+            task.task_id
+        ));
+    }
+    // Every reader verifies the signature before trusting a row: the
+    // marker's manifest must carry a records signature bound to the
+    // pinned builder identity — an unverifiable marker means build
+    // normally (stow#877).
+    if !marker_signature_verified(&session, &reference, &manifest_digest).await? {
+        return Ok(None);
+    }
+    Ok(Some(manifest))
+}
+
+/// The `built-` marker's manifest verifies only when one signature
+/// layer both checks out under the build trust *and* binds a
+/// `records-` tag in this repository at this digest — tag aliases
+/// share the manifest's digest, so the `sha256-<digest>.sig` bundle
+/// indexes the signature the records push wrote, which names the
+/// `records-` tag rather than the marker's own.
+async fn marker_signature_verified(
+    session: &stow_oci::RegistrySession,
+    reference: &stow_oci::Reference,
+    manifest_digest: &str,
+) -> stow_types::error::Result<bool> {
+    let trust = records_trust().await?;
+    let Ok(materials) =
+        stow_oci::pull_signature_materials(session, reference, manifest_digest).await
+    else {
+        return Ok(false);
+    };
+    let repository = format!("{}/{}", reference.registry(), reference.repository());
+    Ok(materials.iter().any(|material| {
+        let Some(bound) = stow_oci::verify::payload_docker_reference(&material.payload_bytes)
+        else {
+            return false;
+        };
+        let Some((bound_repo, bound_tag)) = bound.rsplit_once(':') else {
+            return false;
+        };
+        if bound_repo != repository || !stow_types::records::is_records_tag(bound_tag) {
+            return false;
+        }
+        let signature = stow_types::bundle::SigstoreSignature {
+            payload_path: material.payload_path.clone(),
+            signature: material.signature.clone(),
+            certificate_pem: material.certificate_pem.clone(),
+            rekor_bundle_json: material.rekor_bundle_json.clone(),
+        };
+        stow_oci::verify::verify_material(
+            &trust,
+            &bound,
+            manifest_digest,
+            &signature,
+            &material.payload_bytes,
+            stow_types::trusted_builder::CERTIFICATE_IDENTITY,
+        )
+        .is_ok()
+    }))
+}
+
+/// The trust a records read verifies against — the mock registry's
+/// local key under `STOW_MOCK_PUBLIC_KEY_PATH`, else Fulcio/Rekor with
+/// the `build-crate.yml` certificate identity pinned.
+async fn records_trust() -> stow_types::error::Result<stow_oci::verify::Trust> {
+    #[cfg(feature = "mock-verify")]
+    if let Ok(path) = std::env::var("STOW_MOCK_PUBLIC_KEY_PATH") {
+        return Ok(stow_oci::verify::Trust::MockKey(path.into()));
+    }
+    #[cfg(not(feature = "mock-verify"))]
+    if std::env::var_os("STOW_MOCK_PUBLIC_KEY_PATH").is_some() {
+        return Err(stow_types::stow_error!(
+            "STOW_MOCK_PUBLIC_KEY_PATH set but stow-build lacks mock-verify"
+        ));
+    }
+    let cache_dir = std::env::var_os("STOW_CACHE_DIR")
+        .map_or_else(
+            || {
+                std::env::var_os("HOME")
+                    .map(|home| std::path::PathBuf::from(home).join(".cache").join("stow"))
+            },
+            |dir| Some(dir.into()),
+        )
+        .ok_or_else(|| stow_types::stow_error!("resolve the sigstore trust cache directory"))?;
+    Ok(stow_oci::verify::Trust::GithubCi(std::sync::Arc::new(
+        stow_oci::verify::load_trust_material(&cache_dir).await?,
+    )))
+}
+
 async fn publish(
     task: &BuildTaskPayload,
     input_dir: &std::path::Path,
 ) -> stow_types::error::Result<u32> {
-    let output = validated_build_output(task, input_dir).await?;
-
     let credentials = stow_oci::RegistryCredentials::from_env()?;
     // One client for the whole publish: the artifact push and the
     // records push share the trust-store load (stow#624).
     let http = stow_oci::RegistryHttp::new().await?;
+    // A run whose task's signed records already exist re-tags the
+    // proven manifest under its own `records-<…>-<run_id>-<attempt>`
+    // tag — the webhook's per-run check still resolves — instead of
+    // validating and pushing a second build (stow#877).
+    if let Some(manifest) = published_manifest(task, &credentials, &http).await? {
+        let repository = stow_types::registry::cache_repository(&task.rustc_version);
+        let session =
+            stow_oci::RegistryBase::production()?.push_session(&repository, &credentials, &http);
+        let reference = session.reference(&stow_types::records::records_tag(
+            task.rustc_version.as_str(),
+            &task.task_id,
+            build_run_from_env()?,
+        ))?;
+        // The proven manifest is re-signed, not just re-tagged: every
+        // reader binds the signature to the tag it pulled, so this
+        // run's `records-…-<run>-<attempt>` tag needs its own layer
+        // in the shared `sha256-<digest>.sig` bundle (stow#877).
+        let reference_string = reference.to_string();
+        stow_oci::put_signed_manifest(&session, &reference, &manifest, |digest| {
+            let reference_string = reference_string.clone();
+            async move { stow_oci::sign_artifact(&reference_string, &digest, &credentials).await }
+        })
+        .await
+        .map_err(|error| stow_types::stow_error!("retag records manifest {reference}: {error}"))?;
+        tracing::info!(
+            task_id = %task.task_id,
+            "records already published — re-tagged, nothing built"
+        );
+        return Ok(0);
+    }
+    let output = validated_build_output(task, input_dir).await?;
     let upload_outcome =
         stow_oci::push_artifacts(&output.plan, &task.rustc_version, &credentials, &http).await?;
     let artifact_records = stow_types::upload_plan::build_artifact_records(
@@ -305,22 +471,20 @@ async fn serve_stage(listen: std::net::SocketAddr) -> stow_types::error::Result<
         env_required(STOW_GITHUB_WEBHOOK_SECRET_ENV)?,
         env_required(STOW_MOCK_PRIVATE_KEY_PATH_ENV)?,
         env_required(STOW_MOCK_REGISTRY_ROOT_ENV)?,
+        env_required(GITHUB_APP_SLUG_ENV)?,
     );
     local_server::serve(listen, state).await
 }
 
-/// The task both stages act on: leg `leg` of the batch the run was
-/// dispatched with. The batch rides the `workflow_dispatch` event file
-/// (`GITHUB_EVENT_PATH`), so the publish job's copy comes from the
-/// scheduler, never from the build job.
-fn load_task_payload(leg: usize) -> stow_types::error::Result<BuildTaskPayload> {
-    task_from_event_file(
-        std::path::Path::new(&env_required(GITHUB_EVENT_PATH_ENV)?),
-        leg,
-    )
+/// The task both stages act on — the one `build-crate.yml` input the
+/// run was dispatched with. The task rides the `workflow_dispatch`
+/// event file (`GITHUB_EVENT_PATH`), so the publish job's copy comes
+/// from the scheduler, never from the build job.
+fn load_task_payload() -> stow_types::error::Result<BuildTaskPayload> {
+    task_from_event_file(std::path::Path::new(&env_required(GITHUB_EVENT_PATH_ENV)?))
 }
 
-/// The `workflow_dispatch` event file: only the `batch` input is read.
+/// The `workflow_dispatch` event file: only the `task` input is read.
 #[derive(serde::Deserialize)]
 struct DispatchEvent {
     inputs: Option<DispatchInputs>,
@@ -328,15 +492,14 @@ struct DispatchEvent {
 
 #[derive(serde::Deserialize)]
 struct DispatchInputs {
-    /// The JSON-encoded [`BuildBatchPayload`].
-    batch: Option<String>,
+    /// The JSON-encoded [`BuildTaskPayload`].
+    task: Option<String>,
 }
 
-/// Leg `leg` of the batch in the dispatch event file at `event_path`
-/// (`.inputs.batch`, a JSON-encoded [`BuildBatchPayload`]).
+/// The task in the dispatch event file at `event_path`
+/// (`.inputs.task`, a JSON-encoded [`BuildTaskPayload`]).
 fn task_from_event_file(
     event_path: &std::path::Path,
-    leg: usize,
 ) -> stow_types::error::Result<BuildTaskPayload> {
     let raw = std::fs::read(event_path).map_err(|error| {
         stow_types::stow_error!(
@@ -344,7 +507,7 @@ fn task_from_event_file(
             event_path.display()
         )
     })?;
-    task_from_event(&raw, event_path, leg)
+    task_from_event(&raw, event_path)
 }
 
 /// [`task_from_event_file`] over the file's bytes, which the async local
@@ -352,7 +515,6 @@ fn task_from_event_file(
 pub(crate) fn task_from_event(
     raw: &[u8],
     event_path: &std::path::Path,
-    leg: usize,
 ) -> stow_types::error::Result<BuildTaskPayload> {
     let event: DispatchEvent = serde_json::from_slice(raw).map_err(|error| {
         stow_types::stow_error!(
@@ -360,19 +522,15 @@ pub(crate) fn task_from_event(
             event_path.display()
         )
     })?;
-    let batch = event
-        .inputs
-        .and_then(|inputs| inputs.batch)
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "dispatch event file {} has no `inputs.batch`",
-                event_path.display()
-            )
-        })?;
-    let batch: BuildBatchPayload = serde_json::from_str(&batch).map_err(|error| {
-        stow_types::stow_error!("parse `inputs.batch` of {}: {error}", event_path.display())
+    let task = event.inputs.and_then(|inputs| inputs.task).ok_or_else(|| {
+        stow_types::stow_error!(
+            "dispatch event file {} has no `inputs.task`",
+            event_path.display()
+        )
     })?;
-    batch.task(leg)
+    serde_json::from_str(&task).map_err(|error| {
+        stow_types::stow_error!("parse `inputs.task` of {}: {error}", event_path.display())
+    })
 }
 
 fn env_required(name: &str) -> stow_types::error::Result<String> {
@@ -408,15 +566,15 @@ fn install_tracing() {
         .try_init();
 }
 
-/// A batch of single-crate legs for the tests that read or record one.
+/// Single-crate tasks for the tests that read one.
 #[cfg(test)]
-mod batch_fixture {
-    use stow_types::api::{BatchEncoder, BuildTaskPayload};
+mod task_fixture {
+    use stow_types::api::BuildTaskPayload;
     use stow_types::identity::{
         CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
     };
 
-    fn task(crate_name: &str) -> BuildTaskPayload {
+    pub fn task(crate_name: &str) -> BuildTaskPayload {
         BuildTaskPayload {
             task_id: format!("task-{crate_name}"),
             attempt: 1,
@@ -435,25 +593,15 @@ mod batch_fixture {
         }
     }
 
-    /// The encoded batch (`inputs.batch`) holding one leg per name in
-    /// `crates`, at `parallelism` slots.
-    pub fn encoded_batch(crates: &[&str], parallelism: u32) -> String {
-        let mut encoder = BatchEncoder::new(
-            "0123456789abcdef0123456789abcdef".parse().unwrap(),
-            WireRustcVersion::parse("1.91.1").unwrap(),
-            parallelism,
-        )
-        .unwrap();
-        for name in crates {
-            encoder.push(&task(name)).unwrap();
-        }
-        encoder.finish().unwrap()
+    /// The encoded `inputs.task` for one name.
+    pub fn encoded_task(crate_name: &str) -> String {
+        serde_json::to_string(&task(crate_name)).unwrap()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{batch_fixture::encoded_batch, task_from_event_file};
+    use super::{task_fixture::encoded_task, task_from_event_file};
 
     fn event_file(contents: &serde_json::Value) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -462,11 +610,11 @@ mod tests {
     }
 
     #[test]
-    fn a_leg_is_read_from_the_event_files_batch() {
+    fn a_task_is_read_from_the_event_files_inputs() {
         let event = event_file(&serde_json::json!({
-            "inputs": { "batch": encoded_batch(&["serde", "tokio"], 2) }
+            "inputs": { "task": encoded_task("tokio") }
         }));
-        let task = task_from_event_file(event.path(), 1).unwrap();
+        let task = task_from_event_file(event.path()).unwrap();
         assert_eq!(task.task_id, "task-tokio");
         assert_eq!(task.crate_name.as_str(), "tokio");
         assert_eq!(task.rustc_version.as_str(), "1.91.1");
@@ -474,35 +622,31 @@ mod tests {
 
     #[test]
     fn a_missing_event_file_names_the_path() {
-        let error = task_from_event_file(std::path::Path::new("/nonexistent/event.json"), 0)
+        let error = task_from_event_file(std::path::Path::new("/nonexistent/event.json"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("/nonexistent/event.json"), "{error}");
     }
 
     #[test]
-    fn a_missing_batch_input_is_named() {
+    fn a_missing_task_input_is_named() {
         for contents in [
             serde_json::json!({}),
             serde_json::json!({ "inputs": {} }),
-            serde_json::json!({ "inputs": { "batch": null } }),
+            serde_json::json!({ "inputs": { "task": null } }),
         ] {
             let event = event_file(&contents);
-            let error = task_from_event_file(event.path(), 0)
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("inputs.batch"), "{contents}: {error}");
+            let error = task_from_event_file(event.path()).unwrap_err().to_string();
+            assert!(error.contains("inputs.task"), "{contents}: {error}");
         }
     }
 
     #[test]
-    fn an_out_of_range_leg_is_an_error() {
+    fn a_malformed_task_input_is_named() {
         let event = event_file(&serde_json::json!({
-            "inputs": { "batch": encoded_batch(&["serde"], 1) }
+            "inputs": { "task": "{not json" }
         }));
-        let error = task_from_event_file(event.path(), 1)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("leg 1 is out of range"), "{error}");
+        let error = task_from_event_file(event.path()).unwrap_err().to_string();
+        assert!(error.contains("inputs.task"), "{error}");
     }
 }

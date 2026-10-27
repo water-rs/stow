@@ -51,22 +51,42 @@ impl TaskNodeIdentity {
     /// subgraph, then `-host` for host-side nodes.
     #[must_use]
     pub fn task_id(&self, dependency_identity: &DependencyIdentity) -> String {
-        let base = format!(
-            "{}-d{}",
-            crate::api::task_id_prefix(
-                self.crate_name.as_str(),
-                &self.version.to_string(),
-                &self.features_json.raw(),
-                self.target.as_str(),
-                self.rustc_version.as_str(),
-            ),
-            dependency_identity,
-        );
-        if self.host_side {
-            format!("{base}-host")
-        } else {
-            base
-        }
+        canonical_task_id(
+            self.crate_name.as_str(),
+            &self.version.to_string(),
+            &self.features_json.raw(),
+            self.target.as_str(),
+            self.rustc_version.as_str(),
+            dependency_identity.as_str(),
+            self.host_side,
+        )
+    }
+}
+
+/// [`TaskNodeIdentity::task_id`] over the identity's rendered fields.
+///
+/// For holders that keep the fields interned rather than typed (the
+/// scheduler's in-memory graph re-mints ids from them on demand).
+/// `features_json` is the canonical raw list and `dependency_identity`
+/// its 64-hex digest.
+#[must_use]
+pub fn canonical_task_id(
+    crate_name: &str,
+    version: &str,
+    features_json: &str,
+    target: &str,
+    rustc_version: &str,
+    dependency_identity: &str,
+    host_side: bool,
+) -> String {
+    let base = format!(
+        "{}-d{dependency_identity}",
+        crate::api::task_id_prefix(crate_name, version, features_json, target, rustc_version),
+    );
+    if host_side {
+        format!("{base}-host")
+    } else {
+        base
     }
 }
 
@@ -207,6 +227,22 @@ impl ResolvedTaskGraph {
     #[must_use]
     pub fn task_id(&self, index: usize) -> Option<&str> {
         self.task_ids.get(index).map(String::as_str)
+    }
+
+    /// The sorted, deduplicated task ids of `index`'s direct
+    /// dependencies — the preimage [`Self::dependency_identity`] hashes
+    /// (stow#919). `None` when `index` is out of range.
+    #[must_use]
+    pub fn dependency_task_ids(&self, index: usize) -> Option<Vec<String>> {
+        let node = self.nodes.get(index)?;
+        let mut ids = node
+            .dependencies
+            .iter()
+            .map(|&dep| self.task_ids[dep].clone())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
     }
 
     /// The computed dependency digest of the node at `index`, `None`

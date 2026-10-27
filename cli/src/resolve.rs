@@ -18,13 +18,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use semver::Version;
 use stow_types::api::{DependencyGraphEntry, ResolvedDependencyGraphEntry, runner_family};
+use stow_types::feature_sets::smallest_containing_set;
 use stow_types::glibc::GlibcVersion;
 use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple,
     WireRustcVersion,
 };
 use stow_types::index::ArtifactIndexRow;
-use stow_types::public_cache::stable_c_metadata_for_compile_key;
+use stow_types::public_cache::{UnitSide, stable_c_metadata_for_compile_key};
 use stow_types::task_graph::{DigestEntry, TaskNodeIdentity, shared_dependency_identities};
 use stow_types::versioning::is_semver_compatible_upgrade;
 
@@ -122,6 +123,10 @@ pub struct GraphAnalysis {
     pub expanded_total: usize,
     /// Exact artifacts the driver should fetch to satisfy the graph.
     pub prefetch_artifacts: Vec<PrefetchArtifactRow>,
+    /// Semantic keys the build serves inexactly — covered only
+    /// through a superset candidate (stow#882). Each is a node whose
+    /// exact chain the inexact report asks the scheduler to build.
+    pub inexact_keys: BTreeSet<(PackageKey, String)>,
 }
 
 /// Whether `row`'s recorded glibc floor lets this host load it. `None` on
@@ -197,6 +202,7 @@ pub fn analyze_dependency_graph(
             expanded_cached: 0,
             expanded_total: 0,
             prefetch_artifacts: Vec::new(),
+            inexact_keys: BTreeSet::new(),
         });
     }
 
@@ -256,6 +262,7 @@ pub fn analyze_dependency_graph(
         expanded_cached: plan.expanded_cached,
         expanded_total: plan.expanded_total,
         prefetch_artifacts: plan.prefetch_artifacts,
+        inexact_keys: plan.inexact_keys,
     })
 }
 
@@ -291,6 +298,7 @@ fn expanded_scheduler_plan(
         expanded_cached,
         expanded_total,
         prefetch_artifacts: cached.prefetch_artifacts,
+        inexact_keys: cached.inexact_keys,
     })
 }
 
@@ -298,6 +306,7 @@ struct ExpandedSchedulerPlan {
     expanded_cached: usize,
     expanded_total: usize,
     prefetch_artifacts: Vec<PrefetchArtifactRow>,
+    inexact_keys: BTreeSet<(PackageKey, String)>,
 }
 
 struct ExactExpandedGraph {
@@ -489,6 +498,9 @@ fn expanded_dependency_identities(
 
 struct CachedArtifacts {
     semantic_keys: BTreeSet<(PackageKey, String)>,
+    /// Semantic keys whose only reachable coverage is a superset
+    /// candidate (stow#882) — the nodes this build serves inexactly.
+    inexact_keys: BTreeSet<(PackageKey, String)>,
     prefetch_artifacts: Vec<PrefetchArtifactRow>,
 }
 
@@ -510,6 +522,7 @@ fn cached_artifacts(
     if key_pairs.is_empty() {
         return Ok(CachedArtifacts {
             semantic_keys: BTreeSet::new(),
+            inexact_keys: BTreeSet::new(),
             prefetch_artifacts: Vec::new(),
         });
     }
@@ -518,6 +531,15 @@ fn cached_artifacts(
     let semantic_keys = reachable
         .candidates
         .iter()
+        .map(|candidate| candidate.semantic_key.clone())
+        .collect::<BTreeSet<_>>();
+    // stow#882: a key covered only through a `superset` candidate is a
+    // node served inexactly — its exact chain is the chain the inexact
+    // report asks the scheduler to build.
+    let inexact_keys = reachable
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.superset)
         .map(|candidate| candidate.semantic_key.clone())
         .collect::<BTreeSet<_>>();
     // Coverage counts the catalog as it stands: a row this host's glibc
@@ -541,6 +563,7 @@ fn cached_artifacts(
     let prefetch_artifacts = servable_reachable.closure_artifacts(&selected_prefetch_rows);
     Ok(CachedArtifacts {
         semantic_keys,
+        inexact_keys,
         prefetch_artifacts,
     })
 }
@@ -551,9 +574,22 @@ fn resolve_reachable_cached_rows<'a>(
     rows: &'a [ArtifactIndexRow],
 ) -> stow_types::error::Result<ReachableRows<'a>> {
     let IndexedRows {
-        candidates,
+        mut candidates,
         chain_rows,
     } = partition_cached_rows(key_pairs, dependency_identity_by_key, rows)?;
+
+    let (reachable_candidates, _) = reachable_indices(&candidates, &chain_rows);
+    // stow#881: a node whose exact chain is not published may still be
+    // served — by the smallest published set containing its requested
+    // one, when that set's whole chain is published. Rows for the
+    // serving set join the candidates under the *node's* semantic key;
+    // reachability decides as it does for any candidate, so a node moves
+    // only once the whole chain its build needs is there.
+    let covered = reachable_candidates
+        .iter()
+        .map(|&index| candidates[index].semantic_key.clone())
+        .collect::<BTreeSet<_>>();
+    add_superset_candidates(&mut candidates, key_pairs, &covered, rows)?;
 
     let (reachable_candidates, reachable_chain) = reachable_indices(&candidates, &chain_rows);
 
@@ -709,11 +745,15 @@ fn partition_cached_rows<'a>(
             version: row.version.as_semver().clone(),
         };
         let semantic_key = (package_key, row.features_json.raw());
-        if key_pairs.contains(&semantic_key)
-            && dependency_identity_by_key
+        let context_matches = if key_pairs.contains(&semantic_key) {
+            let digest = row.dependency_identity()?;
+            dependency_identity_by_key
                 .get(&semantic_key.0)
-                .is_some_and(|digest| *digest == row.dependency_identity)
-        {
+                .is_some_and(|expected| *expected == digest)
+        } else {
+            false
+        };
+        if context_matches {
             if let Some(existing_index) = candidate_index.get(&identity_key).copied() {
                 if !deduplicate_cached_candidate(
                     &candidates[existing_index],
@@ -734,6 +774,7 @@ fn partition_cached_rows<'a>(
                 semantic_key,
                 row,
                 dependency_identities,
+                superset: false,
             });
             continue;
         }
@@ -794,6 +835,91 @@ fn deduplicate_cached_candidate(
     row.c_metadata.as_str() == existing.row.c_metadata.as_str()
 }
 
+/// The superset pass (stow#881): for every requested `(pkg, S)` no
+/// reachable exact candidate covers, compute the serving set `T` — the
+/// smallest feature set the slice publishes for `pkg` that contains `S`
+/// — and add its canonical target-side rows as candidates under the
+/// *node's* semantic key. The row's `dependency_identity` is `T`'s build
+/// context, so the digest equality the exact pass requires cannot hold;
+/// publication of the whole chain the serving build needs is what
+/// [`reachable_indices`] proves instead. A node whose own set is
+/// published — reachable or not — is never moved: its `S` is already the
+/// smallest containing set, and an unreachable exact chain keeps the
+/// node on the miss path it has.
+fn add_superset_candidates<'a>(
+    candidates: &mut Vec<ReachableCandidateRow<'a>>,
+    key_pairs: &BTreeSet<(PackageKey, String)>,
+    covered: &BTreeSet<SemanticKey>,
+    rows: &'a [ArtifactIndexRow],
+) -> stow_types::error::Result<()> {
+    // The chooser's pool: every canonical target-side row is built by
+    // definition, grouped by package with its decoded feature set.
+    let mut published = BTreeMap::<PackageKey, Vec<(&'a ArtifactIndexRow, Vec<String>)>>::new();
+    for row in rows {
+        if row.unit_shape.side != UnitSide::Target || !cached_row_has_canonical_metadata(row)? {
+            continue;
+        }
+        let Ok(features) = serde_json::from_str::<Vec<String>>(row.features_json.raw().as_str())
+        else {
+            continue;
+        };
+        published
+            .entry(PackageKey {
+                crate_name: row.crate_name.clone(),
+                version: row.version.as_semver().clone(),
+            })
+            .or_default()
+            .push((row, features));
+    }
+    let mut added = BTreeSet::<(String, SemanticKey)>::new();
+    for key_pair in key_pairs {
+        if covered.contains(key_pair) {
+            continue;
+        }
+        let Some(pkg_rows) = published.get(&key_pair.0) else {
+            continue;
+        };
+        let Ok(requested) = serde_json::from_str::<Vec<String>>(key_pair.1.as_str()) else {
+            continue;
+        };
+        let Some(serving) =
+            smallest_containing_set(&requested, pkg_rows.iter().map(|(_, f)| f.as_slice()))
+        else {
+            continue;
+        };
+        if serving == requested.as_slice() {
+            // The node's own set is published; only its chain was
+            // unreachable — a superset move is never warranted over an
+            // existing exact artifact.
+            continue;
+        }
+        for (row, features) in pkg_rows {
+            if features.as_slice() != serving {
+                continue;
+            }
+            let dependency_identities = canonicalize_dependency_identities(
+                row.dependency_c_metadata_json
+                    .entries()
+                    .iter()
+                    .map(|entry| DepChainIdentity {
+                        crate_name: entry.crate_name.as_str().to_owned(),
+                        c_metadata: entry.c_metadata.as_str().to_owned(),
+                    })
+                    .collect(),
+            );
+            if added.insert((row.c_metadata.as_str().to_owned(), key_pair.clone())) {
+                candidates.push(ReachableCandidateRow {
+                    semantic_key: key_pair.clone(),
+                    row,
+                    dependency_identities,
+                    superset: true,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DepChainIdentity {
     crate_name: String,
@@ -805,6 +931,11 @@ struct ReachableCandidateRow<'a> {
     semantic_key: (PackageKey, String),
     row: &'a ArtifactIndexRow,
     dependency_identities: Vec<DepChainIdentity>,
+    /// `true` when the row serves `semantic_key`'s node from a published
+    /// superset of the requested features rather than an exact match
+    /// (stow#881) — such a row sits outside every exact candidate's
+    /// recorded closure, so prefetch must select it itself.
+    superset: bool,
 }
 
 /// A canonical row that is not a semantic match for the current request but
@@ -944,6 +1075,16 @@ fn select_prefetch_candidates(
         // All emit/kind variants of the root are useful: `check` injects the
         // rmeta-only artifact while `build` injects the linkable one.
         selected.extend(indices.iter().copied());
+    }
+    // A superset-served node's row was built under the serving set's
+    // context, so no selected candidate's recorded closure is
+    // guaranteed to name it — select every reachable superset candidate
+    // outright; `closure_artifacts` then pulls in the chain it was
+    // proven against (stow#881).
+    for (index, candidate) in reachable.candidates.iter().enumerate() {
+        if candidate.superset {
+            selected.insert(index);
+        }
     }
     Ok(selected)
 }
@@ -1345,8 +1486,7 @@ mod tests {
         deps: &[(&str, &str)],
     ) -> ArtifactIndexRow {
         ArtifactIndexRow {
-            dependency_identity: stow_types::identity::DependencyIdentity::leaf()
-                .expect("leaf identity"),
+            dependency_task_ids: Vec::new(),
             crate_name: CrateName::parse(crate_name).expect("name"),
             version: CrateVersion::new(Version::parse(version).expect("version")),
             features_json: FeaturesJson::canonicalize(
@@ -2013,8 +2153,9 @@ mod tests {
         }];
         dep_a_entry.dependency_subgraph = dep_subgraph.clone();
         let expanded_entries = vec![dep_a_entry, leaf_entry(&dep_b)];
-        // dep-a's own digest — the same resolve the analysis runs.
-        let dep_digest = dep_subgraph
+        // dep-a's own child task ids — the preimage the published row
+        // carries under this dependency context (stow#919).
+        let dep_task_ids = dep_subgraph
             .resolve(
                 &stow_types::task_graph::TaskNodeIdentity {
                     crate_name: dep_a.crate_name.clone(),
@@ -2028,9 +2169,8 @@ mod tests {
                 stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             )
             .expect("subgraph resolves")
-            .dependency_identity(0)
-            .expect("root digest")
-            .clone();
+            .dependency_task_ids(0)
+            .expect("root children");
 
         let mut dep_a_row = row(
             "dep-a",
@@ -2039,8 +2179,7 @@ mod tests {
             &[],
             &[("dep-b", "bbbbbbbbbbbbbbbb")],
         );
-        dep_a_row.dependency_identity =
-            stow_types::identity::DependencyIdentity::parse("f".repeat(64)).expect("digest");
+        dep_a_row.dependency_task_ids = vec!["foreign-dep-1.0.0-x".to_owned()];
         let rows = vec![
             dep_a_row.clone(),
             row("dep-b", "1.0.0", "bbbbbbbbbbbbbbbb", &[], &[]),
@@ -2059,7 +2198,7 @@ mod tests {
             "the wrong-context row never joins the prefetch set"
         );
 
-        dep_a_row.dependency_identity = dep_digest;
+        dep_a_row.dependency_task_ids = dep_task_ids;
         let rows = vec![
             dep_a_row,
             row("dep-b", "1.0.0", "bbbbbbbbbbbbbbbb", &[], &[]),

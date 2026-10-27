@@ -3,9 +3,9 @@
 //! bundles use (stow#455). Each build publishes under its own
 //! `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag, so a
 //! rebuilt task never overwrites the previous build's artifact
-//! (stow#655). Records are the registry's only record store — the
-//! edge's D1 catalog is a read replica synced off these artifacts,
-//! never a source of truth.
+//! (stow#655). Records are the registry’s only record store —
+//! catalog reads resolve against the signed index slices the
+//! records fold into — never against an edge-side replica.
 
 use std::collections::BTreeMap;
 
@@ -15,7 +15,7 @@ use stow_types::api::ArtifactRecord;
 use stow_types::identity::WireRustcVersion;
 use stow_types::records::{
     BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
-    is_records_tag, records_tag,
+    is_records_tag, published_tag, records_tag,
 };
 use stow_types::registry::{cache_repository, sha256_digest};
 
@@ -127,6 +127,17 @@ where
         })
         .await
         .map_err(|error| stow_types::stow_error!("push records manifest {reference}: {error}"))?;
+    // The `built-<rustc>-<task_id hash>` marker points at the same
+    // manifest (stow#877): a run checking whether the task's signed
+    // records already exist fetches one tag — no re-sign needed, the
+    // digest is identical.
+    let marker_reference = session.reference(&published_tag(rustc_version.as_str(), task_id))?;
+    session
+        .put_manifest(&marker_reference, &manifest_bytes)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!("push published marker {marker_reference}: {error}")
+        })?;
     tracing::info!(
         oci_reference = %reference,
         digest = %manifest_digest,

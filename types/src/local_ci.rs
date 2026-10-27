@@ -1,8 +1,8 @@
 //! The local CI server's `GET /tasks` run listing.
 //!
-//! `stow-build serve`'s answer, read by `stow-admin preheat manual
-//! --dispatch-url` and the `Preheat cost` lane (stow#773). One wire
-//! type, so the server and its readers cannot drift.
+//! `stow-build serve`'s answer, read by the mock e2e and the
+//! `Preheat cost` lane (stow#773). One wire type, so the server and
+//! its readers cannot drift.
 
 use serde::{Deserialize, Serialize};
 
@@ -13,15 +13,24 @@ pub struct LocalCiTasks {
     pub tasks: Vec<LocalCiRun>,
 }
 
+/// The `triggering_actor.login` of a seeded — external — run.
+///
+/// A run that exists upstream without a dispatch through the server
+/// stands in for one an operator dispatched (`gh workflow run`, a
+/// rerun), so its actor is this login, not the App's bot (stow#940).
+/// The traffic-cost callback lane signs its `workflow_run` deliveries
+/// for those runs under the same login.
+pub const SEEDED_RUN_OPERATOR_LOGIN: &str = "mock-operator";
+
 /// One dispatched run — the local stand-in for a GitHub Actions
 /// workflow run, with the fields the API spells the same way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalCiRun {
     /// Numeric GitHub-compatible run identity, stable for this dispatch.
     pub workflow_run_id: u64,
-    /// The run's name — `<rustc>-b<batch_id>` for a build batch
-    /// ([`crate::records::batch_run_title`]), the same shape
-    /// `build-batch.yml`'s `run-name` stamps on the real API.
+    /// The run's name — `<rustc>-<task_id>` for a build run
+    /// ([`crate::records::run_title`]), the same shape
+    /// `build-crate.yml`'s `run-name` stamps on the real API.
     pub display_title: String,
     /// `queued`, `in_progress`, or `completed` — the GitHub Actions
     /// `status` field's spelling.
@@ -41,60 +50,45 @@ pub struct LocalCiRun {
     pub dispatched_at_ms: u64,
     /// When the run reached `completed`, Unix milliseconds.
     pub completed_at_ms: Option<u64>,
-    /// A failure no single leg owns — the dispatch itself or a
-    /// `workflow_run` delivery — so a harness can name the cause
-    /// without reading the server log. It applies to every leg of the
-    /// run; a leg's own build or publish error rides
-    /// [`LocalCiLeg::error`] instead.
+    /// A failure the run's own jobs did not report — the dispatch
+    /// itself or a `workflow_run` delivery — so a harness can name the
+    /// cause without reading the server log.
     pub error: Option<String>,
     /// Every `workflow_run` delivery attempt the edge refused, in order,
     /// including attempts a later retry recovered from: a delivery the
     /// edge answered with an error happened even when the run landed.
     pub delivery_errors: Vec<String>,
-    /// A build run's matrix legs (stow#833) — one per task the batch
-    /// carries, in batch order. A `resolve-request` run has none: it
-    /// fans nothing out.
-    pub legs: Vec<LocalCiLeg>,
+    /// A build run's task — the scheduler task id the run builds. A
+    /// `resolve-request` run has none: it fans nothing out.
+    pub task_id: Option<String>,
+    /// Whether the run actually ran the build stage — `false` on a
+    /// queued/cancelled run and on one whose records already existed in
+    /// the registry, so a harness can prove a doubly-submitted task
+    /// built once (stow#877).
+    #[serde(default)]
+    pub built: bool,
+    /// `triggering_actor.login` — who dispatched the run: the App's
+    /// `<slug>[bot]` login on a dispatch through this server,
+    /// [`SEEDED_RUN_OPERATOR_LOGIN`] on a seeded run (stow#940).
+    #[serde(default)]
+    pub triggering_actor_login: String,
 }
 
-/// One leg of a batched build run — the per-task row `GET /tasks`
-/// folds to a task state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalCiLeg {
-    /// The leg's index into the batch's `tasks` —
-    /// [`crate::api::BatchTask::leg`].
-    pub leg: u32,
-    /// The scheduler task id the leg builds —
-    /// [`crate::api::BatchTask::task_id`].
-    pub task_id: String,
-    /// `queued`, `in_progress`, or `completed` — the GitHub Actions
-    /// `status` field's spelling, per leg.
-    pub status: String,
-    /// `success`, `failure` or `cancelled` once `status` is
-    /// `completed`; `null` before, exactly like the API.
-    pub conclusion: Option<String>,
-    /// That leg's build or publish error — `None` for a leg that
-    /// succeeded or has not finished.
-    pub error: Option<String>,
-}
-
-/// `POST /seeded-runs`: `build-batch.yml` runs that exist upstream
+/// `POST /seeded-runs`: `build-crate.yml` runs that exist upstream
 /// without a dispatch through the server.
 ///
 /// Two callers seed them. The traffic-cost harness seeds the scheduler
-/// fixture's bound in-flight batches
-/// (`crate::fixture::FixtureShape::in_flight_batch`), each under the run
-/// id the fixture already bound. The budget probe's batch-resolution
-/// drives seed the run a drive's claimed batch ran as, and the
-/// lease-check drive the run its batch is still running as, each under
-/// an id the server allocates, and bind the batch to it. The server
-/// records each run in the [`LocalCiSeededStatus`] it names, so its run
-/// object and attempt-jobs page answer as GitHub's would at that point,
-/// and it publishes every succeeded leg's records artifact under the
-/// run's tag before it records the run, as the run's publish jobs would
-/// have. Nothing drives a seeded run afterwards: a running one stays
-/// running until a `POST …/runs/{id}/cancel` ends it, and the caller
-/// delivers any `workflow_run` completion itself.
+/// fixture's bound in-flight runs
+/// (`crate::fixture::FixtureShape::in_flight_run`), each under the run
+/// id the fixture already bound. The budget probe's run-resolution
+/// drives seed the run a drive's claimed task ran as under an id the
+/// server allocates, and bind the task to it. The server records each
+/// run in the [`LocalCiSeededStatus`] it names, so its run object
+/// answers as GitHub's would at that point, and it publishes the
+/// records artifact under the run's tag before it records the run, as
+/// the run's publish job would have. Nothing drives a seeded run
+/// afterwards: a running one stays running, and the caller delivers
+/// any `workflow_run` completion itself.
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LocalCiSeededRuns {
     /// The runs to record.
@@ -109,13 +103,11 @@ pub struct LocalCiSeededRun {
     /// allocate; `None` has the server allocate it, as GitHub assigns a
     /// dispatch's.
     pub workflow_run_id: Option<u64>,
-    /// The batch's rustc — the run title's lead and the records tag's
+    /// The run's rustc — the run title's lead and the records tag's
     /// namespace.
     pub rustc_version: crate::identity::WireRustcVersion,
-    /// The batch the run carries — the run title's `b<batch_id>`.
-    pub batch_id: crate::api::BatchId,
-    /// Each leg's task id, in leg order.
-    pub legs: Vec<String>,
+    /// The task the run builds — the run title's `<task_id>` half.
+    pub task_id: String,
     /// Where the run stands — GitHub's `status` and, once `completed`,
     /// its `conclusion`, both at the run's top level as the API spells
     /// them.
@@ -123,33 +115,30 @@ pub struct LocalCiSeededRun {
     pub status: LocalCiSeededStatus,
 }
 
-/// Where a [`LocalCiSeededRun`] stands, the state every one of its legs
-/// shares — GitHub's `status`, with the `conclusion` only a `completed`
-/// run carries.
+/// Where a [`LocalCiSeededRun`] stands — GitHub's `status`, with the
+/// `conclusion` only a `completed` run carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum LocalCiSeededStatus {
-    /// Every leg's build job is running and its publish job has not
-    /// started, so nothing is published and the run's `conclusion` is
-    /// `null`. A `POST …/runs/{id}/cancel` completes it as `cancelled`.
+    /// The build job is running and the publish job has not started,
+    /// so nothing is published and the run's `conclusion` is `null`.
     InProgress,
-    /// The run finished, every leg at `conclusion`.
+    /// The run finished at `conclusion`.
     Completed {
-        /// How every leg of the run ended.
+        /// How the run ended.
         conclusion: LocalCiSeededConclusion,
     },
 }
 
-/// The one outcome every leg of a completed [`LocalCiSeededRun`]
-/// shares.
+/// The outcome of a completed [`LocalCiSeededRun`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalCiSeededConclusion {
-    /// Every leg's build and publish jobs succeeded and its records
-    /// artifact is published; the run concluded `success`.
+    /// The build and publish jobs succeeded and the records artifact
+    /// is published; the run concluded `success`.
     Success,
-    /// Every leg's build job failed at its first verdict step and its
-    /// publish job was skipped, so no leg published records; the run
+    /// The build job failed at its first verdict step and the publish
+    /// job was skipped, so nothing published records; the run
     /// concluded `failure`.
     Failure,
 }
@@ -188,8 +177,7 @@ mod tests {
                 workflow_run_id: None,
                 rustc_version: crate::identity::WireRustcVersion::parse("1.86.0".to_owned())
                     .unwrap(),
-                batch_id: task_id[32..].parse().unwrap(),
-                legs: vec![task_id.clone()],
+                task_id: task_id.clone(),
                 status,
             };
             let value = serde_json::to_value(&run).unwrap();

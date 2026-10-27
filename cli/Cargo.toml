@@ -64,7 +64,7 @@ stow-oci.workspace = true
 # aws-lc-rs, which conflicts with the ring provider this crate installs.
 oci-client = { version = "0.16.1", default-features = false }
 oci-spec = "0.10"
-sigstore = { version = "0.14.0", default-features = false, features = ["cosign", "verify", "sigstore-trust-root", "rustls-tls"] }
+sigstore = { version = "0.14.0", default-features = false, features = ["cosign", "verify", "rustls-tls"] }
 tokio = { version = "1", features = ["io-std", "io-util", "net", "rt", "rt-multi-thread", "sync", "time"] }
 x509-cert = "0.2.5"
 webpki = { package = "rustls-webpki", version = "0.103.8" }
@@ -83,6 +83,10 @@ sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runti
 axoupdater = "0.10"
 which = "8"
 same-file = "1"
+time = { version = "0.3.55", default-features = false, features = [
+    "std",
+    "formatting",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -104,7 +108,6 @@ tokio = { version = "1", features = ["test-util"] }
 process-wrap = { version = "10.0.1", default-features = false, features = ["std", "process-group", "job-object"] }
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 stow-types.workspace = true
-time = "0.3"
 
 [lints]
 workspace = true

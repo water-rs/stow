@@ -3,7 +3,7 @@
 //! Each run measures four signal groups — Cloudflare usage against the
 //! hourly share of the monthly included allowances, edge health (Worker
 //! invocation statuses, DO resource failures, `overloaded` events), the
-//! build pipeline (build-batch failed-leg share, dispatch retries,
+//! build pipeline (build-crate failed-task share, dispatch retries,
 //! pending age, dispatch stalls), and the public endpoints — then acts on the
 //! verdict: `Trip` breaches disable the dispatching workflows that read
 //! `active` — the exact set, recorded on the incident issue for `clear`
@@ -23,7 +23,7 @@
 //! GraphQL POST, one Analytics Engine SQL POST, ≤3 admin/endpoint calls,
 //! one GHCR verified pull for the bundle probe (tag list + index
 //! manifest + signature + blob), ≤ `1 + completed-runs +
-//! MAX_CLASSIFIED_LEGS` GitHub REST reads (a run's legs live only on
+//! MAX_CLASSIFIED_TASKS` GitHub REST reads (a run's jobs live only on
 //! its jobs page) plus one per trip workflow when a trip runs, and, only
 //! while an incident is open, ≤8 REST mutations
 //! plus one email — idle runs issue no mutations at all.
@@ -34,13 +34,13 @@ use std::fmt::Write as _;
 use askama::Template;
 use clap::{Args, Subcommand};
 use futures_util::StreamExt as _;
-use stow_types::analytics::{self, Envelope};
+use stow_types::analytics;
 use stow_types::api::{AdminStatus, DispatchFreeze};
 use stow_types::identity::WireRustcVersion;
-use stow_types::runs::{LegFailure, LegOutcome, RunFailure, RunJobRow};
+use stow_types::runs::{RunFailure, RunJobRow};
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
-use stow_types::trusted_builder::BATCH_WORKFLOW_FILE;
+use stow_types::trusted_builder::WORKFLOW_FILE;
 
 use crate::maintenance::{self, MaintenanceScope};
 use time::OffsetDateTime;
@@ -135,15 +135,11 @@ const HOURS_PER_MONTH: f64 = 720.0;
 //   25G rows read/mo, 50M rows written/mo (SQLite storage billing).
 //   `activeTime` and `cpuTime` are collected as diagnostics.
 //   <https://developers.cloudflare.com/durable-objects/platform/pricing/>
-// - D1 Paid — 25G rows read/mo, 50M rows written/mo.
-//   <https://developers.cloudflare.com/d1/platform/pricing/>
 pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY};
 pub const DO_REQUESTS_MONTHLY: f64 = 1e6;
 pub const DO_DURATION_GB_S_MONTHLY: f64 = 400e3;
 pub const WORKER_REQUESTS_MONTHLY: f64 = 10e6;
 pub const WORKER_CPU_MS_MONTHLY: f64 = 30e6;
-pub const D1_ROWS_READ_MONTHLY: f64 = 25e9;
-pub const D1_ROWS_WRITTEN_MONTHLY: f64 = 50e6;
 
 /// One hour — the usage window. An hourly window trips a sustained burn
 /// to the monthly allowance's hourly share within an hour instead of
@@ -192,24 +188,6 @@ const SIGNALS: &[Signal] = &[
         min_sample: 0,
         threshold: DO_REQUESTS_MONTHLY / HOURS_PER_MONTH,
         unit: "requests",
-        effect: Effect::Trip,
-    },
-    Signal {
-        id: "cf.d1.rows_read",
-        label: "D1 rows read/h vs hourly share of the 25G/mo allowance",
-        window_secs: HOUR,
-        min_sample: 0,
-        threshold: D1_ROWS_READ_MONTHLY / HOURS_PER_MONTH,
-        unit: "rows",
-        effect: Effect::Trip,
-    },
-    Signal {
-        id: "cf.d1.rows_written",
-        label: "D1 rows written/h vs hourly share of the 50M/mo allowance",
-        window_secs: HOUR,
-        min_sample: 0,
-        threshold: D1_ROWS_WRITTEN_MONTHLY / HOURS_PER_MONTH,
-        unit: "rows",
         effect: Effect::Trip,
     },
     Signal {
@@ -272,7 +250,7 @@ const SIGNALS: &[Signal] = &[
     },
     Signal {
         id: "edge.do.overloaded",
-        label: "DO `overloaded` events (Analytics Engine, written by #438)",
+        label: "`overloaded` fault events (Analytics Engine stow_cache_misses)",
         window_secs: HOUR,
         min_sample: 0,
         threshold: 1.0,
@@ -280,11 +258,10 @@ const SIGNALS: &[Signal] = &[
         effect: Effect::Alert,
     },
     // ── build pipeline ──
-    // The leg is the unit (stow#833): one failed leg fails its whole
-    // batch run, so a per-run share would read near 100%.
+    // The task is the unit: one failed task is one failed run.
     Signal {
         id: "pipeline.failure_rate",
-        label: "build-batch failed-leg share of completed legs",
+        label: "build-crate failed-task share of completed tasks",
         window_secs: HOUR,
         min_sample: 20,
         threshold: 50.0,
@@ -293,7 +270,7 @@ const SIGNALS: &[Signal] = &[
     },
     Signal {
         id: "pipeline.retry_storm",
-        label: "build-batch runs at dispatch attempt ≥3",
+        label: "build-crate runs at dispatch attempt ≥3",
         window_secs: HOUR,
         min_sample: 0,
         threshold: 10.0,
@@ -354,7 +331,7 @@ fn signal(id: &str) -> &'static Signal {
 struct Reading {
     signal: &'static Signal,
     /// Denominator or count basis the verdict's `min_sample` reads —
-    /// total requests for a rate, completed legs for the leg share, `1`
+    /// total requests for a rate, completed tasks for the task share, `1`
     /// for a point check, pending count for the dispatch stall.
     sample: u64,
     /// The measured value in the signal's unit.
@@ -438,10 +415,10 @@ const CF_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
 const WORKER_SCRIPT_NAME: &str = "stow-edge";
 
 /// Bound on per-run GitHub log classification — each classified failed
-/// leg costs one log call on top of its run's jobs read, so a
+/// task costs one log call on top of its run's jobs read, so a
 /// pathological failure storm is reported at the cap instead of
 /// burning the job's minutes.
-const MAX_CLASSIFIED_LEGS: usize = 25;
+const MAX_CLASSIFIED_TASKS: usize = 25;
 /// Independent jobs-page reads in flight at once — the same bound
 /// `github::runs_in_range` uses for its subdivision reads.
 const JOBS_READ_CONCURRENCY: usize = 8;
@@ -450,14 +427,13 @@ const JOBS_READ_CONCURRENCY: usize = 8;
 const RUNNER_CAPACITY: usize = 60;
 
 /// Dispatching workflows a trip touches — everything that can start a
-/// build wave or move the index: `build-batch` (the workflow the
-/// scheduler dispatches to; `build-crate.yml` is `workflow_call`-only
-/// now, stow#833), the index cron, and every preheat lane. A trip
-/// disables only the ones reading `active`
+/// build wave or move the index: `build-crate` (the per-task workflow
+/// the scheduler dispatches to), the index cron, and every preheat
+/// lane. A trip disables only the ones reading `active`
 /// and records exactly that set on the incident issue; `clear` restores
 /// the record, nothing more (stow#744).
 const TRIP_WORKFLOWS: &[&str] = &[
-    BATCH_WORKFLOW_FILE,
+    WORKFLOW_FILE,
     "index-publish-cron.yml",
     "preheat-admin.yml",
     "preheat-cron.yml",
@@ -465,15 +441,13 @@ const TRIP_WORKFLOWS: &[&str] = &[
     "preheat-projects.yml",
 ];
 
-/// One failed leg inside a completed run — the `pipeline.failure_rate`
-/// numerator's unit (stow#833).
-struct FailedLeg {
-    /// Index into the completed-run list — the run carrying the leg.
+/// One failed task inside a completed run — the `pipeline.failure_rate`
+/// numerator's unit.
+struct FailedTask {
+    /// Index into the completed-run list — the run carrying the task.
     run: usize,
-    /// The leg index in its batch.
-    leg: u32,
-    /// The leg's classified failure.
-    failure: LegFailure,
+    /// The task's classified failure.
+    failure: crate::runs::TaskFailure,
 }
 
 /// Runtime context every collector and actuation shares.
@@ -491,6 +465,10 @@ struct Watcher<'a> {
     /// The edge URL's host — the `http.host` term the maintenance rules
     /// carry.
     host: &'a str,
+    /// REST base `overloaded_reading` posts its Analytics Engine SQL
+    /// to — `cloudflare::API_BASE` in production, a loopback fixture
+    /// under `STOW_CF_ANALYTICS_SQL_BASE` (stow#888's mock seam).
+    analytics_sql_base: &'a str,
     now: OffsetDateTime,
 }
 
@@ -502,7 +480,7 @@ impl Watcher<'_> {
         let mut readings = Vec::new();
         let mut failures = Vec::new();
         // Sequential collectors keep a run at ~20 outbound calls total —
-        // deliberate under AGENTS.md's spend rules, and each batch
+        // deliberate under AGENTS.md's spend rules, and each run
         // already rides one HTTP request.
         macro_rules! gather {
             ($scope:literal, $fut:expr) => {
@@ -580,56 +558,60 @@ impl Watcher<'_> {
 
     // ----- Analytics Engine: DO overloaded events -----
 
-    /// `stow_events` `blob1='overloaded'` count over the hour — the edge
-    /// writes the event at the point it catches a DO `overloaded` error
-    /// (#438); until that writer lands the count is legitimately 0.
+    /// `stow_cache_misses` overload count over the hour — the edge
+    /// writes `index1='#fault', blob1='overloaded'` points at every
+    /// overload it detects: the platform's "Durable Object is
+    /// overloaded" answer and its own queue-full refusals (stow#888).
+    /// `count()` over the same window is the liveness probe: a dataset
+    /// that received no points at all means the writer chain is down,
+    /// and the collector fails naming the dataset rather than reporting
+    /// a legitimate zero.
     async fn overloaded_reading(&self) -> Result<Vec<Reading>, String> {
-        // Additive estimate: `_sample_interval * double1` sums each
-        // point's engine-recorded interval times its stored weight —
-        // `count()` for today's unsampled writes, scaled if sampled.
-        let query = "SELECT sum(_sample_interval * double1) AS events FROM stow_events \
-                     WHERE blob1 = 'overloaded' \
-                     AND timestamp >= NOW() - INTERVAL '1' HOUR \
+        // `sumIf` keeps the additive estimate's shape — each point's
+        // `_sample_interval * double1` — restricted to the overload
+        // markers, so unsampled writes count as `count()` while sampled
+        // ones stay scaled.
+        let query = "SELECT sumIf(_sample_interval * double1, index1 = '#fault' AND blob1 = 'overloaded') AS events, \
+                     count() AS points FROM stow_cache_misses \
+                     WHERE timestamp >= NOW() - INTERVAL '1' HOUR \
                      FORMAT JSON";
-        let url = format!("{API_BASE}/accounts/{}/analytics_engine/sql", self.account);
-        let mut client = zenwave::client().timeout(std::time::Duration::from_secs(45));
-        let response = client
-            .post(&url)
-            .and_then(|request| {
-                request.header("Authorization", format!("Bearer {}", self.cf_token))
-            })
-            .map(|request| request.bytes_body(query.as_bytes().to_vec()))
-            .map_err(|error| format!("POST {url}: {error}"))?
-            .await
-            .map_err(|error| format!("POST {url}: {error}"))?
-            .error_for_status()
-            .await
-            .map_err(|error| format!("POST {url}: {error}"))?;
-        let envelope: Envelope<AnalyticsRow> = response
-            .into_json()
-            .await
-            .map_err(|error| format!("decode {url}: {error}"))?;
-        let events = envelope.data.first().map_or(0.0, |row| row.events);
+        let rows = cloudflare::analytics_engine_sql::<AnalyticsRow>(
+            self.analytics_sql_base,
+            self.cf_token,
+            self.account,
+            query,
+        )
+        .await?;
+        let row = rows
+            .first()
+            .ok_or_else(|| "stow_cache_misses aggregate query returned no row".to_owned())?;
+        if row.points == 0 {
+            return Err(
+                "stow_cache_misses received no points in the last hour — the edge's analytics writer chain is down"
+                    .to_owned(),
+            );
+        }
         let signal = signal("edge.do.overloaded");
         Ok(vec![Reading {
             signal,
-            sample: 1,
-            value: events,
+            sample: row.points,
+            value: row.events,
             evidence: vec![format!(
-                "stow_events blob1='overloaded' last hour: {events}"
+                "stow_cache_misses index1='#fault' blob1='overloaded' last hour: {}",
+                row.events
             )],
         }])
     }
 
     // ----- GitHub pipeline -----
 
-    /// build-batch completed runs over the hour → the failed-leg
+    /// build-crate completed runs over the hour → the failed-task
     /// share and dispatch-retry signals, with per-target and
     /// per-class evidence.
     ///
-    /// Legs live only on each run's jobs page — one read per
-    /// completed run, bounded-concurrent. A page that cannot be read
-    /// or whose leg classification fails is a failed read: the
+    /// A task's outcome lives only on its run's jobs page — one read
+    /// per completed run, bounded-concurrent. A page that cannot be
+    /// read or whose classification fails is a failed read: the
     /// collector returns `Err`, never an understated share.
     #[allow(clippy::too_many_lines)]
     async fn pipeline_readings(&self) -> Result<Vec<Reading>, String> {
@@ -642,7 +624,7 @@ impl Watcher<'_> {
         let runs = fetch_completed_runs(self.gh_token, since).await?;
         // One jobs read per completed run, bounded-concurrent — a
         // failed read or an unreadable page fails the reading rather
-        // than understating the leg share (a collector failure is an
+        // than understating the task share (a collector failure is an
         // incident of its own).
         let pages: Vec<Vec<RunJobRow>> =
             futures_util::stream::iter(runs.iter().map(|run| async move {
@@ -656,47 +638,44 @@ impl Watcher<'_> {
             .into_iter()
             .collect::<Result<_, _>>()?;
 
-        // Fold every run's page into completed/failed legs — the leg
-        // is the unit: one failed leg fails its whole run.
-        let mut completed_legs = 0u64;
-        let mut failed_legs: Vec<FailedLeg> = Vec::new();
+        // Fold every run's page into completed/failed tasks — the
+        // task is the unit: one failed task is one failed run.
+        let mut completed_tasks = 0u64;
+        let mut failed_tasks: Vec<FailedTask> = Vec::new();
         for (index, (run, jobs)) in runs.iter().zip(&pages).enumerate() {
-            let legs = runs::classify_page(
+            let outcome = runs::classify_page(
                 jobs,
                 run.conclusion.as_deref().unwrap_or_default(),
                 self.now,
             )
-            .map_err(|error| format!("run {}: leg classification: {error}", run.id))?;
-            for leg in legs {
-                match leg.outcome {
-                    // A leg still settling is not a completed leg.
-                    LegOutcome::Unsettled => {}
-                    LegOutcome::Succeeded { .. } => completed_legs += 1,
-                    LegOutcome::Failed(failure) => {
-                        completed_legs += 1;
-                        if runs::leg_attempted(&failure) {
-                            failed_legs.push(FailedLeg {
-                                run: index,
-                                leg: leg.leg,
-                                failure,
-                            });
-                        }
+            .map_err(|error| format!("run {}: task classification: {error}", run.id))?;
+            match outcome {
+                // A run still settling is not a completed task.
+                crate::runs::TaskOutcome::Unsettled => {}
+                crate::runs::TaskOutcome::Succeeded => completed_tasks += 1,
+                crate::runs::TaskOutcome::Failed(failure) => {
+                    completed_tasks += 1;
+                    if runs::attempted(&failure) {
+                        failed_tasks.push(FailedTask {
+                            run: index,
+                            failure,
+                        });
                     }
                 }
             }
         }
         #[allow(clippy::cast_precision_loss)]
-        let failure_rate = if completed_legs == 0 {
+        let failure_rate = if completed_tasks == 0 {
             0.0
         } else {
-            failed_legs.len() as f64 / completed_legs as f64 * 100.0
+            failed_tasks.len() as f64 / completed_tasks as f64 * 100.0
         };
         let retrying: Vec<&GhRun> = runs.iter().filter(|run| run.run_attempt >= 3).collect();
 
         let mut evidence_rate = Vec::new();
         let mut evidence_retry = Vec::new();
-        if !failed_legs.is_empty() {
-            let (targets, classes) = self.classify_failed(&failed_legs, &pages).await;
+        if !failed_tasks.is_empty() {
+            let (targets, classes) = self.classify_failed(&failed_tasks, &pages).await;
             if !targets.is_empty() {
                 evidence_rate.push(format!("targets: {}", targets.join(", ")));
             }
@@ -704,14 +683,14 @@ impl Watcher<'_> {
                 evidence_rate.push(format!("classes: {}", classes.join(", ")));
             }
             let mut run_urls: BTreeSet<&str> = BTreeSet::new();
-            for leg in &failed_legs {
-                run_urls.insert(runs[leg.run].html_url.as_str());
+            for task in &failed_tasks {
+                run_urls.insert(runs[task.run].html_url.as_str());
             }
             for url in run_urls.iter().take(5) {
                 evidence_rate.push((*url).to_owned());
             }
-            if failed_legs.len() > 5 {
-                evidence_rate.push(format!("+{} more failed legs", failed_legs.len() - 5));
+            if failed_tasks.len() > 5 {
+                evidence_rate.push(format!("+{} more failed tasks", failed_tasks.len() - 5));
             }
         }
         for run in retrying.iter().take(5) {
@@ -726,7 +705,7 @@ impl Watcher<'_> {
         Ok(vec![
             Reading {
                 signal: signal("pipeline.failure_rate"),
-                sample: completed_legs,
+                sample: completed_tasks,
                 value: failure_rate,
                 evidence: evidence_rate,
             },
@@ -739,36 +718,32 @@ impl Watcher<'_> {
         ])
     }
 
-    /// For each failed leg (≤ `MAX_CLASSIFIED_LEGS`), read its build
-    /// job's label for the per-target view and fetch the failed job's
-    /// log for the failure class. Log fetch failures degrade the
-    /// evidence, never the signal.
+    /// For each failed task (≤ `MAX_CLASSIFIED_TASKS`), read its
+    /// build job's label for the per-target view and fetch the failed
+    /// job's log for the failure class. Log fetch failures degrade
+    /// the evidence, never the signal.
     async fn classify_failed(
         &self,
-        failed: &[FailedLeg],
+        failed: &[FailedTask],
         pages: &[Vec<RunJobRow>],
     ) -> (Vec<String>, Vec<String>) {
         let mut by_target: std::collections::BTreeMap<String, u32> =
             std::collections::BTreeMap::new();
         let mut by_class: std::collections::BTreeMap<&'static str, u32> =
             std::collections::BTreeMap::new();
-        for leg in failed.iter().take(MAX_CLASSIFIED_LEGS) {
-            let page = &pages[leg.run];
-            if let Some(target) = runs::leg_build_job(page, leg.leg)
-                .and_then(|job| runs::leg_label(&job.name))
+        for task in failed.iter().take(MAX_CLASSIFIED_TASKS) {
+            let page = &pages[task.run];
+            if let Some(target) = runs::build_job(page)
+                .and_then(|job| runs::task_label(&job.name))
                 .map(|label| label.target)
             {
                 *by_target.entry(target).or_default() += 1;
             }
-            let job_name = match &leg.failure {
-                LegFailure::Invariant(_) => {
-                    *by_class.entry("invariant").or_default() += 1;
-                    continue;
-                }
-                LegFailure::Run(
+            let job_name = match &task.failure {
+                crate::runs::TaskFailure::Run(
                     RunFailure::Verdict { job, .. } | RunFailure::Infrastructure { job, .. },
                 )
-                | LegFailure::Concluded { job, .. } => job.as_str(),
+                | crate::runs::TaskFailure::Concluded { job, .. } => job.as_str(),
             };
             let Some(job) = page.iter().find(|job| job.name == job_name) else {
                 continue;
@@ -901,7 +876,7 @@ impl Watcher<'_> {
 
         // Pick a real bundle so the GET exercises the byte path: the
         // signed index slice on GHCR — the verified pull `index export`
-        // uses, not the D1 mirror — → a row's `bundle_digest`. GET, not
+        // uses — a row's `bundle_digest`. GET, not
         // HEAD: the route registers no HEAD handler, and the probe's job
         // is the real user fetch anyway.
         match self.pick_bundle_digest().await {
@@ -969,7 +944,7 @@ impl Watcher<'_> {
     /// or `None` when none of its slices carries rows.
     /// The slice is pulled and verified off GHCR — the same signed source
     /// `index export` and `preheat manual` pull — so the probe depends on
-    /// the store the CLI itself reads, not the D1 mirror. Only the current
+    /// the store the CLI itself reads. Only the current
     /// stable rustc's `index.<target>.<rustc>` tags answer: another
     /// toolchain's slice proves nothing about what users are served.
     async fn pick_bundle_digest(
@@ -1011,7 +986,7 @@ impl Watcher<'_> {
     }
 }
 
-/// `now` minus `secs`, rendered the way D1 writes `datetime('now')` —
+/// `now` minus `secs`, rendered the way SQL writes `datetime('now')` —
 /// `YYYY-MM-DD HH:MM:SS` UTC, lexically comparable.
 fn sqlite_now_minus(now: OffsetDateTime, secs: u64) -> String {
     let at = now - time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX));
@@ -1046,13 +1021,13 @@ fn classify_one(log: &str) -> &'static str {
 // 2026-09-28 — the `workersInvocationsAdaptive` sum carries
 // `clientDisconnects cpuTimeUs duration errors requestDuration requests
 // responseBodySize subrequests wallTime`, the DO invocations sum
-// `errors requests responseBodySize wallTime`, and the DO periodic and
-// D1 sums match the uses below.
+// `errors requests responseBodySize wallTime`, and the DO periodic
+// sums match the uses below.
 
 /// The watchdog's single GraphQL request — one POST covers every
 /// dataset: DO periodic sums (usage + resource failures), DO invocations
 /// (requests), Worker invocations over the hour (usage) and grouped by
-/// invocation status over the last 15 minutes (health), and D1 rows.
+/// invocation status over the last 15 minutes (health).
 const WATCHDOG_QUERY: &str = include_str!("../queries/watchdog.graphql");
 
 /// Query variables — account tag, Worker script name, and the two
@@ -1081,8 +1056,6 @@ struct AccountGroups {
     worker: Vec<WorkerGroup>,
     #[serde(rename = "workerStatus", default)]
     worker_status: Vec<WorkerStatusGroup>,
-    #[serde(default)]
-    d1: Vec<D1Group>,
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
@@ -1188,21 +1161,6 @@ struct WorkerStatusSum {
     requests: f64,
 }
 
-#[derive(Debug, serde::Deserialize, Default)]
-struct D1Group {
-    #[serde(default)]
-    sum: D1Sum,
-}
-
-#[derive(Debug, serde::Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-struct D1Sum {
-    #[serde(default)]
-    rows_read: f64,
-    #[serde(default)]
-    rows_written: f64,
-}
-
 /// The decoded analytics snapshot the readings are built from — kept
 /// whole so diagnostics (unbilled fields) reach the report.
 #[derive(Debug, Default)]
@@ -1212,7 +1170,6 @@ struct CfSnapshot {
     worker: WorkerSum,
     /// `(status, requests)` pairs from the status-grouped query.
     worker_status: Vec<(String, f64)>,
-    d1: D1Sum,
 }
 
 impl From<AccountGroups> for CfSnapshot {
@@ -1271,17 +1228,11 @@ impl From<AccountGroups> for CfSnapshot {
                     .map(|status| (status, group.sum.requests))
             })
             .collect();
-        let d1 = groups.d1.iter().fold(D1Sum::default(), |mut acc, group| {
-            acc.rows_read += group.sum.rows_read;
-            acc.rows_written += group.sum.rows_written;
-            acc
-        });
         Self {
             do_periodic: fold(groups.do_periodic),
             do_invoke,
             worker,
             worker_status,
-            d1,
         }
     }
 }
@@ -1362,18 +1313,6 @@ impl CfSnapshot {
                 )],
             },
             Reading {
-                signal: signal("cf.d1.rows_read"),
-                sample: 1,
-                value: self.d1.rows_read,
-                evidence: vec![],
-            },
-            Reading {
-                signal: signal("cf.d1.rows_written"),
-                sample: 1,
-                value: self.d1.rows_written,
-                evidence: vec![],
-            },
-            Reading {
                 signal: signal("cf.worker.requests"),
                 sample: 1,
                 value: self.worker.requests,
@@ -1419,10 +1358,14 @@ impl CfSnapshot {
 
 #[derive(Debug, serde::Deserialize)]
 struct AnalyticsRow {
-    // `sum(_sample_interval * double1)` is a Float64 — a plain JSON
-    // number (the quoted form is accepted too).
+    // `sumIf(_sample_interval * double1, …)` is a Float64 — a plain
+    // JSON number (the quoted form is accepted too).
     #[serde(default, deserialize_with = "analytics::de_f64")]
     events: f64,
+    /// `count()` over the window — the liveness probe; `UInt64` arrives
+    /// quoted on the wire.
+    #[serde(default, deserialize_with = "analytics::de_u64")]
+    points: u64,
 }
 
 // ----- GitHub wire types -----
@@ -1435,7 +1378,7 @@ struct GhRun {
     conclusion: Option<String>,
     /// The run's latest attempt — GitHub answers it on every workflow
     /// run row, and the jobs read is scoped to it (stow#852).
-    run_attempt: u32,
+    run_attempt: u64,
 }
 
 impl github::RunRow for GhRun {
@@ -1477,8 +1420,8 @@ struct GhComment {
     body: Option<String>,
 }
 
-/// Every `completed` build-batch run in the closed window `[since, now]`
-/// — both outcomes, since the leg share needs the denominator: range
+/// Every `completed` build-crate run in the closed window `[since, now]`
+/// — both outcomes, since the task share needs the denominator: range
 /// enumeration reads past GitHub's 1000-row listing cap so a dense wave
 /// cannot silently shrink the denominator (stow#555).
 async fn fetch_completed_runs(gh_token: &str, since: OffsetDateTime) -> Result<Vec<GhRun>, String> {
@@ -2287,6 +2230,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
     let zone = maintenance::zone_id()?;
     let host = maintenance::host_from_url(edge.base()).map_err(|error| stow_error!("{error}"))?;
+    let sql_base = cloudflare::analytics_sql_base()?;
     let watcher = Watcher {
         edge,
         gh_token: &gh_token,
@@ -2294,6 +2238,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         account: &account,
         zone: &zone,
         host: &host,
+        analytics_sql_base: &sql_base,
         now: OffsetDateTime::now_utc(),
     };
 
@@ -2581,6 +2526,7 @@ async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         std::env::var(CF_ACCOUNT_ID_ENV).map_err(|_| stow_error!("missing {CF_ACCOUNT_ID_ENV}"))?;
     let zone = maintenance::zone_id()?;
     let host = maintenance::host_from_url(edge.base()).map_err(|error| stow_error!("{error}"))?;
+    let sql_base = cloudflare::analytics_sql_base()?;
     let watcher = Watcher {
         edge,
         gh_token: &gh_token,
@@ -2588,6 +2534,7 @@ async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         account: &account,
         zone: &zone,
         host: &host,
+        analytics_sql_base: &sql_base,
         now: OffsetDateTime::now_utc(),
     };
     let mut outcome = ApplyOutcome::default();
@@ -3006,9 +2953,9 @@ mod tests {
     #[test]
     fn usage_over_allowance_trips() {
         let readings = vec![reading(
-            "cf.d1.rows_written",
+            "cf.do.rows_written",
             1,
-            D1_ROWS_WRITTEN_MONTHLY / HOURS_PER_MONTH * 2.0,
+            DO_ROWS_WRITTEN_MONTHLY / HOURS_PER_MONTH * 2.0,
         )];
         let decision = decide(&readings, &[]);
         assert!(decision.incident);
@@ -3019,12 +2966,12 @@ mod tests {
     /// Below threshold → clear, no incident.
     #[test]
     fn usage_below_allowance_clears() {
-        let readings = vec![reading("cf.d1.rows_written", 1, 1000.0)];
+        let readings = vec![reading("cf.do.rows_written", 1, 1000.0)];
         let decision = decide(&readings, &[]);
         assert!(!decision.incident);
     }
 
-    /// Minimum sample: 5 failed legs of 5 completed is 100% but below
+    /// Minimum sample: 5 failed tasks of 5 completed is 100% but below
     /// `min_sample` 20 → skipped, no trip.
     #[test]
     fn failure_rate_respects_minimum_sample() {
@@ -3074,7 +3021,7 @@ mod tests {
     #[test]
     fn collector_failure_is_an_incident() {
         let decision = decide(
-            &[reading("cf.d1.rows_read", 1, 1.0)],
+            &[reading("cf.do.rows_read", 1, 1.0)],
             &[CollectFailure {
                 scope: "pipeline",
                 error: "403".to_owned(),
@@ -3092,8 +3039,7 @@ mod tests {
             "doPeriodic":[{"sum":{"activeTime":12,"cpuTime":5,"duration":700,"exceededCpuErrors":0,"exceededMemoryErrors":0,"fatalInternalErrors":0,"rowsRead":40000000000,"rowsWritten":1000,"storageDeletes":0,"storageReadUnits":0,"storageWriteUnits":0,"subrequests":9}}],
             "doInvoke":[{"sum":{"requests":2000,"wallTime":9,"errors":0}}],
             "worker":[{"sum":{"clientDisconnects":0,"cpuTimeUs":45000000,"duration":1,"errors":0,"requestDuration":2,"requests":15000,"responseBodySize":0,"subrequests":300,"wallTime":4}}],
-            "workerStatus":[{"dimensions":{"status":"success"},"sum":{"requests":100}},{"dimensions":{"status":"scriptThrewException"},"sum":{"requests":4}}],
-            "d1":[{"sum":{"rowsRead":10,"rowsWritten":5}}]
+            "workerStatus":[{"dimensions":{"status":"success"},"sum":{"requests":100}},{"dimensions":{"status":"scriptThrewException"},"sum":{"requests":4}}]
         }]}}}"#;
         let envelope: cloudflare::Envelope<AccountGroups> = serde_json::from_str(json).unwrap();
         let account = envelope.into_account().unwrap();
@@ -3118,15 +3064,131 @@ mod tests {
     /// aggregates — `"0"` decodes just like `0` (issue #485).
     #[test]
     fn analytics_response_decodes_quoted_numbers() {
-        let json =
-            r#"{"meta":[{"name":"events","type":"UInt64"}],"data":[{"events":"0"}],"rows":1}"#;
-        let envelope: Envelope<AnalyticsRow> = serde_json::from_str(json).unwrap();
+        let json = r#"{"meta":[{"name":"events","type":"Float64"},{"name":"points","type":"UInt64"}],"data":[{"events":"0","points":"42"}],"rows":1}"#;
+        let envelope: analytics::Envelope<AnalyticsRow> = serde_json::from_str(json).unwrap();
         assert_eq!(envelope.data[0].events, 0.0);
+        assert_eq!(envelope.data[0].points, 42);
         // An unquoted number decodes too — a Float64 column stays a
         // plain JSON number on the wire.
-        let envelope: Envelope<AnalyticsRow> =
-            serde_json::from_str(r#"{"data":[{"events":17}]}"#).unwrap();
+        let envelope: analytics::Envelope<AnalyticsRow> =
+            serde_json::from_str(r#"{"data":[{"events":17,"points":5}]}"#).unwrap();
         assert_eq!(envelope.data[0].events, 17.0);
+        assert_eq!(envelope.data[0].points, 5);
+    }
+
+    /// A `Watcher` pointed at a loopback Analytics Engine fixture —
+    /// every field but `analytics_sql_base` is inert for the overload
+    /// collector.
+    fn sql_watcher<'a>(edge: &'a crate::Edge, sql_base: &'a str) -> Watcher<'a> {
+        Watcher {
+            edge,
+            gh_token: "gh-test",
+            cf_token: "cf-test",
+            account: "test-account",
+            zone: "zone-test",
+            host: "stow.waterui.dev",
+            analytics_sql_base: sql_base,
+            now: OffsetDateTime::now_utc(),
+        }
+    }
+
+    fn sql_edge() -> crate::Edge {
+        crate::Edge {
+            base: "http://127.0.0.1:1".to_owned(),
+            token: None,
+            version_override: None,
+        }
+    }
+
+    /// The watchdog query must name the live dataset and carry both the
+    /// fault marker and the liveness aggregate — asserted off the
+    /// captured request, not presumed.
+    fn assert_watchdog_sql(body: &[u8]) {
+        let sql = std::str::from_utf8(body).expect("SQL body is UTF-8");
+        assert!(sql.contains("stow_cache_misses"), "{sql}");
+        assert!(sql.contains("index1 = '#fault'"), "{sql}");
+        assert!(sql.contains("blob1 = 'overloaded'"), "{sql}");
+        assert!(sql.contains("count() AS points"), "{sql}");
+    }
+
+    /// Overload points over the trailing hour → the reading breaches
+    /// the `edge.do.overloaded` threshold (`Effect::Alert`), with the
+    /// dataset point count as the sample basis.
+    #[tokio::test]
+    async fn overloaded_reading_alerts_above_threshold() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: r#"{"meta":[],"data":[{"events":"3","points":"17"}],"rows":1}"#,
+        }])
+        .await;
+        let edge = sql_edge();
+        let watcher = sql_watcher(&edge, &server.url);
+        let readings = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            watcher.overloaded_reading(),
+        )
+        .await
+        .expect("read completes within the deadline")
+        .expect("a live dataset with overload points reads");
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].signal.id, "edge.do.overloaded");
+        assert_eq!(readings[0].sample, 17);
+        assert_eq!(verdict(&readings[0]), Verdict::Breach);
+        let requests = server.join().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].head.uri.path(),
+            "/accounts/test-account/analytics_engine/sql"
+        );
+        assert_watchdog_sql(&requests[0].body);
+    }
+
+    /// A live dataset (`points` > 0) with zero overload markers → the
+    /// signal is `clear`, not an incident.
+    #[tokio::test]
+    async fn overloaded_reading_clears_on_live_dataset() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: r#"{"meta":[],"data":[{"events":"0","points":"42"}],"rows":1}"#,
+        }])
+        .await;
+        let edge = sql_edge();
+        let watcher = sql_watcher(&edge, &server.url);
+        let readings = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            watcher.overloaded_reading(),
+        )
+        .await
+        .expect("read completes within the deadline")
+        .expect("a live dataset reads");
+        assert_eq!(verdict(&readings[0]), Verdict::Clear);
+        assert_watchdog_sql(&server.join().await[0].body);
+    }
+
+    /// A dataset that received no points at all in the window is a dead
+    /// writer chain — the collector fails and the error names
+    /// `stow_cache_misses`, never a silent zero.
+    #[tokio::test]
+    async fn overloaded_reading_fails_on_dead_dataset() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 200,
+            retry_after: None,
+            body: r#"{"meta":[],"data":[{"events":"0","points":"0"}],"rows":1}"#,
+        }])
+        .await;
+        let edge = sql_edge();
+        let watcher = sql_watcher(&edge, &server.url);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            watcher.overloaded_reading(),
+        )
+        .await
+        .expect("read completes within the deadline")
+        .expect_err("a pointless dataset is a collector failure");
+        assert!(error.contains("stow_cache_misses"), "{error}");
+        server.join().await;
     }
 
     /// A GraphQL `errors` array is a hard error — never a partial read.
@@ -3179,8 +3241,8 @@ mod tests {
     #[test]
     fn incident_body_renders() {
         let breach = BreachView {
-            id: "cf.d1.rows_written",
-            label: "D1 rows",
+            id: "cf.do.rows_written",
+            label: "DO rows",
             effect: "trip",
             window: "1h".to_owned(),
             observed: "1.4M rows".to_owned(),
@@ -3192,14 +3254,14 @@ mod tests {
             now: "2026-09-28T00:00:00Z",
             dry_run: false,
             breaches: &[breach],
-            actions: &["disabled build-batch.yml".to_owned()],
+            actions: &["disabled build-crate.yml".to_owned()],
             failures: &[],
             disabled: &disabled,
         }
         .render()
         .unwrap();
-        assert!(body.contains("cf.d1.rows_written"));
-        assert!(body.contains("disabled build-batch.yml"));
+        assert!(body.contains("cf.do.rows_written"));
+        assert!(body.contains("disabled build-crate.yml"));
     }
 
     /// Marker render + parse round-trip: the set the template writes is
@@ -3207,7 +3269,7 @@ mod tests {
     #[test]
     fn disabled_marker_round_trips() {
         let disabled =
-            BTreeSet::from(["build-batch.yml".to_owned(), "preheat-cron.yml".to_owned()]);
+            BTreeSet::from(["build-crate.yml".to_owned(), "preheat-cron.yml".to_owned()]);
         let body = IncidentTemplate {
             now: "2026-10-14T00:00:00Z",
             dry_run: false,
@@ -3219,7 +3281,7 @@ mod tests {
         .render()
         .unwrap();
         assert!(
-            body.contains("<!-- stow-watchdog:disabled build-batch.yml,preheat-cron.yml -->"),
+            body.contains("<!-- stow-watchdog:disabled build-crate.yml,preheat-cron.yml -->"),
             "unexpected body:\n{body}"
         );
         assert_eq!(parse_disabled_marker(42, &body), Ok(Some(disabled)));
@@ -3254,11 +3316,11 @@ mod tests {
             parse_disabled_marker(42, "<!-- stow-watchdog:disabled-else a.yml -->"),
             Ok(None)
         );
-        let error = parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-batch.yml, -->")
+        let error = parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-crate.yml, -->")
             .unwrap_err();
         assert!(error.contains("incident #42"), "unexpected error: {error}");
         let error =
-            parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-batch.yml").unwrap_err();
+            parse_disabled_marker(42, "<!-- stow-watchdog:disabled build-crate.yml").unwrap_err();
         assert!(error.contains("incident #42"), "unexpected error: {error}");
         let error =
             parse_disabled_marker(42, "<!-- stow-watchdog:disabled not a file -->").unwrap_err();
@@ -3271,7 +3333,7 @@ mod tests {
     fn trip_selects_only_the_active() {
         let reads = vec![
             TripState {
-                workflow: "build-batch.yml",
+                workflow: "build-crate.yml",
                 state: Ok("active".to_owned()),
             },
             TripState {
@@ -3284,7 +3346,7 @@ mod tests {
             },
         ];
         let (set, failures) = select_trip_set(&reads);
-        assert_eq!(set, BTreeSet::from(["build-batch.yml".to_owned()]));
+        assert_eq!(set, BTreeSet::from(["build-crate.yml".to_owned()]));
         assert_eq!(failures.len(), 1);
         assert!(failures[0].contains("index-publish-cron.yml"));
     }
@@ -3301,11 +3363,11 @@ mod tests {
             pull_request: None,
         };
         match clear_restore(Some(&issue(Some(
-            "<!-- stow-watchdog:disabled build-batch.yml,preheat-cron.yml -->",
+            "<!-- stow-watchdog:disabled build-crate.yml,preheat-cron.yml -->",
         )))) {
             RestoreSet::Set(set) => assert_eq!(
                 set,
-                BTreeSet::from(["build-batch.yml".to_owned(), "preheat-cron.yml".to_owned()])
+                BTreeSet::from(["build-crate.yml".to_owned(), "preheat-cron.yml".to_owned()])
             ),
             _ => panic!("a recorded set restores"),
         }
@@ -3326,13 +3388,13 @@ mod tests {
         ));
     }
 
-    /// The trip list stays exactly the dispatch lanes — `build-batch`
+    /// The trip list stays exactly the dispatch lanes — `build-crate`
     /// plus the five cron/preheat workflows — each a workflow file the
     /// API names by path.
     #[test]
     fn trip_workflows_are_the_dispatch_lanes() {
         assert_eq!(TRIP_WORKFLOWS.len(), 6);
-        assert!(TRIP_WORKFLOWS.contains(&BATCH_WORKFLOW_FILE));
+        assert!(TRIP_WORKFLOWS.contains(&WORKFLOW_FILE));
         assert!(TRIP_WORKFLOWS.iter().all(|name| {
             std::path::Path::new(name)
                 .extension()
@@ -3340,16 +3402,13 @@ mod tests {
         }));
     }
 
-    /// `pipeline_readings`'s evidence path — a leg's build job name
+    /// `pipeline_readings`'s evidence path — a build job name
     /// carries the target verbatim, logs classify through `runs`'s
     /// table.
     #[test]
-    fn leg_build_job_name_parses() {
-        let hash = stow_types::api::TaskHash::of("some-task");
-        let label = runs::leg_label(&format!(
-            "leg 3 / build #3 serde_json 1.0.149 (aarch64-apple-darwin) {hash}"
-        ))
-        .expect("leg label");
+    fn build_job_name_parses() {
+        let label = runs::task_label("build serde_json 1.0.149 (aarch64-apple-darwin)")
+            .expect("task label");
         assert_eq!(label.target, "aarch64-apple-darwin");
         assert_eq!(label.crate_name, "serde_json");
         assert_eq!(label.version, "1.0.149");
@@ -3694,7 +3753,7 @@ mod tests {
                     token: "test-token",
                 },
                 OffsetDateTime::now_utc(),
-                "stow incident: cf.d1.rows_written",
+                "stow incident: cf.do.rows_written",
                 &[],
                 &[],
                 &BTreeSet::new(),

@@ -58,7 +58,15 @@ pub async fn run_rustc_capture_wrapper(
     if let Some(code) = answer_mock_host_probe(rustc, &args[3..]).await? {
         std::process::exit(code);
     }
-    let args = remapped_target_dir_args(&pinned_link_args(&args[3..]));
+    let args = remapped_target_dir_args(
+        &pinned_link_args(
+            &args[3..],
+            std::env::var_os(STOW_BUILD_LINK_ARG_ENV).as_deref(),
+            std::env::var_os(STOW_BUILD_LINK_ARG_CROSS_ENV).is_some(),
+        ),
+        std::env::var_os(STOW_BUILD_TARGET_DIR_REMAP_ENV).as_deref(),
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+    );
     let original_parsed = match ParsedRustcArgs::parse(&args) {
         Ok(mut parsed) => {
             // Cargo exports OUT_DIR on the rustc invocation of a links crate's
@@ -77,7 +85,13 @@ pub async fn run_rustc_capture_wrapper(
             ));
         }
     };
-    if !original_parsed.is_restorable_artifact() || is_generated_wrapper_unit(&original_parsed) {
+    if !original_parsed.is_restorable_artifact()
+        || is_generated_wrapper_unit(
+            &original_parsed,
+            std::env::var_os(STOW_BUILD_WRAPPER_CRATE_NAME_ENV).as_deref(),
+            std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
+        )
+    {
         let started = Instant::now();
         let status = rustc_status(rustc, &args).await?;
         // Cargo units that produce nothing restorable — and the generated
@@ -309,11 +323,14 @@ async fn record_compiled_capture(
 /// would inherit whatever linker the runner image happened to ship.
 /// Appending it here also lands it in `ParsedRustcArgs`' link options, the
 /// compile-key term that records which link choice produced the artifact.
-fn pinned_link_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
-    let Some(link_arg) = std::env::var_os(STOW_BUILD_LINK_ARG_ENV) else {
+fn pinned_link_args(
+    args: &[std::ffi::OsString],
+    link_arg: Option<&std::ffi::OsStr>,
+    cross: bool,
+) -> Vec<std::ffi::OsString> {
+    let Some(link_arg) = link_arg else {
         return args.to_vec();
     };
-    let cross = std::env::var_os(STOW_BUILD_LINK_ARG_CROSS_ENV).is_some();
     if !unit_targets_linux_gnu(args, cross) {
         return args.to_vec();
     }
@@ -367,11 +384,12 @@ fn unit_targets_linux_gnu(args: &[std::ffi::OsString], cross: bool) -> bool {
 /// the compile key), so appending it uniformly is safe; a unit whose argv
 /// already carries the identical flag — anything the rustflags reached —
 /// is not rewritten.
-fn remapped_target_dir_args(args: &[std::ffi::OsString]) -> Vec<std::ffi::OsString> {
-    let (Some(mapped), Some(target_dir)) = (
-        std::env::var_os(STOW_BUILD_TARGET_DIR_REMAP_ENV),
-        std::env::var_os("CARGO_TARGET_DIR"),
-    ) else {
+fn remapped_target_dir_args(
+    args: &[std::ffi::OsString],
+    mapped: Option<&std::ffi::OsStr>,
+    target_dir: Option<&std::ffi::OsStr>,
+) -> Vec<std::ffi::OsString> {
+    let (Some(mapped), Some(target_dir)) = (mapped, target_dir) else {
         return args.to_vec();
     };
     let flag = std::ffi::OsString::from(format!(
@@ -554,11 +572,15 @@ fn capture_dir() -> stow_types::error::Result<PathBuf> {
 /// the name match can never attach to a same-named registry dependency. The
 /// wrapper is scaffolding, not a publishable artifact — it is recorded as
 /// observed so anything forging a record under its identity collides.
-fn is_generated_wrapper_unit(parsed: &ParsedRustcArgs) -> bool {
-    let Some(wrapper_name) = std::env::var_os(STOW_BUILD_WRAPPER_CRATE_NAME_ENV) else {
+fn is_generated_wrapper_unit(
+    parsed: &ParsedRustcArgs,
+    wrapper_name: Option<&std::ffi::OsStr>,
+    primary_package: bool,
+) -> bool {
+    let Some(wrapper_name) = wrapper_name else {
         return false;
     };
-    if std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none() {
+    if !primary_package {
         return false;
     }
     wrapper_name.to_str().is_some_and(|wrapper_name| {
@@ -1580,20 +1602,6 @@ impl heel::IpcCommand for StowCaptureCommand {
 mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    /// The process environment is global, and the harness runs tests on
-    /// several threads, so every test that sets
-    /// `STOW_BUILD_WRAPPER_CRATE_NAME` or `CARGO_PRIMARY_PACKAGE` holds
-    /// this for its whole body. Without it one test's `set_var` lands in
-    /// the middle of another's assertion and the suite flakes.
-    fn env_guard() -> MutexGuard<'static, ()> {
-        static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
-        GUARD
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 
     use tempfile::tempdir;
 
@@ -1610,49 +1618,16 @@ mod tests {
     /// feature set instead (stow#611).
     #[test]
     fn the_record_stamps_the_invocations_feature_set() {
-        let _guard = env_guard();
-        // `ParsedRustcArgs::parse` folds RUSTFLAGS in; the sandbox never
-        // leaks them, so neither may the test.
-        let rustflags = std::env::var_os("RUSTFLAGS");
-        let encoded = std::env::var_os("CARGO_ENCODED_RUSTFLAGS");
-        unsafe {
-            std::env::remove_var("RUSTFLAGS");
-            std::env::remove_var("CARGO_ENCODED_RUSTFLAGS");
-        }
-        let parsed = ParsedRustcArgs::parse(
-            &[
-                "--crate-name",
-                "itoa",
-                "--crate-type",
-                "rlib",
-                "--target",
-                "aarch64-apple-darwin",
-                "--cfg",
-                "feature=\"a\"",
-                "--cfg",
-                "feature=\"b\"",
-                "--cfg",
-                "unix",
-                "--out-dir",
-                "/tmp/out",
-                "-C",
-                "metadata=abc123",
-            ]
-            .iter()
-            .map(std::ffi::OsString::from)
-            .collect::<Vec<_>>(),
-        )
-        .expect("parse argv");
-        unsafe {
-            match rustflags {
-                Some(value) => std::env::set_var("RUSTFLAGS", value),
-                None => std::env::remove_var("RUSTFLAGS"),
-            }
-            match encoded {
-                Some(value) => std::env::set_var("CARGO_ENCODED_RUSTFLAGS", value),
-                None => std::env::remove_var("CARGO_ENCODED_RUSTFLAGS"),
-            }
-        }
+        // The record carries the invocation's own feature set — the state
+        // `ParsedRustcArgs` holds after `--cfg feature="…"` argv — and a
+        // non-feature cfg like `unix` never enters it.
+        let mut parsed = parsed_lib(
+            "itoa",
+            PathBuf::from("/tmp/target-check/debug/deps"),
+            "-abc123",
+        );
+        parsed.features = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
+        parsed.cfgs = BTreeSet::from(["unix".to_owned()]);
 
         let record = super::observed_capture_record(&parsed, "abc123", 0).expect("record");
         assert_eq!(
@@ -2211,7 +2186,6 @@ mod tests {
 
     #[test]
     fn task_crate_capture_identity_comes_from_the_registry_path() {
-        let _env = env_guard();
         // The task crate compiles out of the registry source dir like every
         // other dependency of the generated wrapper package, so its
         // captured identity is the path-derived registry one — cargo's
@@ -2263,7 +2237,6 @@ mod tests {
 
     #[test]
     fn generated_wrapper_unit_is_classified_by_primary_package_env() {
-        let _env = env_guard();
         let parsed = parsed_lib(
             "stow_ci_wrapper",
             PathBuf::from("/tmp/target-build/debug/deps"),
@@ -2274,38 +2247,37 @@ mod tests {
             PathBuf::from("/tmp/target-build/debug/deps"),
             "-c89425c946911fe2",
         );
+        let wrapper_name = std::ffi::OsStr::new("stow-ci-wrapper");
 
         // Without the env the unit is ordinary: classification is off
         // wherever the variable is not set.
-        unsafe {
-            std::env::remove_var(super::STOW_BUILD_WRAPPER_CRATE_NAME_ENV);
-            std::env::set_var("CARGO_PRIMARY_PACKAGE", "1");
-        }
-        assert!(!super::is_generated_wrapper_unit(&parsed));
+        assert!(!super::is_generated_wrapper_unit(&parsed, None, true));
 
         // The name alone is not enough: without CARGO_PRIMARY_PACKAGE a
         // registry dependency could share the package name and must not
         // classify.
-        unsafe {
-            std::env::set_var(super::STOW_BUILD_WRAPPER_CRATE_NAME_ENV, "stow-ci-wrapper");
-            std::env::remove_var("CARGO_PRIMARY_PACKAGE");
-        }
-        assert!(!super::is_generated_wrapper_unit(&parsed));
+        assert!(!super::is_generated_wrapper_unit(
+            &parsed,
+            Some(wrapper_name),
+            false
+        ));
 
         // Root package + name match: the generated wrapper's own unit.
-        unsafe { std::env::set_var("CARGO_PRIMARY_PACKAGE", "1") };
-        assert!(super::is_generated_wrapper_unit(&parsed));
-        assert!(!super::is_generated_wrapper_unit(&other));
-
-        unsafe {
-            std::env::remove_var(super::STOW_BUILD_WRAPPER_CRATE_NAME_ENV);
-            std::env::remove_var("CARGO_PRIMARY_PACKAGE");
-        }
+        assert!(super::is_generated_wrapper_unit(
+            &parsed,
+            Some(wrapper_name),
+            true
+        ));
+        assert!(!super::is_generated_wrapper_unit(
+            &other,
+            Some(wrapper_name),
+            true
+        ));
     }
 
     #[test]
     fn pinned_link_args_appends_only_for_linux_gnu_units() {
-        let _env = env_guard();
+        let mold = std::ffi::OsStr::new("-fuse-ld=mold");
         let host_args: Vec<std::ffi::OsString> = [
             "rustc",
             "--crate-name",
@@ -2318,14 +2290,11 @@ mod tests {
         .map(std::ffi::OsString::from)
         .collect();
 
-        unsafe { std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV) };
-        assert_eq!(super::pinned_link_args(&host_args), host_args);
-
-        unsafe { std::env::set_var(super::STOW_BUILD_LINK_ARG_ENV, "-fuse-ld=mold") };
+        assert_eq!(super::pinned_link_args(&host_args, None, false), host_args);
 
         // A unit without `--target` builds for the host — linux on the jobs
         // that set the pin — so it gets the flag.
-        let pinned = super::pinned_link_args(&host_args);
+        let pinned = super::pinned_link_args(&host_args, Some(mold), false);
         let tail: Vec<&str> = pinned[pinned.len() - 2..]
             .iter()
             .map(|arg| arg.to_str().expect("pinned arg"))
@@ -2347,10 +2316,12 @@ mod tests {
         ] {
             let mut args = host_args.clone();
             args.extend(spelling.iter().map(std::ffi::OsString::from));
-            assert!(super::pinned_link_args(&args).ends_with(&[
-                std::ffi::OsString::from("-C"),
-                std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
-            ]));
+            assert!(
+                super::pinned_link_args(&args, Some(mold), false).ends_with(&[
+                    std::ffi::OsString::from("-C"),
+                    std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
+                ])
+            );
         }
 
         // A unit for anything else — an android or wasm triple — never
@@ -2359,15 +2330,13 @@ mod tests {
             let mut args = host_args.clone();
             args.push(std::ffi::OsString::from("--target"));
             args.push(std::ffi::OsString::from(target));
-            assert_eq!(super::pinned_link_args(&args), args);
+            assert_eq!(super::pinned_link_args(&args, Some(mold), false), args);
         }
-
-        unsafe { std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV) };
     }
 
     #[test]
     fn cross_mode_pins_target_units_but_never_host_units() {
-        let _env = env_guard();
+        let mold = std::ffi::OsStr::new("-fuse-ld=mold");
         let mut host_args: Vec<std::ffi::OsString> = [
             "rustc",
             "--crate-name",
@@ -2380,15 +2349,13 @@ mod tests {
         .map(std::ffi::OsString::from)
         .collect();
 
-        unsafe {
-            std::env::set_var(super::STOW_BUILD_LINK_ARG_ENV, "-fuse-ld=mold");
-            std::env::set_var(super::STOW_BUILD_LINK_ARG_CROSS_ENV, "1");
-        }
-
         // Under a cross invocation a host unit sits beyond the rustflag
         // boundary — a consumer's `cfg(target_os = "linux")` selection
         // cannot reach it either, so it builds unpinned.
-        assert_eq!(super::pinned_link_args(&host_args), host_args);
+        assert_eq!(
+            super::pinned_link_args(&host_args, Some(mold), true),
+            host_args
+        );
 
         // A linux-gnu `--target` unit still takes the pin in both
         // spellings; anything else never does.
@@ -2398,22 +2365,22 @@ mod tests {
         ] {
             let mut args = host_args.clone();
             args.extend(spelling.iter().map(std::ffi::OsString::from));
-            assert!(super::pinned_link_args(&args).ends_with(&[
-                std::ffi::OsString::from("-C"),
-                std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
-            ]));
+            assert!(
+                super::pinned_link_args(&args, Some(mold), true).ends_with(&[
+                    std::ffi::OsString::from("-C"),
+                    std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
+                ])
+            );
         }
         host_args.extend(
             ["--target", "wasm32-unknown-unknown"]
                 .iter()
                 .map(std::ffi::OsString::from),
         );
-        assert_eq!(super::pinned_link_args(&host_args), host_args);
-
-        unsafe {
-            std::env::remove_var(super::STOW_BUILD_LINK_ARG_ENV);
-            std::env::remove_var(super::STOW_BUILD_LINK_ARG_CROSS_ENV);
-        }
+        assert_eq!(
+            super::pinned_link_args(&host_args, Some(mold), true),
+            host_args
+        );
     }
 
     /// The production shape behind `fix/msvc-host-capture-collision`: under
@@ -2425,7 +2392,6 @@ mod tests {
     /// boundary dropped.
     #[test]
     fn remapped_args_append_the_flag_the_rustflag_boundary_drops() {
-        let _env = env_guard();
         let host_args: Vec<std::ffi::OsString> = [
             "rustc",
             "--crate-name",
@@ -2442,18 +2408,15 @@ mod tests {
         .map(std::ffi::OsString::from)
         .collect();
         let flag = "--remap-path-prefix=/run/target-check-target=stow-ci://target".to_owned();
+        let mapped = std::ffi::OsStr::new("stow-ci://target");
+        let target_dir = std::ffi::OsStr::new("/run/target-check-target");
 
-        unsafe {
-            std::env::remove_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV);
-            std::env::remove_var("CARGO_TARGET_DIR");
-        }
-        assert_eq!(super::remapped_target_dir_args(&host_args), host_args);
+        assert_eq!(
+            super::remapped_target_dir_args(&host_args, None, None),
+            host_args
+        );
 
-        unsafe {
-            std::env::set_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV, "stow-ci://target");
-            std::env::set_var("CARGO_TARGET_DIR", "/run/target-check-target");
-        }
-        let remapped = super::remapped_target_dir_args(&host_args);
+        let remapped = super::remapped_target_dir_args(&host_args, Some(mapped), Some(target_dir));
         assert_eq!(
             remapped[remapped.len() - 1].to_str().expect("remap arg"),
             flag,
@@ -2465,11 +2428,6 @@ mod tests {
                 .crate_name,
             "unicode_ident"
         );
-
-        unsafe {
-            std::env::remove_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV);
-            std::env::remove_var("CARGO_TARGET_DIR");
-        }
     }
 
     /// Units the rustflags already reached — target-side units under
@@ -2477,7 +2435,6 @@ mod tests {
     /// verbatim; the wrapper must not append a second copy.
     #[test]
     fn remapped_args_do_not_duplicate_the_rustflags_copy() {
-        let _env = env_guard();
         let flag = "--remap-path-prefix=/run/target-check-target=stow-ci://target".to_owned();
         let args: Vec<std::ffi::OsString> = [
             "rustc",
@@ -2492,16 +2449,14 @@ mod tests {
         .map(std::ffi::OsString::from)
         .collect();
 
-        unsafe {
-            std::env::set_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV, "stow-ci://target");
-            std::env::set_var("CARGO_TARGET_DIR", "/run/target-check-target");
-        }
-        assert_eq!(super::remapped_target_dir_args(&args), args);
-
-        unsafe {
-            std::env::remove_var(super::STOW_BUILD_TARGET_DIR_REMAP_ENV);
-            std::env::remove_var("CARGO_TARGET_DIR");
-        }
+        assert_eq!(
+            super::remapped_target_dir_args(
+                &args,
+                Some(std::ffi::OsStr::new("stow-ci://target")),
+                Some(std::ffi::OsStr::new("/run/target-check-target")),
+            ),
+            args
+        );
     }
 
     /// stow#578: cargo names the fingerprint dir after the package

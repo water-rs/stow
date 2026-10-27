@@ -10,13 +10,13 @@
 //! so the registry plus cosign is the only record store and no
 //! `STOW_EDGE_URL` reaches `build-crate.yml`.
 
-use crate::api::{ArtifactRecord, BatchId};
+use crate::api::ArtifactRecord;
 use crate::index::ArtifactIndexRow;
 use crate::registry::MAX_OCI_TAG_LEN;
 
 /// `artifactType` (and single-layer media type) of a records artifact: a
 /// JSON array of [`ArtifactRecord`] — the full set of rows one
-/// `build-batch.yml` leg's publish job pushed.
+/// `build-crate.yml` run's publish job pushed.
 pub const RECORDS_ARTIFACT_TYPE: &str = "application/vnd.stow.records.v1+json";
 
 /// Media type of the records artifact's empty OCI config blob.
@@ -26,35 +26,30 @@ pub const RECORDS_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.records.config
 /// readers never parse the tag for it.
 pub const RECORDS_TASK_ID_ANNOTATION: &str = "dev.stow.records.task-id";
 
-/// The `run-name` `build-batch.yml` stamps on its run (stow#833).
+/// The `run-name` `build-crate.yml` stamps on its run —
+/// `<rustc>-<task_id>`, unhashed.
 ///
-/// The full `<rustc>-b<batch_id>`. `batch_id` is the 32-lowercase-hex
-/// [`BatchId`] the scheduler minted at claim (`lower(hex(randomblob(16)))`,
-/// like `generation_id`). The `b` marker keeps batch titles disjoint
-/// from the other trusted run title — `resolve-request.yml`'s
-/// `resolve-a<attempt>-<request_id>` never has `b` + 32 hex after its
-/// first dash. `index-publish-cron.yml`'s
-/// `${RUN_TITLE%%-*}` still yields the rustc.
+/// `WireRustcVersion` is numeric (`1.99.0`) and never contains `-`, so
+/// the title splits at the first `-`: the rustc version selects which
+/// records an export pass considers, the task id identifies the run.
+/// `index-publish-cron.yml`'s `${RUN_TITLE%%-*}` still yields the
+/// rustc.
 #[must_use]
-pub fn batch_run_title(rustc_version: &str, batch_id: &BatchId) -> String {
+pub fn run_title(rustc_version: &str, task_id: &str) -> String {
     debug_assert!(
         !rustc_version.is_empty() && !rustc_version.contains('-'),
         "rustc version {rustc_version:?} cannot lead a run title"
     );
-    format!("{rustc_version}-b{batch_id}")
+    format!("{rustc_version}-{task_id}")
 }
 
-/// The `(rustc_version, batch_id)` a batch run title names.
-///
-/// The inverse of [`batch_run_title`], returning the [`BatchId`]
-/// without its `b` marker. `None` when the title is not
-/// `<rustc>-b<32 lowercase hex>`: the run is not one ours could have
-/// made.
+/// The `(rustc_version, task_id)` a run title names — the inverse of
+/// [`run_title`]. `None` when the title is not `<rustc>-<task_id>`: the
+/// run is not one ours could have made, or its name was hand-edited.
 #[must_use]
-pub fn parse_batch_run_title(title: &str) -> Option<(&str, BatchId)> {
-    let (rustc_version, rest) = title.split_once('-')?;
-    let batch_id = rest.strip_prefix('b')?.parse().ok()?;
-    (!rustc_version.is_empty()).then_some((rustc_version, batch_id))
+pub fn parse_run_title(title: &str) -> Option<(&str, &str)> {
+    let (rustc_version, task_id) = title.split_once('-')?;
+    (!rustc_version.is_empty() && !task_id.is_empty()).then_some((rustc_version, task_id))
 }
 
 /// The `run-name` `resolve-request.yml` stamps on its run —
@@ -63,7 +58,7 @@ pub fn parse_batch_run_title(title: &str) -> Option<(&str, BatchId)> {
 /// The `a<attempt>` leg pins the record's dispatch epoch so a stale
 /// run's `workflow_run` events cannot land on a re-request's live
 /// attempt, and the `resolve-` leg keeps the title's first-dash split
-/// disjoint from `build-batch.yml`'s `<rustc>-b<batch_id>`.
+/// disjoint from `build-crate.yml`'s `<rustc>-<task_id>`.
 #[must_use]
 pub fn resolve_run_title(attempt: u32, request_id: &str) -> String {
     format!("resolve-a{attempt}-{request_id}")
@@ -128,6 +123,30 @@ pub fn records_tag(rustc_version: &str, task_id: &str, build: BuildRun) -> Strin
     assert!(
         tag.len() <= MAX_OCI_TAG_LEN,
         "records tag {tag:?} exceeds {MAX_OCI_TAG_LEN} chars"
+    );
+    tag
+}
+
+/// `built-<rustc>-<task_id hash>` — the published-records marker tag.
+///
+/// A publish points it at the task's records manifest, so a
+/// `build-crate.yml` run learns "this task's signed records already
+/// exist" in one manifest fetch (stow#877): two submitters naming the
+/// same task race to one build, and the superseded or following run
+/// exits without building by re-tagging the manifest this tag names
+/// instead of compiling. The tag space stays disjoint from `records-`,
+/// which the index export folds.
+///
+/// # Panics
+///
+/// When the produced tag exceeds [`MAX_OCI_TAG_LEN`].
+#[must_use]
+pub fn published_tag(rustc_version: &str, task_id: &str) -> String {
+    let digest = blake3::hash(task_id.as_bytes()).to_hex();
+    let tag = format!("built-{rustc_version}-{digest}");
+    assert!(
+        tag.len() <= MAX_OCI_TAG_LEN,
+        "published tag {tag:?} exceeds {MAX_OCI_TAG_LEN} chars"
     );
     tag
 }
@@ -198,8 +217,8 @@ pub fn is_records_tag(tag: &str) -> bool {
 /// artifact is not in GHCR.
 ///
 /// The claim is not the record, so a task is done only once the
-/// artifact exists (stow#655). A batch leg's resolution reports the
-/// wording verbatim (stow#833 §4.1).
+/// artifact exists (stow#655). The run's completion reports the
+/// wording verbatim.
 #[must_use]
 pub fn missing_records_error(task_id: &str) -> String {
     format!("GitHub reports success but the records artifact for task {task_id} is not in GHCR")
@@ -214,7 +233,7 @@ pub fn record_to_index_row(record: &ArtifactRecord) -> ArtifactIndexRow {
         version: record.version.clone(),
         features_json: record.features_json.clone(),
         dependency_c_metadata_json: record.dependency_c_metadata_json.clone(),
-        dependency_identity: record.dependency_identity.clone(),
+        dependency_task_ids: record.dependency_task_ids.clone(),
         c_metadata: record.c_metadata.clone(),
         compile_key: record.compile_key.clone(),
         bundle_digest: record.bundle_digest.clone(),
@@ -233,48 +252,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn batch_run_title_round_trips() {
-        let batch_id: BatchId = "0123456789abcdef0123456789abcdef"
-            .parse()
-            .expect("batch id");
+    fn run_title_round_trips() {
+        let task_id = "serde-1.0.0-deadbeef-x86_64_unknown-linux-gnu-1_99_0";
+        assert_eq!(run_title("1.99.0", task_id), format!("1.99.0-{task_id}"));
         assert_eq!(
-            batch_run_title("1.99.0", &batch_id),
-            "1.99.0-b0123456789abcdef0123456789abcdef"
-        );
-        assert_eq!(
-            parse_batch_run_title("1.99.0-b0123456789abcdef0123456789abcdef"),
-            Some(("1.99.0", batch_id))
+            parse_run_title(&format!("1.99.0-{task_id}")),
+            Some(("1.99.0", task_id))
         );
     }
 
-    /// A batch title parses only as `<rustc>-b<32 lowercase hex>` — a
-    /// task-id-shaped title, a resolve title, a short or long
-    /// or mis-cased batch id, or a trailing suffix are all refused.
+    /// A run title parses only as `<rustc>-<task_id>` — no dash, an
+    /// empty half, or a trailing-only split are all refused.
     #[test]
-    fn parse_batch_run_title_refuses_malformed_titles() {
-        for title in [
-            // Not a `<rustc>-<id>` split at all.
-            "nodash",
-            "1.99.0-",
-            "-b0123456789abcdef0123456789abcdef",
-            // The `b` marker missing.
-            "1.99.0-0123456789abcdef0123456789abcdef",
-            // Wrong length.
-            "1.99.0-b0123456789abcdef0123456789abcde",
-            "1.99.0-b0123456789abcdef0123456789abcdef0",
-            // Uppercase hex and non-hex characters.
-            "1.99.0-b0123456789ABCDEF0123456789abcdef",
-            "1.99.0-b0123456789abcdef0123456789abcdeg",
-            // A trailing suffix is not part of the id.
-            "1.99.0-b0123456789abcdef0123456789abcdef-extra",
-            // A task-id-shaped title and a resolve run title.
-            "1.99.0-serde-1.0.0-deadbeef-x86_64_unknown-linux-gnu-1_99_0",
-            "resolve-a1-req-serde-1.0.0",
-        ] {
-            assert_eq!(parse_batch_run_title(title), None, "{title}");
+    fn parse_run_title_refuses_malformed_titles() {
+        for title in ["nodash", "1.99.0-", "-some-task-id"] {
+            assert_eq!(parse_run_title(title), None, "{title}");
         }
-        // A title without the `b<batch_id>` half never parses.
-        assert_eq!(parse_batch_run_title("1.99.0-some-task-id"), None);
     }
 
     const BUILD: BuildRun = BuildRun {
@@ -364,8 +357,8 @@ mod tests {
     /// with prerelease>-<features>-<target>-<rustc>` — blows past OCI's
     /// 128-character tag limit at a 64-character crate name, so the tag
     /// carries the task id's blake3 and stays legal by construction.
-    /// The scheduler's batch-leg resolution computes the same tag off
-    /// the leg's task id and the run identity, which is exactly what
+    /// The scheduler's run resolution computes the same tag off
+    /// the task's id and the run identity, which is exactly what
     /// `push_records` signed the artifact under.
     #[test]
     fn a_long_task_id_still_produces_a_legal_tag() {

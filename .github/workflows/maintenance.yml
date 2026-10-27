@@ -1,0 +1,71 @@
+name: Maintenance
+
+# Toggle the zone's WAF maintenance rules (stow#953). The Cloudflare
+# credential is the repository's own secret, so no operator holds a WAF
+# token: dispatching this workflow takes write access to the repository,
+# which binds every toggle to a GitHub account and leaves it on record
+# here. `maintenance ensure` stays in deploy-edge.yml and the watchdog's
+# trip in watchdog.yml; this is the operator's hand on the same rules.
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: Turn the rule on or off, or read all three.
+        type: choice
+        options: [status, "on", "off"]
+        required: true
+      scope:
+        description: >-
+          The rule `on`/`off` writes — `anonymous` sheds public traffic,
+          `lanes` the scheduler-backed routes, `all` the whole site.
+        type: choice
+        options: [lanes, anonymous, all]
+        required: true
+
+permissions:
+  # Pull the signed toolchain artifact from ghcr.io/water-rs/stow-toolchain.
+  packages: read
+  contents: read
+
+# Two toggles never race on the same rules.
+concurrency:
+  group: maintenance
+
+jobs:
+  maintenance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The same signed binary the watchdog runs: main's head carries the
+      # toolchain, and the action fails if the signature does not verify.
+      - name: Resolve main's head
+        id: main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" \
+            >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/actions
+          persist-credentials: false
+      - name: stow-admin from the signed toolchain
+        uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ steps.main.outputs.sha }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Maintenance
+        env:
+          CF_ZONE_ID: ${{ vars.CF_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACTION: ${{ inputs.action }}
+          SCOPE: ${{ inputs.scope }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTION" = status ]; then
+            stow-admin maintenance status
+          else
+            stow-admin maintenance "$ACTION" --scope "$SCOPE" --yes
+            stow-admin maintenance status
+          fi

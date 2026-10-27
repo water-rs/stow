@@ -142,7 +142,7 @@ Three read-only lookups back the request form's crate field, version
 picker, and feature checkboxes. They are a thin, cached proxy over
 crates.io: the browser never talks to crates.io directly, so its CORS
 and user-agent rules do not apply to every visitor, and the version and
-feature answers come out of the same TTL-bounded D1 caches the
+feature answers come out of the same TTL-bounded Workers Cache entries the
 dependency resolver fills — a catalog lookup and a later graph expansion
 of the same version share one round trip.
 

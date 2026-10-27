@@ -7,6 +7,10 @@ workers_dev = false
 [cloudflare.vars]
 GHCR_BASE_URL = "http://127.0.0.1:28123"
 GITHUB_REPO = "water-rs/stow"
+# Mock value for the App's slug — the local CI stamps `<slug>[bot]` as
+# `triggering_actor` on the runs it was dispatched, which is what the
+# webhook's `in_progress` filter reads (stow#940).
+GITHUB_APP_SLUG = "mock-stow-ci"
 # Any value works locally — trusted calls use the developer's GitHub
 # user token; the audience pin only binds OIDC credentials.
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
@@ -20,10 +24,8 @@ STOW_LOCAL_CI_URL = "http://127.0.0.1:28124"
 STOW_GITHUB_API_URL = "http://127.0.0.1:28123"
 STOW_DISPATCH_MIN_AGE_MINUTES = "0"
 STOW_MAX_CONCURRENT_JOBS = "3"
-# Batches hold at most the mock's 3-job pool at once; B keeps the
-# production default so the reduced wave still packs legs (stow#833).
-STOW_BATCH_PARALLELISM = "3"
-STOW_BATCH_MAX_TASKS = "40"
+# The mock's 3-job pool bounds concurrent task runs; every task is its
+# own build-crate.yml run.
 # The seeded fixture holds ~60k pending rows — the production-sized cap
 # keeps the mock's untrusted enqueue lanes on the accept path (the load
 # test drives real admissions and PoW redemptions and expects 200s, not
@@ -45,6 +47,7 @@ STOW_SCHEDULER_BUDGET = "1"
 STOW_COST_BUDGET_MULTIPLIER = "10000"
 STOW_POW_CHALLENGE_SECRET = "mock-pow-challenge-secret"
 STOW_GITHUB_WEBHOOK_SECRET = "mock-github-webhook-secret"
+STOW_NEWRELEASES_WEBHOOK_SECRET = "mock-newreleases-webhook-secret"
 # Cloudflare's documented always-pass Turnstile test pair: any token sent
 # through the request API verifies in the mock deployment.
 TURNSTILE_SITE_KEY = "1x00000000000000000000AA"
@@ -56,16 +59,12 @@ TURNSTILE_HOSTNAME = "example.com"
 # which the mock registry stubs.
 CF_ACCOUNT_ID = "00000000000000000000000000000000"
 CF_ANALYTICS_TOKEN = "mock-analytics-token"
+STOW_STATS_SALT_SECRET = "mock-stats-salt"
 # `stow-mock-registry serve` answers POST /analytics_engine/sql with one
 # union row every stats_*.sql query decodes. Loopback-only by the same
 # rule as STOW_LOCAL_CI_URL — the token rides in Authorization.
 STOW_STATS_SQL_URL = "http://127.0.0.1:28123/analytics_engine/sql"
 
-[[cloudflare.d1_databases]]
-binding = "STOW_DB"
-database_name = "stow-mock"
-database_id = "00000000-0000-0000-0000-000000000009"
-preview_database_id = "00000000-0000-0000-0000-000000000009"
 
 [[cloudflare.durable_objects.bindings]]
 name = "SCHEDULER"
@@ -79,3 +78,7 @@ new_sqlite_classes = ["Scheduler"]
 [[cloudflare.raw.analytics_engine_datasets]]
 binding = "STOW_ANALYTICS"
 dataset = "stow_cache_misses"
+
+[[cloudflare.raw.analytics_engine_datasets]]
+binding = "STOW_STATS"
+dataset = "stow_events"

@@ -21,34 +21,37 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::api::{SchedulerLedger, SchedulerLedgerOp};
-use crate::do_budgets::{
-    DO_BUDGETS, LEDGER_OP_ALARM, LEDGER_OP_BATCH_COMPLETE, PREHEAT_BUDGET, grew,
-};
+use crate::do_budgets::{DO_BUDGETS, LEDGER_OP_ALARM, LEDGER_OP_TASK_COMPLETE, grew};
 use crate::local_ci::LocalCiRun;
 
 /// The event kinds a wave is made of, each one scheduler operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
-    /// A preheat lane's trusted batch submit.
+    /// A preheat lane's trusted task submit.
     Submit,
     /// The alarm's dispatch pass.
     Dispatch,
-    /// A batch run's `workflow_run` completion — one per
-    /// `build-batch.yml` run, however many legs it carried.
+    /// A build run's `workflow_run` completion — one per
+    /// `build-crate.yml` run, so one per task.
     Completion,
-    /// An `index-publish` slice report, which also dispatches the
-    /// dependents it releases.
+    /// An `index-publish` run's slice report, which also dispatches
+    /// the dependents it releases — one per publish run (stow#940).
     SliceReport,
+    /// A build run's `in_progress` — forwarded only for a run the
+    /// scheduler did not dispatch (stow#940), so a wave of its own runs
+    /// books none.
+    ExternalRunUpdate,
 }
 
 impl EventKind {
     /// Every kind, in the order a wave meets them.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::Submit,
         Self::Dispatch,
         Self::Completion,
         Self::SliceReport,
+        Self::ExternalRunUpdate,
     ];
 
     /// The probe-ledger operation this kind books under.
@@ -57,21 +60,22 @@ impl EventKind {
         match self {
             Self::Submit => "POST /tasks/submit/trusted",
             Self::Dispatch => LEDGER_OP_ALARM,
-            Self::Completion => LEDGER_OP_BATCH_COMPLETE,
+            Self::Completion => LEDGER_OP_TASK_COMPLETE,
             Self::SliceReport => "POST /index/published",
+            Self::ExternalRunUpdate => "POST /tasks/run-update",
         }
     }
 
     /// The stow#433 drive whose budget one event of this kind must fit,
     /// for the kinds whose event has a fixed size: one alarm pass claims
-    /// at most the dispatch cap. A submit batch, a batch completion and a
+    /// at most the dispatch cap. A submit, a completion and a
     /// slice report scale with what they carry, so their fixture drives
     /// do not bound a wave's events.
     #[must_use]
     pub const fn drive(self) -> Option<&'static str> {
         match self {
             Self::Dispatch => Some("alarm pass"),
-            Self::Submit | Self::Completion | Self::SliceReport => None,
+            Self::Submit | Self::Completion | Self::SliceReport | Self::ExternalRunUpdate => None,
         }
     }
 }
@@ -106,7 +110,7 @@ pub struct Round {
 /// One preheat lane's run: its submit and the ledger around it.
 #[derive(Debug, Clone)]
 pub struct LaneRun {
-    /// `top`, `top-binaries` or `projects`.
+    /// `top-binaries` or `projects`.
     pub lane: String,
     /// Tasks the lane posted.
     pub submitted: u64,
@@ -122,6 +126,25 @@ pub struct LaneRun {
     /// The ledger before the lane started.
     pub before: LedgerSnapshot,
     /// The ledger after the lane exited.
+    pub after: LedgerSnapshot,
+}
+
+/// One restart of the dev edge the harness made mid-run.
+///
+/// The probe ledger lives on the scheduler graph and persists only
+/// through its snapshot, so a restarted edge answers the ledger of its
+/// last snapshot: every booking since then is gone. The harness reads
+/// the ledger right before it stops the edge and right after the new
+/// one answers; [`analyse`] carries every later read across the
+/// restart as `before + (read − after)`. Nothing but those two reads
+/// and the readiness polls may reach the scheduler in between — a build
+/// dispatched there is a booking neither read holds, and the report
+/// fails on it.
+#[derive(Debug, Clone)]
+pub struct EdgeRestart {
+    /// The ledger read right before the edge stopped.
+    pub before: LedgerSnapshot,
+    /// The ledger read once the restarted edge answered.
     pub after: LedgerSnapshot,
 }
 
@@ -161,7 +184,7 @@ pub struct ProductionTask {
 /// One production preheat lane's plan-only output.
 #[derive(Debug, Clone)]
 pub struct ProductionLane {
-    /// `top`, `top-binaries` or `projects`.
+    /// `top-binaries` or `projects`.
     pub lane: String,
     /// Every task the lane planned, duplicates included.
     pub tasks: Vec<ProductionTask>,
@@ -262,6 +285,8 @@ pub struct WaveObservations {
     pub wave: PhaseObservations,
     /// The daily resubmit of the same lists.
     pub resubmit: PhaseObservations,
+    /// Every edge restart across both phases, in the order they ran.
+    pub restarts: Vec<EdgeRestart>,
     /// Every run the local CI was dispatched, both phases.
     pub runs: Vec<LocalCiRun>,
     /// Task ids the final published slices serve — the gate's own
@@ -302,7 +327,7 @@ impl KindCost {
 }
 
 /// One phase's cost.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseCost {
     /// Per event kind.
     pub kinds: Vec<KindCost>,
@@ -312,18 +337,10 @@ pub struct PhaseCost {
     pub rows_read: u64,
     /// `rowsWritten` over every counted operation.
     pub rows_written: u64,
-    /// The budget's `rowsRead` for this phase at this node count.
-    pub budget_rows_read: f64,
-    /// The budget's `rowsWritten` for this phase at this node count.
-    pub budget_rows_written: f64,
-    /// `build-batch.yml` runs the local CI was dispatched during the
-    /// phase — the completions the phase must have paid.
-    pub batches: u64,
-    /// Legs across those runs — the builds the phase dispatched.
-    pub legs: u64,
-    /// `legs / batches`, the achieved `b̄` every per-batch cost is
-    /// spread over; `None` when the phase dispatched no batch.
-    pub legs_per_batch: Option<f64>,
+    /// `build-crate.yml` runs the local CI was dispatched during the
+    /// phase — one per task — the completions the phase must have
+    /// paid.
+    pub tasks: u64,
     /// Wall milliseconds from the phase's first to its last ledger read.
     pub wall_ms: u64,
 }
@@ -347,10 +364,9 @@ pub struct LayerCost {
     pub layer: usize,
     /// Task ids the layer's round first published.
     pub published: u64,
-    /// `build-batch.yml` runs dispatched during the layer.
-    pub batches: u64,
-    /// Legs across those runs.
-    pub legs: u64,
+    /// `build-crate.yml` runs dispatched during the layer — one per
+    /// task.
+    pub tasks: u64,
     /// Per event kind.
     pub kinds: Vec<KindCost>,
 }
@@ -386,7 +402,7 @@ pub struct Check {
 }
 
 /// `preheat-cost-report.json`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreheatCostReport {
     /// The rustc the wave built for.
     pub rustc_version: String,
@@ -413,8 +429,8 @@ impl PreheatCostReport {
     }
 }
 
-/// `later − earlier`, per operation. An operation missing from
-/// `earlier` started at zero.
+/// `later − earlier`, per operation. An operation missing from either
+/// side is at zero there.
 ///
 /// # Errors
 /// An operation's counters went backwards — the ledger was reset under
@@ -423,8 +439,28 @@ pub fn ledger_delta(
     earlier: &SchedulerLedger,
     later: &SchedulerLedger,
 ) -> crate::error::Result<Vec<SchedulerLedgerOp>> {
+    if earlier.woken_at_ms != later.woken_at_ms {
+        return Err(crate::stow_error!(
+            "probe ledger reloaded between two reads (graph woken at {} ms, then at {} ms) \
+             with no edge restart recorded around it: every booking since its last snapshot \
+             was dropped — the ledger was reset mid-run",
+            earlier.woken_at_ms,
+            later.woken_at_ms
+        ));
+    }
     let before: BTreeMap<&str, &SchedulerLedgerOp> =
         earlier.ops.iter().map(|op| (op.op.as_str(), op)).collect();
+    if let Some(lost) = earlier
+        .ops
+        .iter()
+        .find(|op| op.events > 0 && !later.ops.iter().any(|later| later.op == op.op))
+    {
+        return Err(crate::stow_error!(
+            "probe ledger {} went from {} events to none: the ledger was reset mid-run",
+            lost.op,
+            lost.events
+        ));
+    }
     later
         .ops
         .iter()
@@ -451,6 +487,175 @@ pub fn ledger_delta(
         .collect()
 }
 
+/// `base + delta`, per operation.
+fn ledger_sum(base: &SchedulerLedger, delta: &[SchedulerLedgerOp]) -> SchedulerLedger {
+    let mut ops: BTreeMap<&str, SchedulerLedgerOp> = base
+        .ops
+        .iter()
+        .map(|op| (op.op.as_str(), op.clone()))
+        .collect();
+    for op in delta {
+        let sum = ops
+            .entry(op.op.as_str())
+            .or_insert_with(|| SchedulerLedgerOp {
+                op: op.op.clone(),
+                events: 0,
+                rows_read: 0,
+                rows_written: 0,
+            });
+        sum.events += op.events;
+        sum.rows_read += op.rows_read;
+        sum.rows_written += op.rows_written;
+    }
+    SchedulerLedger {
+        woken_at_ms: base.woken_at_ms,
+        ops: ops.into_values().collect(),
+    }
+}
+
+/// The run's ledger reads on one continuous timeline: each read after
+/// an [`EdgeRestart`] is carried across it, so the run reports the
+/// totals it would have without the restart. A carried read answers the
+/// first graph's `woken_at_ms`, so [`ledger_delta`] still refuses any
+/// pair of reads a reload separates that no recorded restart explains.
+struct Timeline<'a> {
+    restarts: &'a [EdgeRestart],
+    /// Per restart, its `before` read already carried across every
+    /// earlier restart — what the edge had booked when it stopped.
+    carried: Vec<SchedulerLedger>,
+}
+
+impl<'a> Timeline<'a> {
+    /// # Errors
+    /// The restarts are out of order or overlap, or a restart's `before`
+    /// read went backwards against an earlier restart's `after`.
+    fn new(restarts: &'a [EdgeRestart]) -> crate::error::Result<Self> {
+        let mut timeline = Self {
+            restarts,
+            carried: Vec::with_capacity(restarts.len()),
+        };
+        for (index, restart) in restarts.iter().enumerate() {
+            if restart.after.taken_at_ms <= restart.before.taken_at_ms {
+                return Err(crate::stow_error!(
+                    "edge restart {}: its after read ({} ms) does not follow its before read ({} ms)",
+                    index + 1,
+                    restart.after.taken_at_ms,
+                    restart.before.taken_at_ms
+                ));
+            }
+            if let Some(previous) = index.checked_sub(1).map(|previous| &restarts[previous])
+                && restart.before.taken_at_ms <= previous.after.taken_at_ms
+            {
+                return Err(crate::stow_error!(
+                    "edge restart {} began ({} ms) before restart {index} ended ({} ms)",
+                    index + 1,
+                    restart.before.taken_at_ms,
+                    previous.after.taken_at_ms
+                ));
+            }
+            let carried = timeline.carry(&restart.before, index)?;
+            timeline.carried.push(carried);
+        }
+        Ok(timeline)
+    }
+
+    /// `snapshot`'s ledger carried across the first `restarts` restarts.
+    fn carry(
+        &self,
+        snapshot: &LedgerSnapshot,
+        restarts: usize,
+    ) -> crate::error::Result<SchedulerLedger> {
+        let at = snapshot.taken_at_ms;
+        let last = self.restarts[..restarts]
+            .iter()
+            .rposition(|restart| restart.before.taken_at_ms < at);
+        let Some(last) = last else {
+            return Ok(snapshot.ledger.clone());
+        };
+        let restart = &self.restarts[last];
+        if at < restart.after.taken_at_ms {
+            return Err(crate::stow_error!(
+                "a ledger read at {at} ms fell inside edge restart {} ({} → {} ms)",
+                last + 1,
+                restart.before.taken_at_ms,
+                restart.after.taken_at_ms
+            ));
+        }
+        Ok(ledger_sum(
+            &self.carried[last],
+            &ledger_delta(&restart.after.ledger, &snapshot.ledger)?,
+        ))
+    }
+
+    /// `snapshot` on the continuous timeline.
+    fn snapshot(&self, snapshot: &LedgerSnapshot) -> crate::error::Result<LedgerSnapshot> {
+        Ok(LedgerSnapshot {
+            taken_at_ms: snapshot.taken_at_ms,
+            ledger: self.carry(snapshot, self.restarts.len())?,
+        })
+    }
+
+    /// Every ledger read of `phase` on the continuous timeline.
+    fn phase(&self, phase: &PhaseObservations) -> crate::error::Result<PhaseObservations> {
+        Ok(PhaseObservations {
+            start: self.snapshot(&phase.start)?,
+            rounds: phase
+                .rounds
+                .iter()
+                .map(|round| {
+                    Ok(Round {
+                        before_report: self.snapshot(&round.before_report)?,
+                        end: self.snapshot(&round.end)?,
+                        published: round.published.clone(),
+                    })
+                })
+                .collect::<crate::error::Result<_>>()?,
+            lanes: phase
+                .lanes
+                .iter()
+                .map(|lane| {
+                    Ok(LaneRun {
+                        before: self.snapshot(&lane.before)?,
+                        after: self.snapshot(&lane.after)?,
+                        ..lane.clone()
+                    })
+                })
+                .collect::<crate::error::Result<_>>()?,
+            end: self.snapshot(&phase.end)?,
+        })
+    }
+}
+
+/// No build was dispatched while the edge restarted: the dispatch's
+/// alarm booked into a ledger neither of the restart's reads holds.
+fn restart_check(observed: &WaveObservations) -> Check {
+    let dispatched: Vec<String> = observed
+        .restarts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, restart)| {
+            let builds = build_tasks_between(
+                &observed.runs,
+                restart.before.taken_at_ms,
+                restart.after.taken_at_ms,
+            );
+            (builds > 0).then(|| format!("restart {}: {builds} build runs", index + 1))
+        })
+        .collect();
+    check(
+        "No build dispatched during an edge restart",
+        dispatched.is_empty(),
+        if dispatched.is_empty() {
+            format!(
+                "{} edge restarts, each with nothing dispatched",
+                observed.restarts.len()
+            )
+        } else {
+            dispatched.join("; ")
+        },
+    )
+}
+
 fn kind_costs(ops: &[SchedulerLedgerOp]) -> Vec<KindCost> {
     EventKind::ALL
         .iter()
@@ -473,36 +678,22 @@ fn kind(costs: &[KindCost], kind: EventKind) -> &KindCost {
         .expect("kind_costs yields every EventKind")
 }
 
-/// The `build-batch.yml` runs dispatched in `(from_ms, to_ms]`, and
-/// the legs they carried. Other workflows the local CI ran (a request's
-/// resolve) are not builds.
-fn batches_between(runs: &[LocalCiRun], from_ms: u64, to_ms: u64) -> (u64, u64) {
+/// The `build-crate.yml` runs dispatched in `(from_ms, to_ms]` — one
+/// per task. Other workflows the local CI ran (a request's resolve)
+/// are not builds.
+fn build_tasks_between(runs: &[LocalCiRun], from_ms: u64, to_ms: u64) -> u64 {
     let path = format!(
         ".github/workflows/{}",
-        crate::trusted_builder::BATCH_WORKFLOW_FILE
+        crate::trusted_builder::WORKFLOW_FILE
     );
     runs.iter()
         .filter(|run| {
             run.path == path && run.dispatched_at_ms > from_ms && run.dispatched_at_ms <= to_ms
         })
-        .fold((0, 0), |(batches, legs), run| {
-            (batches + 1, legs + run.legs.len() as u64)
-        })
+        .count() as u64
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "leg and batch counts stay far below f64's exact-integer range"
-)]
-fn per_batch(legs: u64, batches: u64) -> Option<f64> {
-    (batches > 0).then(|| legs as f64 / batches as f64)
-}
-
-fn phase_cost(
-    phase: &PhaseObservations,
-    runs: &[LocalCiRun],
-    budget: (f64, f64),
-) -> crate::error::Result<PhaseCost> {
+fn phase_cost(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::Result<PhaseCost> {
     let ops = ledger_delta(&phase.start.ledger, &phase.end.ledger)?;
     let counted: Vec<&SchedulerLedgerOp> = ops
         .iter()
@@ -513,17 +704,13 @@ fn phase_cost(
         .filter(|op| !EventKind::ALL.iter().any(|kind| kind.ledger_op() == op.op))
         .map(|op| (*op).clone())
         .collect();
-    let (batches, legs) = batches_between(runs, phase.start.taken_at_ms, phase.end.taken_at_ms);
+    let tasks = build_tasks_between(runs, phase.start.taken_at_ms, phase.end.taken_at_ms);
     Ok(PhaseCost {
         kinds: kind_costs(&ops),
         other_ops,
         rows_read: counted.iter().map(|op| op.rows_read).sum(),
         rows_written: counted.iter().map(|op| op.rows_written).sum(),
-        budget_rows_read: budget.0,
-        budget_rows_written: budget.1,
-        batches,
-        legs,
-        legs_per_batch: per_batch(legs, batches),
+        tasks,
         wall_ms: phase
             .end
             .taken_at_ms
@@ -536,12 +723,10 @@ fn layers(phase: &PhaseObservations, runs: &[LocalCiRun]) -> crate::error::Resul
     let mut out = Vec::with_capacity(phase.rounds.len());
     for (index, round) in phase.rounds.iter().enumerate() {
         let ops = ledger_delta(&previous.ledger, &round.end.ledger)?;
-        let (batches, legs) = batches_between(runs, previous.taken_at_ms, round.end.taken_at_ms);
         out.push(LayerCost {
             layer: index + 1,
             published: round.published.len() as u64,
-            batches,
-            legs,
+            tasks: build_tasks_between(runs, previous.taken_at_ms, round.end.taken_at_ms),
             kinds: kind_costs(&ops),
         });
         previous = &round.end;
@@ -579,25 +764,8 @@ fn check(name: impl Into<String>, passed: bool, detail: impl Into<String>) -> Ch
     }
 }
 
-#[allow(
-    clippy::cast_precision_loss,
-    reason = "row counts stay far below f64's exact-integer range"
-)]
-fn totals_check(name: &str, cost: &PhaseCost) -> Check {
-    let passed = (cost.rows_read as f64) <= cost.budget_rows_read
-        && (cost.rows_written as f64) <= cost.budget_rows_written;
-    check(
-        name,
-        passed,
-        format!(
-            "rowsRead {} of {:.0}, rowsWritten {} of {:.0}",
-            cost.rows_read, cost.budget_rows_read, cost.rows_written, cost.budget_rows_written
-        ),
-    )
-}
-
-/// Every batch run a phase dispatched completes through exactly one
-/// `POST /batches/{batch_id}/complete`, and nothing else books one —
+/// Every build run a phase dispatched completes through exactly one
+/// `POST /tasks/complete-run`, and nothing else books one —
 /// the count the projection prices completions at. Fewer means a
 /// completion never reached the scheduler or was booked under another
 /// ledger key; more means a run's completion was paid twice.
@@ -605,57 +773,95 @@ fn completions_check(name: &str, cost: &PhaseCost) -> Check {
     let completions = kind(&cost.kinds, EventKind::Completion).events;
     check(
         name,
-        completions == cost.batches,
+        completions == cost.tasks,
         format!(
-            "{completions} completions booked under `{}`, {} batch runs dispatched",
+            "{completions} completions booked under `{}`, {} build runs dispatched",
             EventKind::Completion.ledger_op(),
-            cost.batches
+            cost.tasks
         ),
     )
 }
 
-/// Per-event growth first → last layer for the kinds a layer
-/// normalises: alarm passes, completions and slice reports.
+/// The webhook forwards a build run's `in_progress` only when the
+/// scheduler did not dispatch the run (stow#940): the phase's
+/// `POST /tasks/run-update` events are at most its external build runs
+/// — on the local CI, the runs seeded under
+/// [`crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN`] rather than
+/// dispatched through it. More means own runs' deliveries reach the
+/// scheduler again, a DO request per node the projection does not
+/// price.
+fn external_run_updates_check(
+    name: &str,
+    cost: &PhaseCost,
+    phase: &PhaseObservations,
+    runs: &[LocalCiRun],
+) -> Check {
+    let updates = kind(&cost.kinds, EventKind::ExternalRunUpdate).events;
+    let path = format!(
+        ".github/workflows/{}",
+        crate::trusted_builder::WORKFLOW_FILE
+    );
+    let external = runs
+        .iter()
+        .filter(|run| {
+            run.path == path
+                && run.triggering_actor_login == crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN
+                && run.dispatched_at_ms > phase.start.taken_at_ms
+                && run.dispatched_at_ms <= phase.end.taken_at_ms
+        })
+        .count() as u64;
+    check(
+        name,
+        updates <= external,
+        format!(
+            "{updates} `{}` events, {external} external build runs",
+            EventKind::ExternalRunUpdate.ledger_op()
+        ),
+    )
+}
+
+/// Per-event growth first → last layer for the kinds whose events
+/// scale with what they carry: completions and slice reports. The
+/// alarm pass is fixed-size and held to its drive budget in every layer
+/// instead ([`drive_checks`]); since the in-memory scheduler a slice
+/// report dispatches the dependents it releases in its own turn
+/// (stow#878), so the alarm may dispatch in the first layer alone.
 fn growth_checks(layers: &[LayerCost]) -> Vec<Check> {
-    [
-        EventKind::Dispatch,
-        EventKind::Completion,
-        EventKind::SliceReport,
-    ]
-    .iter()
-    .map(|&event| {
-        let measured: Vec<(usize, (f64, f64))> = layers
-            .iter()
-            .filter_map(|layer| {
-                kind(&layer.kinds, event)
-                    .per_event()
-                    .map(|rate| (layer.layer, rate))
-            })
-            .collect();
-        let name = format!("{event:?} per-event cost flat across layers");
-        match (measured.first(), measured.last()) {
-            (Some(&(first, (r0, w0))), Some(&(last, (r1, w1)))) if first != last => {
-                let passed = !grew(r0, r1) && !grew(w0, w1);
-                check(
-                    name,
-                    passed,
-                    format!(
-                        "layer {first}: {r0:.1} read / {w0:.1} written per event; \
+    [EventKind::Completion, EventKind::SliceReport]
+        .iter()
+        .map(|&event| {
+            let measured: Vec<(usize, (f64, f64))> = layers
+                .iter()
+                .filter_map(|layer| {
+                    kind(&layer.kinds, event)
+                        .per_event()
+                        .map(|rate| (layer.layer, rate))
+                })
+                .collect();
+            let name = format!("{event:?} per-event cost flat across layers");
+            match (measured.first(), measured.last()) {
+                (Some(&(first, (r0, w0))), Some(&(last, (r1, w1)))) if first != last => {
+                    let passed = !grew(r0, r1) && !grew(w0, w1);
+                    check(
+                        name,
+                        passed,
+                        format!(
+                            "layer {first}: {r0:.1} read / {w0:.1} written per event; \
                          layer {last}: {r1:.1} read / {w1:.1} written (tolerance 10% + 50 rows)"
+                        ),
+                    )
+                }
+                _ => check(
+                    name,
+                    false,
+                    format!(
+                        "{event:?} events landed in {} layer(s); flatness needs two",
+                        measured.len()
                     ),
-                )
-            }
-            _ => check(
-                name,
-                false,
-                format!(
-                    "{event:?} events landed in {} layer(s); flatness needs two",
-                    measured.len()
                 ),
-            ),
-        }
-    })
-    .collect()
+            }
+        })
+        .collect()
 }
 
 /// Submit cost per inserted unit — a queue row or a dependency edge —
@@ -768,38 +974,36 @@ fn order_check(observed: &WaveObservations) -> Check {
         .collect();
     let mut violations = Vec::new();
     for run in &observed.runs {
-        // `available` turns on the run's dispatch time alone, so it is
-        // computed once per run rather than once per leg.
         let available: BTreeSet<&String> = rounds
             .iter()
             .filter(|round| round.before_report.taken_at_ms <= run.dispatched_at_ms)
             .flat_map(|round| &round.published)
             .collect();
-        for leg in &run.legs {
-            let task_id = leg.task_id.as_str();
-            let Some(node) = observed.nodes.get(task_id) else {
-                continue;
-            };
-            let missing: Vec<&String> = node
-                .dependencies
-                .iter()
-                .filter(|dep| !available.contains(dep))
-                .collect();
-            if !missing.is_empty() {
-                violations.push(format!(
-                    "{task_id} dispatched at {} before {} of its dependencies were published (first: {})",
-                    run.dispatched_at_ms,
-                    missing.len(),
-                    missing[0]
-                ));
-            }
-            if let Some(error) = leg
-                .error
-                .as_deref()
-                .filter(|error| error.contains(FOREIGN_UNIT_MARKER))
-            {
-                violations.push(format!("{task_id} compiled a dependency itself: {error}"));
-            }
+        let Some(task_id) = run.task_id.as_deref() else {
+            continue;
+        };
+        let Some(node) = observed.nodes.get(task_id) else {
+            continue;
+        };
+        let missing: Vec<&String> = node
+            .dependencies
+            .iter()
+            .filter(|dep| !available.contains(dep))
+            .collect();
+        if !missing.is_empty() {
+            violations.push(format!(
+                "{task_id} dispatched at {} before {} of its dependencies were published (first: {})",
+                run.dispatched_at_ms,
+                missing.len(),
+                missing[0]
+            ));
+        }
+        if let Some(error) = run
+            .error
+            .as_deref()
+            .filter(|error| error.contains(FOREIGN_UNIT_MARKER))
+        {
+            violations.push(format!("{task_id} compiled a dependency itself: {error}"));
         }
     }
     check(
@@ -807,12 +1011,12 @@ fn order_check(observed: &WaveObservations) -> Check {
         violations.is_empty(),
         if violations.is_empty() {
             format!(
-                "{} legs checked",
+                "{} tasks checked",
                 observed
                     .runs
                     .iter()
-                    .map(|run| run.legs.len())
-                    .sum::<usize>()
+                    .filter(|run| run.task_id.is_some())
+                    .count()
             )
         } else {
             summarise(&violations)
@@ -826,19 +1030,13 @@ fn published_check(observed: &WaveObservations) -> Check {
         .keys()
         .filter(|task_id| !observed.covered.contains(*task_id))
         .map(|task_id| {
-            // Two sources: the leg's own error when the leg produced
-            // one, else the run-level error — it holds only failures no
-            // leg owns (the dispatch, a webhook delivery), so it applies
-            // to every leg the run carried.
+            // The run's own error — the build's, the dispatch's or a
+            // webhook delivery's — names why the task never published.
             let last_error = observed
                 .runs
                 .iter()
-                .filter_map(|run| {
-                    run.legs
-                        .iter()
-                        .find(|leg| leg.task_id == *task_id)
-                        .and_then(|leg| leg.error.as_deref().or(run.error.as_deref()))
-                })
+                .filter(|run| run.task_id.as_deref() == Some(task_id.as_str()))
+                .filter_map(|run| run.error.as_deref())
                 .next_back();
             last_error.map_or_else(
                 || format!("{task_id}: never published"),
@@ -940,29 +1138,35 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
     for node in observed.nodes.values() {
         *nodes_per_target.entry(node.target.clone()).or_default() += 1;
     }
-    let wave = phase_cost(&observed.wave, &observed.runs, PREHEAT_BUDGET.wave(nodes))?;
-    let resubmit = phase_cost(
-        &observed.resubmit,
-        &observed.runs,
-        PREHEAT_BUDGET.resubmit(nodes),
-    )?;
-    let layers = layers(&observed.wave, &observed.runs)?;
-    let mut lanes = lane_costs("wave", &observed.wave)?;
-    lanes.extend(lane_costs("resubmit", &observed.resubmit)?);
+    let timeline = Timeline::new(&observed.restarts)?;
+    let wave_reads = timeline.phase(&observed.wave)?;
+    let resubmit_reads = timeline.phase(&observed.resubmit)?;
+    let wave = phase_cost(&wave_reads, &observed.runs)?;
+    let resubmit = phase_cost(&resubmit_reads, &observed.runs)?;
+    let layers = layers(&wave_reads, &observed.runs)?;
+    let mut lanes = lane_costs("wave", &wave_reads)?;
+    lanes.extend(lane_costs("resubmit", &resubmit_reads)?);
 
     let mut checks = vec![
-        totals_check("Wave total within the preheat budget", &wave),
-        totals_check("Resubmit total within the preheat budget", &resubmit),
         check(
             "Resubmit rebuilt nothing",
-            resubmit.legs == 0,
-            format!(
-                "{} legs in {} batch runs dispatched by the resubmit",
-                resubmit.legs, resubmit.batches
-            ),
+            resubmit.tasks == 0,
+            format!("{} build runs dispatched by the resubmit", resubmit.tasks),
         ),
-        completions_check("Wave completions equal its batch runs", &wave),
-        completions_check("Resubmit completions equal its batch runs", &resubmit),
+        completions_check("Wave completions equal its build runs", &wave),
+        completions_check("Resubmit completions equal its build runs", &resubmit),
+        external_run_updates_check(
+            "Wave run updates come from external runs only",
+            &wave,
+            &wave_reads,
+            &observed.runs,
+        ),
+        external_run_updates_check(
+            "Resubmit run updates come from external runs only",
+            &resubmit,
+            &resubmit_reads,
+            &observed.runs,
+        ),
         check(
             "Wave ran in at least three layers",
             layers.len() >= 3,
@@ -972,6 +1176,7 @@ pub fn analyse(observed: &WaveObservations) -> crate::error::Result<PreheatCostR
     checks.extend(growth_checks(&layers));
     checks.push(submit_growth_check(&lanes));
     checks.extend(drive_checks(&layers));
+    checks.push(restart_check(observed));
     checks.push(order_check(observed));
     checks.push(published_check(observed));
     checks.push(overload_check(observed));
@@ -998,21 +1203,24 @@ mod tests {
         ProductionTask, Round, WaveObservations, analyse, count_production, ledger_delta,
     };
     use crate::api::{SchedulerLedger, SchedulerLedgerOp};
-    use crate::local_ci::{LocalCiLeg, LocalCiRun};
+    use crate::local_ci::LocalCiRun;
 
     /// A ledger whose kinds each ran `events` times — completions
-    /// `completions` times, one per batch run — at `rate` rows read and
+    /// `completions` times, one per build run — at `rate` rows read and
     /// one written per event, plus `completion_extra` reads on
     /// completions.
     fn ledger(events: u64, completions: u64, rate: u64, completion_extra: u64) -> SchedulerLedger {
         SchedulerLedger {
+            woken_at_ms: 0,
             ops: EventKind::ALL
                 .iter()
                 .map(|kind| {
-                    let (events, extra) = if *kind == EventKind::Completion {
-                        (completions, completion_extra)
-                    } else {
-                        (events, 0)
+                    let (events, extra) = match kind {
+                        EventKind::Completion => (completions, completion_extra),
+                        // The scheduler dispatched every run, so no
+                        // `in_progress` reaches it.
+                        EventKind::ExternalRunUpdate => (0, 0),
+                        _ => (events, 0),
                     };
                     SchedulerLedgerOp {
                         op: kind.ledger_op().to_owned(),
@@ -1035,28 +1243,26 @@ mod tests {
     fn run(task_id: &str, dispatched_at_ms: u64) -> LocalCiRun {
         LocalCiRun {
             workflow_run_id: dispatched_at_ms,
-            // A real batch run's title — `<rustc>-b<32 lowercase hex>`.
-            display_title: format!("1.99.1-b{task_id:0>32}"),
+            // A real build run's title — `<rustc>-<task_id>`.
+            display_title: format!("1.99.1-{task_id}"),
             status: "completed".to_owned(),
             conclusion: Some("success".to_owned()),
+            built: true,
             html_url: String::new(),
-            path: ".github/workflows/build-batch.yml".to_owned(),
+            path: ".github/workflows/build-crate.yml".to_owned(),
             dispatched_at_ms,
             completed_at_ms: Some(dispatched_at_ms + 1),
             error: None,
             delivery_errors: Vec::new(),
-            legs: vec![LocalCiLeg {
-                leg: 0,
-                task_id: task_id.to_owned(),
-                status: "completed".to_owned(),
-                conclusion: Some("success".to_owned()),
-                error: None,
-            }],
+            task_id: Some(task_id.to_owned()),
+            // Dispatched through the local CI, which stamps the App's
+            // bot login on its runs.
+            triggering_actor_login: "stow-ci[bot]".to_owned(),
         }
     }
 
-    /// A three-layer chain a → b → c, one one-leg batch run per node:
-    /// each layer runs 10 events per kind and one completion at 20 rows
+    /// A three-layer chain a → b → c, one build run per node:
+    /// each layer runs 10 events per kind and one completion at 2 rows
     /// each; `completion_growth` adds that many reads to each later
     /// layer's completion in total.
     fn chain(completion_growth: u64) -> WaveObservations {
@@ -1086,13 +1292,13 @@ mod tests {
         let start = snapshot(0, SchedulerLedger::default());
         let rounds: Vec<Round> = (1..=3u64)
             .map(|layer| Round {
-                before_report: snapshot(layer * 100 - 10, ledger(layer * 10, layer - 1, 20, 0)),
+                before_report: snapshot(layer * 100 - 10, ledger(layer * 10, layer - 1, 2, 0)),
                 end: snapshot(
                     layer * 100,
                     ledger(
                         layer * 10,
                         layer,
-                        20,
+                        2,
                         completion_growth * (layer - 1) * layer / 2,
                     ),
                 ),
@@ -1103,13 +1309,13 @@ mod tests {
             .collect();
         let end = rounds.last().unwrap().end.clone();
         let lane = LaneRun {
-            lane: "top".to_owned(),
+            lane: "top-binaries".to_owned(),
             submitted: 3,
             inserted: 3,
             inserted_edges: 2,
             submit_failures: vec![],
             before: start.clone(),
-            after: snapshot(5, ledger(1, 0, 20, 0)),
+            after: snapshot(5, ledger(1, 0, 2, 0)),
         };
         WaveObservations {
             rustc_version: "1.99.1".to_owned(),
@@ -1128,10 +1334,109 @@ mod tests {
             },
             // a dispatches before round 1; b after round 1's report
             // began; c after round 2's.
+            restarts: vec![],
             runs: vec![run("a", 10), run("b", 95), run("c", 195)],
             covered: BTreeSet::from(["a".to_owned(), "b".to_owned(), "c".to_owned()]),
             overload_sightings: vec![],
         }
+    }
+
+    /// One edge restart a test replays: it stops right after `stop_at`,
+    /// when the never-restarted ledger stood at `truth`, and the new
+    /// edge's first ledger read, at `after_at`, answers `reloaded` — its
+    /// last snapshot plus the readiness poll that woke it.
+    struct Replayed {
+        stop_at: u64,
+        after_at: u64,
+        truth: SchedulerLedger,
+        reloaded: SchedulerLedger,
+    }
+
+    /// What the restarted edge answers at `at` for the never-restarted
+    /// `truth`: the last restart's reloaded ledger plus everything
+    /// booked since it stopped.
+    fn answered(truth: &SchedulerLedger, at: u64, restarts: &[Replayed]) -> SchedulerLedger {
+        restarts
+            .iter()
+            .rev()
+            .find(|restart| restart.after_at <= at)
+            .map_or_else(
+                || truth.clone(),
+                |restart| {
+                    super::ledger_sum(
+                        &restart.reloaded,
+                        &ledger_delta(&restart.truth, truth).expect("truth only grows"),
+                    )
+                },
+            )
+    }
+
+    /// `observed` as the restarted edge would have answered it, with the
+    /// restarts recorded the way `scripts/preheat-cost.sh` records them.
+    fn restarted(mut observed: WaveObservations, restarts: &[Replayed]) -> WaveObservations {
+        let answer = |read: &mut LedgerSnapshot| {
+            read.ledger = answered(&read.ledger, read.taken_at_ms, restarts);
+        };
+        for phase in [&mut observed.wave, &mut observed.resubmit] {
+            answer(&mut phase.start);
+            answer(&mut phase.end);
+            for round in &mut phase.rounds {
+                answer(&mut round.before_report);
+                answer(&mut round.end);
+            }
+            for lane in &mut phase.lanes {
+                answer(&mut lane.before);
+                answer(&mut lane.after);
+            }
+        }
+        observed.restarts = restarts
+            .iter()
+            .map(|restart| super::EdgeRestart {
+                before: snapshot(
+                    restart.stop_at,
+                    answered(&restart.truth, restart.stop_at, restarts),
+                ),
+                after: snapshot(restart.after_at, restart.reloaded.clone()),
+            })
+            .collect();
+        observed
+    }
+
+    /// The edge's last snapshot `ledger` as the graph woken at
+    /// `woken_at_ms` holds it, plus the readiness poll and the ledger
+    /// read that woke it.
+    fn reloaded(mut ledger: SchedulerLedger, woken_at_ms: i64) -> SchedulerLedger {
+        ledger.woken_at_ms = woken_at_ms;
+        for op in ["GET /budget/ledger", "GET /status"] {
+            ledger.ops.push(SchedulerLedgerOp {
+                op: op.to_owned(),
+                events: 1,
+                rows_read: 500,
+                rows_written: 0,
+            });
+        }
+        ledger.ops.sort_by(|a, b| a.op.cmp(&b.op));
+        ledger
+    }
+
+    /// Two restarts — one mid-wave, after layer 1; one between the
+    /// wave's end and the resubmit's — each reloading a snapshot older
+    /// than the ledger it stopped with.
+    fn two_restarts(observed: &WaveObservations) -> Vec<Replayed> {
+        vec![
+            Replayed {
+                stop_at: 150,
+                after_at: 160,
+                truth: observed.wave.rounds[0].end.ledger.clone(),
+                reloaded: reloaded(ledger(4, 0, 2, 0), 158),
+            },
+            Replayed {
+                stop_at: 330,
+                after_at: 340,
+                truth: observed.wave.end.ledger.clone(),
+                reloaded: reloaded(ledger(25, 1, 2, 0), 338),
+            },
+        ]
     }
 
     fn production_lane(lane: &str, tasks: &[(&str, &str)]) -> ProductionLane {
@@ -1184,36 +1489,18 @@ mod tests {
     }
 
     #[test]
-    fn a_foreign_unit_failure_names_only_its_own_leg() {
+    fn a_foreign_unit_failure_names_only_its_own_task() {
         let mut observed = chain(0);
-        // One run, two failed legs: only a's carries the foreign-unit
-        // marker, while its message names leg 1 — attribution reads the
-        // leg's own error, never the run's joined summary.
-        let mut run = run("b", 95);
-        run.conclusion = Some("failure".to_owned());
-        run.legs = vec![
-            LocalCiLeg {
-                leg: 0,
-                task_id: "a".to_owned(),
-                status: "completed".to_owned(),
-                conclusion: Some("failure".to_owned()),
-                error: Some(
-                    "leg 0 build: Error: unit of leg 1 is not the task's own crate".to_owned(),
-                ),
-            },
-            LocalCiLeg {
-                leg: 1,
-                task_id: "b".to_owned(),
-                status: "completed".to_owned(),
-                conclusion: Some("failure".to_owned()),
-                error: Some("leg 1 build: Error: rustc failed".to_owned()),
-            },
-        ];
-        run.error = Some(format!(
-            "2 of 2 legs failed; {}",
-            run.legs[0].error.as_deref().expect("leg error")
-        ));
-        observed.runs[1] = run;
+        // Two failed runs: only a's carries the foreign-unit marker —
+        // attribution reads the run's own error.
+        let mut a = run("a", 10);
+        a.conclusion = Some("failure".to_owned());
+        a.error = Some("Error: unit of b is not the task's own crate".to_owned());
+        let mut b = run("b", 95);
+        b.conclusion = Some("failure".to_owned());
+        b.error = Some("Error: rustc failed".to_owned());
+        observed.runs[0] = a;
+        observed.runs[1] = b;
         let report = analyse(&observed).expect("analyse");
         let order = report
             .checks
@@ -1251,7 +1538,105 @@ mod tests {
 
     #[test]
     fn a_ledger_that_went_backwards_is_refused() {
-        assert!(ledger_delta(&ledger(10, 1, 20, 0), &ledger(5, 1, 20, 0)).is_err());
+        assert!(ledger_delta(&ledger(10, 1, 2, 0), &ledger(5, 1, 2, 0)).is_err());
+        // An operation that vanished went back to zero.
+        let mut vanished = ledger(10, 1, 2, 0);
+        vanished
+            .ops
+            .retain(|op| op.op != EventKind::SliceReport.ledger_op());
+        let error = ledger_delta(&ledger(10, 1, 2, 0), &vanished).unwrap_err();
+        assert!(error.to_string().contains("reset mid-run"), "{error}");
+        // A reload whose counters all grew past the earlier read's is
+        // still a reset: the graph's wake tells it.
+        let mut reloaded = ledger(20, 2, 2, 0);
+        reloaded.woken_at_ms = 7;
+        let error = ledger_delta(&ledger(10, 1, 2, 0), &reloaded).unwrap_err();
+        assert!(error.to_string().contains("reset mid-run"), "{error}");
+    }
+
+    /// stow#928: a run whose edge restarted reports exactly the totals,
+    /// layers and lanes of the same run without the restarts.
+    #[test]
+    fn edge_restarts_report_the_totals_of_a_run_without_them() {
+        let baseline = chain(0);
+        let restarts = two_restarts(&baseline);
+        let observed = restarted(baseline.clone(), &restarts);
+        assert_ne!(
+            observed.wave.end.ledger, baseline.wave.end.ledger,
+            "the restarted edge answers a different ledger"
+        );
+        let expected = analyse(&baseline).expect("baseline");
+        let report = analyse(&observed).expect("restarted");
+        assert_eq!(report.wave, expected.wave);
+        assert_eq!(report.resubmit, expected.resubmit);
+        assert_eq!(report.layers, expected.layers);
+        assert_eq!(report.lanes, expected.lanes);
+        let restart_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "No build dispatched during an edge restart")
+            .expect("the restart check");
+        assert!(restart_check.passed, "{}", restart_check.detail);
+        assert!(
+            restart_check.detail.starts_with("2 edge restarts"),
+            "{}",
+            restart_check.detail
+        );
+    }
+
+    /// A reset no recorded restart accounts for still fails the report.
+    #[test]
+    fn a_reset_no_restart_accounts_for_is_refused() {
+        let baseline = chain(0);
+        let mut observed = restarted(baseline.clone(), &two_restarts(&baseline));
+        observed.restarts.remove(0);
+        let error = analyse(&observed).unwrap_err();
+        assert!(error.to_string().contains("reset mid-run"), "{error}");
+        // Nor does a recorded restart excuse a second reset after it.
+        let mut observed = restarted(baseline.clone(), &two_restarts(&baseline));
+        observed.wave.rounds[2].end.ledger = ledger(1, 0, 2, 0);
+        assert!(analyse(&observed).is_err());
+    }
+
+    /// A build dispatched while the edge restarted booked an alarm pass
+    /// neither restart read holds: the report fails on it.
+    #[test]
+    fn a_build_dispatched_during_a_restart_fails_the_report() {
+        let baseline = chain(0);
+        let mut observed = restarted(baseline.clone(), &two_restarts(&baseline));
+        observed.runs.push(run("c", 155));
+        let report = analyse(&observed).expect("analysed");
+        let restart_check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "No build dispatched during an edge restart")
+            .expect("the restart check");
+        assert!(!restart_check.passed);
+        assert_eq!(restart_check.detail, "restart 1: 1 build runs");
+    }
+
+    /// Restart records that overlap or run backwards, and a ledger read
+    /// taken inside a restart, are refused.
+    #[test]
+    fn malformed_restart_records_are_refused() {
+        let baseline = chain(0);
+        let restarts = two_restarts(&baseline);
+
+        let mut observed = restarted(baseline.clone(), &restarts);
+        observed.restarts[0].after.taken_at_ms = 150;
+        assert!(analyse(&observed).is_err(), "after not following before");
+
+        let mut observed = restarted(baseline.clone(), &restarts);
+        observed.restarts[1].before.taken_at_ms = 155;
+        assert!(analyse(&observed).is_err(), "overlapping restarts");
+
+        let mut observed = restarted(baseline, &restarts);
+        observed.wave.rounds[1].before_report.taken_at_ms = 155;
+        let error = analyse(&observed).unwrap_err();
+        assert!(
+            error.to_string().contains("inside edge restart 1"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1259,30 +1644,26 @@ mod tests {
         let wave = count_production(&[
             // `a` twice inside the lane: two targets' resolves of the
             // same shared node land on one task id.
-            production_lane("top", &[("a", "t1"), ("b", "t1"), ("a", "t1")]),
-            production_lane("top-binaries", &[("b", "t1"), ("c", "t2"), ("d", "t2")]),
-            production_lane("projects", &[("a", "t1"), ("d", "t2"), ("e", "t1")]),
+            production_lane("top-binaries", &[("a", "t1"), ("b", "t1"), ("a", "t1")]),
+            production_lane("projects", &[("a", "t1"), ("b", "t1"), ("c", "t2")]),
         ]);
-        assert_eq!(wave.nodes, 5);
-        assert_eq!(wave.nodes_per_target["t1"], 3);
-        assert_eq!(wave.nodes_per_target["t2"], 2);
+        assert_eq!(wave.nodes, 3);
+        assert_eq!(wave.nodes_per_target["t1"], 2);
+        assert_eq!(wave.nodes_per_target["t2"], 1);
         let counts: Vec<(&str, u64, u64)> = wave
             .lanes
             .iter()
             .map(|lane| (lane.lane.as_str(), lane.planned, lane.new_nodes))
             .collect();
-        assert_eq!(
-            counts,
-            [("top", 3, 2), ("top-binaries", 3, 2), ("projects", 3, 1)]
-        );
+        assert_eq!(counts, [("top-binaries", 3, 2), ("projects", 3, 1)]);
     }
 
     #[test]
     fn a_lane_that_planned_nothing_is_refused() {
-        let planned = count_production(&[production_lane("top", &[("a", "t1")])]);
+        let planned = count_production(&[production_lane("top-binaries", &[("a", "t1")])]);
         planned.require_planned().expect("every lane planned");
         let empty = count_production(&[
-            production_lane("top", &[("a", "t1")]),
+            production_lane("top-binaries", &[("a", "t1")]),
             production_lane("projects", &[]),
         ]);
         let error = empty.require_planned().expect_err("an empty lane");
@@ -1293,55 +1674,91 @@ mod tests {
     #[test]
     fn a_phase_bills_every_counted_operation_as_a_request() {
         let report = analyse(&chain(0)).expect("analyse");
-        // Three kinds at 30 events each over the three layers, and one
-        // completion per batch run.
+        // Three kinds at 30 events each over the three layers, one
+        // completion per build run, and no run update.
         assert_eq!(report.wave.requests(), 3 * 30 + 3);
     }
 
-    #[test]
-    fn a_phase_reports_its_achieved_legs_per_batch() {
+    /// `chain(0)` with `updates` `in_progress` forwards booked by the
+    /// wave's last round, carried into every later read.
+    fn with_run_updates(updates: u64) -> WaveObservations {
         let mut observed = chain(0);
-        // b's run carries a second leg; a resolve run is no batch.
-        observed.runs[1].legs.push(LocalCiLeg {
-            leg: 1,
-            task_id: "a".to_owned(),
-            status: "completed".to_owned(),
-            conclusion: Some("success".to_owned()),
-            error: None,
-        });
+        let book = |read: &mut LedgerSnapshot| {
+            for op in &mut read.ledger.ops {
+                if op.op == EventKind::ExternalRunUpdate.ledger_op() {
+                    op.events += updates;
+                    op.rows_read += updates;
+                    op.rows_written += updates;
+                }
+            }
+        };
+        book(&mut observed.wave.rounds[2].end);
+        book(&mut observed.wave.end);
+        book(&mut observed.resubmit.start);
+        book(&mut observed.resubmit.end);
+        observed
+    }
+
+    /// A wave of runs the scheduler dispatched forwards no
+    /// `in_progress` (stow#940); one that books them fails the gate,
+    /// since the projection prices none.
+    #[test]
+    fn own_runs_book_no_run_update() {
+        let name = "Wave run updates come from external runs only";
+        let clean = analyse(&chain(0)).expect("analyse");
+        assert!(!failed(&clean).contains(&name), "{:?}", clean.checks);
+        let forwarded = analyse(&with_run_updates(3)).expect("analyse");
+        assert!(failed(&forwarded).contains(&name), "{:?}", forwarded.checks);
+        // The forwards are still billed: the phase's requests carry them.
+        assert_eq!(forwarded.wave.requests(), clean.wave.requests() + 3);
+    }
+
+    /// An external run's `in_progress` is the forward the route still
+    /// serves — one per external run passes.
+    #[test]
+    fn an_external_run_may_book_its_run_update() {
+        let mut observed = with_run_updates(1);
+        observed.runs[2].triggering_actor_login =
+            crate::local_ci::SEEDED_RUN_OPERATOR_LOGIN.to_owned();
+        let report = analyse(&observed).expect("analyse");
+        assert!(
+            !failed(&report).contains(&"Wave run updates come from external runs only"),
+            "{:?}",
+            report.checks
+        );
+    }
+
+    #[test]
+    fn a_phase_counts_its_build_runs() {
+        let mut observed = chain(0);
+        // A resolve run is no build.
         let mut resolve = run("x", 96);
         resolve.path = ".github/workflows/resolve-request.yml".to_owned();
-        resolve.legs.clear();
+        resolve.task_id = None;
         observed.runs.push(resolve);
         let report = analyse(&observed).expect("analyse");
-        assert_eq!((report.wave.batches, report.wave.legs), (3, 4));
-        assert_eq!(report.wave.legs_per_batch, Some(4.0 / 3.0));
-        assert_eq!(report.resubmit.legs_per_batch, None);
-        let layers: Vec<(u64, u64)> = report
-            .layers
-            .iter()
-            .map(|layer| (layer.batches, layer.legs))
-            .collect();
-        assert_eq!(layers, [(2, 3), (1, 1), (0, 0)]);
+        assert_eq!(report.wave.tasks, 3);
+        let layers: Vec<u64> = report.layers.iter().map(|layer| layer.tasks).collect();
+        assert_eq!(layers, [2, 1, 0]);
         assert!(failed(&report).is_empty(), "{:?}", report.checks);
     }
 
     #[test]
-    fn a_completion_count_off_the_batch_runs_fails() {
-        // A fourth batch run whose completion never booked.
+    fn a_completion_count_off_the_build_runs_fails() {
+        // A fourth build run whose completion never booked.
         let mut observed = chain(0);
         observed.runs.push(run("c", 196));
         let report = analyse(&observed).expect("analyse");
-        assert_eq!(failed(&report), ["Wave completions equal its batch runs"]);
+        assert_eq!(failed(&report), ["Wave completions equal its build runs"]);
 
-        // Completions booked under each batch's own path, as a ledger
-        // that does not collapse the batch id books them.
+        // Completions booked under a different op name, as a ledger
+        // that keys completions elsewhere books them.
         let mut observed = chain(0);
         for round in &mut observed.wave.rounds {
             for snapshot in [&mut round.before_report, &mut round.end] {
                 for op in &mut snapshot.ledger.ops {
                     if op.op == EventKind::Completion.ledger_op() {
-                        op.op = format!("POST /batches/{:032x}/complete", 7);
+                        op.op = "POST /tasks/7/complete-run".to_owned();
                     }
                 }
             }
@@ -1351,7 +1768,7 @@ mod tests {
         observed.resubmit.end.ledger = observed.wave.end.ledger.clone();
         let report = analyse(&observed).expect("analyse");
         assert!(
-            failed(&report).contains(&"Wave completions equal its batch runs"),
+            failed(&report).contains(&"Wave completions equal its build runs"),
             "{:?}",
             report.checks
         );

@@ -7,32 +7,22 @@ use serde::{Deserialize, Serialize};
 use skyzen::durable::DurableObject;
 use skyzen::routing::{CreateRouteNode, Params, Route, Router};
 use skyzen::runtime::wasm::WasmEnv;
-use skyzen::utils::Json;
+use skyzen::utils::{Json, State};
 use skyzen::{Error, Result, StatusCode};
 use skyzen_services::durable::{Alarm, DurableDb};
 use wasm_bindgen::JsValue;
 
-use std::collections::BTreeSet;
-
-use skyzen_cloudflare::CfD1;
-use skyzen_services::Db;
 use stow_types::api::SchedulerResetReport;
 
-use crate::db;
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
 use crate::github_app;
-use crate::scheduler::batching::FormedBatch;
-use crate::scheduler::dispatch::BuildRuns as _;
 use crate::scheduler::meter::{self, Meter, MeterGuard};
 use crate::scheduler::queue::SchedulerSettings;
 use crate::scheduler::{budget, fixture};
-use crate::scheduler::{dispatch, feed, queue};
+use crate::scheduler::{dispatch, feed, graph, queue, routes, store};
 
 const STOW_LOCAL_CI_URL_BINDING: &str = "STOW_LOCAL_CI_URL";
-/// The catalog D1 binding — `pub(super)` so the budget probe's counted
-/// backend wraps the same binding the dispatch path reads.
-pub(super) const STOW_DB_BINDING: &str = "STOW_DB";
 const STOW_DISPATCH_MIN_AGE_MINUTES_BINDING: &str = "STOW_DISPATCH_MIN_AGE_MINUTES";
 const STOW_MAX_CONCURRENT_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_JOBS";
 const STOW_MAX_CONCURRENT_MACOS_JOBS_BINDING: &str = "STOW_MAX_CONCURRENT_MACOS_JOBS";
@@ -40,8 +30,6 @@ const STOW_STALE_DISPATCH_MINUTES_BINDING: &str = "STOW_STALE_DISPATCH_MINUTES";
 const STOW_MAX_QUEUE_PENDING_BINDING: &str = "STOW_MAX_QUEUE_PENDING";
 const STOW_HUMAN_DAILY_TASK_BUDGET_BINDING: &str = "STOW_HUMAN_DAILY_TASK_BUDGET";
 const STOW_MIN_DISPATCH_VALUE_BINDING: &str = "STOW_MIN_DISPATCH_VALUE";
-const STOW_BATCH_PARALLELISM_BINDING: &str = "STOW_BATCH_PARALLELISM";
-const STOW_BATCH_MAX_TASKS_BINDING: &str = "STOW_BATCH_MAX_TASKS";
 const GITHUB_APP_ID_BINDING: &str = "GITHUB_APP_ID";
 const GITHUB_APP_INSTALLATION_ID_BINDING: &str = "GITHUB_APP_INSTALLATION_ID";
 const GITHUB_APP_PRIVATE_KEY_BINDING: &str = "GITHUB_APP_PRIVATE_KEY";
@@ -50,6 +38,66 @@ const STOW_FREEZE_WINDOW_MINUTES_BINDING: &str = "STOW_FREEZE_WINDOW_MINUTES";
 const STOW_FREEZE_MIN_OUTCOMES_BINDING: &str = "STOW_FREEZE_MIN_OUTCOMES";
 const STOW_FREEZE_FAIL_PERCENT_BINDING: &str = "STOW_FREEZE_FAIL_PERCENT";
 const STOW_COST_BUDGET_MULTIPLIER_BINDING: &str = "STOW_COST_BUDGET_MULTIPLIER";
+
+/// The status a core's [`QueueError`] answers with: a contract
+/// violation or empty selector is the caller's 400, an unknown record
+/// 404, a superseded report 409, a full queue or spent budget
+/// 429, anything else the object's 500.
+fn route_error(error: QueueError) -> Error {
+    let status = match &error {
+        QueueError::Invariant(_)
+        | QueueError::Overflow { .. }
+        | QueueError::EmptySelector
+        | QueueError::PurgeRequiresAge => StatusCode::BAD_REQUEST,
+        QueueError::UnknownRequest(_) => StatusCode::NOT_FOUND,
+        QueueError::RequestAttemptSuperseded { .. } => StatusCode::CONFLICT,
+        QueueError::QueueFull { .. } | QueueError::HumanDailyBudgetExhausted { .. } => {
+            StatusCode::TOO_MANY_REQUESTS
+        }
+        QueueError::Sql(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    to_error(error).set_status(status)
+}
+
+/// Ensure the isolate's graph is loaded — the wake: snapshot + log
+/// tail replay, installed before anything else awaits so a concurrent
+/// request never replays a log the winner has since appended to. The
+/// one request that installed it then runs the post-wake `status`
+/// reconcile, which re-binds own runs by title (review Q6) and rebuilds
+/// external occupancy.
+async fn ensure_graph<'a>(
+    env: &WasmEnv,
+    db: &DurableDb,
+    cell: &'a graph::GraphCell,
+) -> Result<graph::LoadedGraph<'a>> {
+    let loaded = routes::wake_graph(db, cell, now_ms())
+        .await
+        .map_err(to_error)?;
+    // The admission floor is a deploy binding, never persisted: every
+    // wake plan and claim reads the one stamped here.
+    let floor = scheduler_settings(env)?.min_dispatch_value;
+    loaded.with(|graph| graph.set_floor(floor));
+    if cell.take_reconcile() {
+        // The CI `status` listing is the truth for runs a snapshot's
+        // eviction could have orphaned (claims whose bindings never
+        // landed). A failure leaves the replayed state: the delivery
+        // stream and the stale lease repair the same drift.
+        let listed = match ci_interface(env, loaded).await {
+            Ok(interface) => interface.status_runs().await,
+            Err(error) => Err(dispatch::DispatchError::Response(error.to_string())),
+        };
+        match listed {
+            Ok(runs) => {
+                loaded.with(|graph| graph.reconcile_runs(&runs, now_ms()));
+            }
+            Err(error) => {
+                loaded.with(|graph| graph.reconcile_failed(now_ms()));
+                tracing::warn!(%error, "post-wake CI status reconcile failed — keeping replayed state");
+            }
+        }
+    }
+    Ok(loaded)
+}
 
 fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
     // The local-CI dispatcher only exists beside the budget probe: a
@@ -92,10 +140,6 @@ fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
         .unwrap_or(defaults.human_daily_task_budget),
         min_dispatch_value: read_optional_i64_binding(env, STOW_MIN_DISPATCH_VALUE_BINDING)?
             .unwrap_or(defaults.min_dispatch_value),
-        batch_parallelism: read_optional_u32_binding(env, STOW_BATCH_PARALLELISM_BINDING)?
-            .unwrap_or(defaults.batch_parallelism),
-        batch_max_tasks: read_optional_u32_binding(env, STOW_BATCH_MAX_TASKS_BINDING)?
-            .unwrap_or(defaults.batch_max_tasks),
     })
 }
 
@@ -114,31 +158,6 @@ fn freeze_settings(env: &WasmEnv) -> Result<FreezeSettings> {
     })
 }
 
-/// `freeze::FreezeStore` over the object's own `settings` row — the
-/// storage seam the transition coordinator runs on.
-struct DbStore<'a>(&'a DurableDb);
-
-impl freeze::FreezeStore for DbStore<'_> {
-    fn record(
-        &self,
-    ) -> impl std::future::Future<
-        Output = std::result::Result<Option<stow_types::api::DispatchFreezeRecord>, QueueError>,
-    > + Send {
-        queue::freeze_record(self.0)
-    }
-    fn set(
-        &self,
-        record: &stow_types::api::DispatchFreezeRecord,
-    ) -> impl std::future::Future<Output = std::result::Result<(), QueueError>> + Send {
-        queue::set_freeze(self.0, record)
-    }
-    fn delete(
-        &self,
-    ) -> impl std::future::Future<Output = std::result::Result<(), QueueError>> + Send {
-        queue::delete_freeze(self.0)
-    }
-}
-
 /// `freeze::AlertSink` over the edge's one alert channel — the
 /// `send_email` notify (`crate::email::EdgeAlerter`). A missing
 /// binding degrades to a `Disabled` outcome instead of erroring, so a
@@ -150,7 +169,13 @@ type EdgeAlerter = crate::email::EdgeAlerter;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[skyzen::durable_object]
-pub struct Scheduler;
+pub struct Scheduler {
+    /// The in-memory graph — `None` until the first touch wakes it
+    /// (stow#878). Serde never sees it: a rehydrated object replays
+    /// the store like a fresh isolate.
+    #[serde(skip)]
+    graph: graph::GraphCell,
+}
 
 impl DurableObject for Scheduler {
     fn fetch(&self) -> Router {
@@ -172,10 +197,15 @@ impl DurableObject for Scheduler {
                 "/promote".post(queue_promote),
                 "/purge".post(queue_purge),
             )),
-            // The batched run's completion channel (stow#833 §3.2):
-            // the report lands on the `build_batches` row verbatim and
-            // the alarm pass resolves each leg from it.
-            "/batches/{batch_id}/complete".post(complete_batch),
+            // The build run's lifecycle channel (stow#876): the
+            // webhook forwards a `build-crate.yml` run's verified
+            // `completed` delivery to `complete-run`, and to
+            // `run-update` the `in_progress` delivery of a run the
+            // scheduler did not dispatch — external occupancy is
+            // delivery-tracked (stow#940); both fence on the queue
+            // row's bound generation.
+            "/tasks/complete-run".post(complete_run),
+            "/tasks/run-update".post(apply_task_run_update),
             // The human request lane (stow#428): admit deduplicates on
             // the request id and dispatches `resolve-request.yml`;
             // `outcome` is the resolve job's report channel and
@@ -219,26 +249,50 @@ impl DurableObject for Scheduler {
             )),
             // A nested Route under the root — the outer tuple caps at
             // 15 nodes.
-            Route::new(("/dispatch-freeze"
-                .at(read_dispatch_freeze)
-                .post(write_dispatch_freeze),)),
+            Route::new((
+                "/dispatch-freeze"
+                    .at(read_dispatch_freeze)
+                    .post(write_dispatch_freeze),
+                // The edge's health probe (stow#860): one read of held
+                // state, reached from `GET /api/v1/scheduler/health`.
+                "/health".at(health),
+                // The newreleases.io wake (stow#880): the edge
+                // forwards a verified `rust-lang/rust` release, and
+                // the object dispatches `preheat-admin.yml` for its
+                // claimed rustc.
+                "/preheat/release".post(preheat_release),
+            )),
         ))
-        .on_alarm(run_alarm)
+        // The alarm endpoint runs without the router's middleware, so it
+        // carries its own handle to the graph.
+        .on_alarm({
+            let graph = self.graph.clone();
+            move |env: WasmEnv, db: DurableDb, alarm: Alarm| {
+                run_alarm(graph.clone(), env, db, alarm)
+            }
+        })
+        // Route middleware, not a router layer: skyzen checks at build
+        // time that every extractor's provider sits on its route.
+        .with(State(self.graph.clone()))
         .build()
-        .layer(MeterGuard)
+        .layer(MeterGuard::new(self.graph.clone()))
     }
 }
 
 /// `POST /reset` — the only endpoint that may issue DDL on the queue
 /// database. Reached from `POST /api/v1/admin/scheduler/reset`, which
 /// `stow-admin scheduler reset --yes` invokes. Drops every store object
-/// and re-executes `schema.sql`, then stamps the configured dispatch
-/// floor — on the empty queue its conditional backfill is a zero-row
-/// pass.
-async fn reset_scheduler(env: WasmEnv, db: DurableDb) -> Result<Json<SchedulerResetReport>> {
-    let settings = scheduler_settings(&env)?;
-    let report = queue::reset(&db).await.map_err(to_error)?;
-    queue::apply_dispatch_floor(&db, &settings)
+/// and re-executes `schema.sql`; the in-memory graph is dropped with
+/// the store, so the next request wakes an empty one. The alarm is
+/// cleared — nothing is left to wake for.
+async fn reset_scheduler(
+    State(graph): State<graph::GraphCell>,
+    db: DurableDb,
+    alarm: Alarm,
+) -> Result<Json<SchedulerResetReport>> {
+    let report = store::reset(&db).await.map_err(to_error)?;
+    graph.clear();
+    queue::arm_alarm(&alarm, queue::AlarmPlan::Delete)
         .await
         .map_err(to_error)?;
     tracing::warn!(dropped = report.dropped, "scheduler store reset");
@@ -251,6 +305,7 @@ async fn reset_scheduler(env: WasmEnv, db: DurableDb) -> Result<Json<SchedulerRe
 /// stack's `Skyzen.mock.toml` sets it; production never does.
 async fn scheduler_budget_seed(
     env: WasmEnv,
+    State(graph): State<graph::GraphCell>,
     db: DurableDb,
     Json(request): Json<stow_types::api::SchedulerSeedRequest>,
 ) -> Result<Json<stow_types::api::SchedulerSeedReport>> {
@@ -260,20 +315,26 @@ async fn scheduler_budget_seed(
                 .set_status(StatusCode::NOT_FOUND),
         );
     }
+    let shape = fixture::FixtureShape {
+        queue_rows: request
+            .queue_rows
+            .unwrap_or(stow_types::fixture::FixtureShape::PRODUCTION.queue_rows),
+    };
     Ok(Json(
-        fixture::seed(&db, &request, &scheduler_settings(&env)?)
+        fixture::seed(&db, &graph, shape, now_ms())
             .await
             .map_err(to_error)?,
     ))
 }
 
-/// `POST /budget/rearm` — re-arm the seeded fixture's in-flight batches
+/// `POST /budget/rearm` — re-arm the seeded fixture's in-flight tasks
 /// the callback lane's deliveries resolved and answer every armed one
 /// (stow#833). Same guard as the seed endpoint; a request naming another fixture size than the seeded
-/// one is a 409, since its batch and run ids would not be the store's.
+/// one is a 409, since its run ids would not be the store's.
 /// Reached from `POST /api/v1/admin/scheduler/budget/rearm`.
 async fn scheduler_budget_rearm(
     env: WasmEnv,
+    State(graph): State<graph::GraphCell>,
     db: DurableDb,
     Json(request): Json<stow_types::api::SchedulerRearmRequest>,
 ) -> Result<Json<stow_types::api::SchedulerRearmReport>> {
@@ -283,13 +344,13 @@ async fn scheduler_budget_rearm(
                 .set_status(StatusCode::NOT_FOUND),
         );
     }
-    let cursor = fixture::read_seed_cursor(&db)
-        .await
-        .map_err(to_error)?
-        .ok_or_else(|| {
-            Error::msg("no fixture was seeded — nothing to re-arm").set_status(StatusCode::CONFLICT)
-        })?;
-    let seeded = fixture::seed_cursor_shape(&cursor).map_err(to_error)?;
+    // The seeded shape rides the snapshot head — the graph answers it
+    // without a store statement, keeping the probe inside the
+    // appends-only-between-checkpoints rule (stow#931).
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let seeded = graph.with(|graph| graph.seeded_rows).ok_or_else(|| {
+        Error::msg("no fixture was seeded — nothing to re-arm").set_status(StatusCode::CONFLICT)
+    })?;
     if seeded != request.queue_rows {
         return Err(Error::msg(format!(
             "re-arm names a {}-row fixture, but the store was seeded at {seeded} rows",
@@ -297,14 +358,18 @@ async fn scheduler_budget_rearm(
         ))
         .set_status(StatusCode::CONFLICT));
     }
-    let settings = scheduler_settings(&env)?;
-    let armed = fixture::rearm_in_flight(
+    // Re-arming reopens the resolved runs and rebinds them: the
+    // graph binds all thirty in-flight runs again with no
+    // completion recorded.
+    fixture::rearm(
         &db,
+        graph,
         fixture::FixtureShape { queue_rows: seeded },
-        settings.dispatch_min_age_minutes,
+        now_ms(),
     )
     .await
     .map_err(to_error)?;
+    let armed: Vec<u32> = (0..stow_types::fixture::FixtureShape::IN_FLIGHT_ROWS).collect();
     Ok(Json(stow_types::api::SchedulerRearmReport { armed }))
 }
 
@@ -313,6 +378,7 @@ async fn scheduler_budget_rearm(
 /// seed endpoint. Reached from `POST /api/v1/admin/scheduler/budget`.
 async fn scheduler_budget(
     env: WasmEnv,
+    State(graph): State<graph::GraphCell>,
     db: DurableDb,
     alarm: Alarm,
     Json(request): Json<stow_types::api::SchedulerBudgetRequest>,
@@ -325,7 +391,7 @@ async fn scheduler_budget(
     }
     let settings = scheduler_settings(&env)?;
     Ok(Json(
-        budget::run(&db, &settings, &env, &alarm, &request)
+        budget::run(&db, &graph, &settings, &env, &alarm, &request)
             .await
             .map_err(to_error)?,
     ))
@@ -336,6 +402,7 @@ async fn scheduler_budget(
 /// Reached from `GET /api/v1/admin/scheduler/budget/ledger`.
 async fn scheduler_budget_ledger(
     env: WasmEnv,
+    State(graph): State<graph::GraphCell>,
     db: DurableDb,
 ) -> Result<Json<stow_types::api::SchedulerLedger>> {
     if !budget_probe_enabled(&env) {
@@ -344,7 +411,10 @@ async fn scheduler_budget_ledger(
                 .set_status(StatusCode::NOT_FOUND),
         );
     }
-    Ok(Json(meter::ledger(&db).await.map_err(to_error)?))
+    // The ledger lives on the graph: a freshly woken isolate loads it
+    // first, like every other route that reads the graph.
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(meter::ledger(graph)))
 }
 
 /// Whether this deploy carries the budget probe — `STOW_SCHEDULER_BUDGET=1`,
@@ -358,22 +428,17 @@ pub(super) fn budget_probe_enabled(env: &WasmEnv) -> bool {
 /// `POST /demand` — trusted demand batches (stow#522 I7). Reached only
 /// through `POST /api/v1/admin/scheduler/demand`; never a request path.
 async fn scheduler_demand(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(request): Json<stow_types::api::SchedulerDemandRequest>,
 ) -> Result<Json<stow_types::api::SchedulerDemandReport>> {
     let (now_ms, settings) = alarm_inputs(&env)?;
-    let (report, plan) = queue::demand_pass(&db, &request, now_ms, &settings)
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let (report, plan) = routes::demand(graph, &db, &request, &settings, now_ms)
         .await
-        .map_err(|error| {
-            let status = match &error {
-                crate::errors::QueueError::Invariant(_)
-                | crate::errors::QueueError::Overflow { .. } => StatusCode::BAD_REQUEST,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
+        .map_err(route_error)?;
     // A folded batch can raise a queue row over the admission floor
     // (or clear its age gate) — arm the plan the shared pass decided,
     // an exact replay included: a replay repairs a schedule a
@@ -398,10 +463,13 @@ fn feed_now_secs() -> i64 {
 /// `POST /demand-feed/begin` — open or rotate the hour's staging
 /// attempt (stow#523).
 async fn demand_feed_begin(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
     db: DurableDb,
     Json(request): Json<stow_types::api::DemandFeedBeginRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedBeginReport>> {
-    feed::feed_begin(&db, &request.hour, feed_now_secs())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::feed_begin(graph, &db, &request.hour, feed_now_secs())
         .await
         .map(Json)
         .map_err(demand_feed_error)
@@ -409,36 +477,45 @@ async fn demand_feed_begin(
 
 /// `POST /demand-feed/page` — stage one bounded immutable page.
 async fn demand_feed_page(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
     db: DurableDb,
     Json(request): Json<stow_types::api::DemandFeedPageRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    feed::feed_page(&db, &request, feed_now_secs())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::feed_page(graph, &db, &request, feed_now_secs())
         .await
-        .map(|()| Json(serde_json::json!({"staged": true})))
-        .map_err(demand_feed_error)
+        .map_err(demand_feed_error)?;
+    Ok(Json(serde_json::json!({"staged": true})))
 }
 
 /// `POST /demand-feed/complete` — the completion barrier: freeze the
 /// hour once every page of its generation is staged and the manifest
 /// matches.
 async fn demand_feed_complete(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
     db: DurableDb,
     Json(request): Json<stow_types::api::DemandFeedCompleteRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    feed::feed_complete(&db, &request, feed_now_secs())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::feed_complete(graph, &db, &request, feed_now_secs())
         .await
-        .map(|()| Json(serde_json::json!({"complete": true})))
-        .map_err(demand_feed_error)
+        .map_err(demand_feed_error)?;
+    Ok(Json(serde_json::json!({"complete": true})))
 }
 
 /// `POST /demand-feed/cleanup` — retire one bounded chunk of the
 /// hour's dead page rows (obsolete generations or a delivered hour's
 /// acknowledged payloads). Explicit event work, never a timer.
 async fn demand_feed_cleanup(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
     db: DurableDb,
     Json(request): Json<stow_types::api::DemandFeedCleanupRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedCleanupReport>> {
-    feed::feed_cleanup(&db, &request.hour, feed_now_secs())
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::feed_cleanup(graph, &db, &request.hour, feed_now_secs())
         .await
         .map(Json)
         .map_err(demand_feed_error)
@@ -448,13 +525,15 @@ async fn demand_feed_cleanup(
 /// page into the demand ledger, then arm the plan the shared pass
 /// decided — the same probe/rearm `/demand` performs.
 async fn demand_feed_deliver(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(request): Json<stow_types::api::DemandFeedDeliverRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedDeliverReport>> {
     let (now_ms, settings) = alarm_inputs(&env)?;
-    let (report, plan) = feed::feed_deliver(&db, &request.hour, now_ms, &settings)
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let (report, plan) = routes::feed_deliver(graph, &db, &request.hour, &settings, now_ms)
         .await
         .map_err(demand_feed_error)?;
     queue::arm_alarm(&alarm, plan).await.map_err(|error| {
@@ -466,11 +545,13 @@ async fn demand_feed_deliver(
 }
 
 /// `GET /demand-feed/status` — the durable resume cursor.
-async fn demand_feed_status(db: DurableDb) -> Result<Json<stow_types::api::DemandFeedStatus>> {
-    feed::feed_status(&db)
-        .await
-        .map(Json)
-        .map_err(demand_feed_error)
+async fn demand_feed_status(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::DemandFeedStatus>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(graph.with(|graph| feed::feed_status(graph))))
 }
 
 /// Map a feed [`QueueError`] — contract violations are 400s like
@@ -487,24 +568,26 @@ fn demand_feed_error(error: QueueError) -> Error {
 /// cap refuses miss-lane batches once the queue is full, and human-lane
 /// tasks spend against the daily budget; either refusal answers 429.
 async fn submit_tasks(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
-    Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
+    Json(trees): Json<Vec<stow_types::api::SubmissionTree>>,
 ) -> Result<Json<InsertedResponse>> {
-    submit(&env, &db, &alarm, &requests, true).await
+    submit(&graph, &env, &db, &alarm, &trees, true).await
 }
 
 /// `POST /tasks/submit/trusted` — the same submit minus the
 /// pending-depth cap: callers reached it through the edge's repo-writer
 /// trust check, so a full queue must not turn their work away.
 async fn submit_tasks_trusted(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
-    Json(requests): Json<Vec<stow_types::api::EnqueueRequest>>,
+    Json(trees): Json<Vec<stow_types::api::SubmissionTree>>,
 ) -> Result<Json<InsertedResponse>> {
-    submit(&env, &db, &alarm, &requests, false).await
+    submit(&graph, &env, &db, &alarm, &trees, false).await
 }
 
 /// `POST /tasks/submit/ids` — the trusted submit-by-id lane (stow#588):
@@ -514,33 +597,30 @@ async fn submit_tasks_trusted(
 /// pending-depth cap does not apply — the edge's repo-writer trust
 /// check is the bound — but a frozen queue still refuses.
 async fn submit_tasks_by_id(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(body): Json<stow_types::api::SubmitTaskIdsRequest>,
 ) -> Result<Json<stow_types::api::SubmitTaskIdsResponse>> {
-    let settings = scheduler_settings(&env)?;
-    refuse_if_frozen(&db).await?;
-    let outcome = queue::submit_task_ids(&db, &body.tasks, &settings)
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    if graph.with(|graph| graph.freeze().is_some()) {
+        return Err(Error::msg("dispatch is frozen").set_status(StatusCode::SERVICE_UNAVAILABLE));
+    }
+    let (inserted, unknown) = routes::submit_ids(graph, &db, &body.tasks, now_ms())
         .await
-        .map_err(|error| {
-            let status = match &error {
-                crate::errors::QueueError::QueueFull { .. }
-                | crate::errors::QueueError::HumanDailyBudgetExhausted { .. } => {
-                    StatusCode::TOO_MANY_REQUESTS
-                }
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
+        .map_err(route_error)?;
+    let outcome = queue::SubmitTaskIdsOutcome { inserted, unknown };
     if !outcome.unknown.is_empty() {
         tracing::info!(
             unknown = outcome.unknown.len(),
             "submit-by-id: node store misses"
         );
     }
-    // Same hand-off as submit: the alarm pass owns dispatch.
-    schedule_alarm(&env, &db, &alarm).await?;
+    // Same hand-off as submit: the promoted rows sit behind the
+    // dispatch age gate, so the first pass after a submit stays the
+    // alarm's (stow#940).
+    schedule_alarm(&env, &db, &alarm, graph.cell()).await?;
     Ok(Json(stow_types::api::SubmitTaskIdsResponse {
         submitted: u32::try_from(body.tasks.len()).map_err(|_| {
             to_error("submit-ids task count exceeds u32").set_status(StatusCode::PAYLOAD_TOO_LARGE)
@@ -551,40 +631,39 @@ async fn submit_tasks_by_id(
 }
 
 async fn submit(
+    graph: &graph::GraphCell,
     env: &WasmEnv,
     db: &DurableDb,
     alarm: &Alarm,
-    requests: &[stow_types::api::EnqueueRequest],
+    trees: &[stow_types::api::SubmissionTree],
     enforce_pending_cap: bool,
 ) -> Result<Json<InsertedResponse>> {
     let settings = scheduler_settings(env)?;
-    if !enforce_pending_cap {
-        refuse_if_frozen(db).await?;
+    let graph = ensure_graph(env, db, graph).await?;
+    if !enforce_pending_cap && graph.with(|graph| graph.freeze().is_some()) {
+        return Err(Error::msg("dispatch is frozen").set_status(StatusCode::SERVICE_UNAVAILABLE));
     }
-    let result = if enforce_pending_cap {
-        queue::enqueue(db, requests, &settings).await
-    } else {
-        queue::enqueue_trusted(db, requests, &settings).await
-    };
-    let inserted = result.map_err(|error| {
-        let status = match &error {
-            crate::errors::QueueError::QueueFull { .. }
-            | crate::errors::QueueError::HumanDailyBudgetExhausted { .. } => {
-                StatusCode::TOO_MANY_REQUESTS
-            }
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        to_error(error).set_status(status)
-    })?;
-    // Dispatch is not this request's work: the alarm's dispatch pass
-    // runs it, so the submit answers once the queue write lands instead
-    // of holding the client — and burning the DO's per-request CPU
-    // budget — through claim plus a fan-out of GitHub calls. `next_alarm`
-    // decides whether a wake can make progress at all: a submit whose
-    // rows all sit behind unmet gates arms nothing, while a stale
-    // in-flight lease still arms at its expiry (stow#444).
-    schedule_alarm(env, db, alarm).await?;
-    Ok(Json(InsertedResponse { inserted }))
+    // The pending-depth cap gates miss-lane trees only — trusted and
+    // human lanes arrive through their own bound — and every tree's
+    // Submit parts land in one turn before the merge: the single
+    // transaction the ack follows.
+    let (inserted, unpublished_ids) =
+        routes::submit(graph, db, &settings, trees, enforce_pending_cap, now_ms())
+            .await
+            .map_err(route_error)?;
+    // The first pass after a submit stays the alarm's (stow#940):
+    // submitted rows sit behind the dispatch min-age gate, so an
+    // inline pass would claim nothing now — the submit answers once
+    // the queue write lands instead of holding the client through a
+    // pass that cannot make progress. `next_alarm` decides whether a
+    // wake can make progress at all: a submit whose rows all sit
+    // behind unmet gates arms nothing, while a stale in-flight lease
+    // still arms at its expiry (stow#444).
+    schedule_alarm(env, db, alarm, graph.cell()).await?;
+    Ok(Json(InsertedResponse {
+        inserted,
+        unpublished_ids,
+    }))
 }
 
 /// The trusted submit lane refuses while the freeze is engaged — a
@@ -592,8 +671,8 @@ async fn submit(
 /// would merely wait are declined with the freeze reason. Anonymous
 /// submits stay open: a miss costs nothing until it dispatches, and
 /// dropping it would just blind the queue.
-async fn refuse_if_frozen(db: &DurableDb) -> Result<()> {
-    if let Some(record) = queue::freeze_record(db).await.map_err(to_error)? {
+fn refuse_if_frozen(graph: graph::LoadedGraph<'_>) -> Result<()> {
+    if let Some(record) = graph.with(|graph| graph.freeze().cloned()) {
         let reason = format!(
             "dispatch is frozen ({})",
             freeze::summarize_trigger(&record.trigger)
@@ -603,51 +682,184 @@ async fn refuse_if_frozen(db: &DurableDb) -> Result<()> {
     Ok(())
 }
 
-/// `POST /batches/{batch_id}/complete` — the edge's webhook forwards a
-/// `build-batch.yml` run's `completed` delivery here (stow#833 §3.2).
-/// The write lands even while `github_run_id` is still NULL — an early
-/// webhook that beat the dispatch response — and a duplicate delivery
-/// is a no-op 2xx. A batch the store does not hold answers 404: the
-/// run named nothing real, so the webhook logs the orphan rather than
-/// retrying it.
-async fn complete_batch(
+/// `POST /tasks/complete-run` — the edge's webhook route forwards a
+/// `build-crate.yml` run's verified `completed` delivery here; the
+/// report carries the task id and outcome but no attempt, which
+/// `complete_run` resolves against the live row.
+///
+/// A completion for a task the queue never held answers 404, not 500 —
+/// the report references nothing real. A row whose live attempt or
+/// status no longer matches what the event describes answers 409 — the
+/// row moved on, and the webhook logs both rather than propagating
+/// them: a retried delivery changes nothing about a row that already
+/// moved.
+async fn complete_run(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
-    params: Params,
-    Json(report): Json<stow_types::api::BatchRunComplete>,
+    Json(report): Json<stow_types::api::WorkflowRunComplete>,
 ) -> Result<Json<OkResponse>> {
-    queue::record_batch_completion(&db, batch_id_param(&params)?, &report)
-        .await
-        .map_err(|error| {
-            let status = match &error {
-                QueueError::UnknownBatch(_) => StatusCode::NOT_FOUND,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
-    // A recorded completion is resolution work for the alarm — arm the
-    // pass the row's `resolve_after` points at.
-    schedule_alarm(&env, &db, &alarm).await?;
+    complete_run_pass(&graph, &env, &db, &alarm, &report).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
-/// The `{batch_id}` path parameter — verbatim; a completion naming an
-/// id the store does not hold is the route's 404.
-fn batch_id_param(params: &Params) -> Result<&str> {
-    params
-        .get("batch_id")
-        .map_err(|_| Error::msg("batch id is required").set_status(StatusCode::BAD_REQUEST))
+/// The claims one completion's inline pass may take: one concurrent
+/// `workflow_dispatch` round — `MAX_OUTBOUND_INFLIGHT` — so the
+/// webhook's answer lands inside GitHub's 10 s delivery timeout.
+/// Anything still claimable past it arms the alarm at `now`.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "MAX_OUTBOUND_INFLIGHT is the small constant 4"
+)]
+const COMPLETION_CLAIM_BOUND: u32 = crate::fetch_guard::MAX_OUTBOUND_INFLIGHT as u32;
+
+/// The completion's work, shared with the budget probe's
+/// `complete-run` drives so they price the route's whole pass.
+/// Returns the task ids the inline pass claimed.
+///
+/// The completion frees a slot, so this request — not the alarm —
+/// runs the dispatch pass (stow#940): the `RunFinished` row and the
+/// pass's `Claims` row land in ONE append before the fan-out, the
+/// POSTs run as one bounded round under the outbound pool, the
+/// bindings settle, and only then does the response go out — nothing
+/// outlives it (stow#444). The freeze, the breaker and every claim
+/// rule apply exactly as in the alarm's pass — it is the same code.
+pub(super) async fn complete_run_pass(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+    db: &DurableDb,
+    alarm: &Alarm,
+    report: &stow_types::api::WorkflowRunComplete,
+) -> Result<Vec<String>> {
+    let settings = scheduler_settings(env)?;
+    let graph = ensure_graph(env, db, graph).await?;
+    let now = now_ms();
+    // The finish is durable before anything fallible: parse, append
+    // and apply `RunFinished` ahead of every binding read, mint,
+    // listing and POST — a webhook has no redelivery, so a failure
+    // before this row lands loses the completion (stow#940).
+    let outcome = routes::complete_run(graph, db, report, now)
+        .await
+        .map_err(route_error)?;
+    match outcome {
+        // An external run's finish frees its runner-family occupancy
+        // just as an own run's frees its slot, so both claim inline.
+        graph::FinishOutcome::Applied
+        | graph::FinishOutcome::Parked
+        | graph::FinishOutcome::External => {}
+        graph::FinishOutcome::Stale => {
+            tracing::info!(
+                task_id = %report.task_id,
+                run_id = %report.github_run_id,
+                "workflow_run completion names a run no row or external record holds"
+            );
+            schedule_alarm(env, db, alarm, graph.cell()).await?;
+            return Ok(Vec::new());
+        }
+    }
+    // The completion freed a slot, so this request claims one
+    // concurrent round inline — never the status reconcile: its
+    // listing calls plus a POST round could carry the webhook past
+    // GitHub's 10 s delivery window, and a due reconcile arms the
+    // alarm via `wake_plan` instead. A pass failure here loses
+    // nothing durable — log it, arm the alarm to retry, and still
+    // answer 200 (stow#940).
+    match dispatch_pass(
+        graph.cell(),
+        env,
+        db,
+        &settings,
+        COMPLETION_CLAIM_BOUND,
+        PassReconcile::Never,
+    )
+    .await
+    {
+        Ok(claimed) => {
+            schedule_alarm(env, db, alarm, graph.cell()).await?;
+            Ok(claimed)
+        }
+        Err(error) => {
+            tracing::error!(%error, "complete-run inline dispatch pass failed — the alarm retries it");
+            schedule_alarm(env, db, alarm, graph.cell()).await?;
+            Ok(Vec::new())
+        }
+    }
 }
 
-async fn status(db: DurableDb) -> Result<Json<stow_types::api::SchedulerStatus>> {
-    let status = queue::status(&db).await.map_err(to_error)?;
-    Ok(Json(status))
+/// `POST /tasks/run-update` — the webhook's `in_progress` delivery,
+/// which since stow#940 only a run the scheduler did not dispatch
+/// sends: its occupancy records here. An own run's `dispatched` →
+/// `running` transition arrives through the post-wake CI-listing
+/// reconcile instead.
+///
+/// A task the queue never held answers 404; a report naming a run the
+/// row is not bound to — or a row that already moved past it —
+/// answers 409, which the webhook logs rather than propagating.
+async fn apply_task_run_update(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    Json(update): Json<stow_types::api::TaskRunUpdate>,
+) -> Result<Json<OkResponse>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let outcome = routes::task_run_update(graph, &db, &update, now_ms())
+        .await
+        .map_err(route_error)?;
+    match outcome {
+        // Own runs change nothing persistent — the post-wake reconcile
+        // restores running state (review); an external run's occupancy
+        // was appended by the core.
+        graph::StartOutcome::Applied
+        | graph::StartOutcome::Stale
+        | graph::StartOutcome::External => {}
+    }
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// `GET /health` — the edge's `GET /api/v1/scheduler/health` body
+/// (stow#860): one request reading state the graph already holds, no
+/// store access past the wake. The edge turns a `scheduler: unhealthy`
+/// body into the public route's 503.
+async fn health(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::SchedulerHealth>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(graph.with(|graph| graph.health(now_ms()))))
+}
+
+async fn status(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::SchedulerStatus>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let counts = graph.with(|graph| graph.status_counts());
+    let count =
+        |label: &str| u32::try_from(counts.get(label).copied().unwrap_or(0)).unwrap_or(u32::MAX);
+    Ok(Json(stow_types::api::SchedulerStatus {
+        pending: count("pending").saturating_add(count("blocked")),
+        human_pending: count("human_pending"),
+        dispatched: count("dispatched"),
+        running: count("running"),
+        completed: count("completed"),
+        failed: count("failed"),
+        blocked: count("blocked"),
+    }))
 }
 
 /// `GET /admin/status` — the operator view behind `stow-admin status`.
-async fn admin_status(db: DurableDb) -> Result<Json<stow_types::api::AdminStatus>> {
-    let status = queue::admin_status(&db).await.map_err(to_error)?;
+async fn admin_status(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::AdminStatus>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let status = graph
+        .with(|graph| graph.admin_status(now_ms()))
+        .map_err(to_error)?;
     Ok(Json(status))
 }
 
@@ -655,95 +867,141 @@ async fn admin_status(db: DurableDb) -> Result<Json<stow_types::api::AdminStatus
 /// request's flattened query string
 /// (`?task_ids=…&status=&target=&crate=&older_than=&limit=`).
 async fn list_tasks(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
     db: DurableDb,
     skyzen::extract::Query(selector): skyzen::extract::Query<stow_types::api::QueueSelector>,
 ) -> Result<Json<Vec<stow_types::api::QueueTask>>> {
-    let tasks = queue::list_tasks(&db, &selector).await.map_err(to_error)?;
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let tasks = graph
+        .with(|graph| graph.list(&selector, now_ms()))
+        .map_err(to_error)?;
     Ok(Json(tasks))
 }
 
 /// `POST /tasks/{verb}` — one admin mutation over a [`QueueSelector`].
-/// Retried and promoted rows can dispatch immediately, and a cancellation
-/// frees a slot, so every non-purge verb runs a dispatch pass.
+/// The selector resolves to ids against the graph, the resolved ids
+/// are the logged event, and the apply is the same event replay runs.
+/// Retried and promoted rows can dispatch immediately, and a
+/// cancellation frees a slot, so every non-purge verb runs a dispatch
+/// pass.
 async fn apply_queue_mutation(
+    graph: &graph::GraphCell,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
-    mutation: queue::QueueMutation,
+    op: stow_types::api::MutationKind,
     selector: stow_types::api::QueueSelector,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
-    let affected = queue::apply_mutation(&db, &scheduler_settings(&env)?, mutation, &selector)
+    let graph = ensure_graph(&env, &db, graph).await?;
+    let affected = routes::mutate(graph, &db, op, &selector, now_ms())
         .await
-        .map_err(|error| {
-            let status = match &error {
-                QueueError::EmptySelector | QueueError::PurgeRequiresAge => StatusCode::BAD_REQUEST,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
-    if affected > 0 && mutation != queue::QueueMutation::Purge {
-        dispatch_pending(&env, &db).await.map_err(|error| {
-            tracing::error!(%error, "scheduler mutation dispatch_pending failed");
-            error
-        })?;
-        schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
-            tracing::error!(%error, "scheduler mutation schedule_alarm failed");
-            error
-        })?;
+        .map_err(route_error)?;
+    if affected > 0 && op != stow_types::api::MutationKind::Purge {
+        dispatch_pending(&env, &db, graph.cell())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "scheduler mutation dispatch_pending failed");
+                error
+            })?;
+        schedule_alarm(&env, &db, &alarm, graph.cell())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "scheduler mutation schedule_alarm failed");
+                error
+            })?;
     }
     Ok(Json(stow_types::api::QueueMutationResult { affected }))
 }
 
 async fn queue_retry(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
-    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Retry, selector).await
+    apply_queue_mutation(
+        &graph,
+        env,
+        db,
+        alarm,
+        stow_types::api::MutationKind::Retry,
+        selector,
+    )
+    .await
 }
 
 async fn queue_cancel(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
-    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Cancel, selector).await
+    apply_queue_mutation(
+        &graph,
+        env,
+        db,
+        alarm,
+        stow_types::api::MutationKind::Cancel,
+        selector,
+    )
+    .await
 }
 
 async fn queue_promote(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
-    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Promote, selector).await
+    apply_queue_mutation(
+        &graph,
+        env,
+        db,
+        alarm,
+        stow_types::api::MutationKind::Promote,
+        selector,
+    )
+    .await
 }
 
 async fn queue_purge(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
-    apply_queue_mutation(env, db, alarm, queue::QueueMutation::Purge, selector).await
+    apply_queue_mutation(
+        &graph,
+        env,
+        db,
+        alarm,
+        stow_types::api::MutationKind::Purge,
+        selector,
+    )
+    .await
 }
 
 /// `POST /requests` — the human request lane's admission, reached from
 /// the edge's `POST /api/v1/requests` after Turnstile. The work itself
 /// is [`admit_request_pass`], shared with the budget probe's drive.
 async fn admit_request(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     Json(admission): Json<stow_types::api::RequestAdmission>,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
     let settings = scheduler_settings(&env)?;
     // `Date::now()` returns whole milliseconds well below 2^53; the
     // payload's `dispatched_at` wants unix seconds.
     #[allow(clippy::cast_possible_truncation)]
     let dispatched_at = (js_sys::Date::now() / 1_000.0) as i64;
-    admit_request_pass(&env, &db, &settings, &admission, dispatched_at)
+    admit_request_pass(graph, &env, &db, &settings, &admission, dispatched_at)
         .await
         .map(Json)
 }
@@ -761,26 +1019,21 @@ async fn admit_request(
 /// refuses admission outright: a cost trip means no new dispatches, and
 /// a resolve run is one.
 pub(super) async fn admit_request_pass(
+    graph: graph::LoadedGraph<'_>,
     env: &WasmEnv,
     db: &DurableDb,
     settings: &SchedulerSettings,
     admission: &stow_types::api::RequestAdmission,
     dispatched_at: i64,
 ) -> Result<stow_types::api::CrateRequestStatus> {
-    refuse_if_frozen(db).await?;
-    let step = queue::admit_request(db, admission, dispatched_at, settings)
+    refuse_if_frozen(graph)?;
+    let step = routes::admit_request(graph, db, settings, admission, dispatched_at, now_ms())
         .await
-        .map_err(|error| {
-            let status = match &error {
-                QueueError::HumanDailyBudgetExhausted { .. } => StatusCode::TOO_MANY_REQUESTS,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
+        .map_err(route_error)?;
     let queue::RequestAdmissionStep::Dispatch { attempt } = step else {
         // A live record already serves this request — answer it.
-        return queue::crate_request_status(db, &admission.request_id)
-            .await
+        return graph
+            .with(|graph| queue::crate_request_status(graph, &admission.request_id, now_ms()))
             .map_err(to_error)?
             .ok_or_else(|| {
                 Error::msg(format!(
@@ -807,40 +1060,53 @@ pub(super) async fn admit_request_pass(
     let pool = crate::fetch_guard::OutboundPool::new();
     let outcome = match credential_source {
         CredentialSource::LocalCi(url) => {
-            dispatch::LocalCiBuildRuns::new(&url)
-                .trigger_resolve(&dispatch_payload, &github_repo, &pool)
+            dispatch::CiInterface::local_ci(&url, dispatch::CfTransport::new(pool.clone()))
+                .submit_resolve(&dispatch_payload)
                 .await
         }
         CredentialSource::GitHub(config) => {
-            match github_app::installation_token(db, &config).await {
+            match github_app::installation_token(graph.tokens(), &config).await {
                 Ok(token) => {
-                    dispatch::GitHubBuildRuns::new(token)
-                        .trigger_resolve(&dispatch_payload, &github_repo, &pool)
-                        .await
+                    dispatch::CiInterface::github(
+                        &github_repo,
+                        &token.token,
+                        dispatch::CfTransport::new(pool.clone()),
+                    )
+                    .submit_resolve(&dispatch_payload)
+                    .await
                 }
                 Err(error) => {
                     let error = dispatch::DispatchError::TokenMint(error.to_string());
-                    queue::fail_request_dispatch(
+                    routes::fail_request_dispatch(
+                        graph,
                         db,
                         &admission.request_id,
                         attempt,
                         &error.to_string(),
+                        now_ms(),
                     )
                     .await
-                    .map_err(to_error)?;
+                    .map_err(route_error)?;
                     return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
                 }
             }
         }
     };
     if let Err(error) = outcome {
-        queue::fail_request_dispatch(db, &admission.request_id, attempt, &error.to_string())
-            .await
-            .map_err(to_error)?;
+        routes::fail_request_dispatch(
+            graph,
+            db,
+            &admission.request_id,
+            attempt,
+            &error.to_string(),
+            now_ms(),
+        )
+        .await
+        .map_err(route_error)?;
         return Err(Error::msg(error.to_string()).set_status(StatusCode::BAD_GATEWAY));
     }
-    queue::crate_request_status(db, &admission.request_id)
-        .await
+    graph
+        .with(|graph| queue::crate_request_status(graph, &admission.request_id, now_ms()))
         .map_err(to_error)?
         .ok_or_else(|| {
             Error::msg(format!(
@@ -852,12 +1118,15 @@ pub(super) async fn admit_request_pass(
 
 /// `GET /requests/{request_id}` — the request record's live status.
 async fn read_request(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
     db: DurableDb,
     params: Params,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
     let request_id = request_id_param(&params)?;
-    queue::crate_request_status(&db, request_id)
-        .await
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    graph
+        .with(|graph| queue::crate_request_status(graph, request_id, now_ms()))
         .map_err(to_error)?
         .map(Json)
         .ok_or_else(|| {
@@ -867,11 +1136,12 @@ async fn read_request(
 
 /// `POST /requests/{request_id}/outcome` — the resolve job's report
 /// channel (stow#428): the trusted enqueue, the per-target roots and
-/// the `enqueued`/`failed` transition apply in one call, then the
-/// alarm handoff runs the dispatch pass the new tasks wait on. A report
-/// for an unknown record answers 404; one naming a superseded attempt,
-/// 409 — the webhook logs both rather than propagating them.
+/// the `enqueued`/`failed` transition apply in one call, then this
+/// request runs the dispatch pass the new tasks wait on (stow#940).
+/// A report for an unknown record answers 404; one naming a superseded
+/// attempt, 409 — the webhook logs both rather than propagating them.
 async fn apply_request_outcome(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
@@ -879,22 +1149,39 @@ async fn apply_request_outcome(
     Json(report): Json<stow_types::api::RequestOutcomeReport>,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
     let request_id = request_id_param(&params)?;
-    let status = queue::apply_request_outcome(&db, &scheduler_settings(&env)?, request_id, &report)
+    let (status, _claimed) =
+        request_outcome_pass(&graph, &env, &db, &alarm, request_id, &report).await?;
+    Ok(Json(status))
+}
+
+/// The outcome's work, shared with the budget probe's
+/// `outcome (dispatching)` drive: the report lands, then the inline
+/// pass claims every free slot — the resolve job released a layer,
+/// which is when slots sit idle (stow#940). Returns the record's
+/// status and the claimed task ids.
+pub(super) async fn request_outcome_pass(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+    db: &DurableDb,
+    alarm: &Alarm,
+    request_id: &str,
+    report: &stow_types::api::RequestOutcomeReport,
+) -> Result<(stow_types::api::CrateRequestStatus, Vec<String>)> {
+    let graph = ensure_graph(env, db, graph).await?;
+    let status = routes::request_outcome(graph, db, request_id, report, now_ms())
+        .await
+        .map_err(route_error)?;
+    // The enqueue's human-lane rows are eligible at once, so this
+    // request fans them out itself; the pass ends before the response
+    // (stow#444).
+    let claimed = dispatch_pending(env, db, graph.cell())
         .await
         .map_err(|error| {
-            let status = match &error {
-                QueueError::UnknownRequest(_) => StatusCode::NOT_FOUND,
-                QueueError::RequestAttemptSuperseded { .. } => StatusCode::CONFLICT,
-                QueueError::HumanDailyBudgetExhausted { .. } => StatusCode::TOO_MANY_REQUESTS,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
+            tracing::error!(%error, "scheduler request-outcome dispatch_pending failed");
+            error
         })?;
-    // Same handoff as submit: the report answers once the rows land, and
-    // the alarm's dispatch pass — not this request — fans them out. An
-    // outcome whose batch is fully gated arms nothing (stow#444).
-    schedule_alarm(&env, &db, &alarm).await?;
-    Ok(Json(status))
+    schedule_alarm(env, db, alarm, graph.cell()).await?;
+    Ok((status, claimed))
 }
 
 /// `POST /requests/{request_id}/run-update` — the `workflow_run`
@@ -905,21 +1192,17 @@ async fn apply_request_outcome(
 /// superseded attempt → 409, and an event on an already-settled record
 /// is an applied no-op.
 async fn apply_request_run_update(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
     db: DurableDb,
     params: Params,
     Json(update): Json<stow_types::api::RequestRunUpdate>,
 ) -> Result<Json<OkResponse>> {
     let request_id = request_id_param(&params)?;
-    queue::record_request_run_update(&db, request_id, &update)
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::request_run_update(graph, &db, request_id, &update, now_ms())
         .await
-        .map_err(|error| {
-            let status = match &error {
-                QueueError::UnknownRequest(_) => StatusCode::NOT_FOUND,
-                QueueError::RequestAttemptSuperseded { .. } => StatusCode::CONFLICT,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            to_error(error).set_status(status)
-        })?;
+        .map_err(route_error)?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -933,34 +1216,51 @@ fn request_id_param(params: &Params) -> Result<&str> {
 
 /// `GET /dispatch-freeze` — the dispatch freeze's current state: the
 /// flag plus the stored record (trigger and notify outcome) when
-/// engaged.
-async fn read_dispatch_freeze(db: DurableDb) -> Result<Json<stow_types::api::DispatchFreeze>> {
-    let record = queue::freeze_record(&db).await.map_err(to_error)?;
-    let transitions = queue::freeze_transitions(&db, 25).await.map_err(to_error)?;
-    Ok(Json(stow_types::api::DispatchFreeze {
-        enabled: record.is_some(),
-        record,
-        transitions,
-    }))
+/// engaged, and the recent transitions.
+async fn read_dispatch_freeze(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::DispatchFreeze>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(freeze_view(graph)))
+}
+
+/// The freeze flag, record and transition history the graph holds.
+fn freeze_view(graph: graph::LoadedGraph<'_>) -> stow_types::api::DispatchFreeze {
+    graph.with(|graph| {
+        let record = graph.freeze().cloned();
+        stow_types::api::DispatchFreeze {
+            enabled: record.is_some(),
+            record,
+            transitions: graph.freeze_transitions(),
+        }
+    })
 }
 
 /// `POST /dispatch-freeze` — the manual transition that is also the
 /// only recovery path. Each direction sends exactly one alert, and
 /// writing the state already held is a no-op so alerts never repeat.
 async fn write_dispatch_freeze(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
     Json(switch): Json<stow_types::api::DispatchFreeze>,
 ) -> Result<Json<stow_types::api::DispatchFreeze>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
     let sink = EdgeAlerter::new(env.as_js());
     let action = if switch.enabled {
         freeze::FreezeAction::Freeze
     } else {
         freeze::FreezeAction::Clear
     };
+    // The freeze gates `claim` on the graph — the transition applies
+    // its `Freeze` event there and the route appends it (stow#878).
+    let now = now_ms();
+    let store = graph::GraphFreezeStore::new(graph, iso_now(), now);
     let transition = freeze::apply_transition(
-        &DbStore(&db),
+        &store,
         &sink,
         action,
         stow_types::api::DispatchFreezeTrigger::Manual,
@@ -968,50 +1268,40 @@ async fn write_dispatch_freeze(
     )
     .await
     .map_err(to_error)?;
+    routes::persist_freeze(&db, &store, now)
+        .await
+        .map_err(to_error)?;
     match transition {
         freeze::FreezeTransition::Engaged(record) => {
-            // While frozen `next_alarm` plans a delete — a live alarm
+            // While frozen the wake plan is a delete — a live alarm
             // would only spin dispatch passes the gate would eat.
-            schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
-                tracing::error!(%error, "scheduler freeze schedule_alarm failed");
-                error
-            })?;
+            schedule_alarm(&env, &db, &alarm, graph.cell())
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "scheduler freeze schedule_alarm failed");
+                    error
+                })?;
             tracing::warn!(?record.notify, "dispatch freeze engaged manually");
-            let transitions = queue::freeze_transitions(&db, 25).await.map_err(to_error)?;
-            Ok(Json(stow_types::api::DispatchFreeze {
-                enabled: true,
-                record: Some(record),
-                transitions,
-            }))
         }
         freeze::FreezeTransition::Cleared(_) => {
             // Misses that queued during the freeze dispatch first now.
-            dispatch_pending(&env, &db).await.map_err(|error| {
-                tracing::error!(%error, "scheduler unfreeze dispatch_pending failed");
-                error
-            })?;
-            schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
-                tracing::error!(%error, "scheduler unfreeze schedule_alarm failed");
-                error
-            })?;
+            dispatch_pending(&env, &db, graph.cell())
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "scheduler unfreeze dispatch_pending failed");
+                    error
+                })?;
+            schedule_alarm(&env, &db, &alarm, graph.cell())
+                .await
+                .map_err(|error| {
+                    tracing::error!(%error, "scheduler unfreeze schedule_alarm failed");
+                    error
+                })?;
             tracing::warn!("dispatch freeze cleared manually");
-            let transitions = queue::freeze_transitions(&db, 25).await.map_err(to_error)?;
-            Ok(Json(stow_types::api::DispatchFreeze {
-                enabled: false,
-                record: None,
-                transitions,
-            }))
         }
-        freeze::FreezeTransition::Unchanged => {
-            let record = queue::freeze_record(&db).await.map_err(to_error)?;
-            let transitions = queue::freeze_transitions(&db, 25).await.map_err(to_error)?;
-            Ok(Json(stow_types::api::DispatchFreeze {
-                enabled: record.is_some(),
-                record,
-                transitions,
-            }))
-        }
+        freeze::FreezeTransition::Unchanged => {}
     }
+    Ok(Json(freeze_view(graph)))
 }
 
 /// `Date#toISOString` — the timestamp format the record and alert
@@ -1024,36 +1314,41 @@ fn iso_now() -> String {
 }
 
 /// After a failed completion, decide whether the trailing window trips
-/// the freeze. `freeze_trip_draft` owns the database half — the
-/// already-frozen gate plus the window read — which the host cost
-/// drive calls too, so both arms bill the same statements.
-/// `apply_transition` owns the one-alert-per-transition rule: a live
-/// freeze answers `Unchanged` without rewriting the record or
-/// resending the alert. Storage and query errors propagate (loud);
-/// the alert's outcome only ever lands on the record.
+/// the freeze. `freeze_trip_draft` owns the graph half — the
+/// already-frozen gate plus the window fold over the outcome ring —
+/// which the host cost drive calls too. `apply_transition` owns the
+/// one-alert-per-transition rule: a live freeze answers `Unchanged`
+/// without rewriting the record or resending the alert. The alert's
+/// outcome only ever lands on the record.
 async fn evaluate_dispatch_freeze(
+    graph: graph::LoadedGraph<'_>,
     env: &WasmEnv,
     db: &DurableDb,
     settings: &FreezeSettings,
 ) -> Result<()> {
-    let Some(draft) = queue::freeze_trip_draft(db, settings)
-        .await
+    let now = now_ms();
+    let Some(draft) = graph
+        .with(|graph| queue::freeze_trip_draft(graph, settings, now))
         .map_err(to_error)?
     else {
         return Ok(());
     };
     let trigger = trip_trigger(env, draft, settings)?;
     let sink = EdgeAlerter::new(env.as_js());
-    if let freeze::FreezeTransition::Engaged(record) = freeze::apply_transition(
-        &DbStore(db),
+    let store = graph::GraphFreezeStore::new(graph, iso_now(), now);
+    let transition = freeze::apply_transition(
+        &store,
         &sink,
         freeze::FreezeAction::Freeze,
         trigger,
         &iso_now(),
     )
     .await
-    .map_err(to_error)?
-    {
+    .map_err(to_error)?;
+    routes::persist_freeze(db, &store, now)
+        .await
+        .map_err(to_error)?;
+    if let freeze::FreezeTransition::Engaged(record) = transition {
         if freeze::notify_reached(&record.notify) {
             tracing::warn!(trigger = ?record.trigger, notify = %freeze::summarize_notify(&record.notify), "dispatch freeze tripped");
         } else {
@@ -1068,18 +1363,43 @@ async fn evaluate_dispatch_freeze(
 }
 
 /// `MeterGuard`'s and `run_alarm`'s shared tail: settle the
-/// operation's statement counts into the day meter and — when it just
-/// crossed the budget — engage the freeze on this operation, not a
-/// later poll (`settle_and_trip` owns the verdict→freeze→email
-/// sequence). The freeze's own bookkeeping goes through the unmetered
-/// inner handle. A settle failure is logged, never raised: a metering
-/// bug must not take dispatch down with it.
-pub(super) async fn settle_meter(meter: &Meter, env: &WasmEnv, multiplier: f64) {
+/// operation's row counts into the graph's day meter and — when it
+/// just crossed the budget — engage the freeze on this operation, not
+/// a later poll (`meter::trip_and_persist` owns the
+/// settle→verdict→freeze-append→settle sequence, on the metered
+/// handle). A settle failure is logged, never raised: a metering bug
+/// must not take dispatch down with it.
+pub(super) async fn settle_meter(
+    graph: &graph::GraphCell,
+    db: &DurableDb,
+    meter: &Meter,
+    env: &WasmEnv,
+    multiplier: f64,
+) {
+    // A reset leaves the graph empty; settling wakes it first — on a
+    // metered handle: the wake's reads and the freeze append below are
+    // booked into the same settle (stow#931).
+    let (metered_db, aux_meter) = Meter::wrap(db.clone(), graph);
+    let graph = match ensure_graph(env, &metered_db, graph).await {
+        Ok(graph) => graph,
+        Err(error) => {
+            tracing::error!(%error, "do meter settle: graph wake failed");
+            return;
+        }
+    };
     let sink = EdgeAlerter::new(env.as_js());
-    match meter
-        .settle_and_trip(&DbStore(meter.unmetered()), &sink, multiplier, &iso_now())
-        .await
-    {
+    let result = meter::trip_and_persist(
+        &aux_meter,
+        &metered_db,
+        meter,
+        graph,
+        &sink,
+        multiplier,
+        now_ms(),
+        &iso_now(),
+    )
+    .await;
+    match result {
         Ok(Some(freeze::FreezeTransition::Engaged(record))) => {
             if freeze::notify_reached(&record.notify) {
                 tracing::warn!(trigger = ?record.trigger, notify = %freeze::summarize_notify(&record.notify), "dispatch freeze tripped on cost");
@@ -1116,81 +1436,153 @@ fn trip_trigger(
         .map_err(|invariant| Error::msg(format!("freeze trip evidence invariant: {invariant}")))
 }
 
-/// `POST /index/published` — the index-publish path's report that a slice
-/// went live, carrying the semantic identities it serves. Recording it
-/// before the dispatch pass lets a dependent the report just released
-/// claim in the same turn.
-async fn record_published_index(
+/// `POST /preheat/release` — the edge's verified newreleases.io
+/// delivery for a `rust-lang/rust` release (stow#880). The object
+/// dispatches `preheat-admin.yml` through the same credential arm the
+/// dispatch pass uses; the workflow's own manifest check is the
+/// authority on the version, so the payload is only a hint.
+///
+/// The route creates nothing: no event, no graph load — its cost is
+/// the delivery's own (binding reads, the token cache read, one
+/// `workflow_dispatch` POST), never a replay of stored data. A
+/// dispatch failure answers 502 so newreleases.io's backoff retry
+/// redelivers.
+async fn preheat_release(
+    State(graph): State<graph::GraphCell>,
     env: WasmEnv,
-    db: DurableDb,
-    alarm: Alarm,
-    Json(slice): Json<stow_types::api::PublishedSlice>,
+    Json(request): Json<stow_types::api::PreheatReleaseRequest>,
 ) -> Result<Json<OkResponse>> {
-    let settings = scheduler_settings(&env)?;
-    match queue::record_published_slice(
-        &db,
-        &settings,
-        slice.target.as_str(),
-        slice.rustc_version.as_str(),
-        &stow_types::api::PublishedSliceReport {
-            base_generation: slice.base_generation,
-            generation: slice.generation,
-            added: slice.added,
-            retired: slice.retired,
-        },
-    )
-    .await
-    {
-        Ok(()) => {}
-        Err(error @ QueueError::SliceGenerationConflict { .. }) => {
-            // A delta report on a stale base can never apply — the live
-            // generation moved since the reporter read it — so the error
-            // names both generations and the reporter resyncs with a
-            // full report rather than retrying.
-            return Err(to_error(error).set_status(StatusCode::CONFLICT));
-        }
-        Err(error) => return Err(to_error(error)),
-    }
-    dispatch_pending(&env, &db).await.map_err(|error| {
-        tracing::error!(%error, "scheduler published-index dispatch_pending failed");
-        error
-    })?;
-    schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
-        tracing::error!(%error, "scheduler published-index schedule_alarm failed");
-        error
-    })?;
+    preheat_release_pass(&graph, &env, &request).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
+/// The dispatch, shared with the budget probe's
+/// `POST /preheat/release` drive so the probe prices the route's whole
+/// pass — the credential resolution and the `workflow_dispatch` POST.
+pub(super) async fn preheat_release_pass(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+    request: &stow_types::api::PreheatReleaseRequest,
+) -> Result<()> {
+    let pool = crate::fetch_guard::OutboundPool::new();
+    let outcome = match credential_source(env)? {
+        CredentialSource::LocalCi(url) => {
+            dispatch::CiInterface::local_ci(&url, dispatch::CfTransport::new(pool))
+                .submit_preheat(request.rustc_version.as_str())
+                .await
+        }
+        CredentialSource::GitHub(config) => {
+            match github_app::installation_token(graph.tokens(), &config).await {
+                Ok(token) => {
+                    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+                    dispatch::CiInterface::github(
+                        &github_repo,
+                        &token.token,
+                        dispatch::CfTransport::new(pool),
+                    )
+                    .submit_preheat(request.rustc_version.as_str())
+                    .await
+                }
+                Err(error) => Err(dispatch::DispatchError::TokenMint(error.to_string())),
+            }
+        }
+    };
+    outcome.map_err(|error| {
+        let error = to_error(error.to_string());
+        tracing::error!(%error, "preheat release dispatch failed");
+        error.set_status(StatusCode::BAD_GATEWAY)
+    })
+}
+
+/// `POST /index/published` — the index-publish path's report that a
+/// run's slices went live, carrying the semantic identities they
+/// serve. Recording them before the dispatch pass lets a dependent the
+/// report just released claim in the same turn (stow#940: one report
+/// per publish run).
+async fn record_published_index(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    Json(report): Json<stow_types::api::PublishedRunReport>,
+) -> Result<Json<OkResponse>> {
+    published_index_pass(&graph, &env, &db, &alarm, &report.slices).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// The slice report's work, shared with the budget probe's
+/// `index/published (dispatching)` drive: the report's append, then
+/// the inline pass claiming every free slot — a publish releases a
+/// dependency layer, which is when slots sit idle (stow#940). Returns
+/// the claimed task ids.
+pub(super) async fn published_index_pass(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+    db: &DurableDb,
+    alarm: &Alarm,
+    slices: &[stow_types::api::PublishedSlice],
+) -> Result<Vec<String>> {
+    let _settings = scheduler_settings(env)?;
+    let graph = ensure_graph(env, db, graph).await?;
+    // The run's slices append in one commit; their flips land on the
+    // same turn (stow#878 — no generation fencing: reports apply to
+    // in-memory masks, deltas stay idempotent on re-application).
+    routes::slice_reports(graph, db, slices, now_ms())
+        .await
+        .map_err(route_error)?;
+    let claimed = dispatch_pending(env, db, graph.cell())
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "scheduler published-index dispatch_pending failed");
+            error
+        })?;
+    schedule_alarm(env, db, alarm, graph.cell())
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "scheduler published-index schedule_alarm failed");
+            error
+        })?;
+    Ok(claimed)
+}
+
 /// The dispatch freeze stops the scheduler as well as the work-submitting
-/// routes: `plan_alarm` answers `AlarmPlan::Delete` while frozen, so a
-/// dispatch pass reads no pending queue and the alarm does not re-arm —
-/// nothing runs until `dispatch-freeze clear` lifts it.
+/// routes: a frozen graph claims nothing and plans no wake, so the
+/// alarm does not re-arm — nothing runs until `dispatch-freeze clear`
+/// lifts it.
 ///
 /// The alarm handler's `DurableDb` is extracted fresh (alarms bypass
 /// the router middleware), so it wraps the handle in the metering
 /// backend itself and settles regardless of outcome.
-async fn run_alarm(env: WasmEnv, db: DurableDb, alarm: Alarm) -> Result<&'static str> {
+async fn run_alarm(
+    graph: graph::GraphCell,
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+) -> Result<&'static str> {
     let multiplier = cost_budget_multiplier(&env)?;
-    let (db, meter) = Meter::wrap(db);
+    let (metered, meter) = Meter::wrap(db.clone(), &graph);
     let meter = if budget_probe_enabled(&env) {
         meter.with_ledger_op(stow_types::do_budgets::LEDGER_OP_ALARM.to_owned())
     } else {
         meter
     };
     let result = async {
-        dispatch_pending(&env, &db).await.map_err(|error| {
-            tracing::error!(%error, "scheduler alarm dispatch_pending failed");
-            error
-        })?;
-        schedule_alarm(&env, &db, &alarm).await.map_err(|error| {
-            tracing::error!(%error, "scheduler alarm schedule_alarm failed");
-            error
-        })?;
+        dispatch_pending(&env, &metered, &graph)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "scheduler alarm dispatch_pending failed");
+                error
+            })?;
+        schedule_alarm(&env, &metered, &alarm, &graph)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "scheduler alarm schedule_alarm failed");
+                error
+            })?;
         Ok("ok")
     }
     .await;
-    settle_meter(&meter, &env, multiplier).await;
+    settle_meter(&graph, &db, &meter, &env, multiplier).await;
     result
 }
 
@@ -1229,45 +1621,57 @@ pub fn loopback_url(binding: &str, url: &str) -> Result<String> {
     }
 }
 
-/// The artifact catalog in D1, asked at claim time which pending tasks an
-/// already-landed publish covered.
-pub(super) struct CatalogCoverage {
-    /// The catalog handle — plain `CfD1` on a real pass, the counted
-    /// backend under the budget probe so the lookup's rows are priced.
-    pub(super) db: Db,
-}
-
-impl queue::CoverageOracle for CatalogCoverage {
-    async fn covered(
-        &self,
-        identities: &[queue::SemanticTaskIdentity],
-    ) -> std::result::Result<BTreeSet<queue::SemanticTaskIdentity>, QueueError> {
-        db::covered_semantic_identities(&self.db, identities)
-            .await
-            .map_err(|error| QueueError::Sql(format!("artifact coverage lookup: {error}")))
-    }
-}
-
-async fn dispatch_pending(env: &WasmEnv, db: &DurableDb) -> Result<()> {
-    // The dispatch freeze gates here and inside `claim_dispatchable_tasks`
+async fn dispatch_pending(
+    env: &WasmEnv,
+    db: &DurableDb,
+    graph: &graph::GraphCell,
+) -> Result<Vec<String>> {
+    let graph = ensure_graph(env, db, graph).await?;
+    // The dispatch freeze gates here and inside `claim`
     // — the enqueue side never consults it, so misses keep arriving and
     // stay pending for the first pass after a human lifts the freeze. It
     // precedes binding resolution on purpose: while frozen there is no
     // dispatch pass at all, not even its failures.
-    if queue::freeze_enabled(db).await.map_err(to_error)? {
+    if graph.with(|graph| graph.freeze().is_some()) {
         tracing::info!("dispatch frozen — skipping dispatch pass");
-        return Ok(());
+        return Ok(Vec::new());
     }
     let settings = scheduler_settings(env)?;
-    let coverage = CatalogCoverage {
-        db: Db::new(
-            CfD1::from_env(env.as_js(), STOW_DB_BINDING)
-                .map_err(|error| Error::msg(format!("load D1 binding: {error}")))?,
-        ),
-    };
-    dispatch_pass(env, db, &settings, &coverage)
-        .await
-        .map(|_| ())
+    dispatch_pass(
+        graph.cell(),
+        env,
+        db,
+        &settings,
+        u32::MAX,
+        PassReconcile::Due,
+    )
+    .await
+}
+
+/// The CI interface one pass resolves — same credential arm as
+/// `dispatch_pass`.
+async fn ci_interface(
+    env: &WasmEnv,
+    graph: graph::LoadedGraph<'_>,
+) -> Result<dispatch::CiInterface<dispatch::CfTransport>> {
+    let pool = crate::fetch_guard::OutboundPool::new();
+    match credential_source(env)? {
+        CredentialSource::LocalCi(url) => Ok(dispatch::CiInterface::local_ci(
+            &url,
+            dispatch::CfTransport::new(pool),
+        )),
+        CredentialSource::GitHub(config) => {
+            let token = github_app::installation_token(graph.tokens(), &config)
+                .await
+                .map_err(to_error)?;
+            let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+            Ok(dispatch::CiInterface::github(
+                &github_repo,
+                &token.token,
+                dispatch::CfTransport::new(pool),
+            ))
+        }
+    }
 }
 
 /// The credential arm a dispatch resolves — `STOW_LOCAL_CI_URL` for the
@@ -1286,152 +1690,112 @@ fn credential_source(env: &WasmEnv) -> Result<CredentialSource> {
     )
 }
 
-/// The local CI a mock stack dispatches to — where the budget probe's
-/// batch-resolution drives seed the run their batch concluded as.
-///
-/// # Errors
-/// The deploy names no `STOW_LOCAL_CI_URL`: the probe runs only on mock
-/// stacks, and every one of them carries it.
-pub(super) fn local_ci_runs(env: &WasmEnv) -> Result<dispatch::LocalCiBuildRuns> {
-    match credential_source(env)? {
-        CredentialSource::LocalCi(url) => Ok(dispatch::LocalCiBuildRuns::new(&url)),
-        CredentialSource::GitHub(_) => Err(Error::msg(
-            "the budget probe's batch drives seed their runs on the local CI, \
-             but the deploy names no STOW_LOCAL_CI_URL",
-        )),
-    }
+/// Whether a dispatch pass may run the CI status reconcile.
+pub(super) enum PassReconcile {
+    /// The reconcile rides the pass when due — the alarm's pass and
+    /// the passes of requests that release work (mutations, unfreeze,
+    /// the slice report, the request outcome): CI-job callers, not
+    /// webhooks.
+    Due,
+    /// A completion's bounded pass never reconciles: the listing
+    /// calls plus a POST round could carry the webhook past GitHub's
+    /// 10 s delivery window, so a due reconcile is left to the alarm,
+    /// which `wake_plan` arms (stow#940).
+    Never,
 }
 
-/// Cancel `run_id` on the local CI through the backend's own
-/// `cancel_run`, under the deploy's `GITHUB_REPO` — how the budget
-/// probe's lease-check drive ends the running run its setup seeded.
-///
-/// # Errors
-/// The deploy names no local CI or no repository, or the cancel failed.
-pub(super) async fn cancel_local_ci_run(env: &WasmEnv, run_id: u64) -> Result<()> {
-    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
-    local_ci_runs(env)?
-        .cancel_run(
-            &github_repo,
-            run_id,
-            &crate::fetch_guard::OutboundPool::new(),
-        )
-        .await
-        .map_err(|error| Error::msg(format!("cancel local CI run {run_id}: {error}")))
-}
-
-/// The claim-plus-fan-out half of a dispatch pass, shared with the
-/// budget probe's `"alarm pass"` drive (`drives.rs`) so the probe's
-/// `wall_ms` covers the concurrent `dispatch_batch` fan-out and the
-/// counted-D1 coverage lookups a real wake pays. Returns the claimed
-/// task ids — the probe's claim record and the launch gate's claim
-/// count both derive from the pass's own set.
+/// The claim-plus-fan-out half of a dispatch pass, shared by the
+/// alarm's pass, the inline passes the slot-freeing and work-releasing
+/// requests run (stow#940), and the budget probe's `"alarm pass"`
+/// drive (`drives.rs`) so the probe's `wall_ms` covers the concurrent
+/// `dispatch` fan-out a real wake pays. `bound` caps the claim set —
+/// a completion claims at most one concurrent POST round, every other
+/// pass `u32::MAX`. `completion` folds a finish into the pass.
+/// Returns the claimed task ids — the probe's claim record and the
+/// launch gate's claim count both derive from the pass's own set.
 pub(super) async fn dispatch_pass(
+    graph: &graph::GraphCell,
     env: &WasmEnv,
     db: &DurableDb,
     settings: &SchedulerSettings,
-    coverage: &impl queue::CoverageOracle,
+    bound: u32,
+    reconcile: PassReconcile,
 ) -> Result<Vec<String>> {
+    let graph = ensure_graph(env, db, graph).await?;
     // Binding resolution precedes claiming: a misconfigured binding fails
     // the pass with every row still `pending` instead of burned as a
     // dispatch attempt.
     let bindings = PassBindings::read(env)?;
-    let scope = bindings.scope(env, db, settings);
-    // §4.3: expired leases settle first, so a completion the lease check
-    // recovers resolves in this same pass.
-    check_batch_leases(&scope, &bindings.credential_source).await?;
-    // §3.2: completed batches resolve before claiming — a resolved
-    // batch's freed slots fill this same pass.
-    resolve_ready_batches(&scope, &bindings.credential_source).await?;
-    let batches = queue::claim_dispatchable_tasks(db, settings, coverage)
-        .await
-        .map_err(to_error)?;
-    let task_ids: Vec<String> = batches
-        .iter()
-        .flat_map(|batch| batch.tasks.iter().map(|task| task.task_id.clone()))
-        .collect();
-    tracing::info!(
-        batches = batches.len(),
-        claimed = task_ids.len(),
-        "scheduler dispatch_pending selected batches"
-    );
-    if batches.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // The backend resolves once per pass, only when batches exist: the
-    // local-CI branch carries no Authorization; the GitHub branch reuses
-    // the installation token cached in DO storage while more than five
-    // minutes of validity remain and otherwise mints a fresh one. A
-    // failed mint is a dispatch failure for every claimed batch — the
-    // same backoff a failed POST would get.
-    match &bindings.credential_source {
+    // The backend resolves once per pass, before the claim: the local-CI
+    // branch carries no Authorization; the GitHub branch reuses the
+    // isolate's cached installation token while more than five minutes
+    // of validity remain and otherwise mints a fresh one. A failed mint
+    // fails the pass with every row still `pending` — a transient mint
+    // outage is not worth a burned build attempt.
+    let pool = crate::fetch_guard::OutboundPool::new();
+    let interface = match &bindings.credential_source {
         CredentialSource::LocalCi(url) => {
             tracing::info!(url = %url, "dispatching via local-CI endpoint");
-            dispatch_batches(
-                db,
-                settings,
-                &dispatch::LocalCiBuildRuns::new(url),
-                batches,
-                &bindings.github_repo,
-            )
-            .await?;
+            dispatch::CiInterface::local_ci(url, dispatch::CfTransport::new(pool.clone()))
         }
         CredentialSource::GitHub(config) => {
-            match github_app::installation_token(db, config).await {
-                Ok(token) => {
-                    dispatch_batches(
-                        db,
-                        settings,
-                        &dispatch::GitHubBuildRuns::new(token),
-                        batches,
-                        &bindings.github_repo,
-                    )
-                    .await?;
-                }
+            match github_app::installation_token(graph.tokens(), config).await {
+                Ok(token) => dispatch::CiInterface::github(
+                    &bindings.github_repo,
+                    &token.token,
+                    dispatch::CfTransport::new(pool.clone()),
+                ),
                 Err(error) => {
                     let error = dispatch::DispatchError::TokenMint(error.to_string());
-                    for batch in &batches {
-                        queue::persist_batch_dispatch(db, settings, batch, Err(error.to_string()))
-                            .await
-                            .map_err(to_error)?;
-                    }
+                    return Err(to_error(error.to_string()));
                 }
             }
         }
+    };
+    // External occupancy (stow#877): runs this scheduler did not
+    // dispatch are tracked from `workflow_run` deliveries —
+    // `in_progress` for an unbound run adds, `completed` removes —
+    // and `status` only reconciles the set: at most once per
+    // STATUS_RECONCILE minutes and only while the graph holds work,
+    // so an idle scheduler costs zero calls. A reconcile failure is
+    // not worth burning the pass over — the delivery-tracked set is
+    // the primary source; `status` only corrects its drift.
+    if matches!(reconcile, PassReconcile::Due)
+        && graph.with(|graph| graph.reconcile_due(now_ms(), settings))
+    {
+        match interface.status_runs().await {
+            Ok(listed) => {
+                graph.with(|graph| graph.reconcile_runs(&listed, now_ms()));
+            }
+            Err(error) => {
+                graph.with(|graph| graph.reconcile_failed(now_ms()));
+                tracing::warn!(%error, "CI status reconcile failed — keeping delivery-tracked external occupancy");
+            }
+        }
     }
+    let now = now_ms();
+    // The breaker is evaluated every pass: the outcome ring it reads
+    // is window-filtered in memory, so the check costs no row.
+    let freeze = freeze_settings(env)?;
+    evaluate_dispatch_freeze(graph, env, db, &freeze).await?;
+    let claims = routes::claim_pass(graph, db, settings, now, bound)
+        .await
+        .map_err(route_error)?;
+    let task_ids: Vec<String> = claims.iter().map(|claim| claim.task_id.clone()).collect();
+    tracing::info!(
+        claimed = task_ids.len(),
+        "scheduler dispatch_pending selected tasks"
+    );
+    if claims.is_empty() {
+        return Ok(Vec::new());
+    }
+    dispatch_claims(graph, db, &interface, claims).await?;
     Ok(task_ids)
 }
 
-/// How long a batch whose jobs page cannot have settled yet — or one
-/// whose GitHub/GHCR read failed transiently — defers its resolution:
-/// the 30 s §3.2 grants the page to finish writing. The deferral ends
-/// at the batch's ceiling, where the batch fails instead
-/// ([`queue::defer_unresolved_batch`]).
-const BATCH_RESOLVE_DEFER_MS: i64 = 30_000;
-
-/// How long the lease check leaves a batch whose run lookup, cancel or
-/// token mint failed before the next pass asks again — without it the
-/// alarm would re-arm at `now` for as long as GitHub is failing. A
-/// batch at its ceiling is failed instead ([`queue::retry_unreadable_batch`]).
-const LEASE_RETRY_MS: i64 = BATCH_RESOLVE_DEFER_MS;
-
-/// The GHCR config the batch resolution's records check reads — the
-/// same binding the Worker's webhook builds for the per-task path
-/// (entry.rs).
-fn ghcr_config(env: &WasmEnv) -> crate::api::GhcrConfig {
-    crate::api::GhcrConfig {
-        base_url: read_optional_string_binding(env, crate::entry::GHCR_BASE_URL_BINDING)
-            .unwrap_or_else(|| crate::ghcr::default_base_url().to_owned()),
-        tokens: crate::registry_auth::RegistryTokens::default(),
-    }
-}
-
-/// The bindings an alarm pass's batch steps read, resolved once per
-/// pass.
+/// The bindings an alarm pass reads, resolved once per pass.
 struct PassBindings {
     github_repo: String,
-    freeze: FreezeSettings,
     credential_source: CredentialSource,
 }
 
@@ -1439,575 +1803,105 @@ impl PassBindings {
     fn read(env: &WasmEnv) -> Result<Self> {
         Ok(Self {
             github_repo: read_string_binding(env, GITHUB_REPO_BINDING)?,
-            freeze: freeze_settings(env)?,
             credential_source: credential_source(env)?,
         })
     }
-
-    fn scope<'a>(
-        &'a self,
-        env: &'a WasmEnv,
-        db: &'a DurableDb,
-        settings: &'a SchedulerSettings,
-    ) -> PassScope<'a> {
-        PassScope {
-            env,
-            db,
-            settings,
-            github_repo: &self.github_repo,
-            freeze: &self.freeze,
-        }
-    }
 }
-
-/// Which batch step of an alarm pass the budget probe runs on its own.
-#[derive(Clone, Copy, Debug)]
-pub(super) enum BatchStep {
-    /// §4.3's lease check over the expired batches.
-    Leases,
-    /// §3.2's resolution of the completed batches.
-    Resolution,
-}
-
-/// One batch step of the dispatch pass, exactly as [`dispatch_pass`]
-/// runs it — the budget probe's `alarm pass (batch resolution)` and
-/// `alarm pass (lease check)` drives price the step alone.
-pub(super) async fn run_batch_step(
-    env: &WasmEnv,
-    db: &DurableDb,
-    settings: &SchedulerSettings,
-    step: BatchStep,
-) -> Result<()> {
-    let bindings = PassBindings::read(env)?;
-    let scope = bindings.scope(env, db, settings);
-    match step {
-        BatchStep::Leases => check_batch_leases(&scope, &bindings.credential_source).await,
-        BatchStep::Resolution => resolve_ready_batches(&scope, &bindings.credential_source).await,
-    }
-}
-
-/// What one alarm pass's batch resolution reads from its caller —
-/// the bindings and handles every step of the pass shares.
-struct PassScope<'a> {
-    env: &'a WasmEnv,
-    db: &'a DurableDb,
-    settings: &'a SchedulerSettings,
-    github_repo: &'a str,
-    freeze: &'a FreezeSettings,
-}
-
-/// §4.3: settle every batch whose lease expired — before resolving
-/// and claiming, so a recorded completion resolves and a requeued leg
-/// is claimable in this same pass. It runs whether or not dispatch is
-/// paused: a paused scheduler still owes its in-flight builds the
-/// lease check.
-///
-/// An unbound batch (the dispatch response was lost) has no run to ask
-/// about and requeues its legs without any HTTP. The bound ones are
-/// looked up concurrently ([`check_bound_leases`]); the credential
-/// resolves only when one expired, like the other arms'.
-async fn check_batch_leases(
-    scope: &PassScope<'_>,
-    credential_source: &CredentialSource,
-) -> Result<()> {
-    let PassScope { db, settings, .. } = *scope;
-    let now_ms = now_ms();
-    let mut bound = Vec::new();
-    for batch in queue::expired_batches(db, now_ms).await.map_err(to_error)? {
-        match batch.run_id {
-            None => {
-                tracing::warn!(
-                    batch_id = %batch.batch_id,
-                    "batch lease expired unbound — requeueing its legs"
-                );
-                queue::requeue_unbound_batch(db, settings, &batch.batch_id)
-                    .await
-                    .map_err(to_error)?;
-            }
-            Some(run_id) => bound.push((batch, run_id)),
-        }
-    }
-    if bound.is_empty() {
-        return Ok(());
-    }
-    match credential_source {
-        CredentialSource::LocalCi(url) => {
-            check_bound_leases(scope, &dispatch::LocalCiBuildRuns::new(url), bound, now_ms).await
-        }
-        CredentialSource::GitHub(config) => {
-            match github_app::installation_token(db, config).await {
-                Ok(token) => {
-                    check_bound_leases(scope, &dispatch::GitHubBuildRuns::new(token), bound, now_ms)
-                        .await
-                }
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        batches = bound.len(),
-                        "installation token mint failed — leaving expired batches for the next pass"
-                    );
-                    for (batch, _) in &bound {
-                        queue::retry_unreadable_batch(db, batch, now_ms, LEASE_RETRY_MS)
-                            .await
-                            .map_err(to_error)?;
-                    }
-                    Ok(())
-                }
-            }
-        }
-    }
-}
-
-/// What the lease check decided for one bound, expired batch.
-enum LeaseVerdict {
-    /// The run completed — record it as the webhook would have.
-    Completed(stow_types::api::BatchRunComplete),
-    /// The run is still going inside its ceiling.
-    Extend,
-    /// The run outlived its ceiling — cancel it, then fail the batch.
-    Cancel,
-    /// The lookup failed — the next pass asks again.
-    Retry,
-}
-
-/// One bound expired set's lease check. The run lookups, then the
-/// cancels of the runs past their ceiling, each run concurrently under
-/// the invocation's outbound bound; the queue writes apply
-/// sequentially afterward (`&DurableDb` is not `Send`, so it never
-/// enters a concurrent future).
-async fn check_bound_leases(
-    scope: &PassScope<'_>,
-    backend: &impl dispatch::BuildRuns,
-    bound: Vec<(queue::ExpiredBatch, u64)>,
-    now_ms: i64,
-) -> Result<()> {
-    let github_repo = scope.github_repo;
-    let pool = crate::fetch_guard::OutboundPool::new();
-    // Collected before streaming, like the dispatch fan-out's.
-    let lookups: Vec<_> = bound
-        .iter()
-        .map(|&(_, run_id)| backend.run_status(github_repo, run_id, &pool))
-        .collect();
-    let statuses = stream::iter(lookups)
-        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-        .collect::<Vec<_>>()
-        .await;
-    let mut verdicts = Vec::with_capacity(bound.len());
-    for ((batch, run_id), status) in bound.iter().zip(statuses) {
-        verdicts.push(lease_verdict(batch, *run_id, status)?);
-    }
-    let cancels: Vec<_> = bound
-        .iter()
-        .zip(&verdicts)
-        .filter(|(_, verdict)| matches!(verdict, LeaseVerdict::Cancel))
-        .map(|(&(_, run_id), _)| backend.cancel_run(github_repo, run_id, &pool))
-        .collect();
-    let mut cancels = stream::iter(cancels)
-        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-        .collect::<Vec<_>>()
-        .await
-        .into_iter();
-    for ((batch, run_id), verdict) in bound.iter().zip(verdicts) {
-        let cancelled = matches!(verdict, LeaseVerdict::Cancel).then(|| {
-            cancels
-                .next()
-                .expect("one cancel was issued per past-ceiling verdict")
-        });
-        apply_lease_verdict(scope, batch, *run_id, verdict, cancelled, now_ms).await?;
-    }
-    Ok(())
-}
-
-/// What the lease check decides for one bound, expired batch from its
-/// run's state.
-///
-/// # Errors
-/// A `completed` run with no conclusion is corrupt GitHub state.
-fn lease_verdict(
-    batch: &queue::ExpiredBatch,
-    run_id: u64,
-    status: std::result::Result<stow_types::runs::RunStatus, dispatch::DispatchError>,
-) -> Result<LeaseVerdict> {
-    Ok(match status {
-        Err(error) => {
-            tracing::error!(
-                batch_id = %batch.batch_id,
-                run_id,
-                %error,
-                "run status lookup failed — leaving the batch for the next pass"
-            );
-            LeaseVerdict::Retry
-        }
-        Ok(status) if status.status == "completed" => {
-            let conclusion = status.conclusion.ok_or_else(|| {
-                Error::msg(format!(
-                    "run {run_id} of batch {} is completed with no conclusion",
-                    batch.batch_id
-                ))
-            })?;
-            LeaseVerdict::Completed(stow_types::api::BatchRunComplete {
-                run_id,
-                run_attempt: status.run_attempt,
-                conclusion,
-                html_url: status.html_url,
-            })
-        }
-        Ok(_) if batch.past_ceiling => LeaseVerdict::Cancel,
-        Ok(_) => LeaseVerdict::Extend,
-    })
-}
-
-/// Apply one batch's verdict to the queue. `cancelled` is the cancel
-/// call's outcome for a [`LeaseVerdict::Cancel`] verdict, `None` for
-/// every other.
-async fn apply_lease_verdict(
-    scope: &PassScope<'_>,
-    batch: &queue::ExpiredBatch,
-    run_id: u64,
-    verdict: LeaseVerdict,
-    cancelled: Option<std::result::Result<(), dispatch::DispatchError>>,
-    now_ms: i64,
-) -> Result<()> {
-    let PassScope { db, settings, .. } = *scope;
-    let batch_id = batch.batch_id.as_str();
-    match verdict {
-        LeaseVerdict::Completed(report) => {
-            tracing::info!(
-                batch_id,
-                run_id,
-                conclusion = %report.conclusion,
-                "expired lease found its run completed — recording the lost delivery"
-            );
-            match queue::record_batch_completion(db, batch_id, &report).await {
-                Ok(()) => {}
-                // The row left between the lookup and the write; the run
-                // it named resolves nothing.
-                Err(QueueError::UnknownBatch(_)) => {
-                    tracing::warn!(batch_id, "batch gone before its completion was recorded");
-                }
-                Err(error) => return Err(to_error(error)),
-            }
-        }
-        LeaseVerdict::Extend => {
-            queue::extend_batch_lease(db, settings, batch_id, now_ms)
-                .await
-                .map_err(to_error)?;
-        }
-        LeaseVerdict::Cancel => match cancelled.expect("a cancel verdict carries its cancel") {
-            Ok(()) => {
-                tracing::error!(
-                    batch_id,
-                    run_id,
-                    "run exceeded its ceiling — cancelled, failing its legs"
-                );
-                queue::fail_batch_past_ceiling(db, batch_id, queue::CeilingFailure::RunOutlived)
-                    .await
-                    .map_err(to_error)?;
-            }
-            Err(error) => {
-                tracing::error!(
-                    batch_id,
-                    run_id,
-                    %error,
-                    "cancelling a run past its ceiling failed"
-                );
-                queue::retry_unreadable_batch(db, batch, now_ms, LEASE_RETRY_MS)
-                    .await
-                    .map_err(to_error)?;
-            }
-        },
-        LeaseVerdict::Retry => {
-            queue::retry_unreadable_batch(db, batch, now_ms, LEASE_RETRY_MS)
-                .await
-                .map_err(to_error)?;
-        }
-    }
-    Ok(())
-}
-
-/// §3.2: resolve every batch whose `completed` delivery is bound and
-/// due — before claiming, so a freed slot fills this same pass. The
-/// backend resolves once, like the dispatch arm's: a token-mint
-/// failure defers every ready batch rather than burning it.
-async fn resolve_ready_batches(
-    scope: &PassScope<'_>,
-    credential_source: &CredentialSource,
-) -> Result<()> {
-    let PassScope { env, db, .. } = *scope;
-    let now_ms = now_ms();
-    let ready = queue::ready_batches(db, now_ms).await.map_err(to_error)?;
-    if ready.is_empty() {
-        return Ok(());
-    }
-    let ghcr = ghcr_config(env);
-    match credential_source {
-        CredentialSource::LocalCi(url) => {
-            resolve_batch_set(
-                scope,
-                &dispatch::LocalCiBuildRuns::new(url),
-                &ghcr,
-                ready,
-                now_ms,
-            )
-            .await
-        }
-        CredentialSource::GitHub(config) => {
-            match github_app::installation_token(db, config).await {
-                Ok(token) => {
-                    resolve_batch_set(
-                        scope,
-                        &dispatch::GitHubBuildRuns::new(token),
-                        &ghcr,
-                        ready,
-                        now_ms,
-                    )
-                    .await
-                }
-                Err(error) => {
-                    tracing::error!(
-                        %error,
-                        batches = ready.len(),
-                        "installation token mint failed — deferring batch resolution"
-                    );
-                    for batch in &ready {
-                        queue::defer_unresolved_batch(db, batch, now_ms, BATCH_RESOLVE_DEFER_MS)
-                            .await
-                            .map_err(to_error)?;
-                    }
-                    Ok(())
-                }
-            }
-        }
-    }
-}
-
-/// One ready-batch set's resolution fan-out — the outbound reads
-/// (jobs page, then a manifest read per successful leg) run
-/// concurrently under the invocation's outbound bound, the same bound
-/// the dispatch fan-out runs under. The queue writes apply
-/// sequentially afterward: `&DurableDb` is not `Send`, so it never
-/// enters a concurrent future.
-async fn resolve_batch_set(
-    scope: &PassScope<'_>,
-    backend: &impl dispatch::BuildRuns,
-    ghcr: &crate::api::GhcrConfig,
-    ready: Vec<queue::ReadyBatch>,
-    now_ms: i64,
-) -> Result<()> {
-    let PassScope {
-        env,
-        db,
-        settings,
-        github_repo,
-        freeze,
-    } = *scope;
-    let pool = crate::fetch_guard::OutboundPool::new();
-    let now = time::OffsetDateTime::from_unix_timestamp(now_ms / 1000)
-        .map_err(|error| Error::msg(format!("alarm clock out of range: {error}")))?;
-    // Collected before streaming: a closure inside the stream's type
-    // borrows each batch under a higher-ranked lifetime, and the alarm
-    // future then cannot prove itself `Send`.
-    let probes: Vec<_> = ready
-        .iter()
-        .map(|batch| probe_batch(backend, ghcr, github_repo, batch, &pool, now))
-        .collect();
-    let probes = stream::iter(probes)
-        .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-        .collect::<Vec<_>>()
-        .await;
-    for (batch, probe) in ready.iter().zip(probes) {
-        let Some(resolutions) = probe else {
-            queue::defer_unresolved_batch(db, batch, now_ms, BATCH_RESOLVE_DEFER_MS)
-                .await
-                .map_err(to_error)?;
-            continue;
-        };
-        if queue::resolve_batch(db, settings, batch, &resolutions, freeze.window_minutes)
-            .await
-            .map_err(to_error)?
-        {
-            evaluate_dispatch_freeze(env, db, freeze).await?;
-        }
-    }
-    Ok(())
-}
-
-/// One batch's outbound reads resolved into per-leg resolutions —
-/// `None` while any leg is unsettled or a read failed transiently
-/// (the caller defers the batch 30 s inside its ceiling and fails it at
-/// the ceiling, §3.2). Concurrent-safe: it
-/// touches nothing but the outbound pool.
-async fn probe_batch(
-    backend: &impl dispatch::BuildRuns,
-    ghcr: &crate::api::GhcrConfig,
-    github_repo: &str,
-    batch: &queue::ReadyBatch,
-    pool: &crate::fetch_guard::OutboundPool,
-    now: time::OffsetDateTime,
-) -> Option<Vec<queue::LegResolution>> {
-    let run_id = batch.run_id;
-    let jobs = match backend
-        .attempt_jobs(github_repo, run_id, batch.done_attempt, pool)
-        .await
-    {
-        Ok(jobs) => jobs,
-        Err(error) => {
-            tracing::warn!(batch_id = %batch.batch_id, run_id, %error, "batch jobs page read failed — deferring");
-            return None;
-        }
-    };
-    let outcomes = queue::leg_outcomes(batch, &jobs, now);
-    // One GHCR manifest read per successful leg, concurrently under
-    // the same outbound bound — the tag pins the publish job's
-    // `run_attempt` (§3.1).
-    let checks: Vec<_> = batch
-        .legs
-        .iter()
-        .map(|leg| {
-            let outcome = &outcomes[index_to_usize(leg.batch_leg)];
-            leg_records_present(ghcr, batch, leg, outcome, run_id, pool)
-        })
-        .collect();
-    let checks = stream::iter(checks)
-        .buffer_unordered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
-        .collect::<Vec<_>>()
-        .await;
-    let mut confirmed = std::collections::BTreeSet::new();
-    for check in checks {
-        match check {
-            Ok(Some(leg_index)) => {
-                confirmed.insert(leg_index);
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(batch_id = %batch.batch_id, run_id, %error, "batch records check failed — deferring");
-                return None;
-            }
-        }
-    }
-    let resolutions = queue::batch_resolutions(batch, &jobs, |leg| confirmed.contains(&leg), now);
-    if !batch
-        .legs
-        .iter()
-        .all(|leg| resolutions[index_to_usize(leg.batch_leg)].is_some())
-    {
-        tracing::debug!(batch_id = %batch.batch_id, "batch legs still settling — deferring");
-        return None;
-    }
-    Some(
-        resolutions
-            .into_iter()
-            .enumerate()
-            .map(|(index, resolution)| {
-                resolution.unwrap_or_else(|| queue::LegResolution::Failed {
-                    error: format!("invariant: leg {index} has no queue row"),
-                })
-            })
-            .collect(),
-    )
-}
-
-/// One leg's records-artifact check — a GHCR manifest read on a
-/// `Succeeded` leg only, absent for every other outcome. The tag
-/// pins the publish job's `run_attempt` (§3.1).
-async fn leg_records_present(
-    ghcr: &crate::api::GhcrConfig,
-    batch: &queue::ReadyBatch,
-    leg: &queue::ReadyBatchLeg,
-    outcome: &stow_types::runs::LegOutcome,
-    run_id: u64,
-    pool: &crate::fetch_guard::OutboundPool,
-) -> std::result::Result<Option<u32>, crate::ghcr::FetchError> {
-    use skyzen_cloudflare::worker::send::IntoSendFuture as _;
-    let present = match outcome {
-        stow_types::runs::LegOutcome::Succeeded {
-            publish_attempt, ..
-        } => {
-            crate::ghcr::records_artifact_exists(
-                ghcr,
-                &batch.rustc_version,
-                &leg.task_id,
-                stow_types::records::BuildRun {
-                    run_id,
-                    run_attempt: *publish_attempt,
-                },
-                pool,
-            )
-            .into_send()
-            .await?
-        }
-        _ => false,
-    };
-    std::result::Result::Ok(present.then_some(leg.batch_leg))
-}
-
-/// A leg index as a slice index — `u32` fits `usize` on every stow
-/// target.
-fn index_to_usize(leg: u32) -> usize {
-    usize::try_from(leg).expect("u32 leg index fits usize")
-}
-
 /// The wall clock a pass reads — `Date::now()` returns whole
 /// milliseconds well below 2^53, so the value is exactly
 /// representable and always fits i64.
-fn now_ms() -> i64 {
+pub(super) fn now_ms() -> i64 {
     #[allow(clippy::cast_possible_truncation)]
     {
         js_sys::Date::now() as i64
     }
 }
 
-/// The `build-batch.yml` dispatch fan-out over one resolved backend —
-/// one `workflow_dispatch` per formed batch, concurrently, then the
-/// ordered outcome apply (stow#833 §4.2).
+/// The `build-crate.yml` dispatch fan-out over one resolved backend —
+/// one `workflow_dispatch` per claimed task, concurrently, then the
+/// ordered outcome apply (stow#876).
 ///
 /// The POSTs run under the invocation's outbound bound: the stream's
 /// `buffered` admits at most `MAX_OUTBOUND_INFLIGHT` (4) at once, and
-/// the pool slot `dispatch_batch` waits on enforces the same bound
+/// the pool slot `trigger_build` waits on enforces the same bound
 /// before any request posts. `buffered` — not `buffer_unordered` —
-/// yields results in the batches' own order, so each outcome stays
-/// matched to its batch. The queue writes then apply sequentially:
+/// yields results in the tasks' own order, so each outcome stays
+/// matched to its task. The queue writes then apply sequentially:
 /// `&DurableDb` is not `Send`, so it never enters a concurrent future.
-async fn dispatch_batches(
+async fn dispatch_claims(
+    graph: graph::LoadedGraph<'_>,
     db: &DurableDb,
-    settings: &SchedulerSettings,
-    backend: &impl dispatch::BuildRuns,
-    batches: Vec<FormedBatch>,
-    github_repo: &str,
+    backend: &dispatch::CiInterface<dispatch::CfTransport>,
+    claims: Vec<graph::Claimed>,
 ) -> Result<()> {
-    let pool = crate::fetch_guard::OutboundPool::new();
     // Collected before streaming: a closure inside the stream's type
-    // borrows each batch under a higher-ranked lifetime, and the alarm
+    // borrows each claim under a higher-ranked lifetime, and the alarm
     // future then cannot prove itself `Send`.
-    let dispatches: Vec<_> = batches
+    let dispatches: Vec<_> = claims
         .iter()
-        .map(|batch| backend.dispatch_batch(&batch.encoded, github_repo, &pool))
+        .map(|claim| {
+            let encoded = claim.payload.encode_dispatch_task().map_err(|error| {
+                dispatch::DispatchError::Response(format!("encode task: {error}"))
+            });
+            async move {
+                match encoded {
+                    Ok(encoded) => backend.submit(&encoded).await,
+                    Err(error) => Err(error),
+                }
+            }
+        })
         .collect();
     let outcomes = stream::iter(dispatches)
         .buffered(crate::fetch_guard::MAX_OUTBOUND_INFLIGHT)
         .collect::<Vec<_>>()
         .await;
-    for (batch, outcome) in batches.iter().zip(outcomes) {
-        let outcome = outcome
-            .map(|run| run.workflow_run_id)
-            .map_err(|error| error.to_string());
-        queue::persist_batch_dispatch(db, settings, batch, outcome)
-            .await
-            .map_err(to_error)?;
+    // ONE `Bindings` row for every returned binding (review); POST
+    // failures re-queue their claim under backoff in memory only —
+    // the failure is not a persistent event: a wake replays the claim
+    // as dispatched-unbound, which the run-listing reconcile binds or
+    // the stale lease returns.
+    let mut bindings = Vec::new();
+    let mut fails: Vec<(String, u64, String)> = Vec::new();
+    for (claim, outcome) in claims.iter().zip(outcomes) {
+        match outcome {
+            Ok(run) => bindings.push(stow_types::api::DispatchBinding {
+                task_id: claim.task_id.clone(),
+                generation: claim.generation,
+                run_id: run.workflow_run_id.to_string(),
+            }),
+            Err(error) => {
+                tracing::error!(task_id = %claim.task_id, %error, "failed to dispatch build");
+                fails.push((claim.task_id.clone(), claim.generation, error.to_string()));
+            }
+        }
     }
-    Ok(())
+    routes::settle_dispatch(graph, db, bindings, fails, now_ms())
+        .await
+        .map_err(route_error)
 }
 
-async fn schedule_alarm(env: &WasmEnv, db: &DurableDb, alarm: &Alarm) -> Result<()> {
+async fn schedule_alarm(
+    env: &WasmEnv,
+    db: &DurableDb,
+    alarm: &Alarm,
+    graph: &graph::GraphCell,
+) -> Result<()> {
     let (now_ms, settings) = alarm_inputs(env)?;
-    let plan = queue::next_alarm(db, now_ms, &settings)
-        .await
-        .map_err(to_error)?;
+    let graph = ensure_graph(env, db, graph).await?;
+    let plan = routes::wake_plan(graph, &settings, now_ms);
     queue::arm_alarm(alarm, plan).await.map_err(|error| {
         let error = to_error(error);
         tracing::error!(%error, "failed to perform scheduler alarm plan");
         error
-    })
+    })?;
+    // The flat log is bounded by snapshots: once the appended tail
+    // crosses the threshold, this turn writes the chunked snapshot —
+    // covered prefix dropped — before the next wake plans against the
+    // same graph.
+    routes::snapshot_if_due(graph, db, now_ms)
+        .await
+        .map_err(route_error)?;
+    Ok(())
 }
 
 /// The instant and settings every alarm plan is decided under — read
@@ -2111,6 +2005,9 @@ fn to_error(error: impl std::fmt::Display) -> Error {
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 struct InsertedResponse {
     inserted: u32,
+    /// Task ids the merge found unpublished — the redemption path's
+    /// miss set (stow#886).
+    unpublished_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]

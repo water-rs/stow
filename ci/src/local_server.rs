@@ -1,21 +1,21 @@
 //! Dev-only local CI dispatch server.
 //!
 //! Activated via `stow-build serve`. Implements `POST /dispatch` so a
-//! locally-running edge worker can dispatch `build-batch` runs (a
-//! `BuildBatchPayload`) and `resolve-request` runs (a `RequestDispatch`)
+//! locally-running edge worker can dispatch `build-crate` runs (a
+//! `BuildTaskPayload`) and `resolve-request` runs (a `RequestDispatch`)
 //! for end-to-end tests without touching real GitHub Actions — the
 //! GitHub-shaped run endpoints the edge's `LocalCiBuildRuns` drives on
 //! the same loopback base (`GET/POST …/actions/runs/{id}` plus the
-//! attempt-jobs listing and `…/cancel`), and `GET /tasks`, the
-//! run-state list `stow-admin preheat manual` polls in its
-//! `--dispatch-url` mode.
+//! attempt-jobs listing and `…/cancel`), `GET /tasks`, the run-state
+//! list the mock e2e polls, and the `preheat` event the scheduler's
+//! new-stable dispatch posts (stow#880).
 //!
-//! A batch run mirrors the production shape exactly: one run id for the
-//! batch, an event file carrying the dispatch input, and per leg a build
-//! in one process, a publish stage that lands the leg's records artifact
-//! in the mock registry, and `build #N`/`publish #N` job rows named as
-//! GitHub names reusable-workflow matrix jobs. Completion reaches the
-//! edge as one `workflow_run` webhook POST for the run — the same
+//! A run mirrors the production shape exactly: one run id for the task,
+//! an event file carrying the dispatch input, a build in one process,
+//! a publish stage that lands the task's records artifact in the mock
+//! registry, and `build`/`publish` job rows named as GitHub names
+//! `build-crate.yml`'s jobs. Completion reaches the edge as one
+//! `workflow_run` webhook POST for the run — the same
 //! `X-Hub-Signature-256` HMAC GitHub signs with — never a scheduler call.
 //!
 //! Uses skyzen + skyzen-hyper for routing so the same DSL is shared with the
@@ -40,17 +40,29 @@ use skyzen::extract::Query;
 use skyzen::routing::{CreateRouteNode, Params, Route, Router};
 use skyzen::utils::{Json, State};
 use skyzen::{Body, Response, StatusCode};
-use stow_types::api::{BatchTask, BuildBatchPayload, RequestDispatch, TaskHash};
+use stow_types::api::{BuildTaskPayload, RequestDispatch};
 use stow_types::local_ci::{
-    LocalCiLeg, LocalCiRun, LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRunIds,
-    LocalCiSeededRuns, LocalCiSeededStatus,
+    LocalCiRun, LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRunIds, LocalCiSeededRuns,
+    LocalCiSeededStatus,
 };
-use stow_types::runs::{LegJobName, VERDICT_STEPS};
+use stow_types::runs::VERDICT_STEPS;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, sleep};
 use zenwave::{Client, ResponseExt};
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// One task's `build-crate.yml` concurrency group: the run the group
+/// runs and the one queued behind it.
+#[derive(Debug, Default)]
+struct GroupRuns {
+    /// The run building or publishing now.
+    active: Option<u64>,
+    /// The run queued behind `active` — a new dispatch in the group
+    /// cancels and replaces it, as GitHub keeps at most one pending run
+    /// per `cancel-in-progress: false` group.
+    pending: Option<u64>,
+}
 
 /// Per-process state injected into every `/dispatch` invocation.
 #[derive(Clone)]
@@ -65,19 +77,34 @@ pub struct LocalServerState {
     pub mock_private_key_path: String,
     /// Root directory the mock OCI registry serves out of.
     pub mock_registry_root: String,
+    /// The App's slug — the `GITHUB_APP_SLUG` the edge deploys under.
+    /// Every run dispatched through this server reports
+    /// `triggering_actor.login` = `<slug>[bot]`; seeded runs report
+    /// [`stow_types::local_ci::SEEDED_RUN_OPERATOR_LOGIN`] (stow#940).
+    pub app_slug: String,
     /// Every dispatched run's state, served by `GET /tasks`.
     pub runs: Arc<Mutex<BTreeMap<String, LocalCiRun>>>,
-    /// Every batch run's job rows by run id — the rows GitHub's jobs
+    /// Every run's job rows by run id — the rows GitHub's jobs
     /// API serves for the run.
     jobs: Arc<Mutex<BTreeMap<u64, Vec<RecordedJob>>>>,
-    /// Run ids a `POST …/cancel` has landed — queued legs check it
+    /// Run ids a `POST …/cancel` has landed — a queued task checks it
     /// before starting and the run's conclusion reads it once the
-    /// running legs settle.
+    /// a running task settles.
     cancels: Arc<Mutex<BTreeSet<u64>>>,
     /// Seeded runs recorded `in_progress` that have not ended. No runner
     /// drives them, so their cancel settles them itself
     /// ([`Self::cancel_undriven_run`]).
     undriven: Arc<Mutex<BTreeSet<u64>>>,
+    /// `build-crate.yml`'s concurrency group per task id (stow#877):
+    /// `build-crate-<task_id>` admits at most one active run and one
+    /// pending run behind it — a dispatch arriving while a run of the
+    /// same task is live cancels the pending one, exactly as GitHub
+    /// does for `cancel-in-progress: false`.
+    groups: Arc<Mutex<BTreeMap<String, GroupRuns>>>,
+    /// The `inputs.task` payload each run id was dispatched with — a
+    /// promoted or superseded run's webhook and job names need it long
+    /// after the dispatch handler returned.
+    task_payloads: Arc<Mutex<BTreeMap<u64, BuildTaskPayload>>>,
     /// The local equivalent of GitHub assigning a fresh id to every
     /// workflow dispatch and every job.
     next_id: Arc<AtomicU64>,
@@ -109,16 +136,20 @@ impl LocalServerState {
         webhook_secret: String,
         mock_private_key_path: String,
         mock_registry_root: String,
+        app_slug: String,
     ) -> Self {
         Self {
             edge_url,
             webhook_secret,
             mock_private_key_path,
             mock_registry_root,
+            app_slug,
             runs: Arc::new(Mutex::new(BTreeMap::new())),
             jobs: Arc::new(Mutex::new(BTreeMap::new())),
             cancels: Arc::new(Mutex::new(BTreeSet::new())),
             undriven: Arc::new(Mutex::new(BTreeSet::new())),
+            groups: Arc::new(Mutex::new(BTreeMap::new())),
+            task_payloads: Arc::new(Mutex::new(BTreeMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             runners: Arc::new(Semaphore::new(
                 std::thread::available_parallelism()
@@ -129,8 +160,14 @@ impl LocalServerState {
         }
     }
 
+    /// The `triggering_actor.login` a run dispatched through this
+    /// server reports — the App's bot login, `<slug>[bot]`.
+    fn app_bot_login(&self) -> String {
+        format!("{}[bot]", self.app_slug)
+    }
+
     /// A fresh run or job id — GitHub assigns every dispatch and every
-    /// job one, including a repeated dispatch of the same batch.
+    /// job one, including a repeated dispatch of the same task.
     fn allocate_id(&self) -> u64 {
         self.next_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
@@ -138,7 +175,7 @@ impl LocalServerState {
     }
 
     /// Record a dispatched run under the id GitHub assigned it. The
-    /// display title remains the workflow's stable batch/request
+    /// display title remains the workflow's stable task/request
     /// run-name, so repeated dispatches retain separate records.
     fn mark_run(
         &self,
@@ -163,7 +200,9 @@ impl LocalServerState {
                 completed_at_ms: None,
                 error: None,
                 delivery_errors: Vec::new(),
-                legs: Vec::new(),
+                task_id: None,
+                built: false,
+                triggering_actor_login: self.app_bot_login(),
             });
         status.clone_into(&mut entry.status);
         entry.conclusion = conclusion.map(str::to_owned);
@@ -202,38 +241,74 @@ impl LocalServerState {
             .contains(&run_id)
     }
 
-    /// Seed a batch run's legs as `queued` — GitHub queues the whole
-    /// matrix at dispatch; `run_leg` flips each leg to `in_progress`
-    /// then `completed` as its jobs settle.
-    fn seed_legs(&self, workflow_run_id: u64, batch: &BuildBatchPayload) {
+    /// The run's build stage actually spawned `stow-build` — the flag a
+    /// harness reads to prove a doubly-submitted task compiled once.
+    fn mark_built(&self, workflow_run_id: u64) {
         if let Some(run) = self
             .runs
             .lock()
             .expect("runs mutex poisoned")
             .get_mut(&workflow_run_id.to_string())
         {
-            run.legs = batch
-                .tasks
-                .iter()
-                .map(|task| LocalCiLeg {
-                    leg: task.leg,
-                    task_id: task.task_id.clone(),
-                    status: "queued".to_owned(),
-                    conclusion: None,
-                    error: None,
-                })
-                .collect();
+            run.built = true;
         }
     }
 
-    /// Flip leg `leg` of run `run_id` to `status`/`conclusion` — the
-    /// per-leg row `GET /tasks` serves. A failure settles with its
-    /// `error` recorded on the leg itself, so a reader never parses
-    /// which leg failed back out of the run's joined summary.
-    fn set_leg(
+    /// The task a run id was dispatched with.
+    fn task_payload(&self, workflow_run_id: u64) -> Option<BuildTaskPayload> {
+        self.task_payloads
+            .lock()
+            .expect("task payloads mutex poisoned")
+            .get(&workflow_run_id)
+            .cloned()
+    }
+
+    /// The mock-registry manifest file `tag` would live at — the same
+    /// `manifests/<repo>/<tag>` layout `stow-mock-registry` serves.
+    fn manifest_path(
+        &self,
+        rustc_version: &stow_types::identity::WireRustcVersion,
+        tag: &str,
+    ) -> std::path::PathBuf {
+        let repository = stow_types::registry::cache_repository(rustc_version);
+        std::path::Path::new(&self.mock_registry_root)
+            .join("manifests")
+            .join(repository.path().to_string())
+            .join(tag)
+    }
+
+    /// The `built-<rustc>-<task_id hash>` marker the publish stage
+    /// writes — a run whose task already holds one exits without
+    /// building, exactly as `build-crate.yml` short-circuits (stow#877).
+    fn records_exist(&self, task: &BuildTaskPayload) -> bool {
+        self.manifest_path(
+            &task.rustc_version,
+            &stow_types::records::published_tag(task.rustc_version.as_str(), &task.task_id),
+        )
+        .exists()
+    }
+
+    /// Seed the dispatched run's task — `run_task` flips the row
+    /// `queued` → `in_progress` → `completed` as its jobs settle.
+    fn seed_task(&self, workflow_run_id: u64, task: &BuildTaskPayload) {
+        if let Some(run) = self
+            .runs
+            .lock()
+            .expect("runs mutex poisoned")
+            .get_mut(&workflow_run_id.to_string())
+        {
+            run.task_id = Some(task.task_id.clone());
+            "queued".clone_into(&mut run.status);
+        }
+    }
+
+    /// Flip the task's run `run_id` to `status`/`conclusion` — the row
+    /// `GET /tasks` serves. A failure settles with its `error` recorded
+    /// on the run itself, so a reader never parses which stage failed
+    /// back out of a joined summary.
+    fn set_task(
         &self,
         run_id: u64,
-        leg: u32,
         status: &'static str,
         conclusion: Option<&'static str>,
         error: Option<&str>,
@@ -243,7 +318,6 @@ impl LocalServerState {
             .lock()
             .expect("runs mutex poisoned")
             .get_mut(&run_id.to_string())
-            .and_then(|run| run.legs.iter_mut().find(|entry| entry.leg == leg))
         {
             status.clone_into(&mut entry.status);
             entry.conclusion = conclusion.map(str::to_owned);
@@ -352,11 +426,10 @@ impl LocalServerState {
             });
     }
 
-    /// Record the leg's publish job skipped — its `if:` gate failed —
-    /// as GitHub serves it: a completed `skipped` row with no steps,
-    /// under the unrendered `name:` template (stow#839).
-    fn skip_job(&self, run_id: u64, leg: u32) {
-        self.close_unstarted_job(run_id, LegJobName::skipped_publish(leg), "skipped");
+    /// Record the task's publish job skipped — its `if:` gate failed —
+    /// as GitHub serves it: a completed `skipped` row with no steps.
+    fn skip_job(&self, run_id: u64) {
+        self.close_unstarted_job(run_id, "publish".to_owned(), "skipped");
     }
 
     /// The id each of `seeded`'s runs is recorded under, in request
@@ -365,13 +438,13 @@ impl LocalServerState {
     /// dispatch or job can take one: GitHub never hands out a run id
     /// twice. An unnamed run takes the allocator's next id, as a
     /// dispatch does. Refused before anything is assigned: an empty
-    /// request, a run with no leg, or a named id that repeats.
+    /// request, a run with no task, or a named id that repeats.
     fn seeded_run_ids(&self, seeded: &LocalCiSeededRuns) -> Result<Vec<u64>, String> {
         if seeded.runs.is_empty() {
             return Err("no runs to seed".to_owned());
         }
-        if let Some(run) = seeded.runs.iter().find(|run| run.legs.is_empty()) {
-            return Err(format!("run of batch {} seeds no leg", run.batch_id));
+        if seeded.runs.iter().any(|run| run.task_id.is_empty()) {
+            return Err("a run seeds no task".to_owned());
         }
         let mut named: Vec<u64> = seeded
             .runs
@@ -401,12 +474,12 @@ impl LocalServerState {
             .collect())
     }
 
-    /// Publish every succeeded leg's records artifact for `seeded`, each
+    /// Publish every succeeded run's records artifact for `seeded`, each
     /// run under its id in `ids`, before any run is recorded — a reader
     /// never sees a finished success whose records are missing. The
-    /// artifact carries the empty set, as a stubbed dispatched leg's
+    /// artifact carries the empty set, as a stubbed dispatched task's
     /// does. The pushes run concurrently, at most one per core, the
-    /// bound the runner pool holds dispatched legs to. `exe` is the
+    /// bound the runner pool holds dispatched tasks to. `exe` is the
     /// `stow-build` binary the mock registry binary sits beside.
     async fn publish_seeded_records(
         &self,
@@ -427,11 +500,10 @@ impl LocalServerState {
                         conclusion: LocalCiSeededConclusion::Success,
                     }
             })
-            .flat_map(|(run, &run_id)| run.legs.iter().map(move |task_id| (run, run_id, task_id)))
-            .map(|(run, run_id, task_id)| {
+            .map(|(run, &run_id)| {
                 push_records(
                     self,
-                    task_id,
+                    &run.task_id,
                     run.rustc_version.as_str(),
                     run_id,
                     &records_path,
@@ -447,11 +519,11 @@ impl LocalServerState {
         results.into_iter().collect()
     }
 
-    /// One seeded run under `run_id`: its run record with every leg at
-    /// the run's status, and per leg the job rows such a leg has at that
-    /// point — the same rows [`run_leg`] writes for a leg whose build is
-    /// running, that succeeded, or that failed its build. A running run
-    /// joins [`Self::undriven`], since no runner will finish it.
+    /// One seeded run under `run_id`: its run record at the seeded
+    /// status, and the job rows such a run has at that point — the same
+    /// rows [`drive_stages`] writes for a run whose build is running,
+    /// that succeeded, or that failed its build. A running run joins
+    /// [`Self::undriven`], since no runner will finish it.
     fn record_seeded_run(&self, seeded: &LocalCiSeededRun, run_id: u64) {
         let now = unix_millis();
         let (status, conclusion) = match seeded.status {
@@ -464,63 +536,50 @@ impl LocalServerState {
             } => ("completed", Some("failure")),
         };
         let failed = conclusion == Some("failure");
-        let legs = (0..)
-            .zip(&seeded.legs)
-            .map(|(leg, task_id)| LocalCiLeg {
-                leg,
-                task_id: task_id.clone(),
-                status: status.to_owned(),
-                conclusion: conclusion.map(str::to_owned),
-                error: failed.then(|| format!("leg {leg} build: seeded as failed")),
-            })
-            .collect::<Vec<_>>();
         self.runs.lock().expect("runs mutex poisoned").insert(
             run_id.to_string(),
             LocalCiRun {
                 workflow_run_id: run_id,
-                display_title: stow_types::records::batch_run_title(
+                display_title: stow_types::records::run_title(
                     seeded.rustc_version.as_str(),
-                    &seeded.batch_id,
+                    &seeded.task_id,
                 ),
                 status: status.to_owned(),
                 conclusion: conclusion.map(str::to_owned),
                 html_url: format!("http://{}/tasks/{run_id}", self.listen),
                 path: format!(
                     ".github/workflows/{}",
-                    stow_types::trusted_builder::BATCH_WORKFLOW_FILE
+                    stow_types::trusted_builder::WORKFLOW_FILE
                 ),
                 dispatched_at_ms: now,
                 completed_at_ms: (status == "completed").then_some(now),
-                error: None,
+                error: failed.then(|| "build: seeded as failed".to_owned()),
                 delivery_errors: Vec::new(),
-                legs,
+                task_id: Some(seeded.task_id.clone()),
+                built: false,
+                // A run that exists without a dispatch through this
+                // server is an external run — its actor is the
+                // operator who dispatched it, not the App (stow#940).
+                triggering_actor_login: stow_types::local_ci::SEEDED_RUN_OPERATOR_LOGIN.to_owned(),
             },
         );
-        for (leg, task_id) in (0..).zip(&seeded.legs) {
-            let hash = TaskHash::of(task_id);
-            let build = self.begin_job(
-                run_id,
-                leg_build_job_name(leg, task_id, &hash),
-                BUILD_JOB_STEPS,
-            );
-            match seeded.status {
-                // The build is running; the publish job waits on it, so
-                // GitHub lists no row for it yet.
-                LocalCiSeededStatus::InProgress => {}
-                LocalCiSeededStatus::Completed {
-                    conclusion: LocalCiSeededConclusion::Success,
-                } => {
-                    self.finish_job(run_id, build, "success", &["success", "success"]);
-                    let publish =
-                        self.begin_job(run_id, leg_publish_job_name(leg, &hash), PUBLISH_JOB_STEPS);
-                    self.finish_job(run_id, publish, "success", &["success"]);
-                }
-                LocalCiSeededStatus::Completed {
-                    conclusion: LocalCiSeededConclusion::Failure,
-                } => {
-                    self.finish_job(run_id, build, "failure", &["failure", "success"]);
-                    self.skip_job(run_id, leg);
-                }
+        let build = self.begin_job(run_id, format!("build {}", seeded.task_id), BUILD_JOB_STEPS);
+        match seeded.status {
+            // The build is running; the publish job waits on it, so
+            // GitHub lists no row for it yet.
+            LocalCiSeededStatus::InProgress => {}
+            LocalCiSeededStatus::Completed {
+                conclusion: LocalCiSeededConclusion::Success,
+            } => {
+                self.finish_job(run_id, build, "success", &["success", "success"]);
+                let publish = self.begin_job(run_id, "publish".to_owned(), PUBLISH_JOB_STEPS);
+                self.finish_job(run_id, publish, "success", &["success"]);
+            }
+            LocalCiSeededStatus::Completed {
+                conclusion: LocalCiSeededConclusion::Failure,
+            } => {
+                self.finish_job(run_id, build, "failure", &["failure", "success"]);
+                self.skip_job(run_id);
             }
         }
         if seeded.status == LocalCiSeededStatus::InProgress {
@@ -534,18 +593,12 @@ impl LocalServerState {
     /// Complete the undriven running run `run_id` as `cancelled`, as
     /// GitHub settles a run whose cancel stopped its running jobs: each
     /// running job `cancelled`, its running step `cancelled` and its
-    /// pending steps `skipped`; each leg's publish job `skipped`, its
-    /// `if:` gate failing as a cancelled build's does; every leg and the
-    /// run `completed`/`cancelled`, after its job rows, so no reader sees
+    /// pending steps `skipped`; the publish job `skipped`, its `if:`
+    /// gate failing as a cancelled build's does; the run `completed`/
+    /// `cancelled`, after its job rows, so no reader sees
     /// a finished run whose jobs are not. No `workflow_run` delivery
     /// follows — a seeded run's caller delivers its own.
     fn cancel_undriven_run(&self, run_id: u64) {
-        let publish_legs: Vec<u32> = self.runs.lock().expect("runs mutex poisoned")
-            [&run_id.to_string()]
-            .legs
-            .iter()
-            .map(|leg| leg.leg)
-            .collect();
         let now = time::OffsetDateTime::now_utc();
         let mut jobs = self.jobs.lock().expect("jobs mutex poisoned");
         for job in jobs
@@ -566,17 +619,11 @@ impl LocalServerState {
             }
         }
         drop(jobs);
-        for leg in publish_legs {
-            self.skip_job(run_id, leg);
-        }
+        self.skip_job(run_id);
         let mut runs = self.runs.lock().expect("runs mutex poisoned");
         let run = runs
             .get_mut(&run_id.to_string())
             .expect("an undriven run is recorded");
-        for leg in &mut run.legs {
-            "completed".clone_into(&mut leg.status);
-            leg.conclusion = Some("cancelled".to_owned());
-        }
         "completed".clone_into(&mut run.status);
         run.conclusion = Some("cancelled".to_owned());
         run.completed_at_ms = Some(unix_millis());
@@ -593,7 +640,7 @@ const BUILD_JOB_STEPS: &[&str] = &[VERDICT_STEPS[0], VERDICT_STEPS[1]];
 /// The `publish` job's step rows: the trusted stage.
 const PUBLISH_JOB_STEPS: &[&str] = &[VERDICT_STEPS[2]];
 
-/// One job row of a batch run, in the shape of GitHub's job object — the
+/// One job row of a run, in the shape of GitHub's job object — the
 /// fields `stow_types::runs::RunJobRow` reads.
 #[derive(Debug, Clone, serde::Serialize)]
 struct RecordedJob {
@@ -618,41 +665,27 @@ struct RecordedStep {
     conclusion: Option<&'static str>,
 }
 
-/// The `build` job's name as GitHub names a reusable-workflow matrix
-/// job: `"<caller job> / <called job>"`, the caller being
-/// `build-batch.yml`'s `leg ${{ matrix.task.i }}` and the called job
-/// `build-crate.yml`'s `build`.
-fn build_job_name(leg: &BatchTask) -> String {
-    leg_build_job_name(
-        leg.leg,
-        &format!("{} {} ({})", leg.crate_name, leg.version, leg.target),
-        &leg.task_hash,
+/// The `build` job's name — `build-crate.yml`'s `name:` for the task's
+/// build job.
+fn build_job_name(task: &BuildTaskPayload) -> String {
+    format!(
+        "build {} {} ({})",
+        task.crate_name, task.version, task.target
     )
 }
 
-/// The `publish` job's name — see [`build_job_name`].
-fn publish_job_name(leg: &BatchTask) -> String {
-    leg_publish_job_name(leg.leg, &leg.task_hash)
-}
-
-/// Leg `i`'s `build` job name over any label — `"leg <i> / build #<i>
-/// <label> <hash>"`. A dispatched leg's label is its crate, version and
-/// target ([`build_job_name`]); a seeded leg carries only its task id.
-fn leg_build_job_name(i: u32, label: &str, hash: &TaskHash) -> String {
-    format!("leg {i} / build #{i} {label} {hash}")
-}
-
-/// Leg `i`'s `publish` job name — `"leg <i> / publish #<i> <hash>"`.
-fn leg_publish_job_name(i: u32, hash: &TaskHash) -> String {
-    format!("leg {i} / publish #{i} {hash}")
+/// The `publish` job's name — `build-crate.yml`'s `name:` for the
+/// trusted publish job.
+fn publish_job_name() -> String {
+    "publish".to_owned()
 }
 
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 struct RepositoryDispatchEvent {
-    /// The scheduler's `trigger_workflow` discriminator — `build-batch`
+    /// The scheduler's `trigger_workflow` discriminator — `build-crate`
     /// or `resolve-request`.
     event_type: String,
-    /// The event's payload: a [`BuildBatchPayload`] for `build-batch`,
+    /// The event's payload: a [`BuildTaskPayload`] for `build-crate`,
     /// a `stow_types::api::RequestDispatch` for `resolve-request`.
     client_payload: serde_json::Value,
 }
@@ -703,6 +736,7 @@ fn build_router(state: LocalServerState) -> Router {
         // `LocalCiBuildRuns` drives on the loopback base — the same
         // paths and shapes api.github.com serves, for run ids this
         // mock allocated.
+        "/repos/{owner}/{repo}/actions/workflows/{workflow}/runs".at(list_workflow_runs),
         "/repos/{owner}/{repo}/actions/runs/{id}".at(get_run),
         "/repos/{owner}/{repo}/actions/runs/{id}/attempts/{attempt}/jobs".at(get_attempt_jobs),
         "/repos/{owner}/{repo}/actions/runs/{id}/cancel".post(cancel_run),
@@ -711,10 +745,9 @@ fn build_router(state: LocalServerState) -> Router {
     .build()
 }
 
-/// `GET /tasks` — the run list `stow-admin preheat manual` polls when it
-/// drives the local runner, answering the same shape the GitHub runs API
-/// does (`status`/`conclusion`/`display_title` semantics), each build
-/// run's legs folded in.
+/// `GET /tasks` — the run list the mock e2e polls, answering the same
+/// shape the GitHub runs API does (`status`/`conclusion`/`display_title`
+/// semantics), one row per dispatched task.
 async fn list_tasks(State(state): State<LocalServerState>) -> Response {
     let tasks = state
         .runs
@@ -785,9 +818,107 @@ fn run_response(state: &LocalServerState, run_id: u64) -> Response {
             "path": run.path,
             "event": "workflow_dispatch",
             "head_branch": stow_types::trusted_builder::BRANCH,
+            "triggering_actor": {"login": run.triggering_actor_login},
         }),
         StatusCode::OK,
     )
+}
+
+/// `status`/`per_page`/`page` of the workflow runs listing — the
+/// filters `stow_types::ci::CiInterface::status` sends (`queued`,
+/// `in_progress`), GitHub's 30-row default page.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+struct WorkflowRunsQuery {
+    /// `queued`, `in_progress` or `completed`; absent lists every run.
+    status: Option<String>,
+    /// Rows per page — GitHub's default 30, capped at 100.
+    per_page: Option<u32>,
+    /// 1-based page index — GitHub's default 1.
+    page: Option<u32>,
+}
+
+/// `GET /repos/{o}/{r}/actions/workflows/{file}/runs` — the listing the
+/// CI interface's `status` reads: `build-crate.yml` runs filtered by
+/// `status`, paged with the `Link: rel="next"` GitHub emits while a
+/// page follows, each row in the run-object shape [`run_response`]
+/// serves singly.
+async fn list_workflow_runs(
+    State(state): State<LocalServerState>,
+    params: Params,
+    Query(query): Query<WorkflowRunsQuery>,
+) -> Response {
+    let Some(workflow) = params.get("workflow").ok() else {
+        return not_found();
+    };
+    let wanted_path = format!(".github/workflows/{workflow}");
+    let page = query.page.unwrap_or(1).max(1);
+    let per_page = query.per_page.unwrap_or(30).clamp(1, 100) as usize;
+    let runs: Vec<stow_types::local_ci::LocalCiRun> = state
+        .runs
+        .lock()
+        .expect("runs mutex poisoned")
+        .values()
+        .filter(|run| run.path == wanted_path)
+        .filter(|run| {
+            query
+                .status
+                .as_deref()
+                .is_none_or(|status| run.status == status)
+        })
+        .cloned()
+        .collect();
+    let total_count = runs.len();
+    // GitHub lists newest first; the mock's ids mint in dispatch order,
+    // so descending ids stand in for created-descending.
+    let mut runs = runs;
+    runs.sort_by_key(|run| std::cmp::Reverse(run.workflow_run_id));
+    let start = usize::try_from(page - 1).unwrap_or(usize::MAX) * per_page;
+    let window: Vec<serde_json::Value> = runs
+        .iter()
+        .skip(start)
+        .take(per_page)
+        .map(|run| {
+            serde_json::json!({
+                "id": run.workflow_run_id,
+                "name": workflow_name(&run.path),
+                "display_title": run.display_title,
+                "status": run.status,
+                "conclusion": run.conclusion,
+                "run_attempt": RUN_ATTEMPT,
+                "html_url": run.html_url,
+                "path": run.path,
+                "event": "workflow_dispatch",
+                "head_branch": stow_types::trusted_builder::BRANCH,
+                "triggering_actor": {"login": run.triggering_actor_login},
+            })
+        })
+        .collect();
+    let mut response = json_response(
+        &serde_json::json!({
+            "total_count": total_count,
+            "workflow_runs": window,
+        }),
+        StatusCode::OK,
+    );
+    if start + per_page < total_count {
+        let owner = params.get("owner").unwrap_or_default();
+        let repo = params.get("repo").unwrap_or_default();
+        let mut next = format!(
+            "http://{}/repos/{owner}/{repo}/actions/workflows/{workflow}/runs?per_page={per_page}&page={}",
+            state.listen,
+            page + 1,
+        );
+        if let Some(status) = &query.status {
+            use std::fmt::Write as _;
+            let _ = write!(next, "&status={status}");
+        }
+        response.headers_mut().insert(
+            skyzen::header::LINK,
+            skyzen::header::HeaderValue::from_str(&format!("<{next}>; rel=\"next\""))
+                .expect("link header value"),
+        );
+    }
+    response
 }
 
 /// `per_page`/`page` of the attempt-jobs listing — GitHub defaults a
@@ -895,9 +1026,9 @@ fn attempt_jobs_page(
     response
 }
 
-/// `POST …/runs/{id}/cancel` — GitHub's 202. On a dispatched run, legs
-/// still queued stop where they are; running legs settle, then
-/// `drive_batch` reports the run `completed`/`cancelled` through the
+/// `POST …/runs/{id}/cancel` — GitHub's 202. On a dispatched run, a
+/// task still queued stops where it is; a running task settles, then
+/// `drive_task` reports the run `completed`/`cancelled` through the
 /// usual `workflow_run` webhook. A running seeded run, which nothing
 /// drives, completes as `cancelled` at once.
 async fn cancel_run(State(state): State<LocalServerState>, params: Params) -> Response {
@@ -935,10 +1066,10 @@ fn cancel_response(state: &LocalServerState, run_id: u64) -> Response {
 
 /// `POST /seeded-runs` — record runs that exist upstream without a
 /// dispatch through this server ([`LocalCiSeededRuns`]): 201 with each
-/// run's id ([`LocalCiSeededRunIds`]) once every succeeded leg's records
+/// run's id ([`LocalCiSeededRunIds`]) once every succeeded run's records
 /// artifact is published and every run is recorded; 409 when a named id
 /// collides with one this server allocated, the request names a run
-/// twice or a run with no leg; 500 when a records push fails.
+/// twice or a run with no task; 500 when a records push fails.
 async fn seed_runs(
     State(state): State<LocalServerState>,
     Json(seeded): Json<LocalCiSeededRuns>,
@@ -963,18 +1094,18 @@ async fn seed_runs(
     json_response(&LocalCiSeededRunIds { runs: ids }, StatusCode::CREATED)
 }
 
-/// `POST /dispatch` — the scheduler's one local fan-out: `build-batch`
-/// events run the full simulated batch, `resolve-request` events are
+/// `POST /dispatch` — the scheduler's one local fan-out: `build-crate`
+/// events run the full simulated task, `resolve-request` events are
 /// the request lane's resolve-job dispatch (stow#428).
 async fn dispatch(
     State(state): State<LocalServerState>,
     Json(event): Json<RepositoryDispatchEvent>,
 ) -> Response {
     match event.event_type.as_str() {
-        "build-batch" => match serde_json::from_value::<BuildBatchPayload>(event.client_payload) {
-            Ok(batch) => dispatch_batch(state, batch),
+        "build-crate" => match serde_json::from_value::<BuildTaskPayload>(event.client_payload) {
+            Ok(task) => dispatch_build(state, task),
             Err(error) => json_response(
-                &bad_request(&format!("build-batch payload: {error}")),
+                &bad_request(&format!("build-crate payload: {error}")),
                 StatusCode::BAD_REQUEST,
             ),
         },
@@ -983,6 +1114,27 @@ async fn dispatch(
                 Ok(dispatch) => dispatch_resolve(state, dispatch),
                 Err(error) => json_response(
                     &bad_request(&format!("resolve-request payload: {error}")),
+                    StatusCode::BAD_REQUEST,
+                ),
+            }
+        }
+        // The scheduler's new-stable preheat dispatch (stow#880): the
+        // mock runs no resolver fleet, so the event only needs the
+        // POST accepted — the `rustc_version` input is carried for
+        // parity with `preheat-admin.yml`.
+        "preheat" => {
+            match serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(
+                event.client_payload,
+            ) {
+                Ok(inputs)
+                    if inputs
+                        .get("rustc_version")
+                        .is_some_and(serde_json::Value::is_string) =>
+                {
+                    json_response(&serde_json::json!({ "ok": true }), StatusCode::OK)
+                }
+                _ => json_response(
+                    &bad_request("preheat payload needs a `rustc_version` string"),
                     StatusCode::BAD_REQUEST,
                 ),
             }
@@ -1007,47 +1159,125 @@ fn bad_request(error: &str) -> serde_json::Value {
     serde_json::json!({ "error": error })
 }
 
-/// A `build-batch` dispatch: one run id for the whole batch, every leg
-/// built and published in the background, and one `workflow_run`
-/// webhook when the last leg settles.
-fn dispatch_batch(state: LocalServerState, batch: BuildBatchPayload) -> Response {
+/// A `build-crate` dispatch: one run id for the task, built and
+/// published in the background, with the `workflow_run` webhooks a
+/// real run emits — `in_progress` when the build starts, `completed`
+/// when the publish settles.
+fn dispatch_build(state: LocalServerState, task: BuildTaskPayload) -> Response {
     let workflow_run_id = state.allocate_id();
-    let run = batch_workflow_run(&state, &batch, workflow_run_id, "in_progress", None, None);
+    let run = task_workflow_run(&state, &task, workflow_run_id, "queued", None, None);
     state.mark_run(
         workflow_run_id,
         run.workflow_file,
         &run.display_title,
-        "in_progress",
+        "queued",
         None,
     );
-    state.seed_legs(workflow_run_id, &batch);
+    state.seed_task(workflow_run_id, &task);
+    state
+        .task_payloads
+        .lock()
+        .expect("task payloads mutex poisoned")
+        .insert(workflow_run_id, task.clone());
+    // The concurrency group `build-crate.yml` declares: one active run
+    // and one pending run per task id; a dispatch while a pending run
+    // waits cancels that pending run.
+    let start = {
+        let mut groups = state.groups.lock().expect("groups mutex poisoned");
+        let group = groups.entry(task.task_id.clone()).or_default();
+        let start = match (group.active, group.pending.take()) {
+            (None, None) => {
+                group.active = Some(workflow_run_id);
+                true
+            }
+            (_, superseded) => {
+                if let Some(superseded_id) = superseded {
+                    tokio::spawn(cancel_superseded(state.clone(), superseded_id));
+                }
+                group.pending = Some(workflow_run_id);
+                false
+            }
+        };
+        drop(groups);
+        start
+    };
     let response = dispatch_response(&run);
-    tokio::spawn(drive_batch(state, batch, workflow_run_id));
+    if start {
+        tokio::spawn(drive_task(state, task, workflow_run_id));
+    }
     json_response(&response, StatusCode::ACCEPTED)
 }
 
-/// Run every leg of a dispatched batch, then report the run: the
-/// `completed` webhook is delivered before the run reads `completed`
-/// in `GET /tasks`, so a caller that sees no batch run in progress
-/// knows no callback is still in flight (scripts/traffic-cost.sh).
-async fn drive_batch(state: LocalServerState, batch: BuildBatchPayload, workflow_run_id: u64) {
+/// The pending run a newer dispatch in its concurrency group replaced:
+/// its jobs never ran, its `completed`/`cancelled` `workflow_run`
+/// delivery goes out as any cancellation's does — the scheduler must
+/// see it to re-queue the task rather than record a failure (stow#877).
+async fn cancel_superseded(state: LocalServerState, workflow_run_id: u64) {
+    let Some(task) = state.task_payload(workflow_run_id) else {
+        return;
+    };
+    state.close_unstarted_job(workflow_run_id, build_job_name(&task), "cancelled");
+    state.skip_job(workflow_run_id);
+    let report = task_workflow_run(
+        &state,
+        &task,
+        workflow_run_id,
+        "completed",
+        Some("cancelled"),
+        None,
+    );
+    if let Err(error) = post_workflow_run(&state, &report).await {
+        state.record_error(workflow_run_id, &format!("workflow_run webhook: {error}"));
+    }
+    state.set_task(workflow_run_id, "completed", Some("cancelled"), None);
+}
+
+/// The group's `active` slot frees: the pending run behind it — when
+/// one waits — becomes the active run and drives now.
+fn promote_pending(state: &LocalServerState, task_id: &str) {
+    let next = {
+        let mut groups = state.groups.lock().expect("groups mutex poisoned");
+        let Some(group) = groups.get_mut(task_id) else {
+            return;
+        };
+        group.active = None;
+        if let Some(next) = group.pending.take() {
+            group.active = Some(next);
+            Some(next)
+        } else {
+            groups.remove(task_id);
+            None
+        }
+    };
+    if let Some(next_id) = next
+        && let Some(task) = state.task_payload(next_id)
+    {
+        tokio::spawn(drive_task(state.clone(), task, next_id));
+    }
+}
+
+/// Run the dispatched task — deliver `in_progress` as its build starts
+/// (the scheduler's `dispatched` → `running` signal), then `completed`:
+/// the webhook is delivered before the run reads `completed` in
+/// `GET /tasks`, so a caller that sees no build run in progress knows
+/// no callback is still in flight (scripts/traffic-cost.sh).
+async fn drive_task(state: LocalServerState, task: BuildTaskPayload, workflow_run_id: u64) {
+    // A run whose task's signed records already exist exits without
+    // building — `build-crate.yml`'s early-exit check, mirrored: the
+    // superseding or following run re-tags the manifest that proves the
+    // task built and never compiles (stow#877).
+    if state.records_exist(&task) {
+        early_exit(state, task, workflow_run_id).await;
+        return;
+    }
     // `failure` is the run's conclusion cause; `run_error` is only the
-    // failure no leg owns — each failed leg carries its own error on
-    // its `LocalCiLeg`, so the joined summary never lands on the run.
-    let (failure, run_error) = match run_legs(&state, &batch, workflow_run_id).await {
-        Ok((root, failures)) => {
-            let failure = failures.first().map(|first| {
-                format!(
-                    "{} of {} legs failed; {first}",
-                    failures.len(),
-                    batch.tasks.len()
-                )
-            });
+    // failure no stage owns.
+    let (failure, run_error) = match run_task(&state, &task, workflow_run_id).await {
+        Ok((root, failure)) => {
             if failure.is_none() {
                 // The runner a dispatch stands in for is ephemeral: a
-                // landed run leaves nothing behind, so a whole preheat
-                // wave does not keep every crate's unpacked workspace on
-                // disk. A failed run keeps its tree.
+                // landed run leaves nothing behind. A failed run keeps
+                // its tree.
                 if let Err(error) = async_fs::remove_dir_all(&root).await {
                     tracing::error!(%error, root = %root.display(), "remove the landed run's directory");
                 }
@@ -1059,8 +1289,8 @@ async fn drive_batch(state: LocalServerState, batch: BuildBatchPayload, workflow
             (Some(error.clone()), Some(error))
         }
     };
-    // A cancel the run collected while its legs ran outranks their
-    // own conclusions, exactly as GitHub reports `cancelled`.
+    // A cancel the run collected while its task ran outranks its own
+    // conclusion, exactly as GitHub reports `cancelled`.
     let conclusion = if state.cancel_requested(workflow_run_id) {
         "cancelled"
     } else if failure.is_some() {
@@ -1069,14 +1299,14 @@ async fn drive_batch(state: LocalServerState, batch: BuildBatchPayload, workflow
         "success"
     };
     if let Some(error) = &failure {
-        tracing::error!(batch_id = %batch.batch_id, %error, "local CI batch run failed");
+        tracing::error!(task_id = %task.task_id, %error, "local CI build run failed");
     }
     if let Some(error) = &run_error {
         state.record_error(workflow_run_id, error);
     }
-    let report = batch_workflow_run(
+    let report = task_workflow_run(
         &state,
-        &batch,
+        &task,
         workflow_run_id,
         "completed",
         Some(conclusion),
@@ -1092,12 +1322,65 @@ async fn drive_batch(state: LocalServerState, batch: BuildBatchPayload, workflow
     );
     if let Err(error) = reported {
         tracing::error!(
-            batch_id = %batch.batch_id,
+            task_id = %task.task_id,
             %error,
-            "failed to report local CI batch run via webhook"
+            "failed to report local CI build run via webhook"
         );
         state.record_error(workflow_run_id, &format!("workflow_run webhook: {error}"));
     }
+    promote_pending(&state, &task.task_id);
+}
+
+/// The early-exit path of [`drive_task`]: the records marker exists, so
+/// the run delivers `in_progress`, skips its build, re-tags the
+/// existing records manifest under its own `records-<…>-<run_id>-<1>`
+/// tag — the webhook's per-run check still resolves — and completes
+/// `success` having compiled nothing (`built` stays `false`).
+async fn early_exit(state: LocalServerState, task: BuildTaskPayload, workflow_run_id: u64) {
+    state.set_task(workflow_run_id, "in_progress", None, None);
+    let started = task_workflow_run(&state, &task, workflow_run_id, "in_progress", None, None);
+    if let Err(error) = post_workflow_run(&state, &started).await {
+        tracing::warn!(task_id = %task.task_id, %error, "in_progress delivery refused");
+    }
+    state.close_unstarted_job(workflow_run_id, build_job_name(&task), "skipped");
+    let publish_job = state.begin_job(workflow_run_id, publish_job_name(), PUBLISH_JOB_STEPS);
+    // Re-tag AND re-sign — readers bind the signature to the tag they
+    // pulled, so the run's own records tag needs a signature layer of
+    // its own, exactly as `stow-build publish` does on GHCR (stow#877).
+    let error = match retag_records(&state, &task, workflow_run_id).await {
+        Ok(()) => {
+            state.finish_job(workflow_run_id, publish_job, "success", &["success"]);
+            None
+        }
+        Err(error) => {
+            let error = format!("publish: retag records manifest: {error}");
+            state.finish_job(workflow_run_id, publish_job, "failure", &["failure"]);
+            Some(error)
+        }
+    };
+    let conclusion = if error.is_some() {
+        "failure"
+    } else {
+        "success"
+    };
+    let report = task_workflow_run(
+        &state,
+        &task,
+        workflow_run_id,
+        "completed",
+        Some(conclusion),
+        error.clone(),
+    );
+    if let Err(error) = post_workflow_run(&state, &report).await {
+        state.record_error(workflow_run_id, &format!("workflow_run webhook: {error}"));
+    }
+    state.set_task(
+        workflow_run_id,
+        "completed",
+        Some(conclusion),
+        error.as_deref(),
+    );
+    promote_pending(&state, &task.task_id);
 }
 
 /// A `resolve-request` dispatch (stow#428): the stub absorbs the hop
@@ -1127,6 +1410,7 @@ fn dispatch_resolve(state: LocalServerState, dispatch: RequestDispatch) -> Respo
         action: "in_progress",
         conclusion: None,
         html_url: format!("http://{}/tasks/{workflow_run_id}", state.listen),
+        triggering_actor_login: state.app_bot_login(),
         error: None,
     };
     let response = dispatch_response(&report);
@@ -1165,34 +1449,31 @@ fn json_response(payload: &impl serde::Serialize, status: StatusCode) -> Respons
 
 /// Whether `STOW_LOCAL_CI_STUB` short-circuits the build and publish
 /// stages: the dispatch POST — the hop the alarm pass pays per claimed
-/// batch — is the piece the budget probe and the launch load run
-/// measure, and a real cargo build per leg is orders of magnitude
+/// task — is the piece the budget probe and the launch load run
+/// measure, and a real cargo build per task is orders of magnitude
 /// heavier than either can afford. A stubbed run still completes
 /// through the same signed `workflow_run` webhook, so the completion
 /// lands and `GET /tasks` reports a finished run; only the
-/// post-dispatch build work is stubbed. Each leg's records artifact is
-/// still pushed (empty) first, because the webhook verifies every
-/// succeeded leg's records artifact before applying a success — the
+/// post-dispatch build work is stubbed. The task's records artifact is
+/// still pushed (empty) first, because the webhook verifies the
+/// succeeded run's records artifact before applying a success — the
 /// same object production writes for an artifact-less task.
 fn stubbed() -> bool {
     std::env::var_os("STOW_LOCAL_CI_STUB").is_some()
 }
 
-/// One dispatched batch run: what every leg of it shares.
-struct BatchRun {
+/// One dispatched task run: the dispatch's shared context.
+struct TaskRun {
     state: LocalServerState,
-    batch: BuildBatchPayload,
-    /// The run id allocated for the whole batch.
+    task: BuildTaskPayload,
+    /// The run id allocated for the dispatch.
     workflow_run_id: u64,
     /// Per-run working directory under `.tmp/local-ci-dispatch`.
     root: PathBuf,
-    /// The `workflow_dispatch` event file the stages read their leg
+    /// The `workflow_dispatch` event file the stages read the task
     /// from (`GITHUB_EVENT_PATH`).
     event_path: PathBuf,
-    /// The matrix's `max-parallel`: a leg holds a slot from its build
-    /// to the end of its publish.
-    slots: Semaphore,
-    /// Skip the build and publish work, pushing only each leg's empty
+    /// Skip the build and publish work, pushing only the task's empty
     /// records artifact ([`stubbed`]).
     stub: bool,
     /// The `stow-build` binary — the build stage's executable and the
@@ -1200,11 +1481,11 @@ struct BatchRun {
     exe: PathBuf,
 }
 
-/// Filesystem layout of one leg's working directory: the workspace the
+/// Filesystem layout of the task's working directory: the workspace the
 /// build stage unpacks into, the output directory it writes to, and the
 /// files the two stages exchange.
-struct LegLayout {
-    /// Per-leg working directory under the run's.
+struct TaskLayout {
+    /// Per-task working directory under the run's.
     root: PathBuf,
     /// `stow-build build --output-dir`: plan and content-addressed blobs.
     output_dir: PathBuf,
@@ -1216,9 +1497,9 @@ struct LegLayout {
     build_log_path: PathBuf,
 }
 
-impl LegLayout {
-    async fn create(run_root: &Path, leg: usize) -> stow_types::error::Result<Self> {
-        let root = run_root.join(format!("leg-{leg}"));
+impl TaskLayout {
+    async fn create(run_root: &Path) -> stow_types::error::Result<Self> {
+        let root = run_root.join("task");
         async_fs::create_dir_all(&root).await?;
         let output_dir = root.join("output");
         Ok(Self {
@@ -1232,114 +1513,77 @@ impl LegLayout {
 }
 
 /// Create the run's directory under `.tmp/local-ci-dispatch`. The
-/// directory names the run, so a repeated dispatch of one batch gets its
-/// own tree and a failed run's `build-stage.log`s survive for diagnosis
+/// directory names the run, so a repeated dispatch of one task gets its
+/// own tree and a failed run's `build-stage.log` survives for diagnosis
 /// (stow#773).
 async fn create_run_root(
-    batch: &BuildBatchPayload,
+    task: &BuildTaskPayload,
     workflow_run_id: u64,
 ) -> stow_types::error::Result<PathBuf> {
     let root = std::env::current_dir()?
         .join(".tmp")
         .join("local-ci-dispatch")
-        .join(format!("{}-{workflow_run_id}", batch.batch_id));
+        .join(format!("{}-{workflow_run_id}", task.task_id));
     async_fs::create_dir_all(&root).await?;
     Ok(root)
 }
 
-/// Run all of a batch's legs, at most `parallelism` at once, and return
-/// the run's directory with each failed leg's error in leg order.
-async fn run_legs(
+/// Run the dispatched task and return the run's directory with the
+/// task's error when it failed.
+async fn run_task(
     state: &LocalServerState,
-    batch: &BuildBatchPayload,
+    task: &BuildTaskPayload,
     workflow_run_id: u64,
-) -> stow_types::error::Result<(PathBuf, Vec<String>)> {
-    let parallelism = usize::try_from(batch.parallelism)?;
-    if parallelism == 0 {
-        return Err(stow_types::stow_error!(
-            "batch {} has parallelism 0 — no leg could ever run",
-            batch.batch_id
-        ));
-    }
-    let root = create_run_root(batch, workflow_run_id).await?;
+) -> stow_types::error::Result<(PathBuf, Option<String>)> {
+    let root = create_run_root(task, workflow_run_id).await?;
     let event_path = root.join("event.json");
-    // The event file GitHub writes for a `workflow_dispatch`: the
-    // batch rides its `inputs.batch` as a JSON-encoded string.
-    let event = serde_json::json!({ "inputs": { "batch": batch.encode_dispatch_batch()? } });
+    // The event file GitHub writes for a `workflow_dispatch`: the task
+    // rides its `inputs.task` as a JSON-encoded string.
+    let event = serde_json::json!({ "inputs": { "task": serde_json::to_string(task)? } });
     async_fs::write(&event_path, serde_json::to_vec(&event)?).await?;
-    let run = Arc::new(BatchRun {
+    let run = Arc::new(TaskRun {
         state: state.clone(),
-        batch: batch.clone(),
+        task: task.clone(),
         workflow_run_id,
         root: root.clone(),
         event_path,
-        slots: Semaphore::new(parallelism),
         stub: stubbed(),
         exe: std::env::current_exe()?,
     });
-    // Every leg is queued at once, as GitHub queues a matrix; the slots
-    // release them in matrix order.
-    let legs: Vec<_> = (0..batch.tasks.len())
-        .map(|leg| tokio::spawn(run_leg(Arc::clone(&run), leg)))
-        .collect();
-    let mut failures = Vec::new();
-    for (leg, handle) in legs.into_iter().enumerate() {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => failures.push(error),
-            Err(error) => {
-                // The leg's task died before it could settle its own
-                // entry: settle it here, with the error it never wrote.
-                let error = format!("leg {leg} task failed: {error}");
-                state.set_leg(
-                    workflow_run_id,
-                    batch.tasks[leg].leg,
-                    "completed",
-                    Some("failure"),
-                    Some(&error),
-                );
-                failures.push(error);
-            }
-        }
-    }
-    Ok((root, failures))
+    let failure = drive_stages(&run).await.err();
+    Ok((root, failure))
 }
 
-/// One matrix leg: its `build` job, then — only when the build
-/// succeeded, as `build-crate.yml`'s `publish` job is gated — its
-/// `publish` job, each recorded as the job and step rows GitHub would
-/// serve. A failed leg's error names the leg and the stage.
-async fn run_leg(run: Arc<BatchRun>, leg: usize) -> Result<(), String> {
-    let _slot = run
-        .slots
-        .acquire()
-        .await
-        .expect("the leg slots are never closed");
+/// The task's `build` job, then — only when the build succeeded, as
+/// `build-crate.yml`'s `publish` job is gated — its `publish` job, each
+/// recorded as the job and step rows GitHub would serve. The task's
+/// error names the stage it failed in. The run's `in_progress`
+/// `workflow_run` delivery goes out as the build starts — the same
+/// delivery GitHub sends when a dispatched run's first job begins.
+async fn drive_stages(run: &TaskRun) -> Result<(), String> {
     let state = &run.state;
     let workflow_run_id = run.workflow_run_id;
-    let task = &run.batch.tasks[leg];
 
     if state.cancel_requested(workflow_run_id) {
-        // A queued matrix job whose run was cancelled never gets a
-        // runner: its row reads `cancelled`, and the publish `if:`
-        // gate skips exactly as a failed build's does.
-        state.close_unstarted_job(workflow_run_id, build_job_name(task), "cancelled");
-        state.skip_job(workflow_run_id, task.leg);
-        state.set_leg(
-            workflow_run_id,
-            task.leg,
-            "completed",
-            Some("cancelled"),
-            None,
-        );
+        // A queued job whose run was cancelled never gets a runner:
+        // its row reads `cancelled`, and the publish `if:` gate skips
+        // exactly as a failed build's does.
+        state.close_unstarted_job(workflow_run_id, build_job_name(&run.task), "cancelled");
+        state.skip_job(workflow_run_id);
+        state.set_task(workflow_run_id, "completed", Some("cancelled"), None);
         return Ok(());
     }
-    state.set_leg(workflow_run_id, task.leg, "in_progress", None, None);
+    state.set_task(workflow_run_id, "in_progress", None, None);
+    let started = task_workflow_run(state, &run.task, workflow_run_id, "in_progress", None, None);
+    if let Err(error) = post_workflow_run(state, &started).await {
+        // A refused `in_progress` lands in `delivery_errors` and is
+        // retried by the caller's clock — the run still builds.
+        tracing::warn!(task_id = %run.task.task_id, %error, "in_progress delivery refused");
+    }
 
-    let build_job = state.begin_job(workflow_run_id, build_job_name(task), BUILD_JOB_STEPS);
-    let layout = match build_stage(&run, leg).await {
+    let build_job = state.begin_job(workflow_run_id, build_job_name(&run.task), BUILD_JOB_STEPS);
+    let layout = match build_stage(run).await {
         Ok(layout) => {
-            // The glibc-floor report runs `always()` and only reads.
             state.finish_job(
                 workflow_run_id,
                 build_job,
@@ -1349,56 +1593,38 @@ async fn run_leg(run: Arc<BatchRun>, leg: usize) -> Result<(), String> {
             layout
         }
         Err(error) => {
-            let error = format!("leg {leg} build: {error}");
+            let error = format!("build: {error}");
             state.finish_job(
                 workflow_run_id,
                 build_job,
                 "failure",
                 &["failure", "success"],
             );
-            state.skip_job(workflow_run_id, task.leg);
-            state.set_leg(
-                workflow_run_id,
-                task.leg,
-                "completed",
-                Some("failure"),
-                Some(&error),
-            );
+            state.skip_job(workflow_run_id);
+            state.set_task(workflow_run_id, "completed", Some("failure"), Some(&error));
             return Err(error);
         }
     };
 
-    let publish_job = state.begin_job(workflow_run_id, publish_job_name(task), PUBLISH_JOB_STEPS);
-    match publish_stage(&run, leg, &layout).await {
+    let publish_job = state.begin_job(workflow_run_id, publish_job_name(), PUBLISH_JOB_STEPS);
+    match publish_stage(run, &layout).await {
         Ok(()) => {
             state.finish_job(workflow_run_id, publish_job, "success", &["success"]);
-            state.set_leg(
-                workflow_run_id,
-                task.leg,
-                "completed",
-                Some("success"),
-                None,
-            );
+            state.set_task(workflow_run_id, "completed", Some("success"), None);
             Ok(())
         }
         Err(error) => {
-            let error = format!("leg {leg} publish: {error}");
+            let error = format!("publish: {error}");
             state.finish_job(workflow_run_id, publish_job, "failure", &["failure"]);
-            state.set_leg(
-                workflow_run_id,
-                task.leg,
-                "completed",
-                Some("failure"),
-                Some(&error),
-            );
+            state.set_task(workflow_run_id, "completed", Some("failure"), Some(&error));
             Err(error)
         }
     }
 }
 
-/// The leg's untrusted build stage.
-async fn build_stage(run: &BatchRun, leg: usize) -> stow_types::error::Result<LegLayout> {
-    let layout = LegLayout::create(&run.root, leg).await?;
+/// The task's untrusted build stage.
+async fn build_stage(run: &TaskRun) -> stow_types::error::Result<TaskLayout> {
+    let layout = TaskLayout::create(&run.root).await?;
     if run.stub {
         return Ok(layout);
     }
@@ -1408,9 +1634,10 @@ async fn build_stage(run: &BatchRun, leg: usize) -> stow_types::error::Result<Le
         .acquire()
         .await
         .expect("the runner pool is never closed");
+    run.state.mark_built(run.workflow_run_id);
     // The child is the untrusted build stage: it gets the event file and
     // nothing else, exactly as the production build job does.
-    let status = run_build_stage(run, leg, &layout).await?;
+    let status = run_build_stage(run, &layout).await?;
     if !status.success() {
         return Err(stow_types::stow_error!(
             "stow-build exited with status {status}: {}",
@@ -1420,15 +1647,11 @@ async fn build_stage(run: &BatchRun, leg: usize) -> stow_types::error::Result<Le
     Ok(layout)
 }
 
-/// The leg's trusted publish stage: the checks `stow-build publish` makes
+/// The task's trusted publish stage: the checks `stow-build publish` makes
 /// before its push, then the mock registry standing in for GHCR and
-/// cosign, then the leg's records artifact under `(run_id, 1)`.
-async fn publish_stage(
-    run: &BatchRun,
-    leg: usize,
-    layout: &LegLayout,
-) -> stow_types::error::Result<()> {
-    let task = &run.batch.tasks[leg];
+/// cosign, then the task's records artifact under `(run_id, 1)`.
+async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error::Result<()> {
+    let task = &run.task;
     if !run.stub {
         let _runner = run
             .state
@@ -1436,12 +1659,12 @@ async fn publish_stage(
             .acquire()
             .await
             .expect("the runner pool is never closed");
-        // The leg is read back from the event file, as `stow-build
+        // The task is read back from the event file, as `stow-build
         // publish` reads it, and validated exactly as it validates it:
         // the mock registry below stands in for GHCR and cosign, not for
         // the validation that gates them.
         let event = async_fs::read(&run.event_path).await?;
-        let dispatched = crate::task_from_event(&event, &run.event_path, leg)?;
+        let dispatched = crate::task_from_event(&event, &run.event_path)?;
         crate::validated_build_output(&dispatched, &layout.output_dir)
             .await
             .map_err(|error| error.wrap_err("publish-stage validation"))?;
@@ -1458,13 +1681,13 @@ async fn publish_stage(
     push_records(
         &run.state,
         &task.task_id,
-        run.batch.rustc_version.as_str(),
+        run.task.rustc_version.as_str(),
         run.workflow_run_id,
         &layout.records_path,
         &run.exe,
     )
     .await?;
-    // The runner a leg stands in for is ephemeral.
+    // The runner a task stands in for is ephemeral.
     async_fs::remove_dir_all(&layout.root).await?;
     Ok(())
 }
@@ -1482,18 +1705,15 @@ async fn stage_error(build_log_path: &Path) -> String {
 }
 
 /// Spawn the untrusted `stow-build build` stage. It receives only the
-/// dispatch event file, its leg and a workspace root — the trusted
-/// credentials are removed from its environment, as they are absent from
-/// the production build job.
+/// dispatch event file and a workspace root — the trusted credentials
+/// are removed from its environment, as they are absent from the
+/// production build job.
 async fn run_build_stage(
-    run: &BatchRun,
-    leg: usize,
-    layout: &LegLayout,
+    run: &TaskRun,
+    layout: &TaskLayout,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
     Ok(async_process::Command::new(&run.exe)
         .arg("build")
-        .arg("--leg")
-        .arg(leg.to_string())
         .arg("--output-dir")
         .arg(&layout.output_dir)
         .env_remove("SCHEDULER_URL")
@@ -1525,7 +1745,7 @@ async fn upload_plan_len(upload_plan_path: &Path) -> stow_types::error::Result<u
 async fn populate_mock_registry(
     exe: &Path,
     state: &LocalServerState,
-    layout: &LegLayout,
+    layout: &TaskLayout,
 ) -> stow_types::error::Result<()> {
     let mock_registry_exe = exe
         .parent()
@@ -1565,7 +1785,7 @@ async fn populate_mock_registry(
 /// Write the build's records artifact into the mock registry — the same
 /// object the production publish stage pushes to GHCR under
 /// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`, signed by the
-/// mock key instead of cosign. The run is the batch dispatch's own
+/// mock key instead of cosign. The run is the dispatch's own
 /// `workflow_run_id` at attempt 1 — the run identity the `workflow_run`
 /// webhook report below carries, so the edge's records check resolves
 /// to this tag.
@@ -1617,9 +1837,51 @@ async fn push_records(
     ))
 }
 
+/// The early-exited run's publish: `stow-mock-registry retag-records`
+/// re-tags the `built-` marker's manifest under this run's `records-`
+/// tag and appends a mock signature binding it (stow#877).
+async fn retag_records(
+    state: &LocalServerState,
+    task: &BuildTaskPayload,
+    workflow_run_id: u64,
+) -> stow_types::error::Result<()> {
+    let exe = std::env::current_exe()?;
+    let mock_registry_exe = exe
+        .parent()
+        .ok_or_else(|| {
+            stow_types::stow_error!("cannot determine parent directory of stow-build binary")
+        })?
+        .join(format!(
+            "stow-mock-registry{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+    let status = async_process::Command::new(&mock_registry_exe)
+        .arg("retag-records")
+        .arg("--task-id")
+        .arg(&task.task_id)
+        .arg("--rustc-version")
+        .arg(task.rustc_version.as_str())
+        .arg("--run-id")
+        .arg(workflow_run_id.to_string())
+        .arg("--run-attempt")
+        .arg(RUN_ATTEMPT.to_string())
+        .arg("--registry-root")
+        .arg(PathBuf::from(&state.mock_registry_root))
+        .arg("--private-key")
+        .arg(PathBuf::from(&state.mock_private_key_path))
+        .status()
+        .await?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(stow_types::stow_error!(
+        "mock registry retag-records failed with status {status}"
+    ))
+}
+
 /// The `workflow_run` event a mock run reports — the fields GitHub's
 /// payload carries that the edge's signature check, authority boundary
-/// and title correlation consume. `run_key` (batch id or request id)
+/// and title correlation consume. `run_key` (task id or request id)
 /// identifies the workflow's title context; `workflow_run_id` is the
 /// per-dispatch identity shared by the response and callback.
 struct WorkflowRunReport {
@@ -1627,7 +1889,7 @@ struct WorkflowRunReport {
     /// the run carries this captured value.
     workflow_run_id: u64,
     run_key: String,
-    /// The workflow file — `build-batch.yml` or `resolve-request.yml`.
+    /// The workflow file — `build-crate.yml` or `resolve-request.yml`.
     workflow_file: &'static str,
     display_title: String,
     /// `in_progress` or `completed` — GitHub's `action` field.
@@ -1636,6 +1898,9 @@ struct WorkflowRunReport {
     conclusion: Option<&'static str>,
     /// The run's link — the mock's own `GET /tasks` page.
     html_url: String,
+    /// `triggering_actor.login` — every run this server was dispatched
+    /// reports the App's bot login (stow#940).
+    triggering_actor_login: String,
     /// Failure detail worth logging alongside the report.
     error: Option<String>,
 }
@@ -1644,11 +1909,11 @@ fn resolve_run_key(dispatch: &RequestDispatch) -> String {
     format!("{}:{}", dispatch.request_id, dispatch.attempt)
 }
 
-/// A dispatched batch run's report under `build-batch.yml`'s run-name.
+/// A dispatched task run's report under `build-crate.yml`'s run-name.
 /// `conclusion` and `error` are present on `completed` reports only.
-fn batch_workflow_run(
+fn task_workflow_run(
     state: &LocalServerState,
-    batch: &BuildBatchPayload,
+    task: &BuildTaskPayload,
     workflow_run_id: u64,
     action: &'static str,
     conclusion: Option<&'static str>,
@@ -1656,15 +1921,13 @@ fn batch_workflow_run(
 ) -> WorkflowRunReport {
     WorkflowRunReport {
         workflow_run_id,
-        run_key: batch.batch_id.to_string(),
-        workflow_file: stow_types::trusted_builder::BATCH_WORKFLOW_FILE,
-        display_title: stow_types::records::batch_run_title(
-            batch.rustc_version.as_str(),
-            &batch.batch_id,
-        ),
+        run_key: task.task_id.clone(),
+        workflow_file: stow_types::trusted_builder::WORKFLOW_FILE,
+        display_title: stow_types::records::run_title(task.rustc_version.as_str(), &task.task_id),
         action,
         conclusion,
         html_url: format!("http://{}/tasks/{workflow_run_id}", state.listen),
+        triggering_actor_login: state.app_bot_login(),
         error,
     }
 }
@@ -1699,6 +1962,7 @@ async fn post_workflow_run(
             "conclusion": run.conclusion,
             "html_url": run.html_url,
             "head_repository": {"full_name": stow_types::trusted_builder::REPOSITORY},
+            "triggering_actor": {"login": run.triggering_actor_login},
         },
     });
     let body = serde_json::to_vec(&payload)?;
@@ -1746,28 +2010,31 @@ async fn post_workflow_run(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use stow_types::api::{BuildBatchPayload, TaskHash};
-    use stow_types::runs::{
-        LegFailure, LegJobKind, LegJobName, LegOutcome, RunFailure, RunJobRow, VERDICT_STEPS,
-        classify_legs,
-    };
-
-    use tokio::sync::Semaphore;
-
-    use super::{
-        BUILD_JOB_STEPS, BatchRun, JobsQuery, LocalServerState, PUBLISH_JOB_STEPS, RUN_ATTEMPT,
-        RecordedJob, WorkflowRunReport, attempt_jobs_page, attempt_jobs_response, build_job_name,
-        cancel_response, dispatch_response, publish_job_name, run_leg, run_response,
-    };
+    use skyzen::StatusCode;
+    use stow_types::api::BuildTaskPayload;
     use stow_types::local_ci::{
         LocalCiSeededConclusion, LocalCiSeededRun, LocalCiSeededRuns, LocalCiSeededStatus,
     };
+    use stow_types::runs::{RunFailure, RunJobRow, RunJobsPage, VERDICT_STEPS, classify_failure};
 
-    use skyzen::StatusCode;
+    use super::{
+        BUILD_JOB_STEPS, JobsQuery, LocalServerState, PUBLISH_JOB_STEPS, RUN_ATTEMPT, RecordedJob,
+        TaskRun, WorkflowRunReport, attempt_jobs_page, build_job_name, cancel_response,
+        dispatch_response, drive_stages, publish_job_name, run_response,
+    };
 
     fn state() -> LocalServerState {
-        LocalServerState::new(String::new(), String::new(), String::new(), String::new())
+        LocalServerState::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            "mock-stow-ci".to_owned(),
+        )
+    }
+
+    fn task() -> BuildTaskPayload {
+        crate::task_fixture::task("serde")
     }
 
     #[test]
@@ -1775,12 +2042,13 @@ mod tests {
         let state = state();
         let first = WorkflowRunReport {
             workflow_run_id: state.allocate_id(),
-            run_key: "batch".to_owned(),
-            workflow_file: "build-batch.yml",
-            display_title: "1.86.0-batch".to_owned(),
+            run_key: "task".to_owned(),
+            workflow_file: "build-crate.yml",
+            display_title: "1.86.0-abc123".to_owned(),
             action: "completed",
             conclusion: None,
             html_url: String::new(),
+            triggering_actor_login: state.app_bot_login(),
             error: None,
         };
         let first_response = dispatch_response(&first);
@@ -1800,6 +2068,7 @@ mod tests {
             action: first.action,
             conclusion: None,
             html_url: String::new(),
+            triggering_actor_login: state.app_bot_login(),
             error: None,
         };
         let second_response = dispatch_response(&second);
@@ -1817,7 +2086,7 @@ mod tests {
         assert_eq!(
             state.runs.lock().expect("runs mutex poisoned").len(),
             2,
-            "repeated batch keys retain both run records"
+            "repeated task keys retain both run records"
         );
     }
 
@@ -1833,32 +2102,49 @@ mod tests {
         assert_eq!(recorded, VERDICT_STEPS);
     }
 
-    /// A one-leg batch run for `run_leg`: `exe` names the build stage
+    #[test]
+    fn task_job_names_follow_the_workflow_naming() {
+        let task = task();
+        assert_eq!(
+            build_job_name(&task),
+            "build serde 1.0.0 (x86_64-unknown-linux-gnu)"
+        );
+        assert_eq!(publish_job_name(), "publish");
+    }
+
+    /// A one-task run for `drive_stages`: `exe` names the build stage
     /// binary and the directory the mock registry binary sits in.
-    fn batch_run(state: &LocalServerState, exe: &std::path::Path, stub: bool) -> Arc<BatchRun> {
-        let batch: BuildBatchPayload =
-            serde_json::from_str(&crate::batch_fixture::encoded_batch(&["serde"], 1)).unwrap();
+    fn task_run(state: &LocalServerState, exe: &std::path::Path, stub: bool) -> TaskRun {
+        let task = task();
         let root = exe.parent().unwrap().join("run");
         std::fs::create_dir_all(&root).unwrap();
         let event_path = root.join("event.json");
         std::fs::write(
             &event_path,
             serde_json::to_vec(&serde_json::json!({
-                "inputs": { "batch": batch.encode_dispatch_batch().unwrap() }
+                "inputs": { "task": serde_json::to_string(&task).unwrap() }
             }))
             .unwrap(),
         )
         .unwrap();
-        Arc::new(BatchRun {
+        let workflow_run_id = state.allocate_id();
+        state.mark_run(
+            workflow_run_id,
+            "build-crate.yml",
+            &stow_types::records::run_title(task.rustc_version.as_str(), &task.task_id),
+            "queued",
+            None,
+        );
+        state.seed_task(workflow_run_id, &task);
+        TaskRun {
             state: state.clone(),
-            batch,
-            workflow_run_id: state.allocate_id(),
+            task,
+            workflow_run_id,
             root,
             event_path,
-            slots: Semaphore::new(1),
             stub,
             exe: exe.to_path_buf(),
-        })
+        }
     }
 
     /// An executable shell script at `path` that exits `code`.
@@ -1869,92 +2155,96 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    /// The recorded jobs of `run`, read the way the edge reads GitHub's
-    /// jobs page, classified for the batch's one leg.
-    #[cfg(unix)]
-    fn classified(state: &LocalServerState, run: &BatchRun) -> LegOutcome {
-        let page = serde_json::json!({
-            "jobs": state.jobs.lock().unwrap()[&run.workflow_run_id],
-        });
-        let jobs: Vec<RunJobRow> = serde_json::from_value::<stow_types::runs::RunJobsPage>(page)
-            .unwrap()
-            .jobs;
-        let names: Vec<_> = jobs
-            .iter()
-            .map(|job| LegJobName::parse(&job.name).unwrap_or_else(|| panic!("{}", job.name)))
-            .collect();
-        let hash = run.batch.tasks[0].task_hash.clone();
-        assert!(names.iter().all(|name| {
-            name.leg == 0 && name.hash.as_ref().is_none_or(|found| *found == hash)
-        }));
-        assert_eq!(names[0].kind, LegJobKind::Build);
-        let expected: Vec<TaskHash> = vec![hash];
-        let conclusion = if jobs
-            .iter()
-            .any(|job| job.conclusion.as_deref() == Some("failure"))
-        {
-            "failure"
-        } else {
-            "success"
-        };
-        classify_legs(
-            &expected,
-            conclusion,
-            &jobs,
-            time::OffsetDateTime::now_utc(),
+    /// The run's recorded jobs read the way the edge reads GitHub's jobs
+    /// page, classified the way a per-task run's failure is.
+    fn classified(state: &LocalServerState, run_id: u64) -> Option<RunFailure> {
+        let jobs: Vec<RunJobRow> = serde_json::from_value::<RunJobsPage>(
+            serde_json::json!({ "jobs": state.jobs.lock().unwrap()[&run_id] }),
         )
         .unwrap()
-        .remove(0)
+        .jobs;
+        classify_failure(&jobs, time::OffsetDateTime::now_utc()).unwrap()
     }
 
-    #[test]
-    fn leg_job_names_follow_the_reusable_workflow_matrix_naming() {
-        let batch: BuildBatchPayload =
-            serde_json::from_str(&crate::batch_fixture::encoded_batch(&["serde"], 1)).unwrap();
-        let leg = &batch.tasks[0];
-        assert_eq!(
-            build_job_name(leg),
-            format!(
-                "leg 0 / build #0 serde 1.0.0 (x86_64-unknown-linux-gnu) {}",
-                leg.task_hash
-            )
-        );
-        assert_eq!(
-            publish_job_name(leg),
-            format!("leg 0 / publish #0 {}", leg.task_hash)
-        );
-        // A skipped job's `name:` stays unrendered — `build-crate.yml`'s
-        // template verbatim under the rendered caller prefix (stow#839).
-        assert_eq!(
-            LegJobName::skipped_publish(0),
-            "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}"
-        );
-    }
-
-    /// A stubbed leg whose records push succeeds records two `success`
-    /// jobs the leg classifier accepts as a success.
+    /// A stubbed task whose records push succeeds records two `success`
+    /// jobs with every verdict step named.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_landed_leg_records_two_successful_jobs() {
+    async fn a_landed_task_records_two_successful_jobs() {
         let dir = tempfile::tempdir().unwrap();
         script(&dir.path().join("stow-mock-registry"), 0);
         let state = state();
-        let run = batch_run(&state, &dir.path().join("stow-build"), true);
-        run_leg(Arc::clone(&run), 0).await.unwrap();
-        assert!(matches!(
-            classified(&state, &run),
-            LegOutcome::Succeeded {
-                publish_attempt: 1,
-                ..
-            }
-        ));
+        let run = task_run(&state, &dir.path().join("stow-build"), true);
+        drive_stages(&run).await.unwrap();
         let jobs = state.jobs.lock().unwrap();
+        assert!(
+            jobs[&run.workflow_run_id]
+                .iter()
+                .all(|job| job.conclusion == Some("success")),
+            "both jobs succeeded"
+        );
         let steps: Vec<_> = jobs[&run.workflow_run_id]
             .iter()
             .flat_map(|job| job.steps.iter().map(|step| step.name.as_str()))
             .collect();
         assert_eq!(steps, VERDICT_STEPS);
         drop(jobs);
+    }
+
+    /// A cancelled queued task never starts: its build row is
+    /// `cancelled`, its publish `skipped`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_run_stops_work_that_never_started() {
+        let dir = tempfile::tempdir().unwrap();
+        script(&dir.path().join("stow-mock-registry"), 0);
+        let state = state();
+        let run = task_run(&state, &dir.path().join("stow-build"), true);
+        cancel_response(&state, run.workflow_run_id);
+        drive_stages(&run).await.unwrap();
+        let jobs = state.jobs.lock().unwrap()[&run.workflow_run_id].clone();
+        let conclusions: Vec<_> = jobs.iter().map(|job| job.conclusion).collect();
+        assert_eq!(conclusions, [Some("cancelled"), Some("skipped")]);
+        let recorded = state.runs.lock().unwrap()[&run.workflow_run_id.to_string()].clone();
+        assert_eq!(
+            (recorded.status.as_str(), recorded.conclusion.as_deref()),
+            ("completed", Some("cancelled"))
+        );
+    }
+
+    /// A failed build settles as a verdict at its first step and the
+    /// publish job is skipped, so nothing publishes records.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_build_is_a_verdict_and_skips_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        script(&dir.path().join("stow-build"), 1);
+        script(&dir.path().join("stow-mock-registry"), 0);
+        let state = state();
+        let run = task_run(&state, &dir.path().join("stow-build"), false);
+        assert!(drive_stages(&run).await.is_err());
+        match classified(&state, run.workflow_run_id) {
+            Some(RunFailure::Verdict { step, .. }) => assert_eq!(step, VERDICT_STEPS[0]),
+            other => panic!("expected a build verdict, got {other:?}"),
+        }
+        let publish = &state.jobs.lock().unwrap()[&run.workflow_run_id][1];
+        assert_eq!(publish.conclusion, Some("skipped"));
+    }
+
+    /// A failed publish settles as a verdict on the publish step.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_publish_is_a_verdict_on_the_publish_step() {
+        let dir = tempfile::tempdir().unwrap();
+        script(&dir.path().join("stow-build"), 0);
+        script(&dir.path().join("stow-mock-registry"), 1);
+        let state = state();
+        let run = task_run(&state, &dir.path().join("stow-build"), false);
+        assert!(drive_stages(&run).await.is_err());
+        match classified(&state, run.workflow_run_id) {
+            Some(RunFailure::Verdict { step, .. }) => assert_eq!(step, VERDICT_STEPS[2]),
+            other => panic!("expected a publish verdict, got {other:?}"),
+        }
     }
 
     /// A recorded job row for the paging tests — the page decoder
@@ -1990,9 +2280,9 @@ mod tests {
         (body["jobs"].as_array().expect("jobs array").len(), link)
     }
 
-    /// A 40-leg batch's 80 jobs page at the request's `per_page` — the
-    /// default 30 gives three pages and `Link`'s `rel="next"` keeps
-    /// walking on the mock's own origin until the last.
+    /// The jobs page pages at the request's `per_page` — the default 30
+    /// gives three pages of 80 and `Link`'s `rel="next"` keeps walking
+    /// on the mock's own origin until the last.
     #[tokio::test]
     async fn attempt_jobs_pages_at_the_requested_size() {
         let mut state = state();
@@ -2000,8 +2290,6 @@ mod tests {
         let run_id = state.allocate_id();
         let jobs: Vec<RecordedJob> = (0..80).map(recorded_job).collect();
 
-        // The default page is GitHub's 30; `next` stays on the mock's
-        // own origin so the edge's scoped pager follows it.
         let (len, link) = page_parts(attempt_jobs_page(
             &state,
             run_id,
@@ -2021,8 +2309,6 @@ mod tests {
         );
         assert!(next.contains("page=2"), "{next}");
 
-        // A middle page links both ways: `next`/`last` onward,
-        // `first`/`prev` back.
         let (len, link) = page_parts(attempt_jobs_page(
             &state,
             run_id,
@@ -2045,7 +2331,6 @@ mod tests {
         assert!(link.contains("rel=\"first\""));
         assert!(link.contains("rel=\"prev\""));
 
-        // The last page ends the walk — no `next`.
         let (len, link) = page_parts(attempt_jobs_page(
             &state,
             run_id,
@@ -2060,8 +2345,6 @@ mod tests {
         assert_eq!(len, 20);
         assert!(stow_types::runs::link_next(link.as_deref()).is_none());
 
-        // `per_page=100` — the edge's own request — lands all 80 jobs
-        // of a 40-leg batch on one page.
         let (len, link) = page_parts(attempt_jobs_page(
             &state,
             run_id,
@@ -2085,7 +2368,7 @@ mod tests {
         let run_id = state.allocate_id();
         state.mark_run(
             run_id,
-            "build-batch.yml",
+            "build-crate.yml",
             "1.99.0-b0123",
             "in_progress",
             None,
@@ -2095,106 +2378,6 @@ mod tests {
             run_response(&state, state.allocate_id()).status(),
             StatusCode::NOT_FOUND
         );
-        let query = |page| JobsQuery {
-            per_page: None,
-            page,
-        };
-        assert_eq!(
-            attempt_jobs_response(&state, state.allocate_id(), RUN_ATTEMPT, &query(None)).status(),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            attempt_jobs_response(&state, run_id, RUN_ATTEMPT + 1, &query(None)).status(),
-            StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            cancel_response(&state, run_id).status(),
-            StatusCode::ACCEPTED
-        );
-        assert_eq!(
-            cancel_response(&state, state.allocate_id()).status(),
-            StatusCode::NOT_FOUND
-        );
-    }
-
-    /// A queued leg of a cancelled run records the GitHub shape — its
-    /// build `cancelled`, its publish `skipped`, the leg
-    /// `completed`/`cancelled` — and never spawns its stages.
-    #[tokio::test]
-    async fn a_cancelled_run_stops_legs_that_never_started() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state();
-        let run = batch_run(&state, &dir.path().join("stow-build"), true);
-        state.mark_run(
-            run.workflow_run_id,
-            "build-batch.yml",
-            "1.99.0-b0123",
-            "in_progress",
-            None,
-        );
-        state.seed_legs(run.workflow_run_id, &run.batch);
-        assert_eq!(
-            cancel_response(&state, run.workflow_run_id).status(),
-            StatusCode::ACCEPTED
-        );
-        run_leg(Arc::clone(&run), 0).await.unwrap();
-        let jobs = state.jobs.lock().unwrap();
-        let conclusions: Vec<_> = jobs[&run.workflow_run_id]
-            .iter()
-            .map(|job| job.conclusion)
-            .collect();
-        drop(jobs);
-        assert_eq!(conclusions, [Some("cancelled"), Some("skipped")]);
-        let leg = state.runs.lock().unwrap()[&run.workflow_run_id.to_string()].legs[0].clone();
-        assert_eq!(leg.status, "completed");
-        assert_eq!(leg.conclusion.as_deref(), Some("cancelled"));
-    }
-
-    /// A build stage that exits non-zero fails the `Run the untrusted
-    /// build stage` step — the crate's verdict — and skips the publish
-    /// job, whose name the page serves unrendered as GitHub does
-    /// (stow#839).
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_failed_build_is_a_verdict_and_skips_publish() {
-        let dir = tempfile::tempdir().unwrap();
-        let exe = dir.path().join("stow-build");
-        script(&exe, 3);
-        let state = state();
-        let run = batch_run(&state, &exe, false);
-        let error = run_leg(Arc::clone(&run), 0).await.unwrap_err();
-        assert!(error.starts_with("leg 0 build:"), "{error}");
-        match classified(&state, &run) {
-            LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { step, .. })) => {
-                assert_eq!(step, VERDICT_STEPS[0]);
-            }
-            other => panic!("expected a build verdict, got {other:?}"),
-        }
-        let publish = state.jobs.lock().unwrap()[&run.workflow_run_id][1].clone();
-        assert_eq!(publish.conclusion, Some("skipped"));
-        assert_eq!(
-            publish.name,
-            "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}"
-        );
-    }
-
-    /// A records push that fails fails the `Run the trusted publish
-    /// stage` step.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_failed_publish_is_a_verdict_on_the_publish_step() {
-        let dir = tempfile::tempdir().unwrap();
-        script(&dir.path().join("stow-mock-registry"), 1);
-        let state = state();
-        let run = batch_run(&state, &dir.path().join("stow-build"), true);
-        let error = run_leg(Arc::clone(&run), 0).await.unwrap_err();
-        assert!(error.starts_with("leg 0 publish:"), "{error}");
-        match classified(&state, &run) {
-            LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { step, .. })) => {
-                assert_eq!(step, VERDICT_STEPS[2]);
-            }
-            other => panic!("expected a publish verdict, got {other:?}"),
-        }
     }
 
     const SUCCESS: LocalCiSeededStatus = LocalCiSeededStatus::Completed {
@@ -2204,22 +2387,17 @@ mod tests {
         conclusion: LocalCiSeededConclusion::Failure,
     };
 
-    fn seeded(
-        run_id: Option<u64>,
-        task_id: &str,
-        status: LocalCiSeededStatus,
-    ) -> stow_types::local_ci::LocalCiSeededRun {
-        stow_types::local_ci::LocalCiSeededRun {
+    fn seeded(run_id: Option<u64>, task_id: &str, status: LocalCiSeededStatus) -> LocalCiSeededRun {
+        LocalCiSeededRun {
             workflow_run_id: run_id,
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.86.0".to_owned())
                 .unwrap(),
-            batch_id: task_id[32..].parse().unwrap(),
-            legs: vec![task_id.to_owned()],
+            task_id: task_id.to_owned(),
             status,
         }
     }
 
-    /// `run_id`'s run object as the edge's lease check decodes it.
+    /// `run_id`'s run object as the edge's status check decodes it.
     async fn run_status(state: &LocalServerState, run_id: u64) -> stow_types::runs::RunStatus {
         let response = run_response(state, run_id);
         assert_eq!(response.status(), StatusCode::OK);
@@ -2227,10 +2405,10 @@ mod tests {
     }
 
     /// A seeded running run reads as GitHub serves one mid-build — the
-    /// run and its leg `in_progress` with no conclusion, the leg's build
-    /// job running at its first step, no publish job and no records —
-    /// until its cancel, which completes it as `cancelled` with the job
-    /// rows a cancelled build leaves. A second cancel changes nothing.
+    /// run `in_progress` with no conclusion, its build job running at
+    /// its first step, no publish job and no records — until its
+    /// cancel, which completes it as `cancelled` with the job rows a
+    /// cancelled build leaves. A second cancel changes nothing.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_seeded_running_run_stays_in_progress_until_its_cancel() {
@@ -2242,7 +2420,7 @@ mod tests {
             runs: vec![seeded(None, &task_id, LocalCiSeededStatus::InProgress)],
         };
         let ids = state.seeded_run_ids(&running).unwrap();
-        // A registry that refuses every push: a running leg pushes none.
+        // A registry that refuses every push: a running run pushes none.
         state
             .publish_seeded_records(&running, &ids, &dir.path().join("stow-build"))
             .await
@@ -2253,8 +2431,11 @@ mod tests {
         let status = run_status(&state, run_id).await;
         assert_eq!(status.status, "in_progress");
         assert_eq!(status.conclusion, None);
-        let leg = state.runs.lock().unwrap()[&run_id.to_string()].legs[0].clone();
-        assert_eq!((leg.status.as_str(), leg.conclusion), ("in_progress", None));
+        let recorded = state.runs.lock().unwrap()[&run_id.to_string()].clone();
+        assert_eq!(
+            (recorded.status.as_str(), recorded.conclusion.as_deref()),
+            ("in_progress", None)
+        );
         let jobs = state.jobs.lock().unwrap()[&run_id].clone();
         let [build] = &jobs[..] else {
             panic!("one job row while the build runs: {jobs:?}");
@@ -2277,12 +2458,12 @@ mod tests {
         );
         let after = |state: &LocalServerState| {
             let jobs = state.jobs.lock().unwrap()[&run_id].clone();
-            let leg = state.runs.lock().unwrap()[&run_id.to_string()].legs[0].clone();
-            (jobs, leg)
+            let recorded = state.runs.lock().unwrap()[&run_id.to_string()].clone();
+            (jobs, recorded)
         };
-        let (jobs, leg) = after(&state);
+        let (jobs, recorded) = after(&state);
         assert_eq!(
-            (leg.status.as_str(), leg.conclusion.as_deref()),
+            (recorded.status.as_str(), recorded.conclusion.as_deref()),
             ("completed", Some("cancelled"))
         );
         let conclusions: Vec<_> = jobs.iter().map(|job| job.conclusion).collect();
@@ -2299,10 +2480,6 @@ mod tests {
                 ("completed", Some("skipped"))
             ]
         );
-        assert!(
-            jobs.iter()
-                .all(|job| LegJobName::parse(&job.name).is_some())
-        );
 
         cancel();
         assert_eq!(after(&state).0.len(), 2, "a second cancel adds no row");
@@ -2318,50 +2495,36 @@ mod tests {
         ids
     }
 
-    /// The recorded jobs of seeded run `run_id`, classified for its one
-    /// leg under the run's recorded conclusion.
-    fn seeded_outcome(state: &LocalServerState, run_id: u64, task_id: &str) -> LegOutcome {
-        let conclusion = state.runs.lock().unwrap()[&run_id.to_string()]
-            .conclusion
-            .clone()
-            .unwrap();
-        let jobs: Vec<RunJobRow> = serde_json::from_value::<stow_types::runs::RunJobsPage>(
-            serde_json::json!({ "jobs": state.jobs.lock().unwrap()[&run_id] }),
-        )
-        .unwrap()
-        .jobs;
-        let hash = TaskHash::of(task_id);
-        assert!(jobs.iter().all(|job| {
-            LegJobName::parse(&job.name).is_some_and(|name| {
-                name.leg == 0 && name.hash.as_ref().is_none_or(|found| *found == hash)
-            })
-        }));
-        classify_legs(&[hash], &conclusion, &jobs, time::OffsetDateTime::now_utc())
-            .unwrap()
-            .remove(0)
+    /// The recorded jobs of seeded run `run_id`, classified the way a
+    /// finished run's failure is.
+    fn seeded_classification(state: &LocalServerState, run_id: u64) -> Option<RunFailure> {
+        classified(state, run_id)
     }
 
-    /// A seeded run reads back as a finished `build-batch.yml` run
-    /// titled for its batch, its jobs page classifies the leg as a
-    /// success, and the allocator moves past it.
+    /// A seeded run reads back as a finished `build-crate.yml` run
+    /// titled for its task, its jobs page classifies as a success, and
+    /// the allocator moves past it.
     #[test]
-    fn a_seeded_run_serves_a_successful_batch_jobs_page() {
+    fn a_seeded_run_serves_a_successful_jobs_page() {
         let state = state();
         let task_id = format!("{:064x}", 97_502_u64);
         let run = seeded(Some(97_502), &task_id, SUCCESS);
-        assert_eq!(record(&state, vec![run.clone()]), [97_502]);
+        assert_eq!(record(&state, vec![run]), [97_502]);
 
         let recorded = state.runs.lock().unwrap()["97502"].clone();
         assert_eq!(
             recorded.display_title,
-            stow_types::records::batch_run_title("1.86.0", &run.batch_id)
+            stow_types::records::run_title("1.86.0", &task_id)
         );
-        assert_eq!(recorded.path, ".github/workflows/build-batch.yml");
+        assert_eq!(recorded.path, ".github/workflows/build-crate.yml");
         assert_eq!(recorded.conclusion.as_deref(), Some("success"));
-        assert!(matches!(
-            seeded_outcome(&state, 97_502, &task_id),
-            LegOutcome::Succeeded { .. }
-        ));
+        assert_eq!(recorded.task_id.as_deref(), Some(task_id.as_str()));
+        assert!(
+            state.jobs.lock().unwrap()[&97_502]
+                .iter()
+                .all(|job| job.conclusion == Some("success")),
+            "both jobs succeeded"
+        );
         assert!(state.allocate_id() > 97_502);
     }
 
@@ -2381,8 +2544,8 @@ mod tests {
                 .as_deref(),
             Some("failure")
         );
-        match seeded_outcome(&state, run_id, &task_id) {
-            LegOutcome::Failed(LegFailure::Run(RunFailure::Verdict { step, .. })) => {
+        match seeded_classification(&state, run_id) {
+            Some(RunFailure::Verdict { step, .. }) => {
                 assert_eq!(step, VERDICT_STEPS[0]);
             }
             other => panic!("expected a build verdict, got {other:?}"),
@@ -2391,11 +2554,8 @@ mod tests {
             .iter()
             .find(|job| job.conclusion == Some("skipped"))
             .cloned()
-            .expect("the failed leg's publish is skipped");
-        assert_eq!(
-            skipped.name,
-            "leg 0 / publish #${{ inputs.leg }} ${{ inputs.task_hash }}"
-        );
+            .expect("the failed task's publish is skipped");
+        assert_eq!(skipped.name, "publish");
     }
 
     /// An unnamed run takes an id the allocator hands out after every
@@ -2417,12 +2577,12 @@ mod tests {
         assert!(state.allocate_id() > ids[0]);
     }
 
-    /// Only a succeeded run's legs publish records: the failed run's
-    /// leg pushes nothing, so the mock registry binary is never run for
-    /// it — a registry that refuses every push fails only the success.
+    /// Only a succeeded run publishes records: the failed run pushes
+    /// nothing, so the mock registry binary is never run for it — a
+    /// registry that refuses every push fails only the success.
     #[cfg(unix)]
     #[tokio::test]
-    async fn only_succeeded_legs_publish_records() {
+    async fn only_succeeded_runs_publish_records() {
         let dir = tempfile::tempdir().unwrap();
         script(&dir.path().join("stow-mock-registry"), 1);
         let exe = dir.path().join("stow-build");
@@ -2449,34 +2609,28 @@ mod tests {
     }
 
     /// A seeded id at or below one the server already allocated, a
-    /// repeated id, a legless run and an empty request are refused
+    /// repeated id, a taskless run and an empty request are refused
     /// before anything is recorded.
     #[test]
     fn seeding_refuses_ids_the_server_could_reuse() {
         let state = state();
         let task_id = format!("{:064x}", 7_u64);
-        let success = SUCCESS;
         let allocated = state.allocate_id();
         let clash = LocalCiSeededRuns {
-            runs: vec![seeded(Some(allocated), &task_id, success)],
+            runs: vec![seeded(Some(allocated), &task_id, SUCCESS)],
         };
         assert!(state.seeded_run_ids(&clash).is_err());
         let twice = LocalCiSeededRuns {
             runs: vec![
-                seeded(Some(50), &task_id, success),
-                seeded(Some(50), &task_id, success),
+                seeded(Some(50), &task_id, SUCCESS),
+                seeded(Some(50), &task_id, SUCCESS),
             ],
         };
         assert!(state.seeded_run_ids(&twice).is_err());
-        let mut legless = seeded(None, &task_id, success);
-        legless.legs.clear();
-        assert!(
-            state
-                .seeded_run_ids(&LocalCiSeededRuns {
-                    runs: vec![legless]
-                })
-                .is_err()
-        );
+        let taskless = LocalCiSeededRuns {
+            runs: vec![seeded(None, "", SUCCESS)],
+        };
+        assert!(state.seeded_run_ids(&taskless).is_err());
         let empty = LocalCiSeededRuns { runs: Vec::new() };
         assert!(state.seeded_run_ids(&empty).is_err());
         assert!(state.runs.lock().unwrap().is_empty());

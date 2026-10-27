@@ -17,11 +17,6 @@ macro_rules! workflow_file {
         "build-crate.yml"
     };
 }
-macro_rules! batch_workflow_file {
-    () => {
-        "build-batch.yml"
-    };
-}
 macro_rules! index_workflow_file {
     () => {
         "index-publish.yml"
@@ -44,24 +39,11 @@ pub const REPOSITORY: &str = repository!();
 pub const WORKFLOW_FILE: &str = workflow_file!();
 /// The `name:` the trusted workflow declares.
 ///
-/// `build-crate.yml` is `workflow_call`-only, so GitHub never lists a
-/// run under this name; the constant pins the file's `name:` line. The
-/// "title not rendered yet" case a reader can meet is a batch run's —
-/// see [`BATCH_WORKFLOW_NAME`].
-pub const WORKFLOW_NAME: &str = "build-crate";
-/// Workflow file that carries a batch of build tasks (stow#833).
-///
-/// The dispatched `workflow_dispatch` caller under `.github/workflows/`
-/// whose matrix legs each *call* [`WORKFLOW_FILE`]. Signing stays with
-/// the called workflow: [`CERTIFICATE_IDENTITY`] is unchanged.
-pub const BATCH_WORKFLOW_FILE: &str = batch_workflow_file!();
-/// The `name:` the batch workflow declares.
-///
 /// GitHub shows it as a run's `display_title` until it has rendered the
 /// workflow's `run-name`, so a reader that meets it is looking at a run
 /// whose title is not known yet, not at another workflow's run
 /// (stow#704).
-pub const BATCH_WORKFLOW_NAME: &str = "build-batch";
+pub const WORKFLOW_NAME: &str = "build-crate";
 /// Branch the trusted workflow runs from. `workflow_dispatch` takes the bare
 /// branch name; the certificate subject carries the full ref.
 pub const BRANCH: &str = branch!();
@@ -87,6 +69,13 @@ pub const INDEX_WORKFLOW_FILE: &str = index_workflow_file!();
 /// workflow on exactly [`BRANCH`] — the same arm [`WORKFLOW_FILE`] has
 /// for build tasks.
 pub const RESOLVE_WORKFLOW_FILE: &str = resolve_workflow_file!();
+/// Workflow file under `.github/workflows/` that resolves a preheat
+/// wave and submits its trees (stow#880).
+///
+/// The scheduler dispatches a new stable rustc's preheat to exactly
+/// this workflow on exactly [`BRANCH`]; the workflow confirms the
+/// version against the official channel manifest before resolving.
+pub const PREHEAT_WORKFLOW_FILE: &str = "preheat-admin.yml";
 /// Subject Alternative Name Fulcio issues to the index-publish workflow.
 ///
 /// The certificate identity under which published artifact indexes are

@@ -17,11 +17,11 @@ mod crates_io_fetch;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod crates_io_index;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod db;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) mod dependency_resolver;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod errors;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod faults;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod fetch_guard;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -44,8 +44,6 @@ mod rust_channel;
 mod scheduler;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod site;
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-mod sql_batch;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod stats;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -74,7 +72,9 @@ mod ghcr;
 mod runtime_settings;
 #[cfg(target_arch = "wasm32")]
 mod scheduler_client;
-// The handler's deps are wasm-only, but its signature/decode/pin logic
-// is what the tests exercise — test builds need it on host too.
+// The handlers' deps are wasm-only, but their signature/decode/pin
+// logic is what the tests exercise — test builds need them on host too.
+#[cfg(any(target_arch = "wasm32", test))]
+mod release_hook;
 #[cfg(any(target_arch = "wasm32", test))]
 mod webhook;

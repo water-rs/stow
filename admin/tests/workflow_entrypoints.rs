@@ -167,7 +167,7 @@ fn cron_declarations() {
             .and_then(|s| field(&s[0], "cron"))
             .map(scalar)
             .as_deref(),
-        Some("0 */2 * * *")
+        Some("0 0 * * *")
     );
     // The tick both schedules and dispatches manually.
     assert!(at(&wf, "on.workflow_dispatch").is_some());
@@ -297,7 +297,7 @@ fn cron_cache_miss_dispatches_admin_once() {
     );
 
     // Exactly one dispatch: preheat-admin.yml with the same rustc and
-    // both lanes enabled.
+    // the projects lane enabled.
     let gh = scn.calls_of("gh");
     assert_eq!(gh.len(), 1, "{gh:?}");
     let args = gh_dispatch_args(&gh[0]);
@@ -310,7 +310,6 @@ fn cron_cache_miss_dispatches_admin_once() {
                 "rustc_version".to_owned(),
                 CHANNEL_FIXTURE_VERSION.to_owned()
             ),
-            ("top_binaries".to_owned(), "true".to_owned()),
             ("projects".to_owned(), "true".to_owned()),
         ])
     );
@@ -402,8 +401,8 @@ fn admin_runner(scn: &Scenario, ctx: Val, env: BTreeMap<String, String>) -> supp
     run_job(scn, &wf, "preheat", ctx, env)
 }
 
-/// The admin lane's `preheat`/`preheat top-binaries`/`projects submit`
-/// argv tails, grouped by subcommand.
+/// The admin lane's `preheat top-binaries`/`projects submit` argv
+/// tails, grouped by subcommand.
 fn admin_calls(scn: &Scenario, sub: &str) -> Vec<Vec<String>> {
     scn.calls_of("stow-admin")
         .into_iter()
@@ -451,7 +450,6 @@ fn admin_declarations() {
     let inputs = dispatch_inputs(&wf);
     assert_eq!(inputs.get("limit"), Some(&Some(Val::Str("100".to_owned()))));
     assert_eq!(inputs.get("rustc_version"), Some(&None));
-    assert_eq!(inputs.get("top_binaries"), Some(&Some(Val::Bool(true))));
     assert_eq!(inputs.get("projects"), Some(&Some(Val::Bool(true))));
     let targets_default = match inputs.get("targets") {
         Some(Some(Val::Str(s))) => s.clone(),
@@ -493,28 +491,25 @@ fn admin_declarations() {
 }
 
 #[test]
-fn admin_all_nine_targets_both_lanes() {
+fn admin_all_nine_targets_every_lane() {
     let scn = Scenario::new();
     let runner = admin_runner(&scn, admin_ctx("1.98.1", &[]), base_env(&[]));
     assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
 
     let want = expected_targets();
-    for sub in ["top", "top-binaries"] {
-        let calls = admin_calls(&scn, sub);
-        assert_eq!(calls.len(), 1, "{sub}: {calls:?}");
-        let argv = &calls[0];
-        assert_eq!(
-            flag_value(argv, "--targets").as_deref(),
-            Some(want.as_str()),
-            "{sub}"
-        );
-        assert_eq!(
-            flag_value(argv, "--rustc-version").as_deref(),
-            Some("1.98.1")
-        );
-        assert_eq!(flag_value(argv, "--limit").as_deref(), Some("100"));
-        assert!(argv.iter().any(|a| a == "--yes"));
-    }
+    let calls = admin_calls(&scn, "top-binaries");
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    let argv = &calls[0];
+    assert_eq!(
+        flag_value(argv, "--targets").as_deref(),
+        Some(want.as_str())
+    );
+    assert_eq!(
+        flag_value(argv, "--rustc-version").as_deref(),
+        Some("1.98.1")
+    );
+    assert_eq!(flag_value(argv, "--limit").as_deref(), Some("100"));
+    assert!(argv.iter().any(|a| a == "--yes"));
     let submits = admin_calls(&scn, "projects");
     assert_eq!(submits.len(), 1, "{submits:?}");
     assert_eq!(submits[0][0], "submit");
@@ -544,7 +539,7 @@ fn admin_explicit_target_override() {
     );
     let runner = admin_runner(&scn, ctx, base_env(&[]));
     assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
-    for argv in admin_calls(&scn, "top") {
+    for argv in admin_calls(&scn, "top-binaries") {
         assert_eq!(
             flag_value(&argv, "--targets").as_deref(),
             Some("x86_64-unknown-linux-gnu,aarch64-apple-darwin")
@@ -553,42 +548,25 @@ fn admin_explicit_target_override() {
 }
 
 #[test]
-fn admin_library_lane_failure_still_runs_binary_lane() {
+fn admin_binary_lane_failure_still_runs_projects() {
     let scn = Scenario::new();
-    // `preheat top ` (trailing space) fails the library lane only —
-    // `preheat top-binaries` must still execute, and the step exits
-    // nonzero because a lane failed.
-    let env = base_env(&[("STUB_FAIL_RE", "preheat top ")]);
+    // A top-binaries failure fails its step, but is not a reason to
+    // drop the projects lane — only a real cancellation is
+    // (`!cancelled() && inputs.projects`).
+    let env = base_env(&[("STUB_FAIL_RE", "preheat top-binaries")]);
     let runner = admin_runner(&scn, admin_ctx("1.98.1", &[]), env);
 
-    let outcome = runner.outcome_of("Enqueue the top crates and the top binaries");
+    let outcome = runner.outcome_of("Enqueue the top binary crates");
     assert!(
         matches!(outcome, Outcome::Ran(code) if *code != 0),
         "{outcome:?}"
     );
     assert_eq!(runner.status(), Status::Failed);
-    assert_eq!(admin_calls(&scn, "top").len(), 1);
     assert_eq!(admin_calls(&scn, "top-binaries").len(), 1);
-    // A top-lane failure is not a reason to drop the projects lane —
-    // only a real cancellation is (`!cancelled() && inputs.projects`).
     assert_eq!(
         runner.outcome_of("Enqueue the projects lane"),
         &Outcome::Ran(0)
     );
-    assert_eq!(admin_calls(&scn, "projects").len(), 1);
-}
-
-#[test]
-fn admin_top_binaries_off_skips_only_that_lane() {
-    let scn = Scenario::new();
-    let runner = admin_runner(
-        &scn,
-        admin_ctx("1.98.1", &[("top_binaries", Val::Bool(false))]),
-        base_env(&[]),
-    );
-    assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
-    assert_eq!(admin_calls(&scn, "top").len(), 1);
-    assert_eq!(admin_calls(&scn, "top-binaries"), Vec::<Vec<String>>::new());
     assert_eq!(admin_calls(&scn, "projects").len(), 1);
 }
 
@@ -901,13 +879,13 @@ fn index_publish_cron() -> serde_yml::Value {
 #[test]
 fn index_publish_declarations() {
     let wf = index_publish_cron();
-    // Fires on a completed build-batch run, on the backstop schedule,
+    // Fires on a completed build-crate run, on the backstop schedule,
     // and manually.
     assert_eq!(
         at(&wf, "on.workflow_run.workflows")
             .and_then(|s| s.as_sequence())
             .map(|s| s.iter().map(scalar).collect::<Vec<_>>()),
-        Some(vec!["build-batch".to_owned()])
+        Some(vec!["build-crate".to_owned()])
     );
     assert_eq!(
         at(&wf, "on.workflow_run.types")
@@ -995,7 +973,7 @@ fn index_publish_completion_forwards_title_rustc() {
     assert_eq!(
         fields.get("rustc_version").map(String::as_str),
         Some("1.98.1"),
-        "the `<rustc>-b<batch_id>` run title's rustc prefix"
+        "the `<rustc>-<task_id>` run title's rustc prefix"
     );
     assert_eq!(fields.len(), 2, "{fields:?}");
     // Nothing probed the URL — `gh` was the only outbound tool.
@@ -1031,7 +1009,7 @@ fn index_publish_schedule_and_manual_carry_no_rustc() {
 
 #[test]
 fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
-    // `${RUN_TITLE%%-*}` trims at the FIRST dash — the `<rustc>-b<batch_id>`
+    // `${RUN_TITLE%%-*}` trims at the FIRST dash — the `<rustc>-<task_id>`
     // title's hex suffix never dashes, but any suffix at all must not
     // bleed into the forwarded rustc.
     let scn = Scenario::new();
@@ -1049,69 +1027,35 @@ fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
 }
 
 // ---------------------------------------------------------------------------
-// build-batch.yml / build-crate.yml (stow#833)
+// build-crate.yml — the dispatched per-task build
 // ---------------------------------------------------------------------------
 
-/// `build-batch.yml` is the one dispatched caller: a `fail-fast: false`
-/// matrix whose legs each call the signer workflow — the caller holds
-/// no token of its own, and the jobs-page names `leg <i>` carries are
-/// the leg binding `stow_types::runs::LegJobName` parses.
+/// The scheduler's deliveries-stopped bound (stow#860) is the sum of
+/// `build-crate.yml`'s job timeouts; a timeout change must move it.
 #[test]
-fn build_batch_declarations() {
-    let wf = load_workflow("build-batch.yml");
-    assert_eq!(
-        at(&wf, "on.workflow_dispatch.inputs.batch.required")
-            .map(scalar)
-            .as_deref(),
-        Some("true")
-    );
-    // The caller declares no permissions: the workflow's token is an
-    // empty set and every grant lives on the leg call.
-    assert_eq!(
-        at(&wf, "permissions")
-            .and_then(serde_yml::Value::as_mapping)
-            .map(serde_yml::Mapping::is_empty),
-        Some(true),
-        "build-batch.yml must declare `permissions: {{}}`"
-    );
-    assert_eq!(
-        at(&wf, "jobs.leg.name").map(scalar).as_deref(),
-        Some("leg ${{ matrix.task.i }}")
-    );
-    // One failed leg must not cancel the others.
-    assert_eq!(
-        at(&wf, "jobs.leg.strategy.fail-fast"),
-        Some(&serde_yml::Value::Bool(false))
-    );
-    // The caller job's grants are the union the called jobs narrow.
-    assert_eq!(
-        at(&wf, "jobs.leg.permissions.contents")
-            .map(scalar)
-            .as_deref(),
-        Some("read")
-    );
-    assert_eq!(
-        at(&wf, "jobs.leg.permissions.packages")
-            .map(scalar)
-            .as_deref(),
-        Some("write")
-    );
-    assert_eq!(
-        at(&wf, "jobs.leg.permissions.id-token")
-            .map(scalar)
-            .as_deref(),
-        Some("write")
-    );
-    assert_eq!(
-        at(&wf, "jobs.leg.uses").map(scalar).as_deref(),
-        Some("./.github/workflows/build-crate.yml")
-    );
+fn build_crate_run_timeout_matches_the_jobs() {
+    let wf = load_workflow("build-crate.yml");
+    let jobs = field(&wf, "jobs")
+        .and_then(serde_yml::Value::as_mapping)
+        .expect("jobs mapping");
+    let minutes: i64 = jobs
+        .values()
+        .map(|job| {
+            field(job, "timeout-minutes")
+                .map(scalar)
+                .expect("every build-crate.yml job sets timeout-minutes")
+                .parse::<i64>()
+                .expect("timeout-minutes is an integer")
+        })
+        .sum();
+    assert_eq!(minutes, stow_types::api::BUILD_CRATE_RUN_TIMEOUT_MINUTES);
 }
 
-/// `build-crate.yml` is `workflow_call`-only — nothing can dispatch a
-/// lone crate build — and keeps its two trust levels, the per-leg job
-/// names the jobs-page parser binds on, and per-leg artifact names
-/// (artifact names are scoped to the run, so every leg needs its own).
+/// `build-crate.yml` is the dispatched per-task build: one
+/// `workflow_dispatch` input `task` carries the whole `BuildTaskPayload`,
+/// the run's `run-name` stamps `<rustc>-<task_id>` for the completion
+/// webhook's `display_title`, and a per-task concurrency group keeps the
+/// same task's re-dispatch from racing an earlier one (no cancel).
 #[test]
 fn build_crate_declarations() {
     let wf = load_workflow("build-crate.yml");
@@ -1123,23 +1067,43 @@ fn build_crate_declarations() {
         .collect();
     assert_eq!(
         triggers,
-        ["workflow_call"],
-        "build-crate.yml is callable only: {triggers:?}"
+        ["workflow_dispatch"],
+        "build-crate.yml is dispatched only: {triggers:?}"
     );
-
+    assert_eq!(
+        at(&wf, "on.workflow_dispatch.inputs.task.required")
+            .map(scalar)
+            .as_deref(),
+        Some("true")
+    );
+    // Per-task run-name binds the `workflow_run` completion: the
+    // scheduler's webhook parses `<rustc>-<task_id>` off `display_title`.
+    assert_eq!(
+        at(&wf, "run-name").map(scalar).as_deref(),
+        Some("${{ fromJSON(inputs.task).rustc_version }}-${{ fromJSON(inputs.task).task_id }}")
+    );
+    // Per-task concurrency, never cancelling an earlier run.
+    assert_eq!(
+        at(&wf, "concurrency.group").map(scalar).as_deref(),
+        Some("build-crate-${{ fromJSON(inputs.task).task_id }}")
+    );
+    assert_eq!(
+        at(&wf, "concurrency.cancel-in-progress")
+            .map(scalar)
+            .as_deref(),
+        Some("false")
+    );
+    // The untrusted build job and the trusted publish job.
     assert_eq!(
         at(&wf, "jobs.build.name").map(scalar).as_deref(),
         Some(
-            "build #${{ inputs.leg }} ${{ inputs.label }} (${{ inputs.target }}) ${{ inputs.task_hash }}"
+            "build ${{ fromJSON(inputs.task).crate_name }} ${{ fromJSON(inputs.task).version }} (${{ fromJSON(inputs.task).target }})"
         )
     );
     assert_eq!(
         at(&wf, "jobs.publish.name").map(scalar).as_deref(),
-        Some("publish #${{ inputs.leg }} ${{ inputs.task_hash }}")
+        Some("publish")
     );
-
-    // Two trust levels: the untrusted build reads, the trusted publish
-    // writes packages and mints the OIDC token cosign signs under.
     assert_eq!(
         at(&wf, "jobs.build.permissions.contents")
             .map(scalar)
@@ -1177,47 +1141,6 @@ fn build_crate_declarations() {
     assert_eq!(
         at(&wf, "jobs.publish.if").map(scalar).as_deref(),
         Some("needs.build.result == 'success'")
-    );
-
-    // Per-leg artifact names on both sides of the handoff.
-    let build_steps = job_steps(&wf, "build");
-    let uploads: Vec<&str> = build_steps
-        .iter()
-        .filter(|s| {
-            s.uses
-                .as_deref()
-                .is_some_and(|u| u.starts_with("actions/upload-artifact"))
-        })
-        .filter_map(|s| s.with.get("name").map(String::as_str))
-        .collect();
-    assert_eq!(
-        uploads,
-        [
-            "build-output-${{ inputs.leg }}",
-            "build-network-audit-${{ inputs.leg }}"
-        ]
-    );
-    let publish_steps = job_steps(&wf, "publish");
-    let download = publish_steps
-        .iter()
-        .find(|s| {
-            s.uses
-                .as_deref()
-                .is_some_and(|u| u.starts_with("actions/download-artifact"))
-        })
-        .expect("download-artifact step");
-    assert_eq!(
-        download.with.get("name").map(String::as_str),
-        Some("build-output-${{ inputs.leg }}")
-    );
-
-    // The task reaches stow-build from the dispatch event file, never
-    // an env var: `STOW_BUILD_TASK_JSON` must not appear anywhere.
-    let text = std::fs::read_to_string(support::workflows_dir().join("build-crate.yml"))
-        .expect("read build-crate.yml");
-    assert!(
-        !text.contains("STOW_BUILD_TASK_JSON"),
-        "build-crate.yml still passes the task through STOW_BUILD_TASK_JSON"
     );
 }
 

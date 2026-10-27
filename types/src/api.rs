@@ -61,7 +61,7 @@ pub fn is_ci_target(target: &str) -> bool {
 /// for the rest. The scheduler caps dispatches per family because the
 /// pools are sized very differently — the org's macOS pool is the
 /// smallest — and starts the slow Windows legs of a wave first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RunnerFamily {
     /// `ubuntu-latest` — also hosts the Android and wasm builds.
     Linux,
@@ -449,10 +449,8 @@ impl BuildTaskPayload {
         Ok(encoded)
     }
 
-    /// The error every dispatch producer raises when this task's
-    /// encoding cannot ride a `workflow_dispatch` input — shared by
-    /// [`Self::encode_dispatch_task`] and [`BatchEncoder::push`] so a
-    /// task refused on size is named identically on either path.
+    /// The error raised when this task's encoding cannot ride a
+    /// `workflow_dispatch` input.
     fn oversize_dispatch_error(&self, encoded_len: usize) -> crate::error::Error {
         stow_error!(
             "build task {} {} on {} encodes to {} characters across {} dependency nodes — over the {}-character workflow_dispatch input cap",
@@ -466,26 +464,6 @@ impl BuildTaskPayload {
     }
 }
 
-// ----- Batched build dispatch (stow#833) -----
-
-/// `k` — the default `max-parallel` runner slots one `build-batch.yml`
-/// matrix holds (stow#833 §1.3).
-///
-/// The sum over in-flight batches is what the runner-family caps
-/// bound; at the defaults nine batches can be in flight — three macOS
-/// (15 of 16 slots) and six Linux/Windows. The scheduler's
-/// `STOW_BATCH_PARALLELISM` binding and `preheat manual
-/// --batch-parallelism` default to it, so the value exists once.
-pub const DEFAULT_BATCH_PARALLELISM: u32 = 5;
-
-/// `B` — the leg bound at which a batch closes (stow#833 §1.3).
-///
-/// Eight `k`-slot rounds at the default, far under GitHub's 256-job
-/// matrix limit, and its tasks pack under [`DISPATCH_INPUT_LIMIT`].
-/// The scheduler's `STOW_BATCH_MAX_TASKS` binding and `preheat manual
-/// --batch-max-tasks` default to it.
-pub const DEFAULT_BATCH_MAX_TASKS: u32 = 40;
-
 /// `value` is exactly `len` lowercase ASCII hex digits.
 fn is_lower_hex(value: &str, len: usize) -> bool {
     value.len() == len
@@ -494,7 +472,7 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// A validated hex id on the batch wire: construction runs only through
+/// A validated hex id on the wire: construction runs only through
 /// [`FromStr`](std::str::FromStr)/`TryFrom<String>`, and serde
 /// deserializes through the same check so a malformed wire value fails
 /// at the boundary.
@@ -560,23 +538,9 @@ macro_rules! hex_newtype {
 }
 
 hex_newtype!(
-    /// The 32-lowercase-hex id the scheduler mints for a batch at
-    /// claim (`lower(hex(randomblob(16)))`, like `generation_id`)
-    /// (stow#833).
-    ///
-    /// The id names the run (`<rustc>-b<batch_id>`) and the
-    /// `POST /batches/{batch_id}/complete` route.
-    BatchId,
-    32,
-    "batch id"
-);
-
-hex_newtype!(
-    /// The first 16 hex of blake3(`task_id`) — a leg's job-name
-    /// binding (stow#833).
-    ///
-    /// The same digest the records tag carries, so a run's jobs map
-    /// back to legs by hash, not by position alone.
+    /// The first 16 hex of blake3(`task_id`) — the task-id digest the
+    /// `records-<rustc>-<task hash>-<run id>-<attempt>` artifact tag
+    /// carries.
     TaskHash,
     16,
     "task hash"
@@ -584,470 +548,10 @@ hex_newtype!(
 
 impl TaskHash {
     /// The task hash `task_id` carries — `blake3(task_id)`'s first 16
-    /// hex, the value [`BatchTask::task_hash`] and the leg's job-name
-    /// suffix hold.
+    /// hex.
     #[must_use]
     pub fn of(task_id: &str) -> Self {
         Self(blake3::hash(task_id.as_bytes()).to_hex()[..16].to_owned())
-    }
-}
-
-/// One leg of a [`BuildBatchPayload`] — the [`BuildTaskPayload`] fields
-/// minus the batch-level `rustc_version`, with the subgraph folded into
-/// the batch's shared node table.
-///
-/// `i`, `h` and `r` keep their short wire names: the payload rides one
-/// `workflow_dispatch` input and the [`DISPATCH_INPUT_LIMIT`] cap is
-/// shared. `i` is the leg's index in the batch's `tasks` list — the
-/// workflow's `--leg` selector and the `#N` in its job names — and `h`
-/// is the first 16 hex of blake3(`task_id`), the same digest the
-/// records tag carries, so a run's jobs map back to legs by hash, not
-/// by position alone.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct BatchTask {
-    /// The leg's index into [`BuildBatchPayload::tasks`].
-    #[serde(rename = "i")]
-    pub leg: u32,
-    /// First 16 hex of blake3(`task_id`) — the job-name binding (stow#833).
-    #[serde(rename = "h")]
-    pub task_hash: TaskHash,
-    /// Opaque scheduler task identifier — [`BuildTaskPayload::task_id`].
-    pub task_id: String,
-    /// Which queue attempt this dispatch carries —
-    /// [`BuildTaskPayload::attempt`].
-    #[serde(default)]
-    pub attempt: u32,
-    /// Crate name as known to crates.io.
-    pub crate_name: CrateName,
-    /// Exact crate version to build.
-    pub version: CrateVersion,
-    /// Canonicalized features list (sorted, deduplicated).
-    pub features_json: FeaturesJson,
-    /// Compilation target triple. Legs of one batch mix targets freely —
-    /// `runs-on` and the toolchain are per leg.
-    pub target: TargetTriple,
-    /// Whether the leg builds the crate as a host-side unit —
-    /// [`BuildTaskPayload::host_side`].
-    #[serde(default)]
-    pub host_side: bool,
-    /// Whether the node keys differently under the explicit
-    /// `--target <host>` spelling — [`BuildTaskPayload::explicit_spelling`].
-    pub explicit_spelling: crate::public_cache::ExplicitSpelling,
-    /// Whether the runner keeps the bundled `Cargo.lock` —
-    /// [`BuildTaskPayload::preserve_lockfile`].
-    #[serde(default)]
-    pub preserve_lockfile: bool,
-    /// Indexes into [`BuildBatchPayload::nodes`] naming this task's
-    /// direct dependencies — [`TaskSubgraph::root_deps`] against the
-    /// shared table.
-    #[serde(rename = "r", default, skip_serializing_if = "Vec::is_empty")]
-    pub root_deps: Vec<u32>,
-}
-
-/// The `batch` `workflow_dispatch` input `build-batch.yml` reads
-/// (stow#833).
-///
-/// One run of up-to-`DISPATCH_INPUT_LIMIT` tasks that share
-/// `rustc_version`, runner family and lane, fanned out as a
-/// `fail-fast: false` matrix of `build-crate.yml` calls under
-/// `max-parallel: parallelism`.
-///
-/// The legs' dependency subgraphs share one node table: a wire node is
-/// only graph inputs — its target is derived from the task that reaches
-/// it (the [`TaskSubgraph`] doc) — so one table entry serves every leg
-/// that references it, whatever its target or side. Entries are
-/// deduplicated by full content, `d` included.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct BuildBatchPayload {
-    /// The [`BatchId`] the scheduler minted at claim — it names the run
-    /// (`<rustc>-b<batch_id>`) and the `POST /batches/{batch_id}/complete`
-    /// route.
-    pub batch_id: BatchId,
-    /// The one rustc every leg builds under — a batch never mixes rustc
-    /// versions.
-    pub rustc_version: WireRustcVersion,
-    /// The matrix's `max-parallel` — the runner slots this run holds.
-    pub parallelism: u32,
-    /// The legs, in matrix order; a leg's `i` is its index here.
-    pub tasks: Vec<BatchTask>,
-    /// The shared node table every leg's `r` and `d` indexes into.
-    pub nodes: Vec<SubgraphNode>,
-}
-
-impl BuildBatchPayload {
-    /// Leg `index`'s task as the standalone [`BuildTaskPayload`] the
-    /// per-task path would have carried: the closure reachable from the
-    /// leg's `r` through the shared [`Self::nodes`] table, reindexed
-    /// onto the leg's own node list.
-    ///
-    /// The rebuilt node order is the shared table's, so a leg whose
-    /// pushed subgraph already listed its nodes in first-intern order
-    /// reproduces it exactly; any other order reindexes to the same
-    /// resolved graph — [`BuildTaskPayload::verified_dependency_graph`]
-    /// and the publish closure check are order-insensitive.
-    ///
-    /// # Errors
-    /// `index` past `tasks`, or a `r`/`d` wire index past `nodes`.
-    pub fn task(&self, index: usize) -> crate::error::Result<BuildTaskPayload> {
-        let leg = self.tasks.get(index).ok_or_else(|| {
-            stow_error!(
-                "batch {} holds {} legs — leg {index} is out of range",
-                self.batch_id,
-                self.tasks.len()
-            )
-        })?;
-        let node = |wire: u32, from: &str| -> crate::error::Result<usize> {
-            let shared = usize::try_from(wire).map_err(|error| stow_error!("{error}"))?;
-            if shared >= self.nodes.len() {
-                return Err(stow_error!(
-                    "batch {} leg {index} {from} index {shared} names no node of the {}-entry shared table",
-                    self.batch_id,
-                    self.nodes.len()
-                ));
-            }
-            Ok(shared)
-        };
-        // The leg's dependency closure, as shared-table indexes.
-        let mut reachable = BTreeSet::new();
-        let mut frontier = leg
-            .root_deps
-            .iter()
-            .map(|&dep| node(dep, "r"))
-            .collect::<crate::error::Result<Vec<usize>>>()?;
-        while let Some(next) = frontier.pop() {
-            if reachable.insert(next) {
-                frontier.extend(
-                    self.nodes[next]
-                        .deps
-                        .iter()
-                        .map(|&dep| node(dep, "d"))
-                        .collect::<crate::error::Result<Vec<usize>>>()?,
-                );
-            }
-        }
-        // Shared index → the leg's wire rank — one lookup per edge, as
-        // in `TaskSubgraph::from_resolved`.
-        let wire_ranks: BTreeMap<usize, u32> = reachable
-            .iter()
-            .enumerate()
-            .map(|(rank, &shared)| {
-                u32::try_from(rank)
-                    .map(|rank| (shared, rank))
-                    .map_err(|_| stow_error!("batch leg {index} node rank {rank} does not fit u32"))
-            })
-            .collect::<crate::error::Result<BTreeMap<usize, u32>>>()?;
-        let wire_index = |shared: usize| -> u32 { wire_ranks[&shared] };
-        let root_deps = leg
-            .root_deps
-            .iter()
-            .map(|&dep| node(dep, "r").map(wire_index))
-            .collect::<crate::error::Result<Vec<u32>>>()?;
-        let nodes = reachable
-            .iter()
-            .map(|&index| {
-                let shared = &self.nodes[index];
-                Ok(SubgraphNode {
-                    crate_name: shared.crate_name.clone(),
-                    version: shared.version.clone(),
-                    features_json: shared.features_json.clone(),
-                    host_side: shared.host_side,
-                    keys_apart: shared.keys_apart,
-                    deps: shared
-                        .deps
-                        .iter()
-                        .map(|&dep| node(dep, "d").map(wire_index))
-                        .collect::<crate::error::Result<Vec<u32>>>()?,
-                })
-            })
-            .collect::<crate::error::Result<Vec<SubgraphNode>>>()?;
-        Ok(BuildTaskPayload {
-            task_id: leg.task_id.clone(),
-            attempt: leg.attempt,
-            crate_name: leg.crate_name.clone(),
-            version: leg.version.clone(),
-            features_json: leg.features_json.clone(),
-            target: leg.target.clone(),
-            rustc_version: self.rustc_version.clone(),
-            preserve_lockfile: leg.preserve_lockfile,
-            host_side: leg.host_side,
-            explicit_spelling: leg.explicit_spelling,
-            dependency_subgraph: TaskSubgraph { root_deps, nodes },
-        })
-    }
-
-    /// Serialize the batch for dispatch.
-    ///
-    /// # Errors
-    /// Serialization failure, or an encoded batch over
-    /// [`DISPATCH_INPUT_LIMIT`] — unreachable through
-    /// [`BatchEncoder`], which never lets a push take the encoding past
-    /// the cap; only a hand-built payload can trip it.
-    pub fn encode_dispatch_batch(&self) -> crate::error::Result<String> {
-        let encoded = serde_json::to_string(self)
-            .map_err(|error| stow_error!("serialize build batch payload: {error}"))?;
-        if encoded.len() > DISPATCH_INPUT_LIMIT {
-            return Err(stow_error!(
-                "build batch {} encodes to {} characters across {} legs — over the {}-character workflow_dispatch input cap",
-                self.batch_id,
-                encoded.len(),
-                self.tasks.len(),
-                DISPATCH_INPUT_LIMIT,
-            ));
-        }
-        Ok(encoded)
-    }
-}
-
-/// Whether [`BatchEncoder::push`] accepted a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchFit {
-    /// The task joined the batch.
-    Fits,
-    /// Adding it would take the encoded batch past
-    /// [`DISPATCH_INPUT_LIMIT`] — close this batch and open another.
-    Full,
-}
-
-/// Packs `BuildTaskPayload`s into a [`BuildBatchPayload`] that stays
-/// under [`DISPATCH_INPUT_LIMIT`] — measured, never estimated.
-///
-/// The byte accounting is exact: the empty-payload framing is measured
-/// once at construction, and each push adds its leg's serialized length
-/// plus every *new* shared-table entry's, commas included — the same
-/// accounting [`DemandFeedPageBuilder`] runs. Node dedup is by full
-/// encoded content, so a `d` index list is part of the key.
-#[derive(Debug)]
-pub struct BatchEncoder {
-    payload: BuildBatchPayload,
-    /// Shared-table position by a node's own serialized bytes — the
-    /// dedup key doubles as the entry's measured length.
-    node_indexes: std::collections::HashMap<Vec<u8>, u32>,
-    /// Bytes the `tasks` array's contents occupy: elements and their
-    /// separating commas.
-    tasks_bytes: usize,
-    /// Same for the `nodes` array.
-    nodes_bytes: usize,
-    /// Serialized length of the payload with `tasks`/`nodes` empty —
-    /// the framing every element lands inside.
-    framing_bytes: usize,
-}
-
-/// A task-subgraph node's mark in [`BatchEncoder::intern`]'s DFS over
-/// one push — the three-color guard that catches a dep cycle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InternState {
-    /// The DFS has not reached the node this push.
-    Unseen,
-    /// On the DFS stack — reaching it again closes a cycle.
-    Open,
-    /// Interned — `positions` holds its shared-table slot.
-    Interned,
-}
-
-impl BatchEncoder {
-    /// An encoder for `batch_id` at `parallelism` matrix slots, under
-    /// `rustc_version`.
-    ///
-    /// # Errors
-    /// The empty-payload framing fails to serialize.
-    pub fn new(
-        batch_id: BatchId,
-        rustc_version: WireRustcVersion,
-        parallelism: u32,
-    ) -> crate::error::Result<Self> {
-        let payload = BuildBatchPayload {
-            batch_id,
-            rustc_version,
-            parallelism,
-            tasks: Vec::new(),
-            nodes: Vec::new(),
-        };
-        let framing_bytes = serde_json::to_vec(&payload)
-            .map_err(|error| stow_error!("encode build batch framing: {error}"))?
-            .len();
-        Ok(Self {
-            payload,
-            node_indexes: std::collections::HashMap::new(),
-            tasks_bytes: 0,
-            nodes_bytes: 0,
-            framing_bytes,
-        })
-    }
-
-    /// The length the staged payload encodes to — framing, legs and the
-    /// shared table together.
-    #[must_use]
-    pub const fn encoded_len(&self) -> usize {
-        self.framing_bytes + self.tasks_bytes + self.nodes_bytes
-    }
-
-    /// Number of legs staged so far.
-    #[must_use]
-    pub const fn legs(&self) -> usize {
-        self.payload.tasks.len()
-    }
-
-    /// Intern the task-subgraph node at local index `local` into the
-    /// shared table, returning its position there — recursion interns
-    /// every dependency first so the node's `d` is already in shared
-    /// indexes when its content is deduplicated.
-    ///
-    /// `states` is the three-color DFS guard ([`InternState`]);
-    /// `positions` records each local index's shared position once
-    /// interned; `added` collects the serialized keys of nodes this
-    /// push appended, for byte accounting and rollback.
-    ///
-    /// # Errors
-    /// A `root_deps`/`d` index past the task's node list, a dependency
-    /// cycle, a shared-table position past `u32`, or a node that fails
-    /// to serialize.
-    fn intern(
-        &mut self,
-        task: &BuildTaskPayload,
-        local: usize,
-        states: &mut [InternState],
-        positions: &mut [u32],
-        added: &mut Vec<Vec<u8>>,
-    ) -> crate::error::Result<u32> {
-        let nodes = &task.dependency_subgraph.nodes;
-        if local >= nodes.len() {
-            return Err(stow_error!(
-                "batch task {} {} ({}) subgraph index {local} names no node of its {}-entry list",
-                task.crate_name,
-                task.version,
-                task.target,
-                nodes.len()
-            ));
-        }
-        match states[local] {
-            InternState::Interned => return Ok(positions[local]),
-            InternState::Open => {
-                return Err(stow_error!(
-                    "batch task {} {} ({}) subgraph closes a dependency cycle through node {local}",
-                    task.crate_name,
-                    task.version,
-                    task.target,
-                ));
-            }
-            InternState::Unseen => states[local] = InternState::Open,
-        }
-        let mut deps = Vec::with_capacity(nodes[local].deps.len());
-        for &dep in &nodes[local].deps {
-            let dep = usize::try_from(dep).map_err(|error| stow_error!("{error}"))?;
-            deps.push(self.intern(task, dep, states, positions, added)?);
-        }
-        let shared = SubgraphNode {
-            crate_name: nodes[local].crate_name.clone(),
-            version: nodes[local].version.clone(),
-            features_json: nodes[local].features_json.clone(),
-            host_side: nodes[local].host_side,
-            keys_apart: nodes[local].keys_apart,
-            deps,
-        };
-        let encoded = serde_json::to_vec(&shared)
-            .map_err(|error| stow_error!("encode build batch node: {error}"))?;
-        let position = if let Some(&position) = self.node_indexes.get(&encoded) {
-            position
-        } else {
-            let position = u32::try_from(self.payload.nodes.len())
-                .map_err(|_| stow_error!("build batch shared table overflows u32 positions"))?;
-            self.node_indexes.insert(encoded.clone(), position);
-            self.payload.nodes.push(shared);
-            added.push(encoded);
-            position
-        };
-        states[local] = InternState::Interned;
-        positions[local] = position;
-        Ok(position)
-    }
-
-    /// Add `task` as the next leg.
-    ///
-    /// The task's dependency closure is interned into the shared table
-    /// — entries already present merge by content — and the leg's `r`
-    /// records its root deps' shared positions. Returns
-    /// [`BatchFit::Full`] when the push would take the encoded batch
-    /// past [`DISPATCH_INPUT_LIMIT`]; the batch is then unchanged and
-    /// the task should open a fresh one.
-    ///
-    /// # Errors
-    /// A task that does not fit even an empty batch's framing — no
-    /// batch can carry it — refused with the same oversize error
-    /// [`BuildTaskPayload::encode_dispatch_task`] raises; or a
-    /// malformed subgraph (`r`/`d` out of range, a cycle).
-    pub fn push(&mut self, task: &BuildTaskPayload) -> crate::error::Result<BatchFit> {
-        let subgraph = &task.dependency_subgraph;
-        let mut states = vec![InternState::Unseen; subgraph.nodes.len()];
-        let mut positions = vec![0_u32; subgraph.nodes.len()];
-        let mut added = Vec::new();
-        let mut root_deps = Vec::with_capacity(subgraph.root_deps.len());
-        for &dep in &subgraph.root_deps {
-            let dep = usize::try_from(dep).map_err(|error| stow_error!("{error}"))?;
-            root_deps.push(self.intern(task, dep, &mut states, &mut positions, &mut added)?);
-        }
-        let leg = BatchTask {
-            leg: u32::try_from(self.payload.tasks.len()).map_err(|_| {
-                stow_error!(
-                    "build batch {} leg index overflows u32",
-                    self.payload.batch_id
-                )
-            })?,
-            task_hash: TaskHash::of(&task.task_id),
-            task_id: task.task_id.clone(),
-            attempt: task.attempt,
-            crate_name: task.crate_name.clone(),
-            version: task.version.clone(),
-            features_json: task.features_json.clone(),
-            target: task.target.clone(),
-            host_side: task.host_side,
-            explicit_spelling: task.explicit_spelling,
-            preserve_lockfile: task.preserve_lockfile,
-            root_deps,
-        };
-        let task_bytes = serde_json::to_vec(&leg)
-            .map_err(|error| stow_error!("encode build batch leg: {error}"))?
-            .len()
-            + usize::from(!self.payload.tasks.is_empty());
-        // Every appended node pays its separating comma — except the
-        // first entry into an empty table.
-        let nodes_delta = added.iter().map(Vec::len).sum::<usize>() + added.len()
-            - usize::from(added.len() == self.payload.nodes.len() && !added.is_empty());
-        let candidate = self.encoded_len() + task_bytes + nodes_delta;
-        if candidate > DISPATCH_INPUT_LIMIT {
-            // Roll back the staged nodes — the task leaves no trace.
-            let staged = self.payload.nodes.len() - added.len();
-            for key in added {
-                self.node_indexes.remove(&key);
-            }
-            self.payload.nodes.truncate(staged);
-            if self.payload.tasks.is_empty() {
-                // Even an empty batch's framing cannot carry the task
-                // — no batch can — refuse it with the per-task
-                // dispatch path's own oversize error.
-                return Err(task.oversize_dispatch_error(candidate));
-            }
-            return Ok(BatchFit::Full);
-        }
-        self.tasks_bytes += task_bytes;
-        self.nodes_bytes += nodes_delta;
-        self.payload.tasks.push(leg);
-        Ok(BatchFit::Fits)
-    }
-
-    /// Close the batch into its `workflow_dispatch` `batch` input.
-    ///
-    /// # Errors
-    /// The encoder holds no legs, or the payload fails to serialize.
-    pub fn finish(self) -> crate::error::Result<String> {
-        if self.payload.tasks.is_empty() {
-            return Err(stow_error!(
-                "build batch {} holds no legs — nothing to dispatch",
-                self.payload.batch_id
-            ));
-        }
-        let encoded = self.payload.encode_dispatch_batch()?;
-        debug_assert_eq!(encoded.len(), self.encoded_len());
-        Ok(encoded)
     }
 }
 
@@ -1057,8 +561,8 @@ impl BatchEncoder {
 /// into the signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
 /// GHCR artifact once the build, re-hash, validation, sign, and push have
 /// all succeeded. Nothing
-/// POSTs it anywhere — `index sync` mirrors the verified records into the
-/// edge's D1 `artifacts` table.
+/// POSTs it anywhere else — `index export` folds the verified records
+/// into the signed index slices in GHCR every reader resolves against.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactRecord {
     /// Stable hash of the trusted build's exact rustc invocation identity.
@@ -1085,9 +589,11 @@ pub struct ArtifactRecord {
     /// JSON-encoded dependency `c_metadata` identities captured from rustc
     /// --extern inputs; sorted by `(crate_name, c_metadata)`.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
-    /// The Merkle dependency digest of the dependency subgraph the
-    /// artifact was built under (stow#588) — the node's context key.
-    pub dependency_identity: DependencyIdentity,
+    /// The node's direct child task ids — the sorted, deduplicated
+    /// preimage [`Self::dependency_identity`] hashes (stow#919). They
+    /// are the node's task-graph edges: build-dependency libs and shadow
+    /// twins included, which the `--extern` list never names.
+    pub dependency_task_ids: Vec<String>,
     /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache-<rustc>:serde.1.0.0-...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
@@ -1123,6 +629,19 @@ pub struct ArtifactRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub min_glibc: Option<GlibcVersion>,
+}
+
+impl ArtifactRecord {
+    /// The Merkle dependency digest of the dependency subgraph the
+    /// artifact was built under (stow#588) — the node's context key,
+    /// derived from the carried child task ids so a record can never
+    /// hold a digest disagreeing with its edges (stow#919).
+    ///
+    /// # Errors
+    /// Mirrors [`DependencyIdentity::from_task_ids`].
+    pub fn dependency_identity(&self) -> crate::error::Result<DependencyIdentity> {
+        DependencyIdentity::from_task_ids(self.dependency_task_ids.iter().map(String::as_str))
+    }
 }
 
 /// Request body for scheduler task submission.
@@ -1336,11 +855,11 @@ pub struct EnqueueAdmission {
     /// `/enqueue` to accept the ticket. `0` means the queue is shallow
     /// enough that admission is free.
     pub difficulty: u32,
-    /// The canonical enqueue request this admission authorizes. The edge is
-    /// stateless: the client echoes `request` back in its ticket and
-    /// `/api/v1/enqueue` forwards it to the scheduler after verifying the
-    /// challenge binds it.
-    pub request: EnqueueRequest,
+    /// The submission tree this admission authorizes (stow#878). The
+    /// edge is stateless: the client echoes `tree` back in its ticket
+    /// and `/api/v1/enqueue` forwards it to the scheduler after
+    /// verifying the challenge binds it.
+    pub tree: SubmissionTree,
 }
 
 /// Request body for `POST /api/v1/enqueue`: the redemption of an
@@ -1355,10 +874,56 @@ pub struct EnqueueTicket {
     /// `blake3(task_id ‖ challenge ‖ nonce)` has at least the required
     /// number of leading zero bits.
     pub nonce: u64,
-    /// The canonical enqueue request from the admission. The edge
-    /// recomputes the challenge HMAC over this payload and forwards it to
-    /// the scheduler — no server-side request lookup.
-    pub request: EnqueueRequest,
+    /// The submission tree from the admission (stow#878). The edge
+    /// recomputes the challenge HMAC over this payload and forwards it
+    /// to the scheduler — no server-side tree lookup.
+    pub tree: SubmissionTree,
+}
+
+/// Request body for `POST /api/v1/build-report`: the install's usage
+/// deltas accumulated since its last report (stow#889).
+///
+/// The CLI posts at most one report per UTC day per install; every
+/// counter is a delta, not a total. The body carries no crate names,
+/// digests, dependency graph or lockfile — identity dimensions arrive
+/// on headers (`User-Agent`, `x-stow-ci`) and the edge's cf metadata.
+/// Under `STOW_NO_ANALYTICS=1` the CLI posts no report at all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct BuildReport {
+    /// Builds the install ran since the last report — supervised runs
+    /// plus drained plain-cargo builds.
+    pub builds: u64,
+    /// Artifacts served from the cache (local or downloaded).
+    pub hits: u64,
+    /// Artifacts compiled locally.
+    pub misses: u64,
+    /// Recorded compile time of every served artifact — the rustc CPU
+    /// time this install skipped.
+    pub cpu_millis_saved: u64,
+}
+
+/// The submission kinds a CLI may claim through `/api/v1/admissions`
+/// (stow#882): a two-variant wire type *is* the validation — a CLI can
+/// never claim an operations, human or preheat source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CliAdmissionSource {
+    /// A cache miss — the node's chain is uncovered.
+    CacheMiss,
+    /// An inexact superset-hit report — the exact chain the cache
+    /// should build next at very low priority.
+    InexactHit,
+}
+
+impl CliAdmissionSource {
+    /// The scheduler source the admission's tree carries.
+    #[must_use]
+    pub const fn submission_source(self) -> SubmissionSource {
+        match self {
+            Self::CacheMiss => SubmissionSource::CacheMiss,
+            Self::InexactHit => SubmissionSource::InexactHit,
+        }
+    }
 }
 
 /// Request body for `POST /api/v1/admissions`: the misses a client's
@@ -1375,6 +940,9 @@ pub struct AdmissionRequest {
     pub target: TargetTriple,
     /// Stable rustc version.
     pub rustc_version: WireRustcVersion,
+    /// What the report is — a miss or an inexact superset-hit report
+    /// (stow#882), the only kinds a CLI may claim.
+    pub source: CliAdmissionSource,
     /// Direct-dep entries the local resolver found uncovered.
     pub entries: Vec<DependencyGraphEntry>,
     /// The client's resolved transitive graph.
@@ -1418,24 +986,40 @@ pub(crate) fn task_id_prefix(
 }
 
 /// Completion the edge's `POST /api/v1/github/workflow-run` handler
-/// forwards to the scheduler Durable Object's
-/// `POST /batches/{batch_id}/complete` for a finished `build-batch.yml`
-/// run (stow#833).
-///
-/// The webhook only records the delivery; resolution — mapping the
-/// run's jobs onto legs — runs in the object's alarm pass, which is why
-/// the report carries the run identity verbatim rather than a per-leg
-/// outcome.
+/// forwards to the scheduler Durable Object's `POST /tasks/complete-run`
+/// for a finished `build-crate.yml` run.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BatchRunComplete {
-    /// The Actions workflow run id.
-    pub run_id: u64,
-    /// The run's attempt number — `1` on the first run.
-    pub run_attempt: u32,
-    /// The run's `conclusion` (`success`, `failure`, `cancelled`, …).
-    pub conclusion: String,
-    /// The run's Actions URL — the record's pointer back to the run.
-    pub html_url: String,
+pub struct WorkflowRunComplete {
+    /// The task id the run's `<rustc>-<task_id>` title named.
+    pub task_id: String,
+    /// The run's `conclusion` mapped onto success: only a run that
+    /// finished green *and* whose run's records artifact exists in GHCR
+    /// counts as a completed build.
+    pub success: bool,
+    /// Failure description when `success` is false — the conclusion and,
+    /// on a missing records artifact, which tag the edge looked for.
+    pub error: Option<String>,
+    /// The run's `conclusion` was `cancelled` — a superseded duplicate of
+    /// the task's concurrency group (stow#877): not a build verdict, so the
+    /// scheduler re-queues the task instead of recording a failure.
+    #[serde(default)]
+    pub cancelled: bool,
+    /// The GitHub Actions run id, stamped onto the queue row so
+    /// `stow-admin status` surfaces the run URL. Required — the
+    /// `workflow_run` delivery always carries the run's `id`, so a
+    /// report without one is not the webhook's shape.
+    pub github_run_id: String,
+}
+
+/// The `workflow_run` `in_progress` delivery for a `build-crate.yml`
+/// run → the DO's `POST /tasks/run-update`, which moves the bound
+/// row `dispatched` → `running` (stow#876).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TaskRunUpdate {
+    /// The task id the run's `<rustc>-<task_id>` title named.
+    pub task_id: String,
+    /// The Actions run id the row's generation is bound to.
+    pub github_run_id: String,
 }
 
 /// A normalized dependency entry from a resolved Cargo dependency graph.
@@ -1528,6 +1112,24 @@ pub struct DispatchFreeze {
 /// (#450) and the edge agree.
 pub const DISPATCH_FREEZE_INCIDENT_KEY: &str = "dispatch-freeze";
 
+/// The longest a started `build-crate.yml` run lasts.
+///
+/// Its `build` job's `timeout-minutes` plus its `publish` job's, both
+/// enforced by GitHub, so the run's `completed` delivery lands within
+/// it. The scheduler's
+/// health check (stow#860) calls deliveries stopped past it; the admin
+/// workflow tests pin it to the workflow file.
+pub const BUILD_CRATE_RUN_TIMEOUT_MINUTES: i64 = 120 + 60;
+
+/// How often, at most, the scheduler reconciles its run set against the
+/// CI listing.
+///
+/// It reconciles only while the graph holds work: at most 2 listing
+/// calls each, at most 12 calls an hour (stow#877). The completion's inline pass skips it and leaves it to the alarm, so
+/// it is also the floor on the alarm's timer wakes under steady build
+/// traffic, which the traffic projection prices from it (stow#940).
+pub const STATUS_RECONCILE_MS: i64 = 10 * 60 * 1000;
+
 /// One line of the dispatch-freeze transition log.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 pub struct DispatchFreezeTransition {
@@ -1581,6 +1183,20 @@ pub enum DispatchFreezeTrigger {
     Tripped(DispatchFreezeTrip),
     /// The scheduler object's own SQL meter crossed a daily budget.
     Cost(DispatchFreezeCost),
+}
+
+impl DispatchFreezeTrigger {
+    /// The one-word trigger summary — the serde `kind` tag the stored
+    /// record serializes under, which `GET /api/v1/scheduler/health`'s
+    /// `freeze_trigger` echoes (stow#860).
+    #[must_use]
+    pub const fn kind(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Tripped(_) => "tripped",
+            Self::Cost(_) => "cost",
+        }
+    }
 }
 
 /// The observed window that tripped a dispatch freeze — the numbers the
@@ -1660,10 +1276,10 @@ pub enum CostMetric {
     WorkerRequests,
     /// Worker CPU milliseconds consumed by `stow-edge`.
     WorkerCpuMs,
-    /// D1 `stow-prod` rows read.
-    D1RowsRead,
-    /// D1 `stow-prod` rows written.
-    D1RowsWritten,
+    /// Scheduler Durable Object SQL rows read.
+    SqlRowsRead,
+    /// Scheduler Durable Object SQL rows written.
+    SqlRowsWritten,
 }
 
 /// One route family's share of the day's Worker requests — the "top
@@ -1686,9 +1302,9 @@ pub struct DispatchFreezeCost {
     pub metric: CostMetric,
     /// Usage so far today (UTC) in the metric's unit.
     pub used: f64,
-    /// The daily budget the usage is compared against — the monthly
-    /// Workers Paid allowance divided by 30, times
-    /// `STOW_COST_BUDGET_MULTIPLIER`.
+    /// The daily budget the usage is compared against — 80% of the
+    /// monthly Workers Paid allowance divided by 30, times
+    /// `STOW_COST_BUDGET_MULTIPLIER` (stow#883).
     pub budget: f64,
     /// Every metric over budget (the trip names `metric`, this lists
     /// all of them).
@@ -1760,6 +1376,43 @@ pub enum ChannelOutcome {
         /// Why the channel is off (names the missing binding/var).
         reason: String,
     },
+}
+
+/// One component's health as `GET /api/v1/scheduler/health` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthState {
+    /// Serving within its contract.
+    Ok,
+    /// Outside its contract — the route answers 503 so a plain HTTP
+    /// uptime check sees it without parsing the body.
+    Unhealthy,
+}
+
+/// The uncached health answer of `GET /api/v1/scheduler/health`
+/// (stow#860) — one scheduler request reading state it already holds:
+/// no D1, no GHCR, no GitHub call.
+///
+/// The serving Worker is `ok` by construction (answering the request
+/// is the proof); the scheduler is `unhealthy` while the dispatch
+/// freeze is engaged or while a run is `running` with no
+/// `workflow_run` delivery accepted inside `build-crate.yml`'s
+/// job-timeout bound.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SchedulerHealth {
+    /// The serving Worker — always `ok`.
+    pub worker: HealthState,
+    /// The scheduler Durable Object's verdict on itself.
+    pub scheduler: HealthState,
+    /// Whether the dispatch freeze is engaged.
+    pub dispatch_frozen: bool,
+    /// One-word summary of the freeze's trigger as the freeze already
+    /// records it (`manual` / `tripped` / `cost`) — `null` while not
+    /// frozen.
+    pub freeze_trigger: Option<String>,
+    /// Seconds since the scheduler last accepted a `workflow_run`
+    /// delivery — `null` before the first one.
+    pub last_run_update_age_seconds: Option<u64>,
 }
 
 /// Scheduler DO queue status for monitoring.
@@ -2142,8 +1795,9 @@ pub enum RequestOutcome {
     /// target's closure — forwarded to the trusted enqueue verbatim —
     /// plus the per-target root facts in [`CI_TARGET_TRIPLES`] order.
     Resolved {
-        /// The uncovered human-lane tasks across every target's closure.
-        tasks: Vec<EnqueueRequest>,
+        /// The uncovered human-lane dependency trees across every
+        /// target's closure (stow#878) — one tree per source graph.
+        trees: Vec<SubmissionTree>,
         /// Per-target root facts in [`CI_TARGET_TRIPLES`] order.
         roots: Vec<RequestRootOutcome>,
     },
@@ -2224,25 +1878,11 @@ pub struct RequestStatus {
     pub blocked_by: Option<String>,
 }
 
-/// Response body for `GET /api/v1/admin/index/{target}/{rustc_version}`.
-///
-/// One keyset page of the slice's servable artifact rows — the data
-/// `stow-admin index export` assembles into the published
-/// [`crate::index::ArtifactIndex`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct ArtifactIndexPage {
-    /// Rows ordered by `c_metadata`, every one strictly after the
-    /// request's `after` cursor and carrying a published bundle.
-    pub rows: Vec<ArtifactIndexRow>,
-    /// The `after` cursor for the next page — the last row's `c_metadata`
-    /// when this page was full, `None` once the slice is exhausted.
-    pub next_after: Option<String>,
-}
-
 /// The index-publish path's report of what a slice serves.
 ///
-/// Request body for `POST /api/v1/admin/index/{target}/{rustc_version}`,
-/// sent after the slice goes live. The scheduler stores the set as the
+/// One slice of a [`PublishedRunReport`], the body of
+/// `POST /api/v1/admin/index/published`, sent after the run's slices go
+/// live. The scheduler stores the set as the
 /// membership the dependency gate checks a dependent's edges against —
 /// a dependent dispatches only when every dependency resolves to a row
 /// the latest report for that dependency's own `(target, rustc_version)`
@@ -2330,6 +1970,15 @@ pub struct PublishedSlice {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<PublishedSliceRow>,
 }
+/// A publish run's one report: every slice the run published, carried
+/// in a single `POST /api/v1/admin/index/published` so the scheduler
+/// applies them in one append and one inline pass (stow#940).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PublishedRunReport {
+    /// The run's slices — each a [`PublishedSlice`]: the
+    /// `(target, rustc_version)` pair, the delta or full membership.
+    pub slices: Vec<PublishedSlice>,
+}
 
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
 
@@ -2407,41 +2056,19 @@ pub struct SchedulerSeedRequest {
     /// Queue rows to seed; absent means the production-shaped 100k.
     #[serde(default)]
     pub queue_rows: Option<u32>,
-    /// Clear the seeded tables first — the probe re-runs against a
-    /// persistent local DO store without an operator cleanup in between.
-    /// Restarting clears chunk by chunk, so the first `reset` call only
-    /// begins the wipe; keep calling until `done`.
-    #[serde(default)]
-    pub reset: Option<bool>,
-    /// Rows one call may seed at most; absent means the server's
-    /// bounded default.
-    #[serde(default)]
-    pub batch: Option<u32>,
 }
 
-/// What the seed reports back. A request carries one chunk of work, so
-/// the caller loops until `done` — `seeded` says whether this call
-/// wrote fixture rows, and `(phase, n)` is its progress witness.
+/// What the seed reports back: the graph the call built, snapshotted
+/// and installed. One call seeds the whole fixture — the store wipe,
+/// the snapshot chunks and the log tail run inside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerSeedReport {
-    /// Rows `queue` holds now.
-    pub queue_rows: u64,
-    /// Rows `queue_dependencies` holds now.
-    pub dependency_rows: u64,
-    /// Rows `published_slice_rows` holds now.
-    pub slice_rows: u64,
-    /// Whether this call wrote fixture rows (false once the seed is
-    /// already `done` and no `reset` was passed).
-    pub seeded: bool,
-    /// Whether the fixture is fully seeded (or was already populated).
-    pub done: bool,
-    /// The seed cursor's phase after this call (`queue`, `edges_*`,
-    /// `nodes`, `slices`, `deps`, `feed_*`, `reset`, `done`) — with
-    /// `n`, the caller's progress witness: a call that returns the same
-    /// `(phase, n)` twice advanced nothing.
-    pub phase: String,
-    /// The phase's position after this call.
-    pub n: u64,
+    /// Nodes the graph holds now.
+    pub nodes: u64,
+    /// Dependency edges the graph holds now.
+    pub edges: u64,
+    /// Published identities the graph holds now.
+    pub published: u64,
 }
 
 /// One statement's real Durable Object cursor counters — the units
@@ -2489,19 +2116,19 @@ pub struct SchedulerBudgetRow {
     pub write_budget: u64,
     /// Budgeted wall milliseconds.
     pub wall_budget: u64,
-    /// Σ D1 `meta.rowsRead` over statements the drive issued through
+    /// Σ `meta.rowsRead` over statements the drive issued through
     /// the counted catalog backend — the coverage lookups a claim pays
-    /// per page, carried separately because D1 bills a different
+    /// per page, carried separately because the counted backend bills a different
     /// product than the object's own rows.
-    pub d1_rows_read: u64,
-    /// Σ D1 `meta.rowsWritten` over the same statements.
-    pub d1_rows_written: u64,
+    pub sql_rows_read: u64,
+    /// Σ `meta.rowsWritten` over the same statements.
+    pub sql_rows_written: u64,
     /// Σ of the awaited durations of the counted catalog backend's
     /// own calls. A sum of operation spans, not a share of drive
     /// wall: concurrent calls overlap in real time but add up here,
     /// so it can exceed the drive's measured window. `0` on host and
     /// on drives that never touch the catalog.
-    pub d1_elapsed_ms: u64,
+    pub sql_elapsed_ms: u64,
     /// `true` when any of the three row budgets is exceeded —
     /// statements, `rowsRead`, `rowsWritten`. Wall time is not in this
     /// set; see `over_wall`.
@@ -2556,14 +2183,14 @@ pub struct SchedulerBudgetReport {
 /// Body of `POST /api/v1/admin/scheduler/budget/rearm`.
 ///
 /// The traffic-cost callback lane's refill: re-arm the seeded fixture's
-/// in-flight batches its deliveries resolved, so every delivery it fires
+/// in-flight runs its deliveries resolved, so every delivery it fires
 /// is a first delivery. Only deploys that set `STOW_SCHEDULER_BUDGET`
 /// answer it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerRearmRequest {
-    /// Queue rows of the fixture the caller derives its batches from —
+    /// Queue rows of the fixture the caller derives its runs from —
     /// refused unless it is the size the store was last seeded at, so
-    /// the caller's batch ids and run ids are the store's.
+    /// the caller's run ids are the store's.
     pub queue_rows: u32,
 }
 
@@ -2571,7 +2198,7 @@ pub struct SchedulerRearmRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerRearmReport {
     /// Every armed in-flight index `k` after the re-arm, ascending —
-    /// each batch is `crate::fixture::FixtureShape::in_flight_batch(k)`,
+    /// each run is `crate::fixture::FixtureShape::in_flight_run(k)`,
     /// bound to its own run with no completion recorded. The whole set,
     /// not the call's increment: a caller replaces what it holds with it.
     pub armed: Vec<u32>,
@@ -2581,11 +2208,16 @@ pub struct SchedulerRearmReport {
 ///
 /// The scheduler Durable Object's billed `rowsRead`/`rowsWritten` booked
 /// per operation since the store was reset — the per-event view of the
-/// cost `do_meter` holds per day. The object books it only on deploys
+/// cost the one-row `meter` checkpoint holds per day. The object books it only on deploys
 /// carrying `STOW_SCHEDULER_BUDGET=1` (the mock stack); the `Preheat
 /// cost` lane (stow#773) snapshots it between layers and diffs.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerLedger {
+    /// When the object last loaded its graph, unix ms. The ledger lives
+    /// on that graph and persists only through its snapshot, so a
+    /// reload drops every booking since the snapshot: two reads that
+    /// answer different values are not comparable.
+    pub woken_at_ms: i64,
     /// One row per operation the object ran, in `op` order.
     pub ops: Vec<SchedulerLedgerOp>,
 }
@@ -2594,8 +2226,7 @@ pub struct SchedulerLedger {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerLedgerOp {
     /// The operation: `<METHOD> <route>` for a request (a request id
-    /// segment collapses to `{id}`, and a batch's completion to
-    /// [`crate::do_budgets::LEDGER_OP_BATCH_COMPLETE`]), or
+    /// segment collapses to `{id}`), or
     /// [`crate::do_budgets::LEDGER_OP_ALARM`] for an alarm pass.
     pub op: String,
     /// How many times the operation ran.
@@ -3217,10 +2848,6 @@ pub struct DemandFeedUnfinished {
 pub const DEMAND_FEED_PAGE_MAX_ENTRIES: usize = 256;
 /// Serialized `entries` byte ceiling per page.
 pub const DEMAND_FEED_PAGE_MAX_BYTES: usize = 512 * 1024;
-/// Page rows one `cleanup` call physically retires — payload
-/// retirement is bounded indexed event work, never a one-statement
-/// wipe of a huge hour (stow#523).
-pub const DEMAND_FEED_RETIRE_CHUNK: i64 = 256;
 /// `batch_id` prefix the feed derives per page —
 /// `demand-feed/{hour}/{page_no}` — so a page's delivery replays the
 /// same frozen payload under a stable identity.
@@ -3251,8 +2878,6 @@ pub struct QueueTask {
     pub error: String,
     /// crates.io download count captured at enqueue time.
     pub downloads: u64,
-    /// Cache misses this row is responsible for.
-    pub miss_count: u32,
     /// Dispatches attempted against this row.
     pub dispatch_attempts: u32,
     /// Whether the row builds against its checked-in lockfile.
@@ -3276,15 +2901,14 @@ pub struct QueueTask {
     /// (`EnqueueRequest::host_side`).
     #[serde(default)]
     pub host_side: bool,
-    /// The persisted raw value as an exact decimal string: precedence
-    /// bands over `MAX(0, priority) + MAX(0, demand)` — the undivided
-    /// operand `dispatch_key`'s exact-cost rank divides. The integer
-    /// column legitimately outgrows the JavaScript-safe range
-    /// (human-lane values sit above 2^53), so the Durable Object
-    /// projects `CAST(value AS TEXT)` and this field carries the text
-    /// unchanged — parsing or rounding it would corrupt adjacent
-    /// values (stow#525 I10).
+    /// The node's rank operand — its priority — as a decimal
+    /// string (stow#879): what `priority × time waited` multiplies.
+    /// Carried as text so a listing never loses precision however the
+    /// operand's units evolve.
     pub value: String,
+    /// The demand the hourly feed has folded into the node. It does
+    /// not enter the rank.
+    pub demand: i64,
 }
 
 /// One in-flight (dispatched/running) queue row in [`AdminStatus`].
@@ -3389,10 +3013,10 @@ pub struct SubmitTaskIdsRequest {
 pub struct SubmitTaskIdsResponse {
     /// Ids accepted for submission.
     pub submitted: u32,
-    /// Brand-new queue rows inserted; the rest of `submitted` updated or
-    /// merged into existing rows.
+    /// Ids the graph held and promoted in place (this lane creates no
+    /// node).
     pub inserted: u32,
-    /// Ids the node store does not hold — reported, never re-minted.
+    /// Ids the graph does not hold — reported, never re-minted.
     pub unknown: Vec<String>,
 }
 
@@ -3449,6 +3073,18 @@ pub struct PreheatPlanResponse {
     pub targets: Vec<PreheatPlanTarget>,
 }
 
+/// The verified newreleases.io delivery the edge forwards to the
+/// scheduler (stow#880).
+///
+/// The release's claimed rustc version. The scheduler dispatches
+/// `preheat-admin.yml` for it; the workflow's own manifest check is the
+/// authority, so the payload is only a hint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct PreheatReleaseRequest {
+    /// The rustc version the delivery claims went stable.
+    pub rustc_version: WireRustcVersion,
+}
+
 /// One target's enqueue plan inside [`PreheatPlanResponse`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PreheatPlanTarget {
@@ -3464,10 +3100,10 @@ pub struct PreheatPlanTarget {
 }
 
 /// Response of `GET /api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}`:
-/// the D1 catalog row plus the bundle image's OCI manifest read from GHCR.
+/// the catalog row plus the bundle image's OCI manifest read from GHCR.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ArtifactInspection {
-    /// The D1 catalog row.
+    /// The catalog row.
     pub record: ArtifactRecord,
     /// The bundle image's OCI manifest (`manifests/<tag>.bundle`).
     pub manifest: OciManifest,
@@ -3548,14 +3184,12 @@ pub struct ArtifactPruneResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchEncoder, BatchFit, BatchTask, BuildBatchPayload, BuildTaskPayload, CI_TARGET_TRIPLES,
-        DEMAND_FEED_PAGE_MAX_BYTES, DEMAND_FEED_PAGE_MAX_ENTRIES, DISPATCH_INPUT_LIMIT,
-        DemandFeedHour, DemandFeedPageBuilder, RunnerFamily, SchedulerDemandEntry, TaskHash,
-        runner_family,
+        CI_TARGET_TRIPLES, DEMAND_FEED_PAGE_MAX_BYTES, DEMAND_FEED_PAGE_MAX_ENTRIES,
+        DemandFeedHour, DemandFeedPageBuilder, RunnerFamily, SchedulerDemandEntry, runner_family,
     };
-    use crate::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
-    use crate::public_cache::ExplicitSpelling;
-    use crate::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
+    use crate::artifact::ArtifactKind;
+    use crate::identity::{DependencyCMetadataJson, FeaturesJson};
+    use crate::index::ArtifactIndexRow;
 
     /// Every CI target must land in exactly one family, and the families'
     /// `targets()` lists together must be exactly `CI_TARGET_TRIPLES` —
@@ -3815,395 +3449,627 @@ mod tests {
         );
     }
 
-    // ----- Batched build dispatch (stow#833) -----
-
-    const BATCH_RUSTC: &str = "1.99.0";
-    const BATCH_ID: &str = "0123456789abcdef0123456789abcdef";
-
-    /// A resolved node for a batch fixture: the crate at `target` under
-    /// `BATCH_RUSTC` with no features, depending on `dependencies`.
-    fn batch_node(
+    /// A hand-built submission node: synthetic task ids are fine as
+    /// inputs — substitution picks representatives by them — and
+    /// [`SubmissionTree::substitute_contained_sets`] recomputes real
+    /// ones on the way out.
+    fn submission_node(
         crate_name: &str,
-        version: &str,
-        target: &str,
-        host_side: bool,
-        dependencies: &[usize],
-    ) -> ResolvedTaskNode {
-        ResolvedTaskNode {
-            identity: TaskNodeIdentity {
-                crate_name: CrateName::parse(crate_name).expect("crate name"),
-                version: CrateVersion::new(semver::Version::parse(version).expect("version")),
-                features_json: FeaturesJson::default(),
-                target: TargetTriple::parse(target).expect("target"),
-                rustc_version: WireRustcVersion::parse(BATCH_RUSTC).expect("rustc"),
-                host_side,
-            },
-            explicit_spelling: ExplicitSpelling::KeysAsNative,
-            dependencies: dependencies.to_vec(),
-        }
-    }
-
-    /// The `BuildTaskPayload` the per-task path produces for the graph —
-    /// node 0 is the task's own node, the rest its dependency closure.
-    fn batch_payload(graph_nodes: Vec<ResolvedTaskNode>) -> BuildTaskPayload {
-        let graph = ResolvedTaskGraph::resolve(graph_nodes).expect("resolved graph");
-        let root = &graph.nodes()[0];
-        BuildTaskPayload {
-            task_id: graph.task_id(0).expect("root task id").to_owned(),
-            attempt: 1,
-            crate_name: root.identity.crate_name.clone(),
-            version: root.identity.version.clone(),
-            features_json: root.identity.features_json.clone(),
-            target: root.identity.target.clone(),
-            rustc_version: root.identity.rustc_version.clone(),
-            preserve_lockfile: false,
-            host_side: root.identity.host_side,
-            explicit_spelling: root.explicit_spelling,
-            dependency_subgraph: super::TaskSubgraph::from_resolved(&graph, 0)
-                .expect("task subgraph"),
-        }
-    }
-
-    /// The length the leg's `BatchTask` element serializes to — used to
-    /// place a task exactly on the [`DISPATCH_INPUT_LIMIT`] boundary.
-    fn batch_leg_len(task: &BuildTaskPayload, leg: u32, root_deps: Vec<u32>) -> usize {
-        let wire = BatchTask {
-            leg,
-            task_hash: TaskHash::of(&task.task_id),
-            task_id: task.task_id.clone(),
-            attempt: task.attempt,
-            crate_name: task.crate_name.clone(),
-            version: task.version.clone(),
-            features_json: task.features_json.clone(),
-            target: task.target.clone(),
-            host_side: task.host_side,
-            explicit_spelling: task.explicit_spelling,
-            preserve_lockfile: task.preserve_lockfile,
-            root_deps,
-        };
-        serde_json::to_vec(&wire).expect("measure leg").len()
-    }
-
-    /// A dep-free task — for size tests the `task_id` is a plausible
-    /// string, never verified.
-    fn dep_free_task(crate_name: &str, target: &str, features: Vec<String>) -> BuildTaskPayload {
-        BuildTaskPayload {
-            task_id: format!(
-                "{crate_name}-1.0.0-{}-x86_64_unknown-linux-gnu-1_99_0",
-                blake3::hash(crate_name.as_bytes()).to_hex()
-            ),
-            attempt: 1,
-            crate_name: CrateName::parse(crate_name).expect("crate name"),
-            version: CrateVersion::new(semver::Version::parse("1.0.0").expect("version")),
-            features_json: FeaturesJson::canonicalize(features).expect("features"),
-            target: TargetTriple::parse(target).expect("target"),
-            rustc_version: WireRustcVersion::parse(BATCH_RUSTC).expect("rustc"),
-            preserve_lockfile: false,
+        features: &[&str],
+        deps: &[u32],
+        task_id: &str,
+    ) -> crate::api::SubmissionNode {
+        crate::api::SubmissionNode {
+            task_id: task_id.to_owned(),
+            crate_name: crate_name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            )
+            .expect("features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
             host_side: false,
-            explicit_spelling: ExplicitSpelling::KeysAsNative,
-            dependency_subgraph: super::TaskSubgraph::default(),
+            explicit_spelling: crate::public_cache::ExplicitSpelling::KeysAsNative,
+            preserve_lockfile: false,
+            dependency_identity: crate::identity::DependencyIdentity::leaf().expect("leaf digest"),
+            deps: deps.to_vec(),
+            downloads: 0,
         }
     }
 
-    /// A dep-free task whose `BatchTask` element serializes to exactly
-    /// `elem_len` bytes — `features_json` carries the size with the
-    /// same accounting [`sized_entry`] runs: a name of `len` chars
-    /// contributes `len + 5` bytes (`\"name\"` plus a separating
-    /// comma), and a list of names costs `Σ(len + 5) - 1` over the
-    /// bare `"[]"`.
-    fn sized_task(crate_name: &str, target: &str, leg: u32, elem_len: usize) -> BuildTaskPayload {
-        let bare = dep_free_task(crate_name, target, Vec::new());
-        let bare_len = batch_leg_len(&bare, leg, Vec::new());
-        if elem_len == bare_len {
-            return bare;
+    fn tree(nodes: Vec<crate::api::SubmissionNode>) -> crate::api::SubmissionTree {
+        crate::api::SubmissionTree {
+            source: crate::api::SubmissionSource::Preheat,
+            roots: vec![0],
+            nodes,
+        }
+    }
+
+    /// The stow#881 rule across one batch: `app`'s dep on `dep@{a}` is
+    /// rewritten to the batch's `dep@{a,b}` node — the subset node
+    /// leaves the tree and the splice lands the two trees on one task
+    /// id, so the scheduler merge builds it once.
+    #[test]
+    fn substitution_serves_a_contained_set_from_its_superset() {
+        let mut trees = vec![
+            tree(vec![
+                submission_node("app", &[], &[1], "app-1.0.0-[]"),
+                submission_node("dep", &["a"], &[], "dep-1.0.0-a"),
+            ]),
+            tree(vec![submission_node(
+                "dep",
+                &["a", "b"],
+                &[],
+                "dep-1.0.0-ab",
+            )]),
+        ];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &[])
+            .expect("substitution");
+        let dep = trees[0]
+            .nodes
+            .iter()
+            .find(|node| node.crate_name.as_str() == "dep")
+            .expect("dep node");
+        assert_eq!(
+            dep.features_json.features(),
+            &["a".to_owned(), "b".to_owned()]
+        );
+        assert_eq!(
+            dep.task_id, trees[1].nodes[0].task_id,
+            "the spliced node is the superset node's task"
+        );
+        let root = &trees[0].nodes[trees[0].roots[0] as usize];
+        assert_eq!(root.crate_name.as_str(), "app");
+        assert_eq!(root.deps.len(), 1);
+        assert!(
+            root.task_id.starts_with("app-"),
+            "root id recomputed: {}",
+            root.task_id
+        );
+        assert_ne!(root.task_id, "app-1.0.0-[]");
+    }
+
+    /// `{a,d}` beside `{a,b,c}` — neither contains the other, so both
+    /// are built as themselves and nothing is rewritten.
+    #[test]
+    fn substitution_leaves_uncontained_sets_alone() {
+        let mut trees = vec![
+            tree(vec![submission_node("dep", &["a", "b", "c"], &[], "abc")]),
+            tree(vec![submission_node("dep", &["a", "d"], &[], "ad")]),
+        ];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &[])
+            .expect("substitution");
+        assert_eq!(
+            trees[1].nodes[0].features_json.features(),
+            &["a".to_owned(), "d".to_owned()]
+        );
+        assert_eq!(trees[1].nodes[0].task_id, "ad");
+    }
+
+    /// A published index row — the fields substitution reads, the rest
+    /// inert. `dependency_task_ids` is the row's task-graph edge list:
+    /// the sorted direct child task ids its dependency digest commits
+    /// to (stow#919).
+    fn published_row(
+        crate_name: &str,
+        features: &[&str],
+        deps: &[(&str, &str)],
+        dependency_task_ids: Vec<String>,
+        c_metadata: &str,
+        host_side: bool,
+    ) -> ArtifactIndexRow {
+        ArtifactIndexRow {
+            crate_name: crate_name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features
+                    .iter()
+                    .map(|feature| (*feature).to_owned())
+                    .collect(),
+            )
+            .expect("features"),
+            dependency_c_metadata_json: DependencyCMetadataJson::canonicalize(
+                deps.iter()
+                    .map(
+                        |(name, meta)| crate::identity::DependencyCMetadataIdentity {
+                            crate_name: name.parse().expect("dep name"),
+                            c_metadata: meta.parse().expect("c_metadata"),
+                        },
+                    )
+                    .collect(),
+            )
+            .expect("dep c_metadata"),
+            dependency_task_ids,
+            c_metadata: c_metadata.parse().expect("c_metadata"),
+            compile_key: format!("{c_metadata}{c_metadata}"),
+            bundle_digest: format!("sha256:{c_metadata:0>64}"),
+            bundle_size: 0,
+            artifact_kind: ArtifactKind::Rlib,
+            crate_types: vec![crate::artifact::RustCrateType::Rlib],
+            profile: crate::platform::Profile {
+                opt_level: "3".to_owned(),
+                debuginfo: 0,
+                debug_assertions: false,
+                overflow_checks: false,
+                panic: crate::platform::PanicStrategy::Unwind,
+                strip: crate::platform::StripLevel::None,
+            },
+            emit: vec!["link".to_owned()],
+            unit_shape: crate::public_cache::UnitShape {
+                side: if host_side {
+                    crate::public_cache::UnitSide::Host
+                } else {
+                    crate::public_cache::UnitSide::Target
+                },
+                invocation: crate::public_cache::UnitInvocation::Native,
+                kind: crate::public_cache::UnitKind::Linked,
+            },
+            min_glibc: None,
+        }
+    }
+
+    /// The published pool (stow#881, second half of the rule): `dep`'s
+    /// smallest containing set lives only in a signed index slice. The
+    /// batch's `dep@{a}` node leaves the tree, the published subtree —
+    /// `dep@{a,b}` and its own dep `d` — lands carrying the rows'
+    /// published identities, and `app`'s task id recomputes against
+    /// `dep@{a,b}`'s published `dependency_identity`.
+    #[test]
+    fn substitution_serves_from_a_published_only_container() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        let identity = |name: &str, features: &[&str]| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .expect("features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side: false,
+        };
+        // The published slice: leaf `d` and `dep@{a,b}` built against it.
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let d_task_id = identity("d", &[]).task_id(&leaf);
+        let t_dep_identity =
+            DependencyIdentity::from_task_ids([d_task_id.as_str()]).expect("digest");
+        let t_task_id = identity("dep", &["a", "b"]).task_id(&t_dep_identity);
+        let published = vec![crate::api::PublishedIndexSlice {
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![
+                published_row("d", &[], &[], Vec::new(), "11", false),
+                published_row(
+                    "dep",
+                    &["a", "b"],
+                    &[("d", "11")],
+                    vec![d_task_id.clone()],
+                    "22",
+                    false,
+                ),
+            ],
+        }];
+        let mut trees = vec![tree(vec![
+            submission_node("app", &[], &[1], "app-sub"),
+            submission_node("dep", &["a"], &[], "dep-a-sub"),
+        ])];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        // The contained set left the batch entirely.
+        assert!(
+            tree.nodes
+                .iter()
+                .all(|node| node.crate_name.as_str() != "dep"
+                    || node.features_json.features() != ["a".to_owned()]),
+            "dep@{{a}} must leave the tree: {:?}",
+            tree.nodes
+                .iter()
+                .map(|node| node.task_id.clone())
+                .collect::<Vec<_>>()
+        );
+        // The published container and its dep land as nodes carrying
+        // their published ids — never roots, so the merge marks them
+        // satisfied instead of dispatching them.
+        let t = tree
+            .nodes
+            .iter()
+            .find(|node| node.task_id == t_task_id)
+            .expect("published dep@{a,b} node");
+        assert_eq!(t.dependency_identity, t_dep_identity);
+        let d = tree
+            .nodes
+            .iter()
+            .find(|node| node.task_id == d_task_id)
+            .expect("reconstructed dep d");
+        assert_eq!(t.deps.len(), 1);
+        let d_index = u32::try_from(
+            tree.nodes
+                .iter()
+                .position(|node| node.task_id == d_task_id)
+                .expect("d index"),
+        )
+        .expect("index fits u32");
+        assert_eq!(t.deps, vec![d_index]);
+        assert_eq!(d.deps, Vec::<u32>::new());
+        // The parent's task id is the one computed against T's
+        // published dependency identity.
+        let app = &tree.nodes[tree.roots[0] as usize];
+        let app_digest = DependencyIdentity::from_task_ids([t_task_id.as_str()]).expect("digest");
+        assert_eq!(app.task_id, identity("app", &[]).task_id(&app_digest));
+        assert_eq!(
+            app.deps,
+            vec![
+                u32::try_from(
+                    tree.nodes
+                        .iter()
+                        .position(|node| node.task_id == t_task_id)
+                        .expect("t index"),
+                )
+                .expect("index fits u32")
+            ]
+        );
+    }
+
+    /// A published row's task-graph edges name a build-dependency lib —
+    /// a host-side child no `--extern` list of the parent ever carries
+    /// (stow#919). The row's `dependency_c_metadata_json` names only
+    /// `lib`; its `dependency_task_ids` names `lib` and the host
+    /// slice's `version_check`. The task-id join finds both, where the
+    /// `--extern` reconstruction minted a digest the row never
+    /// recorded.
+    #[test]
+    fn substitution_joins_a_build_dependency_from_the_host_slice() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        const TARGET: &str = "wasm32-unknown-unknown";
+        const HOST: &str = "aarch64-apple-darwin";
+        let identity = |name: &str, features: &[&str], host_side: bool| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .expect("features"),
+            target: if host_side {
+                HOST.parse().expect("host")
+            } else {
+                TARGET.parse().expect("target")
+            },
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side,
+        };
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let lib_task_id = identity("lib", &[], false).task_id(&leaf);
+        let vc_task_id = identity("version_check", &[], true).task_id(&leaf);
+        let dep_identity =
+            DependencyIdentity::from_task_ids([lib_task_id.as_str(), vc_task_id.as_str()])
+                .expect("digest");
+        let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
+        let published = vec![
+            crate::api::PublishedIndexSlice {
+                target: TARGET.parse().expect("target"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![
+                    published_row("lib", &[], &[], Vec::new(), "11", false),
+                    published_row(
+                        "dep",
+                        &["a", "b"],
+                        &[("lib", "11")],
+                        vec![lib_task_id.clone(), vc_task_id.clone()],
+                        "22",
+                        false,
+                    ),
+                ],
+            },
+            crate::api::PublishedIndexSlice {
+                target: HOST.parse().expect("host"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![published_row(
+                    "version_check",
+                    &[],
+                    &[],
+                    Vec::new(),
+                    "33",
+                    true,
+                )],
+            },
+        ];
+        let mut tree = tree(vec![
+            submission_node("app", &[], &[1], "app-sub"),
+            submission_node("dep", &["a"], &[], "dep-a-sub"),
+        ]);
+        for node in &mut tree.nodes {
+            node.target = TARGET.parse().expect("target");
+        }
+        let mut trees = vec![tree];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        for task_id in [&dep_task_id, &lib_task_id, &vc_task_id] {
+            assert!(
+                tree.nodes.iter().any(|node| node.task_id == *task_id),
+                "reconstructed node {task_id} lands in the tree"
+            );
+        }
+    }
+
+    /// A shadow twin edge (stow#506/#722): the row's children include
+    /// the host lib and its same-features target twin — two tasks no
+    /// `--extern` list names together (stow#919). The task-id join
+    /// reconstructs both.
+    #[test]
+    fn substitution_joins_a_shadow_twin_edge() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        const TARGET: &str = "wasm32-unknown-unknown";
+        const HOST: &str = "aarch64-apple-darwin";
+        let identity = |name: &str, features: &[&str], host_side: bool| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .expect("features"),
+            target: if host_side {
+                HOST.parse().expect("host")
+            } else {
+                TARGET.parse().expect("target")
+            },
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side,
+        };
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let helper_host_id = identity("helper", &[], true).task_id(&leaf);
+        let helper_twin_id = identity("helper", &[], false).task_id(&leaf);
+        let dep_identity =
+            DependencyIdentity::from_task_ids([helper_host_id.as_str(), helper_twin_id.as_str()])
+                .expect("digest");
+        let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
+        let published = vec![
+            crate::api::PublishedIndexSlice {
+                target: TARGET.parse().expect("target"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![
+                    published_row("helper", &[], &[], Vec::new(), "33", false),
+                    published_row(
+                        "dep",
+                        &["a", "b"],
+                        &[("helper", "33")],
+                        vec![helper_host_id.clone(), helper_twin_id.clone()],
+                        "22",
+                        false,
+                    ),
+                ],
+            },
+            crate::api::PublishedIndexSlice {
+                target: HOST.parse().expect("host"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![published_row("helper", &[], &[], Vec::new(), "33", true)],
+            },
+        ];
+        let mut tree = tree(vec![
+            submission_node("app", &[], &[1], "app-sub"),
+            submission_node("dep", &["a"], &[], "dep-a-sub"),
+        ]);
+        for node in &mut tree.nodes {
+            node.target = TARGET.parse().expect("target");
+        }
+        let mut trees = vec![tree];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        for task_id in [&dep_task_id, &helper_host_id, &helper_twin_id] {
+            assert!(
+                tree.nodes.iter().any(|node| node.task_id == *task_id),
+                "reconstructed node {task_id} lands in the tree"
+            );
+        }
+    }
+
+    /// One `c_metadata` carried by a host row and a target row at once
+    /// (stow#919): the `--extern` join picked whichever row sorted
+    /// first — here the wrong one — while the task-id join names the
+    /// host child the row's digest actually commits to.
+    #[test]
+    fn substitution_joins_the_row_the_task_id_names() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
+
+        const TARGET: &str = "wasm32-unknown-unknown";
+        const HOST: &str = "aarch64-apple-darwin";
+        let identity = |name: &str, features: &[&str], host_side: bool| TaskNodeIdentity {
+            crate_name: name.parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )
+            .expect("features"),
+            target: if host_side {
+                HOST.parse().expect("host")
+            } else {
+                TARGET.parse().expect("target")
+            },
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side,
+        };
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let helper_host_id = identity("helper", &[], true).task_id(&leaf);
+        let helper_target_id = identity("helper", &[], false).task_id(&leaf);
+        let dep_identity =
+            DependencyIdentity::from_task_ids([helper_host_id.as_str()]).expect("digest");
+        let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
+        // The ambiguous row orders first in the pulled slices: a
+        // `c_metadata` join binds it, the task-id join cannot.
+        let published = vec![
+            crate::api::PublishedIndexSlice {
+                target: TARGET.parse().expect("target"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![
+                    published_row("helper", &[], &[], Vec::new(), "33", false),
+                    published_row(
+                        "dep",
+                        &["a", "b"],
+                        &[("helper", "33")],
+                        vec![helper_host_id.clone()],
+                        "22",
+                        false,
+                    ),
+                ],
+            },
+            crate::api::PublishedIndexSlice {
+                target: HOST.parse().expect("host"),
+                rustc_version: "1.85.0".parse().expect("rustc"),
+                rows: vec![published_row("helper", &[], &[], Vec::new(), "33", true)],
+            },
+        ];
+        let mut tree = tree(vec![
+            submission_node("app", &[], &[1], "app-sub"),
+            submission_node("dep", &["a"], &[], "dep-a-sub"),
+        ]);
+        for node in &mut tree.nodes {
+            node.target = TARGET.parse().expect("target");
+        }
+        let mut trees = vec![tree];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let tree = &trees[0];
+        for task_id in [&dep_task_id, &helper_host_id] {
+            assert!(
+                tree.nodes.iter().any(|node| node.task_id == *task_id),
+                "reconstructed node {task_id} lands in the tree"
+            );
         }
         assert!(
-            elem_len > bare_len + 4,
-            "target {elem_len} leaves no room for a name"
+            tree.nodes
+                .iter()
+                .all(|node| node.task_id != helper_target_id),
+            "the ambiguous target row is not the named child"
         );
-        // The names together contribute `total = need + 1` in
-        // `Σ(len + 5)` units — the `- 1` is the absent trailing comma.
-        let total = elem_len - bare_len + 1;
-        let count = total / 133;
-        let rest = total - count * 133;
-        let mut features: Vec<String> = (0..count).map(|index| format!("f{index:0127}")).collect();
-        match rest {
-            0 => {}
-            // Shrink the last bulk name by `6 - rest` and add a
-            // one-char "z" name: `-(6 - rest) + 6 = rest`.
-            1..=5 => {
-                let last = features.pop().expect("a bulk name");
-                features.push(last[..last.len() - (6 - rest)].to_owned());
-                features.push("z".to_owned());
-            }
-            _ => features.push("z".repeat(rest - 5)),
-        }
-        let sized = dep_free_task(crate_name, target, features);
-        assert_eq!(
-            batch_leg_len(&sized, leg, Vec::new()),
-            elem_len,
-            "sized leg must land exactly"
-        );
-        sized
     }
 
-    /// The five fixture tasks: `a` on `x86_64` depends on `mid → leaf`;
-    /// `b` on `wasm32` shares that whole wire subgraph (wire nodes carry
-    /// no target); `c` on `x86_64` adds its own `next → leaf`; `d` and
-    /// `e` are host-side apple-darwin tasks sharing the host dep `host`.
-    /// Every subgraph lists its nodes in first-intern order, so each
-    /// leg reconstructs byte-identically.
-    fn batch_fixture_tasks() -> Vec<BuildTaskPayload> {
-        vec![
-            batch_payload(vec![
-                batch_node("crate-a", "1.0.0", "x86_64-unknown-linux-gnu", false, &[2]),
-                batch_node("dep-leaf", "1.0.0", "x86_64-unknown-linux-gnu", false, &[]),
-                batch_node("dep-mid", "1.0.0", "x86_64-unknown-linux-gnu", false, &[1]),
-            ]),
-            batch_payload(vec![
-                batch_node("crate-b", "1.0.0", "wasm32-unknown-unknown", false, &[2]),
-                batch_node("dep-leaf", "1.0.0", "wasm32-unknown-unknown", false, &[]),
-                batch_node("dep-mid", "1.0.0", "wasm32-unknown-unknown", false, &[1]),
-            ]),
-            batch_payload(vec![
-                batch_node("crate-c", "1.0.0", "x86_64-unknown-linux-gnu", false, &[2]),
-                batch_node("dep-leaf", "1.0.0", "x86_64-unknown-linux-gnu", false, &[]),
-                batch_node("dep-next", "1.0.0", "x86_64-unknown-linux-gnu", false, &[1]),
-            ]),
-            batch_payload(vec![
-                batch_node("crate-d", "1.0.0", "aarch64-apple-darwin", true, &[1]),
-                batch_node("dep-host", "1.0.0", "aarch64-apple-darwin", true, &[]),
-            ]),
-            batch_payload(vec![
-                batch_node("crate-e", "1.0.0", "aarch64-apple-darwin", true, &[1]),
-                batch_node("dep-host", "1.0.0", "aarch64-apple-darwin", true, &[]),
-            ]),
-        ]
-    }
-
-    /// §7: every `task(i)` equals the `BuildTaskPayload` it was pushed
-    /// from and passes `verified_dependency_graph`.
+    /// stow#723: the self-twin edge — a host node deping on its
+    /// same-feature target twin — pins both endpoints. A published
+    /// superset on the host side alone serves neither.
     #[test]
-    fn batch_task_round_trips_through_the_wire() {
-        let pushed = batch_fixture_tasks();
-        let mut encoder = BatchEncoder::new(
-            BATCH_ID.parse().expect("batch id"),
-            BATCH_RUSTC.parse().expect("rustc"),
-            5,
-        )
-        .expect("encoder");
-        for task in &pushed {
-            assert_eq!(encoder.push(task).expect("push"), BatchFit::Fits);
-        }
-        let wire = encoder.finish().expect("finish");
-        let batch: BuildBatchPayload = serde_json::from_str(&wire).expect("decode batch");
-        assert_eq!(batch.batch_id.as_str(), BATCH_ID);
-        assert_eq!(batch.tasks.len(), pushed.len());
-        for (index, pushed_task) in pushed.iter().enumerate() {
-            let leg = &batch.tasks[index];
-            assert_eq!(leg.leg, u32::try_from(index).expect("leg index"));
-            assert_eq!(leg.task_hash, TaskHash::of(&pushed_task.task_id));
-            let rebuilt = batch.task(index).expect("rebuild leg");
-            assert_eq!(&rebuilt, pushed_task);
-            rebuilt
-                .verified_dependency_graph()
-                .expect("rebuilt leg verifies");
-        }
-    }
+    fn a_self_twin_pair_moves_together_or_not_at_all() {
+        use crate::identity::DependencyIdentity;
+        use crate::task_graph::TaskNodeIdentity;
 
-    /// A pushed subgraph whose `nodes` are not in first-intern order —
-    /// here reversed, every index remapped — still rebuilds a leg that
-    /// verifies to the pushed task's own resolved graph and keeps every
-    /// leg identity field: wire order is a serialization detail, never
-    /// identity.
-    #[test]
-    fn batch_task_round_trips_a_subgraph_in_another_order() {
-        let pushed = batch_fixture_tasks()
-            .into_iter()
-            .next()
-            .expect("fixture task");
-        let mut reordered = pushed.clone();
-        let wire_len =
-            u32::try_from(reordered.dependency_subgraph.nodes.len()).expect("wire len fits u32");
-        reordered.dependency_subgraph.nodes.reverse();
-        let remap = |index: &u32| wire_len - 1 - *index;
-        for node in &mut reordered.dependency_subgraph.nodes {
-            node.deps = node.deps.iter().map(remap).collect();
+        let mut x_h = submission_node("x", &[], &[1], "x-h");
+        x_h.host_side = true;
+        let x_t = submission_node("x", &[], &[], "x-t");
+        let published = vec![crate::api::PublishedIndexSlice {
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![published_row("x", &["std"], &[], Vec::new(), "33", true)],
+        }];
+        let mut trees = vec![tree(vec![x_h, x_t])];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        for (index, side) in [(0usize, "host"), (1usize, "target")] {
+            let node = &trees[0].nodes[index];
+            assert!(
+                node.features_json.features().is_empty(),
+                "the {side} endpoint stays at its own set when only one side has a superset"
+            );
         }
-        reordered.dependency_subgraph.root_deps = reordered
-            .dependency_subgraph
-            .root_deps
+
+        // A serving set published on both sides is a real superset the
+        // pair can move to — both endpoints land on it.
+        let identity = |host_side: bool| TaskNodeIdentity {
+            crate_name: "x".parse().expect("crate name"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: FeaturesJson::canonicalize(vec!["std".to_owned()]).expect("features"),
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            host_side,
+        };
+        let leaf = DependencyIdentity::leaf().expect("leaf digest");
+        let target_id = identity(false).task_id(&leaf);
+        let host_dep_identity =
+            DependencyIdentity::from_task_ids([target_id.as_str()]).expect("host dep digest");
+        let host_id = identity(true).task_id(&host_dep_identity);
+        let published = vec![crate::api::PublishedIndexSlice {
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![
+                // The host row's own chain names its target twin —
+                // a real published superset carries its real dep list.
+                published_row("x", &["std"], &[], vec![target_id.clone()], "44", true),
+                published_row("x", &["std"], &[], Vec::new(), "55", false),
+            ],
+        }];
+        let mut x_h = submission_node("x", &[], &[1], "x-h");
+        x_h.host_side = true;
+        let mut trees = vec![tree(vec![x_h, submission_node("x", &[], &[], "x-t")])];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let host = trees[0]
+            .nodes
             .iter()
-            .map(remap)
-            .collect();
-        // The reorder keeps the wire graph valid — `resolve` derives
-        // the same task id.
-        reordered
-            .verified_dependency_graph()
-            .expect("reordered subgraph verifies");
-
-        let mut encoder = BatchEncoder::new(
-            BATCH_ID.parse().expect("batch id"),
-            BATCH_RUSTC.parse().expect("rustc"),
-            5,
-        )
-        .expect("encoder");
-        assert_eq!(encoder.push(&reordered).expect("push"), BatchFit::Fits);
-        let batch: BuildBatchPayload =
-            serde_json::from_str(&encoder.finish().expect("finish")).expect("decode batch");
-        let rebuilt = batch.task(0).expect("rebuild leg");
+            .find(|node| node.crate_name.as_str() == "x" && node.host_side)
+            .expect("host endpoint");
+        let target = trees[0]
+            .nodes
+            .iter()
+            .find(|node| node.crate_name.as_str() == "x" && !node.host_side)
+            .expect("target endpoint");
+        assert_eq!(host.features_json.features(), &["std".to_owned()]);
+        assert_eq!(target.features_json.features(), &["std".to_owned()]);
         assert_eq!(
-            rebuilt
-                .verified_dependency_graph()
-                .expect("rebuilt leg verifies"),
-            pushed
-                .verified_dependency_graph()
-                .expect("pushed task verifies"),
-            "a reordered wire subgraph resolves to a different graph"
+            host.task_id, host_id,
+            "host endpoint serves the published set"
         );
-        assert_eq!(rebuilt.task_id, pushed.task_id);
-        assert_eq!(rebuilt.attempt, pushed.attempt);
-        assert_eq!(rebuilt.crate_name, pushed.crate_name);
-        assert_eq!(rebuilt.version, pushed.version);
-        assert_eq!(rebuilt.features_json, pushed.features_json);
-        assert_eq!(rebuilt.target, pushed.target);
-        assert_eq!(rebuilt.rustc_version, pushed.rustc_version);
-        assert_eq!(rebuilt.host_side, pushed.host_side);
-        assert_eq!(rebuilt.explicit_spelling, pushed.explicit_spelling);
-        assert_eq!(rebuilt.preserve_lockfile, pushed.preserve_lockfile);
-    }
-
-    /// The shared node table deduplicates by full content — legs on
-    /// different targets and sides merge on identical wire nodes, and
-    /// no leg's derived task id changes.
-    #[test]
-    fn batch_shared_table_dedups_across_targets_and_sides() {
-        let pushed = batch_fixture_tasks();
-        let mut encoder = BatchEncoder::new(
-            BATCH_ID.parse().expect("batch id"),
-            BATCH_RUSTC.parse().expect("rustc"),
-            5,
-        )
-        .expect("encoder");
-        for task in &pushed {
-            encoder.push(task).expect("push");
-        }
-        let batch: BuildBatchPayload =
-            serde_json::from_str(&encoder.finish().expect("finish")).expect("decode batch");
-        // leaf+mid+next on the target side, host on the host side: the
-        // wasm and second host legs added nothing of their own.
-        assert_eq!(batch.nodes.len(), 4);
-        for (index, pushed_task) in pushed.iter().enumerate() {
-            let rebuilt = batch.task(index).expect("rebuild leg");
-            let graph = rebuilt.verified_dependency_graph().expect("verifies");
-            assert_eq!(
-                graph.task_id(0).map(str::to_owned),
-                Some(pushed_task.task_id.clone()),
-                "leg {index} derives a different task id"
-            );
-            assert_eq!(
-                graph,
-                pushed_task
-                    .verified_dependency_graph()
-                    .expect("pushed verifies"),
-                "leg {index} resolves to a different graph"
-            );
-        }
-    }
-
-    /// Two wire nodes sharing `(n, v, f, h, x)` but differing in `d`
-    /// are different units and must not merge.
-    #[test]
-    fn batch_shared_table_keeps_same_identity_nodes_with_different_deps() {
-        let task = batch_payload(vec![
-            batch_node(
-                "crate-q",
-                "1.0.0",
-                "x86_64-unknown-linux-gnu",
-                false,
-                &[2, 4],
-            ),
-            batch_node("dep-a", "1.0.0", "x86_64-unknown-linux-gnu", false, &[]),
-            batch_node("dep-leaf", "1.0.0", "x86_64-unknown-linux-gnu", false, &[1]),
-            batch_node("dep-b", "1.0.0", "x86_64-unknown-linux-gnu", false, &[]),
-            batch_node("dep-leaf", "1.0.0", "x86_64-unknown-linux-gnu", false, &[3]),
-        ]);
-        let mut encoder = BatchEncoder::new(
-            BATCH_ID.parse().expect("batch id"),
-            BATCH_RUSTC.parse().expect("rustc"),
-            5,
-        )
-        .expect("encoder");
-        encoder.push(&task).expect("push");
-        let batch: BuildBatchPayload =
-            serde_json::from_str(&encoder.finish().expect("finish")).expect("decode batch");
-        assert_eq!(batch.nodes.len(), 4);
-        assert_eq!(batch.task(0).expect("rebuild"), task);
-    }
-
-    /// §7: packing stops exactly at `DISPATCH_INPUT_LIMIT` — a leg that
-    /// fills the batch to the byte stays in; the next returns `Full`
-    /// and leaves the batch untouched.
-    #[test]
-    fn batch_packing_stops_at_the_dispatch_input_limit() {
-        let mut encoder = BatchEncoder::new(
-            BATCH_ID.parse().expect("batch id"),
-            BATCH_RUSTC.parse().expect("rustc"),
-            5,
-        )
-        .expect("encoder");
-        let small = dep_free_task("crate-s", "x86_64-unknown-linux-gnu", Vec::new());
-        assert_eq!(encoder.push(&small).expect("push"), BatchFit::Fits);
-        // The next leg's delta is its element length plus the
-        // separating comma; size it so the encoding lands on the cap.
-        let fat = sized_task(
-            "crate-f",
-            "x86_64-unknown-linux-gnu",
-            1,
-            DISPATCH_INPUT_LIMIT - encoder.encoded_len() - 1,
-        );
-        assert_eq!(encoder.push(&fat).expect("push"), BatchFit::Fits);
-        assert_eq!(encoder.encoded_len(), DISPATCH_INPUT_LIMIT);
-        let tiny = dep_free_task("crate-t", "x86_64-unknown-linux-gnu", Vec::new());
-        assert_eq!(encoder.push(&tiny).expect("push"), BatchFit::Full);
         assert_eq!(
-            encoder.encoded_len(),
-            DISPATCH_INPUT_LIMIT,
-            "a Full push leaves the batch untouched"
+            target.task_id, target_id,
+            "target endpoint serves the same published set"
         );
-        let wire = encoder.finish().expect("finish");
-        assert_eq!(wire.len(), DISPATCH_INPUT_LIMIT);
-        let batch: BuildBatchPayload = serde_json::from_str(&wire).expect("decode batch");
-        assert_eq!(batch.tasks.len(), 2);
     }
 
-    /// §7: a task no batch can carry — its leg alone does not fit an
-    /// empty batch's framing — is refused with the same oversize error
-    /// `encode_dispatch_task` gives today, measured against the batch's
-    /// own encoding.
+    /// stow#723: the shadow pair — a dependent holding the same-feature
+    /// host and target units of one package as two children — is bound
+    /// by the same rule: one side's published superset moves neither.
     #[test]
-    fn batch_push_refuses_a_lone_oversize_task() {
-        let mut encoder = BatchEncoder::new(
-            BATCH_ID.parse().expect("batch id"),
-            BATCH_RUSTC.parse().expect("rustc"),
-            5,
-        )
-        .expect("encoder");
-        let fat = sized_task(
-            "crate-huge",
-            "x86_64-unknown-linux-gnu",
-            0,
-            DISPATCH_INPUT_LIMIT,
+    fn a_shadow_pair_moves_together_or_not_at_all() {
+        let mut x_h = submission_node("x", &[], &[], "x-h");
+        x_h.host_side = true;
+        let x_t = submission_node("x", &[], &[], "x-t");
+        let parent = submission_node("p", &[], &[1, 2], "p");
+        let published = vec![crate::api::PublishedIndexSlice {
+            target: "x86_64-unknown-linux-gnu".parse().expect("target"),
+            rustc_version: "1.85.0".parse().expect("rustc"),
+            rows: vec![published_row("x", &["std"], &[], Vec::new(), "66", false)],
+        }];
+        let mut trees = vec![tree(vec![parent, x_h, x_t])];
+        crate::api::SubmissionTree::substitute_contained_sets(&mut trees, &published)
+            .expect("substitution");
+        let target = trees[0]
+            .nodes
+            .iter()
+            .find(|node| node.crate_name.as_str() == "x" && !node.host_side)
+            .expect("target endpoint");
+        assert!(
+            target.features_json.features().is_empty(),
+            "the target endpoint cannot move alone to the superset"
         );
-        let refused = encoder.push(&fat).expect_err("oversize leg refused");
-        // The refusal is the per-task dispatch path's own oversize
-        // error, naming the batch-encoded length `push` measured.
-        let candidate = encoder.encoded_len() + batch_leg_len(&fat, 0, Vec::new());
-        assert_eq!(
-            refused.to_string(),
-            fat.oversize_dispatch_error(candidate).to_string()
+        let host = trees[0]
+            .nodes
+            .iter()
+            .find(|node| node.crate_name.as_str() == "x" && node.host_side)
+            .expect("host endpoint");
+        assert!(
+            host.features_json.features().is_empty(),
+            "the host endpoint stays too"
         );
-        assert_eq!(encoder.legs(), 0);
     }
 }
 /// Public aggregate usage statistics served by `GET /api/v1/stats`.
@@ -4221,22 +4087,41 @@ pub struct UsageStats {
     /// hits are sampled, so it is a lower bound). `None` below the minimum
     /// publication threshold — stow never reports small counts.
     pub daily_active_installs_7d: Option<u64>,
-    /// Cache hits served in the last 24 hours (sample-scaled estimate).
+    /// Builds the installs' CLIs counted in the last 24 hours, from the
+    /// daily build reports.
+    pub builds_24h: u64,
+    /// Artifacts served from the cache in the last 24 hours, from the
+    /// daily build reports.
     pub hits_24h: u64,
-    /// Cache misses served in the last 24 hours.
+    /// Artifacts compiled locally in the last 24 hours, from the daily
+    /// build reports.
     pub misses_24h: u64,
     /// `hits_24h / (hits_24h + misses_24h)`; `0.0` when nothing was served.
     pub hit_rate_24h: f64,
     /// CPU-hours of rustc compilation saved in the last 30 days: the
-    /// recorded compile time of every artifact served, sample-scaled.
+    /// recorded compile time of every artifact served, as the installs'
+    /// CLIs reported it.
     pub cpu_hours_saved_30d: f64,
-    /// Most-served crates over the last 30 days.
-    pub top_crates_30d: Vec<UsageStatEntry>,
-    /// Hits per compilation target over the last 30 days.
-    pub targets_30d: Vec<UsageStatEntry>,
-    /// Hits per CLI version over the last 30 days; requests that sent no
-    /// `stow-cli` user agent are not counted under any version.
+    /// Most-served bundle digests over the last 30 days, edge-observed —
+    /// an undercount of real usage, since the platform cache answers most
+    /// fetches before the Worker runs. The digest carries no identity;
+    /// `stow-admin` resolves each to a crate from the public signed
+    /// index.
+    pub top_digests_30d: Vec<UsageStatEntry>,
+    /// Hits per rustc version over the last 30 days, edge-observed.
+    pub rustc_versions_30d: Vec<UsageStatEntry>,
+    /// Reported activity per `stow-cli` version over the last 30 days;
+    /// requests that sent no `stow-cli` user agent are not counted under
+    /// any version.
     pub cli_versions_30d: Vec<UsageStatEntry>,
+    /// Reported activity per operating system over the last 30 days.
+    pub operating_systems_30d: Vec<UsageStatEntry>,
+    /// Reported activity per request country over the last 30 days —
+    /// Cloudflare's country code only.
+    pub countries_30d: Vec<UsageStatEntry>,
+    /// Reported activity split between CI and local builds over the
+    /// last 30 days.
+    pub environments_30d: Vec<UsageStatEntry>,
 }
 
 /// One `(name, hits)` bucket of a [`UsageStats`] leaderboard.
@@ -4274,4 +4159,1122 @@ pub mod scheduler_lanes {
     /// Every scheduler-lane path — the router's mount list and the WAF
     /// rule's block list are both built from this.
     pub const ALL: &[&str] = &[ADMISSIONS, ENQUEUE, REQUESTS, REQUEST, REQUEST_PAGE];
+}
+
+/// The admission class a submission tree arrives under (stow#878).
+///
+/// Each entry point the scheduler's rank prices separately (#879).
+/// Priority is a property of the entry point, not the node: operations
+/// carries the caller's choice, every other source is the scheduler's
+/// default for that lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SubmissionSource {
+    /// An operations submission (`stow-admin`) — the caller sets the
+    /// priority the tree's nodes enter the rank with.
+    Operations {
+        /// The caller-chosen priority operand.
+        priority: i64,
+    },
+    /// A CLI cache miss — proof-of-work admission.
+    CacheMiss,
+    /// An #882 inexact superset-hit report — the same proof-of-work
+    /// admission as a miss, queued at very low priority.
+    InexactHit,
+    /// A Turnstile-admitted `stow.waterui.dev` request — the human lane.
+    HumanRequest,
+    /// A trusted preheat lane (top, binaries, projects, missed, dirs).
+    Preheat,
+}
+
+/// One node of a [`SubmissionTree`].
+///
+/// The queue identity columns of the retired `EnqueueRequest` plus the
+/// node's direct-dependency edges, sent once per source instead of
+/// embedded under every dependent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmissionNode {
+    /// The node's canonical task id — the submitter computes it and the
+    /// merge verifies its identity columns re-derive it.
+    pub task_id: String,
+    /// Crate name to build.
+    pub crate_name: CrateName,
+    /// Crate version to build.
+    pub version: CrateVersion,
+    /// Canonical features list.
+    pub features_json: FeaturesJson,
+    /// Compilation target triple.
+    pub target: TargetTriple,
+    /// Stable rustc version.
+    pub rustc_version: WireRustcVersion,
+    /// Whether the node compiles for the build host.
+    #[serde(default)]
+    pub host_side: bool,
+    /// The explicit `--target` spelling flag (stow#736).
+    pub explicit_spelling: crate::public_cache::ExplicitSpelling,
+    /// Build against the binary's published `Cargo.lock` (overlay lane).
+    #[serde(default)]
+    pub preserve_lockfile: bool,
+    /// The Merkle dependency digest the task id commits to (stow#588).
+    pub dependency_identity: crate::identity::DependencyIdentity,
+    /// Indexes into [`SubmissionTree::nodes`] naming this node's
+    /// direct dependencies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deps: Vec<u32>,
+    /// The source's demand signal for this node (crates.io downloads
+    /// for preheat, 0 for misses).
+    #[serde(default)]
+    pub downloads: u64,
+}
+
+/// One dependency tree from one source (stow#878).
+///
+/// The unit every submitter posts once — a project, a crate, a miss —
+/// each node once, merged into the scheduler's graph by task id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SubmissionTree {
+    /// The entry point this tree arrives under.
+    pub source: SubmissionSource,
+    /// Indexes into `nodes` of the submissions' roots — the crates the
+    /// source actually asked for.
+    pub roots: Vec<u32>,
+    /// Every node in the tree, each once, in the resolved graph's
+    /// canonical order.
+    pub nodes: Vec<SubmissionNode>,
+}
+
+impl SubmissionTree {
+    /// One dependency tree from an enqueue batch — the converter every
+    /// submitter runs at its submission boundary: each request's own
+    /// resolved subgraph unfolds into `nodes`, unioned by task id, and
+    /// `deps` re-point at tree indexes. Nodes a request names only as
+    /// dependencies (already published) still enter the tree so their
+    /// edges carry a real node; `roots` keeps one index per request,
+    /// in request order.
+    ///
+    /// # Errors
+    /// `Error` when a request's subgraph cannot resolve or a dep index
+    /// is unmapped — resolver bugs, never accepted data.
+    pub fn from_enqueue_requests(
+        source: SubmissionSource,
+        requests: &[EnqueueRequest],
+    ) -> crate::error::Result<Self> {
+        let mut nodes = Vec::new();
+        let mut index = std::collections::HashMap::new();
+        let mut roots = Vec::with_capacity(requests.len());
+        for request in requests {
+            let graph = request.resolved_dependency_graph()?;
+            let graph_nodes = graph.nodes();
+            let mut map = vec![0u32; graph_nodes.len()];
+            for (ix, node) in graph_nodes.iter().enumerate() {
+                let dependency_identity =
+                    graph.dependency_identity(ix).cloned().ok_or_else(|| {
+                        stow_error!("resolved dependency graph yields no digest for node {ix}")
+                    })?;
+                let task_id = node.identity.task_id(&dependency_identity);
+                if let Some(&existing) = index.get(&task_id) {
+                    map[ix] = existing;
+                    continue;
+                }
+                let next = u32::try_from(nodes.len())
+                    .map_err(|_| stow_error!("submission node count overflows u32"))?;
+                index.insert(task_id.clone(), next);
+                map[ix] = next;
+                nodes.push(SubmissionNode {
+                    task_id,
+                    crate_name: node.identity.crate_name.clone(),
+                    version: node.identity.version.clone(),
+                    features_json: node.identity.features_json.clone(),
+                    target: node.identity.target.clone(),
+                    rustc_version: node.identity.rustc_version.clone(),
+                    host_side: node.identity.host_side,
+                    explicit_spelling: node.explicit_spelling,
+                    preserve_lockfile: request.preserve_lockfile && ix == 0,
+                    dependency_identity,
+                    deps: Vec::new(),
+                    downloads: if ix == 0 { request.downloads } else { 0 },
+                });
+            }
+            for (ix, node) in graph_nodes.iter().enumerate() {
+                nodes[map[ix] as usize].deps =
+                    node.dependencies.iter().map(|&dep| map[dep]).collect();
+            }
+            roots.push(map[0]);
+        }
+        Ok(Self {
+            source,
+            roots,
+            nodes,
+        })
+    }
+
+    /// Apply the superset-serving rule (stow#881): a feature set
+    /// contained in another set of the same `(crate, version, target,
+    /// rustc, side)` is never built — its node is replaced by the
+    /// containing set's node, subtree included, and every task id is
+    /// recomputed bottom-up.
+    ///
+    /// The pool is the submit call's batch **and** the published sets
+    /// in `published` — the signed `index.<target>.<rustc>` slices the
+    /// caller already pulls for coverage. A serving set present only
+    /// in the published pool is reconstructed from its rows: the
+    /// subtree is rebuilt by following each row's `dependency_task_ids`
+    /// edges through the pulled slices (stow#919 — the `--extern` list
+    /// is a different relation and cannot rebuild them), and every
+    /// reconstructed node carries the row's published dependency
+    /// digest, so a dependent's task id commits to the exact identity
+    /// the builder published. The scheduler's merge
+    /// then treats the spliced nodes as already satisfied — they are
+    /// never dispatched — while their edges keep every dependent's
+    /// dispatch payload pinning the full closure.
+    ///
+    /// Batch-side the pool rule is unchanged: for each `(group, serving
+    /// set)` the replacement node is the smallest pre-substitution
+    /// `task_id` among the batch's nodes carrying that set. The rewrite
+    /// runs over a shared interned arena of [`ResolvedTaskNode`]s;
+    /// [`ResolvedTaskGraph::resolve`] recomputes every
+    /// `dependency_identity` and `task_id` bottom-up, each tree is
+    /// re-emitted from its substituted roots' reach, and every
+    /// reconstructed published node is checked to reproduce its
+    /// published task id — a mismatch means the pulled slices disagree
+    /// with the rows' recorded dep closures.
+    ///
+    /// # Errors
+    /// Fails as [`ResolvedTaskGraph::resolve`] does, and fails fast when
+    /// a reconstructed published subtree resolves to an id other than
+    /// the row's published one.
+    ///
+    /// # Panics
+    /// The internal lookups are inhabited by construction: every node's
+    /// group and serving set were computed from the pool itself.
+    #[allow(clippy::too_many_lines)] // the rewrite orchestrates one pass; splitting hides it
+    pub fn substitute_contained_sets(
+        trees: &mut [Self],
+        published: &[PublishedIndexSlice],
+    ) -> crate::error::Result<()> {
+        // Each group's distinct feature sets over the batch ∪ the
+        // published slices, and the serving map over them: a set
+        // contained in no other is built; every other set is served by
+        // the smallest built set containing it.
+        let mut families = BTreeMap::<SubstitutionGroupKey, BTreeSet<Vec<String>>>::new();
+        for tree in trees.iter() {
+            for node in &tree.nodes {
+                families
+                    .entry(substitution_group_key(node))
+                    .or_default()
+                    .insert(node.features_json.features().to_vec());
+            }
+        }
+        for slice in published {
+            for row in &slice.rows {
+                families
+                    .entry(substitution_row_key(slice, row))
+                    .or_default()
+                    .insert(row.features_json.features().to_vec());
+            }
+        }
+        let mut serving = families
+            .iter()
+            .map(|(key, family)| (key.clone(), crate::feature_sets::serving_map(family)))
+            .collect::<BTreeMap<_, _>>();
+        // Every pulled row's own minted task id — the join a row's
+        // `dependency_task_ids` edges name (stow#919) — is needed here to
+        // find twin pairs in the published pool.
+        let mut row_task_ids = Vec::with_capacity(published.len());
+        for slice in published {
+            let mut ids = Vec::with_capacity(slice.rows.len());
+            for row in &slice.rows {
+                ids.push(published_row_identity(slice, row).task_id(&row.dependency_identity()?));
+            }
+            row_task_ids.push(ids);
+        }
+        let mut by_task_id = std::collections::HashMap::new();
+        for (slice_index, ids) in row_task_ids.iter().enumerate() {
+            for (row_index, id) in ids.iter().enumerate() {
+                by_task_id
+                    .entry(id.as_str())
+                    .or_insert((slice_index, row_index));
+            }
+        }
+        patch_twin_pair_serving(trees, published, &by_task_id, &mut serving);
+        if serving
+            .values()
+            .all(|map| map.iter().all(|(set, serve)| set == serve))
+        {
+            return Ok(());
+        }
+
+        // The canonical node a contained set is replaced by: among the
+        // batch's nodes carrying the serving set, the smallest existing
+        // task id — deterministic on both sides of the submit.
+        let mut representatives =
+            BTreeMap::<(SubstitutionGroupKey, Vec<String>), (usize, usize)>::new();
+        for (tree_index, tree) in trees.iter().enumerate() {
+            for (node_index, node) in tree.nodes.iter().enumerate() {
+                let key = substitution_group_key(node);
+                let serve = &serving[&key][node.features_json.features()];
+                if serve.as_slice() != node.features_json.features() {
+                    continue;
+                }
+                representatives
+                    .entry((key, serve.clone()))
+                    .and_modify(|rep| {
+                        if node.task_id < trees[rep.0].nodes[rep.1].task_id {
+                            *rep = (tree_index, node_index);
+                        }
+                    })
+                    .or_insert((tree_index, node_index));
+            }
+        }
+        let (published_reps, row_task_ids) = published_pool_index(published, &serving)?;
+
+        let mut substitution = Substitution {
+            trees,
+            published,
+            serving: &serving,
+            representatives: &representatives,
+            published_reps: &published_reps,
+            row_task_ids: &row_task_ids,
+            by_task_id: &by_task_id,
+            arena: Vec::new(),
+            closure_pm: Vec::new(),
+            interned: std::collections::HashMap::new(),
+            memo: std::collections::HashMap::new(),
+            published_memo: std::collections::HashMap::new(),
+            pinned: std::collections::HashMap::new(),
+        };
+        // Substituting a node into another node's dep position can never
+        // close a cycle: the spliced subtree is the dependency closure
+        // of a real resolved node (batch) or of a published artifact's
+        // recorded chain (index), and a build graph is acyclic.
+        for (tree_index, tree) in trees.iter().enumerate() {
+            for node_index in 0..tree.nodes.len() {
+                substitution.substitute(tree_index, node_index);
+            }
+        }
+        let Substitution {
+            arena,
+            memo,
+            pinned,
+            ..
+        } = substitution;
+        let resolved = ResolvedTaskGraph::resolve(arena)?;
+        // A reconstructed published node is pinned to the id its row
+        // records — recompute reproducing it proves the pulled slices
+        // carry the row's whole dep chain verbatim.
+        for (index, expected) in &pinned {
+            let actual = resolved
+                .task_id(*index)
+                .ok_or_else(|| stow_error!("arena node {index} has no task id"))?;
+            if actual != *expected {
+                return Err(stow_error!(
+                    "published subtree reconstructed to {actual}, index records {expected}"
+                ));
+            }
+        }
+        for (tree_index, tree) in trees.iter_mut().enumerate() {
+            *tree = reemit_substituted_tree(tree, tree_index, &memo, &resolved)?;
+        }
+        Ok(())
+    }
+}
+
+/// One verified `index.<target>.<rustc>` slice as the superset
+/// substitution pool sees it (stow#881): the published rows plus the
+/// slice's coordinates, which rows do not themselves carry.
+#[derive(Debug, Clone)]
+pub struct PublishedIndexSlice {
+    /// The slice's target triple — every row's `TaskNodeIdentity.target`.
+    pub target: TargetTriple,
+    /// The slice's rustc — every row's `TaskNodeIdentity.rustc_version`.
+    pub rustc_version: WireRustcVersion,
+    /// The verified rows.
+    pub rows: Vec<ArtifactIndexRow>,
+}
+
+/// The identity group the superset-serving rule keys on (stow#881) —
+/// every field of a node's task identity except its feature set.
+type SubstitutionGroupKey = (
+    CrateName,
+    CrateVersion,
+    TargetTriple,
+    WireRustcVersion,
+    bool,
+);
+
+fn substitution_group_key(node: &SubmissionNode) -> SubstitutionGroupKey {
+    (
+        node.crate_name.clone(),
+        node.version.clone(),
+        node.target.clone(),
+        node.rustc_version.clone(),
+        node.host_side,
+    )
+}
+
+/// The `(crate, version, target, rustc)` a twin pair shares — the
+/// group key with the side stripped (stow#723).
+type TwinPairKey = (CrateName, CrateVersion, TargetTriple, WireRustcVersion);
+
+/// stow#723: the two endpoints of a twin pair move to the same serving
+/// set or neither. A pair is named wherever an edge binds the
+/// same-feature host and target units of one package — a host node's
+/// self-twin edge, or a dependent holding both as children (the shadow
+/// pair the dedup pin emits). Moving one side alone would hand a
+/// dependent's pins `X_h[F]` and `X_t[S]` with `F ≠ S`, breaking the
+/// equal-features premise cargo's sharing probe needs — and minting
+/// wrong ids, as a substituted shadow edge already did.
+///
+/// For each paired feature set `F` the joint serve is the smallest
+/// strictly-containing set that is itself unserved (a *built* set) on
+/// BOTH sides; with none, both endpoints stay at `F`. The answer is
+/// written back into `serving` on both side-keys, so every later
+/// serve lookup — batch representatives, published reps and the
+/// substitution walk — sees it.
+#[allow(clippy::too_many_lines)] // one pass over both pools; split hurts the shape
+fn patch_twin_pair_serving(
+    trees: &[SubmissionTree],
+    published: &[PublishedIndexSlice],
+    by_task_id: &std::collections::HashMap<&str, (usize, usize)>,
+    serving: &mut BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
+) {
+    type PairKeyAndSet = (TwinPairKey, Vec<String>);
+    let mut paired = BTreeSet::<PairKeyAndSet>::new();
+    // `deps` is a parent identity plus its dep identities — the two
+    // shapes a twin reference takes, on either pool.
+    let mut record = |parent: &TaskNodeIdentity, deps: &[TaskNodeIdentity]| {
+        let parent_key = (
+            parent.crate_name.clone(),
+            parent.version.clone(),
+            parent.target.clone(),
+            parent.rustc_version.clone(),
+        );
+        if parent.host_side {
+            for dep in deps {
+                if !dep.host_side
+                    && dep.crate_name == parent.crate_name
+                    && dep.version == parent.version
+                    && dep.target == parent.target
+                    && dep.rustc_version == parent.rustc_version
+                    && dep.features_json == parent.features_json
+                {
+                    paired.insert((parent_key.clone(), parent.features_json.features().to_vec()));
+                }
+            }
+        }
+        // The shadow pair: one parent's two children at the same
+        // features, one per side.
+        let mut by_set = BTreeMap::<PairKeyAndSet, (bool, bool)>::new();
+        for dep in deps {
+            let entry = by_set
+                .entry((
+                    (
+                        dep.crate_name.clone(),
+                        dep.version.clone(),
+                        dep.target.clone(),
+                        dep.rustc_version.clone(),
+                    ),
+                    dep.features_json.features().to_vec(),
+                ))
+                .or_default();
+            if dep.host_side {
+                entry.0 = true;
+            } else {
+                entry.1 = true;
+            }
+        }
+        paired.extend(
+            by_set
+                .into_iter()
+                .filter(|(_, sides)| sides.0 && sides.1)
+                .map(|(key, _)| key),
+        );
+    };
+    for tree in trees {
+        for node in &tree.nodes {
+            let parent = TaskNodeIdentity {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                target: node.target.clone(),
+                rustc_version: node.rustc_version.clone(),
+                host_side: node.host_side,
+            };
+            let deps: Vec<TaskNodeIdentity> = node
+                .deps
+                .iter()
+                .map(|&dep| {
+                    let dep = &tree.nodes[dep as usize];
+                    TaskNodeIdentity {
+                        crate_name: dep.crate_name.clone(),
+                        version: dep.version.clone(),
+                        features_json: dep.features_json.clone(),
+                        target: dep.target.clone(),
+                        rustc_version: dep.rustc_version.clone(),
+                        host_side: dep.host_side,
+                    }
+                })
+                .collect();
+            record(&parent, &deps);
+        }
+    }
+    for (slice_index, slice) in published.iter().enumerate() {
+        for (row_index, row) in slice.rows.iter().enumerate() {
+            let parent = published_row_identity(slice, row);
+            let mut deps = Vec::with_capacity(row.dependency_task_ids.len());
+            for child_id in &row.dependency_task_ids {
+                // A dep chain the pulled slices do not fully carry
+                // never reconstructs; its edges name no pair either.
+                let Some(&(dep_slice, dep_row)) = by_task_id.get(child_id.as_str()) else {
+                    continue;
+                };
+                deps.push(published_row_identity(
+                    &published[dep_slice],
+                    &published[dep_slice].rows[dep_row],
+                ));
+            }
+            let _ = (slice_index, row_index);
+            record(&parent, &deps);
+        }
+    }
+
+    for (key, features) in paired {
+        // The sets each side would serve, restricted to built sets —
+        // moving an endpoint must land it on a set that stays.
+        let built = |host_side: bool| -> BTreeSet<Vec<String>> {
+            serving
+                .get(&(
+                    key.0.clone(),
+                    key.1.clone(),
+                    key.2.clone(),
+                    key.3.clone(),
+                    host_side,
+                ))
+                .map(|map| {
+                    map.iter()
+                        .filter(|(set, serve)| set == serve)
+                        .map(|(set, _)| set.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let joint = built(true)
+            .intersection(&built(false))
+            .filter(|set| **set != features && crate::feature_sets::contains_all(set, &features))
+            .min()
+            .cloned()
+            .unwrap_or_else(|| features.clone());
+        for host_side in [true, false] {
+            if let Some(map) = serving.get_mut(&(
+                key.0.clone(),
+                key.1.clone(),
+                key.2.clone(),
+                key.3.clone(),
+                host_side,
+            )) && map.contains_key(&features)
+            {
+                map.insert(features.clone(), joint.clone());
+            }
+        }
+    }
+}
+
+/// A published row's identity group — the slice supplies the two
+/// identity columns a row does not carry.
+fn substitution_row_key(
+    slice: &PublishedIndexSlice,
+    row: &ArtifactIndexRow,
+) -> SubstitutionGroupKey {
+    (
+        row.crate_name.clone(),
+        row.version.clone(),
+        slice.target.clone(),
+        slice.rustc_version.clone(),
+        row.unit_shape.side == crate::public_cache::UnitSide::Host,
+    )
+}
+
+/// A published row's task identity — same field split as
+/// [`substitution_row_key`].
+fn published_row_identity(slice: &PublishedIndexSlice, row: &ArtifactIndexRow) -> TaskNodeIdentity {
+    TaskNodeIdentity {
+        crate_name: row.crate_name.clone(),
+        version: row.version.clone(),
+        features_json: row.features_json.clone(),
+        target: slice.target.clone(),
+        rustc_version: slice.rustc_version.clone(),
+        host_side: row.unit_shape.side == crate::public_cache::UnitSide::Host,
+    }
+}
+
+/// The published side of the serving-pool pick (stow#881): among the
+/// rows carrying each serving set, the smallest published task id —
+/// a published row wins over a batch node because its artifact already
+/// exists, so serving from it never waits on this wave. Also every
+/// row's own minted task id — the join key a row's
+/// `dependency_task_ids` edges name (stow#919).
+#[allow(clippy::type_complexity)]
+fn published_pool_index(
+    published: &[PublishedIndexSlice],
+    serving: &BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
+) -> crate::error::Result<(
+    BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize, String)>,
+    Vec<Vec<String>>,
+)> {
+    let mut reps = BTreeMap::new();
+    let mut task_ids = Vec::with_capacity(published.len());
+    for (slice_index, slice) in published.iter().enumerate() {
+        let mut slice_ids = Vec::with_capacity(slice.rows.len());
+        for (row_index, row) in slice.rows.iter().enumerate() {
+            let task_id = published_row_identity(slice, row).task_id(&row.dependency_identity()?);
+            slice_ids.push(task_id.clone());
+            let key = substitution_row_key(slice, row);
+            let serve = &serving[&key][row.features_json.features()];
+            if serve.as_slice() != row.features_json.features() {
+                continue;
+            }
+            reps.entry((key, serve.clone()))
+                .and_modify(|rep: &mut (usize, usize, String)| {
+                    if task_id < rep.2 {
+                        *rep = (slice_index, row_index, task_id.clone());
+                    }
+                })
+                .or_insert((slice_index, row_index, task_id));
+        }
+        task_ids.push(slice_ids);
+    }
+    Ok((reps, task_ids))
+}
+
+/// One batch's shared rewrite state for
+/// [`SubmissionTree::substitute_contained_sets`]: the group serving
+/// maps, each serving set's canonical batch node and published row,
+/// the interned [`ResolvedTaskNode`] arena every tree re-emits from,
+/// and the memoized per-occurrence answers.
+struct Substitution<'a> {
+    trees: &'a [SubmissionTree],
+    published: &'a [PublishedIndexSlice],
+    serving: &'a BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
+    representatives: &'a BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize)>,
+    /// `(slice, row, task id)` of each serving set's published pick.
+    published_reps: &'a BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize, String)>,
+    /// Every pulled row's own minted task id, indexed `(slice, row)` —
+    /// the id a reconstructed node is pinned to reproduce.
+    row_task_ids: &'a [Vec<String>],
+    /// `task id` → `(slice, row)` across every pulled slice — the
+    /// dep-edge join a row's `dependency_task_ids` names (stow#919).
+    by_task_id: &'a std::collections::HashMap<&'a str, (usize, usize)>,
+    arena: Vec<ResolvedTaskNode>,
+    /// Parallel to `arena`: a proc-macro reaches this node's dep
+    /// closure, or the node is one itself. Only published
+    /// reconstructions read it — a published node's `KeysApart` flag is
+    /// recomputed from it.
+    closure_pm: Vec<bool>,
+    interned: std::collections::HashMap<
+        (
+            TaskNodeIdentity,
+            crate::public_cache::ExplicitSpelling,
+            Vec<usize>,
+        ),
+        usize,
+    >,
+    memo: std::collections::HashMap<(usize, usize), usize>,
+    /// `(slice, row)` → reconstructed arena index; `None` when the row's
+    /// dep chain is not fully present in the pulled slices.
+    published_memo: std::collections::HashMap<(usize, usize), Option<usize>>,
+    /// Arena index → the task id its published row records — checked
+    /// against the recompute before any tree re-emits.
+    pinned: std::collections::HashMap<usize, &'a str>,
+}
+
+impl Substitution<'_> {
+    /// The arena node one `(tree, node)` occurrence maps to —
+    /// memoized. A node whose set is served by a containing set
+    /// resolves to that set's published row when one exists — its
+    /// artifact is already built — else to the set's canonical batch
+    /// node; a published pick whose dep chain the pulled slices do not
+    /// fully carry, or a serve with no node or row at all, leaves the
+    /// node on the chain it has.
+    fn substitute(&mut self, tree_index: usize, node_index: usize) -> usize {
+        if let Some(&index) = self.memo.get(&(tree_index, node_index)) {
+            return index;
+        }
+        let node = &self.trees[tree_index].nodes[node_index];
+        let key = substitution_group_key(node);
+        let serve = &self.serving[&key][node.features_json.features()];
+        let index = if serve.as_slice() == node.features_json.features() {
+            self.intern(tree_index, node)
+        } else {
+            let published = self
+                .published_reps
+                .get(&(key.clone(), serve.clone()))
+                .map(|&(slice_index, row_index, _)| (slice_index, row_index))
+                .and_then(|(slice_index, row_index)| self.published_node(slice_index, row_index));
+            match published {
+                Some(index) => index,
+                None => match self.representatives.get(&(key, serve.clone())) {
+                    Some(&(rep_tree, rep_node)) => self.substitute(rep_tree, rep_node),
+                    None => self.intern(tree_index, node),
+                },
+            }
+        };
+        self.memo.insert((tree_index, node_index), index);
+        index
+    }
+
+    /// Intern one uncontained node's post-substitution form — same
+    /// identity, dep positions repointed at substituted children.
+    fn intern(&mut self, tree_index: usize, node: &SubmissionNode) -> usize {
+        let mut dependencies = node
+            .deps
+            .iter()
+            .map(|&dep| self.substitute(tree_index, dep as usize))
+            .collect::<Vec<usize>>();
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        let intern_key = (
+            TaskNodeIdentity {
+                crate_name: node.crate_name.clone(),
+                version: node.version.clone(),
+                features_json: node.features_json.clone(),
+                target: node.target.clone(),
+                rustc_version: node.rustc_version.clone(),
+                host_side: node.host_side,
+            },
+            node.explicit_spelling,
+            dependencies,
+        );
+        if let Some(&index) = self.interned.get(&intern_key) {
+            return index;
+        }
+        let index = self.arena.len();
+        self.arena.push(ResolvedTaskNode {
+            identity: intern_key.0.clone(),
+            explicit_spelling: intern_key.1,
+            dependencies: intern_key.2.clone(),
+        });
+        self.closure_pm
+            .push(intern_key.1 == crate::public_cache::ExplicitSpelling::KeysApart);
+        self.interned.insert(intern_key, index);
+        index
+    }
+
+    /// The arena node reconstructing one published row's subtree —
+    /// memoized per `(slice, row)`. Dep edges follow
+    /// `dependency_task_ids`' child task ids through every pulled
+    /// slice, so a target-side row's host deps land on the host slice
+    /// they publish to (stow#919). `None` when an edge names a task no
+    /// pulled row mints — the chain is not fully published, and the
+    /// dependent stays on its own chain.
+    fn published_node(&mut self, slice_index: usize, row_index: usize) -> Option<usize> {
+        if let Some(&index) = self.published_memo.get(&(slice_index, row_index)) {
+            return index;
+        }
+        let slice = &self.published[slice_index];
+        let row = &slice.rows[row_index];
+        let mut dependencies = Vec::new();
+        for child_id in &row.dependency_task_ids {
+            let Some(&(dep_slice, dep_row)) = self.by_task_id.get(child_id.as_str()) else {
+                self.published_memo.insert((slice_index, row_index), None);
+                return None;
+            };
+            let Some(dep_index) = self.published_node(dep_slice, dep_row) else {
+                self.published_memo.insert((slice_index, row_index), None);
+                return None;
+            };
+            dependencies.push(dep_index);
+        }
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        // A proc-macro in the `--extern` closure keys a node apart —
+        // recomputed from the reconstructed children, the published
+        // rows carry no spelling flag of their own.
+        let keys_apart = dependencies.iter().any(|&dep| self.closure_pm[dep]);
+        let explicit_spelling = if keys_apart {
+            crate::public_cache::ExplicitSpelling::KeysApart
+        } else {
+            crate::public_cache::ExplicitSpelling::KeysAsNative
+        };
+        let identity = published_row_identity(slice, row);
+        let expected_task_id = self.row_task_ids[slice_index][row_index].as_str();
+        let intern_key = (identity, explicit_spelling, dependencies);
+        let index = if let Some(&index) = self.interned.get(&intern_key) {
+            index
+        } else {
+            let index = self.arena.len();
+            self.arena.push(ResolvedTaskNode {
+                identity: intern_key.0.clone(),
+                explicit_spelling: intern_key.1,
+                dependencies: intern_key.2.clone(),
+            });
+            self.closure_pm
+                .push(row.artifact_kind == ArtifactKind::ProcMacro || keys_apart);
+            self.interned.insert(intern_key, index);
+            index
+        };
+        self.pinned.insert(index, expected_task_id);
+        self.published_memo
+            .insert((slice_index, row_index), Some(index));
+        Some(index)
+    }
+}
+
+/// Re-emit one tree from its substituted roots' arena reach (stow#881):
+/// contained-node subtrees no root still reaches leave the batch, and
+/// each surviving node carries a post-substitution `task_id` and
+/// `dependency_identity`.
+///
+/// A node's `downloads`/`preserve_lockfile` survive on its substituted
+/// image inside this tree — several originals collapsing to one image
+/// merge `max`/`or`; nodes no original maps to (a spliced or
+/// reconstructed interior) carry neither.
+fn reemit_substituted_tree(
+    tree: &SubmissionTree,
+    tree_index: usize,
+    memo: &std::collections::HashMap<(usize, usize), usize>,
+    resolved: &ResolvedTaskGraph,
+) -> crate::error::Result<SubmissionTree> {
+    let resolved_nodes = resolved.nodes();
+    let image_of = |index: usize| memo[&(tree_index, index)];
+    let reachable = {
+        let mut seen = BTreeSet::new();
+        let mut frontier: Vec<usize> = tree
+            .roots
+            .iter()
+            .map(|&root| image_of(root as usize))
+            .collect();
+        while let Some(index) = frontier.pop() {
+            if seen.insert(index) {
+                frontier.extend(resolved_nodes[index].dependencies.iter().copied());
+            }
+        }
+        seen
+    };
+    let local: BTreeMap<usize, u32> = reachable
+        .iter()
+        .enumerate()
+        .map(|(rank, &index)| {
+            (
+                index,
+                u32::try_from(rank).expect("submission node count fits u32"),
+            )
+        })
+        .collect();
+    let mut carried = BTreeMap::<usize, (u64, bool)>::new();
+    for (node_index, node) in tree.nodes.iter().enumerate() {
+        let image = image_of(node_index);
+        if !reachable.contains(&image) {
+            continue;
+        }
+        carried
+            .entry(image)
+            .and_modify(|(downloads, lockfile)| {
+                *downloads = (*downloads).max(node.downloads);
+                *lockfile |= node.preserve_lockfile;
+            })
+            .or_insert((node.downloads, node.preserve_lockfile));
+    }
+    let mut nodes = Vec::with_capacity(reachable.len());
+    for &index in &reachable {
+        let node = &resolved_nodes[index];
+        let dependency_identity = resolved
+            .dependency_identity(index)
+            .cloned()
+            .ok_or_else(|| stow_error!("resolved node {index} has no digest"))?;
+        let (downloads, preserve_lockfile) = carried.get(&index).copied().unwrap_or_default();
+        nodes.push(SubmissionNode {
+            task_id: resolved
+                .task_id(index)
+                .ok_or_else(|| stow_error!("resolved node {index} has no task id"))?
+                .to_owned(),
+            crate_name: node.identity.crate_name.clone(),
+            version: node.identity.version.clone(),
+            features_json: node.identity.features_json.clone(),
+            target: node.identity.target.clone(),
+            rustc_version: node.identity.rustc_version.clone(),
+            host_side: node.identity.host_side,
+            explicit_spelling: node.explicit_spelling,
+            preserve_lockfile,
+            dependency_identity,
+            deps: node.dependencies.iter().map(|dep| local[dep]).collect(),
+            downloads,
+        });
+    }
+    let mut roots = Vec::with_capacity(tree.roots.len());
+    for &root in &tree.roots {
+        let image = local[&image_of(root as usize)];
+        if !roots.contains(&image) {
+            roots.push(image);
+        }
+    }
+    Ok(SubmissionTree {
+        source: tree.source,
+        roots,
+        nodes,
+    })
+}
+
+/// One dispatch pass's claim on one task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchClaim {
+    /// The claimed task.
+    pub task_id: String,
+    /// The generation minted for this claim.
+    pub generation: u64,
+    /// The attempt cycle the claim runs under.
+    pub attempt: u32,
+}
+
+/// One dispatch response binding.
+///
+/// The run a claim's `workflow_dispatch` returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchBinding {
+    /// The claimed task.
+    pub task_id: String,
+    /// The generation this binding fences to.
+    pub generation: u64,
+    /// The GitHub Actions run id the dispatch returned.
+    pub run_id: String,
+}
+
+/// The operator mutations `Mutate` records.
+///
+/// The selector is resolved to ids before the event is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationKind {
+    /// Re-queue a terminal task.
+    Retry,
+    /// Drop a pending task.
+    Cancel,
+    /// Move a task to the human lane.
+    Promote,
+    /// Remove aged rows outright.
+    Purge,
+}
+
+/// One demand-batch contribution to one task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DemandEntry {
+    /// The task the batch's closure reached.
+    pub task_id: String,
+    /// This batch's total contribution.
+    pub delta: i64,
+}
+
+/// The human request lane's lifecycle events.
+///
+/// The `requests` record state machine carried as log entries.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RequestEvent {
+    /// The record was admitted and a resolve run dispatched.
+    Admitted {
+        /// The admission's fields.
+        admission: Box<RequestAdmission>,
+        /// The dispatched attempt.
+        attempt: u32,
+        /// The unix-second dispatch stamp.
+        dispatched_at: i64,
+    },
+    /// A `workflow_run` lifecycle event for the resolve run.
+    RunUpdated {
+        /// The update payload.
+        update: Box<RequestRunUpdate>,
+    },
+    /// The resolve job's outcome report landed.
+    Outcome {
+        /// The reported attempt.
+        attempt: u32,
+        /// `enqueued` or `failed`.
+        state: String,
+        /// The serialized stored roots (present when enqueued).
+        outcome_json: Option<String>,
+        /// The failure reason (present when failed).
+        error: Option<String>,
+    },
+}
+
+/// One `Feed` event's payload — the `demand_feed_hours` /
+/// `demand_feed_pages` rows' lifecycle (stow#878 stage 7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FeedEvent {
+    /// `feed_begin`: open a staging generation (or rotate an abandoned
+    /// one — the monotonically bumped generation is the attempt's id).
+    Begin {
+        /// The generation stamp.
+        generation: i64,
+    },
+    /// `feed_page`: one staged page — the wire request's bounded entry
+    /// list, carried verbatim so replay restages it.
+    Page {
+        /// The generation the page lands under.
+        generation: i64,
+        /// In-order page number (`= staged_pages`).
+        page_no: u32,
+        /// The page's demand contributions.
+        entries: Vec<SchedulerDemandEntry>,
+    },
+    /// `feed_complete`: the staged manifest verified — the hour
+    /// accepts for delivery.
+    Complete {
+        /// The generation being accepted.
+        generation: i64,
+    },
+    /// `feed_deliver`: one staged page's `Demand` batch acknowledged
+    /// — `applied_pages` advances; the fold itself rides the paired
+    /// `Demand` event.
+    ApplyPage {
+        /// The page this ack covered.
+        page_no: u32,
+    },
+    /// `feed_deliver`: the terminal transition — `applied_pages ==
+    /// page_count`, the hour becomes the new watermark.
+    Deliver {
+        /// The generation being delivered.
+        generation: i64,
+    },
+    /// `feed_cleanup` expiry — the session is retired; a staging
+    /// session's pages go with it.
+    Expire,
+}
+
+/// One accepted event in the scheduler's flat append-only log (stow#878).
+///
+/// Every state change the in-memory graph survives a forced eviction
+/// by is one of these, appended before the request or pass that
+/// produced it is acknowledged.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "event")]
+pub enum SchedulerEvent {
+    /// One chunk of a multi-row submission: a `SubmissionTree` split at
+    /// ~1 MiB so no row nears the platform's row-size bound, appended
+    /// inside one transaction before the submit is acknowledged. `roots`
+    /// rides part 0; `nodes` carries this part's slice of the tree.
+    Submit {
+        /// The entry point the whole tree arrives under.
+        source: SubmissionSource,
+        /// This part's index.
+        part: u32,
+        /// Total parts the tree was split into.
+        parts: u32,
+        /// Tree roots — set on part 0 only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        roots: Vec<u32>,
+        /// This part's nodes.
+        nodes: Vec<SubmissionNode>,
+    },
+    /// An index-publish report: the unit shapes a live slice serves.
+    SliceReport {
+        /// The slice's compilation target.
+        target: TargetTriple,
+        /// The slice's rustc.
+        rustc_version: WireRustcVersion,
+        /// The report's declared base (delta reports).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_generation: Option<i64>,
+        /// The index generation this report publishes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        generation: Option<i64>,
+        /// Membership rows the report adds.
+        added: Vec<PublishedSliceRow>,
+        /// Membership rows the report retires.
+        retired: Vec<PublishedSliceRow>,
+    },
+    /// One dispatch pass's whole claim set — one row for every claim of
+    /// the pass, appended before the first `workflow_dispatch` posts.
+    Claims {
+        /// The pass's claims, in claim order.
+        claims: Vec<DispatchClaim>,
+    },
+    /// One dispatch pass's whole binding set — one row after the
+    /// concurrent dispatch POSTs return.
+    Bindings {
+        /// The pass's bindings.
+        bindings: Vec<DispatchBinding>,
+    },
+    /// A `workflow_run` `in_progress` delivery for a run the scheduler
+    /// did not dispatch — external occupancy only; the scheduler's own
+    /// `in_progress` deliveries persist nothing.
+    ExternalRunStarted {
+        /// The Actions run id.
+        run_id: String,
+        /// The run's runner family.
+        family: RunnerFamily,
+    },
+    /// A `workflow_run` delivery the scheduler accepted that appended
+    /// nothing else — the `in_progress` channel's own-run and stale
+    /// outcomes (stow#860). The log row's `at` is the acceptance
+    /// instant the health check's last-delivery age reads; deliveries
+    /// that already append an event (`RunFinished`,
+    /// `ExternalRunStarted`, `Request` `RunUpdated`) mark it from
+    /// their own rows instead.
+    RunUpdate,
+    /// A `workflow_run` `completed` delivery — applies to a bound run,
+    /// parks until the binding lands, or just consumes an external run.
+    RunFinished {
+        /// The Actions run id.
+        run_id: String,
+        /// The task the run's title named.
+        task_id: String,
+        /// The mapped conclusion.
+        success: bool,
+        /// The conclusion was `cancelled`.
+        #[serde(default)]
+        cancelled: bool,
+        /// Failure description.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// An operator mutation, selector already resolved to ids.
+    Mutate {
+        /// The mutation applied.
+        op: MutationKind,
+        /// The tasks it applied to.
+        task_ids: Vec<String>,
+    },
+    /// A submit-by-id promotion: the missed lane re-requests tasks the
+    /// graph already holds, raising their downloads and priority.
+    SubmitIds {
+        /// The promoted tasks.
+        entries: Vec<SubmitTaskIdEntry>,
+    },
+    /// A human request lane lifecycle step.
+    Request {
+        /// The record the step applies to.
+        request_id: String,
+        /// The lifecycle event.
+        kind: RequestEvent,
+    },
+    /// An accepted demand batch folded into the graph.
+    Demand {
+        /// The batch's durable identity (replays dedupe on it).
+        batch_id: String,
+        /// The canonical fingerprint the replay guard compares —
+        /// the `demand_batches` row's `input_hash` (stow#878 stage 7).
+        input_hash: String,
+        /// The folded contributions.
+        entries: Vec<DemandEntry>,
+    },
+    /// One demand-feed hour's lifecycle step — staging, completion,
+    /// delivery and expiry replay identically (stow#878 stage 7).
+    Feed {
+        /// The hour the step belongs to (`YYYY-MM-DDTHH`).
+        hour: String,
+        /// The step.
+        kind: FeedEvent,
+    },
+    /// The dispatch freeze's transition record (`None` = cleared).
+    Freeze {
+        /// The serialized record while engaged.
+        record: Option<Box<crate::api::DispatchFreezeRecord>>,
+        /// When the transition happened — the log carries it so the
+        /// transition history survives a cleared record (stow#878).
+        at: String,
+        /// What triggered it — on clears it echoes the cleared
+        /// record's trigger for the history read.
+        trigger: crate::api::DispatchFreezeTrigger,
+    },
 }

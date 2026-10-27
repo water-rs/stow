@@ -26,10 +26,12 @@ use crate::platform::Profile;
 /// The `format_version` this crate writes and the only one
 /// [`ArtifactIndex::decode`] accepts.
 ///
-/// v5 requires `dependency_identity` and `unit_shape` on every row —
-/// there is no row shape an older format encodes that this one can
-/// answer for (stow#730).
-pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 5;
+/// v6 replaces the stored `dependency_identity` digest with
+/// `dependency_task_ids` — the sorted direct child task ids the digest
+/// hashes (stow#919). A v5 row's digest committed to edges the row did
+/// not carry, so no reader can reconstruct them; the preimage is the
+/// only form the substitution pool can join on.
+pub const ARTIFACT_INDEX_FORMAT_VERSION: u32 = 6;
 
 /// Media type of the index's single OCI layer — the zstd-compressed
 /// [`ArtifactIndex`] JSON.
@@ -91,9 +93,12 @@ pub struct ArtifactIndexRow {
     /// Sorted `(crate_name, c_metadata)` identities of the dependencies
     /// this artifact was built against — the transitive-closure chain.
     pub dependency_c_metadata_json: DependencyCMetadataJson,
-    /// The Merkle dependency digest of the dependency subgraph the
-    /// artifact was built under (stow#588) — the node's context key.
-    pub dependency_identity: crate::identity::DependencyIdentity,
+    /// The node's direct child task ids — the sorted, deduplicated
+    /// preimage [`Self::dependency_identity`] hashes (stow#919). They
+    /// are the row's task-graph edges: build-dependency libs and shadow
+    /// twins included, which `dependency_c_metadata_json`'s `--extern`
+    /// list never names.
+    pub dependency_task_ids: Vec<String>,
     /// Cargo's `-C metadata` value — the exact cache lookup key.
     pub c_metadata: CMetadata,
     /// Blake3 compile key of this artifact. A row is *canonical* — the
@@ -130,6 +135,21 @@ pub struct ArtifactIndexRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub min_glibc: Option<crate::glibc::GlibcVersion>,
+}
+
+impl ArtifactIndexRow {
+    /// The Merkle dependency digest of the dependency subgraph the
+    /// artifact was built under (stow#588) — the node's context key,
+    /// derived from the carried child task ids so a row can never hold
+    /// a digest disagreeing with its edges (stow#919).
+    ///
+    /// # Errors
+    /// Mirrors [`crate::identity::DependencyIdentity::from_task_ids`].
+    pub fn dependency_identity(&self) -> crate::error::Result<crate::identity::DependencyIdentity> {
+        crate::identity::DependencyIdentity::from_task_ids(
+            self.dependency_task_ids.iter().map(String::as_str),
+        )
+    }
 }
 
 /// The OCI tag of the index artifact for one slice:
@@ -404,8 +424,7 @@ mod tests {
             features_json: FeaturesJson::canonicalize(vec!["default".to_owned()])
                 .expect("features"),
             dependency_c_metadata_json: DependencyCMetadataJson::default(),
-            dependency_identity: crate::identity::DependencyIdentity::leaf()
-                .expect("leaf identity"),
+            dependency_task_ids: Vec::new(),
             c_metadata: CMetadata::parse(c_metadata).expect("c_metadata"),
             compile_key: format!("{c_metadata}{c_metadata}"),
             bundle_digest: format!("sha256:{c_metadata:0>64}"),
@@ -460,21 +479,28 @@ mod tests {
     /// published index is regenerated, a stale reader upgrades.
     #[test]
     fn the_format_error_names_the_recovery() {
+        let current = ARTIFACT_INDEX_FORMAT_VERSION;
         let mut index = index(Vec::new());
-        index.header.format_version = 4;
+        index.header.format_version = current - 1;
         let bytes = encode(&index).expect("encode");
         let error = ArtifactIndex::decode(&bytes).expect_err("an older format fails");
         assert_eq!(
             error.to_string(),
-            "index format 4 is older than this stow reads (5): \
-             the published index has not been regenerated for this release"
+            format!(
+                "index format {} is older than this stow reads ({current}): \
+                 the published index has not been regenerated for this release",
+                current - 1
+            )
         );
-        index.header.format_version = 6;
+        index.header.format_version = current + 1;
         let bytes = encode(&index).expect("encode");
         let error = ArtifactIndex::decode(&bytes).expect_err("a newer format fails");
         assert_eq!(
             error.to_string(),
-            "index format 6 is newer than this stow reads (5): upgrade stow"
+            format!(
+                "index format {} is newer than this stow reads ({current}): upgrade stow",
+                current + 1
+            )
         );
     }
 

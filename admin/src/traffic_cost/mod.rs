@@ -8,12 +8,12 @@
 //!   on any overload signal or 5xx;
 //! - `verdict` judges the scheduler budget reports: row budgets, growth
 //!   with stored rows, and the peak serialized Durable Object wall;
-//! - `project` is the monthly projection against half of each allowance
+//! - `project` is the monthly projection against 80% of each allowance
 //!   — user traffic from those reports and the CPU report, plus the
 //!   preheat waves and daily resubmits the Preheat cost report measures
 //!   (stow#775). The release gate runs it in its own job, once all
 //!   three tests' reports exist;
-//! - `fixture-runs` prints the runs the fixture's in-flight batches are
+//! - `fixture-runs` prints the runs the fixture's in-flight tasks are
 //!   bound to, which the harness records in the local CI before the
 //!   callback lane completes them.
 
@@ -55,9 +55,9 @@ enum TrafficCostCommand {
     /// serialized wall.
     Verdict(verdict::VerdictArgs),
     /// Project the month — user traffic plus the preheat waves and
-    /// resubmits — against half of each product's allowance.
+    /// resubmits — against 80% of each product's allowance.
     Project(project::ProjectArgs),
-    /// Print the `build-batch.yml` runs the fixture's in-flight batches
+    /// Print the `build-crate.yml` runs the fixture's in-flight tasks
     /// are bound to, for the local CI's `POST /seeded-runs`.
     FixtureRuns(fixture_runs::FixtureRunsArgs),
 }
@@ -65,8 +65,8 @@ enum TrafficCostCommand {
 /// Dispatch one `traffic-cost` subcommand.
 pub async fn run(args: TrafficCostArgs, output: Output) -> stow_types::error::Result<()> {
     match args.command {
-        TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect().await?, &args, output).await,
-        TrafficCostCommand::Peak(args) => peak::run(&Edge::connect().await?, &args, output).await,
+        TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect()?, &args, output).await,
+        TrafficCostCommand::Peak(args) => peak::run(&Edge::connect()?, &args, output).await,
         TrafficCostCommand::Verdict(args) => verdict::run(&args, output).await,
         TrafficCostCommand::Project(args) => project::run(&args, output).await,
         TrafficCostCommand::FixtureRuns(args) => fixture_runs::run(&args, output),

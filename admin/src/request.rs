@@ -94,7 +94,7 @@ async fn resolve(args: RequestResolveArgs, output: Output) -> stow_types::error:
                 // unless its failure is reported — post it; a report
                 // failure only logs, the run's `completed` webhook is
                 // the backstop.
-                match Edge::connect().await {
+                match Edge::connect() {
                     Ok(edge) => {
                         if let Err(report_error) =
                             report_failure(&edge, &dispatch, &error.to_string()).await
@@ -314,11 +314,14 @@ async fn submit_outcome(
     plan: RequestPlan,
     output: Output,
 ) -> stow_types::error::Result<()> {
-    let edge = Edge::connect().await?;
+    let edge = Edge::connect()?;
     let report = RequestOutcomeReport {
         attempt: dispatch.attempt,
         outcome: RequestOutcome::Resolved {
-            tasks: plan.tasks,
+            trees: vec![stow_types::api::SubmissionTree::from_enqueue_requests(
+                stow_types::api::SubmissionSource::HumanRequest,
+                &plan.tasks,
+            )?],
             roots: plan.roots,
         },
     };
