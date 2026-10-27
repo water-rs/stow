@@ -12,6 +12,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// The request timeout a test pointed at the stub uses. It only bounds a
+/// hung stub: a tight one fails a request that merely waited on a loaded
+/// runner, where the accept loop's 2 ms poll sleeps a whole timer tick on
+/// Windows (stow#949).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// One canned answer: the first route whose `path` appears in the
 /// request line replies with `status` and `body`.
 pub struct Route {
@@ -36,6 +42,12 @@ impl StubEdge {
     /// The stub's base URL — what `StowConfig::edge_url` points at.
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Point `config` at the stub, with the stub's request timeout.
+    pub fn configure(&self, config: &mut crate::config::StowConfig) {
+        config.edge_url.clone_from(&self.url);
+        config.request_timeout = REQUEST_TIMEOUT;
     }
 
     /// The request lines (`METHOD path HTTP/1.1`) answered so far.

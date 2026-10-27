@@ -2021,7 +2021,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let edge = stub_edge(&[minted_admission()], "503 Service Unavailable");
         let mut config = test_config(dir.path());
-        config.edge_url = edge.url().to_owned();
+        edge.configure(&mut config);
         let journal = inexact_journal(&config, dir.path()).await;
 
         let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
@@ -2042,7 +2042,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let edge = stub_edge(&[minted_admission()], "200 OK");
         let mut config = test_config(dir.path());
-        config.edge_url = edge.url().to_owned();
+        edge.configure(&mut config);
         let journal = inexact_journal(&config, dir.path()).await;
 
         let mut gate = crate::derive_gate::DerivationGate::unopened(dir.path().join("gate"));
