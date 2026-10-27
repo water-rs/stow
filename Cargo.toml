@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/water-rs/stow"
@@ -46,10 +46,10 @@ blake3 = "1"
 hex = "0.4"
 tracing = "0.1"
 thiserror = "2"
-stow-types = { path = "types", version = "0.8.0" }
-stow-shim = { path = "shim", version = "0.8.0" }
-stow-oci = { path = "oci", version = "0.8.0" }
-stow-cli = { path = "cli", version = "0.8.0" }
+stow-types = { path = "types", version = "0.8.1" }
+stow-shim = { path = "shim", version = "0.8.1" }
+stow-oci = { path = "oci", version = "0.8.1" }
+stow-cli = { path = "cli", version = "0.8.1" }
 stow-resolver = { path = "resolver", version = "0.6.0" }
 anyhow = "1.0.102"
 toml = "0.9"
@@ -110,25 +110,6 @@ zenwave = { git = "https://github.com/zen-rs/zenwave", rev = "776f9fd7d7626406b6
 sqlx = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
 sqlx-core = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
 sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
-# skyzen dev at this rev moves services to sqlx 0.9 and takes services
-# with default-features off, so only the pinned sqlx 0.9 graph exists.
-# The rev also carries unreleased commits: encodeBody for
-# double-encoded responses (zen-rs/skyzen#96), CfFetch rendering a
-# rejected fetch's JS `.message` (zen-rs/skyzen#100), the
-# `DurableDb::sync` durability barrier (zen-rs/skyzen#102) and the JS
-# body passthrough the byte paths use (zen-rs/skyzen#104) — no 0.4.x
-# tag or crates.io release carries them. Every skyzen crate the edge
-# resolves is pinned to one rev so the whole graph agrees: pinning
-# `skyzen-cloudflare` alone duplicates the graph, because a git
-# package's in-repo path deps resolve inside its own checkout while
-# stow-edge's direct deps keep the older rev's crate instances.
-skyzen = { git = "https://github.com/zen-rs/skyzen", rev = "c23a045026fdbbfeb48df574813163b123217cc5" }
-skyzen-cloudflare = { git = "https://github.com/zen-rs/skyzen", rev = "c23a045026fdbbfeb48df574813163b123217cc5" }
-skyzen-core = { git = "https://github.com/zen-rs/skyzen", rev = "c23a045026fdbbfeb48df574813163b123217cc5" }
-skyzen-hyper = { git = "https://github.com/zen-rs/skyzen", rev = "c23a045026fdbbfeb48df574813163b123217cc5" }
-skyzen-macros = { git = "https://github.com/zen-rs/skyzen", rev = "c23a045026fdbbfeb48df574813163b123217cc5" }
-skyzen-manifest = { git = "https://github.com/zen-rs/skyzen", rev = "c23a045026fdbbfeb48df574813163b123217cc5" }
-skyzen-services = { git = "https://github.com/zen-rs/skyzen", rev = "c23a045026fdbbfeb48df574813163b123217cc5" }
 sqlx-macros = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
 sqlx-macros-core = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }
 sqlx-mysql = { git = "https://github.com/launchbadge/sqlx", rev = "b54008a329541c0ce230d8b203e0c00fc8e8ea48" }

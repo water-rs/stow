@@ -10,10 +10,10 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-skyzen = { version = "0.4.3", default-features = false, features = ["json", "query"] }
+skyzen = { version = "0.5.0", default-features = false, features = ["json", "query"] }
 skyzen-core = "0.2"
-skyzen-cloudflare = "0.4.3"
-skyzen-services = { version = "0.2.1", default-features = false }
+skyzen-cloudflare = "0.5.0"
+skyzen-services = { version = "0.3.0", default-features = false }
 stow-types.workspace = true
 stow-shim.workspace = true
 http = "1"
@@ -83,6 +83,6 @@ tar.workspace = true
 # so sqlx-sqlite must not enter the wasm32 dev-dep graph.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
-skyzen-services = { version = "0.2.1", default-features = false, features = ["sqlite", "runtime-tokio"] }
+skyzen-services = { version = "0.3.0", default-features = false, features = ["sqlite", "runtime-tokio"] }
 [lints]
 workspace = true
