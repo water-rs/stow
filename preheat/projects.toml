@@ -1,6 +1,6 @@
 # Reviewed GitHub repositories the projects preheat lane resolves into
-# crate tasks. For each entry the wave clones the tree, drops the
-# committed Cargo.lock, and runs `cargo metadata --filter-platform` once
+# crate tasks. For each entry the edge fetches the tree, drops the
+# committed Cargo.lock, and resolves it once
 # per CI target; every crates.io package in the resolve is enqueued at
 # its resolved feature set — an ordinary crate task, never a project
 # task.
@@ -556,9 +556,6 @@ repo = "https://github.com/rathole-org/rathole"
 repo = "https://github.com/diesel-rs/diesel"
 
 [[project]]
-repo = "https://github.com/tonhowtf/omniget"
-
-[[project]]
 repo = "https://github.com/astral-sh/rye"
 
 [[project]]
@@ -644,3 +641,49 @@ repo = "https://github.com/water-rs/waterui-winui"
 
 [[project]]
 repo = "https://github.com/water-rs/wgpu-external-frame"
+
+[[project]]
+repo = "https://github.com/pbakaus/impeccable"
+
+[[project]]
+repo = "https://github.com/storytold/photocraft"
+
+[[project]]
+repo = "https://github.com/codewhale-hq/Codewhale"
+
+[[project]]
+repo = "https://github.com/storytold/artcraft"
+
+[[project]]
+repo = "https://github.com/trycua/cua"
+
+[[project]]
+repo = "https://github.com/ayangweb/BongoCat"
+
+[[project]]
+repo = "https://github.com/PrimeIntellect-ai/prime-agent"
+
+[[project]]
+repo = "https://github.com/lexmount/moli"
+
+[[project]]
+repo = "https://github.com/NVIDIA/OpenShell"
+
+[[project]]
+repo = "https://github.com/storytold/pdfcraft"
+
+[[project]]
+repo = "https://github.com/storytold/filmcraft"
+
+[[project]]
+repo = "https://github.com/PyO3/pyo3"
+
+[[project]]
+repo = "https://github.com/storytold/wordcraft"
+
+[[project]]
+repo = "https://github.com/xerj-org/xerj"
+
+[[project]]
+repo = "https://github.com/storytold/lightcraft"
+
