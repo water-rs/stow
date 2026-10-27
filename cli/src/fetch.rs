@@ -689,7 +689,7 @@ mod tests {
             edge_url,
             registry_base_url: String::new(),
             cache_dir: std::path::PathBuf::new(),
-            request_timeout: std::time::Duration::from_secs(30),
+            request_timeout: crate::test_edge::REQUEST_TIMEOUT,
             negative_cache_ttl: std::time::Duration::from_secs(0),
             circuit_reset_after: std::time::Duration::from_secs(0),
             circuit_trip_threshold: 0,

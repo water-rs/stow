@@ -178,6 +178,13 @@ pub struct Scheduler {
 }
 
 impl DurableObject for Scheduler {
+    /// Every byte of the scheduler's state lives in its SQLite store;
+    /// the struct holds only the in-memory graph. Without this skyzen
+    /// would persist the struct as a blob and read it back before any
+    /// route runs, so a change to its fields would keep the object —
+    /// and the store reset — from waking (stow#958).
+    const PERSIST: bool = false;
+
     fn fetch(&self) -> Router {
         // The Durable Object runs in its own isolate; the exported fetch
         // goes through this method before the router responds, so this is
