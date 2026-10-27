@@ -20,6 +20,7 @@ mod dump;
 mod github;
 mod index_cmd;
 mod launch_model;
+mod login;
 mod maintenance;
 mod manual;
 mod preheat;
@@ -137,6 +138,9 @@ enum Command {
     Submit(SubmitArgs),
     /// Canary deployment verdicts for the edge Worker.
     Deploy(deploy::DeployArgs),
+    /// Authorize this machine as your GitHub account: the edge
+    /// credential every operator command sends outside Actions.
+    Login(login::LoginArgs),
 }
 
 #[derive(Args)]
@@ -151,13 +155,13 @@ struct StatusArgs {
 
 #[derive(Args)]
 struct DispatchFreezeArgs {
-    /// `status` reads the freeze; `clear` lifts it, resuming dispatch of
-    /// everything that queued during it. Engagement is automatic — a
-    /// systematic-failure or cost trip — or the dispatch-freeze POST.
+    /// `status` reads the freeze; `engage` stops dispatch by hand, as a
+    /// systematic-failure or cost trip does on its own; `clear` lifts
+    /// it, resuming dispatch of everything that queued during it.
     #[arg(value_enum)]
     action: DispatchFreezeAction,
-    /// Apply the clear. `status` never mutates; `clear` without `--yes`
-    /// prints the plan and exits 0.
+    /// Apply the change. `status` never mutates; `engage` and `clear`
+    /// without `--yes` print the plan and exit 0.
     #[arg(long)]
     yes: bool,
 }
@@ -165,6 +169,7 @@ struct DispatchFreezeArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DispatchFreezeAction {
     Status,
+    Engage,
     Clear,
 }
 
@@ -245,9 +250,9 @@ fn run<F: std::future::Future>(future: F) -> stow_types::error::Result<F::Output
 
 async fn dispatch(command: Command, output: Output) -> stow_types::error::Result<()> {
     match command {
-        Command::Status(args) => status(&Edge::connect().await?, args, output).await,
-        Command::Queue(args) => queue::run(&Edge::connect().await?, args, output).await,
-        Command::Scheduler(args) => scheduler::run(&Edge::connect().await?, args, output).await,
+        Command::Status(args) => status(&Edge::connect()?, args, output).await,
+        Command::Queue(args) => queue::run(&Edge::connect()?, args, output).await,
+        Command::Scheduler(args) => scheduler::run(&Edge::connect()?, args, output).await,
         Command::Coverage(args) => coverage::run(args, output).await,
         Command::Preheat(args) => preheat::run(args, output).await,
         Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
@@ -255,16 +260,17 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         Command::Artifacts(args) => artifacts::run(args, output).await,
         Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
         Command::Maintenance(args) => maintenance::run(args, output).await,
-        Command::Watchdog(args) => watchdog::run(&Edge::connect().await?, args, output).await,
+        Command::Watchdog(args) => watchdog::run(&Edge::connect()?, args, output).await,
         Command::DispatchFreeze(args) => {
-            dispatch_freeze_switch(&Edge::connect().await?, args, output).await
+            dispatch_freeze_switch(&Edge::connect()?, args, output).await
         }
         Command::Index(args) => index_cmd::run(args).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
         Command::TrafficCost(args) => traffic_cost::run(args, output).await,
         Command::Request(args) => request::run(args, output).await,
-        Command::Submit(args) => submit_command(&Edge::connect().await?, args, output).await,
+        Command::Submit(args) => submit_command(&Edge::connect()?, args, output).await,
         Command::Deploy(args) => deploy::run(args, output).await,
+        Command::Login(args) => login::run(args).await,
     }
 }
 
@@ -289,14 +295,14 @@ pub(crate) struct Edge {
 
 impl Edge {
     /// Resolve `STOW_EDGE_URL` and the credential source: Actions OIDC
-    /// when the runtime advertises it, else the operator's GitHub token.
-    pub(crate) async fn connect() -> stow_types::error::Result<Self> {
+    /// when the runtime advertises it, else [`edge_token`].
+    pub(crate) fn connect() -> stow_types::error::Result<Self> {
         let base = std::env::var(STOW_EDGE_URL_ENV)
             .map_err(|_| stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
         let token = if actions_oidc_available() {
             None
         } else {
-            Some(github_token().await?)
+            Some(edge_token()?)
         };
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
@@ -310,9 +316,9 @@ impl Edge {
     /// The edge for a lane whose plan needs none: connected only when
     /// the lane will submit (`yes`), so a plan-only run needs neither
     /// `STOW_EDGE_URL` nor a credential.
-    pub(crate) async fn connect_to_submit(yes: bool) -> stow_types::error::Result<Option<Self>> {
+    pub(crate) fn connect_to_submit(yes: bool) -> stow_types::error::Result<Option<Self>> {
         if yes {
-            Self::connect().await.map(Some)
+            Self::connect().map(Some)
         } else {
             Ok(None)
         }
@@ -724,8 +730,9 @@ async fn dispatch_freeze_switch(
         let switch: DispatchFreeze = edge.get_json("/api/v1/admin/dispatch-freeze").await?;
         return render::emit(output, &switch, render_freeze);
     }
+    let enabled = args.action == DispatchFreezeAction::Engage;
     let plan = DispatchFreeze {
-        enabled: false,
+        enabled,
         record: None,
         transitions: Vec::new(),
     };
@@ -733,7 +740,12 @@ async fn dispatch_freeze_switch(
         output,
         plan,
         |envelope: &render::Planned<DispatchFreeze, DispatchFreeze>| {
-            let mut out = "clear dispatch freeze\n".to_owned();
+            let mut out = if enabled {
+                "engage dispatch freeze\n"
+            } else {
+                "clear dispatch freeze\n"
+            }
+            .to_owned();
             if let Some(result) = &envelope.result {
                 let _ = writeln!(out, "{}", render_freeze(result));
             }
@@ -946,9 +958,24 @@ pub(crate) async fn submit(
     Ok(response)
 }
 
-/// The operator's GitHub credential for the edge's trusted endpoints and
-/// the GitHub REST calls (`runs`, `cache`): `GH_TOKEN`/`GITHUB_TOKEN`
-/// when set — the precedence `gh` itself follows — else `gh auth token`.
+/// The edge credential outside Actions: `GH_TOKEN`/`GITHUB_TOKEN` when a
+/// job stages its ephemeral token for a local mock edge, else the
+/// `stow-admin login` token. Never `gh auth token` — the edge is
+/// untrusted, and that token carries every scope gh holds (stow#953).
+fn edge_token() -> stow_types::error::Result<String> {
+    for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(token) = std::env::var(name)
+            && !token.is_empty()
+        {
+            return Ok(token);
+        }
+    }
+    login::stored_token()
+}
+
+/// The operator's GitHub credential for the GitHub REST calls (`runs`,
+/// `cache`), which go to GitHub alone: `GH_TOKEN`/`GITHUB_TOKEN` when
+/// set — the precedence `gh` itself follows — else `gh auth token`.
 pub(crate) async fn github_token() -> stow_types::error::Result<String> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(name)

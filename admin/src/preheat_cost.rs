@@ -137,7 +137,7 @@ fn unix_millis() -> stow_types::error::Result<u64> {
 }
 
 async fn ledger(args: &LedgerArgs) -> stow_types::error::Result<()> {
-    let edge = crate::Edge::connect().await?;
+    let edge = crate::Edge::connect()?;
     let ledger: SchedulerLedger = edge
         .get_json("/api/v1/admin/scheduler/budget/ledger")
         .await?;

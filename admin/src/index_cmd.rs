@@ -227,7 +227,7 @@ pub async fn run(args: IndexArgs) -> stow_types::error::Result<()> {
     match args.command {
         IndexCommand::Export(args) => index_export(args).await,
         IndexCommand::Publish(args) => index_publish(args).await,
-        IndexCommand::Report(args) => index_report(&Edge::connect().await?, args).await,
+        IndexCommand::Report(args) => index_report(&Edge::connect()?, args).await,
         IndexCommand::Targets => {
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())

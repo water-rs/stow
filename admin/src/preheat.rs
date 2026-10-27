@@ -162,15 +162,15 @@ pub async fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result
         PreheatCommand::Projects(args) => crate::projects::run(args, output).await,
         PreheatCommand::Cost(args) => crate::preheat_cost::run(args, output).await,
         PreheatCommand::Binary(args) => {
-            let edge = Edge::connect_to_submit(args.yes).await?;
+            let edge = Edge::connect_to_submit(args.yes)?;
             binary(edge.as_ref(), &mut crates_io::CratesIo::new(), args, output).await
         }
         PreheatCommand::TopBinaries(args) => {
-            let edge = Edge::connect_to_submit(args.yes).await?;
+            let edge = Edge::connect_to_submit(args.yes)?;
             top_binaries(edge.as_ref(), args, output).await
         }
         PreheatCommand::Missed(args) => {
-            let edge = Edge::connect_to_submit(args.yes).await?;
+            let edge = Edge::connect_to_submit(args.yes)?;
             missed(edge.as_ref(), args, output).await
         }
         PreheatCommand::Plan(args) => plan(&mut crates_io::CratesIo::new(), args, output).await,

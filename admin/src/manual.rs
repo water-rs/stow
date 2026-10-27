@@ -78,7 +78,7 @@ pub async fn run(args: ManualArgs, output: Output) -> stow_types::error::Result<
     }
     // The edge is connected up front under `--yes` — a missing
     // `STOW_EDGE_URL` fails before the resolve spends its minutes.
-    let edge = Edge::connect_to_submit(args.yes).await?;
+    let edge = Edge::connect_to_submit(args.yes)?;
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
     let targets = crate::preheat::ci_targets(args.targets.clone())?

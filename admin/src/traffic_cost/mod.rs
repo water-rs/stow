@@ -65,8 +65,8 @@ enum TrafficCostCommand {
 /// Dispatch one `traffic-cost` subcommand.
 pub async fn run(args: TrafficCostArgs, output: Output) -> stow_types::error::Result<()> {
     match args.command {
-        TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect().await?, &args, output).await,
-        TrafficCostCommand::Peak(args) => peak::run(&Edge::connect().await?, &args, output).await,
+        TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect()?, &args, output).await,
+        TrafficCostCommand::Peak(args) => peak::run(&Edge::connect()?, &args, output).await,
         TrafficCostCommand::Verdict(args) => verdict::run(&args, output).await,
         TrafficCostCommand::Project(args) => project::run(&args, output).await,
         TrafficCostCommand::FixtureRuns(args) => fixture_runs::run(&args, output),
