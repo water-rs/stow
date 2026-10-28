@@ -34,6 +34,7 @@ mod derive_gate;
 mod edge_client;
 mod facade;
 mod fetch;
+mod file_lock;
 mod index;
 mod inject;
 mod lockfile_graph_cache;

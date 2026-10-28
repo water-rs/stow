@@ -23,8 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use fs2::FileExt as _;
-
+use crate::file_lock::FileLock;
 use crate::supervisor::{self, Endpoint, Listener, Stream};
 
 /// `<gate_dir>/foreground.lock` — see the module docs.
@@ -49,7 +48,7 @@ const CONNECT_DEADLINE: Duration = Duration::from_millis(250);
 /// while it is held, no miss drain starts a cargo of its own
 /// (stow#667).
 #[derive(Debug, Clone)]
-pub struct ForegroundHold(Option<Arc<std::fs::File>>);
+pub struct ForegroundHold(Option<Arc<FileLock>>);
 
 impl ForegroundHold {
     /// Take the hold in `gate_dir`, then make every derivation in
@@ -61,7 +60,7 @@ impl ForegroundHold {
     /// or the shared lock cannot be taken.
     pub async fn enter(gate_dir: &Path) -> stow_types::error::Result<Self> {
         let dir = gate_dir.to_path_buf();
-        let file = tokio::task::spawn_blocking(move || {
+        let lock = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&dir)
                 .map_err(|error| stow_types::stow_error!("create {}: {error}", dir.display()))?;
             let path = dir.join(FOREGROUND_LOCK);
@@ -74,22 +73,20 @@ impl ForegroundHold {
                 .map_err(|error| stow_types::stow_error!("open {}: {error}", path.display()))?;
             // The only other locker is a drain's instant try-lock
             // probe, so this shared take never waits on a command.
-            file.lock_shared().map_err(|error| {
-                stow_types::stow_error!("lock {} shared: {error}", path.display())
-            })?;
-            Ok::<_, stow_types::error::Error>(file)
+            FileLock::shared(file)
+                .map_err(|error| stow_types::stow_error!("lock {} shared: {error}", path.display()))
         })
         .await
         .map_err(|error| stow_types::stow_error!("take the foreground hold: {error}"))??;
         stop_derivations(gate_dir).await;
-        Ok(Self(Some(Arc::new(file))))
+        Ok(Self(Some(Arc::new(lock))))
     }
 
     /// Give the hold up. Idempotent; also happens when the last clone
     /// drops.
     pub fn release(&self) {
-        if let Some(file) = &self.0 {
-            let _ = file.unlock();
+        if let Some(lock) = &self.0 {
+            lock.release();
         }
     }
 
@@ -341,18 +338,15 @@ fn open_slot_blocking(gate_dir: &Path) -> Result<OpenAttempt, String> {
         .read(true)
         .write(true)
         .open(&lock_path)
-        .and_then(|file| {
-            file.try_lock_exclusive()?;
-            file.unlock()
-        });
+        .and_then(FileLock::try_exclusive);
     match probe {
-        Ok(()) => Ok(OpenAttempt::Ready(DerivationSlot {
+        Ok(Some(_released_at_once)) => Ok(OpenAttempt::Ready(DerivationSlot {
             listener,
             endpoint,
             pointer,
             stop: None,
         })),
-        Err(error) if crate::artifact_cache::is_lock_contended(&error) => {
+        Ok(None) => {
             let _ = std::fs::remove_file(&pointer);
             Ok(OpenAttempt::Contended)
         }

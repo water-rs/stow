@@ -680,6 +680,7 @@ mod tests {
             .read(true)
             .write(true)
             .open(temp_dir.join("lease.lock"))
+            .and_then(crate::file_lock::FileLock::shared)
             .expect("create lease lock");
         let manifest = ArtifactBundleManifest {
             oci_reference: "ghcr.io/water-rs/stow-cache-1.91.1:itoa.test".to_owned(),
