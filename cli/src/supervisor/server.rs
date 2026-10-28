@@ -20,8 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
 use super::protocol::{
-    Answer, ArtifactNotifications, AwaitServeMap, Compiled, Observed, Plan, Request, read_frame,
-    write_frame,
+    Answer, AwaitServeMap, Compiled, Observed, Plan, Request, ServedStderr, read_frame, write_frame,
 };
 use super::{BINARY_ENV, BinaryIdentity, ENDPOINT_ENV, Endpoint, TOKEN_ENV};
 
@@ -37,13 +36,16 @@ pub trait Handler: Send + Sync + 'static {
         self: &Arc<Self>,
         executable: std::ffi::OsString,
         args: Vec<std::ffi::OsString>,
+        invocation: crate::unit_cache::InvocationEnv,
     ) -> impl Future<Output = Decision<Self::Pending>> + Send;
 
-    /// Finish the work that only exists after a real compile.
+    /// Finish the work that only exists after a real compile. `stderr` is
+    /// rustc's, when the decision asked the facade to capture it.
     fn compiled(
         self: &Arc<Self>,
         pending: Self::Pending,
         success: bool,
+        stderr: Option<String>,
     ) -> impl Future<Output = ()> + Send;
 
     /// The bookkeeping a facade-owned compile still needs: the mark before
@@ -90,11 +92,14 @@ pub struct Observation {
 /// A handler's decision about one invocation.
 pub enum Decision<P> {
     /// The outputs are in place; the facade exits 0. The payload is the
-    /// artifact-notification lines the facade owes cargo's stderr first
-    /// (stow#633).
-    Served(ArtifactNotifications),
+    /// stderr lines the facade owes cargo first (stow#633).
+    Served(ServedStderr),
     /// The facade runs rustc and reports back with `pending` restored.
-    Compile(P),
+    Compile {
+        pending: P,
+        /// Whether the report carries rustc's stderr (stow#978).
+        capture_stderr: bool,
+    },
 }
 
 /// How long [`Supervisor::shutdown`] waits for accepted connections to run
@@ -721,9 +726,9 @@ async fn answer_plan<H: Handler>(
             message: "supervisor token mismatch".to_owned(),
         };
     }
-    let (executable, args) = match (plan.executable(), plan.args()) {
-        (Ok(executable), Ok(args)) => (executable, args),
-        (Err(error), _) | (_, Err(error)) => {
+    let (executable, args, invocation) = match (plan.executable(), plan.args(), plan.invocation()) {
+        (Ok(executable), Ok(args), Ok(invocation)) => (executable, args, invocation),
+        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
             return Answer::Failed { message: error };
         }
     };
@@ -742,9 +747,12 @@ async fn answer_plan<H: Handler>(
         },
         Err(_) => None,
     };
-    match handler.plan(executable, args).await {
+    match handler.plan(executable, args, invocation).await {
         Decision::Served(notifications) => Answer::Served(notifications),
-        Decision::Compile(pending) => {
+        Decision::Compile {
+            pending,
+            capture_stderr,
+        } => {
             let (sender, allocated) = oneshot::channel();
             if tickets.send(Ticket::Allocate(pending, sender)).is_err() {
                 return Answer::Failed {
@@ -765,7 +773,10 @@ async fn answer_plan<H: Handler>(
                             completion: in_flight.register(paths),
                         });
                     }
-                    Answer::Compile { ticket }
+                    Answer::Compile {
+                        ticket,
+                        capture_stderr,
+                    }
                 },
             )
         }
@@ -855,7 +866,9 @@ async fn answer_report<H: Handler>(
                 .iter()
                 .position(|mark| mark.ticket == Some(report.ticket))
                 .map(|index| marks.remove(index).completion);
-            handler.compiled(pending, report.success).await;
+            handler
+                .compiled(pending, report.success, report.stderr)
+                .await;
             Answer::Recorded
         }
         Ok(None) => Answer::Failed {
@@ -875,7 +888,7 @@ mod tests {
 
     use super::{Decision, Handler, start};
     use crate::supervisor::client::{Connection, Decision as ClientDecision};
-    use crate::supervisor::protocol::ArtifactNotifications;
+    use crate::supervisor::protocol::ServedStderr;
 
     /// A real file for the supervisor's binary identity — any path
     /// `BinaryIdentity::of` can stat answers.
@@ -896,11 +909,15 @@ mod tests {
             self: &Arc<Self>,
             _executable: OsString,
             args: Vec<OsString>,
+            _invocation: crate::unit_cache::InvocationEnv,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
             std::future::ready(if args.first().is_some_and(|arg| arg == "--serve-me") {
-                Decision::Served(ArtifactNotifications::default())
+                Decision::Served(ServedStderr::default())
             } else {
-                Decision::Compile(args.first().cloned().unwrap_or_default())
+                Decision::Compile {
+                    pending: args.first().cloned().unwrap_or_default(),
+                    capture_stderr: false,
+                }
             })
         }
 
@@ -908,6 +925,7 @@ mod tests {
             self: &Arc<Self>,
             _pending: Self::Pending,
             success: bool,
+            _stderr: Option<String>,
         ) -> impl std::future::Future<Output = ()> + Send {
             if success {
                 self.reports.fetch_add(1, Ordering::SeqCst);
@@ -958,13 +976,17 @@ mod tests {
             .plan(
                 std::ffi::OsStr::new("/usr/bin/rustc"),
                 &[OsString::from("--crate-name"), OsString::from("serde")],
+                &crate::unit_cache::InvocationEnv::current().expect("invocation"),
             )
             .await
             .expect("plan");
         let ClientDecision::Compile(ticket) = decision else {
             panic!("the stub asks for a compile");
         };
-        connection.report(&ticket, true).await.expect("report");
+        connection
+            .report(&ticket, true, None)
+            .await
+            .expect("report");
         assert_eq!(handler.reports.load(Ordering::SeqCst), 1);
     }
 
@@ -1015,14 +1037,16 @@ mod tests {
                 self: &Arc<Self>,
                 _executable: OsString,
                 _args: Vec<OsString>,
+                _invocation: crate::unit_cache::InvocationEnv,
             ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
-                std::future::ready(Decision::Served(ArtifactNotifications::default()))
+                std::future::ready(Decision::Served(ServedStderr::default()))
             }
 
             fn compiled(
                 self: &Arc<Self>,
                 _pending: Self::Pending,
                 _success: bool,
+                _stderr: Option<String>,
             ) -> impl std::future::Future<Output = ()> + Send {
                 std::future::ready(())
             }
@@ -1135,6 +1159,7 @@ mod tests {
             .plan(
                 std::ffi::OsStr::new("/usr/bin/rustc"),
                 &[OsString::from("--serve-me")],
+                &crate::unit_cache::InvocationEnv::current().expect("invocation"),
             )
             .await
             .expect("plan");
@@ -1158,7 +1183,11 @@ mod tests {
             .await
             .expect("connect to the supervisor");
         let error = connection
-            .plan(std::ffi::OsStr::new("/usr/bin/rustc"), &[])
+            .plan(
+                std::ffi::OsStr::new("/usr/bin/rustc"),
+                &[],
+                &crate::unit_cache::InvocationEnv::current().expect("invocation"),
+            )
             .await
             .expect_err("a wrong token must be refused");
         assert!(error.contains("token mismatch"), "{error}");
@@ -1205,14 +1234,16 @@ mod tests {
             self: &Arc<Self>,
             _executable: OsString,
             _args: Vec<OsString>,
+            _invocation: crate::unit_cache::InvocationEnv,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
-            std::future::ready(Decision::Served(ArtifactNotifications::default()))
+            std::future::ready(Decision::Served(ServedStderr::default()))
         }
 
         fn compiled(
             self: &Arc<Self>,
             _pending: Self::Pending,
             _success: bool,
+            _stderr: Option<String>,
         ) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
         }

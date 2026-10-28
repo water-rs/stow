@@ -18,7 +18,7 @@ use crate::config::StowConfig;
 use crate::state_db::StateDb;
 
 pub use crate::index::IndexSlice;
-pub use crate::supervisor::protocol::ArtifactNotifications;
+pub use crate::supervisor::protocol::ServedStderr;
 
 /// The `--json=…artifacts…` notification lines a served unit owes cargo.
 ///
@@ -33,7 +33,7 @@ pub use crate::supervisor::protocol::ArtifactNotifications;
 pub fn artifact_notifications(
     parsed: &ParsedRustcArgs,
     host: &str,
-) -> stow_types::error::Result<ArtifactNotifications> {
+) -> stow_types::error::Result<ServedStderr> {
     crate::cached_rustc_artifact_notifications(parsed, host)
 }
 
@@ -45,9 +45,7 @@ pub fn artifact_notifications(
 ///
 /// A write or flush failure is an error, not a warning: exiting without
 /// the lines leaves cargo blind to artifacts it was told were emitted.
-pub fn write_artifact_notifications(
-    lines: &ArtifactNotifications,
-) -> stow_types::error::Result<()> {
+pub fn write_artifact_notifications(lines: &ServedStderr) -> stow_types::error::Result<()> {
     crate::write_served_artifact_notifications(lines)
 }
 

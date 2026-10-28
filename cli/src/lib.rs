@@ -52,6 +52,7 @@ mod stats;
 mod supervisor;
 #[cfg(test)]
 mod test_edge;
+mod unit_cache;
 mod unit_node;
 mod verify;
 mod workspace_deps;
@@ -71,6 +72,9 @@ pub use supervisor::BinaryIdentity;
 /// supervisor standing in for the real one in integration tests — uses
 /// the product's own types instead of reimplementing the format.
 pub use supervisor::protocol;
+/// The working directory and environment a rustc invocation runs in, as
+/// a [`protocol::Plan`] carries them to the supervisor.
+pub use unit_cache::InvocationEnv;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -99,7 +103,7 @@ use crate::cli_args::{Cli, Command as CliCommand, WrapperCommandArgs};
 use crate::config::StowConfig;
 use crate::fetch::FetchRequest;
 use crate::state_db::StateDb;
-use crate::supervisor::protocol::ArtifactNotifications;
+use crate::supervisor::protocol::ServedStderr;
 
 const STOW_EXPANDED_GRAPH_PATH_ENV: &str = "STOW_EXPANDED_GRAPH_PATH";
 pub(crate) const STOW_PREFETCH_ARTIFACTS_PATH_ENV: &str = "STOW_PREFETCH_ARTIFACTS_PATH";
@@ -405,6 +409,58 @@ async fn run_passthrough_status(
         .wrap_err("failed to spawn wrapped compiler")
 }
 
+/// Run the real rustc with this process's stdio. With `capture_stderr`,
+/// rustc's stderr is forwarded as it arrives — cargo reads the metadata
+/// notification mid-compile to start dependents — and kept for the unit
+/// cache to replay, unless it outgrows
+/// [`unit_cache::MAX_DIAGNOSTICS_BYTES`] or is not UTF-8, when `None`
+/// comes back and the unit is not stored (stow#978).
+async fn run_rustc(
+    executable: &OsString,
+    args: &[OsString],
+    capture_stderr: bool,
+) -> stow_types::error::Result<(async_process::ExitStatus, Option<String>)> {
+    if !capture_stderr {
+        return Ok((run_passthrough_status(executable, &[], args).await?, None));
+    }
+    let mut child = Command::new(executable)
+        .args(args)
+        .stderr(async_process::Stdio::piped())
+        .spawn()
+        .wrap_err("failed to spawn wrapped compiler")?;
+    let mut pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| stow_types::stow_error!("wrapped compiler has no stderr pipe"))?;
+    let mut kept = Some(Vec::new());
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let read = futures_util::AsyncReadExt::read(&mut pipe, &mut chunk)
+            .await
+            .wrap_err("read wrapped compiler stderr")?;
+        if read == 0 {
+            break;
+        }
+        let bytes = &chunk[..read];
+        {
+            let mut stderr = io::stderr().lock();
+            stderr
+                .write_all(bytes)
+                .and_then(|()| stderr.flush())
+                .wrap_err("forward wrapped compiler stderr")?;
+        }
+        if let Some(buffer) = kept.as_mut() {
+            if buffer.len() + read > unit_cache::MAX_DIAGNOSTICS_BYTES {
+                kept = None;
+            } else {
+                buffer.extend_from_slice(bytes);
+            }
+        }
+    }
+    let status = child.status().await.wrap_err("wait for wrapped compiler")?;
+    Ok((status, kept.and_then(|bytes| String::from_utf8(bytes).ok())))
+}
+
 /// Whether this unit has to be compiled locally because one of the
 /// dependencies cargo hands it on the command line was compiled locally
 /// in this build.
@@ -443,7 +499,7 @@ enum Outcome {
     /// the artifact-notification lines the deciding process computed —
     /// written to stderr only by the process cargo spawned, at the
     /// `exit(0)` it earns (stow#633).
-    Served(supervisor::protocol::ArtifactNotifications),
+    Served(supervisor::protocol::ServedStderr),
     /// Nothing serves this unit; the real rustc has to run, and
     /// [`finish_rustc_compile`] finishes the work afterwards.
     Compile(Box<PostCompile>),
@@ -457,6 +513,11 @@ struct PostCompile {
     /// `None` for an invocation stow could not parse — a probe, or a rustc
     /// command line it does not understand. There is nothing to record.
     parsed: Option<rustc_args::ParsedRustcArgs>,
+    /// The unit-cache plan a successful compile is stored under — set for
+    /// a unit the registry identity cannot key whose inputs the unit
+    /// cache can (stow#978). Its presence is what asks the facade to
+    /// capture rustc's stderr.
+    unit: Option<Box<unit_cache::UnitPlan>>,
 }
 
 impl PostCompile {
@@ -465,7 +526,13 @@ impl PostCompile {
         Self {
             executable: executable.clone(),
             parsed: None,
+            unit: None,
         }
+    }
+
+    /// Whether the compile's report must carry rustc's stderr.
+    const fn captures_stderr(&self) -> bool {
+        self.unit.is_some()
     }
 }
 
@@ -487,6 +554,18 @@ async fn compile(
     mark_target: Option<&str>,
     policy_dir: Option<&Path>,
 ) -> Outcome {
+    compile_storing(executable, parsed, mark_target, policy_dir, None).await
+}
+
+/// [`compile`], with the unit-cache plan the finished compile is stored
+/// under (stow#978).
+async fn compile_storing(
+    executable: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+    mark_target: Option<&str>,
+    policy_dir: Option<&Path>,
+    unit: Option<Box<unit_cache::UnitPlan>>,
+) -> Outcome {
     if let Some(target) = mark_target {
         log_nonfatal_result(
             "failed to record a locally built crate for this build",
@@ -502,6 +581,7 @@ async fn compile(
     Outcome::Compile(Box::new(PostCompile {
         executable: executable.clone(),
         parsed: Some(parsed.clone()),
+        unit,
     }))
 }
 
@@ -522,6 +602,7 @@ async fn compile(
 async fn finish_rustc_compile(
     post: &PostCompile,
     success: bool,
+    stderr: Option<&str>,
     local_base: Option<&WrapperEnvBase>,
     env_cache: &WrapperEnvCache,
     ctx: &BuildContext,
@@ -530,6 +611,19 @@ async fn finish_rustc_compile(
         return Ok(None);
     };
     let mut artifact = None;
+    if success && let (Some(plan), Some(base)) = (post.unit.as_deref(), local_base) {
+        if let Some(stderr) = stderr {
+            log_nonfatal_result(
+                "failed to store locally built unit in the stow unit cache",
+                unit_cache::store(&base.config, parsed, plan, stderr, &base.host_target).await,
+            );
+        } else {
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                "not storing unit in the local unit cache: its stderr was too large or not UTF-8"
+            );
+        }
+    }
     if success {
         if let Some(base) = local_base {
             match resolve_local_build_artifact(base, parsed, &ctx.in_flight, ctx.unit_nodes()).await
@@ -1082,10 +1176,18 @@ impl BuildSupervisor {
         &self,
         post: &PostCompile,
         success: bool,
+        stderr: Option<&str>,
         local_base: Option<&WrapperEnvBase>,
     ) {
-        if let Ok(Some(build)) =
-            finish_rustc_compile(post, success, local_base, &self.env_cache, &self.ctx).await
+        if let Ok(Some(build)) = finish_rustc_compile(
+            post,
+            success,
+            stderr,
+            local_base,
+            &self.env_cache,
+            &self.ctx,
+        )
+        .await
             && let Some(parsed) = post.parsed.as_ref()
             && let Some(unit) = miss_journal::observed_unit(parsed, &build)
         {
@@ -1107,23 +1209,41 @@ impl supervisor::server::Handler for BuildSupervisor {
         self: &std::sync::Arc<Self>,
         executable: OsString,
         args: Vec<OsString>,
+        invocation: unit_cache::InvocationEnv,
     ) -> supervisor::server::Decision<Self::Pending> {
         let classified = classify_invocation(&args);
         if !self.resolution_done.has_completed() && describes_compile_unit(&classified) {
             self.resolution_done.complete();
         }
         let Some(parsed) = classify_or_log(classified, &args) else {
-            return supervisor::server::Decision::Compile(Box::new(PostCompile::raw(&executable)));
+            return supervisor::server::Decision::Compile {
+                pending: Box::new(PostCompile::raw(&executable)),
+                capture_stderr: false,
+            };
         };
-        match decide_rustc_invocation(&executable, parsed, &self.env_cache, &self.ctx).await {
-            Outcome::Served(notifications) => supervisor::server::Decision::Served(notifications),
-            Outcome::Compile(post) => supervisor::server::Decision::Compile(post),
+        let invocation = Invocation {
+            args: &args,
+            env: &invocation,
+        };
+        match decide_rustc_invocation(&executable, parsed, invocation, &self.env_cache, &self.ctx)
+            .await
+        {
+            Outcome::Served(lines) => supervisor::server::Decision::Served(lines),
+            Outcome::Compile(post) => supervisor::server::Decision::Compile {
+                capture_stderr: post.captures_stderr(),
+                pending: post,
+            },
         }
     }
 
-    async fn compiled(self: &std::sync::Arc<Self>, pending: Self::Pending, success: bool) {
+    async fn compiled(
+        self: &std::sync::Arc<Self>,
+        pending: Self::Pending,
+        success: bool,
+        stderr: Option<String>,
+    ) {
         let local_base = self.env_cache.local_base(&pending.executable).await;
-        self.finish_and_observe(&pending, success, local_base.as_deref())
+        self.finish_and_observe(&pending, success, stderr.as_deref(), local_base.as_deref())
             .await;
     }
 
@@ -1183,9 +1303,10 @@ impl supervisor::server::Handler for BuildSupervisor {
         }
         let post = PostCompile {
             executable: observation.executable,
+            unit: None,
             parsed: Some(parsed),
         };
-        self.finish_and_observe(&post, success, Some(&local_base))
+        self.finish_and_observe(&post, success, None, Some(&local_base))
             .await;
     }
 }
@@ -1227,8 +1348,9 @@ async fn delegate_to_supervisor(
     let mut connection = supervisor::client::Connection::open(endpoint, token)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
+    let invocation = unit_cache::InvocationEnv::current()?;
     let decision = connection
-        .plan(&command.executable, &command.wrapped_args)
+        .plan(&command.executable, &command.wrapped_args, &invocation)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     tracing::debug!(
@@ -1246,9 +1368,14 @@ async fn delegate_to_supervisor(
         }
         supervisor::client::Decision::Compile(ticket) => ticket,
     };
-    let status = run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
+    let (status, stderr) = run_rustc(
+        &command.executable,
+        &command.wrapped_args,
+        ticket.captures_stderr(),
+    )
+    .await?;
     connection
-        .report(&ticket, status.success())
+        .report(&ticket, status.success(), stderr)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     connection
@@ -1297,18 +1424,28 @@ async fn run_rustc_standalone(
             return run_passthrough_status(&command.executable, &[], &command.wrapped_args).await;
         }
     };
-    match decide_rustc_invocation(&command.executable, parsed, &env_cache, &ctx).await {
-        Outcome::Served(notifications) => {
-            write_served_artifact_notifications(&notifications)?;
+    let invocation_env = unit_cache::InvocationEnv::current()?;
+    let invocation = Invocation {
+        args: &command.wrapped_args,
+        env: &invocation_env,
+    };
+    match decide_rustc_invocation(&command.executable, parsed, invocation, &env_cache, &ctx).await {
+        Outcome::Served(lines) => {
+            write_served_artifact_notifications(&lines)?;
             Ok(std::process::ExitStatus::default())
         }
         Outcome::Compile(post) => {
-            let status =
-                run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
+            let (status, stderr) = run_rustc(
+                &command.executable,
+                &command.wrapped_args,
+                post.captures_stderr(),
+            )
+            .await?;
             let local_base = env_cache.local_base(&command.executable).await;
             if let Ok(Some(build)) = finish_rustc_compile(
                 &post,
                 status.success(),
+                stderr.as_deref(),
                 local_base.as_deref(),
                 &env_cache,
                 &ctx,
@@ -1337,6 +1474,7 @@ async fn run_rustc_standalone(
 async fn decide_rustc_invocation(
     rustc: &OsString,
     parsed: rustc_args::ParsedRustcArgs,
+    invocation: Invocation<'_>,
     env_cache: &WrapperEnvCache,
     ctx: &BuildContext,
 ) -> Outcome {
@@ -1353,6 +1491,10 @@ async fn decide_rustc_invocation(
         cacheable = parsed.is_cacheable(),
         "observed rustc wrapper invocation"
     );
+
+    if !takes_registry_path(&parsed, invocation) {
+        return decide_unit_cache(rustc, &parsed, invocation, env_cache, ctx).await;
+    }
 
     if !parsed.is_cacheable() {
         return decide_local_only(rustc, &parsed, env_cache, ctx).await;
@@ -1429,6 +1571,128 @@ async fn decide_rustc_invocation(
         .await;
     }
     serve_or_compile(rustc, &parsed, &env, ctx, exact_public_cache_allowed).await
+}
+
+/// The raw argv and the process one rustc invocation runs in — what the
+/// unit cache keys (stow#978).
+#[derive(Debug, Clone, Copy)]
+struct Invocation<'a> {
+    args: &'a [OsString],
+    env: &'a unit_cache::InvocationEnv,
+}
+
+/// Whether the registry identity keys this unit: a crates.io package
+/// compiled to a restorable shape with no unmodelled codegen and not as
+/// the build's primary package. Every other unit is the unit cache's
+/// (stow#978). The primary-package mark is read from the invocation's own
+/// environment, which the deciding supervisor does not share.
+fn takes_registry_path(parsed: &rustc_args::ParsedRustcArgs, invocation: Invocation<'_>) -> bool {
+    registry_keys(
+        parsed,
+        invocation
+            .env
+            .vars
+            .contains_key(OsStr::new("CARGO_PRIMARY_PACKAGE")),
+    )
+}
+
+/// [`takes_registry_path`] over an explicit primary-package mark — the
+/// facade's fast path reads its own environment.
+pub(crate) fn registry_keys(parsed: &rustc_args::ParsedRustcArgs, primary_package: bool) -> bool {
+    parsed.is_restorable_artifact()
+        && !parsed.has_custom_codegen
+        && !primary_package
+        && detect_registry_crate_version(parsed).is_ok_and(|version| version.is_some())
+}
+
+/// Decide a unit the registry identity cannot key: serve it from the local
+/// unit cache, or compile it under the plan its outputs are stored with
+/// (stow#978). Local only — nothing here reaches the public cache or mints
+/// a miss.
+async fn decide_unit_cache(
+    rustc: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+    invocation: Invocation<'_>,
+    env_cache: &WrapperEnvCache,
+    ctx: &BuildContext,
+) -> Outcome {
+    let fallback_target = parsed
+        .target
+        .as_deref()
+        .or(ctx.public_cache_target.as_deref());
+    if let Some(reason) = unit_cache::refusal(parsed, invocation.args) {
+        tracing::debug!(crate_name = %parsed.crate_name, %reason, "compiling without the local unit cache");
+        return compile(rustc, parsed, fallback_target, ctx.policy_dir.as_deref()).await;
+    }
+    let Some(local_base) = env_cache.local_base(rustc).await else {
+        return compile(rustc, parsed, fallback_target, ctx.policy_dir.as_deref()).await;
+    };
+    let target = parsed
+        .target
+        .clone()
+        .unwrap_or_else(|| local_base.host_target.clone());
+    let rustc_vv = match env_cache.rustc_verbose_version(rustc).await {
+        Ok(vv) => vv,
+        Err(error) => {
+            tracing::warn!(%error, "failed to probe rustc -vV, compiling without the local unit cache");
+            return compile(rustc, parsed, Some(&target), ctx.policy_dir.as_deref()).await;
+        }
+    };
+    let lookup = unit_cache::lookup(
+        &local_base.config,
+        parsed,
+        invocation.args,
+        invocation.env,
+        &rustc_vv,
+        &target,
+        &local_base.rustc_version,
+        &local_base.host_target,
+    )
+    .await;
+    match lookup {
+        Ok(unit_cache::Keying::Keyed(unit_cache::UnitLookup::Served(lines))) => {
+            // The served bytes are a local compile's: a dependent must not
+            // take a registry artifact built against CI's copy of this
+            // crate, exactly as when it compiles.
+            log_nonfatal_result(
+                "failed to record a locally built crate for this build",
+                provenance::record_local_build(
+                    ctx.policy_dir.as_deref(),
+                    &target,
+                    &parsed.crate_name,
+                    &parsed.extra_filename,
+                )
+                .await,
+            );
+            record_unit_outcome(
+                &local_base.config,
+                parsed,
+                &target,
+                &local_base.rustc_version,
+                UnitOutcome::Hit,
+            )
+            .await;
+            Outcome::Served(lines)
+        }
+        Ok(unit_cache::Keying::Keyed(unit_cache::UnitLookup::Compile(plan))) => {
+            compile_storing(
+                rustc,
+                parsed,
+                Some(&target),
+                ctx.policy_dir.as_deref(),
+                Some(plan),
+            )
+            .await
+        }
+        Ok(unit_cache::Keying::Uncacheable(reason)) => {
+            tracing::debug!(crate_name = %parsed.crate_name, %reason, "compiling without the local unit cache");
+            compile(rustc, parsed, Some(&target), ctx.policy_dir.as_deref()).await
+        }
+        Err(error) => {
+            tracing::warn!(crate_name = %parsed.crate_name, %error, "local unit cache lookup failed, compiling without it");
+            compile(rustc, parsed, Some(&target), ctx.policy_dir.as_deref()).await
+        }
+    }
 }
 
 /// The serve-and-compile tail of the decision: the lookup chain, the one
@@ -1633,6 +1897,9 @@ pub(crate) struct WrapperEnvCache {
     /// depend on an env base that can legitimately be absent (stow#618);
     /// the env bases' own `host_target` reads the same cells.
     host_targets: MemoizedHostMap,
+    /// Each spelling's full `rustc -vV` text — the toolchain identity the
+    /// unit cache keys on, commit hash included (stow#978).
+    verbose_versions: MemoizedHostMap,
     /// The `PATH` bare spellings resolve through, captured at
     /// construction so the cache reads the environment the build
     /// invoked the wrapper with.
@@ -1785,6 +2052,7 @@ impl WrapperEnvCache {
             env_bases: MemoizedBaseMap::default(),
             local_bases: MemoizedBaseMap::default(),
             host_targets: MemoizedHostMap::default(),
+            verbose_versions: MemoizedHostMap::default(),
             path: std::env::var_os("PATH").unwrap_or_default(),
             slices: MemoizedSliceMap::default(),
             circuit_tripped: tokio::sync::OnceCell::new(),
@@ -1869,10 +2137,29 @@ impl WrapperEnvCache {
             {
                 return Ok(seed.host_target.clone());
             }
-            rustc_args::rustc_host_target(rustc).await
+            // The host triple is a line of the same `-vV` the unit
+            // cache keys on: one probe answers both.
+            self.rustc_verbose_version(rustc)
+                .await
+                .and_then(|vv| rustc_args::vv_host(&vv))
         })
         .await
         .clone()
+    }
+
+    /// The full `rustc -vV` text of `rustc` — one probe per executable
+    /// spelling per build.
+    pub(crate) async fn rustc_verbose_version(&self, rustc: &OsStr) -> Result<String, String> {
+        let cell = self
+            .verbose_versions
+            .lock()
+            .expect("verbose version map mutex")
+            .entry(rustc.to_os_string())
+            .or_default()
+            .clone();
+        cell.get_or_init(|| rustc_args::rustc_vv(rustc))
+            .await
+            .clone()
     }
 
     /// The decoded index slice for `(target, rustc)` — read, decompressed
@@ -2095,7 +2382,7 @@ enum RemoteServe {
     /// An artifact was written into the target dir; the wrapper exits 0
     /// after writing the artifact notifications the serve computed
     /// (stow#633).
-    Served(supervisor::protocol::ArtifactNotifications),
+    Served(supervisor::protocol::ServedStderr),
     /// No remote artifact applies; fall through to the miss path.
     Miss,
     /// The cache path failed or the artifact could not be used; run the
@@ -2896,7 +3183,7 @@ async fn try_serve_local_cached_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     request: &FetchRequest<'_>,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     let cached_bundle = match load_cached_bundle(config, request).await {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -2930,7 +3217,7 @@ async fn try_serve_local_prefetched_graph_bundle(
     rustc_version: &str,
     ctx: &BuildContext,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     // `Ok(None)` is the non-registry case, which can match no published
     // bundle.
     let (crate_name, version) = registry_unit_identity(parsed)?;
@@ -3039,7 +3326,7 @@ async fn try_serve_loaded_local_cached_bundle(
     origin: EntryOrigin,
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     if let Some(mismatch) = bundle_mismatch(
         parsed,
         &cached_bundle.profile,
@@ -3137,7 +3424,7 @@ async fn materialize_local_cached_bundle(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     match inject::write_artifacts(
         parsed,
         &cached_bundle,
@@ -3179,7 +3466,7 @@ async fn finish_local_serve(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     if let Err(error) =
         record_materialized_bundle_outputs(config, parsed, &cached_bundle, request.target).await
     {
@@ -3764,7 +4051,7 @@ async fn try_serve_downloaded_bundle(
     request: &FetchRequest<'_>,
     bundle: &fetch::ArtifactBundle,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     let config = &env.env_base.config;
     // The bundle's `crate_name` is the package name — compare against the
     // registry path's name, not `parsed.crate_name`, which `[lib] name`
@@ -3826,7 +4113,7 @@ async fn try_serve_local_semantic_cached_bundle(
     parsed: &rustc_args::ParsedRustcArgs,
     semantic_request: &fetch::SemanticFetchRequest,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     let cached_bundle = match load_semantic_cached_bundle(config, semantic_request).await {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -3925,7 +4212,7 @@ async fn materialize_semantic_cached_bundle(
     semantic_request: &fetch::SemanticFetchRequest,
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     if let Err(error) = inject::write_artifacts(
         parsed,
         &cached_bundle,
@@ -4010,7 +4297,7 @@ async fn try_serve_semantic_downloaded_bundle(
     semantic_request: &fetch::SemanticFetchRequest,
     bundle: &fetch::ArtifactBundle,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     if let Err(error) = fetch::validate_semantic_bundle_identity(bundle, semantic_request) {
         tracing::debug!(
             error = %error,
@@ -4045,7 +4332,7 @@ async fn try_serve_verified_downloaded_bundle(
     request: &FetchRequest<'_>,
     bundle: &fetch::ArtifactBundle,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     let config = &env.env_base.config;
     let cached_bundle = match cache_verified_downloaded_bundle(config, request, bundle).await {
         Ok(cached_bundle) => cached_bundle,
@@ -4105,7 +4392,7 @@ async fn materialize_downloaded_bundle(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     let config = &env.env_base.config;
     match inject::write_artifacts(
         parsed,
@@ -4150,7 +4437,7 @@ async fn finish_downloaded_serve(
     request: &FetchRequest<'_>,
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
-) -> Option<ArtifactNotifications> {
+) -> Option<ServedStderr> {
     let config = &env.env_base.config;
     if let Err(error) =
         record_materialized_bundle_outputs(config, parsed, &cached_bundle, request.target).await
@@ -4815,9 +5102,9 @@ struct RustcArtifactNotification {
 fn cached_rustc_artifact_notifications(
     parsed: &rustc_args::ParsedRustcArgs,
     host: &str,
-) -> stow_types::error::Result<ArtifactNotifications> {
+) -> stow_types::error::Result<ServedStderr> {
     if !parsed.requests_json_artifact_notifications() {
-        return Ok(ArtifactNotifications::default());
+        return Ok(ServedStderr::default());
     }
 
     let mut notifications = Vec::new();
@@ -4864,7 +5151,7 @@ fn cached_rustc_artifact_notifications(
             serde_json::to_string(notification).wrap_err("serialize rustc artifact notification")
         })
         .collect::<stow_types::error::Result<Vec<_>>>()
-        .map(ArtifactNotifications)
+        .map(ServedStderr)
 }
 
 /// Write the artifact notifications a served decision carried to this
@@ -4879,7 +5166,7 @@ fn cached_rustc_artifact_notifications(
 /// exiting 0 without them leaves it blind to the artifacts it was told
 /// were emitted.
 pub(crate) fn write_served_artifact_notifications(
-    notifications: &ArtifactNotifications,
+    notifications: &ServedStderr,
 ) -> stow_types::error::Result<()> {
     let mut stderr = io::stderr().lock();
     for line in notifications.lines() {
@@ -5149,6 +5436,7 @@ mod tests {
             &handler,
             OsString::from("rustc"),
             args(&["-vV"]),
+            crate::unit_cache::InvocationEnv::current().expect("invocation"),
         )
         .await;
         assert!(!resolution_done.has_completed());
@@ -5164,6 +5452,7 @@ mod tests {
                 "--print",
                 "file-names",
             ]),
+            crate::unit_cache::InvocationEnv::current().expect("invocation"),
         )
         .await;
         assert!(!resolution_done.has_completed());
@@ -5183,6 +5472,7 @@ mod tests {
                 "-C",
                 "metadata=abc123",
             ]),
+            crate::unit_cache::InvocationEnv::current().expect("invocation"),
         )
         .await;
         assert!(resolution_done.has_completed());
@@ -5274,7 +5564,7 @@ mod tests {
         // and the `$message_type` tag included (stow#633).
         assert_eq!(
             notifications,
-            crate::supervisor::protocol::ArtifactNotifications(vec![
+            crate::supervisor::protocol::ServedStderr(vec![
                 notification_line("autocfg-xyz789.d", "dep-info"),
                 notification_line("libautocfg-xyz789.rmeta", "metadata"),
                 notification_line("libautocfg-xyz789.rlib", "link"),
@@ -5310,7 +5600,7 @@ mod tests {
 
         assert_eq!(
             notifications,
-            crate::supervisor::protocol::ArtifactNotifications(vec![
+            crate::supervisor::protocol::ServedStderr(vec![
                 notification_line("serde_derive-xyz789.d", "dep-info"),
                 notification_line("libserde_derive-xyz789.dylib", "link"),
             ])
@@ -5343,7 +5633,7 @@ mod tests {
 
         assert_eq!(
             notifications,
-            crate::supervisor::protocol::ArtifactNotifications::default()
+            crate::supervisor::protocol::ServedStderr::default()
         );
     }
 
@@ -5561,6 +5851,7 @@ mod tests {
             env_bases: super::MemoizedBaseMap::default(),
             local_bases: super::MemoizedBaseMap::default(),
             host_targets: super::MemoizedHostMap::default(),
+            verbose_versions: super::MemoizedHostMap::default(),
             path: path.to_os_string(),
             slices: super::MemoizedSliceMap::default(),
             circuit_tripped: tokio::sync::OnceCell::new(),
@@ -6584,7 +6875,15 @@ mod tests {
             let deciding = {
                 let handler = Arc::clone(&handler);
                 let args = args.clone();
-                tokio::spawn(async move { handler.plan(OsString::from("rustc"), args).await })
+                tokio::spawn(async move {
+                    handler
+                        .plan(
+                            OsString::from("rustc"),
+                            args,
+                            crate::unit_cache::InvocationEnv::current().expect("invocation"),
+                        )
+                        .await
+                })
             };
             // The decision found no marker and parked on the owed
             // commit: from here only the commit can answer it.
@@ -6662,22 +6961,36 @@ mod tests {
             let deciding = {
                 let handler = Arc::clone(&handler);
                 let args = args.clone();
-                tokio::spawn(async move { handler.plan(OsString::from("rustc"), args).await })
+                tokio::spawn(async move {
+                    handler
+                        .plan(
+                            OsString::from("rustc"),
+                            args,
+                            crate::unit_cache::InvocationEnv::current().expect("invocation"),
+                        )
+                        .await
+                })
             };
             policy_ready.parked(1).await;
             policy_ready.complete();
             let decision = deciding.await.expect("join the plan");
             assert!(
-                matches!(decision, server::Decision::Compile(_)),
+                matches!(decision, server::Decision::Compile { .. }),
                 "no marker after the commit is a real deny"
             );
 
             // Once the latch is settled the same question costs one
             // marker check — an all-miss build waits on nothing.
             let started = std::time::Instant::now();
-            let decision = handler.plan(OsString::from("rustc"), args).await;
+            let decision = handler
+                .plan(
+                    OsString::from("rustc"),
+                    args,
+                    crate::unit_cache::InvocationEnv::current().expect("invocation"),
+                )
+                .await;
             assert!(
-                matches!(decision, server::Decision::Compile(_)),
+                matches!(decision, server::Decision::Compile { .. }),
                 "the settled deny still compiles"
             );
             assert!(

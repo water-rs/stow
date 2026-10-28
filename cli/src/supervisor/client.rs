@@ -5,18 +5,15 @@ use std::ffi::OsString;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use super::ipc::{IPC_METHOD, IpcCall, IpcCallBody, mint_connection_id};
-use super::protocol::{
-    Answer, ArtifactNotifications, Compiled, Plan, Request, read_frame, write_frame,
-};
+use super::protocol::{Answer, Compiled, Plan, Request, ServedStderr, read_frame, write_frame};
 use super::{Endpoint, Stream};
 
 /// What the supervisor decided for this invocation.
 #[derive(Debug)]
 pub enum Decision {
     /// The outputs are already in place; exit 0 after writing the
-    /// artifact-notification lines cargo is owed to this process's
-    /// stderr (stow#633).
-    Served(ArtifactNotifications),
+    /// stderr lines cargo is owed to this process's stderr (stow#633).
+    Served(ServedStderr),
     /// Run the real rustc, then call [`report`] with its outcome.
     Compile(Ticket),
 }
@@ -25,6 +22,15 @@ pub enum Decision {
 #[derive(Debug)]
 pub struct Ticket {
     ticket: u64,
+    capture_stderr: bool,
+}
+
+impl Ticket {
+    /// Whether the report should carry rustc's stderr (stow#978).
+    #[must_use]
+    pub const fn captures_stderr(&self) -> bool {
+        self.capture_stderr
+    }
 }
 
 /// The transport a [`Connection`] speaks: the build's own socket, or a
@@ -89,11 +95,18 @@ impl Connection {
         &mut self,
         executable: &std::ffi::OsStr,
         args: &[OsString],
+        invocation: &crate::unit_cache::InvocationEnv,
     ) -> Result<Decision, String> {
-        let plan = Plan::new(self.token.clone(), executable, args);
+        let plan = Plan::new(self.token.clone(), executable, args, invocation);
         match self.exchange(&Request::Plan(plan)).await? {
             Answer::Served(notifications) => Ok(Decision::Served(notifications)),
-            Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
+            Answer::Compile {
+                ticket,
+                capture_stderr,
+            } => Ok(Decision::Compile(Ticket {
+                ticket,
+                capture_stderr,
+            })),
             Answer::Recorded | Answer::ServeMapReady => {
                 Err("supervisor answered a plan with an answer that is not a decision".to_owned())
             }
@@ -107,11 +120,17 @@ impl Connection {
     ///
     /// Transport failures, and a supervisor that answers with a failure of
     /// its own.
-    pub async fn report(&mut self, ticket: &Ticket, success: bool) -> Result<(), String> {
+    pub async fn report(
+        &mut self,
+        ticket: &Ticket,
+        success: bool,
+        stderr: Option<String>,
+    ) -> Result<(), String> {
         let report = Compiled {
             token: self.token.clone(),
             ticket: ticket.ticket,
             success,
+            stderr,
         };
         match self.exchange(&Request::Compiled(report)).await? {
             Answer::Recorded => Ok(()),

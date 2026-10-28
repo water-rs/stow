@@ -744,7 +744,10 @@ fn serve_stub_connection(
                     .and_modify(|count| *count += 1)
                     .or_insert(1);
                 ticket += 1;
-                Some(Answer::Compile { ticket })
+                Some(Answer::Compile {
+                    ticket,
+                    capture_stderr: false,
+                })
             }
             Request::Compiled(_) => {
                 counts
@@ -845,6 +848,7 @@ fn drain_stub(endpoint: &str, stub: &StubSupervisor) {
             std::ffi::OsString::from("--crate-name"),
             std::ffi::OsString::from("drain_probe"),
         ],
+        &stow_cli::InvocationEnv::current().expect("the probe's invocation"),
     ));
     let body = serde_json::to_vec(&request).expect("encode probe frame");
     probe

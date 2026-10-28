@@ -181,6 +181,14 @@ fn try_invocation_with(args: &[OsString]) -> stow_types::error::Result<FastPath>
     let Ok(version) = semver::Version::parse(&version) else {
         return Ok(FastPath::Defer);
     };
+    // A registry unit the registry identity cannot key — custom codegen, a
+    // staticlib, the primary package — is the unit cache's, which only the
+    // plan path consults (stow#978).
+    if !crate::registry_keys(&parsed, std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some())
+        && crate::unit_cache::refusal(&parsed, &wrapped_args).is_none()
+    {
+        return Ok(FastPath::Defer);
+    }
     let invocation_covers = |map: &ServeMap| {
         map.covers(
             parsed.target.is_some(),

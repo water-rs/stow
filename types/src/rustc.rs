@@ -223,7 +223,9 @@ impl ParsedRustcArgs {
     /// keeping because cross-worktree release rebuilds are exactly where a
     /// local cache pays. What remains mandatory is a restorable artifact
     /// shape, no custom codegen flags, and not being the workspace's primary
-    /// package (`CARGO_PRIMARY_PACKAGE`): first-party code is never cached.
+    /// package (`CARGO_PRIMARY_PACKAGE`): first-party code never takes the
+    /// registry identity. The CLI's unit cache keys such units by content
+    /// instead (stow#978).
     #[must_use]
     pub fn is_locally_cacheable(&self) -> bool {
         self.is_restorable_artifact()
@@ -333,6 +335,36 @@ impl ParsedRustcArgs {
             "{prefix}{}{}.{}",
             self.crate_name, self.extra_filename, extension
         ))))
+    }
+
+    /// Path of the emitted static library under `--out-dir`, named per the
+    /// target the unit compiles for (`<name><extra>.lib` on an MSVC triple,
+    /// `lib<name><extra>.a` everywhere else): its `--target`, or `host` for
+    /// a host unit that spells none.
+    ///
+    /// Returns `Ok(None)` when the invocation produces no static library.
+    ///
+    /// # Errors
+    /// Returns an error when a static library is produced but `--out-dir` is
+    /// absent, or when the triple the output is named under is unparseable.
+    pub fn output_staticlib_path(&self, host: &str) -> Result<Option<PathBuf>, String> {
+        if !self.crate_types.iter().any(|kind| kind == "staticlib") {
+            return Ok(None);
+        }
+        let out_dir = self
+            .out_dir
+            .as_ref()
+            .ok_or_else(|| "static library output requires --out-dir".to_owned())?;
+        let target = self.target.as_deref().unwrap_or(host);
+        let triple: Triple = target
+            .parse()
+            .map_err(|error| format!("parse target triple `{target}`: {error}"))?;
+        let name = if triple.environment == target_lexicon::Environment::Msvc {
+            format!("{}{}.lib", self.crate_name, self.extra_filename)
+        } else {
+            format!("lib{}{}.a", self.crate_name, self.extra_filename)
+        };
+        Ok(Some(out_dir.join(name)))
     }
 
     /// Path of the emitted dep-info file under `--out-dir`

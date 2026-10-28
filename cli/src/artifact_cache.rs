@@ -1992,7 +1992,7 @@ fn output_file_name(path: &Path) -> stow_types::error::Result<String> {
         })
 }
 
-fn sha256_file_bytes(path: &Path) -> stow_types::error::Result<(String, u64)> {
+pub fn sha256_file_bytes(path: &Path) -> stow_types::error::Result<(String, u64)> {
     let bytes = std::fs::read(path)
         .wrap_err_with(|| format!("read staged cache file {}", path.display()))?;
     Ok((
@@ -2044,7 +2044,7 @@ async fn remove_cached_bundle_locked(
     Ok(())
 }
 
-async fn evict_entries(
+pub async fn evict_entries(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     version_dir: &Path,
@@ -2080,7 +2080,7 @@ async fn evict_entries(
         else {
             continue;
         };
-        delete_artifact_cache_entry(connection, rustc_version, &cache_key).await?;
+        delete_index_entry(connection, rustc_version, &cache_key, entry.table).await?;
         let entry_dir = version_dir.join(&entry.relative_dir);
         if entry_dir.exists() {
             tokio::task::spawn_blocking({
@@ -2116,7 +2116,7 @@ async fn evict_entries(
                 "artifact cache is full and the protected entry {protected_key} is in use by another stow process"
             ));
         };
-        delete_artifact_cache_entry(connection, rustc_version, protected_key).await?;
+        delete_index_entry(connection, rustc_version, protected_key, entry.table).await?;
         let entry_dir = version_dir.join(&entry.relative_dir);
         if entry_dir.exists() {
             tokio::task::spawn_blocking({
@@ -2375,7 +2375,7 @@ fn version_lease_path(leases_root: &Path, rustc_version: &str) -> PathBuf {
     leases_root.join(format!("{rustc_version}.lock"))
 }
 
-fn acquire_entry_shared_lock(
+pub fn acquire_entry_shared_lock(
     version_dir: &Path,
     cache_key: &str,
 ) -> stow_types::error::Result<File> {
@@ -2417,7 +2417,7 @@ fn acquire_entry_exclusive_lock(
     Ok(file)
 }
 
-async fn acquire_entry_exclusive_lock_async(
+pub async fn acquire_entry_exclusive_lock_async(
     version_dir: &Path,
     cache_key: &str,
 ) -> stow_types::error::Result<File> {
@@ -2476,7 +2476,7 @@ async fn load_existing_local_bundle(
 
 /// A leftover entry dir with no row is a crashed writer's stage output: not
 /// an entry, and never silently adopted by the row about to be written.
-async fn remove_orphaned_entry_dir(entry_dir: PathBuf) -> stow_types::error::Result<()> {
+pub async fn remove_orphaned_entry_dir(entry_dir: PathBuf) -> stow_types::error::Result<()> {
     tokio::task::spawn_blocking(move || {
         std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
             format!(
@@ -2560,6 +2560,29 @@ struct ArtifactCacheIndexEntry {
     relative_dir: String,
     size_bytes: u64,
     last_accessed_ms: u64,
+    table: EntryTable,
+}
+
+/// Which table an entry of the shared LRU budget lives in: bundle entries
+/// keyed by registry identity, or unit entries keyed by content
+/// ([`crate::unit_cache`]). One budget covers both, so eviction lists and
+/// deletes across them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryTable {
+    Bundle,
+    Unit,
+}
+
+impl EntryTable {
+    fn from_column(value: i64) -> stow_types::error::Result<Self> {
+        match value {
+            0 => Ok(Self::Bundle),
+            1 => Ok(Self::Unit),
+            other => Err(stow_types::stow_error!(
+                "artifact cache index row has unknown table tag {other}"
+            )),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2658,19 +2681,24 @@ async fn list_artifact_cache_entries(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
 ) -> stow_types::error::Result<BTreeMap<String, ArtifactCacheIndexEntry>> {
-    let rows = sqlx::query_as::<_, (String, String, i64, i64)>(
-        "SELECT cache_key, relative_dir, size_bytes, last_accessed_ms \
+    let rows = sqlx::query_as::<_, (String, String, i64, i64, i64)>(
+        "SELECT cache_key, relative_dir, size_bytes, last_accessed_ms, 0 \
          FROM artifact_cache_entries \
-         WHERE rustc_version = ?",
+         WHERE rustc_version = ?1 \
+         UNION ALL \
+         SELECT cache_key, relative_dir, size_bytes, last_accessed_ms, 1 \
+         FROM unit_cache_entries \
+         WHERE rustc_version = ?1",
     )
     .bind(rustc_version)
     .fetch_all(connection)
     .await?;
     let mut entries = BTreeMap::new();
-    for (cache_key, relative_dir, size_bytes, last_accessed_ms) in rows {
+    for (cache_key, relative_dir, size_bytes, last_accessed_ms, table) in rows {
         entries.insert(
             cache_key,
             ArtifactCacheIndexEntry {
+                table: EntryTable::from_column(table)?,
                 relative_dir,
                 size_bytes: db_int(size_bytes, "artifact cache entry size_bytes")?,
                 last_accessed_ms: db_int(
@@ -2983,12 +3011,12 @@ async fn insert_artifact_cache_sigstore_signatures(
 }
 
 /// How stale an entry's LRU stamp may be before a read rewrites it.
-const LRU_STAMP_INTERVAL_MS: u64 = 60_000;
+pub const LRU_STAMP_INTERVAL_MS: u64 = 60_000;
 
 /// A stamp read back from the database, clamped: a negative value is a row
 /// written by something that did not go through `db_int`, and "very old" is
 /// the reading that keeps eviction honest.
-const fn recorded_millis(stamp: i64) -> u64 {
+pub const fn recorded_millis(stamp: i64) -> u64 {
     if stamp < 0 { 0 } else { stamp.cast_unsigned() }
 }
 
@@ -3049,6 +3077,23 @@ pub async fn persist_cached_bundle_trust_marker(
         ));
     }
     Ok(())
+}
+
+/// Delete one row of the shared LRU budget from the table it lives in.
+async fn delete_index_entry(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    cache_key: &str,
+    table: EntryTable,
+) -> stow_types::error::Result<()> {
+    match table {
+        EntryTable::Bundle => {
+            delete_artifact_cache_entry(connection, rustc_version, cache_key).await
+        }
+        EntryTable::Unit => {
+            crate::unit_cache::delete_unit_entry(connection, rustc_version, cache_key).await
+        }
+    }
 }
 
 async fn delete_artifact_cache_entry(

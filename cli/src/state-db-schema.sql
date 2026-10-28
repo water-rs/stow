@@ -53,6 +53,29 @@ ON artifact_cache_entries (
     c_metadata
 );
 
+-- stow#978: units the registry identity cannot key — path and git
+-- dependencies, workspace members, custom codegen, staticlibs — keyed by
+-- content (`unit_cache.rs`). `invocation_key` digests everything known
+-- before rustc runs; `inputs_json` names the dep-info files and env-dep
+-- variables a lookup re-hashes to rebuild `cache_key`. Rows share the
+-- bundle entries' LRU budget and per-rustc directory.
+CREATE TABLE unit_cache_entries (
+    rustc_version TEXT NOT NULL,
+    cache_key TEXT NOT NULL,
+    invocation_key TEXT NOT NULL,
+    inputs_json TEXT NOT NULL,
+    env_dep_lines_json TEXT NOT NULL,
+    outputs_json TEXT NOT NULL,
+    diagnostics TEXT NOT NULL,
+    relative_dir TEXT NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    last_accessed_ms INTEGER NOT NULL,
+    PRIMARY KEY (rustc_version, cache_key)
+);
+
+CREATE INDEX idx_unit_cache_entries_invocation
+ON unit_cache_entries (rustc_version, invocation_key);
+
 CREATE TABLE artifact_cache_outputs (
     rustc_version TEXT NOT NULL,
     cache_key TEXT NOT NULL,
