@@ -16,7 +16,7 @@ use stow_types::rustc::ParsedRustcArgs;
 
 mod support;
 
-use support::hermetic_stow_env;
+use support::{denied_registry, hermetic_stow_env};
 
 /// The smallest registry unit that invokes the linker: a proc-macro with
 /// no dependencies of its own, so the probe build stays cheap.
@@ -152,9 +152,12 @@ fn a_setup_free_build_keys_like_the_setup_path() {
         .arg("setup")
         .current_dir(&project)
         .env("CARGO_HOME", &setup_home);
+    // Setup fetches the host index slice since stow#1032 — its
+    // registry must answer; `denied_registry` reports the package
+    // missing, resolving to the empty index.
     hermetic_stow_env(
         &mut setup,
-        &edge_url,
+        &denied_registry(),
         &cache_dir,
         &project.join("stow-home"),
     );

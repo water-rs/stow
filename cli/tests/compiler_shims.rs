@@ -18,7 +18,7 @@ mod build_fixture;
 mod support;
 
 use build_fixture::refused_url;
-use support::hermetic_stow_env;
+use support::{denied_registry, hermetic_stow_env};
 
 fn setup_in(dir: &Path) -> toml::Value {
     let cargo_home = dir.join("cargo-home");
@@ -32,7 +32,12 @@ fn setup_in(dir: &Path) -> toml::Value {
     // user-level stow config and exported compiler variables out of it
     // (stow#800).
     let home = dir.join("stow-home");
-    hermetic_stow_env(&mut setup, &refused_url(), &home.join("stow-cache"), &home);
+    hermetic_stow_env(
+        &mut setup,
+        &denied_registry(),
+        &home.join("stow-cache"),
+        &home,
+    );
     let status = setup.status().expect("run stow-cli setup");
     assert!(status.success(), "stow-cli setup failed");
     let config = std::fs::read_to_string(cargo_home.join("config.toml"))
@@ -204,7 +209,12 @@ fn an_explicit_toolchain_survives_setup() {
         .current_dir(dir.path())
         .env("CARGO_HOME", &cargo_home);
     let home = dir.path().join("stow-home");
-    hermetic_stow_env(&mut setup, &refused_url(), &home.join("stow-cache"), &home);
+    hermetic_stow_env(
+        &mut setup,
+        &denied_registry(),
+        &home.join("stow-cache"),
+        &home,
+    );
     let status = setup
         .env("CC", "/usr/bin/clang")
         .env("CXX", "/usr/bin/clang++")

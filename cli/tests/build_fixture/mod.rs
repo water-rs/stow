@@ -5,7 +5,7 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use crate::support::{hermetic_stow_env, sealed_home_env};
+use crate::support::{denied_registry, hermetic_stow_env, sealed_home_env};
 
 /// The home the fixture's child processes get — one directory per
 /// fixture, shared by every command the test runs in `dir` so `stow
@@ -45,6 +45,10 @@ pub fn write_fixture(dir: &Path, cargo_home: &Path, dependencies: &str) {
 
 /// A local port with nothing listening on it: the edge and the registry
 /// both fail fast instead of hanging the build.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
 pub fn refused_url() -> String {
     let port = {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind to pick a port");
@@ -56,6 +60,10 @@ pub fn refused_url() -> String {
 /// `stow-cli setup` in the isolated `CARGO_HOME` — the one-time mold
 /// selection, kept out of the builds under test (stow#294: a Linux
 /// `stow build` refuses to run without it).
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
 pub fn stow_setup_in(dir: &Path, cargo_home: &Path) {
     let mut setup = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     setup
@@ -66,8 +74,16 @@ pub fn stow_setup_in(dir: &Path, cargo_home: &Path) {
     // row into its state DB): without the sealed home and the pinned
     // stow variables it would consult the developer's `~/.stow` and
     // user-level config, and mold would install under the real home.
+    // Since stow#1032 setup also fetches the host index slice, so its
+    // registry must answer — `denied_registry` reports the package
+    // missing, which resolves to the empty index.
     let home = fixture_home(dir);
-    hermetic_stow_env(&mut setup, &refused_url(), &home.join("stow-cache"), &home);
+    hermetic_stow_env(
+        &mut setup,
+        &denied_registry(),
+        &home.join("stow-cache"),
+        &home,
+    );
     let setup = setup.output().expect("run stow-cli setup");
     assert!(
         setup.status.success(),
