@@ -176,7 +176,7 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
 async fn records_exist_stage() -> stow_types::error::Result<()> {
     let task = load_task_payload()?;
     let credentials = stow_oci::RegistryCredentials::from_env()?;
-    let http = stow_oci::RegistryHttp::new().await?;
+    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let exists = published_manifest(&task, &credentials, &http)
         .await?
         .is_some();
@@ -317,7 +317,7 @@ async fn publish(
     let credentials = stow_oci::RegistryCredentials::from_env()?;
     // One client for the whole publish: the artifact push and the
     // records push share the trust-store load (stow#624).
-    let http = stow_oci::RegistryHttp::new().await?;
+    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     // A run whose task's signed records already exist re-tags the
     // proven manifest under its own `records-<…>-<run_id>-<attempt>`
     // tag — the webhook's per-run check still resolves — instead of

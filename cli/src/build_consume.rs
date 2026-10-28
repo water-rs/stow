@@ -111,7 +111,7 @@ pub async fn ensure_slice(
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<IndexSlice> {
-    crate::index::confirmed_slice(&config.0, target, rustc_version).await
+    Ok(crate::index::confirmed_slice(&config.0, target, rustc_version).await?)
 }
 
 /// A verified published bundle staged for a build task's sandbox, with the

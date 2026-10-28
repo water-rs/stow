@@ -1174,6 +1174,13 @@ impl BuildSupervisor {
         supervisor
     }
 
+    /// The build's circuit handle — shared with the enrichment so its
+    /// index-fetch outage trips the breaker the plan path reads and the
+    /// broadcast in-flight downloads abandon on (stow#977).
+    pub(crate) fn circuit(&self) -> circuit::BuildCircuit {
+        self.env_cache.circuit.clone()
+    }
+
     /// Every unit this build compiled locally, in compile order.
     pub(crate) fn observations(&self) -> Vec<artifact_cache::ObservedUnit> {
         self.observations
@@ -1952,8 +1959,9 @@ pub(crate) struct WrapperEnvCache {
     /// `(target, rustc)` instead of once per rustc invocation (stow#347).
     slices: MemoizedSliceMap,
     /// The circuit's tripped state, read once for the build and kept in
-    /// step by the build's own recordings.
-    circuit_tripped: tokio::sync::OnceCell<std::sync::Mutex<bool>>,
+    /// step by the build's own recordings — plus the open broadcast an
+    /// in-flight download abandons on (stow#977).
+    circuit: circuit::BuildCircuit,
     /// The process's state-database handle, given to every config the
     /// base loaders read (stow#682).
     state_db: StateDb,
@@ -2096,7 +2104,7 @@ impl WrapperEnvCache {
             digests: std::sync::Arc::default(),
             path: std::env::var_os("PATH").unwrap_or_default(),
             slices: MemoizedSliceMap::default(),
-            circuit_tripped: tokio::sync::OnceCell::new(),
+            circuit: circuit::BuildCircuit::new(),
             state_db,
         }
     }
@@ -2294,41 +2302,19 @@ impl WrapperEnvCache {
     /// and the breaker guards transport that has already been decided
     /// once the driver laid the build's coverage down (stow#347).
     async fn circuit_tripped(&self, config: &StowConfig) -> stow_types::error::Result<bool> {
-        let cell = self
-            .circuit_tripped
-            .get_or_try_init(|| async {
-                Ok::<_, stow_types::error::Error>(std::sync::Mutex::new(
-                    circuit::is_tripped(config).await?,
-                ))
-            })
-            .await?;
-        Ok(*cell.lock().expect("circuit memo mutex"))
+        self.circuit.tripped(config).await
     }
 
     /// Count a remote-cache failure against the circuit breaker, then
     /// refresh the memo so the rest of the build sees its own recording.
     async fn record_circuit_failure(&self, config: &StowConfig) {
-        log_nonfatal_result(
-            "failed to record stow circuit failure",
-            circuit::record_failure(config).await,
-        );
-        if let Some(cell) = self.circuit_tripped.get()
-            && let Ok(tripped) = circuit::is_tripped(config).await
-        {
-            *cell.lock().expect("circuit memo mutex") = tripped;
-        }
+        self.circuit.record_failure(config).await;
     }
 
     /// Count a remote-cache success toward resetting the circuit breaker;
     /// a success resets it outright, so the memo just clears.
     async fn record_circuit_success(&self, config: &StowConfig) {
-        log_nonfatal_result(
-            "failed to record stow circuit success",
-            circuit::record_success(config).await,
-        );
-        if let Some(cell) = self.circuit_tripped.get() {
-            *cell.lock().expect("circuit memo mutex") = false;
-        }
+        self.circuit.record_success(config).await;
     }
 }
 
@@ -2694,6 +2680,21 @@ async fn serves_against_slice(
 /// `Bypass` means the artifact arrived but could not be used. While
 /// `fetch_pending` marks the slice provisional the miss records nothing:
 /// the negative cache asserts a settled absence (stow#797).
+/// Download a bundle, abandoning the request the moment the build's
+/// circuit opens rather than waiting out `request_timeout`: the edge is
+/// already known unreachable (stow#977).
+async fn download_unless_circuit_opens(
+    env: &WrapperEnvironment<'_>,
+    bundle_ref: &fetch::BundleRef<'_>,
+) -> Result<fetch::ArtifactBundle, fetch::FetchError> {
+    tokio::select! {
+        outcome = fetch::download_bundle(&env.env_base.config, bundle_ref) => outcome,
+        () = env.env_cache.circuit.opened(&env.env_base.config) => {
+            Err(fetch::FetchError::CircuitOpen)
+        }
+    }
+}
+
 async fn try_remote_exact_serve(
     env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -2741,10 +2742,24 @@ async fn try_remote_exact_serve(
         return RemoteServe::Refused;
     }
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
-    match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
+    let outcome = download_unless_circuit_opens(env, &bundle_ref).await;
+    match outcome {
         Ok(bundle) => try_serve_downloaded_bundle(env, parsed, request, &bundle, tally)
             .await
             .map_or(RemoteServe::Bypass, RemoteServe::Served),
+        // The circuit opened mid-download: the breaker is already
+        // tripped, so nothing more is counted — the unit compiles.
+        Err(fetch::FetchError::CircuitOpen) => {
+            tally.failed = true;
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                target = %env.target,
+                rustc_version = %env.rustc_version,
+                bundle_digest = %row.bundle_digest,
+                "stow exact bundle fetch abandoned: circuit opened mid-download"
+            );
+            RemoteServe::Miss
+        }
         // The index is ahead of the catalog: the edge pruned the row (a
         // stale registry blob) after the slice was published. Remember the
         // miss locally until the next slice; the circuit stays closed.
@@ -2821,11 +2836,25 @@ async fn try_remote_semantic_serve(
         };
     };
     let bundle_ref = fetch::BundleRef::from_index_row(&env.target, &env.rustc_version, row);
-    match fetch::download_bundle(&env.env_base.config, &bundle_ref).await {
+    let outcome = download_unless_circuit_opens(env, &bundle_ref).await;
+    match outcome {
         Ok(bundle) => {
             try_serve_semantic_downloaded_bundle(env, parsed, semantic_request, &bundle, tally)
                 .await
                 .map_or(RemoteServe::Bypass, RemoteServe::Served)
+        }
+        Err(fetch::FetchError::CircuitOpen) => {
+            tally.failed = true;
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                semantic_crate_name = %semantic_request.crate_name,
+                semantic_version = %semantic_request.version,
+                target = %env.target,
+                rustc_version = %env.rustc_version,
+                bundle_digest = %row.bundle_digest,
+                "stow semantic bundle fetch abandoned: circuit opened mid-download"
+            );
+            RemoteServe::Bypass
         }
         Err(fetch::FetchError::NotFound) => RemoteServe::Miss,
         Err(error) => {
@@ -5918,7 +5947,7 @@ mod tests {
             digests: std::sync::Arc::default(),
             path: path.to_os_string(),
             slices: super::MemoizedSliceMap::default(),
-            circuit_tripped: tokio::sync::OnceCell::new(),
+            circuit: crate::circuit::BuildCircuit::new(),
             state_db: crate::state_db::StateDb::default(),
         }
     }

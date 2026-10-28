@@ -519,7 +519,7 @@ pub async fn contextual_coverage(
     spellings: &BTreeMap<String, stow_types::public_cache::ExplicitSpelling>,
 ) -> stow_types::error::Result<BTreeSet<String>> {
     let base = crate::index_cmd::registry_base()?;
-    let http = stow_oci::RegistryHttp::new().await?;
+    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let repository = cache_repository(rustc_version);
     let session = base.session(&repository, &http);
     let trust = crate::index_cmd::records_trust().await?;
@@ -544,7 +544,7 @@ pub async fn published_slices(
     pairs: &BTreeSet<(TargetTriple, WireRustcVersion)>,
 ) -> stow_types::error::Result<Vec<stow_types::api::PublishedIndexSlice>> {
     let base = crate::index_cmd::registry_base()?;
-    let http = stow_oci::RegistryHttp::new().await?;
+    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let trust = crate::index_cmd::records_trust().await?;
     // The cache repository is per-rustc; group the pull by it.
     let mut by_rustc = BTreeMap::<&WireRustcVersion, Vec<&TargetTriple>>::new();
@@ -742,7 +742,9 @@ mod tests {
             ],
         );
         let base = stow_oci::RegistryBase::parse(&server.url).expect("registry base");
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let rustc_version = WireRustcVersion::parse("9.99.9").expect("rustc");
         let repository = cache_repository(&rustc_version);
         let session = base.session(&repository, &http);

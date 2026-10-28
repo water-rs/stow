@@ -1832,7 +1832,7 @@ fn write_local_build_entry_blocking(
     let mut size_bytes = 0u64;
     for output in outputs {
         let dest = files_dir.join(&output.file_name);
-        reflink::reflink_or_copy(&output.source, &dest).wrap_err_with(|| {
+        reflink_copy::reflink_or_copy(&output.source, &dest).wrap_err_with(|| {
             format!(
                 "materialize {} into local cache entry",
                 output.source.display()
@@ -4285,6 +4285,38 @@ pub mod tests {
                     .expect("second store")
             );
         });
+    }
+
+    /// Staging is a clone-or-copy of the build's outputs, never a view
+    /// of them: bytes staged into the entry must not move when the
+    /// worktree's outputs are rewritten afterwards — a hardlink would
+    /// carry the rewrite straight through.
+    #[test]
+    fn staged_entry_keeps_its_bytes_when_the_build_output_changes() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let staging_dir = tempdir.path().join("staging");
+        let entry_dir = tempdir.path().join("bundles").join("key-1");
+        std::fs::create_dir_all(&staging_dir).expect("create staging dir");
+        std::fs::create_dir_all(entry_dir.parent().unwrap()).expect("create bundles dir");
+        let source = tempdir.path().join("libdemo-abc.rlib");
+        std::fs::write(&source, b"local-rlib-bytes").expect("write build output");
+
+        let outputs = vec![super::LocalBuildOutput {
+            source: source.clone(),
+            file_name: "libdemo-def.rlib".to_owned(),
+            media_type: super::STOW_RLIB_MEDIA_TYPE,
+            sha256: hex::encode(sha2::Sha256::digest(b"local-rlib-bytes")),
+        }];
+        let write = super::write_local_build_entry_blocking(&staging_dir, &entry_dir, &outputs)
+            .expect("stage local build entry");
+        assert_eq!(write.size_bytes, b"local-rlib-bytes".len() as u64);
+
+        std::fs::write(&source, b"rewritten").expect("rewrite build output");
+        assert_eq!(
+            std::fs::read(entry_dir.join("files/libdemo-def.rlib")).expect("read staged file"),
+            b"local-rlib-bytes",
+            "a rewrite of the build output reached the staged file"
+        );
     }
 
     /// Record a dependency's materialized outputs the way the wrapper does

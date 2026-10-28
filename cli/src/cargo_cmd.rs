@@ -1890,7 +1890,7 @@ fn prefetch_servable_wildcards(
 async fn ensure_consumer_slices(
     config: &StowConfig,
     project: &ProjectContext,
-) -> stow_types::error::Result<(index::IndexSlice, Option<index::IndexSlice>)> {
+) -> Result<(index::IndexSlice, Option<index::IndexSlice>), index::SliceFetchError> {
     let host_target = stow_types::api::runner_family(&project.target)
         .map(|family| family.host_triple().to_owned())
         .filter(|host| *host != project.target);
@@ -3980,7 +3980,7 @@ async fn materialize_mirror_manifest(
             } else {
                 remove_mirror_symlink(&current, false)
                     .wrap_err_with(|| format!("remove manifest symlink {}", current.display()))?;
-                reflink::reflink_or_copy(&target, &current).wrap_err_with(|| {
+                reflink_copy::reflink_or_copy(&target, &current).wrap_err_with(|| {
                     format!(
                         "copy manifest {} into workspace mirror {}",
                         target.display(),
@@ -4662,6 +4662,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         Some(spawn_build_enrichment(BuildEnrichment {
             project: project.clone(),
             config: config.clone(),
+            circuit: handler.circuit(),
             cell: analysis_cell,
             map_path: serve_map_path.clone(),
             policy_dir: cache_policy_path.clone(),
@@ -5406,6 +5407,10 @@ struct BuildEnrichment {
     /// it would queue the user's real build behind a whole second
     /// resolve (stow#608).
     resolution_done: crate::ResolutionDone,
+    /// The build's circuit handle — tripped when the index fetch finds
+    /// the registry unreachable, releasing the plan path and in-flight
+    /// downloads to local compile at once (stow#977).
+    circuit: crate::circuit::BuildCircuit,
 }
 
 /// The policy gate's readiness latch for this build: pending only while
@@ -5523,7 +5528,25 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // allow commit and the serve map's final write both follow it
     // (stow#788). `ensure_slice` memoizes, so the analysis below reuses
     // this pair.
-    let (slice, host_slice) = ensure_consumer_slices(&work.config, &work.project).await?;
+    let (slice, host_slice) = match ensure_consumer_slices(&work.config, &work.project).await {
+        Ok(slices) => slices,
+        Err(error) if error.is_transport() => {
+            // The registry answered nothing — one diagnostic, not a
+            // stall the build re-pays per unit: trip the breaker so the
+            // plan path stops offering remote serves and in-flight
+            // downloads abandon, then end the enrichment. The guards'
+            // drop settles `serve_map_ready` and the policy latch, so
+            // every waiter releases at once to local compile (stow#977).
+            work.circuit.trip(&work.config).await;
+            tracing::warn!(
+                registry = %work.config.registry_base_url,
+                error = %error,
+                "stow index registry is unreachable; this build runs local-only"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     // The policy gate commits as soon as the rows exist — before the
     // `resolution_done` gate and the second resolve. The marker is
     // name-keyed, so "the crate has any row the fetched slices carry"

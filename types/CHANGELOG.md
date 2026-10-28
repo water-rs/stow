@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2](https://github.com/water-rs/stow/compare/stow-types-v0.8.1...stow-types-v0.8.2) - 2026-10-28
+
+### Fixed
+
+- *(admin)* bound scheduler submit bodies by bytes ([#975](https://github.com/water-rs/stow/pull/975))
+
 ## [0.8.0](https://github.com/water-rs/stow/compare/stow-types-v0.7.0...stow-types-v0.8.0) - 2026-10-26
 
 ### Added
