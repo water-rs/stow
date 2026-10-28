@@ -5247,7 +5247,6 @@ mod tests {
         WorkspaceMirror, relative_path, rewrite_args_for_mirror, rewrite_args_for_root,
     };
     use crate::prefetch::PrefetchArtifact;
-    use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
