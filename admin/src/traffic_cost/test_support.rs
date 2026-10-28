@@ -54,10 +54,10 @@ pub(super) fn fixture_report(
 }
 
 /// The reference workload's CPU the fixture report carries, in
-/// milliseconds — the reference the `WORKER_CPU_BUDGETS` rows were
-/// converted at, so each lane's fixture budget is its former
-/// millisecond budget.
-pub(super) const FIXTURE_REFERENCE_CPU_MS: f64 = 40.0;
+/// milliseconds — the reference of run 40631853262, which the
+/// `WORKER_CPU_BUDGETS` rows were derived from, so each lane's fixture
+/// budget is its budget in that run's milliseconds.
+pub(super) const FIXTURE_REFERENCE_CPU_MS: f64 = 22.2;
 
 /// Every lane at `scale(lane)` of its CPU budget, under a reference of
 /// [`FIXTURE_REFERENCE_CPU_MS`].

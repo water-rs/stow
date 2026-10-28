@@ -667,70 +667,77 @@ impl WorkerCpuBudget {
 /// at its measured figure and at its budget.
 pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
     WorkerCpuBudget {
-        // Run 39009034210: 0.38 ms.
+        // Run 40631853262: 0.027 (0.6 ms of a 22.2 ms reference).
         lane: "site",
-        relative_cpu: 0.125,
+        relative_cpu: 0.10,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 2.165 ms.
+        // Eight Analytics Engine SQL queries per page (stow#896);
+        // Workers Cache serves the deployed route for an hour after
+        // each. Run 40631853262: 0.149 (3.315 ms of 22.2 ms).
         lane: "stats",
-        relative_cpu: 0.125,
+        relative_cpu: 0.30,
     },
     WorkerCpuBudget {
         // The pointer GET plus the digest-addressed slice GET.
-        // Run 39009034210: 2.1 ms.
+        // Run 40631853262: 0.118 (2.625 ms of 22.2 ms).
         lane: "index-pull",
-        relative_cpu: 0.125,
+        relative_cpu: 0.25,
     },
     WorkerCpuBudget {
         // A covered bundle streamed through the byte path — the
         // dominant CPU line at 9e5 events/mo. stow#738 measured 11–24 ms
         // mean on the deployed Worker, far above this local figure.
-        // Run 39009034210: 0.595 ms.
+        // Run 40631853262: 0.041 (0.92 ms of 22.2 ms).
         lane: "bundle-fetch",
-        relative_cpu: 0.125,
+        relative_cpu: 0.10,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 1.38 ms.
+        // Provisional until a Traffic cost run measures the pending
+        // index (stow#932). Run 40631853262 measured 0.214 (4.745 ms of
+        // 22.2 ms) while `GET /status` and a human request's lane
+        // position still walked the whole node arena.
         lane: "status-read",
         relative_cpu: 0.125,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 3.06 ms.
+        // Provisional until a Traffic cost run measures the pending
+        // index (stow#932). Run 40631853262 measured 0.441 (9.8 ms of
+        // 22.2 ms) while the counts and the oldest pending request still
+        // walked the whole node arena.
         lane: "admin-status",
         relative_cpu: 0.25,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 5.475 ms.
+        // Run 40631853262: 0.319 (7.09 ms of 22.2 ms).
         lane: "queue-read",
-        relative_cpu: 0.375,
+        relative_cpu: 0.65,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 5.395 ms.
+        // Run 40631853262: 0.136 (3.025 ms of 22.2 ms).
         lane: "queue-mutate",
-        relative_cpu: 0.375,
+        relative_cpu: 0.30,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 4.345 ms.
+        // Run 40631853262: 0.118 (2.625 ms of 22.2 ms).
         lane: "trusted-submit",
         relative_cpu: 0.25,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 1.64 ms.
+        // Run 40631853262: 0.038 (0.85 ms of 22.2 ms).
         lane: "admission",
-        relative_cpu: 0.125,
+        relative_cpu: 0.10,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 5.915 ms.
+        // Run 40631853262: 0.113 (2.51 ms of 22.2 ms).
         lane: "enqueue-redeem",
-        relative_cpu: 0.375,
+        relative_cpu: 0.25,
     },
     WorkerCpuBudget {
-        // The signed `workflow_run` callback: HMAC check, the
-        // run's title decode and the forward to the scheduler. Run
-        // 39009034210 measured 3.185 ms on the per-task path, which
-        // also verified the records artifact's cosign signature.
+        // The signed `workflow_run` callback: HMAC check, the run's
+        // title decode and the forward to the scheduler.
+        // Run 40631853262: 0.161 (3.575 ms of 22.2 ms).
         lane: "workflow-callback",
-        relative_cpu: 0.25,
+        relative_cpu: 0.35,
     },
 ];
