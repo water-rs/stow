@@ -1390,10 +1390,16 @@ mod tests {
             .await
             .expect("connect state db");
         // `first` starts the pass as the least recently used; the hit
-        // must push it behind `second` before `third` is stored.
+        // must push it behind `second` before `third` is stored. Both
+        // stamps are set in the past: a `second` stamped by its store can
+        // land on the same millisecond as the hit, and the tie then
+        // evicts by cache key instead of recency.
         super::touch_cc_cache_entry(&pool, "first", 1)
             .await
             .expect("stale first object's stamp");
+        super::touch_cc_cache_entry(&pool, "second", 2)
+            .await
+            .expect("stale second object's stamp");
         super::record_cc_hit(&config, "first", &first)
             .await
             .expect("hit on first object");
