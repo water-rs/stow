@@ -37,6 +37,12 @@ pub(crate) const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024
 /// read re-checks the tag — `STOW_INDEX_REFRESH_SECS`, config
 /// `index_refresh_secs`, default ten minutes.
 const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
+/// The consumer's registry connect bound: an unreachable registry
+/// answers in seconds, and its connect/DNS failure never joins the
+/// retry sweep — the build's circuit carries the outage instead of
+/// eight stalled attempts (stow#977). Publishing keeps
+/// [`stow_oci::TransportPolicy::PATIENT`].
+const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
     pub edge_url: String,
@@ -151,7 +157,12 @@ impl StowConfig {
     pub async fn registry_http(&self) -> stow_types::error::Result<stow_oci::RegistryHttp> {
         let http = self
             .registry_http
-            .get_or_try_init(stow_oci::RegistryHttp::new)
+            .get_or_try_init(|| {
+                stow_oci::RegistryHttp::new(stow_oci::TransportPolicy {
+                    connect_timeout: Some(REGISTRY_CONNECT_TIMEOUT),
+                    retry_connect_failures: false,
+                })
+            })
             .await?;
         Ok(http.clone())
     }

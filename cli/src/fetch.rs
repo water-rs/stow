@@ -180,6 +180,10 @@ fn classify_client_error(error: &impl zenwave::HttpError) -> FetchError {
 #[derive(Debug)]
 pub enum FetchError {
     NotFound,
+    /// The build's circuit opened while the request was in flight — the
+    /// edge was already known unreachable, so the wait was abandoned
+    /// rather than ridden out to `request_timeout` (stow#977).
+    CircuitOpen,
     Timeout,
     Http(u16),
     Network(String),
@@ -196,6 +200,7 @@ impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => write!(f, "artifact not found"),
+            Self::CircuitOpen => write!(f, "artifact fetch abandoned: circuit opened"),
             Self::Timeout => write!(f, "artifact fetch timed out"),
             Self::Http(status) => write!(f, "artifact fetch returned HTTP {status}"),
             Self::Network(message) => write!(f, "artifact fetch network error: {message}"),

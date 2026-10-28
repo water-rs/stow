@@ -2676,7 +2676,9 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         let base =
             stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let repository =
             cache_repository(&WireRustcVersion::parse("9.99.9").expect("rustc version"));
         let session = base.session(&repository, &http);
@@ -3112,7 +3114,9 @@ mod tests {
         let plan = test_plan(root.path());
         let (listen, probe) = serve_probe_registry(root.path()).await;
 
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
@@ -3189,7 +3193,9 @@ mod tests {
         let manifests = root.path().join("manifests");
         let sign = mock_sign(root.path());
 
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(
             &session,
@@ -3226,7 +3232,9 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         probe.rate_limit(Method::POST, "/blobs/uploads", 3);
 
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
@@ -3253,7 +3261,9 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         probe.refuse_single_post();
 
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
@@ -3294,7 +3304,9 @@ mod tests {
         let (listen, probe) = serve_probe_registry(root.path()).await;
         probe.omit_manifest_digest_header();
 
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = push_session(&listen, &http);
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
@@ -3332,7 +3344,9 @@ mod tests {
 
         let base =
             stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = base.session(&test_cache_repository(), &http);
 
         let tag_reference = session.reference("forged-tag").expect("tag reference");
@@ -3397,7 +3411,9 @@ mod tests {
         let (listen, _probe) = serve_probe_registry(root.path()).await;
         let base =
             stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = base.session(&test_cache_repository(), &http);
         let reference = session.reference(tag_a).expect("reference");
         let materials = stow_oci::pull_signature_materials(&session, &reference, digest)
@@ -3459,7 +3475,9 @@ mod tests {
         let signature_tag = sigstore_signature_tag(digest);
         probe.manifest_unknown(Method::GET, &format!("/manifests/{signature_tag}"), 1);
 
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = push_session(&listen, &http);
         let reference = session.reference(tag).expect("reference");
         let materials = stow_oci::pull_pushed_signature_materials(&session, &reference, digest)
@@ -3490,7 +3508,9 @@ mod tests {
             usize::MAX,
         );
 
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = push_session(&listen, &http);
         let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
         let reference = session.reference(tag).expect("reference");
@@ -3531,7 +3551,9 @@ mod tests {
 
         let base =
             stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
-        let http = stow_oci::RegistryHttp::new().await.expect("registry http");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
         let session = base.session(&test_cache_repository(), &http);
         let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
         let reference = session.reference(tag).expect("reference");
