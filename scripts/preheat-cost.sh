@@ -383,15 +383,22 @@ edge_rss_kb() {
 }
 
 # stow#955: the edge's mutating routes admit only an admitted workflow's
-# OIDC token; the preheat lanes run as operations.yml would, under a
-# token from the mock issuer that outlives the longest lane.
-admin() {
+# OIDC token; each call runs as the workflow that makes it in production
+# (`admin_as`), the preheat lanes as operations.yml, under a token from
+# the mock issuer that outlives the longest lane.
+admin_as() {
+    local workflow="$1"
+    shift
     env STOW_EDGE_URL="$EDGE_URL" \
-        GH_TOKEN="$("$BIN/stow-mock-registry" oidc-token --workflow operations.yml \
+        GH_TOKEN="$("$BIN/stow-mock-registry" oidc-token --workflow "$workflow" \
             --lifetime-secs 7200)" \
         STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         "$BIN/stow-admin" "$@"
+}
+
+admin() {
+    admin_as operations.yml "$@"
 }
 
 start_edge
@@ -544,7 +551,7 @@ publish_round() {
     while read -r index_file _; do
         [ -n "$index_file" ] && report_args+=(--file "$WORK_DIR/index-export/$index_file")
     done <<<"$pairs"
-    admin index report "${report_args[@]}" \
+    admin_as index-publish.yml index report "${report_args[@]}" \
         >>"$LOG_DIR/index-report.log" 2>&1 \
         || die "index report failed — see $LOG_DIR/index-report.log"
     snapshot "$dir/end.json"

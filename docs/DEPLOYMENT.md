@@ -488,8 +488,8 @@ GitHub identity (`edge/src/github_auth.rs`). Two shapes authenticate:
 - **GitHub Actions OIDC JWT.** A workflow's per-run JWT
   (`audience=$STOW_OIDC_AUDIENCE`, minted per request by `stow-admin`).
   The edge verifies the RS256 signature against GitHub's JWKS
-  (`token.actions.githubusercontent.com/.well-known/jwks`, fetched per
-  call) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
+  (`token.actions.githubusercontent.com/.well-known/jwks`, held in
+  isolate memory for an hour and refetched on an unknown `kid`) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
   `repository` (to the `GITHUB_REPO` var), `exp`/`nbf`, and requires
   the `job_workflow_ref`, `workflow_ref`, `ref`, `run_attempt` and
   `actor` claims. Nothing is stored or rotated — a leaked run token
