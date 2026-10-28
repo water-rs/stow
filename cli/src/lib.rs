@@ -6324,6 +6324,12 @@ mod tests {
         #[derive(Clone)]
         struct SharedLog(Arc<std::sync::Mutex<Vec<u8>>>);
 
+        impl SharedLog {
+            fn text(&self) -> String {
+                String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+            }
+        }
+
         impl std::io::Write for SharedLog {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
                 self.0.lock().expect("log buffer").extend_from_slice(buf);
@@ -6332,6 +6338,57 @@ mod tests {
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
+        }
+
+        /// The global default under every capture: it enables nothing and
+        /// answers every callsite "sometimes", so each event asks the
+        /// dispatcher current on its own thread.
+        ///
+        /// tracing-core caches a callsite's interest process-wide when the
+        /// callsite is first reached. While a single dispatcher is
+        /// registered it takes that interest from whichever thread got
+        /// there first: a concurrent test thread with no subscriber caches
+        /// `never` for a production callsite a capture on another thread is
+        /// waiting for, and the capture never sees the event. With this
+        /// subscriber as the global default no thread answers `never`.
+        struct UndecidedInterest;
+
+        impl tracing::Subscriber for UndecidedInterest {
+            fn register_callsite(
+                &self,
+                _: &'static tracing::Metadata<'static>,
+            ) -> tracing::subscriber::Interest {
+                tracing::subscriber::Interest::sometimes()
+            }
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                false
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {}
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        /// Capture this thread's events at `level` and above until the
+        /// guard drops, immune to other tests reaching the same callsites
+        /// first (see [`UndecidedInterest`]).
+        fn capture_logs(level: tracing::Level) -> (SharedLog, tracing::subscriber::DefaultGuard) {
+            // The first capture installs it and every later one finds it
+            // in place: nothing else in the lib tests sets a global
+            // default, so a refusal only means it is already there.
+            let _ = tracing::subscriber::set_global_default(UndecidedInterest);
+            let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
+            let writer = log.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            (log, tracing::subscriber::set_default(subscriber))
         }
 
         /// The shared `--out-dir` both fixture units compile into, cargo's
@@ -6345,7 +6402,9 @@ mod tests {
                 registry_base_url: "http://127.0.0.1:9".to_owned(),
                 cache_dir: root.join(".stow"),
                 request_timeout: Duration::from_millis(200),
-                negative_cache_ttl: Duration::ZERO,
+                // Long enough that a recorded miss is still there when a
+                // test reads it back.
+                negative_cache_ttl: Duration::from_mins(10),
                 circuit_reset_after: Duration::ZERO,
                 circuit_trip_threshold: 1,
                 artifact_cache_max_bytes: u64::MAX,
@@ -6584,20 +6643,12 @@ mod tests {
         }
 
         /// stow#788: a covered unit that reaches the policy check before
-        /// its allow marker lands waits out the commit instead of
-        /// compiling — the marker lands mid-wait, and the unit is
-        /// served. The artifact is staged locally the way the build's
-        /// own prefetch would land it.
+        /// its allow marker lands waits out the commit instead of being
+        /// denied by timing — the marker lands mid-wait, and the unit
+        /// takes the allowed path: its exact registry lookup runs against
+        /// the build's index slice.
         #[tokio::test]
         async fn a_unit_before_its_allow_marker_waits_and_serves() {
-            let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
-            let writer = log.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::DEBUG)
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            let _default = tracing::subscriber::set_default(subscriber);
             let tempdir = tempfile::tempdir().expect("tempdir");
             let out_dir = tempdir.path().join("deps");
             std::fs::create_dir_all(&out_dir).expect("create deps dir");
@@ -6605,10 +6656,22 @@ mod tests {
             let policy_dir = tempdir.path().join("policy");
             std::fs::create_dir_all(&policy_dir).expect("create policy dir");
             let policy_ready = Arc::new(crate::facade::ServeMapSignal::pending());
-            let (_config, _in_flight, handler) = fixture_ctx(tempdir.path(), |in_flight| {
+            let (config, _in_flight, handler) = fixture_ctx(tempdir.path(), |in_flight| {
                 pending_policy_ctx(policy_dir.clone(), &policy_ready, in_flight)
             })
             .await;
+            // The build's slice carries no row for the unit: the exact
+            // lookup — which only the allowed path runs — misses on it and
+            // records that miss in the negative cache. A denied unit never
+            // asks the slice, so it records nothing.
+            crate::index::write_cached_test_slice(
+                &config,
+                HOST_TARGET,
+                RUSTC_VERSION,
+                &super::empty_test_index(HOST_TARGET, RUSTC_VERSION),
+            )
+            .await
+            .expect("write the build's index slice");
 
             let args = unit_args(&registry_src, &out_dir, "demo", "1.0.0", "demometa", &[]);
 
@@ -6635,22 +6698,18 @@ mod tests {
             policy_ready.complete();
 
             let decision = deciding.await.expect("join the plan");
-            let logs = {
-                let buffer = log.0.lock().expect("log buffer");
-                String::from_utf8_lossy(&buffer).into_owned()
-            };
             drop(decision);
-            // The marker was honored: the unit ran its lookup — the
-            // slice check only runs on the allowed path — rather than
-            // being denied by timing. With nothing cached it still
-            // compiles, but the allow it waited for was real.
+            // The marker was honored: the unit's exact lookup asked the
+            // slice — rather than being denied by timing. With no row it
+            // still compiles, but the allow it waited for was real.
             assert!(
-                logs.contains("skipping registry serves"),
-                "the allowed path must reach the lookup chain: {logs}"
-            );
-            assert!(
-                !logs.contains("disabled by stow cache policy"),
-                "the waited unit must not see the early deny: {logs}"
+                crate::circuit::negative_cache_contains(
+                    &config,
+                    &format!("{HOST_TARGET}/{RUSTC_VERSION}/demometa"),
+                )
+                .await
+                .expect("read the negative cache"),
+                "the waited unit must take the allowed path to its exact lookup"
             );
 
             // A served leaf mints no local-build marker: a dependent
@@ -6790,14 +6849,7 @@ mod tests {
         /// debug line says which extern was never recorded (stow#618).
         #[tokio::test]
         async fn a_dead_connection_releases_the_dependent() {
-            let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
-            let writer = log.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::DEBUG)
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            let _default = tracing::subscriber::set_default(subscriber);
+            let (log, _capture) = capture_logs(tracing::Level::DEBUG);
 
             let tempdir = tempfile::tempdir().expect("tempdir");
             let out_dir = tempdir.path().join("deps");
@@ -6841,10 +6893,7 @@ mod tests {
             // the bookkeeping that logs the skip has run to its end.
             flush_frames(&mut consumer_conn, &token).await;
 
-            let captured = {
-                let captured = log.0.lock().expect("log buffer");
-                String::from_utf8_lossy(&captured).into_owned()
-            };
+            let captured = log.text();
             assert!(
                 captured.contains("bookkeeping was never recorded"),
                 "the unrecorded-dependency debug line:\n{captured}"
@@ -6867,14 +6916,7 @@ mod tests {
         /// would never let the flush answer.
         #[tokio::test]
         async fn a_build_script_units_post_compile_owes_nothing() {
-            let log = SharedLog(Arc::new(std::sync::Mutex::new(Vec::new())));
-            let writer = log.clone();
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::WARN)
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            let _default = tracing::subscriber::set_default(subscriber);
+            let (log, _capture) = capture_logs(tracing::Level::WARN);
 
             let tempdir = tempfile::tempdir().expect("tempdir");
             let out_dir = tempdir.path().join("deps");
@@ -6948,10 +6990,7 @@ mod tests {
                 stored_crates(&config).await.is_empty(),
                 "a unit the cache cannot hold stores nothing"
             );
-            let captured = {
-                let captured = log.0.lock().expect("log buffer");
-                String::from_utf8_lossy(&captured).into_owned()
-            };
+            let captured = log.text();
             assert!(
                 captured.is_empty(),
                 "a never-cacheable unit logs no warn:\n{captured}"
