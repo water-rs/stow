@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use super::{
-    DigestMemo, InvocationEnv, Keying, Toolchain, UnitInputs, UnitPlan, invocation_key,
-    out_dir_reaches_output, parse_dep_info, prepare_store, refusal, unit_key,
+    DigestMemo, InvocationEnv, Keying, Toolchain, UnitInputs, UnitPlan, build_script_inputs,
+    invocation_key, out_dir_reaches_output, parse_dep_info, prepare_store, refusal, unit_key,
 };
 use crate::rustc_args::ParsedRustcArgs;
 
@@ -151,11 +151,15 @@ impl Checkout {
             files: files.iter().map(|file| (*file).to_owned()).collect(),
             env: env_deps.iter().map(|name| (*name).to_owned()).collect(),
         };
+        let memo = DigestMemo::default();
+        let build_script = build_script_inputs(env, &memo)
+            .unwrap_or_else(|(path, error)| panic!("unreadable {}: {error}", path.display()));
         unit_key(
             &self.invocation_key(env),
             &inputs,
             env,
-            &DigestMemo::default(),
+            build_script.as_ref(),
+            &memo,
         )
         .unwrap_or_else(|(path, error)| panic!("unreadable {}: {error}", path.display()))
         .key
@@ -497,6 +501,91 @@ fn a_competing_module_file_changes_the_unit_key() {
     assert_ne!(before, with_dir);
     write(&checkout.root.join("mylib/src/foo/mod.rs"), "");
     assert_ne!(with_dir, checkout.unit_key_over(&env, &files, &[]));
+}
+
+/// stow#978 P1 option 2: a package with a build script declares the
+/// inputs its script and proc macros read; an edit to a
+/// `cargo:rerun-if-changed` file is a miss.
+#[test]
+fn a_rerun_if_changed_file_is_keyed_by_contents() {
+    let checkout = Checkout::new(LIB_RS, b"rmeta");
+    let build = checkout.root.join("target/build/mylib-1");
+    let out_dir = build.join("out");
+    write(
+        &build.join("output"),
+        "cargo:rustc-link-search=native=lib\n\
+         cargo:rerun-if-changed=data/input.txt\n\
+         cargo:warning=compiled fine\n",
+    );
+    write(&checkout.root.join("mylib/data/input.txt"), "v1");
+    let env = checkout.env(&[("OUT_DIR", out_dir.to_str().expect("utf-8"))]);
+    let before = checkout.unit_key(&env, &[]);
+    write(&checkout.root.join("mylib/data/input.txt"), "v2");
+    assert_ne!(before, checkout.unit_key(&env, &[]));
+}
+
+/// stow#978 P1 option 2, the sqlx shape: `rerun-if-changed=migrations`
+/// watches a directory, and a file added under it is a miss though no
+/// dep-info lists it.
+#[test]
+fn a_new_file_in_a_rerun_if_changed_directory_changes_the_key() {
+    let checkout = Checkout::new(LIB_RS, b"rmeta");
+    let build = checkout.root.join("target/build/mylib-1");
+    let out_dir = build.join("out");
+    write(
+        &build.join("output"),
+        "cargo::rerun-if-changed=migrations\n",
+    );
+    write(
+        &checkout.root.join("mylib/migrations/0001_init.sql"),
+        "create table t(x int);\n",
+    );
+    let env = checkout.env(&[("OUT_DIR", out_dir.to_str().expect("utf-8"))]);
+    let before = checkout.unit_key(&env, &[]);
+    write(
+        &checkout.root.join("mylib/migrations/0002_more.sql"),
+        "alter table t add column y int;\n",
+    );
+    assert_ne!(before, checkout.unit_key(&env, &[]));
+}
+
+/// stow#978 P1 option 2: a `cargo:rerun-if-env-changed` variable's value
+/// in the unit's environment is keyed, set or unset.
+#[test]
+fn a_rerun_if_env_changed_variable_changes_the_key() {
+    let checkout = Checkout::new(LIB_RS, b"rmeta");
+    let build = checkout.root.join("target/build/mylib-1");
+    let out_dir = build.join("out");
+    write(
+        &build.join("output"),
+        "cargo:rerun-if-env-changed=DATABASE_URL\n",
+    );
+    let out_dir = out_dir.to_str().expect("utf-8");
+    let unset = checkout.unit_key(&checkout.env(&[("OUT_DIR", out_dir)]), &[]);
+    let sqlite = checkout.unit_key(
+        &checkout.env(&[("OUT_DIR", out_dir), ("DATABASE_URL", "sqlite://a.db")]),
+        &[],
+    );
+    let postgres = checkout.unit_key(
+        &checkout.env(&[("OUT_DIR", out_dir), ("DATABASE_URL", "postgres://h/db")]),
+        &[],
+    );
+    assert_ne!(unset, sqlite);
+    assert_ne!(sqlite, postgres);
+}
+
+/// stow#978 P1 option 2: `OUT_DIR` set means the package's build script
+/// ran, and cargo always writes its `output` beside it — a missing one
+/// fails the invocation, it is not an absent input.
+#[test]
+fn a_missing_build_script_output_is_an_error() {
+    let checkout = Checkout::new(LIB_RS, b"rmeta");
+    let out_dir = checkout.root.join("target/build/mylib-1/out");
+    let env = checkout.env(&[("OUT_DIR", out_dir.to_str().expect("utf-8"))]);
+    let (path, error) = build_script_inputs(&env, &DigestMemo::default())
+        .expect_err("a missing output file must not be skipped");
+    assert!(path.ends_with("output"));
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 }
 
 /// stow#978 review 3.1, as measured: debuginfo on an MSVC target, and

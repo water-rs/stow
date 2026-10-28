@@ -16,8 +16,12 @@
 //!   dep-info;
 //! - the *unit key*: the invocation key plus every file the compile's
 //!   dep-info lists (by contents), the entries rustc's module search reads
-//!   beside each of them, and the value of every variable read through
-//!   `env!`/`option_env!`.
+//!   beside each of them, the value of every variable read through
+//!   `env!`/`option_env!`, and the inputs the package's build script
+//!   declares: the `output` file cargo writes beside `OUT_DIR`, every
+//!   `cargo:rerun-if-changed` path — a directory recursively, the way
+//!   cargo walks it — and every `cargo:rerun-if-env-changed` variable's
+//!   value.
 //!
 //! An entry records its dep-info file list under its invocation key, and a
 //! lookup re-hashes that list as it stands now: no extra rustc pass runs on
@@ -30,10 +34,11 @@
 //! to an invocation in the same directories. `--out-dir` is keyed exactly
 //! when the artifact embeds it.
 //!
-//! What no key here sees is what a proc macro reads without dep-info
-//! tracking it: a variable outside the ones keyed below, a file the
-//! compile does not list, a database. sccache and ccache leave the same
-//! gap.
+//! What no key here sees is what a proc macro reads without dep-info or
+//! a `rerun-if-*` line tracking it: a variable outside the keyed set that
+//! no `rerun-if-env-changed` declares, a file the compile does not list
+//! that no `rerun-if-changed` names, a database. sccache and ccache leave
+//! the same gap.
 //!
 //! Nothing here mints a node or reports anything upstream: the entries
 //! live beside the bundle entries, under the same per-rustc directory,
@@ -977,6 +982,182 @@ fn module_search_listing(dir: &Path) -> std::io::Result<Option<(ChangeStamp, Vec
     Ok(Some((ChangeStamp::read(dir)?, names)))
 }
 
+/// The inputs a package's build script declares, hashed once per
+/// invocation: its section digest and the latest change among the files
+/// and directories it names. `None` when the invocation has no `OUT_DIR`
+/// — the package has no build script.
+#[derive(Debug)]
+struct BuildScriptInputs {
+    digest: String,
+    newest_change: SystemTime,
+}
+
+/// Hash the `output` file cargo writes beside `OUT_DIR` and the inputs
+/// its `cargo:rerun-if-changed`/`cargo::rerun-if-changed` and
+/// `cargo:rerun-if-env-changed`/`cargo::rerun-if-env-changed` lines
+/// declare — what a build script or a proc macro then reads without
+/// dep-info tracking it, the way cargo's own rebuild decision watches
+/// it. A relative path resolves against `CARGO_MANIFEST_DIR`.
+///
+/// The `output` file must read: `OUT_DIR` is set only for a package
+/// whose build script ran, and cargo always writes its captured stdout
+/// there. A missing one is an inconsistent state, an error that fails
+/// the invocation — never an absent input.
+fn build_script_inputs(
+    env: &InvocationEnv,
+    memo: &DigestMemo,
+) -> Result<Option<BuildScriptInputs>, (PathBuf, std::io::Error)> {
+    let Some(out_dir) = env.var("OUT_DIR") else {
+        return Ok(None);
+    };
+    let out_dir = Path::new(out_dir);
+    let output = out_dir
+        .parent()
+        .ok_or_else(|| {
+            (
+                out_dir.to_path_buf(),
+                std::io::Error::other("OUT_DIR has no parent to hold the build script's output"),
+            )
+        })?
+        .join("output");
+    let bytes = std::fs::read(&output).map_err(|error| (output.clone(), error))?;
+    let stamp = ChangeStamp::read(&output).map_err(|error| (output.clone(), error))?;
+    let mut newest_change = stamp.changed;
+    let mut key = KeyHasher::new("stow.local-unit.build-script.v2");
+    key.field(&bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    let mut declared_paths = Vec::new();
+    let mut declared_vars = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line
+            .strip_prefix("cargo::")
+            .or_else(|| line.strip_prefix("cargo:"))
+        else {
+            continue;
+        };
+        match rest.split_once('=') {
+            Some(("rerun-if-changed", path)) => declared_paths.push(path),
+            Some(("rerun-if-env-changed", name)) => declared_vars.push(name),
+            _ => {}
+        }
+    }
+    declared_paths.sort_unstable();
+    declared_paths.dedup();
+    let manifest_dir = env.var("CARGO_MANIFEST_DIR").map(PathBuf::from);
+    for declared in declared_paths {
+        key.field(declared.as_bytes());
+        let path = Path::new(declared);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            let Some(manifest_dir) = &manifest_dir else {
+                return Err((
+                    output,
+                    std::io::Error::other(format!(
+                        "`rerun-if-changed={declared}` is relative, but CARGO_MANIFEST_DIR is unset"
+                    )),
+                ));
+            };
+            manifest_dir.join(path)
+        };
+        key_build_script_path(&mut key, memo, &path, &mut newest_change)?;
+    }
+    for name in declared_vars {
+        key.field(name.as_bytes());
+        match env.var(name) {
+            Some(value) => {
+                key.field(b"set");
+                key.field(value.as_encoded_bytes());
+            }
+            None => key.field(b"unset"),
+        }
+    }
+    Ok(Some(BuildScriptInputs {
+        digest: key.finish(),
+        newest_change,
+    }))
+}
+
+/// Key one `rerun-if-changed` path as it stands: a file by contents, a
+/// directory by the relative path and contents of every file under it,
+/// and a missing path by a marker and its nearest surviving ancestor's
+/// stamp — so one removed while rustc ran still fails the
+/// changed-while-compiling check instead of storing as absent.
+fn key_build_script_path(
+    key: &mut KeyHasher,
+    memo: &DigestMemo,
+    path: &Path,
+    newest_change: &mut SystemTime,
+) -> Result<(), (PathBuf, std::io::Error)> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            key.field(b"absent");
+            let mut ancestor = path.parent();
+            while let Some(dir) = ancestor {
+                match ChangeStamp::read(dir) {
+                    Ok(stamp) => {
+                        *newest_change = (*newest_change).max(stamp.changed);
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ancestor = dir.parent();
+                    }
+                    Err(error) => return Err((dir.to_path_buf(), error)),
+                }
+            }
+            return Ok(());
+        }
+        Err(error) => return Err((path.to_path_buf(), error)),
+    };
+    if metadata.is_dir() {
+        key.field(b"dir");
+        for entry in walkdir::WalkDir::new(path).sort_by_file_name() {
+            let entry = entry.map_err(|error| {
+                (
+                    error
+                        .path()
+                        .map_or_else(|| path.to_path_buf(), Path::to_path_buf),
+                    std::io::Error::other(error),
+                )
+            })?;
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                let stamp = ChangeStamp::read(entry_path)
+                    .map_err(|error| (entry_path.to_path_buf(), error))?;
+                *newest_change = (*newest_change).max(stamp.changed);
+            } else if entry_path.is_file() {
+                let relative = entry_path
+                    .strip_prefix(path)
+                    .expect("a walked entry is under the walked directory");
+                let (stamp, digest) = memo
+                    .digest(entry_path)
+                    .map_err(|error| (entry_path.to_path_buf(), error))?;
+                *newest_change = (*newest_change).max(stamp.changed);
+                key.field(relative.as_os_str().as_encoded_bytes());
+                key.field(digest.as_bytes());
+            }
+        }
+        return Ok(());
+    }
+    if metadata.is_file() {
+        key.field(b"file");
+        let (stamp, digest) = memo
+            .digest(path)
+            .map_err(|error| (path.to_path_buf(), error))?;
+        *newest_change = (*newest_change).max(stamp.changed);
+        key.field(digest.as_bytes());
+        return Ok(());
+    }
+    // A named pipe, socket or device cannot be hashed; its stamp is the
+    // only honest key.
+    key.field(b"other");
+    let stamp = ChangeStamp::read(path).map_err(|error| (path.to_path_buf(), error))?;
+    *newest_change = (*newest_change).max(stamp.changed);
+    key.field(stamp.key_bytes().as_bytes());
+    Ok(())
+}
+
 /// A unit key and the latest change time among what it read.
 #[derive(Debug)]
 struct UnitKey {
@@ -990,6 +1171,7 @@ fn unit_key(
     invocation_key: &str,
     inputs: &UnitInputs,
     env: &InvocationEnv,
+    build_script: Option<&BuildScriptInputs>,
     memo: &DigestMemo,
 ) -> Result<UnitKey, (PathBuf, std::io::Error)> {
     let mut key = KeyHasher::new("stow.local-unit.v2");
@@ -1035,6 +1217,10 @@ fn unit_key(
         }
     }
     key.field(vars.finish().as_bytes());
+    if let Some(build_script) = build_script {
+        newest_change = newest_change.max(build_script.newest_change);
+        key.field(build_script.digest.as_bytes());
+    }
     Ok(UnitKey {
         key: key.finish(),
         newest_change,
@@ -1085,8 +1271,10 @@ pub struct LookupContext<'a> {
 /// # Errors
 ///
 /// A failure of the cache itself — the state database, a malformed row,
-/// an entry that cannot be written into the target directory. An entry
-/// that fails to serve is removed so the next build compiles it.
+/// an entry that cannot be written into the target directory, the
+/// declared build-script inputs of a unit with `OUT_DIR` that cannot be
+/// read. An entry that fails to serve is removed so the next build
+/// compiles it.
 pub async fn lookup(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
@@ -1151,17 +1339,21 @@ pub async fn lookup(
 
 /// The cache key of the candidate whose unit key the inputs re-hash to,
 /// hashing each distinct input list once. A candidate whose inputs no
-/// longer read is a miss, not a failure.
+/// longer read is a miss, not a failure; the declared build-script
+/// inputs of a unit with `OUT_DIR` must read, or the invocation fails.
 async fn matching_entry(
     plan: &UnitPlan,
     candidates: Vec<(String, String)>,
     memo: &Arc<DigestMemo>,
 ) -> stow_types::error::Result<Option<String>> {
-    if candidates.is_empty() {
-        return Ok(None);
-    }
     let (plan, memo) = (plan.clone(), Arc::clone(memo));
     tokio::task::spawn_blocking(move || {
+        let build_script = build_script_inputs(&plan.env, &memo).map_err(|(path, error)| {
+            stow_types::stow_error!(
+                "read the declared build-script inputs at {}: {error}",
+                path.display()
+            )
+        })?;
         let mut by_inputs: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (cache_key, inputs_json) in candidates {
             by_inputs.entry(inputs_json).or_default().push(cache_key);
@@ -1169,7 +1361,13 @@ async fn matching_entry(
         for (inputs_json, cache_keys) in by_inputs {
             let inputs: UnitInputs = serde_json::from_str(&inputs_json)
                 .wrap_err("parse unit cache inputs_json")?;
-            let unit_key = match unit_key(&plan.invocation_key, &inputs, &plan.env, &memo) {
+            let unit_key = match unit_key(
+                &plan.invocation_key,
+                &inputs,
+                &plan.env,
+                build_script.as_ref(),
+                &memo,
+            ) {
                 Ok(unit_key) => unit_key.key,
                 Err((path, error)) => {
                     tracing::debug!(path = %path.display(), %error, "unit cache candidate's input no longer reads");
@@ -1475,9 +1673,11 @@ fn require_written_by(path: &Path, started: SystemTime) -> stow_types::error::Re
 /// # Errors
 ///
 /// A failure of the cache itself, or a compile that reported success
-/// without writing its dep-info and outputs. An input that cannot be keyed
-/// — one that changed or vanished while rustc ran — is not an error: the
-/// compile is left unstored and a debug line names the reason.
+/// without writing its dep-info and outputs, or the declared build-script
+/// inputs of a unit with `OUT_DIR` that cannot be read. An input that
+/// cannot be keyed — one that changed or vanished while rustc ran — is
+/// not an error: the compile is left unstored and a debug line names the
+/// reason.
 pub async fn store(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
@@ -1662,7 +1862,19 @@ fn prepare_store(
             .collect(),
         env: dep_info.env_names(),
     };
-    let unit_key = match unit_key(&plan.invocation_key, &inputs, &plan.env, memo) {
+    let build_script = build_script_inputs(&plan.env, memo).map_err(|(path, error)| {
+        stow_types::stow_error!(
+            "read the declared build-script inputs at {} after a successful compile: {error}",
+            path.display()
+        )
+    })?;
+    let unit_key = match unit_key(
+        &plan.invocation_key,
+        &inputs,
+        &plan.env,
+        build_script.as_ref(),
+        memo,
+    ) {
         Ok(unit_key) => unit_key,
         Err((path, error)) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(Keying::Uncacheable(format!(
