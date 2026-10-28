@@ -142,6 +142,27 @@ pub fn encode_event(event: &SchedulerEvent) -> Result<String, QueueError> {
         .map_err(|error| QueueError::Invariant(format!("event encode: {error}")))
 }
 
+/// A log row attributed to the run that requested it: the event's own
+/// fields plus `actor`. No [`SchedulerEvent`] variant has a top-level
+/// `actor` field, and [`decode_event`] ignores the extra key, so replay
+/// reads an attributed row exactly as an unattributed one.
+#[derive(serde::Serialize)]
+struct AttributedRow<'a> {
+    actor: &'a str,
+    #[serde(flatten)]
+    event: &'a SchedulerEvent,
+}
+
+/// Serialize one event attributed to `actor` (stow#955).
+///
+/// # Errors
+/// `QueueError::Invariant` when the event cannot serialize — a bug,
+/// never data-dependent.
+pub fn encode_attributed(actor: &str, event: &SchedulerEvent) -> Result<String, QueueError> {
+    serde_json::to_string(&AttributedRow { actor, event })
+        .map_err(|error| QueueError::Invariant(format!("event encode: {error}")))
+}
+
 /// Decode one log row.
 ///
 /// # Errors
@@ -191,14 +212,24 @@ pub fn submission_events(tree: &SubmissionTree) -> Vec<SchedulerEvent> {
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed insert.
+///
+/// `actor` attributes the batch's first row to the verified `actor`
+/// claim of the GitHub Actions run whose request produced it
+/// (stow#955); `None` for the lanes no workflow identity reaches. The
+/// attribution rides inside that row, so an attributed append writes
+/// exactly the rows and statements an unattributed one does.
 pub async fn append_events(
     db: &DurableDb,
+    actor: Option<&str>,
     events: &[SchedulerEvent],
     at: i64,
 ) -> Result<Appended, QueueError> {
     let mut appended = Appended { seq: 0, bytes: 0 };
-    for event in events {
-        let text = encode_event(event)?;
+    for (index, event) in events.iter().enumerate() {
+        let text = match actor {
+            Some(actor) if index == 0 => encode_attributed(actor, event)?,
+            _ => encode_event(event)?,
+        };
         appended.bytes += u64::try_from(text.len()).expect("row length fits u64");
         appended.seq = db
             .query("INSERT INTO event_log(at, event) VALUES (?, ?) RETURNING seq")
@@ -781,7 +812,7 @@ mod tests {
     /// Append `events` and apply them — the store-and-graph pair a
     /// route's commit leaves.
     async fn commit_to(db: &DurableDb, graph: &mut Graph, events: &[SchedulerEvent], at: i64) {
-        let appended = append_events(db, events, at).await.expect("append");
+        let appended = append_events(db, None, events, at).await.expect("append");
         apply_events(graph, &logged(events, at, appended));
     }
 
@@ -840,7 +871,7 @@ mod tests {
                 error: None,
             },
         ];
-        append_events(&db, &events, 0).await.expect("append");
+        append_events(&db, None, &events, 0).await.expect("append");
         let covered = write_snapshot(&db, &mut graph, &GraphCell::default(), NOW_MS)
             .await
             .expect("snapshot");
@@ -994,7 +1025,7 @@ mod tests {
                 retired,
             });
             for event in &events {
-                append_events(&db, std::slice::from_ref(event), 0)
+                append_events(&db, None, std::slice::from_ref(event), 0)
                     .await
                     .expect("append");
             }
@@ -1052,7 +1083,7 @@ mod tests {
             nodes: vec![node("solo")],
         };
         let events = submission_events(&tree);
-        append_events(&db, &events, 0).await.expect("submit");
+        append_events(&db, None, &events, 0).await.expect("submit");
         apply_events(
             &mut graph,
             &logged(
@@ -1070,6 +1101,7 @@ mod tests {
         // then the isolate is evicted before the bindings land.
         append_events(
             &db,
+            None,
             &[SchedulerEvent::Claims {
                 claims: vec![DispatchClaim {
                     task_id: id("solo"),
@@ -1113,7 +1145,7 @@ mod tests {
             roots: vec![0],
             nodes: vec![node("solo")],
         };
-        append_events(&db, &submission_events(&tree), 0)
+        append_events(&db, None, &submission_events(&tree), 0)
             .await
             .expect("submit");
         // completed arrives before its binding in the log — parked on
@@ -1141,7 +1173,9 @@ mod tests {
                 }],
             },
         ];
-        append_events(&db, &events, 0).await.expect("deliveries");
+        append_events(&db, None, &events, 0)
+            .await
+            .expect("deliveries");
         let (mut restored, tail) = load(&db).await.expect("wake");
         apply_events(&mut restored, &tail);
         assert_eq!(restored.status().completed, 1);
@@ -1163,7 +1197,9 @@ mod tests {
         let events = submission_events(&tree);
         assert_eq!(events.len(), 2);
         // Only the first part landed before the eviction.
-        append_events(&db, &events[..1], 0).await.expect("part 0");
+        append_events(&db, None, &events[..1], 0)
+            .await
+            .expect("part 0");
         let (mut restored, tail) = load(&db).await.expect("wake");
         apply_events(&mut restored, &tail);
         assert_eq!(restored.sizes().0, 0, "the unacknowledged submit dropped");
@@ -1177,7 +1213,7 @@ mod tests {
             roots: vec![0],
             nodes: vec![node("one"), node("two")],
         };
-        let last = append_events(&db, &submission_events(&tree), 5_000)
+        let last = append_events(&db, None, &submission_events(&tree), 5_000)
             .await
             .expect("submit");
         assert_eq!(last.seq, 1, "one Submit part, one appended row");
@@ -1191,7 +1227,9 @@ mod tests {
                 task_ids: vec![id("two")],
             },
         ];
-        let last = append_events(&db, &events, 5_000).await.expect("mutations");
+        let last = append_events(&db, None, &events, 5_000)
+            .await
+            .expect("mutations");
         assert_eq!(last.seq, 3);
 
         // A wake re-counts what it replays: each appended row bills
@@ -1212,6 +1250,7 @@ mod tests {
         let mut graph = Graph::default();
         append_events(
             &db,
+            None,
             &[SchedulerEvent::Mutate {
                 op: MutationKind::Retry,
                 task_ids: Vec::new(),
@@ -1225,6 +1264,7 @@ mod tests {
             .expect("snapshot");
         let appended = append_events(
             &db,
+            None,
             &[SchedulerEvent::Mutate {
                 op: MutationKind::Cancel,
                 task_ids: Vec::new(),
@@ -1352,11 +1392,15 @@ mod tests {
             roots: vec![0],
             nodes: vec![node("one"), node("two")],
         };
+        let retry = [SchedulerEvent::Mutate {
+            op: MutationKind::Retry,
+            task_ids: vec![id("one")],
+        }];
 
         // A request: its appends and read settle like the guard's.
         let (metered, meter) = Meter::wrap(db.clone(), &cell);
         let events = submission_events(&tree);
-        let appended = append_events(&metered, &events, NOW_MS)
+        let appended = append_events(&metered, None, &events, NOW_MS)
             .await
             .expect("submit");
         loaded.with(|graph| {
@@ -1370,16 +1414,9 @@ mod tests {
         // checkpoint covers its own appends plus every snapshot
         // statement (§5.2 instances 1–2).
         let (metered, _meter) = Meter::wrap(db.clone(), &cell);
-        let appended = append_events(
-            &metered,
-            &[SchedulerEvent::Mutate {
-                op: MutationKind::Retry,
-                task_ids: vec![id("one")],
-            }],
-            NOW_MS,
-        )
-        .await
-        .expect("snapshot turn append");
+        let appended = append_events(&metered, None, &retry, NOW_MS)
+            .await
+            .expect("snapshot turn append");
         loaded.with(|graph| graph.log_appended(appended.bytes, appended.seq));
         crate::scheduler::routes::snapshot(loaded, &metered, NOW_MS)
             .await
@@ -1400,7 +1437,7 @@ mod tests {
                 task_ids: vec![id("one")],
             },
         ];
-        let appended = append_events(&metered, &more, NOW_MS + 1)
+        let appended = append_events(&metered, None, &more, NOW_MS + 1)
             .await
             .expect("tail appends");
         loaded.with(|graph| graph.log_appended(appended.bytes, appended.seq));
@@ -1435,16 +1472,9 @@ mod tests {
         let loaded = cell.loaded().expect("woken");
         let (metered, aux) = Meter::wrap(db.clone(), &cell);
         let (op_db, meter) = Meter::wrap(db.clone(), &cell);
-        let appended = append_events(
-            &op_db,
-            &[SchedulerEvent::Mutate {
-                op: MutationKind::Retry,
-                task_ids: vec![id("one")],
-            }],
-            NOW_MS + 2,
-        )
-        .await
-        .expect("op append before the trip");
+        let appended = append_events(&op_db, None, &retry, NOW_MS + 2)
+            .await
+            .expect("op append before the trip");
         loaded.with(|graph| graph.log_appended(appended.bytes, appended.seq));
         let freeze_seq = crate::scheduler::meter::trip_and_persist(
             &aux,
@@ -1494,7 +1524,7 @@ mod tests {
         };
         let (metered, meter) = Meter::wrap(db.clone(), &cell);
         let events = submission_events(&tree);
-        let appended = append_events(&metered, &events, NOW_MS)
+        let appended = append_events(&metered, None, &events, NOW_MS)
             .await
             .expect("submit");
         loaded.with(|graph| {
@@ -1508,6 +1538,7 @@ mod tests {
         let (metered_a, meter_a) = Meter::wrap(db.clone(), &cell);
         let appended = append_events(
             &metered_a,
+            None,
             &[SchedulerEvent::Mutate {
                 op: MutationKind::Retry,
                 task_ids: vec![id("one")],
@@ -1545,7 +1576,7 @@ mod tests {
             op: MutationKind::Retry,
             task_ids: Vec::new(),
         }];
-        append_events(&metered, &events, NOW_MS)
+        append_events(&metered, None, &events, NOW_MS)
             .await
             .expect("append");
 
@@ -1573,6 +1604,7 @@ mod tests {
         let base = log.lock().expect("log").len();
         append_events(
             &db,
+            None,
             &[SchedulerEvent::Mutate {
                 op: MutationKind::Cancel,
                 task_ids: Vec::new(),
@@ -1620,5 +1652,67 @@ mod tests {
             (statement.rows_read, statement.rows_written),
             METER_CHECKPOINT_BILL
         );
+    }
+
+    /// stow#955: an attributed append names the requesting run's actor
+    /// on its batch's first row only, bills exactly the statements and
+    /// rows an unattributed append does, and replays to the same
+    /// events — the unit `StoreReset` row included.
+    #[tokio::test]
+    async fn an_attributed_append_names_the_actor_on_the_first_row_at_no_extra_rows() {
+        let mut batch = submission_events(&chain());
+        batch.push(SchedulerEvent::Mutate {
+            op: MutationKind::Cancel,
+            task_ids: vec![id("a")],
+        });
+        let mut bills = Vec::new();
+        let mut stored = Vec::new();
+        for actor in [Some("octo-dispatcher"), None] {
+            let (db, log) = test_db::counting_memory_db().await.expect("db");
+            let base = log.lock().expect("log").len();
+            append_events(&db, actor, &[SchedulerEvent::StoreReset], 0)
+                .await
+                .expect("reset row");
+            append_events(&db, actor, &batch, 0).await.expect("batch");
+            let statements = log.lock().expect("log").len() - base;
+            bills.push((statements, billed(&log, base)));
+            let rows = db
+                .query(&format!(
+                    "SELECT seq, at, event FROM event_log ORDER BY seq{AUDIT}"
+                ))
+                .fetch_all::<LogRow>()
+                .await
+                .expect("rows");
+            stored.push(rows);
+        }
+        assert_eq!(
+            bills[0], bills[1],
+            "attribution must not add statements or rows"
+        );
+
+        let actors: Vec<Option<String>> = stored[0]
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<serde_json::Value>(&row.event).expect("row json")["actor"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        let mut expected = vec![None; 1 + batch.len()];
+        expected[0] = Some("octo-dispatcher".to_owned());
+        expected[1] = Some("octo-dispatcher".to_owned());
+        assert_eq!(
+            actors, expected,
+            "each append attributes its first row only"
+        );
+
+        for (attributed, plain) in stored[0].iter().zip(&stored[1]) {
+            let decoded = decode_event(&attributed.event).expect("attributed row decodes");
+            assert_eq!(
+                encode_event(&decoded).expect("encode"),
+                plain.event,
+                "an attributed row decodes to the unattributed event"
+            );
+        }
     }
 }

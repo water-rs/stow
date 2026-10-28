@@ -74,7 +74,7 @@ pub struct MutationArgs {
     /// Apply the transition. Without it the command prints the plan and
     /// exits 0 without touching the queue.
     #[arg(long)]
-    yes: bool,
+    pub yes: bool,
 }
 
 fn parse_status(raw: &str) -> Result<QueueTaskStatus, String> {

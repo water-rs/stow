@@ -1,0 +1,162 @@
+name: Operations
+# The single traced path every operator mutation runs through (stow#955).
+# `stow-admin`'s mutating commands dispatch this workflow on `main` with
+# the operator's `stow-admin login` token and follow the run to its end.
+# The edge's operator routes accept only this workflow's OIDC token at
+# `refs/heads/main` and attribute the mutation to the run's `actor`; the
+# run itself is the record. The job runs in the `operations` environment,
+# whose deployment-branch policy admits only `main`.
+#
+# The dispatcher is untrusted: the command line arrives as data and is
+# never evaluated by a shell, only the stow-admin commands below may run,
+# and each command class sees only the secrets it needs.
+run-name: "stow-admin ${{ inputs.argv }} (by ${{ github.actor }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      argv:
+        description: >-
+          The stow-admin arguments as a JSON array of strings, e.g.
+          `["dispatch-freeze","engage","--yes"]`.
+        required: true
+        type: string
+      files:
+        description: >-
+          A JSON object mapping bare file names to contents; each is
+          written under /tmp/stow-ops-files/ before the command runs, for
+          the file arguments `stow-admin` rewrote to that directory.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  # Pull the signed toolchain artifact from ghcr.io/water-rs/stow-toolchain.
+  packages: read
+  contents: read
+  # The OIDC token the edge's mutating routes require.
+  id-token: write
+  # `watchdog clear` re-enables the dispatching workflows.
+  actions: write
+  # `watchdog` opens, comments on and closes the incident issue.
+  issues: write
+
+# Operator mutations never race each other.
+concurrency:
+  group: operations
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    environment: operations
+    timeout-minutes: 60
+    steps:
+      # The same signed binary the watchdog runs: main's head carries the
+      # toolchain, and the action fails if the signature does not verify.
+      - name: Resolve main's head
+        id: main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)" \
+            >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            .github/actions
+            preheat
+          persist-credentials: false
+      - name: stow-admin from the signed toolchain
+        uses: ./.github/actions/stow-toolchain
+        with:
+          sha: ${{ steps.main.outputs.sha }}
+          binaries: stow-admin
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      # No secret is in scope here: the inputs are validated, the files
+      # written, and the command's secret class chosen before any step
+      # that holds a credential runs.
+      - name: Check the command
+        id: command
+        env:
+          ARGV: ${{ inputs.argv }}
+          FILES: ${{ inputs.files }}
+        run: |
+          set -euo pipefail
+          jq -e 'type == "array" and length > 0 and all(.[]; type == "string")' \
+            <<<"$ARGV" >/dev/null \
+            || { echo "::error::argv must be a non-empty JSON array of strings"; exit 1; }
+          command="$(jq -r '.[0]' <<<"$ARGV")"
+          case "$command" in
+            maintenance|watchdog) class=cloudflare ;;
+            preheat)
+              if [ "$(jq -r '.[1] // ""' <<<"$ARGV")" = missed ]; then
+                class=analytics
+              else
+                class=edge
+              fi
+              ;;
+            scheduler|queue|dispatch-freeze|submit) class=edge ;;
+            *) echo "::error::stow-admin $command does not run through operations"; exit 1 ;;
+          esac
+          if [ -n "$FILES" ]; then
+            jq -e 'type == "object"
+                   and all(to_entries[]; (.key | test("^[A-Za-z0-9._-]+$"))
+                                         and .key != "." and .key != ".."
+                                         and (.value | type == "string"))' \
+              <<<"$FILES" >/dev/null \
+              || { echo "::error::files must map bare file names to strings"; exit 1; }
+            mkdir -p /tmp/stow-ops-files
+            while IFS= read -r -d '' name; do
+              jq -j --arg name "$name" '.[$name]' <<<"$FILES" >"/tmp/stow-ops-files/$name"
+            done < <(jq -j 'keys[] | . + "\u0000"' <<<"$FILES")
+          fi
+          # Last, so a refused input leaves no class for a run step.
+          echo "class=$class" >> "$GITHUB_OUTPUT"
+      - name: Run (edge)
+        if: steps.command.outputs.class == 'edge'
+        env:
+          ARGV: ${{ inputs.argv }}
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+          # Resolver scratch goes on the runner's disk: /tmp is
+          # size-capped on the image (#972).
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          argv=()
+          while IFS= read -r -d '' arg; do argv+=("$arg"); done \
+            < <(jq -j '.[] | . + "\u0000"' <<<"$ARGV")
+          stow-admin "${argv[@]}"
+      - name: Run (analytics)
+        if: steps.command.outputs.class == 'analytics'
+        env:
+          ARGV: ${{ inputs.argv }}
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          argv=()
+          while IFS= read -r -d '' arg; do argv+=("$arg"); done \
+            < <(jq -j '.[] | . + "\u0000"' <<<"$ARGV")
+          stow-admin "${argv[@]}"
+      - name: Run (cloudflare)
+        if: steps.command.outputs.class == 'cloudflare'
+        env:
+          ARGV: ${{ inputs.argv }}
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+          CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
+          CF_ZONE_ID: ${{ vars.CF_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          # The watchdog's GitHub REST calls (workflow re-enable, the
+          # incident issue) use the run's own token.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          argv=()
+          while IFS= read -r -d '' arg; do argv+=("$arg"); done \
+            < <(jq -j '.[] | . + "\u0000"' <<<"$ARGV")
+          stow-admin "${argv[@]}"

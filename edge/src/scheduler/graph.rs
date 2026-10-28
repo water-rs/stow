@@ -2498,6 +2498,9 @@ impl Graph {
                     self.run_finished(task_id, run_id, *success, *cancelled, error.clone(), now);
                 }
             }
+            // `Submit` parts are reassembled by the replay loop in
+            // `store.rs` before this is reached.
+            SchedulerEvent::StoreReset | SchedulerEvent::Submit { .. } => {}
             SchedulerEvent::Mutate { op, task_ids } => {
                 self.mutate(*op, task_ids, now);
             }
@@ -2530,10 +2533,8 @@ impl Graph {
                 trigger,
             } => self.apply_freeze(record.as_deref(), at, trigger),
 
-            // `Submit` parts are reassembled by the replay loop in
-            // `store.rs` before this is reached; `Request` lifecycle
-            // events land with the request-lane cutover (stage 7).
-            SchedulerEvent::Submit { .. } => {}
+            // `Request` lifecycle events land with the request-lane
+            // cutover (stage 7).
             SchedulerEvent::Request { request_id, kind } => {
                 self.apply_request_event(request_id, kind, now);
             }
@@ -3394,15 +3395,14 @@ impl crate::freeze::FreezeStore for GraphFreezeStore<'_> {
         });
         async { Ok(()) }
     }
-    fn delete(&self) -> impl std::future::Future<Output = Result<(), QueueError>> + Send {
-        let trigger = self
-            .cell
-            .with(|graph| graph.freeze().map(|record| record.trigger.clone()))
-            .unwrap_or(stow_types::api::DispatchFreezeTrigger::Manual);
+    fn delete(
+        &self,
+        cleared: &stow_types::api::DispatchFreezeRecord,
+    ) -> impl std::future::Future<Output = Result<(), QueueError>> + Send {
         self.commit(SchedulerEvent::Freeze {
             record: None,
             at: self.at.clone(),
-            trigger,
+            trigger: cleared.trigger.clone(),
         });
         async { Ok(()) }
     }
@@ -4335,7 +4335,9 @@ mod tests {
         };
         let record = DispatchFreezeRecord {
             frozen_at: "2026-09-22T03:51:00Z".to_owned(),
-            trigger: DispatchFreezeTrigger::Manual,
+            trigger: DispatchFreezeTrigger::Manual {
+                actor: "test".to_owned(),
+            },
             notify: ChannelOutcome::Disabled {
                 reason: "test".to_owned(),
             },
@@ -4354,7 +4356,9 @@ mod tests {
         graph.apply(
             &SchedulerEvent::Freeze {
                 at: "2026-09-22T04:00:00Z".to_owned(),
-                trigger: DispatchFreezeTrigger::Manual,
+                trigger: DispatchFreezeTrigger::Manual {
+                    actor: "test".to_owned(),
+                },
                 record: None,
             },
             0,
@@ -4373,7 +4377,9 @@ mod tests {
         };
         let record = DispatchFreezeRecord {
             frozen_at: "2026-09-22T03:51:00Z".to_owned(),
-            trigger: DispatchFreezeTrigger::Manual,
+            trigger: DispatchFreezeTrigger::Manual {
+                actor: "test".to_owned(),
+            },
             notify: ChannelOutcome::Disabled {
                 reason: "test".to_owned(),
             },
@@ -4396,7 +4402,9 @@ mod tests {
         graph.apply(
             &SchedulerEvent::Freeze {
                 at: "2026-09-22T04:00:00Z".to_owned(),
-                trigger: DispatchFreezeTrigger::Manual,
+                trigger: DispatchFreezeTrigger::Manual {
+                    actor: "test".to_owned(),
+                },
                 record: None,
             },
             0,
@@ -4430,10 +4438,14 @@ mod tests {
         graph.apply(
             &SchedulerEvent::Freeze {
                 at: "2026-10-24T00:00:00Z".to_owned(),
-                trigger: DispatchFreezeTrigger::Manual,
+                trigger: DispatchFreezeTrigger::Manual {
+                    actor: "test".to_owned(),
+                },
                 record: Some(Box::new(DispatchFreezeRecord {
                     frozen_at: "2026-10-24T00:00:00Z".to_owned(),
-                    trigger: DispatchFreezeTrigger::Manual,
+                    trigger: DispatchFreezeTrigger::Manual {
+                        actor: "test".to_owned(),
+                    },
                     notify: ChannelOutcome::Disabled {
                         reason: "test".to_owned(),
                     },

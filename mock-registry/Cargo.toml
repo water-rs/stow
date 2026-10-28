@@ -24,6 +24,7 @@ base64 = "0.23"
 clap = { version = "4.5", features = ["derive"] }
 axum = "0.8"
 sha2 = "0.11"
+rsa = "0.9"
 sigstore = { version = "0.14.0", default-features = false, features = ["cosign", "verify", "rustls-tls"] }
 rustls.workspace = true
 time = { version = "0.3", features = ["formatting"] }
