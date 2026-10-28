@@ -169,6 +169,18 @@ reset it, rerun `stow setup`, or
 remove the state database with the rest of the local cache (`stow
 clean`).
 
+Setup ends by **fetching the index slice** for the host target and the
+rustc of the toolchain it ran under, through the same signed-slice fetch
+`stow build` uses, and leaves it verified in the local cache. The wrapper
+that plain `cargo` runs reads slices from the cache only — it never
+touches the network — so without this fetch a fresh install's first
+plain `cargo build` would serve no public-cache unit. A failed fetch
+fails setup with the registry's error; nothing falls back. A registry
+that has no slice for the toolchain yet is not a failure: the slice is
+then empty. The fetched slice is a snapshot: the wrapper never refreshes it, so
+`stow index refresh` (or a `stow check`/`build`/`test`, which refresh it
+themselves) brings in newer public units.
+
 `stow check`/`build`/`test` work without setup: on Linux, when the cargo
 configuration does not already select a reachable mold, they provision
 the managed install and pass the same selection to cargo as `--config`

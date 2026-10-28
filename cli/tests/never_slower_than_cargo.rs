@@ -16,7 +16,7 @@ use stow_cli::protocol::{Answer, Plan, Request};
 
 mod support;
 
-use support::{hermetic_stow_env, sealed_home_env};
+use support::{denied_registry, hermetic_stow_env, sealed_home_env};
 
 /// An edge that answers the miss-admissions mint with an empty list and
 /// then fails every other call with a 500.
@@ -166,7 +166,7 @@ fn an_unusable_cache_dir_costs_cache_hits_not_the_build() {
     write_crate(dir.path(), cargo_home.path());
     let setup_cache = tempfile::tempdir().expect("setup cache");
     let edge_url = unreachable_edge_url();
-    stow_setup_in(dir.path(), &edge_url, setup_cache.path(), cargo_home.path());
+    stow_setup_in(dir.path(), setup_cache.path(), cargo_home.path());
 
     let blocker = tempfile::NamedTempFile::new().expect("blocker file");
     let cache_dir = blocker.path().join("cache");
@@ -198,7 +198,7 @@ fn probe_binary(target_dir: &Path) -> std::path::PathBuf {
 
 /// `stow-cli setup` in the isolated `CARGO_HOME` — the one-time mold
 /// selection, kept out of every timed build.
-fn stow_setup_in(dir: &Path, edge_url: &str, cache_dir: &Path, cargo_home: &Path) {
+fn stow_setup_in(dir: &Path, cache_dir: &Path, cargo_home: &Path) {
     // stow#294: a Linux `stow build` refuses to run without a mold
     // selection — `stow setup` installs mold and writes it. Idempotent.
     // Setup writes the global cargo config; the isolated CARGO_HOME keeps
@@ -211,7 +211,15 @@ fn stow_setup_in(dir: &Path, edge_url: &str, cache_dir: &Path, cargo_home: &Path
         .arg("setup")
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
-    hermetic_stow_env(&mut setup, edge_url, cache_dir, &dir.join("stow-home"));
+    // Setup fetches the host index slice since stow#1032; the timed
+    // build's unreachable edge stays, but setup's registry must answer —
+    // `denied_registry` reports the package missing.
+    hermetic_stow_env(
+        &mut setup,
+        &denied_registry(),
+        cache_dir,
+        &dir.join("stow-home"),
+    );
     let setup = setup.output().expect("run stow-cli setup");
     assert!(
         setup.status.success(),
@@ -226,7 +234,7 @@ fn stow_build_in(
     cache_dir: &Path,
     cargo_home: &Path,
 ) -> std::process::Output {
-    stow_setup_in(dir, edge_url, cache_dir, cargo_home);
+    stow_setup_in(dir, cache_dir, cargo_home);
     stow_build_command(dir, edge_url, cache_dir, cargo_home, &dir.join("target"))
 }
 
@@ -443,7 +451,7 @@ fn build_leftovers(main_rs: &str) -> (std::process::Output, Vec<std::path::PathB
     std::fs::write(dir.path().join("src").join("main.rs"), main_rs).expect("write main.rs");
     let setup_cache = tempfile::tempdir().expect("setup cache");
     let edge_url = unreachable_edge_url();
-    stow_setup_in(dir.path(), &edge_url, setup_cache.path(), cargo_home.path());
+    stow_setup_in(dir.path(), setup_cache.path(), cargo_home.path());
     let output = stow_build(
         dir.path(),
         &edge_url,
@@ -1135,7 +1143,7 @@ fn a_fresh_target_dir_serves_everything_the_local_cache_holds() {
     // both refuse every connection, so build 2 can only serve from the
     // local artifact cache.
     let edge_url = unreachable_edge_url();
-    stow_setup_in(dir.path(), &edge_url, cache.path(), cargo_home.path());
+    stow_setup_in(dir.path(), cache.path(), cargo_home.path());
 
     let first = stow_build_command(
         dir.path(),
@@ -1219,7 +1227,7 @@ fn stow_candidate(
     cache_dir: &Path,
     target_dir: &Path,
 ) -> Command {
-    stow_setup_in(dir, edge_url, cache_dir, cargo_home);
+    stow_setup_in(dir, cache_dir, cargo_home);
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     command
         .arg("build")
@@ -1590,7 +1598,7 @@ fn an_all_miss_build_is_never_slower_than_cargo() {
     write_multi_crate(dir.path(), cargo_home.path());
     let setup_cache = tempfile::tempdir().expect("setup cache");
     let edge_url = unreachable_edge_url();
-    stow_setup_in(dir.path(), &edge_url, setup_cache.path(), cargo_home.path());
+    stow_setup_in(dir.path(), setup_cache.path(), cargo_home.path());
 
     let empty_dir = tempfile::tempdir().expect("empty dir");
     write_empty_crate(empty_dir.path());
