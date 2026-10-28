@@ -2893,7 +2893,8 @@ async fn run_cc_wrapper(
                 return Ok(compiler_status);
             }
 
-            if let Err(error) = cc::store_compiled_object(&cache_path, &output_path).await {
+            if let Err(error) = cc::store_compiled_object(&config, &cache_path, &output_path).await
+            {
                 tracing::warn!(
                     error = %error,
                     cache_key = %cache_key,

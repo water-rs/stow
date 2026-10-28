@@ -760,8 +760,9 @@ pub async fn store_downloaded_bundle(
         &connection,
         &request.rustc_version,
         &version_dir,
+        &config.cc_cache_dir(),
         config.artifact_cache_max_bytes,
-        &cache_key,
+        &ProtectedEntry::Rustc(&cache_key),
     )
     .await?;
     Ok(cached_bundle_for_entry(
@@ -925,8 +926,9 @@ pub async fn store_local_build_outputs(
         &connection,
         &build.rustc_version,
         &version_dir,
+        &config.cc_cache_dir(),
         config.artifact_cache_max_bytes,
-        &cache_key,
+        &ProtectedEntry::Rustc(&cache_key),
     )
     .await?;
     Ok(true)
@@ -2044,98 +2046,170 @@ async fn remove_cached_bundle_locked(
     Ok(())
 }
 
+/// The entry the store that just ran shields from its own eviction
+/// pass: it already joined the shared budget, and being its own pass's
+/// first victim serves no one. `Rustc` names an `artifact_cache_entries`
+/// row under `version_dir`; `Cc` names a `cc_cache_entries` object under
+/// `cc_dir`.
+enum ProtectedEntry<'a> {
+    Rustc(&'a str),
+    Cc(&'a str),
+}
+
+impl ProtectedEntry<'_> {
+    fn matches(&self, candidate: &EvictionCandidate) -> bool {
+        let key = match self {
+            Self::Rustc(key) | Self::Cc(key) => *key,
+        };
+        let same_kind = matches!(
+            (self, &candidate.location),
+            (Self::Rustc(_), EvictionLocation::Rustc { .. }) | (Self::Cc(_), EvictionLocation::Cc)
+        );
+        same_kind && key == candidate.cache_key
+    }
+}
+
+/// Where an eviction candidate's bytes live.
+enum EvictionLocation {
+    /// An `artifact_cache_entries` row; `relative_dir` names the entry
+    /// dir under `version_dir`.
+    Rustc { relative_dir: String },
+    /// A `cc_cache_entries` row; the object file is `cc_dir/<key>.o`.
+    Cc,
+}
+
+impl EvictionLocation {
+    /// Deterministic order between candidates tied on stamp and key.
+    const fn rank(&self) -> u8 {
+        match self {
+            Self::Rustc { .. } => 0,
+            Self::Cc => 1,
+        }
+    }
+}
+
+/// One entry in the shared `artifact_cache_max_bytes` LRU — a rustc
+/// bundle entry under `version_dir` or a C/C++ object under `cc_dir`
+/// (stow#980), ordered by `last_accessed_ms`.
+struct EvictionCandidate {
+    cache_key: String,
+    size_bytes: u64,
+    last_accessed_ms: u64,
+    location: EvictionLocation,
+}
+
+/// Post-store eviction for a C/C++ object store: the object joined the
+/// shared budget already, and its own pass protects it the way a rustc
+/// store protects its entry. The rustc half of the pass is the active
+/// version's entries — the same set every rustc-triggered pass sees.
+pub async fn evict_after_cc_store(
+    config: &StowConfig,
+    connection: &sqlx::SqlitePool,
+    cache_key: &str,
+) -> stow_types::error::Result<()> {
+    let rustc_version: Option<String> =
+        sqlx::query_scalar("SELECT value FROM metadata_values WHERE key = 'active_rustc_version'")
+            .fetch_optional(connection)
+            .await?;
+    // No active version means no rustc build has prepared the cache yet, so
+    // no `artifact_cache_entries` row exists and the pass is the `cc/` half
+    // alone; no row carries the empty version.
+    let rustc_version = rustc_version.unwrap_or_default();
+    evict_entries(
+        connection,
+        &rustc_version,
+        &config.artifact_cache_version_dir(&rustc_version),
+        &config.cc_cache_dir(),
+        config.artifact_cache_max_bytes,
+        &ProtectedEntry::Cc(cache_key),
+    )
+    .await
+}
+
 async fn evict_entries(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     version_dir: &Path,
+    cc_dir: &Path,
     max_bytes: u64,
-    protected_key: &str,
+    protected: &ProtectedEntry<'_>,
 ) -> stow_types::error::Result<()> {
-    let mut entries = list_artifact_cache_entries(connection, rustc_version).await?;
-    let mut total_bytes = entries
-        .values()
-        .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes));
+    let mut candidates: Vec<EvictionCandidate> =
+        list_artifact_cache_entries(connection, rustc_version)
+            .await?
+            .into_iter()
+            .map(|(cache_key, entry)| EvictionCandidate {
+                cache_key,
+                size_bytes: entry.size_bytes,
+                last_accessed_ms: entry.last_accessed_ms,
+                location: EvictionLocation::Rustc {
+                    relative_dir: entry.relative_dir,
+                },
+            })
+            .chain(
+                crate::cc::list_cc_cache_entries(connection)
+                    .await?
+                    .into_iter()
+                    .map(|(cache_key, entry)| EvictionCandidate {
+                        cache_key,
+                        size_bytes: entry.size_bytes,
+                        last_accessed_ms: entry.last_accessed_ms,
+                        location: EvictionLocation::Cc,
+                    }),
+            )
+            .collect();
+    let mut total_bytes = candidates.iter().fold(0u64, |sum, candidate| {
+        sum.saturating_add(candidate.size_bytes)
+    });
     if total_bytes <= max_bytes {
         return Ok(());
     }
 
-    let mut eviction_order = entries
+    candidates.sort_by(|left, right| {
+        left.last_accessed_ms
+            .cmp(&right.last_accessed_ms)
+            .then_with(|| left.cache_key.cmp(&right.cache_key))
+            .then_with(|| left.location.rank().cmp(&right.location.rank()))
+    });
+    let protected_index = candidates
         .iter()
-        .filter(|(key, _)| key.as_str() != protected_key)
-        .map(|(key, entry)| (key.clone(), entry.last_accessed_ms))
-        .collect::<Vec<_>>();
-    eviction_order.sort_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)));
-
-    for (cache_key, _) in eviction_order {
-        let Some(entry) = entries.remove(&cache_key) else {
+        .position(|candidate| protected.matches(candidate));
+    for (index, candidate) in candidates.iter().enumerate() {
+        if Some(index) == protected_index {
             continue;
-        };
-        let Some(eviction_lock) = tokio::task::spawn_blocking({
-            let version_dir = version_dir.to_path_buf();
-            let cache_key = cache_key.clone();
-            move || try_acquire_entry_exclusive_lock(&version_dir, &cache_key)
-        })
-        .await
-        .wrap_err("join evict_entries lock task")??
-        else {
-            continue;
-        };
-        delete_artifact_cache_entry(connection, rustc_version, &cache_key).await?;
-        let entry_dir = version_dir.join(&entry.relative_dir);
-        if entry_dir.exists() {
-            tokio::task::spawn_blocking({
-                let entry_dir = entry_dir.clone();
-                move || {
-                    std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
-                        format!("evict artifact cache entry {}", entry_dir.display())
-                    })
-                }
-            })
-            .await
-            .wrap_err("join evict_entries remove_dir task")??;
         }
-        drop(eviction_lock);
-        total_bytes = total_bytes.saturating_sub(entry.size_bytes);
-        if total_bytes <= max_bytes {
-            return Ok(());
+        let evicted = match &candidate.location {
+            EvictionLocation::Rustc { relative_dir } => {
+                try_evict_rustc_entry(
+                    connection,
+                    rustc_version,
+                    version_dir,
+                    &candidate.cache_key,
+                    relative_dir,
+                )
+                .await?
+            }
+            EvictionLocation::Cc => {
+                evict_cc_object(connection, cc_dir, &candidate.cache_key).await?;
+                true
+            }
+        };
+        if evicted {
+            total_bytes = total_bytes.saturating_sub(candidate.size_bytes);
+            if total_bytes <= max_bytes {
+                return Ok(());
+            }
         }
     }
 
     if total_bytes > max_bytes
-        && let Some(entry) = entries.remove(protected_key)
+        && let Some(protected_index) = protected_index
     {
-        let Some(eviction_lock) = tokio::task::spawn_blocking({
-            let version_dir = version_dir.to_path_buf();
-            let protected_key = protected_key.to_owned();
-            move || try_acquire_entry_exclusive_lock(&version_dir, &protected_key)
-        })
-        .await
-        .wrap_err("join evict_entries protected lock task")??
-        else {
-            return Err(stow_types::stow_error!(
-                "artifact cache is full and the protected entry {protected_key} is in use by another stow process"
-            ));
-        };
-        delete_artifact_cache_entry(connection, rustc_version, protected_key).await?;
-        let entry_dir = version_dir.join(&entry.relative_dir);
-        if entry_dir.exists() {
-            tokio::task::spawn_blocking({
-                let entry_dir = entry_dir.clone();
-                move || {
-                    std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
-                        format!(
-                            "evict oversized protected artifact cache entry {}",
-                            entry_dir.display()
-                        )
-                    })
-                }
-            })
-            .await
-            .wrap_err("join evict_entries protected remove_dir task")??;
-        }
-        drop(eviction_lock);
+        let candidate = &candidates[protected_index];
+        evict_protected_entry(connection, rustc_version, version_dir, cc_dir, candidate).await?;
         return Err(stow_types::stow_error!(
-            "artifact cache entry {protected_key} exceeds max local cache size {} bytes",
+            "artifact cache entry {} exceeds max local cache size {} bytes",
+            candidate.cache_key,
             max_bytes
         ));
     }
@@ -2143,6 +2217,115 @@ async fn evict_entries(
     Err(stow_types::stow_error!(
         "artifact cache is full but all eviction candidates are currently in use by other stow processes"
     ))
+}
+
+/// Evict the store's own entry — the last resort when every other
+/// candidate left the cache over budget. A rustc entry another process
+/// has locked fails here rather than being skipped.
+async fn evict_protected_entry(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    version_dir: &Path,
+    cc_dir: &Path,
+    candidate: &EvictionCandidate,
+) -> stow_types::error::Result<()> {
+    match &candidate.location {
+        EvictionLocation::Rustc { relative_dir } => {
+            let cache_key = candidate.cache_key.clone();
+            let Some(eviction_lock) = tokio::task::spawn_blocking({
+                let version_dir = version_dir.to_path_buf();
+                move || try_acquire_entry_exclusive_lock(&version_dir, &cache_key)
+            })
+            .await
+            .wrap_err("join evict_entries protected lock task")??
+            else {
+                return Err(stow_types::stow_error!(
+                    "artifact cache is full and the protected entry {} is in use by another stow process",
+                    candidate.cache_key
+                ));
+            };
+            delete_artifact_cache_entry(connection, rustc_version, &candidate.cache_key).await?;
+            let entry_dir = version_dir.join(relative_dir);
+            if entry_dir.exists() {
+                tokio::task::spawn_blocking({
+                    let entry_dir = entry_dir.clone();
+                    move || {
+                        std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
+                            format!(
+                                "evict oversized protected artifact cache entry {}",
+                                entry_dir.display()
+                            )
+                        })
+                    }
+                })
+                .await
+                .wrap_err("join evict_entries protected remove_dir task")??;
+            }
+            drop(eviction_lock);
+        }
+        EvictionLocation::Cc => {
+            evict_cc_object(connection, cc_dir, &candidate.cache_key).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Try to evict one rustc entry under its lease: `false` when another
+/// process holds a lock on the entry — it stays, and eviction moves on
+/// to the next candidate.
+async fn try_evict_rustc_entry(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    version_dir: &Path,
+    cache_key: &str,
+    relative_dir: &str,
+) -> stow_types::error::Result<bool> {
+    let Some(eviction_lock) = tokio::task::spawn_blocking({
+        let version_dir = version_dir.to_path_buf();
+        let cache_key = cache_key.to_owned();
+        move || try_acquire_entry_exclusive_lock(&version_dir, &cache_key)
+    })
+    .await
+    .wrap_err("join evict_entries lock task")??
+    else {
+        return Ok(false);
+    };
+    delete_artifact_cache_entry(connection, rustc_version, cache_key).await?;
+    let entry_dir = version_dir.join(relative_dir);
+    if entry_dir.exists() {
+        tokio::task::spawn_blocking({
+            let entry_dir = entry_dir.clone();
+            move || {
+                std::fs::remove_dir_all(&entry_dir)
+                    .wrap_err_with(|| format!("evict artifact cache entry {}", entry_dir.display()))
+            }
+        })
+        .await
+        .wrap_err("join evict_entries remove_dir task")??;
+    }
+    drop(eviction_lock);
+    Ok(true)
+}
+
+/// Evict one C/C++ object: the row goes, then the file. A lookup racing
+/// the delete misses or fails its clone and compiles — the shim's hit
+/// path carries no lease machinery.
+async fn evict_cc_object(
+    connection: &sqlx::SqlitePool,
+    cc_dir: &Path,
+    cache_key: &str,
+) -> stow_types::error::Result<()> {
+    crate::cc::delete_cc_cache_entry(connection, cache_key).await?;
+    let object_path = crate::cc::cc_object_path(cc_dir, cache_key);
+    if object_path.exists() {
+        tokio::task::spawn_blocking(move || {
+            std::fs::remove_file(&object_path)
+                .wrap_err_with(|| format!("evict C/C++ object {}", object_path.display()))
+        })
+        .await
+        .wrap_err("join evict_entries remove_file task")??;
+    }
+    Ok(())
 }
 
 fn write_downloaded_bundle_to_entry(
@@ -2983,12 +3166,12 @@ async fn insert_artifact_cache_sigstore_signatures(
 }
 
 /// How stale an entry's LRU stamp may be before a read rewrites it.
-const LRU_STAMP_INTERVAL_MS: u64 = 60_000;
+pub const LRU_STAMP_INTERVAL_MS: u64 = 60_000;
 
 /// A stamp read back from the database, clamped: a negative value is a row
 /// written by something that did not go through `db_int`, and "very old" is
 /// the reading that keeps eviction honest.
-const fn recorded_millis(stamp: i64) -> u64 {
+pub const fn recorded_millis(stamp: i64) -> u64 {
     if stamp < 0 { 0 } else { stamp.cast_unsigned() }
 }
 
