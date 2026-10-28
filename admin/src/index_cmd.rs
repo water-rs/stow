@@ -26,6 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use clap::{Args, Subcommand};
 use futures_util::{StreamExt as _, TryStreamExt as _};
+use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceRow};
 use stow_types::identity::{DependencyIdentity, TargetTriple, WireRustcVersion};
 use stow_types::index::{
@@ -222,11 +223,14 @@ struct IndexReportSummary {
 }
 
 /// Dispatch one `index` subcommand.
-pub async fn run(args: IndexArgs) -> stow_types::error::Result<()> {
+pub async fn run(
+    args: IndexArgs,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
     match args.command {
         IndexCommand::Export(args) => index_export(args).await,
         IndexCommand::Publish(args) => index_publish(args).await,
-        IndexCommand::Report(args) => index_report(&Edge::connect()?, args).await,
+        IndexCommand::Report(args) => index_report(&Edge::connect(store)?, args).await,
         IndexCommand::Targets => {
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())

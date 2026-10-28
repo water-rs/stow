@@ -45,6 +45,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{
     AdminStatus, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger, FreezeTransitionEvent,
     SchedulerSubmitResponse,
@@ -255,31 +256,36 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
     // `operations.yml` instead and follows the run to its conclusion.
     // Inside Actions, or on the mock where the bearer is already a
     // minted JWT, the command runs directly.
+    //
+    // The platform credential store is constructed here and passed down
+    // (stow#1021): tests hand the same signatures an in-memory store, so
+    // no test reaches the operator's real keychain.
+    let store = login::platform_store()?;
     if let Some(dispatch) = operations::traced(&command, std::env::args().skip(1)) {
-        return operations::dispatch_and_follow(&dispatch?).await;
+        return operations::dispatch_and_follow(&dispatch?, &*store).await;
     }
     match command {
-        Command::Status(args) => status(&Edge::connect()?, args, output).await,
-        Command::Queue(args) => queue::run(&Edge::connect()?, args, output).await,
-        Command::Scheduler(args) => scheduler::run(&Edge::connect()?, args, output).await,
+        Command::Status(args) => status(&Edge::connect(&*store)?, args, output).await,
+        Command::Queue(args) => queue::run(&Edge::connect(&*store)?, args, output).await,
+        Command::Scheduler(args) => scheduler::run(&Edge::connect(&*store)?, args, output).await,
         Command::Coverage(args) => coverage::run(args, output).await,
-        Command::Preheat(args) => preheat::run(args, output).await,
+        Command::Preheat(args) => preheat::run(args, output, &*store).await,
         Command::Runs(args) => runs::run(&github_token().await?, args, output).await,
         Command::Builds(args) => builds::run(&github_token().await?, args, output).await,
         Command::Artifacts(args) => artifacts::run(args, output).await,
         Command::Cache(args) => cache::run(&github_token().await?, args, output).await,
         Command::Maintenance(args) => maintenance::run(args, output).await,
-        Command::Watchdog(args) => watchdog::run(&Edge::connect()?, args, output).await,
+        Command::Watchdog(args) => watchdog::run(&Edge::connect(&*store)?, args, output).await,
         Command::DispatchFreeze(args) => {
-            dispatch_freeze_switch(&Edge::connect()?, args, output).await
+            dispatch_freeze_switch(&Edge::connect(&*store)?, args, output).await
         }
-        Command::Index(args) => index_cmd::run(args).await,
+        Command::Index(args) => index_cmd::run(args, &*store).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
-        Command::TrafficCost(args) => traffic_cost::run(args, output).await,
-        Command::Request(args) => request::run(args, output).await,
-        Command::Submit(args) => submit_command(&Edge::connect()?, args, output).await,
+        Command::TrafficCost(args) => traffic_cost::run(args, output, &*store).await,
+        Command::Request(args) => request::run(args, output, &*store).await,
+        Command::Submit(args) => submit_command(&Edge::connect(&*store)?, args, output).await,
         Command::Deploy(args) => deploy::run(args, output).await,
-        Command::Login(args) => login::run(args).await,
+        Command::Login(args) => login::run(args, &*store).await,
     }
 }
 
@@ -304,14 +310,17 @@ pub(crate) struct Edge {
 
 impl Edge {
     /// Resolve `STOW_EDGE_URL` and the credential source: Actions OIDC
-    /// when the runtime advertises it, else [`operator_token`].
-    pub(crate) fn connect() -> stow_types::error::Result<Self> {
+    /// when the runtime advertises it, else the operator token held in
+    /// `store` (see [`operator_token`]).
+    pub(crate) fn connect(
+        store: &(impl CredentialStoreApi + Sync),
+    ) -> stow_types::error::Result<Self> {
         let base = std::env::var(STOW_EDGE_URL_ENV)
             .map_err(|_| stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
         let token = if actions_oidc_available() {
             None
         } else {
-            Some(operator_token()?)
+            Some(operator_token(store)?)
         };
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
@@ -325,9 +334,12 @@ impl Edge {
     /// The edge for a lane whose plan needs none: connected only when
     /// the lane will submit (`yes`), so a plan-only run needs neither
     /// `STOW_EDGE_URL` nor a credential.
-    pub(crate) fn connect_to_submit(yes: bool) -> stow_types::error::Result<Option<Self>> {
+    pub(crate) fn connect_to_submit(
+        store: &(impl CredentialStoreApi + Sync),
+        yes: bool,
+    ) -> stow_types::error::Result<Option<Self>> {
         if yes {
-            Self::connect().map(Some)
+            Self::connect(store).map(Some)
         } else {
             Ok(None)
         }
@@ -971,11 +983,14 @@ pub(crate) async fn submit(
 
 /// The operator's credential outside Actions: `GH_TOKEN`/`GITHUB_TOKEN`
 /// when a job stages a token for a local mock edge, else the
-/// `stow-admin login` token. It authenticates the edge's read routes and
-/// dispatches `operations.yml` for the mutating ones (stow#955). Never
-/// `gh auth token` — the edge is untrusted, and that token carries every
-/// scope gh holds (stow#953).
-pub(crate) fn operator_token() -> stow_types::error::Result<String> {
+/// `stow-admin login` token read from `store` — the platform store in
+/// the binary, an in-memory one in tests (stow#1021). It authenticates
+/// the edge's read routes and dispatches `operations.yml` for the
+/// mutating ones (stow#955). Never `gh auth token` — the edge is
+/// untrusted, and that token carries every scope gh holds (stow#953).
+pub(crate) fn operator_token(
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<String> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(name)
             && !token.is_empty()
@@ -983,7 +998,7 @@ pub(crate) fn operator_token() -> stow_types::error::Result<String> {
             return Ok(token);
         }
     }
-    login::stored_token()
+    login::stored_token(store)
 }
 
 /// The operator's GitHub credential for the GitHub REST calls (`runs`,
