@@ -9,8 +9,8 @@
 #      cursor counters;
 #   2. Worker CPU per traffic lane, sampled by the isolate's V8 profiler
 #      through `wrangler dev`'s DevTools inspector and divided by a fixed
-#      reference workload profiled in the same isolate before and after
-#      the lanes, so the runner's speed cancels, against
+#      reference workload profiled in the same isolate immediately
+#      before and after that lane, so the runner's speed cancels, against
 #      WORKER_CPU_BUDGETS (`stow-admin traffic-cost cpu`);
 #   3. the peak-concurrency drive: every lane at the launch model's peak
 #      rate for 30 minutes (`stow-admin traffic-cost peak`);
@@ -486,8 +486,7 @@ fg admin --json traffic-cost cpu "${LANE_ARGS[@]}" \
     || { cat "$LOG_DIR/worker-cpu.log" >&2; \
          die "Worker CPU pass failed — see $REPORT_DIR/worker-cpu.json"; }
 jq -r '"Worker CPU per event (idle window \(.idle_window_ms) ms collected \(.idle_cpu_ms) ms):",
-       "  reference workload \(.reference.cpu_ms * 100 | round / 100) ms (before \(.reference.rounds_before | map(. * 100 | round / 100)), after \(.reference.rounds_after | map(. * 100 | round / 100)))",
-       (.rows[] | "  \(.lane | . + " " * (20 - length)) \(.cpu_ms * 100 | round / 100) ms = \(.relative_cpu * 10000 | round / 10000) × reference (budget \(.budget_relative_cpu)) rounds \(.rounds_cpu_ms | map(. * 100 | round / 100))")' \
+       (.rows[] | "  \(.lane | . + " " * (20 - length)) \(.cpu_ms * 100 | round / 100) ms = \(.relative_cpu * 10000 | round / 10000) × reference \(.reference.cpu_ms * 100 | round / 100) ms (before \(.reference.rounds_before | map(. * 100 | round / 100)), after \(.reference.rounds_after | map(. * 100 | round / 100)), drift \(.reference.drift * 1000 | round / 1000)) (budget \(.budget_relative_cpu)) rounds \(.rounds_cpu_ms | map(. * 100 | round / 100))")' \
     "$REPORT_DIR/worker-cpu.json"
 drain_builds "cpu"
 
