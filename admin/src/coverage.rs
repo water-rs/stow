@@ -66,7 +66,7 @@ impl IndexSource {
     /// Build the shared pull pieces once for `rustc_version`.
     pub async fn new(rustc_version: &WireRustcVersion) -> stow_types::error::Result<Self> {
         let base = registry_base()?;
-        let http = stow_oci::RegistryHttp::new().await?;
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
         let repository = cache_repository(rustc_version);
         let session = base.session(&repository, &http);
         let trust = crate::index_cmd::records_trust().await?;
