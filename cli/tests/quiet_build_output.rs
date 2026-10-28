@@ -43,12 +43,15 @@ fn is_cargo_line(line: &str) -> bool {
 }
 
 /// The `warn`-level conditions an unreachable edge and registry can
-/// legitimately surface — each at most once per build (stow#633). The
-/// in-build analysis is a detached task that the runtime cuts short when
-/// cargo finishes, so whether its warn fires at all is a race between
-/// the registry retries' backoff and the build's exit.
+/// legitimately surface — each at most once per build (stow#633): the
+/// one unreachable-registry diagnostic the build reports when it goes
+/// local-only (stow#977), and the in-build analysis, a detached task the
+/// runtime cuts short when cargo finishes, so whether its warn fires at
+/// all is a race with the build's exit.
 fn allowed_warn(line: &str) -> bool {
-    line.contains("background build analysis failed; the build keeps its filesystem-only plan")
+    line.contains("stow index registry is unreachable; this build runs local-only")
+        || line
+            .contains("background build analysis failed; the build keeps its filesystem-only plan")
 }
 
 /// Build 1 compiles the fixture into a shared stow cache; build 2, on a

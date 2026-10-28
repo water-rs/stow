@@ -31,6 +31,7 @@ use stow_types::index::{ArtifactIndex, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::registry::{CacheRepository, cache_repository};
 
 use crate::config::StowConfig;
+use crate::file_lock::FileLock;
 use crate::verify;
 
 /// The pointer file inside each slice directory.
@@ -47,6 +48,53 @@ struct SlicePointer {
     manifest_digest: String,
     fetched_at: u64,
     row_count: u64,
+}
+
+/// Why a slice fetch produced nothing usable, with the one class the
+/// build's circuit trips on: `transport` marks a request the registry
+/// never answered — connect, TLS or body-read failure — as opposed to a
+/// refusal it sent (stow#977).
+#[derive(Debug)]
+pub struct SliceFetchError {
+    error: stow_types::error::Error,
+    transport: bool,
+}
+
+impl SliceFetchError {
+    /// Whether the fetch failed in transport — the registry answered
+    /// nothing, so the outage is reachability rather than a verdict.
+    #[must_use]
+    pub const fn is_transport(&self) -> bool {
+        self.transport
+    }
+
+    /// A `RegistryError` with its context kept, the transport class
+    /// carried over from the session's own classification.
+    fn registry(context: impl std::fmt::Display, error: &stow_oci::RegistryError) -> Self {
+        Self {
+            transport: error.is_transport(),
+            error: stow_types::stow_error!("{context}: {error}"),
+        }
+    }
+}
+
+impl std::fmt::Display for SliceFetchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for SliceFetchError {}
+
+/// A slice-fetch failure that is not a registry answer — local I/O,
+/// verification, decode. None of them is a transport outage.
+impl From<stow_types::error::Error> for SliceFetchError {
+    fn from(error: stow_types::error::Error) -> Self {
+        Self {
+            error,
+            transport: false,
+        }
+    }
 }
 
 /// A verified index slice: the decoded rows plus the manifest digest that
@@ -90,12 +138,14 @@ pub struct CachedSliceStatus {
 ///
 /// # Errors
 ///
-/// Returns an error when no usable slice can be produced.
+/// Returns an error when no usable slice can be produced — a
+/// [`SliceFetchError`] whose `is_transport` marks the registry having
+/// answered nothing (stow#977).
 pub async fn ensure_slice(
     config: &StowConfig,
     target: &str,
     rustc_version: &str,
-) -> stow_types::error::Result<IndexSlice> {
+) -> Result<IndexSlice, SliceFetchError> {
     static SLICES: tokio::sync::OnceCell<
         tokio::sync::Mutex<std::collections::BTreeMap<(String, String), IndexSlice>>,
     > = tokio::sync::OnceCell::const_new();
@@ -144,7 +194,7 @@ pub async fn refresh_slice(
     config: &StowConfig,
     target: &str,
     rustc_version: &str,
-) -> stow_types::error::Result<IndexSlice> {
+) -> Result<IndexSlice, SliceFetchError> {
     fetch_slice(config, target, rustc_version, Revalidation::Always).await
 }
 
@@ -163,7 +213,7 @@ pub async fn confirmed_slice(
     config: &StowConfig,
     target: &str,
     rustc_version: &str,
-) -> stow_types::error::Result<IndexSlice> {
+) -> Result<IndexSlice, SliceFetchError> {
     fetch_slice(config, target, rustc_version, Revalidation::Required).await
 }
 
@@ -251,7 +301,7 @@ async fn fetch_slice(
     target: &str,
     rustc_version: &str,
     revalidation: Revalidation,
-) -> stow_types::error::Result<IndexSlice> {
+) -> Result<IndexSlice, SliceFetchError> {
     let dir = slice_dir(config, target, rustc_version);
     let pointer = read_pointer(&dir).await?;
     // A commit landing between the pointer read and the load serves its
@@ -287,7 +337,7 @@ async fn fetch_slice(
             // answer is an empty index; even a cached slice names
             // artifacts a package reset took away.
             Err(error) if error.is_package_missing() => {
-                return empty_slice(target, rustc_version);
+                return empty_slice(target, rustc_version).map_err(Into::into);
             }
             Ok(remote_digest) => {
                 if let Some((pointer, blob)) =
@@ -304,8 +354,9 @@ async fn fetch_slice(
                 // surfaces that `Format` error.
             }
             Err(error) if revalidation == Revalidation::Required => {
-                return Err(stow_types::stow_error!(
-                    "revalidate index slice {tag}: {error}"
+                return Err(SliceFetchError::registry(
+                    format!("revalidate index slice {tag}"),
+                    &error,
                 ));
             }
             Err(error) => {
@@ -332,7 +383,7 @@ async fn fetch_slice(
     )
     .await?
     else {
-        return empty_slice(target, rustc_version);
+        return empty_slice(target, rustc_version).map_err(Into::into);
     };
     commit_slice(&dir, &manifest_digest, blob, index.rows.len() as u64).await?;
     Ok(IndexSlice {
@@ -382,7 +433,7 @@ async fn download_verified_slice(
     tag: &str,
     target: &str,
     rustc_version: &str,
-) -> stow_types::error::Result<Option<(Vec<u8>, String, ArtifactIndex)>> {
+) -> Result<Option<(Vec<u8>, String, ArtifactIndex)>, SliceFetchError> {
     let trust = verify::spawn_trust(config);
     // A package that does not exist is the registry's answer of "empty
     // index", not a pull failure — the same `None` every other index
@@ -391,8 +442,9 @@ async fn download_verified_slice(
         Ok(pulled) => pulled,
         Err(error) if error.is_package_missing() => return Ok(None),
         Err(error) => {
-            return Err(stow_types::stow_error!(
-                "pull manifest {reference}: {error}"
+            return Err(SliceFetchError::registry(
+                format!("pull manifest {reference}"),
+                &error,
             ));
         }
     };
@@ -402,13 +454,15 @@ async fn download_verified_slice(
         return Err(stow_types::stow_error!(
             "index manifest {reference} carries {} layers, expected exactly one",
             manifest.layers.len()
-        ));
+        )
+        .into());
     };
     if layer.media_type != STOW_INDEX_MEDIA_TYPE {
         return Err(stow_types::stow_error!(
             "index manifest {reference} layer is {}, expected {STOW_INDEX_MEDIA_TYPE}",
             layer.media_type
-        ));
+        )
+        .into());
     }
     let (blob, materials) = tokio::try_join!(
         stow_oci::pull_blob_verified(session, layer),
@@ -442,7 +496,8 @@ async fn download_verified_slice(
             "index slice {tag} was published for {}@{}",
             index.header.target.as_str(),
             index.header.rustc_version.as_str()
-        ));
+        )
+        .into());
     }
     Ok(Some((blob, manifest_digest, index)))
 }
@@ -533,7 +588,9 @@ where
 /// replaces them and evicts the previous generation. Every access to a
 /// slice's files goes through one, and only on a blocking thread whose
 /// closure owns the lock, so the lock is released after the last file
-/// handle closes even when the awaiting future is dropped.
+/// handle closes even when the awaiting future is dropped. The release is
+/// an explicit unlock ([`FileLock`]), never the lock file's close, which a
+/// child spawned meanwhile would delay (stow#1003).
 ///
 /// Refreshes of one slice share its directory — two `stow` processes on
 /// one `cache_dir`, every local CI build of one target — and run at once
@@ -546,7 +603,7 @@ where
 /// returns and no name is ever left pending.
 struct LockedSlice<Mode> {
     dir: PathBuf,
-    _lock: std::fs::File,
+    _lock: FileLock,
     _mode: PhantomData<Mode>,
 }
 
@@ -601,7 +658,7 @@ impl LockedSlice<Shared> {
                     .wrap_err_with(|| format!("open index slice lock in {}", dir.display()));
             }
         };
-        lock.lock_shared()
+        let lock = FileLock::shared(lock)
             .wrap_err_with(|| format!("lock index slice {} shared", dir.display()))?;
         Ok(Some(Self {
             dir: dir.to_path_buf(),
@@ -617,7 +674,7 @@ impl LockedSlice<Exclusive> {
             .wrap_err_with(|| format!("create index dir {}", dir.display()))?;
         let lock = Self::open_lock(dir)
             .wrap_err_with(|| format!("open index slice lock in {}", dir.display()))?;
-        lock.lock()
+        let lock = FileLock::exclusive(lock)
             .wrap_err_with(|| format!("lock index slice {} exclusive", dir.display()))?;
         Ok(Self {
             dir: dir.to_path_buf(),

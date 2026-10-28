@@ -3,7 +3,8 @@
 //! Cloudflare allowance without overloading the scheduler (stow#772):
 //!
 //! - `cpu` measures Worker CPU per traffic lane under the isolate's CPU
-//!   profiler and gates each lane against `WORKER_CPU_BUDGETS`;
+//!   profiler and gates each lane against `WORKER_CPU_BUDGETS`,
+//!   relative to a reference workload profiled in the same isolate;
 //! - `peak` drives every lane at the launch model's peak rate and fails
 //!   on any overload signal or 5xx;
 //! - `verdict` judges the scheduler budget reports: row budgets, growth

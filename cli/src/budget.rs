@@ -68,12 +68,6 @@ impl CacheBudget {
         self.total.saturating_sub(self.started.elapsed())
     }
 
-    /// Whether the pre-cargo phase should stop and hand over to cargo.
-    #[must_use]
-    pub fn is_exhausted(&self) -> bool {
-        self.remaining().is_zero()
-    }
-
     /// Total allowance, for logging.
     #[must_use]
     pub const fn total(&self) -> Duration {
@@ -89,7 +83,6 @@ mod tests {
     fn nothing_cached_earns_no_budget() {
         let budget = CacheBudget::for_covered_units(0);
         assert!(budget.total().is_zero());
-        assert!(budget.is_exhausted());
     }
 
     #[test]

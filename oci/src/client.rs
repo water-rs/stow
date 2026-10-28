@@ -109,6 +109,15 @@ enum RegistryErrorKind {
 }
 
 impl RegistryError {
+    /// Whether the request never got an answer — connect, TLS or
+    /// body-read failure, as opposed to a refusal the registry sent.
+    /// The class a consumer's circuit trips on: reachability was the
+    /// question and this is its answer (stow#977).
+    #[must_use]
+    pub const fn is_transport(&self) -> bool {
+        matches!(self.kind, RegistryErrorKind::Transport(_))
+    }
+
     fn transport(what: &str, url: &str, error: impl std::fmt::Display) -> Self {
         Self {
             what: format!("{what} {url}"),
@@ -217,6 +226,34 @@ impl SessionRequest {
     }
 }
 
+/// How a registry client's transport treats connection setup.
+///
+/// Publishing keeps the historical policy — no connect bound, connect
+/// failures retried — because its waits are the fleet's `429` backoff,
+/// not reachability. A consumer's build wants the opposite: an
+/// unreachable registry is one diagnostic, and the build's circuit
+/// carries the outage instead of eight stalled attempts (stow#977).
+#[derive(Debug, Clone, Copy)]
+pub struct TransportPolicy {
+    /// `reqwest`'s connect timeout — it covers the DNS lookup and the
+    /// connect itself; `None` leaves the OS's own bound.
+    pub connect_timeout: Option<Duration>,
+    /// Whether a connect/DNS failure retries like a `429` or `5xx`.
+    /// Every other transport failure keeps its retry either way.
+    pub retry_connect_failures: bool,
+}
+
+impl TransportPolicy {
+    /// The publish/operator policy: no connect bound, and a connect or
+    /// DNS failure retries like every other transient answer — the
+    /// behaviour every caller had before a consumer's build asked for
+    /// fast detection (stow#977).
+    pub const PATIENT: Self = Self {
+        connect_timeout: None,
+        retry_connect_failures: true,
+    };
+}
+
 /// The registry's HTTP client, built once per process and shared by every
 /// session the process opens (stow#624).
 ///
@@ -232,6 +269,9 @@ pub struct RegistryHttp {
     /// `reqwest::Client` is itself reference-counted; the outer `Arc`
     /// gives the handle an identity [`Self::same_client`] can compare.
     client: Arc<reqwest::Client>,
+    /// The caller's transport policy — bounded connect and the
+    /// connect/DNS retry choice every `send` this handle serves shares.
+    transport: TransportPolicy,
 }
 
 impl RegistryHttp {
@@ -242,13 +282,20 @@ impl RegistryHttp {
     /// A TLS backend that cannot initialize — `reqwest::Client::new`
     /// panics on it, the builder returns it — and a blocking task that
     /// cannot be joined.
-    pub async fn new() -> stow_types::error::Result<Self> {
-        let client = tokio::task::spawn_blocking(|| reqwest::Client::builder().build())
-            .await
-            .map_err(|error| stow_types::stow_error!("join registry HTTP client build: {error}"))?
-            .map_err(|error| stow_types::stow_error!("build registry HTTP client: {error}"))?;
+    pub async fn new(transport: TransportPolicy) -> stow_types::error::Result<Self> {
+        let client = tokio::task::spawn_blocking(move || {
+            let mut builder = reqwest::Client::builder();
+            if let Some(connect_timeout) = transport.connect_timeout {
+                builder = builder.connect_timeout(connect_timeout);
+            }
+            builder.build()
+        })
+        .await
+        .map_err(|error| stow_types::stow_error!("join registry HTTP client build: {error}"))?
+        .map_err(|error| stow_types::stow_error!("build registry HTTP client: {error}"))?;
         Ok(Self {
             client: Arc::new(client),
+            transport,
         })
     }
 
@@ -772,8 +819,19 @@ impl RegistrySession {
             let (status, headers, body) = match sent {
                 Ok(answer) => answer,
                 Err(error) => {
+                    // A connect or DNS failure answers reachability, not
+                    // congestion: a policy that declines to retry it
+                    // returns at once — the caller's circuit carries the
+                    // outage (stow#977). Every other transport failure
+                    // stays in the sweep. The timeout the policy sets is
+                    // the connect bound — this client has no request
+                    // timeout, so `is_timeout` can only be a connect
+                    // that outlived it, and reqwest's connect timeout
+                    // does not surface as `is_connect`.
+                    let retriable = self.http.transport.retry_connect_failures
+                        || !(error.is_connect() || error.is_dns() || error.is_timeout());
                     let error = RegistryError::transport(what, &request.url, error);
-                    if attempt >= MAX_ATTEMPTS {
+                    if !retriable || attempt >= MAX_ATTEMPTS {
                         return Err(error);
                     }
                     let delay = retry_delay(attempt, None);
@@ -1167,7 +1225,7 @@ impl RegistryBase {
 
 #[cfg(test)]
 mod tests {
-    use super::{RegistryBase, RegistryCredentials, RegistryHttp};
+    use super::{RegistryBase, RegistryCredentials, RegistryHttp, TransportPolicy};
 
     /// stow#624: sessions opened from one handle ride the one client it
     /// built. The handle's own identity is the count — one constructor
@@ -1176,7 +1234,9 @@ mod tests {
     #[tokio::test]
     async fn sessions_from_one_handle_share_its_client() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = RegistryHttp::new().await.expect("build registry http");
+        let http = RegistryHttp::new(TransportPolicy::PATIENT)
+            .await
+            .expect("build registry http");
         let base = RegistryBase::production().expect("production registry base");
         let repository = stow_types::registry::cache_repository(
             &stow_types::identity::WireRustcVersion::parse("1.99.0").expect("rustc"),
@@ -1194,7 +1254,9 @@ mod tests {
         assert!(push.http.same_client(&http));
         assert!(pull.http.same_client(&push.http));
 
-        let second = RegistryHttp::new().await.expect("build a second handle");
+        let second = RegistryHttp::new(TransportPolicy::PATIENT)
+            .await
+            .expect("build a second handle");
         assert!(
             !base.session(&repository, &second).http.same_client(&http),
             "a second constructor call builds a second client"

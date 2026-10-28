@@ -1831,8 +1831,9 @@ mod sqlite_tests {
     /// Review measurement for stow#790: `node_contexts` derives every
     /// entry's dependency digest in one shared pass; the second timing
     /// re-runs the per-entry `TaskSubgraph::resolve` loop it replaced.
-    /// Host CPU is an upper-bound proxy for the worker's budget — the
-    /// admission route's `WORKER_CPU_BUDGETS` is 5 ms.
+    /// Host CPU is an upper-bound proxy for the worker's CPU — the
+    /// admission route's `WORKER_CPU_BUDGETS` row gates it relative to
+    /// the Traffic cost test's reference workload.
     #[test]
     fn context_construction_at_max_admission_size() {
         const N: usize = super::MAX_EXPANDED_TASKS;
@@ -1935,7 +1936,7 @@ mod sqlite_tests {
         }
         eprintln!(
             "admission context construction at {N} entries / {wire_nodes} wire nodes: \
-             shared pass {shared:?}; per-entry resolve {:?} (route budget 5ms)",
+             shared pass {shared:?}; per-entry resolve {:?}",
             start.elapsed()
         );
     }

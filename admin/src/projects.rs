@@ -270,9 +270,9 @@ pub struct SubmitIdsOutcome {
 const SEARCH_PER_PAGE: usize = 100;
 /// The search API refuses to page beyond result 1000.
 const SEARCH_HARD_LIMIT: usize = 1000;
-/// Requests per `POST /scheduler/tasks/submit` — under the edge's own
-/// `MAX_EXPANDED_TASKS` bound so a wave never splits mid-application.
-const SUBMIT_CHUNK: usize = 1000;
+/// Task ids per `POST /scheduler/tasks/submit-ids` — a fixed-size
+/// entry each, so the count bounds the body.
+const SUBMIT_IDS_CHUNK: usize = 1000;
 /// The header comment `generate` writes above the `[[project]]` rows —
 /// the schema's only documentation lives in the file itself.
 const PROJECTS_HEADER: &str = "\
@@ -1019,8 +1019,9 @@ pub fn resolve_project_dir(
         .collect())
 }
 
-/// POST the batch in [`SUBMIT_CHUNK`]-sized pieces and sum the responses
-/// — a full wave is far over the edge's single-request bound.
+/// POST the batch in bodies under the edge's request-body bound and sum
+/// the responses — a full wave, and a large project's single tree, are
+/// far over one body.
 pub async fn submit_chunked(
     edge: &Edge,
     trees: &[stow_types::api::SubmissionTree],
@@ -1031,8 +1032,12 @@ pub async fn submit_chunked(
         inserted: 0,
         dropped: 0,
     };
-    for chunk in trees.chunks(SUBMIT_CHUNK) {
-        let response: SchedulerSubmitResponse = crate::submit(edge, chunk).await?;
+    let bodies = stow_types::api::SubmissionTree::into_bodies(
+        trees,
+        stow_types::api::SUBMIT_BODY_LIMIT_BYTES,
+    )?;
+    for body in &bodies {
+        let response: SchedulerSubmitResponse = crate::submit(edge, body).await?;
         outcome.batches += 1;
         outcome.submitted += response.submitted;
         outcome.inserted += response.inserted;
@@ -1041,7 +1046,7 @@ pub async fn submit_chunked(
     Ok(outcome)
 }
 
-/// POST the task-id batch in [`SUBMIT_CHUNK`]-sized pieces to the
+/// POST the task-id batch in [`SUBMIT_IDS_CHUNK`]-sized pieces to the
 /// trusted submit-ids route and fold the responses — the promote lane
 /// submits ids, never requests (stow#588).
 pub async fn submit_ids_chunked(
@@ -1054,7 +1059,7 @@ pub async fn submit_ids_chunked(
         inserted: 0,
         unknown: Vec::new(),
     };
-    for chunk in entries.chunks(SUBMIT_CHUNK) {
+    for chunk in entries.chunks(SUBMIT_IDS_CHUNK) {
         let response: stow_types::api::SubmitTaskIdsResponse = edge
             .post_json(
                 "/api/v1/scheduler/tasks/submit-ids",

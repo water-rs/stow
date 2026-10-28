@@ -6,11 +6,7 @@ use std::time::Instant;
 
 use async_process::{Command, ExitStatus};
 use futures_util::future::{BoxFuture, FutureExt as _, Shared};
-use serde::{Deserialize, Serialize};
-use stow_types::artifact::{ArtifactKind, RustCrateType};
-use stow_types::bundle::{STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE};
 use stow_types::error::Context;
-use stow_types::platform::{PanicStrategy, Profile};
 use stow_types::public_cache::UnitShape;
 use tempfile::TempDir;
 use zenwave::{Client, ResponseExt};
@@ -19,9 +15,7 @@ use crate::budget::CacheBudget;
 use crate::cache_policy::{self, CachePolicyEntry};
 use crate::cli_args::CargoCommandArgs;
 use crate::config::StowConfig;
-use crate::fetch::{FetchRequest, SemanticFetchRequest};
 use crate::index;
-use crate::inject;
 use crate::lockfile_resolver;
 use crate::log_nonfatal_result;
 use crate::prefetch::{self, PrefetchArtifact};
@@ -29,9 +23,7 @@ use crate::resolve;
 use crate::rustc_args::{self, STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV, STOW_PUBLIC_CACHE_TARGET_ENV};
 use crate::state_db::StateDb;
 use crate::stats;
-use crate::workspace_deps::{
-    self, ExpandedDependencyGraph, PackageKey, SelectedRegistryDependency,
-};
+use crate::workspace_deps::{self, ExpandedDependencyGraph, PackageKey};
 use crate::{
     STOW_ENABLE_SEMANTIC_FALLBACK_ENV, STOW_EXPANDED_GRAPH_PATH_ENV,
     STOW_PREFETCH_ARTIFACTS_PATH_ENV,
@@ -320,7 +312,6 @@ async fn run_inner(
             &invocation,
             &public_cache_mode,
             maybe_analysis,
-            &budget,
             state_db,
         )
         .await
@@ -508,7 +499,6 @@ async fn run_original_workspace_build(
     invocation: &CargoInvocation,
     public_cache_mode: &PublicCacheMode,
     analysis: Option<WorkspacePrediction>,
-    budget: &CacheBudget,
     state_db: &StateDb,
 ) -> stow_types::error::Result<ExitStatus> {
     let unit_nodes = analysis
@@ -526,41 +516,6 @@ async fn run_original_workspace_build(
     let cache_policy_entries = deferred_cache_policy(config, public_cache_mode, analysis.as_ref());
     let prefetch_artifacts = prefetch_artifacts.as_deref();
     let covered_units = prefetch_artifacts.map_or(0, <[PrefetchArtifact]>::len);
-    // The top-crate fast path pays its own graph resolve plus a
-    // prefetch warm, so it only exists when the filesystem pass already
-    // proved the graph servable — on an all-miss build it can only burn
-    // seconds to reach the same "nothing to serve" the serve map already
-    // holds (stow#347).
-    let anything_servable = servable_units
-        .as_ref()
-        .is_some_and(|map| !map.target.is_empty() || !map.host.is_empty());
-    if let Some(config) = config
-        && public_cache_mode.is_enabled()
-        && anything_servable
-    {
-        match try_run_top_crate_with_cached_dependencies(
-            config,
-            project,
-            invocation,
-            &invocation.cargo_args,
-            cache_policy_entries.as_deref(),
-            prefetch_artifacts,
-            budget,
-        )
-        .await
-        {
-            // `Some` ends the command even on a failing status — see
-            // `try_run_top_crate_with_cached_dependencies`.
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "stow top-crate cached-deps acceleration unavailable; falling back to vanilla cargo"
-                );
-            }
-        }
-    }
     run_cargo(&CargoRunPlan {
         project,
         config,
@@ -581,7 +536,6 @@ async fn run_original_workspace_build(
         // the full graph analysis is owed to the build while cargo runs.
         deferred_analysis: config.is_some(),
         semantic_fallback_enabled,
-        extra_rustflags: &[],
         covered_units,
         sandbox: invocation.sandbox,
     })
@@ -606,11 +560,10 @@ async fn run_mirrored_upgrade_build(
     let mirror_manifest_path = mirror_manifest_path(project, &mirror)?;
 
     // After applying upgrades, re-analyze the mirror so the wrapper's exact +
-    // semantic paths get the post-upgrade transitive graph + prefetch list,
-    // and so the strict top-crate cached-deps fast path can engage when every
-    // (now-upgraded) direct dep is fully covered. Without this, the upgrade
-    // branch ran the mirror with no cache plumbing and saw 0 hits — the
-    // primary cause of the predict-vs-runtime gap reported on populated mocks.
+    // semantic paths get the post-upgrade transitive graph + prefetch list.
+    // Without this, the upgrade branch ran the mirror with no cache plumbing
+    // and saw 0 hits — the primary cause of the predict-vs-runtime gap
+    // reported on populated mocks.
     let mirror_project = build_mirror_project_context(project, &mirror)?;
     let mirror_analysis = match config {
         Some(config) => match analyze_workspace_prediction(
@@ -660,33 +613,6 @@ async fn run_mirrored_upgrade_build(
     ))
     .await?;
 
-    if let Some(config) = config
-        && public_cache_mode.is_enabled()
-    {
-        match try_run_top_crate_with_cached_dependencies(
-            config,
-            &mirror_project,
-            invocation,
-            &mirror_args,
-            cache_policy_entries.as_deref(),
-            mirror_prefetch.as_deref(),
-            budget,
-        )
-        .await
-        {
-            // `Some` ends the command even on a failing status — see
-            // `try_run_top_crate_with_cached_dependencies`.
-            Ok(Some(status)) => return Ok(status),
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "post-upgrade top-crate cached-deps acceleration unavailable; falling back to vanilla cargo"
-                );
-            }
-        }
-    }
-
     let mirror_current_dir = mirror.current_dir();
     run_cargo(&CargoRunPlan {
         project,
@@ -704,7 +630,6 @@ async fn run_mirrored_upgrade_build(
         inexact_entries: mirror_inexact.as_deref(),
         deferred_analysis: false,
         semantic_fallback_enabled: mirror_semantic_fallback,
-        extra_rustflags: &[],
         covered_units: mirror_prefetch.as_ref().map_or(0, Vec::len),
         sandbox: invocation.sandbox,
     })
@@ -1298,37 +1223,6 @@ struct CompatibleUpgrade {
     is_root_candidate: bool,
 }
 
-#[derive(Debug)]
-struct CachedDependencyPlan {
-    bundles: BTreeMap<String, crate::artifact_cache::CachedArtifactBundle>,
-    direct_externs: Vec<CachedDirectExtern>,
-}
-
-#[derive(Debug)]
-struct CachedDirectExtern {
-    extern_name: String,
-    c_metadata: String,
-}
-
-#[derive(Debug)]
-struct CachedDependencyShape {
-    candidates: Vec<CachedDependencyArtifactShape>,
-    direct_preferred_media_types: Vec<&'static str>,
-}
-
-#[derive(Debug)]
-struct CachedDependencyArtifactShape {
-    emit: Vec<String>,
-    kind: ArtifactKind,
-    crate_types: Vec<RustCrateType>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct DependencyCMetadataIdentity {
-    crate_name: String,
-    c_metadata: String,
-}
-
 async fn analyze_workspace_prediction(
     project: &ProjectContext,
     _current_dir: &Path,
@@ -1598,6 +1492,7 @@ fn predict_from_inputs(
     // plus whether the graph's invocation spelled `--target` (stow#615).
     let unit_nodes = Some(crate::unit_node::UnitNodeTable::from_expanded(
         &expanded.entries,
+        &expanded.node_profiles(project.target_given.then_some(project.target.as_str()))?,
         project.target_given,
     ));
     // stow#882: the inexact report carries the exact chain — each
@@ -1890,7 +1785,7 @@ fn prefetch_servable_wildcards(
 async fn ensure_consumer_slices(
     config: &StowConfig,
     project: &ProjectContext,
-) -> stow_types::error::Result<(index::IndexSlice, Option<index::IndexSlice>)> {
+) -> Result<(index::IndexSlice, Option<index::IndexSlice>), index::SliceFetchError> {
     let host_target = stow_types::api::runner_family(&project.target)
         .map(|family| family.host_triple().to_owned())
         .filter(|host| *host != project.target);
@@ -2071,11 +1966,14 @@ pub async fn admit_observed_misses(
         &stow_types::identity::WireRustcVersion::parse(rustc_version)
             .wrap_err("parse rustc_version")?,
     )?;
+    let node_profiles =
+        expanded.node_profiles(consumer_spelled_target.then_some(consumer_target))?;
     let graph = workspace_deps::observed_miss_graph(
         observations,
         &dep_identities,
         consumer_spelled_target,
         &resolved,
+        &node_profiles,
     )?;
     if graph.roots.is_empty() {
         return Ok(());
@@ -2513,6 +2411,7 @@ async fn try_stow_resolver(
         mirror_analysis,
     ))
     .await
+    .map(Some)
 }
 
 /// Ask the local resolver for a cache-optimized lockfile covering
@@ -2671,10 +2570,9 @@ async fn analyze_pinned_mirror(
     }
 }
 
-/// Run cargo against a `PinnedMirror` whose analysis succeeded: the
-/// top-crate cached-deps fast path when it applies, otherwise cargo under
-/// the wrapper with the pinned graph's cache plan. `Some` carries cargo's
-/// own exit status — success or not (stow#652).
+/// Run cargo against a `PinnedMirror` whose analysis succeeded: cargo under
+/// the wrapper with the pinned graph's cache plan. Returns cargo's own exit
+/// status — success or not (stow#652).
 async fn run_pinned_mirror_build(
     config: &StowConfig,
     project: &ProjectContext,
@@ -2682,7 +2580,7 @@ async fn run_pinned_mirror_build(
     pinned: &PinnedMirror,
     public_cache_mode: &PublicCacheMode,
     mirror_analysis: WorkspacePrediction,
-) -> stow_types::error::Result<Option<ExitStatus>> {
+) -> stow_types::error::Result<ExitStatus> {
     let mirror_unit_nodes = mirror_analysis.unit_nodes.clone();
     let mirror_prefetch = mirror_analysis.prefetch_artifacts.clone();
     let mirror_servable = mirror_analysis.servable_units.clone();
@@ -2706,33 +2604,6 @@ async fn run_pinned_mirror_build(
     ))
     .await?;
 
-    match try_run_top_crate_with_cached_dependencies(
-        config,
-        &pinned.project,
-        invocation,
-        &pinned.args,
-        cache_policy_entries.as_deref(),
-        Some(&mirror_prefetch),
-        &budget,
-    )
-    .await
-    {
-        // `Some` ends the command even on a failing status — see
-        // `try_run_top_crate_with_cached_dependencies`.
-        Ok(Some(status)) => return Ok(Some(status)),
-        Ok(None) => {
-            tracing::info!(
-                "top-crate cached-deps fast path not applicable; running cargo with wrapper injection"
-            );
-        }
-        Err(error) => {
-            tracing::info!(
-                %error,
-                "top-crate cached-deps fast path unsatisfied; running cargo with wrapper injection"
-            );
-        }
-    }
-
     let mirror_current_dir = pinned.mirror.current_dir();
     run_cargo(&CargoRunPlan {
         project,
@@ -2750,12 +2621,10 @@ async fn run_pinned_mirror_build(
         inexact_entries: Some(&mirror_inexact),
         deferred_analysis: false,
         semantic_fallback_enabled: mirror_semantic_fallback,
-        extra_rustflags: &[],
         covered_units: mirror_prefetch.len(),
         sandbox: invocation.sandbox,
     })
     .await
-    .map(Some)
 }
 
 async fn collect_user_direct_dependencies(
@@ -3016,8 +2885,8 @@ async fn write_lockfile_into_mirror(
 /// lockfile, and forcing dev-dep coverage would reject every project
 /// with a `[dev-dependencies]` table even though `cargo check` works
 /// fine without those pins. The downstream pipeline catches incomplete
-/// pins via `try_run_top_crate_with_cached_dependencies` /
-/// `analyze_workspace_prediction`, and falls back to passthrough then.
+/// pins via `analyze_workspace_prediction`, and falls back to passthrough
+/// then.
 async fn validate_pinned_lockfile(
     mirror_project: &ProjectContext,
 ) -> stow_types::error::Result<bool> {
@@ -3047,471 +2916,6 @@ async fn validate_pinned_lockfile(
         "cargo metadata --locked rejected pinned lockfile"
     );
     Ok(false)
-}
-
-/// `Some` carries cargo's own exit status — success or not — because a
-/// path that ran cargo has finished the command: a failing status is
-/// the command's answer, never a "not served" that may fall through to
-/// a second cargo run (stow#652). `None` is the fast path declining to
-/// run cargo at all.
-async fn try_run_top_crate_with_cached_dependencies(
-    config: &StowConfig,
-    project: &ProjectContext,
-    invocation: &CargoInvocation,
-    cargo_args: &[OsString],
-    cache_policy_entries: Option<&[CachePolicyEntry]>,
-    prefetch_artifacts: Option<&[PrefetchArtifact]>,
-    budget: &CacheBudget,
-) -> stow_types::error::Result<Option<ExitStatus>> {
-    let Some(shape) = cached_dependency_shape(&invocation.action) else {
-        return Ok(None);
-    };
-    if !prebuilt_deps_path_enabled() {
-        return Ok(None);
-    }
-    if budget.is_exhausted() {
-        tracing::info!(
-            budget_ms = budget.total().as_millis(),
-            "pre-cargo cache budget spent; handing over to cargo without the prebuilt-deps path"
-        );
-        return Ok(None);
-    }
-    // Warm the local cache with one batched fetch before the closure walk:
-    // the walk itself only reads locally, and filling it one artifact at a
-    // time through per-crate GETs is the dominant cost of a fresh run.
-    if let Some(artifacts) = prefetch_artifacts
-        && !artifacts.is_empty()
-        && let Err(error) = prefetch::warm_exact_artifacts(config, artifacts, budget).await
-    {
-        // A cold local cache just means the closure walk below finds nothing
-        // and this path declines; it must not fail the build.
-        tracing::warn!(%error, "prefetch for the prebuilt-deps path failed");
-        return Ok(None);
-    }
-    // The selected packages' direct registry externs ride the same
-    // `--unit-graph` resolve as the expanded graph (and its cache), so
-    // the top-crate path pays no second resolution.
-    let expanded = expanded_graph(config, project, &project.manifest_path, None).await?;
-    if expanded.direct_dependencies.is_empty() {
-        return Ok(None);
-    }
-    // Host-side units mint at the runner family's host triple — the same
-    // platform `expanded_graph` resolves with.
-    let host_triple = stow_types::api::runner_family(&project.target)
-        .map_or(project.target.as_str(), |family| family.host_triple());
-    let build_script_packages = build_script_packages(&expanded.task_units(
-        project.target_given.then_some(project.target.as_str()),
-        host_triple,
-    )?);
-    let plan =
-        resolve_cached_dependency_plan(config, project, &expanded.direct_dependencies, &shape)
-            .await?;
-
-    let target_dir = resolved_target_dir(project, cargo_args, &project.current_dir);
-    let prebuilt_dir = target_dir
-        .join("stow-prebuilt")
-        .join(&invocation.action)
-        .join("deps");
-    refuse_build_script_dependencies(&invocation.action, &plan, &build_script_packages)?;
-    materialize_cached_dependency_plan(&prebuilt_dir, &plan).await?;
-    // Every bundle in the plan replaces one dependency compilation; make the
-    // acceleration visible in `stow status` exactly like wrapper-level hits.
-    for bundle in plan.bundles.values() {
-        log_nonfatal_result(
-            "failed to record rust cache hit stats",
-            crate::stats::record_hit(config, &bundle.crate_name).await,
-        );
-    }
-    let rustflags = top_crate_rustflags(&prebuilt_dir, &plan, &shape)?;
-
-    let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
-    strip_selected_manifest_dependencies(project, &mirror).await?;
-    regenerate_mirror_lockfile(project, &mirror).await?;
-    let mirror_args = rewrite_args_for_mirror(cargo_args, project, &mirror)?;
-    let mirror_current_dir = mirror.current_dir();
-    run_cargo(&CargoRunPlan {
-        project,
-        config: Some(config),
-        state_db: &config.state_db,
-        action: &invocation.action,
-        cargo_args: &mirror_args,
-        source_root: &project.workspace_root,
-        current_dir: &mirror_current_dir,
-        cache_policy_entries,
-        public_cache_mode: &PublicCacheMode::for_rustc(&project.rustc_version),
-        unit_nodes: None,
-        prefetch_artifacts: None,
-        servable_units: None,
-        inexact_entries: None,
-        deferred_analysis: false,
-        semantic_fallback_enabled: false,
-        extra_rustflags: &rustflags,
-        covered_units: plan.bundles.len(),
-        sandbox: invocation.sandbox,
-    })
-    .await
-    .map(Some)
-}
-
-/// Opt-in for the prebuilt-deps path, off by default.
-///
-/// The path compiles the top crate alone against a closure of cached rlibs,
-/// stripping `[dependencies]` from a mirrored manifest and passing
-/// `--extern` plus `-Ldependency=<prebuilt>`. It is fast when it works, but
-/// it has produced two distinct classes of broken build: stripping
-/// `[build-dependencies]` left `build.rs` unable to compile, and keeping them
-/// puts the same crate in both cargo's `deps` directory and the prebuilt one,
-/// so rustc reports "multiple candidates for rlib dependency". Getting it
-/// right needs exact control of rustc's search path for the whole transitive
-/// closure, not just the direct externs. A `build` against it refuses any
-/// cached dependency whose package has a build script, since this path runs
-/// none.
-///
-/// The per-rustc wrapper reaches the same artifacts without any of that: it
-/// serves each unit in place, under cargo's own unit graph. On the twelve
-/// projects in `docs/acceleration-audit.md` it lands within noise of this
-/// path where both work. Until the search-path handling is right, correctness
-/// wins — a broken build is worse than a slow one.
-fn prebuilt_deps_path_enabled() -> bool {
-    std::env::var_os("STOW_ENABLE_PREBUILT_DEPS").is_some_and(|value| value != "0")
-}
-
-fn cached_dependency_shape(action: &str) -> Option<CachedDependencyShape> {
-    match action {
-        "check" => Some(CachedDependencyShape {
-            candidates: vec![
-                rlib_dependency_shape(vec!["dep-info", "metadata"]),
-                proc_macro_dependency_shape(),
-                rlib_dependency_shape(vec!["dep-info", "link", "metadata"]),
-            ],
-            direct_preferred_media_types: vec![
-                STOW_RMETA_MEDIA_TYPE,
-                STOW_RLIB_MEDIA_TYPE,
-                STOW_PROC_MACRO_MEDIA_TYPE,
-            ],
-        }),
-        "build" => Some(CachedDependencyShape {
-            candidates: vec![
-                rlib_dependency_shape(vec!["dep-info", "link", "metadata"]),
-                proc_macro_dependency_shape(),
-            ],
-            direct_preferred_media_types: vec![
-                STOW_RLIB_MEDIA_TYPE,
-                STOW_RMETA_MEDIA_TYPE,
-                STOW_PROC_MACRO_MEDIA_TYPE,
-            ],
-        }),
-        _ => None,
-    }
-}
-
-fn rlib_dependency_shape(emit: Vec<&str>) -> CachedDependencyArtifactShape {
-    CachedDependencyArtifactShape {
-        emit: emit.into_iter().map(str::to_owned).collect(),
-        kind: ArtifactKind::Rlib,
-        crate_types: vec![RustCrateType::Lib],
-    }
-}
-
-fn proc_macro_dependency_shape() -> CachedDependencyArtifactShape {
-    CachedDependencyArtifactShape {
-        emit: vec!["dep-info".to_owned(), "link".to_owned()],
-        kind: ArtifactKind::ProcMacro,
-        crate_types: vec![RustCrateType::ProcMacro],
-    }
-}
-
-async fn resolve_cached_dependency_plan(
-    config: &StowConfig,
-    project: &ProjectContext,
-    direct_dependencies: &[SelectedRegistryDependency],
-    shape: &CachedDependencyShape,
-) -> stow_types::error::Result<CachedDependencyPlan> {
-    let mut bundles = BTreeMap::<String, crate::artifact_cache::CachedArtifactBundle>::new();
-    let mut direct_externs = Vec::with_capacity(direct_dependencies.len());
-    // One unit may carry several extern names — a renamed dependency
-    // beside the plain one, or a dep used on both sides — so rows fold
-    // on the compile identity and emit every name the members recorded
-    // (stow#551).
-    let mut seen = BTreeSet::new();
-    for dependency in direct_dependencies {
-        if !seen.insert((
-            dependency.crate_name.clone(),
-            dependency.version.clone(),
-            dependency.features.clone(),
-        )) {
-            continue;
-        }
-        let candidates =
-            load_cached_dependency_bundle_candidates(config, project, dependency, shape).await?;
-        let mut candidate_errors = Vec::new();
-        let mut selected_c_metadata = None;
-        for candidate in candidates {
-            let c_metadata = candidate.c_metadata.clone();
-            match collect_cached_bundle_closure(config, project, candidate, &mut bundles).await {
-                Ok(()) => {
-                    selected_c_metadata = Some(c_metadata);
-                    break;
-                }
-                Err(error) => {
-                    candidate_errors.push(error.to_string());
-                }
-            }
-        }
-        let c_metadata = selected_c_metadata.ok_or_else(|| {
-            let reason = if candidate_errors.is_empty() {
-                "no matching local semantic cache candidates".to_owned()
-            } else {
-                candidate_errors.join("; ")
-            };
-            stow_types::stow_error!(
-                "direct dependency {} {} cannot be satisfied from cached artifacts: {}",
-                dependency.crate_name,
-                dependency.version,
-                reason
-            )
-        })?;
-        direct_externs.extend(dependency.extern_names.iter().map(|extern_name| {
-            CachedDirectExtern {
-                extern_name: extern_name.clone(),
-                c_metadata: c_metadata.clone(),
-            }
-        }));
-    }
-
-    Ok(CachedDependencyPlan {
-        bundles,
-        direct_externs,
-    })
-}
-
-async fn load_cached_dependency_bundle_candidates(
-    config: &StowConfig,
-    project: &ProjectContext,
-    dependency: &SelectedRegistryDependency,
-    shape: &CachedDependencyShape,
-) -> stow_types::error::Result<Vec<crate::artifact_cache::CachedArtifactBundle>> {
-    let features_json = serde_json::to_string(&dependency.features)?;
-    let mut bundles = BTreeMap::<String, crate::artifact_cache::CachedArtifactBundle>::new();
-    for candidate in &shape.candidates {
-        let request = SemanticFetchRequest {
-            crate_name: dependency.crate_name.clone(),
-            version: dependency.version.to_string(),
-            features_json: features_json.clone(),
-            dependency_c_metadata_json: String::new(),
-            target: project.target.clone(),
-            rustc_version: project.rustc_version.clone(),
-            profile: cached_dependency_profile(),
-            emit: candidate.emit.clone(),
-            kind: candidate.kind.clone(),
-            crate_types: candidate.crate_types.clone(),
-        };
-        for bundle in
-            crate::artifact_cache::load_semantic_cached_bundle_candidates(config, &request).await?
-        {
-            if bundle.crate_version != dependency.version.to_string() {
-                continue;
-            }
-            bundles.entry(bundle.c_metadata.clone()).or_insert(bundle);
-        }
-    }
-    Ok(bundles.into_values().collect())
-}
-
-async fn collect_cached_bundle_closure(
-    config: &StowConfig,
-    project: &ProjectContext,
-    root: crate::artifact_cache::CachedArtifactBundle,
-    bundles: &mut BTreeMap<String, crate::artifact_cache::CachedArtifactBundle>,
-) -> stow_types::error::Result<()> {
-    let mut stack = vec![root];
-    let mut candidate_c_metadata = BTreeSet::<String>::new();
-    let mut candidate_bundles = Vec::new();
-    while let Some(bundle) = stack.pop() {
-        let c_metadata = bundle.c_metadata.clone();
-        if bundles.contains_key(&c_metadata) || candidate_c_metadata.contains(&c_metadata) {
-            continue;
-        }
-        let dependencies = cached_bundle_dependencies(&bundle)?;
-        candidate_c_metadata.insert(c_metadata.clone());
-        for dependency in dependencies {
-            if bundles.contains_key(&dependency.c_metadata)
-                || candidate_c_metadata.contains(&dependency.c_metadata)
-            {
-                continue;
-            }
-            let dependency_bundle = crate::artifact_cache::load_cached_bundle(
-                config,
-                &FetchRequest {
-                    target: &project.target,
-                    rustc_version: &project.rustc_version,
-                    c_metadata: &dependency.c_metadata,
-                },
-            )
-            .await?
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "cached artifact dependency {} ({}) referenced by {} is missing locally",
-                    dependency.crate_name,
-                    dependency.c_metadata,
-                    c_metadata
-                )
-            })?;
-            stack.push(dependency_bundle);
-        }
-        candidate_bundles.push(bundle);
-    }
-    for bundle in candidate_bundles {
-        bundles.insert(bundle.c_metadata.clone(), bundle);
-    }
-    Ok(())
-}
-
-fn cached_bundle_dependencies(
-    bundle: &crate::artifact_cache::CachedArtifactBundle,
-) -> stow_types::error::Result<Vec<DependencyCMetadataIdentity>> {
-    serde_json::from_str(&bundle.dependency_c_metadata_json).wrap_err_with(|| {
-        format!(
-            "parse cached dependency metadata for {} {} ({})",
-            bundle.crate_name, bundle.crate_version, bundle.c_metadata
-        )
-    })
-}
-
-/// The profile the generic top-crate pool is built under: cargo's default
-/// `dev` profile (`debug = true`, i.e. `debuginfo == 2`).
-///
-/// The prebuilt-dependency plan is matched verbatim against the stored
-/// `profile_json` in the local semantic cache, so it serves only artifacts
-/// from that pool; a workspace that tunes its dev profile takes its hits
-/// through the per-unit wrapper path, which derives the profile from the
-/// real rustc arguments.
-fn cached_dependency_profile() -> Profile {
-    Profile {
-        opt_level: "0".to_owned(),
-        debuginfo: 2,
-        debug_assertions: true,
-        overflow_checks: true,
-        panic: PanicStrategy::Unwind,
-        strip: stow_types::platform::StripLevel::None,
-    }
-}
-
-async fn materialize_cached_dependency_plan(
-    prebuilt_dir: &Path,
-    plan: &CachedDependencyPlan,
-) -> stow_types::error::Result<()> {
-    async_fs::create_dir_all(prebuilt_dir)
-        .await
-        .wrap_err_with(|| format!("create prebuilt dependency dir {}", prebuilt_dir.display()))?;
-    for bundle in plan.bundles.values() {
-        for output in &bundle.outputs {
-            let source_path = bundle.output_source_path(output);
-            let output_path = prebuilt_dir.join(&output.file_name);
-            inject::write_cached_output(
-                &source_path,
-                &output_path,
-                Some(&output.sha256),
-                inject::OutputDirWriters::StowOnly,
-            )
-            .await?;
-        }
-    }
-    Ok(())
-}
-
-/// The `(crate name, version)` of every package in the unit graph that has
-/// a build script — a `RunBuildScript` unit exists exactly for those.
-fn build_script_packages(units: &[stow_types::unit_graph::TaskUnit]) -> BTreeSet<(String, String)> {
-    units
-        .iter()
-        .filter(|unit| unit.key.kind == stow_types::unit_graph::TaskUnitKind::RunBuildScript)
-        .map(|unit| (unit.name.clone(), unit.version.clone()))
-        .collect()
-}
-
-/// The prebuilt-deps path compiles the top crate alone and runs no build
-/// script at all, so `build` cannot use a cached dependency whose package
-/// has one — its `cargo:` directives and `OUT_DIR` products would never be
-/// produced. `check` links nothing, so the set does not apply there.
-fn refuse_build_script_dependencies(
-    action: &str,
-    plan: &CachedDependencyPlan,
-    build_script_packages: &BTreeSet<(String, String)>,
-) -> stow_types::error::Result<()> {
-    if action != "build" {
-        return Ok(());
-    }
-
-    for bundle in plan.bundles.values() {
-        if build_script_packages
-            .contains(&(bundle.crate_name.clone(), bundle.crate_version.clone()))
-        {
-            return Err(stow_types::stow_error!(
-                "the prebuilt-deps path cannot build against {} {}: the crate has a build script, and this path runs none",
-                bundle.crate_name,
-                bundle.crate_version
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn top_crate_rustflags(
-    prebuilt_dir: &Path,
-    plan: &CachedDependencyPlan,
-    shape: &CachedDependencyShape,
-) -> stow_types::error::Result<Vec<String>> {
-    let mut flags = vec![format!(
-        "-Ldependency={}",
-        path_as_rustflag(prebuilt_dir, "prebuilt dependency dir")?
-    )];
-    for direct in &plan.direct_externs {
-        let bundle = plan.bundles.get(&direct.c_metadata).ok_or_else(|| {
-            stow_types::stow_error!(
-                "missing cached bundle for direct extern {}",
-                direct.extern_name
-            )
-        })?;
-        let output = preferred_direct_output(bundle, &shape.direct_preferred_media_types)
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "cached bundle for direct extern {} has no usable output; preferred media types: {}",
-                    direct.extern_name,
-                    shape.direct_preferred_media_types.join(", ")
-                )
-            })?;
-        let output_path = prebuilt_dir.join(&output.file_name);
-        let output_path = path_as_rustflag(&output_path, "prebuilt dependency output")?;
-        flags.push(format!("--extern={}={output_path}", direct.extern_name));
-    }
-    Ok(flags)
-}
-
-fn preferred_direct_output<'a>(
-    bundle: &'a crate::artifact_cache::CachedArtifactBundle,
-    media_types: &[&str],
-) -> Option<&'a stow_types::bundle::ArtifactBundleFile> {
-    media_types.iter().find_map(|media_type| {
-        bundle
-            .outputs
-            .iter()
-            .find(|output| output.media_type == *media_type)
-    })
-}
-
-fn path_as_rustflag(path: &Path, label: &str) -> stow_types::error::Result<String> {
-    let value = path
-        .to_str()
-        .ok_or_else(|| stow_types::stow_error!("{label} {} is not UTF-8", path.display()))?;
-    if value.chars().any(char::is_whitespace) {
-        return Err(stow_types::stow_error!(
-            "{label} {} contains whitespace and cannot be passed through RUSTFLAGS",
-            path.display()
-        ));
-    }
-    Ok(value.to_owned())
 }
 
 fn into_api_dependency(
@@ -3745,7 +3149,7 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
             percentage(analysis.expanded_cached, analysis.expanded_total),
         ),
         format!(
-            "  direct deps fully covered (top-crate fast path): {} / {} ({:.1}%)",
+            "  direct deps with cached artifacts: {} / {} ({:.1}%)",
             analysis.current_cached,
             analysis.current_total,
             percentage(analysis.current_cached, analysis.current_total),
@@ -3754,12 +3158,9 @@ fn render_prediction_summary(analysis: &WorkspacePrediction) -> String {
             .to_owned(),
         "    cached artifact's dependency_c_metadata_json to match the user's lockfile-resolved"
             .to_owned(),
-        "    transitive graph. Realized hits track the 'top-crate fast path' line, which engages"
+        "    transitive graph. Serving is per unit: every covered unit is injected and the"
             .to_owned(),
-        "    only when EVERY direct dep has a cached artifact (otherwise stow falls back to"
-            .to_owned(),
-        "    vanilla cargo). For arbitrary projects, populate the cache with `stow-admin"
-            .to_owned(),
+        "    rest compile. For arbitrary projects, populate the cache with `stow-admin".to_owned(),
         "    preheat top-binaries` against the matching binary lockfile.".to_owned(),
     ];
 
@@ -3936,118 +3337,6 @@ async fn create_workspace_mirror(
         })
     })
     .await
-}
-
-/// Replace every symlink on `manifest_path`'s chain inside the mirror with
-/// a real entry, so rewriting the mirror manifest can never reach the
-/// user's workspace.
-///
-/// The mirror is a directory of symlinks into the source workspace, so
-/// `mirror/<member>/Cargo.toml` resolves through the `mirror/<member>`
-/// link into the real member directory — a `remove_file` + `write` on it
-/// would delete and rewrite the user's own `Cargo.toml`. A directory link
-/// on the path is swapped for a real directory whose children re-point at
-/// the originals, and the manifest link itself for a real file copy; only
-/// the entries on the path are materialized, everything else stays a link.
-async fn materialize_mirror_manifest(
-    mirror: &WorkspaceMirror,
-    manifest_path: &Path,
-) -> stow_types::error::Result<()> {
-    let mirror_root = mirror.root().to_path_buf();
-    let manifest_path = manifest_path.to_path_buf();
-    smol::unblock(move || {
-        let relative = manifest_path.strip_prefix(&mirror_root).map_err(|_| {
-            stow_types::stow_error!(
-                "manifest {} is outside workspace mirror {}",
-                manifest_path.display(),
-                mirror_root.display()
-            )
-        })?;
-        let mut current = mirror_root.clone();
-        let mut components = relative.components().peekable();
-        while let Some(component) = components.next() {
-            current.push(component.as_os_str());
-            let is_symlink = std::fs::symlink_metadata(&current)
-                .wrap_err_with(|| format!("stat mirror entry {}", current.display()))?
-                .file_type()
-                .is_symlink();
-            if !is_symlink {
-                continue;
-            }
-            let target = resolve_mirror_symlink(&current)?;
-            if components.peek().is_some() {
-                materialize_mirror_directory(&current, &target)?;
-            } else {
-                remove_mirror_symlink(&current, false)
-                    .wrap_err_with(|| format!("remove manifest symlink {}", current.display()))?;
-                reflink::reflink_or_copy(&target, &current).wrap_err_with(|| {
-                    format!(
-                        "copy manifest {} into workspace mirror {}",
-                        target.display(),
-                        current.display()
-                    )
-                })?;
-            }
-        }
-        Ok(())
-    })
-    .await
-}
-
-/// Read a mirror symlink's target, resolving relative links against the
-/// link's own directory.
-fn resolve_mirror_symlink(link: &Path) -> stow_types::error::Result<PathBuf> {
-    let target = std::fs::read_link(link)
-        .wrap_err_with(|| format!("read mirror symlink {}", link.display()))?;
-    if target.is_absolute() {
-        return Ok(target);
-    }
-    let parent = link.parent().ok_or_else(|| {
-        stow_types::stow_error!("mirror symlink {} has no parent", link.display())
-    })?;
-    Ok(parent.join(target))
-}
-
-/// Swap `link` — a symlink to the real directory `target` — for a real
-/// directory whose children are symlinks to `target`'s entries.
-fn materialize_mirror_directory(link: &Path, target: &Path) -> stow_types::error::Result<()> {
-    let entries = std::fs::read_dir(target)
-        .wrap_err_with(|| format!("read directory {}", target.display()))?
-        .collect::<Result<Vec<_>, io::Error>>()
-        .wrap_err_with(|| format!("read directory {}", target.display()))?;
-    remove_mirror_symlink(link, true)
-        .wrap_err_with(|| format!("remove directory symlink {}", link.display()))?;
-    std::fs::create_dir(link)
-        .wrap_err_with(|| format!("create real directory {}", link.display()))?;
-    for entry in entries {
-        let destination = link.join(entry.file_name());
-        symlink_path(&entry.path(), &destination).wrap_err_with(|| {
-            format!(
-                "symlink {} into materialized mirror directory {}",
-                entry.path().display(),
-                destination.display()
-            )
-        })?;
-    }
-    Ok(())
-}
-
-/// Remove `link` itself without touching its target. Unix `unlink`s every
-/// symlink kind; Windows splits directory symlinks into `remove_dir`.
-fn remove_mirror_symlink(link: &Path, target_is_dir: bool) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let _ = target_is_dir;
-        std::fs::remove_file(link)
-    }
-    #[cfg(windows)]
-    {
-        if target_is_dir {
-            std::fs::remove_dir(link)
-        } else {
-            std::fs::remove_file(link)
-        }
-    }
 }
 
 async fn apply_selected_upgrades(
@@ -4514,7 +3803,6 @@ struct CargoRunPlan<'a> {
     /// for their pinned graph.
     deferred_analysis: bool,
     semantic_fallback_enabled: bool,
-    extra_rustflags: &'a [String],
     covered_units: usize,
     /// The heel sandbox cargo runs inside, `None` for the default
     /// unsandboxed build (stow#779).
@@ -4662,6 +3950,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         Some(spawn_build_enrichment(BuildEnrichment {
             project: project.clone(),
             config: config.clone(),
+            circuit: handler.circuit(),
             cell: analysis_cell,
             map_path: serve_map_path.clone(),
             policy_dir: cache_policy_path.clone(),
@@ -5196,15 +4485,13 @@ async fn export_wrapper_env(
         unit_nodes,
         prefetch_artifacts,
         semantic_fallback_enabled,
-        extra_rustflags,
         ..
     } = *plan;
     export_wrapper_shim_envs(envs, wrappers, &project.target);
-    // The extra rustc arguments ride a build file like the other
-    // workspace-sized payloads — on the prebuilt-deps path the list is
-    // one `--extern` per direct dependency (stow#625) — and a build with
-    // no stow config still writes this one.
-    let extra_args = rustc_wrapper_extra_args(source_root, extra_rustflags)?;
+    // The extra rustc arguments ride a build file like the run's other
+    // generated tables (stow#625) — and a build with no stow config still
+    // writes this one.
+    let extra_args = rustc_wrapper_extra_args(source_root)?;
     let extra_args_path =
         write_build_json_table(scratch_dir, "rustc-extra-args", extra_args).await?;
     envs.push((
@@ -5406,6 +4693,10 @@ struct BuildEnrichment {
     /// it would queue the user's real build behind a whole second
     /// resolve (stow#608).
     resolution_done: crate::ResolutionDone,
+    /// The build's circuit handle — tripped when the index fetch finds
+    /// the registry unreachable, releasing the plan path and in-flight
+    /// downloads to local compile at once (stow#977).
+    circuit: crate::circuit::BuildCircuit,
 }
 
 /// The policy gate's readiness latch for this build: pending only while
@@ -5523,7 +4814,25 @@ async fn run_build_enrichment(mut work: BuildEnrichment) -> stow_types::error::R
     // allow commit and the serve map's final write both follow it
     // (stow#788). `ensure_slice` memoizes, so the analysis below reuses
     // this pair.
-    let (slice, host_slice) = ensure_consumer_slices(&work.config, &work.project).await?;
+    let (slice, host_slice) = match ensure_consumer_slices(&work.config, &work.project).await {
+        Ok(slices) => slices,
+        Err(error) if error.is_transport() => {
+            // The registry answered nothing — one diagnostic, not a
+            // stall the build re-pays per unit: trip the breaker so the
+            // plan path stops offering remote serves and in-flight
+            // downloads abandon, then end the enrichment. The guards'
+            // drop settles `serve_map_ready` and the policy latch, so
+            // every waiter releases at once to local compile (stow#977).
+            work.circuit.trip(&work.config).await;
+            tracing::warn!(
+                registry = %work.config.registry_base_url,
+                error = %error,
+                "stow index registry is unreachable; this build runs local-only"
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
     // The policy gate commits as soon as the rows exist — before the
     // `resolution_done` gate and the second resolve. The marker is
     // name-keyed, so "the crate has any row the fetched slices carry"
@@ -5829,163 +5138,6 @@ fn cargo_target_dir(workspace_root: &Path, cargo_args: &[OsString], current_dir:
     workspace_root.join("target")
 }
 
-async fn strip_selected_manifest_dependencies(
-    project: &ProjectContext,
-    mirror: &WorkspaceMirror,
-) -> stow_types::error::Result<()> {
-    let manifest_path = mirror_manifest_path(project, mirror)?;
-    let source_manifest = async_fs::read_to_string(&project.manifest_path)
-        .await
-        .wrap_err_with(|| format!("read Cargo.toml {}", project.manifest_path.display()))?;
-    let mut document = source_manifest
-        .parse::<toml_edit::DocumentMut>()
-        .wrap_err_with(|| format!("parse Cargo.toml {}", project.manifest_path.display()))?;
-    let dependency_keys = collect_dependency_feature_references(document.as_table());
-    remove_dependency_tables(document.as_table_mut());
-    remove_dependency_feature_references(document.as_table_mut(), &dependency_keys);
-    materialize_mirror_manifest(mirror, &manifest_path).await?;
-    async_fs::remove_file(&manifest_path)
-        .await
-        .wrap_err_with(|| format!("remove mirrored manifest {}", manifest_path.display()))?;
-    async_fs::write(&manifest_path, document.to_string())
-        .await
-        .wrap_err_with(|| format!("write top-crate-only manifest {}", manifest_path.display()))
-}
-
-struct DependencyFeatureReferences {
-    all: BTreeSet<String>,
-    optional: BTreeSet<String>,
-}
-
-fn collect_dependency_feature_references(table: &toml_edit::Table) -> DependencyFeatureReferences {
-    let mut references = DependencyFeatureReferences {
-        all: BTreeSet::new(),
-        optional: BTreeSet::new(),
-    };
-    collect_dependency_feature_references_from_table_like(table, &mut references);
-    if let Some(targets) = table.get("target").and_then(toml_edit::Item::as_table_like) {
-        for (_, item) in targets.iter() {
-            if let Some(target_table) = item.as_table_like() {
-                collect_dependency_feature_references_from_table_like(
-                    target_table,
-                    &mut references,
-                );
-            }
-        }
-    }
-    references
-}
-
-fn collect_dependency_feature_references_from_table_like(
-    table: &dyn toml_edit::TableLike,
-    references: &mut DependencyFeatureReferences,
-) {
-    for section_name in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        let Some(section) = table
-            .get(section_name)
-            .and_then(toml_edit::Item::as_table_like)
-        else {
-            continue;
-        };
-        for (key, item) in section.iter() {
-            references.all.insert(key.to_owned());
-            if dependency_item_is_optional(item) {
-                references.optional.insert(key.to_owned());
-            }
-        }
-    }
-}
-
-fn dependency_item_is_optional(item: &toml_edit::Item) -> bool {
-    item.as_table_like()
-        .and_then(|table| table.get("optional"))
-        .and_then(toml_edit::Item::as_bool)
-        .unwrap_or(false)
-}
-
-async fn regenerate_mirror_lockfile(
-    project: &ProjectContext,
-    mirror: &WorkspaceMirror,
-) -> stow_types::error::Result<()> {
-    let manifest_path = mirror_manifest_path(project, mirror)?;
-    let output = Command::new("cargo")
-        .arg("generate-lockfile")
-        .arg("--offline")
-        .arg("--manifest-path")
-        .arg(&manifest_path)
-        .current_dir(mirror.current_dir())
-        .output()
-        .await
-        .wrap_err("regenerate top-crate-only mirror lockfile")?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(stow_types::stow_error!(
-        "regenerate top-crate-only mirror lockfile failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    ))
-}
-
-fn remove_dependency_feature_references(
-    table: &mut toml_edit::Table,
-    dependency_keys: &DependencyFeatureReferences,
-) {
-    let Some(features) = table
-        .get_mut("features")
-        .and_then(toml_edit::Item::as_table_like_mut)
-    else {
-        return;
-    };
-    for (_, item) in features.iter_mut() {
-        let Some(array) = item.as_array_mut() else {
-            continue;
-        };
-        array.retain(|value| {
-            value
-                .as_str()
-                .is_none_or(|feature| !feature_references_dependency(feature, dependency_keys))
-        });
-    }
-}
-
-fn feature_references_dependency(
-    feature: &str,
-    dependency_keys: &DependencyFeatureReferences,
-) -> bool {
-    if let Some(dependency) = feature.strip_prefix("dep:") {
-        return dependency_keys.all.contains(dependency);
-    }
-    if let Some((dependency, _)) = feature.split_once('/') {
-        return dependency_keys
-            .all
-            .contains(dependency.trim_end_matches('?'));
-    }
-    dependency_keys.optional.contains(feature)
-}
-
-/// Strip the dependency tables the prebuilt closure replaces, and only those.
-///
-/// `[build-dependencies]` stays: the closure supplies runtime `--extern`
-/// flags for the crate being compiled, and nothing at all for `build.rs`,
-/// which cargo still compiles and runs. Removing them left hyperfine's build
-/// script unable to find `clap_complete` and failed the build outright.
-///
-/// `[dev-dependencies]` stays for the same reason — a target that needs them
-/// is compiled by cargo, not served from the closure.
-fn remove_dependency_tables(table: &mut toml_edit::Table) {
-    table.remove("dependencies");
-    if let Some(targets) = table
-        .get_mut("target")
-        .and_then(toml_edit::Item::as_table_like_mut)
-    {
-        for (_, item) in targets.iter_mut() {
-            if let Some(target_table) = item.as_table_like_mut() {
-                target_table.remove("dependencies");
-            }
-        }
-    }
-}
-
 fn resolve_user_path(current_dir: &Path, raw: &str) -> PathBuf {
     let path = PathBuf::from(raw);
     if path.is_absolute() {
@@ -6059,23 +5211,19 @@ fn unsupported_public_cache_reason(rustc_version: &str) -> Option<&'static str> 
     }
 }
 
-/// The rustc arguments a supervised run appends to every unit: the
-/// workspace path remap plus any flags the run itself selected. They
-/// travel through the file [`rustc_args::STOW_RUSTC_EXTRA_ARGS_FILE_ENV`]
-/// names — which the rustc wrapper appends to each unit's argv — rather
-/// than `RUSTFLAGS`, where cargo's precedence rules would discard the
-/// user's `.cargo/config.toml` `target.*.rustflags` for the whole build.
-fn rustc_wrapper_extra_args(
-    source_root: &Path,
-    extra_rustflags: &[String],
-) -> stow_types::error::Result<Vec<String>> {
+/// The rustc argument a supervised run appends to every unit: the
+/// workspace path remap. It travels through the file
+/// [`rustc_args::STOW_RUSTC_EXTRA_ARGS_FILE_ENV`] names — which the rustc
+/// wrapper appends to each unit's argv — rather than `RUSTFLAGS`, where
+/// cargo's precedence rules would discard the user's `.cargo/config.toml`
+/// `target.*.rustflags` for the whole build.
+fn rustc_wrapper_extra_args(source_root: &Path) -> stow_types::error::Result<Vec<String>> {
     let source_root = source_root.to_str().ok_or_else(|| {
         stow_types::stow_error!("workspace root {} is not UTF-8", source_root.display())
     })?;
-    let remap_flag = format!("--remap-path-prefix={source_root}=stow-ci://workspace");
-    Ok(std::iter::once(remap_flag)
-        .chain(extra_rustflags.iter().cloned())
-        .collect())
+    Ok(vec![format!(
+        "--remap-path-prefix={source_root}=stow-ci://workspace"
+    )])
 }
 
 #[cfg(unix)]
@@ -6096,16 +5244,13 @@ fn symlink_path(source: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::build_serve_map;
-    use super::{
-        CachedDependencyPlan, CargoRunPlan, MetadataArgs, MoldSelection, ProjectContext,
-        PublicCacheMode, WorkspaceMirror, build_script_packages, cached_dependency_profile,
-        feature_references_dependency, refuse_build_script_dependencies, relative_path,
-        rewrite_args_for_mirror, rewrite_args_for_root,
-    };
     #[cfg(unix)]
-    use super::{create_workspace_mirror, strip_selected_manifest_dependencies};
+    use super::create_workspace_mirror;
+    use super::{
+        CargoRunPlan, MetadataArgs, MoldSelection, ProjectContext, PublicCacheMode,
+        WorkspaceMirror, relative_path, rewrite_args_for_mirror, rewrite_args_for_root,
+    };
     use crate::prefetch::PrefetchArtifact;
-    use std::collections::BTreeSet;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -6343,200 +5488,6 @@ mod tests {
         );
     }
 
-    /// A plan whose only bundle is a `serde` cached artifact.
-    fn single_serde_bundle_plan() -> CachedDependencyPlan {
-        CachedDependencyPlan {
-            bundles: [(
-                "build-script-dep".to_owned(),
-                crate::artifact_cache::CachedArtifactBundle {
-                    provenance: crate::artifact_cache::ArtifactProvenance::Remote,
-                    oci_reference: String::new(),
-                    oci_digest: String::new(),
-                    compile_key: String::new(),
-                    crate_name: "serde".to_owned(),
-                    crate_version: "1.0.228".to_owned(),
-                    c_metadata: "build-script-dep".to_owned(),
-                    features_json: String::new(),
-                    dependency_c_metadata_json: "[]".to_owned(),
-                    dependency_compile_keys_json: "[]".to_owned(),
-                    dependency_instances_json: "[]".to_owned(),
-                    compile_millis: 0,
-                    size_bytes: 0,
-                    profile: cached_dependency_profile(),
-                    emit: Vec::new(),
-                    kind: stow_types::artifact::ArtifactKind::Rlib,
-                    crate_types: vec![stow_types::artifact::RustCrateType::Lib],
-                    outputs: Vec::new(),
-                    sigstore_signatures: Vec::new(),
-                    entry_dir: PathBuf::new(),
-                    rustc_version: "1.91.1".to_owned(),
-                    cache_key: String::new(),
-                    verified_marker_version: None,
-                    verified_marker_policy: None,
-                    _lease_lock: tempfile::tempfile().expect("temp lease"),
-                },
-            )]
-            .into(),
-            direct_externs: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn top_crate_check_accepts_a_build_script_dependency() {
-        let plan = single_serde_bundle_plan();
-        let build_script_packages = BTreeSet::from([("serde".to_owned(), "1.0.228".to_owned())]);
-
-        refuse_build_script_dependencies("check", &plan, &build_script_packages)
-            .expect("check links nothing, so a build-script dependency is fine");
-    }
-
-    #[test]
-    fn top_crate_build_refuses_a_build_script_dependency() {
-        let plan = single_serde_bundle_plan();
-        let build_script_packages = BTreeSet::from([("serde".to_owned(), "1.0.228".to_owned())]);
-
-        let error = refuse_build_script_dependencies("build", &plan, &build_script_packages)
-            .expect_err("build must refuse a dependency whose package has a build script");
-        assert!(error.to_string().contains("serde 1.0.228"), "{error}");
-
-        refuse_build_script_dependencies("build", &plan, &BTreeSet::new())
-            .expect("no build-script packages means nothing to refuse");
-    }
-
-    #[test]
-    fn build_script_packages_names_run_build_script_packages() {
-        let unit = |kind: stow_types::unit_graph::TaskUnitKind, name: &str, version: &str| {
-            stow_types::unit_graph::TaskUnit {
-                key: stow_types::unit_graph::TaskUnitKey {
-                    pkg: format!(
-                        "registry+https://github.com/rust-lang/crates.io-index#{name}@{version}"
-                    ),
-                    platform: "aarch64-apple-darwin".to_owned(),
-                    side: stow_types::unit_graph::TaskUnitSide::Target,
-                    kind,
-                },
-                name: name.to_owned(),
-                version: version.to_owned(),
-                features: Vec::new(),
-                is_crates_io: true,
-                deps: Vec::new(),
-            }
-        };
-        let units = vec![
-            unit(
-                stow_types::unit_graph::TaskUnitKind::Lib,
-                "serde",
-                "1.0.228",
-            ),
-            unit(
-                stow_types::unit_graph::TaskUnitKind::BuildScript,
-                "serde",
-                "1.0.228",
-            ),
-            unit(
-                stow_types::unit_graph::TaskUnitKind::RunBuildScript,
-                "serde",
-                "1.0.228",
-            ),
-        ];
-
-        assert_eq!(
-            build_script_packages(&units),
-            BTreeSet::from([("serde".to_owned(), "1.0.228".to_owned())])
-        );
-        assert!(build_script_packages(&units[..2]).is_empty());
-    }
-
-    #[test]
-    fn manifest_feature_pruning_keeps_local_feature_matching_required_dependency() {
-        let dependency_keys = super::DependencyFeatureReferences {
-            all: BTreeSet::from(["std".to_owned(), "serde".to_owned()]),
-            optional: BTreeSet::from(["serde".to_owned()]),
-        };
-
-        assert!(!feature_references_dependency("std", &dependency_keys));
-        assert!(feature_references_dependency("serde", &dependency_keys));
-        assert!(feature_references_dependency("dep:std", &dependency_keys));
-        assert!(feature_references_dependency(
-            "std?/alloc",
-            &dependency_keys
-        ));
-    }
-
-    /// The mirror's `member` entry is a symlink into the real workspace, so
-    /// a naive rewrite of `mirror/member/Cargo.toml` lands in the user's
-    /// own manifest. The strip must materialize the path inside the mirror
-    /// first: the member entry becomes a real directory and the manifest a
-    /// real file, and the original bytes stay untouched.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn manifest_strip_never_writes_through_the_mirror_symlink() {
-        let temp = tempfile::tempdir().expect("temp workspace");
-        let workspace = temp.path();
-        std::fs::write(
-            workspace.join("Cargo.toml"),
-            "[workspace]\nmembers = [\"member\"]\n",
-        )
-        .expect("write workspace manifest");
-        let member = workspace.join("member");
-        std::fs::create_dir(&member).expect("create member dir");
-        let manifest_source =
-            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n";
-        std::fs::write(member.join("Cargo.toml"), manifest_source).expect("write member manifest");
-
-        let project = ProjectContext {
-            action: "check".to_owned(),
-            cargo_args: Vec::new(),
-            workspace_root: workspace.to_path_buf(),
-            current_dir: member.clone(),
-            current_dir_relative: PathBuf::from("member"),
-            manifest_path: member.join("Cargo.toml"),
-            metadata_args: MetadataArgs::default(),
-            target: "aarch64-apple-darwin".to_owned(),
-            target_given: false,
-            host_target: "aarch64-apple-darwin".to_owned(),
-            rustc_version: "1.91.1".to_owned(),
-            mold: MoldSelection::resolved(Vec::new()),
-            env_base: None,
-            build_rustc: crate::rustc_args::BuildRustc::ToolchainDefault,
-            foreground: crate::derive_gate::ForegroundHold::detached(),
-        };
-        let mirror = create_workspace_mirror(&project, &project.workspace_root)
-            .await
-            .expect("create workspace mirror");
-
-        strip_selected_manifest_dependencies(&project, &mirror)
-            .await
-            .expect("strip manifest in mirror");
-
-        assert_eq!(
-            std::fs::read_to_string(member.join("Cargo.toml")).expect("read member manifest"),
-            manifest_source,
-            "the user's real manifest must be untouched"
-        );
-        let mirror_member = mirror.root().join("member");
-        assert!(
-            std::fs::symlink_metadata(&mirror_member)
-                .expect("mirror member metadata")
-                .is_dir(),
-            "mirror member must be materialized as a real directory"
-        );
-        let mirror_manifest = mirror_member.join("Cargo.toml");
-        assert!(
-            !std::fs::symlink_metadata(&mirror_manifest)
-                .expect("mirror manifest metadata")
-                .file_type()
-                .is_symlink(),
-            "mirror manifest must be a real file, not a link into the workspace"
-        );
-        let stripped = std::fs::read_to_string(&mirror_manifest).expect("read mirror manifest");
-        assert!(stripped.contains("[package]"));
-        assert!(
-            !stripped.contains("serde"),
-            "mirror manifest lost its dependency table: {stripped}"
-        );
-    }
-
     /// A `MoldSelection` a test completes by hand: the provisioning is
     /// the oneshot's send, so the reader waits exactly until the test
     /// releases it.
@@ -6619,7 +5570,6 @@ mod tests {
                 inexact_entries: None,
                 deferred_analysis: false,
                 semantic_fallback_enabled: false,
-                extra_rustflags: &[],
                 covered_units: 0,
                 sandbox: None,
             };
@@ -7191,6 +6141,7 @@ mod tests {
                         format!("feature-{index}"),
                         format!("a-longer-feature-name-{index}"),
                     ],
+                    profile: None,
                 })
                 .collect(),
         }
@@ -7255,7 +6206,6 @@ mod tests {
             inexact_entries: None,
             semantic_fallback_enabled: true,
             deferred_analysis: false,
-            extra_rustflags: &[],
             covered_units: ledger.len(),
             sandbox: None,
         };

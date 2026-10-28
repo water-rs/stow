@@ -851,7 +851,7 @@ mod tests {
         let (mut restored, tail) = load(&db).await.expect("load");
         assert!(tail.is_empty(), "snapshot covered the whole log");
         apply_events(&mut restored, &tail);
-        assert_eq!(restored.status_counts(), graph.status_counts());
+        assert_eq!(restored.status(), graph.status());
         let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
         assert_eq!(claimed[0].task_id, id("b"));
     }
@@ -948,7 +948,7 @@ mod tests {
         let (mut restored, tail) = load(&db).await.expect("load");
         assert!(tail.is_empty());
         apply_events(&mut restored, &tail);
-        assert_eq!(restored.status_counts(), graph.status_counts());
+        assert_eq!(restored.status(), graph.status());
         assert_eq!(restored.sizes(), graph.sizes());
         let claimed = restored.claim(45, 16, 20_000, 3_600_000).expect("claim b");
         assert_eq!(claimed[0].task_id, id("b"));
@@ -1086,7 +1086,7 @@ mod tests {
         apply_events(&mut restored, &tail);
         // The claim replays as dispatched-unbound — no dispatch is lost
         // and nothing re-dispatches.
-        assert_eq!(restored.status_counts()["dispatched"], 1);
+        assert_eq!(restored.status().dispatched, 1);
         // The post-wake status reconcile binds by run title, and a
         // run listed `in_progress` moves the claim to `running`
         // (stow#940).
@@ -1099,10 +1099,10 @@ mod tests {
             }],
             200,
         );
-        assert_eq!(restored.status_counts()["running"], 1);
+        assert_eq!(restored.status().running, 1);
         let outcome = restored.run_finished(&id("solo"), 4242, true, false, None, 300);
         assert_eq!(outcome, super::super::graph::FinishOutcome::Applied);
-        assert_eq!(restored.status_counts()["completed"], 1);
+        assert_eq!(restored.status().completed, 1);
     }
 
     #[tokio::test]
@@ -1144,7 +1144,7 @@ mod tests {
         append_events(&db, &events, 0).await.expect("deliveries");
         let (mut restored, tail) = load(&db).await.expect("wake");
         apply_events(&mut restored, &tail);
-        assert_eq!(restored.status_counts()["completed"], 1);
+        assert_eq!(restored.status().completed, 1);
     }
 
     /// A submit whose tail was cut mid-parts never reached its ack, so a

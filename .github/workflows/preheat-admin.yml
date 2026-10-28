@@ -113,6 +113,9 @@ jobs:
           LIMIT: ${{ inputs.limit }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
           TARGETS: ${{ inputs.targets }}
+          # Resolver scratch (source trees, submodules) goes on the
+          # runner's disk: /tmp is size-capped on the image (#972).
+          TMPDIR: ${{ runner.temp }}
         # The lane fetches the crates.io database dump once — the
         # ranking and the binary check come from it — then resolves one
         # `.crate` tarball per binary for the whole matrix, so the lane
@@ -132,6 +135,7 @@ jobs:
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           RUSTC_VERSION: ${{ inputs.rustc_version }}
           TARGETS: ${{ inputs.targets }}
+          TMPDIR: ${{ runner.temp }}
         # One codeload tarball per repository resolved in-process, and
         # each repository's tasks post right after it resolves — a token
         # or network failure mid-lane keeps everything before it.

@@ -698,7 +698,7 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
     let base = registry_base()?;
-    let http = stow_oci::RegistryHttp::new().await?;
+    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let repository = cache_repository(&rustc_version);
     let session = base.session(&repository, &http);
     let trust = records_trust().await?;
@@ -928,7 +928,7 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
             publish_index_mock(&args.file, &args.folded, &private_key_path).await?
         } else {
             let credentials = stow_oci::RegistryCredentials::from_env()?;
-            let http = stow_oci::RegistryHttp::new().await?;
+            let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
             let outcome = stow_oci::publish_index(
                 &credentials,
                 &http,
@@ -1269,7 +1269,7 @@ async fn index_join(args: IndexJoinArgs) -> stow_types::error::Result<()> {
     .map_err(|error| stow_error!("analytics engine: {error}"))?;
 
     let base = registry_base()?;
-    let http = stow_oci::RegistryHttp::new().await?;
+    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let trust = records_trust().await?;
     let mut slices = Vec::new();
     for version in &args.rustc_versions {

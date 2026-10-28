@@ -32,11 +32,17 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
 const DEFAULT_CIRCUIT_TRIP_THRESHOLD: u32 = 5;
-const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+pub const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// How long a verified index slice's pointer stays fresh before the next
 /// read re-checks the tag — `STOW_INDEX_REFRESH_SECS`, config
 /// `index_refresh_secs`, default ten minutes.
 const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
+/// The consumer's registry connect bound: an unreachable registry
+/// answers in seconds, and its connect/DNS failure never joins the
+/// retry sweep — the build's circuit carries the outage instead of
+/// eight stalled attempts (stow#977). Publishing keeps
+/// [`stow_oci::TransportPolicy::PATIENT`].
+const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
     pub edge_url: String,
@@ -151,7 +157,12 @@ impl StowConfig {
     pub async fn registry_http(&self) -> stow_types::error::Result<stow_oci::RegistryHttp> {
         let http = self
             .registry_http
-            .get_or_try_init(stow_oci::RegistryHttp::new)
+            .get_or_try_init(|| {
+                stow_oci::RegistryHttp::new(stow_oci::TransportPolicy {
+                    connect_timeout: Some(REGISTRY_CONNECT_TIMEOUT),
+                    retry_connect_failures: false,
+                })
+            })
             .await?;
         Ok(http.clone())
     }
@@ -359,6 +370,14 @@ impl StowConfig {
 
     pub fn artifact_cache_purge_root(&self) -> PathBuf {
         self.cache_dir.join("purge")
+    }
+
+    /// The directory the C/C++ object cache lives in — `<key>.o` files
+    /// the `cc`/`cxx` shims store and serve, each with a
+    /// `cc_cache_entries` row in the state database's shared LRU
+    /// (stow#980).
+    pub fn cc_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("cc")
     }
 }
 

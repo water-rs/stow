@@ -11,12 +11,11 @@ pub use stow_types::rustc::ParsedRustcArgs;
 pub const STOW_PUBLIC_CACHE_RUSTC_VERSION_ENV: &str = "STOW_PUBLIC_CACHE_RUSTC_VERSION";
 pub const STOW_PUBLIC_CACHE_TARGET_ENV: &str = "STOW_PUBLIC_CACHE_TARGET";
 
-/// Env channel carrying the rustc arguments a `stow`-supervised cargo run
-/// appends to every unit — the workspace path remap plus any flags the run
-/// itself selected. It names a JSON `Vec<String>` build file rather than
-/// carrying the list itself: on the prebuilt-deps path the list is one
-/// `--extern` per direct dependency, which a workspace-sized project can
-/// grow past `execve`'s per-string limit (stow#625). A private channel
+/// Env channel carrying the rustc argument a `stow`-supervised cargo run
+/// appends to every unit — the workspace path remap. It names a JSON
+/// `Vec<String>` build file rather than carrying the list itself — the
+/// same file-table channel the build's other generated payloads use
+/// (stow#625). A private channel
 /// rather than `RUSTFLAGS`, because env rustflags replace the user's
 /// configured rustflags outright: assigning `RUSTFLAGS` would make cargo
 /// ignore `.cargo/config.toml` `target.*.rustflags` — the usual way

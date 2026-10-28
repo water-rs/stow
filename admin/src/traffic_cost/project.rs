@@ -15,8 +15,10 @@
 //! **Traffic** multiplies the launch model's per-event monthly counts by
 //! the per-event costs measured in the same run. Nothing it reads is a
 //! checked-in constant: the reports' `*_budget` columns carry the budget
-//! each row was measured against, Worker CPU per event is the profiler's
-//! measurement (`cpu.rs`), and the allowances come from `watchdog`'s
+//! each row was measured against, Worker CPU per event and its budget
+//! are the profiler's report (`cpu.rs`) — both in that run's
+//! milliseconds, the budget converted from its relative row by the run's
+//! reference workload — and the allowances come from `watchdog`'s
 //! single allowance table.
 //!
 //! **Preheat** (`preheat.rs`) adds, to each product the Preheat cost
@@ -45,7 +47,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
-use stow_types::do_budgets::{ALLOWANCE_FRACTION, PREHEAT_BUDGET, WORKER_CPU_BUDGETS};
+use stow_types::do_budgets::{ALLOWANCE_FRACTION, PREHEAT_BUDGET};
 use stow_types::forwards::{self, RunForwards};
 use stow_types::launch_model::{EventKind, LaunchModel};
 use stow_types::preheat_cost::{PreheatCostReport, ProductionWave};
@@ -651,7 +653,8 @@ pub struct RouteCpu {
     /// Measured CPU milliseconds per event (Σ over its lanes).
     pub measured_ms_per_event: f64,
     /// Budgeted CPU milliseconds per event (Σ over its lanes'
-    /// `WORKER_CPU_BUDGETS` rows).
+    /// `WORKER_CPU_BUDGETS` rows, each in the run's milliseconds: the
+    /// relative budget times the run's reference).
     pub budget_ms_per_event: f64,
     /// Projected monthly CPU milliseconds at the measured figure.
     pub projected_ms: f64,
@@ -714,15 +717,6 @@ struct Projection {
     unmeasured_cpu: Vec<UnmeasuredCpu>,
 }
 
-/// A lane's CPU budget per event, from `WORKER_CPU_BUDGETS`.
-fn lane_budget_ms(lane: &str) -> Result<f64, String> {
-    WORKER_CPU_BUDGETS
-        .iter()
-        .find(|budget| budget.lane == lane)
-        .map(|budget| budget.cpu_ms)
-        .ok_or_else(|| format!("lane `{lane}` has no WORKER_CPU_BUDGETS row"))
-}
-
 /// Fold the event kind's Worker CPU price into the projection and
 /// return the CPU milliseconds one event costs across its lanes.
 fn fold_cpu(
@@ -737,7 +731,7 @@ fn fold_cpu(
             let mut budget_ms = 0.0;
             for (lane, events) in lanes {
                 kind_cpu_ms = events.mul_add(cpu.lane_cpu_ms(lane)?, kind_cpu_ms);
-                budget_ms = events.mul_add(lane_budget_ms(lane)?, budget_ms);
+                budget_ms = events.mul_add(cpu.lane_budget_ms(lane)?, budget_ms);
             }
             projection.worker_cpu_ms_at_budget =
                 monthly.mul_add(budget_ms, projection.worker_cpu_ms_at_budget);

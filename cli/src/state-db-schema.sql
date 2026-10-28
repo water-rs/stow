@@ -80,6 +80,19 @@ CREATE TABLE artifact_cache_sigstore_signatures (
         ON DELETE CASCADE
 );
 
+-- stow#980: one row per C/C++ object under `cache_dir/cc/` — the file is
+-- `<cache_key>.o` — so `evict_entries` serves the objects under the same
+-- `artifact_cache_max_bytes` budget and LRU as `artifact_cache_entries`.
+-- A store inserts the row; a hit bumps `last_accessed_ms`.
+CREATE TABLE cc_cache_entries (
+    cache_key TEXT PRIMARY KEY,
+    size_bytes INTEGER NOT NULL,
+    last_accessed_ms INTEGER NOT NULL
+);
+
+CREATE INDEX idx_cc_cache_entries_lru
+ON cc_cache_entries (last_accessed_ms, cache_key);
+
 CREATE TABLE metadata_values (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL

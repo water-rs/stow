@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -5,7 +6,9 @@ use async_process::Command;
 use sha2::{Digest, Sha256};
 use stow_types::error::Context;
 
+use crate::artifact_cache::{LRU_STAMP_INTERVAL_MS, recorded_millis};
 use crate::config::StowConfig;
+use crate::state_db::{db_int, now_millis};
 
 /// Which language the compiler shim was invoked for — the two roles resolve
 /// to different POSIX defaults and the same `cl.exe` on Windows.
@@ -307,9 +310,7 @@ pub async fn try_compile(
     }
 
     if cache_path.exists() {
-        let object = async_fs::read(&cache_path)
-            .await
-            .wrap_err_with(|| format!("read cached object {}", cache_path.display()))?;
+        record_cc_hit(config, &cache_key, &cache_path).await?;
         if let Some(parent) = parsed.output_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -317,9 +318,9 @@ pub async fn try_compile(
                 .await
                 .wrap_err_with(|| format!("create C output directory {}", parent.display()))?;
         }
-        async_fs::write(&parsed.output_path, object)
-            .await
-            .wrap_err_with(|| format!("write cached object {}", parsed.output_path.display()))?;
+        let source = cache_path.clone();
+        let output = parsed.output_path.clone();
+        smol::unblock(move || serve_cached_object_blocking(&source, &output)).await?;
         return Ok(CcOutcome::Hit {
             cache_key,
             output_path: parsed.output_path,
@@ -376,20 +377,275 @@ fn expand_response_arg(
     Ok(())
 }
 
+/// Store a freshly compiled object under its cache key: clone it into a
+/// uniquely named file beside the key, then rename that into place, so a
+/// concurrent lookup sees either no object or a complete one (stow#837).
+/// The first writer wins; a later store of the same key leaves it alone.
+///
+/// The published object joins `cc_cache_entries` — the shared
+/// `artifact_cache_max_bytes` LRU the rustc entries live under
+/// (stow#980) — and the post-store eviction pass runs against the whole
+/// cache.
 pub async fn store_compiled_object(
+    config: &StowConfig,
     cache_path: &Path,
     output_path: &Path,
 ) -> stow_types::error::Result<()> {
-    let object = async_fs::read(output_path)
+    let cache_key = cache_path
+        .file_stem()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            stow_types::stow_error!(
+                "C object cache path {} has no cache-key file name",
+                cache_path.display()
+            )
+        })?
+        .to_owned();
+    let cache_path = cache_path.to_path_buf();
+    let output_path = output_path.to_path_buf();
+    let staged_path = cache_path.clone();
+    smol::unblock(move || stage_compiled_object_blocking(&staged_path, &output_path)?.publish())
+        .await?;
+    let size_bytes = async_fs::metadata(&cache_path)
         .await
-        .wrap_err_with(|| format!("read compiled object {}", output_path.display()))?;
-    async_fs::write(cache_path, object)
-        .await
-        .wrap_err_with(|| format!("write compiled object cache {}", cache_path.display()))
+        .wrap_err_with(|| format!("stat stored C/C++ object {}", cache_path.display()))?
+        .len();
+    let connection = config.state_db_pool().await?;
+    upsert_cc_cache_entry(&connection, &cache_key, size_bytes, now_millis()).await?;
+    crate::artifact_cache::evict_after_cc_store(config, &connection, &cache_key).await
+}
+
+/// How a file reached its destination: a copy-on-write clone sharing the
+/// source's blocks, or a byte copy on a filesystem that cannot clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    Cloned,
+    Copied,
+}
+
+/// Clone `source` to the not-yet-existing `destination` (APFS
+/// `clonefile`, Linux `FICLONE`), copying only where the filesystem cannot
+/// clone.
+fn clone_or_copy(source: &Path, destination: &Path) -> std::io::Result<Placement> {
+    let placement = match reflink_copy::reflink_or_copy(source, destination)? {
+        None => Placement::Cloned,
+        Some(_) => Placement::Copied,
+    };
+    if placement == Placement::Copied {
+        tracing::debug!(
+            source = %source.display(),
+            destination = %destination.display(),
+            "filesystem cannot clone; copied C/C++ object bytes"
+        );
+    }
+    Ok(placement)
+}
+
+/// A compiled object cloned into the cache directory under a temporary
+/// name, not yet visible at its cache key.
+struct StagedObject {
+    staged: tempfile::NamedTempFile<Placement>,
+    cache_path: PathBuf,
+}
+
+impl StagedObject {
+    /// Rename the staged object onto its cache key unless another writer
+    /// got there first; either way the key then holds a complete object.
+    fn publish(self) -> stow_types::error::Result<()> {
+        match self.staged.persist_noclobber(&self.cache_path) {
+            Ok(_) => Ok(()),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(
+                stow_types::error::Error::from(error.error).wrap_err(format!(
+                    "move compiled object into cache at {}",
+                    self.cache_path.display()
+                )),
+            ),
+        }
+    }
+}
+
+fn stage_compiled_object_blocking(
+    cache_path: &Path,
+    output_path: &Path,
+) -> stow_types::error::Result<StagedObject> {
+    let cache_dir = cache_path.parent().ok_or_else(|| {
+        stow_types::stow_error!("C object cache path {} has no parent", cache_path.display())
+    })?;
+    let staged = tempfile::Builder::new()
+        .prefix(".stage-")
+        .suffix(".o")
+        .make_in(cache_dir, |staged| clone_or_copy(output_path, staged))
+        .wrap_err_with(|| {
+            format!(
+                "stage compiled object {} in C object cache {}",
+                output_path.display(),
+                cache_dir.display()
+            )
+        })?;
+    Ok(StagedObject {
+        staged,
+        cache_path: cache_path.to_path_buf(),
+    })
+}
+
+/// Serve a cached object: replace whatever sits at `output_path` with a
+/// clone of the cache entry.
+fn serve_cached_object_blocking(
+    cache_path: &Path,
+    output_path: &Path,
+) -> stow_types::error::Result<Placement> {
+    match std::fs::remove_file(output_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(stow_types::error::Error::from(error)
+                .wrap_err(format!("remove stale object {}", output_path.display())));
+        }
+    }
+    clone_or_copy(cache_path, output_path).wrap_err_with(|| {
+        format!(
+            "serve cached object {} into {}",
+            cache_path.display(),
+            output_path.display()
+        )
+    })
 }
 
 fn cc_cache_path(config: &StowConfig, cache_key: &str) -> PathBuf {
-    config.cache_dir.join("cc").join(format!("{cache_key}.o"))
+    cc_object_path(&config.cc_cache_dir(), cache_key)
+}
+
+/// The object file `cache_key` is stored at inside the C/C++ object
+/// cache directory — `cc_dir` is `StowConfig::cc_cache_dir`.
+pub fn cc_object_path(cc_dir: &Path, cache_key: &str) -> PathBuf {
+    cc_dir.join(format!("{cache_key}.o"))
+}
+
+/// A `cc_cache_entries` row for the shared LRU: the object file's size
+/// and its last-access stamp.
+pub struct CcCacheIndexEntry {
+    pub size_bytes: u64,
+    pub last_accessed_ms: u64,
+}
+
+/// Every C/C++ object's row — the `cc/` half of the candidate list
+/// `evict_entries` orders.
+pub async fn list_cc_cache_entries(
+    connection: &sqlx::SqlitePool,
+) -> stow_types::error::Result<BTreeMap<String, CcCacheIndexEntry>> {
+    let rows = sqlx::query_as::<_, (String, i64, i64)>(
+        "SELECT cache_key, size_bytes, last_accessed_ms FROM cc_cache_entries",
+    )
+    .fetch_all(connection)
+    .await?;
+    let mut entries = BTreeMap::new();
+    for (cache_key, size_bytes, last_accessed_ms) in rows {
+        entries.insert(
+            cache_key,
+            CcCacheIndexEntry {
+                size_bytes: db_int(size_bytes, "cc cache entry size_bytes")?,
+                last_accessed_ms: db_int(last_accessed_ms, "cc cache entry last_accessed_ms")?,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+/// Remove an object's row — `evict_entries` deletes the file itself.
+pub async fn delete_cc_cache_entry(
+    connection: &sqlx::SqlitePool,
+    cache_key: &str,
+) -> stow_types::error::Result<()> {
+    sqlx::query("DELETE FROM cc_cache_entries WHERE cache_key = ?")
+        .bind(cache_key)
+        .execute(connection)
+        .await?;
+    Ok(())
+}
+
+/// Bump the object's LRU stamp for a hit, under the same staleness
+/// window `artifact_cache_entries` uses. A file at the key with no row
+/// is a store that died after publishing — the bytes are
+/// content-addressed and already complete, so the hit adopts them into
+/// the budget rather than leave them off the LRU.
+async fn record_cc_hit(
+    config: &StowConfig,
+    cache_key: &str,
+    cache_path: &Path,
+) -> stow_types::error::Result<()> {
+    let connection = config.state_db_pool().await?;
+    let stamp: Option<i64> =
+        sqlx::query_scalar("SELECT last_accessed_ms FROM cc_cache_entries WHERE cache_key = ?")
+            .bind(cache_key)
+            .fetch_optional(&connection)
+            .await?;
+    let now = now_millis();
+    if let Some(stamp) = stamp {
+        if now.saturating_sub(recorded_millis(stamp)) > LRU_STAMP_INTERVAL_MS {
+            touch_cc_cache_entry(&connection, cache_key, now).await?;
+        }
+    } else {
+        let size_bytes = async_fs::metadata(cache_path)
+            .await
+            .wrap_err_with(|| format!("stat C/C++ object {}", cache_path.display()))?
+            .len();
+        upsert_cc_cache_entry(&connection, cache_key, size_bytes, now).await?;
+    }
+    Ok(())
+}
+
+/// Write the object's row — on a store, or a hit adopting a published
+/// object whose row never landed. The upsert stays one statement against
+/// a racing store of the same key: the content is identical, so the
+/// later writer's stamp wins.
+async fn upsert_cc_cache_entry(
+    connection: &sqlx::SqlitePool,
+    cache_key: &str,
+    size_bytes: u64,
+    last_accessed_ms: u64,
+) -> stow_types::error::Result<()> {
+    sqlx::query(
+        "INSERT INTO cc_cache_entries (cache_key, size_bytes, last_accessed_ms) \
+         VALUES (?, ?, ?) \
+         ON CONFLICT(cache_key) DO UPDATE SET \
+             size_bytes = excluded.size_bytes, \
+             last_accessed_ms = excluded.last_accessed_ms",
+    )
+    .bind(cache_key)
+    .bind(db_int::<_, i64>(size_bytes, "cc cache entry size_bytes")?)
+    .bind(db_int::<_, i64>(
+        last_accessed_ms,
+        "cc cache entry last_accessed_ms",
+    )?)
+    .execute(connection)
+    .await?;
+    Ok(())
+}
+
+/// Rewrite the object's LRU stamp — the same fail-fast as
+/// `touch_artifact_cache_entry`: a row that vanished mid-hit was
+/// evicted, which is not a state to bump over.
+async fn touch_cc_cache_entry(
+    connection: &sqlx::SqlitePool,
+    cache_key: &str,
+    last_accessed_ms: u64,
+) -> stow_types::error::Result<()> {
+    let result =
+        sqlx::query("UPDATE cc_cache_entries SET last_accessed_ms = ? WHERE cache_key = ?")
+            .bind(db_int::<_, i64>(
+                last_accessed_ms,
+                "cc cache entry last_accessed_ms",
+            )?)
+            .bind(cache_key)
+            .execute(connection)
+            .await?;
+    if result.rows_affected() != 1 {
+        return Err(stow_types::stow_error!(
+            "cc cache entry {cache_key} is missing from the state database"
+        ));
+    }
+    Ok(())
 }
 
 async fn compiler_fingerprint(compiler: &ResolvedCompiler) -> stow_types::error::Result<Vec<u8>> {
@@ -602,7 +858,7 @@ mod tests {
             negative_cache_ttl: Duration::from_mins(5),
             circuit_reset_after: Duration::from_mins(1),
             circuit_trip_threshold: 5,
-            artifact_cache_max_bytes: 1024,
+            artifact_cache_max_bytes: crate::config::DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
             index_refresh_interval: Duration::from_mins(1),
             verify_mode: VerifyMode::GithubCi,
             state_db: crate::state_db::StateDb::default(),
@@ -918,6 +1174,69 @@ mod tests {
         }
     }
 
+    /// A store is invisible at its key until it is complete: the staged
+    /// clone sits under a temporary name, so a lookup in that window
+    /// misses instead of reading a partial object, and publishing a second
+    /// store of the same key keeps the first (stow#837).
+    #[test]
+    fn a_staged_object_is_invisible_until_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("key.o");
+        let first_output = dir.path().join("first.o");
+        let second_output = dir.path().join("second.o");
+        std::fs::write(&first_output, b"first object").expect("write first object");
+        std::fs::write(&second_output, b"second object").expect("write second object");
+
+        let first = super::stage_compiled_object_blocking(&cache_path, &first_output)
+            .expect("stage first object");
+        let second = super::stage_compiled_object_blocking(&cache_path, &second_output)
+            .expect("stage second object");
+        assert!(!cache_path.exists(), "a staged object must not be visible");
+
+        first.publish().expect("publish first object");
+        second.publish().expect("a losing store is not an error");
+        assert_eq!(
+            std::fs::read(&cache_path).expect("read cached object"),
+            b"first object"
+        );
+        let leftovers = std::fs::read_dir(dir.path())
+            .expect("list cache dir")
+            .map(|entry| entry.expect("cache dir entry").file_name())
+            .filter(|name| name.to_string_lossy().starts_with(".stage-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "staged files left behind: {leftovers:?}"
+        );
+    }
+
+    /// On a copy-on-write filesystem — APFS here — both directions clone:
+    /// the store shares the compiled object's blocks and the serve shares
+    /// the cache entry's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_and_serve_clone_on_apfs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = dir.path().join("key.o");
+        let compiled = dir.path().join("compiled.o");
+        let served = dir.path().join("served.o");
+        std::fs::write(&compiled, b"object bytes").expect("write compiled object");
+        std::fs::write(&served, b"stale object").expect("write stale output");
+
+        let staged = super::stage_compiled_object_blocking(&cache_path, &compiled)
+            .expect("stage compiled object");
+        assert_eq!(*staged.staged.as_file(), super::Placement::Cloned);
+        staged.publish().expect("publish compiled object");
+
+        let placement =
+            super::serve_cached_object_blocking(&cache_path, &served).expect("serve object");
+        assert_eq!(placement, super::Placement::Cloned);
+        assert_eq!(
+            std::fs::read(&served).expect("read served"),
+            b"object bytes"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn cache_hit_writes_requested_depfile() {
@@ -970,7 +1289,7 @@ mod tests {
             .await
             .expect("spawn cc");
         assert!(status.success());
-        super::store_compiled_object(&cache_path, &output_path)
+        super::store_compiled_object(&config, &cache_path, &output_path)
             .await
             .expect("store compiled object");
 
@@ -979,13 +1298,130 @@ mod tests {
         let second = super::try_compile(&config, &cc, &compiler_args)
             .await
             .expect("second try_compile");
-        assert!(matches!(second, CcOutcome::Hit { .. }));
+        let CcOutcome::Hit { cache_key, .. } = second else {
+            panic!("second compile must be a cache hit");
+        };
         assert!(object.exists());
+        let pool = crate::state_db::connect(&config.cache_dir)
+            .await
+            .expect("connect state db");
+        let row: Option<i64> =
+            sqlx::query_scalar("SELECT last_accessed_ms FROM cc_cache_entries WHERE cache_key = ?")
+                .bind(&cache_key)
+                .fetch_optional(&pool)
+                .await
+                .expect("load cc cache entry");
+        assert!(row.is_some(), "a hit object must carry a state-db row");
         let depfile = std::fs::read_to_string(build.join("demo.d")).expect("read depfile");
         assert!(depfile.contains("value.h"), "depfile contents: {depfile}");
         assert!(
             depfile.contains(&format!("{}:", object.display())),
             "depfile contents: {depfile}"
         );
+    }
+
+    /// Every store leaves `cc/` inside `artifact_cache_max_bytes`: the
+    /// oldest object's file and row go, the freshest stays (stow#980).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cc_objects_stay_under_the_budget_across_stores() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path().join("stow-cache"));
+        let cc_dir = config.cc_cache_dir();
+        std::fs::create_dir_all(&cc_dir).expect("create cc dir");
+        let output = tempdir.path().join("output.o");
+        std::fs::write(&output, b"object bytes").expect("write output object");
+        config.artifact_cache_max_bytes = std::fs::metadata(&output)
+            .expect("stat output object")
+            .len();
+
+        for key in ["key-a", "key-b", "key-c"] {
+            super::store_compiled_object(&config, &cc_dir.join(format!("{key}.o")), &output)
+                .await
+                .expect("store compiled object");
+        }
+
+        let pool = crate::state_db::connect(&config.cache_dir)
+            .await
+            .expect("connect state db");
+        let entries = super::list_cc_cache_entries(&pool)
+            .await
+            .expect("list cc cache entries");
+        assert_eq!(
+            entries.keys().collect::<Vec<_>>(),
+            vec!["key-c"],
+            "only the freshest object may survive the budget"
+        );
+        assert!(cc_dir.join("key-c.o").exists());
+        for key in ["key-a", "key-b"] {
+            assert!(
+                !cc_dir.join(format!("{key}.o")).exists(),
+                "evicted object {key} left its file behind"
+            );
+        }
+    }
+
+    /// A hit moves the object to the back of the shared LRU: the entry
+    /// the bump passed is the one the next store evicts (stow#980).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hit_refreshes_the_objects_lru_position() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path().join("stow-cache"));
+        let cc_dir = config.cc_cache_dir();
+        std::fs::create_dir_all(&cc_dir).expect("create cc dir");
+        let output = tempdir.path().join("output.o");
+        std::fs::write(&output, b"object bytes").expect("write output object");
+        let object_size = std::fs::metadata(&output)
+            .expect("stat output object")
+            .len();
+        config.artifact_cache_max_bytes = 2 * object_size;
+
+        let first = cc_dir.join("first.o");
+        let second = cc_dir.join("second.o");
+        super::store_compiled_object(&config, &first, &output)
+            .await
+            .expect("store first object");
+        super::store_compiled_object(&config, &second, &output)
+            .await
+            .expect("store second object");
+
+        let pool = crate::state_db::connect(&config.cache_dir)
+            .await
+            .expect("connect state db");
+        // `first` starts the pass as the least recently used; the hit
+        // must push it behind `second` before `third` is stored. Both
+        // stamps are set in the past: a `second` stamped by its store can
+        // land on the same millisecond as the hit, and the tie then
+        // evicts by cache key instead of recency.
+        super::touch_cc_cache_entry(&pool, "first", 1)
+            .await
+            .expect("stale first object's stamp");
+        super::touch_cc_cache_entry(&pool, "second", 2)
+            .await
+            .expect("stale second object's stamp");
+        super::record_cc_hit(&config, "first", &first)
+            .await
+            .expect("hit on first object");
+
+        super::store_compiled_object(&config, &cc_dir.join("third.o"), &output)
+            .await
+            .expect("store third object");
+
+        let entries = super::list_cc_cache_entries(&pool)
+            .await
+            .expect("list cc cache entries");
+        assert!(
+            entries.contains_key("first"),
+            "the hit keeps first in the cache"
+        );
+        assert!(
+            !entries.contains_key("second"),
+            "the un-touched entry is evicted first"
+        );
+        assert!(entries.contains_key("third"));
+        assert!(first.exists());
+        assert!(!second.exists());
+        assert!(cc_dir.join("third.o").exists());
     }
 }

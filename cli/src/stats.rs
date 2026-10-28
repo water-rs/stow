@@ -99,11 +99,11 @@ pub async fn record_served_bundle(
 /// The lock is a sibling file rather than `stats.json` itself, so the
 /// rename that replaces the counters never moves the object the lock is
 /// held on.
-async fn lock_local_stats(path: &std::path::Path) -> stow_types::error::Result<std::fs::File> {
+async fn lock_local_stats(
+    path: &std::path::Path,
+) -> stow_types::error::Result<crate::file_lock::FileLock> {
     let lock_path = path.with_extension("json.lock");
     tokio::task::spawn_blocking(move || {
-        use fs2::FileExt as _;
-
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -111,9 +111,8 @@ async fn lock_local_stats(path: &std::path::Path) -> stow_types::error::Result<s
             .write(true)
             .open(&lock_path)
             .wrap_err_with(|| format!("open {}", lock_path.display()))?;
-        file.lock_exclusive()
-            .wrap_err_with(|| format!("lock {}", lock_path.display()))?;
-        Ok(file)
+        crate::file_lock::FileLock::exclusive(file)
+            .wrap_err_with(|| format!("lock {}", lock_path.display()))
     })
     .await
     .wrap_err("join the local stats lock task")?

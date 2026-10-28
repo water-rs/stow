@@ -952,7 +952,7 @@ impl Watcher<'_> {
     ) -> stow_types::error::Result<Option<(WireRustcVersion, String)>> {
         let rustc_version = crate::rust_channel::stable_rustc_version().await?;
         let base = crate::index_cmd::registry_base()?;
-        let http = stow_oci::RegistryHttp::new().await?;
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
         let repository = stow_types::registry::cache_repository(&rustc_version);
         let session = base.session(&repository, &http);
         let trust = crate::index_cmd::records_trust().await?;
