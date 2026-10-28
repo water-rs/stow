@@ -15,7 +15,8 @@ name: deploy-edge
 #                    wait timer IS the observation window (operator setup in
 #                    docs/DEPLOYMENT.md); the job starts only after it elapses
 #                    and runs `stow-admin deploy verdict --phase canary`.
-#   promote          `wrangler versions deploy <id>@100%`.
+#   promote          `wrangler versions deploy <id>@100%`, then the Durable
+#                    Object workload against the candidate.
 #   promoted-verdict `environment: deploy-promoted` (second wait timer), then
 #                    `--phase promoted`.
 #
@@ -29,9 +30,11 @@ name: deploy-edge
 # Phase 1 compares per-`scriptVersion` metrics: worker error rate and
 # cpu/wall p50+p99 (`workersInvocationsAdaptive`), DO requests/errors/wall per
 # request (`durableObjectsInvocationsAdaptiveGroups`). Phase 2 compares the
-# metrics with no version dimension — `durableObjectsPeriodicGroups` —
-# post-promotion window against the equal-length window ending at the
-# deploy start.
+# metrics with no version dimension — `durableObjectsPeriodicGroups` per
+# DO request — over two equal Durable Object workload windows
+# (`scripts/deploy-do-workload.sh`, stow#1022): one driven against the
+# baseline in `prepare` before the candidate joins the deployment, one
+# against the candidate in `promote` right after promotion.
 #
 # Durable Objects under a split deployment (per the Cloudflare "With Durable
 # Objects" doc): each object is *assigned* one version per deployment config —
@@ -85,6 +88,16 @@ env:
   # when the suite did not land. Below SUITE_REQUESTS because Workers
   # analytics is sampled and does not count every invocation (stow#749).
   MIN_SAMPLE_REQUESTS: "200"
+  # The Durable Object workload each side of the promoted verdict carries:
+  # STOW_DO_WORKLOAD_RPS scheduler-status requests a second through
+  # STOW_DO_WORKLOAD_MINUTES whole minutes — ~358 in each window. The
+  # promoted verdict's --min-do-requests floor sits ~0.8x below it, the
+  # margin MIN_SAMPLE_REQUESTS leaves for sampled analytics, so a window
+  # whose workload did not land fails closed instead of letting a few
+  # organic requests decide (stow#1022).
+  STOW_DO_WORKLOAD_RPS: "2"
+  STOW_DO_WORKLOAD_MINUTES: "3"
+  MIN_DO_SAMPLE_REQUESTS: "280"
 
 jobs:
   prepare:
@@ -96,6 +109,8 @@ jobs:
       baseline_version: ${{ steps.versions.outputs.baseline_version }}
       candidate_version: ${{ steps.versions.outputs.candidate_version }}
       deploy_start: ${{ steps.join.outputs.deploy_start }}
+      do_baseline_from: ${{ steps.do_workload.outputs.do_window_from }}
+      do_baseline_to: ${{ steps.do_workload.outputs.do_window_to }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -215,6 +230,16 @@ jobs:
           echo "CANDIDATE_VERSION=$candidate" >> "$GITHUB_ENV"
           echo "baseline_version=$baseline" >> "$GITHUB_OUTPUT"
           echo "candidate_version=$candidate" >> "$GITHUB_OUTPUT"
+
+      # The promoted verdict's baseline DO window. It runs while the
+      # deployment is the baseline alone, so every DO request in it runs
+      # on the baseline version; `promote` drives the identical workload
+      # against the candidate.
+      - name: Durable Object workload against the baseline
+        id: do_workload
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+        run: scripts/deploy-do-workload.sh baseline
 
       # A version override only reaches a version in the current
       # deployment, so the candidate joins at 0% first — the synthetic
@@ -373,20 +398,32 @@ jobs:
       BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
       CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
     outputs:
-      promote_start: ${{ steps.promote.outputs.promote_start }}
+      do_candidate_from: ${{ steps.do_workload.outputs.do_window_from }}
+      do_candidate_to: ${{ steps.do_workload.outputs.do_window_to }}
     steps:
-      # The post-promotion window starts where 100% traffic starts.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.DEPLOY_SHA }}
+          persist-credentials: false
+
       - name: Promote the candidate to 100%
-        id: promote
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
           npm install -g wrangler@4
-          promote_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          echo "promote_start=$promote_start" >> "$GITHUB_OUTPUT"
           wrangler versions deploy --name stow-edge --yes "$CANDIDATE_VERSION@100%"
+
+      # The promoted verdict's candidate DO window: the same workload
+      # `prepare` drove against the baseline. Its warm-up absorbs the
+      # first request on the object the version change reset, so the
+      # window compares a warm object with a warm object.
+      - name: Durable Object workload against the candidate
+        id: do_workload
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+        run: scripts/deploy-do-workload.sh candidate
 
       - name: Roll back to the baseline
         if: failure()
@@ -406,8 +443,10 @@ jobs:
     env:
       BASELINE_VERSION: ${{ needs.prepare.outputs.baseline_version }}
       CANDIDATE_VERSION: ${{ needs.prepare.outputs.candidate_version }}
-      DEPLOY_START: ${{ needs.prepare.outputs.deploy_start }}
-      PROMOTE_START: ${{ needs.promote.outputs.promote_start }}
+      DO_BASELINE_FROM: ${{ needs.prepare.outputs.do_baseline_from }}
+      DO_BASELINE_TO: ${{ needs.prepare.outputs.do_baseline_to }}
+      DO_CANDIDATE_FROM: ${{ needs.promote.outputs.do_candidate_from }}
+      DO_CANDIDATE_TO: ${{ needs.promote.outputs.do_candidate_to }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -419,29 +458,28 @@ jobs:
           binaries: stow-admin
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Phase 2's metrics carry no `scriptVersion` — account totals. The
-      # candidate window is [PROMOTE_START, now]; the baseline window is
-      # its equal-length mirror ending at the deploy start.
+      # Phase 2's metrics carry no `scriptVersion` — account totals. Both
+      # windows are the Durable Object workload windows: equal length,
+      # equal schedule, each on one version, the cold first request on
+      # the reset object excluded by the workload's warm-up. A window
+      # carrying fewer than MIN_DO_SAMPLE_REQUESTS DO requests fails
+      # closed rather than being compared.
       - name: Post-promotion verdict (phase 2)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          now_epoch=$(date -u +%s)
-          promote_epoch=$(date -u -d "$PROMOTE_START" +%s)
-          start_epoch=$(date -u -d "$DEPLOY_START" +%s)
-          baseline_from=$(date -u -d "@$((start_epoch - (now_epoch - promote_epoch)))" +%Y-%m-%dT%H:%M:%SZ)
-          now=$(date -u -d "@$now_epoch" +%Y-%m-%dT%H:%M:%SZ)
           stow-admin deploy verdict --phase promoted \
+            --min-do-requests "$MIN_DO_SAMPLE_REQUESTS" \
             --account-tag "$CLOUDFLARE_ACCOUNT_ID" \
             --script stow-edge \
             --baseline-version "$BASELINE_VERSION" \
             --candidate-version "$CANDIDATE_VERSION" \
-            --baseline-from "$baseline_from" \
-            --baseline-to "$DEPLOY_START" \
-            --candidate-from "$PROMOTE_START" \
-            --candidate-to "$now"
+            --baseline-from "$DO_BASELINE_FROM" \
+            --baseline-to "$DO_BASELINE_TO" \
+            --candidate-from "$DO_CANDIDATE_FROM" \
+            --candidate-to "$DO_CANDIDATE_TO"
 
       - name: Roll back to the baseline
         if: failure()

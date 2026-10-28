@@ -210,6 +210,19 @@ the GitHub credential (`GH_TOKEN` / `GITHUB_TOKEN`, as for the traffic-cost test
 | `STOW_EVICTION_ROWS` | `10000` | Fixture queue rows; the smallest shape whose pending set clears its dependency gates. |
 | `STOW_EVICTION_READY` | `240` | Seconds to wait for each service to listen. |
 
+## Deploy DO workload (`scripts/deploy-do-workload.sh`)
+
+`deploy-edge.yml` runs it on each side of the promoted verdict (see
+`DEPLOYMENT.md`); every variable is required.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STOW_EDGE_URL` | — | Edge base URL the workload requests `/api/v1/scheduler/status` from. |
+| `STOW_DO_WORKLOAD_RPS` | — | Requests a second, on a fixed schedule. |
+| `STOW_DO_WORKLOAD_MINUTES` | — | Whole minutes the measured window lasts. |
+| `GITHUB_OUTPUT` | — | File the window bounds `do_window_from`/`do_window_to` are appended to. |
+| `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT` | — | Part of each probe's unique query string. |
+
 ## Traffic-cost test (`scripts/traffic-cost.sh`)
 
 The release gate's `Traffic cost` job runs this script on the mock stack
