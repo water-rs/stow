@@ -255,8 +255,9 @@ GitHub environment wait timers, which hold no runner. Operator setup
 
 - `deploy-canary` — wait timer `15` minutes (the canary observation
   window, the `canary-verdict` job's delay);
-- `deploy-promoted` — wait timer `15` minutes (the post-promotion
-  window, the `promoted-verdict` job's delay).
+- `deploy-promoted` — wait timer `15` minutes (the `promoted-verdict`
+  job's delay after promotion; the analytics datasets settle on the
+  promoted DO workload window meanwhile).
 
 Change a window by editing that environment's wait timer; the verdict
 reads the window's bounds from timestamps, so nothing else moves.
@@ -264,7 +265,8 @@ reads the window's bounds from timestamps, so nothing else moves.
 The `prepare` job uploads the new Worker version without deploying it —
 `skyzen deploy --upload-only` plans `wrangler versions upload`, and the
 declared `[[secret]]` values travel in the same upload through
-`--secrets-file` — then adds it to the deployment at `0%` so that
+`--secrets-file` — then drives the baseline's Durable Object workload
+(below), then adds it to the deployment at `0%` so that
 version overrides reach it, then
 fires the synthetic suite through the same override — 250 requests on the
 candidate interleaved with 250 on the baseline across the site, crate
@@ -291,10 +293,22 @@ candidate values and exiting non-zero on a breach — which runs
   a reassigned object is reset once, and SQLite state survives).
 - `--phase promoted`, run by `promoted-verdict` after `promote` and the
   `deploy-promoted` wait timer: the metrics that carry no
-  `scriptVersion` compare the post-promotion window against the
-  equal-length window ending at the deploy start — DO cpu and rows
-  read/written per DO request from `durableObjectsPeriodicGroups`.
-  A breach here rolls back too.
+  `scriptVersion` — DO cpu and rows read/written from
+  `durableObjectsPeriodicGroups` per DO request — compare two equal
+  Durable Object workload windows. `scripts/deploy-do-workload.sh`
+  requests `/api/v1/scheduler/status` twice a second
+  (`STOW_DO_WORKLOAD_RPS`), once in `prepare` while the deployment is
+  still the baseline alone and once in `promote` right after promotion;
+  each window is the 3 whole minutes (`STOW_DO_WORKLOAD_MINUTES`) that
+  open at least 60 s after the workload's first request, so the request
+  that hydrates the object the version change reset falls outside it.
+  Both datasets are summed over the same bounds; alarm and organic DO
+  work land in both windows alike. Each window must carry at least
+  `MIN_DO_SAMPLE_REQUESTS` (280 of the ~358 scheduled) DO requests:
+  below it the verdict reports `insufficient sample` on every DO row
+  and fails closed instead of comparing. The report prints each
+  window's bounds, DO requests, DO cpu and rows. A breach here rolls
+  back too.
 
 `stow-admin` comes from the deployed commit's signed toolchain image —
 `.github/actions/stow-toolchain` pulls
