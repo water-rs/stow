@@ -359,7 +359,10 @@ impl ParsedRustcArgs {
         let triple: Triple = target
             .parse()
             .map_err(|error| format!("parse target triple `{target}`: {error}"))?;
-        let name = if triple.environment == target_lexicon::Environment::Msvc {
+        // MSVC-like targets — Windows MSVC and UEFI — name an archive `.lib`.
+        let name = if triple.environment == target_lexicon::Environment::Msvc
+            || triple.operating_system == target_lexicon::OperatingSystem::Uefi
+        {
             format!("{}{}.lib", self.crate_name, self.extra_filename)
         } else {
             format!("lib{}{}.a", self.crate_name, self.extra_filename)

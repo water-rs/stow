@@ -2051,6 +2051,11 @@ pub async fn evict_entries(
     max_bytes: u64,
     protected_key: &str,
 ) -> stow_types::error::Result<()> {
+    // The total alone decides whether anything is evicted; the rows are
+    // listed only when the budget is exceeded.
+    if total_entry_bytes(connection, rustc_version).await? <= max_bytes {
+        return Ok(());
+    }
     let mut entries = list_artifact_cache_entries(connection, rustc_version).await?;
     let mut total_bytes = entries
         .values()
@@ -2675,6 +2680,24 @@ async fn load_artifact_cache_entry(
     .fetch_optional(connection)
     .await
     .map_err(Into::into)
+}
+
+/// The bytes every bundle and unit entry of `rustc_version` holds.
+async fn total_entry_bytes(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+) -> stow_types::error::Result<u64> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COALESCE(SUM(size_bytes), 0) FROM artifact_cache_entries \
+                 WHERE rustc_version = ?1) \
+              + (SELECT COALESCE(SUM(size_bytes), 0) FROM unit_cache_entries \
+                 WHERE rustc_version = ?1)",
+    )
+    .bind(rustc_version)
+    .fetch_one(connection)
+    .await
+    .wrap_err("sum artifact cache entry sizes")?;
+    db_int(total, "artifact cache total size_bytes")
 }
 
 async fn list_artifact_cache_entries(

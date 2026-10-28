@@ -92,9 +92,11 @@ time = { version = "0.3.55", default-features = false, features = [
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Parent-pid and process-liveness lookups for the miss journal.
+# Parent-pid and process-liveness lookups for the miss journal, and the
+# change time the local unit cache reads (stow#978).
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
 ] }

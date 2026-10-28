@@ -503,6 +503,10 @@ enum Outcome {
     /// Nothing serves this unit; the real rustc has to run, and
     /// [`finish_rustc_compile`] finishes the work afterwards.
     Compile(Box<PostCompile>),
+    /// The cache failed in a way no miss explains — a database or entry
+    /// it cannot read, a toolchain it cannot probe. The invocation fails
+    /// with it rather than compiling around it (stow#978).
+    Failed(stow_types::error::Error),
 }
 
 /// The bookkeeping that only exists once a real rustc has run: the stable
@@ -594,11 +598,13 @@ async fn compile_storing(
 ///
 /// # Errors
 ///
-/// Only the build-script output check — it cannot write what it checks,
-/// because cargo owns `build-script-build`: stow copying onto a path
-/// cargo may already have hardlinked to the source turns `fs::copy`'s
-/// truncate into a zeroed shared inode (stow#347). Everything else is
-/// best effort and logged.
+/// The local unit cache's store — a compile that reported success
+/// without writing its dep-info or outputs, or a cache that cannot record
+/// it (stow#978) — and the build-script output check, which cannot write
+/// what it checks, because cargo owns `build-script-build`: stow copying
+/// onto a path cargo may already have hardlinked to the source turns
+/// `fs::copy`'s truncate into a zeroed shared inode (stow#347). Everything
+/// else is best effort and logged.
 async fn finish_rustc_compile(
     post: &PostCompile,
     success: bool,
@@ -613,10 +619,16 @@ async fn finish_rustc_compile(
     let mut artifact = None;
     if success && let (Some(plan), Some(base)) = (post.unit.as_deref(), local_base) {
         if let Some(stderr) = stderr {
-            log_nonfatal_result(
-                "failed to store locally built unit in the stow unit cache",
-                unit_cache::store(&base.config, parsed, plan, stderr, &base.host_target).await,
-            );
+            unit_cache::store(
+                &base.config,
+                parsed,
+                plan,
+                stderr,
+                &base.host_target,
+                &env_cache.digests,
+            )
+            .await
+            .wrap_err("store the compiled unit in the local unit cache")?;
         } else {
             tracing::debug!(
                 crate_name = %parsed.crate_name,
@@ -1178,8 +1190,8 @@ impl BuildSupervisor {
         success: bool,
         stderr: Option<&str>,
         local_base: Option<&WrapperEnvBase>,
-    ) {
-        if let Ok(Some(build)) = finish_rustc_compile(
+    ) -> stow_types::error::Result<()> {
+        if let Some(build) = finish_rustc_compile(
             post,
             success,
             stderr,
@@ -1187,7 +1199,7 @@ impl BuildSupervisor {
             &self.env_cache,
             &self.ctx,
         )
-        .await
+        .await?
             && let Some(parsed) = post.parsed.as_ref()
             && let Some(unit) = miss_journal::observed_unit(parsed, &build)
         {
@@ -1199,6 +1211,7 @@ impl BuildSupervisor {
                 .expect("observations mutex")
                 .push(unit);
         }
+        Ok(())
     }
 }
 
@@ -1233,6 +1246,7 @@ impl supervisor::server::Handler for BuildSupervisor {
                 capture_stderr: post.captures_stderr(),
                 pending: post,
             },
+            Outcome::Failed(error) => supervisor::server::Decision::Failed(error.to_string()),
         }
     }
 
@@ -1241,10 +1255,11 @@ impl supervisor::server::Handler for BuildSupervisor {
         pending: Self::Pending,
         success: bool,
         stderr: Option<String>,
-    ) {
+    ) -> Result<(), String> {
         let local_base = self.env_cache.local_base(&pending.executable).await;
         self.finish_and_observe(&pending, success, stderr.as_deref(), local_base.as_deref())
-            .await;
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn await_serve_map(self: &std::sync::Arc<Self>) {
@@ -1306,8 +1321,13 @@ impl supervisor::server::Handler for BuildSupervisor {
             unit: None,
             parsed: Some(parsed),
         };
-        self.finish_and_observe(&post, success, None, Some(&local_base))
-            .await;
+        // The frame is one-way: nothing can fail the facade's invocation,
+        // so the failure goes to the build's log.
+        log_nonfatal_result(
+            "failed to finish an observed compile",
+            self.finish_and_observe(&post, success, None, Some(&local_base))
+                .await,
+        );
     }
 }
 
@@ -1430,6 +1450,7 @@ async fn run_rustc_standalone(
         env: &invocation_env,
     };
     match decide_rustc_invocation(&command.executable, parsed, invocation, &env_cache, &ctx).await {
+        Outcome::Failed(error) => Err(error),
         Outcome::Served(lines) => {
             write_served_artifact_notifications(&lines)?;
             Ok(std::process::ExitStatus::default())
@@ -1442,7 +1463,7 @@ async fn run_rustc_standalone(
             )
             .await?;
             let local_base = env_cache.local_base(&command.executable).await;
-            if let Ok(Some(build)) = finish_rustc_compile(
+            if let Some(build) = finish_rustc_compile(
                 &post,
                 status.success(),
                 stderr.as_deref(),
@@ -1450,7 +1471,7 @@ async fn run_rustc_standalone(
                 &env_cache,
                 &ctx,
             )
-            .await
+            .await?
                 && let (Some(parsed), Some(base)) = (post.parsed.as_ref(), local_base.as_deref())
             {
                 miss_journal::record_observation(
@@ -1631,22 +1652,34 @@ async fn decide_unit_cache(
         .target
         .clone()
         .unwrap_or_else(|| local_base.host_target.clone());
-    let rustc_vv = match env_cache.rustc_verbose_version(rustc).await {
-        Ok(vv) => vv,
-        Err(error) => {
-            tracing::warn!(%error, "failed to probe rustc -vV, compiling without the local unit cache");
-            return compile(rustc, parsed, Some(&target), ctx.policy_dir.as_deref()).await;
+    let (verbose_version, sysroot) = futures_util::future::join(
+        env_cache.rustc_verbose_version(rustc),
+        env_cache.rustc_sysroot(rustc),
+    )
+    .await;
+    let toolchain = match (verbose_version, sysroot) {
+        (Ok(verbose_version), Ok(sysroot)) => unit_cache::Toolchain {
+            verbose_version,
+            sysroot: PathBuf::from(sysroot),
+        },
+        (Err(error), _) | (_, Err(error)) => {
+            return Outcome::Failed(stow_types::stow_error!(
+                "probe the toolchain the local unit cache keys on: {error}"
+            ));
         }
     };
     let lookup = unit_cache::lookup(
         &local_base.config,
         parsed,
         invocation.args,
-        invocation.env,
-        &rustc_vv,
-        &target,
-        &local_base.rustc_version,
-        &local_base.host_target,
+        unit_cache::LookupContext {
+            env: invocation.env,
+            toolchain: &toolchain,
+            target: &target,
+            rustc_version: &local_base.rustc_version,
+            host: &local_base.host_target,
+        },
+        &env_cache.digests,
     )
     .await;
     match lookup {
@@ -1688,10 +1721,10 @@ async fn decide_unit_cache(
             tracing::debug!(crate_name = %parsed.crate_name, %reason, "compiling without the local unit cache");
             compile(rustc, parsed, Some(&target), ctx.policy_dir.as_deref()).await
         }
-        Err(error) => {
-            tracing::warn!(crate_name = %parsed.crate_name, %error, "local unit cache lookup failed, compiling without it");
-            compile(rustc, parsed, Some(&target), ctx.policy_dir.as_deref()).await
-        }
+        Err(error) => Outcome::Failed(error.wrap_err(format!(
+            "look up `{}` in the local unit cache",
+            parsed.crate_name
+        ))),
     }
 }
 
@@ -1900,6 +1933,12 @@ pub(crate) struct WrapperEnvCache {
     /// Each spelling's full `rustc -vV` text — the toolchain identity the
     /// unit cache keys on, commit hash included (stow#978).
     verbose_versions: MemoizedHostMap,
+    /// Each spelling's `rustc --print sysroot`, whose files the unit
+    /// cache keys beside `-vV` (stow#978).
+    sysroots: MemoizedHostMap,
+    /// The file digests the unit cache's keys read, shared by every
+    /// invocation of the build (stow#978).
+    digests: std::sync::Arc<unit_cache::DigestMemo>,
     /// The `PATH` bare spellings resolve through, captured at
     /// construction so the cache reads the environment the build
     /// invoked the wrapper with.
@@ -2053,6 +2092,8 @@ impl WrapperEnvCache {
             local_bases: MemoizedBaseMap::default(),
             host_targets: MemoizedHostMap::default(),
             verbose_versions: MemoizedHostMap::default(),
+            sysroots: MemoizedHostMap::default(),
+            digests: std::sync::Arc::default(),
             path: std::env::var_os("PATH").unwrap_or_default(),
             slices: MemoizedSliceMap::default(),
             circuit_tripped: tokio::sync::OnceCell::new(),
@@ -2160,6 +2201,27 @@ impl WrapperEnvCache {
         cell.get_or_init(|| rustc_args::rustc_vv(rustc))
             .await
             .clone()
+    }
+
+    /// The sysroot of `rustc` — one probe per executable spelling per
+    /// build.
+    pub(crate) async fn rustc_sysroot(&self, rustc: &OsStr) -> Result<String, String> {
+        let cell = self
+            .sysroots
+            .lock()
+            .expect("sysroot map mutex")
+            .entry(rustc.to_os_string())
+            .or_default()
+            .clone();
+        cell.get_or_init(|| async {
+            let sysroot = rustc_args::rustc_sysroot(rustc).await?;
+            sysroot
+                .into_os_string()
+                .into_string()
+                .map_err(|sysroot| format!("sysroot {} is not UTF-8", sysroot.display()))
+        })
+        .await
+        .clone()
     }
 
     /// The decoded index slice for `(target, rustc)` — read, decompressed
@@ -5852,6 +5914,8 @@ mod tests {
             local_bases: super::MemoizedBaseMap::default(),
             host_targets: super::MemoizedHostMap::default(),
             verbose_versions: super::MemoizedHostMap::default(),
+            sysroots: super::MemoizedHostMap::default(),
+            digests: std::sync::Arc::default(),
             path: path.to_os_string(),
             slices: super::MemoizedSliceMap::default(),
             circuit_tripped: tokio::sync::OnceCell::new(),

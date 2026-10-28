@@ -1,7 +1,7 @@
 //! The local unit cache covers what sccache does, not only crates.io
-//! units (stow#978): a path dependency compiled in one checkout is served
-//! in another checkout of the same workspace in a different directory,
-//! and an edited source or a changed `option_env!` variable is a miss.
+//! units (stow#978): a path dependency cargo recompiles with unchanged
+//! inputs is served, a checkout in another directory is not, and an
+//! edited source or a changed `option_env!` variable is a miss.
 
 mod build_fixture;
 mod support;
@@ -48,10 +48,15 @@ fn write_lib(dir: &Path, greeting: &str) {
     .expect("write lib.rs");
 }
 
-/// One build of `dir` into a fresh target directory against the shared
-/// `cache`; the stderr it printed.
-fn build(dir: &Path, cache: &Path, cargo_home: &Path, flavor: Option<&str>) -> String {
-    let target = tempfile::tempdir().expect("target dir");
+/// One build of `dir` into `target` against the shared `cache`; the
+/// stderr it printed.
+fn build(
+    dir: &Path,
+    target: &Path,
+    cache: &Path,
+    cargo_home: &Path,
+    flavor: Option<&str>,
+) -> String {
     let mut env = vec![("RUST_LOG", "info")];
     if let Some(flavor) = flavor {
         env.push(("STOW_UNIT_CACHE_FLAVOR", flavor));
@@ -63,12 +68,22 @@ fn build(dir: &Path, cache: &Path, cargo_home: &Path, flavor: Option<&str>) -> S
         &refused_url(),
         cache,
         cargo_home,
-        target.path(),
+        target,
         &env,
     );
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(output.status.success(), "stow build failed:\n{stderr}");
     stderr
+}
+
+/// Make cargo recompile `mylib` with its contents unchanged.
+fn touch_lib(dir: &Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(dir.join("mylib/src/lib.rs"))
+        .expect("open lib.rs")
+        .set_modified(std::time::SystemTime::now())
+        .expect("touch lib.rs");
 }
 
 fn served_mylib(stderr: &str) -> bool {
@@ -78,41 +93,68 @@ fn served_mylib(stderr: &str) -> bool {
 }
 
 #[test]
-fn a_path_dependency_is_served_across_checkouts_until_an_input_changes() {
+fn a_path_dependency_is_served_in_its_checkout_until_an_input_changes() {
     let cache = tempfile::tempdir().expect("cache dir");
     let cargo_home = tempfile::tempdir().expect("cargo home");
     let first = tempfile::tempdir().expect("first checkout");
+    let first_target = tempfile::tempdir().expect("first target dir");
     let second = tempfile::tempdir().expect("second checkout");
+    let second_target = tempfile::tempdir().expect("second target dir");
     for checkout in [first.path(), second.path()] {
         write_workspace(checkout, "hello");
         stow_setup_in(checkout, cargo_home.path());
     }
+    let build_first = |flavor| {
+        build(
+            first.path(),
+            first_target.path(),
+            cache.path(),
+            cargo_home.path(),
+            flavor,
+        )
+    };
 
-    let cold = build(first.path(), cache.path(), cargo_home.path(), None);
+    let cold = build_first(None);
     assert!(!served_mylib(&cold), "nothing is stored yet:\n{cold}");
 
-    // Another directory, another target dir, the same sources.
-    let warm = build(second.path(), cache.path(), cargo_home.path(), None);
+    // cargo recompiles a touched file; its contents are what is keyed.
+    touch_lib(first.path());
+    let touched = build_first(None);
     assert!(
-        served_mylib(&warm),
-        "the second checkout must be served the first one's mylib:\n{warm}"
+        served_mylib(&touched),
+        "a recompile of unchanged sources must be served:\n{touched}"
+    );
+
+    // Another directory: a proc macro could read and embed either
+    // checkout's paths, so nothing is shared.
+    let elsewhere = build(
+        second.path(),
+        second_target.path(),
+        cache.path(),
+        cargo_home.path(),
+        None,
+    );
+    assert!(
+        !served_mylib(&elsewhere),
+        "another checkout's directories must miss:\n{elsewhere}"
     );
 
     // A variable the crate reads through `option_env!` is an input.
-    let flavored = build(second.path(), cache.path(), cargo_home.path(), Some("a"));
+    let flavored = build_first(Some("a"));
     assert!(
         !served_mylib(&flavored),
         "a changed option_env! variable must miss:\n{flavored}"
     );
-    let flavored_again = build(second.path(), cache.path(), cargo_home.path(), Some("a"));
+    touch_lib(first.path());
+    let flavored_again = build_first(Some("a"));
     assert!(
         served_mylib(&flavored_again),
         "the same variable value is served again:\n{flavored_again}"
     );
 
     // An edited source is an input.
-    write_lib(second.path(), "edited");
-    let edited = build(second.path(), cache.path(), cargo_home.path(), None);
+    write_lib(first.path(), "edited");
+    let edited = build_first(None);
     assert!(
         !served_mylib(&edited),
         "an edited source file must miss:\n{edited}"

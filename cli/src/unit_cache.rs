@@ -1,37 +1,50 @@
 //! The local cache for units the registry identity cannot key (stow#978):
 //! path and git dependencies, workspace members, primary packages, and
-//! registry units compiled with custom codegen or as a staticlib.
+//! registry units compiled with custom codegen or as a staticlib — the
+//! crate types sccache caches, `lib`/`rlib` and `staticlib`.
 //!
 //! Such a unit's source is not an immutable registry tarball, so it is
 //! keyed by content in two stages:
 //!
-//! - the *invocation key*, computed before rustc runs: the full `rustc -vV`
-//!   text, the argv with output locations and search paths dropped and
-//!   every `--extern` replaced by the digest of the file it names, the
-//!   working directory, the native libraries `-l` resolves to, and the
-//!   environment cargo and rustc read outside dep-info;
+//! - the *invocation key*, computed before rustc runs: the toolchain
+//!   (`rustc -vV` and the change stamps of the sysroot files a compile
+//!   loads), the working directory, the argv with search paths dropped
+//!   and every `--extern` replaced by the digest of the file it names,
+//!   every library file the native search directories hold — what rustc
+//!   can bundle into the artifact — and for a staticlib every rlib on the
+//!   crate search path, and the environment cargo and rustc read outside
+//!   dep-info;
 //! - the *unit key*: the invocation key plus every file the compile's
-//!   dep-info lists (by contents) and the value of every variable it read
-//!   through `env!`/`option_env!`.
+//!   dep-info lists (by contents), the entries rustc's module search reads
+//!   beside each of them, and the value of every variable read through
+//!   `env!`/`option_env!`.
 //!
 //! An entry records its dep-info file list under its invocation key, and a
 //! lookup re-hashes that list as it stands now: no extra rustc pass runs on
-//! a hit or a miss. Paths are normalized by rustc's own
-//! `--remap-path-prefix` rules — a path rustc writes into the artifact in
-//! its remapped form is keyed in that form, so a checkout in another
-//! directory under the same remap hits; every other absolute path is
-//! keyed raw.
+//! a hit or a miss.
+//!
+//! Every path and value is keyed raw, as rustc and the code it runs see
+//! it: a proc macro reads `CARGO_MANIFEST_DIR` or the working directory
+//! through `std::env` and may embed what it read, which
+//! `--remap-path-prefix` never rewrites. An entry is therefore served only
+//! to an invocation in the same directories. `--out-dir` is keyed exactly
+//! when the artifact embeds it.
+//!
+//! What no key here sees is what a proc macro reads without dep-info
+//! tracking it: a variable outside the ones keyed below, a file the
+//! compile does not list, a database. sccache and ccache leave the same
+//! gap.
 //!
 //! Nothing here mints a node or reports anything upstream: the entries
 //! live beside the bundle entries, under the same per-rustc directory,
 //! staging, copy-on-write clone path and LRU budget.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
-use std::path::{Component, Path, PathBuf};
-use std::time::SystemTime;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use sqlx::FromRow;
 use stow_types::error::Context;
 
 use crate::artifact_cache::{
@@ -47,15 +60,16 @@ use crate::supervisor::protocol::ServedStderr;
 /// Directory, beside `bundles/`, holding unit entries.
 const UNITS_DIR: &str = "units";
 /// Layout and key version; part of every cache key and entry path.
-const UNIT_LAYOUT_VERSION: &str = "unit-v1";
+const UNIT_LAYOUT_VERSION: &str = "unit-v2";
 /// Largest stderr a stored entry replays. The served lines travel in one
 /// supervisor frame, so an entry never carries more than a small part of it.
 pub const MAX_DIAGNOSTICS_BYTES: usize = 1024 * 1024;
 
-/// Crate types a unit entry can restore — the shapes sccache caches
-/// (`lib`/`rlib`, `staticlib`) and the dynamic libraries the bundle
-/// entries already restore.
-const CACHEABLE_CRATE_TYPES: &[&str] = &["lib", "rlib", "staticlib", "proc-macro", "dylib"];
+/// Crate types a unit entry can restore — the ones sccache caches. A
+/// linked crate type (`proc-macro`, `dylib`, `bin`, `cdylib`) runs the
+/// system linker, whose inputs — the linker, the files its arguments
+/// name, the C toolchain's objects and libraries — no key here sees.
+const CACHEABLE_CRATE_TYPES: &[&str] = &["lib", "rlib", "staticlib"];
 /// `--emit` kinds a unit entry can restore; `dep-info` is required.
 const CACHEABLE_EMITS: &[&str] = &["dep-info", "metadata", "link"];
 /// The variables cargo sets for the unit it compiles, besides
@@ -75,18 +89,31 @@ const CARGO_UNIT_VARS: &[&str] = &[
     "OUT_DIR",
 ];
 /// Variables rustc itself reads that change what it produces.
-const RUSTC_READ_VARS: &[&str] = &["RUSTC_BOOTSTRAP", "SDKROOT"];
-/// `-Z` options that read or write files the key cannot see.
-const FILE_READING_UNSTABLE_OPTIONS: &[&str] = &[
+const RUSTC_READ_VARS: &[&str] = &["RUSTC_BOOTSTRAP", "RUSTC_FORCE_RUSTC_VERSION", "SDKROOT"];
+/// `-Z` options the cache cannot model: they read or write files the key
+/// does not hash, add dep-info lines it does not parse, or print to stdout
+/// or skip the outputs instead of writing them. A name ending in `-` is a
+/// family.
+const UNMODELED_UNSTABLE_OPTIONS: &[&str] = &[
+    "checksum-hash-algorithm",
     "codegen-backend",
     "dump-",
     "llvm-plugins",
+    "ls",
+    "no-analysis",
+    "no-codegen",
+    "parse-crate-root-only",
+    "print-",
     "profile-sample-use",
     "remap-cwd-prefix",
     "self-profile",
     "split-dwarf",
     "temps-dir",
+    "unpretty",
 ];
+/// The `--print` request a compile can carry: rustc reports it on stderr,
+/// which the entry replays. Every other request prints to stdout.
+const REPLAYED_PRINT: &str = "native-static-libs";
 /// rustc flags whose value is the next argument.
 const SEPARATE_VALUE_FLAGS: &[&str] = &[
     "--crate-name",
@@ -101,6 +128,7 @@ const SEPARATE_VALUE_FLAGS: &[&str] = &[
     "--edition",
     "--error-format",
     "--cap-lints",
+    "--codegen",
     "--color",
     "--diagnostic-width",
     "--remap-path-prefix",
@@ -116,6 +144,12 @@ const SEPARATE_VALUE_FLAGS: &[&str] = &[
     "-F",
     "-o",
 ];
+/// How far a file timestamp may trail the clock that `started` read: the
+/// kernel stamps files from a coarse clock that lags by up to a tick.
+const FINE_TIMESTAMP_SLACK: Duration = Duration::from_millis(50);
+/// The same on a filesystem that keeps whole seconds — a timestamp with no
+/// sub-second part — where FAT rounds to two.
+const COARSE_TIMESTAMP_SLACK: Duration = Duration::from_secs(2);
 
 /// The process one rustc invocation runs in: its working directory and
 /// environment. Carried explicitly because the process that decides — the
@@ -146,41 +180,180 @@ impl InvocationEnv {
     }
 }
 
-/// One `--remap-path-prefix FROM=TO` rule.
+/// The toolchain an invocation compiles with: its `rustc -vV` text and
+/// its sysroot (`rustc --print sysroot`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemapRule {
-    from: PathBuf,
-    to: String,
+pub struct Toolchain {
+    /// The full `rustc -vV` text.
+    pub verbose_version: String,
+    /// The directory `rustc --print sysroot` names.
+    pub sysroot: PathBuf,
 }
 
-/// How a path is spelled in a key and in a stored entry: as rustc was
-/// handed it relative to the working directory, in the remapped form
-/// rustc writes into the artifact, or raw.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-enum InputPath {
-    Relative(String),
-    Remapped { to: String, rest: String },
-    Absolute(String),
+/// One version of a file, known without reading it: its size, its
+/// identity and both timestamps. The change time is the kernel's own — no
+/// tool sets it — so every write, rename onto the path or timestamp
+/// restore moves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChangeStamp {
+    len: u64,
+    file_id: (u64, u64),
+    modified: SystemTime,
+    changed: SystemTime,
 }
 
-impl InputPath {
+impl ChangeStamp {
+    #[cfg(unix)]
+    fn read(path: &Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(path)?;
+        Ok(Self {
+            len: metadata.len(),
+            file_id: (metadata.dev(), metadata.ino()),
+            modified: metadata.modified()?,
+            changed: unix_time(metadata.ctime(), metadata.ctime_nsec())?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn read(path: &Path) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        };
+
+        // Backup semantics open a directory as well as a file.
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let handle = file.as_raw_handle();
+        let mut basic = FILE_BASIC_INFO::default();
+        let basic_size = u32::try_from(std::mem::size_of::<FILE_BASIC_INFO>())
+            .expect("FILE_BASIC_INFO fits in a u32");
+        // SAFETY: `handle` is open for the call, and `basic` is a writable
+        // FILE_BASIC_INFO of the size passed.
+        if unsafe {
+            GetFileInformationByHandleEx(handle, FileBasicInfo, (&raw mut basic).cast(), basic_size)
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut identity = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `handle` is open for the call, and `identity` is a
+        // writable BY_HANDLE_FILE_INFORMATION.
+        if unsafe { GetFileInformationByHandle(handle, &raw mut identity) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let metadata = file.metadata()?;
+        Ok(Self {
+            len: metadata.len(),
+            file_id: (
+                u64::from(identity.dwVolumeSerialNumber),
+                (u64::from(identity.nFileIndexHigh) << 32) | u64::from(identity.nFileIndexLow),
+            ),
+            modified: metadata.modified()?,
+            changed: windows_time(basic.ChangeTime)?,
+        })
+    }
+
+    /// The fields as key bytes.
     fn key_bytes(&self) -> String {
-        match self {
-            Self::Relative(path) => format!("relative:{path}"),
-            Self::Remapped { to, rest } => format!("remapped:{to}\0{rest}"),
-            Self::Absolute(path) => format!("absolute:{path}"),
+        format!(
+            "{}:{}:{}:{}:{}",
+            self.len,
+            self.file_id.0,
+            self.file_id.1,
+            nanos_since_epoch(self.modified),
+            nanos_since_epoch(self.changed)
+        )
+    }
+}
+
+#[cfg(unix)]
+fn unix_time(seconds: i64, nanos: i64) -> std::io::Result<SystemTime> {
+    let nanos = u64::try_from(nanos)
+        .map(Duration::from_nanos)
+        .map_err(|_| std::io::Error::other(format!("change time has {nanos} nanoseconds")))?;
+    let whole = Duration::from_secs(seconds.unsigned_abs());
+    Ok(if seconds >= 0 {
+        UNIX_EPOCH + whole + nanos
+    } else {
+        UNIX_EPOCH - whole + nanos
+    })
+}
+
+/// A Windows timestamp: 100 ns ticks since 1601-01-01.
+#[cfg(windows)]
+fn windows_time(ticks: i64) -> std::io::Result<SystemTime> {
+    const TICKS_TO_UNIX_EPOCH: u64 = 11_644_473_600 * 10_000_000;
+    let ticks = u64::try_from(ticks)
+        .map_err(|_| std::io::Error::other(format!("change time is {ticks} ticks")))?;
+    Ok(if ticks >= TICKS_TO_UNIX_EPOCH {
+        UNIX_EPOCH + Duration::from_nanos((ticks - TICKS_TO_UNIX_EPOCH) * 100)
+    } else {
+        UNIX_EPOCH - Duration::from_nanos((TICKS_TO_UNIX_EPOCH - ticks) * 100)
+    })
+}
+
+fn nanos_since_epoch(time: SystemTime) -> i128 {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).expect("a timestamp fits in i128"),
+        Err(before) => {
+            -i128::try_from(before.duration().as_nanos()).expect("a timestamp fits in i128")
         }
     }
 }
 
-/// What a dep-info file says the compile read.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct UnitInputs {
-    /// Every file the dep-info lists, normalized and sorted.
-    files: Vec<InputPath>,
-    /// Every variable read through `env!`/`option_env!`, sorted.
-    env: Vec<String>,
+/// Whether a file stamped `time` was written at or after `started`, given
+/// how far its filesystem's clock may trail the one `started` read.
+fn written_since(time: SystemTime, started: SystemTime) -> bool {
+    let coarse = time
+        .duration_since(UNIX_EPOCH)
+        .is_ok_and(|since| since.subsec_nanos() == 0);
+    let slack = if coarse {
+        COARSE_TIMESTAMP_SLACK
+    } else {
+        FINE_TIMESTAMP_SLACK
+    };
+    time + slack >= started
+}
+
+/// Content digests this process already computed, each valid while its
+/// file still carries the change stamp it was read under — every unit of
+/// a build reads the same rmeta, rlib and native library files.
+#[derive(Debug, Default)]
+pub struct DigestMemo(Mutex<HashMap<PathBuf, (ChangeStamp, String)>>);
+
+impl DigestMemo {
+    /// The blake3 of `path`'s contents and the stamp it carries once read.
+    /// A file that changed while it was read is not memoized; its stamp
+    /// then shows the change.
+    fn digest(&self, path: &Path) -> std::io::Result<(ChangeStamp, String)> {
+        let before = ChangeStamp::read(path)?;
+        if let Some((stamp, digest)) = self.0.lock().expect("digest memo mutex").get(path)
+            && *stamp == before
+        {
+            return Ok((before, digest.clone()));
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update_reader(std::fs::File::open(path)?)?;
+        let digest = hasher.finalize().to_hex().to_string();
+        let after = ChangeStamp::read(path)?;
+        if after == before {
+            self.0
+                .lock()
+                .expect("digest memo mutex")
+                .insert(path.to_path_buf(), (before, digest.clone()));
+        }
+        Ok((after, digest))
+    }
 }
 
 /// One output file of a unit entry, stored under `files/<file_name>` and
@@ -191,9 +364,19 @@ struct UnitOutput {
     file_name: String,
     /// The artifact notification rustc prints for the file (`metadata`,
     /// `link`), or `None` for a file it leaves beside them unannounced —
-    /// the object files of unpacked split debuginfo.
+    /// the objects of unpacked split debuginfo.
     emit: Option<String>,
     sha256: String,
+}
+
+/// What a dep-info file says the compile read.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct UnitInputs {
+    /// Every file the dep-info lists, spelled as rustc spelled it —
+    /// relative to the working directory, or absolute — sorted.
+    files: Vec<String>,
+    /// Every variable read through `env!`/`option_env!`, sorted.
+    env: Vec<String>,
 }
 
 /// Whether a computation produced a key, or found an input it cannot
@@ -212,9 +395,9 @@ pub struct UnitPlan {
     target: String,
     rustc_version: String,
     env: InvocationEnv,
-    remaps: Vec<RemapRule>,
-    /// Taken before rustc started: a listed source modified at or after it
-    /// may not be what rustc read, so the compile is not stored.
+    /// Taken before rustc started: an input changed at or after it may
+    /// not be what rustc read, and an output older than it is not this
+    /// compile's.
     started: SystemTime,
 }
 
@@ -226,6 +409,33 @@ pub enum UnitLookup {
     Served(ServedStderr),
     /// No entry matches; compile and store under this plan.
     Compile(Box<UnitPlan>),
+}
+
+/// Every `-C`/`--codegen` option as `(key, value)`, in argv order, with
+/// `-g` as the `debuginfo=2` it abbreviates.
+fn codegen_options(args: &[OsString]) -> Vec<(&str, Option<&str>)> {
+    let mut options = Vec::new();
+    let mut iter = args.iter().filter_map(|arg| arg.to_str());
+    while let Some(arg) = iter.next() {
+        if arg == "-g" {
+            options.push(("debuginfo", Some("2")));
+            continue;
+        }
+        let option = match arg {
+            "-C" | "--codegen" => iter.next(),
+            _ => arg
+                .strip_prefix("--codegen=")
+                .or_else(|| arg.strip_prefix("-C")),
+        };
+        if let Some(option) = option {
+            options.push(
+                option
+                    .split_once('=')
+                    .map_or((option, None), |(key, value)| (key, Some(value))),
+            );
+        }
+    }
+    options
 }
 
 /// Why this unit is compiled without the unit cache, or `None` when its
@@ -264,6 +474,14 @@ pub fn refusal(parsed: &ParsedRustcArgs, args: &[OsString]) -> Option<String> {
     {
         return Some("a target spec file is not hashed".to_owned());
     }
+    for (key, _) in codegen_options(args) {
+        if key == "incremental" {
+            return Some("incremental compilation state is not cached".to_owned());
+        }
+        if key == "profile-use" || key == "profile-sample-use" {
+            return Some(format!("`-C {key}` reads a profile the key does not hash"));
+        }
+    }
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let Some(arg) = arg.to_str() else {
@@ -275,125 +493,55 @@ pub fn refusal(parsed: &ParsedRustcArgs, args: &[OsString]) -> Option<String> {
         if arg == "-o" || arg.starts_with("--sysroot") {
             return Some(format!("`{arg}` is not cached"));
         }
-        let codegen = if arg == "-C" {
+        let print = if arg == "--print" {
             iter.next().and_then(|value| value.to_str())
         } else {
-            arg.strip_prefix("-C")
+            arg.strip_prefix("--print=")
         };
-        if let Some(option) = codegen {
-            let key = option.split_once('=').map_or(option, |(key, _)| key);
-            if key == "incremental" {
-                return Some("incremental compilation state is not cached".to_owned());
-            }
-            if key == "profile-use" || key == "profile-sample-use" {
-                return Some(format!("`-C {key}` reads a profile the key does not hash"));
-            }
-            continue;
+        if let Some(request) = print
+            && request != REPLAYED_PRINT
+        {
+            return Some(format!("`--print {request}` writes to stdout"));
         }
         let unstable = if arg == "-Z" {
             iter.next().and_then(|value| value.to_str())
         } else {
             arg.strip_prefix("-Z")
         };
-        if let Some(option) = unstable
-            && FILE_READING_UNSTABLE_OPTIONS
+        if let Some(option) = unstable {
+            let key = option.split_once('=').map_or(option, |(key, _)| key);
+            if UNMODELED_UNSTABLE_OPTIONS
                 .iter()
-                .any(|prefix| option.starts_with(prefix))
-        {
-            return Some(format!(
-                "`-Z {option}` reads or writes files the key does not hash"
-            ));
+                .any(|name| key == *name || (name.ends_with('-') && key.starts_with(name)))
+            {
+                return Some(format!("`-Z {option}` is not modeled by the unit cache"));
+            }
         }
     }
     None
 }
 
-/// The parsed `--remap-path-prefix` rules, in argv order.
-fn remap_rules(args: &[OsString]) -> Result<Vec<RemapRule>, String> {
-    let mut rules = Vec::new();
-    let mut iter = args.iter().filter_map(|arg| arg.to_str());
-    while let Some(arg) = iter.next() {
-        let value = if arg == "--remap-path-prefix" {
-            iter.next()
-        } else {
-            arg.strip_prefix("--remap-path-prefix=")
-        };
-        let Some(value) = value else {
-            continue;
-        };
-        // rustc splits on the last `=`: a FROM may contain one.
-        let (from, to) = value
-            .rsplit_once('=')
-            .ok_or_else(|| format!("--remap-path-prefix `{value}` has no `=`"))?;
-        rules.push(RemapRule {
-            from: PathBuf::from(from),
-            to: to.to_owned(),
-        });
-    }
-    Ok(rules)
-}
-
-/// `path` as the key spells it: rustc applies the last rule whose FROM is
-/// a component prefix of the path.
-fn normalize(path: &Path, remaps: &[RemapRule]) -> Result<InputPath, String> {
-    let utf8 = |path: &Path| {
-        path.to_str()
-            .map(str::to_owned)
-            .ok_or_else(|| format!("path {} is not UTF-8", path.display()))
-    };
-    if path.is_relative() {
-        return Ok(InputPath::Relative(utf8(path)?));
-    }
-    for rule in remaps.iter().rev() {
-        if let Ok(rest) = path.strip_prefix(&rule.from) {
-            let rest = rest
-                .components()
-                .map(|component| match component {
-                    Component::Normal(part) => part
-                        .to_str()
-                        .map(str::to_owned)
-                        .ok_or_else(|| format!("path {} is not UTF-8", path.display())),
-                    other => Err(format!(
-                        "path {} has a `{}` component under a remapped prefix",
-                        path.display(),
-                        other.as_os_str().display()
-                    )),
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .join("/");
-            return Ok(InputPath::Remapped {
-                to: rule.to.clone(),
-                rest,
-            });
+/// Whether the artifact embeds `--out-dir` itself, as measured: with
+/// debuginfo on, an MSVC-like target's objects record their own path, and
+/// an ELF target's record the split DWARF path when split debuginfo is
+/// `packed` or `unpacked`; an Apple target's artifacts never do, and with
+/// debuginfo off no target's do.
+fn out_dir_reaches_output(args: &[OsString], target: &str) -> bool {
+    let mut debuginfo = false;
+    let mut split = None;
+    for (key, value) in codegen_options(args) {
+        match key {
+            "debuginfo" => debuginfo = !matches!(value, Some("0" | "none")),
+            "split-debuginfo" => split = value,
+            _ => {}
         }
     }
-    Ok(InputPath::Absolute(utf8(path)?))
-}
-
-/// The path a stored spelling names in this invocation, or `None` when no
-/// remap rule of this invocation maps to its `TO`.
-fn denormalize(input: &InputPath, cwd: &Path, remaps: &[RemapRule]) -> Option<PathBuf> {
-    match input {
-        InputPath::Relative(path) => Some(cwd.join(path)),
-        InputPath::Remapped { to, rest } => {
-            remaps.iter().rev().find(|rule| &rule.to == to).map(|rule| {
-                rest.split('/')
-                    .filter(|part| !part.is_empty())
-                    .fold(rule.from.clone(), |path, part| path.join(part))
-            })
-        }
-        InputPath::Absolute(path) => Some(PathBuf::from(path)),
+    let vendor = target.split('-').nth(1);
+    if !debuginfo || vendor == Some("apple") {
+        return false;
     }
-}
-
-/// The spelling rustc writes into dep-info for a stored input: relative as
-/// handed over, absolute otherwise — dep-info carries real paths, never
-/// remapped ones.
-fn dep_info_spelling(input: &InputPath, cwd: &Path, remaps: &[RemapRule]) -> Option<String> {
-    match input {
-        InputPath::Relative(path) => Some(path.clone()),
-        other => denormalize(other, cwd, remaps).and_then(|path| path.to_str().map(str::to_owned)),
-    }
+    let msvc_like = target.ends_with("-msvc") || target.split('-').any(|part| part == "uefi");
+    msvc_like || matches!(split, Some("packed" | "unpacked"))
 }
 
 /// Length-prefixed fields under one blake3 domain, so no two field lists
@@ -415,27 +563,6 @@ impl KeyHasher {
     }
 }
 
-/// The blake3 of a file's contents, or `None` when it cannot be read.
-fn file_digest(path: &Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let mut hasher = blake3::Hasher::new();
-    hasher.update_reader(file).ok()?;
-    Some(hasher.finalize().to_hex().to_string())
-}
-
-/// A variable's value as the key reads it: UTF-8, with an absolute path
-/// under a remap rule in its remapped form.
-fn env_value(value: &OsStr, remaps: &[RemapRule]) -> Result<String, String> {
-    let value = value
-        .to_str()
-        .ok_or_else(|| "a hashed environment variable is not UTF-8".to_owned())?;
-    let path = Path::new(value);
-    if path.is_absolute() && remaps.iter().any(|rule| path.starts_with(&rule.from)) {
-        return Ok(normalize(path, remaps)?.key_bytes());
-    }
-    Ok(value.to_owned())
-}
-
 /// Whether the invocation key reads `name` from the environment.
 fn is_keyed_var(name: &str) -> bool {
     name.starts_with("CARGO_PKG_")
@@ -444,9 +571,9 @@ fn is_keyed_var(name: &str) -> bool {
         || name.ends_with("_DEPLOYMENT_TARGET")
 }
 
-/// The `-L` directories rustc searches native libraries in.
-fn native_search_dirs(args: &[OsString], cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
+/// The `-L` directories rustc searches: `(native libraries, crates)`.
+fn search_dirs(args: &[OsString], cwd: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let (mut native, mut crates) = (Vec::new(), Vec::new());
     let mut iter = args.iter().filter_map(|arg| arg.to_str());
     while let Some(arg) = iter.next() {
         let value = if arg == "-L" {
@@ -457,77 +584,172 @@ fn native_search_dirs(args: &[OsString], cwd: &Path) -> Vec<PathBuf> {
         let Some(value) = value else {
             continue;
         };
-        let path = match value.split_once('=') {
-            Some(("native" | "all", path)) => path,
-            Some(("crate" | "dependency" | "framework", _)) => continue,
-            _ => value,
-        };
-        dirs.push(cwd.join(path));
-    }
-    dirs
-}
-
-/// The files a `-l [KIND[:MODS]=]NAME[:RENAME]` resolves to on the `-L`
-/// directories, with their digests. A name found nowhere is a system
-/// library, keyed by its spelling alone, as the toolchain is.
-fn native_library_digests(spec: &str, dirs: &[PathBuf]) -> Vec<(String, String)> {
-    let (kind, name) = spec.split_once('=').unwrap_or(("", spec));
-    if kind.starts_with("framework") {
-        return Vec::new();
-    }
-    let name = name.split_once(':').map_or(name, |(name, _)| name);
-    let candidates = [
-        format!("lib{name}.a"),
-        format!("{name}.lib"),
-        format!("lib{name}.so"),
-        format!("lib{name}.dylib"),
-        format!("lib{name}.dll.a"),
-    ];
-    let mut digests = Vec::new();
-    for dir in dirs {
-        for candidate in &candidates {
-            let path = dir.join(candidate);
-            if let Some(digest) = file_digest(&path) {
-                digests.push((path.display().to_string(), digest));
+        match value.split_once('=') {
+            Some(("native", path)) => native.push(cwd.join(path)),
+            Some(("crate" | "dependency", path)) => crates.push(cwd.join(path)),
+            // Frameworks are only ever linked, which no cached crate type does.
+            Some(("framework", _)) => {}
+            Some(("all", path)) => {
+                native.push(cwd.join(path));
+                crates.push(cwd.join(path));
+            }
+            _ => {
+                native.push(cwd.join(value));
+                crates.push(cwd.join(value));
             }
         }
     }
-    digests
+    (native, crates)
+}
+
+/// Whether `name` is a dynamic library, which producing an rlib or a
+/// staticlib never reads.
+fn is_dynamic_library(name: &str) -> bool {
+    // Windows names are case-insensitive.
+    let name = name.to_ascii_lowercase();
+    let versioned_so = name.split_once(".so.").is_some_and(|(_, version)| {
+        version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    });
+    versioned_so
+        || [".so", ".dylib", ".dll", ".tbd"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
+/// Key every regular file directly in `dir` whose name `include` accepts,
+/// by contents. A missing directory is keyed as absent.
+fn key_directory_files(
+    key: &mut KeyHasher,
+    memo: &DigestMemo,
+    dir: &Path,
+    include: impl Fn(&str) -> bool,
+) -> Result<(), String> {
+    key.field(dir.as_os_str().as_encoded_bytes());
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            key.field(b"absent");
+            return Ok(());
+        }
+        Err(error) => return Err(format!("list {}: {error}", dir.display())),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("list {}: {error}", dir.display()))?
+            .path();
+        let Some(name) = path.file_name().map(OsStr::to_owned) else {
+            continue;
+        };
+        let Some(name) = name.to_str().map(str::to_owned) else {
+            return Err(format!("{} has a non-UTF-8 entry", dir.display()));
+        };
+        if include(&name) && path.is_file() {
+            files.push((name, path));
+        }
+    }
+    files.sort();
+    for (name, path) in files {
+        let (_, digest) = memo
+            .digest(&path)
+            .map_err(|error| format!("hash {}: {error}", path.display()))?;
+        key.field(name.as_bytes());
+        key.field(digest.as_bytes());
+    }
+    Ok(())
+}
+
+/// Key the toolchain beyond `rustc -vV`, which two builds of one commit
+/// share: the sysroot, and the change stamp of every file a compile for
+/// `target` loads from it — the compiler's own libraries and the target's
+/// standard library. Stamps, not contents: the files are written once
+/// per install, and they are a quarter of a gigabyte.
+fn key_toolchain(key: &mut KeyHasher, toolchain: &Toolchain, target: &str) -> Result<(), String> {
+    key.field(toolchain.verbose_version.as_bytes());
+    key.field(toolchain.sysroot.as_os_str().as_encoded_bytes());
+    let sysroot = &toolchain.sysroot;
+    let rustc = format!("rustc{}", std::env::consts::EXE_SUFFIX);
+    let list = |dir: &Path, include: &dyn Fn(&str) -> bool| -> Result<Vec<PathBuf>, String> {
+        let mut files = Vec::new();
+        for entry in
+            std::fs::read_dir(dir).map_err(|error| format!("list {}: {error}", dir.display()))?
+        {
+            let path = entry
+                .map_err(|error| format!("list {}: {error}", dir.display()))?
+                .path();
+            if path.is_file()
+                && path
+                    .file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(include)
+            {
+                files.push(path);
+            }
+        }
+        Ok(files)
+    };
+    // The compiler: `rustc` and the libraries it loads — beside it on
+    // Windows, under `lib` elsewhere.
+    let mut files = list(&sysroot.join("bin"), &|name| {
+        name == rustc
+            || Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("dll"))
+    })?;
+    files.extend(list(&sysroot.join("lib"), &|_| true)?);
+    let target_dir = sysroot.join("lib").join("rustlib").join(target);
+    let spec = target_dir.join("target.json");
+    if spec.is_file() {
+        files.push(spec);
+    }
+    for entry in walkdir::WalkDir::new(target_dir.join("lib")).sort_by_file_name() {
+        let entry =
+            entry.map_err(|error| format!("walk the target's standard library: {error}"))?;
+        if entry.file_type().is_file() {
+            files.push(entry.into_path());
+        }
+    }
+    files.sort();
+    for path in files {
+        let stamp = ChangeStamp::read(&path)
+            .map_err(|error| format!("stat {}: {error}", path.display()))?;
+        key.field(path.as_os_str().as_encoded_bytes());
+        key.field(stamp.key_bytes().as_bytes());
+    }
+    Ok(())
 }
 
 /// Compute the invocation key: everything that decides the compile's
 /// output and is known before rustc runs. Blocking: it reads every
-/// `--extern` and native library.
-fn invocation_key_blocking(
+/// `--extern` and searched library. An `Err` names what cannot be keyed.
+fn invocation_key(
     args: &[OsString],
     parsed: &ParsedRustcArgs,
     env: &InvocationEnv,
-    rustc_vv: &str,
-    remaps: &[RemapRule],
-) -> Keying<String> {
-    match invocation_key_fields(args, parsed, env, rustc_vv, remaps) {
-        Ok(key) => key,
-        Err(reason) => Keying::Uncacheable(reason),
+    toolchain: &Toolchain,
+    target: &str,
+    memo: &DigestMemo,
+) -> Result<String, String> {
+    if let Some(name) = parsed.target.as_deref()
+        && let Some(path) = env.var("RUST_TARGET_PATH")
+        && std::env::split_paths(path).any(|dir| dir.join(format!("{name}.json")).exists())
+    {
+        return Err(format!(
+            "RUST_TARGET_PATH holds a spec for `{name}` the key does not hash"
+        ));
     }
-}
+    let mut sections = KeyHasher::new("stow.local-unit.invocation.v2");
 
-fn invocation_key_fields(
-    args: &[OsString],
-    parsed: &ParsedRustcArgs,
-    env: &InvocationEnv,
-    rustc_vv: &str,
-    remaps: &[RemapRule],
-) -> Result<Keying<String>, String> {
-    let mut key = KeyHasher::new("stow.local-unit.invocation.v1");
-    key.field(rustc_vv.as_bytes());
-    key.field(normalize(&env.cwd, remaps)?.key_bytes().as_bytes());
-    let input_spelling = parsed
-        .input_path
-        .as_ref()
-        .and_then(|path| path.to_str())
-        .ok_or_else(|| "the input path is not UTF-8".to_owned())?;
-    let search_dirs = native_search_dirs(args, &env.cwd);
-    let mut input_seen = false;
+    let mut key = KeyHasher::new("stow.local-unit.toolchain.v2");
+    key_toolchain(&mut key, toolchain, target)?;
+    sections.field(key.finish().as_bytes());
+
+    sections.field(env.cwd.as_os_str().as_encoded_bytes());
+
+    let keep_out_dir = out_dir_reaches_output(args, target);
+    let mut key = KeyHasher::new("stow.local-unit.argv.v2");
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let arg = arg
@@ -546,57 +768,28 @@ fn invocation_key_fields(
             (flag, Some(value))
         } else if let Some(value) = arg.strip_prefix("-L") {
             ("-L", Some(value))
-        } else if let Some(value) = arg.strip_prefix("-l") {
-            ("-l", Some(value))
         } else {
             (arg, None)
         };
         match (flag, value) {
-            // Where the outputs go and where dependencies are searched —
-            // the outputs' names are the argv's own, and what the search
-            // finds is keyed by content below — and the rendering width
-            // of diagnostics.
-            ("--out-dir" | "-L" | "--diagnostic-width", _) => {}
+            // What the searches find is keyed by content below, and the
+            // rendering width of diagnostics is not part of the artifact.
+            ("-L" | "--diagnostic-width", _) => {}
+            ("--out-dir", _) if !keep_out_dir => {}
             ("--extern", Some(spec)) => {
                 key.field(b"--extern");
                 match spec.split_once('=') {
                     Some((name, path)) => {
                         let path = env.cwd.join(path);
-                        let Some(digest) = file_digest(&path) else {
-                            return Ok(Keying::Uncacheable(format!(
-                                "--extern {name} at {} is unreadable",
-                                path.display()
-                            )));
-                        };
+                        let (_, digest) = memo.digest(&path).map_err(|error| {
+                            format!("--extern {name} at {}: {error}", path.display())
+                        })?;
                         key.field(format!("{name}={digest}").as_bytes());
                     }
                     None => key.field(spec.as_bytes()),
                 }
             }
-            // rustc writes only TO into the artifact; FROM decides which
-            // paths are remapped, and every keyed path is keyed remapped.
-            ("--remap-path-prefix", Some(rule)) => {
-                let (_, to) = rule
-                    .rsplit_once('=')
-                    .ok_or_else(|| format!("--remap-path-prefix `{rule}` has no `=`"))?;
-                key.field(b"--remap-path-prefix");
-                key.field(to.as_bytes());
-            }
-            ("-l", Some(spec)) => {
-                key.field(b"-l");
-                key.field(spec.as_bytes());
-                for (path, digest) in native_library_digests(spec, &search_dirs) {
-                    key.field(path.as_bytes());
-                    key.field(digest.as_bytes());
-                }
-            }
             (flag, value) => {
-                if value.is_none() && !input_seen && flag == input_spelling {
-                    input_seen = true;
-                    key.field(b"input");
-                    key.field(normalize(Path::new(flag), remaps)?.key_bytes().as_bytes());
-                    continue;
-                }
                 key.field(flag.as_bytes());
                 if let Some(value) = value {
                     key.field(value.as_bytes());
@@ -604,20 +797,42 @@ fn invocation_key_fields(
             }
         }
     }
-    if !input_seen {
-        return Err("the input path is not a standalone argument".to_owned());
+    sections.field(key.finish().as_bytes());
+
+    // A static library rustc bundles is found on the native search path by
+    // a name the source may give (`#[link(kind = "static")]`), so every
+    // library file there is keyed.
+    let (native_dirs, crate_dirs) = search_dirs(args, &env.cwd);
+    let mut key = KeyHasher::new("stow.local-unit.native.v2");
+    for dir in native_dirs {
+        key_directory_files(&mut key, memo, &dir, |name| !is_dynamic_library(name))?;
     }
-    for (name, value) in &env.vars {
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        if !is_keyed_var(name) {
-            continue;
+    sections.field(key.finish().as_bytes());
+
+    // A staticlib archives the objects of every rlib in its dependency
+    // closure, which the direct externs' contents do not pin: a rebuilt
+    // `-sys` crate's bundled objects leave its dependents' rmeta alone.
+    // An rlib reads only the rmeta of its transitive dependencies, which
+    // the direct externs pin through the dependency hashes they record.
+    let mut key = KeyHasher::new("stow.local-unit.crates.v2");
+    if parsed.crate_types.iter().any(|kind| kind == "staticlib") {
+        for dir in crate_dirs {
+            key_directory_files(&mut key, memo, &dir, |name| {
+                Path::new(name).extension() == Some(OsStr::new("rlib"))
+            })?;
         }
-        key.field(name.as_bytes());
-        key.field(env_value(value, remaps)?.as_bytes());
     }
-    Ok(Keying::Keyed(key.finish()))
+    sections.field(key.finish().as_bytes());
+
+    let mut key = KeyHasher::new("stow.local-unit.env.v2");
+    for (name, value) in &env.vars {
+        if name.to_str().is_some_and(is_keyed_var) {
+            key.field(name.as_encoded_bytes());
+            key.field(value.as_encoded_bytes());
+        }
+    }
+    sections.field(key.finish().as_bytes());
+    Ok(sections.finish())
 }
 
 /// What one dep-info file lists: its files' spellings in order, and its
@@ -706,43 +921,124 @@ fn escape_dep_path(path: &str) -> String {
     path.replace(' ', "\\ ")
 }
 
-/// The unit key over `inputs` as they stand now.
-fn unit_key_blocking(
+/// The directories rustc's module search reads beside the inputs: each
+/// input's own directory, where `mod foo;` finds `foo.rs` or `foo/`, and
+/// for a `.rs` input the directory of its name, where its own `mod`
+/// children live. Dep-info lists the file a search found, never the
+/// candidates it rejected — the second of `foo.rs` and `foo/mod.rs` that
+/// fails the compile with E0761.
+fn module_search_dirs(paths: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let mut dirs = BTreeSet::new();
+    for path in paths {
+        if let Some(parent) = path.parent() {
+            dirs.insert(parent.to_path_buf());
+        }
+        if path.extension() == Some(OsStr::new("rs")) {
+            dirs.insert(path.with_extension(""));
+        }
+    }
+    dirs
+}
+
+/// The entries of `dir` a module search can find — directories, and files
+/// named `*.rs` — with the directory's stamp, or `None` when it does not
+/// exist. Names starting with `.` are never module names.
+fn module_search_listing(dir: &Path) -> std::io::Result<Option<(ChangeStamp, Vec<Vec<u8>>)>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let bytes = name.as_encoded_bytes();
+        if bytes.starts_with(b".") {
+            continue;
+        }
+        let is_dir = entry.file_type()?.is_dir() || entry.path().is_dir();
+        if is_dir {
+            let mut dir_entry = bytes.to_vec();
+            dir_entry.push(b'/');
+            names.push(dir_entry);
+        } else if bytes.ends_with(b".rs") {
+            names.push(bytes.to_vec());
+        }
+    }
+    names.sort();
+    Ok(Some((ChangeStamp::read(dir)?, names)))
+}
+
+/// A unit key and the latest change time among what it read.
+#[derive(Debug)]
+struct UnitKey {
+    key: String,
+    newest_change: SystemTime,
+}
+
+/// The unit key over `inputs` as they stand now. Blocking. An `Err` is
+/// the input or directory that could not be read.
+fn unit_key(
     invocation_key: &str,
     inputs: &UnitInputs,
     env: &InvocationEnv,
-    remaps: &[RemapRule],
-) -> Keying<String> {
-    let mut key = KeyHasher::new("stow.local-unit.v1");
+    memo: &DigestMemo,
+) -> Result<UnitKey, (PathBuf, std::io::Error)> {
+    let mut key = KeyHasher::new("stow.local-unit.v2");
     key.field(invocation_key.as_bytes());
-    for input in &inputs.files {
-        let Some(path) = denormalize(input, &env.cwd, remaps) else {
-            return Keying::Uncacheable(format!(
-                "no remap rule of this invocation maps to the input {}",
-                input.key_bytes()
-            ));
-        };
-        let Some(digest) = file_digest(&path) else {
-            return Keying::Uncacheable(format!("input {} is unreadable", path.display()));
-        };
-        key.field(input.key_bytes().as_bytes());
-        key.field(digest.as_bytes());
+    let mut newest_change = UNIX_EPOCH;
+    let paths = inputs
+        .files
+        .iter()
+        .map(|spelling| env.cwd.join(spelling))
+        .collect::<Vec<_>>();
+    let mut files = KeyHasher::new("stow.local-unit.inputs.v2");
+    for (spelling, path) in inputs.files.iter().zip(&paths) {
+        let (stamp, digest) = memo.digest(path).map_err(|error| (path.clone(), error))?;
+        newest_change = newest_change.max(stamp.changed);
+        files.field(spelling.as_bytes());
+        files.field(digest.as_bytes());
     }
-    for name in &inputs.env {
-        key.field(name.as_bytes());
-        // `env!` values are embedded verbatim: keyed raw, never remapped.
-        match env.var(name) {
-            Some(value) => {
-                let Some(value) = value.to_str() else {
-                    return Keying::Uncacheable(format!("env-dep {name} is not UTF-8"));
-                };
-                key.field(b"set");
-                key.field(value.as_bytes());
+    key.field(files.finish().as_bytes());
+    let mut dirs = KeyHasher::new("stow.local-unit.module-search.v2");
+    for dir in module_search_dirs(&paths) {
+        dirs.field(dir.as_os_str().as_encoded_bytes());
+        match module_search_listing(&dir).map_err(|error| (dir.clone(), error))? {
+            Some((stamp, names)) => {
+                newest_change = newest_change.max(stamp.changed);
+                for name in names {
+                    dirs.field(&name);
+                }
             }
-            None => key.field(b"unset"),
+            None => dirs.field(b"\0absent"),
         }
     }
-    Keying::Keyed(key.finish())
+    key.field(dirs.finish().as_bytes());
+    // `env!` values are embedded verbatim, so they are keyed raw.
+    let mut vars = KeyHasher::new("stow.local-unit.env-deps.v2");
+    for name in &inputs.env {
+        vars.field(name.as_bytes());
+        match env.var(name) {
+            Some(value) => {
+                vars.field(b"set");
+                vars.field(value.as_encoded_bytes());
+            }
+            None => vars.field(b"unset"),
+        }
+    }
+    key.field(vars.finish().as_bytes());
+    Ok(UnitKey {
+        key: key.finish(),
+        newest_change,
+    })
 }
 
 fn cache_key(target: &str, unit_key: &str) -> String {
@@ -756,9 +1052,9 @@ fn entry_relative_dir(target: &str, unit_key: &str) -> PathBuf {
         .join(unit_key)
 }
 
-#[derive(Debug, Clone, FromRow)]
+/// A stored entry as a serve reads it, under the entry's shared lock.
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct UnitEntryRow {
-    cache_key: String,
     inputs_json: String,
     env_dep_lines_json: String,
     outputs_json: String,
@@ -767,123 +1063,122 @@ struct UnitEntryRow {
     last_accessed_ms: i64,
 }
 
+/// Where a lookup's invocation runs and with what: the facts a key reads
+/// that are not the argv.
+#[derive(Debug, Clone, Copy)]
+pub struct LookupContext<'a> {
+    /// The process cargo started rustc in.
+    pub env: &'a InvocationEnv,
+    /// The toolchain the invocation compiles with.
+    pub toolchain: &'a Toolchain,
+    /// The unit's target: its `--target`, else the host.
+    pub target: &'a str,
+    /// The release the per-rustc cache directory is named for.
+    pub rustc_version: &'a str,
+    /// The host triple.
+    pub host: &'a str,
+}
+
 /// Look `parsed` up: serve a matching entry, or return the plan its
 /// compile stores under.
 ///
 /// # Errors
 ///
 /// A failure of the cache itself — the state database, a malformed row,
-/// an entry that cannot be written into the target directory. The caller
-/// compiles without storing.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the lookup reads one invocation's every independent fact"
-)]
+/// an entry that cannot be written into the target directory. An entry
+/// that fails to serve is removed so the next build compiles it.
 pub async fn lookup(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
     args: &[OsString],
-    env: &InvocationEnv,
-    rustc_vv: &str,
-    target: &str,
-    rustc_version: &str,
-    host: &str,
+    context: LookupContext<'_>,
+    memo: &Arc<DigestMemo>,
 ) -> stow_types::error::Result<Keying<UnitLookup>> {
     let started = SystemTime::now();
-    let remaps = match remap_rules(args) {
-        Ok(remaps) => remaps,
-        Err(reason) => return Ok(Keying::Uncacheable(reason)),
-    };
     let invocation_key = {
-        let (args, parsed, env, rustc_vv, remaps) = (
+        let (args, parsed, env, toolchain, target, memo) = (
             args.to_vec(),
             parsed.clone(),
-            env.clone(),
-            rustc_vv.to_owned(),
-            remaps.clone(),
+            context.env.clone(),
+            context.toolchain.clone(),
+            context.target.to_owned(),
+            Arc::clone(memo),
         );
         tokio::task::spawn_blocking(move || {
-            invocation_key_blocking(&args, &parsed, &env, &rustc_vv, &remaps)
+            invocation_key(&args, &parsed, &env, &toolchain, &target, &memo)
         })
         .await
         .wrap_err("join unit invocation key task")?
     };
     let invocation_key = match invocation_key {
-        Keying::Keyed(key) => key,
-        Keying::Uncacheable(reason) => return Ok(Keying::Uncacheable(reason)),
+        Ok(key) => key,
+        Err(reason) => return Ok(Keying::Uncacheable(reason)),
     };
     let connection = config.state_db_pool().await?;
-    let rows = sqlx::query_as::<_, UnitEntryRow>(
-        "SELECT cache_key, inputs_json, env_dep_lines_json, outputs_json, diagnostics, \
-                relative_dir, last_accessed_ms \
-         FROM unit_cache_entries \
+    let candidates = sqlx::query_as::<_, (String, String)>(
+        "SELECT cache_key, inputs_json FROM unit_cache_entries \
          WHERE rustc_version = ? AND invocation_key = ?",
     )
-    .bind(rustc_version)
+    .bind(context.rustc_version)
     .bind(&invocation_key)
     .fetch_all(&connection)
     .await
     .wrap_err("read unit cache candidates")?;
     let plan = UnitPlan {
         invocation_key,
-        target: target.to_owned(),
-        rustc_version: rustc_version.to_owned(),
-        env: env.clone(),
-        remaps,
+        target: context.target.to_owned(),
+        rustc_version: context.rustc_version.to_owned(),
+        env: context.env.clone(),
         started,
     };
-    if let Some(row) = matching_entry(&plan, rows).await? {
-        let (cache_key, relative_dir) = (row.cache_key.clone(), row.relative_dir.clone());
-        match serve_entry(config, &connection, parsed, &plan, row, host).await {
+    if let Some(cache_key) = matching_entry(&plan, candidates, memo).await? {
+        match serve_entry(config, &connection, parsed, &plan, &cache_key, context.host).await {
             Ok(Some(stderr)) => return Ok(Keying::Keyed(UnitLookup::Served(stderr))),
             Ok(None) => {}
             Err(error) => {
-                // An entry that cannot be served is removed, so the
-                // compile this falls back to stores a working one.
-                remove_entry(
-                    config,
-                    &connection,
-                    &plan.rustc_version,
-                    &cache_key,
-                    &relative_dir,
-                )
-                .await?;
-                return Err(error);
+                let removed = remove_entry(config, &connection, &plan, &cache_key).await;
+                return Err(match removed {
+                    Ok(()) => error,
+                    Err(remove_error) => stow_types::stow_error!(
+                        "{error}; removing the unservable entry {cache_key} also failed: {remove_error}"
+                    ),
+                });
             }
         }
     }
     Ok(Keying::Keyed(UnitLookup::Compile(Box::new(plan))))
 }
 
-/// The row whose unit key the inputs re-hash to, hashing each distinct
-/// input list once.
+/// The cache key of the candidate whose unit key the inputs re-hash to,
+/// hashing each distinct input list once. A candidate whose inputs no
+/// longer read is a miss, not a failure.
 async fn matching_entry(
     plan: &UnitPlan,
-    rows: Vec<UnitEntryRow>,
-) -> stow_types::error::Result<Option<UnitEntryRow>> {
-    if rows.is_empty() {
+    candidates: Vec<(String, String)>,
+    memo: &Arc<DigestMemo>,
+) -> stow_types::error::Result<Option<String>> {
+    if candidates.is_empty() {
         return Ok(None);
     }
-    let plan = plan.clone();
+    let (plan, memo) = (plan.clone(), Arc::clone(memo));
     tokio::task::spawn_blocking(move || {
-        let mut by_inputs: BTreeMap<String, Vec<UnitEntryRow>> = BTreeMap::new();
-        for row in rows {
-            by_inputs.entry(row.inputs_json.clone()).or_default().push(row);
+        let mut by_inputs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (cache_key, inputs_json) in candidates {
+            by_inputs.entry(inputs_json).or_default().push(cache_key);
         }
-        for (inputs_json, rows) in by_inputs {
+        for (inputs_json, cache_keys) in by_inputs {
             let inputs: UnitInputs = serde_json::from_str(&inputs_json)
                 .wrap_err("parse unit cache inputs_json")?;
-            let unit_key =
-                match unit_key_blocking(&plan.invocation_key, &inputs, &plan.env, &plan.remaps) {
-                    Keying::Keyed(key) => key,
-                    Keying::Uncacheable(reason) => {
-                        tracing::debug!(%reason, "unit cache candidate does not apply to this checkout");
-                        continue;
-                    }
-                };
+            let unit_key = match unit_key(&plan.invocation_key, &inputs, &plan.env, &memo) {
+                Ok(unit_key) => unit_key.key,
+                Err((path, error)) => {
+                    tracing::debug!(path = %path.display(), %error, "unit cache candidate's input no longer reads");
+                    continue;
+                }
+            };
             let wanted = cache_key(&plan.target, &unit_key);
-            if let Some(row) = rows.into_iter().find(|row| row.cache_key == wanted) {
-                return Ok(Some(row));
+            if cache_keys.contains(&wanted) {
+                return Ok(Some(wanted));
             }
         }
         Ok(None)
@@ -893,24 +1188,39 @@ async fn matching_entry(
 }
 
 /// Write a matching entry's outputs and dep-info into the target
-/// directory. `None` means the entry vanished under a concurrent eviction.
+/// directory. The row is read under the entry's shared lock, so it is the
+/// row of the files being served; `None` means the entry vanished under a
+/// concurrent eviction.
 async fn serve_entry(
     config: &StowConfig,
     connection: &sqlx::SqlitePool,
     parsed: &ParsedRustcArgs,
     plan: &UnitPlan,
-    row: UnitEntryRow,
+    cache_key: &str,
     host: &str,
 ) -> stow_types::error::Result<Option<ServedStderr>> {
     let version_dir = config.artifact_cache_version_dir(&plan.rustc_version);
-    let entry_dir = version_dir.join(&row.relative_dir);
     let _lease = tokio::task::spawn_blocking({
         let version_dir = version_dir.clone();
-        let cache_key = row.cache_key.clone();
+        let cache_key = cache_key.to_owned();
         move || acquire_entry_shared_lock(&version_dir, &cache_key)
     })
     .await
     .wrap_err("join unit cache lease task")??;
+    let Some(row) = sqlx::query_as::<_, UnitEntryRow>(
+        "SELECT inputs_json, env_dep_lines_json, outputs_json, diagnostics, relative_dir, \
+                last_accessed_ms \
+         FROM unit_cache_entries WHERE rustc_version = ? AND cache_key = ?",
+    )
+    .bind(&plan.rustc_version)
+    .bind(cache_key)
+    .fetch_optional(connection)
+    .await
+    .wrap_err("read unit cache entry")?
+    else {
+        return Ok(None);
+    };
+    let entry_dir = version_dir.join(&row.relative_dir);
     if !entry_dir.exists() {
         return Ok(None);
     }
@@ -937,7 +1247,7 @@ async fn serve_entry(
     let dep_info_path = parsed
         .output_dep_info_path()
         .ok_or_else(|| stow_types::stow_error!("served unit has no dep-info path"))?;
-    let dep_info = render_dep_info(&dep_info_path, out_dir, &outputs, &inputs, &env_lines, plan)?;
+    let dep_info = render_dep_info(&dep_info_path, out_dir, &outputs, &inputs, &env_lines)?;
     async_fs::write(&dep_info_path, dep_info)
         .await
         .wrap_err_with(|| format!("write served dep-info {}", dep_info_path.display()))?;
@@ -951,7 +1261,7 @@ async fn serve_entry(
             "unit cache last_accessed_ms",
         )?)
         .bind(&plan.rustc_version)
-        .bind(&row.cache_key)
+        .bind(cache_key)
         .execute(connection)
         .await
         .wrap_err("touch unit cache entry")?;
@@ -974,32 +1284,22 @@ async fn serve_entry(
     Ok(Some(ServedStderr(lines)))
 }
 
-/// The dep-info rustc would write for this checkout: one rule per output
-/// and for the dep-info itself, a phony rule per input, then the env-dep
-/// lines — which match a fresh compile's byte for byte, since the key
-/// holds their raw values.
+/// The dep-info rustc writes: one rule per announced output and for the
+/// dep-info itself, a phony rule per input, then the env-dep lines. The
+/// key holds the working directory, every input spelling and every
+/// env-dep value raw, so this is the compile's own dep-info byte for byte.
 fn render_dep_info(
     dep_info_path: &Path,
     out_dir: &Path,
     outputs: &[UnitOutput],
     inputs: &UnitInputs,
     env_lines: &[String],
-    plan: &UnitPlan,
 ) -> stow_types::error::Result<String> {
     let deps = inputs
         .files
         .iter()
-        .map(|input| {
-            dep_info_spelling(input, &plan.env.cwd, &plan.remaps)
-                .map(|path| escape_dep_path(&path))
-                .ok_or_else(|| {
-                    stow_types::stow_error!(
-                        "served unit input {} has no path in this checkout",
-                        input.key_bytes()
-                    )
-                })
-        })
-        .collect::<stow_types::error::Result<Vec<_>>>()?;
+        .map(|path| escape_dep_path(path))
+        .collect::<Vec<_>>();
     let joined = deps.join(" ");
     let mut text = String::new();
     let targets = outputs
@@ -1073,9 +1373,6 @@ fn expected_link_outputs(
             "staticlib" => parsed
                 .output_staticlib_path(host)
                 .map_err(stow_types::error::Error::msg)?,
-            "proc-macro" | "dylib" => parsed
-                .output_dynamic_library_path(host)
-                .map_err(stow_types::error::Error::msg)?,
             other => {
                 return Err(stow_types::stow_error!(
                     "unit cache has no output for crate type `{other}`"
@@ -1093,33 +1390,47 @@ fn expected_link_outputs(
 }
 
 /// Every file the compile left in `--out-dir` for this unit: the
-/// announced outputs, plus anything else under the unit's own
-/// `<crate><extra-filename>.` stem written since rustc started — the
-/// object files unpacked split debuginfo leaves for the debugger.
+/// announced outputs, which a successful compile must have written, plus
+/// anything else under the unit's own `<crate><extra-filename>.` stem
+/// written since rustc started — the objects unpacked split debuginfo
+/// leaves for the debugger.
+///
+/// # Errors
+///
+/// An announced output that is missing, or older than the compile: rustc
+/// reported success without writing what its argv asks for.
 fn collect_outputs(
     parsed: &ParsedRustcArgs,
     plan: &UnitPlan,
     host: &str,
-) -> Result<Vec<(PathBuf, Option<&'static str>)>, String> {
-    let out_dir = parsed.out_dir.as_ref().ok_or("no --out-dir")?;
+) -> stow_types::error::Result<Vec<(PathBuf, Option<&'static str>)>> {
+    let out_dir = parsed
+        .out_dir
+        .as_ref()
+        .ok_or_else(|| stow_types::stow_error!("stored unit has no --out-dir"))?;
     let mut outputs = Vec::new();
     if parsed.emit.contains("metadata") {
-        outputs.push((
-            parsed.output_rmeta_path().ok_or("no rmeta path")?,
-            Some("metadata"),
-        ));
+        let rmeta = parsed
+            .output_rmeta_path()
+            .ok_or_else(|| stow_types::stow_error!("stored unit has no rmeta path"))?;
+        outputs.push((rmeta, Some("metadata")));
     }
     if parsed.emit.contains("link") {
-        for path in expected_link_outputs(parsed, host).map_err(|error| error.to_string())? {
+        for path in expected_link_outputs(parsed, host)? {
             outputs.push((path, Some("link")));
         }
     }
+    for (path, _) in &outputs {
+        require_written_by(path, plan.started)?;
+    }
     let stem = format!("{}{}.", parsed.crate_name, parsed.extra_filename);
-    let dep_info = parsed.output_dep_info_path().ok_or("no dep-info path")?;
-    let entries = std::fs::read_dir(out_dir)
-        .map_err(|error| format!("list {}: {error}", out_dir.display()))?;
+    let dep_info = parsed
+        .output_dep_info_path()
+        .ok_or_else(|| stow_types::stow_error!("stored unit has no dep-info path"))?;
+    let entries =
+        std::fs::read_dir(out_dir).wrap_err_with(|| format!("list {}", out_dir.display()))?;
     for entry in entries {
-        let entry = entry.map_err(|error| format!("list {}: {error}", out_dir.display()))?;
+        let entry = entry.wrap_err_with(|| format!("list {}", out_dir.display()))?;
         let path = entry.path();
         let Some(name) = path.file_name().and_then(OsStr::to_str) else {
             continue;
@@ -1133,52 +1444,69 @@ fn collect_outputs(
         let modified = entry
             .metadata()
             .and_then(|metadata| metadata.modified())
-            .map_err(|error| format!("stat {}: {error}", path.display()))?;
-        if modified >= plan.started {
+            .wrap_err_with(|| format!("stat {}", path.display()))?;
+        if written_since(modified, plan.started) {
             outputs.push((path, None));
         }
     }
     Ok(outputs)
 }
 
+/// Fail unless `path` exists and was written by the compile that started
+/// at `started`.
+fn require_written_by(path: &Path, started: SystemTime) -> stow_types::error::Result<()> {
+    let stamp = ChangeStamp::read(path).wrap_err_with(|| {
+        format!(
+            "rustc reported success, but its output {} cannot be read",
+            path.display()
+        )
+    })?;
+    if !written_since(stamp.modified, started) {
+        return Err(stow_types::stow_error!(
+            "rustc reported success, but {} predates the compile: it is an earlier compile's",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Store a successful compile's outputs under its unit key.
 ///
 /// # Errors
 ///
-/// A failure of the cache itself. An input that cannot be keyed is not an
-/// error: the compile is left unstored and a debug line names the reason.
+/// A failure of the cache itself, or a compile that reported success
+/// without writing its dep-info and outputs. An input that cannot be keyed
+/// — one that changed or vanished while rustc ran — is not an error: the
+/// compile is left unstored and a debug line names the reason.
 pub async fn store(
     config: &StowConfig,
     parsed: &ParsedRustcArgs,
     plan: &UnitPlan,
     diagnostics: &str,
     host: &str,
+    memo: &Arc<DigestMemo>,
 ) -> stow_types::error::Result<()> {
-    let skip = |reason: String| {
+    let skip = |reason: &str| {
         tracing::debug!(crate_name = %parsed.crate_name, %reason, "not storing unit in the local unit cache");
         Ok(())
     };
     if diagnostics.len() > MAX_DIAGNOSTICS_BYTES {
-        return skip(format!("stderr exceeds {MAX_DIAGNOSTICS_BYTES} bytes"));
+        return skip(&format!("stderr exceeds {MAX_DIAGNOSTICS_BYTES} bytes"));
     }
-    // The announcements are rebuilt for the serving checkout's paths.
-    let diagnostics = diagnostics
-        .lines()
-        .filter(|line| !line.starts_with("{\"$message_type\":\"artifact\""))
-        .fold(String::new(), |mut text, line| {
-            text.push_str(line);
-            text.push('\n');
-            text
-        });
     let prepared = {
-        let (parsed, plan, host) = (parsed.clone(), plan.clone(), host.to_owned());
-        tokio::task::spawn_blocking(move || prepare_store(&parsed, &plan, &host))
+        let (parsed, plan, host, memo) = (
+            parsed.clone(),
+            plan.clone(),
+            host.to_owned(),
+            Arc::clone(memo),
+        );
+        tokio::task::spawn_blocking(move || prepare_store(&parsed, &plan, &host, &memo))
             .await
-            .wrap_err("join unit cache store preparation")?
+            .wrap_err("join unit cache store preparation")??
     };
     let prepared = match prepared {
-        Ok(prepared) => prepared,
-        Err(reason) => return skip(reason),
+        Keying::Keyed(prepared) => prepared,
+        Keying::Uncacheable(reason) => return skip(&reason),
     };
 
     let version_dir = config.artifact_cache_version_dir(&plan.rustc_version);
@@ -1203,13 +1531,25 @@ pub async fn store(
         (false, true) => remove_orphaned_entry_dir(entry_dir.clone()).await?,
         (false, false) => {}
     }
+    // Hashed only once the entry is known to be new: a duplicate store
+    // never reads its outputs.
+    let outputs = tokio::task::spawn_blocking({
+        let files = prepared.outputs.clone();
+        move || hash_outputs(files)
+    })
+    .await
+    .wrap_err("join unit cache output hash task")??;
     let staging = config
         .artifact_cache_staging_dir(&plan.rustc_version)
         .await?;
     let size_bytes = tokio::task::spawn_blocking({
         let staging = staging.clone();
         let entry_dir = entry_dir.clone();
-        let files = prepared.files.clone();
+        let files = prepared
+            .outputs
+            .iter()
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
         move || stage_entry_blocking(staging.path(), &entry_dir, &files)
     })
     .await
@@ -1225,8 +1565,8 @@ pub async fn store(
     .bind(&plan.invocation_key)
     .bind(serde_json::to_string(&prepared.inputs).wrap_err("serialize unit inputs")?)
     .bind(serde_json::to_string(&prepared.env_lines).wrap_err("serialize env-dep lines")?)
-    .bind(serde_json::to_string(&prepared.outputs).wrap_err("serialize unit outputs")?)
-    .bind(&diagnostics)
+    .bind(serde_json::to_string(&outputs).wrap_err("serialize unit outputs")?)
+    .bind(filtered_diagnostics(diagnostics))
     .bind(path_to_string(&relative_dir)?)
     .bind(db_int::<_, i64>(size_bytes, "unit cache size_bytes")?)
     .bind(db_int::<_, i64>(
@@ -1247,71 +1587,111 @@ pub async fn store(
     .await
 }
 
+/// The stderr an entry replays: rustc's, without its artifact
+/// notifications, which a serve rebuilds for the serving invocation.
+fn filtered_diagnostics(diagnostics: &str) -> String {
+    diagnostics
+        .lines()
+        .filter(|line| !line.starts_with("{\"$message_type\":\"artifact\""))
+        .fold(String::new(), |mut text, line| {
+            text.push_str(line);
+            text.push('\n');
+            text
+        })
+}
+
+/// Each output's record: its name, notification and sha256.
+fn hash_outputs(
+    files: Vec<(PathBuf, Option<&'static str>)>,
+) -> stow_types::error::Result<Vec<UnitOutput>> {
+    files
+        .into_iter()
+        .map(|(path, emit)| {
+            let file_name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or_else(|| {
+                    stow_types::stow_error!("output {} has no UTF-8 name", path.display())
+                })?
+                .to_owned();
+            let (sha256, _) = sha256_file_bytes(&path)?;
+            Ok(UnitOutput {
+                file_name,
+                emit: emit.map(str::to_owned),
+                sha256,
+            })
+        })
+        .collect()
+}
+
 /// A compile resolved into what its entry records.
+#[derive(Debug)]
 struct PreparedStore {
     unit_key: String,
     inputs: UnitInputs,
     env_lines: Vec<String>,
-    outputs: Vec<UnitOutput>,
-    /// `(source in out-dir, file name)` pairs to stage.
-    files: Vec<(PathBuf, String)>,
+    /// Each output in `--out-dir`, with the notification rustc printed.
+    outputs: Vec<(PathBuf, Option<&'static str>)>,
 }
 
+/// Read what a successful compile left: its dep-info, its outputs, and
+/// its inputs as they stand.
 fn prepare_store(
     parsed: &ParsedRustcArgs,
     plan: &UnitPlan,
     host: &str,
-) -> Result<PreparedStore, String> {
-    let dep_info_path = parsed.output_dep_info_path().ok_or("no dep-info path")?;
+    memo: &DigestMemo,
+) -> stow_types::error::Result<Keying<PreparedStore>> {
+    let dep_info_path = parsed
+        .output_dep_info_path()
+        .ok_or_else(|| stow_types::stow_error!("stored unit has no dep-info path"))?;
+    require_written_by(&dep_info_path, plan.started)?;
     let text = std::fs::read_to_string(&dep_info_path)
-        .map_err(|error| format!("read dep-info {}: {error}", dep_info_path.display()))?;
-    let dep_info = parse_dep_info(&text)?;
-    let files = dep_info
-        .files
-        .iter()
-        .map(|spelling| normalize(Path::new(spelling), &plan.remaps))
-        .collect::<Result<BTreeSet<_>, _>>()?;
+        .wrap_err_with(|| format!("read dep-info {}", dep_info_path.display()))?;
+    let dep_info = parse_dep_info(&text).map_err(|reason| {
+        stow_types::stow_error!("dep-info {}: {reason}", dep_info_path.display())
+    })?;
+    let outputs = collect_outputs(parsed, plan, host)?;
     let inputs = UnitInputs {
-        files: files.into_iter().collect(),
+        files: dep_info
+            .files
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
         env: dep_info.env_names(),
     };
-    let unit_key = match unit_key_blocking(&plan.invocation_key, &inputs, &plan.env, &plan.remaps) {
-        Keying::Keyed(key) => key,
-        Keying::Uncacheable(reason) => return Err(reason),
-    };
-    // After hashing: a write that lands before the hash and one that lands
-    // after it both leave an mtime at or past the compile's start.
-    for spelling in &dep_info.files {
-        let modified = std::fs::metadata(plan.env.cwd.join(spelling))
-            .and_then(|metadata| metadata.modified())
-            .map_err(|error| format!("stat input {spelling}: {error}"))?;
-        if modified >= plan.started {
-            return Err(format!("input {spelling} changed while rustc ran"));
+    let unit_key = match unit_key(&plan.invocation_key, &inputs, &plan.env, memo) {
+        Ok(unit_key) => unit_key,
+        Err((path, error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Keying::Uncacheable(format!(
+                "input {} was removed while rustc ran",
+                path.display()
+            )));
         }
+        Err((path, error)) => {
+            return Err(stow_types::stow_error!(
+                "read unit input {} after a successful compile: {error}",
+                path.display()
+            ));
+        }
+    };
+    // The change time, not the modification time: a copy, extraction or
+    // restore that keeps an old mtime still moves it. The inputs are
+    // hashed after the compile, so one changed since rustc started may not
+    // be what rustc read.
+    if written_since(unit_key.newest_change, plan.started) {
+        return Ok(Keying::Uncacheable(
+            "an input or a directory rustc searched changed while rustc ran".to_owned(),
+        ));
     }
-    let mut outputs = Vec::new();
-    let mut staged = Vec::new();
-    for (path, emit) in collect_outputs(parsed, plan, host)? {
-        let file_name = path
-            .file_name()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| format!("output {} has no UTF-8 name", path.display()))?
-            .to_owned();
-        let (sha256, _) = sha256_file_bytes(&path).map_err(|error| error.to_string())?;
-        outputs.push(UnitOutput {
-            file_name: file_name.clone(),
-            emit: emit.map(str::to_owned),
-            sha256,
-        });
-        staged.push((path, file_name));
-    }
-    Ok(PreparedStore {
-        unit_key,
+    Ok(Keying::Keyed(PreparedStore {
+        unit_key: unit_key.key,
         inputs,
         env_lines: dep_info.env_lines,
         outputs,
-        files: staged,
-    })
+    }))
 }
 
 /// Clone the outputs into a temp entry in the process's staging directory
@@ -1321,7 +1701,7 @@ fn prepare_store(
 fn stage_entry_blocking(
     staging_dir: &Path,
     entry_dir: &Path,
-    files: &[(PathBuf, String)],
+    files: &[PathBuf],
 ) -> stow_types::error::Result<u64> {
     let tempdir = tempfile::Builder::new()
         .prefix("unit-")
@@ -1331,7 +1711,10 @@ fn stage_entry_blocking(
     std::fs::create_dir_all(&files_dir)
         .wrap_err_with(|| format!("create unit entry files dir {}", files_dir.display()))?;
     let mut size_bytes = 0u64;
-    for (source, file_name) in files {
+    for source in files {
+        let file_name = source.file_name().ok_or_else(|| {
+            stow_types::stow_error!("unit output {} has no file name", source.display())
+        })?;
         let dest = files_dir.join(file_name);
         reflink::reflink_or_copy(source, &dest)
             .wrap_err_with(|| format!("clone {} into the unit cache", source.display()))?;
@@ -1360,14 +1743,16 @@ fn stage_entry_blocking(
 async fn remove_entry(
     config: &StowConfig,
     connection: &sqlx::SqlitePool,
-    rustc_version: &str,
+    plan: &UnitPlan,
     cache_key: &str,
-    relative_dir: &str,
 ) -> stow_types::error::Result<()> {
-    let version_dir = config.artifact_cache_version_dir(rustc_version);
+    let version_dir = config.artifact_cache_version_dir(&plan.rustc_version);
     let lock = acquire_entry_exclusive_lock_async(&version_dir, cache_key).await?;
-    delete_unit_entry(connection, rustc_version, cache_key).await?;
-    let entry_dir = version_dir.join(relative_dir);
+    delete_unit_entry(connection, &plan.rustc_version, cache_key).await?;
+    let unit_key = cache_key
+        .rsplit_once('/')
+        .map_or(cache_key, |(_, unit_key)| unit_key);
+    let entry_dir = version_dir.join(entry_relative_dir(&plan.target, unit_key));
     if entry_dir.exists() {
         remove_orphaned_entry_dir(entry_dir).await?;
     }
@@ -1395,206 +1780,4 @@ pub async fn delete_unit_entry(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::ffi::OsString;
-    use std::path::Path;
-
-    use super::{
-        InputPath, InvocationEnv, Keying, RemapRule, UnitInputs, invocation_key_blocking,
-        normalize, parse_dep_info, refusal, remap_rules, unit_key_blocking,
-    };
-    use crate::rustc_args::ParsedRustcArgs;
-
-    /// One checkout of a workspace whose member `mylib` depends on `dep`:
-    /// the sources, the dependency's rmeta, and the argv and environment
-    /// cargo hands rustc for `mylib` there.
-    struct Checkout {
-        _dir: tempfile::TempDir,
-        root: std::path::PathBuf,
-    }
-
-    impl Checkout {
-        fn new(lib_rs: &str, dep_rmeta: &[u8]) -> Self {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let root = dir.path().join("ws");
-            std::fs::create_dir_all(root.join("mylib/src")).expect("create src");
-            std::fs::write(root.join("mylib/src/lib.rs"), lib_rs).expect("write lib.rs");
-            std::fs::create_dir_all(root.join("target/deps")).expect("create deps");
-            std::fs::write(root.join("target/deps/libdep-1.rmeta"), dep_rmeta)
-                .expect("write rmeta");
-            Self { _dir: dir, root }
-        }
-
-        fn args(&self) -> Vec<OsString> {
-            let root = self.root.display();
-            [
-                "--crate-name".to_owned(),
-                "mylib".to_owned(),
-                "--edition=2021".to_owned(),
-                "mylib/src/lib.rs".to_owned(),
-                "--crate-type".to_owned(),
-                "lib".to_owned(),
-                "--emit=dep-info,metadata,link".to_owned(),
-                "-C".to_owned(),
-                "metadata=0123abcd".to_owned(),
-                "-C".to_owned(),
-                "extra-filename=-0123abcd".to_owned(),
-                "--out-dir".to_owned(),
-                format!("{root}/target/deps"),
-                "-L".to_owned(),
-                format!("dependency={root}/target/deps"),
-                "--extern".to_owned(),
-                format!("dep={root}/target/deps/libdep-1.rmeta"),
-                format!("--remap-path-prefix={root}=stow-ci://workspace"),
-            ]
-            .into_iter()
-            .map(OsString::from)
-            .collect()
-        }
-
-        fn env(&self, extra: &[(&str, &str)]) -> InvocationEnv {
-            let mut vars = std::collections::BTreeMap::new();
-            vars.insert(
-                OsString::from("CARGO_MANIFEST_DIR"),
-                OsString::from(self.root.join("mylib")),
-            );
-            vars.insert(OsString::from("CARGO_PKG_NAME"), OsString::from("mylib"));
-            // Cargo's own configuration reaches rustc only through argv.
-            vars.insert(
-                OsString::from("CARGO_TARGET_DIR"),
-                OsString::from(self.root.join("target")),
-            );
-            for (name, value) in extra {
-                vars.insert(OsString::from(name), OsString::from(value));
-            }
-            InvocationEnv {
-                cwd: self.root.clone(),
-                vars,
-            }
-        }
-
-        fn invocation_key(&self, env: &InvocationEnv) -> String {
-            let args = self.args();
-            let parsed = ParsedRustcArgs::parse(&args).expect("parse argv");
-            assert_eq!(refusal(&parsed, &args), None);
-            let remaps = remap_rules(&args).expect("remap rules");
-            match invocation_key_blocking(
-                &args,
-                &parsed,
-                env,
-                "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
-                &remaps,
-            ) {
-                Keying::Keyed(key) => key,
-                Keying::Uncacheable(reason) => panic!("uncacheable: {reason}"),
-            }
-        }
-
-        fn unit_key(&self, env: &InvocationEnv, env_deps: &[&str]) -> String {
-            let remaps = remap_rules(&self.args()).expect("remap rules");
-            let inputs = UnitInputs {
-                files: vec![normalize(Path::new("mylib/src/lib.rs"), &remaps).expect("normalize")],
-                env: env_deps.iter().map(|name| (*name).to_owned()).collect(),
-            };
-            match unit_key_blocking(&self.invocation_key(env), &inputs, env, &remaps) {
-                Keying::Keyed(key) => key,
-                Keying::Uncacheable(reason) => panic!("uncacheable: {reason}"),
-            }
-        }
-    }
-
-    const LIB_RS: &str = "pub const FLAVOR: Option<&str> = option_env!(\"FLAVOR\");\n";
-
-    #[test]
-    fn a_path_dependency_keys_the_same_in_two_checkouts() {
-        let first = Checkout::new(LIB_RS, b"rmeta");
-        let second = Checkout::new(LIB_RS, b"rmeta");
-        assert_ne!(first.root, second.root);
-        assert_eq!(
-            first.unit_key(&first.env(&[]), &["FLAVOR"]),
-            second.unit_key(&second.env(&[]), &["FLAVOR"])
-        );
-    }
-
-    #[test]
-    fn an_edited_source_file_changes_the_key() {
-        let first = Checkout::new(LIB_RS, b"rmeta");
-        let edited = Checkout::new("pub const FLAVOR: Option<&str> = None;\n", b"rmeta");
-        assert_ne!(
-            first.unit_key(&first.env(&[]), &["FLAVOR"]),
-            edited.unit_key(&edited.env(&[]), &["FLAVOR"])
-        );
-    }
-
-    #[test]
-    fn an_env_read_variable_change_changes_the_key() {
-        let checkout = Checkout::new(LIB_RS, b"rmeta");
-        let unset = checkout.unit_key(&checkout.env(&[]), &["FLAVOR"]);
-        let set = checkout.unit_key(&checkout.env(&[("FLAVOR", "a")]), &["FLAVOR"]);
-        let other = checkout.unit_key(&checkout.env(&[("FLAVOR", "b")]), &["FLAVOR"]);
-        assert_ne!(unset, set);
-        assert_ne!(set, other);
-    }
-
-    #[test]
-    fn a_rebuilt_dependency_changes_the_invocation_key() {
-        let first = Checkout::new(LIB_RS, b"rmeta");
-        let rebuilt = Checkout::new(LIB_RS, b"other rmeta");
-        assert_ne!(
-            first.invocation_key(&first.env(&[])),
-            rebuilt.invocation_key(&rebuilt.env(&[]))
-        );
-    }
-
-    #[test]
-    fn an_unremapped_absolute_path_is_keyed_raw() {
-        let remaps = vec![RemapRule {
-            from: "/work/a".into(),
-            to: "stow-ci://workspace".to_owned(),
-        }];
-        assert_eq!(
-            normalize(Path::new("/work/a/src/lib.rs"), &remaps).expect("normalize"),
-            InputPath::Remapped {
-                to: "stow-ci://workspace".to_owned(),
-                rest: "src/lib.rs".to_owned(),
-            }
-        );
-        assert_eq!(
-            normalize(Path::new("/work/ab/src/lib.rs"), &remaps).expect("normalize"),
-            InputPath::Absolute("/work/ab/src/lib.rs".to_owned())
-        );
-    }
-
-    #[test]
-    fn dep_info_lists_files_and_env_deps() {
-        let text = "/t/deps/libmylib-1.rmeta: mylib/src/lib.rs /w/with\\ space.rs\n\
-                    /t/deps/mylib-1.d: mylib/src/lib.rs /w/with\\ space.rs\n\n\
-                    mylib/src/lib.rs:\n/w/with\\ space.rs:\n\n\
-                    # env-dep:FLAVOR=a\n# env-dep:UNSET\n";
-        let dep_info = parse_dep_info(text).expect("parse");
-        assert_eq!(dep_info.files, vec!["mylib/src/lib.rs", "/w/with space.rs"]);
-        assert_eq!(dep_info.env_names(), vec!["FLAVOR", "UNSET"]);
-        assert!(parse_dep_info("# checksum:blake3=00 file_len:1 a.rs\n").is_err());
-    }
-
-    #[test]
-    fn incremental_units_are_refused() {
-        let args: Vec<OsString> = [
-            "--crate-name",
-            "mylib",
-            "src/lib.rs",
-            "--crate-type",
-            "lib",
-            "--emit=dep-info,metadata,link",
-            "--out-dir",
-            "/t/deps",
-            "-C",
-            "incremental=/t/incremental",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
-        let parsed = ParsedRustcArgs::parse(&args).expect("parse argv");
-        assert!(refusal(&parsed, &args).is_some_and(|reason| reason.contains("incremental")));
-    }
-}
+mod tests;

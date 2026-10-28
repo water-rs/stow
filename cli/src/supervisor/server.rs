@@ -40,13 +40,14 @@ pub trait Handler: Send + Sync + 'static {
     ) -> impl Future<Output = Decision<Self::Pending>> + Send;
 
     /// Finish the work that only exists after a real compile. `stderr` is
-    /// rustc's, when the decision asked the facade to capture it.
+    /// rustc's, when the decision asked the facade to capture it. An
+    /// `Err` fails the facade's invocation with its message.
     fn compiled(
         self: &Arc<Self>,
         pending: Self::Pending,
         success: bool,
         stderr: Option<String>,
-    ) -> impl Future<Output = ()> + Send;
+    ) -> impl Future<Output = Result<(), String>> + Send;
 
     /// The bookkeeping a facade-owned compile still needs: the mark before
     /// rustc starts (`observation.success` is `None`) and the observation
@@ -100,6 +101,9 @@ pub enum Decision<P> {
         /// Whether the report carries rustc's stderr (stow#978).
         capture_stderr: bool,
     },
+    /// The invocation fails with this message: deciding it hit a failure
+    /// no compile would route around (stow#978).
+    Failed(String),
 }
 
 /// How long [`Supervisor::shutdown`] waits for accepted connections to run
@@ -749,6 +753,7 @@ async fn answer_plan<H: Handler>(
     };
     match handler.plan(executable, args, invocation).await {
         Decision::Served(notifications) => Answer::Served(notifications),
+        Decision::Failed(message) => Answer::Failed { message },
         Decision::Compile {
             pending,
             capture_stderr,
@@ -866,10 +871,13 @@ async fn answer_report<H: Handler>(
                 .iter()
                 .position(|mark| mark.ticket == Some(report.ticket))
                 .map(|index| marks.remove(index).completion);
-            handler
+            match handler
                 .compiled(pending, report.success, report.stderr)
-                .await;
-            Answer::Recorded
+                .await
+            {
+                Ok(()) => Answer::Recorded,
+                Err(message) => Answer::Failed { message },
+            }
         }
         Ok(None) => Answer::Failed {
             message: format!("supervisor has no record of compile {}", report.ticket),
@@ -926,11 +934,11 @@ mod tests {
             _pending: Self::Pending,
             success: bool,
             _stderr: Option<String>,
-        ) -> impl std::future::Future<Output = ()> + Send {
+        ) -> impl std::future::Future<Output = Result<(), String>> + Send {
             if success {
                 self.reports.fetch_add(1, Ordering::SeqCst);
             }
-            std::future::ready(())
+            std::future::ready(Ok(()))
         }
 
         fn observed(
@@ -1047,8 +1055,8 @@ mod tests {
                 _pending: Self::Pending,
                 _success: bool,
                 _stderr: Option<String>,
-            ) -> impl std::future::Future<Output = ()> + Send {
-                std::future::ready(())
+            ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+                std::future::ready(Ok(()))
             }
 
             fn observed(
@@ -1244,8 +1252,8 @@ mod tests {
             _pending: Self::Pending,
             _success: bool,
             _stderr: Option<String>,
-        ) -> impl std::future::Future<Output = ()> + Send {
-            std::future::ready(())
+        ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+            std::future::ready(Ok(()))
         }
 
         fn observed(

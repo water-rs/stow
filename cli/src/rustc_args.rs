@@ -182,6 +182,15 @@ impl BuildRustc {
 /// directory. `rustc` is the executable the probe runs — the build
 /// rustc's [`BuildRustc::executable`].
 async fn sysroot_rustc_executable(rustc: &OsStr) -> Result<OsString, String> {
+    Ok(rustc_sysroot(rustc)
+        .await?
+        .join("bin")
+        .join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
+        .into_os_string())
+}
+
+/// The sysroot `rustc --print sysroot` names.
+pub async fn rustc_sysroot(rustc: &OsStr) -> Result<std::path::PathBuf, String> {
     let output = Command::new(rustc)
         .arg("--print")
         .arg("sysroot")
@@ -196,10 +205,7 @@ async fn sysroot_rustc_executable(rustc: &OsStr) -> Result<OsString, String> {
     }
     let sysroot = String::from_utf8(output.stdout)
         .map_err(|error| format!("rustc --print sysroot output is not UTF-8: {error}"))?;
-    Ok(Path::new(sysroot.trim())
-        .join("bin")
-        .join(format!("rustc{}", std::env::consts::EXE_SUFFIX))
-        .into_os_string())
+    Ok(Path::new(sysroot.trim()).to_path_buf())
 }
 
 /// One `rustc -vV` shared by every consumer — the project context's
