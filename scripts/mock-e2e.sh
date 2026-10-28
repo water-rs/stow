@@ -1303,17 +1303,20 @@ fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     >"$LOG_DIR/preheat-manual.log" 2>&1 \
     || { cat "$LOG_DIR/preheat-manual.log"; die "stow-admin preheat manual failed — see $LOG_DIR/preheat-manual.log"; }
 
-# Poll the local CI until every dispatched run settles, then run the
-# publish pass — the same export → publish → report sequence
-# index-publish.yml drives, which the scheduler-dispatched wave leaves
-# to that lane too.
+# Poll the local CI until both of the wave's runs exist and settle,
+# then run the publish pass — the same export → publish → report
+# sequence index-publish.yml drives, which the scheduler-dispatched wave
+# leaves to that lane too. The scheduler dispatches after the submit
+# returns, so "no open run" alone holds before the wave has started.
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
-    open_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
-        | jq '[.tasks[] | select(.status != "completed")] | length')"
-    [ "$open_runs" -eq 0 ] && break
-    [ "$SECONDS" -ge "$deadline" ] && die "manual wave still has $open_runs open run(s) after ${TASK_DEADLINE}s"
+    read -r wave_runs open_runs <<<"$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq -r '[.tasks[] | select(.task_id != null and (.task_id | test("walkdir|same-file")))]
+            | "\(length) \([.[] | select(.status != "completed")] | length)"')"
+    [ "$wave_runs" -ge 2 ] && [ "$open_runs" -eq 0 ] && break
+    [ "$SECONDS" -ge "$deadline" ] \
+        && die "manual wave has $wave_runs run(s), $open_runs open, after ${TASK_DEADLINE}s"
     sleep 5
 done
 fg publish_slices "manual"
