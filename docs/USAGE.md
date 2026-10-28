@@ -488,3 +488,57 @@ touches only GitHub, `index export`/`publish`/`targets` touch only
 the registry, and a preheat lane (`top-binaries`, `binary`,
 `missed`, `projects submit`, `plan`) run without `--yes` only plans and
 needs no edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
+
+## Local code signing (macOS)
+
+Every link leaves a fresh ad-hoc signature on `stow-admin`, and a
+keychain item's ACL evaluates the calling program against the code
+requirement it recorded — a new cdhash is a new program, so an "Always
+Allow" on the login item survives only until the next `cargo build`.
+Signing every local build with one stable identity makes the
+requirement certificate-based instead, and one "Always Allow" holds
+across rebuilds.
+
+Two committed pieces, both opt-in:
+
+- `admin/build.rs` emits
+  `cargo:rustc-link-arg-bin=stow-admin=--ld-path=<repo>/scripts/signing-ld.sh`
+  when `STOW_LOCAL_SIGNING_IDENTITY` is set on a macOS target, selecting
+  the script as the linker for the `stow-admin` binary alone — nothing
+  else's rustc command line changes, so no other unit's cache identity
+  moves. The script runs `ld`, then `codesign --sign` on the output —
+  only the `stow-admin` binary is signed, including the
+  `CARGO_BIN_EXE_stow-admin` the integration tests spawn. Unset, the
+  build script emits nothing but its rerun trigger and the link is
+  byte-for-byte what it is without the mechanism. Set to an identity
+  `codesign` cannot find — or any other codesign failure — the link
+  fails with a message; there is no silent unsigned build under a set
+  variable.
+- `scripts/local-signing-identity.sh` creates that identity once per
+  machine: a self-signed EC P-256 certificate (`keyUsage` digital
+  signature, `extendedKeyUsage` code signing — what `-p codesigning`
+  lookups and `codesign` require) imported into the login keychain with
+  `/usr/bin/codesign` authorised, plus the key partition list modern
+  macOS checks separately. Idempotent — a second run keeps the existing
+  identity and re-applies the partition list. It asks once for the
+  login keychain password. The identity need not be trusted: the ACL
+  matches the certificate leaf, not a trust decision.
+
+Setup is one pass:
+
+```sh
+scripts/local-signing-identity.sh        # creates stow-admin-local
+# then make the variable reach cargo, either per shell
+export STOW_LOCAL_SIGNING_IDENTITY=stow-admin-local
+# or once, in ~/.cargo/config.toml:
+#   [env]
+#   STOW_LOCAL_SIGNING_IDENTITY = "stow-admin-local"
+```
+
+Setting the variable re-links `stow-admin` once (the build script's
+`rerun-if-env-changed` fires, and the new `--ld-path` flag changes that
+one unit's command line); afterwards the mechanism costs one `codesign`
+call per `stow-admin` link. Unset the variable to return to unsigned
+ad-hoc links. Linux and Windows are untouched — their credential stores
+do not bind access to the caller's signature, and the build script
+gates on `CARGO_CFG_TARGET_OS`.

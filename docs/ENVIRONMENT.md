@@ -144,6 +144,12 @@ task from the dispatch event file `GITHUB_EVENT_PATH` names
 | `STOW_LOCAL_CI_STUB` | serve | **Mock/test-only.** When set (any value), the local CI server short-circuits each task's build and publish work — the dispatch POST the budget probe and the launch-load run measure stays real, while a stubbed run still pushes the task's (empty) records artifact and completes through the same signed `workflow_run` webhook. |
 | `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), visible in CI logs here. |
 
+## Local code signing (`admin/build.rs` + `scripts/signing-ld.sh`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STOW_LOCAL_SIGNING_IDENTITY` | unset | Read by `admin/build.rs` on macOS targets only: set to a code-signing identity name (`stow-admin-local`, created once per machine by `scripts/local-signing-identity.sh`), the build script selects `scripts/signing-ld.sh` as the `stow-admin` binary's linker (`--ld-path`), which re-signs the link's output with that identity instead of keeping the ad-hoc signature `ld` leaves — a stable, certificate-based code requirement the keychain ACL still recognises after the next rebuild, which is what keeps `stow-admin login`'s "Always Allow" valid. Only the `stow-admin` bin target is signed. Unset, the build emits nothing and the link is identical to one without the mechanism; set to an identity `codesign` cannot find, the link fails. See `USAGE.md`'s local code signing section. |
+
 ## scripts/preheat-cost.sh
 
 The `Preheat cost` lane (stow#773): a whole preheat wave and the daily
