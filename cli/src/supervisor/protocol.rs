@@ -60,12 +60,12 @@ impl Request {
 pub struct InvocationEnv {
     /// The invocation's `CARGO_PRIMARY_PACKAGE` fact — set on the units of
     /// the crate cargo is building, which are never cached.
-    #[serde(default)]
     pub primary_package: bool,
-    /// The invocation's `OUT_DIR` — cargo exports it on a links crate's
-    /// units — OS-encoded like the argv.
-    #[serde(default)]
-    pub out_dir: Option<Vec<u8>>,
+    /// The invocation's `CARGO_MANIFEST_DIR` — cargo sets it on every
+    /// rustc call — OS-encoded like the argv. The git-source detection
+    /// reads the manifest path inside the checkout from it rather than
+    /// probing ancestor directories for a `Cargo.toml`.
+    pub manifest_dir: Option<Vec<u8>>,
 }
 
 impl InvocationEnv {
@@ -75,17 +75,18 @@ impl InvocationEnv {
     pub fn current() -> Self {
         Self {
             primary_package: std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
-            out_dir: std::env::var_os("OUT_DIR").map(|value| os_bytes::encode(&value)),
+            manifest_dir: std::env::var_os("CARGO_MANIFEST_DIR")
+                .map(|value| os_bytes::encode(&value)),
         }
     }
 
-    /// The decoded `OUT_DIR`.
+    /// The decoded `CARGO_MANIFEST_DIR`.
     ///
     /// # Errors
     ///
     /// When the peer's encoding is not decodable on this platform.
-    pub fn out_dir(&self) -> Result<Option<std::path::PathBuf>, String> {
-        self.out_dir
+    pub fn manifest_dir(&self) -> Result<Option<std::path::PathBuf>, String> {
+        self.manifest_dir
             .as_ref()
             .map(|bytes| os_bytes::decode(bytes).map(std::path::PathBuf::from))
             .transpose()
@@ -102,7 +103,6 @@ pub struct Plan {
     /// Everything after the executable, in order.
     pub args: Vec<Vec<u8>>,
     /// The invocation's environment the supervisor cannot see.
-    #[serde(default)]
     pub env: InvocationEnv,
 }
 
@@ -137,7 +137,6 @@ pub struct Observed {
     /// decision. `Some` reports the finished compile's exit status.
     pub success: Option<bool>,
     /// The invocation's environment the supervisor cannot see.
-    #[serde(default)]
     pub env: InvocationEnv,
 }
 

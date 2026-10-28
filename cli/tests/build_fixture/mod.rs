@@ -133,3 +133,185 @@ pub fn stow_build_in_with_env(
     command.envs(env.iter().copied());
     command.output().expect("run stow-cli build")
 }
+
+/// Copy the directory tree at `from` into `to`.
+#[allow(dead_code)] // only the fixtures that vendor a registry source call it
+pub fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("create copy target");
+    for entry in std::fs::read_dir(from).expect("read copy source") {
+        let entry = entry.expect("copy source entry");
+        let dest = to.join(entry.file_name());
+        if entry.file_type().expect("entry type").is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), &dest).expect("copy file");
+        }
+    }
+}
+
+/// Copy the extracted registry source of `package` (any version) out of
+/// the isolated `cargo_home` into `to`.
+#[allow(dead_code)] // only the fixtures that vendor a registry source call it
+pub fn copy_registry_package(cargo_home: &Path, package: &str, to: &Path) {
+    let registry_src = cargo_home.join("registry").join("src");
+    let prefix = format!("{package}-");
+    for index in std::fs::read_dir(&registry_src).expect("read registry src") {
+        for entry in
+            std::fs::read_dir(index.expect("index dir").path()).expect("read registry package dir")
+        {
+            let entry = entry.expect("package entry");
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(&prefix))
+            {
+                copy_tree(&entry.path(), to);
+                return;
+            }
+        }
+    }
+    panic!("the fetched {package} source was not found");
+}
+
+/// Turn `repo` into a git repository with every file committed, and
+/// return the `file://` URL cargo clones it from.
+#[allow(dead_code)] // only the git fixtures call it
+pub fn commit_git_repo(repo: &Path, home: &Path) -> String {
+    for args in [
+        &["init", "--quiet", "--initial-branch=main"][..],
+        &["add", "--all"],
+        &[
+            "-c",
+            "user.name=stow-test",
+            "-c",
+            "user.email=stow-test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--message=fixture",
+        ],
+    ] {
+        let mut git = Command::new("git");
+        git.args(args).current_dir(repo);
+        sealed_home_env(&mut git, home);
+        let output = git.output().expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    format!("file://{}", repo.display())
+}
+
+/// `cargo fetch` in `dir` against the isolated `cargo_home`, so the
+/// builds under test never need the network (git checkouts included).
+#[allow(dead_code)] // only the fixtures that edit their manifest call it
+pub fn cargo_fetch(dir: &Path, cargo_home: &Path) {
+    let mut fetch = Command::new("cargo");
+    fetch
+        .arg("fetch")
+        .current_dir(dir)
+        .env("CARGO_HOME", cargo_home);
+    sealed_home_env(&mut fetch, &fixture_home(dir));
+    let fetched = fetch.output().expect("run cargo fetch");
+    assert!(
+        fetched.status.success(),
+        "cargo fetch failed:\n{}",
+        String::from_utf8_lossy(&fetched.stderr)
+    );
+}
+
+/// One `artifact_cache_entries` row the local store holds.
+#[allow(dead_code)] // only the local-only fixtures read the store
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct StoredEntry {
+    pub crate_name: String,
+    pub compile_key: String,
+    pub c_metadata: String,
+    pub reach: i64,
+}
+
+/// Every entry the state db at `db` stores; empty when the build stored
+/// nothing and so never created the db.
+#[allow(dead_code)] // only the local-only fixtures read the store
+pub fn stored_entries(db: &Path) -> Vec<StoredEntry> {
+    if !db.exists() {
+        return Vec::new();
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(async {
+            let options = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(db)
+                .read_only(true);
+            let pool = sqlx::SqlitePool::connect_with(options)
+                .await
+                .expect("open the state db read-only");
+            let rows = sqlx::query_as::<_, StoredEntry>(sqlx::AssertSqlSafe(
+                "SELECT crate_name, compile_key, c_metadata, reach FROM artifact_cache_entries"
+                    .to_owned(),
+            ))
+            .fetch_all(&pool)
+            .await
+            .expect("list stored entries");
+            pool.close().await;
+            rows
+        })
+}
+
+/// Every request line a [`recording_edge`] has received.
+#[allow(dead_code)] // only the local-only fixtures record requests
+pub type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+/// A local edge and registry that answers every request `404` and
+/// records its request line: what a build asked the remote for.
+#[allow(dead_code)] // only the local-only fixtures record requests
+pub fn recording_edge() -> (String, RecordedRequests) {
+    use std::io::{BufRead, Write};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a recording edge");
+    let url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let recorded: RecordedRequests = std::sync::Arc::default();
+    let requests = std::sync::Arc::clone(&recorded);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let requests = std::sync::Arc::clone(&requests);
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                let Ok(clone) = stream.try_clone() else {
+                    return;
+                };
+                if std::io::BufReader::new(clone).read_line(&mut line).is_ok() {
+                    requests
+                        .lock()
+                        .expect("recorded requests lock")
+                        .push(line.trim_end().to_owned());
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    (url, recorded)
+}
+
+/// The miss journals and drain claims `target_dir` holds: a build that
+/// reported a miss leaves `stow-misses.*` there until its detached
+/// drain has admitted it.
+#[allow(dead_code)] // only the local-only fixtures read the journals
+pub fn journal_files(target_dir: &Path) -> Vec<String> {
+    std::fs::read_dir(target_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("stow-misses."))
+                .collect()
+        })
+        .unwrap_or_default()
+}

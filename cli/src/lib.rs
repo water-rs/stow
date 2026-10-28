@@ -85,7 +85,7 @@ use stow_types::identity::DependencyCompileKeyIdentity;
 use stow_types::public_cache::{
     Reach, UnitSource, detect_git_checkout,
     detect_registry_crate_version as shared_detect_registry_crate_version,
-    normalized_cache_profile, registry_index_dir, stable_unit_identity,
+    normalized_cache_profile, stable_unit_identity,
 };
 use stow_types::rustc::{UncachedReason, UnitClass};
 use tracing_subscriber::layer::SubscriberExt;
@@ -789,91 +789,135 @@ pub(crate) struct BuildContext {
     /// How this build tells a crates.io package from another registry's —
     /// the workspace's `Cargo.lock` for a supervised build, the cargo
     /// config's source table for the standalone wrapper (stow#1006).
-    pub(crate) registry_sources: RegistrySources,
+    /// Lazily resolved for the standalone wrapper: the cargo-config load
+    /// only runs when a registry slot is actually classified, never for
+    /// a path or git unit. A supervised build seeds it with the
+    /// lockfile's answer.
+    pub(crate) registry_sources: std::sync::OnceLock<RegistrySources>,
+}
+
+impl BuildContext {
+    /// The source map this build classifies registry slots against: the
+    /// map the cell was seeded with — the lockfile's for a supervised
+    /// build — else the cargo-config host rule the standalone wrapper
+    /// lives on.
+    ///
+    /// # Errors
+    ///
+    /// The cargo config the standalone rule reads does not load or names
+    /// a source chain cargo itself would reject.
+    pub(crate) fn registry_sources(&self) -> stow_types::error::Result<&RegistrySources> {
+        if let Some(sources) = self.registry_sources.get() {
+            return Ok(sources);
+        }
+        let sources = RegistrySources::from_cargo_config()?;
+        Ok(self.registry_sources.get_or_init(|| sources))
+    }
 }
 
 /// The source map a build classifies registry slots against (stow#1006):
 /// only crates.io packages may carry a crates.io identity — every other
 /// registry's package is [`UncachedReason::NonCratesIoRegistry`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) enum RegistrySources {
-    /// The `(package, version)` pairs the build's `Cargo.lock` records
-    /// with a crates.io source — a supervised build's authoritative map.
-    /// A replaced crates.io still records the crates.io source, so a
-    /// mirror's extraction directory classifies correctly.
-    Lockfile(std::collections::BTreeSet<(String, String)>),
+    /// The `(package, version)` → registry-source map `Cargo.lock`
+    /// records — a supervised build's authoritative answer. A package
+    /// the lockfile names from several registries (a renamed
+    /// alternative-registry dependency at crates.io's own
+    /// `(name, version)`) is settled by the extraction slot's index
+    /// directory against `crates_io_hosts`. A replaced crates.io still
+    /// records the crates.io source, so a mirror's extraction directory
+    /// classifies correctly.
+    Lockfile {
+        /// `(package, version)` → the registry `SourceId`s the lockfile
+        /// records for it.
+        sources: std::collections::BTreeMap<
+            (String, String),
+            std::collections::BTreeSet<cargo_lock::package::SourceId>,
+        >,
+        /// The index-dir hosts a crates.io or replace-with slot extracts
+        /// under — the cargo-config source chain, resolved once.
+        crates_io_hosts: std::collections::BTreeSet<String>,
+    },
     /// The registry index-dir hosts a standalone wrapper accepts as
     /// crates.io: `index.crates.io` plus every host the
     /// `source.crates-io.replace-with` chain resolves to, matched by the
     /// URL host against the `<host>-<hash>` directory name.
     CargoConfig(std::collections::BTreeSet<String>),
-    /// No lockfile and no config — the empty `BuildContext` tests build.
-    /// Only cargo's own `index.crates.io` slot counts as crates.io.
-    #[default]
-    Unknown,
 }
 
 impl RegistrySources {
     /// The map a supervised build's `Cargo.lock` at `workspace_root`
-    /// carries — the packages whose `source` is crates.io's. A missing or
-    /// unparseable lockfile degrades to the cargo-config rule rather than
-    /// misclassifying a registry slot.
-    pub(crate) fn from_lockfile(workspace_root: &Path) -> Self {
-        std::fs::read_to_string(workspace_root.join("Cargo.lock")).map_or_else(
-            |_| Self::from_cargo_config(),
-            |contents| Self::parse_lockfile(&contents),
-        )
+    /// carries. A missing lockfile degrades to the cargo-config rule —
+    /// cargo writes it during this very build, so absence is a defined
+    /// state, same answer `lockfile_registry_packages` gives. A
+    /// lockfile that exists but does not parse is an error: degraded
+    /// source classification is exactly the D1 defect this map exists
+    /// to close.
+    ///
+    /// # Errors
+    ///
+    /// The lockfile is unreadable or unparseable.
+    pub(crate) async fn from_lockfile(workspace_root: &Path) -> stow_types::error::Result<Self> {
+        let lockfile_path = workspace_root.join("Cargo.lock");
+        let contents = match async_fs::read(&lockfile_path).await {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Self::from_cargo_config();
+            }
+            Err(error) => {
+                return Err(stow_types::stow_error!(
+                    "read lockfile {}: {error}",
+                    lockfile_path.display()
+                ));
+            }
+        };
+        let contents = String::from_utf8(contents).map_err(|error| {
+            stow_types::stow_error!("lockfile {} is not UTF-8: {error}", lockfile_path.display())
+        })?;
+        Self::parse_lockfile(&contents, &cargo_config_hosts()?).map_err(|error| {
+            stow_types::stow_error!("parse lockfile {}: {error}", lockfile_path.display())
+        })
     }
 
-    /// The crates.io `(package, version)` pairs one `Cargo.lock` records.
-    fn parse_lockfile(contents: &str) -> Self {
-        let Ok(lockfile) = toml::from_str::<toml::Value>(contents) else {
-            return Self::from_cargo_config();
-        };
-        let Some(packages) = lockfile.get("package").and_then(toml::Value::as_array) else {
-            return Self::from_cargo_config();
-        };
-        let crates_io = packages
-            .iter()
-            .filter_map(|package| {
-                let name = package.get("name")?.as_str()?;
-                let version = package.get("version")?.as_str()?;
-                let source = package.get("source")?.as_str()?;
-                (source == "registry+https://github.com/rust-lang/crates.io-index"
-                    || source == "sparse+https://index.crates.io/")
-                    .then(|| (name.to_owned(), version.to_owned()))
-            })
-            .collect();
-        Self::Lockfile(crates_io)
+    /// The `(package, version)` → source map one `Cargo.lock` records,
+    /// classified against `crates_io_hosts` when several registries ship
+    /// the same pair.
+    fn parse_lockfile(
+        contents: &str,
+        crates_io_hosts: &std::collections::BTreeSet<String>,
+    ) -> Result<Self, cargo_lock::Error> {
+        let lockfile = contents.parse::<cargo_lock::Lockfile>()?;
+        let mut sources: std::collections::BTreeMap<
+            (String, String),
+            std::collections::BTreeSet<cargo_lock::package::SourceId>,
+        > = std::collections::BTreeMap::new();
+        for package in &lockfile.packages {
+            let Some(source) = package.source.as_ref() else {
+                continue;
+            };
+            if !source.is_registry() {
+                continue;
+            }
+            sources
+                .entry((package.name.to_string(), package.version.to_string()))
+                .or_default()
+                .insert(source.clone());
+        }
+        Ok(Self::Lockfile {
+            sources,
+            crates_io_hosts: crates_io_hosts.clone(),
+        })
     }
 
     /// The index-dir hosts a standalone wrapper accepts as crates.io:
-    /// `index.crates.io`, plus every host the
-    /// `source.crates-io.replace-with` chain resolves through — the
-    /// extraction slot a replaced crates.io lands under.
-    pub(crate) fn from_cargo_config() -> Self {
-        let mut hosts = std::collections::BTreeSet::from(["index.crates.io".to_owned()]);
-        let Ok(config) = cargo_config2::Config::load() else {
-            return Self::CargoConfig(hosts);
-        };
-        let mut source = Some("crates-io".to_owned());
-        let mut seen = std::collections::BTreeSet::new();
-        while let Some(name) = source.as_deref() {
-            if !seen.insert(name.to_owned()) {
-                break;
-            }
-            let Some(table) = config.source.get(name) else {
-                break;
-            };
-            if let Some(registry) = table.registry.as_deref()
-                && let Ok(url) = url::Url::parse(registry)
-                && let Some(host) = url.host_str()
-            {
-                hosts.insert(host.to_owned());
-            }
-            source.clone_from(&table.replace_with);
-        }
-        Self::CargoConfig(hosts)
+    /// the cargo-config source chain's answer.
+    ///
+    /// # Errors
+    ///
+    /// See [`cargo_config_hosts`].
+    pub(crate) fn from_cargo_config() -> stow_types::error::Result<Self> {
+        Ok(Self::CargoConfig(cargo_config_hosts()?))
     }
 
     /// Whether the registry slot's `(package, version)` at `index_dir`
@@ -881,15 +925,80 @@ impl RegistrySources {
     /// package.
     pub(crate) fn is_crates_io(&self, package: &str, version: &str, index_dir: &str) -> bool {
         match self {
-            Self::Lockfile(crates_io) => {
-                crates_io.contains(&(package.to_owned(), version.to_owned()))
+            Self::Lockfile {
+                sources,
+                crates_io_hosts,
+            } => {
+                let Some(set) = sources.get(&(package.to_owned(), version.to_owned())) else {
+                    return false;
+                };
+                if set.len() == 1 {
+                    return set
+                        .iter()
+                        .next()
+                        .is_some_and(cargo_lock::package::SourceId::is_default_registry);
+                }
+                // Several registries ship this `(name, version)`: the
+                // extraction slot decides which one this unit came from.
+                set.iter()
+                    .any(cargo_lock::package::SourceId::is_default_registry)
+                    && index_dir_in_hosts(index_dir, crates_io_hosts)
             }
-            Self::CargoConfig(hosts) => index_dir
-                .rsplit_once('-')
-                .is_some_and(|(host, _)| hosts.contains(host)),
-            Self::Unknown => index_dir.starts_with("index.crates.io-"),
+            Self::CargoConfig(hosts) => index_dir_in_hosts(index_dir, hosts),
         }
     }
+}
+
+/// The `<index>` directory's `<host>` half against a host allowlist.
+fn index_dir_in_hosts(index_dir: &str, hosts: &std::collections::BTreeSet<String>) -> bool {
+    index_dir
+        .rsplit_once('-')
+        .is_some_and(|(host, _)| hosts.contains(host))
+}
+
+/// The index-dir hosts a crates.io slot or its replacement chain can
+/// extract under: `index.crates.io`, plus every host the
+/// `source.crates-io.replace-with` chain resolves through.
+///
+/// # Errors
+///
+/// The cargo config does not load, or its chain names an undefined
+/// source, loops, or carries a registry URL without a host — configs
+/// cargo itself rejects, so no classification is guessed from them.
+fn cargo_config_hosts() -> stow_types::error::Result<std::collections::BTreeSet<String>> {
+    let mut hosts = std::collections::BTreeSet::from(["index.crates.io".to_owned()]);
+    let config = cargo_config2::Config::load()
+        .map_err(|error| stow_types::stow_error!("load the cargo config: {error}"))?;
+    let mut source = Some("crates-io".to_owned());
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(name) = source.as_deref() {
+        if !seen.insert(name.to_owned()) {
+            return Err(stow_types::stow_error!(
+                "cargo config `source.{name}` closes a replace-with cycle"
+            ));
+        }
+        let Some(table) = config.source.get(name) else {
+            if name == "crates-io" {
+                break;
+            }
+            return Err(stow_types::stow_error!(
+                "cargo config replace-with names `{name}`, which no `source.{name}` defines"
+            ));
+        };
+        if let Some(registry) = table.registry.as_deref() {
+            let host = url::Url::parse(registry)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .ok_or_else(|| {
+                    stow_types::stow_error!(
+                        "cargo config `source.{name}.registry` `{registry}` has no host"
+                    )
+                })?;
+            hosts.insert(host);
+        }
+        source.clone_from(&table.replace_with);
+    }
+    Ok(hosts)
 }
 
 /// The one-shot latch every build-scoped "it happened" signal shares —
@@ -1065,7 +1174,7 @@ impl BuildContext {
             // No supervisor shares a standalone invocation's registry —
             // the wait finds nothing and returns at once.
             in_flight: crate::supervisor::server::InFlightUnits::default(),
-            registry_sources: RegistrySources::from_cargo_config(),
+            registry_sources: std::sync::OnceLock::new(),
         })
     }
 
@@ -1313,29 +1422,38 @@ impl supervisor::server::Handler for BuildSupervisor {
             return;
         };
         let mut parsed = parsed;
-        if let Ok(out_dir) = observation.env.out_dir() {
-            parsed.build_script_out_dir = out_dir;
-        }
         resolve_native_target_cpu(&observation.executable, &mut parsed, &self.env_cache).await;
-        if let Ok(source) = detect_unit_source(&parsed, &self.env_cache, &self.ctx).await {
-            // Only a publicly-missable unit counts: a git source or
-            // extra codegen could never have been served remotely, so
-            // its local compile is not a cache miss (stow#1006).
-            let missable = source.as_ref().is_ok_and(|source| {
-                parsed.extra_codegen.is_empty() && !matches!(source, UnitSource::Git { .. })
-            }) && matches!(
-                parsed.unit_class(source, observation.env.primary_package),
-                UnitClass::Keyed { .. }
-            );
-            record_unit_outcome(
-                &local_base.config,
-                &parsed,
-                &target,
-                &local_base.rustc_version,
-                UnitOutcome::Miss,
-                missable,
-            )
-            .await;
+        let source = match observation.env.manifest_dir() {
+            Ok(manifest_dir) => {
+                detect_unit_source(&parsed, manifest_dir.as_deref(), &self.env_cache, &self.ctx)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            Err(error) => Err(error),
+        };
+        match source {
+            Ok(source) => {
+                let class = parsed.unit_class(source, observation.env.primary_package);
+                // Only a publicly-missable unit counts: a git source or
+                // extra codegen could never have been served remotely,
+                // so its local compile is not a cache miss (stow#1006).
+                record_unit_outcome(
+                    &local_base.config,
+                    &parsed,
+                    &target,
+                    &local_base.rustc_version,
+                    UnitOutcome::Miss,
+                    class.remote_missable(),
+                )
+                .await;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    crate_name = %parsed.crate_name,
+                    "failed to detect an observed unit's source; miss outcome skipped"
+                );
+            }
         }
         let post = PostCompile {
             executable: observation.executable,
@@ -1526,10 +1644,7 @@ async fn decide_rustc_invocation(
         }
     };
 
-    let UnitClass::Keyed { ref source, .. } = class else {
-        let UnitClass::Uncached(reason) = class else {
-            unreachable!("matched non-Keyed above")
-        };
+    if let UnitClass::Uncached(reason) = &class {
         tracing::debug!(
             crate_name = %parsed.crate_name,
             reason = ?reason,
@@ -1546,23 +1661,9 @@ async fn decide_rustc_invocation(
             invocation_env,
         )
         .await;
-    };
-
-    if ctx.public_cache_disabled || class.source_local_only() {
-        // The kill switch disables the *public* cache; a self-produced
-        // local entry is not public. A git source or extra codegen is
-        // local-only by construction — it can never be looked up
-        // remotely or reported (stow#1006).
-        tracing::debug!(
-            crate_name = %parsed.crate_name,
-            "serving local lookups only for this invocation"
-        );
-        return decide_local_only(rustc, &parsed, source, env_cache, ctx, invocation_env).await;
     }
 
-    let exact_public_cache_allowed = exact_public_cache_allowed(&parsed, ctx).await;
-
-    let Some(env) = prepare_wrapper_environment(rustc, &parsed, source, env_cache, ctx).await
+    let Some(prepared) = prepare_unit_environment(rustc, &parsed, &class, env_cache, ctx).await
     else {
         return compile(
             rustc,
@@ -1576,39 +1677,48 @@ async fn decide_rustc_invocation(
         )
         .await;
     };
-    if env.reach == Reach::LocalOnly {
-        // A crates.io unit over a local-only dependency is local-only
-        // itself: local lookups only, no remote, no miss (stow#1006).
-        return decide_local_only(rustc, &parsed, source, env_cache, ctx, invocation_env).await;
+    match prepared {
+        UnitPreparation::LocalOnly(prep) => {
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                "serving local lookups only for this invocation"
+            );
+            decide_local_only(rustc, &parsed, &class, prep, ctx, invocation_env).await
+        }
+        UnitPreparation::Public(env) => {
+            // The policy wait only exists for a public lookup — a
+            // local-only unit was diverted before it (stow#788).
+            let exact_public_cache_allowed = exact_public_cache_allowed(&parsed, ctx).await;
+            if must_build_locally(&parsed, &env.target, ctx.policy_dir.as_deref()) {
+                record_unit_outcome(
+                    &env.env_base.config,
+                    &parsed,
+                    &env.target,
+                    &env.rustc_version,
+                    UnitOutcome::LocalDependencyBuild,
+                    true,
+                )
+                .await;
+                return compile(
+                    rustc,
+                    &parsed,
+                    Some(env.target.as_str()),
+                    ctx.policy_dir.as_deref(),
+                    invocation_env,
+                )
+                .await;
+            }
+            serve_or_compile(
+                rustc,
+                &parsed,
+                &env,
+                ctx,
+                exact_public_cache_allowed,
+                invocation_env,
+            )
+            .await
+        }
     }
-    if must_build_locally(&parsed, &env.target, ctx.policy_dir.as_deref()) {
-        record_unit_outcome(
-            &env.env_base.config,
-            &parsed,
-            &env.target,
-            &env.rustc_version,
-            UnitOutcome::LocalDependencyBuild,
-            env.reach == Reach::Public,
-        )
-        .await;
-        return compile(
-            rustc,
-            &parsed,
-            Some(env.target.as_str()),
-            ctx.policy_dir.as_deref(),
-            invocation_env,
-        )
-        .await;
-    }
-    serve_or_compile(
-        rustc,
-        &parsed,
-        &env,
-        ctx,
-        exact_public_cache_allowed,
-        invocation_env,
-    )
-    .await
 }
 
 /// Classify one invocation (stow#1006): the invocation's own `OUT_DIR`
@@ -1623,15 +1733,17 @@ async fn classify_unit_invocation(
     ctx: &BuildContext,
     invocation_env: &supervisor::protocol::InvocationEnv,
 ) -> stow_types::error::Result<UnitClass> {
-    // The invocation's own `OUT_DIR`, not this process's: under a
-    // supervised build the supervisor's environment is the driver's.
-    if let Ok(out_dir) = invocation_env.out_dir() {
-        parsed.build_script_out_dir = out_dir;
-    }
+    // The invocation's own `CARGO_MANIFEST_DIR`, not this process's:
+    // under a supervised build the supervisor's environment is the
+    // driver's. A frame that cannot decode it is a wiring bug, not a
+    // missing value.
+    let manifest_dir = invocation_env
+        .manifest_dir()
+        .map_err(stow_types::error::Error::msg)?;
     // `target-cpu=native` resolves to the host's concrete CPU before
     // classification; a `native` that survives is unfoldable.
     resolve_native_target_cpu(rustc, parsed, env_cache).await;
-    let source = detect_unit_source(parsed, env_cache, ctx).await?;
+    let source = detect_unit_source(parsed, manifest_dir.as_deref(), env_cache, ctx).await?;
     let class = parsed.unit_class(source, invocation_env.primary_package);
     tracing::Span::current().record("crate_name", parsed.crate_name.as_str());
     tracing::debug!(
@@ -1714,7 +1826,7 @@ async fn serve_or_compile(
         &env.target,
         &env.rustc_version,
         UnitOutcome::of(served.is_some(), &tally, refused),
-        env.reach == Reach::Public,
+        true,
     )
     .await;
     match served {
@@ -1751,13 +1863,6 @@ async fn lookup_chain(
         try_serve_local_cached_bundle(&env.env_base.config, parsed, &request, tally).await
     {
         return RemoteServe::Served(notifications);
-    }
-    if env.reach == Reach::LocalOnly {
-        // A local-only unit never consults a remote-provenance answer:
-        // the exact-key entry is the only shape its identity can have,
-        // so the prefetch, semantic and remote stages cannot serve it
-        // (stow#1006).
-        return RemoteServe::Miss;
     }
     if let Some(notifications) = try_serve_local_prefetched_graph_bundle(
         &env.env_base.config,
@@ -1817,10 +1922,6 @@ struct WrapperEnvironment<'a> {
     /// The `c_metadata` to query with: the stable identity's when the
     /// invocation's own was rewritten, else the raw cargo one.
     request_c_metadata: String,
-    /// How far the unit's identity may travel — the source's reach
-    /// folded with its dependencies' recorded reaches. `LocalOnly`
-    /// skips every remote-provenance lookup stage (stow#1006).
-    reach: Reach,
     /// Semantic fallback request, only built when
     /// `STOW_ENABLE_SEMANTIC_FALLBACK` opts in.
     semantic_request: Option<fetch::SemanticFetchRequest>,
@@ -2093,14 +2194,23 @@ impl WrapperEnvCache {
             return commit.clone();
         }
         let root = checkout_root.to_path_buf();
-        let commit = tokio::task::spawn_blocking(move || {
-            let repository = gix::open(&root).ok()?;
-            let commit = repository.head_id().ok()?;
-            Some(commit.to_string())
+        let commit = match tokio::task::spawn_blocking(move || {
+            let repository = gix::open(&root).map_err(|error| error.to_string())?;
+            let commit = repository.head_id().map_err(|error| error.to_string())?;
+            Ok::<_, String>(commit.to_string())
         })
         .await
-        .ok()
-        .flatten();
+        {
+            Ok(Ok(commit)) => Some(commit),
+            Ok(Err(error)) => {
+                tracing::debug!(error = %error, "git checkout commit resolution failed");
+                None
+            }
+            Err(error) => {
+                tracing::debug!(error = %error, "git checkout commit task failed");
+                None
+            }
+        };
         self.git_commits
             .lock()
             .expect("git commits mutex")
@@ -2440,42 +2550,64 @@ enum RemoteServe {
 /// invocation. Every step can legitimately be unavailable — the wrapper
 /// exists to accelerate builds, never to break them — so `None` means "run
 /// the real rustc".
-async fn prepare_wrapper_environment<'a>(
+/// What the preparation concluded about a keyed invocation: the full
+/// remote-capable environment when the unit's identity may travel, or
+/// the local identity work when it may not. The match on this type is
+/// the one place the public/local-only split is decided — a
+/// `LocalOnly` variant carries exactly what `decide_local_only` needs,
+/// so no caller recomputes the identity or re-reads the reach
+/// (stow#1006).
+enum UnitPreparation<'a> {
+    /// Remote-capable: the identity folded to `Public`.
+    Public(WrapperEnvironment<'a>),
+    /// Local-only by construction — the kill switch, a git source,
+    /// extra codegen, or a `LocalOnly` dependency.
+    LocalOnly(LocalOnlyPreparation),
+}
+
+/// The local path's resolved inputs: the local base, the unit's target,
+/// and the stable identity (and reach) `build_stable_exact_identity`
+/// already computed once.
+struct LocalOnlyPreparation {
+    env_base: std::sync::Arc<WrapperEnvBase>,
+    target: String,
+    identity: Option<(stow_types::public_cache::StableUnitIdentity, Reach)>,
+}
+
+/// The preparation half of the decision: which cache shape the unit's
+/// identity takes, with the identity resolved exactly once whichever
+/// branch it lands on. `None` bypasses the cache entirely.
+async fn prepare_unit_environment<'a>(
     rustc: &OsString,
     parsed: &rustc_args::ParsedRustcArgs,
-    source: &UnitSource,
+    class: &UnitClass,
     env_cache: &'a WrapperEnvCache,
     ctx: &'a BuildContext,
-) -> Option<WrapperEnvironment<'a>> {
-    let env_base = env_cache.env_base(rustc).await?;
-    let circuit_tripped = match env_cache.circuit_tripped(&env_base.config).await {
-        Ok(tripped) => tripped,
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to read stow circuit state, bypassing rust cache");
-            return None;
-        }
+) -> Option<UnitPreparation<'a>> {
+    let UnitClass::Keyed { source, .. } = class else {
+        unreachable!("prepare_unit_environment only runs for a keyed unit");
     };
-    if circuit_tripped {
-        tracing::debug!("circuit breaker tripped, serving local lookups only");
+    if ctx.public_cache_disabled || class.source_local_only() {
+        // The kill switch disables the *public* cache; a self-produced
+        // local entry is not public. A git source or extra codegen is
+        // local-only by construction — it can never be looked up
+        // remotely or reported (stow#1006).
+        return prepare_local_only(rustc, parsed, source, class.source_local_only(), env_cache)
+            .await
+            .map(UnitPreparation::LocalOnly);
     }
-
+    let env_base = env_cache.env_base(rustc).await?;
     let target = parsed
         .target
         .clone()
         .unwrap_or_else(|| env_base.host_target.clone());
-    let Some(c_metadata) = parsed.c_metadata.as_deref() else {
-        tracing::warn!("cacheable rustc invocation is missing -C metadata, bypassing rust cache");
-        return None;
-    };
-    let rustc_version = env_base.rustc_version.clone();
-    let cache_key = format!("{target}/{rustc_version}/{c_metadata}");
-
     let stable_exact_identity = match build_stable_exact_identity(
         &env_base.config,
         parsed,
         source,
+        class.source_local_only(),
         &target,
-        &rustc_version,
+        &env_base.rustc_version,
     )
     .await
     {
@@ -2488,11 +2620,38 @@ async fn prepare_wrapper_environment<'a>(
     let reach = stable_exact_identity
         .as_ref()
         .map_or(Reach::Public, |(_, reach)| *reach);
+    if reach == Reach::LocalOnly {
+        // A crates.io unit over a local-only dependency is local-only
+        // itself: local lookups only, no remote, no miss (stow#1006).
+        let local_base = env_cache.local_base(rustc).await?;
+        return Some(UnitPreparation::LocalOnly(LocalOnlyPreparation {
+            env_base: local_base,
+            target,
+            identity: stable_exact_identity,
+        }));
+    }
+
+    let circuit_tripped = match env_cache.circuit_tripped(&env_base.config).await {
+        Ok(tripped) => tripped,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to read stow circuit state, bypassing rust cache");
+            return None;
+        }
+    };
+    if circuit_tripped {
+        tracing::debug!("circuit breaker tripped, serving local lookups only");
+    }
+    let Some(c_metadata) = parsed.c_metadata.as_deref() else {
+        tracing::warn!("cacheable rustc invocation is missing -C metadata, bypassing rust cache");
+        return None;
+    };
+    let rustc_version = env_base.rustc_version.clone();
+    let cache_key = format!("{target}/{rustc_version}/{c_metadata}");
     let request_c_metadata = stable_exact_identity
         .as_ref()
         .map_or(c_metadata, |(identity, _)| identity.c_metadata.as_str())
         .to_owned();
-    let semantic_request = if reach == Reach::Public && ctx.semantic_fallback_enabled() {
+    let semantic_request = if ctx.semantic_fallback_enabled() {
         match build_semantic_fetch_request(
             &env_base.config,
             parsed,
@@ -2511,7 +2670,7 @@ async fn prepare_wrapper_environment<'a>(
     } else {
         None
     };
-    Some(WrapperEnvironment {
+    Some(UnitPreparation::Public(WrapperEnvironment {
         env_base,
         env_cache,
         circuit_tripped,
@@ -2519,9 +2678,49 @@ async fn prepare_wrapper_environment<'a>(
         rustc_version,
         cache_key,
         request_c_metadata,
-        reach,
         semantic_request,
         host_glibc: resolve::host_glibc(),
+    }))
+}
+
+/// The local-only preparation: the local base plus the stable identity
+/// — resolved against the same `materialized_outputs` table either
+/// config reads — for the local serve and store the decision runs.
+/// `source_local_only` is the identity's own reach input — a kill-switch
+/// detour passes `false`, since the recorded reach must reflect the
+/// identity, not this build's cache policy.
+async fn prepare_local_only(
+    rustc: &OsString,
+    parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
+    source_local_only: bool,
+    env_cache: &WrapperEnvCache,
+) -> Option<LocalOnlyPreparation> {
+    let local_base = env_cache.local_base(rustc).await?;
+    let target = parsed
+        .target
+        .clone()
+        .unwrap_or_else(|| local_base.host_target.clone());
+    let identity = match build_stable_exact_identity(
+        &local_base.config,
+        parsed,
+        source,
+        source_local_only,
+        &target,
+        &local_base.rustc_version,
+    )
+    .await
+    {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to resolve local artifact identity, bypassing local artifact cache");
+            return None;
+        }
+    };
+    Some(LocalOnlyPreparation {
+        env_base: local_base,
+        target,
+        identity,
     })
 }
 
@@ -3019,66 +3218,22 @@ async fn evict_cached_bundle(
 async fn decide_local_only(
     rustc: &OsString,
     parsed: &rustc_args::ParsedRustcArgs,
-    source: &UnitSource,
-    env_cache: &WrapperEnvCache,
+    class: &UnitClass,
+    prep: LocalOnlyPreparation,
     ctx: &BuildContext,
     invocation_env: &supervisor::protocol::InvocationEnv,
 ) -> Outcome {
-    // The fallback mark key is the consumer target the driver recorded,
-    // as `compile` resolved it from the environment before the context
-    // existed.
-    let fallback_target = || {
-        parsed
-            .target
-            .as_deref()
-            .or(ctx.public_cache_target.as_deref())
-    };
-    let Some(local_base) = env_cache.local_base(rustc).await else {
-        return compile(
-            rustc,
-            parsed,
-            fallback_target(),
-            ctx.policy_dir.as_deref(),
-            invocation_env,
-        )
-        .await;
-    };
-    let target = parsed
-        .target
-        .clone()
-        .unwrap_or_else(|| local_base.host_target.clone());
-    let identity = match build_stable_exact_identity(
-        &local_base.config,
-        parsed,
-        source,
-        &target,
-        &local_base.rustc_version,
-    )
-    .await
-    {
-        Ok(identity) => identity,
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to resolve local artifact identity, bypassing local artifact cache");
-            return compile(
-                rustc,
-                parsed,
-                Some(target.as_str()),
-                ctx.policy_dir.as_deref(),
-                invocation_env,
-            )
-            .await;
-        }
-    };
+    let target = prep.target;
     if must_build_locally(parsed, &target, ctx.policy_dir.as_deref()) {
         // A remote-missable unit records the build against stats; a
-        // local-only one is never reported (stow#1006).
+        // local-only-by-source one is never reported (stow#1006).
         record_unit_outcome(
-            &local_base.config,
+            &prep.env_base.config,
             parsed,
             &target,
-            &local_base.rustc_version,
+            &prep.env_base.rustc_version,
             UnitOutcome::LocalDependencyBuild,
-            !source_local_only(parsed, source),
+            class.remote_missable(),
         )
         .await;
         return compile(
@@ -3090,25 +3245,26 @@ async fn decide_local_only(
         )
         .await;
     }
-    if let Some((identity, _reach)) = identity {
+    if let Some((identity, _reach)) = prep.identity {
         let request = FetchRequest {
             target: &target,
-            rustc_version: &local_base.rustc_version,
+            rustc_version: &prep.env_base.rustc_version,
             c_metadata: identity.c_metadata.as_str(),
         };
         let mut tally = LookupTally::default();
         let served =
-            try_serve_local_cached_bundle(&local_base.config, parsed, &request, &mut tally).await;
+            try_serve_local_cached_bundle(&prep.env_base.config, parsed, &request, &mut tally)
+                .await;
         // A miss is never counted here: this path serves units the
         // public cache does not carry, so an unmet local lookup means
         // nothing was promised. A serve and a failed lookup are the
         // only outcomes.
         if served.is_some() || tally.failed {
             record_unit_outcome(
-                &local_base.config,
+                &prep.env_base.config,
                 parsed,
                 &target,
-                &local_base.rustc_version,
+                &prep.env_base.rustc_version,
                 UnitOutcome::of(served.is_some(), &tally, false),
                 false,
             )
@@ -4670,17 +4826,11 @@ async fn build_semantic_fetch_request(
     }))
 }
 
-/// Whether a keyed unit's own identity is already local-only — a git
-/// source or extra codegen the builder never publishes — before its
-/// dependencies' recorded reaches fold in (stow#1006).
-fn source_local_only(parsed: &rustc_args::ParsedRustcArgs, source: &UnitSource) -> bool {
-    !parsed.extra_codegen.is_empty() || matches!(source, UnitSource::Git { .. })
-}
-
 async fn build_stable_exact_identity(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
     source: &UnitSource,
+    source_local_only: bool,
     target: &str,
     rustc_version: &str,
 ) -> stow_types::error::Result<Option<(stow_types::public_cache::StableUnitIdentity, Reach)>> {
@@ -4703,7 +4853,7 @@ async fn build_stable_exact_identity(
     // — folded with the reaches the externs' `materialized_outputs` rows
     // recorded: a unit over a local-only dependency is local-only itself
     // (stow#1006).
-    let reach = if source_local_only(parsed, source) {
+    let reach = if source_local_only {
         Reach::LocalOnly
     } else {
         Reach::Public
@@ -4876,8 +5026,12 @@ async fn resolve_local_build_artifact(
             return Ok(LocalBuildResolution::UnrecordedExtern { extern_path });
         }
     };
-    let source = detect_unit_source(parsed, env_cache, ctx).await?;
+    let manifest_dir = invocation_env
+        .manifest_dir()
+        .map_err(stow_types::error::Error::msg)?;
+    let source = detect_unit_source(parsed, manifest_dir.as_deref(), env_cache, ctx).await?;
     let class = parsed.unit_class(source, invocation_env.primary_package);
+    let local_only = class.source_local_only();
     let UnitClass::Keyed { ref source, .. } = class else {
         if let UnitClass::Uncached(reason) = &class {
             tracing::debug!(
@@ -4888,7 +5042,7 @@ async fn resolve_local_build_artifact(
         }
         return Ok(LocalBuildResolution::NotAnArtifactUnit);
     };
-    let reach = if source_local_only(parsed, source) {
+    let reach = if local_only {
         Reach::LocalOnly
     } else {
         Reach::Public
@@ -4933,7 +5087,8 @@ async fn resolve_local_build_artifact(
     // Hash the unit's outputs once here — the materialized-output rows
     // record the instance digest, and the local store reuses the per-file
     // sha256s instead of re-reading the staged copy (stow#836).
-    let stable_parsed = inject::parsed_with_stable_identity(parsed, &identity);
+    let stable_parsed =
+        inject::parsed_with_stable_identity(parsed, &identity.c_metadata, &identity.extra_filename);
     let outputs =
         artifact_cache::local_build_output_specs(parsed, &stable_parsed, &base.host_target)?;
     let outputs = artifact_cache::hash_local_build_outputs(outputs).await?;
@@ -5030,6 +5185,12 @@ fn resolved_unit_features_json(
     }
 }
 
+fn detect_registry_package_slot(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<Option<stow_types::public_cache::RegistryPackageSlot>> {
+    stow_types::public_cache::detect_registry_package_slot(parsed)
+}
+
 fn detect_registry_crate_version(
     parsed: &rustc_args::ParsedRustcArgs,
 ) -> stow_types::error::Result<Option<(String, String)>> {
@@ -5042,23 +5203,44 @@ fn detect_registry_crate_version(
 /// slot.
 async fn detect_unit_source(
     parsed: &rustc_args::ParsedRustcArgs,
+    manifest_dir: Option<&Path>,
     env_cache: &WrapperEnvCache,
     ctx: &BuildContext,
 ) -> stow_types::error::Result<Result<UnitSource, UncachedReason>> {
-    if let Some((package, version)) = detect_registry_crate_version(parsed)? {
-        let index_dir = registry_index_dir(parsed).unwrap_or_default();
+    if let Some(slot) = detect_registry_package_slot(parsed)? {
         return Ok(
             if ctx
-                .registry_sources
-                .is_crates_io(&package, &version, &index_dir)
+                .registry_sources()?
+                .is_crates_io(&slot.package, &slot.version, &slot.index_dir)
             {
-                Ok(UnitSource::CratesIo { package, version })
+                Ok(UnitSource::CratesIo {
+                    package: slot.package,
+                    version: slot.version,
+                })
             } else {
                 Err(UncachedReason::NonCratesIoRegistry)
             },
         );
     }
     if let Some(checkout) = detect_git_checkout(parsed) {
+        // The manifest path inside the repository is cargo's own
+        // `CARGO_MANIFEST_DIR` — the package root inside the checkout —
+        // relative to the checkout root (`""` for a root package). One
+        // that escapes the root, or an absent manifest dir, is a git
+        // identity that cannot be verified.
+        let manifest_path_in_repo = manifest_dir
+            .and_then(|dir| dir.strip_prefix(&checkout.root).ok())
+            .and_then(|path| path.to_str())
+            .map(str::to_owned);
+        let Some(manifest_path_in_repo) = manifest_path_in_repo else {
+            tracing::debug!(
+                crate_name = %parsed.crate_name,
+                checkout = %checkout.root.display(),
+                manifest_dir = ?manifest_dir,
+                "git checkout's manifest dir is not inside the checkout; unit compiles uncached"
+            );
+            return Ok(Err(UncachedReason::GitIdentityFailed));
+        };
         return Ok(match env_cache.git_commit(&checkout.root).await {
             // The checkout's `<short id>` directory is a prefix of the
             // resolved commit — cargo hashes the source id for the name,
@@ -5066,7 +5248,7 @@ async fn detect_unit_source(
             // checkout and pins the commit the identity keys under.
             Some(commit) if commit.starts_with(&checkout.short_id) => Ok(UnitSource::Git {
                 commit,
-                manifest_path_in_repo: checkout.manifest_path_in_repo,
+                manifest_path_in_repo,
             }),
             Some(commit) => {
                 tracing::debug!(
@@ -5502,11 +5684,110 @@ mod tests {
         value.map(OsString::from)
     }
 
+    /// A one-commit git repository at `<root>/git/checkouts/demo-9f9f/<name>`
+    /// — `name` is the commit's 7-hex prefix when `None`, else the given
+    /// (wrong) directory name — and the commit it resolves to.
+    fn git_checkout_slot(root: &std::path::Path, name: Option<&str>) -> (PathBuf, String) {
+        let work = root.join("work");
+        std::fs::create_dir_all(work.join("src")).expect("create work tree");
+        std::fs::write(work.join("src").join("lib.rs"), "pub fn leaf() {}\n").expect("write lib");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).expect("utf8 git output")
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "--all"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "--message=m",
+        ]);
+        let commit = git(&["rev-parse", "HEAD"]).trim().to_owned();
+        let slot_name = name.unwrap_or(&commit[..7]);
+        let slot = root.join("git/checkouts/demo-9f9f").join(slot_name);
+        std::fs::create_dir_all(slot.parent().expect("slot parent")).expect("create slot parent");
+        std::fs::rename(&work, &slot).expect("move the checkout into its slot");
+        (slot, commit)
+    }
+
+    /// The identity of a git unit is the commit its checkout resolves
+    /// to: a `<short id>` directory that is a prefix of it keys the
+    /// unit, one that is not fails the identity (stow#1006).
+    #[tokio::test]
+    async fn a_git_checkout_keys_by_its_resolved_commit() {
+        let signal = std::sync::Arc::new(crate::facade::ServeMapSignal::settled());
+        let ctx = serve_ctx(&signal);
+        let cache = test_cache(std::ffi::OsStr::new(""));
+        let parse = |slot: &std::path::Path| {
+            ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "demo",
+                "--crate-type",
+                "lib",
+                slot.join("src/lib.rs").to_str().expect("utf8 path"),
+            ]))
+            .expect("parse")
+        };
+
+        let matching = tempfile::tempdir().expect("tempdir");
+        let (slot, commit) = git_checkout_slot(matching.path(), None);
+        let source = super::detect_unit_source(&parse(&slot), Some(&slot), &cache, &ctx)
+            .await
+            .expect("detection reads the checkout");
+        assert_eq!(
+            source,
+            Ok(stow_types::public_cache::UnitSource::Git {
+                commit,
+                manifest_path_in_repo: String::new(),
+            })
+        );
+
+        // A manifest dir below the root names its path inside the repo.
+        let nested = slot.join("tools/demo");
+        let source = super::detect_unit_source(&parse(&slot), Some(&nested), &cache, &ctx)
+            .await
+            .expect("detection reads the checkout");
+        assert!(
+            matches!(
+                source,
+                Ok(stow_types::public_cache::UnitSource::Git { ref manifest_path_in_repo, .. })
+                    if manifest_path_in_repo == "tools/demo"
+            ),
+            "{source:?}"
+        );
+
+        let mismatched = tempfile::tempdir().expect("tempdir");
+        let (slot, _) = git_checkout_slot(mismatched.path(), Some("0000000"));
+        let source = super::detect_unit_source(&parse(&slot), Some(&slot), &cache, &ctx)
+            .await
+            .expect("detection reads the checkout");
+        assert_eq!(
+            source,
+            Err(stow_types::rustc::UncachedReason::GitIdentityFailed)
+        );
+    }
+
     #[test]
     fn registry_sources_classify_only_crates_io() {
         // The lockfile map is authoritative: a package whose source is a
         // crates.io entry classifies; the same `(name, version)` under
         // another registry does not (stow#1006).
+        let hosts_set = std::iter::once("index.crates.io".to_owned()).collect();
         let lockfile = super::RegistrySources::parse_lockfile(
             r#"
             [[package]]
@@ -5528,17 +5809,42 @@ mod tests {
             name = "patched"
             version = "0.4.0"
             "#,
-        );
-        let super::RegistrySources::Lockfile(crates_io) = &lockfile else {
-            panic!("lockfile parse must yield the lockfile map");
-        };
-        assert!(crates_io.contains(&("itoa".to_owned(), "1.0.15".to_owned())));
-        assert!(crates_io.contains(&("mycrate".to_owned(), "0.2.0".to_owned())));
-        assert!(!crates_io.contains(&("mirrored".to_owned(), "0.3.0".to_owned())));
-        assert!(!crates_io.contains(&("patched".to_owned(), "0.4.0".to_owned())));
+            &hosts_set,
+        )
+        .expect("lockfile parses");
         assert!(lockfile.is_crates_io("itoa", "1.0.15", "index.crates.io-0123abcd"));
+        assert!(lockfile.is_crates_io("mycrate", "0.2.0", "index.crates.io-0123abcd"));
         assert!(!lockfile.is_crates_io("mirrored", "0.3.0", "my-mirror.example.com-deadbeef"));
+        assert!(!lockfile.is_crates_io("patched", "0.4.0", "index.crates.io-0123abcd"));
         assert!(!lockfile.is_crates_io("itoa", "9.9.9", "index.crates.io-0123abcd"));
+
+        // An unparseable lockfile is an error, never a degraded map.
+        assert!(
+            super::RegistrySources::parse_lockfile("not [toml", &hosts_set).is_err(),
+            "an unparseable lockfile must fail, not degrade"
+        );
+
+        // Two registries shipping the same `(name, version)`: the slot's
+        // index dir settles which source this unit came from — a
+        // crates.io answer under the crates.io slot, a non-crates.io
+        // answer under the mirror's (the D1 case).
+        let shared = super::RegistrySources::parse_lockfile(
+            r#"
+            [[package]]
+            name = "shared"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+
+            [[package]]
+            name = "shared"
+            version = "1.0.0"
+            source = "sparse+https://my-alt.example.com/index"
+            "#,
+            &hosts_set,
+        )
+        .expect("shared-source lockfile parses");
+        assert!(shared.is_crates_io("shared", "1.0.0", "index.crates.io-0123abcd"));
+        assert!(!shared.is_crates_io("shared", "1.0.0", "my-alt.example.com-deadbeef"));
 
         // The cargo-config map matches on the slot's host component:
         // crates.io's own slot, plus every host the replace-with chain
@@ -5554,18 +5860,6 @@ mod tests {
         assert!(hosts.is_crates_io("itoa", "1.0.15", "index.crates.io-0123abcd"));
         assert!(hosts.is_crates_io("mirrored", "0.3.0", "my-mirror.example.com-deadbeef"));
         assert!(!hosts.is_crates_io("other", "1.0.0", "other.example.com-abcdef12"));
-
-        // With no source map at all only cargo's own slot is crates.io.
-        assert!(super::RegistrySources::Unknown.is_crates_io(
-            "itoa",
-            "1.0.15",
-            "index.crates.io-0123abcd"
-        ));
-        assert!(!super::RegistrySources::Unknown.is_crates_io(
-            "other",
-            "1.0.0",
-            "other.example.com-abcdef12"
-        ));
     }
 
     #[test]
@@ -6504,7 +6798,6 @@ mod tests {
             rustc_version: rustc_version.to_owned(),
             cache_key: format!("{target}/{rustc_version}/{c_metadata}"),
             request_c_metadata: c_metadata.to_owned(),
-            reach: stow_types::public_cache::Reach::Public,
             semantic_request: None,
             host_glibc: None,
         }
@@ -6527,7 +6820,9 @@ mod tests {
             serve_map_ready: std::sync::Arc::clone(serve_map_ready),
             policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
             in_flight: crate::supervisor::server::InFlightUnits::default(),
-            registry_sources: crate::RegistrySources::default(),
+            registry_sources: std::sync::OnceLock::from(crate::RegistrySources::CargoConfig(
+                std::iter::once("index.crates.io".to_owned()).collect(),
+            )),
         }
     }
 
@@ -6748,6 +7043,7 @@ mod tests {
                 package: "lexicon".to_owned(),
                 version: "0.9.6".to_owned(),
             },
+            false,
             "x86_64-unknown-linux-gnu",
             "1.99.0",
         )
@@ -7052,7 +7348,9 @@ mod tests {
                 serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
                 policy_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
                 in_flight: in_flight.clone(),
-                registry_sources: crate::RegistrySources::default(),
+                registry_sources: std::sync::OnceLock::from(crate::RegistrySources::CargoConfig(
+                    std::iter::once("index.crates.io".to_owned()).collect(),
+                )),
             })
             .await
         }
@@ -7201,7 +7499,9 @@ mod tests {
                 serve_map_ready: std::sync::Arc::new(crate::facade::ServeMapSignal::settled()),
                 policy_ready: std::sync::Arc::clone(ready),
                 in_flight: in_flight.clone(),
-                registry_sources: crate::RegistrySources::default(),
+                registry_sources: std::sync::OnceLock::from(crate::RegistrySources::CargoConfig(
+                    std::iter::once("index.crates.io".to_owned()).collect(),
+                )),
             }
         }
 

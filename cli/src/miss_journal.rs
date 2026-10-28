@@ -154,6 +154,10 @@ pub fn observed_unit(parsed: &ParsedRustcArgs, build: &LocalBuildArtifact) -> Op
     // admissions post could act on, so the journal skips it entirely
     // (stow#1006).
     if build.reach == stow_types::public_cache::Reach::LocalOnly {
+        tracing::debug!(
+            crate_name = %parsed.crate_name,
+            "local-only unit; not journaled"
+        );
         return None;
     }
     let externs = match serde_json::from_str(&build.dependencies.c_metadata_json) {

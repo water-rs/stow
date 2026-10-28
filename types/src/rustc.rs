@@ -85,7 +85,11 @@ pub struct ParsedRustcArgs {
     pub embed_bitcode: bool,
     /// The `-C` / `-Z` options the registry identity does not model,
     /// normalized to their `-C key=value` / `-Z key=value` spellings —
-    /// argv and the `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` effect both.
+    /// argv only. Cargo puts every applicable `RUSTFLAGS` /
+    /// `CARGO_ENCODED_RUSTFLAGS` token on the argv, and rustc never reads
+    /// the variables, so argv is the one stream that says which flags the
+    /// unit actually compiled with — a host unit under `--target` gets no
+    /// env flags on argv precisely because cargo did not apply them.
     /// Sorted and folded into the compile key, so two invocations with the
     /// same extra options share one local identity.
     pub extra_codegen: BTreeSet<String>,
@@ -101,16 +105,16 @@ pub struct ParsedRustcArgs {
 impl ParsedRustcArgs {
     /// Parse a captured rustc argv into `ParsedRustcArgs`.
     ///
-    /// Recognizes the flags cargo passes for dependency compilations. Unknown
-    /// `-C` / `-Z` options set `has_custom_codegen` rather than failing, so
-    /// the invocation is still parsed — it just will not be cacheable.
+    /// Recognizes the flags cargo passes for dependency compilations.
+    /// Unknown `-C` / `-Z` options land in `extra_codegen` rather than
+    /// failing, so the invocation is still parsed — they key it
+    /// local-only, and the unfoldable ones classify it uncached.
     ///
     /// # Errors
     /// Returns an error when an argument is not valid UTF-8, a flag that
     /// requires a value is the last argument, an `--extern` pair or codegen
     /// boolean is malformed, or `--crate-name` is missing.
     pub fn parse(args: &[OsString]) -> Result<Self, String> {
-        let env_effect = env_rustflags_effect();
         let mut parsed = Self {
             crate_name: String::new(),
             crate_types: Vec::new(),
@@ -134,8 +138,8 @@ impl ParsedRustcArgs {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: true,
-            extra_codegen: env_effect.extra_codegen,
-            link_options: env_effect.link_options,
+            extra_codegen: BTreeSet::new(),
+            link_options: BTreeSet::new(),
         };
 
         let mut iter = args.iter();
@@ -173,11 +177,11 @@ impl ParsedRustcArgs {
         source: Result<crate::public_cache::UnitSource, UncachedReason>,
         primary_package: bool,
     ) -> UnitClass {
-        let Some(shape) = self.unit_shape_kind() else {
+        if self.unit_shape_kind().is_none() {
             return UnitClass::Uncached(UncachedReason::UnrestorableCrateType(
                 self.crate_types.join(","),
             ));
-        };
+        }
         if self.c_metadata.is_none() || self.out_dir.is_none() {
             return UnitClass::Uncached(UncachedReason::NoMetadataOrOutDir);
         }
@@ -197,7 +201,6 @@ impl ParsedRustcArgs {
             Ok(source) => UnitClass::Keyed {
                 source,
                 extra_codegen: self.extra_codegen.iter().cloned().collect(),
-                shape,
             },
         }
     }
@@ -462,8 +465,6 @@ pub enum UnitClass {
         /// The sorted, normalized `-C`/`-Z` options the registry
         /// identity does not model — folded into the compile key.
         extra_codegen: Vec<String>,
-        /// The restorable artifact shape the unit produces.
-        shape: UnitShapeKind,
     },
     /// The cache never holds this unit — never stored, never served.
     Uncached(UncachedReason),
@@ -486,6 +487,16 @@ impl UnitClass {
             }
             Self::Uncached(_) => false,
         }
+    }
+
+    /// Whether this compile could have been a public-cache miss — keyed
+    /// under an identity that is itself remote-lookupable. A dep-tainted
+    /// unit is still missable by this measure (its own identity is a
+    /// public one), which is what the local-dependency build accounting
+    /// counts (stow#734); a git or codegen-keyed unit is not (stow#1006).
+    #[must_use]
+    pub const fn remote_missable(&self) -> bool {
+        matches!(self, Self::Keyed { .. }) && !self.source_local_only()
     }
 }
 
@@ -890,117 +901,6 @@ fn next_str<'a>(
     next_os(iter, flag)?
         .to_str()
         .ok_or_else(|| format!("value after {flag} is not valid UTF-8"))
-}
-
-/// What the process-wide rustflags contribute to the invocation's
-/// identity.
-#[derive(Debug, Default, Clone)]
-struct EnvRustflagsEffect {
-    /// The normalized `-C`/`-Z` options the registry identity does not
-    /// model — folded into the compile key.
-    extra_codegen: BTreeSet<String>,
-    /// Flags that steer only the final link step: inert for a unit that
-    /// never links, part of the key for one that does.
-    link_options: BTreeSet<String>,
-}
-
-/// Classify `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` into the two effects.
-///
-/// Both are process-wide, so this cannot know the crate type of the unit
-/// being compiled — the caller decides what a link option means for the
-/// unit it holds.
-fn env_rustflags_effect() -> EnvRustflagsEffect {
-    let mut effect = EnvRustflagsEffect::default();
-    if let Some(encoded) = std::env::var("CARGO_ENCODED_RUSTFLAGS")
-        .ok()
-        .filter(|value| !value.is_empty())
-    {
-        let mut flags = encoded
-            .split('\x1f')
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        apply_env_rustflags(&mut flags, &mut effect, &encoded);
-    }
-    match split_rustflags_env() {
-        Ok(extra) => {
-            let mut flags = extra.into_iter();
-            apply_env_rustflags(&mut flags, &mut effect, "RUSTFLAGS");
-        }
-        Err(error) => {
-            // The variable cannot be decomposed into options, so the
-            // whole raw value is the key input: still deterministic, still
-            // distinct from every decomposable spelling.
-            tracing::warn!(
-                %error,
-                "RUSTFLAGS could not be parsed — keying on its raw value"
-            );
-            if let Ok(raw) = std::env::var("RUSTFLAGS") {
-                effect.extra_codegen.insert(format!("rustflags-env={raw}"));
-            }
-        }
-    }
-    effect
-}
-
-/// Fold one rustflags token stream into the effect. `-C`/`--codegen`
-/// options normalize to their `-C <option>` spelling, `-Z` options to
-/// `-Z <option>`; any other flag is folded verbatim — every spelling is
-/// deterministic, and an unmatched spelling only ever costs a miss.
-fn apply_env_rustflags(
-    flags: &mut impl Iterator<Item = String>,
-    effect: &mut EnvRustflagsEffect,
-    raw: &str,
-) {
-    while let Some(flag) = flags.next() {
-        match flag.as_str() {
-            "--remap-path-prefix" => {
-                let Some(value) = flags.next() else {
-                    effect.extra_codegen.insert(format!("rustflags-env={raw}"));
-                    return;
-                };
-                let _ = value;
-            }
-            _ if flag.starts_with("--remap-path-prefix=") => {}
-            "-C" | "--codegen" => {
-                let Some(option) = flags.next() else {
-                    effect.extra_codegen.insert(format!("rustflags-env={raw}"));
-                    return;
-                };
-                apply_env_codegen_option(&option, effect);
-            }
-            "-Z" => {
-                let Some(option) = flags.next() else {
-                    effect.extra_codegen.insert(format!("rustflags-env={raw}"));
-                    return;
-                };
-                effect.extra_codegen.insert(format!("-Z {option}"));
-            }
-            _ => {
-                if let Some(option) = flag
-                    .strip_prefix("-C")
-                    .or_else(|| flag.strip_prefix("--codegen="))
-                {
-                    apply_env_codegen_option(option, effect);
-                } else if let Some(option) = flag.strip_prefix("-Z") {
-                    effect.extra_codegen.insert(format!("-Z {option}"));
-                } else {
-                    effect.extra_codegen.insert(flag);
-                }
-            }
-        }
-    }
-}
-
-fn apply_env_codegen_option(option: &str, effect: &mut EnvRustflagsEffect) {
-    if is_link_only_codegen_option(option) {
-        effect.link_options.insert(option.to_owned());
-    } else {
-        effect.extra_codegen.insert(format!("-C {option}"));
-    }
-}
-
-fn split_rustflags_env() -> Result<Vec<String>, shell_words::ParseError> {
-    std::env::var("RUSTFLAGS").map_or_else(|_| Ok(Vec::new()), |value| shell_words::split(&value))
 }
 
 #[cfg(test)]
@@ -1516,14 +1416,10 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn link_only_env_rustflags_key_a_unit_that_links() {
-        // The same split for process-wide rustflags: `RUSTFLAGS` cannot
-        // know the crate type, so the decision belongs to the unit. The
-        // linked unit carries the option into its key; the rlib does not
-        // see it at all.
-        unsafe {
-            std::env::set_var("RUSTFLAGS", "-C link-arg=-fuse-ld=mold");
-        }
+    fn link_flags_on_argv_key_a_unit_that_links() {
+        // `-C link-arg` on argv keys only a unit that invokes the linker:
+        // the proc-macro carries the option into its key; the rlib does
+        // not see it at all.
         let linked = ParsedRustcArgs::parse(&args(&[
             "--crate-name",
             "serde_derive",
@@ -1535,6 +1431,8 @@ mod tests {
             "/tmp/out",
             "-C",
             "metadata=abc123",
+            "-C",
+            "link-arg=-fuse-ld=mold",
         ]))
         .expect("parser should succeed");
         let rlib = ParsedRustcArgs::parse(&args(&[
@@ -1550,26 +1448,23 @@ mod tests {
             "metadata=abc123",
         ]))
         .expect("parser should succeed");
-        unsafe {
-            std::env::remove_var("RUSTFLAGS");
-        }
 
         assert_eq!(
             linked.link_options_reaching_the_linker(),
             vec!["link-arg=-fuse-ld=mold".to_owned()],
-            "a linked unit lost the rustflags link option from its key"
+            "a linked unit lost the link option from its key"
         );
         assert!(keyed(&linked), "a mold-linked proc-macro stopped serving");
         assert!(
             rlib.link_options_reaching_the_linker().is_empty(),
-            "an rlib took a rustflags link option into its key"
+            "an rlib took a link option into its key"
         );
         assert!(keyed(&rlib), "the rlib stopped being cacheable");
     }
 
     #[test]
     #[serial_test::serial]
-    fn codegen_flags_that_change_objects_stay_custom() {
+    fn foldable_codegen_flags_key_the_unit_local_only() {
         with_clean_rustc_env(|| {
             // Foldable options key into extra-codegen: the unit stays a
             // cache unit, local-only by reach (stow#1006).
@@ -1626,6 +1521,46 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn options_the_key_cannot_see_stay_uncached() {
+        with_clean_rustc_env(|| {
+            // Each of these depends on a file or a location the compile
+            // key cannot see: the unit is uncached, never keyed.
+            for (flag, option) in [
+                ("-C", "profile-use=/tmp/merged.profdata"),
+                ("-C", "profile-sample-use=/tmp/sample.prof"),
+                ("-Z", "codegen-backend=cranelift"),
+                ("-Z", "llvm-plugins=/tmp/plugin.so"),
+                ("-Z", "temps-dir=/tmp/temps"),
+                ("-Z", "split-dwarf-kind=split"),
+                ("-Z", "self-profile=/tmp/profile"),
+                ("-Z", "dump-mir=all"),
+            ] {
+                let parsed = ParsedRustcArgs::parse(&args(&[
+                    "--crate-name",
+                    "itoa",
+                    "--crate-type",
+                    "rlib",
+                    "--out-dir",
+                    "/tmp/out",
+                    "-C",
+                    "metadata=abc123",
+                    flag,
+                    option,
+                ]))
+                .expect("parser should succeed");
+                assert!(
+                    matches!(
+                        parsed.unit_class(Ok(test_source()), false),
+                        UnitClass::Uncached(UncachedReason::UnfoldableOption(_))
+                    ),
+                    "{flag} {option} was keyed"
+                );
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn nightly_cargo_embed_metadata_is_not_custom_codegen() {
         with_clean_rustc_env(|| {
             for spelling in ["-Z embed-metadata=no", "-Zembed-metadata=no"] {
@@ -1647,7 +1582,6 @@ mod tests {
 
                 assert_eq!(parsed.embed_metadata, Some(false));
                 assert!(parsed.extra_codegen.is_empty());
-                assert!(keyed(&parsed));
                 assert!(keyed(&parsed));
             }
         });
@@ -2089,7 +2023,9 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn remap_rustflags_do_not_disable_cacheability() {
+    fn env_remap_rustflags_do_not_enter_the_key() {
+        // `--remap-path-prefix` on argv is ignored by the parser, and in
+        // env it is not the invocation's: either way nothing keys.
         unsafe {
             std::env::set_var(
                 "RUSTFLAGS",
@@ -2119,7 +2055,11 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn link_flag_env_rustflags_do_not_disable_cacheability() {
+    fn env_link_rustflags_do_not_enter_the_key() {
+        // Cargo puts env rustflags on the argv of every unit they apply
+        // to — an env-only flag was not applied to this unit (a host
+        // unit under --target), so keying on it would collide this unit
+        // with a target unit that compiled with the flag (stow#1006).
         for value in [
             "-C link-arg=-fuse-ld=mold",
             "-Clink-arg=-fuse-ld=mold",
@@ -2147,13 +2087,20 @@ mod tests {
             }
 
             assert!(keyed(&parsed), "{value} made unit uncacheable");
-            assert!(parsed.extra_codegen.is_empty(), "{value} marked custom");
+            assert!(
+                parsed.extra_codegen.is_empty(),
+                "{value} entered the key without being on argv"
+            );
+            assert!(
+                parsed.link_options.is_empty(),
+                "{value} entered link options without being on argv"
+            );
         }
     }
 
     #[test]
     #[serial_test::serial]
-    fn mixed_env_rustflags_still_disable_cacheability() {
+    fn env_rustflags_with_link_and_codegen_do_not_enter_the_key() {
         unsafe {
             std::env::set_var(
                 "RUSTFLAGS",
@@ -2177,13 +2124,14 @@ mod tests {
             std::env::remove_var("RUSTFLAGS");
         }
 
-        assert!(!keyed(&parsed));
-        assert!(!parsed.extra_codegen.is_empty());
+        assert!(keyed(&parsed));
+        assert!(parsed.extra_codegen.is_empty());
+        assert!(parsed.link_options.is_empty());
     }
 
     #[test]
     #[serial_test::serial]
-    fn custom_env_rustflags_disable_cacheability() {
+    fn env_target_cpu_native_does_not_enter_the_key() {
         unsafe {
             std::env::set_var("RUSTFLAGS", "-C target-cpu=native");
         }
@@ -2204,8 +2152,8 @@ mod tests {
             std::env::remove_var("RUSTFLAGS");
         }
 
-        assert!(!keyed(&parsed));
-        assert!(!parsed.extra_codegen.is_empty());
+        assert!(keyed(&parsed));
+        assert!(parsed.extra_codegen.is_empty());
     }
 
     #[test]

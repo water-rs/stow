@@ -122,7 +122,8 @@ pub async fn materialize_local_build_stable_aliases(
     host: &str,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
-    let stable_parsed = parsed_with_stable_identity(parsed, identity);
+    let stable_parsed =
+        parsed_with_stable_identity(parsed, &identity.c_metadata, &identity.extra_filename);
 
     materialize_optional_local_alias(
         parsed.output_rlib_path(),
@@ -156,19 +157,8 @@ async fn materialize_cached_bundle_stable_aliases(
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
-    let stable_identity = StableUnitIdentity {
-        compile_key: bundle.compile_key.clone(),
-        c_metadata: stable_c_metadata.clone(),
-        extra_filename: format!("-{stable_c_metadata}"),
-        crate_name: bundle.crate_name.clone(),
-        version: bundle.crate_version.clone(),
-        source: stow_types::public_cache::UnitSource::CratesIo {
-            package: bundle.crate_name.clone(),
-            version: bundle.crate_version.clone(),
-        },
-        reach: stow_types::public_cache::Reach::Public,
-    };
-    let stable_parsed = parsed_with_stable_identity(parsed, &stable_identity);
+    let stable_parsed =
+        parsed_with_stable_identity(parsed, &stable_c_metadata, &format!("-{stable_c_metadata}"));
 
     materialize_optional_local_alias(
         parsed.output_rlib_path(),
@@ -197,11 +187,12 @@ async fn materialize_cached_bundle_stable_aliases(
 
 pub fn parsed_with_stable_identity(
     parsed: &ParsedRustcArgs,
-    identity: &StableUnitIdentity,
+    c_metadata: &str,
+    extra_filename: &str,
 ) -> ParsedRustcArgs {
     let mut stable = parsed.clone();
-    stable.c_metadata = Some(identity.c_metadata.clone());
-    stable.extra_filename.clone_from(&identity.extra_filename);
+    stable.c_metadata = Some(c_metadata.to_owned());
+    stable.extra_filename.clone_from(&extra_filename.to_owned());
     stable
 }
 
@@ -735,6 +726,7 @@ mod tests {
         let crate_types = manifest.config.crate_types.clone();
         CachedArtifactBundle {
             provenance: crate::artifact_cache::ArtifactProvenance::Remote,
+            reach: stow_types::public_cache::Reach::Public,
             oci_reference: manifest.oci_reference,
             oci_digest: manifest.oci_digest,
             compile_key: manifest.config.compile_key.clone(),

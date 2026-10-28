@@ -108,8 +108,23 @@ pub fn canonical_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
-/// Detect `(crate_name, version)` for an invocation whose input file lives
-/// under a cargo registry `src/` directory (`<name>-<version>/src/lib.rs`).
+/// A registry package slot found on an invocation's input path: the
+/// `<package>-<version>` directory under `…/registry/src/<index>/`,
+/// decomposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryPackageSlot {
+    /// Package name as it appears in the registry path (hyphenated
+    /// form).
+    pub package: String,
+    /// Package version parsed from the directory name.
+    pub version: String,
+    /// The `<index>` directory name (`index.crates.io-<hash>`,
+    /// `<host>-<hash>`) the slot sits under.
+    pub index_dir: String,
+}
+
+/// Detect the registry slot an invocation's input file lives under
+/// (`<name>-<version>/src/lib.rs` below `…/registry/src/<index>/`).
 ///
 /// The identity comes from the directory at the canonical registry slot
 /// `…/registry/src/<index>/<package>-<version>` — both sides see that
@@ -124,9 +139,9 @@ pub fn canonical_crate_name(name: &str) -> String {
 /// # Errors
 /// Never fails today; the `Result` shape lets callers `?` it uniformly
 /// alongside the fallible identity steps.
-pub fn detect_registry_crate_version(
+pub fn detect_registry_package_slot(
     parsed: &ParsedRustcArgs,
-) -> crate::error::Result<Option<(String, String)>> {
+) -> crate::error::Result<Option<RegistryPackageSlot>> {
     let Some(input_path) = parsed.input_path.as_ref() else {
         return Ok(None);
     };
@@ -137,9 +152,36 @@ pub fn detect_registry_crate_version(
         let Some(component) = ancestor.file_name().and_then(|value| value.to_str()) else {
             return Ok(None);
         };
-        return Ok(split_package_version_component(component));
+        let Some((package, version)) = split_package_version_component(component) else {
+            return Ok(None);
+        };
+        let Some(index_dir) = ancestor
+            .parent()
+            .and_then(|index| index.file_name())
+            .and_then(|name| name.to_str())
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(RegistryPackageSlot {
+            package,
+            version,
+            index_dir: index_dir.to_owned(),
+        }));
     }
     Ok(None)
+}
+
+/// Detect `(crate_name, version)` for an invocation whose input file lives
+/// under a cargo registry `src/` directory — see
+/// [`detect_registry_package_slot`].
+///
+/// # Errors
+/// Never fails today; the `Result` shape lets callers `?` it uniformly
+/// alongside the fallible identity steps.
+pub fn detect_registry_crate_version(
+    parsed: &ParsedRustcArgs,
+) -> crate::error::Result<Option<(String, String)>> {
+    Ok(detect_registry_package_slot(parsed)?.map(|slot| (slot.package, slot.version)))
 }
 
 /// The registry index directory a crates.io-sourced invocation's input
@@ -163,11 +205,12 @@ pub fn registry_index_dir(parsed: &ParsedRustcArgs) -> Option<String> {
 
 /// The remote git checkout an invocation's input path sits under.
 ///
-/// Finds the checkout root at `<…>/git/checkouts/<ident>/<short id>`,
+/// Finds the checkout root at `<…>/git/checkouts/<ident>/<short id>` and
 /// reads the `<short id>` directory name — a prefix of the commit the
-/// checkout must resolve to — and the manifest directory's path inside
-/// the repository. `None` when no ancestor sits at cargo's checkout
-/// slot.
+/// checkout must resolve to. `None` when no ancestor sits at cargo's
+/// checkout slot. Pure path math: the manifest directory's path inside
+/// the repository comes from the invocation's `CARGO_MANIFEST_DIR`,
+/// which cargo sets on every rustc call.
 #[must_use]
 pub fn detect_git_checkout(parsed: &ParsedRustcArgs) -> Option<GitCheckout> {
     let input_path = parsed.input_path.as_ref()?;
@@ -187,23 +230,9 @@ pub fn detect_git_checkout(parsed: &ParsedRustcArgs) -> Option<GitCheckout> {
             continue;
         }
         let short_id = checkout_root.file_name()?.to_str()?.to_owned();
-        // The manifest directory is the deepest ancestor of the input
-        // file carrying a `Cargo.toml` — the crate's package root inside
-        // the repository (`""` when the package sits at the root).
-        let manifest_dir = input_path
-            .ancestors()
-            .take_while(|dir| *dir != checkout_root.parent().unwrap_or(checkout_root))
-            .find(|dir| dir.join("Cargo.toml").exists())
-            .filter(|dir| dir.starts_with(checkout_root))?;
-        let manifest_path_in_repo = manifest_dir
-            .strip_prefix(checkout_root)
-            .ok()?
-            .to_str()?
-            .to_owned();
         return Some(GitCheckout {
             root: checkout_root.to_path_buf(),
             short_id,
-            manifest_path_in_repo,
         });
     }
     None
@@ -217,8 +246,6 @@ pub struct GitCheckout {
     /// The `<short id>` directory name — a prefix of the commit the
     /// checkout resolves to.
     pub short_id: String,
-    /// The manifest directory's path inside the repository.
-    pub manifest_path_in_repo: String,
 }
 
 /// Compute the stable cache identity for one captured rustc invocation
@@ -937,8 +964,9 @@ mod tests {
 
     use super::{
         ExplicitSpelling, Reach, StableUnitIdentity, UnitInvocation, UnitKind, UnitShape, UnitSide,
-        detect_git_checkout, detect_registry_crate_version, normalized_cache_profile,
-        registry_index_dir, required_unit_shapes, stable_unit_identity_for_package,
+        UnitSource, detect_git_checkout, detect_registry_crate_version, normalized_cache_profile,
+        registry_index_dir, required_unit_shapes, stable_unit_identity,
+        stable_unit_identity_for_package,
     };
     use crate::rustc::ParsedRustcArgs;
 
@@ -1007,7 +1035,48 @@ mod tests {
     }
 
     #[test]
-    fn detect_git_checkout_reads_the_slot_and_manifest_path() {
+    fn git_and_registry_identities_of_one_crate_never_share_a_key() {
+        // The production git identity keys under an empty version, the
+        // registry one under the slot's: the same crate name and version
+        // text on both sides must still key apart.
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "demo",
+            "--crate-type",
+            "rlib",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=abc123",
+        ]))
+        .expect("parse");
+        let identity = |source: &UnitSource| {
+            stable_unit_identity(
+                &parsed,
+                source,
+                Reach::Public,
+                "aarch64-apple-darwin",
+                "1.91.1",
+                "[]",
+                "[]",
+            )
+            .expect("identity")
+        };
+        let registry = identity(&UnitSource::CratesIo {
+            package: "demo".to_owned(),
+            version: "0.1.0".to_owned(),
+        });
+        let git = identity(&UnitSource::Git {
+            commit: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_owned(),
+            manifest_path_in_repo: String::new(),
+        });
+        assert_eq!(git.version, "", "a git unit carries no registry version");
+        assert_ne!(registry.compile_key, git.compile_key);
+        assert_ne!(registry.c_metadata, git.c_metadata);
+    }
+
+    #[test]
+    fn detect_git_checkout_reads_the_slot() {
         let temp = tempfile::tempdir().expect("tempdir");
         let checkout = temp
             .path()
@@ -1033,7 +1102,6 @@ mod tests {
         .expect("parse");
         let found = detect_git_checkout(&parsed).expect("checkout slot detected");
         assert_eq!(found.short_id, "1a2b3c4d");
-        assert_eq!(found.manifest_path_in_repo, "tools/demo");
         assert!(
             found.root.ends_with("git/checkouts/demo-9f9f9f/1a2b3c4d"),
             "checkout root names the commit slot: {}",

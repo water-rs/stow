@@ -207,6 +207,10 @@ pub struct CachedArtifactBundle {
     /// local entry was compiled against; `'[]'` on remote entries, whose
     /// binding is the published instance by construction (stow#836).
     pub dependency_instances_json: String,
+    /// How far this entry's identity may travel — recorded at store
+    /// time, so a served local-only bundle keeps marking its outputs
+    /// (and therefore its consumers) `LocalOnly` (stow#1006).
+    pub reach: stow_types::public_cache::Reach,
     /// Compile time the publisher recorded for this artifact — `0` for
     /// locally produced entries, which carry no measurement.
     pub compile_millis: u64,
@@ -331,6 +335,12 @@ pub async fn load_cached_bundle(
     let shape = EntryShape::parse(&entry, &rustc_version, &cache_key)?;
     Ok(Some(CachedArtifactBundle {
         provenance: ArtifactProvenance::from_column(&entry.provenance)?,
+        reach: stow_types::public_cache::Reach::from_int(entry.reach).ok_or_else(|| {
+            stow_types::stow_error!(
+                "artifact cache entry {cache_key} for rustc {rustc_version} has unknown reach {}",
+                entry.reach
+            )
+        })?,
         oci_reference: entry.oci_reference,
         oci_digest: entry.oci_digest,
         compile_key: entry.compile_key,
@@ -488,6 +498,7 @@ pub fn load_bundle_entry_dir(
     let lease_lock = acquire_entry_shared_lock(lease_dir, cache_key)?;
     Ok(Some(CachedArtifactBundle {
         provenance: ArtifactProvenance::Remote,
+        reach: stow_types::public_cache::Reach::Public,
         oci_reference: manifest.oci_reference,
         oci_digest: manifest.oci_digest,
         compile_key: manifest.config.compile_key,
@@ -562,7 +573,8 @@ pub async fn load_semantic_cached_bundle(
         "SELECT c_metadata, crate_version, emit_json, features_json \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND target = ? AND crate_name = ? \
-           AND profile_json = ? AND kind_json = ? AND crate_types_json = ?",
+           AND profile_json = ? AND kind_json = ? AND crate_types_json = ? \
+           AND reach = ?",
     )
     .bind(&request.rustc_version)
     .bind(&request.target)
@@ -570,6 +582,7 @@ pub async fn load_semantic_cached_bundle(
     .bind(profile_json)
     .bind(kind_json)
     .bind(crate_types_json)
+    .bind(stow_types::public_cache::Reach::Public.to_int())
     .fetch_all(&connection)
     .await?;
     let mut candidates = rows
@@ -725,6 +738,7 @@ fn cached_bundle_for_entry(
 ) -> CachedArtifactBundle {
     CachedArtifactBundle {
         provenance: ArtifactProvenance::Remote,
+        reach: stow_types::public_cache::Reach::Public,
         oci_reference: bundle.manifest.oci_reference.clone(),
         oci_digest: bundle.manifest.oci_digest.clone(),
         compile_key: bundle.manifest.config.compile_key.clone(),
@@ -996,6 +1010,7 @@ async fn record_local_entry_metadata(
             dependency_c_metadata_json: build.dependencies.c_metadata_json.clone(),
             dependency_compile_keys_json: &binding.compile_keys_json,
             dependency_instances_json: &binding.instances_json,
+            reach: build.reach,
             compile_millis: 0,
             target: &build.target,
             profile: &profile,
@@ -1022,21 +1037,15 @@ pub async fn record_materialized_bundle_outputs(
     let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
     let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
     let dependency_identity = stable_c_metadata.as_str();
+    let stable_extra_filename = format!("-{stable_c_metadata}");
     let instance =
         outputs_instance_digest(bundle.outputs.iter().map(|output| output.sha256.as_str()));
-    let stable_identity = StableUnitIdentity {
-        compile_key: bundle.compile_key.clone(),
-        c_metadata: stable_c_metadata.clone(),
-        extra_filename: format!("-{stable_c_metadata}"),
-        crate_name: bundle.crate_name.clone(),
-        version: bundle.crate_version.clone(),
-        source: stow_types::public_cache::UnitSource::CratesIo {
-            package: bundle.crate_name.clone(),
-            version: bundle.crate_version.clone(),
-        },
-        reach: stow_types::public_cache::Reach::Public,
-    };
-    let stable_parsed = parsed_with_stable_identity(parsed, &stable_identity);
+    // The entry's own reach: a served local-only bundle keeps marking
+    // its materialized outputs local-only, so its consumers fold to
+    // `LocalOnly` exactly as if it had compiled here (stow#1006).
+    let reach = bundle.reach;
+    let stable_parsed =
+        parsed_with_stable_identity(parsed, &stable_c_metadata, &stable_extra_filename);
 
     for file in &bundle.outputs {
         let output_path = crate::inject::expected_output_path(parsed, out_dir, file, host)?;
@@ -1045,7 +1054,7 @@ pub async fn record_materialized_bundle_outputs(
             &output_path,
             dependency_identity,
             &instance,
-            stow_types::public_cache::Reach::Public,
+            reach,
             updated_at_ms,
         )
         .await?;
@@ -1056,7 +1065,7 @@ pub async fn record_materialized_bundle_outputs(
                 &original_path,
                 dependency_identity,
                 &instance,
-                stow_types::public_cache::Reach::Public,
+                reach,
                 updated_at_ms,
             )
             .await?;
@@ -1069,7 +1078,7 @@ pub async fn record_materialized_bundle_outputs(
                 &stable_output_path,
                 dependency_identity,
                 &instance,
-                stow_types::public_cache::Reach::Public,
+                reach,
                 updated_at_ms,
             )
             .await?;
@@ -1101,7 +1110,7 @@ pub async fn record_materialized_closure_outputs(
             &original_path,
             bundle.c_metadata.as_str(),
             &instance,
-            stow_types::public_cache::Reach::Public,
+            bundle.reach,
             updated_at_ms,
         )
         .await?;
@@ -1148,7 +1157,11 @@ pub async fn record_materialized_local_build_outputs(
     let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
     let dependency_identity = build.identity.c_metadata.as_str();
     let instance = build.instance();
-    let stable_parsed = parsed_with_stable_identity(parsed, &build.identity);
+    let stable_parsed = parsed_with_stable_identity(
+        parsed,
+        &build.identity.c_metadata,
+        &build.identity.extra_filename,
+    );
 
     // The stable-named invocation is the same unit under another file
     // name, so it names the same outputs: a shape present under one name
@@ -2943,6 +2956,7 @@ struct ArtifactCacheEntryRow {
     verified_marker_version: Option<i64>,
     verified_marker_policy: Option<String>,
     provenance: String,
+    reach: i64,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -2995,7 +3009,7 @@ async fn load_artifact_cache_entry(
                 compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, \
                 compile_millis, size_bytes, \
                 profile_json, emit_json, kind_json, crate_types_json, \
-                verified_marker_version, verified_marker_policy, provenance \
+                verified_marker_version, verified_marker_policy, provenance, reach \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND cache_key = ?",
     )
@@ -3162,6 +3176,9 @@ struct CacheEntryMetadata<'a> {
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: &'a str,
     dependency_instances_json: &'a str,
+    /// `Public` for remote bundles; the local build's folded reach for
+    /// self-produced entries.
+    reach: stow_types::public_cache::Reach,
     /// Publisher-recorded compile time; `0` for locally produced entries.
     compile_millis: u64,
     target: &'a str,
@@ -3188,6 +3205,7 @@ impl<'a> CacheEntryMetadata<'a> {
             dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
             dependency_compile_keys_json: &bundle.manifest.config.dependency_compile_keys_json,
             dependency_instances_json: "[]",
+            reach: stow_types::public_cache::Reach::Public,
             compile_millis: bundle.manifest.config.compile_millis,
             target: bundle.manifest.config.target.as_str(),
             profile: &bundle.manifest.config.profile,
@@ -3250,8 +3268,8 @@ async fn insert_artifact_cache_entry(
 ) -> stow_types::error::Result<()> {
     sqlx::query(
         "INSERT OR REPLACE INTO artifact_cache_entries \
-         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance, reach) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
     )
     .bind(rustc_version)
     .bind(cache_key)
@@ -3281,6 +3299,7 @@ async fn insert_artifact_cache_entry(
     .bind(serde_json::to_string(metadata.kind)?)
     .bind(serde_json::to_string(metadata.crate_types)?)
     .bind(metadata.provenance.as_column())
+    .bind(metadata.reach.to_int())
     .execute(connection)
     .await?;
     Ok(())
@@ -4251,6 +4270,7 @@ pub mod tests {
         let lease_path = tempdir.path().join("local.lock");
         let bundle = super::CachedArtifactBundle {
             provenance: super::ArtifactProvenance::Local,
+            reach: stow_types::public_cache::Reach::Public,
             oci_reference: "local".to_owned(),
             oci_digest: "local".to_owned(),
             compile_key: "compile-key".to_owned(),
@@ -4420,6 +4440,82 @@ pub mod tests {
                 resolved.c_metadata_json,
                 r#"[{"crate_name":"colorchoice","c_metadata":"0123456789abcdef"}]"#
             );
+        });
+    }
+
+    #[test]
+    fn dependency_reach_folds_local_only_rows_whatever_recorded_them() {
+        use stow_types::public_cache::Reach;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        // A local build recorded local-only, and a served bundle whose
+        // entry was stored local-only, both mark their outputs so.
+        let built = parsed_rustc_args(
+            "colorchoice",
+            "abc123",
+            out_dir.clone(),
+            Vec::new(),
+            vec!["lib".to_owned()],
+        );
+        let mut local_build = local_build_artifact(&built, "stable-colorchoice");
+        local_build.reach = Reach::LocalOnly;
+        let served = parsed_rustc_args(
+            "anstyle",
+            "compile-key",
+            out_dir,
+            Vec::new(),
+            vec!["lib".to_owned()],
+        );
+        let mut artifact_bundle =
+            sample_bundle("0123456789abcdef", "libanstyle-0123456789abcdef.rmeta");
+        artifact_bundle.manifest.config.compile_key =
+            "0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210".to_owned();
+        let mut bundle = remote_cached_bundle(&artifact_bundle, tempdir.path());
+        bundle.reach = Reach::LocalOnly;
+
+        run_async(async {
+            super::record_materialized_local_build_outputs(
+                &config,
+                &built,
+                &local_build,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record local build outputs");
+            super::record_materialized_bundle_outputs(
+                &config,
+                &served,
+                &bundle,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record bundle outputs");
+
+            for dependency in [&built, &served] {
+                let consumer = consumer_parsed_args(
+                    tempdir.path(),
+                    dependency
+                        .output_rmeta_path()
+                        .expect("dependency rmeta path"),
+                );
+                let super::DependencyCMetadataResolution::Resolved(resolved) =
+                    super::resolve_dependency_c_metadata_json(&config, &consumer)
+                        .await
+                        .expect("resolve dependency metadata")
+                else {
+                    panic!("the dependency's bookkeeping resolved");
+                };
+                assert_eq!(
+                    resolved.reach,
+                    Reach::LocalOnly,
+                    "a consumer of {} did not fold local-only",
+                    dependency.crate_name
+                );
+            }
         });
     }
 
@@ -6010,7 +6106,11 @@ pub mod tests {
         // tolerates a missing source — the skips-missing-output test
         // needs an artifact whose outputs rustc never wrote, which the
         // real resolve path can never produce.
-        let stable_parsed = crate::inject::parsed_with_stable_identity(parsed, &identity);
+        let stable_parsed = crate::inject::parsed_with_stable_identity(
+            parsed,
+            &identity.c_metadata,
+            &identity.extra_filename,
+        );
         let mut outputs =
             super::local_build_output_specs(parsed, &stable_parsed, "aarch64-apple-darwin")
                 .expect("local build output specs");
@@ -6081,6 +6181,7 @@ pub mod tests {
         let lease_path = temp_dir.join("bundle.lock");
         super::CachedArtifactBundle {
             provenance: super::ArtifactProvenance::Remote,
+            reach: stow_types::public_cache::Reach::Public,
             oci_reference: artifact_bundle.manifest.oci_reference.clone(),
             oci_digest: artifact_bundle.manifest.oci_digest.clone(),
             compile_key: artifact_bundle.manifest.config.compile_key.clone(),

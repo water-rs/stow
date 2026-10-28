@@ -3905,7 +3905,9 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
             policy_ready: std::sync::Arc::clone(&policy_ready),
             in_flight: in_flight.clone(),
-            registry_sources: crate::RegistrySources::from_lockfile(&project.workspace_root),
+            registry_sources: std::sync::OnceLock::from(
+                crate::RegistrySources::from_lockfile(&project.workspace_root).await?,
+            ),
         },
         env_base,
         resolution_done.clone(),
@@ -5806,9 +5808,9 @@ mod tests {
         sqlx::query(sqlx::AssertSqlSafe(
             "INSERT INTO artifact_cache_entries \
              (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, \
-              oci_reference, oci_digest, crate_name, crate_version, target, provenance) \
+              oci_reference, oci_digest, crate_name, crate_version, target, provenance, reach) \
              VALUES ('1.91.1', 'key', 'dir', 0, 0, '', '', 'cfg-if', '1.0.0', \
-              'aarch64-apple-darwin', 'local')",
+              'aarch64-apple-darwin', 'local', 0)",
         ))
         .execute(&pool)
         .await
