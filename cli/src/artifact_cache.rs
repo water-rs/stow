@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use fs2::FileExt;
 use semver::Version;
 use sqlx::FromRow;
 use stow_types::artifact::{ArtifactKind, RustCrateType};
@@ -24,6 +23,7 @@ use crate::fetch::{
     ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path,
     decode_bundle_output_bytes,
 };
+use crate::file_lock::FileLock;
 use crate::inject::parsed_with_stable_identity;
 use crate::rustc_args::ParsedRustcArgs;
 use crate::state_db::{db_int, now_millis};
@@ -79,7 +79,7 @@ impl ArtifactProvenance {
 
 #[derive(Debug)]
 pub struct RustcVersionLease {
-    _file: File,
+    _lock: FileLock,
 }
 
 /// Everything the rustc wrapper resolved about a finished local build that
@@ -222,7 +222,7 @@ pub struct CachedArtifactBundle {
     pub(crate) cache_key: String,
     pub(crate) verified_marker_version: Option<u8>,
     pub(crate) verified_marker_policy: Option<String>,
-    pub(crate) _lease_lock: File,
+    pub(crate) _lease_lock: FileLock,
 }
 
 impl CachedArtifactBundle {
@@ -691,7 +691,7 @@ pub async fn store_downloaded_bundle(
     let cache_key = cache_key_owned(&request);
     let connection = config.state_db_pool().await?;
 
-    // Serialize writers on the fs2 entry lock: a concurrent local store or a
+    // Serialize writers on the entry lock: a concurrent local store or a
     // second download of the same identity must not interleave temp dirs or
     // row writes.
     let mut write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
@@ -783,7 +783,7 @@ fn cached_bundle_for_entry(
     rustc_version: String,
     cache_key: String,
     size_bytes: u64,
-    lease_lock: File,
+    lease_lock: FileLock,
 ) -> CachedArtifactBundle {
     CachedArtifactBundle {
         provenance: ArtifactProvenance::Remote,
@@ -828,7 +828,7 @@ fn cached_bundle_for_entry(
 /// expected output must be present on disk. The entry is staged under a temp
 /// name inside the process's staging directory and renamed into place, so
 /// readers never see a half-written entry; concurrent writers serialize on
-/// the fs2 entry lock rather than double-storing.
+/// the entry lock rather than double-storing.
 #[tracing::instrument(name = "stow.cache.store_local_build", skip_all, fields(crate_name = %parsed.crate_name))]
 pub async fn store_local_build_outputs(
     config: &StowConfig,
@@ -1483,7 +1483,7 @@ pub async fn remove_loaded_bundle_entry(
 
 /// One process's staging directory inside a cache version's staging root:
 /// `<name>/` holds every entry the process is mid-store on, and the
-/// sibling `<name>.lock` carries the exclusive fs2 lock that marks the
+/// sibling `<name>.lock` carries the exclusive lock that marks the
 /// owner alive. `<name>` is the process id plus tempfile's random suffix.
 ///
 /// The lock file is created under a temporary name, locked, then renamed
@@ -1499,7 +1499,7 @@ pub struct StagingDir {
     rustc_version: String,
     dir: PathBuf,
     lock_path: PathBuf,
-    _lock_file: File,
+    _lock: FileLock,
 }
 
 impl StagingDir {
@@ -1512,23 +1512,22 @@ impl StagingDir {
                 staging_root.display()
             )
         })?;
-        let lock = tempfile::Builder::new()
+        let (file, temp_path) = tempfile::Builder::new()
             .prefix(&format!("{}-", std::process::id()))
             .tempfile_in(staging_root)
-            .wrap_err_with(|| format!("create staging lock in {}", staging_root.display()))?;
-        lock.as_file()
-            .lock_exclusive()
-            .wrap_err_with(|| format!("lock staging lock {}", lock.path().display()))?;
-        let name = lock
-            .path()
+            .wrap_err_with(|| format!("create staging lock in {}", staging_root.display()))?
+            .into_parts();
+        let lock = FileLock::exclusive(file)
+            .wrap_err_with(|| format!("lock staging lock {}", temp_path.display()))?;
+        let name = temp_path
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .ok_or_else(|| {
-                stow_types::stow_error!("staging lock {} has no UTF-8 name", lock.path().display())
+                stow_types::stow_error!("staging lock {} has no UTF-8 name", temp_path.display())
             })?
             .to_owned();
         let lock_path = staging_root.join(format!("{name}.lock"));
-        let lock_file = lock.persist_noclobber(&lock_path).map_err(|error| {
+        temp_path.persist_noclobber(&lock_path).map_err(|error| {
             stow_types::stow_error!("persist staging lock {}: {error}", lock_path.display())
         })?;
         let dir = staging_root.join(&name);
@@ -1538,7 +1537,7 @@ impl StagingDir {
             rustc_version: rustc_version.to_owned(),
             dir,
             lock_path,
-            _lock_file: lock_file,
+            _lock: lock,
         })
     }
 
@@ -1598,7 +1597,7 @@ fn prepare_local_cache_blocking(
         )
     })?;
     let version_lease = RustcVersionLease {
-        _file: acquire_version_shared_lock(&leases_root, rustc_version)?,
+        _lock: acquire_version_shared_lock(&leases_root, rustc_version)?,
     };
     // Under the version lease, so a concurrent stale-version purge cannot
     // move this directory while its staging is being swept.
@@ -1797,7 +1796,7 @@ pub fn hash_local_build_outputs_sync(
 }
 
 /// Stage a locally-built entry under a temp name in the process's staging
-/// directory and rename it into place. Runs under the exclusive fs2 entry
+/// directory and rename it into place. Runs under the exclusive entry
 /// lock, so a partial stage never lands: a failed stage drops the
 /// `TempDir`, and a crash between rename and row insert leaves an orphan
 /// `entry_dir` the next store removes. A process killed mid-stage leaves
@@ -2439,7 +2438,7 @@ pub fn path_to_string(path: &Path) -> stow_types::error::Result<String> {
 fn acquire_version_shared_lock(
     leases_root: &Path,
     rustc_version: &str,
-) -> stow_types::error::Result<File> {
+) -> stow_types::error::Result<FileLock> {
     let lock_path = version_lease_path(leases_root, rustc_version);
     let file = OpenOptions::new()
         .create(true)
@@ -2448,17 +2447,7 @@ fn acquire_version_shared_lock(
         .write(true)
         .open(&lock_path)
         .wrap_err_with(|| format!("open version lease {}", lock_path.display()))?;
-    file.lock_shared()
-        .wrap_err_with(|| format!("lock version lease {}", lock_path.display()))?;
-    Ok(file)
-}
-
-/// Whether a `try_lock_exclusive` failure means another process holds the
-/// lock. The platform error differs (`EWOULDBLOCK` on Unix,
-/// `ERROR_LOCK_VIOLATION` on Windows, which maps to no `ErrorKind`), so the
-/// comparison goes through fs2's own contended-error value.
-pub fn is_lock_contended(error: &std::io::Error) -> bool {
-    error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+    FileLock::shared(file).wrap_err_with(|| format!("lock version lease {}", lock_path.display()))
 }
 
 /// Whether opening or removing a staging lock failed because another
@@ -2502,16 +2491,16 @@ fn sweep_staging_locks(staging_root: &Path) -> stow_types::error::Result<()> {
                 ));
             }
         };
-        match file.try_lock_exclusive() {
-            Ok(()) => {}
-            Err(error) if is_lock_contended(&error) => continue,
+        let _reclaim = match FileLock::try_exclusive(file) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => continue,
             Err(error) => {
                 return Err(stow_types::stow_error!(
                     "lock staging lease {}: {error}",
                     lock_path.display()
                 ));
             }
-        }
+        };
         let staged_dir = lock_path.with_extension("");
         if staged_dir.exists() {
             std::fs::remove_dir_all(&staged_dir).wrap_err_with(|| {
@@ -2535,7 +2524,7 @@ fn sweep_staging_locks(staging_root: &Path) -> stow_types::error::Result<()> {
 fn try_acquire_version_exclusive_lock(
     leases_root: &Path,
     rustc_version: &str,
-) -> stow_types::error::Result<Option<File>> {
+) -> stow_types::error::Result<Option<FileLock>> {
     let lock_path = version_lease_path(leases_root, rustc_version);
     let file = OpenOptions::new()
         .create(true)
@@ -2544,14 +2533,9 @@ fn try_acquire_version_exclusive_lock(
         .write(true)
         .open(&lock_path)
         .wrap_err_with(|| format!("open stale version lease {}", lock_path.display()))?;
-    match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(file)),
-        Err(error) if is_lock_contended(&error) => Ok(None),
-        Err(error) => Err(stow_types::stow_error!(
-            "lock stale version lease {}: {error}",
-            lock_path.display()
-        )),
-    }
+    FileLock::try_exclusive(file).map_err(|error| {
+        stow_types::stow_error!("lock stale version lease {}: {error}", lock_path.display())
+    })
 }
 
 fn version_lease_path(leases_root: &Path, rustc_version: &str) -> PathBuf {
@@ -2561,7 +2545,7 @@ fn version_lease_path(leases_root: &Path, rustc_version: &str) -> PathBuf {
 fn acquire_entry_shared_lock(
     version_dir: &Path,
     cache_key: &str,
-) -> stow_types::error::Result<File> {
+) -> stow_types::error::Result<FileLock> {
     let lock_path = entry_lock_path(version_dir, cache_key);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)
@@ -2574,15 +2558,13 @@ fn acquire_entry_shared_lock(
         .write(true)
         .open(&lock_path)
         .wrap_err_with(|| format!("open cache lease lock {}", lock_path.display()))?;
-    file.lock_shared()
-        .wrap_err_with(|| format!("lock cache lease {}", lock_path.display()))?;
-    Ok(file)
+    FileLock::shared(file).wrap_err_with(|| format!("lock cache lease {}", lock_path.display()))
 }
 
 fn acquire_entry_exclusive_lock(
     version_dir: &Path,
     cache_key: &str,
-) -> stow_types::error::Result<File> {
+) -> stow_types::error::Result<FileLock> {
     let lock_path = entry_lock_path(version_dir, cache_key);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)
@@ -2595,15 +2577,14 @@ fn acquire_entry_exclusive_lock(
         .write(true)
         .open(&lock_path)
         .wrap_err_with(|| format!("open cache write lock {}", lock_path.display()))?;
-    file.lock_exclusive()
-        .wrap_err_with(|| format!("lock cache entry writer {}", lock_path.display()))?;
-    Ok(file)
+    FileLock::exclusive(file)
+        .wrap_err_with(|| format!("lock cache entry writer {}", lock_path.display()))
 }
 
 async fn acquire_entry_exclusive_lock_async(
     version_dir: &Path,
     cache_key: &str,
-) -> stow_types::error::Result<File> {
+) -> stow_types::error::Result<FileLock> {
     tokio::task::spawn_blocking({
         let version_dir = version_dir.to_path_buf();
         let cache_key = cache_key.to_owned();
@@ -2675,7 +2656,7 @@ async fn remove_orphaned_entry_dir(entry_dir: PathBuf) -> stow_types::error::Res
 fn try_acquire_entry_exclusive_lock(
     version_dir: &Path,
     cache_key: &str,
-) -> stow_types::error::Result<Option<File>> {
+) -> stow_types::error::Result<Option<FileLock>> {
     let lock_path = entry_lock_path(version_dir, cache_key);
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)
@@ -2688,14 +2669,9 @@ fn try_acquire_entry_exclusive_lock(
         .write(true)
         .open(&lock_path)
         .wrap_err_with(|| format!("open cache eviction lock {}", lock_path.display()))?;
-    match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(file)),
-        Err(error) if is_lock_contended(&error) => Ok(None),
-        Err(error) => Err(stow_types::stow_error!(
-            "lock cache eviction {}: {error}",
-            lock_path.display()
-        )),
-    }
+    FileLock::try_exclusive(file).map_err(|error| {
+        stow_types::stow_error!("lock cache eviction {}: {error}", lock_path.display())
+    })
 }
 
 fn entry_lock_path(version_dir: &Path, cache_key: &str) -> PathBuf {
@@ -4108,7 +4084,10 @@ pub mod tests {
             cache_key: "cache-key".to_owned(),
             verified_marker_version: None,
             verified_marker_policy: None,
-            _lease_lock: std::fs::File::create(&lease_path).expect("lease lock"),
+            _lease_lock: super::FileLock::shared(
+                std::fs::File::create(&lease_path).expect("lease file"),
+            )
+            .expect("lease lock"),
         };
 
         run_async(async {
@@ -5539,7 +5518,10 @@ pub mod tests {
             cache_key: "cache-key".to_owned(),
             verified_marker_version: None,
             verified_marker_policy: None,
-            _lease_lock: std::fs::File::create(&lease_path).expect("lease lock"),
+            _lease_lock: super::FileLock::shared(
+                std::fs::File::create(&lease_path).expect("lease file"),
+            )
+            .expect("lease lock"),
         }
     }
 

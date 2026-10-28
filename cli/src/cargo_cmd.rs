@@ -6396,7 +6396,10 @@ mod tests {
                     cache_key: String::new(),
                     verified_marker_version: None,
                     verified_marker_policy: None,
-                    _lease_lock: tempfile::tempfile().expect("temp lease"),
+                    _lease_lock: crate::file_lock::FileLock::shared(
+                        tempfile::tempfile().expect("temp lease"),
+                    )
+                    .expect("lock temp lease"),
                 },
             )]
             .into(),

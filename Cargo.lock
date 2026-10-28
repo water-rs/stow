@@ -8031,7 +8031,6 @@ dependencies = [
  "dirs 7.0.0",
  "find-msvc-tools",
  "flate2",
- "fs2",
  "futures-lite",
  "futures-util",
  "glob",
