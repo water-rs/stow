@@ -256,28 +256,29 @@ fn reference_cpu(
 }
 
 /// A `DevTools` protocol session on the inspector socket.
-struct Inspector {
+struct Session {
     socket: WebSocket,
     next_id: AtomicU64,
 }
 
-impl Inspector {
-    async fn connect(url: &str) -> stow_types::error::Result<Self> {
-        let socket = websocket::connect(url)
-            .await
-            .map_err(|error| stow_error!("connect to the inspector at {url}: {error}"))?;
-        Ok(Self {
-            socket,
-            next_id: AtomicU64::new(1),
-        })
-    }
-
+impl Session {
     /// Send one command and return its `result`, skipping the protocol
     /// events that arrive in between.
     async fn call(
         &self,
         method: &str,
         params: serde_json::Value,
+    ) -> stow_types::error::Result<serde_json::Value> {
+        self.call_observing(method, params, |_| Ok(())).await
+    }
+
+    /// [`Session::call`], handing every protocol event that arrives
+    /// before the answer to `observe`.
+    async fn call_observing(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        mut observe: impl FnMut(&serde_json::Value) -> stow_types::error::Result<()>,
     ) -> stow_types::error::Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let message = serde_json::json!({ "id": id, "method": method, "params": params });
@@ -304,6 +305,9 @@ impl Inspector {
             let reply: serde_json::Value = serde_json::from_str(&text)
                 .map_err(|error| stow_error!("inspector {method}: decode: {error}"))?;
             if reply.get("id").and_then(serde_json::Value::as_u64) != Some(id) {
+                if reply.get("method").is_some() {
+                    observe(&reply)?;
+                }
                 continue;
             }
             if let Some(error) = reply.get("error") {
@@ -312,6 +316,60 @@ impl Inspector {
             return Ok(reply.get("result").cloned().unwrap_or_default());
         }
     }
+}
+
+/// The inspector session, bound to the edge's execution context.
+struct Inspector {
+    session: Session,
+    /// The execution context [`REFERENCE_WORKLOAD`] evaluates in.
+    context_id: u64,
+}
+
+impl Inspector {
+    /// Connect and resolve the edge's execution context.
+    ///
+    /// workerd's inspector client names no default context, so a
+    /// `Runtime.evaluate` without a `contextId` fails with V8's "Cannot
+    /// find default execution context"; the context is only known from
+    /// the `Runtime.executionContextCreated` event V8 reports for it.
+    /// `wrangler dev`'s inspector proxy shares one runtime session among
+    /// its clients and enabled the `Runtime` domain on it when it
+    /// connected — the events that reported the contexts then went to
+    /// whichever client connected first — so a client's `Runtime.enable`
+    /// is a no-op that reports nothing. `Runtime.disable` first makes the
+    /// `Runtime.enable` that follows report every live context again,
+    /// whoever connected before.
+    async fn connect(url: &str) -> stow_types::error::Result<Self> {
+        let socket = websocket::connect(url)
+            .await
+            .map_err(|error| stow_error!("connect to the inspector at {url}: {error}"))?;
+        let session = Session {
+            socket,
+            next_id: AtomicU64::new(1),
+        };
+        session
+            .call("Runtime.disable", serde_json::Value::Null)
+            .await?;
+        let mut contexts = Vec::new();
+        session
+            .call_observing("Runtime.enable", serde_json::Value::Null, |event| {
+                track_context(&mut contexts, event)
+            })
+            .await?;
+        Ok(Self {
+            session,
+            context_id: edge_context(&contexts)?,
+        })
+    }
+
+    /// [`Session::call`] on this inspector's session.
+    async fn call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> stow_types::error::Result<serde_json::Value> {
+        self.session.call(method, params).await
+    }
 
     /// Evaluate [`REFERENCE_WORKLOAD`] in the isolate and check it
     /// returned [`REFERENCE_CHECKSUM`].
@@ -319,7 +377,11 @@ impl Inspector {
         let evaluated = self
             .call(
                 "Runtime.evaluate",
-                serde_json::json!({ "expression": REFERENCE_WORKLOAD, "returnByValue": true }),
+                serde_json::json!({
+                    "expression": REFERENCE_WORKLOAD,
+                    "contextId": self.context_id,
+                    "returnByValue": true,
+                }),
             )
             .await?;
         if let Some(exception) = evaluated.get("exceptionDetails") {
@@ -337,6 +399,65 @@ impl Inspector {
         }
         Ok(())
     }
+}
+
+/// The name workerd gives a worker's execution context when it registers
+/// it with the inspector (`setupContext` in workerd's `io/worker.c++`).
+const WORKER_CONTEXT_NAME: &str = "Worker";
+
+/// An execution context the inspector reported.
+#[derive(Debug, Deserialize)]
+struct ExecutionContext {
+    id: u64,
+    name: String,
+}
+
+/// Apply one protocol event to the live execution contexts.
+fn track_context(
+    contexts: &mut Vec<ExecutionContext>,
+    event: &serde_json::Value,
+) -> stow_types::error::Result<()> {
+    let params = event.get("params").unwrap_or(&serde_json::Value::Null);
+    match event.get("method").and_then(serde_json::Value::as_str) {
+        Some("Runtime.executionContextCreated") => {
+            let context = ExecutionContext::deserialize(&params["context"])
+                .map_err(|error| stow_error!("decode {event}: {error}"))?;
+            contexts.retain(|live| live.id != context.id);
+            contexts.push(context);
+        }
+        Some("Runtime.executionContextDestroyed") => {
+            let id = params["executionContextId"]
+                .as_u64()
+                .ok_or_else(|| stow_error!("{event} names no execution context id"))?;
+            contexts.retain(|live| live.id != id);
+        }
+        Some("Runtime.executionContextsCleared") => contexts.clear(),
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The one worker context among `contexts`, or why there is none to
+/// evaluate in.
+fn edge_context(contexts: &[ExecutionContext]) -> stow_types::error::Result<u64> {
+    let workers: Vec<u64> = contexts
+        .iter()
+        .filter(|context| context.name == WORKER_CONTEXT_NAME)
+        .map(|context| context.id)
+        .collect();
+    if let [id] = workers.as_slice() {
+        return Ok(*id);
+    }
+    let reported: Vec<String> = contexts
+        .iter()
+        .map(|context| format!("{} `{}`", context.id, context.name))
+        .collect();
+    Err(stow_error!(
+        "Runtime.enable reported {} `{WORKER_CONTEXT_NAME}` execution contexts, not one \
+         (reported: [{}]) — the reference workload has no single isolate context to run in",
+        workers.len(),
+        reported.join(", ")
+    ))
 }
 
 /// The part of a `Profiler.stop` profile the count needs.
@@ -625,7 +746,10 @@ fn render_report(report: &WorkerCpuReport) -> String {
 mod tests {
     use stow_types::do_budgets::WORKER_CPU_BUDGETS;
 
-    use super::{CpuProfile, LaneCpu, REFERENCE_DRIFT_LIMIT, profile_cpu_ms, reference_cpu};
+    use super::{
+        CpuProfile, LaneCpu, REFERENCE_DRIFT_LIMIT, edge_context, profile_cpu_ms, reference_cpu,
+        track_context,
+    };
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 1e-9
@@ -688,5 +812,41 @@ mod tests {
         .expect("profile");
         // Four busy samples at 100 µs — the 9 ms delta is a gap, not CPU.
         assert!((profile_cpu_ms(&profile) - 0.4).abs() < 1e-9);
+    }
+
+    /// The reference evaluates in the one live worker context the
+    /// inspector reported; none, or more than one, is refused.
+    #[test]
+    fn the_reference_runs_in_the_one_worker_context() {
+        let created = |id: u64, name: &str| {
+            serde_json::json!({
+                "method": "Runtime.executionContextCreated",
+                "params": {"context": {"id": id, "origin": "", "name": name, "uniqueId": "u"}},
+            })
+        };
+        let mut contexts = Vec::new();
+        for event in [
+            created(1, "Worker"),
+            serde_json::json!({"method": "Runtime.executionContextsCleared"}),
+            created(2, "Compiler"),
+            created(3, "Worker"),
+            serde_json::json!({
+                "method": "Runtime.executionContextDestroyed",
+                "params": {"executionContextId": 2},
+            }),
+            serde_json::json!({"method": "Runtime.consoleAPICalled", "params": {}}),
+        ] {
+            track_context(&mut contexts, &event).expect("event");
+        }
+        assert_eq!(edge_context(&contexts).expect("context"), 3);
+
+        track_context(&mut contexts, &created(4, "Worker")).expect("event");
+        assert!(edge_context(&contexts).is_err());
+        assert!(edge_context(&[]).is_err());
+        let malformed = serde_json::json!({
+            "method": "Runtime.executionContextCreated",
+            "params": {"context": {"name": "Worker"}},
+        });
+        assert!(track_context(&mut contexts, &malformed).is_err());
     }
 }
