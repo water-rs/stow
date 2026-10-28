@@ -390,8 +390,10 @@ async fn consume_delivery(
 /// run's signed records artifact is in GHCR. `GhcrConfig` carries it on
 /// wasm; tests stub it.
 trait RecordsCheck: Sync {
-    /// A registry fetch that failed — transient, so the delivery
-    /// answers 500 for GitHub to retry.
+    /// A registry fetch that failed — transient, so the completion
+    /// forwards as not-a-verdict and the scheduler re-queues the task
+    /// rather than the delivery answering 500 GitHub never retries
+    /// (stow#944).
     type Error: std::fmt::Display;
 
     /// Whether GHCR holds the records artifact this `build` of the task
@@ -560,6 +562,7 @@ async fn complete_build_task(
     task_id: &str,
 ) -> Result<(), GetArtifactError> {
     let mut success = run.conclusion.as_deref() == Some("success");
+    let mut cancelled = run.conclusion.as_deref() == Some("cancelled");
     let mut error = None;
     if success {
         let build = stow_types::records::BuildRun {
@@ -579,12 +582,19 @@ async fn complete_build_task(
                 tracing::error!(task_id, "successful run produced no records artifact");
             }
             Err(fetch_error) => {
-                // A registry hiccup is transient: answer 500 so GitHub's
-                // redelivery retries the completion instead of dropping it.
+                // GitHub never redelivers a failed delivery, so a 500
+                // would drop the completion and the task would hold its
+                // slot until the dispatch lease ran out (stow#944).
+                // Forward not-a-verdict instead: the scheduler re-queues
+                // the task, the re-dispatched run finds its records
+                // already published and exits quickly, and that run's
+                // own completion is verified here the same way.
                 tracing::warn!(task_id, %fetch_error, "records artifact check failed");
-                return Err(GetArtifactError::InternalWithMessage(format!(
-                    "verify records artifact for {task_id}: {fetch_error}"
-                )));
+                success = false;
+                cancelled = true;
+                error = Some(format!(
+                    "records artifact check failed for {task_id}: {fetch_error}"
+                ));
             }
         }
     } else {
@@ -598,7 +608,7 @@ async fn complete_build_task(
         ));
     }
 
-    forward_run_complete(forward, run, task_id, success, error).await
+    forward_run_complete(forward, run, task_id, success, cancelled, error).await
 }
 
 /// Forward the settled outcome to `POST /tasks/complete-run` — every
@@ -612,16 +622,19 @@ async fn forward_run_complete(
     run: &WorkflowRunFields,
     task_id: &str,
     success: bool,
+    cancelled: bool,
     error: Option<String>,
 ) -> Result<(), GetArtifactError> {
     let completion = WorkflowRunComplete {
         task_id: task_id.to_owned(),
         success,
         error,
-        // A `cancelled` conclusion is the concurrency group's verdict on a
-        // superseded duplicate — the scheduler re-queues the task instead
-        // of recording a failure (stow#877).
-        cancelled: run.conclusion.as_deref() == Some("cancelled"),
+        // Not a build verdict — the scheduler re-queues the task without
+        // recording a failure or bumping the attempt: a `cancelled`
+        // conclusion on a superseded duplicate of the task's concurrency
+        // group (stow#877), or a records check the edge could not verify
+        // (stow#944). The caller decides.
+        cancelled,
         github_run_id: run.id.to_string(),
     };
     match forward.send_run_complete(&completion).await {
@@ -1335,7 +1348,7 @@ mod tests {
                 panic!("build-crate.yml decodes a task subject");
             };
             let forward = CountingForward::default();
-            forward_run_complete(&forward, run, task_id, true, None)
+            forward_run_complete(&forward, run, task_id, true, false, None)
                 .await
                 .expect("forwarded");
             let completions = forward.completions.lock().expect("completions");
@@ -1378,6 +1391,95 @@ mod tests {
         ) -> impl Future<Output = Result<bool, Self::Error>> + Send + 'a {
             std::future::ready(Ok(true))
         }
+    }
+
+    /// The records check's test double for a transient registry
+    /// failure — the fetch never produced a verdict.
+    struct RecordsUnreachable;
+
+    impl RecordsCheck for RecordsUnreachable {
+        type Error = &'static str;
+
+        fn records_artifact_exists<'a>(
+            &'a self,
+            _rustc_version: &'a str,
+            _task_id: &'a str,
+            _build: stow_types::records::BuildRun,
+        ) -> impl Future<Output = Result<bool, Self::Error>> + Send + 'a {
+            std::future::ready(Err("registry boom"))
+        }
+    }
+
+    /// The records check's test double for a missing artifact — the
+    /// check answered and the artifact is not in GHCR.
+    struct RecordsAbsent;
+
+    impl RecordsCheck for RecordsAbsent {
+        type Error = std::convert::Infallible;
+
+        fn records_artifact_exists<'a>(
+            &'a self,
+            _rustc_version: &'a str,
+            _task_id: &'a str,
+            _build: stow_types::records::BuildRun,
+        ) -> impl Future<Output = Result<bool, Self::Error>> + Send + 'a {
+            std::future::ready(Ok(false))
+        }
+    }
+
+    /// A transient records-check error is not a build verdict and
+    /// GitHub never redelivers a failed delivery (stow#944): the
+    /// handler forwards the completion `cancelled` — the scheduler
+    /// re-queues the task without recording a failure — and still
+    /// answers Ok.
+    #[tokio::test]
+    async fn a_records_check_error_forwards_not_a_verdict() {
+        let body = task_completed_event(|_| {});
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let forward = CountingForward::default();
+        consume_delivery(&delivery, &RecordsUnreachable, &forward, APP_BOT_LOGIN)
+            .await
+            .expect("a transient check error is consumed, not a 500");
+        let completion = {
+            let completions = forward.completions.lock().expect("completions");
+            assert_eq!(completions.len(), 1, "the completion still forwards");
+            completions[0].clone()
+        };
+        assert!(!completion.success);
+        assert!(completion.cancelled, "not a build verdict");
+        let error = completion.error.as_deref().expect("the check names itself");
+        assert!(error.contains("records artifact check"), "{error}");
+        assert!(error.contains("registry boom"), "{error}");
+    }
+
+    /// A missing artifact is a verdict the check did render: the run
+    /// forwards as a failure the scheduler records, not a `cancelled`
+    /// re-queue.
+    #[tokio::test]
+    async fn a_missing_records_artifact_still_forwards_a_failure() {
+        let body = task_completed_event(|_| {});
+        let delivery = verified("workflow_run", &body)
+            .await
+            .expect("signed delivery verifies");
+        let forward = CountingForward::default();
+        consume_delivery(&delivery, &RecordsAbsent, &forward, APP_BOT_LOGIN)
+            .await
+            .expect("consumed");
+        let completion = {
+            let completions = forward.completions.lock().expect("completions");
+            assert_eq!(completions.len(), 1);
+            completions[0].clone()
+        };
+        assert!(!completion.success);
+        assert!(!completion.cancelled, "a missing artifact is a verdict");
+        assert!(
+            completion
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("records artifact")),
+        );
     }
 
     /// One run of `workflow` (its file under `.github/workflows/`)

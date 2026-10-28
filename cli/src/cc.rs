@@ -427,7 +427,7 @@ enum Placement {
 /// `clonefile`, Linux `FICLONE`), copying only where the filesystem cannot
 /// clone.
 fn clone_or_copy(source: &Path, destination: &Path) -> std::io::Result<Placement> {
-    let placement = match reflink::reflink_or_copy(source, destination)? {
+    let placement = match reflink_copy::reflink_or_copy(source, destination)? {
         None => Placement::Cloned,
         Some(_) => Placement::Copied,
     };
