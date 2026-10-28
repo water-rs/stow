@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/water-rs/stow/compare/stow-cli-v0.9.1...stow-cli-v0.9.2) - 2026-10-28
+
+### Fixed
+
+- *(cli)* fetch the host index slice during setup ([#1036](https://github.com/water-rs/stow/pull/1036))
+
 ## [0.9.1](https://github.com/water-rs/stow/compare/stow-cli-v0.9.0...stow-cli-v0.9.1) - 2026-10-28
 
 ### Other
