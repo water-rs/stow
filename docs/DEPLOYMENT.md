@@ -645,7 +645,7 @@ scheduler dispatches them to GitHub Actions in parallel as
 `build-crate.yml` runs (subject to
 `STOW_MAX_CONCURRENT_JOBS`, default 45 — runner slots, one per
 in-flight run — the per-family
-`STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and
+`STOW_MAX_CONCURRENT_MACOS_JOBS`, default 11, and
 `STOW_DISPATCH_MIN_AGE_MINUTES`; failed dispatches retry with
 exponential backoff, and a task's lease — renewed by each `status`
 reconcile that lists its run queued or in progress — expires after
