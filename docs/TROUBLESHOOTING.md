@@ -21,15 +21,6 @@ cache is keyed on rustc version, and stow refuses to attempt cache hits
 for non-stable toolchains because they invalidate the cache key. Run
 your benchmark on `rustup run stable stow check ...`.
 
-## `direct dependency X cannot be satisfied from cached artifacts: no matching local semantic cache candidates`
-
-This used to be a fatal error; modern stow logs a warning and falls
-back to vanilla `cargo`. If you see the fatal form, you are on an old
-binary — rebuild and reinstall. The underlying condition is "the
-all-or-nothing top-crate fast path tried to engage but at least one
-direct dep was not in the local artifact cache". Falling back to cargo
-is the right behavior.
-
 ## `workspace dev profile enables LTO`
 
 Every profile knob rustc sees (`opt-level`, `debug`, `debug-assertions`,

@@ -206,7 +206,7 @@ lost an owner, and 91 of 190 artifacts registered.
 a lockfile and must report that exact resolution; without it cargo may
 re-resolve and report versions rustc never compiled.
 
-### 12. The prebuilt-deps path produced broken builds
+### 12. The top-crate cached-deps path produced broken builds
 
 It compiles the top crate alone against a closure of cached rlibs, stripping
 `[dependencies]` from a mirrored manifest and passing `--extern` plus
@@ -219,8 +219,8 @@ rlib dependency clap".
 Getting it right needs exact control of rustc's search path across the whole
 transitive closure. The per-rustc wrapper reaches the same artifacts without
 any of it, and on hyperfine it is both correct and faster — 3.8 s against the
-prebuilt path's 4.3 s *failure*. The path is now behind
-`STOW_ENABLE_PREBUILT_DEPS`, off by default.
+prebuilt path's 4.3 s *failure*. The path has since been removed entirely:
+the per-rustc wrapper serves the same artifacts under cargo's own unit graph.
 
 ### 13. The cache layer could fail the build
 
@@ -273,7 +273,7 @@ silently skipped the cache. **Suggested fix:** ship `out_dir_files` as its own
 zstd-compressed OCI layer rather than hex inside the signed config, and stop
 duplicating the config into `manifest.json`.
 
-### ~~The top-crate fast path is all-or-nothing~~ (path disabled, see 12)
+### ~~The top-crate fast path is all-or-nothing~~ (path removed, see 12)
 
 `resolve_cached_dependency_plan` fails the entire plan if any single direct
 registry dependency cannot be satisfied, and the whole prebuilt closure is

@@ -86,13 +86,11 @@ Prints two numbers:
   reflecting what the signed index slice covers. Whether each row is
   *usable* at runtime depends on the user's exact
   `dependency_c_metadata_json` resolution matching the cached entry's.
-- **direct deps fully covered (top-crate fast path) M / N** — the strict
-  tier. At 100% the workspace qualifies for the closure-materialization
-  path that pre-cooks every direct dep and lets Cargo compile only the
-  top crate; that path is experimental and engages only when
-  `STOW_ENABLE_PREBUILT_DEPS` is set, so on a default install this line
-  reports the ceiling the regular per-unit inject path could reach, and
-  coverage short of 100% is served per unit rather than all-or-nothing.
+- **direct deps with cached artifacts M / N** — the direct registry
+  dependencies whose resolved version has a cached artifact in the index.
+  Coverage short of 100% is served per unit — every covered unit is
+  injected and the rest compile — so this line reports the direct-dep
+  slice of what the cache can serve.
 
 ```sh
 stow predict --manifest-path /path/to/project/Cargo.toml

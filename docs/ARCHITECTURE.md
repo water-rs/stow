@@ -675,7 +675,9 @@ nothing on this path needs the script's `OUT_DIR` products.
 Local entries join the remote LRU: post-insert `evict_entries` runs against
 `artifact_cache_max_bytes`, `last_accessed_ms` bumps on every hit, and
 `size_bytes` charges the staged entry's bytes. Eviction is
-provenance-agnostic.
+provenance-agnostic. C/C++ objects under `cache_dir/cc/` share the same
+budget and ordering through their `cc_cache_entries` rows — a store or a
+hit on either side of the cache moves the whole LRU.
 
 ### Trust
 
