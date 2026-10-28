@@ -1928,7 +1928,7 @@ fn stage_entry_blocking(
             stow_types::stow_error!("unit output {} has no file name", source.display())
         })?;
         let dest = files_dir.join(file_name);
-        reflink::reflink_or_copy(source, &dest)
+        reflink_copy::reflink_or_copy(source, &dest)
             .wrap_err_with(|| format!("clone {} into the unit cache", source.display()))?;
         size_bytes = size_bytes.saturating_add(
             std::fs::metadata(&dest)
