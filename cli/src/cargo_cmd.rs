@@ -3980,7 +3980,7 @@ async fn materialize_mirror_manifest(
             } else {
                 remove_mirror_symlink(&current, false)
                     .wrap_err_with(|| format!("remove manifest symlink {}", current.display()))?;
-                reflink::reflink_or_copy(&target, &current).wrap_err_with(|| {
+                reflink_copy::reflink_or_copy(&target, &current).wrap_err_with(|| {
                     format!(
                         "copy manifest {} into workspace mirror {}",
                         target.display(),

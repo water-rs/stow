@@ -423,7 +423,7 @@ fn materialize_cached_file_blocking(
         return Ok(false);
     }
     remove_existing_output(output_path)?;
-    reflink::reflink_or_copy(source_path, output_path)
+    reflink_copy::reflink_or_copy(source_path, output_path)
         .map(|_| ())
         .wrap_err_with(|| {
             format!(
@@ -910,6 +910,36 @@ mod tests {
             .expect("stale marker is rejected")
         );
         assert_eq!(std::fs::read(&output).expect("output"), b"artifact");
+    }
+
+    /// The materialized output is a clone-or-copy of the cache entry,
+    /// never a view of it: a rewrite of the cached source afterwards
+    /// must not reach the bytes a build already materialized — a
+    /// hardlink would carry it straight through.
+    #[test]
+    fn materialized_output_keeps_its_bytes_when_the_cache_entry_changes() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let source = tempdir.path().join("cache").join("lib.rlib");
+        let output = tempdir.path().join("target").join("lib.rlib");
+        std::fs::create_dir_all(source.parent().unwrap()).expect("source parent");
+        std::fs::create_dir_all(output.parent().unwrap()).expect("output parent");
+        std::fs::write(&source, b"artifact").expect("source");
+        let sha256 = hex::encode(sha2::Sha256::digest(b"artifact"));
+
+        materialize_cached_file_blocking(
+            &source,
+            &output,
+            Some(&sha256),
+            OutputDirWriters::StowOnly,
+        )
+        .expect("materialize cached file");
+
+        std::fs::write(&source, b"replaced").expect("rewrite cache entry");
+        assert_eq!(
+            std::fs::read(&output).expect("output"),
+            b"artifact",
+            "a rewrite of the cache entry reached the materialized output"
+        );
     }
 
     #[test]

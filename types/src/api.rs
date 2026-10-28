@@ -3492,6 +3492,109 @@ mod tests {
         }
     }
 
+    /// Ten apps sharing `lib_a` → `lib_b`, each with a leaf of its
+    /// own; every app is a root.
+    fn shared_dependency_tree() -> crate::api::SubmissionTree {
+        let mut nodes = vec![
+            submission_node("lib_b", &[], &[], "t-lib-b"),
+            submission_node("lib_a", &[], &[0], "t-lib-a"),
+        ];
+        let mut roots = Vec::new();
+        for app in 0..10u32 {
+            let leaf = u32::try_from(nodes.len()).unwrap();
+            nodes.push(submission_node("leaf", &[], &[], &format!("t-leaf-{app}")));
+            roots.push(leaf + 1);
+            nodes.push(submission_node(
+                "app",
+                &[],
+                &[1, leaf],
+                &format!("t-app-{app}"),
+            ));
+        }
+        crate::api::SubmissionTree {
+            source: crate::api::SubmissionSource::Preheat,
+            roots,
+            nodes,
+        }
+    }
+
+    /// Each node's dependency task ids — the edge set the scheduler
+    /// commits on a fresh node's first merge.
+    fn edges_by_task_id(
+        tree: &crate::api::SubmissionTree,
+    ) -> std::collections::BTreeMap<String, Vec<String>> {
+        tree.nodes
+            .iter()
+            .map(|node| {
+                let mut deps: Vec<String> = node
+                    .deps
+                    .iter()
+                    .map(|&dep| tree.nodes[dep as usize].task_id.clone())
+                    .collect();
+                deps.sort();
+                (node.task_id.clone(), deps)
+            })
+            .collect()
+    }
+
+    /// A batch under the bound travels as one body, unchanged.
+    #[test]
+    fn bodies_keep_a_fitting_batch_whole() {
+        let whole = shared_dependency_tree();
+        let bodies = crate::api::SubmissionTree::into_bodies(
+            std::slice::from_ref(&whole),
+            crate::api::SUBMIT_BODY_LIMIT_BYTES,
+        )
+        .unwrap();
+        assert_eq!(bodies, vec![vec![whole]]);
+    }
+
+    /// A tree over the bound splits into pieces that each fit, each
+    /// closed under `deps` with every node's edge set intact, together
+    /// covering every node and root.
+    #[test]
+    fn bodies_split_an_oversized_tree_into_dependency_closed_pieces() {
+        let whole = shared_dependency_tree();
+        let max_bytes = serde_json::to_vec(&[&whole]).unwrap().len() / 2;
+        let bodies =
+            crate::api::SubmissionTree::into_bodies(std::slice::from_ref(&whole), max_bytes)
+                .unwrap();
+        assert!(bodies.len() >= 2, "the tree must not fit one body");
+        let edges = edges_by_task_id(&whole);
+        let mut seen = std::collections::BTreeSet::new();
+        let mut seen_roots = std::collections::BTreeSet::new();
+        for body in &bodies {
+            assert!(serde_json::to_vec(body).unwrap().len() <= max_bytes);
+            for piece in body {
+                for (task_id, deps) in edges_by_task_id(piece) {
+                    assert_eq!(edges[&task_id], deps, "{task_id} keeps its edges");
+                    seen.insert(task_id);
+                }
+                for &root in &piece.roots {
+                    seen_roots.insert(piece.nodes[root as usize].task_id.clone());
+                }
+            }
+        }
+        assert_eq!(seen, edges.keys().cloned().collect());
+        let roots: std::collections::BTreeSet<String> = whole
+            .roots
+            .iter()
+            .map(|&root| whole.nodes[root as usize].task_id.clone())
+            .collect();
+        assert_eq!(seen_roots, roots);
+    }
+
+    /// One node whose own subtree outgrows the bound has no split.
+    #[test]
+    fn bodies_refuse_a_subtree_over_the_bound() {
+        let whole = shared_dependency_tree();
+        let max_bytes = serde_json::to_vec(&whole.nodes[..2]).unwrap().len();
+        let error =
+            crate::api::SubmissionTree::into_bodies(std::slice::from_ref(&whole), max_bytes)
+                .unwrap_err();
+        assert!(error.to_string().contains("dependency subtree"), "{error}");
+    }
+
     /// The stow#881 rule across one batch: `app`'s dep on `dep@{a}` is
     /// rewritten to the batch's `dep@{a,b}` node — the subset node
     /// leaves the tree and the splice lands the two trees on one task
@@ -4230,6 +4333,34 @@ pub struct SubmissionNode {
     pub downloads: u64,
 }
 
+/// The largest `POST /api/v1/scheduler/tasks/submit` body, in bytes.
+///
+/// The edge parses the body, and the scheduler parses the edge's
+/// forward of the same trees, with skyzen's `Json` extractor at its
+/// default request-body limit; `stow-edge` pins this constant to that
+/// default. Submitters split a batch with
+/// [`SubmissionTree::into_bodies`].
+pub const SUBMIT_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
+/// The length of `value`'s JSON serialization, counted without
+/// buffering it.
+fn json_len(value: &impl Serialize) -> crate::error::Result<usize> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value)
+        .map_err(|error| stow_error!("serialize a submission tree: {error}"))?;
+    Ok(count.0)
+}
+
 /// One dependency tree from one source (stow#878).
 ///
 /// The unit every submitter posts once — a project, a crate, a miss —
@@ -4309,6 +4440,210 @@ impl SubmissionTree {
             roots,
             nodes,
         })
+    }
+
+    /// Pack `trees` into request bodies — each a JSON array of trees
+    /// serializing to at most `max_bytes` — for a submitter whose batch
+    /// outgrows one body: a preheat wave carries tens of thousands of
+    /// nodes, a single project tree several thousand.
+    ///
+    /// A tree that fits travels whole. A tree that does not is split
+    /// into pieces closed under `deps`: a piece carries each of its
+    /// nodes with that node's whole dependency subtree, because the
+    /// scheduler's merge builds a fresh node's edges from the tree it
+    /// arrives in and never rewrites them. A node several pieces need
+    /// arrives in each and merges by task id, so merging the pieces
+    /// leaves the graph merging the whole tree would. Each piece keeps
+    /// the roots it holds.
+    ///
+    /// # Errors
+    /// `Error` when one node's dependency subtree alone serializes past
+    /// `max_bytes` — no split can carry it.
+    pub fn into_bodies(trees: &[Self], max_bytes: usize) -> crate::error::Result<Vec<Vec<Self>>> {
+        // A body's `[` and `]`; trees inside it are `,`-separated.
+        let budget = max_bytes
+            .checked_sub(2)
+            .ok_or_else(|| stow_error!("a {max_bytes}-byte body cannot hold a JSON array"))?;
+        let mut bodies = Vec::new();
+        let mut body = Vec::new();
+        let mut body_bytes = 0;
+        for tree in trees {
+            let whole = json_len(tree)?;
+            let pieces = if whole <= budget {
+                vec![(tree.clone(), whole)]
+            } else {
+                tree.dependency_closed_pieces(budget)?
+            };
+            for (piece, bytes) in pieces {
+                if !body.is_empty() && body_bytes + 1 + bytes > budget {
+                    bodies.push(std::mem::take(&mut body));
+                }
+                body_bytes = if body.is_empty() {
+                    bytes
+                } else {
+                    body_bytes + 1 + bytes
+                };
+                body.push(piece);
+            }
+        }
+        if !body.is_empty() {
+            bodies.push(body);
+        }
+        Ok(bodies)
+    }
+
+    /// Split this tree into dependency-closed pieces of at most `budget`
+    /// serialized bytes each, with each piece's exact size — the
+    /// [`SubmissionTree::into_bodies`] split. Roots seed the pieces
+    /// first, in order, so a piece grows along one request's subtree.
+    fn dependency_closed_pieces(&self, budget: usize) -> crate::error::Result<Vec<(Self, usize)>> {
+        let len = self.nodes.len();
+        let widest = u32::try_from(len.saturating_sub(1))
+            .map_err(|_| stow_error!("submission node count overflows u32"))?;
+        // A node's size once its deps re-index into a piece is bounded
+        // by writing every index at the widest index's width; a root
+        // index likewise costs at most that width plus its `,`.
+        let node_bytes = self
+            .nodes
+            .iter()
+            .map(|node| {
+                json_len(&SubmissionNode {
+                    deps: vec![widest; node.deps.len()],
+                    ..node.clone()
+                })
+            })
+            .collect::<crate::error::Result<Vec<_>>>()?;
+        let root_bytes = widest.to_string().len() + 1;
+        let mut root_count = vec![0usize; len];
+        for &root in &self.roots {
+            root_count[root as usize] += 1;
+        }
+        let envelope = json_len(&Self {
+            source: self.source,
+            roots: Vec::new(),
+            nodes: Vec::new(),
+        })?;
+        let bound = |nodes: usize, bytes: usize, roots: usize| {
+            envelope + bytes + nodes.saturating_sub(1) + roots * root_bytes
+        };
+
+        let mut pieces = Vec::new();
+        let mut covered = vec![false; len];
+        let mut in_piece = vec![false; len];
+        let mut visited = vec![0u32; len];
+        let mut epoch = 0u32;
+        let mut piece: Vec<u32> = Vec::new();
+        let (mut piece_bytes, mut piece_roots) = (0, 0);
+        let seeds = self
+            .roots
+            .iter()
+            .copied()
+            .chain(0..u32::try_from(len).expect("node count checked against u32 above"));
+        for seed in seeds {
+            if covered[seed as usize] {
+                continue;
+            }
+            let mut fresh = self.closure_outside(seed, &in_piece, &mut visited, &mut epoch);
+            let mut fresh_bytes: usize = fresh.iter().map(|&ix| node_bytes[ix as usize]).sum();
+            let mut fresh_roots: usize = fresh.iter().map(|&ix| root_count[ix as usize]).sum();
+            if !piece.is_empty()
+                && bound(
+                    piece.len() + fresh.len(),
+                    piece_bytes + fresh_bytes,
+                    piece_roots + fresh_roots,
+                ) > budget
+            {
+                pieces.push(self.piece(&mut piece, &mut in_piece)?);
+                (piece_bytes, piece_roots) = (0, 0);
+                fresh = self.closure_outside(seed, &in_piece, &mut visited, &mut epoch);
+                fresh_bytes = fresh.iter().map(|&ix| node_bytes[ix as usize]).sum();
+                fresh_roots = fresh.iter().map(|&ix| root_count[ix as usize]).sum();
+            }
+            if piece.is_empty() && bound(fresh.len(), fresh_bytes, fresh_roots) > budget {
+                return Err(stow_error!(
+                    "task {}'s dependency subtree of {} nodes serializes past the {budget}-byte submission body bound",
+                    self.nodes[seed as usize].task_id,
+                    fresh.len()
+                ));
+            }
+            for &ix in &fresh {
+                in_piece[ix as usize] = true;
+                covered[ix as usize] = true;
+            }
+            piece.extend(fresh);
+            piece_bytes += fresh_bytes;
+            piece_roots += fresh_roots;
+        }
+        if !piece.is_empty() {
+            pieces.push(self.piece(&mut piece, &mut in_piece)?);
+        }
+        Ok(pieces)
+    }
+
+    /// `seed`'s dependency subtree minus the nodes already `in_piece` —
+    /// those carry their own subtrees there already.
+    fn closure_outside(
+        &self,
+        seed: u32,
+        in_piece: &[bool],
+        visited: &mut [u32],
+        epoch: &mut u32,
+    ) -> Vec<u32> {
+        *epoch += 1;
+        let mut closure = Vec::new();
+        let mut stack = vec![seed];
+        while let Some(ix) = stack.pop() {
+            let at = ix as usize;
+            if in_piece[at] || visited[at] == *epoch {
+                continue;
+            }
+            visited[at] = *epoch;
+            closure.push(ix);
+            stack.extend(&self.nodes[at].deps);
+        }
+        closure
+    }
+
+    /// Emit the piece holding `members` (drained), in this tree's node
+    /// order with its deps and roots re-indexed, and its exact size.
+    fn piece(
+        &self,
+        members: &mut Vec<u32>,
+        in_piece: &mut [bool],
+    ) -> crate::error::Result<(Self, usize)> {
+        members.sort_unstable();
+        let mut remap = std::collections::HashMap::with_capacity(members.len());
+        for (at, &ix) in members.iter().enumerate() {
+            remap.insert(
+                ix,
+                u32::try_from(at).expect("a piece is no larger than its tree"),
+            );
+        }
+        let nodes = members
+            .iter()
+            .map(|&ix| {
+                let node = &self.nodes[ix as usize];
+                SubmissionNode {
+                    deps: node.deps.iter().map(|dep| remap[dep]).collect(),
+                    ..node.clone()
+                }
+            })
+            .collect();
+        let roots = self
+            .roots
+            .iter()
+            .filter_map(|root| remap.get(root).copied())
+            .collect();
+        for ix in members.drain(..) {
+            in_piece[ix as usize] = false;
+        }
+        let piece = Self {
+            source: self.source,
+            roots,
+            nodes,
+        };
+        let bytes = json_len(&piece)?;
+        Ok((piece, bytes))
     }
 
     /// Apply the superset-serving rule (stow#881): a feature set

@@ -445,6 +445,18 @@ mod tests {
     use super::{GetArtifactError, ResolverError, SchedulerClientError};
     use skyzen::{HttpError as _, StatusCode};
 
+    /// Submitters split their batches at `SUBMIT_BODY_LIMIT_BYTES`; the
+    /// submit route and the scheduler forward both parse at skyzen's
+    /// default body limit and answer a larger body 413, so the two must
+    /// stay one number.
+    #[test]
+    fn submit_body_bound_is_the_extractor_limit() {
+        assert_eq!(
+            stow_types::api::SUBMIT_BODY_LIMIT_BYTES,
+            skyzen::RequestBodyLimit::DEFAULT
+        );
+    }
+
     /// An upstream fetch failure stays a server error — its detail is
     /// redacted from the body by the shared renderer, so only the status
     /// is asserted here.
