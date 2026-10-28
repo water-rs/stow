@@ -7,12 +7,12 @@ use stow_types::identity::TargetTriple;
 
 use crate::errors::QueueError;
 
-// Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (20
+// Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (15
 // of them macOS): 45 total leaves 15 runners for the repo's own CI, and
 // the macOS cap keeps a full wave from queueing on the smallest pool
 // while leaving 4 macOS runners free.
 const DEFAULT_MAX_CONCURRENT_JOBS: NonZeroU32 = NonZeroU32::new(45).unwrap();
-const DEFAULT_MAX_CONCURRENT_MACOS_JOBS: u32 = 16;
+const DEFAULT_MAX_CONCURRENT_MACOS_JOBS: u32 = 11;
 const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
 // A single crate build on GitHub-hosted runners (toolchain install + compile
 // + sign + push) can legitimately take tens of minutes and nothing updates
