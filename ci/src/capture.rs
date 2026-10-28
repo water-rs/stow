@@ -949,7 +949,7 @@ async fn materialize_optional_alias(
                 )
             })?;
         }
-        reflink::reflink_or_copy(&source_for_copy, &alias_for_copy).wrap_err_with(|| {
+        reflink_copy::reflink_or_copy(&source_for_copy, &alias_for_copy).wrap_err_with(|| {
             format!(
                 "materialize original cargo output alias {} from {}",
                 alias_for_copy.display(),
@@ -1389,7 +1389,7 @@ async fn snapshot_outputs(
         let source_path = output.path.clone();
         let snapshot_for_copy = snapshot_path.clone();
         smol::unblock(move || {
-            reflink::reflink_or_copy(&source_path, &snapshot_for_copy).wrap_err_with(|| {
+            reflink_copy::reflink_or_copy(&source_path, &snapshot_for_copy).wrap_err_with(|| {
                 format!(
                     "snapshot rustc output {} into {}",
                     source_path.display(),
@@ -2457,6 +2457,43 @@ mod tests {
             ),
             args
         );
+    }
+
+    /// The materialized alias is a clone-or-copy of the rewritten
+    /// output, never a view of it: the bytes under the original hash
+    /// name must not move when the rewritten output changes — a
+    /// hardlink would carry the rewrite straight through.
+    #[test]
+    fn materialized_alias_keeps_its_bytes_when_the_source_changes() {
+        smol::block_on(async {
+            let tempdir = tempdir().expect("tempdir");
+            let capture_dir = tempdir.path().join("capture");
+            let source = tempdir.path().join("deps/libchrono-rewritten.rlib");
+            let alias = tempdir.path().join("deps/libchrono-original.rlib");
+            std::fs::create_dir_all(source.parent().unwrap()).expect("create deps dir");
+            std::fs::write(&source, b"rustc-output-bytes").expect("write source");
+
+            super::materialize_optional_alias(
+                Some(source.clone()),
+                Some(alias.clone()),
+                "test-compile-key",
+                "0123456789abcdef",
+                &capture_dir,
+            )
+            .await
+            .expect("materialize alias");
+            assert_eq!(
+                std::fs::read(&alias).expect("read alias"),
+                b"rustc-output-bytes"
+            );
+
+            std::fs::write(&source, b"recompiled").expect("rewrite source");
+            assert_eq!(
+                std::fs::read(&alias).expect("read alias"),
+                b"rustc-output-bytes",
+                "a rewrite of the source reached the materialized alias"
+            );
+        });
     }
 
     /// stow#578: cargo names the fingerprint dir after the package
