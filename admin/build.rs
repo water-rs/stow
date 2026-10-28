@@ -26,6 +26,12 @@ fn main() {
     // `--ld-path` flag selects, so the wrapper sees it even where plain
     // env inheritance would not reach; being fingerprinted, it also
     // re-links (re-signs) the binary when the identity changes.
-    println!("cargo:rustc-env=STOW_LOCAL_SIGNING_IDENTITY={}", identity.to_string_lossy());
-    println!("cargo:rustc-link-arg-bin=stow-admin=--ld-path={}", linker.display());
+    println!(
+        "cargo:rustc-env=STOW_LOCAL_SIGNING_IDENTITY={}",
+        identity.to_string_lossy()
+    );
+    println!(
+        "cargo:rustc-link-arg-bin=stow-admin=--ld-path={}",
+        linker.display()
+    );
 }
