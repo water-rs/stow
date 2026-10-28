@@ -18,7 +18,9 @@ pub use artifacts::{
     UploadOutcome, pull_pushed_signature_materials, pull_signature_materials, push_artifacts,
     push_artifacts_with,
 };
-pub use client::{OPERATOR_LOG_FILTER, RegistryError, RegistryHttp, RegistrySession};
+pub use client::{
+    OPERATOR_LOG_FILTER, RegistryError, RegistryHttp, RegistrySession, TransportPolicy,
+};
 pub use index::{
     IndexPublishOutcome, PulledFolded, PulledIndex, publish_folded, publish_index,
     published_index_content_sha256, pull_folded, pull_index, pull_published_index,
