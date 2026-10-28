@@ -4,6 +4,7 @@
 use std::fmt::Write as _;
 
 use clap::{Args, Subcommand};
+use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{
     CI_TARGET_TRIPLES, EnqueueRequest, EnqueueSource, PreheatPlanResponse, PreheatPlanTarget,
     is_ci_target,
@@ -156,21 +157,25 @@ pub struct PlanArgs {
 /// fails before the resolve spends its minutes) and never otherwise.
 /// Each lane gets its own crates.io client: its pace gate serializes the
 /// lane's API calls and it counts them for the dry-run report.
-pub async fn run(args: PreheatArgs, output: Output) -> stow_types::error::Result<()> {
+pub async fn run(
+    args: PreheatArgs,
+    output: Output,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
     match args.command {
-        PreheatCommand::Manual(manual) => crate::manual::run(manual, output).await,
-        PreheatCommand::Projects(args) => crate::projects::run(args, output).await,
-        PreheatCommand::Cost(args) => crate::preheat_cost::run(args, output).await,
+        PreheatCommand::Manual(manual) => crate::manual::run(manual, output, store).await,
+        PreheatCommand::Projects(args) => crate::projects::run(args, output, store).await,
+        PreheatCommand::Cost(args) => crate::preheat_cost::run(args, output, store).await,
         PreheatCommand::Binary(args) => {
-            let edge = Edge::connect_to_submit(args.yes)?;
+            let edge = Edge::connect_to_submit(store, args.yes)?;
             binary(edge.as_ref(), &mut crates_io::CratesIo::new(), args, output).await
         }
         PreheatCommand::TopBinaries(args) => {
-            let edge = Edge::connect_to_submit(args.yes)?;
+            let edge = Edge::connect_to_submit(store, args.yes)?;
             top_binaries(edge.as_ref(), args, output).await
         }
         PreheatCommand::Missed(args) => {
-            let edge = Edge::connect_to_submit(args.yes)?;
+            let edge = Edge::connect_to_submit(store, args.yes)?;
             missed(edge.as_ref(), args, output).await
         }
         PreheatCommand::Plan(args) => plan(&mut crates_io::CratesIo::new(), args, output).await,

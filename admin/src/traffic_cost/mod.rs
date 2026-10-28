@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use clap::{Args, Subcommand};
+use keyring_core::api::CredentialStoreApi;
 use stow_types::launch_model::LaunchModel;
 use stow_types::stow_error;
 
@@ -64,10 +65,14 @@ enum TrafficCostCommand {
 }
 
 /// Dispatch one `traffic-cost` subcommand.
-pub async fn run(args: TrafficCostArgs, output: Output) -> stow_types::error::Result<()> {
+pub async fn run(
+    args: TrafficCostArgs,
+    output: Output,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
     match args.command {
-        TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect()?, &args, output).await,
-        TrafficCostCommand::Peak(args) => peak::run(&Edge::connect()?, &args, output).await,
+        TrafficCostCommand::Cpu(args) => cpu::run(&Edge::connect(store)?, &args, output).await,
+        TrafficCostCommand::Peak(args) => peak::run(&Edge::connect(store)?, &args, output).await,
         TrafficCostCommand::Verdict(args) => verdict::run(&args, output).await,
         TrafficCostCommand::Project(args) => project::run(&args, output).await,
         TrafficCostCommand::FixtureRuns(args) => fixture_runs::run(&args, output),

@@ -45,6 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
+use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{ArtifactRecord, SchedulerLedger};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::local_ci::LocalCiTasks;
@@ -121,9 +122,13 @@ struct ProductionArgs {
 }
 
 /// Command entry point.
-pub async fn run(args: CostArgs, output: Output) -> stow_types::error::Result<()> {
+pub async fn run(
+    args: CostArgs,
+    output: Output,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
     match args.command {
-        CostCommand::Ledger(args) => ledger(&args).await,
+        CostCommand::Ledger(args) => ledger(&args, store).await,
         CostCommand::Report(args) => report(&args, output).await,
         CostCommand::Production(args) => production(&args, output).await,
     }
@@ -136,8 +141,11 @@ fn unix_millis() -> stow_types::error::Result<u64> {
     u64::try_from(elapsed.as_millis()).map_err(|_| stow_error!("unix millis overflow u64"))
 }
 
-async fn ledger(args: &LedgerArgs) -> stow_types::error::Result<()> {
-    let edge = crate::Edge::connect()?;
+async fn ledger(
+    args: &LedgerArgs,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
+    let edge = crate::Edge::connect(store)?;
     let ledger: SchedulerLedger = edge
         .get_json("/api/v1/admin/scheduler/budget/ledger")
         .await?;

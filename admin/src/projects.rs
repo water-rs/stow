@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
 use futures_util::{StreamExt, stream};
+use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{EnqueueRequest, SchedulerSubmitResponse};
 use stow_types::identity::{TargetTriple, WireRustcVersion};
 use stow_types::stow_error;
@@ -300,14 +301,18 @@ const PROJECTS_HEADER: &str = "\
 
 /// Dispatch the projects lane: `generate` needs only GitHub; `submit`
 /// resolves locally and posts batches to the edge.
-pub async fn run(args: ProjectsArgs, output: Output) -> stow_types::error::Result<()> {
+pub async fn run(
+    args: ProjectsArgs,
+    output: Output,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
     match args.command {
         ProjectsCommand::Generate(args) => {
             let token = crate::github_token().await?;
             generate(&token, &args, output).await
         }
         ProjectsCommand::Submit(args) => {
-            let edge = crate::Edge::connect_to_submit(args.yes)?;
+            let edge = crate::Edge::connect_to_submit(store, args.yes)?;
             tokio::task::spawn_blocking(move || submit(edge.as_ref(), &args, output))
                 .await
                 .expect("projects submit panicked")
