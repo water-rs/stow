@@ -44,8 +44,7 @@ pub struct ExpandedDependencyGraph {
     /// The normalized expanded graph the resolver and the admissions
     /// request both consume.
     pub entries: Vec<ResolvedDependencyGraphEntry>,
-    /// The roots' direct registry externs — the top-crate path's
-    /// dependency set, from the same unit graph.
+    /// The roots' direct registry externs, from the same unit graph.
     pub direct_dependencies: Vec<SelectedRegistryDependency>,
     /// Every local (path-source) package manifest cargo read for this
     /// answer, with its content hash — path deps outside the workspace
