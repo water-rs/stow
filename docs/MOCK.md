@@ -55,7 +55,9 @@ without overloading the scheduler. In one stack start it:
    `rowsWritten`;
 2. measures Worker CPU per traffic lane with the isolate's V8 CPU
    profiler, reached through `wrangler dev --inspector-port`
-   (`stow-admin traffic-cost cpu`);
+   (`stow-admin traffic-cost cpu`), and gates each lane on its CPU
+   over a fixed reference workload profiled in the same isolate before
+   and after the lanes, so a slower or faster runner cancels out;
 3. drives every lane at the launch model's peak rate for thirty
    minutes (`stow-admin traffic-cost peak`);
 4. runs the drives again on the loaded fixture;

@@ -153,14 +153,13 @@ pub struct ObservedUnit {
     /// The `--target` cargo passed for the unit — `None` marks a
     /// host-side compile, which cargo never passes one to (stow#317).
     pub explicit_target: Option<String>,
-    /// Whether the unit's rustc argv carried cargo's build-override
-    /// profile — no `-C debuginfo` and no `-C opt-level`, the flags
-    /// cargo's normal profile maps onto every ordinary dep unit. A
-    /// native build (`consumer_target == build_host`) gives host units
-    /// and target units the same recorded platform, so the profile is
-    /// the only argv evidence left that splits them (stow#349).
-    #[serde(default)]
-    pub build_override: bool,
+    /// The profile the unit compiled with — normalized from the argv
+    /// codegen flags the way the unit graph states `unit.profile`, so
+    /// the two compare like for like. A native build
+    /// (`consumer_target == build_host`) gives host units and target
+    /// units the same recorded platform, so the profile is part of the
+    /// evidence that splits them (stow#596).
+    pub profile: stow_types::platform::Profile,
     /// The invocation's `--extern` deps, resolved to their stable
     /// identities.
     pub externs: Vec<DependencyCMetadataIdentity>,
@@ -1998,7 +1997,7 @@ impl ProtectedEntry<'_> {
         };
         let same_kind = matches!(
             (self, &candidate.location),
-            (Self::Rustc(_), EvictionLocation::Rustc { .. }) | (Self::Cc(_), EvictionLocation::Cc)
+            (Self::Rustc(_), EvictionLocation::Rustc) | (Self::Cc(_), EvictionLocation::Cc)
         );
         same_kind && key == candidate.cache_key
     }
@@ -2006,9 +2005,9 @@ impl ProtectedEntry<'_> {
 
 /// Where an eviction candidate's bytes live.
 enum EvictionLocation {
-    /// An `artifact_cache_entries` row; `relative_dir` names the entry
-    /// dir under `version_dir`.
-    Rustc { relative_dir: String },
+    /// An `artifact_cache_entries` row; its `relative_dir` in the pass's
+    /// listing names the entry dir under `version_dir`.
+    Rustc,
     /// A `cc_cache_entries` row; the object file is `cc_dir/<key>.o`.
     Cc,
 }
@@ -2017,7 +2016,7 @@ impl EvictionLocation {
     /// Deterministic order between candidates tied on stamp and key.
     const fn rank(&self) -> u8 {
         match self {
-            Self::Rustc { .. } => 0,
+            Self::Rustc => 0,
             Self::Cc => 1,
         }
     }
@@ -2061,6 +2060,146 @@ pub async fn evict_after_cc_store(
     .await
 }
 
+/// The dependency-closure view of one pass's `artifact_cache_entries`
+/// listing (stow#1005): `providers` maps a compile key to the cache keys
+/// of the entries carrying it, and `dependents_of` maps it to the cache
+/// keys of the entries whose `dependency_compile_keys_json` names it, so a
+/// victim carries out every entry its removal would leave without a
+/// dependency entry. Remote and local rows both record the column, so the
+/// rule is provenance-agnostic.
+struct ClosureGraph {
+    /// Compile key → cache keys of the listed entries carrying it.
+    providers: BTreeMap<String, BTreeSet<String>>,
+    /// Compile key → cache keys of the listed entries depending on it.
+    dependents_of: BTreeMap<String, BTreeSet<String>>,
+    /// Cache key → the entry's own compile key.
+    compile_key_of: BTreeMap<String, String>,
+    /// Cache key → the compile keys the entry depends on.
+    dep_keys_of: BTreeMap<String, Vec<String>>,
+}
+
+impl ClosureGraph {
+    /// Build the closure view over a listing's rows; a row whose
+    /// `dependency_compile_keys_json` does not parse is a corrupt store
+    /// and fails the pass.
+    fn build(
+        entries: &BTreeMap<String, ArtifactCacheIndexEntry>,
+    ) -> stow_types::error::Result<Self> {
+        let mut graph = Self {
+            providers: BTreeMap::new(),
+            dependents_of: BTreeMap::new(),
+            compile_key_of: BTreeMap::new(),
+            dep_keys_of: BTreeMap::new(),
+        };
+        for (cache_key, entry) in entries {
+            graph
+                .providers
+                .entry(entry.compile_key.clone())
+                .or_default()
+                .insert(cache_key.clone());
+            let dep_keys = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
+                &entry.dependency_compile_keys_json,
+            )
+            .wrap_err_with(|| {
+                format!(
+                    "parse artifact cache dependency_compile_keys_json for cache key {cache_key}"
+                )
+            })?;
+            for dep in &dep_keys {
+                graph
+                    .dependents_of
+                    .entry(dep.compile_key.clone())
+                    .or_default()
+                    .insert(cache_key.clone());
+            }
+            graph
+                .compile_key_of
+                .insert(cache_key.clone(), entry.compile_key.clone());
+            graph.dep_keys_of.insert(
+                cache_key.clone(),
+                dep_keys.into_iter().map(|dep| dep.compile_key).collect(),
+            );
+        }
+        Ok(graph)
+    }
+
+    /// The cache keys no victim group may touch: the protected entry and
+    /// every entry it transitively depends on — evicting inside that
+    /// closure would orphan the just-stored entry on the spot.
+    fn untouchable_closure(&self, protected_key: &str) -> BTreeSet<String> {
+        let mut closure = BTreeSet::from([protected_key.to_owned()]);
+        let mut frontier = vec![protected_key.to_owned()];
+        while let Some(cache_key) = frontier.pop() {
+            let Some(dep_keys) = self.dep_keys_of.get(&cache_key) else {
+                continue;
+            };
+            for dep_key in dep_keys {
+                let Some(providers) = self.providers.get(dep_key) else {
+                    continue;
+                };
+                for provider in providers {
+                    if closure.insert(provider.clone()) {
+                        frontier.push(provider.clone());
+                    }
+                }
+            }
+        }
+        closure
+    }
+
+    /// The victim's eviction group: the victim plus every entry that
+    /// depends on it, transitively — an entry joins the group when the
+    /// group and the already-evicted set together hold every remaining
+    /// provider of a compile key it needs. `None` when a member would be
+    /// in the protected entry's closure, which is never a victim: the
+    /// group cannot complete, so the victim keeps its place.
+    fn victim_group(
+        &self,
+        victim: &str,
+        evicted: &BTreeSet<String>,
+        untouchable: &BTreeSet<String>,
+    ) -> Option<BTreeSet<String>> {
+        let mut group = BTreeSet::from([victim.to_owned()]);
+        let mut frontier = vec![victim.to_owned()];
+        while let Some(member) = frontier.pop() {
+            // `member` is a listed rustc entry, so it has a compile key.
+            let compile_key = &self.compile_key_of[&member];
+            let last_provider = self
+                .providers
+                .get(compile_key)
+                .into_iter()
+                .flatten()
+                .all(|provider| group.contains(provider) || evicted.contains(provider));
+            if !last_provider {
+                continue;
+            }
+            for dependent in self.dependents_of.get(compile_key).into_iter().flatten() {
+                if group.contains(dependent) || evicted.contains(dependent) {
+                    continue;
+                }
+                if untouchable.contains(dependent) {
+                    return None;
+                }
+                group.insert(dependent.clone());
+                frontier.push(dependent.clone());
+            }
+        }
+        Some(group)
+    }
+}
+
+/// `(cache_key, relative_dir)` for each member of a victim group, in
+/// cache-key order — the order `try_lock_entry_group` takes the locks in.
+fn entry_group_members(
+    entries: &BTreeMap<String, ArtifactCacheIndexEntry>,
+    group: &BTreeSet<String>,
+) -> Vec<(String, String)> {
+    group
+        .iter()
+        .map(|cache_key| (cache_key.clone(), entries[cache_key].relative_dir.clone()))
+        .collect()
+}
+
 async fn evict_entries(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
@@ -2069,30 +2208,27 @@ async fn evict_entries(
     max_bytes: u64,
     protected: &ProtectedEntry<'_>,
 ) -> stow_types::error::Result<()> {
-    let mut candidates: Vec<EvictionCandidate> =
-        list_artifact_cache_entries(connection, rustc_version)
-            .await?
-            .into_iter()
-            .map(|(cache_key, entry)| EvictionCandidate {
-                cache_key,
-                size_bytes: entry.size_bytes,
-                last_accessed_ms: entry.last_accessed_ms,
-                location: EvictionLocation::Rustc {
-                    relative_dir: entry.relative_dir,
-                },
-            })
-            .chain(
-                crate::cc::list_cc_cache_entries(connection)
-                    .await?
-                    .into_iter()
-                    .map(|(cache_key, entry)| EvictionCandidate {
-                        cache_key,
-                        size_bytes: entry.size_bytes,
-                        last_accessed_ms: entry.last_accessed_ms,
-                        location: EvictionLocation::Cc,
-                    }),
-            )
-            .collect();
+    let entries = list_artifact_cache_entries(connection, rustc_version).await?;
+    let mut candidates: Vec<EvictionCandidate> = entries
+        .iter()
+        .map(|(cache_key, entry)| EvictionCandidate {
+            cache_key: cache_key.clone(),
+            size_bytes: entry.size_bytes,
+            last_accessed_ms: entry.last_accessed_ms,
+            location: EvictionLocation::Rustc,
+        })
+        .chain(
+            crate::cc::list_cc_cache_entries(connection)
+                .await?
+                .into_iter()
+                .map(|(cache_key, entry)| EvictionCandidate {
+                    cache_key,
+                    size_bytes: entry.size_bytes,
+                    last_accessed_ms: entry.last_accessed_ms,
+                    location: EvictionLocation::Cc,
+                }),
+        )
+        .collect();
     let mut total_bytes = candidates.iter().fold(0u64, |sum, candidate| {
         sum.saturating_add(candidate.size_bytes)
     });
@@ -2100,6 +2236,18 @@ async fn evict_entries(
         return Ok(());
     }
 
+    // stow#1005: eviction is closure-aware — a victim carries out every
+    // entry that depends on it, transitively, in the same pass, and
+    // nothing in the protected entry's own dependency closure is ever a
+    // victim. Victim order stays `last_accessed_ms`.
+    let mut pass = EvictionPass {
+        connection,
+        rustc_version,
+        version_dir,
+        graph: ClosureGraph::build(&entries)?,
+        entries,
+        evicted: BTreeSet::new(),
+    };
     candidates.sort_by(|left, right| {
         left.last_accessed_ms
             .cmp(&right.last_accessed_ms)
@@ -2109,31 +2257,35 @@ async fn evict_entries(
     let protected_index = candidates
         .iter()
         .position(|candidate| protected.matches(candidate));
+    let untouchable: BTreeSet<String> = match protected {
+        ProtectedEntry::Rustc(cache_key) => pass.graph.untouchable_closure(cache_key),
+        ProtectedEntry::Cc(_) => BTreeSet::new(),
+    };
     for (index, candidate) in candidates.iter().enumerate() {
-        if Some(index) == protected_index {
+        if Some(index) == protected_index
+            || untouchable.contains(&candidate.cache_key)
+            || pass.evicted.contains(&candidate.cache_key)
+        {
             continue;
         }
-        let evicted = match &candidate.location {
-            EvictionLocation::Rustc { relative_dir } => {
-                try_evict_rustc_entry(
-                    connection,
-                    rustc_version,
-                    version_dir,
-                    &candidate.cache_key,
-                    relative_dir,
-                )
-                .await?
+        let evicted_bytes = match &candidate.location {
+            EvictionLocation::Rustc => {
+                let Some(bytes) = pass
+                    .try_evict_lru_victim(&candidate.cache_key, &untouchable)
+                    .await?
+                else {
+                    continue;
+                };
+                bytes
             }
             EvictionLocation::Cc => {
                 evict_cc_object(connection, cc_dir, &candidate.cache_key).await?;
-                true
+                candidate.size_bytes
             }
         };
-        if evicted {
-            total_bytes = total_bytes.saturating_sub(candidate.size_bytes);
-            if total_bytes <= max_bytes {
-                return Ok(());
-            }
+        total_bytes = total_bytes.saturating_sub(evicted_bytes);
+        if total_bytes <= max_bytes {
+            return Ok(());
         }
     }
 
@@ -2141,7 +2293,7 @@ async fn evict_entries(
         && let Some(protected_index) = protected_index
     {
         let candidate = &candidates[protected_index];
-        evict_protected_entry(connection, rustc_version, version_dir, cc_dir, candidate).await?;
+        pass.evict_protected_entry(cc_dir, candidate).await?;
         return Err(stow_types::stow_error!(
             "artifact cache entry {} exceeds max local cache size {} bytes",
             candidate.cache_key,
@@ -2154,91 +2306,161 @@ async fn evict_entries(
     ))
 }
 
-/// Evict the store's own entry — the last resort when every other
-/// candidate left the cache over budget. A rustc entry another process
-/// has locked fails here rather than being skipped.
-async fn evict_protected_entry(
+/// One eviction pass's working state (stow#1005): the listing it runs
+/// over, the closure graph built from it, and the cache keys already
+/// removed — group computation treats them as gone.
+struct EvictionPass<'a> {
+    connection: &'a sqlx::SqlitePool,
+    rustc_version: &'a str,
+    version_dir: &'a Path,
+    graph: ClosureGraph,
+    entries: BTreeMap<String, ArtifactCacheIndexEntry>,
+    evicted: BTreeSet<String>,
+}
+
+impl EvictionPass<'_> {
+    /// One victim's group eviction — the victim plus every entry its
+    /// removal would orphan, returned as the group's byte total. `None`
+    /// when the group cannot go — it would touch the protected closure,
+    /// or another process holds a member's lock — in which case no
+    /// member is removed, so no pass leaves a dependent without its
+    /// dependency.
+    async fn try_evict_lru_victim(
+        &mut self,
+        victim: &str,
+        untouchable: &BTreeSet<String>,
+    ) -> stow_types::error::Result<Option<u64>> {
+        let Some(group) = self.graph.victim_group(victim, &self.evicted, untouchable) else {
+            return Ok(None);
+        };
+        if !try_evict_rustc_entry_group(
+            self.connection,
+            self.rustc_version,
+            self.version_dir,
+            &entry_group_members(&self.entries, &group),
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        self.evicted.extend(group.iter().cloned());
+        Ok(Some(group.iter().fold(0u64, |sum, cache_key| {
+            sum.saturating_add(self.entries[cache_key].size_bytes)
+        })))
+    }
+
+    /// Evict the store's own entry — the last resort when every other
+    /// candidate left the cache over budget. A rustc entry goes out with
+    /// its whole victim group, like any other group; a member another
+    /// process has locked fails here rather than being skipped.
+    async fn evict_protected_entry(
+        &self,
+        cc_dir: &Path,
+        candidate: &EvictionCandidate,
+    ) -> stow_types::error::Result<()> {
+        match &candidate.location {
+            EvictionLocation::Rustc => {
+                let group = self
+                    .graph
+                    .victim_group(&candidate.cache_key, &self.evicted, &BTreeSet::new())
+                    .expect("the protected entry's group has no untouchable member");
+                let members = entry_group_members(&self.entries, &group);
+                let Some(eviction_locks) = tokio::task::spawn_blocking({
+                    let version_dir = self.version_dir.to_path_buf();
+                    let members = members.clone();
+                    move || try_lock_entry_group(&version_dir, &members)
+                })
+                .await
+                .wrap_err("join evict_entries protected lock task")??
+                else {
+                    return Err(stow_types::stow_error!(
+                        "artifact cache is full and the protected entry {} or one of its dependents is in use by another stow process",
+                        candidate.cache_key
+                    ));
+                };
+                remove_entry_group(
+                    self.connection,
+                    self.rustc_version,
+                    self.version_dir,
+                    &members,
+                )
+                .await?;
+                drop(eviction_locks);
+            }
+            EvictionLocation::Cc => {
+                evict_cc_object(self.connection, cc_dir, &candidate.cache_key).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Exclusive entry locks on every group member, taken in the members'
+/// cache-key order; `None` when another process holds one — the locks
+/// already taken release with the `Vec`, so a skipped group loses no
+/// member.
+fn try_lock_entry_group(
+    version_dir: &Path,
+    members: &[(String, String)],
+) -> stow_types::error::Result<Option<Vec<FileLock>>> {
+    let mut locks = Vec::with_capacity(members.len());
+    for (cache_key, _) in members {
+        match try_acquire_entry_exclusive_lock(version_dir, cache_key)? {
+            Some(lock) => locks.push(lock),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(locks))
+}
+
+/// Delete each member's state-db row, then its entry dir — called under
+/// the group's held locks.
+async fn remove_entry_group(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     version_dir: &Path,
-    cc_dir: &Path,
-    candidate: &EvictionCandidate,
+    members: &[(String, String)],
 ) -> stow_types::error::Result<()> {
-    match &candidate.location {
-        EvictionLocation::Rustc { relative_dir } => {
-            let cache_key = candidate.cache_key.clone();
-            let Some(eviction_lock) = tokio::task::spawn_blocking({
-                let version_dir = version_dir.to_path_buf();
-                move || try_acquire_entry_exclusive_lock(&version_dir, &cache_key)
+    for (cache_key, relative_dir) in members {
+        delete_artifact_cache_entry(connection, rustc_version, cache_key).await?;
+        let entry_dir = version_dir.join(relative_dir);
+        if entry_dir.exists() {
+            tokio::task::spawn_blocking({
+                let entry_dir = entry_dir.clone();
+                move || {
+                    std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
+                        format!("evict artifact cache entry {}", entry_dir.display())
+                    })
+                }
             })
             .await
-            .wrap_err("join evict_entries protected lock task")??
-            else {
-                return Err(stow_types::stow_error!(
-                    "artifact cache is full and the protected entry {} is in use by another stow process",
-                    candidate.cache_key
-                ));
-            };
-            delete_artifact_cache_entry(connection, rustc_version, &candidate.cache_key).await?;
-            let entry_dir = version_dir.join(relative_dir);
-            if entry_dir.exists() {
-                tokio::task::spawn_blocking({
-                    let entry_dir = entry_dir.clone();
-                    move || {
-                        std::fs::remove_dir_all(&entry_dir).wrap_err_with(|| {
-                            format!(
-                                "evict oversized protected artifact cache entry {}",
-                                entry_dir.display()
-                            )
-                        })
-                    }
-                })
-                .await
-                .wrap_err("join evict_entries protected remove_dir task")??;
-            }
-            drop(eviction_lock);
-        }
-        EvictionLocation::Cc => {
-            evict_cc_object(connection, cc_dir, &candidate.cache_key).await?;
+            .wrap_err("join evict_entries remove_dir task")??;
         }
     }
     Ok(())
 }
 
-/// Try to evict one rustc entry under its lease: `false` when another
-/// process holds a lock on the entry — it stays, and eviction moves on
-/// to the next candidate.
-async fn try_evict_rustc_entry(
+/// Try to evict a victim group under one lock hold for the whole group:
+/// `false` when another process uses any member, in which case no member
+/// is removed.
+async fn try_evict_rustc_entry_group(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
     version_dir: &Path,
-    cache_key: &str,
-    relative_dir: &str,
+    members: &[(String, String)],
 ) -> stow_types::error::Result<bool> {
-    let Some(eviction_lock) = tokio::task::spawn_blocking({
+    let Some(eviction_locks) = tokio::task::spawn_blocking({
         let version_dir = version_dir.to_path_buf();
-        let cache_key = cache_key.to_owned();
-        move || try_acquire_entry_exclusive_lock(&version_dir, &cache_key)
+        let members = members.to_vec();
+        move || try_lock_entry_group(&version_dir, &members)
     })
     .await
     .wrap_err("join evict_entries lock task")??
     else {
         return Ok(false);
     };
-    delete_artifact_cache_entry(connection, rustc_version, cache_key).await?;
-    let entry_dir = version_dir.join(relative_dir);
-    if entry_dir.exists() {
-        tokio::task::spawn_blocking({
-            let entry_dir = entry_dir.clone();
-            move || {
-                std::fs::remove_dir_all(&entry_dir)
-                    .wrap_err_with(|| format!("evict artifact cache entry {}", entry_dir.display()))
-            }
-        })
-        .await
-        .wrap_err("join evict_entries remove_dir task")??;
-    }
-    drop(eviction_lock);
+    remove_entry_group(connection, rustc_version, version_dir, members).await?;
+    drop(eviction_locks);
     Ok(true)
 }
 
@@ -2655,6 +2877,12 @@ struct ArtifactCacheIndexEntry {
     relative_dir: String,
     size_bytes: u64,
     last_accessed_ms: u64,
+    /// The compile key this entry provides — what a dependent's
+    /// `dependency_compile_keys_json` names (stow#1005).
+    compile_key: String,
+    /// `[{crate_name, compile_key}]` — the direct dependencies the entry
+    /// was compiled against, as stored.
+    dependency_compile_keys_json: String,
 }
 
 #[derive(Debug)]
@@ -2753,8 +2981,9 @@ async fn list_artifact_cache_entries(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
 ) -> stow_types::error::Result<BTreeMap<String, ArtifactCacheIndexEntry>> {
-    let rows = sqlx::query_as::<_, (String, String, i64, i64)>(
-        "SELECT cache_key, relative_dir, size_bytes, last_accessed_ms \
+    let rows = sqlx::query_as::<_, (String, String, i64, i64, String, String)>(
+        "SELECT cache_key, relative_dir, size_bytes, last_accessed_ms, compile_key, \
+                dependency_compile_keys_json \
          FROM artifact_cache_entries \
          WHERE rustc_version = ?",
     )
@@ -2762,7 +2991,8 @@ async fn list_artifact_cache_entries(
     .fetch_all(connection)
     .await?;
     let mut entries = BTreeMap::new();
-    for (cache_key, relative_dir, size_bytes, last_accessed_ms) in rows {
+    for (cache_key, relative_dir, size_bytes, last_accessed_ms, compile_key, dep_keys_json) in rows
+    {
         entries.insert(
             cache_key,
             ArtifactCacheIndexEntry {
@@ -2772,6 +3002,8 @@ async fn list_artifact_cache_entries(
                     last_accessed_ms,
                     "artifact cache entry last_accessed_ms",
                 )?,
+                compile_key,
+                dependency_compile_keys_json: dep_keys_json,
             },
         );
     }
@@ -5124,6 +5356,411 @@ pub mod tests {
             );
             assert!(index.contains_key(&local_key));
             assert!(index.contains_key(&cache_key(&third_request)));
+        });
+    }
+
+    /// A `derive_demo` proc-macro unit in `out_dir`, compiled against the
+    /// `serde_core` rmeta at `dep_rmeta`, with its dylib written — the
+    /// host-side dependent shape stow#1005 names.
+    fn proc_macro_dependent(out_dir: &Path, dep_rmeta: PathBuf) -> ParsedRustcArgs {
+        let mut parsed = parsed_rustc_args(
+            "derive_demo",
+            "cargo-meta-derive",
+            out_dir.to_path_buf(),
+            vec![ParsedExternCrate {
+                crate_name: "serde_core".to_owned(),
+                path: dep_rmeta,
+            }],
+            vec!["proc-macro".to_owned()],
+        );
+        parsed.emit = BTreeSet::from(["link".to_owned()]);
+        std::fs::write(
+            parsed
+                .output_dynamic_library_path("aarch64-apple-darwin")
+                .expect("proc-macro dylib path")
+                .expect("proc-macro produces a dylib"),
+            b"derive-dylib",
+        )
+        .expect("write proc-macro dylib");
+        parsed
+    }
+
+    /// The invariant a closure-aware pass leaves (stow#1005): every
+    /// dependency compile key a stored entry names is still carried by a
+    /// stored entry.
+    fn assert_closure_complete(index: &BTreeMap<String, super::ArtifactCacheIndexEntry>) {
+        let provided: BTreeSet<&str> = index
+            .values()
+            .map(|entry| entry.compile_key.as_str())
+            .collect();
+        for (cache_key, entry) in index {
+            let deps: Vec<stow_types::identity::DependencyCompileKeyIdentity> =
+                serde_json::from_str(&entry.dependency_compile_keys_json)
+                    .expect("parse dependency compile keys");
+            for dep in deps {
+                assert!(
+                    provided.contains(dep.compile_key.as_str()),
+                    "entry {cache_key} lost the entry for dependency compile key {}",
+                    dep.compile_key
+                );
+            }
+        }
+    }
+
+    /// stow#1005: evicting a dependency's entry carries out every entry
+    /// that depends on it — a proc macro over evicted deps is dead
+    /// weight, so it goes out in the same pass.
+    #[test]
+    fn evicting_a_dependency_evicts_its_proc_macro_dependent() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let dep_dir = tempdir.path().join("dep/deps");
+        let derive_dir = tempdir.path().join("derive/deps");
+        let leaf_dir = tempdir.path().join("leaf/deps");
+        for dir in [&dep_dir, &derive_dir, &leaf_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let dep = local_build_parsed("serde_core", "cargo-meta-dep", dep_dir, &["metadata"]);
+        std::fs::write(dep.output_rmeta_path().expect("rmeta"), b"dep-rmeta").expect("write");
+        let dep_build = local_build_artifact(&dep, dep_stable);
+
+        let derive_stable = "de31c0dede31c0de";
+        let derive = proc_macro_dependent(&derive_dir, dep.output_rmeta_path().expect("rmeta"));
+
+        let leaf_stable = "1eaf1eaf1eaf1eaf";
+        let leaf = local_build_parsed("leaf", "cargo-meta-leaf", leaf_dir, &["metadata"]);
+        let leaf_rmeta = leaf.output_rmeta_path().expect("rmeta");
+        std::fs::write(&leaf_rmeta, b"leaf-rmeta").expect("write");
+        let leaf_build = local_build_artifact(&leaf, leaf_stable);
+        let leaf_size = std::fs::metadata(&leaf_rmeta)
+            .expect("leaf rmeta metadata")
+            .len();
+
+        let dep_key = super::artifact_cache_key("aarch64-apple-darwin", dep_stable);
+        let derive_key = super::artifact_cache_key("aarch64-apple-darwin", derive_stable);
+        let leaf_key = super::artifact_cache_key("aarch64-apple-darwin", leaf_stable);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &dep, &dep_build).await);
+            let (stored, _) =
+                store_dependent(&config, &derive, derive_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "the proc-macro dependent binds to the dep");
+
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let resident: u64 = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries")
+                .values()
+                .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes));
+            config.artifact_cache_max_bytes = resident + leaf_size - 1;
+            touch_artifact_cache_entry(&pool, "1.91.1", &dep_key, 1)
+                .await
+                .expect("stale dep lru timestamp");
+
+            assert!(
+                store_dependency(&config, &leaf, &leaf_build).await,
+                "the leaf store triggers the pass"
+            );
+
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after eviction");
+            assert!(!index.contains_key(&dep_key), "the dep is evicted");
+            assert!(
+                !index.contains_key(&derive_key),
+                "its proc-macro dependent goes out in the same pass"
+            );
+            assert!(index.contains_key(&leaf_key));
+            let entries_dir = config
+                .artifact_cache_version_dir("1.91.1")
+                .join("bundles/v3/aarch64-apple-darwin");
+            assert!(!entries_dir.join(dep_stable).exists());
+            assert!(!entries_dir.join(derive_stable).exists());
+            assert_closure_complete(&index);
+        });
+    }
+
+    /// stow#1005: nothing in the protected entry's dependency closure is
+    /// ever a victim — the oldest entry stays when the just-stored entry
+    /// depends on it, provenance-agnostic: a remote dependent over a
+    /// local dep keeps the dep.
+    #[test]
+    fn the_protected_entrys_dependency_closure_is_never_evicted() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let dep_dir = tempdir.path().join("dep/deps");
+        let leaf_dir = tempdir.path().join("leaf/deps");
+        for dir in [&dep_dir, &leaf_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let dep = local_build_parsed("serde_core", "cargo-meta-dep", dep_dir, &["metadata"]);
+        std::fs::write(dep.output_rmeta_path().expect("rmeta"), b"dep-rmeta").expect("write");
+        let dep_build = local_build_artifact(&dep, dep_stable);
+
+        let leaf_stable = "1eaf1eaf1eaf1eaf";
+        let leaf = local_build_parsed("leaf", "cargo-meta-leaf", leaf_dir, &["metadata"]);
+        std::fs::write(leaf.output_rmeta_path().expect("rmeta"), b"leaf-rmeta").expect("write");
+        let leaf_build = local_build_artifact(&leaf, leaf_stable);
+
+        // A remote dependent bound to the dep's compile key — the binding
+        // a published artifact carries.
+        let remote_meta = "70a170a170a170a1";
+        let mut remote = sample_bundle(remote_meta, "libtoml-70a170a170a170a1.rmeta");
+        remote.manifest.config.dependency_compile_keys_json =
+            serde_json::to_string(&[stow_types::identity::DependencyCompileKeyIdentity {
+                crate_name: stow_types::identity::CrateName::parse("serde_core")
+                    .expect("crate name"),
+                compile_key: dep_build.identity.compile_key.clone(),
+            }])
+            .expect("serialize dependency compile keys");
+        let remote_size =
+            write_downloaded_bundle_to_entry(&tempdir.path().join("scratch"), &remote)
+                .expect("measure remote bundle size");
+        let remote_key = cache_key(&fetch_request(remote_meta));
+
+        let dep_key = super::artifact_cache_key("aarch64-apple-darwin", dep_stable);
+        let leaf_key = super::artifact_cache_key("aarch64-apple-darwin", leaf_stable);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &dep, &dep_build).await);
+            assert!(store_dependency(&config, &leaf, &leaf_build).await);
+
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let dep_size = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries")
+                .get(&dep_key)
+                .expect("dep entry")
+                .size_bytes;
+            // Evicting the dep's group would leave the remote dependent
+            // without its dependency, but the remote store's own pass
+            // protects its closure: the leaf goes instead.
+            config.artifact_cache_max_bytes = dep_size + remote_size;
+            touch_artifact_cache_entry(&pool, "1.91.1", &dep_key, 1)
+                .await
+                .expect("stale dep lru timestamp");
+
+            super::store_downloaded_bundle(&config, &fetch_request(remote_meta), &remote)
+                .await
+                .expect("store remote dependent");
+
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after eviction");
+            assert!(
+                index.contains_key(&dep_key),
+                "the protected entry's dependency is never a victim"
+            );
+            assert!(index.contains_key(&remote_key));
+            assert!(
+                !index.contains_key(&leaf_key),
+                "the unprotected leaf takes the eviction"
+            );
+            assert_closure_complete(&index);
+        });
+    }
+
+    /// stow#1005: a victim group is evicted whole or not at all — a
+    /// member another process holds a lock on skips the whole group, so
+    /// no pass can leave a dependent without its dependency.
+    #[test]
+    fn a_victim_group_with_a_locked_member_is_skipped_whole() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let dep_dir = tempdir.path().join("dep/deps");
+        let dependent_dir = tempdir.path().join("dependent/deps");
+        let leaf_dir = tempdir.path().join("leaf/deps");
+        let trigger_dir = tempdir.path().join("trigger/deps");
+        for dir in [&dep_dir, &dependent_dir, &leaf_dir, &trigger_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let dep = local_build_parsed("serde_core", "cargo-meta-dep", dep_dir, &["metadata"]);
+        std::fs::write(dep.output_rmeta_path().expect("rmeta"), b"dep-rmeta").expect("write");
+        let dep_build = local_build_artifact(&dep, dep_stable);
+
+        let toml_stable = "70a170a170a170a1";
+        let toml = toml_dependent(&dependent_dir, dep.output_rmeta_path().expect("rmeta"));
+
+        let leaf_stable = "1eaf1eaf1eaf1eaf";
+        let leaf = local_build_parsed("leaf", "cargo-meta-leaf", leaf_dir, &["metadata"]);
+        std::fs::write(leaf.output_rmeta_path().expect("rmeta"), b"leaf-rmeta").expect("write");
+        let leaf_build = local_build_artifact(&leaf, leaf_stable);
+
+        let trigger_stable = "71a971a971a971a9";
+        let trigger =
+            local_build_parsed("trigger", "cargo-meta-trigger", trigger_dir, &["metadata"]);
+        let trigger_rmeta = trigger.output_rmeta_path().expect("rmeta");
+        std::fs::write(&trigger_rmeta, b"trigger").expect("write");
+        let trigger_build = local_build_artifact(&trigger, trigger_stable);
+        let trigger_size = std::fs::metadata(&trigger_rmeta)
+            .expect("trigger rmeta metadata")
+            .len();
+
+        let dep_key = super::artifact_cache_key("aarch64-apple-darwin", dep_stable);
+        let toml_key = super::artifact_cache_key("aarch64-apple-darwin", toml_stable);
+        let leaf_key = super::artifact_cache_key("aarch64-apple-darwin", leaf_stable);
+        let trigger_key = super::artifact_cache_key("aarch64-apple-darwin", trigger_stable);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &dep, &dep_build).await);
+            let (stored, _) =
+                store_dependent(&config, &toml, toml_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "the dependent binds to the dep");
+            assert!(store_dependency(&config, &leaf, &leaf_build).await);
+
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries");
+            let leaf_size = index.get(&leaf_key).expect("leaf entry").size_bytes;
+            let resident: u64 = index
+                .values()
+                .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes));
+            // The dep's group holds `toml`; with `toml` locked the whole
+            // group is skipped and the budget comes out of the leaf alone.
+            config.artifact_cache_max_bytes = resident - leaf_size + trigger_size;
+            touch_artifact_cache_entry(&pool, "1.91.1", &dep_key, 1)
+                .await
+                .expect("stale dep lru timestamp");
+            touch_artifact_cache_entry(&pool, "1.91.1", &toml_key, 2)
+                .await
+                .expect("stale dependent lru timestamp");
+            touch_artifact_cache_entry(&pool, "1.91.1", &leaf_key, 3)
+                .await
+                .expect("stale leaf lru timestamp");
+
+            // Another process holds the dependent's lease.
+            let _dependent_lease = super::acquire_entry_shared_lock(
+                &config.artifact_cache_version_dir("1.91.1"),
+                &toml_key,
+            )
+            .expect("lease the dependent entry");
+
+            assert!(
+                store_dependency(&config, &trigger, &trigger_build).await,
+                "the trigger store runs the pass"
+            );
+
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after eviction");
+            assert!(
+                index.contains_key(&dep_key),
+                "a locked member skips the whole group — the dep stays"
+            );
+            assert!(index.contains_key(&toml_key));
+            assert!(index.contains_key(&trigger_key));
+            assert!(!index.contains_key(&leaf_key));
+            assert_closure_complete(&index);
+        });
+    }
+
+    /// stow#1005, the done-when: after a pass no stored entry lacks a
+    /// dependency entry. `serde_core` ← `toml` ← `toml_edit`; evicting the
+    /// dep carries the whole chain out, transitively.
+    #[test]
+    fn an_eviction_pass_leaves_no_dependent_without_its_dependency() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(tempdir.path());
+        let dep_dir = tempdir.path().join("dep/deps");
+        let toml_dir = tempdir.path().join("toml/deps");
+        let top_dir = tempdir.path().join("top/deps");
+        let leaf_dir = tempdir.path().join("leaf/deps");
+        for dir in [&dep_dir, &toml_dir, &top_dir, &leaf_dir] {
+            std::fs::create_dir_all(dir).expect("create out dir");
+        }
+
+        let dep_stable = "5edec0de5edec0de";
+        let dep = local_build_parsed("serde_core", "cargo-meta-dep", dep_dir, &["metadata"]);
+        std::fs::write(dep.output_rmeta_path().expect("rmeta"), b"dep-rmeta").expect("write");
+        let dep_build = local_build_artifact(&dep, dep_stable);
+
+        let toml_stable = "70a170a170a170a1";
+        let toml = toml_dependent(&toml_dir, dep.output_rmeta_path().expect("rmeta"));
+        let top_stable = "70e170e170e170e1";
+        let top = toml_edit_dependent(&top_dir, toml.output_rmeta_path().expect("rmeta"));
+        std::fs::write(top.output_rlib_path().expect("rlib"), b"top-rlib").expect("write");
+        std::fs::write(top.output_rmeta_path().expect("rmeta"), b"top-rmeta").expect("write");
+
+        let leaf_stable = "1eaf1eaf1eaf1eaf";
+        let leaf = local_build_parsed("leaf", "cargo-meta-leaf", leaf_dir, &["metadata"]);
+        let leaf_rmeta = leaf.output_rmeta_path().expect("rmeta");
+        std::fs::write(&leaf_rmeta, b"leaf-rmeta").expect("write");
+        let leaf_build = local_build_artifact(&leaf, leaf_stable);
+        let leaf_size = std::fs::metadata(&leaf_rmeta)
+            .expect("leaf rmeta metadata")
+            .len();
+
+        let dep_key = super::artifact_cache_key("aarch64-apple-darwin", dep_stable);
+        let toml_key = super::artifact_cache_key("aarch64-apple-darwin", toml_stable);
+        let top_key = super::artifact_cache_key("aarch64-apple-darwin", top_stable);
+        let leaf_key = super::artifact_cache_key("aarch64-apple-darwin", leaf_stable);
+
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            assert!(store_dependency(&config, &dep, &dep_build).await);
+            let (stored, toml_build) =
+                store_dependent(&config, &toml, toml_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "toml binds to the dep");
+            super::record_materialized_local_build_outputs(
+                &config,
+                &toml,
+                &toml_build,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record toml outputs");
+            let (stored, _) =
+                store_dependent(&config, &top, top_stable, "aarch64-apple-darwin").await;
+            assert!(stored, "toml_edit binds to toml");
+
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            let resident: u64 = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries")
+                .values()
+                .fold(0u64, |sum, entry| sum.saturating_add(entry.size_bytes));
+            config.artifact_cache_max_bytes = resident + leaf_size - 1;
+            touch_artifact_cache_entry(&pool, "1.91.1", &dep_key, 1)
+                .await
+                .expect("stale dep lru timestamp");
+
+            assert!(
+                store_dependency(&config, &leaf, &leaf_build).await,
+                "the leaf store triggers the pass"
+            );
+
+            let index = list_artifact_cache_entries(&pool, "1.91.1")
+                .await
+                .expect("list entries after eviction");
+            assert!(!index.contains_key(&dep_key), "the dep is evicted");
+            assert!(
+                !index.contains_key(&toml_key),
+                "the direct dependent goes with it"
+            );
+            assert!(
+                !index.contains_key(&top_key),
+                "the transitive dependent goes with it"
+            );
+            assert!(index.contains_key(&leaf_key));
+            assert_closure_complete(&index);
         });
     }
 

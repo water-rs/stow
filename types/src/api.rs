@@ -1425,7 +1425,7 @@ pub struct SchedulerHealth {
 }
 
 /// Scheduler DO queue status for monitoring.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerStatus {
     /// Tasks waiting to become dispatchable.
     pub pending: u32,
