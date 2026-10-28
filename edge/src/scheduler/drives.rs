@@ -1329,7 +1329,7 @@ pub const DRIVES: &[Drive] = &[
         setup: None,
         run: |_db, _shape, _settings, ctx| {
             Box::pin(async move {
-                ctx.loaded().with(|graph| graph.status_counts());
+                ctx.loaded().with(|graph| graph.status());
                 Ok(())
             })
         },

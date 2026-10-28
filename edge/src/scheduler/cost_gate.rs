@@ -443,7 +443,7 @@ async fn rearm_restores_the_seeded_state() {
         .await
         .expect("seed fixture");
     let cell = cell.loaded().expect("seeded");
-    let seeded = cell.with(|graph| graph.status_counts());
+    let seeded = cell.with(|graph| graph.status());
     let run = shape.in_flight_run(0);
     let finished = cell.with(|graph| {
         graph.run_finished(
@@ -456,9 +456,9 @@ async fn rearm_restores_the_seeded_state() {
         )
     });
     assert_eq!(finished, super::graph::FinishOutcome::Applied);
-    assert_ne!(cell.with(|graph| graph.status_counts()), seeded);
+    assert_ne!(cell.with(|graph| graph.status()), seeded);
     fixture::rearm(&db, cell, shape, drives::HOST_NOW_MS)
         .await
         .expect("rearm");
-    assert_eq!(cell.with(|graph| graph.status_counts()), seeded);
+    assert_eq!(cell.with(|graph| graph.status()), seeded);
 }

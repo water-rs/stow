@@ -843,18 +843,7 @@ async fn status(
     db: DurableDb,
 ) -> Result<Json<stow_types::api::SchedulerStatus>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let counts = graph.with(|graph| graph.status_counts());
-    let count =
-        |label: &str| u32::try_from(counts.get(label).copied().unwrap_or(0)).unwrap_or(u32::MAX);
-    Ok(Json(stow_types::api::SchedulerStatus {
-        pending: count("pending").saturating_add(count("blocked")),
-        human_pending: count("human_pending"),
-        dispatched: count("dispatched"),
-        running: count("running"),
-        completed: count("completed"),
-        failed: count("failed"),
-        blocked: count("blocked"),
-    }))
+    Ok(Json(graph.with(|graph| graph.status())))
 }
 
 /// `GET /admin/status` — the operator view behind `stow-admin status`.
