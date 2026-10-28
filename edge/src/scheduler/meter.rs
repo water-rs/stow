@@ -460,7 +460,7 @@ pub async fn trip_and_persist(
     let transition = meter
         .settle_and_trip(graph, now_ms, &store, sink, multiplier, at)
         .await?;
-    if let Err(error) = super::routes::persist_freeze(metered_db, &store, now_ms).await {
+    if let Err(error) = super::routes::persist_freeze(metered_db, &store, None, now_ms).await {
         tracing::error!(%error, "persist cost-trip freeze failed");
     }
     aux.settle(graph, now_ms);
@@ -601,7 +601,7 @@ mod tests {
         let owner = cell();
         let (db, meter) = metered(&owner).await;
         let cell = owner.loaded().expect("installed");
-        store::append_events(&db, &[mutate(), mutate()], NOW_MS)
+        store::append_events(&db, None, &[mutate(), mutate()], NOW_MS)
             .await
             .expect("append");
         store::log_tail(&db, 0).await.expect("tail");
@@ -624,7 +624,7 @@ mod tests {
         let meter = meter.with_ledger_op("POST /tasks/retry".to_owned());
         let cell = owner.loaded().expect("installed");
         cell.with(|graph| graph.woken_at_ms = NOW_MS - 5);
-        store::append_events(&db, &[mutate()], NOW_MS)
+        store::append_events(&db, None, &[mutate()], NOW_MS)
             .await
             .expect("append");
         meter.settle(cell, NOW_MS);
@@ -646,11 +646,11 @@ mod tests {
         let owner = cell();
         let (db, meter) = metered(&owner).await;
         let cell = owner.loaded().expect("installed");
-        store::append_events(&db, &[mutate()], NOW_MS)
+        store::append_events(&db, None, &[mutate()], NOW_MS)
             .await
             .expect("append");
         let first = meter.settle(cell, NOW_MS).expect("settle");
-        store::append_events(&db, &[mutate()], NOW_MS + 86_400_000)
+        store::append_events(&db, None, &[mutate()], NOW_MS + 86_400_000)
             .await
             .expect("append");
         let next = meter.settle(cell, NOW_MS + 86_400_000).expect("settle");
@@ -667,7 +667,7 @@ mod tests {
         // A burst of writes through the wrapped handle; a tiny
         // multiplier puts the write budget under the burst.
         for _ in 0..8 {
-            store::append_events(&db, &[mutate()], NOW_MS)
+            store::append_events(&db, None, &[mutate()], NOW_MS)
                 .await
                 .expect("append");
         }

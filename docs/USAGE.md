@@ -325,6 +325,16 @@ Operations CLI for cache operators. Not for end users. Nouns then verbs;
 table), and every mutating command prints its plan and exits without
 acting unless `--yes` is given.
 
+Run outside GitHub Actions, the mutating commands — `scheduler reset`,
+`scheduler demand-feed`, `queue retry|cancel|promote|purge`,
+`dispatch-freeze engage|clear`, `submit`, `maintenance`, `watchdog`
+(not `--dry-run`), and the `preheat` lanes under `--yes` — do not call
+the edge or Cloudflare themselves: they dispatch
+`.github/workflows/operations.yml` on `main` with the `stow-admin login`
+token, print the run URL, follow the run and succeed only when it does.
+The run is the record of who changed what; the edge's mutating routes
+accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
+
 - `stow-admin status` — lane depths, dependents blocked behind failed
   dependencies, oldest pending age, in-flight builds with their GitHub
   Actions run URLs, and per-target outcomes over the trailing 24 h.
@@ -349,9 +359,11 @@ acting unless `--yes` is given.
   catalog rows (GHCR tags are not deleted).
 - `stow-admin cache stats` / `cache clear --prefix <p> --yes` — the
   repository's GitHub Actions cache quota and prefix eviction.
-- `stow-admin maintenance ensure|on|off|status [--scope anonymous|lanes|all]`
+- `stow-admin maintenance ensure|on|off|status [--scope anonymous|lanes|all] [--yes]`
   — the zone WAF maintenance rules; `ensure` creates the entrypoint and
-  any missing rule disabled (`ensure`/`on`/`off` are mutations).
+  any missing rule disabled (`ensure`/`on`/`off` are mutations). Every
+  invocation, `status` included, runs in `operations.yml`, which holds
+  the Cloudflare token.
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
@@ -427,6 +439,11 @@ acting unless `--yes` is given.
   non-zero naming it; a `--crates` or `--dirs` failure still aborts
   before submission. `--source-trees` is only
   valid with `--projects` — see [source-trees.md](source-trees.md).
+  Under `--yes` the command runs in `operations.yml`, which receives the
+  `--crates`, `--projects` and `--source-trees` files' contents;
+  `--dirs` resolves directories on the operator's machine and is
+  refused there — submit the same crates with `--crates` or
+  `--projects`.
 - `stow-admin index export --out-dir <dir>` /
   `index publish --file <index> --folded <folded>` /
   `index report --file <index>` / `index targets` — export
@@ -450,7 +467,10 @@ completed, and retires pending tasks the catalog already covers, so each
 wave builds only what is missing or previously failed.
 
 `stow-admin` requires `STOW_EDGE_URL` and a GitHub account with push
-access to `water-rs/stow`, signed in with `stow-admin login`.
+access to `water-rs/stow`, signed in with `stow-admin login`. A command
+that dispatches `operations.yml` also requires the login token to carry
+Actions read and write, and refuses a `STOW_EDGE_URL` that is unset or
+loopback before dispatching. Reads use the login token directly.
 The exceptions never touch the edge: `preheat projects generate`
 touches only GitHub, `index export`/`publish`/`targets` touch only
 the registry, and a preheat lane (`top-binaries`, `binary`,

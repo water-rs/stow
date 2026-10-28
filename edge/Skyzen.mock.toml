@@ -11,14 +11,17 @@ GITHUB_REPO = "water-rs/stow"
 # `triggering_actor` on the runs it was dispatched, which is what the
 # webhook's `in_progress` filter reads (stow#940).
 GITHUB_APP_SLUG = "mock-stow-ci"
-# Any value works locally — trusted calls use the developer's GitHub
-# user token; the audience pin only binds OIDC credentials.
+# The audience the mock OIDC issuer (`stow-mock-registry oidc-token`)
+# signs — every mutating route takes only a workflow's OIDC token
+# (stow#955), so the two must agree; a test in mock-registry pins it.
 STOW_OIDC_AUDIENCE = "https://stow.waterui.dev"
 STOW_LOCAL_CI_URL = "http://127.0.0.1:28124"
 # The trusted lanes' bearer check probes GitHub for the operator
 # credential's push access (`/user` plus the git-receive-pack
-# advertisement) — the mock registry's stub answers them so the check
-# never leaves the stack (stow#793). Required whenever
+# advertisement) and fetches the OIDC issuer's key set
+# (`/.well-known/jwks`) — the mock registry's stub answers all of them,
+# the key set being its own mock issuer's, so the check never leaves the
+# stack (stow#793, stow#955). Required whenever
 # STOW_LOCAL_CI_URL is set: the edge fails startup without it rather
 # than calling the real API.
 STOW_GITHUB_API_URL = "http://127.0.0.1:28123"

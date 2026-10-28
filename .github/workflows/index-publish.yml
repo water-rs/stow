@@ -30,11 +30,11 @@ name: Index publish
 on:
   workflow_dispatch:
     inputs:
-      stow_edge_url:
-        description: "Edge base URL the slice report posts to; reporting runs only when set"
+      report:
+        description: "Report the published slices to the edge's scheduler (the repository's STOW_EDGE_URL)"
         required: false
-        default: ""
-        type: string
+        default: false
+        type: boolean
       rustc_version:
         description: "Rustc the export pass scopes to; defaults to the current stable channel"
         required: false
@@ -141,14 +141,16 @@ jobs:
           echo "export_dir=$out" >> "$GITHUB_ENV"
       - name: Publish and sign each changed slice
         env:
-          # The dispatch input, not a runtime probe: when the edge URL is
-          # configured the loop reports each slice to the edge's
-          # scheduler gate; when it is absent (Cloudflare offline) the
-          # report simply does not run.
-          STOW_EDGE_URL: ${{ inputs.stow_edge_url }}
+          # The dispatch input, not a runtime probe: `report` makes the
+          # loop report each slice to the edge's scheduler gate; without
+          # it (Cloudflare offline) the report does not run. The edge is
+          # the repository's own: a dispatcher chooses whether to report,
+          # never where this run's OIDC token is sent.
+          REPORT: ${{ inputs.report }}
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           # stow-admin mints a fresh Actions OIDC JWT for every edge
-          # request under this audience; the RepoWriter policy admits any
-          # workflow inside water-rs/stow.
+          # request under this audience; the index route admits only this
+          # workflow's runs on main.
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -178,7 +180,7 @@ jobs:
               # append, one dispatch pass (stow#940). A slice whose
               # publish failed is left out of the report, not failed
               # into it.
-              if ok and os.environ.get("STOW_EDGE_URL"):
+              if ok and os.environ["REPORT"] == "true":
                   report += ["--file", file]
               print("::endgroup::", flush=True)
               if not ok:

@@ -58,16 +58,16 @@ JSON) and sends nothing.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `scheduler demand-feed` (the `/api/v1/admin/scheduler/demand-feed/*` input lane — see the demand-feed runbook below), `dispatch-freeze status\|engage\|clear` (the `/api/v1/admin/dispatch-freeze` switch) and `index report` (`/api/v1/admin/index/{target}/{rustc_version}`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. `index export`/`publish` never read it — they run against GHCR only. `preheat manual` and the preheat lanes (`top-binaries`, `binary`, `missed`, `projects submit`, `plan`) read it only under `--yes`, when they submit: a plan-only run needs neither it nor an edge credential. |
+| `STOW_EDGE_URL` | _required for the edge-backed commands_ | Edge base URL the admin's trusted calls go to: scheduler task submits (including `request resolve`'s `/api/v1/scheduler/requests/{id}/outcome` post), `scheduler demand-feed` (the `/api/v1/admin/scheduler/demand-feed/*` input lane — see the demand-feed runbook below), `dispatch-freeze status\|engage\|clear` (the `/api/v1/admin/dispatch-freeze` switch) and `index report` (`/api/v1/admin/index/published`). Its host is also the `http.host` term `maintenance ensure`/`on`/`off` write into the zone's WAF rules. A command that dispatches `operations.yml` (every operator mutation run outside Actions — see `DEPLOYMENT.md`'s *Operator mutations*) requires it set and not loopback, but only as a guard: the workflow acts on the repository variable `STOW_EDGE_URL` whatever this says. `index export`/`publish` never read it — they run against GHCR only. `preheat manual` and the preheat lanes (`top-binaries`, `binary`, `missed`, `projects submit`, `plan`) read it only under `--yes`, when they submit: a plan-only run needs neither it nor an edge credential. |
 | `STOW_EDGE_VERSION_OVERRIDE` | _optional_ | Verbatim `Cloudflare-Workers-Version-Overrides` header value (e.g. `stow-edge="<version-id>"`) pinned onto every edge call — `deploy-edge.yml` sets it so trusted calls run on the uploaded candidate before traffic shifts. |
-| `GH_TOKEN` / `GITHUB_TOKEN` | edge: the `stow-admin login` token; GitHub REST: `gh auth token` | GitHub credential for the GitHub REST calls (`runs`, `builds`, `cache`, `preheat projects generate`), and for the edge's trusted endpoints when a job or the local mock loop stages one; the owner must have push access to `water-rs/stow`. |
+| `GH_TOKEN` / `GITHUB_TOKEN` | edge: the `stow-admin login` token; GitHub REST: `gh auth token` | GitHub credential for the GitHub REST calls (`runs`, `builds`, `cache`, `preheat projects generate`), and when set and non-empty it replaces the `stow-admin login` token as the operator credential: it authenticates the edge's read routes and dispatches `operations.yml` for the mutating commands, so its owner needs push access to `water-rs/stow` and Actions read and write. A value that is a JWT (`eyJ…`, three segments) is an Actions OIDC identity instead — the mock stack's `stow-mock-registry oidc-token` — and makes the mutating commands call the edge directly rather than dispatch. `stow-admin` never forwards `gh auth token` to the edge. |
 | `CF_ACCOUNT_ID` | _required for `preheat missed` and `watchdog`_ | Cloudflare account ID the Analytics Engine SQL API URL is built from. |
-| `CF_ZONE_ID` | _required for `maintenance` and `watchdog`_ | Cloudflare zone ID of `waterui.dev`, whose `http_request_firewall_custom` phase holds the three `stow maintenance:` WAF rules. In CI it is the `CF_ZONE_ID` repository variable. |
-| `CF_ANALYTICS_TOKEN` | _required for `preheat missed`_ | Cloudflare API token with `Account Analytics: Read`, used to query the `stow_cache_misses` dataset. In CI it comes from the `CF_ANALYTICS_TOKEN` repository secret (see `DEPLOYMENT.md`). |
+| `CF_ZONE_ID` | _required for `maintenance` and `watchdog`_ | Cloudflare zone ID of `waterui.dev`, whose `http_request_firewall_custom` phase holds the three `stow maintenance:` WAF rules. In CI it is the `CF_ZONE_ID` repository variable; an operator never sets it, since `operations.yml` runs these commands. |
+| `CF_ANALYTICS_TOKEN` | _required for `preheat missed`_ | Cloudflare API token with `Account Analytics: Read`, used to query the `stow_cache_misses` dataset. In CI it comes from the `CF_ANALYTICS_TOKEN` repository secret (see `DEPLOYMENT.md`); `operations.yml` hands it to `preheat missed` alone. |
 | `STOW_CF_ANALYTICS_SQL_BASE` | unset | **Mock/test-only.** Overrides the Analytics Engine SQL API base URL (`https://api.cloudflare.com/client/v4`) that `preheat missed` and the watchdog's `edge.do.overloaded` collector post their `stow_cache_misses` queries to, so the e2e can point those lanes at a loopback fixture. Production never sets it — the constant is the only live endpoint — and like `STOW_STATS_SQL_URL` the URL must stay loopback-pinned: the Cloudflare API token rides in the `Authorization` header, so a non-loopback URL would exfiltrate it. |
-| `CLOUDFLARE_API_TOKEN` | _required for `watchdog`, `deploy verdict` and `maintenance`_ | Cloudflare API token. The watchdog queries the GraphQL analytics and Analytics Engine APIs with it and sends the alert mail through the Email Sending REST API (`POST /accounts/{id}/email/sending/send`); `deploy verdict` queries the GraphQL Analytics API (`workersInvocationsAdaptive`, `durableObjectsInvocationsAdaptiveGroups`, `durableObjectsPeriodicGroups`); `maintenance` toggles the zone's WAF maintenance rules. Needs `Account Analytics:Read`, Email Sending and `Zone WAF:Edit` on `waterui.dev`. In CI it is the `CLOUDFLARE_API_TOKEN` repository secret — see `DEPLOYMENT.md`. |
+| `CLOUDFLARE_API_TOKEN` | _required for `watchdog`, `deploy verdict` and `maintenance`_ | Cloudflare API token. The watchdog queries the GraphQL analytics and Analytics Engine APIs with it and sends the alert mail through the Email Sending REST API (`POST /accounts/{id}/email/sending/send`); `deploy verdict` queries the GraphQL Analytics API (`workersInvocationsAdaptive`, `durableObjectsInvocationsAdaptiveGroups`, `durableObjectsPeriodicGroups`); `maintenance` toggles the zone's WAF maintenance rules. Needs `Account Analytics:Read`, Email Sending and `Zone WAF:Edit` on `waterui.dev`. In CI it is the `CLOUDFLARE_API_TOKEN` repository secret — see `DEPLOYMENT.md`; no operator holds it, since `operations.yml` runs `maintenance` and `watchdog`. |
 | `STOW_OIDC_AUDIENCE` | _required in Actions_ | `aud` the admin requests when it mints a GitHub Actions OIDC token for an edge call; must equal the edge's `STOW_OIDC_AUDIENCE` var. Set from `vars.STOW_OIDC_AUDIENCE` in the workflow. |
-| `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | injected by Actions | Endpoint + bearer the runtime exposes for OIDC mints; the admin reads both to mint a fresh token per edge call. Absent them (outside Actions), the admin uses `GH_TOKEN`, else the `stow-admin login` token. |
+| `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN` | injected by Actions | Endpoint + bearer the runtime exposes for OIDC mints; the admin reads both to mint a fresh token per edge call. Absent them (outside Actions), the admin uses `GH_TOKEN`/`GITHUB_TOKEN`, else the `stow-admin login` token. |
 | `STOW_REGISTRY_BASE_URL` | production GHCR | OCI registry root (`scheme://host[:port]`, no path — the per-rustc repository is appended by code) `index export`/`preheat manual`/`preheat plan` pull records, bundles and published slices from — anonymously, signatures verified. Override for mock-registry runs. |
 | `STOW_MOCK_PUBLIC_KEY_PATH` | unset | Mock cosign key `index export`/`preheat manual`/`preheat plan` verify records and index slices against under a mock registry — the `mock-verify` code path, never production. |
 | `STOW_CACHE_DIR` | `~/.cache/stow` | Fulcio/Rekor trust material cache for `index export`, `preheat manual` and `preheat plan` signature verification. |
@@ -92,7 +92,9 @@ publish of a new rustc and for disaster recovery.
 
 `stow-admin preheat manual --crates|--projects <file> --rustc-version <v>
 [--targets a,b] [--priority 30] [--yes]` is the operator-driven wave
-(stow#880): it resolves the graph in-process for every CI target and
+(stow#880): it resolves the graph in-process for every CI target — under
+`--yes`, outside Actions, inside the `operations.yml` run it dispatches,
+which carries the files' contents (`--dirs` is refused there) — and
 submits one dependency tree per source to the scheduler's operations
 entry point at the caller's `--priority` — the same operand
 `stow-admin submit` takes — through
@@ -136,7 +138,6 @@ task from the dispatch event file `GITHUB_EVENT_PATH` names
 | `GITHUB_APP_SLUG` | serve | The App slug the server renders into `triggering_actor.login` (`<slug>[bot]`) on the `workflow_run` deliveries of every run it was dispatched — the value the edge's `GITHUB_APP_SLUG` binding names, so the webhook reads its own runs as dispatched by the App. Required. |
 | `STOW_NEWRELEASES_WEBHOOK_SECRET` | serve | Signing secret of the newreleases.io webhook on `rust-lang/rust` releases (stow#880) — the value the subscription's *Key* shows, which the edge verifies `X-Newreleases-Signature` (hex HMAC-SHA256 of `<X-Newreleases-Timestamp>.<body>`, timestamp inside ±300 s) against on `POST /api/v1/newreleases/release`. Required. |
 | `STOW_OIDC_AUDIENCE` | publish (Actions) | `aud` for the edge OIDC token minted when a publish step calls a trusted edge route (the publish's `index report`); unused when the run only pushes GHCR artifacts. |
-| `GH_TOKEN` / `GITHUB_TOKEN` | serve (falls back to `gh auth token`) | Developer GitHub credential the edge's trusted endpoints accept outside Actions. |
 | `STOW_MOCK_PRIVATE_KEY_PATH` / `STOW_MOCK_REGISTRY_ROOT` | serve | Mock cosign signing key and mock registry root the local dispatcher populates. Required. |
 | `STOW_LOCAL_CI_STUB` | serve | **Mock/test-only.** When set (any value), the local CI server short-circuits each task's build and publish work — the dispatch POST the budget probe and the launch-load run measure stays real, while a stubbed run still pushes the task's (empty) records artifact and completes through the same signed `workflow_run` webhook. |
 | `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), visible in CI logs here. |
@@ -145,7 +146,10 @@ task from the dispatch event file `GITHUB_EVENT_PATH` names
 
 The `Preheat cost` lane (stow#773): a whole preheat wave and the daily
 resubmit driven through the mock stack, priced in the scheduler's
-billed rows. `docs/MOCK.md` describes the run.
+billed rows. `docs/MOCK.md` describes the run. The script stops unless a GitHub
+credential is in the environment (`GH_TOKEN` / `GITHUB_TOKEN`, else `gh
+auth token`); every edge call it makes carries a token from
+`stow-mock-registry oidc-token`.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -177,8 +181,10 @@ credential is involved (`docs/MOCK.md`).
 ## scripts/mock-e2e.sh
 
 The mock end-to-end run (`docs/MOCK.md`). Every variable is optional
-except the GitHub credential (`GH_TOKEN` / `GITHUB_TOKEN`, else `gh
-auth token`).
+except a GitHub credential (`GH_TOKEN` / `GITHUB_TOKEN`, else `gh
+auth token`), which the script uses for its read-route calls against the
+mock's push check; every mutating call carries a token from
+`stow-mock-registry oidc-token`.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -198,11 +204,15 @@ auth token`).
 | `RUST_LOG` | unset | Standard tracing filter. |
 
 The mock registry is a one-shot CLI; everything else is positional args.
+`stow-mock-registry oidc-token --workflow <file> [--ref <ref>] [--actor <login>]
+[--lifetime-secs <n>]` prints a mock-issued Actions OIDC token for one
+workflow run (`docs/MOCK.md`).
 
 ## Forced-eviction check (`scripts/eviction-check.sh`)
 
-Runs on the mock stack (`docs/MOCK.md`); every variable is optional except
-the GitHub credential (`GH_TOKEN` / `GITHUB_TOKEN`, as for the traffic-cost test).
+Runs on the mock stack (`docs/MOCK.md`); every variable is optional, and
+no GitHub credential is needed (its edge calls carry a token from
+`stow-mock-registry oidc-token`).
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -226,11 +236,12 @@ the GitHub credential (`GH_TOKEN` / `GITHUB_TOKEN`, as for the traffic-cost test
 ## Traffic-cost test (`scripts/traffic-cost.sh`)
 
 The release gate's `Traffic cost` job runs this script on the mock stack
-(`docs/MOCK.md`). Every variable is optional except the GitHub credential.
+(`docs/MOCK.md`). Every variable is optional, and no GitHub credential
+is needed: its edge calls carry a token from `stow-mock-registry
+oidc-token`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GH_TOKEN` / `GITHUB_TOKEN` | `gh auth token` | Credential the local edge's trusted endpoints authenticate (push permission on `water-rs/stow`); the script stops when none is found. |
 | `STOW_TRAFFIC_WORK_DIR` | fresh `mktemp -d` under `TMPDIR` | Work directory: keys, mock registry, edge state, `logs/` and `reports/`. |
 | `STOW_E2E_TOOLCHAIN` | `stable` | rustup toolchain the script builds with (`RUSTUP_TOOLCHAIN`). |
 | `STOW_E2E_READY_DEADLINE` | `600` | Seconds to wait for each service to listen. |
@@ -261,14 +272,14 @@ The release gate's `Traffic cost` job runs this script on the mock stack
 | `STOW_LOCAL_CI_URL` | unset | When set, the scheduler dispatches to this URL instead of GitHub `workflow_dispatch`. Used by mock fixtures. |
 | `STOW_SCHEDULER_BUDGET` | unset | **Mock-only.** When `"1"`, the Durable Object answers the `/budget` and `/budget/seed` probe routes the traffic-cost test (`scripts/traffic-cost.sh`) drives. Set only by `edge/Skyzen.mock.toml`; a test asserts it never appears in `edge/Skyzen.toml`, so the probe cannot reach production. |
 | `STOW_STATS_SQL_URL` | unset | **Mock-only.** Overrides the Analytics Engine SQL API base URL the public stats routes post to (`/stats` and friends) — and the edge-side override the demand feed's `analytics_engine/sql` query posts through in the mock deploy. Loopback-pinned — the account's analytics token rides in the `Authorization` header, so a non-loopback URL would exfiltrate it; set only by `edge/Skyzen.mock.toml` (to `stow-mock-registry serve`'s stub) and pinned out of `edge/Skyzen.toml` by the same manifest test as `STOW_LOCAL_CI_URL`. |
-| `STOW_GITHUB_API_URL` | unset | **Mock-only.** Origin the trusted lanes' bearer check resolves its GitHub probes under — `GET /user`, `GET /{repo}.git/info/refs?service=git-receive-pack`, and the OIDC `/.well-known/jwks` all build on it, replacing `api.github.com`, `github.com` and `token.actions.githubusercontent.com` with a single mock origin. Required whenever `STOW_LOCAL_CI_URL` is set — a mock deploy that omits it fails worker startup rather than letting the check reach the real GitHub API — and loopback-pinned like `STOW_STATS_SQL_URL`, because the caller's credential rides in `Authorization`. The mock manifests point it at `stow-mock-registry serve`'s GitHub stub (same base as `GHCR_BASE_URL`); production never sets it. |
+| `STOW_GITHUB_API_URL` | unset | **Mock-only.** Origin the trusted lanes' bearer check resolves its GitHub probes under — `GET /user`, `GET /{repo}.git/info/refs?service=git-receive-pack`, and the OIDC `/.well-known/jwks` (the key set of the mock issuer `stow-mock-registry oidc-token` signs with) all build on it, replacing `api.github.com`, `github.com` and `token.actions.githubusercontent.com` with a single mock origin. Required whenever `STOW_LOCAL_CI_URL` is set — a mock deploy that omits it fails worker startup rather than letting the check reach the real GitHub API — and loopback-pinned like `STOW_STATS_SQL_URL`, because the caller's credential rides in `Authorization`. The mock manifests point it at `stow-mock-registry serve`'s GitHub stub (same base as `GHCR_BASE_URL`); production never sets it. |
 | `STOW_DISPATCH_MIN_AGE_MINUTES` | `5` | Minimum age (minutes) a task must wait in `pending` before being dispatched, so misses can coalesce. Mock fixtures set `0`. |
 | `STOW_MAX_CONCURRENT_JOBS` | `45` | Maximum runner slots in-flight `build-crate.yml` runs may hold at once — one run is one slot — across all runner families. Sized against the org's 60-runner pool, leaving 15 runners for the repo's own CI. Mock fixtures set `3` because miniflare OOMs under parallel complete bursts. `"0"` pauses dispatch: submits keep queueing, nothing is claimed, and the alarm wakes only for stale recovery on builds already in flight — see `DEPLOYMENT.md`'s pause procedure. |
 | `STOW_MAX_CONCURRENT_MACOS_JOBS` | `16` | Maximum runner slots in-flight `build-crate.yml` runs may hold on macOS targets (`aarch64-apple-*`). The org has 20 macOS runners; the cap leaves 4 for the repo's own CI, and macOS rows past the cap stay pending until a slot frees. |
 | `STOW_STALE_DISPATCH_MINUTES` | `60` | The lease on a claimed task, measured from its claim stamp and renewed each time the scheduler's `status` reconcile (run while work lives, and on every wake) lists the claim's own run `queued` or `in_progress` — a build that outlives the span is not re-dispatched. A claim whose run stops listing returns to pending this many minutes after its last sighting. Past the task's ceiling the run fails, so the ceiling — never the lease — is what ends a task. |
 | `STOW_POW_CHALLENGE_SECRET` | _required_ (secret) | HMAC-SHA256 key for the enqueue-admission challenge minted on public cache misses and verified by `POST /api/v1/enqueue`. |
 | `STOW_POW_MIN_BITS` | `12` | Floor on enqueue proof-of-work difficulty: minted admissions and redeemed tickets never require fewer bits, even on an empty queue. |
-| `STOW_MAX_QUEUE_PENDING` | `2000` | Pending-task count at which the miss lane refuses `POST /api/v1/enqueue` with 429 and `Retry-After: 600`. Checked inside the scheduler Durable Object at submit; human-lane and RepoWriter-trusted submits are exempt. |
+| `STOW_MAX_QUEUE_PENDING` | `2000` | Pending-task count at which the miss lane refuses `POST /api/v1/enqueue` with 429 and `Retry-After: 600`. Checked inside the scheduler Durable Object at submit; human-lane and workflow-trusted submits are exempt. |
 | `STOW_HUMAN_MAX_CLOSURE` | `150` | Largest single-target uncovered closure a request may need. The admitted value rides the `resolve-request.yml` dispatch; the job's resolve fails a request whose largest uncovered target closure exceeds it, so the record ends `failed` naming the size and the cap. |
 | `STOW_HUMAN_DAILY_TASK_BUDGET` | `2000` | Human-lane tasks the scheduler accepts per UTC day. The Durable Object keeps the counter (`human_daily_task_budget` table) and refuses an overspending submit with 429; the edge sets `Retry-After` to seconds until 00:00 UTC. |
 | `STOW_MIN_DISPATCH_VALUE` | `0` | Admission floor on a pending node's rank operand — its priority, the term `priority × time waited` multiplies (stow#879): a node claims only while its operand reaches the bound — under-floor work stays queued and listed, never built; the human lane is exempt. A nonnegative i64 decimal string in the operand's centi-units (`100` is the CLI miss's priority); the DO parses it when its settings initialize, so an overflow or negative value surfaces then, not at deploy time. |
@@ -312,8 +323,9 @@ ledger. Semantics the operator knobs expose:
   document (meta contract, declared `rows`, terminal EOF) before a
   single page freezes — a late-invalid or truncated body abandons the
   attempt under a fresh generation on the next tick.
-- Concurrency: the GitHub hourly job plus a possible manual rerun are
-  the only callers; overlapping invocations contend only on the
+- Concurrency: the GitHub hourly job plus a fresh manual dispatch or an
+  operator's `operations.yml` recovery run are the only callers (a
+  re-run of a job is refused at the edge); overlapping invocations contend only on the
   DO's serialized storage — the durable cursor is the arbiter, and a
   second job finding the hour frozen delivers rather than
   re-materializing.

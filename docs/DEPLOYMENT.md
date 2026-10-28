@@ -51,7 +51,9 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    `workflow_run` deliveries, which only GitHub can send. Every
    operator/CI-facing trusted endpoint still authenticates a GitHub
    identity, never a shared token (see
-   [Trusted-endpoint authentication](#trusted-endpoint-authentication)).
+   [Trusted-endpoint authentication](#trusted-endpoint-authentication)),
+   and every mutation runs through `operations.yml` (see
+   [Operator mutations](#operator-mutations)).
 
 2. Deploys run from GitHub Actions — see below. The first deploy also
    attaches the `stow.waterui.dev` custom domain (Cloudflare creates the
@@ -59,16 +61,23 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
 
 3. Initialize the scheduler store. The scheduler Durable Object's
    schema exists only through the operator reset route — once the first
-   deploy is live:
+   deploy is live and the `operations` environment exists (see
+   [Operator mutations](#operator-mutations)):
 
    ```sh
-   stow-admin scheduler reset --yes
+   STOW_EDGE_URL=https://stow.waterui.dev stow-admin scheduler reset --yes
    ```
 
-   The same pass is how a schema change lands: it drops every table,
+   The command dispatches `operations.yml`, prints the run URL and
+   follows the run to its end; the reset appends a `StoreReset` row
+   carrying the dispatcher's login as the fresh log's first row. The
+   same pass is how a schema change lands: it drops every table,
    index and trigger in the store and re-executes
    `edge/src/scheduler/schema.sql`; the queue and recorded slices are
-   destroyed and refill from the lanes that feed them.
+   destroyed and refill from the lanes that feed them. A stored record
+   whose shape changes — the dispatch freeze's manual trigger carries
+   its `actor` — is part of that schema, so a deploy that changes one is
+   followed by the reset.
 
 4. Give the weekly miss-promotion lane (`preheat-missed.yml`) read access
    to the `stow_cache_misses` Analytics Engine dataset. In the Cloudflare
@@ -214,12 +223,12 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    **disabled** and the `http_request_firewall_custom` entrypoint itself
    when the phase has never had a ruleset (the API answers error 10003),
    matching rules by `description`, so they exist before anyone needs
-   them and a redeploy never stomps a live toggle. Toggle by hand by
-   dispatching `maintenance.yml`
-   (`gh workflow run maintenance.yml -f action=on|off|status -f scope=anonymous|lanes|all`):
-   it runs `stow-admin maintenance` with the repository's
-   `CLOUDFLARE_API_TOKEN`, so no operator holds a WAF token and every
-   toggle is recorded under the GitHub account that dispatched it.
+   them and a redeploy never stomps a live toggle. Toggle by hand with
+   `stow-admin maintenance on|off|status [--scope anonymous|lanes|all] --yes`:
+   it dispatches `operations.yml`, which runs `stow-admin maintenance`
+   with the repository's `CLOUDFLARE_API_TOKEN`, so no operator holds a
+   WAF token and every toggle is recorded under the GitHub account that
+   dispatched it.
 
 ### Billing notifications
 
@@ -327,7 +336,8 @@ Required GitHub Actions secrets:
   (the `POST …/email/sending/send` alert mail), and `Zone WAF:Edit` on
   `waterui.dev` (the maintenance rules below and the watchdog's trip).
   The zone's id goes in the `CF_ZONE_ID` repository variable — the
-  WAF step below and `stow-admin maintenance`/`watchdog` read it.
+  WAF step below and `stow-admin maintenance`/`watchdog` read it,
+  `operations.yml` among them.
 - `STOW_APP_PRIVATE_KEY` → Worker `GITHUB_APP_PRIVATE_KEY` — the same
   GitHub App private key release-plz mints tokens from (see Releases
   below).
@@ -389,13 +399,15 @@ cosign signs with the job's OIDC identity, so the certificate subject is
 `index-publish.yml` (the artifact-index lane) folds the signed
 records artifacts into per-`(target, rustc)` slices and pushes them to
 GHCR under the same keyless identity scheme (the pinned
-`index-publish.yml` certificate identity). Its `stow_edge_url`
-dispatch input is optional: when it names a live edge the job also
-reports each slice's membership to the scheduler
-(`POST /api/v1/admin/index/{target}/{rustc_version}`, the report the
-scheduler's dependency gate reads) and prints the export report;
-when empty — Cloudflare down or the edge unprovisioned — the publish
-still lands. The remaining dispatch inputs shape the export pass
+`index-publish.yml` certificate identity). Its `report` dispatch input
+(boolean, default `false`) is optional: when set, the job also reports
+each slice's membership to the edge named by the `STOW_EDGE_URL`
+repository variable (`POST /api/v1/admin/index/published`, the report
+the scheduler's dependency gate reads) and prints the export report; when
+unset — Cloudflare down or the edge unprovisioned — the publish still
+lands. The dispatcher chooses whether to report, never where the run's
+OIDC token goes; `index-publish-cron.yml` sets `report` whenever the
+variable is configured. The remaining dispatch inputs shape the export pass
 itself: `rustc_version` names the rustc it scopes to (empty resolves
 the current stable channel), and `full` — per rustc, like the pass —
 rebuilds that rustc's slices from every `records-<rustc>-*` artifact
@@ -481,22 +493,20 @@ forged delivery costs one manifest check. A dispatch failure answers
 ## Trusted-endpoint authentication
 
 Every authenticated endpoint — the whole `/api/v1/admin/*` surface
-(artifact sync, listing, inspection and prune, coverage, the
-queue transitions, the admin index export, preheat
-planning, operator status) plus `POST /api/v1/scheduler/tasks/submit` —
-takes
+(queue reads and transitions, the dispatch freeze, the scheduler reset,
+the demand lane, the index report, operator status) plus the
+`/api/v1/scheduler/*` submit and outcome routes — takes
 `Authorization: Bearer <credential>` and resolves the credential to a
-GitHub identity (`edge/src/github_auth.rs`). Two shapes are accepted:
+GitHub identity (`edge/src/github_auth.rs`). Two shapes authenticate:
 
-- **GitHub Actions OIDC JWT.** `preheat-admin.yml`'s submit step mints
-  a per-run JWT (`audience=$STOW_OIDC_AUDIENCE`), and so does
-  `index-publish.yml` when it reports a slice. The edge verifies
-  the RS256 signature against GitHub's JWKS
-  (`token.actions.githubusercontent.com/.well-known/jwks`, fetched per
-  call) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
-  `repository` (to the `GITHUB_REPO` var), `exp`/`nbf`, and
-  `job_workflow_ref`. `tasks/submit` accepts any workflow running inside
-  the trusted repo. Nothing is stored or rotated — a leaked run token
+- **GitHub Actions OIDC JWT.** A workflow's per-run JWT
+  (`audience=$STOW_OIDC_AUDIENCE`, minted per request by `stow-admin`).
+  The edge verifies the RS256 signature against GitHub's JWKS
+  (`token.actions.githubusercontent.com/.well-known/jwks`, held in
+  isolate memory for an hour and refetched on an unknown `kid`) and pins `iss`, `aud` (to the `STOW_OIDC_AUDIENCE` var),
+  `repository` (to the `GITHUB_REPO` var), `exp`/`nbf`, and requires
+  the `job_workflow_ref`, `workflow_ref`, `ref`, `run_attempt` and
+  `actor` claims. Nothing is stored or rotated — a leaked run token
   dies with the run.
 - **Repo-push credential.** Outside Actions, `stow-admin` sends the
   token `stow-admin login` stored: a `stow-ci` App user token from
@@ -506,25 +516,107 @@ GitHub identity (`edge/src/github_auth.rs`). Two shapes are accepted:
   never forwards `gh auth token` to the edge. The edge probes push capability directly — a GET on the repo's
   `git-receive-pack` ref advertisement answers 200 only when GitHub would
   accept a push from that credential — which works uniformly for user
-  tokens, fine-grained PATs, and installation tokens like the mock-e2e
-  job's `GITHUB_TOKEN` (REST permission fields do not reflect job-scoped
-  installation tokens). Access follows GitHub role changes — revoke by
-  removing push access, nothing to rotate.
+  tokens, fine-grained PATs, and installation tokens. Access follows
+  GitHub role changes — revoke by removing push access, nothing to
+  rotate.
+
+Both shapes read. **Only a workflow's OIDC token mutates**: each
+mutating route names the workflow files that may call it, and admits a
+token only when its `ref` is `refs/heads/main` and both its
+`workflow_ref` and `job_workflow_ref` are one listed file at
+`refs/heads/main` — a user token, another ref's copy of a listed
+workflow, a listed workflow reached as a reusable workflow, and any
+other workflow are refused with `401`. Every run is admitted on its
+first attempt only: a re-run carries the original run's `actor`, so
+admitting it would attribute one person's mutation to another. A failed
+lane recovers by dispatching a fresh run, never by re-running jobs. The
+lists live in `edge/src/api.rs` (the
+`MutationPolicy` types):
+
+| Routes | Workflows |
+|---|---|
+| `POST /api/v1/admin/dispatch-freeze`, `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`, `POST /api/v1/admin/scheduler/reset`, the mock-only `POST /api/v1/admin/scheduler/budget[/seed,/rearm]` | `operations.yml` |
+| `POST /api/v1/scheduler/tasks/submit` | `operations.yml`, `preheat-admin.yml`, `preheat-missed.yml` |
+| `POST /api/v1/scheduler/tasks/submit-ids` | `operations.yml`, `preheat-admin.yml` |
+| `POST /api/v1/admin/scheduler/demand`, `POST /api/v1/admin/scheduler/demand-feed/{query,begin,page,complete,cleanup,deliver}` | `operations.yml`, `demand-feed.yml` |
+| `POST /api/v1/admin/index/published` | `index-publish.yml` |
+| `POST /api/v1/scheduler/requests/{request_id}/outcome` | `resolve-request.yml` |
+
+The verified `actor` — the login that started the run — is written into
+the first scheduler log row each mutating request appends, and into the
+manual dispatch-freeze record (`{"kind":"manual","actor":…}`, which the
+freeze alert mail names). A scheduler reset has dropped every earlier row,
+so it appends a `StoreReset` row first to carry the actor.
 
 Upstream GitHub failures return `502 github trust upstream unavailable`
 (so CI retries); every credential failure returns `401`. The trusted
-caller — `actions:<job_workflow_ref> run <id>` or `push:<login>` — is
-recorded in the worker log on each write.
+caller — `actions:<job_workflow_ref> run <id> attempt <n> actor <login>`
+or `push:<login>` — is recorded in the worker log on each write.
+
+## Operator mutations
+
+Operators are untrusted, and no credential on an operator's machine
+mutates the edge: every mutation runs in `.github/workflows/operations.yml`
+on `main`, so it leaves a GitHub Actions run under the dispatcher's
+account. The run's OIDC token is the only credential the operator
+routes above accept.
+
+Setup (once per repository): under Settings → Environments create
+`operations` and limit its deployment branches to `main` (*Deployment
+branches and tags → Selected branches and tags*). The workflow's job runs
+in that environment, so a run of any other ref cannot start. It reads the
+repository variables `STOW_EDGE_URL`, `STOW_OIDC_AUDIENCE`,
+`CF_ACCOUNT_ID` and `CF_ZONE_ID` and the secrets `CLOUDFLARE_API_TOKEN`
+and `CF_ANALYTICS_TOKEN` (see the secrets above and
+[`ENVIRONMENT.md`](ENVIRONMENT.md)), and each command sees only what its
+class needs: `maintenance` and `watchdog` get the Cloudflare token, zone
+and account; `preheat missed` gets the analytics token and account; the
+rest get the edge URL and audience alone.
+
+`stow-admin` dispatches the workflow for these mutating commands, each
+under `--yes` where the command takes it: `scheduler reset`,
+`scheduler demand-feed`, `queue retry|cancel|promote|purge`,
+`dispatch-freeze engage|clear`, `submit`, `maintenance ensure|on|off|status`,
+`watchdog` (not `--dry-run`), `preheat binary|top-binaries|missed|manual`
+and `preheat projects submit`. It sends the argument list as a JSON array
+the workflow replays without a shell, plus the contents of the files
+`preheat manual` names with `--crates`, `--projects` and `--source-trees`;
+`preheat manual --dirs` is refused, since the runner cannot see the
+operator's directories. The command prints `operations.yml run: <url>` as
+soon as GitHub creates the run, follows it every 10 seconds, and succeeds
+only when the run concludes `success`; it gives up after 75 minutes (the
+job's own limit is 60). Runs queue in one concurrency group, so mutations
+never race, and the run name is `stow-admin <argv> (by <login>)`. The
+tool comes from the signed toolchain of `main`'s head, the same pull
+`watchdog.yml` makes.
+
+What the operator needs:
+
+- `STOW_EDGE_URL` set and not a loopback address — the workflow acts on
+  the production edge whatever the variable says, so a command aimed at a
+  local edge is refused before anything is dispatched.
+- A `stow-admin login` token that carries Actions read and write, to
+  dispatch the run and read its status.
+
+Without `--yes` a command prints its plan locally and dispatches nothing.
+Reads (`status`, `queue list`, `dispatch-freeze status`) call the edge
+directly with the login token. Inside Actions, or with a minted OIDC JWT
+in `GH_TOKEN` (the mock stack, [`MOCK.md`](MOCK.md)), a command calls
+the edge directly instead of dispatching. The scheduled and dispatched
+lanes (`preheat-admin.yml`, `preheat-missed.yml`, `demand-feed.yml`,
+`index-publish.yml`, `resolve-request.yml`) call their own routes with
+their own tokens.
 
 ## Initial cache population
 
 The cache preheats itself — `preheat-cron.yml` dispatches a wave
 daily, and the newreleases.io webhook wakes one on every new stable
-rustc. To seed a wave by hand, `preheat manual` resolves the graph
-on the operator's machine and submits one dependency tree per source
-to the scheduler's operations lane at the caller's `--priority`
-(stow#880 — the scheduler owns dispatch from there, so it needs a
-reachable edge):
+rustc. To seed a wave by hand, `preheat manual` dispatches
+`operations.yml` ([Operator mutations](#operator-mutations)), which
+resolves the graph on the runner from the carried `--crates` /
+`--projects` files and submits one dependency tree per source to the
+scheduler's operations lane at the caller's `--priority` (stow#880 —
+the scheduler owns dispatch from there, so it needs a reachable edge):
 
 ```sh
 STOW_EDGE_URL=https://stow.waterui.dev stow-admin preheat manual \
@@ -539,8 +631,8 @@ identity, so a re-run inserts only what is still missing — and exits
 non-zero naming every `--projects` repository that failed to resolve.
 
 The scheduler-driven lanes still work the same way when the edge is up —
-from a machine that has `STOW_EDGE_URL` exported and the same GitHub
-credential:
+from a machine that has `STOW_EDGE_URL` exported and is signed in with
+`stow-admin login`:
 
 ```sh
 stow-admin preheat top-binaries \
@@ -566,9 +658,9 @@ pending for re-dispatch).
 ## Operating
 
 - **Queue introspection:** `curl https://your-edge/api/v1/scheduler/status`
-- **Under attack:** `gh workflow run maintenance.yml -f action=on -f
-  scope=anonymous`, watch the request graph, then the same with
-  `action=off`. The
+- **Under attack:** `stow-admin maintenance on --scope anonymous --yes`
+  (dispatches `operations.yml`), watch the request graph, then
+  `maintenance off --scope anonymous --yes`. The
   rule lives on the `waterui.dev` zone's `http_request_firewall_custom`
   phase — blocked requests never invoke the Worker — and the trusted CI
   endpoints keep working. `--scope lanes` sheds only the scheduler-backed
@@ -579,9 +671,11 @@ pending for re-dispatch).
   `ghcr.io/water-rs/stow-cache-<rustc>` package per rustc (every
   artifact a tag); monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.
-  CI access is the `build-crate.yml` OIDC identity itself — revoke by
-  removing the workflow or narrowing the `job_workflow_ref` pin in
-  `edge/src/github_auth.rs`. A user's access is their repo push
+  A workflow's access to a mutating route is its entry in that route's
+  policy in `edge/src/api.rs` — revoke by removing the entry or the
+  workflow. An operator can mutate only by dispatching `operations.yml`,
+  which needs write access to the repository: revoke on GitHub. Their
+  read access is their repo push
   permission — revoke on GitHub, effective within
   `PUSH_VERDICT_TTL_SECS` (5 minutes): the edge caches the push-capable
   verdict per credential for that long rather than re-probing GitHub on

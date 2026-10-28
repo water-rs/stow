@@ -110,9 +110,13 @@ async function freshStub() {
 	return env.SCHEDULER.get(id);
 }
 
+// The verified caller the edge forwards on every attributed route
+// (stow#955); the object refuses those routes without it.
+const ACTOR = { "x-stow-actor": "idle-proof" };
+
 async function reset(stub: DurableObjectStub) {
 	// Operator route only — the one place DDL may issue.
-	const res = await stub.fetch(`${DO}/reset`, { method: "POST" });
+	const res = await stub.fetch(`${DO}/reset`, { method: "POST", headers: ACTOR });
 	expect(res.status).toBe(200);
 	return res.json();
 }
@@ -129,7 +133,7 @@ async function submit(stub: DurableObjectStub, requests: unknown[]) {
 async function submitTrusted(stub: DurableObjectStub, requests: unknown[]) {
 	const res = await stub.fetch(`${DO}/tasks/submit/trusted`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { "content-type": "application/json", ...ACTOR },
 		body: JSON.stringify(requests),
 	});
 	return { status: res.status, body: await res.json() };
@@ -415,7 +419,7 @@ describe("scheduler idle proof (stow#593)", () => {
 		// untrusted lane still admits, and neither arms a wake.
 		const res = await stub.fetch(`${DO}/dispatch-freeze`, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
+			headers: { "content-type": "application/json", ...ACTOR },
 			body: JSON.stringify({ enabled: true, reason: "idle-proof" }),
 		});
 		expect(res.status).toBe(200);

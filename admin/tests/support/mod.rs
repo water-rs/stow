@@ -577,7 +577,7 @@ pub fn eval_if(cond: Option<&str>, ctx: &Val, status: Status) -> bool {
 /// `<set>`/`<empty>` — presence is asserted, values never logged).
 pub const STUB_ENV_KEYS: &str = "GH_REPO GH_TOKEN GITHUB_TOKEN RUSTC_VERSION TARGETS LIMIT \
      TOP_BINARIES SINCE_DAYS EVENT_NAME RUN_TITLE STOW_EDGE_URL STOW_OIDC_AUDIENCE \
-     CF_ACCOUNT_ID CF_ANALYTICS_TOKEN";
+     CF_ACCOUNT_ID CF_ANALYTICS_TOKEN CF_ZONE_ID CLOUDFLARE_API_TOKEN";
 
 const STUB_SCRIPT: &str = r#"#!/usr/bin/env bash
 # stow#593 recorder stub — one tab-separated record per invocation, then
