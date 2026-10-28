@@ -32,7 +32,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_NEGATIVE_CACHE_TTL_SECS: u64 = 300;
 const DEFAULT_CIRCUIT_RESET_SECS: u64 = 60;
 const DEFAULT_CIRCUIT_TRIP_THRESHOLD: u32 = 5;
-const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_ARTIFACT_CACHE_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 /// How long a verified index slice's pointer stays fresh before the next
 /// read re-checks the tag — `STOW_INDEX_REFRESH_SECS`, config
 /// `index_refresh_secs`, default ten minutes.

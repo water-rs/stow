@@ -858,7 +858,7 @@ mod tests {
             negative_cache_ttl: Duration::from_mins(5),
             circuit_reset_after: Duration::from_mins(1),
             circuit_trip_threshold: 5,
-            artifact_cache_max_bytes: 1024,
+            artifact_cache_max_bytes: crate::config::DEFAULT_ARTIFACT_CACHE_MAX_BYTES,
             index_refresh_interval: Duration::from_mins(1),
             verify_mode: VerifyMode::GithubCi,
             state_db: crate::state_db::StateDb::default(),
