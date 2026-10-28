@@ -72,13 +72,13 @@ measured — see below.
 Between steps it waits until the dispatch stub reports no build run in
 progress, so a dispatch callback from one step never lands in the next
 step's measurement, and it stops the services in reverse start order.
-Every lane stays on the machine except the trusted endpoints' GitHub
-push-permission check. The tunables are listed in
-`docs/ENVIRONMENT.md`. CI runs it as the release gate's `Traffic cost`
+Every lane stays on the machine, and the run needs no GitHub
+credential: its edge calls carry a token the mock registry mints. The
+tunables are listed in `docs/ENVIRONMENT.md`. CI runs it as the release gate's `Traffic cost`
 job and uploads `reports/` on every run.
 
 ```sh
-GH_TOKEN=$(gh auth token) scripts/traffic-cost.sh
+scripts/traffic-cost.sh
 ```
 
 The rest of this doc is the manual recipe the script automates, with
@@ -195,7 +195,7 @@ cargo build --release -p stow-cli -p stow-build -p stow-mock-registry -p stow-ad
 ┌──────────────────────────────┐    POST /api/v1/scheduler/tasks/submit
 │ stow-admin (host)            │────────────────────────────────────────┐
 └──────────────────────────────┘                                        │
-         │ POST /api/v1/admin/index/{target}/{rustc} (index report)      ▼
+         │ POST /api/v1/admin/index/published (index report)      ▼
 ┌──────────────────────────────┐  POST {STOW_LOCAL_CI_URL}/dispatch  ┌──────────────┐
 │ wrangler dev (port 8788)     │────────────────────────────────────►│ stow-build   │
 │ stow-edge wasm + miniflare   │  POST /api/v1/github/workflow-run   │ local CI     │
@@ -215,11 +215,29 @@ pushes the bundle and the records artifact to the mock registry — it
 never calls the edge — and reports completion through the same
 `workflow_run` webhook shape GitHub sends, HMAC-signed with the
 fixture's `STOW_GITHUB_WEBHOOK_SECRET`. `stow-admin index report` then
-tells the scheduler which identities each published slice serves,
-behind the developer's GitHub token (`GH_TOKEN`/`GITHUB_TOKEN`, else
-`gh auth token`), which the edge checks for push access to
-`water-rs/stow` — against the mock registry's GitHub stub
-(`STOW_GITHUB_API_URL`), never the real API.
+tells the scheduler which identities each published slice serves.
+
+The edge's mutating routes take only a workflow's OIDC token run on
+`main`, so the mock registry is also the GitHub Actions OIDC issuer:
+`serve` publishes its key set at `/.well-known/jwks` (the edge fetches
+it through `STOW_GITHUB_API_URL`, never the real GitHub), and
+`oidc-token` signs a token for one workflow run:
+
+```sh
+target/release/stow-mock-registry oidc-token --workflow operations.yml \
+    [--ref refs/heads/main] [--actor <login>] [--lifetime-secs 600]
+```
+
+`--workflow` names the file under `.github/workflows/` that the route
+lists (`operations.yml`, `demand-feed.yml`, `index-publish.yml`, …);
+`--ref` defaults to `refs/heads/main`, `--actor` to `stow-mock-operator`,
+and `--lifetime-secs` to 600 — a real token lives minutes and
+`stow-admin` re-mints it per request, so a script handing one token to a
+long lane sets the lane's length. The token goes in `GH_TOKEN` (or
+`GITHUB_TOKEN`): a token that parses as a JWT makes `stow-admin` call
+the edge directly instead of dispatching `operations.yml`, which it
+refuses against a loopback edge. The same token authenticates the read
+routes, so the scripts need no push credential for them.
 
 ## Bring services up
 
@@ -269,7 +287,8 @@ is enough — the scheduler routes are 500s until the schema exists):
 ```sh
 # Prints `scheduler store reset — <n> objects dropped` and stamps the
 # configured dispatch floor.
-STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
+STOW_EDGE_URL=http://127.0.0.1:8788 \
+GH_TOKEN="$(target/release/stow-mock-registry oidc-token --workflow operations.yml)" \
     target/release/stow-admin scheduler reset --yes
 ```
 
@@ -317,7 +336,9 @@ crate lane (each one's bundled `Cargo.lock` is dropped like every lane's,
 so tasks land on the latest semver-compatible versions):
 
 ```sh
-STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
+STOW_EDGE_URL=http://127.0.0.1:8788 \
+GH_TOKEN="$(target/release/stow-mock-registry oidc-token \
+    --workflow operations.yml --lifetime-secs 7200)" \
 target/release/stow-admin preheat top-binaries \
   --targets aarch64-apple-darwin --rustc-version 1.91.1 --limit 100 --yes
 ```
@@ -341,7 +362,6 @@ back into the mock registry (mock-key mode delegates the signed push to
 `stow-mock-registry publish-index`):
 
 ```sh
-STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
 target/release/stow-admin index export \
   --out-dir /tmp/stow-bench/index-export --rustc-version 1.91.1
 STOW_MOCK_PRIVATE_KEY_PATH=/tmp/stow-bench/keys/private.pem \
@@ -349,7 +369,8 @@ STOW_MOCK_REGISTRY_ROOT=/tmp/stow-bench/mock-registry \
 target/release/stow-admin index publish \
   --file /tmp/stow-bench/index-export/index.aarch64-apple-darwin.1.91.1 \
   --folded /tmp/stow-bench/index-export/folded.aarch64-apple-darwin.1.91.1
-STOW_EDGE_URL=http://127.0.0.1:8788 GH_TOKEN="$(gh auth token)" \
+STOW_EDGE_URL=http://127.0.0.1:8788 \
+GH_TOKEN="$(target/release/stow-mock-registry oidc-token --workflow index-publish.yml)" \
 target/release/stow-admin index report \
   --file /tmp/stow-bench/index-export/index.aarch64-apple-darwin.1.91.1
 ```

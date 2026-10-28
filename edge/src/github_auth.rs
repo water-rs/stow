@@ -123,8 +123,8 @@ pub enum TrustedCaller {
 /// [`MAIN_REF`] with both its run's and its job's workflow being one of
 /// `workflows` at [`MAIN_REF`], so neither another ref's copy of an
 /// allowed workflow nor an allowed workflow called from another one
-/// can mutate; an [`OPERATIONS_WORKFLOW`] run passes only on its first
-/// attempt. Every claim compared here was read from a token whose
+/// can mutate; a run passes only on its first attempt, since a re-run
+/// carries the original run's actor. Every claim compared here was read from a token whose
 /// signature, issuer, audience, expiry and repository
 /// [`authenticate`] already verified. Returns the actor the mutation is
 /// attributed to.
@@ -152,7 +152,7 @@ pub fn authorize_mutation<'a>(
     if git_ref != MAIN_REF || job_workflow_ref != workflow_ref || !admitted(workflow_ref) {
         return Err(AuthError::Unauthorized);
     }
-    if *workflow_ref == pinned(OPERATIONS_WORKFLOW) && run_attempt != "1" {
+    if run_attempt != "1" {
         return Err(AuthError::Unauthorized);
     }
     Ok(actor)
@@ -1276,22 +1276,20 @@ mod tests {
         ));
     }
 
-    /// A re-run of an operations run carries the original dispatcher as
-    /// its `actor`, so it may not mutate; a re-run of another admitted
-    /// workflow still may.
+    /// A re-run carries the original run's `actor`, not whoever started
+    /// the re-run, so no re-run may mutate; recovery dispatches a fresh
+    /// run.
     #[tokio::test]
-    async fn mutation_refuses_a_rerun_of_an_operations_run() {
-        let mut rerun = workflow_claims("operations.yml", MAIN_REF);
-        rerun["run_attempt"] = serde_json::json!("2");
-        let caller = oidc_caller(&rerun).await;
-        assert!(matches!(
-            authorize_mutation(&caller, OPERATIONS, "water-rs/stow"),
-            Err(AuthError::Unauthorized)
-        ));
-        let mut lane_rerun = workflow_claims("preheat-admin.yml", MAIN_REF);
-        lane_rerun["run_attempt"] = serde_json::json!("2");
-        let caller = oidc_caller(&lane_rerun).await;
-        assert!(authorize_mutation(&caller, &["preheat-admin.yml"], "water-rs/stow").is_ok());
+    async fn mutation_refuses_a_rerun() {
+        for workflow in ["operations.yml", "preheat-admin.yml"] {
+            let mut rerun = workflow_claims(workflow, MAIN_REF);
+            rerun["run_attempt"] = serde_json::json!("2");
+            let caller = oidc_caller(&rerun).await;
+            assert!(matches!(
+                authorize_mutation(&caller, &[workflow], "water-rs/stow"),
+                Err(AuthError::Unauthorized)
+            ));
+        }
     }
 
     /// An Actions token missing a claim the gate judges is refused at
