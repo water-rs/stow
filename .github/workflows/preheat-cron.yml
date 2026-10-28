@@ -65,7 +65,9 @@ jobs:
           RUSTC_VERSION: ${{ steps.channel.outputs.version }}
         run: |
           set -euo pipefail
-          gh workflow run preheat-admin.yml \
+          # The wave talks to the edge deployed from main, so its
+          # stow-admin is built from main too (#973).
+          gh workflow run preheat-admin.yml --ref main \
             -f rustc_version="$RUSTC_VERSION" \
             -f projects=true
           echo "$RUSTC_VERSION ${{ steps.channel.outputs.day }}" > .preheat-marker

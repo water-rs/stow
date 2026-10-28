@@ -245,7 +245,7 @@ fn populate_workspace(source_root: &Path, mirror_root: &Path) -> stow_types::err
         }
 
         if entry.file_type().is_file() {
-            reflink::reflink_or_copy(path, &destination).wrap_err_with(|| {
+            reflink_copy::reflink_or_copy(path, &destination).wrap_err_with(|| {
                 format!(
                     "copy workspace file {} into stable mirror {}",
                     path.display(),
@@ -334,5 +334,50 @@ fn create_symlink(target: &Path, destination: &Path) -> std::io::Result<()> {
         std::os::windows::fs::symlink_dir(target, destination)
     } else {
         std::os::windows::fs::symlink_file(target, destination)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::populate_workspace;
+
+    /// A regular file lands in the mirror as a real file holding the
+    /// source's bytes — a clone-or-copy, never a view of the source: a
+    /// rewrite of the source afterwards must not reach the mirror.
+    #[test]
+    fn populate_workspace_copies_regular_files_independent_of_the_source() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let source_root = tempdir.path().join("source");
+        let mirror_root = tempdir.path().join("mirror");
+        std::fs::create_dir_all(source_root.join("src")).expect("create source tree");
+        std::fs::write(source_root.join("Cargo.toml"), b"[package]\n").expect("write manifest");
+        std::fs::write(source_root.join("src/lib.rs"), b"pub fn f() {}\n").expect("write lib");
+
+        populate_workspace(&source_root, &mirror_root).expect("populate mirror");
+
+        let manifest = mirror_root.join("Cargo.toml");
+        let lib = mirror_root.join("src/lib.rs");
+        for path in [&manifest, &lib] {
+            assert!(
+                std::fs::symlink_metadata(path)
+                    .expect("mirror entry metadata")
+                    .file_type()
+                    .is_file(),
+                "mirror entry {} is not a regular file",
+                path.display()
+            );
+        }
+        assert_eq!(
+            std::fs::read(&manifest).expect("read manifest"),
+            b"[package]\n"
+        );
+        assert_eq!(std::fs::read(&lib).expect("read lib"), b"pub fn f() {}\n");
+
+        std::fs::write(source_root.join("src/lib.rs"), b"changed\n").expect("rewrite source");
+        assert_eq!(
+            std::fs::read(&lib).expect("read lib"),
+            b"pub fn f() {}\n",
+            "a rewrite of the source reached the mirrored file"
+        );
     }
 }

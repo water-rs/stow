@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/water-rs/stow/compare/stow-cli-v0.8.0...stow-cli-v0.8.1) - 2026-10-27
+
+### Other
+
+- *(cli)* give stub-edge tests a stub-sized request timeout ([#962](https://github.com/water-rs/stow/pull/962))
+
 ## [0.8.0](https://github.com/water-rs/stow/compare/stow-cli-v0.7.0...stow-cli-v0.8.0) - 2026-10-26
 
 ### Added
