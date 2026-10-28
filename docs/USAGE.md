@@ -1,9 +1,28 @@
-# Stow CLI usage
+# stow CLI usage
 
-The user-facing binary is `stow`. It ships three personalities in one
-executable: a `cargo` driver (`stow check|build|test|predict`), a
-maintenance/setup CLI (`stow setup|update|status|stats|index|clean|check-artifact|fetch-artifact`),
-and a hidden `rustc`/`cc` wrapper invoked by Cargo through `RUSTC_WRAPPER`.
+One executable, installed as `stow`, `stow-cli` and `cargo-stow`, with
+three roles: a cargo driver (`stow check|build|test|predict`), a setup
+and maintenance CLI (`stow setup|update|status|stats|clean|index|check-artifact|fetch-artifact`),
+and the hidden `rustc`/`cc` wrapper cargo invokes. The operator CLI,
+`stow-admin`, is documented in [ADMIN.md](ADMIN.md).
+
+| Command | Arguments and flags |
+|---|---|
+| `stow check`, `stow build`, `stow test`, `stow predict` | `--silent-compatible-upgrades`, `--no-stow-resolver`, `--sandbox`, `--sandbox-deny-network`, then any cargo arguments |
+| `stow setup` | `--github-env` |
+| `stow update` | — |
+| `stow status` | — |
+| `stow stats` | `--json` |
+| `stow clean` | — |
+| `stow index refresh` | `--target <triple>`, `--rustc-version <version>` |
+| `stow index status` | — |
+| `stow check-artifact` | `<target> <rustc_version> <c_metadata>` |
+| `stow fetch-artifact` | `<target> <rustc_version> <c_metadata> <output_path> <crate_name>` |
+| `stow --version`, `stow --help` | — |
+
+Everything after the stow flags of a cargo-driver command is passed to
+cargo unchanged, so `stow build --release -p foo` is `cargo build
+--release -p foo` with stow in front.
 
 ## Configuration
 
@@ -14,14 +33,16 @@ should run in. See [`CONFIG.md`](CONFIG.md) for the file format and
 
 ## `stow check` / `build` / `test`
 
-Drop-in replacements for `cargo check|build|test`. Stow inspects your
-workspace, resolves which prebuilt artifacts cover your dependencies
-against the signed index slice it caches locally, prefetches those
-bundles through the edge worker, and lets Cargo compile only the
-remaining units. When stow cannot accelerate (e.g. zero coverage,
-nightly toolchain, unreachable edge), it transparently falls back to
-vanilla Cargo — the command never fails just because the cache
-was unavailable.
+Drop-in replacements for `cargo check|build|test`. Stow resolves your
+dependencies against the signed index slice it caches locally, prefetches
+the covered bundles within a short pre-cargo budget
+(`STOW_CACHE_BUDGET_SECS`), and runs cargo with its wrapper in front of
+every rustc call. The wrapper serves each unit from the local cache, then
+from the public cache, and otherwise lets rustc compile it and stores the
+result locally. Units it compiled are reported as misses after cargo
+exits. When the public cache cannot help — zero coverage, a nightly
+toolchain, an unreachable edge or registry — the build is plain cargo
+plus the local cache; it never fails because the cache was unavailable.
 
 `--no-stow-resolver` skips the lockfile takeover: by default stow
 synthesizes a cache-optimized `Cargo.lock` locally — every package pins
@@ -271,9 +292,59 @@ Nothing leaves the machine: the command reads local counters only. See
 
 ## `stow clean`
 
-Removes the local stow cache directory (`$STOW_CACHE_DIR`, or `~/.stow`
-by default; see [`ENVIRONMENT.md`](ENVIRONMENT.md)). Does NOT remove the
-local stats DB or wrapper shims.
+Removes the whole cache directory (`STOW_CACHE_DIR`, `cache_dir` in the
+config file, or `~/.stow`): every locally built and fetched artifact,
+the cached index slices, the state database (`state-v3.sqlite3`, which
+holds the local hit counters and the recorded link resolution) and
+`stats.json`. It does not touch the wrapper shims under
+`$CARGO_HOME/stow/shims/`, the managed mold install, the config file, or
+`$CARGO_HOME/config.toml`.
+
+## The local cache
+
+Every dependency stow serves or compiles goes through one cache per
+machine, shared by every project, worktree and target directory.
+
+- **Location.** `<cache_dir>/cache/<rustc version>/bundles/v3/<target>/<c_metadata>/`,
+  where `<cache_dir>` is `STOW_CACHE_DIR`, else `cache_dir` in the config
+  file, else `~/.stow`. Index slices live under `<cache_dir>/index/`, the
+  state database and `stats.json` directly in `<cache_dir>`.
+- **What goes in.** Every bundle fetched from the public cache, and every
+  clean local compile of a crates.io dependency that produces an rlib,
+  dylib or proc-macro without custom codegen flags, in any profile.
+  Workspace members, path and git dependencies, binaries and build-script
+  runs are not stored.
+- **How it is keyed.** By the same stable compile key the public cache
+  uses, so a crate compiled in one project is a hit in another that
+  resolves it identically, regardless of where either checkout lives.
+- **Copy-on-write.** Hits are placed in `target/` as reflinks on APFS,
+  Btrfs, XFS and ReFS, and as copies elsewhere.
+- **Size and eviction.** `STOW_ARTIFACT_CACHE_MAX_BYTES`
+  (`artifact_cache_max_bytes` in the config file, default 20 GiB) bounds
+  each rustc version's cache. After an insert pushes it over, the least
+  recently used entries are deleted; a hit refreshes an entry.
+- **One rustc at a time.** When a build runs under a different rustc
+  version than the previous one, the other versions' caches are deleted
+  in the background (a version another running build is using is kept).
+  Switching toolchains back and forth therefore starts each switch cold.
+- **Trust.** Local entries are trusted because this machine compiled
+  them. They are never uploaded and never signature-checked; fetched
+  entries are verified once, when they are downloaded.
+
+### Offline
+
+With no network, or with GHCR or the edge unreachable, a build still
+serves every unit the local cache holds and stores every unit it
+compiles; the rest compile locally. A cached index slice is used as-is
+when the registry cannot be reached. After `circuit_trip_threshold`
+consecutive edge failures (default 5) the wrapper stops trying the
+network for `circuit_reset_secs` (default 60); local hits continue.
+Misses that could not be reported are kept and sent by a later build.
+
+Expect the first units of an offline build to be slower than plain
+cargo: with no cached index slice, units that miss locally wait for the
+index fetch to give up, and with a cached slice each unit already
+downloading waits out `request_timeout_secs` before the breaker trips.
 
 ## `stow index refresh` / `stow index status`
 
@@ -297,164 +368,36 @@ wrapper degrades to plain cargo over.
 
 ## `stow check-artifact <target> <rustc_version> <c_metadata>`
 
-HEAD probe against the edge artifact endpoint. Useful for debugging
-"is this exact key in cache" questions without actually downloading
-the bundle.
+Looks the exact artifact up in the verified index slice for `target` and
+`rustc_version` (fetching the slice if needed) and prints `status:
+present` with the crate, version and bundle digest, or `status: absent`,
+plus the slice's manifest digest. Downloads no bundle.
 
 ## `stow fetch-artifact <target> <rustc_version> <c_metadata> <output_path> <crate_name>`
 
-GETs the OCI bundle for an exact key and writes it to disk. Supports
-introspection workflows; the regular wrapper path doesn't need this.
+Resolves the artifact the same way, downloads its bundle through the
+edge, checks the bytes against the digest the index pins, and writes the
+bundle tar to `output_path`. For inspection; builds do not need it.
 
 ## Hidden subcommands
 
-`stow rustc <real-rustc> <args>` and `stow cc <real-compiler> <args>`
-are how Cargo invokes the wrapper. End users should never call these
-directly. `stow __purge-cache-dir <paths>` is invoked by the parent
-`stow check` when the local cache exceeds its byte budget; never call
-it manually.
+Not for users:
 
-## `cargo-stow`
+- `stow rustc <rustc> <args>` and `stow cc <compiler> <args>` — how cargo
+  and the C/C++ shims invoke the wrapper.
+- `stow __drain-misses <target_dir>` — posts the misses a finished
+  build's wrappers journaled under `target_dir`; the driver or a later
+  wrapper spawns it detached.
+- `stow __purge-cache-dir <path>...` — deletes the cache directories of
+  rustc versions no longer in use, spawned detached when a build switches
+  rustc.
 
-A `cargo` plugin entry point. Installing this binary alongside `stow`
-lets you run `cargo stow check` instead of `stow check`. Behavior is
-identical.
+## `cargo-stow` and `stow-cli`
+
+`cargo-stow` is the cargo plugin entry point: `cargo stow build` is
+`stow build`. `stow-cli` is the same program under the package's name.
+All three binaries behave identically.
 
 ## `stow-admin`
 
-Operations CLI for cache operators. Not for end users. Nouns then verbs;
-`--json` is a global flag (machine-readable stdout instead of the human
-table), and every mutating command prints its plan and exits without
-acting unless `--yes` is given.
-
-- `stow-admin status` — lane depths, dependents blocked behind failed
-  dependencies, oldest pending age, in-flight builds with their GitHub
-  Actions run URLs, and per-target outcomes over the trailing 24 h.
-  `--watch` repaints a live view of the scheduler queue merged with
-  `build-crate.yml`'s in-flight runs every 30 s until Ctrl-C; under
-  `--json` each frame is one NDJSON line per tick.
-- `stow-admin queue list [--status failed] [--target T] [--rustc V] [--crate X] [--older-than 24h]`
-  — filtered queue rows; `queue retry|cancel|promote|purge`
-  mutate the same selection (explicit `--task-id`s or filter flags),
-  printing the matched rows first and applying only under `--yes`.
-  `purge` also requires `--older-than` so live work can never be
-  swept. `retry` returns `failed` rows — builds that exhausted their
-  automatic retries or were operator-cancelled — to `pending` with a
-  fresh `attempt`, e.g. `--status failed --rustc V --target T`.
-- `stow-admin coverage <crate>[@version] [--target T]` — which servable
-  identities exist per CI target, and which targets have none.
-- `stow-admin runs failures --since 24h` — classify the failed tasks of
-  `build-crate.yml` runs from their job logs, grouped by failure class.
-- `stow-admin artifacts inspect <c_metadata> --target T --rustc-version V`
-  — the catalog row plus its OCI bundle manifest;
-  `artifacts prune --rustc-version V --yes` deletes a retired toolchain's
-  catalog rows (GHCR tags are not deleted).
-- `stow-admin cache stats` / `cache clear --prefix <p> --yes` — the
-  repository's GitHub Actions cache quota and prefix eviction.
-- `stow-admin maintenance ensure|on|off|status [--scope anonymous|lanes|all]`
-  — the zone WAF maintenance rules; `ensure` creates the entrypoint and
-  any missing rule disabled (`ensure`/`on`/`off` are mutations).
-- `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
-  — enqueue one specific build task.
-- `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
-  — preheat one named **binary** crate's dependency graph from
-  crates.io: stow-admin fetches the `.crate` tarball and runs cargo's
-  resolver in-process once per CI target — every crates.io node an
-  ordinary crate task at its resolved feature set, with its crates.io
-  dependencies as `depends_on` edges. The binary's own package is a name
-  source, never a task. The published tarball's bundled `Cargo.lock` is
-  dropped before the resolve like every other lane's — the resolve
-  lands on the latest semver-compatible versions, its pins surviving
-  only as yanked/git admission. `preserve_lockfile` stays `false` on
-  every derived task — on the runner it names the task crate's own
-  lockfile, not the source binary's. A crate with no binary target is
-  refused. `--rustc-version` defaults to the scheduler's current
-  stable channel version, `--targets` to every CI target.
-- `stow-admin preheat top-binaries --rustc-version ... [--targets a,b] [--limit 100] --yes`
-  — the popularity lane (stow#891): the top-N crates whose *default*
-  version ships a binary target and no library (stow#918), ranked by
-  the last 90 days of `version_downloads`. Both answers come from one
-  fetch of the crates.io daily database dump (`default_versions` →
-  `versions.bin_names`/`has_lib` for the binary check); no categories
-  and no per-crate API calls. Each candidate resolves exactly the way
-  `preheat binary` resolves one: name sources, never tasks of their
-  own. The emitted tasks carry the crate's 90-day download count as
-  their queue priority. A binary that fails to resolve is reported and
-  skipped; `--targets` defaults to every CI target.
-- `stow-admin preheat missed --rustc-version ... [--limit 50] [--since-days 7] [--targets a,b] --yes`
-  — promote the top-K most-missed `(crate, version, features)` identities
-  from the `stow_cache_misses` Analytics Engine dataset.
-- `stow-admin preheat projects submit [--file preheat/projects.toml] --rustc-version ... [--targets a,b] [--source-trees preheat/source-trees.toml] --yes`
-  — resolve every repository the reviewed `preheat/projects.toml` lists:
-  stow-admin does a depth-1 git fetch of the repository and materializes
-  its pinned submodules recursively, drops the committed
-  `Cargo.lock` so cargo re-resolves the latest semver-compatible
-  versions, and runs the resolve once per CI target — in-process, four
-  projects at a time (`resolve::RESOLVE_CONCURRENCY`; cargo's
-  `GlobalContext` is not `Sync`, so each worker thread builds its own).
-  Every crates.io node in
-  the resolve is enqueued as an ordinary crate task at its resolved
-  feature set — feature sets are never merged — with its crates.io
-  dependencies as `depends_on` edges at the same `(target,
-  rustc_version)`. A repository that fails to resolve is reported and
-  skipped; a project contributes names and feature sets, never version
-  pins. `--source-trees` declares pinned extra source trees for
-  projects whose checkout names inputs git does not carry — schema
-  and semantics in [source-trees.md](source-trees.md).
-- `stow-admin preheat projects generate [--limit 200] [--min-stars 250] [--output preheat/projects.toml]`
-  — refresh the reviewed list: every entry already in the file is
-  re-evaluated under the same admission rule — a git tree carrying a
-  `Cargo.lock` beside a `Cargo.toml`, shallowest first, which is why
-  libraries (they commit no lockfile) drop out to the download-ranked
-  lane — and stays while it passes, whether the sweep named it or a
-  human merged it; a listed entry whose tree fetch fails transport-wise
-  stays too, since a network failure says nothing about the repository.
-  The star sweep only discovers new candidates, appended after the
-  kept entries. Prints every rejection with its reason and writes the
-  file; `preheat-projects.yml` runs this weekly and opens the pull
-  request.
-- `stow-admin preheat plan <crate>[@version] [--target T]` — dry-run the
-  closure expansion a request would produce; enqueues nothing.
-- `stow-admin preheat manual --crates <file>|--projects <file>
-  --rustc-version <v> [--targets a,b] [--priority 30]
-  [--source-trees <file>] [--yes]` — the
-  operator-driven wave (stow#880): resolve the input in-process and
-  submit one dependency tree per source to the scheduler's operations
-  lane at `--priority` — the same operand `stow-admin submit` takes.
-  The scheduler owns dispatch from there; without `--yes` the plan
-  prints and nothing is submitted. Resumable — the scheduler merges on
-  task identity, so a re-run inserts only what is still missing.
-  A `--projects` repository that fails to
-  resolve is reported after the wave submits the rest, exiting
-  non-zero naming it; a `--crates` or `--dirs` failure still aborts
-  before submission. `--source-trees` is only
-  valid with `--projects` — see [source-trees.md](source-trees.md).
-- `stow-admin index export --out-dir <dir>` /
-  `index publish --file <index> --folded <folded>` /
-  `index report --file <index>` / `index targets` — export
-  every changed index slice in one pass from the registry's verified
-  records artifacts (each `index.<t>.<r>` plus its `folded.<t>.<r>`
-  companion; only the records tags no folded set covers are pulled),
-  push both to GHCR signed under the index workflow (mock deploys
-  delegate to `stow-mock-registry publish-index`), and report each
-  slice's membership to the scheduler. `index-publish.yml`
-  runs this loop after every `build-crate` run. `index targets` lists
-  the `(target, rustc)` pairs a published index covers.
-
-None of this has to be run by hand. `preheat-cron.yml` dispatches the
-whole wave — `preheat top-binaries` and
-`preheat projects submit` — once per
-UTC day and immediately whenever the stable channel moves, since the
-cache identity pins the exact stable `rustc_version` and every release
-invalidates the pool. Re-submitting the same list is deliberately cheap:
-the scheduler deduplicates on task identity, leaves completed tasks
-completed, and retires pending tasks the catalog already covers, so each
-wave builds only what is missing or previously failed.
-
-`stow-admin` requires `STOW_EDGE_URL` and a GitHub account with push
-access to `water-rs/stow`, signed in with `stow-admin login`.
-The exceptions never touch the edge: `preheat projects generate`
-touches only GitHub, `index export`/`publish`/`targets` touch only
-the registry, and a preheat lane (`top-binaries`, `binary`,
-`missed`, `projects submit`, `plan`) run without `--yes` only plans and
-needs no edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
+The operator CLI is not for users. See [ADMIN.md](ADMIN.md).

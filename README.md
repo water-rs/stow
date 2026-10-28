@@ -1,172 +1,151 @@
 # stow
 
-A public prebuilt cache for Rust. Stow builds popular crates on fully auditable GitHub Actions CI, stores artifacts in OCI registries, and serves them from Cloudflare's edge — so your `cargo check` and `cargo build` can skip compilation for dependencies that already have a matching prebuilt.
+A prebuilt cache for Rust dependencies, and a local compilation cache that
+replaces sccache. `cargo build` asks stow for each dependency: if a
+signed prebuilt exists — on your machine or in the public cache — it is
+dropped into `target/` and rustc never runs; otherwise rustc compiles it
+and stow keeps the result for every later build on the machine.
 
-Each hit lands in your target directory as a copy-on-write clone of stow's local cache. On filesystems with clone support (APFS, Btrfs, XFS with reflink, ReFS Dev Drive) ten projects that share a crate store its bytes once; on filesystems without it (ext4, NTFS) it is a plain copy, no worse than before. This is different from sccache, which keeps compressed cache entries and expands every hit into a full fresh copy per project.
+The public cache is built on GitHub Actions in public, signed by the
+workflow that built it, and served through
+[stow.waterui.dev](https://stow.waterui.dev), where anyone can also
+request a crate.
 
-The landing page at [stow.waterui.dev](https://stow.waterui.dev) explains the
-cache and lets anyone request a crate to be built ahead of the miss queue
-(see [`docs/API.md`](docs/API.md) for the request API and
-[`docs/site/`](docs/site) for renders of the page).
+## Install
 
-## Quickstart
+```sh
+curl -fsSL https://stow.waterui.dev/install.sh | sh      # macOS, Linux
+```
 
-1. Install and configure in one line — the installer places `stow` on your PATH and runs `stow setup`, which writes `$CARGO_HOME/config.toml` so every `cargo` invocation on the machine routes through stow:
+```powershell
+irm https://stow.waterui.dev/install.ps1 | iex           # Windows
+```
 
-   - **macOS / Linux:** `curl -fsSL https://stow.waterui.dev/install.sh | sh`
-   - **Windows (PowerShell):** `irm https://stow.waterui.dev/install.ps1 | iex`
+The installer puts `stow` on your `PATH` and runs `stow setup`, which wires
+`$CARGO_HOME/config.toml` so every `cargo` invocation on the machine goes
+through stow's rustc and C/C++ wrappers. On Linux it also installs mold
+and selects it as the linker. Nothing per project.
 
-   The setup writes `[build] rustc-wrapper` and the `[env]` entries `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`, `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` so the wrapper can capture native builds too; on Linux it also installs mold and selects it as the linker.
+Then build as usual:
 
-2. Build anything: `cargo build` — accelerated everywhere, no per-project step. (Or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`.)
+```sh
+cargo build
+```
 
-3. Or skip setup entirely: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands — work without it; on Linux they provision and select mold for the invocation alone. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
+Without `stow setup`, `stow check`, `stow build` and `stow test` are
+drop-in replacements for the cargo subcommands. `stow update` updates the
+install. In GitHub Actions, `- uses: water-rs/stow@main` does the same
+for the job. Every command and flag is in [docs/USAGE.md](docs/USAGE.md).
 
-4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — request the crates it names at [stow.waterui.dev](https://stow.waterui.dev), which queues them ahead of the miss lane (see [`docs/USAGE.md`](docs/USAGE.md)). Update with `stow update`.
+## What you get
 
-For the full surface area:
+**Prebuilt dependencies.** Each dependency unit is looked up in a signed
+index of the public cache that stow keeps on your machine; your dependency
+graph is resolved locally and is never sent anywhere for a lookup. A hit
+is downloaded, checked against the digest the index pins and the
+signature of the workflow that built it, and placed in `target/`.
 
-- [`docs/USAGE.md`](docs/USAGE.md) — every subcommand, with examples.
-- [`docs/CONFIG.md`](docs/CONFIG.md) — config file schema.
-- [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md) — every env var stow reads.
-- [`docs/MOCK.md`](docs/MOCK.md) — end-to-end local mock recipe (no Cloudflare or GitHub needed).
-- [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) — production deployment.
-- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — common failure modes and fixes.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — wire protocol, schema, trust boundaries.
-- [`PRIVACY.md`](PRIVACY.md) — exactly which anonymous usage statistics are collected and how to opt out (`STOW_NO_ANALYTICS=1`).
+**A local cache of everything it compiles and fetches.** Every bundle
+stow downloads and every dependency it compiles is kept in one cache
+under `~/.stow`, shared by every project and worktree on the machine. A
+second project using the same crate, a `cargo clean`, a new worktree or a
+branch switch hits it without the network. Hits are placed in `target/`
+as copy-on-write clones on APFS, Btrfs, XFS and ReFS, so ten projects
+sharing a crate store its bytes once; on ext4 or NTFS they are plain
+copies. sccache, by comparison, expands every hit into a fresh copy per
+project.
+
+Today the local cache stores crates.io dependencies. Your own workspace
+crates, path and git dependencies compile as they would under cargo.
+
+**It works offline.** With the network, GHCR or stow.waterui.dev down, a
+build serves what the local cache holds and stores what it compiles; the
+missing pieces compile locally. Nothing fails because the cache is
+unreachable.
+
+**The cache fills itself.** A dependency your build had to compile is
+reported to the scheduler (with a small proof-of-work), and the public
+cache builds it. The report carries the identities of the crates your
+build compiled; the rest of your graph stays on the machine.
+
+## What is in the public cache
+
+Compiled library and proc-macro crates — rlibs, dylibs and proc-macros.
+Never binaries, and never your own code.
+
+A crate is cached at one exact identity: crate, version, feature set,
+target, rustc version, and the identities of its own dependencies. The
+same crate at two feature sets is two artifacts. A build that needs a
+feature set contained in a larger built set is served the larger set,
+and the exact set is queued so the next build hits exactly.
+
+The cache builds the latest release of each semver-compatible line. If
+your lockfile pins an older patch release, that crate is a miss until
+you update; `stow predict` lists the compatible upgrades that would hit,
+and `--silent-compatible-upgrades` applies them.
+
+On Linux a crate that links a system library — `openssl-sys`,
+`alsa-sys` — is built against the system libraries of the Ubuntu
+release the builders run on (Ubuntu 26.04, so OpenSSL 3.5), pinned by
+checksum. If its build script turns the library's
+version into compile flags, your machine is served only when its own
+library yields the same flags; otherwise the crate compiles locally.
+
+Crates enter the cache from the misses real builds report, from requests
+at [stow.waterui.dev](https://stow.waterui.dev), and from preheat waves
+over the most-downloaded binary crates and the most-starred Rust
+applications, rerun on every stable Rust release. `stow predict` reports
+how much of your project is covered.
 
 ## On Linux, mold is the linker
 
-When stow serves a project's dependencies, their compilation disappears and what is left in an edit-rebuild round is your own crate plus the link — so the link stops being noise and starts being the thing you wait for. [mold](https://github.com/rui314/mold) is a modern parallel linker, and the two effects compound: the more stow removes, the larger the link's share of what remains.
+Once dependencies are served, an edit-rebuild round is your own crate
+plus the link, so the link becomes what you wait for. Measured on
+[zed](https://github.com/zed-industries/zed), mold is level with
+`rust-lld` on a full build and about six seconds faster on every
+incremental re-link.
 
-Measured on [zed](https://github.com/zed-industries/zed), mold is level on a full build and about **six seconds faster than `rust-lld` on every incremental re-link**. The full build is where compilation dominates and the link vanishes into it; the incremental round is the one you pay over and over. On a small project you will see nothing either way — a binary of a few hundred objects re-links in a fraction of a second whatever links it.
+The cache publishes only the mold variant of units that link
+(proc-macro, dylib, cdylib), so mold is required. `stow setup` installs a
+pinned, checksummed mold release under stow's own tools directory — no
+root, no `PATH` edit — and selects it for every Linux target. `stow
+build` without setup does the same for that invocation only. A Linux
+build that cannot link with mold stops and says so rather than building
+artifacts the cache will never serve. Linker options do not affect rlibs,
+so the rest of the graph still resolves.
 
-mold is not optional: the cache publishes only the mold variant of units that invoke the linker (proc-macro, dylib, cdylib). `stow setup` installs mold when the machine does not already provide a usable one — a pinned, checksummed [release tarball](https://github.com/rui314/mold/releases) under stow's own tools directory, no root and no `PATH` edits — and writes the selection into the global cargo configuration for every Linux target, cross builds included. A `stow` build without setup provisions the same install and selects it for that invocation only, through cargo `--config` overrides that produce identical compile keys. A Linux build that cannot link with mold stops with a message saying so instead of silently falling back: the fallback would produce artifacts keyed for a linker the cache does not publish.
+## Why you can trust it
 
-Selecting a linker this way does not cost you the cache. Link options are inert for an rlib — rustc never runs the linker to produce one — so every dependency in the graph still resolves; only a unit that actually links (a proc-macro, dylib, cdylib or binary) is excluded, because there the options change the image that would be served.
+- Artifacts are built only by `build-crate.yml` on the `main` branch of
+  this repository, on GitHub-hosted runners, in public. Third-party build
+  scripts run in a sandboxed job that holds no credentials; a separate job
+  re-checks the output and signs it.
+- Every artifact and every index slice carries a keyless Sigstore
+  signature bound to that workflow. stow checks the signature, its Rekor
+  entry and the bytes' digest before anything reaches `target/`; a
+  failure is a local compile, never a served artifact.
+- stow.waterui.dev only relays bytes and queues builds. It holds no
+  signing identity, so a compromised site can slow you down but cannot
+  hand you an artifact stow will accept.
 
-## What is in the cache
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the full model.
 
-The cache holds compiled **library and macro crates** — rlibs, dylibs and proc-macros. It never holds a binary, and it never holds your own code: your crates compile on your machine every time, and so does anything you patched, vendored or pulled from git. What stow removes is the dependency tree underneath.
+## Privacy
 
-A dependency is cached at one exact identity — crate, version, feature set, target, rustc version and profile — because that is what the compiler's output depends on. The same crate at two feature sets is two different artifacts, and asking for one when only the other was built is a miss, not a near-miss. This is what `stow predict` reports on, and why a project can be mostly covered and still compile a few crates itself.
+stow sends anonymous usage statistics: bundle fetches and a once-a-day
+count of builds and hits, with no IP address, dependency graph or
+lockfile. `STOW_NO_ANALYTICS=1` turns them off. [PRIVACY.md](PRIVACY.md)
+lists every field.
 
-On Linux, a crate that links a system library — `openssl-sys`, `alsa-sys` — is built against the library of the Ubuntu LTS image the builders run on (Ubuntu 24.04 today, so OpenSSL 3.0). When the crate's build script turns the library's version into compile flags, as `openssl-sys` does, your machine is served only if its own library yields the same flags; otherwise that crate compiles locally, exactly as it would without stow.
+## Documentation
 
-Crates enter the cache from four places: the most-downloaded binary crates on crates.io and the library trees beneath them, requests anyone can make at [stow.waterui.dev](https://stow.waterui.dev), the misses real builds report automatically, and preheats run by whoever operates the cache. A crate nobody has ever asked for is not there yet; asking is what puts it in the queue.
-
-## Why
-
-Every Rust developer compiles the same popular crates over and over. Stow replaces per-machine compilation caches such as sccache with one shared, transparent, publicly verifiable cache backed by trusted CI: the same signed artifact serves every machine, and the CLI talks to the production edge at `https://stow.waterui.dev` out of the box.
-
-## How it works
-
-```
-  your machine              Cloudflare (untrusted)              GitHub (trusted)
-┌────────────┐           ┌───────────────────┐              ┌──────────────────┐
-│ stow CLI   │─admissions>│  Edge Worker      │   workflow_run│ GitHub Actions   │
-│ (rustc     │  on miss  │  (mint PoW        │<──webhook─────│ CI (stow-build): │
-│  wrapper)  │<──PoW─────│   admissions,     │   (HMAC)      │ builds, signs,   │
-└─────┬──────┘           │   no database)    │               │ pushes           │
-      │                  └────────┬──────────┘               └──┬─────────▲─────┘
-      │ inject               miss │  ^ status            push+sign     │ dispatch
-      v                           v  │                    bundles +    │  (workflow_dispatch)
-  cargo target/          ┌───────────────────┐       records-<r>-<id>    │
-      ▲                  │  Scheduler (DO)   │<───────────────┘         │
-      │                  │  (priority queue, │    a task is done   │
-      │                  │   dedup, dispatch)│    only once its records │
-      │                  └────────┬──────────┘    artifact verifies      │
-      │                           │ persists  ┌──────────────────┐
-      │                           │ its log   │  GHCR (OCI):     │
-      └────────────────────────────────────────>│  signed index.*  │
-        (bundles stream via the edge byte path) │  + bundle blobs  │
-                                                │  + records-*     │
-                                                └──────────────────┘
-```
-
-1. You run `cargo check` (or `cargo build`). Stow wraps `rustc` and intercepts every compilation unit.
-2. The CLI downloads a **signed artifact index** for your `(target, rustc)` slice — a zstd-compressed, cosign-signed catalog of every cached artifact — and resolves your whole dependency graph against it **locally**, the way cargo resolves against the sparse index. Your dependency graph never leaves the machine.
-3. The local resolver includes **semver-upgraded versions** when available — if you request `serde 1.4.3`, the index may show `1.4.9` has a prebuilt. Since semver guarantees compatibility, the CLI can silently accept these upgrades (opt-in flag) to maximize cache hits.
-4. On cache hit, the CLI streams the bundle through the edge byte path (`GET /api/v1/bundles/{rustc_version}/{digest}`, a Workers-Cache-backed relay of the GHCR blob), checks the bytes against the digest the signed index pins, verifies the cosign signature inside, and injects the outputs into the Cargo target directory — skipping compilation entirely.
-5. On cache miss, the CLI posts the uncovered graph to `/api/v1/admissions`; the edge mints proof-of-work admissions, and redeeming them submits build tasks to the scheduler. The crate will be available next time.
-
-## Architecture
-
-Stow is split into four main components, each with a clear trust boundary.
-
-### CLI (`cli/`)
-
-A `rustc` wrapper installed on the user's machine, similar to sccache. When Cargo invokes `rustc`, stow intercepts the call, checks whether a prebuilt artifact is available, and either injects the cached result or falls through to normal compilation.
-
-The CLI resolves artifact identities against a locally cached, cryptographically verified index — the dependency graph is never sent anywhere for a lookup. A graph leaves the machine only when posted to `/api/v1/admissions`: the *miss* set when the index could not cover it, and the exact chain of a crate served from a larger feature set than the build asked for, so the cache builds that exact set next.
-
-Cached artifacts are materialized into Cargo's target directory as a reflink where the filesystem clones — APFS and other clone-capable filesystems share bytes with the local stow cache — and as a real copy where it does not.
-
-### Edge (`edge/`)
-
-A Cloudflare Worker that serves as the public HTTP layer. It is explicitly **untrusted** — it cannot write artifact records or forge cache entries.
-
-- **Byte path** — `GET /api/v1/bundles/{rustc_version}/{digest}` streams the published bundle blob from GHCR behind Workers Cache (the immutable answer is cached at the edge — a hit bills a request but never runs the Worker); the client takes the digest from its signed index and checks the bytes against it.
-- **Admission minting** — `POST /api/v1/admissions` re-derives a posted graph's uncovered nodes against the scheduler's coverage and mints stateless proof-of-work admissions for them.
-- **Miss submission** — when a crate has no prebuilt, the redeemed admission submits the task to the scheduler and logs the miss to Analytics Engine.
-
-### Scheduler (`edge/src/scheduler/`)
-
-A Cloudflare Durable Object that manages the build queue. It exposes two public-facing endpoints:
-
-| Endpoint | Access | Description |
-|---|---|---|
-| `/status` | Public | View current queue state |
-| `/tasks/submit` | Edge, Admin | Submit build tasks |
-
-Task completion arrives from GitHub's `workflow_run` webhook at `POST /api/v1/github/workflow-run` — trusted CI never calls the edge.
-
-Tasks are **automatically deduplicated** by identity key `(crate, version, features, target, rustc_version)`. Resubmitting an existing task does not create a duplicate — it raises the request count and recomputes the priority from the latest downloads and miss count, but `first_requested_at` is untouched, so a resubmit never lets a task jump its lane's queue. The scheduler dispatches work to CI by triggering `workflow_dispatch` of `build-crate.yml` on `main` — one task is one run.
-
-### CI (`ci/`)
-
-The trusted build runner, hosted on GitHub Actions. This is the root of trust — every workflow run is public and auditable by anyone.
-
-1. Receives its task as the `workflow_dispatch` `task` input from the scheduler — `build-crate.yml` reads its `BuildTaskPayload` out of the dispatch event file.
-2. `build` job (read-only token, no secrets): builds the crate with the specified features, target, and rustc version, and hands the outputs over as a workflow artifact. Third-party build scripts run here and nowhere else.
-3. `publish` job (GHCR token, OIDC): validates the build output against the task and a dependency closure it resolves itself, then pushes the artifacts to OCI storage (GHCR) and signs them with cosign.
-4. Pushes the build's artifact records to GHCR as one cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` OCI artifact, under the same `build-crate.yml` identity. GitHub's `workflow_run` webhook — not the runner — reports the completed run to the edge; the scheduler then completes the task once its records artifact verifies in GHCR.
-
-### Admin (`admin/`)
-
-The operations CLI the cache is run with. Its commands are documented in [`docs/USAGE.md`](docs/USAGE.md) and [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md); nothing in this README needs it.
-
-## Version policy
-
-Stow always builds the **latest version within each semver-compatible line**. The scheduler will never build `1.6.8` if `1.6.9` exists. When the edge receives a request, it resolves to the newest compatible patch release.
-
-You never have to ask for a patch release specifically: a request for `1.6.8` is served by `1.6.9` when that is what was built, because semver says it can be.
-
-## Security: trust through transparency
-
-Stow does **not** rely on trusting the edge or the scheduler. Both are treated as untrusted infrastructure that could be compromised without affecting artifact integrity.
-
-- **CI is the sole producer of artifacts.** Builds run on GitHub Actions, where every workflow run is public and fully auditable.
-- **CI never calls the edge.** Records live in GHCR as cosign-signed OCI artifacts — the same keyless signature clients verify on bundles — and completion reaches the edge through GitHub's `workflow_run` webhook, HMAC-verified with a stored secret.
-- **Artifacts are stored in OCI (GHCR).** Content-addressable storage with digest verification.
-- **Artifacts are signed, and identity is signature-bound.** Clients verify that an artifact was produced by the trusted CI pipeline before writing any bytes to disk, and additionally require the bundle's identity fields (crate name, version, target, rustc version, features, dependency identities) to byte-for-byte match the OCI config that the signature covers — a tamperer cannot relabel a validly-signed bundle as a different artifact. A record that points at a digest the attacker doesn't control fails signature verification on the client and is pruned by the edge.
-- **The edge cannot publish or forge artifacts.** It mints miss admissions and relays bundle bytes from GHCR — but it cannot forge OCI bundles, index slices, or sigstore signatures: every bundle a client receives must hash to the digest the signed index pins and carry a valid signature, both checked locally.
-
-Even if the edge or scheduler were fully compromised, an attacker cannot inject malicious artifacts — every artifact byte a client accepts must still match the digest and signature the trusted pipeline produced.
-
-## Project structure
-
-```
-stow/
-├── cli/            rustc wrapper and user-facing CLI
-├── edge/           Cloudflare Worker + Durable Object scheduler
-├── ci/             GitHub Actions build runner (stow-build)
-├── admin/          Admin operations CLI
-├── types/          Shared API types and artifact key definitions
-├── shim/           Rustc wrapper shim shared by cli and ci
-└── mock-registry/  Local mock OCI registry for testing
-```
+- [docs/USAGE.md](docs/USAGE.md) — every command and flag, the local
+  cache, GitHub Actions.
+- [docs/CONFIG.md](docs/CONFIG.md) — the config file.
+- [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) — every environment variable.
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — common failures.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how stow works.
 
 ## License
 
-stow is released under the [MIT License](LICENSE).
+MIT — see [LICENSE](LICENSE).

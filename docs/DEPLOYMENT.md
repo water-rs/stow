@@ -16,7 +16,7 @@ CI is the only producer of artifacts and writes them — bundles and
 records alike — straight into GHCR; the edge learns build completion
 from GitHub's `workflow_run` webhook; end users only ever talk to the
 edge. Detailed trust analysis lives in
-[`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries).
+[`ARCHITECTURE.md`](ARCHITECTURE.md#trust).
 
 ## One-time Cloudflare setup
 
@@ -360,7 +360,7 @@ one per task) to GHCR, cosign-signing both
 `workflow_run` webhook delivery reports the outcome instead, and the
 edge checks the records artifact each successful task published exists
 in GHCR before it forwards the completion. See
-[`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
+[`ARCHITECTURE.md`](ARCHITECTURE.md#trust) for what the
 publisher checks.
 
 `build-crate.yml` reads no repository variables — `run-name` carries
@@ -378,7 +378,7 @@ GHCR under the same keyless identity scheme (the pinned
 `index-publish.yml` certificate identity). Its `stow_edge_url`
 dispatch input is optional: when it names a live edge the job also
 reports each slice's membership to the scheduler
-(`POST /api/v1/admin/index/{target}/{rustc_version}`, the report the
+(`POST /api/v1/admin/index/published`, the report the
 scheduler's dependency gate reads) and prints the export report;
 when empty — Cloudflare down or the edge unprovisioned — the publish
 still lands. The remaining dispatch inputs shape the export pass

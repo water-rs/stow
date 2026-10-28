@@ -195,7 +195,7 @@ cargo build --release -p stow-cli -p stow-build -p stow-mock-registry -p stow-ad
 ┌──────────────────────────────┐    POST /api/v1/scheduler/tasks/submit
 │ stow-admin (host)            │────────────────────────────────────────┐
 └──────────────────────────────┘                                        │
-         │ POST /api/v1/admin/index/{target}/{rustc} (index report)      ▼
+         │ POST /api/v1/admin/index/published (index report)             ▼
 ┌──────────────────────────────┐  POST {STOW_LOCAL_CI_URL}/dispatch  ┌──────────────┐
 │ wrangler dev (port 8788)     │────────────────────────────────────►│ stow-build   │
 │ stow-edge wasm + miniflare   │  POST /api/v1/github/workflow-run   │ local CI     │
