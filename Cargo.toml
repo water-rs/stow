@@ -20,7 +20,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.1"
+version = "0.9.2"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/water-rs/stow"
@@ -46,10 +46,10 @@ blake3 = "1"
 hex = "0.4"
 tracing = "0.1"
 thiserror = "2"
-stow-types = { path = "types", version = "0.9.1" }
-stow-shim = { path = "shim", version = "0.9.1" }
-stow-oci = { path = "oci", version = "0.9.1" }
-stow-cli = { path = "cli", version = "0.9.1" }
+stow-types = { path = "types", version = "0.9.2" }
+stow-shim = { path = "shim", version = "0.9.2" }
+stow-oci = { path = "oci", version = "0.9.2" }
+stow-cli = { path = "cli", version = "0.9.2" }
 stow-resolver = { path = "resolver", version = "0.6.0" }
 anyhow = "1.0.102"
 toml = "0.9"
