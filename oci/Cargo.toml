@@ -52,6 +52,9 @@ x509-cert = "0.2.5"
 const-oid = { version = "0.10", features = ["db"] }
 webpki = { package = "rustls-webpki", version = "0.103.8" }
 async-fs = "2"
+# The sigstore trust cache's default root — the platform cache
+# directory, not `$HOME` (a Windows Actions runner has none, stow#1026).
+dirs = "7"
 # `RegistryHttp` builds the reqwest client on a blocking thread: the
 # trust-store load is synchronous and must not run on an async worker.
 tokio = { version = "1", features = ["rt"] }
@@ -60,6 +63,9 @@ tokio = { version = "1", features = ["rt"] }
 mock-verify = []
 
 [dev-dependencies]
+# Env-mutating tests serialize against each other — `std::env` is
+# process-global.
+serial_test = "4"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["macros", "rt"] }
 # The protobuf types `sigstore` 0.14's `SigstoreTrustRoot` parsed

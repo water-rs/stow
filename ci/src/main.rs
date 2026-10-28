@@ -246,7 +246,7 @@ async fn marker_signature_verified(
     reference: &stow_oci::Reference,
     manifest_digest: &str,
 ) -> stow_types::error::Result<bool> {
-    let trust = records_trust().await?;
+    let trust = stow_oci::verify::records_trust().await?;
     let Ok(materials) =
         stow_oci::pull_signature_materials(session, reference, manifest_digest).await
     else {
@@ -280,34 +280,6 @@ async fn marker_signature_verified(
         )
         .is_ok()
     }))
-}
-
-/// The trust a records read verifies against — the mock registry's
-/// local key under `STOW_MOCK_PUBLIC_KEY_PATH`, else Fulcio/Rekor with
-/// the `build-crate.yml` certificate identity pinned.
-async fn records_trust() -> stow_types::error::Result<stow_oci::verify::Trust> {
-    #[cfg(feature = "mock-verify")]
-    if let Ok(path) = std::env::var("STOW_MOCK_PUBLIC_KEY_PATH") {
-        return Ok(stow_oci::verify::Trust::MockKey(path.into()));
-    }
-    #[cfg(not(feature = "mock-verify"))]
-    if std::env::var_os("STOW_MOCK_PUBLIC_KEY_PATH").is_some() {
-        return Err(stow_types::stow_error!(
-            "STOW_MOCK_PUBLIC_KEY_PATH set but stow-build lacks mock-verify"
-        ));
-    }
-    let cache_dir = std::env::var_os("STOW_CACHE_DIR")
-        .map_or_else(
-            || {
-                std::env::var_os("HOME")
-                    .map(|home| std::path::PathBuf::from(home).join(".cache").join("stow"))
-            },
-            |dir| Some(dir.into()),
-        )
-        .ok_or_else(|| stow_types::stow_error!("resolve the sigstore trust cache directory"))?;
-    Ok(stow_oci::verify::Trust::GithubCi(std::sync::Arc::new(
-        stow_oci::verify::load_trust_material(&cache_dir).await?,
-    )))
 }
 
 async fn publish(

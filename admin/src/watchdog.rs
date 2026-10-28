@@ -955,7 +955,7 @@ impl Watcher<'_> {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
         let repository = stow_types::registry::cache_repository(&rustc_version);
         let session = base.session(&repository, &http);
-        let trust = crate::index_cmd::records_trust().await?;
+        let trust = stow_oci::verify::records_trust().await?;
         for target in stow_types::api::CI_TARGET_TRIPLES {
             let tag = stow_types::index::index_tag(target, rustc_version.as_str());
             let Some(pulled) =
