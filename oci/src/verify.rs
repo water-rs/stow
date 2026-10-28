@@ -29,6 +29,8 @@ use x509_cert::Certificate;
 use x509_cert::der::{DecodePem, Encode};
 
 const TRUSTED_CERT_ISSUER: &str = stow_types::trusted_builder::CERTIFICATE_ISSUER;
+const STOW_CACHE_DIR_ENV: &str = "STOW_CACHE_DIR";
+const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 
 /// Dispatch `material`'s verification on `trust`: Fulcio/Rekor + pinned
 /// certificate identity under [`Trust::GithubCi`], the local keypair
@@ -335,6 +337,54 @@ impl TrustMaterial {
     }
 }
 
+/// The trust a records read verifies against — the mock registry's
+/// local key under `STOW_MOCK_PUBLIC_KEY_PATH`, else Fulcio/Rekor from
+/// the trust root [`load_trust_material`] fetches into the trust cache.
+///
+/// One implementation serves `stow-build`'s records checks and every
+/// `stow-admin` signature verification (stow#1026): the mock arm exists
+/// only in a `mock-verify` build, and a `STOW_MOCK_PUBLIC_KEY_PATH`
+/// reaching any other build is refused rather than ignored.
+///
+/// # Errors
+///
+/// `STOW_MOCK_PUBLIC_KEY_PATH` set on a build without `mock-verify`,
+/// the trust cache directory not resolving, or a trust-root load
+/// failure.
+pub async fn records_trust() -> stow_types::error::Result<Trust> {
+    #[cfg(feature = "mock-verify")]
+    if let Ok(path) = std::env::var(STOW_MOCK_PUBLIC_KEY_PATH_ENV) {
+        return Ok(Trust::MockKey(path.into()));
+    }
+    #[cfg(not(feature = "mock-verify"))]
+    if std::env::var_os(STOW_MOCK_PUBLIC_KEY_PATH_ENV).is_some() {
+        return Err(stow_types::stow_error!(
+            "{STOW_MOCK_PUBLIC_KEY_PATH_ENV} is set, but this binary was built without the `mock-verify` feature"
+        ));
+    }
+    Ok(Trust::GithubCi(std::sync::Arc::new(
+        load_trust_material(&trust_cache_dir()?).await?,
+    )))
+}
+
+/// The directory [`load_trust_material`] writes the verified TUF
+/// metadata through to: `STOW_CACHE_DIR` when set, else `stow` under
+/// the platform cache directory. `HOME` is never read — a Windows
+/// Actions runner has none (stow#1026).
+///
+/// # Errors
+///
+/// `STOW_CACHE_DIR` is unset and the platform cache directory does not
+/// resolve.
+fn trust_cache_dir() -> stow_types::error::Result<std::path::PathBuf> {
+    std::env::var_os(STOW_CACHE_DIR_ENV)
+        .map_or_else(
+            || dirs::cache_dir().map(|dir| dir.join("stow")),
+            |dir| Some(dir.into()),
+        )
+        .ok_or_else(|| stow_types::stow_error!("resolve the sigstore trust cache directory"))
+}
+
 /// Verify one cosign signature against the Fulcio/Rekor trust root.
 ///
 /// A Fulcio certificate lives for minutes, so "the certificate was valid
@@ -623,7 +673,10 @@ mod tests {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
 
-    use super::{TrustMaterial, verify_signature_material, verify_signature_material_github_ci};
+    use super::{
+        TrustMaterial, trust_cache_dir, verify_signature_material,
+        verify_signature_material_github_ci,
+    };
 
     const CERTIFICATE_IDENTITY: &str = stow_types::trusted_builder::CERTIFICATE_IDENTITY;
     const CERTIFICATE_ISSUER: &str = super::TRUSTED_CERT_ISSUER;
@@ -644,6 +697,70 @@ mod tests {
 
     fn base64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// Run `f` with each named variable set (`Some`) or removed (`None`),
+    /// restoring the inherited environment afterwards.
+    fn with_env<T>(settings: &[(&str, Option<&std::ffi::OsStr>)], f: impl FnOnce() -> T) -> T {
+        let saved = settings
+            .iter()
+            .map(|(name, _)| (*name, std::env::var_os(name)))
+            .collect::<Vec<_>>();
+        for (name, value) in settings {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        let result = f();
+        for (name, value) in saved {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        result
+    }
+
+    /// stow#1026: a Windows Actions runner has no `HOME` — the trust
+    /// cache resolves to the platform cache directory's `stow` child
+    /// without it.
+    #[test]
+    #[serial_test::serial]
+    fn trust_cache_dir_resolves_without_home() {
+        with_env(
+            &[("HOME", None), ("STOW_CACHE_DIR", None)],
+            || match dirs::cache_dir() {
+                Some(base) => assert_eq!(
+                    trust_cache_dir().expect("trust cache dir resolves without HOME"),
+                    base.join("stow")
+                ),
+                None => {
+                    trust_cache_dir().expect_err("no platform cache directory must fail");
+                }
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn trust_cache_dir_stow_cache_dir_wins() {
+        with_env(
+            &[(
+                "STOW_CACHE_DIR",
+                Some(std::ffi::OsStr::new("/stow-cache-dir-sentinel")),
+            )],
+            || {
+                assert_eq!(
+                    trust_cache_dir().expect("STOW_CACHE_DIR resolves"),
+                    std::path::Path::new("/stow-cache-dir-sentinel")
+                );
+            },
+        );
     }
 
     /// A signing identity: a leaf certificate and its private key.

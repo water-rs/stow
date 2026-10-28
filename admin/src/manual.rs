@@ -522,7 +522,7 @@ pub async fn contextual_coverage(
     let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let repository = cache_repository(rustc_version);
     let session = base.session(&repository, &http);
-    let trust = crate::index_cmd::records_trust().await?;
+    let trust = stow_oci::verify::records_trust().await?;
     covered_nodes(
         &Index {
             session: &session,
@@ -545,7 +545,7 @@ pub async fn published_slices(
 ) -> stow_types::error::Result<Vec<stow_types::api::PublishedIndexSlice>> {
     let base = crate::index_cmd::registry_base()?;
     let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
-    let trust = crate::index_cmd::records_trust().await?;
+    let trust = stow_oci::verify::records_trust().await?;
     // The cache repository is per-rustc; group the pull by it.
     let mut by_rustc = BTreeMap::<&WireRustcVersion, Vec<&TargetTriple>>::new();
     for (target, rustc_version) in pairs {

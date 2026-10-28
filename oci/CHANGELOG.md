@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.1](https://github.com/water-rs/stow/compare/stow-oci-v0.9.0...stow-oci-v0.9.1) - 2026-10-28
+
+### Fixed
+
+- *(oci)* resolve the sigstore trust cache without HOME and keep one records_trust ([#1027](https://github.com/water-rs/stow/pull/1027))
+
 ## [0.8.0](https://github.com/water-rs/stow/compare/stow-oci-v0.7.0...stow-oci-v0.8.0) - 2026-10-26
 
 ### Added

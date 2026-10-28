@@ -69,7 +69,7 @@ impl IndexSource {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
         let repository = cache_repository(rustc_version);
         let session = base.session(&repository, &http);
-        let trust = crate::index_cmd::records_trust().await?;
+        let trust = stow_oci::verify::records_trust().await?;
         Ok(Self {
             session,
             trust,
