@@ -184,25 +184,6 @@ pub fn detect_registry_crate_version(
     Ok(detect_registry_package_slot(parsed)?.map(|slot| (slot.package, slot.version)))
 }
 
-/// The registry index directory a crates.io-sourced invocation's input
-/// path sits under (`<index>` in `…/registry/src/<index>/<pkg>-<ver>`),
-/// for a caller classifying crates.io against other registries.
-#[must_use]
-pub fn registry_index_dir(parsed: &ParsedRustcArgs) -> Option<String> {
-    let input_path = parsed.input_path.as_ref()?;
-    for ancestor in input_path.ancestors() {
-        if !is_registry_package_slot(ancestor) {
-            continue;
-        }
-        return ancestor
-            .parent()
-            .and_then(|index| index.file_name())
-            .and_then(|name| name.to_str())
-            .map(str::to_owned);
-    }
-    None
-}
-
 /// The remote git checkout an invocation's input path sits under.
 ///
 /// Finds the checkout root at `<…>/git/checkouts/<ident>/<short id>` and
@@ -964,9 +945,9 @@ mod tests {
 
     use super::{
         ExplicitSpelling, Reach, StableUnitIdentity, UnitInvocation, UnitKind, UnitShape, UnitSide,
-        UnitSource, detect_git_checkout, detect_registry_crate_version, normalized_cache_profile,
-        registry_index_dir, required_unit_shapes, stable_unit_identity,
-        stable_unit_identity_for_package,
+        UnitSource, detect_git_checkout, detect_registry_crate_version,
+        detect_registry_package_slot, normalized_cache_profile, required_unit_shapes,
+        stable_unit_identity, stable_unit_identity_for_package,
     };
     use crate::rustc::ParsedRustcArgs;
 
@@ -1003,7 +984,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_index_dir_names_the_host_slot() {
+    fn the_registry_slot_names_its_index_dir() {
         let parsed = ParsedRustcArgs::parse(&args(&[
             "--crate-name",
             "itoa",
@@ -1015,7 +996,10 @@ mod tests {
         ]))
         .expect("parse");
         assert_eq!(
-            registry_index_dir(&parsed).as_deref(),
+            detect_registry_package_slot(&parsed)
+                .expect("slot")
+                .map(|slot| slot.index_dir)
+                .as_deref(),
             Some("index.crates.io-0123abcd")
         );
         let parsed = ParsedRustcArgs::parse(&args(&[
@@ -1029,7 +1013,10 @@ mod tests {
         ]))
         .expect("parse");
         assert_eq!(
-            registry_index_dir(&parsed).as_deref(),
+            detect_registry_package_slot(&parsed)
+                .expect("slot")
+                .map(|slot| slot.index_dir)
+                .as_deref(),
             Some("my-mirror.example.com-deadbeef")
         );
     }
@@ -1129,7 +1116,11 @@ mod tests {
         ]))
         .expect("parse");
         assert!(detect_git_checkout(&parsed).is_none());
-        assert!(registry_index_dir(&parsed).is_none());
+        assert!(
+            detect_registry_package_slot(&parsed)
+                .expect("slot")
+                .is_none()
+        );
     }
 
     #[test]

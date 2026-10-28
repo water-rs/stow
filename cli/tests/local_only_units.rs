@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use build_fixture::{
     RecordedRequests, StoredEntry, cargo_fetch, commit_git_repo, copy_registry_package,
-    journal_files, recording_edge, stored_entries, stow_build_in_with_env, stow_setup_in,
+    journal_files, recording_edge, resolved_packages, rustc_host_and_release, seed_index_slice,
+    stored_entries, stow_build_in_with_env, stow_setup_in,
 };
 
 /// The info event a local-cache serve emits.
@@ -121,6 +122,18 @@ impl Scenario {
     /// One `stow build` of `project` into a fresh target dir, returning
     /// the output and the target dir (which holds the miss journal).
     fn build(&self, project: &Path, args: &[&str], env: &[(&str, &str)]) -> (Output, PathBuf) {
+        self.build_against(self.cache.path(), project, args, env)
+    }
+
+    /// [`build`] against a caller's cache directory instead of the
+    /// scenario's shared one.
+    fn build_against(
+        &self,
+        cache: &Path,
+        project: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> (Output, PathBuf) {
         let build_number = self.builds.get() + 1;
         self.builds.set(build_number);
         let target = self.root.path().join(format!("target-{build_number}"));
@@ -132,7 +145,7 @@ impl Scenario {
             args,
             &self.edge_url,
             &self.edge_url,
-            self.cache.path(),
+            cache,
             self.cargo_home.path(),
             &target,
             &env,
@@ -143,6 +156,27 @@ impl Scenario {
             stderr_of(&output)
         );
         (output, target)
+    }
+
+    /// `project` built against a fresh cache whose index slice names
+    /// every `entries` key: a remote lookup of one of those units would
+    /// fetch its row's bundle, and the request line would carry the
+    /// compile key — so `assert_nothing_reported` can fail on a
+    /// local-only unit that reaches the remote stage, rather than on
+    /// nothing ever looking remotely.
+    fn remote_index_build(
+        &self,
+        project: &Path,
+        entries: &[StoredEntry],
+        env: &[(&str, &str)],
+    ) -> (Output, PathBuf) {
+        let cache = tempfile::tempdir().expect("remote index cache");
+        let (host, release) = rustc_host_and_release();
+        let resolved = resolved_packages(project, self.cargo_home.path());
+        seed_index_slice(cache.path(), &host, &release, entries, &resolved);
+        let mut env = env.to_vec();
+        env.push(("STOW_ENABLE_SEMANTIC_FALLBACK", "1"));
+        self.build_against(cache.path(), project, &["build", "--offline"], &env)
     }
 
     fn entries(&self) -> Vec<StoredEntry> {
@@ -352,6 +386,11 @@ fn a_git_unit_and_its_crates_io_consumers_are_local_only() {
         after.iter().all(|entry| entry.reach == LOCAL_ONLY),
         "an entry over a git unit is public: {after:#?}"
     );
+
+    // A remote index that names the stored keys: a local-only unit
+    // reaching the remote stage would fetch its row's bundle, and the
+    // request line would carry the compile key.
+    let (_remote, remote_target) = scenario.remote_index_build(&second, &after, &[]);
     scenario.assert_nothing_reported(
         &after,
         &[
@@ -359,6 +398,7 @@ fn a_git_unit_and_its_crates_io_consumers_are_local_only() {
             second_target.as_path(),
             featured_target.as_path(),
             third_target.as_path(),
+            remote_target.as_path(),
         ],
     );
 }
@@ -415,6 +455,7 @@ fn a_crates_io_unit_under_extra_codegen_is_local_only() {
         stored.len(),
         "the served build stored entries of its own"
     );
+
     scenario.assert_nothing_reported(&stored, &[first_target.as_path(), second_target.as_path()]);
 
     // The stock build keys apart: a second, public entry per crate.

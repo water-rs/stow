@@ -263,6 +263,187 @@ pub fn stored_entries(db: &Path) -> Vec<StoredEntry> {
         })
 }
 
+/// The `(host triple, release)` of the `rustc` on `PATH` — the same
+/// probe the builds' wrapper answers these facts with.
+#[allow(dead_code)] // only the local-only fixtures seed an index
+pub fn rustc_host_and_release() -> (String, String) {
+    let output = Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .expect("run rustc -vV");
+    assert!(
+        output.status.success(),
+        "rustc -vV failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let vv = String::from_utf8_lossy(&output.stdout).into_owned();
+    let field = |name: &str| {
+        vv.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}: ")))
+            .unwrap_or_else(|| panic!("rustc -vV output is missing {name}"))
+            .to_owned()
+    };
+    (field("host"), field("release"))
+}
+
+/// A package as cargo resolves it for a project: the version and the
+/// feature set an index row for the package must carry to match the
+/// build's own lookup.
+#[allow(dead_code)] // only the local-only fixtures seed an index
+pub struct ResolvedPackage {
+    pub version: semver::Version,
+    pub features: Vec<String>,
+}
+
+/// Every package `project` resolves, by name, as `cargo metadata`
+/// reports it against `cargo_home`'s offline registry.
+#[allow(dead_code)] // only the local-only fixtures seed an index
+pub fn resolved_packages(
+    project: &Path,
+    cargo_home: &Path,
+) -> std::collections::BTreeMap<String, ResolvedPackage> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--offline"])
+        .current_dir(project)
+        .env("CARGO_HOME", cargo_home)
+        .output()
+        .expect("run cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata is JSON");
+    let nodes = metadata["resolve"]["nodes"]
+        .as_array()
+        .expect("resolve nodes");
+    metadata["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .map(|package| {
+            let name = package["name"].as_str().expect("package name").to_owned();
+            let id = &package["id"];
+            let node = nodes
+                .iter()
+                .find(|node| &node["id"] == id)
+                .unwrap_or_else(|| panic!("{name} has no resolve node"));
+            let features = node["features"]
+                .as_array()
+                .expect("node features")
+                .iter()
+                .map(|feature| feature.as_str().expect("feature name").to_owned())
+                .collect();
+            let version = package["version"]
+                .as_str()
+                .expect("package version")
+                .parse()
+                .expect("package version is semver");
+            (name, ResolvedPackage { version, features })
+        })
+        .collect()
+}
+
+/// Write the index slice a remote serve of `entries` would resolve into
+/// `cache`'s slice directory: one row per entry, keyed on the stored
+/// `c_metadata`, carrying the version and feature set `resolved` gives
+/// its package, and each `bundle_digest` carrying the stored
+/// `compile_key` so a bundle fetch it triggers has that key in the
+/// request line. A semantic lookup (`STOW_ENABLE_SEMANTIC_FALLBACK`)
+/// of a leaf crate finds its row by that identity.
+///
+/// The file layout is the verified index cache's own
+/// (`index/<target>/<rustc>/current.json`, its digest-named blob and the
+/// `slice.lock` every locked read opens):
+/// the read path decodes the blob without re-verifying, so a test can
+/// stand in for a published slice the signature path would produce.
+#[allow(dead_code)] // only the local-only fixtures seed an index
+pub fn seed_index_slice(
+    cache_dir: &Path,
+    target: &str,
+    rustc_version: &str,
+    entries: &[StoredEntry],
+    resolved: &std::collections::BTreeMap<String, ResolvedPackage>,
+) {
+    use sha2::Digest as _;
+    use stow_types::identity::{
+        CMetadata, CrateName, CrateVersion, DependencyCMetadataJson, FeaturesJson, TargetTriple,
+        WireRustcVersion,
+    };
+    use stow_types::index::{
+        ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
+    };
+    let rows: Vec<ArtifactIndexRow> = entries
+        .iter()
+        .map(|entry| {
+            let package = entry.crate_name.replace('_', "-");
+            let resolved = resolved
+                .get(&package)
+                .unwrap_or_else(|| panic!("{package} is not resolved by the project"));
+            ArtifactIndexRow {
+                crate_name: CrateName::parse(package).expect("crate name"),
+                version: CrateVersion::new(resolved.version.clone()),
+                features_json: FeaturesJson::canonicalize(resolved.features.clone())
+                    .expect("features"),
+                dependency_c_metadata_json: DependencyCMetadataJson::default(),
+                dependency_task_ids: Vec::new(),
+                c_metadata: CMetadata::parse(entry.c_metadata.clone()).expect("c_metadata"),
+                compile_key: entry.compile_key.clone(),
+                bundle_digest: format!("sha256:{}", entry.compile_key),
+                bundle_size: 1,
+                artifact_kind: stow_types::artifact::ArtifactKind::Rlib,
+                crate_types: vec![stow_types::artifact::RustCrateType::Rlib],
+                profile: stow_types::platform::Profile {
+                    opt_level: "0".to_owned(),
+                    debuginfo: 2,
+                    debug_assertions: true,
+                    overflow_checks: true,
+                    panic: stow_types::platform::PanicStrategy::Unwind,
+                    strip: stow_types::platform::StripLevel::None,
+                },
+                emit: vec!["link".to_owned(), "metadata".to_owned()],
+                unit_shape: stow_types::public_cache::UnitShape {
+                    side: stow_types::public_cache::UnitSide::Target,
+                    invocation: stow_types::public_cache::UnitInvocation::Native,
+                    kind: stow_types::public_cache::UnitKind::Linked,
+                },
+                min_glibc: None,
+            }
+        })
+        .collect();
+    let index = ArtifactIndex {
+        header: ArtifactIndexHeader {
+            format_version: ARTIFACT_INDEX_FORMAT_VERSION,
+            target: TargetTriple::parse(target.to_owned()).expect("target"),
+            rustc_version: WireRustcVersion::parse(rustc_version.to_owned())
+                .expect("rustc version"),
+            generated_at: "2026-01-01T00:00:00Z".to_owned(),
+            generation: 1,
+            row_count: rows.len() as u64,
+        },
+        rows,
+    };
+    let blob = stow_types::index::encode(&index).expect("encode index");
+    let manifest_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+    let dir = cache_dir.join("index").join(target).join(rustc_version);
+    std::fs::create_dir_all(&dir).expect("create slice dir");
+    std::fs::write(dir.join("slice.lock"), []).expect("write slice lock");
+    std::fs::write(dir.join(manifest_digest.replace(':', "_")), &blob).expect("write slice blob");
+    let fetched_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    std::fs::write(
+        dir.join("current.json"),
+        format!(
+            "{{\"manifest_digest\":\"{manifest_digest}\",\"fetched_at\":{fetched_at},\"row_count\":{}}}",
+            index.rows.len()
+        ),
+    )
+    .expect("write slice pointer");
+}
+
 /// Every request line a [`recording_edge`] has received.
 #[allow(dead_code)] // only the local-only fixtures record requests
 pub type RecordedRequests = std::sync::Arc<std::sync::Mutex<Vec<String>>>;

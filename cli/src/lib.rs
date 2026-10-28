@@ -821,13 +821,12 @@ impl BuildContext {
 #[derive(Debug)]
 pub(crate) enum RegistrySources {
     /// The `(package, version)` → registry-source map `Cargo.lock`
-    /// records — a supervised build's authoritative answer. A package
-    /// the lockfile names from several registries (a renamed
-    /// alternative-registry dependency at crates.io's own
-    /// `(name, version)`) is settled by the extraction slot's index
-    /// directory against `crates_io_hosts`. A replaced crates.io still
-    /// records the crates.io source, so a mirror's extraction directory
-    /// classifies correctly.
+    /// records — a supervised build's authoritative answer, but read
+    /// before cargo runs: a build that rewrites the lockfile can leave
+    /// it stale, so the extraction slot's index directory against
+    /// `crates_io_hosts` is always checked too. A replaced crates.io
+    /// still records the crates.io source, so a mirror's extraction
+    /// directory classifies correctly.
     Lockfile {
         /// `(package, version)` → the registry `SourceId`s the lockfile
         /// records for it.
@@ -932,14 +931,12 @@ impl RegistrySources {
                 let Some(set) = sources.get(&(package.to_owned(), version.to_owned())) else {
                     return false;
                 };
-                if set.len() == 1 {
-                    return set
-                        .iter()
-                        .next()
-                        .is_some_and(cargo_lock::package::SourceId::is_default_registry);
-                }
-                // Several registries ship this `(name, version)`: the
-                // extraction slot decides which one this unit came from.
+                // The lockfile was read before cargo ran and can be a
+                // build stale — the extraction slot's index dir must
+                // also name a crates.io host. One recorded source is no
+                // shortcut: a lockfile written before this build's
+                // resolution still says crates.io for the alternative-
+                // registry package cargo just extracted elsewhere.
                 set.iter()
                     .any(cargo_lock::package::SourceId::is_default_registry)
                     && index_dir_in_hosts(index_dir, crates_io_hosts)
@@ -1721,8 +1718,9 @@ async fn decide_rustc_invocation(
     }
 }
 
-/// Classify one invocation (stow#1006): the invocation's own `OUT_DIR`
-/// and `CARGO_PRIMARY_PACKAGE` facts, the `native`-CPU resolution, and
+/// Classify one invocation (stow#1006): the invocation's own
+/// `CARGO_MANIFEST_DIR` and `CARGO_PRIMARY_PACKAGE` facts, the
+/// `native`-CPU resolution, and
 /// the source detection the identity needs, folded into the unit's
 /// `UnitClass`. An `Err` means the source could not be *read* — a harder
 /// failure than an uncached classification, which is `Ok(Uncached(..))`.
@@ -4261,7 +4259,7 @@ fn expected_bundle_crate_name(parsed: &rustc_args::ParsedRustcArgs) -> Option<St
 /// The serve paths calling this return `bool` — no error channel — so a
 /// probe error is logged and lands on the same miss as a mismatch.
 fn registry_unit_identity(parsed: &rustc_args::ParsedRustcArgs) -> Option<(String, String)> {
-    match detect_registry_crate_version(parsed) {
+    match shared_detect_registry_crate_version(parsed) {
         Ok(identity) => identity,
         Err(error) => {
             tracing::warn!(
@@ -4773,7 +4771,7 @@ async fn build_semantic_fetch_request(
     rustc_version: &str,
     unit_nodes: Option<&unit_node::UnitNodeTable>,
 ) -> stow_types::error::Result<Option<fetch::SemanticFetchRequest>> {
-    let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
+    let Some((crate_name, version)) = shared_detect_registry_crate_version(parsed)? else {
         return Ok(None);
     };
     // The request's feature set is the unit's cargo feature set — the
@@ -5185,18 +5183,6 @@ fn resolved_unit_features_json(
     }
 }
 
-fn detect_registry_package_slot(
-    parsed: &rustc_args::ParsedRustcArgs,
-) -> stow_types::error::Result<Option<stow_types::public_cache::RegistryPackageSlot>> {
-    stow_types::public_cache::detect_registry_package_slot(parsed)
-}
-
-fn detect_registry_crate_version(
-    parsed: &rustc_args::ParsedRustcArgs,
-) -> stow_types::error::Result<Option<(String, String)>> {
-    shared_detect_registry_crate_version(parsed)
-}
-
 /// The unit's immutable source identity, or the reason its source is
 /// uncached (stow#1006): a registry slot that is not crates.io, a git
 /// checkout whose commit could not be verified, or a path under neither
@@ -5207,7 +5193,7 @@ async fn detect_unit_source(
     env_cache: &WrapperEnvCache,
     ctx: &BuildContext,
 ) -> stow_types::error::Result<Result<UnitSource, UncachedReason>> {
-    if let Some(slot) = detect_registry_package_slot(parsed)? {
+    if let Some(slot) = stow_types::public_cache::detect_registry_package_slot(parsed)? {
         return Ok(
             if ctx
                 .registry_sources()?
@@ -5356,7 +5342,7 @@ fn validate_exact_bundle_semantics(
     // injected into a bitflags 1.3.2 unit on dust, breaking the build with 126
     // conflicting-impl errors inside `nix`. Nothing downstream can detect it,
     // so it has to fail closed here.
-    if let Some((_, requested_version)) = detect_registry_crate_version(parsed)?
+    if let Some((_, requested_version)) = shared_detect_registry_crate_version(parsed)?
         && requested_version != crate_version
     {
         return Ok(Some(BundleMismatch::Other(stow_types::stow_error!(
@@ -5845,6 +5831,23 @@ mod tests {
         .expect("shared-source lockfile parses");
         assert!(shared.is_crates_io("shared", "1.0.0", "index.crates.io-0123abcd"));
         assert!(!shared.is_crates_io("shared", "1.0.0", "my-alt.example.com-deadbeef"));
+
+        // A stale lockfile: `foo` records crates.io alone, but the slot
+        // this build extracted it into sits under the alternative
+        // registry's index dir. The single recorded source is no answer
+        // — the dir must name a crates.io host too.
+        let stale = super::RegistrySources::parse_lockfile(
+            r#"
+            [[package]]
+            name = "foo"
+            version = "1.0.0"
+            source = "registry+https://github.com/rust-lang/crates.io-index"
+            "#,
+            &hosts_set,
+        )
+        .expect("stale lockfile parses");
+        assert!(stale.is_crates_io("foo", "1.0.0", "index.crates.io-0123abcd"));
+        assert!(!stale.is_crates_io("foo", "1.0.0", "my-alt.example.com-deadbeef"));
 
         // The cargo-config map matches on the slot's host component:
         // crates.io's own slot, plus every host the replace-with chain
