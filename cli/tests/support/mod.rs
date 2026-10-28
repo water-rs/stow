@@ -31,7 +31,6 @@ pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path
         .env_remove("STOW_MOCK_PUBLIC_KEY_PATH")
         .env_remove("STOW_DISABLE_PUBLIC_CACHE")
         .env_remove("STOW_ENABLE_SEMANTIC_FALLBACK")
-        .env_remove("STOW_ENABLE_PREBUILT_DEPS")
         .env_remove("STOW_PUBLIC_CACHE_RUSTC_VERSION")
         .env_remove("STOW_PUBLIC_CACHE_TARGET")
         .env_remove("STOW_CACHE_POLICY_PATH")

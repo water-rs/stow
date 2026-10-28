@@ -22,7 +22,7 @@ cache and lets anyone request a crate to be built ahead of the miss queue
 
 3. Or skip setup entirely: `stow check`, `stow build`, `stow test` — drop-in replacements for the equivalent `cargo` subcommands — work without it; on Linux they provision and select mold for the invocation alone. Add `--silent-compatible-upgrades` to auto-accept semver-compatible patch upgrades that gain cached artifacts.
 
-4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps fully covered" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — request the crates it names at [stow.waterui.dev](https://stow.waterui.dev), which queues them ahead of the miss lane (see [`docs/USAGE.md`](docs/USAGE.md)). Update with `stow update`.
+4. Inspect coverage with `stow predict --manifest-path Cargo.toml`. If the "index has rows for" line is high but "direct deps with cached artifacts" is low, your project's lockfile resolves dep `c_metadata` differently from the cached standalone builds — request the crates it names at [stow.waterui.dev](https://stow.waterui.dev), which queues them ahead of the miss lane (see [`docs/USAGE.md`](docs/USAGE.md)). Update with `stow update`.
 
 For the full surface area:
 

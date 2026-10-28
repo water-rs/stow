@@ -1106,7 +1106,6 @@ fn sandbox_env_names(names: impl Iterator<Item = String>) -> Vec<String> {
         // Debugging knobs a user spelled for this build — stow's own
         // wiring (`STOW_*` context, the config blob, the supervisor's
         // endpoint) arrives through `.env` on the command instead.
-        "STOW_ENABLE_PREBUILT_DEPS",
         "STOW_TRACE_WRAPPED_COMPILERS",
         "STOW_IDENTITY_TRACE",
         "STOW_TRACE_FILE",
