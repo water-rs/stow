@@ -1,7 +1,7 @@
 //! `stow-admin traffic-cost cpu` — Worker CPU per traffic lane, measured
 //! on the mock stack and gated against `WORKER_CPU_BUDGETS` (stow#772),
 //! relative to a reference workload measured in the same isolate on the
-//! same runner (stow#932).
+//! same runner, bracketing each lane (stow#932).
 //!
 //! Local workerd reports no CPU time of its own: the tail `outcome`
 //! event's `cpuTime` is hard-coded to zero in open-source workerd, and
@@ -37,22 +37,26 @@
 //! Those milliseconds scale with the runner: release gate runs of the
 //! same code measured the same lane up to twice apart between runs,
 //! while its rounds within one run agreed to a few percent. So the gate
-//! never judges a lane's milliseconds. Before the lanes and again after
-//! them the pass profiles a fixed reference workload
-//! (`reference_workload.js`), evaluated through the same inspector into
-//! the same isolate, on the same runner and the same V8 build; a lane is
-//! gated on its CPU per event over the reference's CPU. The workload
-//! does the two kinds of work the lanes spend their CPU on: the
-//! scheduler's scans over its in-memory graph, at the graph's layout
-//! and the fixture's node count, so it meets the same cache behaviour;
-//! and serializing, parsing and hashing request-sized JSON. A runner
-//! that runs that work slower runs the lanes slower too, and the
-//! quotient cancels it. The reference is unusable — and the pass fails
-//! rather than gate on it — when it returns anything but its checksum,
-//! when a round collects too few samples to resolve, or when the
-//! reference before the lanes and after them disagree by more than
-//! [`REFERENCE_DRIFT_LIMIT`]: the runner's speed moved during the pass,
-//! so no single reference describes every lane.
+//! never judges a lane's milliseconds. The pass profiles a fixed
+//! reference workload (`reference_workload.js`), evaluated through the
+//! same inspector into the same isolate, on the same runner and the same
+//! V8 build, immediately before and immediately after every lane — the
+//! reference measured after one lane is the one measured before the
+//! next — and a lane is gated on its CPU per event over the smaller of
+//! its two adjacent references. The workload does the two kinds of work
+//! the lanes spend their CPU on: the scheduler's scans over its
+//! in-memory graph, at the graph's layout and the fixture's node count,
+//! so it meets the same cache behaviour; and serializing, parsing and
+//! hashing request-sized JSON. A runner that runs that work slower runs
+//! the lanes slower too, and the quotient cancels it. A runner's speed
+//! moves during a pass, so one reference over the whole pass cannot
+//! describe every lane; the window each comparison spans is one lane
+//! long. The references are unusable — and the pass fails, naming the
+//! lane, rather than gate on them — when one returns anything but its
+//! checksum, when a round collects too few samples to resolve, or when
+//! the two that bracket a lane disagree by more than
+//! [`REFERENCE_DRIFT_LIMIT`]: the runner's speed moved during that lane,
+//! so neither describes it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -111,20 +115,26 @@ const REFERENCE_CHECKSUM: u64 = 1_000_149_044;
 /// reference by at most 1%.
 const MIN_REFERENCE_CPU_MS: f64 = 10.0;
 
-/// How far apart the reference before the lanes and the reference after
-/// them may lie, as the larger over the smaller.
+/// How far apart the two references that bracket one lane may lie, as
+/// the larger over the smaller.
 const REFERENCE_DRIFT_LIMIT: f64 = 1.25;
 
-/// The reference workload's measurement.
+/// The two reference measurements that bracket one lane.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReferenceCpu {
-    /// Each round's CPU milliseconds, profiled before the first lane.
+    /// Each round's CPU milliseconds, profiled immediately before the
+    /// lane.
     pub rounds_before: Vec<f64>,
-    /// Each round's CPU milliseconds, profiled after the last lane.
+    /// Each round's CPU milliseconds, profiled immediately after the
+    /// lane.
     pub rounds_after: Vec<f64>,
     /// The reference's CPU milliseconds: the smallest round of either
-    /// set.
+    /// set — what the lane is gated against.
     pub cpu_ms: f64,
+    /// The larger of the smallest round before and the smallest round
+    /// after, over the smaller: how far the runner's speed moved across
+    /// the lane. At most [`REFERENCE_DRIFT_LIMIT`] in a report.
+    pub drift: f64,
 }
 
 /// One lane's measurement.
@@ -138,18 +148,22 @@ pub struct WorkerCpuRow {
     pub rounds_cpu_ms: Vec<f64>,
     /// The lane's CPU milliseconds per event: the smallest round.
     pub cpu_ms: f64,
-    /// `cpu_ms` over the reference's CPU milliseconds — the gated figure.
+    /// The references that bracket the lane, and the one it is gated
+    /// against.
+    pub reference: ReferenceCpu,
+    /// `cpu_ms` over `reference.cpu_ms` — the gated figure.
     pub relative_cpu: f64,
     /// The lane's budget, relative to the reference.
     pub budget_relative_cpu: f64,
     /// The budget in this run's milliseconds: `budget_relative_cpu`
-    /// times the reference's CPU milliseconds.
+    /// times `reference.cpu_ms`.
     pub budget_ms: f64,
     /// `relative_cpu > budget_relative_cpu`.
     pub over_budget: bool,
 }
 
-/// What the pass writes — the per-lane rows plus the premise checks.
+/// What the pass writes — the per-lane rows, each with the references it
+/// was gated against, plus the premise checks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerCpuReport {
     /// The profiler's sampling interval.
@@ -158,8 +172,6 @@ pub struct WorkerCpuReport {
     pub idle_window_ms: u64,
     /// CPU milliseconds the quiet window collected.
     pub idle_cpu_ms: f64,
-    /// The reference workload every lane is gated relative to.
-    pub reference: ReferenceCpu,
     /// Per-lane measurements, in lane order.
     pub rows: Vec<WorkerCpuRow>,
 }
@@ -189,7 +201,7 @@ impl WorkerCpuReport {
     }
 }
 
-/// One lane's profiled rounds, before the reference that gates them is
+/// One lane's profiled rounds, before the references that gate them are
 /// known.
 struct LaneCpu {
     budget: &'static WorkerCpuBudget,
@@ -198,10 +210,11 @@ struct LaneCpu {
 }
 
 impl LaneCpu {
-    /// Gate the lane against its budget, relative to `reference_ms`.
-    fn gate(self, reference_ms: f64) -> WorkerCpuRow {
+    /// Gate the lane against its budget, relative to the references that
+    /// bracket it.
+    fn gate(self, reference: ReferenceCpu) -> WorkerCpuRow {
         let cpu_ms = smallest(&self.rounds_cpu_ms);
-        let relative_cpu = cpu_ms / reference_ms;
+        let relative_cpu = cpu_ms / reference.cpu_ms;
         WorkerCpuRow {
             lane: self.budget.lane.to_owned(),
             events_per_round: self.events_per_round,
@@ -209,8 +222,9 @@ impl LaneCpu {
             cpu_ms,
             relative_cpu,
             budget_relative_cpu: self.budget.relative_cpu,
-            budget_ms: self.budget.relative_cpu * reference_ms,
+            budget_ms: self.budget.relative_cpu * reference.cpu_ms,
             over_budget: self.budget.over_budget(relative_cpu),
+            reference,
         }
     }
 }
@@ -221,9 +235,10 @@ fn smallest(rounds: &[f64]) -> f64 {
     rounds.iter().copied().fold(f64::INFINITY, f64::min)
 }
 
-/// The reference from its rounds before and after the lanes, or why it
-/// cannot gate them.
+/// The references that bracket `lane` from their rounds, or why they
+/// cannot gate it.
 fn reference_cpu(
+    lane: &str,
     rounds_before: Vec<f64>,
     rounds_after: Vec<f64>,
 ) -> stow_types::error::Result<ReferenceCpu> {
@@ -235,23 +250,24 @@ fn reference_cpu(
         .find(|&&round| round < MIN_REFERENCE_CPU_MS)
     {
         return Err(stow_error!(
-            "a reference round collected {round:.1} ms of samples, under the \
-             {MIN_REFERENCE_CPU_MS} ms one round needs to resolve — the profile did not cover \
-             the reference workload"
+            "a reference round beside lane `{lane}` collected {round:.1} ms of samples, under \
+             the {MIN_REFERENCE_CPU_MS} ms one round needs to resolve — the profile did not \
+             cover the reference workload"
         ));
     }
     let drift = before.max(after) / before.min(after);
     if drift > REFERENCE_DRIFT_LIMIT {
         return Err(stow_error!(
-            "the reference measured {before:.2} ms before the lanes and {after:.2} ms after \
-             them, {drift:.2}× apart (limit {REFERENCE_DRIFT_LIMIT}×) — the runner's speed \
-             moved during the pass, so no one reference gates every lane"
+            "the reference measured {before:.2} ms before lane `{lane}` and {after:.2} ms after \
+             it, {drift:.2}× apart (limit {REFERENCE_DRIFT_LIMIT}×) — the runner's speed moved \
+             during the lane, so no reference gates it"
         ));
     }
     Ok(ReferenceCpu {
         rounds_before,
         rounds_after,
         cpu_ms: before.min(after),
+        drift,
     })
 }
 
@@ -618,9 +634,9 @@ async fn measure_reference(inspector: &Inspector) -> stow_types::error::Result<V
     Ok(rounds_ms)
 }
 
-/// `stow-admin traffic-cost cpu` — check the sampler, measure the
-/// reference and every lane, emit the report, and exit nonzero on a
-/// lane over budget.
+/// `stow-admin traffic-cost cpu` — check the sampler, measure every lane
+/// between two reference measurements, emit the report, and exit nonzero
+/// on a lane over budget or a bracket that drifted.
 #[expect(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
@@ -658,22 +674,21 @@ pub async fn run(edge: &Edge, args: &CpuArgs, output: Output) -> stow_types::err
         ));
     }
 
-    let rounds_before = measure_reference(&inspector).await?;
-    let mut measured = Vec::with_capacity(lanes.len());
+    // The reference measured after a lane is the one measured before the
+    // next, so every lane has one immediately on each side.
+    let mut rounds_before = measure_reference(&inspector).await?;
+    let mut rows = Vec::with_capacity(lanes.len());
     for lane in &lanes {
-        measured.push(measure_lane(lane, edge, &inspector, args).await?);
+        let measured = measure_lane(lane, edge, &inspector, args).await?;
+        let rounds_after = measure_reference(&inspector).await?;
+        let reference = reference_cpu(lane.name, rounds_before, rounds_after.clone())?;
+        rows.push(measured.gate(reference));
+        rounds_before = rounds_after;
     }
-    let rounds_after = measure_reference(&inspector).await?;
-    let reference = reference_cpu(rounds_before, rounds_after)?;
-    let rows = measured
-        .into_iter()
-        .map(|lane| lane.gate(reference.cpu_ms))
-        .collect();
     let report = WorkerCpuReport {
         sampling_interval_us: SAMPLING_INTERVAL_US,
         idle_window_ms: IDLE_WINDOW.as_millis() as u64,
         idle_cpu_ms,
-        reference,
         rows,
     };
     emit(output, &report, render_report)?;
@@ -702,6 +717,8 @@ fn render_report(report: &WorkerCpuReport) -> String {
         "lane",
         "cpu ms/event",
         "rounds",
+        "reference ms",
+        "drift",
         "× reference",
         "budget × reference",
         "",
@@ -711,6 +728,8 @@ fn render_report(report: &WorkerCpuReport) -> String {
             row.lane.clone(),
             format!("{:.2}", row.cpu_ms),
             rounds(&row.rounds_cpu_ms),
+            format!("{:.2}", row.reference.cpu_ms),
+            format!("{:.3}", row.reference.drift),
             format!("{:.4}", row.relative_cpu),
             format!("{:.4}", row.budget_relative_cpu),
             if row.over_budget { "OVER" } else { "" }.to_owned(),
@@ -723,10 +742,8 @@ fn render_report(report: &WorkerCpuReport) -> String {
     );
     let _ = writeln!(
         out,
-        "reference workload {:.2} ms (before the lanes {}; after {})",
-        report.reference.cpu_ms,
-        rounds(&report.reference.rounds_before),
-        rounds(&report.reference.rounds_after)
+        "reference workload measured before and after every lane; a lane is gated on the \
+         smaller, and its drift is the larger over the smaller"
     );
     let _ = writeln!(out, "{}", table.render());
     let over: Vec<&str> = report.breaches().map(|row| row.lane.as_str()).collect();
@@ -755,19 +772,21 @@ mod tests {
         (a - b).abs() < 1e-9
     }
 
-    /// The reference is the smallest round of either set, and a lane is
-    /// judged on its smallest round over it: the same code on a runner
-    /// twice as slow gives the same verdict.
+    /// A lane's reference is the smallest round of the two measurements
+    /// that bracket it, and the lane is judged on its smallest round over
+    /// it: the same code on a runner twice as slow gives the same verdict.
     #[test]
     fn a_lane_is_gated_relative_to_the_reference() {
         let budget = &WORKER_CPU_BUDGETS[0];
         let verdict = |speed: f64| {
             let reference = reference_cpu(
+                budget.lane,
                 vec![42.0 * speed, 40.0 * speed, 41.0 * speed],
                 vec![40.5 * speed, 43.0 * speed, 40.2 * speed],
             )
             .expect("reference");
             assert!(close(reference.cpu_ms, 40.0 * speed));
+            assert!(close(reference.drift, 40.2 / 40.0));
             let lane = LaneCpu {
                 budget,
                 events_per_round: 20,
@@ -776,7 +795,7 @@ mod tests {
                     budget.relative_cpu * 40.0 * speed * 0.9,
                 ],
             };
-            let row = lane.gate(reference.cpu_ms);
+            let row = lane.gate(reference);
             assert!(close(row.relative_cpu, budget.relative_cpu * 0.9));
             assert!(close(row.budget_ms, budget.relative_cpu * 40.0 * speed));
             row.over_budget
@@ -785,15 +804,73 @@ mod tests {
         assert!(!verdict(2.0));
     }
 
-    /// A reference that moved between the two sets, or a round too
-    /// small to resolve, is refused rather than used.
+    /// Each lane is gated on the references beside it, not on a pass-wide
+    /// figure: the same lane CPU is within budget under a slow reference
+    /// and over it under a fast one, with every bracket inside the drift
+    /// limit.
     #[test]
-    fn an_unusable_reference_fails_the_pass() {
+    fn each_lane_is_gated_against_its_adjacent_references() {
+        let budget = &WORKER_CPU_BUDGETS[0];
+        // One lane CPU, set to 0.9 of the budget under a 40 ms reference.
+        let lane_cpu = budget.relative_cpu * 40.0 * 0.9;
+        let gate = |before: f64, after: f64| {
+            let reference =
+                reference_cpu(budget.lane, vec![before; 3], vec![after; 3]).expect("reference");
+            LaneCpu {
+                budget,
+                events_per_round: 20,
+                rounds_cpu_ms: vec![lane_cpu],
+            }
+            .gate(reference)
+        };
+        // Reference measurements down a pass whose runner slows by 1.2x
+        // per lane: 40, 48, 57.6. No bracket drifts past the limit, but
+        // the pass as a whole (40 to 57.6, 1.44x) would have.
+        let references = [40.0, 48.0, 57.6];
+        let first = gate(references[0], references[1]);
+        let second = gate(references[1], references[2]);
+        assert!(close(first.reference.cpu_ms, 40.0));
+        assert!(close(second.reference.cpu_ms, 48.0));
+        assert!(close(first.reference.drift, 1.2));
+        assert!(close(first.relative_cpu, budget.relative_cpu * 0.9));
+        assert!(close(
+            second.relative_cpu,
+            budget.relative_cpu * 0.9 * 40.0 / 48.0
+        ));
+        assert!(close(second.budget_ms, budget.relative_cpu * 48.0));
+        assert!(!first.over_budget);
+        assert!(!second.over_budget);
+        // The same lane CPU against a faster adjacent reference is over.
+        let fast = gate(30.0, 31.0);
+        assert!(close(fast.reference.cpu_ms, 30.0));
+        assert!(fast.over_budget);
+    }
+
+    /// A bracket that moved past the limit, or a round too small to
+    /// resolve, is refused naming the lane rather than used.
+    #[test]
+    fn an_unusable_reference_fails_the_pass_naming_the_lane() {
         let moved = 40.0 * REFERENCE_DRIFT_LIMIT * 1.01;
-        assert!(reference_cpu(vec![40.0; 3], vec![moved; 3]).is_err());
-        assert!(reference_cpu(vec![moved; 3], vec![40.0; 3]).is_err());
-        assert!(reference_cpu(vec![40.0, 9.9, 40.0], vec![40.0; 3]).is_err());
-        assert!(reference_cpu(vec![40.0; 3], vec![40.0 * REFERENCE_DRIFT_LIMIT; 3]).is_ok());
+        for (before, after) in [(40.0, moved), (moved, 40.0)] {
+            let error = reference_cpu("stats", vec![before; 3], vec![after; 3])
+                .expect_err("drifted bracket")
+                .to_string();
+            assert!(error.contains("`stats`"), "{error}");
+            assert!(error.contains("40.00 ms"), "{error}");
+            assert!(error.contains(&format!("{moved:.2} ms")), "{error}");
+        }
+        let error = reference_cpu("stats", vec![40.0, 9.9, 40.0], vec![40.0; 3])
+            .expect_err("unresolvable round")
+            .to_string();
+        assert!(error.contains("`stats`"), "{error}");
+        assert!(
+            reference_cpu(
+                "stats",
+                vec![40.0; 3],
+                vec![40.0 * REFERENCE_DRIFT_LIMIT; 3]
+            )
+            .is_ok()
+        );
     }
 
     /// Idle samples are not CPU; every other sample is one interval.
