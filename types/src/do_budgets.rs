@@ -693,18 +693,14 @@ pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
         relative_cpu: 0.10,
     },
     WorkerCpuBudget {
-        // Provisional until a Traffic cost run measures the pending
-        // index (stow#932). Run 40631853262 measured 0.214 (4.745 ms of
-        // 22.2 ms) while `GET /status` and a human request's lane
-        // position still walked the whole node arena.
+        // Counters and the pending human-lane index (stow#932).
+        // Run 40637518261: 0.069 (1.645 ms of 23.7 ms).
         lane: "status-read",
-        relative_cpu: 0.125,
+        relative_cpu: 0.15,
     },
     WorkerCpuBudget {
-        // Provisional until a Traffic cost run measures the pending
-        // index (stow#932). Run 40631853262 measured 0.441 (9.8 ms of
-        // 22.2 ms) while the counts and the oldest pending request still
-        // walked the whole node arena.
+        // Counters and the pending-age index (stow#932).
+        // Run 40637518261: 0.116 (2.74 ms of 23.7 ms).
         lane: "admin-status",
         relative_cpu: 0.25,
     },
