@@ -44,6 +44,9 @@ smol = "2"
 tempfile = "3"
 toml_edit = "0.25"
 cargo-config2 = "0.1"
+# `head_id` resolves a checkout's reset commit — the git source's
+# identity input (stow#1006).
+gix = { version = "0.85", default-features = false, features = ["revision", "sha1"] }
 url = "2"
 find-msvc-tools = "0.1.13"
 zenwave.workspace = true

@@ -845,6 +845,7 @@ fn drain_stub(endpoint: &str, stub: &StubSupervisor) {
             std::ffi::OsString::from("--crate-name"),
             std::ffi::OsString::from("drain_probe"),
         ],
+        stow_cli::protocol::InvocationEnv::default(),
     ));
     let body = serde_json::to_vec(&request).expect("encode probe frame");
     probe

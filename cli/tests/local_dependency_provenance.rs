@@ -41,6 +41,18 @@ fn compiled_behind_local_dependency(stderr: &str, crate_name: &str) -> bool {
     })
 }
 
+/// The debug event the classification emits when a unit is not a cache
+/// unit at all — a path crate is `Uncached(PathSource)` under stow#1006,
+/// which is strictly stronger than "sent local": it can never be
+/// served, so nothing it links can deliver the wrong bytes.
+fn compiled_uncached_path_source(stderr: &str, crate_name: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.contains("unit is not a cache unit; compiling")
+            && line.contains(&format!("crate_name={crate_name} "))
+            && line.contains("reason=PathSource")
+    })
+}
+
 /// One tiny path lib at `dir` — the manifest's `[dependencies]` table
 /// verbatim, so a rename or a nested path dep is spelled by the caller.
 fn write_path_lib(dir: &Path, name: &str, dependencies: &str) {
@@ -192,16 +204,24 @@ fn a_renamed_dependency_compiled_locally_sends_its_consumer_local() {
     let output = build(target_b.path(), "build 2");
     let stderr = stderr_of(&output);
 
-    // `top` links `libmiddle-<hash>` under the alias `renamed`: an
-    // alias-keyed marker misses it entirely (stow#733), so this event
-    // firing is the regression being closed.
+    // `top` and `middle` are path crates: under stow#1006 they classify
+    // `Uncached(PathSource)` — they compile unconditionally, which is
+    // stronger than "sent local by the marker" (stow#733's bad-bytes
+    // outcome can never apply to a unit that cannot be served). The
+    // renamed-`--extern` marker check the old assertion exercised is
+    // unreachable for them now; `proc-macro2`/`quote` below still
+    // exercise `must_build_locally` for the crates.io chain.
     assert!(
-        compiled_behind_local_dependency(&stderr, "top"),
-        "the consumer of the renamed local build was not sent local:\n{stderr}"
+        compiled_uncached_path_source(&stderr, "top"),
+        "the path-crate consumer of the renamed local build was not compiled uncached:\n{stderr}"
     );
     assert!(
-        compiled_behind_local_dependency(&stderr, "middle"),
-        "the consumer of a plainly-named local build was not sent local:\n{stderr}"
+        compiled_uncached_path_source(&stderr, "middle"),
+        "the path-crate consumer of a plainly-named local build was not compiled uncached:\n{stderr}"
+    );
+    assert!(
+        compiled_uncached_path_source(&stderr, "inner"),
+        "the path-crate leaf was not compiled uncached:\n{stderr}"
     );
     assert!(
         !compiled_behind_local_dependency(&stderr, "inner"),

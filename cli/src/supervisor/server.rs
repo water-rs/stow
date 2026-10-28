@@ -37,6 +37,7 @@ pub trait Handler: Send + Sync + 'static {
         self: &Arc<Self>,
         executable: std::ffi::OsString,
         args: Vec<std::ffi::OsString>,
+        env: crate::supervisor::protocol::InvocationEnv,
     ) -> impl Future<Output = Decision<Self::Pending>> + Send;
 
     /// Finish the work that only exists after a real compile.
@@ -85,6 +86,8 @@ pub struct Observation {
     /// `None` marks the unit as compiling locally; `Some` reports how the
     /// finished compile exited.
     pub success: Option<bool>,
+    /// The invocation's environment the supervisor cannot see.
+    pub env: crate::supervisor::protocol::InvocationEnv,
 }
 
 /// A handler's decision about one invocation.
@@ -742,7 +745,7 @@ async fn answer_plan<H: Handler>(
         },
         Err(_) => None,
     };
-    match handler.plan(executable, args).await {
+    match handler.plan(executable, args, plan.env).await {
         Decision::Served(notifications) => Answer::Served(notifications),
         Decision::Compile(pending) => {
             let (sender, allocated) = oneshot::channel();
@@ -823,6 +826,7 @@ async fn answer_observation<H: Handler>(
             executable,
             args,
             success: observed.success,
+            env: observed.env,
         })
         .await;
 }
@@ -896,6 +900,7 @@ mod tests {
             self: &Arc<Self>,
             _executable: OsString,
             args: Vec<OsString>,
+            _env: crate::supervisor::protocol::InvocationEnv,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
             std::future::ready(if args.first().is_some_and(|arg| arg == "--serve-me") {
                 Decision::Served(ArtifactNotifications::default())
@@ -1015,6 +1020,7 @@ mod tests {
                 self: &Arc<Self>,
                 _executable: OsString,
                 _args: Vec<OsString>,
+                _env: crate::supervisor::protocol::InvocationEnv,
             ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
                 std::future::ready(Decision::Served(ArtifactNotifications::default()))
             }
@@ -1205,6 +1211,7 @@ mod tests {
             self: &Arc<Self>,
             _executable: OsString,
             _args: Vec<OsString>,
+            _env: crate::supervisor::protocol::InvocationEnv,
         ) -> impl std::future::Future<Output = Decision<Self::Pending>> + Send {
             std::future::ready(Decision::Served(ArtifactNotifications::default()))
         }
@@ -1290,6 +1297,7 @@ mod tests {
                 OsString::from("lib"),
             ],
             Some(true),
+            crate::supervisor::protocol::InvocationEnv::default(),
         );
         write_frame(&mut *stream, &Request::Observed(report))
             .await

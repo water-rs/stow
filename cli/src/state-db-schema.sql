@@ -131,6 +131,10 @@ CREATE TABLE materialized_outputs (
     -- `outputs_instance_digest` of the artifact instance at this path —
     -- which exact bytes a dependent's `--extern` resolves to.
     instance TEXT NOT NULL,
+    -- `Reach` (`stow_types::public_cache`) as its small integer: a
+    -- dependent folds this column into its own reach, so a git-sourced
+    -- or codegen-keyed dep marks every consumer local-only (stow#1006).
+    reach INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
 

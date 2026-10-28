@@ -83,10 +83,12 @@ pub struct ParsedRustcArgs {
     /// bitcode is a different artifact, so it participates in the compile
     /// key.
     pub embed_bitcode: bool,
-    /// Whether the invocation (or `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS`)
-    /// carries codegen flags stow does not model; such builds are never
-    /// served from the public cache.
-    pub has_custom_codegen: bool,
+    /// The `-C` / `-Z` options the registry identity does not model,
+    /// normalized to their `-C key=value` / `-Z key=value` spellings —
+    /// argv and the `RUSTFLAGS` / `CARGO_ENCODED_RUSTFLAGS` effect both.
+    /// Sorted and folded into the compile key, so two invocations with the
+    /// same extra options share one local identity.
+    pub extra_codegen: BTreeSet<String>,
     /// The `-C` options that steer only the final link step, normalized to
     /// their `key=value` spelling and sorted. Inert for a unit that never
     /// reaches the linker, and part of the compile key for one that does —
@@ -132,7 +134,7 @@ impl ParsedRustcArgs {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: true,
-            has_custom_codegen: env_effect.custom_codegen,
+            extra_codegen: env_effect.extra_codegen,
             link_options: env_effect.link_options,
         };
 
@@ -154,23 +156,66 @@ impl ParsedRustcArgs {
         Ok(parsed)
     }
 
-    /// Whether this invocation may be served from the public cache.
+    /// Classify this invocation for the cache: a keyed unit — its source,
+    /// its normalized extra codegen options and its artifact shape — or
+    /// the reason the cache can never hold it.
     ///
-    /// Requires a restorable artifact, no custom codegen flags, and no
-    /// `CARGO_PRIMARY_PACKAGE` (workspace crates are never cached). The
-    /// profile is not a restriction: `opt-level`, `debuginfo`, assertions,
-    /// `panic` and `strip` are all part of the compile identity, so a unit
-    /// built under any profile is served exactly when the pool holds an
-    /// artifact built under the same one.
+    /// `source` is the source detection's answer: the unit's immutable
+    /// source identity, or the [`UncachedReason`] the detection itself
+    /// settled on (no source slot, a registry that is not crates.io, a git
+    /// checkout whose commit could not be verified). `primary_package` is
+    /// the invocation's own `CARGO_PRIMARY_PACKAGE` fact — passed in
+    /// because the deciding process's environment is not the invocation's
+    /// under a supervised build.
     #[must_use]
-    pub fn is_cacheable(&self) -> bool {
-        if !self.is_restorable_artifact() {
-            return false;
+    pub fn unit_class(
+        &self,
+        source: Result<crate::public_cache::UnitSource, UncachedReason>,
+        primary_package: bool,
+    ) -> UnitClass {
+        let Some(shape) = self.unit_shape_kind() else {
+            return UnitClass::Uncached(UncachedReason::UnrestorableCrateType(
+                self.crate_types.join(","),
+            ));
+        };
+        if self.c_metadata.is_none() || self.out_dir.is_none() {
+            return UnitClass::Uncached(UncachedReason::NoMetadataOrOutDir);
         }
-        if self.has_custom_codegen {
-            return false;
+        if primary_package {
+            return UnitClass::Uncached(UncachedReason::PrimaryPackage);
         }
-        std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
+        for option in &self.extra_codegen {
+            if option.starts_with("-C incremental") {
+                return UnitClass::Uncached(UncachedReason::Incremental);
+            }
+            if is_unfoldable_codegen_option(option) || option == "-C target-cpu=native" {
+                return UnitClass::Uncached(UncachedReason::UnfoldableOption(option.clone()));
+            }
+        }
+        match source {
+            Err(reason) => UnitClass::Uncached(reason),
+            Ok(source) => UnitClass::Keyed {
+                source,
+                extra_codegen: self.extra_codegen.iter().cloned().collect(),
+                shape,
+            },
+        }
+    }
+
+    /// The artifact shape the invocation produces for the cache — the
+    /// unit's library kind — or `None` when no crate type is restorable.
+    #[must_use]
+    fn unit_shape_kind(&self) -> Option<UnitShapeKind> {
+        if self.is_proc_macro() {
+            return Some(UnitShapeKind::ProcMacro);
+        }
+        if self.produces_dynamic_library() {
+            return Some(UnitShapeKind::Dylib);
+        }
+        if self.produces_rlib() {
+            return Some(UnitShapeKind::Rlib);
+        }
+        None
     }
 
     /// The link-only `-C` options that actually reach a link step here,
@@ -212,23 +257,6 @@ impl ParsedRustcArgs {
         self.crate_types
             .iter()
             .any(|kind| matches!(kind.as_str(), "proc-macro" | "dylib" | "cdylib" | "bin"))
-    }
-
-    /// Whether this invocation's outputs may be stored in the local artifact
-    /// cache after a successful build.
-    ///
-    /// The gate is deliberately narrower than [`Self::is_cacheable`] in one
-    /// direction and wider in another: the artifacts are self-produced, so
-    /// there is no profile restriction — dev *and* release outputs are worth
-    /// keeping because cross-worktree release rebuilds are exactly where a
-    /// local cache pays. What remains mandatory is a restorable artifact
-    /// shape, no custom codegen flags, and not being the workspace's primary
-    /// package (`CARGO_PRIMARY_PACKAGE`): first-party code is never cached.
-    #[must_use]
-    pub fn is_locally_cacheable(&self) -> bool {
-        self.is_restorable_artifact()
-            && !self.has_custom_codegen
-            && std::env::var_os("CARGO_PRIMARY_PACKAGE").is_none()
     }
 
     /// Whether the invocation produces an artifact stow can restore: an rlib
@@ -421,6 +449,109 @@ impl ParsedRustcArgs {
     }
 }
 
+/// The classification one rustc invocation gets: keyed under a source
+/// identity the cache can express, or excluded with its reason, so no
+/// call site can store or serve a unit the scope excludes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnitClass {
+    /// The unit carries an immutable source identity and a restorable
+    /// shape: the cache keys it.
+    Keyed {
+        /// Where the unit's source of truth lives.
+        source: crate::public_cache::UnitSource,
+        /// The sorted, normalized `-C`/`-Z` options the registry
+        /// identity does not model — folded into the compile key.
+        extra_codegen: Vec<String>,
+        /// The restorable artifact shape the unit produces.
+        shape: UnitShapeKind,
+    },
+    /// The cache never holds this unit — never stored, never served.
+    Uncached(UncachedReason),
+}
+
+impl UnitClass {
+    /// Whether the unit's own identity already forbids a remote lookup —
+    /// a git source or extra codegen the builder never publishes — before
+    /// its dependencies' reach is even folded in.
+    #[must_use]
+    pub const fn source_local_only(&self) -> bool {
+        match self {
+            Self::Keyed {
+                source,
+                extra_codegen,
+                ..
+            } => {
+                !extra_codegen.is_empty()
+                    || matches!(source, crate::public_cache::UnitSource::Git { .. })
+            }
+            Self::Uncached(_) => false,
+        }
+    }
+}
+
+/// The restorable artifact shapes the cache holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitShapeKind {
+    /// An `rlib`/`lib` archive — never linked.
+    Rlib,
+    /// A `dylib` dynamic library.
+    Dylib,
+    /// A `proc-macro` dynamic library.
+    ProcMacro,
+}
+
+/// Why a unit is uncached: the reason a debug line names next to the
+/// crate name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UncachedReason {
+    /// The input file sits under neither a registry `src/` slot nor a
+    /// cargo `git/checkouts/` slot — a path dependency, a workspace
+    /// member or a vendored copy.
+    PathSource,
+    /// `CARGO_PRIMARY_PACKAGE` was set on the invocation — the crate the
+    /// user is building is never cached.
+    PrimaryPackage,
+    /// `-C incremental` on the invocation: incremental objects depend on
+    /// the incremental work directory, which the key cannot see.
+    Incremental,
+    /// A `-C`/`-Z` option whose output depends on a file or a location
+    /// the key cannot see.
+    UnfoldableOption(String),
+    /// No crate type stow restores: `cdylib`, `staticlib`, `bin` and
+    /// friends.
+    UnrestorableCrateType(String),
+    /// A restorable shape without `-C metadata` or `--out-dir`.
+    NoMetadataOrOutDir,
+    /// A registry package whose source is not crates.io — it must never
+    /// take the crates.io identity of the same name and version.
+    NonCratesIoRegistry,
+    /// A git checkout whose resolved commit could not be read or whose
+    /// `<short id>` directory is not a prefix of it — the identity the
+    /// source would have keyed under cannot be verified.
+    GitIdentityFailed,
+}
+
+/// Options whose output depends on a file or a location the compile key
+/// cannot see — never folded, always uncached.
+fn is_unfoldable_codegen_option(option: &str) -> bool {
+    let name = option
+        .split_once(' ')
+        .map_or(option, |(_, rest)| rest)
+        .split('=')
+        .next()
+        .unwrap_or_default();
+    match option.split(' ').next().unwrap_or_default() {
+        "-C" => matches!(name, "profile-use" | "profile-sample-use"),
+        "-Z" => {
+            matches!(name, "codegen-backend" | "llvm-plugins" | "temps-dir")
+                || name.starts_with("split-dwarf")
+                || name.starts_with("self-profile")
+                || name.starts_with("dump-")
+        }
+        _ => false,
+    }
+}
+
 fn apply_rustc_arg<'a>(
     arg: &str,
     iter: &mut impl Iterator<Item = &'a OsString>,
@@ -589,7 +720,9 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
     let Some((key, value)) = option.split_once('=') else {
         match option {
             "prefer-dynamic" => {}
-            _ => parsed.has_custom_codegen = true,
+            _ => {
+                parsed.extra_codegen.insert(format!("-C {option}"));
+            }
         }
         return Ok(());
     };
@@ -608,7 +741,9 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
         _ if is_link_only_codegen_option(option) => {
             parsed.link_options.insert(option.to_owned());
         }
-        _ => parsed.has_custom_codegen = true,
+        _ => {
+            parsed.extra_codegen.insert(format!("-C {option}"));
+        }
     }
 
     Ok(())
@@ -636,13 +771,15 @@ fn is_link_only_codegen_option(option: &str) -> bool {
 
 /// Handle a `-Z` option. `embed-metadata` is the flag nightly cargo emits on
 /// every unit and is modeled as compile identity; every other `-Z` option
-/// marks the invocation as custom codegen, same as before.
+/// joins the normalized extra-codegen set the compile key folds.
 fn parse_unstable_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<(), String> {
     match option.split_once('=') {
         Some(("embed-metadata", value)) => {
             parsed.embed_metadata = Some(parse_bool(value)?);
         }
-        _ => parsed.has_custom_codegen = true,
+        _ => {
+            parsed.extra_codegen.insert(format!("-Z {option}"));
+        }
     }
     Ok(())
 }
@@ -755,11 +892,13 @@ fn next_str<'a>(
         .ok_or_else(|| format!("value after {flag} is not valid UTF-8"))
 }
 
-/// What the process-wide rustflags contribute to cacheability.
+/// What the process-wide rustflags contribute to the invocation's
+/// identity.
 #[derive(Debug, Default, Clone)]
 struct EnvRustflagsEffect {
-    /// A flag that changes the compiled objects: disqualifying outright.
-    custom_codegen: bool,
+    /// The normalized `-C`/`-Z` options the registry identity does not
+    /// model — folded into the compile key.
+    extra_codegen: BTreeSet<String>,
     /// Flags that steer only the final link step: inert for a unit that
     /// never links, part of the key for one that does.
     link_options: BTreeSet<String>,
@@ -771,70 +910,93 @@ struct EnvRustflagsEffect {
 /// being compiled — the caller decides what a link option means for the
 /// unit it holds.
 fn env_rustflags_effect() -> EnvRustflagsEffect {
-    if std::env::var_os("CARGO_ENCODED_RUSTFLAGS").is_none()
-        && std::env::var_os("RUSTFLAGS").is_none()
+    let mut effect = EnvRustflagsEffect::default();
+    if let Some(encoded) = std::env::var("CARGO_ENCODED_RUSTFLAGS")
+        .ok()
+        .filter(|value| !value.is_empty())
     {
-        return EnvRustflagsEffect::default();
+        let mut flags = encoded
+            .split('\x1f')
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        apply_env_rustflags(&mut flags, &mut effect, &encoded);
     }
-
-    let mut flags = encoded_rustflags();
     match split_rustflags_env() {
-        Ok(extra) => flags.extend(extra),
+        Ok(extra) => {
+            let mut flags = extra.into_iter();
+            apply_env_rustflags(&mut flags, &mut effect, "RUSTFLAGS");
+        }
         Err(error) => {
+            // The variable cannot be decomposed into options, so the
+            // whole raw value is the key input: still deterministic, still
+            // distinct from every decomposable spelling.
             tracing::warn!(
                 %error,
-                "RUSTFLAGS could not be parsed — treating as custom codegen (cache disabled)"
+                "RUSTFLAGS could not be parsed — keying on its raw value"
             );
-            return EnvRustflagsEffect {
-                custom_codegen: true,
-                link_options: BTreeSet::new(),
-            };
-        }
-    }
-
-    let custom = EnvRustflagsEffect {
-        custom_codegen: true,
-        link_options: BTreeSet::new(),
-    };
-    let mut effect = EnvRustflagsEffect::default();
-    let mut iter = flags.into_iter();
-    while let Some(flag) = iter.next() {
-        match flag.as_str() {
-            "--remap-path-prefix" => {
-                if iter.next().is_none() {
-                    return custom;
-                }
-            }
-            _ if flag.starts_with("--remap-path-prefix=") => {}
-            "-C" | "--codegen" => match iter.next() {
-                Some(option) if is_link_only_codegen_option(&option) => {
-                    effect.link_options.insert(option);
-                }
-                _ => return custom,
-            },
-            _ => {
-                let Some(option) = flag
-                    .strip_prefix("-C")
-                    .or_else(|| flag.strip_prefix("--codegen="))
-                    .filter(|option| is_link_only_codegen_option(option))
-                else {
-                    return custom;
-                };
-                effect.link_options.insert(option.to_owned());
+            if let Ok(raw) = std::env::var("RUSTFLAGS") {
+                effect.extra_codegen.insert(format!("rustflags-env={raw}"));
             }
         }
     }
-
     effect
 }
 
-fn encoded_rustflags() -> Vec<String> {
-    std::env::var("CARGO_ENCODED_RUSTFLAGS")
-        .ok()
-        .into_iter()
-        .flat_map(|value| value.split('\x1f').map(str::to_owned).collect::<Vec<_>>())
-        .filter(|value| !value.is_empty())
-        .collect()
+/// Fold one rustflags token stream into the effect. `-C`/`--codegen`
+/// options normalize to their `-C <option>` spelling, `-Z` options to
+/// `-Z <option>`; any other flag is folded verbatim — every spelling is
+/// deterministic, and an unmatched spelling only ever costs a miss.
+fn apply_env_rustflags(
+    flags: &mut impl Iterator<Item = String>,
+    effect: &mut EnvRustflagsEffect,
+    raw: &str,
+) {
+    while let Some(flag) = flags.next() {
+        match flag.as_str() {
+            "--remap-path-prefix" => {
+                let Some(value) = flags.next() else {
+                    effect.extra_codegen.insert(format!("rustflags-env={raw}"));
+                    return;
+                };
+                let _ = value;
+            }
+            _ if flag.starts_with("--remap-path-prefix=") => {}
+            "-C" | "--codegen" => {
+                let Some(option) = flags.next() else {
+                    effect.extra_codegen.insert(format!("rustflags-env={raw}"));
+                    return;
+                };
+                apply_env_codegen_option(&option, effect);
+            }
+            "-Z" => {
+                let Some(option) = flags.next() else {
+                    effect.extra_codegen.insert(format!("rustflags-env={raw}"));
+                    return;
+                };
+                effect.extra_codegen.insert(format!("-Z {option}"));
+            }
+            _ => {
+                if let Some(option) = flag
+                    .strip_prefix("-C")
+                    .or_else(|| flag.strip_prefix("--codegen="))
+                {
+                    apply_env_codegen_option(option, effect);
+                } else if let Some(option) = flag.strip_prefix("-Z") {
+                    effect.extra_codegen.insert(format!("-Z {option}"));
+                } else {
+                    effect.extra_codegen.insert(flag);
+                }
+            }
+        }
+    }
+}
+
+fn apply_env_codegen_option(option: &str, effect: &mut EnvRustflagsEffect) {
+    if is_link_only_codegen_option(option) {
+        effect.link_options.insert(option.to_owned());
+    } else {
+        effect.extra_codegen.insert(format!("-C {option}"));
+    }
 }
 
 fn split_rustflags_env() -> Result<Vec<String>, shell_words::ParseError> {
@@ -846,11 +1008,29 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
-    use super::ParsedRustcArgs;
+    use super::{ParsedRustcArgs, UncachedReason, UnitClass};
     use crate::platform::StripLevel;
 
     fn args(parts: &[&str]) -> Vec<std::ffi::OsString> {
         parts.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    /// A crates.io source for classification assertions — the source
+    /// detection itself lives in the wrapper, which owns the filesystem
+    /// probes.
+    fn test_source() -> crate::public_cache::UnitSource {
+        crate::public_cache::UnitSource::CratesIo {
+            package: "itoa".to_owned(),
+            version: "1.0.0".to_owned(),
+        }
+    }
+
+    /// Whether the invocation classifies as a keyed unit.
+    fn keyed(parsed: &ParsedRustcArgs) -> bool {
+        matches!(
+            parsed.unit_class(Ok(test_source()), false),
+            UnitClass::Keyed { .. }
+        )
     }
 
     fn with_clean_rustc_env<T>(f: impl FnOnce() -> T) -> T {
@@ -909,7 +1089,7 @@ mod tests {
             assert_eq!(parsed.crate_name, "itoa");
             assert_eq!(parsed.target.as_deref(), Some("aarch64-apple-darwin"));
             assert_eq!(parsed.c_metadata.as_deref(), Some("abc123"));
-            assert!(parsed.is_cacheable());
+            assert!(keyed(&parsed));
             assert!(parsed.features.contains("default"));
             assert!(
                 parsed
@@ -949,7 +1129,7 @@ mod tests {
                 parsed.out_dir.as_deref(),
                 Some(std::path::Path::new("/tmp/out"))
             );
-            assert!(parsed.is_cacheable());
+            assert!(keyed(&parsed));
             assert!(parsed.features.contains("default"));
             assert!(
                 parsed
@@ -1032,7 +1212,7 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(!parsed.is_cacheable());
+            assert!(!keyed(&parsed));
         });
     }
 
@@ -1056,7 +1236,7 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(parsed.is_cacheable());
+            assert!(keyed(&parsed));
             assert!(parsed.is_proc_macro());
         });
     }
@@ -1083,8 +1263,8 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(parsed.is_cacheable());
-            assert!(parsed.is_locally_cacheable());
+            assert!(keyed(&parsed));
+            assert!(keyed(&parsed));
             let profile = parsed.profile().expect("profile");
             assert_eq!(profile.opt_level, "3");
             assert!(!profile.debug_assertions);
@@ -1095,7 +1275,6 @@ mod tests {
     #[serial_test::serial]
     fn primary_package_is_never_locally_cacheable() {
         with_clean_rustc_env(|| {
-            unsafe { std::env::set_var("CARGO_PRIMARY_PACKAGE", "1") };
             let parsed = ParsedRustcArgs::parse(&args(&[
                 "--crate-name",
                 "itoa",
@@ -1110,13 +1289,17 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(!parsed.is_locally_cacheable());
+            assert!(keyed(&parsed));
+            assert_eq!(
+                parsed.unit_class(Ok(test_source()), true),
+                UnitClass::Uncached(UncachedReason::PrimaryPackage)
+            );
         });
     }
 
     #[test]
     #[serial_test::serial]
-    fn custom_codegen_is_never_locally_cacheable() {
+    fn an_unresolved_native_target_cpu_is_never_cached() {
         with_clean_rustc_env(|| {
             let parsed = ParsedRustcArgs::parse(&args(&[
                 "--crate-name",
@@ -1134,7 +1317,19 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(!parsed.is_locally_cacheable());
+            // `native` is still keyed: the wrapper resolves it to the
+            // concrete CPU before classifying. A `native` that survives to
+            // the classifier means resolution failed — never cached.
+            assert_eq!(
+                parsed.extra_codegen.iter().next().map(String::as_str),
+                Some("-C target-cpu=native")
+            );
+            assert_eq!(
+                parsed.unit_class(Ok(test_source()), false),
+                UnitClass::Uncached(UncachedReason::UnfoldableOption(
+                    "-C target-cpu=native".to_owned()
+                ))
+            );
         });
     }
 
@@ -1165,8 +1360,8 @@ mod tests {
                 ]))
                 .expect("parser should succeed");
 
-                assert!(!parsed.has_custom_codegen, "{option} marked custom");
-                assert!(parsed.is_cacheable(), "{option} made unit uncacheable");
+                assert!(parsed.extra_codegen.is_empty(), "{option} marked custom");
+                assert!(keyed(&parsed), "{option} made unit uncacheable");
             }
         });
     }
@@ -1203,15 +1398,15 @@ mod tests {
                     "{crate_type} lost the link option the key needs"
                 );
                 assert!(
-                    !parsed.has_custom_codegen,
+                    parsed.extra_codegen.is_empty(),
                     "{crate_type} was misfiled as custom codegen"
                 );
                 assert!(
-                    parsed.is_cacheable(),
+                    keyed(&parsed),
                     "{crate_type} with a link option was refused instead of keyed"
                 );
                 assert!(
-                    parsed.is_locally_cacheable(),
+                    keyed(&parsed),
                     "{crate_type} with a link option was refused by the local cache"
                 );
             }
@@ -1250,7 +1445,7 @@ mod tests {
                 parsed.link_options_reaching_the_linker().is_empty(),
                 "an rlib reported a link option as reaching the linker"
             );
-            assert!(parsed.is_cacheable(), "a mold-built rlib stopped serving");
+            assert!(keyed(&parsed), "a mold-built rlib stopped serving");
         });
     }
     #[test]
@@ -1315,7 +1510,7 @@ mod tests {
                 vec!["link-arg=-L/opt/custom/lib".to_owned()],
                 "a lib+cdylib unit dropped the link option from its key"
             );
-            assert!(parsed.is_cacheable(), "a lib+cdylib unit stopped serving");
+            assert!(keyed(&parsed), "a lib+cdylib unit stopped serving");
         });
     }
 
@@ -1364,22 +1559,21 @@ mod tests {
             vec!["link-arg=-fuse-ld=mold".to_owned()],
             "a linked unit lost the rustflags link option from its key"
         );
-        assert!(
-            linked.is_cacheable(),
-            "a mold-linked proc-macro stopped serving"
-        );
+        assert!(keyed(&linked), "a mold-linked proc-macro stopped serving");
         assert!(
             rlib.link_options_reaching_the_linker().is_empty(),
             "an rlib took a rustflags link option into its key"
         );
-        assert!(rlib.is_cacheable(), "the rlib stopped being cacheable");
+        assert!(keyed(&rlib), "the rlib stopped being cacheable");
     }
 
     #[test]
     #[serial_test::serial]
     fn codegen_flags_that_change_objects_stay_custom() {
         with_clean_rustc_env(|| {
-            for option in ["linker-plugin-lto", "link-dead-code=y", "target-cpu=native"] {
+            // Foldable options key into extra-codegen: the unit stays a
+            // cache unit, local-only by reach (stow#1006).
+            for option in ["linker-plugin-lto", "link-dead-code=y"] {
                 let parsed = ParsedRustcArgs::parse(&args(&[
                     "--crate-name",
                     "itoa",
@@ -1396,9 +1590,37 @@ mod tests {
                 ]))
                 .expect("parser should succeed");
 
-                assert!(parsed.has_custom_codegen, "{option} lost its marking");
-                assert!(!parsed.is_locally_cacheable());
+                let UnitClass::Keyed {
+                    ref extra_codegen, ..
+                } = parsed.unit_class(Ok(test_source()), false)
+                else {
+                    panic!("{option} should key into extra-codegen");
+                };
+                assert!(
+                    extra_codegen.contains(&format!("-C {option}")),
+                    "{option} lost its marking"
+                );
             }
+
+            // A `target-cpu=native` that survives the wrapper's
+            // resolution is not deterministically representable —
+            // uncached, never keyed.
+            let parsed = ParsedRustcArgs::parse(&args(&[
+                "--crate-name",
+                "itoa",
+                "--crate-type",
+                "rlib",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--out-dir",
+                "/tmp/out",
+                "-C",
+                "metadata=abc123",
+                "-C",
+                "target-cpu=native",
+            ]))
+            .expect("parser should succeed");
+            assert!(!keyed(&parsed));
         });
     }
 
@@ -1424,9 +1646,9 @@ mod tests {
                     ParsedRustcArgs::parse(&args(&invocation)).expect("parser should succeed");
 
                 assert_eq!(parsed.embed_metadata, Some(false));
-                assert!(!parsed.has_custom_codegen);
-                assert!(parsed.is_locally_cacheable());
-                assert!(parsed.is_cacheable());
+                assert!(parsed.extra_codegen.is_empty());
+                assert!(keyed(&parsed));
+                assert!(keyed(&parsed));
             }
         });
     }
@@ -1452,7 +1674,7 @@ mod tests {
             .expect("parser should succeed");
 
             assert_eq!(parsed.embed_metadata, Some(true));
-            assert!(!parsed.has_custom_codegen);
+            assert!(parsed.extra_codegen.is_empty());
         });
     }
 
@@ -1478,8 +1700,8 @@ mod tests {
                     ParsedRustcArgs::parse(&args(&invocation)).expect("parser should succeed");
 
                 assert_eq!(parsed.embed_metadata, None);
-                assert!(parsed.has_custom_codegen);
-                assert!(!parsed.is_locally_cacheable());
+                assert!(keyed(&parsed));
+                assert!(!parsed.extra_codegen.is_empty());
             }
         });
     }
@@ -1522,9 +1744,9 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(parsed.is_cacheable());
+            assert!(keyed(&parsed));
             assert!(parsed.is_proc_macro());
-            assert!(!parsed.has_custom_codegen);
+            assert!(parsed.extra_codegen.is_empty());
         });
     }
 
@@ -1548,8 +1770,10 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(!parsed.is_cacheable());
-            assert!(parsed.has_custom_codegen);
+            // An unknown codegen flag is byte-representable: it keys
+            // into extra-codegen and the unit is local-only (stow#1006).
+            assert!(keyed(&parsed));
+            assert!(parsed.extra_codegen.contains("-C mystery-flag"));
         });
     }
 
@@ -1575,8 +1799,8 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(parsed.is_cacheable());
-            assert!(!parsed.has_custom_codegen);
+            assert!(keyed(&parsed));
+            assert!(parsed.extra_codegen.is_empty());
         });
     }
 
@@ -1598,7 +1822,7 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(parsed.is_cacheable());
+            assert!(keyed(&parsed));
         });
     }
 
@@ -1629,7 +1853,7 @@ mod tests {
             .expect("parser should succeed");
 
             assert!(parsed.is_restorable_artifact());
-            assert!(parsed.is_cacheable());
+            assert!(keyed(&parsed));
             assert!(parsed.requests_json_artifact_notifications());
         });
     }
@@ -1658,7 +1882,7 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(parsed.is_cacheable());
+            assert!(keyed(&parsed));
             assert_eq!(
                 parsed
                     .output_dynamic_library_path("x86_64-unknown-linux-gnu")
@@ -1889,8 +2113,8 @@ mod tests {
             std::env::remove_var("RUSTFLAGS");
         }
 
-        assert!(parsed.is_cacheable());
-        assert!(!parsed.has_custom_codegen);
+        assert!(keyed(&parsed));
+        assert!(parsed.extra_codegen.is_empty());
     }
 
     #[test]
@@ -1922,8 +2146,8 @@ mod tests {
                 std::env::remove_var("RUSTFLAGS");
             }
 
-            assert!(parsed.is_cacheable(), "{value} made unit uncacheable");
-            assert!(!parsed.has_custom_codegen, "{value} marked custom");
+            assert!(keyed(&parsed), "{value} made unit uncacheable");
+            assert!(parsed.extra_codegen.is_empty(), "{value} marked custom");
         }
     }
 
@@ -1953,8 +2177,8 @@ mod tests {
             std::env::remove_var("RUSTFLAGS");
         }
 
-        assert!(!parsed.is_cacheable());
-        assert!(parsed.has_custom_codegen);
+        assert!(!keyed(&parsed));
+        assert!(!parsed.extra_codegen.is_empty());
     }
 
     #[test]
@@ -1980,8 +2204,8 @@ mod tests {
             std::env::remove_var("RUSTFLAGS");
         }
 
-        assert!(!parsed.is_cacheable());
-        assert!(parsed.has_custom_codegen);
+        assert!(!keyed(&parsed));
+        assert!(!parsed.extra_codegen.is_empty());
     }
 
     #[test]
@@ -2051,7 +2275,7 @@ mod tests {
             "strip=debuginfo",
         ]))
         .expect("parser should succeed");
-        assert!(!parsed.has_custom_codegen);
+        assert!(parsed.extra_codegen.is_empty());
         assert_eq!(parsed.strip.as_deref(), Some("debuginfo"));
         assert_eq!(
             parsed.profile().expect("profile").strip,

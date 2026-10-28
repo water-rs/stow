@@ -252,16 +252,29 @@ async fn run_inner(
         tracing::debug_span!("stow.precargo.config_load").in_scope(|| load_stow_config(state_db));
     invocation.sandbox = resolve_sandbox_request(&invocation, config.as_ref())?;
     let project = begin_project(config.as_ref(), &invocation).await?;
-    let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
+    let mut public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
     }
 
-    if let Some(status) = run_divergent_profile_passthrough(&project, &invocation)
-        .instrument(tracing::debug_span!("stow.precargo.profile_guard"))
-        .await?
+    // Dev-profile LTO used to mean no cache could serve this build —
+    // `-C linker-plugin-lto` had no identity. Now the flag keys into
+    // extra-codegen, so the workspace keeps its *local* cache and loses
+    // only the remote half: every unit is local-only by construction
+    // (stow#1006).
+    if public_cache_mode.is_enabled()
+        && let Some(divergence) =
+            crate::profile_guard::dev_profile_divergence(&project.workspace_root).await?
     {
-        return Ok(status);
+        let message = format!(
+            "warning: stow public cache is disabled for this build because {divergence}; \
+             the local cache still serves its own entries"
+        );
+        write_stdout(&format!("{message}\n"))?;
+        public_cache_mode = PublicCacheMode::Disabled {
+            reason: "profile",
+            message,
+        };
     }
 
     if let Some(status) = Box::pin(try_resolver_fast_path(
@@ -327,38 +340,6 @@ async fn run_inner(
         ))
         .await
     }
-}
-
-/// No-slowdown floor, part 1: a workspace whose dev profile turns on LTO
-/// compiles every dependency with `-C linker-plugin-lto`, which no cache
-/// identity expresses, so no unit can ever hit. Detect that early, skip the
-/// entire resolver/analysis/prefetch machinery, and behave exactly like
-/// cargo. Every other profile knob is part of the compile identity and is
-/// served when the pool holds artifacts built under it. Returns
-/// `Some` with cargo's exit status when the passthrough ran.
-async fn run_divergent_profile_passthrough(
-    project: &ProjectContext,
-    invocation: &CargoInvocation,
-) -> stow_types::error::Result<Option<ExitStatus>> {
-    let Some(divergence) =
-        crate::profile_guard::dev_profile_divergence(&project.workspace_root).await?
-    else {
-        return Ok(None);
-    };
-    tracing::info!(
-        %divergence,
-        "workspace dev profile enables LTO, which no cache identity expresses; \
-         running plain cargo (no acceleration possible for this workspace)"
-    );
-    run_cargo_passthrough(
-        project,
-        &invocation.action,
-        &invocation.cargo_args,
-        project.current_dir(),
-        invocation.sandbox,
-    )
-    .await
-    .map(Some)
 }
 
 /// Phase 0: stow-resolver fast path. When `--no-stow-resolver` is NOT set
@@ -3920,6 +3901,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
             policy_ready: std::sync::Arc::clone(&policy_ready),
             in_flight: in_flight.clone(),
+            registry_sources: crate::RegistrySources::from_lockfile(&project.workspace_root),
         },
         env_base,
         resolution_done.clone(),

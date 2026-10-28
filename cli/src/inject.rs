@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use std::time::UNIX_EPOCH;
 use stow_types::bundle::ArtifactBundleFile;
 use stow_types::error::Context;
-use stow_types::public_cache::{StableRegistryArtifactIdentity, stable_c_metadata_for_compile_key};
+use stow_types::public_cache::{StableUnitIdentity, stable_c_metadata_for_compile_key};
 
 use crate::artifact_cache::CachedArtifactBundle;
 use crate::rustc_args::ParsedRustcArgs;
@@ -118,7 +118,7 @@ pub async fn materialize_original_outputs(
 
 pub async fn materialize_local_build_stable_aliases(
     parsed: &ParsedRustcArgs,
-    identity: &StableRegistryArtifactIdentity,
+    identity: &StableUnitIdentity,
     host: &str,
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
@@ -156,12 +156,17 @@ async fn materialize_cached_bundle_stable_aliases(
     writers: OutputDirWriters,
 ) -> stow_types::error::Result<()> {
     let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
-    let stable_identity = StableRegistryArtifactIdentity {
+    let stable_identity = StableUnitIdentity {
         compile_key: bundle.compile_key.clone(),
         c_metadata: stable_c_metadata.clone(),
         extra_filename: format!("-{stable_c_metadata}"),
         crate_name: bundle.crate_name.clone(),
         version: bundle.crate_version.clone(),
+        source: stow_types::public_cache::UnitSource::CratesIo {
+            package: bundle.crate_name.clone(),
+            version: bundle.crate_version.clone(),
+        },
+        reach: stow_types::public_cache::Reach::Public,
     };
     let stable_parsed = parsed_with_stable_identity(parsed, &stable_identity);
 
@@ -192,7 +197,7 @@ async fn materialize_cached_bundle_stable_aliases(
 
 pub fn parsed_with_stable_identity(
     parsed: &ParsedRustcArgs,
-    identity: &StableRegistryArtifactIdentity,
+    identity: &StableUnitIdentity,
 ) -> ParsedRustcArgs {
     let mut stable = parsed.clone();
     stable.c_metadata = Some(identity.c_metadata.clone());
@@ -661,7 +666,7 @@ mod tests {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
-            has_custom_codegen: false,
+            extra_codegen: std::collections::BTreeSet::new(),
             link_options: std::collections::BTreeSet::new(),
         }
     }

@@ -50,6 +50,48 @@ impl Request {
     }
 }
 
+/// The per-invocation environment the deciding process cannot read for
+/// itself.
+///
+/// Under a supervised build the supervisor's environment is the driver's,
+/// not the invocation's, so the facade carries the values the
+/// classification needs (stow#1006).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvocationEnv {
+    /// The invocation's `CARGO_PRIMARY_PACKAGE` fact — set on the units of
+    /// the crate cargo is building, which are never cached.
+    #[serde(default)]
+    pub primary_package: bool,
+    /// The invocation's `OUT_DIR` — cargo exports it on a links crate's
+    /// units — OS-encoded like the argv.
+    #[serde(default)]
+    pub out_dir: Option<Vec<u8>>,
+}
+
+impl InvocationEnv {
+    /// The values this process's invocation carries — only ever called in
+    /// the facade, which IS the invocation process.
+    #[must_use]
+    pub fn current() -> Self {
+        Self {
+            primary_package: std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
+            out_dir: std::env::var_os("OUT_DIR").map(|value| os_bytes::encode(&value)),
+        }
+    }
+
+    /// The decoded `OUT_DIR`.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn out_dir(&self) -> Result<Option<std::path::PathBuf>, String> {
+        self.out_dir
+            .as_ref()
+            .map(|bytes| os_bytes::decode(bytes).map(std::path::PathBuf::from))
+            .transpose()
+    }
+}
+
 /// One rustc invocation as the facade received it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Plan {
@@ -59,6 +101,9 @@ pub struct Plan {
     pub executable: Vec<u8>,
     /// Everything after the executable, in order.
     pub args: Vec<Vec<u8>>,
+    /// The invocation's environment the supervisor cannot see.
+    #[serde(default)]
+    pub env: InvocationEnv,
 }
 
 /// The facade reporting the compile the supervisor asked for.
@@ -91,6 +136,9 @@ pub struct Observed {
     /// decision, carried as a frame because this unit never asked for a
     /// decision. `Some` reports the finished compile's exit status.
     pub success: Option<bool>,
+    /// The invocation's environment the supervisor cannot see.
+    #[serde(default)]
+    pub env: InvocationEnv,
 }
 
 impl Observed {
@@ -101,12 +149,14 @@ impl Observed {
         executable: &std::ffi::OsStr,
         args: &[OsString],
         success: Option<bool>,
+        env: InvocationEnv,
     ) -> Self {
         Self {
             token,
             executable: os_bytes::encode(executable),
             args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
             success,
+            env,
         }
     }
 
@@ -189,11 +239,17 @@ pub enum Answer {
 impl Plan {
     /// Build a plan for this invocation.
     #[must_use]
-    pub fn new(token: String, executable: &std::ffi::OsStr, args: &[OsString]) -> Self {
+    pub fn new(
+        token: String,
+        executable: &std::ffi::OsStr,
+        args: &[OsString],
+        env: InvocationEnv,
+    ) -> Self {
         Self {
             token,
             executable: os_bytes::encode(executable),
             args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
+            env,
         }
     }
 
@@ -289,6 +345,7 @@ mod tests {
             "token".to_owned(),
             std::ffi::OsStr::new("/usr/bin/rustc"),
             &[OsString::from("--crate-name"), OsString::from("serde")],
+            super::InvocationEnv::default(),
         );
         let mut buffer = Vec::new();
         write_frame(&mut buffer, &Request::Plan(plan.clone()))

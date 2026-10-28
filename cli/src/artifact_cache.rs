@@ -15,7 +15,7 @@ use stow_types::error::Context;
 use stow_types::identity::{CrateName, DependencyCompileKeyIdentity};
 use stow_types::platform::Profile;
 use stow_types::public_cache::{
-    StableRegistryArtifactIdentity, normalized_cache_profile, stable_c_metadata_for_compile_key,
+    StableUnitIdentity, normalized_cache_profile, stable_c_metadata_for_compile_key,
 };
 use stow_types::versioning::is_semver_compatible_upgrade;
 
@@ -91,8 +91,11 @@ pub struct LocalBuildArtifact {
     pub target: String,
     /// The rustc version that produced the outputs.
     pub rustc_version: String,
-    /// The stable registry identity (`compile_key` + 16-hex `c_metadata`).
-    pub identity: StableRegistryArtifactIdentity,
+    /// The stable unit identity (`compile_key` + 16-hex `c_metadata`).
+    pub identity: StableUnitIdentity,
+    /// How far this artifact's identity may travel — a local-only unit
+    /// records rows its dependents fold to `LocalOnly` (stow#1006).
+    pub reach: stow_types::public_cache::Reach,
     /// Canonical features JSON as fed into the compile key.
     pub features_json: String,
     /// The unit's `--extern` deps resolved against `materialized_outputs`,
@@ -1022,12 +1025,17 @@ pub async fn record_materialized_bundle_outputs(
     let dependency_identity = stable_c_metadata.as_str();
     let instance =
         outputs_instance_digest(bundle.outputs.iter().map(|output| output.sha256.as_str()));
-    let stable_identity = StableRegistryArtifactIdentity {
+    let stable_identity = StableUnitIdentity {
         compile_key: bundle.compile_key.clone(),
         c_metadata: stable_c_metadata.clone(),
         extra_filename: format!("-{stable_c_metadata}"),
         crate_name: bundle.crate_name.clone(),
         version: bundle.crate_version.clone(),
+        source: stow_types::public_cache::UnitSource::CratesIo {
+            package: bundle.crate_name.clone(),
+            version: bundle.crate_version.clone(),
+        },
+        reach: stow_types::public_cache::Reach::Public,
     };
     let stable_parsed = parsed_with_stable_identity(parsed, &stable_identity);
 
@@ -1038,6 +1046,7 @@ pub async fn record_materialized_bundle_outputs(
             &output_path,
             dependency_identity,
             &instance,
+            stow_types::public_cache::Reach::Public,
             updated_at_ms,
         )
         .await?;
@@ -1048,6 +1057,7 @@ pub async fn record_materialized_bundle_outputs(
                 &original_path,
                 dependency_identity,
                 &instance,
+                stow_types::public_cache::Reach::Public,
                 updated_at_ms,
             )
             .await?;
@@ -1060,6 +1070,7 @@ pub async fn record_materialized_bundle_outputs(
                 &stable_output_path,
                 dependency_identity,
                 &instance,
+                stow_types::public_cache::Reach::Public,
                 updated_at_ms,
             )
             .await?;
@@ -1091,6 +1102,7 @@ pub async fn record_materialized_closure_outputs(
             &original_path,
             bundle.c_metadata.as_str(),
             &instance,
+            stow_types::public_cache::Reach::Public,
             updated_at_ms,
         )
         .await?;
@@ -1159,6 +1171,7 @@ pub async fn record_materialized_local_build_outputs(
             path,
             dependency_identity,
             &instance,
+            build.reach,
             updated_at_ms,
         )
         .await?;
@@ -1291,6 +1304,9 @@ pub struct ResolvedDependencies {
     /// Each extern's crate, stable identity and recorded instance digest,
     /// in `c_metadata_json` order.
     pub externs: Vec<MaterializedDependency>,
+    /// The tightest reach any extern's row recorded — `LocalOnly` when a
+    /// dependency is git-sourced or codegen-keyed (stow#1006).
+    pub reach: stow_types::public_cache::Reach,
 }
 
 /// One resolved `--extern`: which stable identity the extern path belongs
@@ -1316,6 +1332,7 @@ pub async fn resolve_dependency_c_metadata_json(
             ResolvedDependencies {
                 c_metadata_json: "[]".to_owned(),
                 externs: Vec::new(),
+                reach: stow_types::public_cache::Reach::Public,
             },
         ));
     }
@@ -1328,18 +1345,26 @@ pub async fn resolve_dependency_c_metadata_json(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT output_path, c_metadata, instance FROM materialized_outputs \
+        "SELECT output_path, c_metadata, instance, reach FROM materialized_outputs \
          WHERE output_path IN ({placeholders})"
     );
-    let mut rows = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(sql));
+    let mut rows = sqlx::query_as::<_, (String, String, String, i64)>(sqlx::AssertSqlSafe(sql));
     for output_path in identities.iter().map(|(_, output_path)| output_path) {
         rows = rows.bind(output_path);
     }
     let rows = rows.fetch_all(&connection).await?;
-    let metadata_by_path: BTreeMap<String, (String, String)> = rows
-        .into_iter()
-        .map(|(path, c_metadata, instance)| (path, (c_metadata, instance)))
-        .collect();
+    let mut reach = stow_types::public_cache::Reach::Public;
+    let mut metadata_by_path = BTreeMap::new();
+    for (path, c_metadata, instance, row_reach) in rows {
+        // A reach value the table cannot decode is an inconsistent
+        // schema — fail fast rather than misclassify a local-only dep
+        // as public.
+        let row_reach = stow_types::public_cache::Reach::from_int(row_reach).ok_or_else(|| {
+            stow_types::stow_error!("materialized_outputs.reach has unknown value {row_reach}")
+        })?;
+        reach = reach.fold(row_reach);
+        metadata_by_path.insert(path, (c_metadata, instance));
+    }
     let mut resolved = Vec::with_capacity(identities.len());
     let mut externs = Vec::with_capacity(identities.len());
     for (crate_name, output_path) in identities {
@@ -1361,6 +1386,7 @@ pub async fn resolve_dependency_c_metadata_json(
         ResolvedDependencies {
             c_metadata_json: serde_json::to_string(&resolved)?,
             externs,
+            reach,
         },
     ))
 }
@@ -1370,19 +1396,22 @@ async fn record_materialized_output(
     path: &Path,
     c_metadata: &str,
     instance: &str,
+    reach: stow_types::public_cache::Reach,
     updated_at_ms: i64,
 ) -> stow_types::error::Result<()> {
     sqlx::query(
-        "INSERT INTO materialized_outputs (output_path, c_metadata, instance, updated_at_ms) \
-         VALUES (?, ?, ?, ?) \
+        "INSERT INTO materialized_outputs (output_path, c_metadata, instance, reach, updated_at_ms) \
+         VALUES (?, ?, ?, ?, ?) \
          ON CONFLICT(output_path) DO UPDATE SET \
              c_metadata = excluded.c_metadata, \
              instance = excluded.instance, \
+             reach = excluded.reach, \
              updated_at_ms = excluded.updated_at_ms",
     )
     .bind(path_to_string(path)?)
     .bind(c_metadata)
     .bind(instance)
+    .bind(reach.to_int())
     .bind(updated_at_ms)
     .execute(connection)
     .await?;
@@ -3282,7 +3311,7 @@ pub mod tests {
     use stow_types::bundle::{
         ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, SigstoreSignature,
     };
-    use stow_types::public_cache::StableRegistryArtifactIdentity;
+    use stow_types::public_cache::StableUnitIdentity;
 
     use stow_types::rustc::ParsedExternCrate;
 
@@ -5317,7 +5346,7 @@ pub mod tests {
             extern_crates,
             embed_metadata: None,
             embed_bitcode: false,
-            has_custom_codegen: false,
+            extra_codegen: std::collections::BTreeSet::new(),
             link_options: std::collections::BTreeSet::new(),
         }
     }
@@ -5347,7 +5376,7 @@ pub mod tests {
         parsed: &ParsedRustcArgs,
         stable_c_metadata: &str,
     ) -> super::LocalBuildArtifact {
-        let identity = StableRegistryArtifactIdentity {
+        let identity = StableUnitIdentity {
             // Real compile keys are hex; the stable c_metadata is the
             // first 16 hex digits of the key.
             compile_key: format!("{stable_c_metadata}{stable_c_metadata}"),
@@ -5355,6 +5384,11 @@ pub mod tests {
             extra_filename: format!("-{stable_c_metadata}"),
             crate_name: parsed.crate_name.clone(),
             version: "1.0.0".to_owned(),
+            source: stow_types::public_cache::UnitSource::CratesIo {
+                package: parsed.crate_name.clone(),
+                version: "1.0.0".to_owned(),
+            },
+            reach: stow_types::public_cache::Reach::Public,
         };
         // The fixture mirrors the resolve path's hashing, except it
         // tolerates a missing source — the skips-missing-output test
@@ -5375,10 +5409,12 @@ pub mod tests {
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
             identity,
+            reach: stow_types::public_cache::Reach::Public,
             features_json: "[]".to_owned(),
             dependencies: super::ResolvedDependencies {
                 c_metadata_json: "[]".to_owned(),
                 externs: Vec::new(),
+                reach: stow_types::public_cache::Reach::Public,
             },
             outputs,
         }
@@ -5414,7 +5450,7 @@ pub mod tests {
             }],
             embed_metadata: None,
             embed_bitcode: false,
-            has_custom_codegen: false,
+            extra_codegen: std::collections::BTreeSet::new(),
             link_options: std::collections::BTreeSet::new(),
         }
     }
