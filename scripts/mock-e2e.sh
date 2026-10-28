@@ -16,7 +16,8 @@
 #      wave by hand through
 #      `stow-admin preheat manual` on a crate with a real dependency
 #      (walkdir → same-file) so the operations-lane submit and the
-#      scheduler's own dispatch chain are exercised
+#      scheduler's own dispatch chain are exercised, publishing the
+#      slices after each layer so the slice report releases the next
 #   5. `stow index refresh` + `stow check` a throwaway consumer crate in
 #      mock-key verify mode and assert the dependency was served from the
 #      cache via local index resolution and a direct digest pull
@@ -1288,35 +1289,81 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 # operations lane (stow#880) — the scheduler then claims and dispatches
 # to the local CI server, exactly as the stow-admin submit wave did.
 # walkdir carries one unix dep (same-file), so the wave holds two
-# tasks.
+# tasks in two layers. `--json` puts the submitted plan, task ids
+# included, on stdout: the wait below follows exactly those ids.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
 fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
     STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-    "$BIN/stow-admin" preheat manual \
+    "$BIN/stow-admin" --json preheat manual \
     --crates "$WORK_DIR/manual-crates.txt" \
     --rustc-version "$RUSTC_VERSION" \
     --targets "$HOST_TARGET" \
     --yes \
-    >"$LOG_DIR/preheat-manual.log" 2>&1 \
+    >"$WORK_DIR/preheat-manual.json" 2>"$LOG_DIR/preheat-manual.log" \
     || { cat "$LOG_DIR/preheat-manual.log"; die "stow-admin preheat manual failed — see $LOG_DIR/preheat-manual.log"; }
+manual_ids="$(jq -c '[.plan[].nodes[].task_id] | unique' "$WORK_DIR/preheat-manual.json")" \
+    || die "preheat manual printed no plan — see $WORK_DIR/preheat-manual.json"
+manual_total="$(jq 'length' <<<"$manual_ids")"
+[ "$manual_total" -eq 2 ] \
+    || die "manual wave planned $manual_total task(s), expected walkdir and same-file: $manual_ids"
 
-# Poll the local CI until every dispatched run settles, then run the
-# publish pass — the same export → publish → report sequence
-# index-publish.yml drives, which the scheduler-dispatched wave leaves
-# to that lane too.
+# How the scheduler releases this wave, layer by layer:
+#   - the submit claims nothing inline; it arms the alarm, whose pass
+#     claims same-file (walkdir's edge to it is unmet) and posts it to
+#     the local CI;
+#   - same-file's completion only marks the node completed — walkdir's
+#     edge is met by a slice report carrying same-file's shapes, never
+#     by a finished run, so the wave stalls there until slices publish;
+#   - the slice report flips that edge and runs a dispatch pass before
+#     it answers, and the local CI lists a run before it answers the
+#     dispatch, so walkdir's run exists by the time `index report`
+#     returns.
+# So: wait for the alarm's first layer, publish each settled layer,
+# and require the next layer to be on /tasks right after its publish.
+# The final publish folds walkdir's own records in.
+MANUAL_DISPATCH_DEADLINE=60
+manual_runs() {
+    curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq -r --argjson ids "$manual_ids" '
+            [.tasks[] | select(.task_id != null and (.task_id | IN($ids[])))] as $runs
+            | [($runs | map(.task_id) | unique | length),
+               ($runs | map(select(.conclusion == "success") | .task_id) | unique | length),
+               ($runs | map(select(.status != "completed")) | length),
+               ($runs | map(select(.conclusion != null and .conclusion != "success")) | length)]
+            | map(tostring) | join(" ")'
+}
+manual_layer=0
+manual_published=0
+dispatch_deadline=$((SECONDS + MANUAL_DISPATCH_DEADLINE))
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
-    open_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
-        | jq '[.tasks[] | select(.status != "completed")] | length')"
-    [ "$open_runs" -eq 0 ] && break
-    [ "$SECONDS" -ge "$deadline" ] && die "manual wave still has $open_runs open run(s) after ${TASK_DEADLINE}s"
+    runs="$(manual_runs)" || die "local CI /tasks read failed during the manual wave"
+    read -r seen succeeded open bad <<<"$runs"
+    [ "$bad" -eq 0 ] \
+        || die "a manual-wave run did not conclude success: $(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+            | jq -c --argjson ids "$manual_ids" '[.tasks[] | select(.task_id != null and (.task_id | IN($ids[])))]')"
+    if [ "$open" -eq 0 ] && [ "$succeeded" -gt "$manual_published" ]; then
+        manual_layer=$((manual_layer + 1))
+        echo "[mock-e2e] manual wave: layer $manual_layer settled ($succeeded/$manual_total succeeded), publishing slices"
+        fg publish_slices "manual-$manual_layer"
+        manual_published="$succeeded"
+        [ "$succeeded" -eq "$manual_total" ] && break
+        runs="$(manual_runs)" || die "local CI /tasks read failed after the layer-$manual_layer publish"
+        read -r seen succeeded open bad <<<"$runs"
+        [ "$seen" -gt "$manual_published" ] \
+            || die "manual wave stalled: the layer-$manual_layer slice report released none of the $((manual_total - manual_published)) gated task(s) (scheduler: $(curl -fsS --max-time 10 "$SCHEDULER_URL/status" || echo unreachable))"
+        continue
+    fi
+    [ "$seen" -gt 0 ] || [ "$SECONDS" -lt "$dispatch_deadline" ] \
+        || die "scheduler dispatched none of the manual wave's $manual_total task(s) within ${MANUAL_DISPATCH_DEADLINE}s of the submit (scheduler: $(curl -fsS --max-time 10 "$SCHEDULER_URL/status" || echo unreachable))"
+    [ "$SECONDS" -lt "$deadline" ] \
+        || die "manual wave unfinished after ${TASK_DEADLINE}s: $succeeded/$manual_total succeeded, $open run(s) still open"
     sleep 5
 done
-fg publish_slices "manual"
 
 # The manual wave's publish must have landed a slice serving walkdir —
 # assert the registry view directly so a pipeline-side wait bug cannot
@@ -1344,6 +1391,11 @@ UNICODE_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
 [ -n "$UNICODE_VERSION" ] || die "no non-yanked unicode-ident found on crates.io"
 echo "[mock-e2e] dual-submitter task: unicode-ident $UNICODE_VERSION (manual + scheduler)"
 printf 'unicode-ident\n' >"$WORK_DIR/dual-crates.txt"
+# The completed baseline precedes the first submit: the alarm that
+# submit arms can dispatch and finish the task before a later sample.
+status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")" \
+    || die "scheduler status read before the dual submit failed"
+completed_before="$(jq -r '.completed' <<<"$status_json")"
 isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
@@ -1360,10 +1412,6 @@ isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
 # The identical task submitted the second way: the scheduler merges by
 # task id, so the operations submit behind it inserts nothing and no
 # second `workflow_dispatch` exists for the node.
-status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
-completed_before=0
-[ -n "$status_json" ] && completed_before="$(jq -r '.completed' <<<"$status_json")"
-
 fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
     "$BIN/stow-admin" submit \
     --crate-name "unicode-ident" \
@@ -1377,14 +1425,16 @@ fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
 grep -q "inserted 0" "$LOG_DIR/admin-submit-dual.log" \
     || { cat "$LOG_DIR/admin-submit-dual.log"; die "dual submit inserted a second task — the merge should hold one"; }
 
-# The task's one run settles.
+# The task's one run exists and settles — the alarm dispatches it after
+# the submit returns, so "no open run" alone holds before it exists.
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
-    open_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
-        | jq '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident"))) | select(.status != "completed")] | length')"
-    [ "$open_runs" -eq 0 ] && break
-    [ "$SECONDS" -ge "$deadline" ] && die "dual task still has $open_runs open run(s) after ${TASK_DEADLINE}s"
+    read -r dual_seen open_runs <<<"$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq -r '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident")))]
+            | "\(length) \(map(select(.status != "completed")) | length)"')"
+    [ "$dual_seen" -ge 1 ] && [ "$open_runs" -eq 0 ] && break
+    [ "$SECONDS" -ge "$deadline" ] && die "dual task has $dual_seen run(s), $open_runs open, after ${TASK_DEADLINE}s"
     sleep 5
 done
 
