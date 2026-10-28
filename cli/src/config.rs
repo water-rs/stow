@@ -360,6 +360,14 @@ impl StowConfig {
     pub fn artifact_cache_purge_root(&self) -> PathBuf {
         self.cache_dir.join("purge")
     }
+
+    /// The directory the C/C++ object cache lives in — `<key>.o` files
+    /// the `cc`/`cxx` shims store and serve, each with a
+    /// `cc_cache_entries` row in the state database's shared LRU
+    /// (stow#980).
+    pub fn cc_cache_dir(&self) -> PathBuf {
+        self.cache_dir.join("cc")
+    }
 }
 
 pub fn config_file_path() -> stow_types::error::Result<PathBuf> {
