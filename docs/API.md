@@ -7,7 +7,7 @@ build fleet covers. Admission is a Cloudflare Turnstile token — the
 miss path's proof-of-work admission on `/api/v1/enqueue` is unchanged
 and unrelated. Accepted work enters the scheduler's human lane ahead of
 queued misses; see
-[`ARCHITECTURE.md`](ARCHITECTURE.md#human-request-lane) for the lane
+[`ARCHITECTURE.md`](ARCHITECTURE.md#website-requests) for the lane
 semantics.
 
 All wire types live in `stow_types::api`; names below are the Rust

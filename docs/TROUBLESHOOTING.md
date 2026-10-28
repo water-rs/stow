@@ -133,7 +133,7 @@ You're hitting an endpoint the edge doesn't expose. Common cases:
 - The wasm bundle on disk predates a recent route addition. Re-run
   `skyzen dev` to repackage the bundle.
 - You typed the path wrong. The full route table is in
-  [`ARCHITECTURE.md`](ARCHITECTURE.md#wire-protocol-surface-http).
+  [`ARCHITECTURE.md`](ARCHITECTURE.md#http-surface).
 
 ## `"failed: 1"` lingering in `/api/v1/scheduler/status`
 

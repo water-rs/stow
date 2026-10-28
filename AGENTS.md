@@ -10,6 +10,7 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 - Feature sets are never unioned. A set contained in another set of the same crate, version, target and side is served by the smallest containing set, ties broken by the sorted list; CI and the CLI apply the same rule, and the CLI moves to another set only once the whole chain its build needs under that choice is published.
 - One task is one `build-crate.yml` run; dispatch is never batched.
 - Deduplication is node identity; no mechanism is added on top of it.
+- The CLI is a full replacement for sccache: every unit it compiles and every bundle it fetches is kept in a global, copy-on-write local cache, and with GHCR or the edge unreachable a build serves and stores locally.
 
 ## Architecture
 
