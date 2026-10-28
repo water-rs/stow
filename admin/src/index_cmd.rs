@@ -54,7 +54,6 @@ const PREV_PULL_CONCURRENCY: usize = 8;
 /// Sync chunk posts in flight — the chunks are independent writes, so
 /// the bound only limits how many edge requests the pass holds open.
 const STOW_MOCK_PRIVATE_KEY_PATH_ENV: &str = "STOW_MOCK_PRIVATE_KEY_PATH";
-const STOW_MOCK_PUBLIC_KEY_PATH_ENV: &str = "STOW_MOCK_PUBLIC_KEY_PATH";
 const STOW_MOCK_REGISTRY_ROOT_ENV: &str = "STOW_MOCK_REGISTRY_ROOT";
 /// Records artifacts are signed by `build-crate.yml` — the export pins
 /// that identity the same way the CLI pins it for bundles.
@@ -234,24 +233,6 @@ pub async fn run(args: IndexArgs) -> stow_types::error::Result<()> {
         }
         IndexCommand::Join(args) => index_join(args).await,
     }
-}
-
-/// The trust a records read verifies against — the mock registry's local
-/// key under `STOW_MOCK_PUBLIC_KEY_PATH`, else Fulcio/Rekor with the
-/// `build-crate.yml` certificate identity pinned.
-pub async fn records_trust() -> stow_types::error::Result<stow_oci::verify::Trust> {
-    if let Ok(path) = std::env::var(STOW_MOCK_PUBLIC_KEY_PATH_ENV) {
-        return Ok(stow_oci::verify::Trust::MockKey(path.into()));
-    }
-    let cache_dir = std::env::var_os("STOW_CACHE_DIR")
-        .map_or_else(
-            || dirs::home_dir().map(|home| home.join(".cache").join("stow")),
-            |dir| Some(dir.into()),
-        )
-        .ok_or_else(|| stow_error!("resolve the sigstore trust cache directory"))?;
-    Ok(stow_oci::verify::Trust::GithubCi(std::sync::Arc::new(
-        stow_oci::verify::load_trust_material(&cache_dir).await?,
-    )))
 }
 
 /// Verify the signature on one manifest digest and return `()` — the
@@ -701,7 +682,7 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
     let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
     let repository = cache_repository(&rustc_version);
     let session = base.session(&repository, &http);
-    let trust = records_trust().await?;
+    let trust = stow_oci::verify::records_trust().await?;
     let mut tags = session
         .list_tags()
         .await
@@ -1270,7 +1251,7 @@ async fn index_join(args: IndexJoinArgs) -> stow_types::error::Result<()> {
 
     let base = registry_base()?;
     let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
-    let trust = records_trust().await?;
+    let trust = stow_oci::verify::records_trust().await?;
     let mut slices = Vec::new();
     for version in &args.rustc_versions {
         let rustc_version = WireRustcVersion::parse(version.clone())

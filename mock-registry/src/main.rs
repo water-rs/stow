@@ -47,6 +47,8 @@ use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
+mod oidc;
+
 const OCI_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
 /// Manifest annotation the index publisher compares for change detection —
 /// the same one `stow_oci::publish_index` writes on GHCR.
@@ -75,6 +77,10 @@ fn main() -> stow_types::error::Result<()> {
 
 async fn async_main() -> stow_types::error::Result<()> {
     match Cli::parse().command {
+        Command::OidcToken(request) => {
+            println!("{}", oidc::mint(&oidc::signing_key(), &request)?);
+            Ok(())
+        }
         Command::Populate(request) => populate_registry(request).await,
         Command::PublishIndex(request) => publish_index(request).await,
         Command::IndexFromRecords(request) => index_from_records(request).await,
@@ -548,6 +554,7 @@ fn registry_app_with_probe(
             post(analytics_engine_sql_account),
         )
         .route("/user", get(github_user))
+        .route("/.well-known/jwks", get(github_jwks))
         .route("/{owner}/{repo}/info/refs", get(github_info_refs))
         .with_state(MockRegistryState {
             registry_root,
@@ -557,6 +564,7 @@ fn registry_app_with_probe(
             refusals: probe.as_ref().map(|probe| Arc::clone(&probe.refusals)),
             toggles: probe.as_ref().map(|probe| Arc::clone(&probe.toggles)),
             demand_fixtures,
+            oidc_key: crate::oidc::signing_key(),
         })
 }
 
@@ -1275,6 +1283,10 @@ enum Command {
     /// digest — a bundle-sized body the edge's byte path can stream,
     /// for the traffic-cost CPU measurement (`scripts/traffic-cost.sh`).
     PutBlob(PutBlobArgs),
+    /// Print a GitHub Actions OIDC token for one workflow run, signed by
+    /// the issuer key `serve` publishes at `/.well-known/jwks` — the
+    /// credential the mock edge's mutating routes require (stow#955).
+    OidcToken(oidc::OidcTokenArgs),
     Serve(ServeArgs),
 }
 
@@ -1402,6 +1414,9 @@ struct MockRegistryState {
     /// The optional per-hour demand-feed fixture directory — `None`
     /// keeps the built-in scripted `analytics_engine/sql` documents.
     demand_fixtures: Option<PathBuf>,
+    /// The mock's GitHub Actions OIDC issuer, whose public key
+    /// `/.well-known/jwks` serves (stow#955).
+    oidc_key: rsa::RsaPrivateKey,
 }
 
 /// Issued bearer tokens and their expirations; `Instant` is enough
@@ -2194,6 +2209,13 @@ async fn github_info_refs(
         "0000",
     )
         .into_response()
+}
+
+/// `GET /.well-known/jwks` — the issuer's key set the edge's OIDC
+/// verifier fetches from the GitHub API stub (`STOW_GITHUB_API_URL`).
+async fn github_jwks(State(state): State<MockRegistryState>) -> Response<Body> {
+    state.record(&Method::GET, "/.well-known/jwks");
+    axum::Json(oidc::jwks(&state.oidc_key)).into_response()
 }
 
 /// The edge byte path for hosts that run no worker (the bench lane):
@@ -3685,6 +3707,7 @@ mod tests {
             refusals: None,
             toggles: None,
             demand_fixtures: Some(fixtures),
+            oidc_key: crate::oidc::signing_key(),
         };
         let body = rendered_feed_query("2020-01-01 05");
         let miss_body = rendered_feed_query("2020-01-01 07");
@@ -3718,6 +3741,7 @@ mod tests {
             refusals: None,
             toggles: None,
             demand_fixtures: None,
+            oidc_key: crate::oidc::signing_key(),
         };
         let sql = "SELECT sumIf(_sample_interval * double1, index1 = '#fault' AND blob1 = 'overloaded') AS events, count() AS points FROM stow_cache_misses WHERE timestamp >= NOW() - INTERVAL '1' HOUR FORMAT JSON";
         block_on(async move {

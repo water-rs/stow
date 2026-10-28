@@ -46,9 +46,9 @@ jobs:
     permissions:
       contents: read
       packages: read # pull the pinned stow toolchain from GHCR
-      # Mints the run's OIDC token — the edge accepts any workflow OIDC
-      # minted inside water-rs/stow for the scheduler endpoints, and
-      # stow-admin refreshes it per request.
+      # Mints the run's OIDC token — the edge's outcome route admits
+      # only this workflow's runs on main, and stow-admin refreshes it
+      # per request.
       id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

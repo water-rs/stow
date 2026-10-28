@@ -297,7 +297,9 @@ pub fn human_count(value: f64) -> String {
 #[must_use]
 pub fn freeze_subject(trigger: &DispatchFreezeTrigger) -> String {
     match trigger {
-        DispatchFreezeTrigger::Manual => "[stow] dispatch frozen — manual".to_owned(),
+        DispatchFreezeTrigger::Manual { actor } => {
+            format!("[stow] dispatch frozen — manual by {actor}")
+        }
         DispatchFreezeTrigger::Tripped(_) => {
             "[stow] dispatch frozen — systematic failures".to_owned()
         }
@@ -403,7 +405,9 @@ pub const fn notify_reached(notify: &ChannelOutcome) -> bool {
 #[must_use]
 pub fn summarize_trigger(trigger: &DispatchFreezeTrigger) -> String {
     match trigger {
-        DispatchFreezeTrigger::Manual => "manual (POST /api/v1/admin/dispatch-freeze)".to_owned(),
+        DispatchFreezeTrigger::Manual { actor } => {
+            format!("manual by {actor} (POST /api/v1/admin/dispatch-freeze)")
+        }
         DispatchFreezeTrigger::Tripped(trip) => {
             let tripped: Vec<&str> = trip
                 .targets
@@ -558,7 +562,7 @@ pub fn render_freeze_alert(
     let render_bodies =
         |trigger: &DispatchFreezeTrigger| -> Result<(String, String), askama::Error> {
             let (manual, trip, cost) = match trigger {
-                DispatchFreezeTrigger::Manual => (true, None, None),
+                DispatchFreezeTrigger::Manual { .. } => (true, None, None),
                 DispatchFreezeTrigger::Tripped(trip) => (false, Some(trip_context(trip)), None),
                 DispatchFreezeTrigger::Cost(cost) => (false, None, Some(cost_context(cost))),
             };
@@ -572,7 +576,7 @@ pub fn render_freeze_alert(
             }
             .render()?;
             let (manual, trip, cost) = match trigger {
-                DispatchFreezeTrigger::Manual => (true, None, None),
+                DispatchFreezeTrigger::Manual { .. } => (true, None, None),
                 DispatchFreezeTrigger::Tripped(trip) => (false, Some(trip_context(trip)), None),
                 DispatchFreezeTrigger::Cost(cost) => (false, None, Some(cost_context(cost))),
             };
@@ -663,8 +667,11 @@ pub trait FreezeStore {
         &self,
         record: &DispatchFreezeRecord,
     ) -> impl Future<Output = Result<(), QueueError>> + Send;
-    /// Drop the record — clears the flag.
-    fn delete(&self) -> impl Future<Output = Result<(), QueueError>> + Send;
+    /// Drop `cleared`, the record the store holds — clears the flag.
+    fn delete(
+        &self,
+        cleared: &DispatchFreezeRecord,
+    ) -> impl Future<Output = Result<(), QueueError>> + Send;
 }
 
 /// Alert seam for the transition coordinator: the wasm impl sends the
@@ -756,7 +763,7 @@ pub async fn apply_transition(
             let Some(record) = store.record().await? else {
                 return Ok(FreezeTransition::Unchanged);
             };
-            store.delete().await?;
+            store.delete(&record).await?;
             if let Ok(draft) =
                 render_freeze_cleared(&record.frozen_at, now, &record.trigger, &record.notify)
             {
@@ -974,8 +981,13 @@ mod tests {
 
     #[test]
     fn manual_freeze_alert_renders_without_trip_stats() {
-        let draft = render_freeze_alert("2026-09-22T03:51:00Z", &DispatchFreezeTrigger::Manual)
-            .expect("template renders");
+        let draft = render_freeze_alert(
+            "2026-09-22T03:51:00Z",
+            &DispatchFreezeTrigger::Manual {
+                actor: "test".to_owned(),
+            },
+        )
+        .expect("template renders");
         assert_eq!(draft.key, "dispatch-freeze");
         assert!(draft.body.contains("manual"));
         assert!(
@@ -1114,7 +1126,10 @@ mod tests {
             *self.0.lock().expect("store") = Some(record.clone());
             std::future::ready(Ok(()))
         }
-        fn delete(&self) -> impl Future<Output = Result<(), QueueError>> + Send {
+        fn delete(
+            &self,
+            _cleared: &DispatchFreezeRecord,
+        ) -> impl Future<Output = Result<(), QueueError>> + Send {
             *self.0.lock().expect("store") = None;
             std::future::ready(Ok(()))
         }
@@ -1208,7 +1223,9 @@ mod tests {
                 &store,
                 &sink,
                 super::FreezeAction::Clear,
-                DispatchFreezeTrigger::Manual,
+                DispatchFreezeTrigger::Manual {
+                    actor: "operator".to_owned()
+                },
                 "2026-09-22T05:10:00Z",
             )
             .await
@@ -1220,7 +1237,9 @@ mod tests {
                 &store,
                 &sink,
                 super::FreezeAction::Clear,
-                DispatchFreezeTrigger::Manual,
+                DispatchFreezeTrigger::Manual {
+                    actor: "operator".to_owned()
+                },
                 "2026-09-22T05:11:00Z",
             )
             .await

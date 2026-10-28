@@ -16,7 +16,8 @@
 #      wave by hand through
 #      `stow-admin preheat manual` on a crate with a real dependency
 #      (walkdir → same-file) so the operations-lane submit and the
-#      scheduler's own dispatch chain are exercised
+#      scheduler's own dispatch chain are exercised, publishing the
+#      slices after each layer so the slice report releases the next
 #   5. `stow index refresh` + `stow check` a throwaway consumer crate in
 #      mock-key verify mode and assert the dependency was served from the
 #      cache via local index resolution and a direct digest pull
@@ -350,7 +351,7 @@ for s in json.load(open(sys.argv[1])):
     while read -r index_file _; do
         [ -n "$index_file" ] && report_files+=(--file "$WORK_DIR/index-export/$index_file")
     done <<<"$pairs"
-    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc index-publish.yml)" \
         "$BIN/stow-admin" index report "${report_files[@]}" \
         >>"$LOG_DIR/index-report-$tag.log" 2>&1 \
         || die "stow-admin index report failed — see $LOG_DIR/index-report-$tag.log"
@@ -429,6 +430,14 @@ require_command wrangler
 
 [ -n "$EDGE_BEARER" ] || die \
     "no GitHub credential for the edge's trusted endpoints — set GH_TOKEN or run \`gh auth login\`"
+
+# stow#955: reads keep the push credential, but a mutating route admits
+# only the OIDC token of a workflow it names, run on main — `oidc <file>`
+# signs one with the mock issuer the edge's key-set fetch reaches. The
+# lifetime covers the longest lane a token is handed to.
+oidc() {
+    "$BIN/stow-mock-registry" oidc-token --workflow "$1" --lifetime-secs 7200
+}
 
 RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
@@ -563,7 +572,7 @@ echo "[mock-e2e] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
 # takes the route's response code as its ready signal.
 wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
     http_listening "$SCHEDULER_URL/status"
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" scheduler reset --yes >"$WORK_DIR/scheduler-reset.log" 2>&1 \
     || die "stow-admin scheduler reset failed — see $WORK_DIR/scheduler-reset.log"
 echo "[mock-e2e] $(cat "$WORK_DIR/scheduler-reset.log")"
@@ -607,18 +616,18 @@ QUERY_LOG="$WORK_DIR/mock-registry/demand-queries.log"
 EXPECT_TASKS="$(jq 'length' "$FIXTURES/expectations.json")"
 
 feed_post() { # sub-route, body-file -> response body (fails on non-2xx)
-    curl -fsS -H "Authorization: Bearer $EDGE_BEARER" \
+    curl -fsS -H "Authorization: Bearer $(oidc demand-feed.yml)" \
         -H "Content-Type: application/json" \
         -X POST --data-binary "@$2" "$FEED_ROUTE/$1"
 }
 feed_post_code() { # sub-route, body-file -> HTTP status only
     curl -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer $EDGE_BEARER" \
+        -H "Authorization: Bearer $(oidc demand-feed.yml)" \
         -H "Content-Type: application/json" \
         -X POST --data-binary "@$2" "$FEED_ROUTE/$1"
 }
 demand_post() { # body-file -> demand report body
-    curl -fsS -H "Authorization: Bearer $EDGE_BEARER" \
+    curl -fsS -H "Authorization: Bearer $(oidc demand-feed.yml)" \
         -H "Content-Type: application/json" \
         -X POST --data-binary "@$1" "$DEMAND_ROUTE"
 }
@@ -662,7 +671,7 @@ feed_cleanup() { # hour: existing cleanup op drains staged payload pages
 }
 feed_cli() { # out_file [cli args...] -> prints captured output, CLI exit preserved
     local out_file="$1"; shift
-    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc demand-feed.yml)" \
         "$BIN/stow-admin" scheduler demand-feed --json "$@" \
         >"$out_file" 2>&1
     local status=$?
@@ -815,13 +824,25 @@ assert_values_unchanged() { # before-map
 # setting changes.
 echo "[mock-e2e] demand feed: submitting fixture queue tasks"
 submit_code="$(curl -s -o "$LOG_DIR/submit-fixture.json" -w '%{http_code}' \
-    -H "Authorization: Bearer $EDGE_BEARER" -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $(oidc operations.yml)" -H "Content-Type: application/json" \
     -X POST --data-binary @"$FIXTURES/enqueue.json" \
     "$EDGE_URL/api/v1/scheduler/tasks/submit")"
 [ "$submit_code" -ge 200 ] && [ "$submit_code" -lt 300 ] \
     || die "fixture submit failed ($submit_code): $(cat "$LOG_DIR/submit-fixture.json")"
+# stow#955: an operator route refuses a user token, another workflow's
+# token and the operations workflow's own token from another ref — each
+# before the body is read.
+for refused in "$EDGE_BEARER" "$(oidc preheat-admin.yml)" \
+    "$("$BIN/stow-mock-registry" oidc-token --workflow operations.yml --ref refs/heads/feature)"; do
+    refused_code="$(curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $refused" -H "Content-Type: application/json" \
+        -X POST --data-binary @"$FIXTURES/anchor-selector.json" \
+        "$EDGE_URL/api/v1/admin/queue/cancel")"
+    [ "$refused_code" = 401 ] \
+        || die "queue/cancel answered $refused_code to a credential it must refuse"
+done
 cancel_out="$(curl -s -o "$LOG_DIR/cancel-anchors.json" -w '%{http_code}' \
-    -H "Authorization: Bearer $EDGE_BEARER" -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $(oidc operations.yml)" -H "Content-Type: application/json" \
     -X POST --data-binary @"$FIXTURES/anchor-selector.json" \
     "$EDGE_URL/api/v1/admin/queue/cancel")"
 [ "$cancel_out" -ge 200 ] && [ "$cancel_out" -lt 300 ] \
@@ -1234,7 +1255,7 @@ TASK_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
 [ -n "$TASK_VERSION" ] || die "no non-yanked itoa 1.0.x found on crates.io"
 echo "[mock-e2e] submitting $TASK_CRATE $TASK_VERSION features=$TASK_FEATURES target=$HOST_TARGET rustc=$RUSTC_VERSION"
 
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" submit \
     --crate-name "$TASK_CRATE" \
     --version "$TASK_VERSION" \
@@ -1288,35 +1309,81 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 # operations lane (stow#880) — the scheduler then claims and dispatches
 # to the local CI server, exactly as the stow-admin submit wave did.
 # walkdir carries one unix dep (same-file), so the wave holds two
-# tasks.
+# tasks in two layers. `--json` puts the submitted plan, task ids
+# included, on stdout: the wait below follows exactly those ids.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
     STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-    "$BIN/stow-admin" preheat manual \
+    "$BIN/stow-admin" --json preheat manual \
     --crates "$WORK_DIR/manual-crates.txt" \
     --rustc-version "$RUSTC_VERSION" \
     --targets "$HOST_TARGET" \
     --yes \
-    >"$LOG_DIR/preheat-manual.log" 2>&1 \
+    >"$WORK_DIR/preheat-manual.json" 2>"$LOG_DIR/preheat-manual.log" \
     || { cat "$LOG_DIR/preheat-manual.log"; die "stow-admin preheat manual failed — see $LOG_DIR/preheat-manual.log"; }
+manual_ids="$(jq -c '[.plan[].nodes[].task_id] | unique' "$WORK_DIR/preheat-manual.json")" \
+    || die "preheat manual printed no plan — see $WORK_DIR/preheat-manual.json"
+manual_total="$(jq 'length' <<<"$manual_ids")"
+[ "$manual_total" -eq 2 ] \
+    || die "manual wave planned $manual_total task(s), expected walkdir and same-file: $manual_ids"
 
-# Poll the local CI until every dispatched run settles, then run the
-# publish pass — the same export → publish → report sequence
-# index-publish.yml drives, which the scheduler-dispatched wave leaves
-# to that lane too.
+# How the scheduler releases this wave, layer by layer:
+#   - the submit claims nothing inline; it arms the alarm, whose pass
+#     claims same-file (walkdir's edge to it is unmet) and posts it to
+#     the local CI;
+#   - same-file's completion only marks the node completed — walkdir's
+#     edge is met by a slice report carrying same-file's shapes, never
+#     by a finished run, so the wave stalls there until slices publish;
+#   - the slice report flips that edge and runs a dispatch pass before
+#     it answers, and the local CI lists a run before it answers the
+#     dispatch, so walkdir's run exists by the time `index report`
+#     returns.
+# So: wait for the alarm's first layer, publish each settled layer,
+# and require the next layer to be on /tasks right after its publish.
+# The final publish folds walkdir's own records in.
+MANUAL_DISPATCH_DEADLINE=60
+manual_runs() {
+    curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq -r --argjson ids "$manual_ids" '
+            [.tasks[] | select(.task_id != null and (.task_id | IN($ids[])))] as $runs
+            | [($runs | map(.task_id) | unique | length),
+               ($runs | map(select(.conclusion == "success") | .task_id) | unique | length),
+               ($runs | map(select(.status != "completed")) | length),
+               ($runs | map(select(.conclusion != null and .conclusion != "success")) | length)]
+            | map(tostring) | join(" ")'
+}
+manual_layer=0
+manual_published=0
+dispatch_deadline=$((SECONDS + MANUAL_DISPATCH_DEADLINE))
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
-    open_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
-        | jq '[.tasks[] | select(.status != "completed")] | length')"
-    [ "$open_runs" -eq 0 ] && break
-    [ "$SECONDS" -ge "$deadline" ] && die "manual wave still has $open_runs open run(s) after ${TASK_DEADLINE}s"
+    runs="$(manual_runs)" || die "local CI /tasks read failed during the manual wave"
+    read -r seen succeeded open bad <<<"$runs"
+    [ "$bad" -eq 0 ] \
+        || die "a manual-wave run did not conclude success: $(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+            | jq -c --argjson ids "$manual_ids" '[.tasks[] | select(.task_id != null and (.task_id | IN($ids[])))]')"
+    if [ "$open" -eq 0 ] && [ "$succeeded" -gt "$manual_published" ]; then
+        manual_layer=$((manual_layer + 1))
+        echo "[mock-e2e] manual wave: layer $manual_layer settled ($succeeded/$manual_total succeeded), publishing slices"
+        fg publish_slices "manual-$manual_layer"
+        manual_published="$succeeded"
+        [ "$succeeded" -eq "$manual_total" ] && break
+        runs="$(manual_runs)" || die "local CI /tasks read failed after the layer-$manual_layer publish"
+        read -r seen succeeded open bad <<<"$runs"
+        [ "$seen" -gt "$manual_published" ] \
+            || die "manual wave stalled: the layer-$manual_layer slice report released none of the $((manual_total - manual_published)) gated task(s) (scheduler: $(curl -fsS --max-time 10 "$SCHEDULER_URL/status" || echo unreachable))"
+        continue
+    fi
+    [ "$seen" -gt 0 ] || [ "$SECONDS" -lt "$dispatch_deadline" ] \
+        || die "scheduler dispatched none of the manual wave's $manual_total task(s) within ${MANUAL_DISPATCH_DEADLINE}s of the submit (scheduler: $(curl -fsS --max-time 10 "$SCHEDULER_URL/status" || echo unreachable))"
+    [ "$SECONDS" -lt "$deadline" ] \
+        || die "manual wave unfinished after ${TASK_DEADLINE}s: $succeeded/$manual_total succeeded, $open run(s) still open"
     sleep 5
 done
-fg publish_slices "manual"
 
 # The manual wave's publish must have landed a slice serving walkdir —
 # assert the registry view directly so a pipeline-side wait bug cannot
@@ -1344,7 +1411,12 @@ UNICODE_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
 [ -n "$UNICODE_VERSION" ] || die "no non-yanked unicode-ident found on crates.io"
 echo "[mock-e2e] dual-submitter task: unicode-ident $UNICODE_VERSION (manual + scheduler)"
 printf 'unicode-ident\n' >"$WORK_DIR/dual-crates.txt"
-isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+# The completed baseline precedes the first submit: the alarm that
+# submit arms can dispatch and finish the task before a later sample.
+status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")" \
+    || die "scheduler status read before the dual submit failed"
+completed_before="$(jq -r '.completed' <<<"$status_json")"
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
@@ -1360,11 +1432,7 @@ isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
 # The identical task submitted the second way: the scheduler merges by
 # task id, so the operations submit behind it inserts nothing and no
 # second `workflow_dispatch` exists for the node.
-status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
-completed_before=0
-[ -n "$status_json" ] && completed_before="$(jq -r '.completed' <<<"$status_json")"
-
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" submit \
     --crate-name "unicode-ident" \
     --version "$UNICODE_VERSION" \
@@ -1377,14 +1445,16 @@ fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
 grep -q "inserted 0" "$LOG_DIR/admin-submit-dual.log" \
     || { cat "$LOG_DIR/admin-submit-dual.log"; die "dual submit inserted a second task — the merge should hold one"; }
 
-# The task's one run settles.
+# The task's one run exists and settles — the alarm dispatches it after
+# the submit returns, so "no open run" alone holds before it exists.
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
-    open_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
-        | jq '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident"))) | select(.status != "completed")] | length')"
-    [ "$open_runs" -eq 0 ] && break
-    [ "$SECONDS" -ge "$deadline" ] && die "dual task still has $open_runs open run(s) after ${TASK_DEADLINE}s"
+    read -r dual_seen open_runs <<<"$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq -r '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident")))]
+            | "\(length) \(map(select(.status != "completed")) | length)"')"
+    [ "$dual_seen" -ge 1 ] && [ "$open_runs" -eq 0 ] && break
+    [ "$SECONDS" -ge "$deadline" ] && die "dual task has $dual_seen run(s), $open_runs open, after ${TASK_DEADLINE}s"
     sleep 5
 done
 
@@ -1451,7 +1521,7 @@ superset_completed=0
 [ -n "$status_json" ] \
     && superset_completed="$(jq -r '.completed' <<<"$status_json")"
 
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" submit \
     --crate-name "$SUPERSET_CRATE" \
     --version "$SUPERSET_VERSION" \
@@ -1766,7 +1836,7 @@ pre_task_ids="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
 # The submit route takes `Vec<SubmissionTree>`, so the batch goes
 # through the trusted admin path — it resolves the same crate, target
 # and rustc and runs `SubmissionTree::from_enqueue_requests` itself.
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" submit \
     --crate-name "$HOST_DEPS_CRATE" \
     --version "$HOST_DEPS_VERSION" \

@@ -611,9 +611,9 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
     },
 ];
 
-/// One traffic lane's Worker CPU budget — milliseconds of isolate CPU
-/// per lane event, measured by the Traffic cost test's profiler pass
-/// (`stow-admin traffic-cost cpu`).
+/// One traffic lane's Worker CPU budget — isolate CPU per lane event,
+/// relative to a fixed reference workload, measured by the Traffic cost
+/// test's profiler pass (`stow-admin traffic-cost cpu`).
 ///
 /// The measured quantity is the CPU the edge isolate spends executing
 /// one event, sampled by V8's profiler through the dev inspector — the
@@ -621,20 +621,28 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
 /// runs, which shares the isolate under `wrangler dev`. It therefore
 /// reads at or above the Worker CPU Cloudflare bills for the event,
 /// never below it.
+///
+/// Its milliseconds scale with the runner the pass lands on, so the
+/// budget is not in milliseconds: the same pass profiles the reference
+/// workload (`admin/src/traffic_cost/reference_workload.js`) in the same
+/// isolate on the same runner, and a lane's figure is its CPU per event
+/// over the reference's CPU. A budget of 0.25 lets one event spend a
+/// quarter of what the reference spends, on whatever runner measures it.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerCpuBudget {
     /// The lane (`admin/src/traffic_cost/lanes.rs`) — the report row's
     /// key.
     pub lane: &'static str,
-    /// Budgeted CPU milliseconds per lane event.
-    pub cpu_ms: f64,
+    /// Budgeted CPU per lane event over the reference workload's CPU.
+    pub relative_cpu: f64,
 }
 
 impl WorkerCpuBudget {
-    /// `true` when the measured per-event CPU exceeds the budget.
+    /// `true` when the measured per-event CPU, relative to the
+    /// reference, exceeds the budget.
     #[must_use]
-    pub fn over_budget(&self, cpu_ms: f64) -> bool {
-        cpu_ms > self.cpu_ms
+    pub fn over_budget(&self, relative_cpu: f64) -> bool {
+        relative_cpu > self.relative_cpu
     }
 }
 
@@ -642,86 +650,90 @@ impl WorkerCpuBudget {
 /// profiler pass measures without a row here fails the test, as a
 /// scheduler route without a drive does.
 ///
-/// How a row's number is derived: the lane's measured CPU per event —
-/// the smallest of the profiler pass's three rounds in a Traffic cost
-/// run, read from that run's `worker-cpu.json` — times a 2× margin,
-/// rounded up to the next 5 ms. The 2× is the same headroom `DO_BUDGETS`
-/// keeps over its measured rows: room for ordinary code growth, while a
-/// change that doubles a lane's CPU fails. Each row's comment names the
-/// run and the measured value it came from.
+/// How a row's number is derived: the lane's relative CPU per event —
+/// the smallest of the profiler pass's three rounds over the reference,
+/// read as `relative_cpu` from a Traffic cost run's `worker-cpu.json` —
+/// times a 2× margin, rounded up to the next 0.05. The 2× is the same
+/// headroom `DO_BUDGETS` keeps over its measured rows: room for ordinary
+/// code growth, while a change that doubles a lane's CPU fails. Each
+/// row's comment names the run and the measured value it came from.
 ///
 /// A budget is also bounded by the allowance, not only by the
 /// measurement: `stow-admin traffic-cost project` prices every route
-/// at its full budget under the launch model and fails when that month
-/// passes half of the Worker CPU allowance (`cpu_ms_at_budget`), and
-/// prints each route's share of the allowance at its measured figure
-/// and at its budget.
+/// at its full budget — in the run's milliseconds, the budget times that
+/// run's reference — under the launch model, fails when that month
+/// passes `ALLOWANCE_FRACTION` of the Worker CPU allowance
+/// (`cpu_ms_at_budget`), and prints each route's share of the allowance
+/// at its measured figure and at its budget.
 pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
     WorkerCpuBudget {
-        // Run 39009034210: 0.38 ms.
+        // Run 40631853262: 0.027 (0.6 ms of a 22.2 ms reference).
         lane: "site",
-        cpu_ms: 5.0,
+        relative_cpu: 0.10,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 2.165 ms.
+        // Eight Analytics Engine SQL queries per page (stow#896);
+        // Workers Cache serves the deployed route for an hour after
+        // each. Run 40631853262: 0.149 (3.315 ms of 22.2 ms).
         lane: "stats",
-        cpu_ms: 5.0,
+        relative_cpu: 0.30,
     },
     WorkerCpuBudget {
         // The pointer GET plus the digest-addressed slice GET.
-        // Run 39009034210: 2.1 ms.
+        // Run 40631853262: 0.118 (2.625 ms of 22.2 ms).
         lane: "index-pull",
-        cpu_ms: 5.0,
+        relative_cpu: 0.25,
     },
     WorkerCpuBudget {
         // A covered bundle streamed through the byte path — the
         // dominant CPU line at 9e5 events/mo. stow#738 measured 11–24 ms
         // mean on the deployed Worker, far above this local figure.
-        // Run 39009034210: 0.595 ms.
+        // Run 40631853262: 0.041 (0.92 ms of 22.2 ms).
         lane: "bundle-fetch",
-        cpu_ms: 5.0,
+        relative_cpu: 0.10,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 1.38 ms.
+        // Counters and the pending human-lane index (stow#932).
+        // Run 40637518261: 0.069 (1.645 ms of 23.7 ms).
         lane: "status-read",
-        cpu_ms: 5.0,
+        relative_cpu: 0.15,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 3.06 ms.
+        // Counters and the pending-age index (stow#932).
+        // Run 40637518261: 0.116 (2.74 ms of 23.7 ms).
         lane: "admin-status",
-        cpu_ms: 10.0,
+        relative_cpu: 0.25,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 5.475 ms.
+        // Run 40631853262: 0.319 (7.09 ms of 22.2 ms).
         lane: "queue-read",
-        cpu_ms: 15.0,
+        relative_cpu: 0.65,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 5.395 ms.
+        // Run 40631853262: 0.136 (3.025 ms of 22.2 ms).
         lane: "queue-mutate",
-        cpu_ms: 15.0,
+        relative_cpu: 0.30,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 4.345 ms.
+        // Run 40631853262: 0.118 (2.625 ms of 22.2 ms).
         lane: "trusted-submit",
-        cpu_ms: 10.0,
+        relative_cpu: 0.25,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 1.64 ms.
+        // Run 40631853262: 0.038 (0.85 ms of 22.2 ms).
         lane: "admission",
-        cpu_ms: 5.0,
+        relative_cpu: 0.10,
     },
     WorkerCpuBudget {
-        // Run 39009034210: 5.915 ms.
+        // Run 40631853262: 0.113 (2.51 ms of 22.2 ms).
         lane: "enqueue-redeem",
-        cpu_ms: 15.0,
+        relative_cpu: 0.25,
     },
     WorkerCpuBudget {
-        // The signed `workflow_run` callback: HMAC check, the
-        // run's title decode and the forward to the scheduler. Run
-        // 39009034210 measured 3.185 ms on the per-task path, which
-        // also verified the records artifact's cosign signature.
+        // The signed `workflow_run` callback: HMAC check, the run's
+        // title decode and the forward to the scheduler.
+        // Run 40631853262: 0.161 (3.575 ms of 22.2 ms).
         lane: "workflow-callback",
-        cpu_ms: 10.0,
+        relative_cpu: 0.35,
     },
 ];

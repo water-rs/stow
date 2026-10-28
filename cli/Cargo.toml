@@ -52,7 +52,6 @@ find-msvc-tools = "0.1.13"
 zenwave.workspace = true
 toml = "1"
 dirs = "7"
-fs2 = "0.4"
 pathdiff = "0.2"
 sha2 = "0.11"
 base64 = "0.23"

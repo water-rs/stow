@@ -372,6 +372,19 @@ pub struct Graph {
     inflight: BTreeSet<u32>,
     /// Nodes per [`Status`].
     counts: [u32; Status::COUNT],
+    /// Pending nodes whose blocked flag is set. With `counts`,
+    /// `human_pending` and `pending_ages` it is the pending index
+    /// [`Graph::index_pending`] keeps, so the status reads never walk
+    /// the arena (stow#932).
+    pending_blocked: u32,
+    /// Pending nodes on the human lane: `GET /status`'s
+    /// `human_pending` is its length, and a human node's lane position
+    /// compares only these.
+    human_pending: BTreeSet<u32>,
+    /// Pending nodes per `first_requested` instant, which never changes
+    /// while a node holds queue state: the oldest pending request is
+    /// its first key.
+    pending_ages: BTreeMap<i64, u32>,
     /// External `build-crate.yml` runs (stow#877): run id → family bit.
     external_runs: HashMap<u64, u8>,
     /// The dispatch freeze record while engaged.
@@ -664,11 +677,13 @@ impl Graph {
     /// in-flight set.
     fn set_status(&mut self, ix: u32, to: Status) {
         self.touch(ix);
-        let node = &mut self.nodes[ix as usize];
-        let from = std::mem::replace(&mut node.status, to);
+        let from = self.nodes[ix as usize].status;
         if from == to {
             return;
         }
+        self.index_pending(ix, false);
+        self.nodes[ix as usize].status = to;
+        self.index_pending(ix, true);
         self.counts[from.index()] -= 1;
         self.counts[to.index()] += 1;
         if from.in_flight() {
@@ -677,6 +692,52 @@ impl Graph {
         if to.in_flight() {
             self.inflight.insert(ix);
         }
+    }
+
+    /// Add (`on`) or withdraw a node's share of the pending index —
+    /// `pending_blocked`, `human_pending` and `pending_ages` — from its
+    /// current status and flags; nothing for a node that is not
+    /// pending. Every change to a node's status or flags withdraws the
+    /// share first and adds it again after.
+    fn index_pending(&mut self, ix: u32, on: bool) {
+        let node = self.node(ix);
+        if node.status != Status::Pending {
+            return;
+        }
+        let blocked = u32::from(node.flags.blocked());
+        let human = node.flags.lane() == Lane::Human;
+        let first = self.state(ix).first_requested;
+        if on {
+            self.pending_blocked += blocked;
+            if human {
+                self.human_pending.insert(ix);
+            }
+            *self.pending_ages.entry(first).or_default() += 1;
+        } else {
+            self.pending_blocked -= blocked;
+            if human {
+                assert!(
+                    self.human_pending.remove(&ix),
+                    "pending human node {ix} is missing from the human index"
+                );
+            }
+            let std::collections::btree_map::Entry::Occupied(mut held) =
+                self.pending_ages.entry(first)
+            else {
+                panic!("pending node {ix}'s request instant {first} is missing from the age index");
+            };
+            *held.get_mut() -= 1;
+            if *held.get() == 0 {
+                held.remove();
+            }
+        }
+    }
+
+    /// Edit a node's flags, keeping the pending index.
+    fn edit_flags(&mut self, ix: u32, edit: impl FnOnce(&mut Flags)) {
+        self.index_pending(ix, false);
+        edit(&mut self.node_mut(ix).flags);
+        self.index_pending(ix, true);
     }
 
     /// Run `edit` on the node's extra fields, creating the entry on
@@ -826,6 +887,7 @@ impl Graph {
             flags: new.flags,
         });
         self.counts[status.index()] += 1;
+        self.index_pending(ix, true);
         let nodes = &self.nodes;
         self.ids.insert(u64::from(new.keys.tag), ix, |held| {
             u64::from(nodes[held as usize].id_tag)
@@ -944,6 +1006,11 @@ impl Graph {
             .collect();
         self.inflight = self
             .inflight
+            .iter()
+            .map(|&ix| remap[ix as usize])
+            .collect::<BTreeSet<_>>();
+        self.human_pending = self
+            .human_pending
             .iter()
             .map(|&ix| remap[ix as usize])
             .collect::<BTreeSet<_>>();
@@ -1244,7 +1311,7 @@ impl Graph {
         node.edges_start = edges_start;
         node.edges_len = edges_len;
         node.unmet = unmet;
-        node.flags.set_blocked(blocked);
+        self.edit_flags(owner, |flags| flags.set_blocked(blocked));
         if self.edges.reverse_stale() {
             self.rebuild_reverse();
         }
@@ -1747,7 +1814,7 @@ impl Graph {
             self.tally_outcome(now, target, false);
             // Dependents of a failed dep become blocked.
             for owner in self.dependents_of(ix) {
-                self.node_mut(owner).flags.set_blocked(true);
+                self.edit_flags(owner, |flags| flags.set_blocked(true));
                 self.refresh_ready(owner);
             }
         } else {
@@ -1929,7 +1996,7 @@ impl Graph {
                     if status == Status::Pending && self.node(ix).flags.lane() != Lane::Human =>
                 {
                     self.remove_ready(ix);
-                    self.node_mut(ix).flags.set_lane(Lane::Human);
+                    self.edit_flags(ix, |flags| flags.set_lane(Lane::Human));
                     // The verb's raise is the website class's operand —
                     // what a request someone asked for by name carries.
                     self.state_mut(ix).priority =
@@ -1955,7 +2022,7 @@ impl Graph {
                         .any(|edge| self.edges.dep(edge) == ix && !self.edges.met(edge));
                     if waits && self.node(owner).status == Status::Pending {
                         let blocked = fell || self.has_failed_dep(owner);
-                        self.node_mut(owner).flags.set_blocked(blocked);
+                        self.edit_flags(owner, |flags| flags.set_blocked(blocked));
                         self.refresh_ready(owner);
                     }
                 }
@@ -2112,25 +2179,20 @@ impl Graph {
         }
     }
 
-    /// `GET /status` counts — computed from the arena, no trigger.
-    pub fn status_counts(&self) -> BTreeMap<&'static str, u64> {
-        let mut counts = BTreeMap::new();
-        for node in &self.nodes {
-            let label = match node.status {
-                Status::Pending if node.flags.blocked() => "blocked",
-                Status::Pending => "pending",
-                Status::Dispatched => "dispatched",
-                Status::Running => "running",
-                Status::Completed => "completed",
-                Status::Failed => "failed",
-                Status::Published | Status::Free => continue,
-            };
-            *counts.entry(label).or_insert(0) += 1;
-            if node.flags.lane() == Lane::Human && node.status == Status::Pending {
-                *counts.entry("human_pending").or_insert(0) += 1;
-            }
+    /// `GET /status`'s body, read from the counters the status changes
+    /// keep — constant work whatever the graph holds.
+    pub fn status(&self) -> stow_types::api::SchedulerStatus {
+        let count = |status: Status| self.counts[status.index()];
+        stow_types::api::SchedulerStatus {
+            pending: count(Status::Pending),
+            human_pending: u32::try_from(self.human_pending.len())
+                .expect("the human index holds arena indexes, fewer than 2^32"),
+            dispatched: count(Status::Dispatched),
+            running: count(Status::Running),
+            completed: count(Status::Completed),
+            failed: count(Status::Failed),
+            blocked: self.pending_blocked,
         }
-        counts
     }
 
     /// Dispatch slots free under `settings`: the cap minus in-flight and
@@ -2436,6 +2498,9 @@ impl Graph {
                     self.run_finished(task_id, run_id, *success, *cancelled, error.clone(), now);
                 }
             }
+            // `Submit` parts are reassembled by the replay loop in
+            // `store.rs` before this is reached.
+            SchedulerEvent::StoreReset | SchedulerEvent::Submit { .. } => {}
             SchedulerEvent::Mutate { op, task_ids } => {
                 self.mutate(*op, task_ids, now);
             }
@@ -2468,10 +2533,8 @@ impl Graph {
                 trigger,
             } => self.apply_freeze(record.as_deref(), at, trigger),
 
-            // `Submit` parts are reassembled by the replay loop in
-            // `store.rs` before this is reached; `Request` lifecycle
-            // events land with the request-lane cutover (stage 7).
-            SchedulerEvent::Submit { .. } => {}
+            // `Request` lifecycle events land with the request-lane
+            // cutover (stage 7).
             SchedulerEvent::Request { request_id, kind } => {
                 self.apply_request_event(request_id, kind, now);
             }
@@ -2790,13 +2853,10 @@ impl Graph {
             )
         };
         let mine = order(ix);
-        let ahead = (0..u32::try_from(self.nodes.len()).expect("node indexes fit u32"))
-            .filter(|&other| {
-                let node = self.node(other);
-                node.status == Status::Pending
-                    && node.flags.lane() == Lane::Human
-                    && order(other) < mine
-            })
+        let ahead = self
+            .human_pending
+            .iter()
+            .filter(|&&other| order(other) < mine)
             .count();
         u32::try_from(ahead).unwrap_or(u32::MAX).saturating_add(1)
     }
@@ -3012,23 +3072,11 @@ impl Graph {
     /// `QueueError::Invariant` when an in-flight node's identity cannot
     /// decode.
     pub fn admin_status(&self, now: i64) -> Result<stow_types::api::AdminStatus, QueueError> {
-        let counts = self.status_counts();
-        let count = |label: &str| {
-            u32::try_from(counts.get(label).copied().unwrap_or(0)).unwrap_or(u32::MAX)
-        };
-        let pending = count("pending").saturating_add(count("blocked"));
-        let human_pending = count("human_pending");
+        let status = self.status();
         let oldest_pending = self
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| node.status == Status::Pending)
-            .map(|(ix, _)| {
-                self.state(u32::try_from(ix).expect("node indexes fit u32"))
-                    .first_requested
-            })
-            .min()
-            .map(|first| u64::try_from((now - first).max(0) / 1000).unwrap_or(0));
+            .pending_ages
+            .first_key_value()
+            .map(|(&first, _)| u64::try_from((now - first).max(0) / 1000).unwrap_or(0));
         let mut in_flight: Vec<u32> = self.inflight.iter().copied().collect();
         in_flight.sort_by_key(|&ix| (self.claimed_at_of(ix), ix));
         let in_flight = in_flight
@@ -3077,9 +3125,9 @@ impl Graph {
             })
             .collect::<Result<Vec<_>, QueueError>>()?;
         Ok(stow_types::api::AdminStatus {
-            pending_miss: pending.saturating_sub(human_pending),
-            pending_human: human_pending,
-            blocked: count("blocked"),
+            pending_miss: status.pending.saturating_sub(status.human_pending),
+            pending_human: status.human_pending,
+            blocked: status.blocked,
             oldest_pending_seconds: oldest_pending,
             in_flight,
             targets,
@@ -3130,6 +3178,7 @@ impl Graph {
             if status.in_flight() {
                 self.inflight.insert(ix);
             }
+            self.index_pending(ix, true);
         }
         self.rebuild_indexes_over_nodes();
         for ix in 0..u32::try_from(self.nodes.len()).expect("node indexes fit u32") {
@@ -3346,15 +3395,14 @@ impl crate::freeze::FreezeStore for GraphFreezeStore<'_> {
         });
         async { Ok(()) }
     }
-    fn delete(&self) -> impl std::future::Future<Output = Result<(), QueueError>> + Send {
-        let trigger = self
-            .cell
-            .with(|graph| graph.freeze().map(|record| record.trigger.clone()))
-            .unwrap_or(stow_types::api::DispatchFreezeTrigger::Manual);
+    fn delete(
+        &self,
+        cleared: &stow_types::api::DispatchFreezeRecord,
+    ) -> impl std::future::Future<Output = Result<(), QueueError>> + Send {
         self.commit(SchedulerEvent::Freeze {
             record: None,
             at: self.at.clone(),
-            trigger,
+            trigger: cleared.trigger.clone(),
         });
         async { Ok(()) }
     }
@@ -3453,6 +3501,27 @@ mod tests {
         graph.ready.values().map(BTreeSet::len).sum()
     }
 
+    /// The pending index recomputed by walking the arena — what
+    /// `index_pending` keeps through every transition must equal it.
+    fn assert_pending_index(graph: &Graph) {
+        let mut blocked = 0u32;
+        let mut human = BTreeSet::new();
+        let mut ages: BTreeMap<i64, u32> = BTreeMap::new();
+        for (ix, node) in (0u32..).zip(&graph.nodes) {
+            if node.status != Status::Pending {
+                continue;
+            }
+            blocked += u32::from(node.flags.blocked());
+            if node.flags.lane() == Lane::Human {
+                human.insert(ix);
+            }
+            *ages.entry(graph.state(ix).first_requested).or_default() += 1;
+        }
+        assert_eq!(graph.pending_blocked, blocked, "blocked pending nodes");
+        assert_eq!(graph.human_pending, human, "pending human nodes");
+        assert_eq!(graph.pending_ages, ages, "pending request instants");
+    }
+
     /// What a wake decodes when the store holds exactly this graph's
     /// plan — every row of every dirty span, in key order.
     fn round_trip(graph: &Graph) -> Graph {
@@ -3482,7 +3551,7 @@ mod tests {
         assert_eq!((report.inserted, report.merged), (3, 0));
         let report = graph.merge(&chain(), 2000).expect("remerge");
         assert_eq!((report.inserted, report.merged), (0, 3));
-        assert_eq!(graph.status_counts()["pending"], 3);
+        assert_eq!(graph.status().pending, 3);
     }
 
     #[test]
@@ -3663,9 +3732,11 @@ mod tests {
             assert_eq!(graph.edges.owners_of(leaf), vec![dependent]);
         }
         assert_eq!(ready_count(&graph), 1_000, "the unpublished leaves");
+        assert_pending_index(&graph);
         // The renumbered graph still flips edges.
         assert_eq!(publish(&mut graph, "l1500"), 1);
         assert_eq!(ready_count(&graph), 1_000, "l1500 left, d1500 joined");
+        assert_pending_index(&graph);
     }
 
     #[test]
@@ -4068,6 +4139,90 @@ mod tests {
         assert!(!graph.node(b).flags.blocked());
     }
 
+    /// The status reads come from the pending index, so it must match
+    /// the arena after every kind of transition: a merge, a failure
+    /// that blocks dependents, each operator verb, a publish, a
+    /// compaction and a wake.
+    #[test]
+    fn the_pending_index_tracks_every_transition() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 1_000).expect("merge");
+        assert_pending_index(&graph);
+        let claimed = graph.claim(45, 16, 1_000, 3_600_000).expect("claim c");
+        graph.bind(&id("c"), claimed[0].generation, 77, 1_000);
+        assert_pending_index(&graph);
+        for _ in 1..queue::MAX_BUILD_ATTEMPTS {
+            graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 2_000);
+            assert_pending_index(&graph);
+            let ix = graph.node_ix(&id("c")).expect("node");
+            graph.edit_extra(ix, |extra| extra.not_before = 0);
+            graph.refresh_ready(ix);
+            let claimed = graph.claim(45, 16, 3_000, 3_600_000).expect("reclaim");
+            graph.bind(&id("c"), claimed[0].generation, 77, 4_000);
+        }
+        graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 5_000);
+        assert_pending_index(&graph);
+        assert_eq!(graph.status().blocked, 1, "b waits on the failed c");
+
+        for (name, at) in [("h1", 6_000), ("h2", 7_000)] {
+            let tree = SubmissionTree {
+                source: SubmissionSource::HumanRequest,
+                roots: vec![0],
+                nodes: vec![sub(name)],
+            };
+            graph.merge(&tree, at).expect("merge human");
+        }
+        assert_pending_index(&graph);
+        assert_eq!(graph.status().human_pending, 2);
+        assert_eq!(graph.mutate(MutationKind::Promote, &[id("b")], 8_000), 1);
+        assert_pending_index(&graph);
+        assert_eq!(graph.status().human_pending, 3);
+        assert_eq!(graph.mutate(MutationKind::Retry, &[id("c")], 9_000), 1);
+        assert_pending_index(&graph);
+        assert_eq!(graph.status().blocked, 0, "c left failed");
+        assert_eq!(graph.mutate(MutationKind::Cancel, &[id("h1")], 10_000), 1);
+        assert_pending_index(&graph);
+        assert_eq!(graph.mutate(MutationKind::Purge, &[id("h1")], 11_000), 1);
+        assert_pending_index(&graph);
+
+        let status = graph.admin_status(1_000 + 61_000).expect("admin status");
+        assert_eq!(
+            status.oldest_pending_seconds,
+            Some(61),
+            "a and b from t=1000"
+        );
+        assert_eq!((status.pending_human, status.pending_miss), (2, 2));
+
+        let claimed = graph.claim(45, 16, 12_000, 3_600_000).expect("claim");
+        for (run, task) in (100u64..).zip(&claimed) {
+            graph.bind(&task.task_id, task.generation, run, 12_000);
+            graph.run_finished(&task.task_id, run, true, false, None, 13_000);
+        }
+        assert_pending_index(&graph);
+        // A human node behind the purged h1's slot: the compaction
+        // renumbers it.
+        let tree = SubmissionTree {
+            source: SubmissionSource::HumanRequest,
+            roots: vec![0],
+            nodes: vec![sub("h3")],
+        };
+        graph.merge(&tree, 14_000).expect("merge h3");
+        publish(&mut graph, "c");
+        assert_pending_index(&graph);
+        let h3 = graph.node_ix(&id("h3")).expect("h3");
+        graph.compact();
+        assert_ne!(
+            graph.node_ix(&id("h3")),
+            Some(h3),
+            "the compaction moved h3"
+        );
+        assert_pending_index(&graph);
+
+        let restored = round_trip(&graph);
+        assert_pending_index(&restored);
+        assert_eq!(restored.status(), graph.status());
+    }
+
     #[test]
     fn stale_lease_reclaims_dispatch() {
         let mut graph = Graph::default();
@@ -4107,7 +4262,7 @@ mod tests {
         graph.meter.record("test", 7, 11);
         graph.seeded_rows = Some(10_000);
         let mut restored = round_trip(&graph);
-        assert_eq!(restored.status_counts(), graph.status_counts());
+        assert_eq!(restored.status(), graph.status());
         // stow#931: the head carries only the probe ledger — the day
         // totals live in the `meter` table row alone.
         assert_eq!(restored.meter.rows_read, 0);
@@ -4180,7 +4335,9 @@ mod tests {
         };
         let record = DispatchFreezeRecord {
             frozen_at: "2026-09-22T03:51:00Z".to_owned(),
-            trigger: DispatchFreezeTrigger::Manual,
+            trigger: DispatchFreezeTrigger::Manual {
+                actor: "test".to_owned(),
+            },
             notify: ChannelOutcome::Disabled {
                 reason: "test".to_owned(),
             },
@@ -4199,7 +4356,9 @@ mod tests {
         graph.apply(
             &SchedulerEvent::Freeze {
                 at: "2026-09-22T04:00:00Z".to_owned(),
-                trigger: DispatchFreezeTrigger::Manual,
+                trigger: DispatchFreezeTrigger::Manual {
+                    actor: "test".to_owned(),
+                },
                 record: None,
             },
             0,
@@ -4218,7 +4377,9 @@ mod tests {
         };
         let record = DispatchFreezeRecord {
             frozen_at: "2026-09-22T03:51:00Z".to_owned(),
-            trigger: DispatchFreezeTrigger::Manual,
+            trigger: DispatchFreezeTrigger::Manual {
+                actor: "test".to_owned(),
+            },
             notify: ChannelOutcome::Disabled {
                 reason: "test".to_owned(),
             },
@@ -4241,7 +4402,9 @@ mod tests {
         graph.apply(
             &SchedulerEvent::Freeze {
                 at: "2026-09-22T04:00:00Z".to_owned(),
-                trigger: DispatchFreezeTrigger::Manual,
+                trigger: DispatchFreezeTrigger::Manual {
+                    actor: "test".to_owned(),
+                },
                 record: None,
             },
             0,
@@ -4275,10 +4438,14 @@ mod tests {
         graph.apply(
             &SchedulerEvent::Freeze {
                 at: "2026-10-24T00:00:00Z".to_owned(),
-                trigger: DispatchFreezeTrigger::Manual,
+                trigger: DispatchFreezeTrigger::Manual {
+                    actor: "test".to_owned(),
+                },
                 record: Some(Box::new(DispatchFreezeRecord {
                     frozen_at: "2026-10-24T00:00:00Z".to_owned(),
-                    trigger: DispatchFreezeTrigger::Manual,
+                    trigger: DispatchFreezeTrigger::Manual {
+                        actor: "test".to_owned(),
+                    },
                     notify: ChannelOutcome::Disabled {
                         reason: "test".to_owned(),
                     },

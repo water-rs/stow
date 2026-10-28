@@ -31,6 +31,7 @@ use stow_types::index::{ArtifactIndex, STOW_INDEX_MEDIA_TYPE, index_tag};
 use stow_types::registry::{CacheRepository, cache_repository};
 
 use crate::config::StowConfig;
+use crate::file_lock::FileLock;
 use crate::verify;
 
 /// The pointer file inside each slice directory.
@@ -587,7 +588,9 @@ where
 /// replaces them and evicts the previous generation. Every access to a
 /// slice's files goes through one, and only on a blocking thread whose
 /// closure owns the lock, so the lock is released after the last file
-/// handle closes even when the awaiting future is dropped.
+/// handle closes even when the awaiting future is dropped. The release is
+/// an explicit unlock ([`FileLock`]), never the lock file's close, which a
+/// child spawned meanwhile would delay (stow#1003).
 ///
 /// Refreshes of one slice share its directory — two `stow` processes on
 /// one `cache_dir`, every local CI build of one target — and run at once
@@ -600,7 +603,7 @@ where
 /// returns and no name is ever left pending.
 struct LockedSlice<Mode> {
     dir: PathBuf,
-    _lock: std::fs::File,
+    _lock: FileLock,
     _mode: PhantomData<Mode>,
 }
 
@@ -655,7 +658,7 @@ impl LockedSlice<Shared> {
                     .wrap_err_with(|| format!("open index slice lock in {}", dir.display()));
             }
         };
-        lock.lock_shared()
+        let lock = FileLock::shared(lock)
             .wrap_err_with(|| format!("lock index slice {} shared", dir.display()))?;
         Ok(Some(Self {
             dir: dir.to_path_buf(),
@@ -671,7 +674,7 @@ impl LockedSlice<Exclusive> {
             .wrap_err_with(|| format!("create index dir {}", dir.display()))?;
         let lock = Self::open_lock(dir)
             .wrap_err_with(|| format!("open index slice lock in {}", dir.display()))?;
-        lock.lock()
+        let lock = FileLock::exclusive(lock)
             .wrap_err_with(|| format!("lock index slice {} exclusive", dir.display()))?;
         Ok(Self {
             dir: dir.to_path_buf(),

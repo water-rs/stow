@@ -31,8 +31,8 @@ on:
 
 permissions:
   contents: read
-  # Mints the run's OIDC token — the edge accepts any workflow OIDC minted
-  # inside water-rs/stow for the scheduler endpoints.
+  # Mints the run's OIDC token — the edge's submit route admits this
+  # workflow's runs on main.
   id-token: write
 
 concurrency:
@@ -67,8 +67,8 @@ jobs:
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           # stow-admin mints a fresh Actions OIDC JWT for every edge
-          # request under this audience; the RepoWriter policy admits any
-          # workflow inside water-rs/stow.
+          # request under this audience; the submit route admits this
+          # workflow on main.
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
           CF_ACCOUNT_ID: ${{ vars.CF_ACCOUNT_ID }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}

@@ -63,6 +63,26 @@ const PUSH_VERDICT_TTL_SECS: i64 = 300;
 /// the full positive TTL.
 const PUSH_DENIED_TTL_SECS: i64 = 60;
 
+/// The ref every mutating route pins (stow#955): a workflow run on any
+/// other ref can read but never mutate.
+pub const MAIN_REF: &str = "refs/heads/main";
+
+/// The workflow every operator mutation runs through (stow#955).
+/// `stow-admin` dispatches a fresh run per command, so the edge admits
+/// only a run's first attempt: a token's `actor` names whoever started
+/// the run, never whoever re-ran it, and a re-run would attribute one
+/// operator's mutation to another.
+pub const OPERATIONS_WORKFLOW: &str = "operations.yml";
+
+/// Which workflows' runs may call a mutating route (stow#955). Each
+/// route names its own policy type, so the set it admits is fixed where
+/// the route is mounted; only a GitHub Actions OIDC identity of one of
+/// these workflows, running at [`MAIN_REF`], passes [`authorize_mutation`].
+pub trait MutationPolicy: Send + Sync + 'static {
+    /// Workflow files under the repository's `.github/workflows/`.
+    const WORKFLOWS: &'static [&'static str];
+}
+
 /// A caller that cleared the trust check. Carried into tracing so the
 /// write logs name *who* wrote rather than "someone with the token".
 #[derive(Debug, Clone)]
@@ -71,8 +91,20 @@ pub enum TrustedCaller {
     Actions {
         /// `owner/repo/.github/workflows/<file>.yml@refs/...` of the job.
         job_workflow_ref: String,
+        /// `owner/repo/.github/workflows/<file>.yml@refs/...` of the run
+        /// — differs from `job_workflow_ref` only when the job runs a
+        /// reusable workflow.
+        workflow_ref: String,
         /// The workflow run id, for correlating a write back to its run.
         run_id: String,
+        /// Which attempt of the run the job belongs to — `1` unless the
+        /// run was re-run.
+        run_attempt: String,
+        /// The token's `ref` claim — the ref the run executes at.
+        git_ref: String,
+        /// The token's `actor` claim — the GitHub login that triggered
+        /// the run, which a mutation's log row is attributed to.
+        actor: String,
     },
     /// A GitHub credential that proved push access to the repo — a user
     /// token (label is the login) or an installation token such as the
@@ -85,13 +117,60 @@ pub enum TrustedCaller {
     },
 }
 
+/// Gate an authenticated caller for a mutating route (stow#955). Only a
+/// GitHub Actions OIDC identity passes — a user token and every other
+/// push credential are read-only — and only one whose run executes at
+/// [`MAIN_REF`] with both its run's and its job's workflow being one of
+/// `workflows` at [`MAIN_REF`], so neither another ref's copy of an
+/// allowed workflow nor an allowed workflow called from another one
+/// can mutate; a run passes only on its first attempt, since a re-run
+/// carries the original run's actor. Every claim compared here was read from a token whose
+/// signature, issuer, audience, expiry and repository
+/// [`authenticate`] already verified. Returns the actor the mutation is
+/// attributed to.
+///
+/// # Errors
+/// [`AuthError::Unauthorized`] for any caller outside the policy.
+pub fn authorize_mutation<'a>(
+    caller: &'a TrustedCaller,
+    workflows: &[&str],
+    repo: &str,
+) -> Result<&'a str, AuthError> {
+    let TrustedCaller::Actions {
+        job_workflow_ref,
+        workflow_ref,
+        run_attempt,
+        git_ref,
+        actor,
+        ..
+    } = caller
+    else {
+        return Err(AuthError::Unauthorized);
+    };
+    let pinned = |file: &str| format!("{repo}/.github/workflows/{file}@{MAIN_REF}");
+    let admitted = |claim: &str| workflows.iter().any(|file| claim == pinned(file));
+    if git_ref != MAIN_REF || job_workflow_ref != workflow_ref || !admitted(workflow_ref) {
+        return Err(AuthError::Unauthorized);
+    }
+    if run_attempt != "1" {
+        return Err(AuthError::Unauthorized);
+    }
+    Ok(actor)
+}
+
 impl std::fmt::Display for TrustedCaller {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Actions {
                 job_workflow_ref,
                 run_id,
-            } => write!(f, "actions:{job_workflow_ref} run {run_id}"),
+                run_attempt,
+                actor,
+                ..
+            } => write!(
+                f,
+                "actions:{job_workflow_ref} run {run_id} attempt {run_attempt} actor {actor}"
+            ),
             Self::Push { label } => write!(f, "push:{label}"),
         }
     }
@@ -230,7 +309,11 @@ async fn authenticate_oidc(
     }
     Ok(TrustedCaller::Actions {
         job_workflow_ref: claims.job_workflow_ref,
+        workflow_ref: claims.workflow_ref,
         run_id: claims.run_id,
+        run_attempt: claims.run_attempt,
+        git_ref: claims.git_ref,
+        actor: claims.actor,
     })
 }
 
@@ -281,6 +364,16 @@ struct OidcClaims {
     job_workflow_ref: String,
     #[serde(default)]
     run_id: String,
+    /// GitHub sets `workflow_ref`, `run_attempt`, `ref` and `actor` on
+    /// every Actions token; one without them is not a token the mutation
+    /// gate can judge, so they are required rather than defaulted.
+    workflow_ref: String,
+    run_attempt: String,
+    /// The `ref` claim (a Rust keyword — renamed).
+    #[serde(rename = "ref")]
+    git_ref: String,
+    /// The `actor` claim — the login that triggered the run.
+    actor: String,
 }
 
 /// `aud` arrives as a string for a single audience and an array for many.
@@ -1032,8 +1125,194 @@ mod tests {
             "repository": "water-rs/stow",
             "job_workflow_ref":
                 "water-rs/stow/.github/workflows/preheat-admin.yml@refs/heads/main",
+            "workflow_ref":
+                "water-rs/stow/.github/workflows/preheat-admin.yml@refs/heads/main",
             "run_id": "12345",
+            "run_attempt": "1",
+            "ref": "refs/heads/main",
+            "actor": "octo-dispatcher",
         })
+    }
+
+    /// The claims a run of `file` at `git_ref` carries — a direct run,
+    /// so its run and job workflow refs agree.
+    fn workflow_claims(file: &str, git_ref: &str) -> serde_json::Value {
+        let mut claims = actions_claims();
+        let workflow = format!("water-rs/stow/.github/workflows/{file}@{git_ref}");
+        claims["job_workflow_ref"] = serde_json::json!(workflow);
+        claims["workflow_ref"] = serde_json::json!(workflow);
+        claims["ref"] = serde_json::json!(git_ref);
+        claims
+    }
+
+    /// Authenticate `claims` as a minted OIDC token.
+    async fn oidc_caller(claims: &serde_json::Value) -> TrustedCaller {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        authenticate(
+            &test_config(),
+            &api,
+            &Jwks::default(),
+            &PushVerdicts::default(),
+            &mint_jwt(&key, claims),
+            NOW,
+        )
+        .await
+        .expect("actions caller")
+    }
+
+    const OPERATIONS: &[&str] = &[OPERATIONS_WORKFLOW];
+
+    /// stow#955: a push credential — the `stow-admin login` user token
+    /// included — authenticates for reads but never mutates.
+    #[tokio::test]
+    async fn mutation_refuses_a_user_token() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        *api.push_login.lock().expect("lock") = Some("octo-dispatcher".to_owned());
+        let caller = authenticate(
+            &test_config(),
+            &api,
+            &Jwks::default(),
+            &PushVerdicts::default(),
+            "ghu_user_token",
+            NOW,
+        )
+        .await
+        .expect("a user token with push access still authenticates for reads");
+        assert!(matches!(
+            authorize_mutation(&caller, OPERATIONS, "water-rs/stow"),
+            Err(AuthError::Unauthorized)
+        ));
+    }
+
+    /// The operations workflow on `main` passes, attributed to the
+    /// login that dispatched it.
+    #[tokio::test]
+    async fn mutation_admits_operations_on_main_with_its_actor() {
+        let caller = oidc_caller(&workflow_claims("operations.yml", MAIN_REF)).await;
+        assert_eq!(
+            authorize_mutation(&caller, OPERATIONS, "water-rs/stow").expect("admitted"),
+            "octo-dispatcher"
+        );
+    }
+
+    /// Another workflow of the same repository on `main` is refused by a
+    /// route that does not name it, and admitted by one that does.
+    #[tokio::test]
+    async fn mutation_refuses_a_workflow_the_route_does_not_name() {
+        let caller = oidc_caller(&workflow_claims("preheat-admin.yml", MAIN_REF)).await;
+        assert!(matches!(
+            authorize_mutation(&caller, OPERATIONS, "water-rs/stow"),
+            Err(AuthError::Unauthorized)
+        ));
+        assert!(
+            authorize_mutation(
+                &caller,
+                &["operations.yml", "preheat-admin.yml"],
+                "water-rs/stow"
+            )
+            .is_ok()
+        );
+    }
+
+    /// The operations workflow run from any ref but `main` — a branch
+    /// carrying its own copy of the file, a tag, a pull request merge
+    /// ref — is refused.
+    #[tokio::test]
+    async fn mutation_refuses_operations_from_another_ref() {
+        for git_ref in [
+            "refs/heads/feature",
+            "refs/tags/v1.0.0",
+            "refs/pull/1/merge",
+        ] {
+            let caller = oidc_caller(&workflow_claims("operations.yml", git_ref)).await;
+            assert!(
+                matches!(
+                    authorize_mutation(&caller, OPERATIONS, "water-rs/stow"),
+                    Err(AuthError::Unauthorized)
+                ),
+                "{git_ref} must not mutate"
+            );
+        }
+    }
+
+    /// Each pinned claim is checked: a `main` run whose job workflow is
+    /// another ref's copy, an allowed file reached as a reusable workflow
+    /// from another one (allowed or not), and a file whose name only
+    /// starts with an allowed one are all refused.
+    #[tokio::test]
+    async fn mutation_pins_every_workflow_claim() {
+        let mut job_elsewhere = workflow_claims("operations.yml", MAIN_REF);
+        job_elsewhere["job_workflow_ref"] =
+            serde_json::json!("water-rs/stow/.github/workflows/operations.yml@refs/heads/feature");
+        let mut reused = workflow_claims("operations.yml", MAIN_REF);
+        reused["workflow_ref"] =
+            serde_json::json!("water-rs/stow/.github/workflows/test.yml@refs/heads/main");
+        let lookalike = workflow_claims("operations.yml.bak", MAIN_REF);
+        for claims in [job_elsewhere, reused, lookalike] {
+            let caller = oidc_caller(&claims).await;
+            assert!(
+                matches!(
+                    authorize_mutation(&caller, OPERATIONS, "water-rs/stow"),
+                    Err(AuthError::Unauthorized)
+                ),
+                "{claims}"
+            );
+        }
+        // Both files on the route's list, one reached as a reusable
+        // workflow from the other: the two claims must name one file.
+        let mut crossed = workflow_claims("preheat-admin.yml", MAIN_REF);
+        crossed["workflow_ref"] =
+            serde_json::json!("water-rs/stow/.github/workflows/operations.yml@refs/heads/main");
+        let caller = oidc_caller(&crossed).await;
+        assert!(matches!(
+            authorize_mutation(
+                &caller,
+                &["operations.yml", "preheat-admin.yml"],
+                "water-rs/stow"
+            ),
+            Err(AuthError::Unauthorized)
+        ));
+    }
+
+    /// A re-run carries the original run's `actor`, not whoever started
+    /// the re-run, so no re-run may mutate; recovery dispatches a fresh
+    /// run.
+    #[tokio::test]
+    async fn mutation_refuses_a_rerun() {
+        for workflow in ["operations.yml", "preheat-admin.yml"] {
+            let mut rerun = workflow_claims(workflow, MAIN_REF);
+            rerun["run_attempt"] = serde_json::json!("2");
+            let caller = oidc_caller(&rerun).await;
+            assert!(matches!(
+                authorize_mutation(&caller, &[workflow], "water-rs/stow"),
+                Err(AuthError::Unauthorized)
+            ));
+        }
+    }
+
+    /// An Actions token missing a claim the gate judges is refused at
+    /// authentication — never defaulted to an empty actor or ref.
+    #[tokio::test]
+    async fn oidc_without_actor_or_ref_is_refused() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        for claim in ["actor", "ref", "workflow_ref", "run_attempt"] {
+            let mut claims = workflow_claims("operations.yml", MAIN_REF);
+            claims.as_object_mut().expect("claims object").remove(claim);
+            assert_unauthorized(
+                &authenticate(
+                    &test_config(),
+                    &api,
+                    &Jwks::default(),
+                    &PushVerdicts::default(),
+                    &mint_jwt(&key, &claims),
+                    NOW,
+                )
+                .await,
+            );
+        }
     }
 
     fn assert_unauthorized(result: &Result<TrustedCaller, AuthError>) {
@@ -1061,6 +1340,7 @@ mod tests {
         let TrustedCaller::Actions {
             job_workflow_ref,
             run_id,
+            ..
         } = caller
         else {
             panic!("expected Actions caller");

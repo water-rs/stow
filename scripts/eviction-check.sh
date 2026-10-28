@@ -74,7 +74,6 @@ manifest_var() { sed -n "s/^$2 *= *\"\([^\"]*\)\".*/\1/p" "$REPO_ROOT/edge/$1"; 
 DISPATCH_LIMIT="$(manifest_var Skyzen.toml STOW_MAX_CONCURRENT_JOBS)"
 WEBHOOK_SECRET="$(manifest_var Skyzen.mock.toml STOW_GITHUB_WEBHOOK_SECRET)"
 APP_SLUG="$(manifest_var Skyzen.mock.toml GITHUB_APP_SLUG)"
-BEARER="${GH_TOKEN:-$(gh auth token 2>/dev/null)}"
 [ -n "$DISPATCH_LIMIT" ] && [ -n "$WEBHOOK_SECRET" ] || die "edge manifests carry no dispatch cap or webhook secret"
 for tool in jq curl wrangler openssl; do
     command -v "$tool" >/dev/null || die "$tool is required"
@@ -82,6 +81,9 @@ done
 for bin in stow-mock-registry stow-build stow-admin; do
     [ -x "$BIN/$bin" ] || die "$BIN/$bin is not built"
 done
+# stow#955: the freeze, reset and seed routes admit only the operations
+# workflow's OIDC token on main; the mock issuer signs one for the run.
+BEARER="$("$BIN/stow-mock-registry" oidc-token --workflow operations.yml --lifetime-secs 7200)"
 
 openssl ecparam -name prime256v1 -genkey -noout -out "$WORK/keys/private.pem" 2>/dev/null
 openssl pkcs8 -topk8 -nocrypt -in "$WORK/keys/private.pem" -out "$WORK/keys/p8.pem" 2>/dev/null

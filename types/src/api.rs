@@ -1178,8 +1178,14 @@ pub struct DispatchFreezeRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DispatchFreezeTrigger {
-    /// An operator froze dispatch by hand (`POST /dispatch-freeze`).
-    Manual,
+    /// An operator froze dispatch by hand (`POST /dispatch-freeze`),
+    /// which only the `operations.yml` run on `main` can reach
+    /// (stow#955).
+    Manual {
+        /// The verified `actor` claim of that run's OIDC token — the
+        /// GitHub login that dispatched it.
+        actor: String,
+    },
     /// The systematic-failure trip condition fired on a completion
     /// report: enough outcomes inside the window *and* a failure ratio
     /// over them, both required.
@@ -1195,7 +1201,7 @@ impl DispatchFreezeTrigger {
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
-            Self::Manual => "manual",
+            Self::Manual { .. } => "manual",
             Self::Tripped(_) => "tripped",
             Self::Cost(_) => "cost",
         }
@@ -1419,7 +1425,7 @@ pub struct SchedulerHealth {
 }
 
 /// Scheduler DO queue status for monitoring.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct SchedulerStatus {
     /// Tasks waiting to become dispatchable.
     pub pending: u32,
@@ -5566,6 +5572,10 @@ pub enum SchedulerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// The first row of a store an operator reset — the reset drops
+    /// every row before it, so this row is what carries the resetting
+    /// run's `actor` (stow#955). Applies to nothing.
+    StoreReset,
     /// An operator mutation, selector already resolved to ids.
     Mutate {
         /// The mutation applied.

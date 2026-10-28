@@ -158,7 +158,7 @@ The miss lane is also depth-capped: once the scheduler reports
 `pending >= STOW_MAX_QUEUE_PENDING` the handler refuses tickets with 429
 and `Retry-After: 600`, and the Durable Object repeats the check inside
 `enqueue` so a race of concurrent redemptions cannot overshoot by more
-than one submit batch. Human-lane and RepoWriter-trusted submits
+than one submit batch. Human-lane and workflow-trusted submits
 (`POST /tasks/submit/trusted` inside the object) skip this gate.
 
 ### Human request lane
@@ -311,7 +311,7 @@ lockfile-preserving overlay build is a different artifact.
 Completion is not what releases a waiting dependent, though: completed
 is not servable. The `index-publish` workflow reports each signed
 slice's semantic membership to the edge after a publish lands
-(`POST /api/v1/admin/index/{target}/{rustc_version}`, forwarded into the
+(`POST /api/v1/admin/index/published`, forwarded into the
 scheduler's `published_slice_rows` tables), and the dependency gate in
 `DEPENDENCY_NOT_BLOCKED_SQL` lets a pending row claim only when every
 edge resolves to a row the latest report for that dependency's own
@@ -332,11 +332,16 @@ alone — nothing reads an older shape of a store.
 
 - The scheduler Durable Object's schema is `edge/src/scheduler/schema.sql`,
   created by the operator reset route — `stow-admin scheduler reset
-  --yes` (→ `POST /api/v1/admin/scheduler/reset` → the object's `/reset`)
-  drops every table, index and trigger and re-executes the file; the
+  --yes` (→ `operations.yml` → `POST /api/v1/admin/scheduler/reset` →
+  the object's `/reset`) drops every table, index and trigger and
+  re-executes the file, then appends a `StoreReset` row carrying the
+  dispatcher's login as the fresh log's first row; the
   queue and recorded slices are destroyed and refill from the lanes
   that feed them. A store that was never initialized gets its schema
   from the same pass — a fresh deployment's operator runs it once.
+  A stored record's shape is part of the schema: a change to one — the
+  dispatch freeze's manual trigger carries its `actor` — lands with the
+  reset.
 - Request code and the alarm never create, alter, drop, backfill or
   check the schema — a request on an uninitialized store fails with
   SQLite's own `no such table` error.
@@ -514,7 +519,7 @@ What each hop is allowed to do:
 | scheduler DO | its SQLite store | its SQLite store; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/{target}/{rustc_version}` when its `stow_edge_url` input is set |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/published` when its `report` input is set |
 
 The edge's remaining crates.io reads are the request route's version and
 rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,
@@ -588,10 +593,18 @@ CI holds no Cloudflare credential. The edge's trusted routes authorize
 by GitHub identity on the `Authorization: Bearer` header — an Actions
 OIDC token minted inside the
 repo (signature verified against GitHub's JWKS, with `iss`/`aud`/`repository`/
-`job_workflow_ref`/`exp` pinned), or any credential GitHub would accept a
+`exp` pinned and the `workflow_ref`/`job_workflow_ref`/`ref`/`run_attempt`/`actor`
+claims read), or any credential GitHub would accept a
 push from on the repo (probed via the `git-receive-pack` ref
 advertisement — uniform across user tokens, fine-grained PATs, and
-installation tokens). The CLI verifies cosign signatures on every cache hit
+installation tokens). The second shape only reads. A mutating route
+admits only the OIDC token of a workflow on its own list, run at
+`refs/heads/main`, so an operator — untrusted — mutates only by
+dispatching `.github/workflows/operations.yml`, which leaves a run under
+their account; the token's `actor` is recorded on the first scheduler
+log row the request appends and on a manual freeze record
+([`DEPLOYMENT.md`](DEPLOYMENT.md#trusted-endpoint-authentication)).
+The CLI verifies cosign signatures on every cache hit
 (`cli/src/verify.rs`) before injecting bytes into Cargo's target directory,
 and the digest-addressed fetch requires the bytes to hash to the index's
 `bundle_digest`, so a polluted record (e.g. from a stolen credential)
@@ -739,8 +752,8 @@ Four workflows keep it warm:
   unfinished staging attempt re-materializes from scratch under a fresh
   generation, a frozen `complete` hour delivers its original staged
   pages without a new query, and only then is the watermark's
-  successor — or `--hour YYYY-MM-DDTHH`, the operator's recovery path —
-  materialized: one `analytics_engine/sql` `FORMAT JSON` query over the
+  successor — or `--hour YYYY-MM-DDTHH`, the operator's recovery path,
+  dispatched through `operations.yml` — materialized: one `analytics_engine/sql` `FORMAT JSON` query over the
   closed hour's `semantic`/`graph` misses weighted
   `sum(_sample_interval * double1)`, response streamed to disk, parsed
   on the blocking pool with whole-document validation (meta shape,
@@ -804,9 +817,9 @@ fields, retention, opt-out — is documented in
 
 All endpoints live on the edge worker. `?` paths use `Json<T>` extractors,
 which means the body is parsed *after* the per-handler extractor chain — and
-the bearer-credential extractor (`SchedulerCaller`) is declared first on
-authenticated handlers, so unauthorized POSTs short-circuit before
-deserialization.
+the bearer-credential extractor (`SchedulerCaller` for reads, `Mutator`
+for mutations) is declared first on authenticated handlers, so
+unauthorized POSTs short-circuit before deserialization.
 
 | Method + path | Auth | Body | Response | Purpose |
 |---|---|---|---|---|
@@ -816,10 +829,10 @@ deserialization.
 | POST `/api/v1/build-report` | none | `BuildReport` | 204 | One install's daily usage counters — at most one report per install per UTC day, one `stow_events` `build` point per accepted report |
 | GET `/api/v1/bundles/{rustc_version}/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Byte fetch — the only artifact-serving route; the `{rustc_version}` segment names the artifact's GHCR package and the `sha256:<64 hex>` segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
-| POST `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
+| POST `/api/v1/admin/dispatch-freeze` | Bearer: `operations.yml` OIDC on `main` | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
-| POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: repo-workflow OIDC or push user | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
+| POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: `operations.yml` OIDC on `main` | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
@@ -829,16 +842,20 @@ deserialization.
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestStatus` | Human request: admit and dispatch a `resolve-request.yml` run that enqueues the crate's closure on every CI target in the human lane |
 | GET `/api/v1/requests/{request_id}` | none | — | `CrateRequestStatus` | Live request record: `accepted` → `resolving` → `enqueued`/`failed` plus per-target states |
 | GET `/requests/{request_id}` | none | — | HTML | The same `CrateRequestStatus` rendered as a page, the link the request form returns |
-| POST `/api/v1/scheduler/requests/{request_id}/outcome` | Bearer: repo-workflow OIDC or push user | `RequestOutcomeReport` | `CrateRequestStatus` | The `resolve-request.yml` job's submission — enqueues the resolved tasks and settles the request record |
+| POST `/api/v1/scheduler/requests/{request_id}/outcome` | Bearer: `resolve-request.yml` OIDC on `main` | `RequestOutcomeReport` | `CrateRequestStatus` | The `resolve-request.yml` job's submission — enqueues the resolved tasks and settles the request record |
 | GET `/api/v1/crates/search?q=&limit=` | none | — | `CrateSearchResponse` | crates.io search, proxied for the request form's completions; query must be ≥2 chars, limit clamps to 1–25 (default 10), response cached 5 min |
 | GET `/api/v1/crates/{crate_name}/versions` | none | — | `CrateVersionsResponse` | Published, non-yanked versions newest-first — the form's version picker; cached 10 min |
 | GET `/api/v1/crates/{crate_name}/versions/{version}/features` | none | — | `CrateFeaturesResponse` | Every selectable feature, `default` first — the form's feature checkboxes; cached 10 min |
-| POST `/api/v1/scheduler/tasks/submit` | Bearer: repo-workflow OIDC or push user | `Vec<EnqueueRequest>` | `SchedulerSubmitResponse` | Submit one task batch |
+| POST `/api/v1/scheduler/tasks/submit` | Bearer: `operations.yml`, `preheat-admin.yml` or `preheat-missed.yml` OIDC on `main` | `Vec<SubmissionTree>` | `SchedulerSubmitResponse` | Submit one task batch |
+| POST `/api/v1/scheduler/tasks/submit-ids` | Bearer: `operations.yml` or `preheat-admin.yml` OIDC on `main` | `SubmitTaskIdsRequest` | `SubmitTaskIdsResponse` | Submit stored subgraphs by task id — `preheat projects submit` |
+| POST `/api/v1/admin/scheduler/reset` | Bearer: `operations.yml` OIDC on `main` | — | `SchedulerResetReport` | Drop and recreate the scheduler store — `scheduler reset` |
+| POST `/api/v1/admin/scheduler/demand`, `…/demand-feed/{query\|begin\|page\|complete\|cleanup\|deliver}` | Bearer: `operations.yml` or `demand-feed.yml` OIDC on `main` | demand-feed request types | demand-feed reports | The demand ledger's input lane — `scheduler demand-feed` |
+| POST `/api/v1/admin/index/published` | Bearer: `index-publish.yml` OIDC on `main` | `PublishedRunReport` | `OkResponse` | One publish run's slice membership — `index report` |
 | POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-crate.yml` run completed; the edge parses `display_title` (`<rustc>-<task_id>`) → task id and forwards the run's identity to the scheduler's `POST /tasks/complete-run`; the alarm's resolution completes the task only once the records artifact its publish job pushed verifies in GHCR |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection — lane depths for `stow-admin status --watch` (stow#853); `Cache-Control: no-store` |
 | GET `/api/v1/scheduler/health` | none | — | `SchedulerHealth` | Uncached liveness for uptime monitors (stow#860): worker/scheduler verdict, dispatch-freeze state and last `workflow_run` delivery age; any unhealthy component answers 503, all under `Cache-Control: no-store` |
 
-Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed.
+Authenticated POSTs resolve the `Authorization: Bearer` credential to a GitHub identity in the extractor, before the body is parsed. Rows marked `repo-workflow OIDC or push user` are reads; the other authenticated rows name the workflows whose OIDC token, run on `main`, may call them.
 
 Every `/api/v1/` path sits behind the zone rate-limit rule documented in
 [`DEPLOYMENT.md`](DEPLOYMENT.md#one-time-cloudflare-setup) — 60 requests
@@ -865,7 +882,8 @@ prefixes; `stow maintenance: scheduler lanes` blocks exactly the public
 routes whose handlers reach the scheduler Durable Object
 (`scheduler_lanes` in `types/src/api.rs`) — the partial reopening where
 bundle bytes keep serving; and `stow maintenance: all` blocks the
-whole hostname. `stow-admin maintenance on --scope anonymous` flips the
+whole hostname. `stow-admin maintenance on --scope anonymous` (run by
+`operations.yml`, which holds the Cloudflare token) flips the
 rule's `enabled` flag through the Rulesets API; the watchdog (#450)
 trips by enabling `anonymous`. Blocked requests are answered in the
 security phase — they never invoke the Worker and never reach the
@@ -903,9 +921,12 @@ naming the trigger; the `github/workflow-run` webhook and the task
 completion it forwards stay open so
 in-flight builds still land. Recovery is manual only:
 `POST /api/v1/admin/dispatch-freeze` (`stow-admin dispatch-freeze clear
---yes`) lifts the freeze and immediately resumes dispatch, while
+--yes`, which dispatches `operations.yml`) lifts the freeze and
+immediately resumes dispatch, while
 `dispatch-freeze status` shows the trigger, the alert outcome, and the
-transition log (engaged/cleared events with their triggers).
+transition log (engaged/cleared events with their triggers). A manual
+trigger names the `actor` of the `operations.yml` run that flipped the
+switch, in the record, the transition log and the alert mail.
 
 Alerting is split by who owns the fact. The edge sends **email only** —
 one transition mail per change through the `send_email` binding

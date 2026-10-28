@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/water-rs/stow/compare/stow-types-v0.8.2...stow-types-v0.9.0) - 2026-10-28
+
+### Added
+
+- route every operator mutation through one traced workflow on main ([#1020](https://github.com/water-rs/stow/pull/1020))
+
 ## [0.8.2](https://github.com/water-rs/stow/compare/stow-types-v0.8.1...stow-types-v0.8.2) - 2026-10-28
 
 ### Fixed

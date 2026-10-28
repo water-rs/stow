@@ -23,6 +23,7 @@ mod launch_model;
 mod login;
 mod maintenance;
 mod manual;
+mod operations;
 mod preheat;
 mod preheat_cost;
 mod projects;
@@ -249,6 +250,14 @@ fn run<F: std::future::Future>(future: F) -> stow_types::error::Result<F::Output
 }
 
 async fn dispatch(command: Command, output: Output) -> stow_types::error::Result<()> {
+    // stow#955: an operator's machine holds no credential the edge's
+    // mutating routes accept — every mutating command dispatches
+    // `operations.yml` instead and follows the run to its conclusion.
+    // Inside Actions, or on the mock where the bearer is already a
+    // minted JWT, the command runs directly.
+    if let Some(dispatch) = operations::traced(&command, std::env::args().skip(1)) {
+        return operations::dispatch_and_follow(&dispatch?).await;
+    }
     match command {
         Command::Status(args) => status(&Edge::connect()?, args, output).await,
         Command::Queue(args) => queue::run(&Edge::connect()?, args, output).await,
@@ -295,14 +304,14 @@ pub(crate) struct Edge {
 
 impl Edge {
     /// Resolve `STOW_EDGE_URL` and the credential source: Actions OIDC
-    /// when the runtime advertises it, else [`edge_token`].
+    /// when the runtime advertises it, else [`operator_token`].
     pub(crate) fn connect() -> stow_types::error::Result<Self> {
         let base = std::env::var(STOW_EDGE_URL_ENV)
             .map_err(|_| stow_error!("missing {STOW_EDGE_URL_ENV}"))?;
         let token = if actions_oidc_available() {
             None
         } else {
-            Some(edge_token()?)
+            Some(operator_token()?)
         };
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
@@ -789,7 +798,9 @@ fn render_freeze(switch: &DispatchFreeze) -> String {
 /// cleared-transition email carries.
 fn summarize_trigger(trigger: &DispatchFreezeTrigger) -> String {
     match trigger {
-        DispatchFreezeTrigger::Manual => "manual (dispatch-freeze POST)".to_owned(),
+        DispatchFreezeTrigger::Manual { actor } => {
+            format!("manual by {actor} (dispatch-freeze POST)")
+        }
         DispatchFreezeTrigger::Tripped(trip) => {
             let tripped: Vec<&str> = trip
                 .targets
@@ -958,11 +969,13 @@ pub(crate) async fn submit(
     Ok(response)
 }
 
-/// The edge credential outside Actions: `GH_TOKEN`/`GITHUB_TOKEN` when a
-/// job stages its ephemeral token for a local mock edge, else the
-/// `stow-admin login` token. Never `gh auth token` — the edge is
-/// untrusted, and that token carries every scope gh holds (stow#953).
-fn edge_token() -> stow_types::error::Result<String> {
+/// The operator's credential outside Actions: `GH_TOKEN`/`GITHUB_TOKEN`
+/// when a job stages a token for a local mock edge, else the
+/// `stow-admin login` token. It authenticates the edge's read routes and
+/// dispatches `operations.yml` for the mutating ones (stow#955). Never
+/// `gh auth token` — the edge is untrusted, and that token carries every
+/// scope gh holds (stow#953).
+pub(crate) fn operator_token() -> stow_types::error::Result<String> {
     for name in ["GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(name)
             && !token.is_empty()

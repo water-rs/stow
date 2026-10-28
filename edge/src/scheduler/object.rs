@@ -289,15 +289,27 @@ impl DurableObject for Scheduler {
 /// `POST /reset` — the only endpoint that may issue DDL on the queue
 /// database. Reached from `POST /api/v1/admin/scheduler/reset`, which
 /// `stow-admin scheduler reset --yes` invokes. Drops every store object
-/// and re-executes `schema.sql`; the in-memory graph is dropped with
-/// the store, so the next request wakes an empty one. The alarm is
-/// cleared — nothing is left to wake for.
+/// and re-executes `schema.sql`, then appends one `StoreReset` row
+/// attributed to the requesting run; the in-memory graph is dropped
+/// with the store, so the next request wakes an empty one. The alarm
+/// is cleared — nothing is left to wake for.
 async fn reset_scheduler(
     State(graph): State<graph::GraphCell>,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
 ) -> Result<Json<SchedulerResetReport>> {
     let report = store::reset(&db).await.map_err(to_error)?;
+    // The reset dropped every row that could have named the run behind
+    // it, so the fresh log's first row does (stow#955).
+    store::append_events(
+        &db,
+        Some(&actor.0),
+        &[stow_types::api::SchedulerEvent::StoreReset],
+        now_ms(),
+    )
+    .await
+    .map_err(to_error)?;
     graph.clear();
     queue::arm_alarm(&alarm, queue::AlarmPlan::Delete)
         .await
@@ -439,11 +451,12 @@ async fn scheduler_demand(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(request): Json<stow_types::api::SchedulerDemandRequest>,
 ) -> Result<Json<stow_types::api::SchedulerDemandReport>> {
     let (now_ms, settings) = alarm_inputs(&env)?;
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let (report, plan) = routes::demand(graph, &db, &request, &settings, now_ms)
+    let (report, plan) = routes::demand(graph, &db, &request, &settings, Some(&actor.0), now_ms)
         .await
         .map_err(route_error)?;
     // A folded batch can raise a queue row over the admission floor
@@ -473,10 +486,11 @@ async fn demand_feed_begin(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
+    actor: Actor,
     Json(request): Json<stow_types::api::DemandFeedBeginRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedBeginReport>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    routes::feed_begin(graph, &db, &request.hour, feed_now_secs())
+    routes::feed_begin(graph, &db, &request.hour, &actor.0, feed_now_secs())
         .await
         .map(Json)
         .map_err(demand_feed_error)
@@ -487,10 +501,11 @@ async fn demand_feed_page(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
+    actor: Actor,
     Json(request): Json<stow_types::api::DemandFeedPageRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    routes::feed_page(graph, &db, &request, feed_now_secs())
+    routes::feed_page(graph, &db, &request, &actor.0, feed_now_secs())
         .await
         .map_err(demand_feed_error)?;
     Ok(Json(serde_json::json!({"staged": true})))
@@ -503,10 +518,11 @@ async fn demand_feed_complete(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
+    actor: Actor,
     Json(request): Json<stow_types::api::DemandFeedCompleteRequest>,
 ) -> Result<Json<serde_json::Value>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    routes::feed_complete(graph, &db, &request, feed_now_secs())
+    routes::feed_complete(graph, &db, &request, &actor.0, feed_now_secs())
         .await
         .map_err(demand_feed_error)?;
     Ok(Json(serde_json::json!({"complete": true})))
@@ -519,10 +535,11 @@ async fn demand_feed_cleanup(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
     db: DurableDb,
+    actor: Actor,
     Json(request): Json<stow_types::api::DemandFeedCleanupRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedCleanupReport>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    routes::feed_cleanup(graph, &db, &request.hour, feed_now_secs())
+    routes::feed_cleanup(graph, &db, &request.hour, &actor.0, feed_now_secs())
         .await
         .map(Json)
         .map_err(demand_feed_error)
@@ -536,13 +553,15 @@ async fn demand_feed_deliver(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(request): Json<stow_types::api::DemandFeedDeliverRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedDeliverReport>> {
     let (now_ms, settings) = alarm_inputs(&env)?;
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let (report, plan) = routes::feed_deliver(graph, &db, &request.hour, &settings, now_ms)
-        .await
-        .map_err(demand_feed_error)?;
+    let (report, plan) =
+        routes::feed_deliver(graph, &db, &request.hour, &settings, &actor.0, now_ms)
+            .await
+            .map_err(demand_feed_error)?;
     queue::arm_alarm(&alarm, plan).await.map_err(|error| {
         let error = to_error(error);
         tracing::error!(%error, "demand feed deliver schedule_alarm failed");
@@ -581,7 +600,7 @@ async fn submit_tasks(
     alarm: Alarm,
     Json(trees): Json<Vec<stow_types::api::SubmissionTree>>,
 ) -> Result<Json<InsertedResponse>> {
-    submit(&graph, &env, &db, &alarm, &trees, true).await
+    submit(&graph, &env, &db, &alarm, &trees, true, None).await
 }
 
 /// `POST /tasks/submit/trusted` — the same submit minus the
@@ -592,9 +611,10 @@ async fn submit_tasks_trusted(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(trees): Json<Vec<stow_types::api::SubmissionTree>>,
 ) -> Result<Json<InsertedResponse>> {
-    submit(&graph, &env, &db, &alarm, &trees, false).await
+    submit(&graph, &env, &db, &alarm, &trees, false, Some(&actor.0)).await
 }
 
 /// `POST /tasks/submit/ids` — the trusted submit-by-id lane (stow#588):
@@ -608,13 +628,14 @@ async fn submit_tasks_by_id(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(body): Json<stow_types::api::SubmitTaskIdsRequest>,
 ) -> Result<Json<stow_types::api::SubmitTaskIdsResponse>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
     if graph.with(|graph| graph.freeze().is_some()) {
         return Err(Error::msg("dispatch is frozen").set_status(StatusCode::SERVICE_UNAVAILABLE));
     }
-    let (inserted, unknown) = routes::submit_ids(graph, &db, &body.tasks, now_ms())
+    let (inserted, unknown) = routes::submit_ids(graph, &db, &body.tasks, Some(&actor.0), now_ms())
         .await
         .map_err(route_error)?;
     let outcome = queue::SubmitTaskIdsOutcome { inserted, unknown };
@@ -644,6 +665,7 @@ async fn submit(
     alarm: &Alarm,
     trees: &[stow_types::api::SubmissionTree],
     enforce_pending_cap: bool,
+    actor: Option<&str>,
 ) -> Result<Json<InsertedResponse>> {
     let settings = scheduler_settings(env)?;
     let graph = ensure_graph(env, db, graph).await?;
@@ -654,10 +676,17 @@ async fn submit(
     // human lanes arrive through their own bound — and every tree's
     // Submit parts land in one turn before the merge: the single
     // transaction the ack follows.
-    let (inserted, unpublished_ids) =
-        routes::submit(graph, db, &settings, trees, enforce_pending_cap, now_ms())
-            .await
-            .map_err(route_error)?;
+    let (inserted, unpublished_ids) = routes::submit(
+        graph,
+        db,
+        &settings,
+        trees,
+        enforce_pending_cap,
+        actor,
+        now_ms(),
+    )
+    .await
+    .map_err(route_error)?;
     // The first pass after a submit stays the alarm's (stow#940):
     // submitted rows sit behind the dispatch min-age gate, so an
     // inline pass would claim nothing now — the submit answers once
@@ -843,18 +872,7 @@ async fn status(
     db: DurableDb,
 ) -> Result<Json<stow_types::api::SchedulerStatus>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let counts = graph.with(|graph| graph.status_counts());
-    let count =
-        |label: &str| u32::try_from(counts.get(label).copied().unwrap_or(0)).unwrap_or(u32::MAX);
-    Ok(Json(stow_types::api::SchedulerStatus {
-        pending: count("pending").saturating_add(count("blocked")),
-        human_pending: count("human_pending"),
-        dispatched: count("dispatched"),
-        running: count("running"),
-        completed: count("completed"),
-        failed: count("failed"),
-        blocked: count("blocked"),
-    }))
+    Ok(Json(graph.with(|graph| graph.status())))
 }
 
 /// `GET /admin/status` — the operator view behind `stow-admin status`.
@@ -897,11 +915,12 @@ async fn apply_queue_mutation(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: &str,
     op: stow_types::api::MutationKind,
     selector: stow_types::api::QueueSelector,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
     let graph = ensure_graph(&env, &db, graph).await?;
-    let affected = routes::mutate(graph, &db, op, &selector, now_ms())
+    let affected = routes::mutate(graph, &db, op, &selector, Some(actor), now_ms())
         .await
         .map_err(route_error)?;
     if affected > 0 && op != stow_types::api::MutationKind::Purge {
@@ -926,6 +945,7 @@ async fn queue_retry(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
     apply_queue_mutation(
@@ -933,6 +953,7 @@ async fn queue_retry(
         env,
         db,
         alarm,
+        &actor.0,
         stow_types::api::MutationKind::Retry,
         selector,
     )
@@ -944,6 +965,7 @@ async fn queue_cancel(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
     apply_queue_mutation(
@@ -951,6 +973,7 @@ async fn queue_cancel(
         env,
         db,
         alarm,
+        &actor.0,
         stow_types::api::MutationKind::Cancel,
         selector,
     )
@@ -962,6 +985,7 @@ async fn queue_promote(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
     apply_queue_mutation(
@@ -969,6 +993,7 @@ async fn queue_promote(
         env,
         db,
         alarm,
+        &actor.0,
         stow_types::api::MutationKind::Promote,
         selector,
     )
@@ -980,6 +1005,7 @@ async fn queue_purge(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(selector): Json<stow_types::api::QueueSelector>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>> {
     apply_queue_mutation(
@@ -987,6 +1013,7 @@ async fn queue_purge(
         env,
         db,
         alarm,
+        &actor.0,
         stow_types::api::MutationKind::Purge,
         selector,
     )
@@ -1153,11 +1180,12 @@ async fn apply_request_outcome(
     db: DurableDb,
     alarm: Alarm,
     params: Params,
+    actor: Actor,
     Json(report): Json<stow_types::api::RequestOutcomeReport>,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
     let request_id = request_id_param(&params)?;
     let (status, _claimed) =
-        request_outcome_pass(&graph, &env, &db, &alarm, request_id, &report).await?;
+        request_outcome_pass(&graph, &env, &db, &alarm, request_id, &report, &actor.0).await?;
     Ok(Json(status))
 }
 
@@ -1173,9 +1201,10 @@ pub(super) async fn request_outcome_pass(
     alarm: &Alarm,
     request_id: &str,
     report: &stow_types::api::RequestOutcomeReport,
+    actor: &str,
 ) -> Result<(stow_types::api::CrateRequestStatus, Vec<String>)> {
     let graph = ensure_graph(env, db, graph).await?;
-    let status = routes::request_outcome(graph, db, request_id, report, now_ms())
+    let status = routes::request_outcome(graph, db, request_id, report, Some(actor), now_ms())
         .await
         .map_err(route_error)?;
     // The enqueue's human-lane rows are eligible at once, so this
@@ -1221,6 +1250,45 @@ fn request_id_param(params: &Params) -> Result<&str> {
         .map_err(|_| Error::msg("request id is required").set_status(StatusCode::BAD_REQUEST))
 }
 
+/// The verified `actor` claim the edge forwards on
+/// [`crate::scheduler_client::ACTOR_HEADER`] for every route a GitHub
+/// Actions identity authenticated (stow#955). Only the edge reaches the
+/// object and it builds each request itself, so the header never
+/// carries a client's value. A route taking this refuses a request
+/// without it — an attributed route must never write unattributed rows.
+struct Actor(String);
+
+/// An attributed route reached without [`Actor`]'s header.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{} is required on an attributed route",
+    crate::scheduler_client::ACTOR_HEADER
+)]
+struct MissingActor;
+
+impl skyzen::HttpError for MissingActor {
+    fn status(&self) -> StatusCode {
+        StatusCode::BAD_REQUEST
+    }
+}
+
+impl skyzen::extract::Extractor for Actor {
+    type Error = MissingActor;
+
+    fn extract(
+        request: &mut skyzen::Request,
+    ) -> impl std::future::Future<Output = core::result::Result<Self, Self::Error>> + Send {
+        let actor = request
+            .headers()
+            .get(crate::scheduler_client::ACTOR_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .filter(|actor| !actor.is_empty())
+            .map(|actor| Self(actor.to_owned()))
+            .ok_or(MissingActor);
+        std::future::ready(actor)
+    }
+}
+
 /// `GET /dispatch-freeze` — the dispatch freeze's current state: the
 /// flag plus the stored record (trigger and notify outcome) when
 /// engaged, and the recent transitions.
@@ -1253,6 +1321,7 @@ async fn write_dispatch_freeze(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(switch): Json<stow_types::api::DispatchFreeze>,
 ) -> Result<Json<stow_types::api::DispatchFreeze>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
@@ -1270,12 +1339,14 @@ async fn write_dispatch_freeze(
         &store,
         &sink,
         action,
-        stow_types::api::DispatchFreezeTrigger::Manual,
+        stow_types::api::DispatchFreezeTrigger::Manual {
+            actor: actor.0.clone(),
+        },
         &iso_now(),
     )
     .await
     .map_err(to_error)?;
-    routes::persist_freeze(&db, &store, now)
+    routes::persist_freeze(&db, &store, Some(&actor.0), now)
         .await
         .map_err(to_error)?;
     match transition {
@@ -1352,7 +1423,7 @@ async fn evaluate_dispatch_freeze(
     )
     .await
     .map_err(to_error)?;
-    routes::persist_freeze(db, &store, now)
+    routes::persist_freeze(db, &store, None, now)
         .await
         .map_err(to_error)?;
     if let freeze::FreezeTransition::Engaged(record) = transition {
@@ -1511,9 +1582,10 @@ async fn record_published_index(
     env: WasmEnv,
     db: DurableDb,
     alarm: Alarm,
+    actor: Actor,
     Json(report): Json<stow_types::api::PublishedRunReport>,
 ) -> Result<Json<OkResponse>> {
-    published_index_pass(&graph, &env, &db, &alarm, &report.slices).await?;
+    published_index_pass(&graph, &env, &db, &alarm, &report.slices, &actor.0).await?;
     Ok(Json(OkResponse { ok: true }))
 }
 
@@ -1528,13 +1600,14 @@ pub(super) async fn published_index_pass(
     db: &DurableDb,
     alarm: &Alarm,
     slices: &[stow_types::api::PublishedSlice],
+    actor: &str,
 ) -> Result<Vec<String>> {
     let _settings = scheduler_settings(env)?;
     let graph = ensure_graph(env, db, graph).await?;
     // The run's slices append in one commit; their flips land on the
     // same turn (stow#878 — no generation fencing: reports apply to
     // in-memory masks, deltas stay idempotent on re-application).
-    routes::slice_reports(graph, db, slices, now_ms())
+    routes::slice_reports(graph, db, slices, Some(actor), now_ms())
         .await
         .map_err(route_error)?;
     let claimed = dispatch_pending(env, db, graph.cell())
