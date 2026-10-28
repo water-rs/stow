@@ -153,14 +153,13 @@ pub struct ObservedUnit {
     /// The `--target` cargo passed for the unit — `None` marks a
     /// host-side compile, which cargo never passes one to (stow#317).
     pub explicit_target: Option<String>,
-    /// Whether the unit's rustc argv carried cargo's build-override
-    /// profile — no `-C debuginfo` and no `-C opt-level`, the flags
-    /// cargo's normal profile maps onto every ordinary dep unit. A
-    /// native build (`consumer_target == build_host`) gives host units
-    /// and target units the same recorded platform, so the profile is
-    /// the only argv evidence left that splits them (stow#349).
-    #[serde(default)]
-    pub build_override: bool,
+    /// The profile the unit compiled with — normalized from the argv
+    /// codegen flags the way the unit graph states `unit.profile`, so
+    /// the two compare like for like. A native build
+    /// (`consumer_target == build_host`) gives host units and target
+    /// units the same recorded platform, so the profile is part of the
+    /// evidence that splits them (stow#596).
+    pub profile: stow_types::platform::Profile,
     /// The invocation's `--extern` deps, resolved to their stable
     /// identities.
     pub externs: Vec<DependencyCMetadataIdentity>,

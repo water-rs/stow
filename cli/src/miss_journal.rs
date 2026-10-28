@@ -161,16 +161,28 @@ pub fn observed_unit(parsed: &ParsedRustcArgs, build: &LocalBuildArtifact) -> Op
             return None;
         }
     };
+    let profile = match crate::unit_node::UnitEvidence::from_invocation(
+        &build.identity.crate_name,
+        &build.identity.version,
+        parsed,
+    ) {
+        Ok(evidence) => evidence.profile,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                crate_name = %parsed.crate_name,
+                "compiled unit's profile did not parse; not observing it"
+            );
+            return None;
+        }
+    };
     Some(ObservedUnit {
         crate_name: build.identity.crate_name.clone(),
         crate_version: build.identity.version.clone(),
         features: parsed.features.iter().cloned().collect(),
         target: build.target.clone(),
         explicit_target: parsed.target.clone(),
-        // Cargo spells explicit codegen flags for target units but not
-        // for the build-override units on the host half — the split a
-        // target build leaves on the argv (stow#349).
-        build_override: crate::unit_node::build_override_signal(parsed),
+        profile,
         externs,
     })
 }
@@ -1364,7 +1376,14 @@ mod tests {
             features: vec!["derive".to_owned()],
             target: "x86_64-unknown-linux-gnu".to_owned(),
             explicit_target: explicit_target.map(str::to_owned),
-            build_override: false,
+            profile: stow_types::platform::Profile {
+                opt_level: "0".to_owned(),
+                debuginfo: 2,
+                debug_assertions: true,
+                overflow_checks: true,
+                panic: stow_types::platform::PanicStrategy::Unwind,
+                strip: stow_types::platform::StripLevel::None,
+            },
             externs: vec![crate::artifact_cache::DependencyCMetadataIdentity {
                 crate_name: "serde_core".to_owned(),
                 c_metadata: "abc".to_owned(),
