@@ -1,6 +1,7 @@
 //! Isolation regressions for the five `disabled_manually` workflow
 //! entrypoints (stow#593): `preheat-cron.yml`, `preheat-admin.yml`,
-//! `preheat-missed.yml`, `preheat-projects.yml`, `index-publish-cron.yml`.
+//! `preheat-missed.yml`, `preheat-projects.yml`, `index-publish-cron.yml`
+//! — and for `operations.yml`, the traced operator path (stow#955).
 //!
 //! Every test parses the real YAML, runs its `run:` steps under bash
 //! against a PATH of recording stubs, and asserts the recorded
@@ -966,9 +967,9 @@ fn index_publish_completion_forwards_title_rustc() {
     );
     let fields = input_fields(&args);
     assert_eq!(
-        fields.get("stow_edge_url").map(String::as_str),
-        Some("https://edge.invalid"),
-        "the configured edge URL forwards verbatim — never probed"
+        fields.get("report").map(String::as_str),
+        Some("true"),
+        "a configured edge turns reporting on — never probed, never forwarded"
     );
     assert_eq!(
         fields.get("rustc_version").map(String::as_str),
@@ -998,10 +999,7 @@ fn index_publish_schedule_and_manual_carry_no_rustc() {
             !fields.contains_key("rustc_version"),
             "{event} forwarded a rustc: {fields:?}"
         );
-        assert_eq!(
-            fields.get("stow_edge_url").map(String::as_str),
-            Some("https://edge.invalid")
-        );
+        assert_eq!(fields.get("report").map(String::as_str), Some("true"));
         let ref_idx = args.iter().position(|a| a == "--ref").expect("--ref");
         assert_eq!(args[ref_idx + 1], "main");
     }
@@ -1154,6 +1152,7 @@ fn entrypoints_run_on_linux_runners() {
         "preheat-missed.yml",
         "preheat-projects.yml",
         "index-publish-cron.yml",
+        "operations.yml",
     ] {
         let workflow = load_workflow(file);
         let jobs = field(&workflow, "jobs")
@@ -1168,5 +1167,174 @@ fn entrypoints_run_on_linux_runners() {
                 scalar(name)
             );
         }
+    }
+}
+
+// ===========================================================================
+// operations.yml (stow#955)
+// ===========================================================================
+
+fn operations() -> serde_yml::Value {
+    load_workflow("operations.yml")
+}
+
+/// A dispatch of `operations.yml` with `argv` (and `files` when given),
+/// carrying every secret and variable the workflow may hand a step.
+fn operations_runner<'a>(
+    scn: &'a Scenario,
+    argv: &str,
+    files: Option<&str>,
+) -> support::Runner<'a> {
+    let mut ctx = actions_ctx();
+    set_path(
+        &mut ctx,
+        "github.event_name",
+        Val::Str("workflow_dispatch".to_owned()),
+    );
+    for (key, value) in [
+        ("github.actor", "octo-dispatcher"),
+        ("secrets.GITHUB_TOKEN", "test-github-token"),
+        ("secrets.CLOUDFLARE_API_TOKEN", "test-cloudflare-token"),
+        ("vars.CF_ZONE_ID", "test-zone"),
+    ] {
+        set_path(&mut ctx, key, Val::Str(value.to_owned()));
+    }
+    let mut inputs = vec![("argv", Val::Str(argv.to_owned()))];
+    if let Some(files) = files {
+        inputs.push(("files", Val::Str(files.to_owned())));
+    }
+    let mut ctx = with_inputs(ctx, &inputs);
+    let wf = operations();
+    apply_dispatch_defaults(&mut ctx, &wf);
+    run_job(scn, &wf, "run", ctx, base_env(&[]))
+}
+
+/// The `stow-admin` invocations of the run step (the toolchain step is a
+/// declared `uses:`).
+fn operations_calls(scn: &Scenario) -> Vec<Call> {
+    scn.calls_of("stow-admin")
+}
+
+#[test]
+fn operations_declarations() {
+    let wf = operations();
+    let triggers = field(&wf, "on")
+        .and_then(serde_yml::Value::as_mapping)
+        .expect("triggers");
+    assert_eq!(
+        triggers.keys().map(scalar).collect::<Vec<_>>(),
+        vec!["workflow_dispatch".to_owned()],
+        "dispatch is the only trigger — no other event may run it"
+    );
+    assert_eq!(
+        at(&wf, "jobs.run.environment").map(scalar).as_deref(),
+        Some("operations")
+    );
+    assert_eq!(
+        at(&wf, "permissions.id-token").map(scalar).as_deref(),
+        Some("write")
+    );
+    assert_eq!(
+        at(&wf, "concurrency.group").map(scalar).as_deref(),
+        Some("operations")
+    );
+}
+
+/// The command line is data: an argument carrying shell syntax reaches
+/// stow-admin as one literal argument, and an edge-class command sees
+/// no Cloudflare credential and no GitHub token.
+#[test]
+fn operations_replays_argv_literally_without_secrets() {
+    let scn = Scenario::new();
+    let runner = operations_runner(
+        &scn,
+        r#"["queue","cancel","--crate","a b; $(touch pwned)","--yes"]"#,
+        None,
+    );
+    assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
+    let calls = operations_calls(&scn);
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(
+        calls[0].argv,
+        ["queue", "cancel", "--crate", "a b; $(touch pwned)", "--yes"]
+    );
+    assert!(!scn.workdir().join("pwned").exists(), "argv was evaluated");
+    for secret in ["CLOUDFLARE_API_TOKEN", "CF_ANALYTICS_TOKEN", "GH_TOKEN"] {
+        assert_eq!(
+            calls[0].env.get(secret).map(String::as_str),
+            Some("<empty>"),
+            "{secret} leaked into an edge command"
+        );
+    }
+    assert_eq!(
+        calls[0].env.get("STOW_EDGE_URL").map(String::as_str),
+        Some("https://edge.invalid")
+    );
+}
+
+/// Each secret reaches only the command class that needs it.
+#[test]
+fn operations_scopes_secrets_by_command() {
+    for (argv, cloudflare, analytics) in [
+        (
+            r#"["maintenance","on","--scope","lanes","--yes"]"#,
+            "<set>",
+            "<empty>",
+        ),
+        (r#"["watchdog","clear"]"#, "<set>", "<empty>"),
+        (
+            r#"["preheat","missed","--rustc-version","1.98.1","--yes"]"#,
+            "<empty>",
+            "<set>",
+        ),
+        (r#"["preheat","binary","--yes"]"#, "<empty>", "<empty>"),
+    ] {
+        let scn = Scenario::new();
+        let runner = operations_runner(&scn, argv, None);
+        assert_eq!(runner.status(), Status::Ok, "{argv}: {:?}", runner.outcomes);
+        let calls = operations_calls(&scn);
+        assert_eq!(calls.len(), 1, "{argv}: {calls:?}");
+        assert_eq!(
+            calls[0].env.get("CLOUDFLARE_API_TOKEN").map(String::as_str),
+            Some(cloudflare),
+            "{argv}"
+        );
+        assert_eq!(
+            calls[0].env.get("GH_TOKEN").map(String::as_str),
+            Some(cloudflare),
+            "{argv}"
+        );
+        assert_eq!(
+            calls[0].env.get("CF_ANALYTICS_TOKEN").map(String::as_str),
+            Some(analytics),
+            "{argv}"
+        );
+    }
+}
+
+/// Commands outside the operator set, malformed argv and file names
+/// that leave the files directory never reach stow-admin.
+#[test]
+fn operations_refuses_what_it_does_not_run() {
+    for (argv, files) in [
+        (r#"["deploy","verdict","--phase","canary"]"#, None),
+        (r#"["index","report"]"#, None),
+        (r#""queue retry --yes""#, None),
+        ("[]", None),
+        (r#"["queue",1]"#, None),
+        (
+            r#"["preheat","manual","--yes"]"#,
+            Some(r#"{"../escape":"x"}"#),
+        ),
+        (r#"["preheat","manual","--yes"]"#, Some(r#"{"a/b":"x"}"#)),
+        (r#"["preheat","manual","--yes"]"#, Some(r#"{"..":"x"}"#)),
+    ] {
+        let scn = Scenario::new();
+        let runner = operations_runner(&scn, argv, files);
+        assert_eq!(runner.status(), Status::Failed, "{argv} {files:?}");
+        assert!(
+            operations_calls(&scn).is_empty(),
+            "{argv} {files:?} reached stow-admin"
+        );
     }
 }

@@ -350,7 +350,7 @@ for s in json.load(open(sys.argv[1])):
     while read -r index_file _; do
         [ -n "$index_file" ] && report_files+=(--file "$WORK_DIR/index-export/$index_file")
     done <<<"$pairs"
-    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc index-publish.yml)" \
         "$BIN/stow-admin" index report "${report_files[@]}" \
         >>"$LOG_DIR/index-report-$tag.log" 2>&1 \
         || die "stow-admin index report failed — see $LOG_DIR/index-report-$tag.log"
@@ -429,6 +429,14 @@ require_command wrangler
 
 [ -n "$EDGE_BEARER" ] || die \
     "no GitHub credential for the edge's trusted endpoints — set GH_TOKEN or run \`gh auth login\`"
+
+# stow#955: reads keep the push credential, but a mutating route admits
+# only the OIDC token of a workflow it names, run on main — `oidc <file>`
+# signs one with the mock issuer the edge's key-set fetch reaches. The
+# lifetime covers the longest lane a token is handed to.
+oidc() {
+    "$BIN/stow-mock-registry" oidc-token --workflow "$1" --lifetime-secs 7200
+}
 
 RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
@@ -563,7 +571,7 @@ echo "[mock-e2e] started edge (pid $SERVICE_PID), log: $LOG_DIR/edge.log"
 # takes the route's response code as its ready signal.
 wait_for "edge listener" "$READY_DEADLINE" "$SERVICE_PID" \
     http_listening "$SCHEDULER_URL/status"
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" scheduler reset --yes >"$WORK_DIR/scheduler-reset.log" 2>&1 \
     || die "stow-admin scheduler reset failed — see $WORK_DIR/scheduler-reset.log"
 echo "[mock-e2e] $(cat "$WORK_DIR/scheduler-reset.log")"
@@ -607,18 +615,18 @@ QUERY_LOG="$WORK_DIR/mock-registry/demand-queries.log"
 EXPECT_TASKS="$(jq 'length' "$FIXTURES/expectations.json")"
 
 feed_post() { # sub-route, body-file -> response body (fails on non-2xx)
-    curl -fsS -H "Authorization: Bearer $EDGE_BEARER" \
+    curl -fsS -H "Authorization: Bearer $(oidc demand-feed.yml)" \
         -H "Content-Type: application/json" \
         -X POST --data-binary "@$2" "$FEED_ROUTE/$1"
 }
 feed_post_code() { # sub-route, body-file -> HTTP status only
     curl -s -o /dev/null -w '%{http_code}' \
-        -H "Authorization: Bearer $EDGE_BEARER" \
+        -H "Authorization: Bearer $(oidc demand-feed.yml)" \
         -H "Content-Type: application/json" \
         -X POST --data-binary "@$2" "$FEED_ROUTE/$1"
 }
 demand_post() { # body-file -> demand report body
-    curl -fsS -H "Authorization: Bearer $EDGE_BEARER" \
+    curl -fsS -H "Authorization: Bearer $(oidc demand-feed.yml)" \
         -H "Content-Type: application/json" \
         -X POST --data-binary "@$1" "$DEMAND_ROUTE"
 }
@@ -662,7 +670,7 @@ feed_cleanup() { # hour: existing cleanup op drains staged payload pages
 }
 feed_cli() { # out_file [cli args...] -> prints captured output, CLI exit preserved
     local out_file="$1"; shift
-    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc demand-feed.yml)" \
         "$BIN/stow-admin" scheduler demand-feed --json "$@" \
         >"$out_file" 2>&1
     local status=$?
@@ -815,13 +823,25 @@ assert_values_unchanged() { # before-map
 # setting changes.
 echo "[mock-e2e] demand feed: submitting fixture queue tasks"
 submit_code="$(curl -s -o "$LOG_DIR/submit-fixture.json" -w '%{http_code}' \
-    -H "Authorization: Bearer $EDGE_BEARER" -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $(oidc operations.yml)" -H "Content-Type: application/json" \
     -X POST --data-binary @"$FIXTURES/enqueue.json" \
     "$EDGE_URL/api/v1/scheduler/tasks/submit")"
 [ "$submit_code" -ge 200 ] && [ "$submit_code" -lt 300 ] \
     || die "fixture submit failed ($submit_code): $(cat "$LOG_DIR/submit-fixture.json")"
+# stow#955: an operator route refuses a user token, another workflow's
+# token and the operations workflow's own token from another ref — each
+# before the body is read.
+for refused in "$EDGE_BEARER" "$(oidc preheat-admin.yml)" \
+    "$("$BIN/stow-mock-registry" oidc-token --workflow operations.yml --ref refs/heads/feature)"; do
+    refused_code="$(curl -s -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $refused" -H "Content-Type: application/json" \
+        -X POST --data-binary @"$FIXTURES/anchor-selector.json" \
+        "$EDGE_URL/api/v1/admin/queue/cancel")"
+    [ "$refused_code" = 401 ] \
+        || die "queue/cancel answered $refused_code to a credential it must refuse"
+done
 cancel_out="$(curl -s -o "$LOG_DIR/cancel-anchors.json" -w '%{http_code}' \
-    -H "Authorization: Bearer $EDGE_BEARER" -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $(oidc operations.yml)" -H "Content-Type: application/json" \
     -X POST --data-binary @"$FIXTURES/anchor-selector.json" \
     "$EDGE_URL/api/v1/admin/queue/cancel")"
 [ "$cancel_out" -ge 200 ] && [ "$cancel_out" -lt 300 ] \
@@ -1234,7 +1254,7 @@ TASK_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
 [ -n "$TASK_VERSION" ] || die "no non-yanked itoa 1.0.x found on crates.io"
 echo "[mock-e2e] submitting $TASK_CRATE $TASK_VERSION features=$TASK_FEATURES target=$HOST_TARGET rustc=$RUSTC_VERSION"
 
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" submit \
     --crate-name "$TASK_CRATE" \
     --version "$TASK_VERSION" \
@@ -1290,7 +1310,7 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 # walkdir carries one unix dep (same-file), so the wave holds two
 # tasks.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
@@ -1344,7 +1364,7 @@ UNICODE_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
 [ -n "$UNICODE_VERSION" ] || die "no non-yanked unicode-ident found on crates.io"
 echo "[mock-e2e] dual-submitter task: unicode-ident $UNICODE_VERSION (manual + scheduler)"
 printf 'unicode-ident\n' >"$WORK_DIR/dual-crates.txt"
-isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
@@ -1364,7 +1384,7 @@ status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || tr
 completed_before=0
 [ -n "$status_json" ] && completed_before="$(jq -r '.completed' <<<"$status_json")"
 
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" submit \
     --crate-name "unicode-ident" \
     --version "$UNICODE_VERSION" \
@@ -1451,7 +1471,7 @@ superset_completed=0
 [ -n "$status_json" ] \
     && superset_completed="$(jq -r '.completed' <<<"$status_json")"
 
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" submit \
     --crate-name "$SUPERSET_CRATE" \
     --version "$SUPERSET_VERSION" \
@@ -1766,7 +1786,7 @@ pre_task_ids="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
 # The submit route takes `Vec<SubmissionTree>`, so the batch goes
 # through the trusted admin path — it resolves the same crate, target
 # and rustc and runs `SubmissionTree::from_enqueue_requests` itself.
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     "$BIN/stow-admin" submit \
     --crate-name "$HOST_DEPS_CRATE" \
     --version "$HOST_DEPS_VERSION" \

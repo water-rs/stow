@@ -44,8 +44,8 @@ on:
 
 permissions:
   contents: read
-  # Mints the run's OIDC token — the edge accepts any workflow OIDC minted
-  # inside water-rs/stow for the scheduler endpoints.
+  # Mints the run's OIDC token — the edge's submit routes admit this
+  # workflow's runs on main.
   id-token: write
 
 env:
@@ -104,8 +104,7 @@ jobs:
       # stow-admin mints a fresh Actions OIDC JWT for every edge request
       # — a lane that resolves a few hundred sources outlives one token's
       # ~10-minute lifetime. The JWT shape is how the edge tells the OIDC
-      # caller apart, and the RepoWriter policy admits any workflow
-      # inside the trusted repo.
+      # caller apart, and the submit routes admit this workflow on main.
       - name: Enqueue the top binary crates
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}

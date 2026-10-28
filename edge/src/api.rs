@@ -16,7 +16,7 @@ use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersi
 
 use crate::errors::GetArtifactError;
 use crate::fetch_guard::OutboundPool;
-use crate::github_auth;
+use crate::github_auth::{self, OPERATIONS_WORKFLOW};
 use crate::registry_auth::RegistryTokens;
 use crate::turnstile::{CfTurnstileVerifier, TurnstileVerifier};
 use crate::{
@@ -32,7 +32,8 @@ pub struct OkResponse {
 /// Marker that the request's `Authorization: Bearer` credential cleared the
 /// GitHub trust check: a GitHub Actions OIDC token minted inside the
 /// trusted repo, or any credential with push access to it (`stow-admin`,
-/// local dev, CI `GITHUB_TOKEN`).
+/// local dev, CI `GITHUB_TOKEN`). It gates the read routes only; every
+/// mutating route takes a [`Mutator`] (stow#955).
 ///
 /// Verifying inside the extractor — rather than in the handler body —
 /// rejects unauthorized requests *before* `Json` deserializes a
@@ -46,6 +47,89 @@ impl Extractor for SchedulerCaller {
     async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
         extract_trusted_caller(request).await.map(Self)
     }
+}
+
+/// A mutating route's caller (stow#955): only a GitHub Actions OIDC
+/// identity of one of `P`'s workflows, running at `refs/heads/main` — a
+/// user token and every other push credential stay read-only. Carries
+/// the verified `actor` the scheduler log attributes the mutation to.
+#[derive(Debug)]
+pub struct Mutator<P> {
+    /// The authenticated identity (always `TrustedCaller::Actions`).
+    pub caller: github_auth::TrustedCaller,
+    /// The token's verified `actor` claim.
+    pub actor: String,
+    policy: std::marker::PhantomData<fn() -> P>,
+}
+
+impl<P: github_auth::MutationPolicy> Extractor for Mutator<P> {
+    type Error = GetArtifactError;
+
+    async fn extract(request: &mut Request) -> Result<Self, Self::Error> {
+        let caller = extract_trusted_caller(request).await?;
+        let config = State::<github_auth::GitHubTrustConfig>::extract(request)
+            .await
+            .map_err(|_| {
+                GetArtifactError::InternalWithMessage(
+                    "github trust config binding missing".to_owned(),
+                )
+            })?;
+        let actor = github_auth::authorize_mutation(&caller, P::WORKFLOWS, &config.repo)
+            .map_err(|_| {
+                tracing::warn!(%caller, "mutation refused: caller outside the route's workflows");
+                GetArtifactError::Unauthorized
+            })?
+            .to_owned();
+        Ok(Self {
+            caller,
+            actor,
+            policy: std::marker::PhantomData,
+        })
+    }
+}
+
+/// Operator-only routes: the freeze switch, queue mutations, the store
+/// reset and the mock-only budget probe.
+pub struct OperatorRoute;
+impl github_auth::MutationPolicy for OperatorRoute {
+    const WORKFLOWS: &'static [&'static str] = &[OPERATIONS_WORKFLOW];
+}
+
+/// `tasks/submit`: operator submits plus the scheduled and dispatched
+/// preheat lanes.
+pub struct SubmitRoute;
+impl github_auth::MutationPolicy for SubmitRoute {
+    const WORKFLOWS: &'static [&'static str] = &[
+        OPERATIONS_WORKFLOW,
+        "preheat-admin.yml",
+        "preheat-missed.yml",
+    ];
+}
+
+/// `tasks/submit-ids`: `preheat projects submit`, by an operator or the
+/// preheat-admin lane.
+pub struct SubmitIdsRoute;
+impl github_auth::MutationPolicy for SubmitIdsRoute {
+    const WORKFLOWS: &'static [&'static str] = &[OPERATIONS_WORKFLOW, "preheat-admin.yml"];
+}
+
+/// `scheduler/demand` and the demand feed: the hourly feed plus an
+/// operator's `scheduler demand-feed --hour` recovery.
+pub struct DemandRoute;
+impl github_auth::MutationPolicy for DemandRoute {
+    const WORKFLOWS: &'static [&'static str] = &[OPERATIONS_WORKFLOW, "demand-feed.yml"];
+}
+
+/// `index/published`: the index publish run's slice report.
+pub struct IndexPublishRoute;
+impl github_auth::MutationPolicy for IndexPublishRoute {
+    const WORKFLOWS: &'static [&'static str] = &["index-publish.yml"];
+}
+
+/// `requests/{id}/outcome`: the resolve job's verdict.
+pub struct RequestOutcomeRoute;
+impl github_auth::MutationPolicy for RequestOutcomeRoute {
+    const WORKFLOWS: &'static [&'static str] = &["resolve-request.yml"];
 }
 
 /// Pull the bearer credential off `Authorization` and authenticate it
@@ -254,11 +338,11 @@ pub async fn get_dispatch_freeze(
 /// The manual transition that is also the freeze's only recovery path —
 /// clearing it resumes dispatch of everything that queued meanwhile.
 pub async fn set_dispatch_freeze(
-    SchedulerCaller(caller): SchedulerCaller,
+    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
     Json(switch): Json<stow_types::api::DispatchFreeze>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::DispatchFreeze>, GetArtifactError> {
-    let stored = scheduler_client::set_dispatch_freeze(&scheduler, switch.enabled).await?;
+    let stored = scheduler_client::set_dispatch_freeze(&scheduler, switch.enabled, &actor).await?;
     tracing::warn!(enabled = stored.enabled, %caller, "dispatch freeze flipped via admin endpoint");
     Ok(Json(stored))
 }
@@ -270,10 +354,9 @@ pub async fn set_dispatch_freeze(
 /// inside the scheduler as the membership the dependency gate checks a
 /// dependent's edges against. One report per publish run: the object
 /// applies the slices in one append and one dispatch pass (stow#940).
-/// Same `SchedulerCaller` (repo-writer) trust as the page reads: the
-/// index-publish workflow mints its token inside the trusted repo.
+/// Only the index-publish workflow's own run on `main` may report.
 pub async fn record_published_index(
-    SchedulerCaller(caller): SchedulerCaller,
+    Mutator { caller, actor, .. }: Mutator<IndexPublishRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(report): Json<stow_types::api::PublishedRunReport>,
 ) -> Result<Json<OkResponse>, GetArtifactError> {
@@ -283,7 +366,7 @@ pub async fn record_published_index(
         .iter()
         .map(|slice| slice.added.len() + slice.retired.len())
         .sum();
-    scheduler_client::record_published_index(&scheduler, &report).await?;
+    scheduler_client::record_published_index(&scheduler, &report, &actor).await?;
     tracing::info!(
         slices,
         rows,
@@ -317,10 +400,10 @@ pub async fn admin_status(
 /// reset --yes` is the manual path, which a fresh deployment's
 /// operator runs once to create the schema.
 pub async fn admin_scheduler_reset(
-    SchedulerCaller(caller): SchedulerCaller,
+    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::SchedulerResetReport>, GetArtifactError> {
-    let report = scheduler_client::reset_scheduler(&scheduler).await?;
+    let report = scheduler_client::reset_scheduler(&scheduler, &actor).await?;
     tracing::warn!(
         dropped = report.dropped,
         %caller,
@@ -336,7 +419,7 @@ pub async fn admin_scheduler_reset(
 /// unless the deploy carries `STOW_SCHEDULER_BUDGET=1`, which only the
 /// mock stack does.
 pub async fn admin_scheduler_budget_seed(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { .. }: Mutator<OperatorRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(request): Json<stow_types::api::SchedulerSeedRequest>,
 ) -> Result<Json<stow_types::api::SchedulerSeedReport>, GetArtifactError> {
@@ -352,7 +435,7 @@ pub async fn admin_scheduler_budget_seed(
 /// Cloudflare bills on, and the budget the merge gate enforces
 /// (stow#433). Same deploy-var guard as the seed route.
 pub async fn admin_scheduler_budget(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { .. }: Mutator<OperatorRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(request): Json<stow_types::api::SchedulerBudgetRequest>,
 ) -> Result<Json<stow_types::api::SchedulerBudgetReport>, GetArtifactError> {
@@ -368,7 +451,7 @@ pub async fn admin_scheduler_budget(
 /// each delivery it fires is a first delivery (stow#833). Same deploy-var
 /// guard as the seed route.
 pub async fn admin_scheduler_budget_rearm(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { .. }: Mutator<OperatorRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(request): Json<stow_types::api::SchedulerRearmRequest>,
 ) -> Result<Json<stow_types::api::SchedulerRearmReport>, GetArtifactError> {
@@ -394,14 +477,14 @@ pub async fn admin_scheduler_budget_ledger(
 ///
 /// Apply one demand batch to the scheduler's unbuilt closure
 /// (stow#522): the trusted input the hourly demand feed (#523)
-/// delivers. Operator-only — `SchedulerCaller`, like every route here.
+/// delivers, or an operator's recovery run.
 pub async fn admin_scheduler_demand(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<DemandRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(request): Json<stow_types::api::SchedulerDemandRequest>,
 ) -> Result<Json<stow_types::api::SchedulerDemandReport>, GetArtifactError> {
     Ok(Json(
-        scheduler_client::scheduler_demand(&scheduler, &request).await?,
+        scheduler_client::scheduler_demand(&scheduler, &request, &actor).await?,
     ))
 }
 
@@ -412,7 +495,7 @@ pub async fn admin_scheduler_demand(
 /// checked-in query and hands the body through unbuffered — the hour
 /// can exceed anything the worker could hold.
 pub async fn admin_scheduler_demand_feed_query(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { .. }: Mutator<DemandRoute>,
     State(stats_ctx): State<stats::StatsContext>,
     Json(request): Json<stow_types::api::DemandFeedQueryRequest>,
 ) -> Result<Response, GetArtifactError> {
@@ -429,12 +512,12 @@ pub async fn admin_scheduler_demand_feed_query(
 ///
 /// Open or resume the hour's staging attempt (stow#523). Operator-only.
 pub async fn admin_scheduler_demand_feed_begin(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<DemandRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(request): Json<stow_types::api::DemandFeedBeginRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedBeginReport>, GetArtifactError> {
     Ok(Json(
-        scheduler_client::demand_feed_begin(&scheduler, &request).await?,
+        scheduler_client::demand_feed_begin(&scheduler, &request, &actor).await?,
     ))
 }
 
@@ -442,11 +525,11 @@ pub async fn admin_scheduler_demand_feed_begin(
 ///
 /// Stage one bounded immutable page under the attempt generation.
 pub async fn admin_scheduler_demand_feed_page(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<DemandRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(request): Json<stow_types::api::DemandFeedPageRequest>,
 ) -> Result<StatusCode, GetArtifactError> {
-    scheduler_client::demand_feed_page(&scheduler, &request).await?;
+    scheduler_client::demand_feed_page(&scheduler, &request, &actor).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -455,11 +538,11 @@ pub async fn admin_scheduler_demand_feed_page(
 /// The completion barrier — freeze the hour when its generation's
 /// manifest is fully staged.
 pub async fn admin_scheduler_demand_feed_complete(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<DemandRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(request): Json<stow_types::api::DemandFeedCompleteRequest>,
 ) -> Result<StatusCode, GetArtifactError> {
-    scheduler_client::demand_feed_complete(&scheduler, &request).await?;
+    scheduler_client::demand_feed_complete(&scheduler, &request, &actor).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -468,12 +551,12 @@ pub async fn admin_scheduler_demand_feed_complete(
 /// Retire one bounded chunk of the hour's dead page rows — explicit
 /// event work the feed's caller drains to completion (stow#523).
 pub async fn admin_scheduler_demand_feed_cleanup(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<DemandRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(request): Json<stow_types::api::DemandFeedCleanupRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedCleanupReport>, GetArtifactError> {
     Ok(Json(
-        scheduler_client::demand_feed_cleanup(&scheduler, &request).await?,
+        scheduler_client::demand_feed_cleanup(&scheduler, &request, &actor).await?,
     ))
 }
 
@@ -482,12 +565,12 @@ pub async fn admin_scheduler_demand_feed_cleanup(
 /// Deliver the next undelivered original page of a complete hour into
 /// the demand ledger, or retire a fully-acked hour (stow#523).
 pub async fn admin_scheduler_demand_feed_deliver(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<DemandRoute>,
     State(scheduler): State<CfDurableNamespace>,
     Json(request): Json<stow_types::api::DemandFeedDeliverRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedDeliverReport>, GetArtifactError> {
     Ok(Json(
-        scheduler_client::demand_feed_deliver(&scheduler, &request).await?,
+        scheduler_client::demand_feed_deliver(&scheduler, &request, &actor).await?,
     ))
 }
 
@@ -526,8 +609,9 @@ async fn queue_mutation(
     scheduler: &CfDurableNamespace,
     verb: &'static str,
     selector: &stow_types::api::QueueSelector,
+    actor: &str,
 ) -> Result<stow_types::api::QueueMutationResult, GetArtifactError> {
-    scheduler_client::queue_mutation(scheduler, verb, selector)
+    scheduler_client::queue_mutation(scheduler, verb, selector, actor)
         .await
         .map_err(|error| match error {
             // The scheduler's 400 (empty selector, age-less purge) names
@@ -544,53 +628,59 @@ async fn queue_mutation(
 
 /// POST /api/v1/admin/queue/retry — failed → pending, backoff cleared.
 pub async fn admin_queue_retry(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<OperatorRoute>,
     Json(selector): Json<stow_types::api::QueueSelector>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
-    Ok(Json(queue_mutation(&scheduler, "retry", &selector).await?))
+    Ok(Json(
+        queue_mutation(&scheduler, "retry", &selector, &actor).await?,
+    ))
 }
 
 /// POST /api/v1/admin/queue/cancel — pending/dispatched → failed as
 /// `cancelled by operator`.
 pub async fn admin_queue_cancel(
-    SchedulerCaller(_caller): SchedulerCaller,
-    Json(selector): Json<stow_types::api::QueueSelector>,
-    State(scheduler): State<CfDurableNamespace>,
-) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
-    Ok(Json(queue_mutation(&scheduler, "cancel", &selector).await?))
-}
-
-/// POST /api/v1/admin/queue/promote — pending miss-lane rows → human lane.
-pub async fn admin_queue_promote(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<OperatorRoute>,
     Json(selector): Json<stow_types::api::QueueSelector>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
     Ok(Json(
-        queue_mutation(&scheduler, "promote", &selector).await?,
+        queue_mutation(&scheduler, "cancel", &selector, &actor).await?,
+    ))
+}
+
+/// POST /api/v1/admin/queue/promote — pending miss-lane rows → human lane.
+pub async fn admin_queue_promote(
+    Mutator { actor, .. }: Mutator<OperatorRoute>,
+    Json(selector): Json<stow_types::api::QueueSelector>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
+    Ok(Json(
+        queue_mutation(&scheduler, "promote", &selector, &actor).await?,
     ))
 }
 
 /// POST /api/v1/admin/queue/purge — delete completed/failed rows older
 /// than the selector's age.
 pub async fn admin_queue_purge(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<OperatorRoute>,
     Json(selector): Json<stow_types::api::QueueSelector>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::QueueMutationResult>, GetArtifactError> {
-    Ok(Json(queue_mutation(&scheduler, "purge", &selector).await?))
+    Ok(Json(
+        queue_mutation(&scheduler, "purge", &selector, &actor).await?,
+    ))
 }
 
 /// POST /api/v1/scheduler/tasks/submit
 ///
 /// Control endpoint that submits arbitrary tasks into the scheduler.
 ///
-/// `SchedulerCaller` extracts first and rejects unauthorized requests
-/// before `Json` runs, so an attacker cannot make us deserialize an
-/// arbitrary body without a trusted GitHub credential.
+/// `Mutator` extracts first and rejects unauthorized requests before
+/// `Json` runs, so an attacker cannot make us deserialize an arbitrary
+/// body without an admitted workflow's OIDC token.
 pub async fn submit_scheduler_tasks(
-    SchedulerCaller(caller): SchedulerCaller,
+    Mutator { caller, actor, .. }: Mutator<SubmitRoute>,
     Json(trees): Json<Vec<stow_types::api::SubmissionTree>>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::SchedulerSubmitResponse>, GetArtifactError> {
@@ -598,10 +688,10 @@ pub async fn submit_scheduler_tasks(
     // already submits resolver-canonical trees, so they land verbatim —
     // `Json` deserialization itself is the only check (`FeaturesJson`
     // rejects a non-canonical feature list there).
-    // Repo-writer submissions are exempt from the pending-depth cap — the
-    // credential check is the bound on this path.
+    // Admitted workflows' submissions are exempt from the pending-depth
+    // cap — the workflow pin is the bound on this path.
     let nodes: usize = trees.iter().map(|tree| tree.nodes.len()).sum();
-    let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &trees).await?;
+    let inserted = scheduler_client::send_enqueue_trusted(&scheduler, &trees, &actor).await?;
     tracing::info!(tasks = nodes, %caller, "submitted scheduler tasks");
     Ok(Json(stow_types::api::SchedulerSubmitResponse {
         submitted: u32::try_from(nodes).map_err(|_| {
@@ -619,11 +709,11 @@ pub async fn submit_scheduler_tasks(
 /// submit-by-id route; the scheduler resolves each subgraph from its
 /// node store and reports ids it does not hold as `unknown`.
 pub async fn submit_task_ids(
-    SchedulerCaller(caller): SchedulerCaller,
+    Mutator { caller, actor, .. }: Mutator<SubmitIdsRoute>,
     Json(request): Json<stow_types::api::SubmitTaskIdsRequest>,
     State(scheduler): State<CfDurableNamespace>,
 ) -> Result<Json<stow_types::api::SubmitTaskIdsResponse>, GetArtifactError> {
-    let response = scheduler_client::send_task_ids(&scheduler, &request).await?;
+    let response = scheduler_client::send_task_ids(&scheduler, &request, &actor).await?;
     tracing::info!(
         tasks = request.tasks.len(),
         unknown = response.unknown.len(),
@@ -777,10 +867,10 @@ pub async fn submit_crate_request(
 /// ride the trusted submit path verbatim — the resolver already pinned
 /// each identity, so no canonicalization runs here.
 ///
-/// `SchedulerCaller` extracts first and rejects unauthorized requests
-/// before `Json` runs.
+/// `Mutator` extracts first and rejects unauthorized requests before
+/// `Json` runs.
 pub async fn scheduler_request_outcome(
-    SchedulerCaller(_caller): SchedulerCaller,
+    Mutator { actor, .. }: Mutator<RequestOutcomeRoute>,
     params: Params,
     Json(report): Json<stow_types::api::RequestOutcomeReport>,
     State(scheduler): State<CfDurableNamespace>,
@@ -788,7 +878,8 @@ pub async fn scheduler_request_outcome(
     let request_id = params
         .get("request_id")
         .map_err(|_| GetArtifactError::BadRequest)?;
-    let status = scheduler_client::send_request_outcome(&scheduler, request_id, &report).await?;
+    let status =
+        scheduler_client::send_request_outcome(&scheduler, request_id, &report, &actor).await?;
     Ok(Json(status))
 }
 

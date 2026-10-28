@@ -88,7 +88,7 @@ pub struct TopBinariesArgs {
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
-    yes: bool,
+    pub yes: bool,
 }
 
 #[derive(Args)]
@@ -107,7 +107,7 @@ pub struct BinaryArgs {
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
-    yes: bool,
+    pub yes: bool,
 }
 
 #[derive(Args)]
@@ -128,7 +128,7 @@ pub struct MissedArgs {
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
-    yes: bool,
+    pub yes: bool,
 }
 
 #[derive(Args)]

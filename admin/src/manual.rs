@@ -34,22 +34,22 @@ pub struct ManualArgs {
     /// bare name resolves to the newest non-yanked release. `#`
     /// comments and blank lines are ignored.
     #[arg(long, conflicts_with = "projects")]
-    crates: Option<PathBuf>,
+    pub crates: Option<PathBuf>,
     /// A projects list in the `preheat/projects.toml` shape —
     /// `[[project]] repo = "https://github.com/<owner>/<name>"`.
     #[arg(long)]
-    projects: Option<PathBuf>,
+    pub projects: Option<PathBuf>,
     /// Pinned source trees (stow#558) for `--projects` entries whose
     /// git checkout does not carry every Rust input — see
     /// `preheat/source-trees.toml`. Only meaningful with `--projects`.
     #[arg(long, requires = "projects", conflicts_with_all = ["crates", "dirs"])]
-    source_trees: Option<PathBuf>,
+    pub source_trees: Option<PathBuf>,
     /// Comma-separated local project directories — resolved like a
     /// `--projects` entry (cargo's own resolver, the tree's `Cargo.lock`
     /// dropped). Each directory is mutated: pass a disposable copy.
     /// The mock lane seeds the wave with a consumer project's own graph.
     #[arg(long, conflicts_with_all = ["crates", "projects"], value_delimiter = ',')]
-    dirs: Option<Vec<PathBuf>>,
+    pub dirs: Option<Vec<PathBuf>>,
     /// The stable rustc every task pins — `1.85.0`-style.
     #[arg(long)]
     rustc_version: String,
@@ -66,7 +66,7 @@ pub struct ManualArgs {
     /// Submit the batch. Without it the command prints the plan and exits
     /// 0 without enqueuing.
     #[arg(long)]
-    yes: bool,
+    pub yes: bool,
 }
 
 /// Entry point — `stow-admin preheat manual`.

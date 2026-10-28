@@ -430,6 +430,11 @@ fn list(ctx: &DriveContext, selector: &QueueSelector) -> Result<(), String> {
         .map_err(text)
 }
 
+/// The `actor` every authenticated-route drive appends under: a real
+/// request attributes its first row to the verified run (stow#955), so
+/// each drive prices the attributed row it writes.
+const DRIVE_ACTOR: &str = "cost-drive";
+
 async fn mutate(
     ctx: &DriveContext,
     db: &DurableDb,
@@ -444,6 +449,7 @@ async fn mutate(
             task_ids: ids,
             ..QueueSelector::default()
         },
+        Some(DRIVE_ACTOR),
         now_ms(),
     )
     .await
@@ -597,7 +603,8 @@ fn source_node_id(name: &str, tag: u64) -> String {
 }
 
 /// Land `trees` the way the trusted lane does, returning the fresh node
-/// count.
+/// count. The capped lane is the anonymous one, so only the trusted
+/// lane's append is attributed — as on the object.
 async fn submit(
     ctx: &DriveContext,
     db: &DurableDb,
@@ -611,6 +618,7 @@ async fn submit(
         settings,
         trees,
         enforce_pending_cap,
+        (!enforce_pending_cap).then_some(DRIVE_ACTOR),
         now_ms(),
     )
     .await
@@ -1076,9 +1084,15 @@ fn feed_drive_complete_request(
 /// generation to [`FEED_DRIVE_GENERATION`].
 async fn feed_drive_begin(ctx: &DriveContext, db: &DurableDb, idx: u32) -> Result<(), String> {
     let hour = feed_drive_hour(idx);
-    routes::feed_begin(ctx.loaded(), db, &hour, feed_drive_now_secs(idx))
-        .await
-        .map_err(text)?;
+    routes::feed_begin(
+        ctx.loaded(),
+        db,
+        &hour,
+        DRIVE_ACTOR,
+        feed_drive_now_secs(idx),
+    )
+    .await
+    .map_err(text)?;
     commit(
         ctx,
         db,
@@ -1107,6 +1121,7 @@ async fn feed_seed_page(
         ctx.loaded(),
         db,
         &feed_drive_page_request(idx, page_no, count, entries)?,
+        DRIVE_ACTOR,
         feed_drive_now_secs(idx),
     )
     .await
@@ -1159,6 +1174,7 @@ async fn seed_feed_hour_sized(
         ctx.loaded(),
         db,
         &feed_drive_complete_request(idx, counts, entries)?,
+        DRIVE_ACTOR,
         feed_drive_now_secs(idx),
     )
     .await
@@ -1193,6 +1209,7 @@ async fn feed_deliver_once(
         db,
         &feed_drive_hour(idx),
         settings,
+        DRIVE_ACTOR,
         feed_drive_now_ms(idx),
     )
     .await
@@ -1705,6 +1722,7 @@ pub const DRIVES: &[Drive] = &[
                     db,
                     DRIVE_REQUEST_ID,
                     &request_report(shape),
+                    Some(DRIVE_ACTOR),
                     now_ms(),
                 )
                 .await
@@ -1771,6 +1789,7 @@ pub const DRIVES: &[Drive] = &[
                     &refused,
                     &submit_batch(shape, TAG_UNTRUSTED).trees,
                     true,
+                    None,
                     now_ms(),
                 )
                 .await
@@ -1877,9 +1896,10 @@ pub const DRIVES: &[Drive] = &[
                         downloads: 1,
                     })
                     .collect();
-                let (promoted, unknown) = routes::submit_ids(ctx.loaded(), db, &entries, now_ms())
-                    .await
-                    .map_err(text)?;
+                let (promoted, unknown) =
+                    routes::submit_ids(ctx.loaded(), db, &entries, Some(DRIVE_ACTOR), now_ms())
+                        .await
+                        .map_err(text)?;
                 (promoted == 3 && unknown.is_empty())
                     .then_some(())
                     .ok_or_else(|| {
@@ -2087,9 +2107,16 @@ pub const DRIVES: &[Drive] = &[
                     batch_id: "costgate-demand".to_owned(),
                     entries: vec![fixture_entry(101)?],
                 };
-                let (report, plan) = routes::demand(ctx.loaded(), db, &request, settings, now_ms())
-                    .await
-                    .map_err(text)?;
+                let (report, plan) = routes::demand(
+                    ctx.loaded(),
+                    db,
+                    &request,
+                    settings,
+                    Some(DRIVE_ACTOR),
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
                 if !(report.applied && report.touched_tasks > 0) {
                     return Err(format!(
                         "demand batch touched {} tasks, applied={}",
@@ -2169,6 +2196,7 @@ pub const DRIVES: &[Drive] = &[
                         added: fixture::full_slice_report(),
                         retired: Vec::new(),
                     }],
+                    Some(DRIVE_ACTOR),
                     now_ms(),
                 )
                 .await
@@ -2202,6 +2230,7 @@ pub const DRIVES: &[Drive] = &[
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
                     }],
+                    Some(DRIVE_ACTOR),
                     now_ms(),
                 )
                 .await
@@ -2230,6 +2259,7 @@ pub const DRIVES: &[Drive] = &[
                         added,
                         retired,
                     }],
+                    Some(DRIVE_ACTOR),
                     now_ms(),
                 )
                 .await
@@ -2263,6 +2293,7 @@ pub const DRIVES: &[Drive] = &[
                         added: retired,
                         retired: added,
                     }],
+                    Some(DRIVE_ACTOR),
                     now_ms(),
                 )
                 .await
@@ -2603,6 +2634,7 @@ pub const DRIVES: &[Drive] = &[
                         db,
                         alarm,
                         std::slice::from_ref(&slice),
+                        DRIVE_ACTOR,
                     )
                     .await
                     .map_err(text)?
@@ -2610,9 +2642,15 @@ pub const DRIVES: &[Drive] = &[
                 #[cfg(not(target_arch = "wasm32"))]
                 let claimed = {
                     let now = now_ms();
-                    routes::slice_reports(ctx.loaded(), db, std::slice::from_ref(&slice), now)
-                        .await
-                        .map_err(text)?;
+                    routes::slice_reports(
+                        ctx.loaded(),
+                        db,
+                        std::slice::from_ref(&slice),
+                        Some(DRIVE_ACTOR),
+                        now,
+                    )
+                    .await
+                    .map_err(text)?;
                     let claims = routes::claim_pass(ctx.loaded(), db, settings, now, u32::MAX)
                         .await
                         .map_err(text)?;
@@ -2660,6 +2698,7 @@ pub const DRIVES: &[Drive] = &[
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
                     }],
+                    Some(DRIVE_ACTOR),
                     now_ms(),
                 )
                 .await
@@ -2737,6 +2776,7 @@ pub const DRIVES: &[Drive] = &[
                             alarm,
                             DISPATCH_REQUEST_ID,
                             &report,
+                            DRIVE_ACTOR,
                         )
                         .await
                         .map_err(text)?
@@ -2745,9 +2785,16 @@ pub const DRIVES: &[Drive] = &[
                 #[cfg(not(target_arch = "wasm32"))]
                 let claimed = {
                     let now = now_ms();
-                    routes::request_outcome(ctx.loaded(), db, DISPATCH_REQUEST_ID, &report, now)
-                        .await
-                        .map_err(text)?;
+                    routes::request_outcome(
+                        ctx.loaded(),
+                        db,
+                        DISPATCH_REQUEST_ID,
+                        &report,
+                        Some(DRIVE_ACTOR),
+                        now,
+                    )
+                    .await
+                    .map_err(text)?;
                     let claims = routes::claim_pass(ctx.loaded(), db, settings, now, u32::MAX)
                         .await
                         .map_err(text)?;
@@ -2821,6 +2868,7 @@ pub const DRIVES: &[Drive] = &[
                     ctx.loaded(),
                     db,
                     &feed_drive_hour(3),
+                    DRIVE_ACTOR,
                     feed_drive_now_secs(3),
                 )
                 .await
@@ -2851,6 +2899,7 @@ pub const DRIVES: &[Drive] = &[
                     ctx.loaded(),
                     db,
                     &feed_drive_hour(4),
+                    DRIVE_ACTOR,
                     feed_drive_now_secs(4),
                 )
                 .await
@@ -2918,6 +2967,7 @@ pub const DRIVES: &[Drive] = &[
                     ctx.loaded(),
                     db,
                     &feed_drive_complete_request(7, &[4; 3], feed_drive_entries)?,
+                    DRIVE_ACTOR,
                     feed_drive_now_secs(7),
                 )
                 .await
@@ -2939,6 +2989,7 @@ pub const DRIVES: &[Drive] = &[
                     ctx.loaded(),
                     db,
                     &feed_drive_complete_request(8, &[], feed_drive_entries)?,
+                    DRIVE_ACTOR,
                     feed_drive_now_secs(8),
                 )
                 .await
@@ -3037,6 +3088,7 @@ pub const DRIVES: &[Drive] = &[
                     ctx.loaded(),
                     db,
                     &feed_drive_complete_request(3, &[4; 3], feed_drive_entries)?,
+                    DRIVE_ACTOR,
                     feed_drive_now_secs(3),
                 )
                 .await
@@ -3054,6 +3106,7 @@ pub const DRIVES: &[Drive] = &[
                     ctx.loaded(),
                     db,
                     &feed_drive_hour(3),
+                    DRIVE_ACTOR,
                     feed_drive_now_secs(3),
                 )
                 .await
@@ -3079,6 +3132,7 @@ pub const DRIVES: &[Drive] = &[
                     ctx.loaded(),
                     db,
                     &feed_drive_hour(4),
+                    DRIVE_ACTOR,
                     feed_drive_now_secs(4),
                 )
                 .await
@@ -3290,6 +3344,7 @@ async fn snapshot_slice_report(
             added,
             retired,
         }],
+        Some(DRIVE_ACTOR),
         now_ms(),
     )
     .await

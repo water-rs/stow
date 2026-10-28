@@ -75,12 +75,6 @@ LOCAL_CI_ADDR="127.0.0.1:${STOW_TRAFFIC_LOCAL_CI_PORT:-28124}"
 EDGE_URL="http://127.0.0.1:${EDGE_PORT}"
 SCHEDULER_URL="${EDGE_URL}/api/v1/scheduler"
 INSPECTOR_URL="ws://127.0.0.1:${INSPECTOR_PORT}/ws"
-EDGE_BEARER="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
-if [ -z "$EDGE_BEARER" ]; then
-    if command -v gh >/dev/null 2>&1; then
-        EDGE_BEARER="$(gh auth token 2>/dev/null || true)"
-    fi
-fi
 READY_DEADLINE="${STOW_E2E_READY_DEADLINE:-600}"
 SIZES="${STOW_TRAFFIC_SIZES:-100000 480000}"
 DURATION_SECS="${STOW_TRAFFIC_DURATION_SECS:-1800}"
@@ -251,8 +245,15 @@ drain_builds() {
     wait_for "dispatch callbacks drained ($1)" "$DRAIN_DEADLINE" "" builds_drained
 }
 
+# stow#955: every trusted call — reads, the budget probe, the lanes'
+# queue mutations and submits — carries an operations.yml token signed
+# by the mock issuer; one token serves a whole lane, so it outlives the
+# longest (the 30-minute peak).
 admin() {
-    env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" "$BIN/stow-admin" "$@"
+    env STOW_EDGE_URL="$EDGE_URL" \
+        GH_TOKEN="$("$BIN/stow-mock-registry" oidc-token --workflow operations.yml \
+            --lifetime-secs 7200)" \
+        "$BIN/stow-admin" "$@"
 }
 
 require_command cargo
@@ -262,9 +263,6 @@ require_command jq
 require_command openssl
 require_command skyzen
 require_command wrangler
-
-[ -n "$EDGE_BEARER" ] || die \
-    "no GitHub credential for the edge's trusted endpoints — set GH_TOKEN or run \`gh auth login\`"
 
 read -r -a size_list <<<"$SIZES"
 [ "${#size_list[@]}" -eq 2 ] || die "STOW_TRAFFIC_SIZES must name exactly two sizes"

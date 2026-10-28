@@ -37,7 +37,24 @@ pub(super) async fn commit(
     events: &[SchedulerEvent],
     now: i64,
 ) -> Result<(), QueueError> {
-    append(graph, db, events, now).await?;
+    commit_as(graph, db, None, events, now).await
+}
+
+/// [`commit`] for a request a GitHub Actions identity authenticated:
+/// the first appended row carries that run's verified `actor`
+/// (stow#955) — `None` on lanes no bearer credential reached (webhook
+/// forwards, the anonymous submit, the alarm).
+///
+/// # Errors
+/// `QueueError::Sql` when the append fails; nothing is applied then.
+pub(super) async fn commit_as(
+    graph: LoadedGraph<'_>,
+    db: &DurableDb,
+    actor: Option<&str>,
+    events: &[SchedulerEvent],
+    now: i64,
+) -> Result<(), QueueError> {
+    append(graph, db, actor, events, now).await?;
     graph.with(|graph| {
         for event in events {
             graph.apply(event, now);
@@ -46,15 +63,17 @@ pub(super) async fn commit(
     Ok(())
 }
 
-/// Append `events` to the log and count their bytes toward the next
-/// snapshot's byte trigger.
+/// Append `events` to the log — the first row attributed to `actor`
+/// when one authenticated the request — and count their bytes toward
+/// the next snapshot's byte trigger.
 async fn append(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
+    actor: Option<&str>,
     events: &[SchedulerEvent],
     now: i64,
 ) -> Result<(), QueueError> {
-    let appended = store::append_events(db, events, now).await?;
+    let appended = store::append_events(db, actor, events, now).await?;
     graph.with(|graph| graph.log_appended(appended.bytes, appended.seq));
     Ok(())
 }
@@ -72,6 +91,7 @@ pub(super) async fn commit_trees(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     trees: &[SubmissionTree],
+    actor: Option<&str>,
     now: i64,
 ) -> Result<(u32, Vec<String>), QueueError> {
     let changing = graph.with(|graph| {
@@ -86,7 +106,7 @@ pub(super) async fn commit_trees(
         .filter(|&(_, &changes)| changes)
         .flat_map(|(tree, _)| store::submission_events(tree))
         .collect();
-    append(graph, db, &events, now).await?;
+    append(graph, db, actor, &events, now).await?;
     graph.with(|graph| {
         trees
             .iter()
@@ -113,6 +133,7 @@ pub(super) async fn submit(
     settings: &SchedulerSettings,
     trees: &[SubmissionTree],
     enforce_pending_cap: bool,
+    actor: Option<&str>,
     now: i64,
 ) -> Result<(u32, Vec<String>), QueueError> {
     if enforce_pending_cap {
@@ -128,7 +149,7 @@ pub(super) async fn submit(
             });
         }
     }
-    commit_trees(graph, db, trees, now).await
+    commit_trees(graph, db, trees, actor, now).await
 }
 
 /// `POST /tasks/submit/ids`: the promote lane. The entries append as
@@ -141,12 +162,13 @@ pub(super) async fn submit_ids(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     entries: &[SubmitTaskIdEntry],
+    actor: Option<&str>,
     now: i64,
 ) -> Result<(u32, Vec<String>), QueueError> {
     let event = SchedulerEvent::SubmitIds {
         entries: entries.to_vec(),
     };
-    append(graph, db, std::slice::from_ref(&event), now).await?;
+    append(graph, db, actor, std::slice::from_ref(&event), now).await?;
     Ok(graph.with(|graph| graph.submit_by_ids(entries)))
 }
 
@@ -162,6 +184,7 @@ pub(super) async fn mutate(
     db: &DurableDb,
     op: MutationKind,
     selector: &QueueSelector,
+    actor: Option<&str>,
     now: i64,
 ) -> Result<u32, QueueError> {
     let task_ids = graph.with(|graph| graph.select_ids(op, selector, now))?;
@@ -172,7 +195,7 @@ pub(super) async fn mutate(
             task_ids: ids.to_vec(),
         })
         .collect();
-    append(graph, db, &events, now).await?;
+    append(graph, db, actor, &events, now).await?;
     Ok(graph.with(|graph| {
         events.iter().fold(0u32, |affected, event| match event {
             SchedulerEvent::Mutate { op, task_ids } => {
@@ -194,12 +217,13 @@ pub(super) async fn demand(
     db: &DurableDb,
     request: &stow_types::api::SchedulerDemandRequest,
     settings: &SchedulerSettings,
+    actor: Option<&str>,
     now: i64,
 ) -> Result<(stow_types::api::SchedulerDemandReport, AlarmPlan), QueueError> {
     let (report, event, plan) =
         graph.with(|graph| queue::demand_pass(graph, request, now, settings))?;
     if let Some(event) = event {
-        commit(graph, db, &[event], now).await?;
+        commit_as(graph, db, actor, &[event], now).await?;
     }
     Ok((report, plan))
 }
@@ -214,6 +238,7 @@ pub(super) async fn slice_reports(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     slices: &[stow_types::api::PublishedSlice],
+    actor: Option<&str>,
     now: i64,
 ) -> Result<(), QueueError> {
     let events: Vec<SchedulerEvent> = slices
@@ -227,7 +252,7 @@ pub(super) async fn slice_reports(
             retired: slice.retired.clone(),
         })
         .collect();
-    commit(graph, db, &events, now).await
+    commit_as(graph, db, actor, &events, now).await
 }
 
 /// The `RunFinished` event a completion carries, with its parsed run
@@ -291,7 +316,7 @@ pub(super) async fn complete_run(
     now: i64,
 ) -> Result<FinishOutcome, QueueError> {
     let (event, run_id) = run_finished_event(report)?;
-    append(graph, db, std::slice::from_ref(&event), now).await?;
+    append(graph, db, None, std::slice::from_ref(&event), now).await?;
     Ok(apply_run_finished(graph, report, run_id, now))
 }
 
@@ -336,7 +361,7 @@ pub(super) async fn task_run_update(
         },
         StartOutcome::Applied | StartOutcome::Stale => SchedulerEvent::RunUpdate,
     };
-    append(graph, db, std::slice::from_ref(&event), now).await?;
+    append(graph, db, None, std::slice::from_ref(&event), now).await?;
     Ok(outcome)
 }
 
@@ -438,16 +463,19 @@ pub(super) async fn wake_graph<'a>(
 /// applied them, so only the log write remains. `db` is the
 /// operation's metered handle: the append's rows must book like every
 /// other statement so a later checkpoint covers the row's seq and a
-/// wake replays it exactly once (stow#931).
+/// wake replays it exactly once (stow#931). `actor` attributes a
+/// manual transition's row to the run that requested it (stow#955);
+/// the automatic trips pass `None`.
 ///
 /// # Errors
 /// `QueueError::Sql` on a failed append.
 pub(super) async fn persist_freeze(
     db: &DurableDb,
     store: &super::graph::GraphFreezeStore<'_>,
+    actor: Option<&str>,
     now: i64,
 ) -> Result<(), QueueError> {
-    let appended = store::append_events(db, &store.take_events(), now).await?;
+    let appended = store::append_events(db, actor, &store.take_events(), now).await?;
     store
         .cell()
         .with(|graph| graph.log_appended(appended.bytes, appended.seq));
@@ -494,7 +522,7 @@ pub(super) async fn claim_pass(
             })
             .collect(),
     };
-    append(graph, db, std::slice::from_ref(&event), now).await?;
+    append(graph, db, None, std::slice::from_ref(&event), now).await?;
     Ok(claims)
 }
 
@@ -537,6 +565,7 @@ pub(super) async fn request_outcome(
     db: &DurableDb,
     request_id: &str,
     report: &stow_types::api::RequestOutcomeReport,
+    actor: Option<&str>,
     now: i64,
 ) -> Result<stow_types::api::CrateRequestStatus, QueueError> {
     let (queued_before, probe) =
@@ -547,7 +576,7 @@ pub(super) async fn request_outcome(
                 .filter(|&task_id| graph.with(|graph| graph.has_task(task_id)))
                 .cloned()
                 .collect();
-            commit_trees(graph, db, trees, now).await?;
+            commit_trees(graph, db, trees, actor, now).await?;
             // The post-enqueue probe the per-target invariant reads.
             let ids: Vec<String> = roots
                 .iter()
@@ -640,10 +669,11 @@ pub(super) async fn feed_begin(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     hour: &stow_types::api::DemandFeedHour,
+    actor: &str,
     now_secs: i64,
 ) -> Result<stow_types::api::DemandFeedBeginReport, QueueError> {
     let (report, event) = graph.with(|graph| super::feed::feed_begin(graph, hour, now_secs))?;
-    commit(graph, db, &[event], now_secs * 1_000).await?;
+    commit_as(graph, db, Some(actor), &[event], now_secs * 1_000).await?;
     Ok(report)
 }
 
@@ -656,10 +686,11 @@ pub(super) async fn feed_page(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     request: &stow_types::api::DemandFeedPageRequest,
+    actor: &str,
     now_secs: i64,
 ) -> Result<(), QueueError> {
     if let Some(event) = graph.with(|graph| super::feed::feed_page(graph, request, now_secs))? {
-        commit(graph, db, &[event], now_secs * 1_000).await?;
+        commit_as(graph, db, Some(actor), &[event], now_secs * 1_000).await?;
     }
     Ok(())
 }
@@ -673,10 +704,11 @@ pub(super) async fn feed_complete(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     request: &stow_types::api::DemandFeedCompleteRequest,
+    actor: &str,
     now_secs: i64,
 ) -> Result<(), QueueError> {
     let event = graph.with(|graph| super::feed::feed_complete(graph, request, now_secs))?;
-    commit(graph, db, &[event], now_secs * 1_000).await
+    commit_as(graph, db, Some(actor), &[event], now_secs * 1_000).await
 }
 
 /// `POST /demand-feed/cleanup`: retire one bounded chunk of the hour's
@@ -688,11 +720,12 @@ pub(super) async fn feed_cleanup(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
     hour: &stow_types::api::DemandFeedHour,
+    actor: &str,
     now_secs: i64,
 ) -> Result<stow_types::api::DemandFeedCleanupReport, QueueError> {
     let (report, event) = graph.with(|graph| super::feed::feed_cleanup(graph, hour, now_secs))?;
     if let Some(event) = event {
-        commit(graph, db, &[event], now_secs * 1_000).await?;
+        commit_as(graph, db, Some(actor), &[event], now_secs * 1_000).await?;
     }
     Ok(report)
 }
@@ -707,11 +740,12 @@ pub(super) async fn feed_deliver(
     db: &DurableDb,
     hour: &stow_types::api::DemandFeedHour,
     settings: &SchedulerSettings,
+    actor: &str,
     now_ms: i64,
 ) -> Result<(stow_types::api::DemandFeedDeliverReport, AlarmPlan), QueueError> {
     let (report, events, plan) =
         graph.with(|graph| super::feed::feed_deliver(graph, hour, now_ms, settings))?;
-    commit(graph, db, &events, now_ms).await?;
+    commit_as(graph, db, Some(actor), &events, now_ms).await?;
     Ok((report, plan))
 }
 
@@ -1221,6 +1255,213 @@ mod inline_dispatch_tests {
     }
 }
 
+/// stow#955: every mutation a workflow identity requested is
+/// attributed in the log to that run's verified actor, and a manual
+/// freeze's record names it — both surviving a wake.
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+    use crate::scheduler::drives::HOST_NOW_MS;
+    use crate::scheduler::fixture;
+    use crate::scheduler::graph::{Graph, GraphCell, GraphFreezeStore};
+    use crate::scheduler::test_db;
+    use stow_types::api::{
+        ChannelOutcome, DispatchFreezeTrigger, FreezeTransitionEvent, SubmissionSource,
+    };
+
+    #[derive(skyzen::FromRow)]
+    struct Row {
+        event: String,
+    }
+
+    /// Each log row's `actor`, in append order.
+    async fn row_actors(db: &DurableDb) -> Vec<Option<String>> {
+        db.query("SELECT event FROM event_log ORDER BY seq")
+            .fetch_all::<Row>()
+            .await
+            .expect("rows")
+            .iter()
+            .map(|row| {
+                serde_json::from_str::<serde_json::Value>(&row.event).expect("row json")["actor"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    async fn woken(db: &DurableDb) -> GraphCell {
+        let (mut graph, tail) = store::load(db).await.expect("load");
+        store::apply_events(&mut graph, &tail);
+        let cell = GraphCell::default();
+        cell.install(graph);
+        cell
+    }
+
+    struct Sink;
+
+    impl crate::freeze::AlertSink for Sink {
+        fn opened(
+            &self,
+            _draft: &crate::freeze::AlertDraft,
+        ) -> impl std::future::Future<Output = ChannelOutcome> + Send {
+            core::future::ready(ChannelOutcome::Sent { message_id: None })
+        }
+        fn updated(
+            &self,
+            _draft: &crate::freeze::AlertDraft,
+        ) -> impl std::future::Future<Output = ChannelOutcome> + Send {
+            core::future::ready(ChannelOutcome::Sent { message_id: None })
+        }
+        fn resolved(
+            &self,
+            _draft: &crate::freeze::AlertDraft,
+        ) -> impl std::future::Future<Output = ChannelOutcome> + Send {
+            core::future::ready(ChannelOutcome::Sent { message_id: None })
+        }
+    }
+
+    /// One manual transition as `write_dispatch_freeze` runs it.
+    async fn manual(
+        db: &DurableDb,
+        cell: LoadedGraph<'_>,
+        action: crate::freeze::FreezeAction,
+        actor: &str,
+    ) {
+        let store = GraphFreezeStore::new(cell, "2026-10-28T12:00:00Z".to_owned(), HOST_NOW_MS);
+        crate::freeze::apply_transition(
+            &store,
+            &Sink,
+            action,
+            DispatchFreezeTrigger::Manual {
+                actor: actor.to_owned(),
+            },
+            "2026-10-28T12:00:00Z",
+        )
+        .await
+        .expect("transition");
+        persist_freeze(db, &store, Some(actor), HOST_NOW_MS)
+            .await
+            .expect("persist");
+    }
+
+    #[tokio::test]
+    async fn a_manual_freeze_names_who_engaged_and_who_cleared_it() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = GraphCell::default();
+        let cell = owner.install(Graph::default());
+        manual(
+            &db,
+            cell,
+            crate::freeze::FreezeAction::Freeze,
+            "octo-engager",
+        )
+        .await;
+
+        let engaged = woken(&db).await;
+        let record = engaged
+            .loaded()
+            .expect("woken")
+            .with(|graph| graph.freeze().cloned())
+            .expect("frozen after the wake");
+        assert_eq!(
+            record.trigger,
+            DispatchFreezeTrigger::Manual {
+                actor: "octo-engager".to_owned()
+            }
+        );
+
+        manual(
+            &db,
+            cell,
+            crate::freeze::FreezeAction::Clear,
+            "octo-clearer",
+        )
+        .await;
+        assert_eq!(
+            row_actors(&db).await,
+            vec![
+                Some("octo-engager".to_owned()),
+                Some("octo-clearer".to_owned())
+            ],
+            "the engage and the clear rows each name their own run"
+        );
+        let cleared = woken(&db).await;
+        let transitions = cleared
+            .loaded()
+            .expect("woken")
+            .with(|graph| graph.freeze_transitions());
+        let last = transitions.first().expect("newest first: the clear");
+        assert_eq!(last.event, FreezeTransitionEvent::Cleared);
+        assert_eq!(
+            last.trigger,
+            Some(DispatchFreezeTrigger::Manual {
+                actor: "octo-engager".to_owned()
+            }),
+            "a cleared line still echoes the trigger it cleared"
+        );
+    }
+
+    /// A trusted submit and a queue mutation attribute their first row;
+    /// a no-op mutation appends nothing at all.
+    #[tokio::test]
+    async fn trusted_mutations_attribute_their_first_row() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = GraphCell::default();
+        let cell = owner.install(Graph::default());
+        let tree = SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![0],
+            nodes: vec![fixture::fixture_node(9_000_000, Vec::new())],
+        };
+        let task_id = tree.nodes[0].task_id.clone();
+        commit_trees(
+            cell,
+            &db,
+            std::slice::from_ref(&tree),
+            Some("octo-submitter"),
+            1,
+        )
+        .await
+        .expect("submit");
+        let cancel = QueueSelector {
+            task_ids: vec![task_id],
+            ..QueueSelector::default()
+        };
+        let cancelled = mutate(
+            cell,
+            &db,
+            MutationKind::Cancel,
+            &cancel,
+            Some("octo-operator"),
+            HOST_NOW_MS,
+        )
+        .await
+        .expect("cancel");
+        assert_eq!(cancelled, 1);
+        let unknown = QueueSelector {
+            task_ids: vec!["no-such-task".to_owned()],
+            ..QueueSelector::default()
+        };
+        mutate(
+            cell,
+            &db,
+            MutationKind::Cancel,
+            &unknown,
+            Some("octo-operator"),
+            HOST_NOW_MS,
+        )
+        .await
+        .expect("no-op cancel");
+        assert_eq!(
+            row_actors(&db).await,
+            vec![
+                Some("octo-submitter".to_owned()),
+                Some("octo-operator".to_owned())
+            ]
+        );
+    }
+}
+
 /// The snapshot trigger is events OR bytes, whichever comes first: a
 /// wake replays at most the byte threshold of log, whatever the
 /// submissions weigh (stow#878 §3.3).
@@ -1269,7 +1510,7 @@ mod snapshot_trigger_tests {
             let mut widest = 0u64;
             for turn in 0..40u32 {
                 let tree = tree(FIRST_ROW + turn * nodes, nodes);
-                commit_trees(cell, &db, std::slice::from_ref(&tree), 1)
+                commit_trees(cell, &db, std::slice::from_ref(&tree), None, 1)
                     .await
                     .expect("submit");
                 if snapshot_if_due(cell, &db, HOST_NOW_MS)
@@ -1310,7 +1551,7 @@ mod snapshot_trigger_tests {
         let owner = GraphCell::default();
         let cell = owner.install(Graph::default());
         let wave = tree(FIRST_ROW, WAVE);
-        commit_trees(cell, &db, std::slice::from_ref(&wave), 1)
+        commit_trees(cell, &db, std::slice::from_ref(&wave), None, 1)
             .await
             .expect("submit the wave");
         assert!(

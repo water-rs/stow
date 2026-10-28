@@ -39,9 +39,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      # The edge URL rides the dispatch input: configured, the publish
-      # run reports each slice to the scheduler; unset, it publishes
-      # the index and skips reporting — the workflow never probes.
+      # A configured edge URL turns the publish run's `report` on: it
+      # reports each slice to the scheduler; unset, it publishes the
+      # index and skips reporting — the workflow never probes.
       # A `workflow_run` tick also forwards the rustc the completed run's
       # `<rustc>-<task_id>` title names; a schedule or manual tick leaves
       # the input empty and index-publish takes the stable channel.
@@ -53,7 +53,10 @@ jobs:
           RUN_TITLE: ${{ github.event.workflow_run.display_title }}
         run: |
           set -euo pipefail
-          args=(--repo "$GITHUB_REPOSITORY" --ref main -f stow_edge_url="$STOW_EDGE_URL")
+          args=(--repo "$GITHUB_REPOSITORY" --ref main)
+          if [ -n "$STOW_EDGE_URL" ]; then
+            args+=(-f report=true)
+          fi
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
             args+=(-f "rustc_version=${RUN_TITLE%%-*}")
           fi

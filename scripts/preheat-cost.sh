@@ -382,8 +382,13 @@ edge_rss_kb() {
     echo "$total"
 }
 
+# stow#955: the edge's mutating routes admit only an admitted workflow's
+# OIDC token; the preheat lanes run as operations.yml would, under a
+# token from the mock issuer that outlives the longest lane.
 admin() {
-    env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    env STOW_EDGE_URL="$EDGE_URL" \
+        GH_TOKEN="$("$BIN/stow-mock-registry" oidc-token --workflow operations.yml \
+            --lifetime-secs 7200)" \
         STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
         STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
         "$BIN/stow-admin" "$@"

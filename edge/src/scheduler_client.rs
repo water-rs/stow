@@ -23,6 +23,10 @@ const SCHEDULER_BUDGET_URL: &str = "https://scheduler.internal/budget";
 const SCHEDULER_BUDGET_LEDGER_URL: &str = "https://scheduler.internal/budget/ledger";
 const SCHEDULER_BUDGET_REARM_URL: &str = "https://scheduler.internal/budget/rearm";
 const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
+/// The header the edge forwards a mutating request's verified `actor`
+/// claim on; the object attributes the request's first log row to it
+/// (stow#955). Only the edge builds requests to the object.
+pub const ACTOR_HEADER: &str = "x-stow-actor";
 const SCHEDULER_PREHEAT_RELEASE_URL: &str = "https://scheduler.internal/preheat/release";
 
 pub async fn send_enqueue(
@@ -46,6 +50,7 @@ pub async fn send_enqueue(
 pub async fn send_enqueue_trusted(
     namespace: &CfDurableNamespace,
     trees: &[stow_types::api::SubmissionTree],
+    actor: &str,
 ) -> Result<u32, SchedulerClientError> {
     #[derive(serde::Deserialize)]
     struct InsertedResponse {
@@ -55,7 +60,7 @@ pub async fn send_enqueue_trusted(
         return Ok(0);
     }
     let response: InsertedResponse =
-        post_json(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, trees).await?;
+        post_json_as(namespace, SCHEDULER_SUBMIT_TRUSTED_URL, trees, actor).await?;
     Ok(response.inserted)
 }
 
@@ -65,8 +70,9 @@ pub async fn send_enqueue_trusted(
 pub async fn send_task_ids(
     namespace: &CfDurableNamespace,
     request: &stow_types::api::SubmitTaskIdsRequest,
+    actor: &str,
 ) -> Result<stow_types::api::SubmitTaskIdsResponse, SchedulerClientError> {
-    post_json(namespace, SCHEDULER_SUBMIT_IDS_URL, request).await
+    post_json_as(namespace, SCHEDULER_SUBMIT_IDS_URL, request, actor).await
 }
 
 /// The `workflow_run` webhook's completion channel for a
@@ -141,11 +147,13 @@ pub async fn send_request_outcome(
     namespace: &CfDurableNamespace,
     request_id: &str,
     report: &stow_types::api::RequestOutcomeReport,
+    actor: &str,
 ) -> Result<stow_types::api::CrateRequestStatus, SchedulerClientError> {
-    post_json(
+    post_json_as(
         namespace,
         &format!("{SCHEDULER_REQUESTS_URL}/{request_id}/outcome"),
         report,
+        actor,
     )
     .await
 }
@@ -174,8 +182,9 @@ pub async fn send_request_run_update(
 pub async fn record_published_index(
     namespace: &CfDurableNamespace,
     report: &stow_types::api::PublishedRunReport,
+    actor: &str,
 ) -> Result<(), SchedulerClientError> {
-    send_json(namespace, SCHEDULER_PUBLISHED_INDEX_URL, report).await
+    send_json_as(namespace, SCHEDULER_PUBLISHED_INDEX_URL, report, actor).await
 }
 
 /// Reset the scheduler store — the operator endpoint behind
@@ -184,8 +193,15 @@ pub async fn record_published_index(
 /// re-executes `schema.sql`, destroying the queue.
 pub async fn reset_scheduler(
     namespace: &CfDurableNamespace,
+    actor: &str,
 ) -> Result<stow_types::api::SchedulerResetReport, SchedulerClientError> {
-    post_json(namespace, SCHEDULER_RESET_URL, &serde_json::json!({})).await
+    post_json_as(
+        namespace,
+        SCHEDULER_RESET_URL,
+        &serde_json::json!({}),
+        actor,
+    )
+    .await
 }
 
 /// The dispatch freeze's current state — flag plus the stored record
@@ -201,8 +217,9 @@ pub async fn get_dispatch_freeze(
 pub async fn set_dispatch_freeze(
     namespace: &CfDurableNamespace,
     enabled: bool,
+    actor: &str,
 ) -> Result<stow_types::api::DispatchFreeze, SchedulerClientError> {
-    post_json(
+    post_json_as(
         namespace,
         SCHEDULER_FREEZE_URL,
         &stow_types::api::DispatchFreeze {
@@ -210,6 +227,7 @@ pub async fn set_dispatch_freeze(
             record: None,
             transitions: Vec::new(),
         },
+        actor,
     )
     .await
 }
@@ -270,8 +288,9 @@ pub async fn scheduler_ledger(
 pub async fn scheduler_demand(
     namespace: &CfDurableNamespace,
     request: &stow_types::api::SchedulerDemandRequest,
+    actor: &str,
 ) -> Result<stow_types::api::SchedulerDemandReport, SchedulerClientError> {
-    post_json(namespace, SCHEDULER_DEMAND_URL, request).await
+    post_json_as(namespace, SCHEDULER_DEMAND_URL, request, actor).await
 }
 
 const SCHEDULER_DEMAND_FEED_BEGIN_URL: &str = "https://scheduler.internal/demand-feed/begin";
@@ -297,8 +316,9 @@ pub async fn send_preheat_release(
 pub async fn demand_feed_begin(
     namespace: &CfDurableNamespace,
     request: &stow_types::api::DemandFeedBeginRequest,
+    actor: &str,
 ) -> Result<stow_types::api::DemandFeedBeginReport, SchedulerClientError> {
-    post_json(namespace, SCHEDULER_DEMAND_FEED_BEGIN_URL, request).await
+    post_json_as(namespace, SCHEDULER_DEMAND_FEED_BEGIN_URL, request, actor).await
 }
 
 /// `POST /demand-feed/page` — stage one bounded immutable page under
@@ -306,8 +326,9 @@ pub async fn demand_feed_begin(
 pub async fn demand_feed_page(
     namespace: &CfDurableNamespace,
     request: &stow_types::api::DemandFeedPageRequest,
+    actor: &str,
 ) -> Result<(), SchedulerClientError> {
-    send_json(namespace, SCHEDULER_DEMAND_FEED_PAGE_URL, request).await
+    send_json_as(namespace, SCHEDULER_DEMAND_FEED_PAGE_URL, request, actor).await
 }
 
 /// `POST /demand-feed/complete` — the completion barrier freezing the
@@ -315,8 +336,15 @@ pub async fn demand_feed_page(
 pub async fn demand_feed_complete(
     namespace: &CfDurableNamespace,
     request: &stow_types::api::DemandFeedCompleteRequest,
+    actor: &str,
 ) -> Result<(), SchedulerClientError> {
-    send_json(namespace, SCHEDULER_DEMAND_FEED_COMPLETE_URL, request).await
+    send_json_as(
+        namespace,
+        SCHEDULER_DEMAND_FEED_COMPLETE_URL,
+        request,
+        actor,
+    )
+    .await
 }
 
 /// `POST /demand-feed/cleanup` — retire one bounded chunk of the
@@ -324,8 +352,9 @@ pub async fn demand_feed_complete(
 pub async fn demand_feed_cleanup(
     namespace: &CfDurableNamespace,
     request: &stow_types::api::DemandFeedCleanupRequest,
+    actor: &str,
 ) -> Result<stow_types::api::DemandFeedCleanupReport, SchedulerClientError> {
-    post_json(namespace, SCHEDULER_DEMAND_FEED_CLEANUP_URL, request).await
+    post_json_as(namespace, SCHEDULER_DEMAND_FEED_CLEANUP_URL, request, actor).await
 }
 
 /// `POST /demand-feed/deliver` — replay the next undelivered original
@@ -333,8 +362,9 @@ pub async fn demand_feed_cleanup(
 pub async fn demand_feed_deliver(
     namespace: &CfDurableNamespace,
     request: &stow_types::api::DemandFeedDeliverRequest,
+    actor: &str,
 ) -> Result<stow_types::api::DemandFeedDeliverReport, SchedulerClientError> {
-    post_json(namespace, SCHEDULER_DEMAND_FEED_DELIVER_URL, request).await
+    post_json_as(namespace, SCHEDULER_DEMAND_FEED_DELIVER_URL, request, actor).await
 }
 
 /// `GET /demand-feed/status` — the durable resume cursor.
@@ -367,11 +397,13 @@ pub async fn queue_mutation(
     namespace: &CfDurableNamespace,
     verb: &str,
     selector: &stow_types::api::QueueSelector,
+    actor: &str,
 ) -> Result<stow_types::api::QueueMutationResult, SchedulerClientError> {
-    post_json(
+    post_json_as(
         namespace,
         &format!("{SCHEDULER_TASKS_URL}/{verb}"),
         selector,
+        actor,
     )
     .await
 }
@@ -381,7 +413,7 @@ async fn get_json<T: serde::de::DeserializeOwned>(
     namespace: &CfDurableNamespace,
     url: &str,
 ) -> Result<T, SchedulerClientError> {
-    let mut response = fetch(namespace, Method::GET, url, None::<&String>).await?;
+    let mut response = fetch(namespace, Method::GET, url, None::<&String>, None).await?;
     response
         .body_mut()
         .into_json::<T>()
@@ -395,7 +427,38 @@ async fn post_json<T: serde::de::DeserializeOwned>(
     url: &str,
     payload: &(impl serde::Serialize + Sync + ?Sized),
 ) -> Result<T, SchedulerClientError> {
-    let mut response = fetch(namespace, Method::POST, url, Some(payload)).await?;
+    let mut response = fetch(namespace, Method::POST, url, Some(payload), None).await?;
+    response
+        .body_mut()
+        .into_json::<T>()
+        .await
+        .map_err(|error| SchedulerClientError::Decode(error.to_string()))
+}
+
+/// [`send_json`] carrying the verified actor on [`ACTOR_HEADER`].
+async fn send_json_as(
+    namespace: &CfDurableNamespace,
+    url: &str,
+    payload: &(impl serde::Serialize + Sync + ?Sized),
+    actor: &str,
+) -> Result<(), SchedulerClientError> {
+    let response = fetch(namespace, Method::POST, url, Some(payload), Some(actor)).await?;
+    response
+        .into_body()
+        .into_bytes()
+        .await
+        .map(|_| ())
+        .map_err(|error| SchedulerClientError::Decode(error.to_string()))
+}
+
+/// [`post_json`] carrying the verified actor on [`ACTOR_HEADER`].
+async fn post_json_as<T: serde::de::DeserializeOwned>(
+    namespace: &CfDurableNamespace,
+    url: &str,
+    payload: &(impl serde::Serialize + Sync + ?Sized),
+    actor: &str,
+) -> Result<T, SchedulerClientError> {
+    let mut response = fetch(namespace, Method::POST, url, Some(payload), Some(actor)).await?;
     response
         .body_mut()
         .into_json::<T>()
@@ -411,7 +474,7 @@ async fn send_json(
     url: &str,
     payload: &(impl serde::Serialize + Sync + ?Sized),
 ) -> Result<(), SchedulerClientError> {
-    let response = fetch(namespace, Method::POST, url, Some(payload)).await?;
+    let response = fetch(namespace, Method::POST, url, Some(payload), None).await?;
     response
         .into_body()
         .into_bytes()
@@ -428,6 +491,7 @@ async fn fetch(
     method: Method,
     url: &str,
     payload: Option<&(impl serde::Serialize + Sync + ?Sized)>,
+    actor: Option<&str>,
 ) -> Result<Response, SchedulerClientError> {
     let stub = namespace
         .get_by_name(SCHEDULER_SINGLETON_NAME)
@@ -445,6 +509,13 @@ async fn fetch(
         request
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    }
+    if let Some(actor) = actor {
+        request.headers_mut().insert(
+            ACTOR_HEADER,
+            HeaderValue::from_str(actor)
+                .map_err(|error| SchedulerClientError::BuildRequest(error.to_string()))?,
+        );
     }
     let response = stub.fetch(request).await.map_err(|error| {
         let message = error.to_string();
