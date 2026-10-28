@@ -68,7 +68,7 @@ in `cargo check`/`cargo build`. Keep them at `stow check` startup, on
 ## Measuring overhead
 
 ```sh
-rm -rf "$STOW_CACHE_DIR" ~/.cache/stow /tmp/tokei
+rm -rf "$STOW_CACHE_DIR" ~/.cache/stow ~/Library/Caches/stow /tmp/tokei
 git clone --depth 1 https://github.com/XAMPPRocky/tokei /tmp/tokei
 STOW_TRACE_FILE=/tmp/stow-cold.json stow check --manifest-path /tmp/tokei/Cargo.toml
 # repeat without removing cache for warm path
