@@ -123,6 +123,15 @@ fn serve_one(mut stream: std::net::TcpStream, captured: &Captured) {
 
     let (status, response_body) = if request_line.contains("/api/v1/admissions") {
         ("200 OK", ADMISSIONS_RESPONSE.to_owned())
+    } else if request_line.contains("/v2") || request_line.contains("/token") {
+        // `stow setup` fetches the host index slice since stow#1032:
+        // report every registry package missing, which the slice fetch
+        // resolves to the empty index (stow#844).
+        (
+            "403 Forbidden",
+            r#"{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}"#
+                .to_owned(),
+        )
     } else {
         ("404 Not Found", String::new())
     };

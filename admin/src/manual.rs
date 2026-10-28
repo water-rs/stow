@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use futures_util::{StreamExt as _, TryStreamExt as _};
+use keyring_core::api::CredentialStoreApi;
 use oci_client::manifest::OciImageManifest;
 use stow_types::api::{EnqueueRequest, SubmissionSource, SubmissionTree};
 use stow_types::identity::{CrateName, CrateVersion, TargetTriple, WireRustcVersion};
@@ -70,7 +71,11 @@ pub struct ManualArgs {
 }
 
 /// Entry point — `stow-admin preheat manual`.
-pub async fn run(args: ManualArgs, output: Output) -> stow_types::error::Result<()> {
+pub async fn run(
+    args: ManualArgs,
+    output: Output,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
     if args.crates.is_none() && args.projects.is_none() && args.dirs.is_none() {
         return Err(stow_error!(
             "one of --crates, --projects or --dirs is required"
@@ -78,7 +83,7 @@ pub async fn run(args: ManualArgs, output: Output) -> stow_types::error::Result<
     }
     // The edge is connected up front under `--yes` — a missing
     // `STOW_EDGE_URL` fails before the resolve spends its minutes.
-    let edge = Edge::connect_to_submit(args.yes)?;
+    let edge = Edge::connect_to_submit(store, args.yes)?;
     let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
         .map_err(|error| stow_error!("--rustc-version: {error}"))?;
     let targets = crate::preheat::ci_targets(args.targets.clone())?

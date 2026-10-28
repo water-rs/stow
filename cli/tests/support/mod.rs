@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The environment a hermetic `stow-cli` invocation needs: `edge_url` as
-/// both the edge and the OCI registry base — without the second the CLI
+/// both the edge and the OCI registry root (no path: the registry
+/// client rejects a base URL carrying one, stow#1032) — without the second the CLI
 /// reaches the real registry, and once the public index covers a
 /// fixture's crates an "all-miss" build is no longer one (stow#608) — an
 /// isolated cache dir, a `home` the child's home directories all point
@@ -13,10 +14,7 @@ pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path
     sealed_home_env(command, home);
     command
         .env("STOW_EDGE_URL", edge_url)
-        .env(
-            "STOW_REGISTRY_BASE_URL",
-            format!("{edge_url}/water-rs/stow"),
-        )
+        .env("STOW_REGISTRY_BASE_URL", edge_url)
         .env("STOW_CACHE_DIR", cache_dir)
         // Isolate from the developer's ambient stow config: a user-level
         // `verify_mode = "mock-key"` (or an inherited `STOW_CONFIG_BLOB`)
@@ -48,6 +46,74 @@ pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path
         .env_remove("STOW_REAL_CXX")
         .env("NO_PROXY", "127.0.0.1,localhost")
         .env("no_proxy", "127.0.0.1,localhost");
+}
+
+/// The OCI `DENIED` envelope GHCR answers the anonymous token exchange
+/// with for a package that does not exist — what `ensure_slice` resolves
+/// to the empty index (stow#844).
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+const DENIED_BODY: &str =
+    r#"{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}"#;
+
+/// A registry that reports every package missing: `/v2` requests get the
+/// bearer challenge and the token exchange answers `DENIED`, the shape
+/// the slice fetch resolves to the empty index with no signature to
+/// verify (stow#844). `stow setup` fetches the host slice since
+/// stow#1032, so every setup in a test needs an answer like this —
+/// a refused port fails the fetch and the command with it.
+///
+/// Returns the server's base URL; use it where an edge URL is expected —
+/// `hermetic_stow_env` derives `STOW_REGISTRY_BASE_URL` from it.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn denied_registry() -> String {
+    use std::io::Write as _;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let realm = url.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let read = std::io::Read::read(&mut stream, &mut buffer).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let path = request
+                .split(|byte| *byte == b' ')
+                .nth(1)
+                .unwrap_or_default();
+            // `/v2` may sit under the registry base URL's path prefix
+            // (`{base}/v2/…`): match it wherever it lands. `/token`
+            // and everything else take the DENIED answer.
+            if path.windows(3).any(|window| window == b"/v2") {
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"{realm}/token\",service=\"mock\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                );
+            } else {
+                let _ = stream.write_all(
+                    format!(
+                        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{DENIED_BODY}",
+                        DENIED_BODY.len()
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    });
+    url
 }
 
 /// The home a hermetic child process gets: `HOME` and the platform's

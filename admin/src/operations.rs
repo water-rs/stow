@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use keyring_core::api::CredentialStoreApi;
 use stow_types::stow_error;
 use stow_types::transient::Backoff;
 
@@ -241,9 +242,12 @@ struct WorkflowRun {
 /// `stow_error` when `STOW_EDGE_URL` is unset or names a local edge, the
 /// dispatch is refused, the run does not finish inside [`RUN_DEADLINE`],
 /// or it concludes other than `success`.
-pub async fn dispatch_and_follow(dispatch: &Dispatch) -> stow_types::error::Result<()> {
+pub async fn dispatch_and_follow(
+    dispatch: &Dispatch,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
     refuse_loopback_edge(std::env::var(crate::STOW_EDGE_URL_ENV).ok().as_deref())?;
-    let token = crate::operator_token()?;
+    let token = crate::operator_token(store)?;
     let run: DispatchedRun = github::post(
         &token,
         &format!("actions/workflows/{WORKFLOW}/dispatches"),

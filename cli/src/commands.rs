@@ -36,9 +36,16 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
     }
     let current_dir = std::env::current_dir().wrap_err("resolve current directory")?;
     let cargo_home = config::require_cargo_home()?;
-    let host_target = detect_rustc_host_target(std::ffi::OsStr::new("rustc"))
-        .await
+    // The host triple and the version probe are independent answers
+    // from the same toolchain — await them together (stow#1032).
+    let (host_target, rustc_version) = tokio::join!(
+        detect_rustc_host_target(std::ffi::OsStr::new("rustc")),
+        detect_rustc_version(std::ffi::OsStr::new("rustc")),
+    );
+    let host_target = host_target
         .map_err(|error| stow_types::stow_error!("detect rustc host target: {error}"))?;
+    let rustc_version =
+        rustc_version.map_err(|error| stow_types::stow_error!("detect rustc version: {error}"))?;
     // A global setup answers only from the global configuration — the
     // directory it runs in must not change the result.
     let mold_bin_dir = mold::prepare_global().await?;
@@ -53,24 +60,17 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         mold_bin_dir.as_deref(),
     )
     .await?;
+    // The config the link-cache record below and the index-slice fetch
+    // at the end both read — loaded once, so setup fails on the same
+    // error either would have hit (stow#1032).
+    let stow_config = StowConfig::load(state_db.clone())?;
     // The link resolution a first build would run, recorded now under
     // the per-machine key — a project with no config of its own builds
     // warm (stow#608). The record must come after the write: the key
     // digests the global file's content. Linux only;
     // `warm_global_link_cache` is a no-op elsewhere.
     if cfg!(target_os = "linux") {
-        // Recording the row is an optimisation: a setup whose state DB
-        // is unavailable still configures cargo fully — the first build
-        // resolves the link itself and reports live (stow#608). Only a
-        // failure of the resolution itself is an error.
-        match StowConfig::load(state_db.clone()) {
-            Ok(stow_config) => {
-                mold::warm_global_link_cache(&cargo_home, &stow_config).await?;
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "stow config unavailable, setup leaves the link cache cold");
-            }
-        }
+        mold::warm_global_link_cache(&cargo_home, &stow_config).await?;
     }
 
     // The stable sandbox identity's persistent toolchain grants
@@ -85,6 +85,21 @@ pub async fn setup_project(args: SetupArgs, state_db: &StateDb) -> stow_types::e
         .await
         .map_err(|error| {
             stow_types::stow_error!("prepare the {identity_name} sandbox identity: {error}")
+        })?;
+
+    // The index slice every wrapper lookup on this toolchain reads:
+    // the wrapper's `cached_slice` is read-only by design
+    // (docs/wrapper-hot-path.md), so without the fetch a fresh install's
+    // first plain `cargo build` serves nothing (stow#1032). Setup ends
+    // by leaving it verified in the local cache through the same
+    // `ensure_slice` `stow build` uses — a failed fetch is the
+    // command's error, never a fallback.
+    index::ensure_slice(&stow_config, &host_target, &rustc_version)
+        .await
+        .map_err(|error| {
+            stow_types::stow_error!(
+                "fetch the {host_target} index slice for rustc {rustc_version}: {error}"
+            )
         })?;
 
     tracing::info!(

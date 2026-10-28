@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Subcommand};
+use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{
     CI_TARGET_TRIPLES, CrateRequestStatus, EnqueueRequest, EnqueueSource, RequestDispatch,
     RequestOutcome, RequestOutcomeReport, RequestRootOutcome,
@@ -72,13 +73,21 @@ struct RequestPlan {
     closure_size: usize,
 }
 
-pub async fn run(args: RequestArgs, output: Output) -> stow_types::error::Result<()> {
+pub async fn run(
+    args: RequestArgs,
+    output: Output,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
     match args.command {
-        RequestCommand::Resolve(args) => resolve(args, output).await,
+        RequestCommand::Resolve(args) => resolve(args, output, store).await,
     }
 }
 
-async fn resolve(args: RequestResolveArgs, output: Output) -> stow_types::error::Result<()> {
+async fn resolve(
+    args: RequestResolveArgs,
+    output: Output,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
     let dispatch: RequestDispatch = serde_json::from_str(&args.request)
         .map_err(|error| stow_error!("--request payload: {error}"))?;
     match plan_request(&dispatch, args.cargo_home).await {
@@ -86,7 +95,7 @@ async fn resolve(args: RequestResolveArgs, output: Output) -> stow_types::error:
             if !args.yes {
                 return render_plan(&dispatch, &plan, output);
             }
-            submit_outcome(&dispatch, plan, output).await
+            submit_outcome(&dispatch, plan, output, store).await
         }
         Err(error) => {
             if args.yes {
@@ -94,7 +103,7 @@ async fn resolve(args: RequestResolveArgs, output: Output) -> stow_types::error:
                 // unless its failure is reported — post it; a report
                 // failure only logs, the run's `completed` webhook is
                 // the backstop.
-                match Edge::connect() {
+                match Edge::connect(store) {
                     Ok(edge) => {
                         if let Err(report_error) =
                             report_failure(&edge, &dispatch, &error.to_string()).await
@@ -313,8 +322,9 @@ async fn submit_outcome(
     dispatch: &RequestDispatch,
     plan: RequestPlan,
     output: Output,
+    store: &(impl CredentialStoreApi + Sync),
 ) -> stow_types::error::Result<()> {
-    let edge = Edge::connect()?;
+    let edge = Edge::connect(store)?;
     let report = RequestOutcomeReport {
         attempt: dispatch.attempt,
         outcome: RequestOutcome::Resolved {

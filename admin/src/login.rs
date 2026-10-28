@@ -10,11 +10,12 @@
 //! `gh auth token`, with every scope gh was granted, never leaves the
 //! machine for the edge.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Args;
 use keyring_core::Entry;
-use keyring_core::api::CredentialStoreApi as _;
+use keyring_core::api::CredentialStoreApi;
 use serde::{Deserialize, Serialize};
 use stow_types::stow_error;
 use zenwave::{Client, ResponseExt};
@@ -79,8 +80,14 @@ struct AccessTokenResponse {
     interval: Option<u64>,
 }
 
-pub async fn run(args: LoginArgs) -> stow_types::error::Result<()> {
-    let entry = entry()?;
+/// `store` is the credential store the token is read from and written
+/// to — the platform store in the binary, an in-memory one in tests
+/// (stow#1021).
+pub async fn run(
+    args: LoginArgs,
+    store: &(impl CredentialStoreApi + Sync),
+) -> stow_types::error::Result<()> {
+    let entry = entry(store)?;
     if args.logout {
         return match entry.delete_credential() {
             Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
@@ -155,10 +162,10 @@ pub async fn run(args: LoginArgs) -> stow_types::error::Result<()> {
     }
 }
 
-/// The stored operator token, or an error naming `stow-admin login`
-/// when there is none or it has expired.
-pub fn stored_token() -> stow_types::error::Result<String> {
-    let json = match entry()?.get_password() {
+/// The operator token stored in `store`, or an error naming
+/// `stow-admin login` when there is none or it has expired.
+pub fn stored_token(store: &(impl CredentialStoreApi + Sync)) -> stow_types::error::Result<String> {
+    let json = match entry(store)?.get_password() {
         Ok(json) => json,
         Err(keyring_core::Error::NoEntry) => {
             return Err(stow_error!(
@@ -177,16 +184,26 @@ pub fn stored_token() -> stow_types::error::Result<String> {
     Ok(stored.token)
 }
 
-fn entry() -> stow_types::error::Result<Entry> {
-    #[cfg(target_os = "macos")]
-    let store = apple_native_keyring_store::keychain::Store::new();
-    #[cfg(target_os = "linux")]
-    let store = linux_keyutils_keyring_store::Store::new();
-    #[cfg(target_os = "windows")]
-    let store = windows_native_keyring_store::Store::new();
+/// The platform credential store the binary reads and writes through:
+/// the login keychain on macOS, kernel keyutils on Linux, the Credential
+/// Manager on Windows.
+#[cfg(target_os = "macos")]
+pub type PlatformStore = apple_native_keyring_store::keychain::Store;
+#[cfg(target_os = "linux")]
+pub type PlatformStore = linux_keyutils_keyring_store::Store;
+#[cfg(target_os = "windows")]
+pub type PlatformStore = windows_native_keyring_store::Store;
+
+/// Constructing the store touches nothing — it opens on an entry's
+/// first read or write.
+pub fn platform_store() -> stow_types::error::Result<Arc<PlatformStore>> {
+    PlatformStore::new().map_err(|error| stow_error!("open the OS credential store: {error}"))
+}
+
+fn entry(store: &(impl CredentialStoreApi + Sync)) -> stow_types::error::Result<Entry> {
     store
-        .and_then(|store| store.build(SERVICE, ACCOUNT, None))
-        .map_err(|error| stow_error!("open the OS credential store: {error}"))
+        .build(SERVICE, ACCOUNT, None)
+        .map_err(|error| stow_error!("open the credential store: {error}"))
 }
 
 async fn post<B: Serialize + Sync, T: serde::de::DeserializeOwned>(
@@ -211,4 +228,40 @@ async fn post<B: Serialize + Sync, T: serde::de::DeserializeOwned>(
 
 fn now_unix() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The token path reads and writes the store it is handed — never a
+    /// process-wide or platform one — so a test cannot reach the
+    /// machine's real keychain (stow#1021).
+    #[tokio::test]
+    async fn the_token_path_uses_the_store_it_is_given() {
+        let store = keyring_core::mock::Store::new().expect("mock store");
+        let stored = StoredToken {
+            token: "the-token".to_owned(),
+            expires_at: now_unix() + 3600,
+        };
+        store
+            .build(SERVICE, ACCOUNT, None)
+            .expect("entry")
+            .set_password(&serde_json::to_string(&stored).expect("encode"))
+            .expect("store the token");
+        assert_eq!(stored_token(&*store).expect("read"), "the-token");
+
+        run(LoginArgs { logout: true }, &*store)
+            .await
+            .expect("logout");
+        let deleted = stored_token(&*store).expect_err("the token is deleted");
+        assert!(
+            deleted.to_string().contains("stow-admin login"),
+            "{deleted}"
+        );
+
+        let other = keyring_core::mock::Store::new().expect("a second mock store");
+        let absent = stored_token(&*other).expect_err("a fresh store holds no token");
+        assert!(absent.to_string().contains("stow-admin login"), "{absent}");
+    }
 }

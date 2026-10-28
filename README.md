@@ -16,7 +16,7 @@ cache and lets anyone request a crate to be built ahead of the miss queue
    - **macOS / Linux:** `curl -fsSL https://stow.waterui.dev/install.sh | sh`
    - **Windows (PowerShell):** `irm https://stow.waterui.dev/install.ps1 | iex`
 
-   The setup writes `[build] rustc-wrapper` and the `[env]` entries `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`, `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` so the wrapper can capture native builds too; on Linux it also installs mold and selects it as the linker.
+   The setup writes `[build] rustc-wrapper` and the `[env]` entries `STOW_REAL_CC`, `STOW_REAL_CXX`, `CC`, `CXX`, `CMAKE_C_COMPILER_LAUNCHER`, `CMAKE_CXX_COMPILER_LAUNCHER` so the wrapper can capture native builds too; on Linux it also installs mold and selects it as the linker. It also fetches the signed index slice for your host target and toolchain, so the first plain `cargo build` already serves from the public cache.
 
 2. Build anything: `cargo build` — accelerated everywhere, no per-project step. (Or build from source: `cargo build --release -p stow-cli && install target/release/stow ~/.cargo/bin/`.)
 
