@@ -1492,6 +1492,7 @@ fn predict_from_inputs(
     // plus whether the graph's invocation spelled `--target` (stow#615).
     let unit_nodes = Some(crate::unit_node::UnitNodeTable::from_expanded(
         &expanded.entries,
+        &expanded.node_profiles(project.target_given.then_some(project.target.as_str()))?,
         project.target_given,
     ));
     // stow#882: the inexact report carries the exact chain — each
@@ -1965,11 +1966,14 @@ pub async fn admit_observed_misses(
         &stow_types::identity::WireRustcVersion::parse(rustc_version)
             .wrap_err("parse rustc_version")?,
     )?;
+    let node_profiles =
+        expanded.node_profiles(consumer_spelled_target.then_some(consumer_target))?;
     let graph = workspace_deps::observed_miss_graph(
         observations,
         &dep_identities,
         consumer_spelled_target,
         &resolved,
+        &node_profiles,
     )?;
     if graph.roots.is_empty() {
         return Ok(());
@@ -6137,6 +6141,7 @@ mod tests {
                         format!("feature-{index}"),
                         format!("a-longer-feature-name-{index}"),
                     ],
+                    profile: None,
                 })
                 .collect(),
         }

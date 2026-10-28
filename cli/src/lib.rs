@@ -4592,10 +4592,25 @@ fn resolved_unit_features_json(
     target: &str,
     rustc_version: &str,
 ) -> Option<String> {
+    let evidence =
+        match crate::unit_node::UnitEvidence::from_invocation(crate_name, version, parsed) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    crate_name = %crate_name,
+                    version = %version,
+                    target,
+                    rustc_version,
+                    "compiled unit's profile did not parse"
+                );
+                return None;
+            }
+        };
     match crate::unit_node::resolve_unit_node(
         table.coordinates(),
         table.consumer_spelled_target,
-        &crate::unit_node::UnitEvidence::from_invocation(crate_name, version, parsed),
+        &evidence,
     ) {
         Ok(node) => match serde_json::to_string(node.features) {
             Ok(features_json) => Some(features_json),

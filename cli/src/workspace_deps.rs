@@ -110,6 +110,42 @@ impl ExpandedDependencyGraph {
         }
         unit_graph_task_units(&graph, target, host_triple)
     }
+
+    /// The compile profile cargo states for each node of this graph,
+    /// keyed by node identity `(crate, version, host_side)` — the
+    /// [`crate::unit_node::NodeProfiles`] a compiled unit's side resolves
+    /// against (stow#596).
+    ///
+    /// A lib unit reachable on both sides under the native spelling is
+    /// the twin cargo merged into one compile — the target node's —
+    /// so its profile lands on the target node only: the re-split host
+    /// node has no compile of its own in this build to state a profile
+    /// for, and nothing on an invocation could prove it.
+    ///
+    /// `target` is the triple cargo was given (`None` native).
+    ///
+    /// # Errors
+    /// As [`ExpandedDependencyGraph::task_units`], or a profile field
+    /// spelling cargo documents but this parser does not cover.
+    pub fn node_profiles(
+        &self,
+        target: Option<&str>,
+    ) -> stow_types::error::Result<crate::unit_node::NodeProfiles> {
+        if self.raw_unit_graph.is_empty() {
+            return Err(stow_types::stow_error!(
+                "expanded dependency graph carries no raw unit graph (a pre-588 cached row) — cannot derive node profiles"
+            ));
+        }
+        let graph: UnitGraph<'_> = serde_json::from_slice(&self.raw_unit_graph)
+            .wrap_err("parse cargo --unit-graph JSON")?;
+        if graph.version != 1 {
+            return Err(stow_types::stow_error!(
+                "cargo --unit-graph reported version {}; only version 1 is understood",
+                graph.version
+            ));
+        }
+        unit_node_profiles(&graph, target)
+    }
 }
 
 /// A manifest cargo read, recorded with its blake3 so a later cache
@@ -570,10 +606,84 @@ struct Unit<'a> {
     platform: Option<&'a str>,
     #[serde(borrow)]
     mode: &'a str,
+    #[serde(borrow)]
+    profile: CargoUnitProfile<'a>,
     #[serde(borrow, default)]
     features: Vec<&'a str>,
     #[serde(borrow, default)]
     dependencies: Vec<UnitDependency<'a>>,
+}
+
+/// `unit.profile` — the compile profile cargo states for the unit. The
+/// fields map onto [`stow_types::platform::Profile`] one to one; the
+/// whole resolved profile is kept, not a side heuristic, so the node a
+/// compile resolves to is right whatever profile either side builds at
+/// (stow#596).
+#[derive(Deserialize)]
+struct CargoUnitProfile<'a> {
+    /// `opt_level` spells exactly like rustc's `-C opt-level`
+    /// (`"0"`–`"3"`, `"s"`, `"z"`).
+    #[serde(borrow)]
+    opt_level: &'a str,
+    /// `debuginfo` is the resolved level — 0, 1 or 2.
+    debuginfo: u32,
+    debug_assertions: bool,
+    overflow_checks: bool,
+    /// `panic` spells like `-C panic` — `"unwind"` or `"abort"`.
+    #[serde(borrow)]
+    panic: &'a str,
+    strip: CargoStrip<'a>,
+}
+
+/// `unit.profile.strip` — cargo's `{"resolved"|"deferred": <inner>}`.
+/// Deferred and resolved differ only in whether cargo may still adjust
+/// the value; the unit graph reports the final one either way.
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CargoStrip<'a> {
+    Resolved(#[serde(borrow)] CargoStripInner<'a>),
+    Deferred(#[serde(borrow)] CargoStripInner<'a>),
+}
+
+/// The strip setting's value — `"None"` or `{"Named": "<level>"}`.
+#[derive(Deserialize)]
+enum CargoStripInner<'a> {
+    None,
+    #[serde(borrow)]
+    Named(&'a str),
+}
+
+impl CargoUnitProfile<'_> {
+    /// The unit's profile as the typed [`stow_types::platform::Profile`]
+    /// the invocation's parsed profile compares against.
+    fn normalized(&self, pkg_id: &str) -> stow_types::error::Result<stow_types::platform::Profile> {
+        use stow_types::platform::{PanicStrategy, Profile, StripLevel};
+        let bad = |field: &str, value: &str| {
+            stow_types::stow_error!(
+                "cargo --unit-graph unit `{pkg_id}` profile {field} `{value}` is not understood"
+            )
+        };
+        let inner = match &self.strip {
+            CargoStrip::Resolved(inner) | CargoStrip::Deferred(inner) => inner,
+        };
+        Ok(Profile {
+            opt_level: self.opt_level.to_owned(),
+            debuginfo: self.debuginfo,
+            debug_assertions: self.debug_assertions,
+            overflow_checks: self.overflow_checks,
+            panic: match self.panic {
+                "unwind" => PanicStrategy::Unwind,
+                "abort" => PanicStrategy::Abort,
+                other => return Err(bad("panic", other)),
+            },
+            strip: match inner {
+                CargoStripInner::None => StripLevel::None,
+                CargoStripInner::Named("debuginfo") => StripLevel::Debuginfo,
+                CargoStripInner::Named("symbols") => StripLevel::Symbols,
+                CargoStripInner::Named(other) => return Err(bad("strip", other)),
+            },
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -750,7 +860,36 @@ fn unit_sides(graph: &UnitGraph<'_>, target: Option<&str>) -> stow_types::error:
     Ok(sides)
 }
 
-/// Project one unit graph onto the shared [`stow_types::unit_graph::TaskUnit`]
+/// Each node's compile profile as cargo states it, keyed by node
+/// identity `(crate, version, host_side)` — see
+/// [`ExpandedDependencyGraph::node_profiles`]. A both-reachable lib
+/// unit's profile lands on the target side only (stow#596).
+fn unit_node_profiles(
+    graph: &UnitGraph<'_>,
+    target: Option<&str>,
+) -> stow_types::error::Result<crate::unit_node::NodeProfiles> {
+    let infos = unit_infos(graph)?;
+    let sides = unit_sides(graph, target)?;
+    let mut profiles = crate::unit_node::NodeProfiles::new();
+    for (index, (unit, info)) in graph.units.iter().zip(infos.iter()).enumerate() {
+        let Some((crate_name, version)) = info.parsed.clone() else {
+            continue;
+        };
+        for side in [HOST, TARGET] {
+            if sides[index] & side == 0 {
+                continue;
+            }
+            // Cargo merged the twin into this one compile — the target
+            // node's. The host node re-split from it states no profile.
+            if side == HOST && sides[index] & TARGET != 0 {
+                continue;
+            }
+            let profile = unit.profile.normalized(unit.pkg_id)?;
+            profiles.insert((crate_name.clone(), version.clone(), side == HOST), profile);
+        }
+    }
+    Ok(profiles)
+}
 /// model — the same shape `stow-resolver`'s `emit.rs` assigns, so the
 /// build stage's dependency-context check resolves onto the same task
 /// identities the resolver mints (stow#588).
@@ -1325,6 +1464,7 @@ pub fn observed_miss_graph(
     dep_identities: &BTreeMap<String, crate::artifact_cache::ObservedDepIdentity>,
     consumer_spelled_target: bool,
     resolved: &stow_types::task_graph::ResolvedTaskGraph,
+    profiles: &crate::unit_node::NodeProfiles,
 ) -> stow_types::error::Result<ObservedMissGraph> {
     let node_features = node_feature_index(resolved)?;
 
@@ -1352,7 +1492,8 @@ pub fn observed_miss_graph(
         // observation's `features` — the argv `--cfg feature="…"` scan —
         // is evidence for the resolution, never the node's set: a build
         // script's `cargo:rustc-cfg=feature="…"` lines ride it (stow#615).
-        let Some(node) = resolve_observed_unit(observation, consumer_spelled_target, resolved)
+        let Some(node) =
+            resolve_observed_unit(observation, consumer_spelled_target, resolved, profiles)
         else {
             continue;
         };
@@ -1433,6 +1574,7 @@ fn resolve_observed_unit<'r>(
     observation: &crate::artifact_cache::ObservedUnit,
     consumer_spelled_target: bool,
     resolved: &'r stow_types::task_graph::ResolvedTaskGraph,
+    profiles: &'r crate::unit_node::NodeProfiles,
 ) -> Option<crate::unit_node::NodeCoordinates<'r>> {
     let feature_scan = observation
         .features
@@ -1443,14 +1585,14 @@ fn resolve_observed_unit<'r>(
         resolved
             .nodes()
             .iter()
-            .map(crate::unit_node::NodeCoordinates::from),
+            .map(|node| crate::unit_node::NodeCoordinates::from_task_node(node, profiles)),
         consumer_spelled_target,
         &crate::unit_node::UnitEvidence {
             crate_name: observation.crate_name.as_str(),
             version: observation.crate_version.as_str(),
             spelled_target: observation.explicit_target.is_some(),
             feature_scan: &feature_scan,
-            build_override: observation.build_override,
+            profile: observation.profile.clone(),
         },
     ) {
         Ok(node) => Some(node),
@@ -2082,7 +2224,7 @@ mod observed_miss_tests {
                 .collect(),
             target: target.to_owned(),
             explicit_target: None,
-            build_override: false,
+            profile: target_profile(),
             externs: externs
                 .iter()
                 .map(|(name, c_metadata)| DependencyCMetadataIdentity {
@@ -2137,6 +2279,31 @@ mod observed_miss_tests {
         stow_types::task_graph::ResolvedTaskGraph::resolve(nodes).expect("fixture resolves")
     }
 
+    /// Canonical per-side profiles for a resolved fixture's nodes — the
+    /// shape a graph cargo did not merge takes.
+    fn profiles_for(
+        graph: &stow_types::task_graph::ResolvedTaskGraph,
+    ) -> crate::unit_node::NodeProfiles {
+        graph
+            .nodes()
+            .iter()
+            .map(|node| {
+                (
+                    (
+                        node.identity.crate_name.clone(),
+                        node.identity.version.as_semver().clone(),
+                        node.identity.host_side,
+                    ),
+                    if node.identity.host_side {
+                        host_profile()
+                    } else {
+                        target_profile()
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// A resolved task graph covering every node an observed miss
     /// graph could mint from these inputs — one leaf node per
     /// `(name, version, features, side)` an observation or dep identity
@@ -2146,12 +2313,15 @@ mod observed_miss_tests {
         observations: &[crate::artifact_cache::ObservedUnit],
         deps: &BTreeMap<String, ObservedDepIdentity>,
         consumer_spelled_target: bool,
-    ) -> stow_types::task_graph::ResolvedTaskGraph {
+    ) -> (
+        stow_types::task_graph::ResolvedTaskGraph,
+        crate::unit_node::NodeProfiles,
+    ) {
         let mut nodes = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
         for observation in observations {
             let host_side = observation.explicit_target.is_none()
-                && (consumer_spelled_target || observation.build_override);
+                && (consumer_spelled_target || observation.profile == host_profile());
             let mut features: Vec<&str> = observation.features.iter().map(String::as_str).collect();
             features.sort_unstable();
             features.dedup();
@@ -2189,7 +2359,43 @@ mod observed_miss_tests {
                 }
             }
         }
-        resolved_graph(nodes)
+        // Each fixture node states its side's canonical profile — the
+        // shape a graph cargo did not merge takes.
+        let mut profiles = crate::unit_node::NodeProfiles::new();
+        for node in &nodes {
+            let key = (
+                node.identity.crate_name.clone(),
+                node.identity.version.as_semver().clone(),
+                node.identity.host_side,
+            );
+            let profile = if node.identity.host_side {
+                host_profile()
+            } else {
+                target_profile()
+            };
+            profiles.insert(key, profile);
+        }
+        (resolved_graph(nodes), profiles)
+    }
+
+    /// The profile a target-side compile states under dev.
+    fn target_profile() -> stow_types::platform::Profile {
+        stow_types::platform::Profile {
+            opt_level: "0".to_owned(),
+            debuginfo: 2,
+            debug_assertions: true,
+            overflow_checks: true,
+            panic: stow_types::platform::PanicStrategy::Unwind,
+            strip: stow_types::platform::StripLevel::None,
+        }
+    }
+
+    /// The build-override profile a host-side compile states under dev.
+    fn host_profile() -> stow_types::platform::Profile {
+        stow_types::platform::Profile {
+            debuginfo: 0,
+            ..target_profile()
+        }
     }
 
     fn dep_identities(deps: &[DepIdentityFixture<'_>]) -> BTreeMap<String, ObservedDepIdentity> {
@@ -2257,13 +2463,11 @@ mod observed_miss_tests {
             None,
             false,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            false,
-            &resolved_fixture(&observations, &dep_identities, false),
-        )
-        .expect("miss graph mints");
+        let (resolved, profiles) = resolved_fixture(&observations, &dep_identities, false);
+
+        let graph =
+            observed_miss_graph(&observations, &dep_identities, false, &resolved, &profiles)
+                .expect("miss graph mints");
 
         let app = node(&graph, "app", false);
         assert_eq!(app.features, vec!["full"]);
@@ -2279,9 +2483,9 @@ mod observed_miss_tests {
     /// compile at — is a host-side node, and the dependent's edge into
     /// it names the same side (stow#349).
     #[test]
-    fn native_build_classifies_host_units_by_their_build_override() {
+    fn native_build_classifies_host_units_by_their_stated_profile() {
         let mut serde_derive = observation("serde_derive", "1.0.228", HOST, &[], &[]);
-        serde_derive.build_override = true;
+        serde_derive.profile = host_profile();
         let observations = vec![
             observation(
                 "serde",
@@ -2300,13 +2504,11 @@ mod observed_miss_tests {
             None,
             true,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            false,
-            &resolved_fixture(&observations, &dep_identities, false),
-        )
-        .expect("miss graph mints");
+        let (resolved, profiles) = resolved_fixture(&observations, &dep_identities, false);
+
+        let graph =
+            observed_miss_graph(&observations, &dep_identities, false, &resolved, &profiles)
+                .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -2361,13 +2563,14 @@ mod observed_miss_tests {
     #[test]
     fn a_flagless_native_compile_takes_the_unit_graphs_side() {
         let mut cfg_if = observation("cfg-if", "1.0.5", HOST, &[], &[]);
-        cfg_if.build_override = true; // the flagless-argv false positive
+        cfg_if.profile = host_profile();
         let observations = vec![cfg_if];
         let graph = observed_miss_graph(
             &observations,
             &BTreeMap::new(),
             false,
             &resolved_at("cfg-if", "1.0.5", &[], false),
+            &crate::unit_node::NodeProfiles::new(),
         )
         .expect("miss graph mints");
 
@@ -2381,13 +2584,14 @@ mod observed_miss_tests {
     #[test]
     fn a_flagless_native_compile_on_a_host_only_unit_stays_host() {
         let mut anyhow = observation("anyhow", "1.0.104", HOST, &["std"], &[]);
-        anyhow.build_override = true;
+        anyhow.profile = host_profile();
         let observations = vec![anyhow];
         let graph = observed_miss_graph(
             &observations,
             &BTreeMap::new(),
             false,
             &resolved_at("anyhow", "1.0.104", &["std"], true),
+            &crate::unit_node::NodeProfiles::new(),
         )
         .expect("miss graph mints");
 
@@ -2428,13 +2632,10 @@ mod observed_miss_tests {
             None,
             true,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            true,
-            &resolved_fixture(&observations, &dep_identities, true),
-        )
-        .expect("miss graph mints");
+        let (resolved, profiles) = resolved_fixture(&observations, &dep_identities, false);
+
+        let graph = observed_miss_graph(&observations, &dep_identities, true, &resolved, &profiles)
+            .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -2468,13 +2669,10 @@ mod observed_miss_tests {
             Some(true),
             false,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            true,
-            &resolved_fixture(&observations, &dep_identities, true),
-        )
-        .expect("miss graph mints");
+        let (resolved, profiles) = resolved_fixture(&observations, &dep_identities, false);
+
+        let graph = observed_miss_graph(&observations, &dep_identities, true, &resolved, &profiles)
+            .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -2502,13 +2700,11 @@ mod observed_miss_tests {
             None,
             false,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            false,
-            &resolved_fixture(&observations, &dep_identities, false),
-        )
-        .expect("miss graph mints");
+        let (resolved, profiles) = resolved_fixture(&observations, &dep_identities, false);
+
+        let graph =
+            observed_miss_graph(&observations, &dep_identities, false, &resolved, &profiles)
+                .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.features, vec!["std"]);
@@ -2542,13 +2738,11 @@ mod observed_miss_tests {
             None,
             false,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            false,
-            &resolved_fixture(&observations, &dep_identities, false),
-        )
-        .expect("miss graph mints");
+        let (resolved, profiles) = resolved_fixture(&observations, &dep_identities, false);
+
+        let graph =
+            observed_miss_graph(&observations, &dep_identities, false, &resolved, &profiles)
+                .expect("miss graph mints");
 
         assert_eq!(
             graph.roots,
@@ -2569,13 +2763,11 @@ mod observed_miss_tests {
             observation("serde", "1.0.228", HOST, &["derive"], &[]),
         ];
         let dep_identities = dep_identities(&[]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            false,
-            &resolved_fixture(&observations, &dep_identities, false),
-        )
-        .expect("miss graph mints");
+        let (resolved, profiles) = resolved_fixture(&observations, &dep_identities, false);
+
+        let graph =
+            observed_miss_graph(&observations, &dep_identities, false, &resolved, &profiles)
+                .expect("miss graph mints");
 
         assert_eq!(graph.expanded.len(), 1);
         assert_eq!(graph.expanded[0].crate_name.as_str(), "serde");
@@ -2603,7 +2795,7 @@ mod observed_miss_tests {
         serde.explicit_target = Some(HOST.to_owned());
         // The host unit carries no `--target` and — under a spelled
         // build — the same debuginfo flag a target dep would, so
-        // `build_override` stays false.
+        // `profile` stays the target side's.
         let serde_derive = observation("serde_derive", "1.0.228", HOST, &[], &[]);
         let observations = vec![serde, serde_derive];
         let dep_identities = dep_identities(&[(
@@ -2614,13 +2806,10 @@ mod observed_miss_tests {
             None,
             true,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            true,
-            &resolved_fixture(&observations, &dep_identities, true),
-        )
-        .expect("miss graph mints");
+        let (resolved, profiles) = resolved_fixture(&observations, &dep_identities, false);
+
+        let graph = observed_miss_graph(&observations, &dep_identities, true, &resolved, &profiles)
+            .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert_eq!(serde.dependencies[0].crate_name.as_str(), "serde_derive");
@@ -2649,8 +2838,14 @@ mod observed_miss_tests {
         let dep_identities = dep_identities(&[]);
         // The build's unit graph carries cargo's resolved set alone.
         let resolved = resolved_graph(vec![task_node("scripted", "1.0.0", &["declared"], false)]);
-        let graph = observed_miss_graph(&[observation], &dep_identities, false, &resolved)
-            .expect("miss graph mints");
+        let graph = observed_miss_graph(
+            &[observation],
+            &dep_identities,
+            false,
+            &resolved,
+            &profiles_for(&resolved),
+        )
+        .expect("miss graph mints");
 
         let entry = node(&graph, "scripted", false);
         assert_eq!(entry.features, vec!["declared"]);
@@ -2673,8 +2868,11 @@ mod observed_miss_tests {
         ];
         let dep_identities = dep_identities(&[]);
         let resolved = resolved_graph(vec![task_node("present", "1.0.0", &[], false)]);
-        let graph = observed_miss_graph(&observations, &dep_identities, false, &resolved)
-            .expect("miss graph mints");
+        let profiles = profiles_for(&resolved);
+
+        let graph =
+            observed_miss_graph(&observations, &dep_identities, false, &resolved, &profiles)
+                .expect("miss graph mints");
 
         assert_eq!(graph.expanded.len(), 1);
         assert_eq!(graph.expanded[0].crate_name.as_str(), "present");
@@ -2710,8 +2908,11 @@ mod observed_miss_tests {
             task_node("serde", "1.0.228", &["resolved"], false),
             task_node("serde", "1.0.228", &["resolved"], true),
         ]);
-        let graph = observed_miss_graph(&observations, &dep_identities, false, &resolved)
-            .expect("miss graph mints");
+        let profiles = profiles_for(&resolved);
+
+        let graph =
+            observed_miss_graph(&observations, &dep_identities, false, &resolved, &profiles)
+                .expect("miss graph mints");
 
         let leaf = node(&graph, "serde", false);
         assert_eq!(leaf.features, vec!["resolved"]);
@@ -2739,8 +2940,11 @@ mod observed_miss_tests {
         )]);
         // No serde node in this build's unit graph.
         let resolved = resolved_graph(vec![task_node("app", "1.0.0", &[], false)]);
-        let graph = observed_miss_graph(&observations, &dep_identities, false, &resolved)
-            .expect("miss graph mints");
+        let profiles = profiles_for(&resolved);
+
+        let graph =
+            observed_miss_graph(&observations, &dep_identities, false, &resolved, &profiles)
+                .expect("miss graph mints");
 
         assert_eq!(
             graph.roots,
@@ -2762,7 +2966,9 @@ mod observed_miss_tests {
             task_node("dep", "1.0.0", &["a"], false),
             task_node("dep", "1.0.0", &["a", "b"], false),
         ]);
-        let error = observed_miss_graph(&[], &BTreeMap::new(), false, &resolved)
+        let profiles = profiles_for(&resolved);
+
+        let error = observed_miss_graph(&[], &BTreeMap::new(), false, &resolved, &profiles)
             .err()
             .expect("conflicting feature sets fail the graph");
         let message = error.to_string();
@@ -2796,13 +3002,10 @@ mod observed_miss_tests {
             Some(true),
             false,
         )]);
-        let graph = observed_miss_graph(
-            &observations,
-            &dep_identities,
-            true,
-            &resolved_fixture(&observations, &dep_identities, true),
-        )
-        .expect("miss graph mints");
+        let (resolved, profiles) = resolved_fixture(&observations, &dep_identities, false);
+
+        let graph = observed_miss_graph(&observations, &dep_identities, true, &resolved, &profiles)
+            .expect("miss graph mints");
 
         let serde = node(&graph, "serde", false);
         assert!(serde.dependencies[0].host_side);
@@ -3032,7 +3235,9 @@ mod unit_graph_tests {
             .cloned()
             .chain(std::iter::once("probe_from_build_script".to_owned()))
             .collect::<BTreeSet<_>>();
-        let table = crate::unit_node::UnitNodeTable::from_expanded(&graph.entries, false);
+        let profiles = graph.node_profiles(None).expect("node profiles");
+        let table =
+            crate::unit_node::UnitNodeTable::from_expanded(&graph.entries, &profiles, false);
         let resolved_node = crate::unit_node::resolve_unit_node(
             table.coordinates(),
             table.consumer_spelled_target,
@@ -3041,7 +3246,11 @@ mod unit_graph_tests {
                 version: "1.0.0",
                 spelled_target: false,
                 feature_scan: &scan,
-                build_override: false,
+                profile: profiles
+                    .iter()
+                    .find(|((name, _, side), _)| name.as_str() == "probe-dep" && !*side)
+                    .map(|(_, profile)| profile.clone())
+                    .expect("probe-dep's target node has a profile"),
             },
         )
         .expect("the inflated scan resolves to the graph's node");
@@ -3304,7 +3513,7 @@ mod unit_graph_tests {
         );
         let url = url::Url::from_directory_path(&project).expect("dir url");
         let json = format!(
-            r#"{{"version":1,"roots":[0],"units":[{{"pkg_id":"path+{url}#0.1.0","target":{{"kind":["lib"],"name":"x","crate_types":["lib"]}},"platform":null,"mode":"build","features":[],"dependencies":[]}}]}}"#
+            r#"{{"version":1,"roots":[0],"units":[{{"pkg_id":"path+{url}#0.1.0","target":{{"kind":["lib"],"name":"x","crate_types":["lib"]}},"platform":null,"mode":"build","profile":{{"opt_level":"0","debuginfo":0,"debug_assertions":true,"overflow_checks":true,"panic":"unwind","strip":{{"deferred":"None"}}}},"features":[],"dependencies":[]}}]}}"#
         );
         let graph: UnitGraph<'_> = serde_json::from_str(&json).expect("parse");
         let hashes = super::local_manifest_hashes(&graph).expect("hashes");
@@ -3326,6 +3535,8 @@ mod unit_graph_tests {
                 "target": {"kind": ["lib"]},
                 "platform": null,
                 "mode": "build",
+                "profile": {"opt_level": "0", "debuginfo": 0, "debug_assertions": true,
+                            "overflow_checks": true, "panic": "unwind", "strip": {"deferred": "None"}},
                 "features": [],
                 "dependencies": [{"index": 9, "extern_crate_name": "b"}]
             }]
@@ -3494,13 +3705,22 @@ mod unit_graph_tests {
             "units": [
                 {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#a@1.0.0",
                  "target": {"kind": ["lib"]}, "platform": "x86_64-pc-windows-msvc",
-                 "mode": "build", "features": [], "dependencies": []},
+                 "mode": "build", "profile": {"opt_level": "0", "debuginfo": 0,
+                     "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
+                     "strip": {"deferred": "None"}},
+                 "features": [], "dependencies": []},
                 {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#a@1.0.0",
                  "target": {"kind": ["lib"]}, "platform": "x86_64-unknown-linux-gnu",
-                 "mode": "build", "features": [], "dependencies": []},
+                 "mode": "build", "profile": {"opt_level": "0", "debuginfo": 0,
+                     "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
+                     "strip": {"deferred": "None"}},
+                 "features": [], "dependencies": []},
                 {"pkg_id": "registry+https://github.com/rust-lang/crates.io-index#h@1.0.0",
                  "target": {"kind": ["lib"]}, "platform": null,
-                 "mode": "build", "features": [], "dependencies": []}
+                 "mode": "build", "profile": {"opt_level": "0", "debuginfo": 0,
+                     "debug_assertions": true, "overflow_checks": true, "panic": "unwind",
+                     "strip": {"deferred": "None"}},
+                 "features": [], "dependencies": []}
             ]
         }"#;
         let graph: UnitGraph<'_> = serde_json::from_str(json).expect("parse");
