@@ -359,8 +359,11 @@ alone — nothing reads an older shape of a store.
   the object's `/reset`) drops every table, index and trigger and
   re-executes the file, then appends a `StoreReset` row carrying the
   dispatcher's login as the fresh log's first row; the
-  queue and recorded slices are destroyed and refill from the lanes
-  that feed them. A store that was never initialized gets its schema
+  queue and recorded slices are destroyed, and the same `operations.yml`
+  run refills them once the reset succeeds (`index-publish.yml` with
+  `report=true` per rustc `stow-admin index published-rustcs` finds
+  published, `preheat-cron.yml` with `refresh`).
+  A store that was never initialized gets its schema
   from the same pass — a fresh deployment's operator runs it once.
   A stored record's shape is part of the schema: a change to one — the
   dispatch freeze's manual trigger carries its `actor` — lands with the

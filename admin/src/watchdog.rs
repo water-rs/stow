@@ -5,7 +5,9 @@
 //! allowances (with the last hour's pace as alert-only context), edge health (Worker
 //! invocation statuses, DO resource failures, `overloaded` events), the
 //! build pipeline (build-crate failed-task share, dispatch retries,
-//! pending age, dispatch stalls, stalled builds, preheat freshness), and the public endpoints — then acts on the
+//! pending age, dispatch stalls, stalled builds, preheat freshness), the
+//! workflow history (failed `operations.yml` runs, a missed watchdog
+//! dispatch), and the public endpoints — then acts on the
 //! verdict: `Trip` breaches disable the dispatching workflows that read
 //! `active` — the exact set, recorded on the incident issue for `clear`
 //! to restore — and enable
@@ -30,7 +32,9 @@
 //! manifest + signature + blob), ≤ `1 + completed-runs +
 //! MAX_CLASSIFIED_TASKS` GitHub REST reads (a run's jobs live only on
 //! its jobs page), plus two for the liveness signals (the newest
-//! build-crate run, the newest successful preheat-admin run), plus one per trip workflow when a trip runs, and, only
+//! build-crate run, the newest successful preheat-admin run), plus two
+//! for the history signals (recent watchdog runs, the operations runs
+//! of the report window), plus one per trip workflow when a trip runs, and, only
 //! while an incident is open, ≤8 REST mutations
 //! plus one email — idle runs issue no mutations at all.
 
@@ -403,6 +407,29 @@ const SIGNALS: &[Signal] = &[
         unit: "h",
         effect: Effect::Alert,
     },
+    // The two workflow-history signals: an operator mutation that failed
+    // and a watchdog that was not dispatched on time. Their levels are
+    // operator settings ([`HistoryLevels`]), so the table carries `0.0`
+    // and each reading brings its own threshold (`operations.failed`
+    // breaches at one failed run).
+    Signal {
+        id: "operations.failed",
+        label: "operations.yml runs that concluded failure, timed_out or startup_failure since the previous watchdog run (at least the operator's window)",
+        window: Window::Now,
+        min_sample: 1,
+        threshold: 0.0,
+        unit: "runs",
+        effect: Effect::Alert,
+    },
+    Signal {
+        id: "watchdog.gap",
+        label: "time since the previous watchdog run started (a missed periodic dispatch, reported after the fact)",
+        window: Window::Now,
+        min_sample: 1,
+        threshold: 0.0,
+        unit: "h",
+        effect: Effect::Alert,
+    },
     // ── public endpoints — alert ──
     Signal {
         id: "endpoint.stats",
@@ -576,6 +603,31 @@ const DEFAULT_PREHEAT_MAX_AGE_HOURS: f64 = 26.0;
 const BUILD_STALL_ENV: &str = "STOW_WATCHDOG_BUILD_STALL_HOURS";
 /// The window used while [`BUILD_STALL_ENV`] is unset or empty.
 const DEFAULT_BUILD_STALL_HOURS: f64 = 2.0;
+/// The repository variable that sets how long a failed `operations.yml`
+/// run stays reported, in hours (the longer of this and the time since
+/// the previous watchdog run is read).
+const OPERATIONS_WINDOW_ENV: &str = "STOW_WATCHDOG_OPERATIONS_WINDOW_HOURS";
+/// The window used while [`OPERATIONS_WINDOW_ENV`] is unset or empty: one
+/// hour, the incident digest's cadence, so a failed run is seen by an
+/// incident that lives long enough to digest it.
+const DEFAULT_OPERATIONS_WINDOW_HOURS: f64 = 1.0;
+/// The repository variable that sets how long after the previous
+/// watchdog run started the next may start, in hours.
+const RUN_GAP_ENV: &str = "STOW_WATCHDOG_RUN_GAP_HOURS";
+/// The gap used while [`RUN_GAP_ENV`] is unset or empty: 45 minutes, three
+/// of the 15-minute cadence.
+const DEFAULT_RUN_GAP_HOURS: f64 = 0.75;
+/// The operator mutation workflow whose failures `operations.failed` reads.
+const OPERATIONS_WORKFLOW: &str = "operations.yml";
+/// This workflow, whose run history `watchdog.gap` reads.
+const WATCHDOG_WORKFLOW: &str = "watchdog.yml";
+/// Completed watchdog runs read to find the newest that finished
+/// `success` or `failure` — a cancelled one never evaluated.
+const WATCHDOG_HISTORY_PAGE: u32 = 10;
+/// How long before the report cutoff an `operations.yml` run may have
+/// been created and still conclude after it: the job's 60-minute timeout
+/// plus a wait behind one run of the `operations` concurrency group.
+const OPERATIONS_RUN_LEAD: time::Duration = time::Duration::hours(2);
 /// The workflow whose successful runs prove a preheat wave reached the
 /// scheduler: the one lane that submits (the daily cron and the
 /// newreleases.io delivery both dispatch it).
@@ -635,6 +687,7 @@ impl Watcher<'_> {
         &self,
         hourly: &HourlyAlertLevels,
         liveness: &LivenessLevels,
+        history: &HistoryLevels,
     ) -> (Vec<Reading>, Vec<CollectFailure>) {
         let mut readings = Vec::new();
         let mut failures = Vec::new();
@@ -657,6 +710,7 @@ impl Watcher<'_> {
         gather!("pipeline", self.pipeline_readings());
         gather!("queue", self.queue_readings(liveness));
         gather!("preheat", self.preheat_reading(liveness));
+        gather!("workflow-history", self.history_readings(history));
         gather!("dispatch-freeze", self.freeze_reading());
         let (endpoint_readings, endpoint_failure) = self.endpoint_readings().await;
         readings.extend(endpoint_readings);
@@ -1056,6 +1110,67 @@ impl Watcher<'_> {
         )])
     }
 
+    // ----- workflow history -----
+
+    /// `watchdog.gap` and `operations.failed`. The newest completed
+    /// watchdog run that finished `success` or `failure` is one REST read
+    /// (the run in progress is not completed, so it is never its own
+    /// predecessor). The `operations.yml` runs are then enumerated over
+    /// the closed created-window that can hold a run concluding after the
+    /// report cutoff — `OPERATIONS_RUN_LEAD` before it — so the window is
+    /// covered however many successes fill it, with no page size to
+    /// outgrow; the failed conclusions are kept in code.
+    async fn history_readings(&self, levels: &HistoryLevels) -> Result<Vec<Reading>, String> {
+        let watchdogs = recent_runs(
+            self.gh_token,
+            WATCHDOG_WORKFLOW,
+            "&status=completed",
+            WATCHDOG_HISTORY_PAGE,
+        )
+        .await?;
+        let previous = watchdogs
+            .into_iter()
+            .find(|run| matches!(run.conclusion.as_deref(), Some("success" | "failure")));
+        let previous = previous
+            .as_ref()
+            .map(|run| (run.created_at, run.html_url.as_str()));
+        let cutoff = operations_cutoff(
+            self.now,
+            previous.map(|(at, _)| at),
+            levels.operations_window_hours,
+        );
+        let gh_token = self.gh_token;
+        let operations: Vec<GhRunStamp> = github::runs_in_range(
+            OPERATIONS_WORKFLOW,
+            "status=completed",
+            (cutoff - OPERATIONS_RUN_LEAD).min(self.now),
+            self.now,
+            |path| async move {
+                github::get::<github::RunsPage<GhRunStamp>>(gh_token, &path, Backoff::new()).await
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let runs: Vec<OperationRun<'_>> = operations
+            .iter()
+            .map(|run| OperationRun {
+                concluded: run.updated_at,
+                conclusion: run.conclusion.as_deref().unwrap_or_default(),
+                name: &run.display_title,
+                url: &run.html_url,
+            })
+            .collect();
+        Ok(vec![
+            operations_failed_reading(
+                self.now,
+                previous.map(|(at, _)| at),
+                levels.operations_window_hours,
+                &runs,
+            ),
+            watchdog_gap_reading(self.now, previous, levels.run_gap_hours),
+        ])
+    }
+
     // ----- the DO's own breaker -----
 
     /// `GET /api/v1/admin/dispatch-freeze` — the freeze flag, its
@@ -1303,6 +1418,155 @@ impl LivenessLevels {
             )?,
             build_stall_hours: hours(BUILD_STALL_ENV, build_stall, DEFAULT_BUILD_STALL_HOURS)?,
         })
+    }
+}
+
+/// The operator-set levels of the two workflow-history signals, in hours.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HistoryLevels {
+    /// How long a failed `operations.yml` run stays reported at least.
+    operations_window_hours: f64,
+    /// Time since the previous watchdog run started at which
+    /// `watchdog.gap` breaches.
+    run_gap_hours: f64,
+}
+
+impl HistoryLevels {
+    /// Read [`OPERATIONS_WINDOW_ENV`] and [`RUN_GAP_ENV`]; an unset or
+    /// empty variable is its default.
+    fn from_env() -> stow_types::error::Result<Self> {
+        let read = |name: &str| std::env::var(name).ok();
+        Self::parse(
+            read(OPERATIONS_WINDOW_ENV).as_deref(),
+            read(RUN_GAP_ENV).as_deref(),
+        )
+    }
+
+    /// Parse the two settings. The values carry no ceiling or floor —
+    /// they are the operator's call — but each must be a number.
+    fn parse(
+        operations_window: Option<&str>,
+        run_gap: Option<&str>,
+    ) -> stow_types::error::Result<Self> {
+        let hours = |name: &str, text: Option<&str>, default: f64| match text.map(str::trim) {
+            Some(text) if !text.is_empty() => text
+                .parse::<f64>()
+                .ok()
+                .filter(|hours| hours.is_finite())
+                .ok_or_else(|| stow_error!("{name}: `{text}` is not a number")),
+            _ => Ok(default),
+        };
+        Ok(Self {
+            operations_window_hours: hours(
+                OPERATIONS_WINDOW_ENV,
+                operations_window,
+                DEFAULT_OPERATIONS_WINDOW_HOURS,
+            )?,
+            run_gap_hours: hours(RUN_GAP_ENV, run_gap, DEFAULT_RUN_GAP_HOURS)?,
+        })
+    }
+}
+
+/// A completed `operations.yml` run.
+#[derive(Debug, Clone, Copy)]
+struct OperationRun<'a> {
+    /// When the run concluded (the row's `updated_at`).
+    concluded: OffsetDateTime,
+    /// The run's conclusion (`success`, `failure`, `cancelled`, …).
+    conclusion: &'a str,
+    /// The run-name: `stow-admin <argv> (by <actor>)`.
+    name: &'a str,
+    /// The run's page.
+    url: &'a str,
+}
+
+/// The conclusions `operations.failed` reports: a command that failed,
+/// ran out of time, or never started. `cancelled` is an operator's own
+/// choice and stays unreported.
+fn is_operations_failure(conclusion: &str) -> bool {
+    matches!(conclusion, "failure" | "timed_out" | "startup_failure")
+}
+
+/// The earliest conclusion `operations.failed` reports: the previous
+/// watchdog run's start, or the operator's window back from `now` when
+/// that reaches further (and when there is no previous run).
+fn operations_cutoff(
+    now: OffsetDateTime,
+    previous_watchdog: Option<OffsetDateTime>,
+    window_hours: f64,
+) -> OffsetDateTime {
+    #[allow(clippy::cast_possible_truncation)]
+    let window = now - time::Duration::seconds((window_hours * 3600.0) as i64);
+    previous_watchdog.map_or(window, |previous| previous.min(window))
+}
+
+/// `operations.failed`: the failed runs that concluded since
+/// [`operations_cutoff`], newest first, each named with its argv
+/// run-name and its conclusion.
+fn operations_failed_reading(
+    now: OffsetDateTime,
+    previous_watchdog: Option<OffsetDateTime>,
+    window_hours: f64,
+    runs: &[OperationRun<'_>],
+) -> Reading {
+    let cutoff = operations_cutoff(now, previous_watchdog, window_hours);
+    let mut failed: Vec<&OperationRun<'_>> = runs
+        .iter()
+        .filter(|run| is_operations_failure(run.conclusion) && run.concluded >= cutoff)
+        .collect();
+    failed.sort_by_key(|run| std::cmp::Reverse(run.concluded));
+    let evidence: Vec<String> = failed
+        .iter()
+        .map(|run| {
+            format!(
+                "{} concluded {} {} — {}",
+                run.name,
+                run.conclusion,
+                format_time(run.concluded),
+                run.url
+            )
+        })
+        .collect();
+    #[allow(clippy::cast_precision_loss)]
+    let value = evidence.len() as f64;
+    Reading {
+        signal: signal("operations.failed"),
+        sample: 1,
+        value,
+        threshold: Some(1.0),
+        evidence,
+    }
+}
+
+/// `watchdog.gap`: hours since the previous watchdog run started,
+/// `previous` being its `(created, url)`. The first run on record has no
+/// predecessor and abstains.
+fn watchdog_gap_reading(
+    now: OffsetDateTime,
+    previous: Option<(OffsetDateTime, &str)>,
+    gap_hours: f64,
+) -> Reading {
+    let (sample, value, evidence) = match previous {
+        Some((at, url)) => (
+            1,
+            age_hours(now, at),
+            vec![format!(
+                "previous {WATCHDOG_WORKFLOW} run started {} — {url}",
+                format_time(at)
+            )],
+        ),
+        None => (
+            0,
+            0.0,
+            vec![format!("no earlier {WATCHDOG_WORKFLOW} run on record")],
+        ),
+    };
+    Reading {
+        signal: signal("watchdog.gap"),
+        sample,
+        value,
+        threshold: Some(gap_hours),
+        evidence,
     }
 }
 
@@ -1966,11 +2230,25 @@ impl github::RunRow for GhRun {
 /// The two timestamps of a workflow-run row the liveness signals read.
 #[derive(Debug, serde::Deserialize)]
 struct GhRunStamp {
+    id: u64,
     html_url: String,
+    /// The run-name (`operations.yml` sets one carrying its argv); the
+    /// workflow's name otherwise.
+    #[serde(default)]
+    display_title: String,
+    /// `success`, `failure`, … once completed.
+    #[serde(default)]
+    conclusion: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     updated_at: OffsetDateTime,
+}
+
+impl github::RunRow for GhRunStamp {
+    fn run_id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// The newest run (by creation) of `workflow` under `filters`
@@ -1980,14 +2258,28 @@ async fn latest_run(
     workflow: &str,
     filters: &str,
 ) -> Result<Option<GhRunStamp>, String> {
+    Ok(recent_runs(gh_token, workflow, filters, 1)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// The newest `per_page` runs (by creation) of `workflow` under
+/// `filters`, newest first. One REST read.
+async fn recent_runs(
+    gh_token: &str,
+    workflow: &str,
+    filters: &str,
+    per_page: u32,
+) -> Result<Vec<GhRunStamp>, String> {
     let page: github::RunsPage<GhRunStamp> = github::get(
         gh_token,
-        &format!("actions/workflows/{workflow}/runs?per_page=1{filters}"),
+        &format!("actions/workflows/{workflow}/runs?per_page={per_page}{filters}"),
         Backoff::new(),
     )
     .await
     .map_err(|error| error.to_string())?;
-    Ok(page.workflow_runs.into_iter().next())
+    Ok(page.workflow_runs)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2839,6 +3131,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
     let sql_base = cloudflare::analytics_sql_base()?;
     let hourly_levels = HourlyAlertLevels::from_env()?;
     let liveness = LivenessLevels::from_env()?;
+    let history = HistoryLevels::from_env()?;
     let watcher = Watcher {
         edge,
         gh_token: &gh_token,
@@ -2850,7 +3143,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         now: OffsetDateTime::now_utc(),
     };
 
-    let (readings, collect_failures) = watcher.collect(&hourly_levels, &liveness).await;
+    let (readings, collect_failures) = watcher.collect(&hourly_levels, &liveness, &history).await;
     let decision = decide(&readings, &collect_failures);
     let mut outcome = ApplyOutcome::default();
     let now_text = format_time(watcher.now);
@@ -4707,5 +5000,152 @@ mod tests {
         let empty: github::RunsPage<GhRunStamp> =
             serde_json::from_str(r#"{"total_count":0,"workflow_runs":[]}"#).unwrap();
         assert!(empty.workflow_runs.is_empty());
+    }
+
+    fn failed_op<'a>(
+        now: OffsetDateTime,
+        ago: f64,
+        name: &'a str,
+        url: &'a str,
+    ) -> OperationRun<'a> {
+        OperationRun {
+            concluded: hours_ago(now, ago),
+            conclusion: "failure",
+            name,
+            url,
+        }
+    }
+
+    /// A failed operations run is reported when it concluded after the
+    /// previous watchdog run started, or inside the operator's window,
+    /// whichever reaches further back; it names the run and its argv.
+    #[test]
+    fn operations_failed_reports_runs_since_the_previous_watchdog_run() {
+        let now = october_29();
+        let reset = failed_op(
+            now,
+            0.1,
+            r#"stow-admin ["scheduler","reset","--yes"] (by lexoliu)"#,
+            "https://github.com/water-rs/stow/actions/runs/11",
+        );
+        let older = failed_op(
+            now,
+            0.6,
+            r#"stow-admin ["queue","purge","--yes"] (by lexoliu)"#,
+            "https://github.com/water-rs/stow/actions/runs/10",
+        );
+        let runs = [older, reset];
+        let previous = Some(hours_ago(now, 0.25));
+
+        // 15 minutes back with a 6-minute window: only the newer run.
+        let recent = operations_failed_reading(now, previous, 0.1, &runs);
+        assert_eq!(verdict_of(&recent), Verdict::Breach);
+        assert!((recent.value - 1.0).abs() < f64::EPSILON);
+        assert!(recent.evidence[0].contains(r#"["scheduler","reset","--yes"]"#));
+        assert!(recent.evidence[0].contains("actions/runs/11"));
+
+        // The default hour reaches the older run too, newest first.
+        let hour = operations_failed_reading(now, previous, 1.0, &runs);
+        assert!((hour.value - 2.0).abs() < f64::EPSILON);
+        assert!(hour.evidence[0].contains("actions/runs/11"));
+
+        // A missed dispatch widens the read to the previous run's start.
+        let gap = operations_failed_reading(now, Some(hours_ago(now, 3.0)), 0.1, &runs);
+        assert!((gap.value - 2.0).abs() < f64::EPSILON);
+
+        // No previous run: the window alone decides; nothing in it is clear.
+        let first = operations_failed_reading(now, None, 0.2, &runs);
+        assert!((first.value - 1.0).abs() < f64::EPSILON);
+        let none = operations_failed_reading(now, previous, 0.1, &[older]);
+        assert_eq!(verdict_of(&none), Verdict::Clear);
+        assert_eq!(none.evidence, [] as [String; 0]);
+
+        // It alerts and never trips.
+        let decision = decide(&[recent], &[]);
+        assert!(decision.incident);
+        assert_eq!(decision.tripped, [] as [usize; 0]);
+        assert_eq!(decision.alerting.len(), 1);
+    }
+
+    /// Failure, timeout and a run that never started are reported; a
+    /// success, a cancellation and an unfinished conclusion are not.
+    #[test]
+    fn operations_failed_keeps_failure_timeout_and_startup_failure() {
+        let now = october_29();
+        let url = "https://github.com/water-rs/stow/actions/runs/30";
+        let run = |conclusion| OperationRun {
+            concluded: hours_ago(now, 0.1),
+            conclusion,
+            name: r#"stow-admin ["queue","purge","--yes"] (by lexoliu)"#,
+            url,
+        };
+        for conclusion in ["failure", "timed_out", "startup_failure"] {
+            let reading = operations_failed_reading(now, None, 1.0, &[run(conclusion)]);
+            assert_eq!(verdict_of(&reading), Verdict::Breach, "{conclusion}");
+            assert!(reading.evidence[0].contains(conclusion), "{conclusion}");
+        }
+        for conclusion in ["success", "cancelled", "skipped", ""] {
+            let reading = operations_failed_reading(now, None, 1.0, &[run(conclusion)]);
+            assert_eq!(verdict_of(&reading), Verdict::Clear, "{conclusion}");
+        }
+    }
+
+    /// A previous run that started 45 minutes or more ago breaches at
+    /// the default level, the operator's level replaces it, and the
+    /// first run on record abstains.
+    #[test]
+    fn watchdog_gap_fires_at_the_operator_level() {
+        let now = october_29();
+        let url = "https://github.com/water-rs/stow/actions/runs/20";
+        let gap = |minutes: f64, level| {
+            watchdog_gap_reading(now, Some((hours_ago(now, minutes / 60.0), url)), level)
+        };
+        assert_eq!(verdict_of(&gap(44.0, 0.75)), Verdict::Clear);
+        let missed = gap(45.0, 0.75);
+        assert_eq!(verdict_of(&missed), Verdict::Breach);
+        assert!(missed.evidence[0].contains("actions/runs/20"));
+        assert_eq!(verdict_of(&gap(30.0, 0.25)), Verdict::Breach);
+        assert_eq!(verdict_of(&gap(180.0, 4.0)), Verdict::Clear);
+        let first = watchdog_gap_reading(now, None, 0.75);
+        assert_eq!(verdict_of(&first), Verdict::Skipped);
+        let decision = decide(&[missed], &[]);
+        assert!(decision.incident);
+        assert_eq!(decision.tripped, [] as [usize; 0]);
+    }
+
+    #[test]
+    fn history_levels_parse_with_defaults_and_no_ceiling() {
+        assert_eq!(
+            HistoryLevels::parse(None, Some("  ")).unwrap(),
+            HistoryLevels {
+                operations_window_hours: 1.0,
+                run_gap_hours: 0.75
+            }
+        );
+        assert_eq!(
+            HistoryLevels::parse(Some("100000"), Some("0.1")).unwrap(),
+            HistoryLevels {
+                operations_window_hours: 100_000.0,
+                run_gap_hours: 0.1
+            }
+        );
+        assert!(HistoryLevels::parse(Some("an hour"), None).is_err());
+        assert!(HistoryLevels::parse(None, Some("inf")).is_err());
+    }
+
+    /// The history rows carry the run-name and the conclusion.
+    #[test]
+    fn run_listing_decodes_the_run_name_and_conclusion() {
+        let page: github::RunsPage<GhRunStamp> = serde_json::from_str(
+            r#"{"total_count":1,"workflow_runs":[{"id":9,"name":"stow-admin [\"queue\"] (by a)",
+            "display_title":"stow-admin [\"queue\"] (by a)",
+            "html_url":"https://github.com/water-rs/stow/actions/runs/9",
+            "created_at":"2026-10-28T00:01:10Z","updated_at":"2026-10-28T00:41:02Z",
+            "conclusion":"failure"}]}"#,
+        )
+        .unwrap();
+        let run = page.workflow_runs.into_iter().next().unwrap();
+        assert_eq!(run.display_title, r#"stow-admin ["queue"] (by a)"#);
+        assert_eq!(run.conclusion.as_deref(), Some("failure"));
     }
 }

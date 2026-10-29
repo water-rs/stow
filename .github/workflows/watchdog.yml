@@ -4,7 +4,8 @@ name: Watchdog
 # by the edge Worker's Cron Trigger, stow#1100, rather than the `schedule` below —
 # GitHub skipped most scheduled ticks) it reads
 # the Cloudflare usage/health signals, the build-pipeline failure rate,
-# the scheduler queue, the liveness of preheat and builds, and the public
+# the scheduler queue, the liveness of preheat and builds, failed
+# operations runs and a missed watchdog dispatch, and the public
 # endpoints. On a breach it trips the
 # breaker itself — the `stow maintenance: anonymous` WAF rule on,
 # dispatching workflows disabled — then
@@ -88,6 +89,12 @@ jobs:
           # is the default.
           STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS: ${{ vars.STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS }}
           STOW_WATCHDOG_BUILD_STALL_HOURS: ${{ vars.STOW_WATCHDOG_BUILD_STALL_HOURS }}
+          # History levels in hours: how long a failed operations.yml run stays
+          # reported (default 1; the time since the previous watchdog run
+          # reaches further back) and the longest gap since the previous
+          # watchdog run started (default 0.75); unset or empty is the default.
+          STOW_WATCHDOG_OPERATIONS_WINDOW_HOURS: ${{ vars.STOW_WATCHDOG_OPERATIONS_WINDOW_HOURS }}
+          STOW_WATCHDOG_RUN_GAP_HOURS: ${{ vars.STOW_WATCHDOG_RUN_GAP_HOURS }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

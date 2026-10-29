@@ -627,51 +627,85 @@ impl RegistrySession {
         /// Tags per page — large enough that the records tag space is one
         /// request for a long time.
         const PAGE_SIZE: u32 = 1000;
-        #[derive(serde::Deserialize)]
-        struct TagsList {
-            #[serde(default)]
-            tags: Vec<String>,
-        }
         let mut tags = Vec::new();
         let mut last: Option<String> = None;
         loop {
-            let url = self.api("tags/list");
-            let url = last.as_ref().map_or_else(
-                || format!("{url}?n={PAGE_SIZE}"),
-                |last| format!("{url}?n={PAGE_SIZE}&last={last}"),
-            );
-            let response = match self
-                .send(
-                    "list tags",
-                    SessionRequest::authenticated(Method::GET, url.clone()),
-                )
-                .await
-            {
-                Ok(response) => response,
-                // A package that does not exist yet holds no tags — its
-                // first publish creates it, and every index reader treats
-                // the missing package as the empty index.
-                Err(error) if error.is_not_found() => return Ok(tags),
-                Err(error) => return Err(error),
+            let Some((page, has_next)) = self.tags_page(PAGE_SIZE, last.as_deref()).await? else {
+                break;
             };
-            response.ensure_success("list tags", &url)?;
-            let page: TagsList =
-                serde_json::from_slice(&response.body).map_err(|error| RegistryError {
-                    what: format!("list tags {url}"),
-                    kind: RegistryErrorKind::Transport(format!("decode tags list: {error}")),
-                })?;
-            let has_next = response
-                .headers
-                .get(header::LINK)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|link| link.contains("rel=\"next\""));
-            last = page.tags.last().cloned();
-            tags.extend(page.tags);
+            last = page.last().cloned();
+            tags.extend(page);
             if !has_next || last.is_none() {
                 break;
             }
         }
         Ok(tags)
+    }
+
+    /// Whether the repository holds at least one tag: one
+    /// `tags/list?n=1` request, however many tags it carries. A package
+    /// that does not exist (see [`RegistryError::is_not_found`]) and an
+    /// empty one hold none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RegistryError`] on a transport failure, a refusal that
+    /// is not an absence, or an undecodable body.
+    pub async fn has_tags(&self) -> Result<bool, RegistryError> {
+        Ok(self
+            .tags_page(1, None)
+            .await?
+            .is_some_and(|(page, _)| !page.is_empty()))
+    }
+
+    /// One `tags/list?n=<n>[&last=<last>]` page and whether the registry
+    /// links a next one; `None` when the package does not exist yet, which
+    /// every index reader treats as the empty index — an absence answered
+    /// on the token exchange or on the listing itself
+    /// (`404`/`NAME_UNKNOWN`). `"tags": null` is an empty page.
+    async fn tags_page(
+        &self,
+        n: u32,
+        last: Option<&str>,
+    ) -> Result<Option<(Vec<String>, bool)>, RegistryError> {
+        #[derive(serde::Deserialize)]
+        struct TagsList {
+            /// Distribution registries answer an empty repository
+            /// `"tags": null`.
+            #[serde(default)]
+            tags: Option<Vec<String>>,
+        }
+        let url = self.api("tags/list");
+        let url = last.map_or_else(
+            || format!("{url}?n={n}"),
+            |last| format!("{url}?n={n}&last={last}"),
+        );
+        let response = match self
+            .send(
+                "list tags",
+                SessionRequest::authenticated(Method::GET, url.clone()),
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is_not_found() => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match response.ensure_success("list tags", &url) {
+            Err(error) if error.is_not_found() => return Ok(None),
+            other => other?,
+        }
+        let page: TagsList =
+            serde_json::from_slice(&response.body).map_err(|error| RegistryError {
+                what: format!("list tags {url}"),
+                kind: RegistryErrorKind::Transport(format!("decode tags list: {error}")),
+            })?;
+        let has_next = response
+            .headers
+            .get(header::LINK)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|link| link.contains("rel=\"next\""));
+        Ok(Some((page.tags.unwrap_or_default(), has_next)))
     }
 
     /// GET the manifest `reference` names: its bytes exactly as stored and
@@ -1225,7 +1259,9 @@ impl RegistryBase {
 
 #[cfg(test)]
 mod tests {
-    use super::{RegistryBase, RegistryCredentials, RegistryHttp, TransportPolicy};
+    use super::{
+        RegistryBase, RegistryCredentials, RegistryHttp, RegistrySession, TransportPolicy,
+    };
 
     /// stow#624: sessions opened from one handle ride the one client it
     /// built. The handle's own identity is the count — one constructor
@@ -1261,5 +1297,140 @@ mod tests {
             !base.session(&repository, &second).http.same_client(&http),
             "a second constructor call builds a second client"
         );
+    }
+
+    type Answer = (u16, String, &'static str);
+
+    /// An anonymous registry on loopback answering each connection with
+    /// the next scripted answer; the script is built from the server's
+    /// own URL because the challenge names it. The task returns every
+    /// request line.
+    async fn scripted_registry(
+        script: impl FnOnce(&str) -> Vec<Answer>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let script = script(&url);
+        let task = tokio::spawn(async move {
+            let mut lines = Vec::new();
+            for (status, headers, body) in script {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut buffer = vec![0_u8; 8192];
+                let read = stream.read(&mut buffer).await.expect("read");
+                let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+                lines.push(request.lines().next().unwrap_or_default().to_owned());
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n{headers}\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.expect("write");
+            }
+            lines
+        });
+        (url, task)
+    }
+
+    const NAME_UNKNOWN: &str = r#"{"errors":[{"code":"NAME_UNKNOWN","message":"x"}]}"#;
+    const DENIED: &str = r#"{"errors":[{"code":"DENIED","message":"x"}]}"#;
+
+    /// The challenge, then a token (or a `403 DENIED` exchange when
+    /// `denied`), then the `tags/list` answers.
+    fn script(url: &str, denied: bool, tags: Vec<(u16, &'static str)>) -> Vec<Answer> {
+        let mut answers = vec![(
+            401,
+            format!("www-authenticate: Bearer realm=\"{url}/token\",service=\"s\"\r\n"),
+            "",
+        )];
+        if denied {
+            answers.push((403, String::new(), DENIED));
+        } else {
+            answers.push((200, String::new(), r#"{"token":"t"}"#));
+            answers.extend(
+                tags.into_iter()
+                    .map(|(status, body)| (status, String::new(), body)),
+            );
+        }
+        answers
+    }
+
+    async fn session_on(url: &str) -> (RegistrySession, RegistryHttp) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let http = RegistryHttp::new(TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let repository = stow_types::registry::cache_repository(
+            &stow_types::identity::WireRustcVersion::parse("1.99.0").expect("rustc"),
+        );
+        let session = RegistryBase::parse(url)
+            .expect("base")
+            .session(&repository, &http);
+        (session, http)
+    }
+
+    /// `has_tags` asks for one tag, and answers from it.
+    #[tokio::test]
+    async fn has_tags_asks_for_one_tag() {
+        let (url, task) =
+            scripted_registry(|url| script(url, false, vec![(200, r#"{"tags":["index.x"]}"#)]))
+                .await;
+        let (session, _http) = session_on(&url).await;
+        assert!(session.has_tags().await.expect("has tags"));
+        let lines = task.await.expect("server");
+        assert!(lines[2].contains("/tags/list?n=1 "), "{lines:?}");
+    }
+
+    /// An absent package, an empty repository and `"tags": null` hold no tags.
+    #[tokio::test]
+    async fn has_tags_is_false_for_absent_and_empty_repositories() {
+        for (denied, tags) in [
+            (true, vec![]),
+            (false, vec![(404, NAME_UNKNOWN)]),
+            (false, vec![(200, r#"{"tags":[]}"#)]),
+            (false, vec![(200, r#"{"name":"n","tags":null}"#)]),
+        ] {
+            let (url, task) = scripted_registry(|url| script(url, denied, tags.clone())).await;
+            let (session, _http) = session_on(&url).await;
+            assert!(!session.has_tags().await.expect("absence is an answer"));
+            task.await.expect("server");
+        }
+    }
+
+    /// Any other refusal is an error.
+    #[tokio::test]
+    async fn has_tags_fails_on_other_refusals() {
+        let (url, task) = scripted_registry(|url| {
+            script(
+                url,
+                false,
+                vec![(400, r#"{"errors":[{"code":"UNSUPPORTED"}]}"#)],
+            )
+        })
+        .await;
+        let (session, _http) = session_on(&url).await;
+        assert!(session.has_tags().await.is_err());
+        task.await.expect("server");
+    }
+
+    /// `list_tags` reads a `404`/`NAME_UNKNOWN` listing as no tags, and a
+    /// `null` tag list as an empty page.
+    #[tokio::test]
+    async fn list_tags_reads_absence_on_the_listing_and_null_tags() {
+        for tags in [(404, NAME_UNKNOWN), (200, r#"{"tags":null}"#)] {
+            let (url, task) = scripted_registry(|url| script(url, false, vec![tags])).await;
+            let (session, _http) = session_on(&url).await;
+            assert_eq!(
+                session.list_tags().await.expect("list"),
+                Vec::<String>::new()
+            );
+            task.await.expect("server");
+        }
+        let (url, task) =
+            scripted_registry(|url| script(url, false, vec![(200, r#"{"tags":["a","b"]}"#)])).await;
+        let (session, _http) = session_on(&url).await;
+        assert_eq!(session.list_tags().await.expect("list"), ["a", "b"]);
+        task.await.expect("server");
     }
 }

@@ -343,6 +343,35 @@ fn cron_cache_hit_skips_dispatch_and_save() {
     );
 }
 
+/// `refresh` (a scheduler reset's refill) dispatches although the day's
+/// marker exists, and saves nothing: the restored entry is the marker.
+#[test]
+fn cron_refresh_dispatches_on_a_cache_hit() {
+    let wf = preheat_cron();
+    let scn = Scenario::new();
+    let ctx = with_inputs(actions_ctx(), &[("refresh", Val::Bool(true))]);
+    let mut runner = support::Runner::new(&scn, ctx, base_env(&[]));
+    runner.seed_output("marker", "cache-hit", "true");
+    runner.run_job(&wf, "preheat");
+
+    assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
+    assert_eq!(runner.outcome_of("Already preheated"), &Outcome::Skipped);
+    assert_eq!(
+        runner.outcome_of("Dispatch the preheat wave"),
+        &Outcome::Ran(0)
+    );
+    assert_eq!(
+        runner.outcome_of("Record the wave marker"),
+        &Outcome::Skipped
+    );
+    let gh = scn.calls_of("gh");
+    assert_eq!(gh.len(), 1, "{gh:?}");
+    assert_eq!(
+        gh_dispatch_args(&gh[0]).first().map(String::as_str),
+        Some("preheat-admin.yml")
+    );
+}
+
 #[test]
 fn cron_failed_dispatch_writes_no_marker() {
     let wf = preheat_cron();
@@ -1225,6 +1254,23 @@ fn operations_runner<'a>(
     argv: &str,
     files: Option<&str>,
 ) -> support::Runner<'a> {
+    operations_runner_env(scn, argv, files, &[])
+}
+
+fn operations_runner_with<'a>(
+    scn: &'a Scenario,
+    argv: &str,
+    env: &[(&str, &str)],
+) -> support::Runner<'a> {
+    operations_runner_env(scn, argv, None, env)
+}
+
+fn operations_runner_env<'a>(
+    scn: &'a Scenario,
+    argv: &str,
+    files: Option<&str>,
+    env: &[(&str, &str)],
+) -> support::Runner<'a> {
     let mut ctx = actions_ctx();
     set_path(
         &mut ctx,
@@ -1246,7 +1292,7 @@ fn operations_runner<'a>(
     let mut ctx = with_inputs(ctx, &inputs);
     let wf = operations();
     apply_dispatch_defaults(&mut ctx, &wf);
-    run_job(scn, &wf, "run", ctx, base_env(&[]))
+    run_job(scn, &wf, "run", ctx, base_env(env))
 }
 
 /// The `stow-admin` invocations of the run step (the toolchain step is a
@@ -1376,5 +1422,171 @@ fn operations_refuses_what_it_does_not_run() {
             operations_calls(&scn).is_empty(),
             "{argv} {files:?} reached stow-admin"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// operations.yml: the refill after a scheduler reset (stow#1094)
+// ---------------------------------------------------------------------------
+
+/// The `gh workflow run` calls of the refill step: workflow file, ref and
+/// input fields.
+fn refill_dispatches(scn: &Scenario) -> Vec<(String, String, BTreeMap<String, String>)> {
+    scn.calls_of("gh")
+        .iter()
+        .filter(|call| call.argv.first().map(String::as_str) == Some("workflow"))
+        .map(|call| {
+            let args = gh_dispatch_args(call);
+            let reference = args
+                .iter()
+                .position(|a| a == "--ref")
+                .and_then(|i| args.get(i + 1))
+                .cloned()
+                .expect("dispatch names its ref");
+            (args[0].clone(), reference, input_fields(&args))
+        })
+        .collect()
+}
+
+const RESET_ARGV: &str = r#"["scheduler","reset","--yes"]"#;
+
+#[test]
+fn operations_reset_refills_every_published_rustc_and_forces_a_preheat() {
+    let scn = Scenario::new();
+    let runner = operations_runner_with(&scn, RESET_ARGV, &[("STUB_STDOUT", "1.99.0\n1.99.1\n")]);
+    assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
+    assert_eq!(
+        runner.outcome_of("Refill the index report and the queue after a reset"),
+        &Outcome::Ran(0)
+    );
+    // The reset, then the enumeration of the published rustcs.
+    let admin = operations_calls(&scn);
+    assert_eq!(admin.len(), 2, "{admin:?}");
+    assert_eq!(admin[0].argv, ["scheduler", "reset", "--yes"]);
+    assert_eq!(admin[1].argv, ["index", "published-rustcs"]);
+
+    let report = |rustc: &str| {
+        (
+            "index-publish.yml".to_owned(),
+            "main".to_owned(),
+            BTreeMap::from([
+                ("report".to_owned(), "true".to_owned()),
+                ("rustc_version".to_owned(), rustc.to_owned()),
+            ]),
+        )
+    };
+    assert_eq!(
+        refill_dispatches(&scn),
+        vec![
+            report("1.99.0"),
+            report("1.99.1"),
+            (
+                "preheat-cron.yml".to_owned(),
+                "main".to_owned(),
+                BTreeMap::from([("refresh".to_owned(), "true".to_owned())]),
+            ),
+        ]
+    );
+    let refill = scn
+        .calls_of("gh")
+        .into_iter()
+        .find(|c| c.argv.first().map(String::as_str) == Some("workflow"))
+        .expect("a dispatch");
+    assert_eq!(
+        refill.env.get("GH_TOKEN").map(String::as_str),
+        Some("<set>")
+    );
+    assert_eq!(
+        refill.env.get("GH_REPO").map(String::as_str),
+        Some("water-rs/stow")
+    );
+}
+
+/// Only a reset refills: every other command, and a reset that failed,
+/// dispatches nothing.
+#[test]
+fn operations_refills_only_after_a_successful_reset() {
+    for argv in [
+        r#"["queue","purge","--yes"]"#,
+        r#"["scheduler","demand-feed"]"#,
+        r#"["preheat","binary","--yes"]"#,
+    ] {
+        let scn = Scenario::new();
+        let runner = operations_runner_with(&scn, argv, &[("STUB_STDOUT", "1.99.0")]);
+        assert_eq!(runner.status(), Status::Ok, "{argv}: {:?}", runner.outcomes);
+        assert!(refill_dispatches(&scn).is_empty(), "{argv}");
+    }
+    let scn = Scenario::new();
+    let runner = operations_runner_with(
+        &scn,
+        RESET_ARGV,
+        &[("STUB_STDOUT", "1.99.0"), ("STUB_ADMIN_EXIT", "1")],
+    );
+    assert_eq!(runner.status(), Status::Failed);
+    assert_eq!(
+        runner.outcome_of("Refill the index report and the queue after a reset"),
+        &Outcome::Skipped
+    );
+    assert!(
+        refill_dispatches(&scn).is_empty(),
+        "a failed reset refilled"
+    );
+}
+
+/// A failed enumeration or dispatch fails the run, and an enumeration
+/// that fails dispatches nothing at all.
+#[test]
+fn operations_refill_failure_fails_the_run() {
+    for (fail, dispatched) in [
+        ("published-rustcs", 0),
+        ("index-publish", 1),
+        ("preheat-cron", 3),
+    ] {
+        let scn = Scenario::new();
+        let runner = operations_runner_with(
+            &scn,
+            RESET_ARGV,
+            &[("STUB_STDOUT", "1.99.0\n1.99.1\n"), ("STUB_FAIL_RE", fail)],
+        );
+        assert_eq!(runner.status(), Status::Failed, "{fail}");
+        assert_eq!(refill_dispatches(&scn).len(), dispatched, "{fail}");
+    }
+}
+
+#[test]
+fn operations_refill_and_preheat_cron_declare_what_they_dispatch() {
+    let wf = operations();
+    assert_eq!(
+        at(&wf, "permissions.actions").map(scalar).as_deref(),
+        Some("write")
+    );
+    let cron = preheat_cron();
+    let dispatch = dispatch_inputs(&cron);
+    assert!(dispatch.contains_key("refresh"), "{dispatch:?}");
+}
+
+/// The watchdog reads its history levels from the environment its two
+/// entry points hand it (stow#1094).
+#[test]
+fn watchdog_entry_points_pass_the_history_levels() {
+    let text = |file: &str| {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../.github/workflows")
+                .join(file),
+        )
+        .expect("workflow file")
+    };
+    for file in ["watchdog.yml", "operations.yml"] {
+        let text = text(file);
+        for name in [
+            "STOW_WATCHDOG_OPERATIONS_WINDOW_HOURS",
+            "STOW_WATCHDOG_RUN_GAP_HOURS",
+        ] {
+            assert!(
+                text.contains(&format!("{name}: ${{{{ vars.{name} }}}}")),
+                "{file} does not pass {name}"
+            );
+        }
     }
 }
