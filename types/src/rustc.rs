@@ -166,7 +166,6 @@ impl ParsedRustcArgs {
         if parsed.crate_name.is_empty() {
             return Err("missing --crate-name in rustc arguments".to_owned());
         }
-        parsed.drop_cargo_default_split_debuginfo();
         parsed.drop_inert_prefer_dynamic();
 
         Ok(parsed)
@@ -188,7 +187,9 @@ impl ParsedRustcArgs {
         &self,
         source: Result<crate::public_cache::UnitSource, UncachedReason>,
         primary_package: bool,
+        target: &str,
     ) -> UnitClass {
+        let extra_codegen = self.extra_codegen_for(target);
         if !(self.produces_dynamic_library() || self.produces_rlib()) {
             return UnitClass::Uncached(UncachedReason::UnrestorableCrateType(
                 self.crate_types.join(","),
@@ -200,7 +201,7 @@ impl ParsedRustcArgs {
         if primary_package {
             return UnitClass::Uncached(UncachedReason::PrimaryPackage);
         }
-        for option in &self.extra_codegen {
+        for option in &extra_codegen {
             if option.starts_with("-C incremental") {
                 return UnitClass::Uncached(UncachedReason::Incremental);
             }
@@ -212,7 +213,7 @@ impl ParsedRustcArgs {
             Err(reason) => UnitClass::Uncached(reason),
             Ok(source) => UnitClass::Keyed {
                 source,
-                extra_codegen: self.extra_codegen.clone(),
+                extra_codegen,
             },
         }
     }
@@ -834,20 +835,26 @@ pub fn cargo_default_split_debuginfo(target: &str) -> &'static str {
 }
 
 impl ParsedRustcArgs {
-    /// Drop `-C split-debuginfo` when it is [`cargo_default_split_debuginfo`]
-    /// for the unit's target. Any other value changes how debug info is
-    /// laid out in the output, so it stays in `extra_codegen`.
+    /// The unit's `-C`/`-Z` options as its identity sees them: the argv
+    /// options minus `-C split-debuginfo` when that is
+    /// [`cargo_default_split_debuginfo`] for `target`. Any other value
+    /// changes how debug info is laid out in the output, so it stays.
     ///
-    /// With no `--target` the unit compiles for the host this process
-    /// runs on, which is the host of the rustc cargo drives.
-    fn drop_cargo_default_split_debuginfo(&mut self) {
-        let host = target_lexicon::HOST.to_string();
-        let target = self.target.as_deref().unwrap_or(&host);
-        let option = format!(
+    /// `target` is the triple the unit is keyed under: its `--target`, or
+    /// for a target-less unit the host triple the caller resolves (the
+    /// runner host in CI, rustc's host in the CLI). This is the one place
+    /// the rule is applied; every consumer of the options goes through it.
+    #[must_use]
+    pub fn extra_codegen_for(&self, target: &str) -> Vec<String> {
+        let default = format!(
             "{SPLIT_DEBUGINFO_OPTION}{}",
             cargo_default_split_debuginfo(target)
         );
-        self.extra_codegen.retain(|seen| *seen != option);
+        self.extra_codegen
+            .iter()
+            .filter(|seen| **seen != default)
+            .cloned()
+            .collect()
     }
 }
 
@@ -1159,7 +1166,7 @@ mod tests {
     /// Whether the invocation classifies as a keyed unit.
     fn keyed(parsed: &ParsedRustcArgs) -> bool {
         matches!(
-            parsed.unit_class(Ok(test_source()), false),
+            parsed.unit_class(Ok(test_source()), false, "x86_64-unknown-linux-gnu"),
             UnitClass::Keyed { .. }
         )
     }
@@ -1374,7 +1381,7 @@ mod tests {
 
         assert!(keyed(&parsed));
         assert_eq!(
-            parsed.unit_class(Ok(test_source()), true),
+            parsed.unit_class(Ok(test_source()), true, "x86_64-unknown-linux-gnu"),
             UnitClass::Uncached(UncachedReason::PrimaryPackage)
         );
     }
@@ -1405,7 +1412,7 @@ mod tests {
             Some("-C target-cpu=native")
         );
         assert_eq!(
-            parsed.unit_class(Ok(test_source()), false),
+            parsed.unit_class(Ok(test_source()), false, "x86_64-unknown-linux-gnu"),
             UnitClass::Uncached(UncachedReason::UnfoldableOption(
                 "-C target-cpu=native".to_owned()
             ))
@@ -1653,7 +1660,7 @@ mod tests {
 
             let UnitClass::Keyed {
                 ref extra_codegen, ..
-            } = parsed.unit_class(Ok(test_source()), false)
+            } = parsed.unit_class(Ok(test_source()), false, "x86_64-unknown-linux-gnu")
             else {
                 panic!("{option} should key into extra-codegen");
             };
@@ -1713,7 +1720,7 @@ mod tests {
             .expect("parser should succeed");
             assert!(
                 matches!(
-                    parsed.unit_class(Ok(test_source()), false),
+                    parsed.unit_class(Ok(test_source()), false, "x86_64-unknown-linux-gnu"),
                     UnitClass::Uncached(UncachedReason::UnfoldableOption(_))
                 ),
                 "{flag} {option} was keyed"
@@ -1874,7 +1881,10 @@ mod tests {
         .expect("parser should succeed");
 
         assert!(keyed(&parsed));
-        assert_eq!(parsed.extra_codegen, Vec::<String>::new());
+        assert_eq!(
+            parsed.extra_codegen_for("aarch64-apple-darwin"),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

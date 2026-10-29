@@ -1454,7 +1454,7 @@ impl supervisor::server::Handler for BuildSupervisor {
         };
         match source {
             Ok(source) => {
-                let class = parsed.unit_class(source, observation.env.primary_package);
+                let class = parsed.unit_class(source, observation.env.primary_package, &target);
                 // Only a publicly-missable unit counts: a git source or
                 // extra codegen could never have been served remotely,
                 // so its local compile is not a cache miss (stow#1006).
@@ -1789,7 +1789,16 @@ async fn classify_unit_invocation(
     // classification; a `native` that survives is unfoldable.
     resolve_native_target_cpu(rustc, parsed, env_cache).await;
     let source = detect_unit_source(parsed, manifest_dir.as_deref(), env_cache, ctx).await?;
-    let class = parsed.unit_class(source, invocation_env.primary_package);
+    // The triple the unit is keyed under: its own `--target`, else the
+    // compiling rustc's host.
+    let target = match parsed.target.clone() {
+        Some(target) => target,
+        None => env_cache
+            .rustc_host_target(rustc)
+            .await
+            .map_err(stow_types::error::Error::msg)?,
+    };
+    let class = parsed.unit_class(source, invocation_env.primary_package, &target);
     tracing::Span::current().record("crate_name", parsed.crate_name.as_str());
     tracing::debug!(
         crate_name = %parsed.crate_name,
@@ -4866,7 +4875,7 @@ async fn build_semantic_fetch_request(
         &parsed.crate_name,
         parsed.build_script_out_dir.as_deref(),
     )?;
-    let consumer = stow_types::upload_plan::ConsumerInputs::of(parsed, &build_script);
+    let consumer = stow_types::upload_plan::ConsumerInputs::of(parsed, &build_script, target);
     tracing::debug!(
         crate_name = %crate_name,
         version = %version,
@@ -5100,7 +5109,7 @@ async fn resolve_local_build_artifact(
         .manifest_dir()
         .map_err(stow_types::error::Error::msg)?;
     let source = detect_unit_source(parsed, manifest_dir.as_deref(), env_cache, ctx).await?;
-    let class = parsed.unit_class(source, invocation_env.primary_package);
+    let class = parsed.unit_class(source, invocation_env.primary_package, &target);
     let local_only = class.source_local_only();
     let UnitClass::Keyed { ref source, .. } = class else {
         if let UnitClass::Uncached(reason) = &class {

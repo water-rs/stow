@@ -599,6 +599,33 @@ async fn replay_rustc_output(output: &async_process::Output) -> stow_types::erro
     .await
 }
 
+/// A published node is a dev-profile build with no cfg of its own, no
+/// extra codegen and no `embed-metadata`; the CLI's semantic match
+/// relies on exactly that to prove a stand-in against its key
+/// (stow#1047). An invocation outside it must not be published.
+/// `target` is the triple the unit is keyed under, against which the
+/// cargo-default options are judged.
+fn ensure_publishable_shape(
+    parsed: &ParsedRustcArgs,
+    target: &str,
+) -> stow_types::error::Result<()> {
+    let build_script = stow_types::upload_plan::BuildScriptInputs::of_out_dir(
+        &parsed.crate_name,
+        parsed.build_script_out_dir.as_deref(),
+    )?;
+    let consumer = stow_types::upload_plan::ConsumerInputs::of(parsed, &build_script, target);
+    if !consumer.is_publishable_shape() {
+        return Err(stow_types::stow_error!(
+            "`{}` was invoked with cfgs {:?}, extra codegen {:?} or embed-metadata {:?} no published node may carry",
+            parsed.crate_name,
+            consumer.cfgs,
+            consumer.extra_codegen,
+            consumer.embed_metadata,
+        ));
+    }
+    Ok(())
+}
+
 async fn prepare_stable_rustc_invocation(
     rustc: &std::ffi::OsString,
     original_args: &[std::ffi::OsString],
@@ -656,24 +683,7 @@ async fn prepare_stable_rustc_invocation(
             original_parsed.input_path,
         ));
     };
-    // A published node is a dev-profile build with no cfg of its own, no
-    // extra codegen and no `embed-metadata`; the CLI's semantic match
-    // relies on exactly that to prove a stand-in against its key
-    // (stow#1047). An invocation outside it must not be published.
-    let build_script = stow_types::upload_plan::BuildScriptInputs::of_out_dir(
-        &original_parsed.crate_name,
-        original_parsed.build_script_out_dir.as_deref(),
-    )?;
-    let consumer = stow_types::upload_plan::ConsumerInputs::of(original_parsed, &build_script);
-    if !consumer.is_publishable_shape() {
-        return Err(stow_types::stow_error!(
-            "`{}` was invoked with cfgs {:?}, extra codegen {:?} or embed-metadata {:?} no published node may carry",
-            original_parsed.crate_name,
-            consumer.cfgs,
-            consumer.extra_codegen,
-            consumer.embed_metadata,
-        ));
-    }
+    ensure_publishable_shape(original_parsed, &effective_target)?;
     let identity = stable_unit_identity_for_package(
         original_parsed,
         &package_name,
@@ -2166,6 +2176,38 @@ mod tests {
             stamped.invocation = Some(stow_types::public_cache::UnitInvocation::Native);
             assert_eq!(collector.into_records().expect("records"), vec![stamped]);
         });
+    }
+
+    /// stow#1066: the mock answers as the task's runner, so a target-less
+    /// host unit of an Apple task is keyed under `aarch64-apple-darwin`
+    /// whatever machine the wrapper runs on; the cargo-default
+    /// `-C split-debuginfo=unpacked` it carries is then no extra codegen
+    /// and the unit publishes. Under a Linux host the same flag stays.
+    #[test]
+    fn a_target_less_apple_host_unit_with_the_cargo_default_split_debuginfo_publishes() {
+        let argv = [
+            "--crate-name",
+            "unicode_ident",
+            "--crate-type",
+            "lib",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=fd828ed38da2eccd",
+            "-C",
+            "extra-filename=-d1c4311f6644f7fa",
+            "-C",
+            "split-debuginfo=unpacked",
+        ]
+        .map(std::ffi::OsString::from);
+        let parsed = ParsedRustcArgs::parse(&argv).expect("parse");
+        assert_eq!(parsed.target, None);
+
+        super::ensure_publishable_shape(&parsed, "aarch64-apple-darwin")
+            .expect("the apple default is not extra codegen");
+        let error = super::ensure_publishable_shape(&parsed, "x86_64-unknown-linux-gnu")
+            .expect_err("`unpacked` is not the Linux default");
+        assert!(error.to_string().contains("extra codegen"), "{error}");
     }
 
     #[test]

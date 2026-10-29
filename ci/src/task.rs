@@ -2815,7 +2815,11 @@ mod tests {
             "cargo:rustc-link-arg=-Wl,--export-dynamic".to_owned(),
             "cargo:rustc-link-arg=-Wl,-z,relro".to_owned(),
         ]);
-        let split = stow_types::upload_plan::ConsumerInputs::of(&parsed(&consumer), &own);
+        let split = stow_types::upload_plan::ConsumerInputs::of(
+            &parsed(&consumer),
+            &own,
+            "x86_64-unknown-linux-gnu",
+        );
         assert_eq!(split.link_options, ["link-arg=-fuse-ld=mold"]);
         let mut rejoined = split.link_options;
         rejoined.extend(own.link_args);

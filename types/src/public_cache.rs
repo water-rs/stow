@@ -316,7 +316,7 @@ fn stable_unit_identity_for_source(
             }),
         ),
     };
-    let extra_codegen = parsed.extra_codegen.clone();
+    let extra_codegen = parsed.extra_codegen_for(target);
     let cfgs = parsed.cfgs.iter().cloned().collect::<Vec<_>>();
     // Empty unless this unit actually links, which keeps every rlib's key
     // exactly what it was before the linker was part of identity.
@@ -1259,6 +1259,41 @@ mod tests {
         assert_ne!(key("unpacked", msvc), flagged_key(&[], msvc));
     }
 
+    /// stow#1066: a target-less unit is keyed under the host triple its
+    /// caller resolves, so the default is judged against that triple and
+    /// never the machine the parser runs on.
+    #[test]
+    fn a_target_less_unit_judges_split_debuginfo_against_the_resolved_host() {
+        let flagged =
+            ParsedRustcArgs::parse(&lib_args(&["-C", "split-debuginfo=unpacked"])).expect("parse");
+        let plain = ParsedRustcArgs::parse(&lib_args(&[])).expect("parse");
+        assert_eq!(flagged.target, None);
+        let key = |parsed: &ParsedRustcArgs, host: &str| {
+            stable_unit_identity_for_package(
+                parsed,
+                "unicode-ident",
+                "1.0.24",
+                host,
+                "1.91.1",
+                "[]",
+                "[]",
+            )
+            .expect("identity")
+            .compile_key
+        };
+        let none = crate::upload_plan::BuildScriptInputs::default();
+        let apple = "aarch64-apple-darwin";
+        assert_eq!(key(&flagged, apple), key(&plain, apple));
+        assert!(
+            crate::upload_plan::ConsumerInputs::of(&flagged, &none, apple).is_publishable_shape()
+        );
+        let linux = "x86_64-unknown-linux-gnu";
+        assert_ne!(key(&flagged, linux), key(&plain, linux));
+        assert!(
+            !crate::upload_plan::ConsumerInputs::of(&flagged, &none, linux).is_publishable_shape()
+        );
+    }
+
     /// stow#1066: `-C prefer-dynamic` decides how a dylib, cdylib or bin
     /// links std, so it keys there; cargo adds it to every proc-macro and
     /// it does nothing to an rlib, so it keys nowhere else.
@@ -1367,7 +1402,7 @@ mod tests {
         parsed: &ParsedRustcArgs,
         own: &crate::upload_plan::BuildScriptInputs,
     ) -> crate::upload_plan::ConsumerInputs {
-        crate::upload_plan::ConsumerInputs::of(parsed, own)
+        crate::upload_plan::ConsumerInputs::of(parsed, own, "x86_64-unknown-linux-gnu")
     }
 
     /// A candidate compiled with exactly the consumer's inputs recomputes
