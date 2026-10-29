@@ -5,7 +5,7 @@
 //! allowances (with the last hour's pace as alert-only context), edge health (Worker
 //! invocation statuses, DO resource failures, `overloaded` events), the
 //! build pipeline (build-crate failed-task share, dispatch retries,
-//! pending age, dispatch stalls), and the public endpoints — then acts on the
+//! pending age, dispatch stalls, stalled builds, preheat freshness), and the public endpoints — then acts on the
 //! verdict: `Trip` breaches disable the dispatching workflows that read
 //! `active` — the exact set, recorded on the incident issue for `clear`
 //! to restore — and enable
@@ -29,7 +29,8 @@
 //! one GHCR verified pull for the bundle probe (tag list + index
 //! manifest + signature + blob), ≤ `1 + completed-runs +
 //! MAX_CLASSIFIED_TASKS` GitHub REST reads (a run's jobs live only on
-//! its jobs page) plus one per trip workflow when a trip runs, and, only
+//! its jobs page), plus two for the liveness signals (the newest
+//! build-crate run, the newest successful preheat-admin run), plus one per trip workflow when a trip runs, and, only
 //! while an incident is open, ≤8 REST mutations
 //! plus one email — idle runs issue no mutations at all.
 
@@ -380,6 +381,28 @@ const SIGNALS: &[Signal] = &[
         unit: "stalled",
         effect: Effect::Alert,
     },
+    // The two liveness signals: a pipeline that does nothing raises no
+    // failure, so each judges the absence. Their levels are operator
+    // settings ([`LivenessLevels`]), so the table carries `0.0` and each
+    // reading brings its own threshold.
+    Signal {
+        id: "pipeline.preheat_stale",
+        label: "age of the last successful preheat-admin run (its tasks reached the scheduler)",
+        window: Window::Now,
+        min_sample: 1,
+        threshold: 0.0,
+        unit: "h",
+        effect: Effect::Alert,
+    },
+    Signal {
+        id: "pipeline.builds_stalled",
+        label: "time since the last build-crate run started while dispatchable tasks and free slots exist",
+        window: Window::Now,
+        min_sample: 1,
+        threshold: 0.0,
+        unit: "h",
+        effect: Effect::Alert,
+    },
     // ── public endpoints — alert ──
     Signal {
         id: "endpoint.stats",
@@ -542,6 +565,22 @@ const HOURLY_ALERT_ENV: &str = "STOW_WATCHDOG_HOURLY_ALERT_PERCENTS";
 /// 200% and 300% of the hourly pace.
 const DEFAULT_HOURLY_ALERT_PERCENTS: [f64; 2] = [200.0, 300.0];
 
+/// The repository variable (passed into the watchdog's environment)
+/// that sets how old the last successful preheat may be, in hours.
+const PREHEAT_MAX_AGE_ENV: &str = "STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS";
+/// The age used while [`PREHEAT_MAX_AGE_ENV`] is unset or empty: a daily
+/// cron plus two hours of slack for the wave to finish.
+const DEFAULT_PREHEAT_MAX_AGE_HOURS: f64 = 26.0;
+/// The repository variable that sets how long dispatchable work may sit
+/// with no `build-crate.yml` run starting, in hours.
+const BUILD_STALL_ENV: &str = "STOW_WATCHDOG_BUILD_STALL_HOURS";
+/// The window used while [`BUILD_STALL_ENV`] is unset or empty.
+const DEFAULT_BUILD_STALL_HOURS: f64 = 2.0;
+/// The workflow whose successful runs prove a preheat wave reached the
+/// scheduler: the one lane that submits (the daily cron and the
+/// newreleases.io delivery both dispatch it).
+const PREHEAT_WORKFLOW: &str = "preheat-admin.yml";
+
 /// Dispatching workflows a trip touches — everything that can start a
 /// build wave or move the index: `build-crate` (the per-task workflow
 /// the scheduler dispatches to), the index cron, and every preheat
@@ -592,7 +631,11 @@ impl Watcher<'_> {
     /// Gather every signal; a collector that fails records a
     /// [`CollectFailure`] — one blind spot never hides the signals that
     /// did read.
-    async fn collect(&self, hourly: &HourlyAlertLevels) -> (Vec<Reading>, Vec<CollectFailure>) {
+    async fn collect(
+        &self,
+        hourly: &HourlyAlertLevels,
+        liveness: &LivenessLevels,
+    ) -> (Vec<Reading>, Vec<CollectFailure>) {
         let mut readings = Vec::new();
         let mut failures = Vec::new();
         // Sequential collectors keep a run at ~20 outbound calls total —
@@ -612,7 +655,8 @@ impl Watcher<'_> {
         gather!("cloudflare-usage", self.cf_readings(hourly));
         gather!("overloaded-events", self.overloaded_reading());
         gather!("pipeline", self.pipeline_readings());
-        gather!("queue", self.queue_readings());
+        gather!("queue", self.queue_readings(liveness));
+        gather!("preheat", self.preheat_reading(liveness));
         gather!("dispatch-freeze", self.freeze_reading());
         let (endpoint_readings, endpoint_failure) = self.endpoint_readings().await;
         readings.extend(endpoint_readings);
@@ -929,7 +973,7 @@ impl Watcher<'_> {
     /// `GET /api/v1/admin/status` → oldest-pending age and the
     /// dispatch-stall check: pending work, free slots, and no in-flight
     /// row touched inside the window.
-    async fn queue_readings(&self) -> Result<Vec<Reading>, String> {
+    async fn queue_readings(&self, liveness: &LivenessLevels) -> Result<Vec<Reading>, String> {
         // The cap in force is the operator's to set, so a stall is
         // judged against it rather than against any fixed pool size.
         let (status, caps) = futures_util::join!(
@@ -962,7 +1006,22 @@ impl Watcher<'_> {
         }
         #[allow(clippy::cast_precision_loss)]
         let oldest_pending = status.oldest_pending_seconds.map_or(0.0, |s| s as f64);
+        let latest_build = latest_run(self.gh_token, github::BUILD_WORKFLOW, "")
+            .await?
+            .map(|run| (run.created_at, run.html_url));
+        let stalled_builds = builds_stalled_reading(
+            self.now,
+            &BuildQueue {
+                ready: status.ready,
+                in_flight: status.in_flight.len(),
+                cap,
+                frozen: status.dispatch_frozen,
+            },
+            latest_build.as_ref().map(|(at, url)| (*at, url.as_str())),
+            liveness.build_stall_hours,
+        );
         Ok(vec![
+            stalled_builds,
             Reading {
                 signal: signal("pipeline.oldest_pending"),
                 threshold: None,
@@ -978,6 +1037,23 @@ impl Watcher<'_> {
                 evidence: stall_evidence,
             },
         ])
+    }
+
+    // ----- preheat freshness -----
+
+    /// The newest successful `preheat-admin.yml` run. A success means
+    /// every submit step exited zero, so its tasks were accepted by the
+    /// scheduler; it is the one workflow that submits, whoever
+    /// dispatched it. One REST read.
+    async fn preheat_reading(&self, liveness: &LivenessLevels) -> Result<Vec<Reading>, String> {
+        let latest = latest_run(self.gh_token, PREHEAT_WORKFLOW, "&status=success")
+            .await?
+            .map(|run| (run.updated_at, run.html_url));
+        Ok(vec![preheat_stale_reading(
+            self.now,
+            latest.as_ref().map(|(at, url)| (*at, url.as_str())),
+            liveness.preheat_max_age_hours,
+        )])
     }
 
     // ----- the DO's own breaker -----
@@ -1181,6 +1257,146 @@ impl HourlyAlertLevels {
             .collect::<Result<Vec<_>, _>>()?;
         levels.sort_by(f64::total_cmp);
         Ok(Self(levels))
+    }
+}
+
+/// The operator-set levels of the two liveness signals, in hours.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LivenessLevels {
+    /// Age of the last successful preheat at which `pipeline.preheat_stale` breaches.
+    preheat_max_age_hours: f64,
+    /// Time without a started build run, with work ready, at which
+    /// `pipeline.builds_stalled` breaches.
+    build_stall_hours: f64,
+}
+
+impl LivenessLevels {
+    /// Read [`PREHEAT_MAX_AGE_ENV`] and [`BUILD_STALL_ENV`]; an unset or
+    /// empty variable is its default.
+    fn from_env() -> stow_types::error::Result<Self> {
+        let read = |name: &str| std::env::var(name).ok();
+        Self::parse(
+            read(PREHEAT_MAX_AGE_ENV).as_deref(),
+            read(BUILD_STALL_ENV).as_deref(),
+        )
+    }
+
+    /// Parse the two settings. The values carry no ceiling or floor —
+    /// they are the operator's call — but each must be a number.
+    fn parse(
+        preheat_max_age: Option<&str>,
+        build_stall: Option<&str>,
+    ) -> stow_types::error::Result<Self> {
+        let hours = |name: &str, text: Option<&str>, default: f64| match text.map(str::trim) {
+            Some(text) if !text.is_empty() => text
+                .parse::<f64>()
+                .ok()
+                .filter(|hours| hours.is_finite())
+                .ok_or_else(|| stow_error!("{name}: `{text}` is not a number")),
+            _ => Ok(default),
+        };
+        Ok(Self {
+            preheat_max_age_hours: hours(
+                PREHEAT_MAX_AGE_ENV,
+                preheat_max_age,
+                DEFAULT_PREHEAT_MAX_AGE_HOURS,
+            )?,
+            build_stall_hours: hours(BUILD_STALL_ENV, build_stall, DEFAULT_BUILD_STALL_HOURS)?,
+        })
+    }
+}
+
+/// Hours between `at` and `now`; a stamp in the future (clock skew) is age zero.
+fn age_hours(now: OffsetDateTime, at: OffsetDateTime) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let secs = (now - at).whole_seconds().max(0) as f64;
+    secs / 3600.0
+}
+
+/// `pipeline.preheat_stale`: the age of the newest successful preheat
+/// run, `latest` being its `(finished, url)`. No successful run at all
+/// is an infinite age.
+fn preheat_stale_reading(
+    now: OffsetDateTime,
+    latest: Option<(OffsetDateTime, &str)>,
+    max_age_hours: f64,
+) -> Reading {
+    let (value, evidence) = match latest {
+        Some((at, url)) => (
+            age_hours(now, at),
+            vec![format!(
+                "last successful {PREHEAT_WORKFLOW} run finished {} — {url}",
+                format_time(at)
+            )],
+        ),
+        None => (
+            f64::INFINITY,
+            vec![format!(
+                "no successful {PREHEAT_WORKFLOW} run in the repository's run history"
+            )],
+        ),
+    };
+    Reading {
+        signal: signal("pipeline.preheat_stale"),
+        sample: 1,
+        value,
+        threshold: Some(max_age_hours),
+        evidence,
+    }
+}
+
+/// What the scheduler's admin status says about dispatchable work.
+#[derive(Debug, Clone, Copy)]
+struct BuildQueue {
+    /// Pending tasks dispatchable now (`AdminStatus::ready`).
+    ready: u32,
+    /// Tasks dispatched or running.
+    in_flight: usize,
+    /// The dispatch cap in force.
+    cap: usize,
+    /// The dispatch freeze is engaged — `edge.dispatch_frozen` owns that case.
+    frozen: bool,
+}
+
+/// `pipeline.builds_stalled`: the sample is the ready count, so a queue
+/// with nothing dispatchable abstains. With work ready, a free slot and
+/// no freeze the value is the time since the newest `build-crate.yml`
+/// run was created, `latest_run` being its `(created, url)`; no run at
+/// all is an infinite wait. A full pool or an engaged freeze explains
+/// the idle itself and reads zero.
+fn builds_stalled_reading(
+    now: OffsetDateTime,
+    queue: &BuildQueue,
+    latest_run: Option<(OffsetDateTime, &str)>,
+    stall_hours: f64,
+) -> Reading {
+    let mut evidence = vec![
+        format!("ready={}", queue.ready),
+        format!("in_flight={}", queue.in_flight),
+        format!("dispatch_cap={}", queue.cap),
+    ];
+    let value = if queue.frozen {
+        evidence.push("dispatch freeze engaged — reported by edge.dispatch_frozen".to_owned());
+        0.0
+    } else if queue.in_flight >= queue.cap {
+        evidence.push("every dispatch slot is in use".to_owned());
+        0.0
+    } else if let Some((at, url)) = latest_run {
+        evidence.push(format!(
+            "newest build-crate run created {} — {url}",
+            format_time(at)
+        ));
+        age_hours(now, at)
+    } else {
+        evidence.push("no build-crate run in the repository's run history".to_owned());
+        f64::INFINITY
+    };
+    Reading {
+        signal: signal("pipeline.builds_stalled"),
+        sample: u64::from(queue.ready),
+        value,
+        threshold: Some(stall_hours),
+        evidence,
     }
 }
 
@@ -1747,6 +1963,33 @@ impl github::RunRow for GhRun {
     }
 }
 
+/// The two timestamps of a workflow-run row the liveness signals read.
+#[derive(Debug, serde::Deserialize)]
+struct GhRunStamp {
+    html_url: String,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    updated_at: OffsetDateTime,
+}
+
+/// The newest run (by creation) of `workflow` under `filters`
+/// (`&status=success`), or `None` when it has none. One REST read.
+async fn latest_run(
+    gh_token: &str,
+    workflow: &str,
+    filters: &str,
+) -> Result<Option<GhRunStamp>, String> {
+    let page: github::RunsPage<GhRunStamp> = github::get(
+        gh_token,
+        &format!("actions/workflows/{workflow}/runs?per_page=1{filters}"),
+        Backoff::new(),
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(page.workflow_runs.into_iter().next())
+}
+
 #[derive(Debug, serde::Deserialize)]
 pub struct GhIssue {
     /// The issue number.
@@ -2300,6 +2543,9 @@ struct BreachView<'a> {
 /// `42.0` — exact equality is the intent, not an approximation.
 #[allow(clippy::float_cmp)]
 fn fmt_value(value: f64, unit: &str) -> String {
+    if !value.is_finite() {
+        return "never".to_owned();
+    }
     let scaled = [(1e12, "T"), (1e9, "G"), (1e6, "M"), (1e3, "k")];
     for (divisor, suffix) in scaled {
         if value.abs() >= divisor {
@@ -2592,6 +2838,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
     let host = maintenance::host_from_url(edge.base()).map_err(|error| stow_error!("{error}"))?;
     let sql_base = cloudflare::analytics_sql_base()?;
     let hourly_levels = HourlyAlertLevels::from_env()?;
+    let liveness = LivenessLevels::from_env()?;
     let watcher = Watcher {
         edge,
         gh_token: &gh_token,
@@ -2603,7 +2850,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         now: OffsetDateTime::now_utc(),
     };
 
-    let (readings, collect_failures) = watcher.collect(&hourly_levels).await;
+    let (readings, collect_failures) = watcher.collect(&hourly_levels, &liveness).await;
     let decision = decide(&readings, &collect_failures);
     let mut outcome = ApplyOutcome::default();
     let now_text = format_time(watcher.now);
@@ -4333,5 +4580,132 @@ mod tests {
         );
         let heads = server.join().await;
         assert_eq!(heads.len(), 1);
+    }
+
+    // ----- liveness signals -----
+
+    fn hours_ago(now: OffsetDateTime, hours: f64) -> OffsetDateTime {
+        #[allow(clippy::cast_possible_truncation)]
+        let secs = (hours * 3600.0) as i64;
+        now - time::Duration::seconds(secs)
+    }
+
+    fn verdict_of(reading: &Reading) -> Verdict {
+        verdict(reading)
+    }
+
+    /// The 2026-10-29 outage: a preheat 26h or older breaches, a fresher
+    /// one is clear, and no successful run ever is a breach reading
+    /// "never".
+    #[test]
+    fn preheat_stale_fires_at_the_operator_age() {
+        let now = october_29();
+        let url = "https://github.com/water-rs/stow/actions/runs/1";
+        let fresh = preheat_stale_reading(now, Some((hours_ago(now, 25.9), url)), 26.0);
+        assert_eq!(verdict_of(&fresh), Verdict::Clear);
+        let stale = preheat_stale_reading(now, Some((hours_ago(now, 26.0), url)), 26.0);
+        assert_eq!(verdict_of(&stale), Verdict::Breach);
+        let never = preheat_stale_reading(now, None, 26.0);
+        assert_eq!(verdict_of(&never), Verdict::Breach);
+        assert_eq!(signal_report(&never).observed, "never");
+        // The operator's level replaces the default, in both directions.
+        let tight = preheat_stale_reading(now, Some((hours_ago(now, 5.0), url)), 4.0);
+        assert_eq!(verdict_of(&tight), Verdict::Breach);
+        let loose = preheat_stale_reading(now, Some((hours_ago(now, 30.0), url)), 48.0);
+        assert_eq!(verdict_of(&loose), Verdict::Clear);
+        // It alerts and never trips.
+        let decision = decide(&[stale], &[]);
+        assert!(decision.incident);
+        assert_eq!(decision.tripped, [] as [usize; 0]);
+        assert_eq!(decision.alerting.len(), 1);
+    }
+
+    fn queue(ready: u32, in_flight: usize, cap: usize, frozen: bool) -> BuildQueue {
+        BuildQueue {
+            ready,
+            in_flight,
+            cap,
+            frozen,
+        }
+    }
+
+    /// Ready work, a free slot and no run started inside the window
+    /// breaches — the state `failure_rate` reports as `skipped`.
+    #[test]
+    fn builds_stalled_fires_with_ready_work_and_no_recent_run() {
+        let now = october_29();
+        let url = "https://github.com/water-rs/stow/actions/runs/2";
+        let idle = |latest, q| builds_stalled_reading(now, &q, latest, 2.0);
+
+        let stalled = idle(Some((hours_ago(now, 6.0), url)), queue(40, 0, 20, false));
+        assert_eq!(verdict_of(&stalled), Verdict::Breach);
+        let none_ever = idle(None, queue(40, 0, 20, false));
+        assert_eq!(verdict_of(&none_ever), Verdict::Breach);
+
+        // A run started inside the window keeps it clear.
+        let busy = idle(Some((hours_ago(now, 1.9), url)), queue(40, 3, 20, false));
+        assert_eq!(verdict_of(&busy), Verdict::Clear);
+        // Nothing dispatchable: the signal abstains, whatever the age.
+        let empty = idle(Some((hours_ago(now, 30.0), url)), queue(0, 0, 20, false));
+        assert_eq!(verdict_of(&empty), Verdict::Skipped);
+        // A full pool and an engaged freeze explain the idle.
+        let full = idle(Some((hours_ago(now, 30.0), url)), queue(40, 20, 20, false));
+        assert_eq!(verdict_of(&full), Verdict::Clear);
+        let frozen = idle(Some((hours_ago(now, 30.0), url)), queue(40, 0, 20, true));
+        assert_eq!(verdict_of(&frozen), Verdict::Clear);
+        // The operator's window replaces the default.
+        let wide = builds_stalled_reading(
+            now,
+            &queue(40, 0, 20, false),
+            Some((hours_ago(now, 6.0), url)),
+            12.0,
+        );
+        assert_eq!(verdict_of(&wide), Verdict::Clear);
+
+        // With no build events, failure_rate abstains and this reports.
+        let readings = [reading("pipeline.failure_rate", 0, 0.0), stalled];
+        let decision = decide(&readings, &[]);
+        assert_eq!(decision.skipped, [0]);
+        assert_eq!(decision.alerting, [1]);
+        assert_eq!(decision.tripped, [] as [usize; 0]);
+    }
+
+    #[test]
+    fn liveness_levels_parse_with_defaults_and_no_ceiling() {
+        assert_eq!(
+            LivenessLevels::parse(None, Some("  ")).unwrap(),
+            LivenessLevels {
+                preheat_max_age_hours: 26.0,
+                build_stall_hours: 2.0
+            }
+        );
+        assert_eq!(
+            LivenessLevels::parse(Some("100000"), Some("0.5")).unwrap(),
+            LivenessLevels {
+                preheat_max_age_hours: 100_000.0,
+                build_stall_hours: 0.5
+            }
+        );
+        assert!(LivenessLevels::parse(Some("a day"), None).is_err());
+        assert!(LivenessLevels::parse(None, Some("inf")).is_err());
+    }
+
+    /// The runs listing's row shape decodes into the stamps both signals
+    /// read, extra fields ignored, and an empty listing is no run.
+    #[test]
+    fn run_listing_decodes_to_stamps() {
+        let page: github::RunsPage<GhRunStamp> = serde_json::from_str(
+            r#"{"total_count":1,"workflow_runs":[{"id":7,"name":"Preheat popular crates",
+            "html_url":"https://github.com/water-rs/stow/actions/runs/7",
+            "created_at":"2026-10-28T00:01:10Z","updated_at":"2026-10-28T00:41:02Z",
+            "conclusion":"success"}]}"#,
+        )
+        .unwrap();
+        let run = page.workflow_runs.into_iter().next().unwrap();
+        assert_eq!(run.created_at.unix_timestamp(), 1_793_145_670);
+        assert_eq!(run.updated_at.unix_timestamp(), 1_793_148_062);
+        let empty: github::RunsPage<GhRunStamp> =
+            serde_json::from_str(r#"{"total_count":0,"workflow_runs":[]}"#).unwrap();
+        assert!(empty.workflow_runs.is_empty());
     }
 }

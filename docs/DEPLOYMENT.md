@@ -225,7 +225,12 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    current UTC calendar month passes 80% of its monthly allowance; the
    last hour at 200% and 300% of the hourly pace (levels set by the
    `STOW_WATCHDOG_HOURLY_ALERT_PERCENTS` repository variable) only
-   alerts. `stow-admin watchdog clear` disables both scopes the
+   alerts. Two liveness signals alert too: `pipeline.preheat_stale` (no
+   successful `preheat-admin.yml` run for 26 hours, set by
+   `STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS`) and `pipeline.builds_stalled`
+   (dispatchable tasks and a free slot, yet no `build-crate.yml` run
+   created for 2 hours, set by `STOW_WATCHDOG_BUILD_STALL_HOURS`).
+   `stow-admin watchdog clear` disables both scopes the
    watchdog can enable.
 
    `<edge host>` is the host of `STOW_EDGE_URL` — the rules follow

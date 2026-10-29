@@ -3153,6 +3153,10 @@ pub struct AdminStatus {
     pub pending_miss: u32,
     /// Pending rows in the human lane.
     pub pending_human: u32,
+    /// Pending rows dispatchable now: no unmet dependency, not blocked,
+    /// at or above the admission floor. The watchdog's stalled-builds
+    /// signal reads it.
+    pub ready: u32,
     /// Pending rows parked behind a terminally failed dependency.
     #[serde(default)]
     pub blocked: u32,

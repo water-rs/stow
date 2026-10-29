@@ -153,6 +153,12 @@ jobs:
           # Hourly-pace alert levels (percent of the hourly pace); unset
           # or empty is the default 200,300.
           STOW_WATCHDOG_HOURLY_ALERT_PERCENTS: ${{ vars.STOW_WATCHDOG_HOURLY_ALERT_PERCENTS }}
+          # Liveness levels in hours: the oldest acceptable successful
+          # preheat (default 26) and the longest ready work may wait
+          # with no build-crate run started (default 2); unset or empty
+          # is the default.
+          STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS: ${{ vars.STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS }}
+          STOW_WATCHDOG_BUILD_STALL_HOURS: ${{ vars.STOW_WATCHDOG_BUILD_STALL_HOURS }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           # The watchdog's GitHub REST calls (workflow re-enable, the
           # incident issue) use the run's own token.
