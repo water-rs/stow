@@ -728,10 +728,7 @@ async fn toolchain_grants(
 /// `/usr/include` exists only on a host with C headers. Each is pushed
 /// only when its path exists: a grant must resolve to a real path.
 /// cargo's `credentials`/`credentials.toml` are never among them.
-fn conditional_grants(
-    cargo_home: &Path,
-    grants: &mut Vec<(PathBuf, Access, &'static str)>,
-) {
+fn conditional_grants(cargo_home: &Path, grants: &mut Vec<(PathBuf, Access, &'static str)>) {
     grants.push((
         cargo_home.join(".package-cache"),
         Access::READ | Access::WRITE,
