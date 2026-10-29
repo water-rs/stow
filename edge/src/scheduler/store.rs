@@ -845,7 +845,7 @@ mod tests {
         let generation = claims[0].generation;
         graph.bind(&id("c"), generation, 700, 1_000);
         graph.run_finished(&id("c"), 700, true, false, None, 10_000);
-        graph.apply_slice_report(TARGET, RUSTC, &c_rows(), &[]);
+        graph.apply_slice_report(TARGET, RUSTC, None, 1, &c_rows(), &[]);
 
         // The log records the wave; the snapshot then drops it.
         let events = vec![
@@ -953,7 +953,7 @@ mod tests {
             2_000,
         )
         .await;
-        graph.apply_slice_report(TARGET, RUSTC, &c_rows(), &[]);
+        graph.apply_slice_report(TARGET, RUSTC, None, 1, &c_rows(), &[]);
         let covered2 = write_snapshot(&db, &mut graph, &GraphCell::default(), NOW_MS)
             .await
             .expect("snapshot 2");
@@ -1016,11 +1016,14 @@ mod tests {
                     }],
                 })
                 .collect();
+            let live = graph
+                .slice_generation(stow_types::api::CI_TARGET_TRIPLES[0], "1.85.0")
+                .expect("the fixture reports its delta slice");
             events.push(SchedulerEvent::SliceReport {
                 target: TargetTriple::parse(stow_types::api::CI_TARGET_TRIPLES[0]).expect("target"),
                 rustc_version: WireRustcVersion::parse("1.85.0").expect("rustc"),
-                base_generation: None,
-                generation: Some(1),
+                base_generation: Some(live),
+                generation: live + 1,
                 added,
                 retired,
             });

@@ -2190,9 +2190,9 @@ pub const DRIVES: &[Drive] = &[
                     db,
                     &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
-                        rustc_version: WireRustcVersion::parse("1.86.0").map_err(text)?,
+                        rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
-                        generation: None,
+                        generation: 1,
                         added: fixture::full_slice_report(),
                         retired: Vec::new(),
                     }],
@@ -2224,9 +2224,9 @@ pub const DRIVES: &[Drive] = &[
                     db,
                     &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
-                        rustc_version: WireRustcVersion::parse("1.86.0").map_err(text)?,
+                        rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
-                        generation: None,
+                        generation: 1,
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
                     }],
@@ -2248,14 +2248,15 @@ pub const DRIVES: &[Drive] = &[
         run: |db, shape, settings, ctx| {
             Box::pin(async move {
                 let (added, retired) = fixture::delta_slice_report(shape);
+                let live = delta_slice_generation(ctx)?;
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
                     &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
-                        base_generation: None,
-                        generation: None,
+                        base_generation: Some(live),
+                        generation: live + 1,
                         added,
                         retired,
                     }],
@@ -2282,14 +2283,15 @@ pub const DRIVES: &[Drive] = &[
                     .collect();
                 restore_claimed(ctx, db, ids).await?;
                 let (added, retired) = fixture::delta_slice_report(shape);
+                let live = delta_slice_generation(ctx)?;
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
                     &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
-                        base_generation: None,
-                        generation: None,
+                        base_generation: Some(live),
+                        generation: live + 1,
                         added: retired,
                         retired: added,
                     }],
@@ -2697,7 +2699,7 @@ pub const DRIVES: &[Drive] = &[
                     target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                     rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
                     base_generation: None,
-                    generation: None,
+                    generation: 1,
                     added: fixture::full_slice_report(),
                     retired: Vec::new(),
                 };
@@ -2779,7 +2781,7 @@ pub const DRIVES: &[Drive] = &[
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
                         base_generation: None,
-                        generation: None,
+                        generation: 1,
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
                     }],
@@ -3404,6 +3406,14 @@ fn snapshot_merge_tree(shape: FixtureShape) -> SubmissionTree {
     }
 }
 
+/// The live generation of the slice the delta drives report on — a
+/// delta applies only on top of it.
+fn delta_slice_generation(ctx: &DriveContext) -> Result<i64, String> {
+    ctx.loaded()
+        .with(|graph| graph.slice_generation(stow_types::api::CI_TARGET_TRIPLES[0], "1.85.0"))
+        .ok_or_else(|| "the fixture's delta slice was never reported".to_owned())
+}
+
 /// The delta slice report the snapshot batch carries, or, with `undo`,
 /// its inverse, which the cleanup applies.
 async fn snapshot_slice_report(
@@ -3418,14 +3428,15 @@ async fn snapshot_slice_report(
     } else {
         (added, retired)
     };
+    let live = delta_slice_generation(ctx)?;
     routes::slice_reports(
         ctx.loaded(),
         db,
         &[PublishedSlice {
             target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
             rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
-            base_generation: None,
-            generation: None,
+            base_generation: Some(live),
+            generation: live + 1,
             added,
             retired,
         }],

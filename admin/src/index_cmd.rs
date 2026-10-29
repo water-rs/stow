@@ -90,6 +90,13 @@ pub enum IndexCommand {
     /// a dependent. `index-publish.yml` runs it after a successful
     /// publish; running it again against the same file is idempotent.
     Report(IndexReportArgs),
+    /// Report every published slice of the rustc whose generation the
+    /// scheduler does not hold, each as a full report. A publish run
+    /// whose report failed, or that died between a slice's two tags,
+    /// leaves a live generation the scheduler never received and no
+    /// later export re-emits; `index-publish.yml` runs this before each
+    /// export so the next run converges on the published state.
+    Reconcile(IndexReconcileArgs),
     /// Print every `CI_TARGET_TRIPLES` entry, one per line — the slice
     /// list `index-publish.yml` iterates, read from the binary so the
     /// workflow never carries its own copy.
@@ -205,6 +212,14 @@ pub struct IndexReportArgs {
     full: bool,
 }
 
+#[derive(Args)]
+pub struct IndexReconcileArgs {
+    /// The rustc whose published `index.<target>.<rustc>` slices are
+    /// compared against the scheduler's.
+    #[arg(long)]
+    rustc_version: String,
+}
+
 /// The JSON line `index report` prints on stdout — one line for the
 /// run's whole report.
 #[derive(Debug, serde::Serialize)]
@@ -231,6 +246,7 @@ pub async fn run(
         IndexCommand::Export(args) => index_export(args).await,
         IndexCommand::Publish(args) => index_publish(args).await,
         IndexCommand::Report(args) => index_report(&Edge::connect(store)?, args).await,
+        IndexCommand::Reconcile(args) => index_reconcile(&Edge::connect(store)?, args).await,
         IndexCommand::Targets => {
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())
@@ -286,9 +302,12 @@ struct PullContext {
 
 impl PullContext {
     /// Pull and verify the published `index`/`folded` pair `folded`
-    /// names. A folded tag without its index sibling — or an index with
-    /// no folded set at all — is state an incremental export cannot
-    /// extend; `--full` rebuilds it.
+    /// names. An index with no folded set is a publish that died between
+    /// its two tags: the slice extends with an empty folded set, so the
+    /// pass refolds every record onto the published rows and the next
+    /// publish writes the pair. A folded tag without its index sibling
+    /// is state an incremental export cannot extend; `--full` rebuilds
+    /// it.
     async fn prev_slice(
         &self,
         folded: &str,
@@ -301,30 +320,48 @@ impl PullContext {
         let rustc_version = WireRustcVersion::parse(rustc_version)
             .map_err(|error| stow_error!("folded rustc_version: {error}"))?;
 
-        let folded_reference = self.session.reference(folded)?;
         let pulled_folded =
-            stow_oci::pull_folded(&self.session, target.as_str(), rustc_version.as_str())
-                .await?
-                .ok_or_else(|| {
-                    stow_error!("folded tag {folded} listed but its manifest does not exist")
-                })?;
-        verify_artifact(
-            &self.session,
-            &self.trust,
-            &folded_reference,
-            &self.repository.reference(folded),
-            &pulled_folded.manifest_digest,
-            INDEX_CERT_URL,
-        )
-        .await?;
+            stow_oci::pull_folded(&self.session, target.as_str(), rustc_version.as_str()).await?;
+        if let Some(pulled_folded) = &pulled_folded {
+            verify_artifact(
+                &self.session,
+                &self.trust,
+                &self.session.reference(folded)?,
+                &self.repository.reference(folded),
+                &pulled_folded.manifest_digest,
+                INDEX_CERT_URL,
+            )
+            .await?;
+        }
 
-        let Some(pulled_index) =
-            stow_oci::pull_index(&self.session, target.as_str(), rustc_version.as_str()).await?
-        else {
+        let Some(index) = self.live_index(&target, &rustc_version).await? else {
             return Err(stow_error!(
                 "folded {folded} exists but index.{target}.{rustc_version} is missing — \
                  re-export with --full"
             ));
+        };
+        Ok(Some((
+            (target, rustc_version),
+            PrevSlice {
+                index,
+                folded: pulled_folded
+                    .map(|pulled| pulled.tags.into_iter().collect())
+                    .unwrap_or_default(),
+            },
+        )))
+    }
+
+    /// Pull and verify the published `index.<target>.<rustc>` slice;
+    /// `None` when the tag does not exist.
+    async fn live_index(
+        &self,
+        target: &TargetTriple,
+        rustc_version: &WireRustcVersion,
+    ) -> stow_types::error::Result<Option<ArtifactIndex>> {
+        let Some(pulled_index) =
+            stow_oci::pull_index(&self.session, target.as_str(), rustc_version.as_str()).await?
+        else {
+            return Ok(None);
         };
         let itag = index_tag(target.as_str(), rustc_version.as_str());
         let index_reference = self.session.reference(&itag)?;
@@ -337,21 +374,15 @@ impl PullContext {
             INDEX_CERT_URL,
         )
         .await?;
-        let index = decode_published_slice(&index_reference, &rustc_version, &pulled_index.bytes)?;
-        if index.header.target != target || index.header.rustc_version != rustc_version {
+        let index = decode_published_slice(&index_reference, rustc_version, &pulled_index.bytes)?;
+        if index.header.target != *target || index.header.rustc_version != *rustc_version {
             return Err(stow_error!(
                 "index.{target}.{rustc_version} carries header {}/{} — re-export with --full",
                 index.header.target,
                 index.header.rustc_version,
             ));
         }
-        Ok(Some((
-            (target, rustc_version),
-            PrevSlice {
-                index,
-                folded: pulled_folded.tags.into_iter().collect(),
-            },
-        )))
+        Ok(Some(index))
     }
 
     /// Pull and verify one records artifact — a signature that fails the
@@ -475,35 +506,34 @@ where
 {
     let is_own_rustc =
         |tag_rustc: &str| WireRustcVersion::parse(tag_rustc).is_ok_and(|v| v == *rustc);
-    let folded_tags: Vec<&str> = tags
+    // A slice is published by its index tag, then its folded tag: a
+    // publish that died between them leaves an index alone, which the
+    // pass extends. Every own-rustc suffix either tag names is pulled.
+    let own_suffixes: BTreeSet<&str> = tags
         .iter()
-        .filter(|tag| folded_tag_parts(tag).is_some_and(|(_, tag_rustc)| is_own_rustc(tag_rustc)))
-        .map(String::as_str)
+        .filter_map(|tag| {
+            folded_tag_parts(tag)
+                .filter(|(_, tag_rustc)| is_own_rustc(tag_rustc))
+                .map(|_| &tag["folded.".len()..])
+                .or_else(|| {
+                    index_tag_parts(tag)
+                        .filter(|(_, tag_rustc)| is_own_rustc(tag_rustc))
+                        .map(|_| &tag["index.".len()..])
+                })
+        })
         .collect();
     let mut prev: BTreeMap<(TargetTriple, WireRustcVersion), PrevSlice> = BTreeMap::new();
     if !full {
-        let pairs = futures_util::stream::iter(folded_tags.iter().copied().map(&pull_prev))
+        let folded_tags: Vec<String> = own_suffixes
+            .iter()
+            .map(|suffix| format!("folded.{suffix}"))
+            .collect();
+        let pairs = futures_util::stream::iter(folded_tags.iter().map(|tag| pull_prev(tag)))
             .buffered(PREV_PULL_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
         for pair in pairs.into_iter().flatten() {
             prev.insert(pair.0, pair.1);
-        }
-        // An index tag with no folded sibling is untracked state an
-        // incremental pass cannot extend — checked for this rustc's
-        // slices only; another rustc's pairs are not this pass's state.
-        for tag in tags.iter().filter(|tag| {
-            index_tag_parts(tag).is_some_and(|(_, tag_rustc)| is_own_rustc(tag_rustc))
-        }) {
-            let suffix = &tag["index.".len()..];
-            let covered = folded_tags
-                .iter()
-                .any(|folded| &folded["folded.".len()..] == suffix);
-            if !covered {
-                return Err(stow_error!(
-                    "index tag {tag} has no folded companion — re-export with --full"
-                ));
-            }
         }
     }
 
@@ -1042,36 +1072,139 @@ async fn slice_report_for(
     let index = ArtifactIndex::decode(&bytes)
         .map_err(|error| stow_error!("decode index file {}: {error}", file.display()))?;
     let rows = semantic_rows(&index)?;
+    if full {
+        return Ok(full_slice(index, rows));
+    }
 
     // The delta base is the `.prev` sidecar — resolved exactly, never
-    // silently: `full` or a first publish takes the explicit full path.
-    let (base_generation, added, retired) = if full {
-        (None, rows.clone(), Vec::new())
-    } else if let Some(prev) = read_prev_sidecar(file, index.header.generation).await? {
-        let prev_rows = semantic_rows(&prev)?;
-        let current: std::collections::BTreeSet<_> = rows.iter().map(row_key).collect();
-        let previous: std::collections::BTreeSet<_> = prev_rows.iter().map(row_key).collect();
-        let added: Vec<PublishedSliceRow> = rows
-            .iter()
-            .filter(|row| !previous.contains(&row_key(row)))
-            .cloned()
-            .collect();
-        let retired: Vec<PublishedSliceRow> = prev_rows
-            .into_iter()
-            .filter(|row| !current.contains(&row_key(row)))
-            .collect();
-        (Some(prev.header.generation), added, retired)
-    } else {
-        (None, rows.clone(), Vec::new())
+    // silently: a first publish takes the explicit full path.
+    let Some(prev) = read_prev_sidecar(file, index.header.generation).await? else {
+        return Ok(full_slice(index, rows));
     };
+    let prev_rows = semantic_rows(&prev)?;
+    let current: std::collections::BTreeSet<_> = rows.iter().map(row_key).collect();
+    let previous: std::collections::BTreeSet<_> = prev_rows.iter().map(row_key).collect();
+    let added: Vec<PublishedSliceRow> = rows
+        .iter()
+        .filter(|row| !previous.contains(&row_key(row)))
+        .cloned()
+        .collect();
+    let retired: Vec<PublishedSliceRow> = prev_rows
+        .into_iter()
+        .filter(|row| !current.contains(&row_key(row)))
+        .collect();
     Ok(stow_types::api::PublishedSlice {
         target: index.header.target,
         rustc_version: index.header.rustc_version,
-        base_generation,
-        generation: Some(index.header.generation),
+        base_generation: Some(prev.header.generation),
+        generation: index.header.generation,
         added,
         retired,
     })
+}
+
+/// The explicit full report of a slice: its whole servable membership,
+/// which the scheduler takes as the slice's set.
+fn full_slice(
+    index: ArtifactIndex,
+    rows: Vec<PublishedSliceRow>,
+) -> stow_types::api::PublishedSlice {
+    stow_types::api::PublishedSlice {
+        target: index.header.target,
+        rustc_version: index.header.rustc_version,
+        base_generation: None,
+        generation: index.header.generation,
+        added: rows,
+        retired: Vec::new(),
+    }
+}
+
+/// `stow-admin index reconcile`: the published slices of one rustc the
+/// scheduler does not hold at their live generation, reported in full.
+/// Every slice read is signature-verified against the index workflow's
+/// identity, exactly as the export reads them.
+async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::error::Result<()> {
+    let rustc_version = WireRustcVersion::parse(args.rustc_version.clone())
+        .map_err(|error| stow_error!("--rustc-version: {error}"))?;
+    let base = registry_base()?;
+    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
+    let repository = cache_repository(&rustc_version);
+    let session = base.session(&repository, &http);
+    let trust = stow_oci::verify::records_trust().await?;
+    let tags = session
+        .list_tags()
+        .await
+        .map_err(|error| stow_error!("list registry tags: {error}"))?;
+    let ctx = PullContext {
+        session,
+        repository,
+        trust,
+    };
+    let status: stow_types::api::AdminStatus = edge.get_json("/api/v1/admin/status").await?;
+    let reported: BTreeMap<(TargetTriple, WireRustcVersion), i64> = status
+        .index_slices
+        .into_iter()
+        .map(|slice| ((slice.target, slice.rustc_version), slice.generation))
+        .collect();
+    let mut indexes = Vec::new();
+    for tag in &tags {
+        let Some((target, tag_rustc)) = index_tag_parts(tag) else {
+            continue;
+        };
+        if WireRustcVersion::parse(tag_rustc).map_or(true, |tag_rustc| tag_rustc != rustc_version) {
+            continue;
+        }
+        let target = TargetTriple::parse(target)
+            .map_err(|error| stow_error!("index tag {tag} target: {error}"))?;
+        let index = ctx
+            .live_index(&target, &rustc_version)
+            .await?
+            .ok_or_else(|| stow_error!("index tag {tag} listed but its manifest does not exist"))?;
+        indexes.push(index);
+    }
+    let report = unreported_slices(indexes, &reported)?;
+    tracing::info!(
+        slices = report.slices.len(),
+        "published slices the scheduler does not hold at their live generation"
+    );
+    if !report.slices.is_empty() {
+        edge.post_json::<_, serde_json::Value>("/api/v1/admin/index/published", &report)
+            .await
+            .map_err(|error| error.wrap_err("reconcile slice report"))?;
+    }
+    let line = serde_json::to_string(&IndexReconcileSummary {
+        reported: report.slices.len(),
+    })
+    .map_err(|error| stow_error!("serialize index reconcile summary: {error}"))?;
+    render::emit_line(&line);
+    Ok(())
+}
+
+/// The full report of every published slice the scheduler does not hold
+/// at the slice's live generation.
+fn unreported_slices(
+    indexes: Vec<ArtifactIndex>,
+    reported: &BTreeMap<(TargetTriple, WireRustcVersion), i64>,
+) -> stow_types::error::Result<stow_types::api::PublishedRunReport> {
+    let mut slices = Vec::new();
+    for index in indexes {
+        let key = (
+            index.header.target.clone(),
+            index.header.rustc_version.clone(),
+        );
+        if reported.get(&key) != Some(&index.header.generation) {
+            let rows = semantic_rows(&index)?;
+            slices.push(full_slice(index, rows));
+        }
+    }
+    Ok(stow_types::api::PublishedRunReport { slices })
+}
+
+/// The JSON line `index reconcile` prints on stdout.
+#[derive(Debug, serde::Serialize)]
+struct IndexReconcileSummary {
+    /// Slices the reconcile report carried.
+    reported: usize,
 }
 
 /// The registry base the anonymous bundle pulls go through —
@@ -2177,6 +2310,75 @@ mod tests {
         .expect_err("a non-conflict refusal is an error");
         let requests = server.join().await;
         assert_eq!(requests.len(), 1, "no resync follows a non-409 refusal");
+    }
+
+    /// stow#1049: a publish that died between the index and folded
+    /// tags leaves an index with no folded companion. The next export
+    /// extends it with an empty folded set — every record refolds onto
+    /// the published rows — instead of refusing the state.
+    #[test]
+    fn an_index_without_its_folded_companion_is_extended() {
+        let rustc = WireRustcVersion::parse(RUSTC).expect("rustc");
+        let published = record("aaaa1111");
+        let new = record("bbbb2222");
+        let prev = prev_index(vec![record_to_index_row(&published)], 4);
+        let tags = vec![
+            index_tag(TARGET, RUSTC),
+            records_tag(RUSTC, "aaaa1111", BUILD),
+            records_tag(RUSTC, "bbbb2222", BUILD),
+        ];
+        let by_tag = BTreeMap::from([
+            (tags[1].clone(), vec![published]),
+            (tags[2].clone(), vec![new]),
+        ]);
+        let pass = block_on(export_pass(
+            &tags,
+            pull_only_prev(prev, BTreeSet::new()),
+            pull_records_by_tag(by_tag),
+            false,
+            &rustc,
+        ))
+        .expect("the orphaned index is extended");
+        assert_eq!(pass.pulled, 2, "an empty folded set refolds every record");
+        let slice = target_slice(&pass);
+        assert_eq!(slice.index.header.generation, 5);
+        assert_eq!(slice.index.rows.len(), 2);
+        assert_eq!(slice.folded.len(), 2, "the next publish writes the pair");
+    }
+
+    /// stow#1049: a report that failed after its slices went live is
+    /// retried by the next run — every published slice the scheduler
+    /// does not hold at its live generation is reported in full, and a
+    /// slice it holds is left alone.
+    #[test]
+    fn the_reconcile_reports_only_what_the_scheduler_lacks() {
+        let index = prev_index(vec![record_to_index_row(&record("aaaa1111"))], 3);
+        let key = (
+            index.header.target.clone(),
+            index.header.rustc_version.clone(),
+        );
+        let none = BTreeMap::new();
+        let report = unreported_slices(vec![index.clone()], &none).expect("a never-reported slice");
+        assert_eq!(report.slices.len(), 1);
+        let slice = &report.slices[0];
+        assert_eq!((slice.base_generation, slice.generation), (None, 3));
+        assert_eq!(slice.added.len(), 1);
+        let stale = BTreeMap::from([(key.clone(), 2)]);
+        assert_eq!(
+            unreported_slices(vec![index.clone()], &stale)
+                .expect("a stale slice")
+                .slices
+                .len(),
+            1
+        );
+        let current = BTreeMap::from([(key, 3)]);
+        assert_eq!(
+            unreported_slices(vec![index], &current)
+                .expect("a current slice")
+                .slices
+                .len(),
+            0
+        );
     }
 
     /// The join resolves a leaderboard digest to its crate identity

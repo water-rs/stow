@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 
 use super::index::hash_of;
 use super::node::{Extra, Flags, NO_STATE, Node, State, Status};
-use super::{AttemptOutcome, FeedSession, Graph, IdKey, RequestRecord};
+use super::{AttemptOutcome, FeedSession, Graph, IdKey, Published, RequestRecord, SliceId};
 use crate::errors::QueueError;
 
 /// The payload text one row carries, about: a range's row closes once
@@ -65,10 +65,10 @@ const NODES_RANGE: u32 = 8_192;
 /// Edges per `edges` range: five fixed bytes an edge, 640 KB a range.
 const EDGES_RANGE: u32 = 131_072;
 
-/// Published-mask buckets: the dense table — 17 fixed bytes an entry —
+/// Published-mask buckets: the dense table — 19 fixed bytes an entry —
 /// sized so a bucket rewrite stays one row at the largest graph the
 /// 128 MiB object holds (#878 measured ~345k nodes at 480k rows): an
-/// all-published graph is 345k x 17 B / 16 = ~367 KB a bucket, ~47% of
+/// all-published graph is 345k x 19 B / 16 = ~410 KB a bucket, ~52% of
 /// the ~786 KB binary row bound, still one row at twice that size.
 const PUBLISHED_BUCKETS: u32 = 16;
 
@@ -261,6 +261,9 @@ struct SnapshotHead {
     /// the first `set`, when the deploy bindings apply.
     dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
     external_runs: Vec<(u64, u8)>,
+    /// The generation of the index each reported slice last applied,
+    /// by target and rustc id.
+    slice_generations: Vec<(SliceId, i64)>,
     human_budget: (i64, i64),
     freeze_history: std::collections::VecDeque<stow_types::api::DispatchFreezeTransition>,
     /// Feed sessions without their staged pages — those ride the
@@ -518,7 +521,7 @@ fn decode_raw(
 /// encoder's creation, bounded by the bucket's own size (the graph is
 /// never copied whole).
 enum SpanItem {
-    Published(IdKey, u8),
+    Published(IdKey, Published),
     Requests(String, RequestRecord),
     Feed(String, usize, Vec<stow_types::api::SchedulerDemandEntry>),
     Batches(String, (String, i64)),
@@ -583,9 +586,11 @@ impl SpanEncoder {
             }
             ChunkKind::Published => {
                 writer.fill_raw(self.items[at..].iter(), |buf, item| match item {
-                    SpanItem::Published(key, mask) => {
+                    SpanItem::Published(key, entry) => {
                         buf.extend_from_slice(key);
-                        buf.push(*mask);
+                        buf.push(entry.mask);
+                        buf.push(entry.slice.0);
+                        buf.push(entry.slice.1);
                         Ok(())
                     }
                     _ => unreachable!("a published span holds published items"),
@@ -753,7 +758,7 @@ impl Graph {
                     .published
                     .iter()
                     .filter(|(key, _)| published_bucket(key) == bucket)
-                    .map(|(&key, &mask)| SpanItem::Published(key, mask))
+                    .map(|(&key, &entry)| SpanItem::Published(key, entry))
                     .collect();
                 items.sort_by_key(|item| match item {
                     SpanItem::Published(key, _) => *key,
@@ -819,6 +824,11 @@ impl Graph {
             freeze: self.freeze.clone(),
             dispatch_cap: self.dispatch_cap.clone(),
             external_runs: self.external_runs.iter().map(|(&k, &v)| (k, v)).collect(),
+            slice_generations: self
+                .slice_generations
+                .iter()
+                .map(|(&slice, &generation)| (slice, generation))
+                .collect(),
             human_budget: self.human_budget,
             freeze_history: self.freeze_history.clone(),
             feed_sessions: self
@@ -913,7 +923,9 @@ impl SnapshotLoader {
             ChunkKind::Published => decode_raw(kind, payload, |bytes| {
                 let key: IdKey = bytes.take()?;
                 let mask = bytes.u8()?;
-                graph.published.insert(key, mask);
+                let slice = (bytes.u8()?, bytes.u8()?);
+                graph.published.insert(key, Published { mask, slice });
+                graph.slice_members.entry(slice).or_default().insert(key);
                 Ok(())
             }),
             ChunkKind::Outcomes => decode_items(kind, payload, |outcome: AttemptOutcome| {
@@ -1032,6 +1044,7 @@ impl SnapshotLoader {
         graph.freeze = head.freeze;
         graph.dispatch_cap = head.dispatch_cap;
         graph.external_runs = head.external_runs.into_iter().collect();
+        graph.slice_generations = head.slice_generations.into_iter().collect();
         graph.human_budget = head.human_budget;
         graph.freeze_history = head.freeze_history;
         graph.feed_sessions = head.feed_sessions;

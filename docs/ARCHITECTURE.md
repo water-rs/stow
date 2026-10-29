@@ -428,6 +428,9 @@ folded set covers, all from GHCR with no edge round-trip — and emits an
 empty generation-1 slice for every `CI_TARGET_TRIPLES` member that got
 no rows and has no published pair, so a `--target` consumer always
 finds the tag —
+a slice whose publish died between its `index` and `folded` tags is
+extended with an empty folded set, so the pass refolds every record onto
+its rows;
 then loops the pass's `slices.json` for `stow-admin index publish`,
 which pushes the `index` plus `folded` pair and signs both. Because the header's
 `generated_at` makes every
@@ -440,6 +443,14 @@ never churns the tag. Pushed indexes are cosign-signed keyless under
 `index-publish.yml@refs/heads/main`
 (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), the same
 Fulcio chain the CLI verifies for artifact bundles.
+
+The scheduler holds each reported slice's generation. A delta report
+applies only on top of exactly that generation and publishes the next
+one, else the route answers 409 and `index report` resends the slice in
+full; a full report replaces the slice's set and restarts the sequence.
+A run whose report failed fails, and the next run's `index reconcile`
+(which reads the generations from `GET /api/v1/admin/status`) reports
+every published slice the scheduler does not hold before its own delta.
 
 Every publish leaves superseded manifests in the package — an index
 republish untags the previous manifest, a rebuilt task's older
