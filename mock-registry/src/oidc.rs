@@ -32,9 +32,8 @@ const REPOSITORY: &str = "water-rs/stow";
 /// edge requires.
 const AUDIENCE: &str = "https://stow.waterui.dev";
 
-/// SHA-256's DER `DigestInfo` prefix — PKCS#1 v1.5 framing done by hand,
-/// as the edge's verifier does, because `rsa` 0.9 and `sha2` 0.11 do not
-/// share a `digest` version.
+/// SHA-256's DER `DigestInfo` prefix — PKCS#1 v1.5 framing done by hand
+/// because `rsa` 0.9 and `sha2` 0.11 do not share a `digest` version.
 const SHA256_DIGEST_INFO_PREFIX: [u8; 19] = [
     0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
     0x00, 0x04, 0x20,

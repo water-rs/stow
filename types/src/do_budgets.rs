@@ -729,8 +729,12 @@ pub const WORKER_CPU_BUDGETS: &[WorkerCpuBudget] = &[
         relative_cpu: 0.15,
     },
     WorkerCpuBudget {
-        // Counters and the pending-age index (stow#932).
-        // Run 40637518261: 0.116 (2.74 ms of 23.7 ms).
+        // Counters and the pending-age index (stow#932). The lane is
+        // authenticated by an OIDC token, so its CPU includes the
+        // signature check: 0.116 before OIDC (run 40637518261), 0.2547
+        // with the check in wasm big-integer code (release gate run
+        // 40907504842), now WebCrypto with the key imported once per
+        // `kid` (stow#1088).
         lane: "admin-status",
         relative_cpu: 0.25,
     },
