@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/water-rs/stow/compare/stow-types-v0.9.2...stow-types-v0.10.0) - 2026-10-29
+
+### Added
+
+- *(scheduler)* operators set the dispatch caps at runtime ([#1056](https://github.com/water-rs/stow/pull/1056))
+- *(cli)* key remote git units and extra codegen flags in the local cache ([#1043](https://github.com/water-rs/stow/pull/1043))
+
+### Fixed
+
+- *(index)* recover index publish and report from partial failure ([#1069](https://github.com/water-rs/stow/pull/1069))
+- *(cli)* key optimized check defaults, keep option order, recompute semantic candidate keys ([#1065](https://github.com/water-rs/stow/pull/1065))
+- *(ci)* read rustc outputs through no-follow handles bound to their digests ([#1064](https://github.com/water-rs/stow/pull/1064))
+- *(ci)* pack OUT_DIR through no-follow handles bound to capture digests ([#1062](https://github.com/water-rs/stow/pull/1062))
+- *(watchdog)* judge usage on the billing month and trip only what the cost needs ([#1055](https://github.com/water-rs/stow/pull/1055))
+
 ## [0.9.0](https://github.com/water-rs/stow/compare/stow-types-v0.8.2...stow-types-v0.9.0) - 2026-10-28
 
 ### Added
