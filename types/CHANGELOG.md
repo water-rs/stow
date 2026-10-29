@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/water-rs/stow/compare/stow-types-v0.10.0...stow-types-v0.11.0) - 2026-10-29
+
+### Added
+
+- *(bundle)* store each node as one zstd stream and repack published bundles in place ([#1080](https://github.com/water-rs/stow/pull/1080))
+
+### Fixed
+
+- *(scheduler)* send full slice reports in parts the scheduler stages and applies with the last ([#1082](https://github.com/water-rs/stow/pull/1082))
+
 ## [0.10.0](https://github.com/water-rs/stow/compare/stow-types-v0.9.2...stow-types-v0.10.0) - 2026-10-29
 
 ### Added
