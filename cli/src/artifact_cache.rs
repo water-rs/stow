@@ -118,11 +118,14 @@ impl LocalBuildArtifact {
 
 /// One digest identifying exactly which bytes a unit instance is: blake3
 /// under `stow.unit-instance.v1` over the unit's output files' sha256s —
-/// the set `artifact_cache_outputs` records for an entry — sorted, so the
-/// output ordering of a bundle manifest never perturbs it.
+/// the set `artifact_cache_outputs` records for an entry — sorted and
+/// deduplicated, so neither the output ordering of a bundle manifest nor a
+/// merged bundle's differently-named copy of the same bytes perturbs it
+/// (stow#1044).
 pub fn outputs_instance_digest<'a>(sha256s: impl IntoIterator<Item = &'a str>) -> String {
     let mut sha256s: Vec<&str> = sha256s.into_iter().collect();
     sha256s.sort_unstable();
+    sha256s.dedup();
     let mut hasher = blake3::Hasher::new_derive_key("stow.unit-instance.v1");
     for sha256 in &sha256s {
         hasher.update(sha256.as_bytes());
@@ -646,13 +649,13 @@ pub async fn store_downloaded_bundle(
     // second download of the same identity must not interleave temp dirs or
     // row writes.
     let mut write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
-    let entry_has_row = loop {
+    let existing = loop {
         let existing =
             load_artifact_cache_entry(&connection, &request.rustc_version, &cache_key).await?;
         // Local-first: a self-produced entry already serves this identity, so
         // a later remote bundle must not displace it.
         if !local_entry_covers(existing.as_ref(), &entry_dir)? {
-            break existing.is_some();
+            break existing;
         }
         // The reload goes through the normal read path, which needs the
         // shared lock — the exclusive lock has to be dropped first or the
@@ -666,10 +669,30 @@ pub async fn store_downloaded_bundle(
         write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
     };
 
+    // A remote row whose directory exists already serves this identity: a
+    // further bundle of the same compile key merges its original-named
+    // files and output rows into the entry instead of replacing the row —
+    // the replacement was what left the row naming files the directory
+    // never held (stow#1044).
+    if let Some(entry) = existing
+        && entry_dir.exists()
+    {
+        return merge_downloaded_bundle_into_entry(
+            config,
+            &connection,
+            &request,
+            &bundle,
+            &entry,
+            entry_dir,
+            write_lease,
+        )
+        .await;
+    }
+
     // A leftover entry dir with no row is a crashed writer's stage output:
     // it is not an entry, and must not be silently adopted by the row the
     // insert below is about to write.
-    if !entry_has_row && entry_dir.exists() {
+    if entry_dir.exists() {
         remove_orphaned_entry_dir(entry_dir.clone()).await?;
     }
 
@@ -766,6 +789,330 @@ fn cached_bundle_for_entry(
         verified_marker_policy: None,
         _lease_lock: lease_lock,
     }
+}
+
+/// Merge a further remote bundle of an already-cached compile key into the
+/// existing entry — the two index rows name the same bytes under different
+/// original file names (the builder's cargo hash), so the entry keeps its
+/// row and gains the incoming bundle's names instead of replacing them.
+/// The merge runs entirely under the caller's exclusive entry lock, so no
+/// state ever names a file the directory does not hold (stow#1044).
+async fn merge_downloaded_bundle_into_entry(
+    config: &StowConfig,
+    connection: &sqlx::SqlitePool,
+    request: &OwnedFetchRequest,
+    bundle: &ArtifactBundle,
+    entry: &ArtifactCacheEntryRow,
+    entry_dir: PathBuf,
+    write_lease: FileLock,
+) -> stow_types::error::Result<CachedArtifactBundle> {
+    let version_dir = config.artifact_cache_version_dir(&request.rustc_version);
+    let cache_key = cache_key_owned(request);
+    let recorded = load_artifact_outputs(connection, &request.rustc_version, &cache_key).await?;
+    let merge = tokio::task::spawn_blocking({
+        let entry_dir = entry_dir.clone();
+        let bundle = bundle.clone();
+        let entry_bundle = format!("{}@{}", entry.oci_reference, entry.oci_digest);
+        move || merge_bundle_entry_files_blocking(&entry_dir, &bundle, &recorded, &entry_bundle)
+    })
+    .await
+    .wrap_err("join store_downloaded_bundle merge task")??;
+    merge_artifact_cache_outputs(
+        connection,
+        &request.rustc_version,
+        &cache_key,
+        &merge.added_outputs,
+        merge.size_bytes,
+        now_millis(),
+    )
+    .await?;
+    drop(write_lease);
+    // Same post-store discipline as the fresh path: the shared lease before
+    // eviction, so the entry this call hands out cannot be deleted from
+    // under the caller.
+    let lease_lock = tokio::task::spawn_blocking({
+        let version_dir = version_dir.clone();
+        let cache_key = cache_key.clone();
+        move || acquire_entry_shared_lock(&version_dir, &cache_key)
+    })
+    .await
+    .wrap_err("join store_downloaded_bundle lock task")??;
+    evict_entries(
+        connection,
+        &request.rustc_version,
+        &version_dir,
+        &config.cc_cache_dir(),
+        config.artifact_cache_max_bytes,
+        &ProtectedEntry::Rustc(&cache_key),
+    )
+    .await?;
+    Ok(cached_bundle_for_entry(
+        bundle,
+        entry_dir,
+        request.rustc_version.clone(),
+        cache_key,
+        merge.size_bytes,
+        lease_lock,
+    ))
+}
+
+/// What the blocking merge pass over an entry's `files/` produced: the
+/// incoming bundle's newly-recorded output names and the entry's size now
+/// on disk.
+struct BundleEntryMerge {
+    added_outputs: Vec<ArtifactBundleFile>,
+    size_bytes: u64,
+}
+
+/// Fail a merge whose bundle disagrees with the entry under one compile
+/// key — the error names both published bundles so the defect is traceable
+/// to the pair of OCI objects, never resolved by a silent pick (stow#1044).
+fn bundle_identity_conflict(
+    entry_bundle: &str,
+    bundle: &ArtifactBundle,
+    detail: &str,
+) -> stow_types::error::Error {
+    stow_types::stow_error!(
+        "bundle {}@{} conflicts with cache entry {entry_bundle} under one compile key: {detail}",
+        bundle.manifest.oci_reference,
+        bundle.manifest.oci_digest,
+    )
+}
+
+/// Check every incoming output against the entry's recorded ones — a
+/// different digest under one compile key is an identity defect. Returns
+/// the recorded outputs by name.
+fn validate_incoming_outputs<'a>(
+    bundle: &ArtifactBundle,
+    recorded: &'a [ArtifactBundleFile],
+    entry_bundle: &str,
+) -> stow_types::error::Result<BTreeMap<&'a str, &'a ArtifactBundleFile>> {
+    let recorded_by_name: BTreeMap<&str, &ArtifactBundleFile> = recorded
+        .iter()
+        .map(|file| (file.file_name.as_str(), file))
+        .collect();
+    let recorded_digests: BTreeSet<&str> =
+        recorded.iter().map(|file| file.sha256.as_str()).collect();
+    let incoming = &bundle.manifest.config.outputs;
+    for output in incoming {
+        match recorded_by_name.get(output.file_name.as_str()) {
+            Some(existing) if existing.sha256 == output.sha256 => {}
+            Some(existing) => {
+                return Err(bundle_identity_conflict(
+                    entry_bundle,
+                    bundle,
+                    &format!(
+                        "output {} carries sha256 {}, the entry records it as {}",
+                        output.file_name, output.sha256, existing.sha256
+                    ),
+                ));
+            }
+            None if !recorded_digests.contains(output.sha256.as_str()) => {
+                return Err(bundle_identity_conflict(
+                    entry_bundle,
+                    bundle,
+                    &format!(
+                        "output {} carries sha256 {} the entry does not record",
+                        output.file_name, output.sha256
+                    ),
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(recorded_by_name)
+}
+
+/// The sha256 of every file an entry's `files/` holds, by name. A crashed
+/// merge's temp files are swept in the same pass.
+fn scan_entry_files(files_dir: &Path) -> stow_types::error::Result<BTreeMap<String, String>> {
+    let mut on_disk: BTreeMap<String, String> = BTreeMap::new();
+    if files_dir.exists() {
+        for dir_entry in std::fs::read_dir(files_dir)
+            .wrap_err_with(|| format!("read cache entry files dir {}", files_dir.display()))?
+        {
+            let dir_entry = dir_entry?;
+            if !dir_entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = dir_entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".merge-") {
+                std::fs::remove_file(dir_entry.path()).wrap_err_with(|| {
+                    format!(
+                        "remove stale merge temp file {}",
+                        dir_entry.path().display()
+                    )
+                })?;
+                continue;
+            }
+            let (sha256, _) = sha256_file_bytes(&dir_entry.path())?;
+            on_disk.insert(name, sha256);
+        }
+    }
+    Ok(on_disk)
+}
+
+/// The file half of a merge: validate the incoming bundle's digests against
+/// the entry's recorded outputs — a different digest under one compile key
+/// is an identity defect and fails with both bundles named — then write
+/// every recorded- or incoming-named file the directory lacks from an
+/// equal-digest source: another file the entry already holds, or this
+/// bundle's own verified bytes. Each write lands through a temp file and
+/// rename inside `files/`, so a reader never sees a partial file.
+fn merge_bundle_entry_files_blocking(
+    entry_dir: &Path,
+    bundle: &ArtifactBundle,
+    recorded: &[ArtifactBundleFile],
+    entry_bundle: &str,
+) -> stow_types::error::Result<BundleEntryMerge> {
+    let recorded_by_name = validate_incoming_outputs(bundle, recorded, entry_bundle)?;
+    let incoming = &bundle.manifest.config.outputs;
+
+    // Hash every file the entry holds once: the merge's copy sources and
+    // the proof a needed file is already there. A crashed merge's temp
+    // files are swept in the same pass.
+    let files_dir = entry_dir.join("files");
+    let on_disk = scan_entry_files(&files_dir)?;
+    let mut by_digest: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for (name, sha256) in &on_disk {
+        by_digest
+            .entry(sha256.clone())
+            .or_insert_with(|| files_dir.join(name));
+    }
+
+    // Everything the row and the incoming bundle name must exist on disk —
+    // recorded names missing or holding different bytes are repaired here
+    // the same way new incoming names are written (stow#1044).
+    let mut needed: BTreeMap<&str, &str> = BTreeMap::new();
+    for file in recorded {
+        needed.insert(file.file_name.as_str(), file.sha256.as_str());
+    }
+    for file in incoming {
+        needed.insert(file.file_name.as_str(), file.sha256.as_str());
+    }
+    let incoming_by_digest: BTreeMap<&str, &ArtifactBundleFile> = incoming
+        .iter()
+        .map(|file| (file.sha256.as_str(), file))
+        .collect();
+    let mut counter = 0u32;
+    for (name, sha256) in &needed {
+        if on_disk.get(*name) == Some(&(*sha256).to_owned()) {
+            continue;
+        }
+        let temp = files_dir.join(format!(".merge-{}-{counter}-{name}", std::process::id()));
+        counter += 1;
+        if let Some(source) = by_digest.get(*sha256) {
+            reflink_copy::reflink_or_copy(source, &temp).wrap_err_with(|| {
+                format!(
+                    "clone equal-digest cache file {} into {}",
+                    source.display(),
+                    temp.display()
+                )
+            })?;
+        } else if let Some(output) = incoming_by_digest.get(sha256) {
+            let contents = bundle
+                .files
+                .get(&bundle_file_path(&output.file_name))
+                .ok_or_else(|| {
+                    stow_types::stow_error!(
+                        "bundle {}@{} is missing its output file {}",
+                        bundle.manifest.oci_reference,
+                        bundle.manifest.oci_digest,
+                        output.file_name
+                    )
+                })?;
+            let decoded = decode_bundle_output_bytes(output, contents)?;
+            std::fs::write(&temp, &decoded)
+                .wrap_err_with(|| format!("write merged cache file {}", temp.display()))?;
+        } else {
+            return Err(bundle_identity_conflict(
+                entry_bundle,
+                bundle,
+                &format!(
+                    "file {name} with sha256 {sha256} has no equal-digest source in the entry or the bundle"
+                ),
+            ));
+        }
+        std::fs::rename(&temp, files_dir.join(name))
+            .wrap_err_with(|| format!("move merged cache file {} into place", temp.display()))?;
+        by_digest.insert((*sha256).to_owned(), files_dir.join(name));
+    }
+
+    let added_outputs = incoming
+        .iter()
+        .filter(|output| !recorded_by_name.contains_key(output.file_name.as_str()))
+        .cloned()
+        .collect();
+    Ok(BundleEntryMerge {
+        added_outputs,
+        size_bytes: directory_size(entry_dir)?,
+    })
+}
+
+/// Append a merge's newly-named outputs to an existing entry and refresh
+/// its size and LRU stamp — an update of the same row, never the
+/// INSERT OR REPLACE that cascaded the recorded output names away
+/// (stow#1044). The whole append commits atomically, so the database never
+/// names a file the merge did not already write.
+async fn merge_artifact_cache_outputs(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    cache_key: &str,
+    added_outputs: &[ArtifactBundleFile],
+    size_bytes: u64,
+    last_accessed_ms: u64,
+) -> stow_types::error::Result<()> {
+    let mut transaction = connection.begin().await?;
+    let mut ordinal = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(ordinal) + 1 \
+         FROM artifact_cache_outputs \
+         WHERE rustc_version = ? AND cache_key = ?",
+    )
+    .bind(rustc_version)
+    .bind(cache_key)
+    .fetch_one(&mut *transaction)
+    .await?
+    .unwrap_or(0);
+    for file in added_outputs {
+        sqlx::query(
+            "INSERT INTO artifact_cache_outputs \
+             (rustc_version, cache_key, ordinal, file_name, media_type, sha256) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(rustc_version)
+        .bind(cache_key)
+        .bind(ordinal)
+        .bind(&file.file_name)
+        .bind(&file.media_type)
+        .bind(&file.sha256)
+        .execute(&mut *transaction)
+        .await?;
+        ordinal += 1;
+    }
+    let updated = sqlx::query(
+        "UPDATE artifact_cache_entries \
+         SET size_bytes = ?, last_accessed_ms = ? \
+         WHERE rustc_version = ? AND cache_key = ?",
+    )
+    .bind(db_int::<_, i64>(
+        size_bytes,
+        "artifact cache entry size_bytes",
+    )?)
+    .bind(db_int::<_, i64>(
+        last_accessed_ms,
+        "artifact cache entry last_accessed_ms",
+    )?)
+    .bind(rustc_version)
+    .bind(cache_key)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(stow_types::stow_error!(
+            "artifact cache entry {cache_key} for rustc {rustc_version} is missing from the state database"
+        ));
+    }
+    transaction.commit().await?;
+    Ok(())
 }
 
 /// Cache the outputs of a successful rustc passthrough build under the same
@@ -3543,10 +3890,10 @@ pub mod tests {
     use stow_types::rustc::ParsedExternCrate;
 
     use super::{
-        STAGING_DIR, cache_key, join_relative_path, list_artifact_cache_entries,
-        load_bundle_entry_dir, load_semantic_cached_bundle, prepare_local_cache,
-        prepare_local_cache_blocking, store_bundle_entry_dir, touch_artifact_cache_entry,
-        write_downloaded_bundle_to_entry,
+        CachedArtifactBundle, STAGING_DIR, cache_key, join_relative_path,
+        list_artifact_cache_entries, load_bundle_entry_dir, load_semantic_cached_bundle,
+        prepare_local_cache, prepare_local_cache_blocking, store_bundle_entry_dir,
+        touch_artifact_cache_entry, write_downloaded_bundle_to_entry,
     };
     use crate::config::{StowConfig, VerifyMode};
     use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path};
@@ -3901,6 +4248,139 @@ pub mod tests {
                 entry_dir
                     .join("files/libdemo-0123456789abcdef.rlib")
                     .exists()
+            );
+        });
+    }
+
+    /// A second published bundle of the sample unit: the same bytes under
+    /// another original file name (the builder's cargo hash) and another
+    /// OCI digest — the shape two index rows of one compile key carry
+    /// (stow#1044).
+    fn renamed_sample_bundle(
+        source: &ArtifactBundle,
+        file_name: &str,
+        oci_digest: &str,
+    ) -> ArtifactBundle {
+        let mut bundle = source.clone();
+        let old_name = bundle.manifest.config.outputs[0].file_name.clone();
+        let contents = bundle
+            .files
+            .remove(&bundle_file_path(&old_name))
+            .expect("sample output file");
+        bundle.files.insert(bundle_file_path(file_name), contents);
+        bundle.manifest.config.outputs[0].file_name = file_name.to_owned();
+        bundle.manifest.oci_digest = oci_digest.to_owned();
+        bundle
+    }
+
+    fn assert_entry_serves_names(
+        loaded: &CachedArtifactBundle,
+        expected: &[&str],
+        expected_bytes: &[u8],
+    ) {
+        let names: BTreeSet<&str> = loaded
+            .outputs
+            .iter()
+            .map(|file| file.file_name.as_str())
+            .collect();
+        assert_eq!(names, expected.iter().copied().collect::<BTreeSet<_>>());
+        for name in expected {
+            let path = loaded.entry_dir.join("files").join(name);
+            assert_eq!(
+                std::fs::read(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "row names {name} but {} is unreadable: {error}",
+                        path.display()
+                    )
+                }),
+                expected_bytes,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_bundles_of_one_compile_key_merge_in_either_order() {
+        let first = sample_bundle("aabbccddeeff0011", "libdemo-d294755568193717.rmeta");
+        let second =
+            renamed_sample_bundle(&first, "libdemo-d889e926a647c184.rmeta", "sha256:second");
+        for (a, b) in [(&first, &second), (&second, &first)] {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let config = test_config(tempdir.path());
+            let request = fetch_request("aabbccddeeff0011");
+            run_async(async {
+                prepare_local_cache(&config, "1.91.1")
+                    .await
+                    .expect("prepare cache");
+                drop(
+                    super::store_downloaded_bundle(&config, &request, a)
+                        .await
+                        .expect("store first bundle"),
+                );
+                drop(
+                    super::store_downloaded_bundle(&config, &request, b)
+                        .await
+                        .expect("store second bundle"),
+                );
+                // A repeat of an already-merged bundle changes nothing.
+                drop(
+                    super::store_downloaded_bundle(&config, &request, b)
+                        .await
+                        .expect("store second bundle again"),
+                );
+                let loaded = super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("load bundle")
+                    .expect("cached bundle");
+                // The row keeps its first bundle's identity and gains the
+                // second bundle's names; every name is on disk.
+                assert_eq!(loaded.oci_digest, a.manifest.oci_digest);
+                assert_entry_serves_names(
+                    &loaded,
+                    &[
+                        "libdemo-d294755568193717.rmeta",
+                        "libdemo-d889e926a647c184.rmeta",
+                    ],
+                    b"demo-artifact",
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_bundle_whose_digests_differ_under_one_compile_key_fails_naming_both() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let request = fetch_request("aabbccddeeff0011");
+        let first = sample_bundle("aabbccddeeff0011", "libdemo-d294755568193717.rmeta");
+        let mut second =
+            renamed_sample_bundle(&first, "libdemo-d889e926a647c184.rmeta", "sha256:second");
+        second.manifest.config.outputs[0].sha256 = hex::encode(sha2::Sha256::digest(b"other"));
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            drop(
+                super::store_downloaded_bundle(&config, &request, &first)
+                    .await
+                    .expect("store first bundle"),
+            );
+            let error = super::store_downloaded_bundle(&config, &request, &second)
+                .await
+                .map(drop)
+                .expect_err("a different digest under one compile key is an identity defect")
+                .to_string();
+            assert!(error.contains("sha256:second"), "{error}");
+            assert!(error.contains("sha256:test"), "{error}");
+            // The entry is untouched.
+            let loaded = super::load_cached_bundle(&config, &request)
+                .await
+                .expect("load bundle")
+                .expect("cached bundle");
+            assert_entry_serves_names(
+                &loaded,
+                &["libdemo-d294755568193717.rmeta"],
+                b"demo-artifact",
             );
         });
     }

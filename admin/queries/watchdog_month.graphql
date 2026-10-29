@@ -1,0 +1,15 @@
+query StowWatchdogMonthDay($accountTag: String!, $scriptName: String!, $since: Time!, $until: Time!) {
+  viewer {
+    accounts(filter: {accountTag: $accountTag}) {
+      doPeriodic: durableObjectsPeriodicGroups(filter: {datetime_geq: $since, datetime_lt: $until}, limit: 100) {
+        sum { duration rowsRead rowsWritten }
+      }
+      doInvoke: durableObjectsInvocationsAdaptiveGroups(filter: {datetime_geq: $since, datetime_lt: $until}, limit: 100) {
+        sum { requests }
+      }
+      worker: workersInvocationsAdaptive(filter: {datetime_geq: $since, datetime_lt: $until, scriptName: $scriptName}, limit: 100) {
+        sum { cpuTimeUs requests }
+      }
+    }
+  }
+}

@@ -892,7 +892,10 @@ bundle bytes keep serving; and `stow maintenance: all` blocks the
 whole hostname. `stow-admin maintenance on --scope anonymous` (run by
 `operations.yml`, which holds the Cloudflare token) flips the
 rule's `enabled` flag through the Rulesets API; the watchdog (#450)
-trips by enabling `anonymous`. Blocked requests are answered in the
+trips by enabling the scope its breach costs — `lanes` for the
+scheduler Durable Object's billed dimensions and the build-pipeline
+signals, `anonymous` for the Worker's — and the widest when several
+breach. Blocked requests are answered in the
 security phase — they never invoke the Worker and never reach the
 Durable Object, so the shed costs nothing and a broken edge cannot
 silence the breaker. The trusted prefixes and the GitHub webhook route
@@ -945,8 +948,8 @@ freeze state and transition log off the admin route every 15 minutes,
 writes and closes the issue, and posts the hourly still-frozen digest —
 the edge's `stow-ci` App token carries no `issues` grant by design (the
 edge is untrusted serving infrastructure). Account-wide cost and
-edge-health signals (request error rate, exceeded CPU/memory, usage
-percentages) are the watchdog's too — the GraphQL Analytics API is only
+edge-health signals (request error rate, exceeded CPU/memory, billed
+usage over the current UTC month against the 80% line) are the watchdog's too — the GraphQL Analytics API is only
 read from Actions, never from the edge.
 
 Which builds failed is a third channel neither of those owns: the
