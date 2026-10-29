@@ -8,9 +8,7 @@ use stow_types::capture::{
     CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind,
 };
 use stow_types::error::Context;
-use stow_types::public_cache::{
-    StableRegistryArtifactIdentity, stable_registry_artifact_identity_for_package,
-};
+use stow_types::public_cache::{StableUnitIdentity, stable_unit_identity_for_package};
 use stow_types::rustc::ParsedRustcArgs;
 
 pub use stow_shim::CAPTURE_DIR_ENV as STOW_BUILD_CAPTURE_DIR_ENV;
@@ -258,7 +256,7 @@ async fn rustc_output(
 async fn record_compiled_capture(
     original_parsed: &ParsedRustcArgs,
     effective_parsed: Option<ParsedRustcArgs>,
-    stable_identity: Option<&StableRegistryArtifactIdentity>,
+    stable_identity: Option<&StableUnitIdentity>,
     host: &str,
     capture_dir: &std::path::Path,
     started: Instant,
@@ -436,7 +434,7 @@ fn elapsed_millis(started: Instant) -> u64 {
 async fn serve_consumed_artifact(
     original_parsed: &ParsedRustcArgs,
     rewritten_parsed: &ParsedRustcArgs,
-    stable_identity: &StableRegistryArtifactIdentity,
+    stable_identity: &StableUnitIdentity,
     effective_target: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<Option<CapturedRustcArtifact>> {
@@ -515,7 +513,7 @@ async fn consumed_capture_record(
     original_parsed: &ParsedRustcArgs,
     rewritten_parsed: &ParsedRustcArgs,
     original_alias_source: Option<&ParsedRustcArgs>,
-    stable_identity: &StableRegistryArtifactIdentity,
+    stable_identity: &StableUnitIdentity,
     effective_target: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
@@ -681,7 +679,7 @@ async fn prepare_stable_rustc_invocation(
 ) -> stow_types::error::Result<(
     Vec<std::ffi::OsString>,
     Option<ParsedRustcArgs>,
-    Option<StableRegistryArtifactIdentity>,
+    Option<StableUnitIdentity>,
     String,
 )> {
     let toolchain = detect_rustc_toolchain(rustc).await?;
@@ -730,7 +728,7 @@ async fn prepare_stable_rustc_invocation(
             original_parsed.input_path,
         ));
     };
-    let identity = stable_registry_artifact_identity_for_package(
+    let identity = stable_unit_identity_for_package(
         original_parsed,
         &package_name,
         &package_version,
@@ -874,7 +872,7 @@ fn rewrite_codegen_identity_args(
 async fn materialize_original_output_aliases(
     original_parsed: &ParsedRustcArgs,
     rewritten_parsed: &ParsedRustcArgs,
-    identity: &StableRegistryArtifactIdentity,
+    identity: &StableUnitIdentity,
     host: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<()> {
@@ -1665,7 +1663,7 @@ mod tests {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
-            has_custom_codegen: false,
+            extra_codegen: std::collections::BTreeSet::new(),
             link_options: std::collections::BTreeSet::new(),
         }
     }
@@ -1878,7 +1876,7 @@ mod tests {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
-            has_custom_codegen: false,
+            extra_codegen: std::collections::BTreeSet::new(),
             link_options: std::collections::BTreeSet::new(),
         }
     }
@@ -2208,16 +2206,20 @@ mod tests {
         // The identity a record registers under is the dependency-side one
         // every real dependent computes — the value a client lookup keys
         // on — not cargo's ephemeral `-C metadata` for the unit.
-        let via_path = stow_types::public_cache::stable_registry_artifact_identity(
+        let via_path = stow_types::public_cache::stable_unit_identity(
             &parsed,
+            &stow_types::public_cache::UnitSource::CratesIo {
+                package: "itoa".to_owned(),
+                version: "1.0.15".to_owned(),
+            },
+            stow_types::public_cache::Reach::Public,
             "aarch64-apple-darwin",
             "1.91.1",
             "[]",
             "[]",
         )
-        .expect("stable identity")
-        .expect("registry path detected");
-        let via_package = stow_types::public_cache::stable_registry_artifact_identity_for_package(
+        .expect("stable identity");
+        let via_package = stow_types::public_cache::stable_unit_identity_for_package(
             &parsed,
             "itoa",
             "1.0.15",

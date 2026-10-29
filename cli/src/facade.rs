@@ -234,6 +234,7 @@ fn run_uncovered(
             executable,
             wrapped_args,
             None,
+            crate::supervisor::protocol::InvocationEnv::current(),
         )),
     )
     .map_err(|error| stow_types::stow_error!("{error}"))?;
@@ -249,6 +250,7 @@ fn run_uncovered(
             executable,
             wrapped_args,
             Some(success),
+            crate::supervisor::protocol::InvocationEnv::current(),
         )),
     )
     .map_err(|error| stow_types::stow_error!("{error}"))?;

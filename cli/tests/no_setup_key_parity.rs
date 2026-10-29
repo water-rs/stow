@@ -11,7 +11,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use stow_types::public_cache::stable_registry_artifact_identity_for_package;
+use stow_types::public_cache::stable_unit_identity_for_package;
 use stow_types::rustc::ParsedRustcArgs;
 
 mod support;
@@ -119,7 +119,7 @@ fn rustc_argv_for(stderr: &str, crate_name: &str) -> Vec<OsString> {
 
 fn compile_key_of(argv: &[OsString]) -> String {
     let parsed = ParsedRustcArgs::parse(argv).expect("parse rustc argv");
-    stable_registry_artifact_identity_for_package(
+    stable_unit_identity_for_package(
         &parsed,
         PROBE_PACKAGE,
         PROBE_DEP_VERSION,
