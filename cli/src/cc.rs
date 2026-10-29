@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
@@ -526,36 +525,6 @@ pub fn cc_object_path(cc_dir: &Path, cache_key: &str) -> PathBuf {
     cc_dir.join(format!("{cache_key}.o"))
 }
 
-/// A `cc_cache_entries` row for the shared LRU: the object file's size
-/// and its last-access stamp.
-pub struct CcCacheIndexEntry {
-    pub size_bytes: u64,
-    pub last_accessed_ms: u64,
-}
-
-/// Every C/C++ object's row — the `cc/` half of the candidate list
-/// `evict_entries` orders.
-pub async fn list_cc_cache_entries(
-    connection: &sqlx::SqlitePool,
-) -> stow_types::error::Result<BTreeMap<String, CcCacheIndexEntry>> {
-    let rows = sqlx::query_as::<_, (String, i64, i64)>(
-        "SELECT cache_key, size_bytes, last_accessed_ms FROM cc_cache_entries",
-    )
-    .fetch_all(connection)
-    .await?;
-    let mut entries = BTreeMap::new();
-    for (cache_key, size_bytes, last_accessed_ms) in rows {
-        entries.insert(
-            cache_key,
-            CcCacheIndexEntry {
-                size_bytes: db_int(size_bytes, "cc cache entry size_bytes")?,
-                last_accessed_ms: db_int(last_accessed_ms, "cc cache entry last_accessed_ms")?,
-            },
-        );
-    }
-    Ok(entries)
-}
-
 /// Remove an object's row — `evict_entries` deletes the file itself.
 pub async fn delete_cc_cache_entry(
     connection: &sqlx::SqlitePool,
@@ -603,7 +572,7 @@ async fn record_cc_hit(
 /// object whose row never landed. The upsert stays one statement against
 /// a racing store of the same key: the content is identical, so the
 /// later writer's stamp wins.
-async fn upsert_cc_cache_entry(
+pub async fn upsert_cc_cache_entry(
     connection: &sqlx::SqlitePool,
     cache_key: &str,
     size_bytes: u64,
@@ -859,6 +828,16 @@ pub enum CcOutcome {
 
 #[cfg(test)]
 mod tests {
+    /// The cache keys of every `cc_cache_entries` row.
+    async fn list_cc_cache_keys(pool: &sqlx::SqlitePool) -> std::collections::BTreeSet<String> {
+        sqlx::query_scalar("SELECT cache_key FROM cc_cache_entries")
+            .fetch_all(pool)
+            .await
+            .expect("list cc cache entries")
+            .into_iter()
+            .collect()
+    }
+
     use std::ffi::OsString;
     use std::path::PathBuf;
     #[cfg(unix)]
@@ -1457,11 +1436,9 @@ mod tests {
         let pool = crate::state_db::connect(&config.cache_dir)
             .await
             .expect("connect state db");
-        let entries = super::list_cc_cache_entries(&pool)
-            .await
-            .expect("list cc cache entries");
+        let entries = list_cc_cache_keys(&pool).await;
         assert_eq!(
-            entries.keys().collect::<Vec<_>>(),
+            entries.iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["key-c"],
             "only the freshest object may survive the budget"
         );
@@ -1521,18 +1498,16 @@ mod tests {
             .await
             .expect("store third object");
 
-        let entries = super::list_cc_cache_entries(&pool)
-            .await
-            .expect("list cc cache entries");
+        let entries = list_cc_cache_keys(&pool).await;
         assert!(
-            entries.contains_key("first"),
+            entries.contains("first"),
             "the hit keeps first in the cache"
         );
         assert!(
-            !entries.contains_key("second"),
+            !entries.contains("second"),
             "the un-touched entry is evicted first"
         );
-        assert!(entries.contains_key("third"));
+        assert!(entries.contains("third"));
         assert!(first.exists());
         assert!(!second.exists());
         assert!(cc_dir.join("third.o").exists());
