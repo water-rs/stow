@@ -74,7 +74,17 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    same pass is how a schema change lands: it drops every table,
    index and trigger in the store and re-executes
    `edge/src/scheduler/schema.sql`; the queue and recorded slices are
-   destroyed and refill from the lanes that feed them. A stored record
+   destroyed. The same run then refills them, so no other step follows
+   the reset: once the reset succeeds, `operations.yml` runs
+   `stow-admin index published-rustcs`, which probes every stable
+   release `static.rust-lang.org/manifests.txt` lists for a published
+   `stow-cache-<rustc>` package through the registry's anonymous tag
+   listing, then dispatches `index-publish.yml` on `main` with
+   `report=true` for each rustc found (not `full`: a reset leaves the
+   slices in GHCR as they were) and `preheat-cron.yml` on `main` with
+   `refresh=true`, which submits the wave although the day's marker
+   exists. A failed probe, dispatch or an empty enumeration fails the
+   run, which the watchdog reports as `operations.failed`. A stored record
    whose shape changes — the dispatch freeze's manual trigger carries
    its `actor` — is part of that schema, so a deploy that changes one is
    followed by the reset.
@@ -229,7 +239,15 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    successful `preheat-admin.yml` run for 26 hours, set by
    `STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS`) and `pipeline.builds_stalled`
    (dispatchable tasks and a free slot, yet no `build-crate.yml` run
-   created for 2 hours, set by `STOW_WATCHDOG_BUILD_STALL_HOURS`).
+   created for 2 hours, set by `STOW_WATCHDOG_BUILD_STALL_HOURS`). Two
+   history signals alert as well: `operations.failed` (an
+   `operations.yml` run concluded `failure`, `timed_out` or
+   `startup_failure` since the previous watchdog
+   run, or within `STOW_WATCHDOG_OPERATIONS_WINDOW_HOURS`, 1 hour by
+   default; the incident names the run and its argv) and
+   `watchdog.gap` (the previous watchdog run started 45 minutes or more
+   ago, set by `STOW_WATCHDOG_RUN_GAP_HOURS`, so a missed periodic
+   dispatch is reported after the fact).
    `stow-admin watchdog clear` disables both scopes the
    watchdog can enable.
 

@@ -29,9 +29,12 @@ pub struct SchedulerArgs {
 pub enum SchedulerCommand {
     /// Reset the scheduler store: drop every table, index and trigger
     /// and re-execute `schema.sql`. This destroys the queue and every
-    /// recorded slice — they refill from the lanes that feed them —
-    /// so the command refuses to run without `--yes`. It is also how a
-    /// store that was never initialized gets its schema.
+    /// recorded slice, so the command refuses to run without `--yes`.
+    /// `operations.yml` refills both once the reset succeeds: it
+    /// dispatches `index-publish.yml` with `report=true` for every
+    /// published rustc and a forced `preheat-cron.yml` wave, and a
+    /// failed dispatch fails the run. It is also how a store that was
+    /// never initialized gets its schema.
     Reset {
         /// Confirm the destructive reset.
         #[arg(long)]
@@ -97,7 +100,8 @@ async fn reset(edge: &Edge, yes: bool, output: Output) -> stow_types::error::Res
         return Err(stow_types::error::Error::msg(
             "scheduler reset drops every table, index and trigger in the store \
              and recreates `schema.sql` — the queue and recorded slices are \
-             destroyed and refill from the lanes that feed them; re-run with --yes",
+             destroyed, and the operations run refills them once the reset \
+             succeeds; re-run with --yes",
         ));
     }
     let report: SchedulerResetReport = edge

@@ -624,7 +624,10 @@ case "$tool" in
     if [ -n "${STUB_STDOUT-}" ]; then printf '%s' "$STUB_STDOUT"; fi
     if [ -n "${STUB_FAIL_RE-}" ] && [[ "$*" =~ $STUB_FAIL_RE ]]; then exit 1; fi
     exit "${STUB_ADMIN_EXIT:-0}";;
-  gh|cargo|cosign|oras|docker)
+  gh)
+    if [ -n "${STUB_FAIL_RE-}" ] && [[ "$*" =~ $STUB_FAIL_RE ]]; then exit 1; fi
+    exit "${STUB_TOOL_EXIT:-0}";;
+  cargo|cosign|oras|docker)
     exit "${STUB_TOOL_EXIT:-0}";;
   *)
     exit "${STUB_TOOL_EXIT:-0}";;

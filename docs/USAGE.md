@@ -554,6 +554,11 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   request body posts in parts; a delta too large for one part is
   reported as the slice's full membership). `index targets` lists
   the `(target, rustc)` pairs a published index covers.
+  `index published-rustcs` prints every stable rustc release
+  (`static.rust-lang.org/manifests.txt`) whose `stow-cache-<rustc>`
+  package holds tags, probed through the registry's anonymous tag
+  listing; `operations.yml` reports each one's slices after a
+  scheduler reset.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
 whole wave — `preheat top-binaries` and
