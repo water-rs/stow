@@ -261,7 +261,7 @@ fn stow_build(
 ) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     command
-        .arg("build")
+        .args(["build", "--isolation", "off"])
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
     hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));
@@ -853,6 +853,7 @@ fn drain_stub(endpoint: &str, stub: &StubSupervisor) {
             std::ffi::OsString::from("--crate-name"),
             std::ffi::OsString::from("drain_probe"),
         ],
+        stow_cli::protocol::InvocationEnv::default(),
     ));
     let body = serde_json::to_vec(&request).expect("encode probe frame");
     probe
@@ -1230,7 +1231,7 @@ fn stow_candidate(
     stow_setup_in(dir, cache_dir, cargo_home);
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     command
-        .arg("build")
+        .args(["build", "--isolation", "off"])
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home);
     hermetic_stow_env(&mut command, edge_url, cache_dir, &dir.join("stow-home"));

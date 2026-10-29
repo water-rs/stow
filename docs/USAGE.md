@@ -45,34 +45,86 @@ workspace mirror instead of prompting. Recommended for CI.
 stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 ```
 
-`--sandbox` (experimental) runs the cargo build inside a heel sandbox:
-cargo, rustc, every build script, proc-macro and linker it spawns are cut
-off from the machine outside a declared grant set — the workspace and the
-target directory are read/write (writes under the target directory only;
-sources stay read-only), the toolchain, cargo registry and stow's wrapper
-shims are read, credentials files (`credentials`/`credentials.toml`) and
-the home directory are never granted, the clipboard is denied, and the
-environment is an allowlist. Stow fetches dependencies first, then the
-sandboxed cargo runs offline; a sandbox that cannot be set up fails the
-command — there is no unsandboxed fallback.
+## Build isolation
 
-`--sandbox-deny-network` goes further and denies the build all network
-access: the only channel out of the sandbox is the socket the rustc
-wrapper uses to reach the supervising stow process.
+Every cargo-running command confines the build — cargo, rustc, every build
+script, proc-macro and linker it spawns — at one of four levels. The level
+is independent of the cache mode: it holds with the public cache on or off.
+
+| Level | Files | Network | Environment |
+| --- | --- | --- | --- |
+| `protect` (default except on Windows) | The machine is open except credential stores, which cannot be read, and persistence locations, which cannot be written | Allowed through an audited proxy | Host variables, minus credential variables |
+| `strict` (default on Windows) | An allowlist: the workspace and target directory, the toolchain and registry, stow's shims | Allowed through an audited proxy | An allowlist |
+| `offline` | As `strict` | None; the only channel out is the socket the rustc wrapper uses to reach stow | An allowlist |
+| `off` | No confinement | Unrestricted | Unrestricted |
 
 ```sh
-stow build --sandbox
-stow build --sandbox-deny-network
+stow build                       # protect (strict on Windows)
+stow build --isolation strict
+stow build --isolation offline
+stow build --isolation off
 ```
 
-The same switches exist in the config file, so an `experimental` table
-enables them for every cargo-running command:
+The config file sets the default for every cargo-running command; the flag
+overrides it:
 
 ```toml
-[experimental]
-sandbox = true
-sandbox_deny_network = true
+[isolation]
+level = "strict"
+audit_files = 30
 ```
+
+`protect` does not fetch ahead of the build: cargo runs online inside the
+sandbox, with a writable cargo home. `strict` and `offline` fetch
+dependencies first and run cargo offline inside.
+
+What `protect` denies is a fixed list:
+
+- Reads of credential stores: SSH and GPG keys and agents, forge and
+  registry tokens (`gh`, `glab`, `~/.cargo/credentials*`, `.npmrc`, `.pypirc`,
+  `.netrc`, `.git-credentials`, Docker, Terraform, Vault, 1Password and
+  `pass` data), cloud-provider configuration (AWS, Azure, gcloud, kube, OCI,
+  DigitalOcean, Heroku, Fly, Wrangler), browser profiles and cookies, and
+  the macOS keychains with the Security service. The `SSH_AUTH_SOCK` and
+  `GNUPGHOME` targets are denied wherever they point.
+- Writes to persistence locations: shell startup files, `~/.ssh`,
+  `~/.gitconfig` and `~/.config/git`, `~/.cargo/bin`, `~/.cargo/config*`,
+  `~/.local/bin`, launch agent and daemon directories, systemd and autostart
+  units, and `.git/hooks` in any repository except cargo's own git cache.
+
+A refused access fails the build script, and a build script that needs a
+path or variable `strict` or `offline` withholds gets it through a grant:
+
+```toml
+[[isolation.grant]]
+crate = "openssl-sys"
+read = ["/opt/homebrew/opt/openssl"]
+write = []
+exec = []
+env = ["OPENSSL_DIR"]
+```
+
+A grant applies at `strict` and `offline` only when the crate is in the
+build's `Cargo.lock`; paths must be absolute. `protect` is open outside the
+denylists and takes no grants.
+
+Every network destination and every denied access is recorded under
+`<local data dir>/stow/audit`: `network-audit.<date>.jsonl` files from the proxy and
+`denied-access.<date>.jsonl` with one JSON line per denial. `audit_files`
+(default 30) is the number of daily files kept of each. Denied accesses are
+recorded on macOS and Linux; Windows reports none.
+
+`protect` is enforced on macOS and Linux through heel's credential and
+persistence denylists. On Linux it, like `strict` and `offline`, needs kernel
+6.7 or newer, and the denylists also need `kernel.yama.ptrace_scope` of 1 or
+lower; a host that fails either makes the command fail with an error naming
+the isolation level and the cause, never a build with less protection. On
+Windows heel refuses the denylists, so `protect` fails when the sandbox is
+created; `strict`, `offline` and `off` work there, and `strict` is the
+default on Windows (it reads and writes only the granted paths, so
+credentials are unreachable). An explicit `protect` on Windows still fails and
+is never replaced by `strict`. No level falls back to
+another. A sandbox that cannot be set up fails the command.
 
 ## `stow predict`
 
@@ -339,7 +391,8 @@ acting unless `--yes` is given.
 
 Run outside GitHub Actions, the mutating commands — `scheduler reset`,
 `scheduler demand-feed`, `queue retry|cancel|promote|purge`,
-`dispatch-freeze engage|clear`, `submit`, `maintenance`, `watchdog`
+`dispatch-freeze engage|clear`, `dispatch-cap set`, `submit`,
+`maintenance`, `watchdog`
 (not `--dry-run`), and the `preheat` lanes under `--yes` — do not call
 the edge or Cloudflare themselves: they dispatch
 `.github/workflows/operations.yml` on `main` with the `stow-admin login`
@@ -376,6 +429,16 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   any missing rule disabled (`ensure`/`on`/`off` are mutations). Every
   invocation, `status` included, runs in `operations.yml`, which holds
   the Cloudflare token.
+- `stow-admin dispatch-cap status` — the dispatch caps in force
+  (in-flight `build-crate.yml` runs overall and on macOS runners) and
+  where each comes from: the deploy bindings or the operator setting.
+  `stow-admin dispatch-cap set --jobs N [--macos M]` replaces the
+  `STOW_MAX_CONCURRENT_JOBS` / `STOW_MAX_CONCURRENT_MACOS_JOBS` binding
+  values at claim time until the next `set` — there is no clear and no
+  expiry, `--macos` omitted leaves that cap on its binding, `--jobs 0`
+  pauses dispatch, and no ceiling is checked. A lowered cap cancels
+  nothing in flight: new claims pause until the in-flight count drops
+  below it.
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`
@@ -458,14 +521,17 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   `--projects`.
 - `stow-admin index export --out-dir <dir>` /
   `index publish --file <index> --folded <folded>` /
-  `index report --file <index>` / `index targets` — export
+  `index report --file <index>` / `index reconcile --rustc-version <r>` /
+  `index targets` — export
   every changed index slice in one pass from the registry's verified
   records artifacts (each `index.<t>.<r>` plus its `folded.<t>.<r>`
   companion; only the records tags no folded set covers are pulled),
   push both to GHCR signed under the index workflow (mock deploys
   delegate to `stow-mock-registry publish-index`), and report each
   slice's membership to the scheduler. `index-publish.yml`
-  runs this loop after every `build-crate` run. `index targets` lists
+  runs this loop after every `build-crate` run, preceded by `index
+  reconcile`, which reports in full every published slice whose
+  generation the scheduler does not hold. `index targets` lists
   the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
@@ -488,3 +554,57 @@ touches only GitHub, `index export`/`publish`/`targets` touch only
 the registry, and a preheat lane (`top-binaries`, `binary`,
 `missed`, `projects submit`, `plan`) run without `--yes` only plans and
 needs no edge. See [`ENVIRONMENT.md`](ENVIRONMENT.md).
+
+## Local code signing (macOS)
+
+Every link leaves a fresh ad-hoc signature on `stow-admin`, and a
+keychain item's ACL evaluates the calling program against the code
+requirement it recorded — a new cdhash is a new program, so an "Always
+Allow" on the login item survives only until the next `cargo build`.
+Signing every local build with one stable identity makes the
+requirement certificate-based instead, and one "Always Allow" holds
+across rebuilds.
+
+Two committed pieces, both opt-in:
+
+- `admin/build.rs` emits
+  `cargo:rustc-link-arg-bin=stow-admin=--ld-path=<repo>/scripts/signing-ld.sh`
+  when `STOW_LOCAL_SIGNING_IDENTITY` is set on a macOS target, selecting
+  the script as the linker for the `stow-admin` binary alone — nothing
+  else's rustc command line changes, so no other unit's cache identity
+  moves. The script runs `ld`, then `codesign --sign` on the output —
+  only the `stow-admin` binary is signed, including the
+  `CARGO_BIN_EXE_stow-admin` the integration tests spawn. Unset, the
+  build script emits nothing but its rerun trigger and the link is
+  byte-for-byte what it is without the mechanism. Set to an identity
+  `codesign` cannot find — or any other codesign failure — the link
+  fails with a message; there is no silent unsigned build under a set
+  variable.
+- `scripts/local-signing-identity.sh` creates that identity once per
+  machine: a self-signed EC P-256 certificate (`keyUsage` digital
+  signature, `extendedKeyUsage` code signing — what `-p codesigning`
+  lookups and `codesign` require) imported into the login keychain with
+  `/usr/bin/codesign` authorised, plus the key partition list modern
+  macOS checks separately. Idempotent — a second run keeps the existing
+  identity and re-applies the partition list. It asks once for the
+  login keychain password. The identity need not be trusted: the ACL
+  matches the certificate leaf, not a trust decision.
+
+Setup is one pass:
+
+```sh
+scripts/local-signing-identity.sh        # creates stow-admin-local
+# then make the variable reach cargo, either per shell
+export STOW_LOCAL_SIGNING_IDENTITY=stow-admin-local
+# or once, in ~/.cargo/config.toml:
+#   [env]
+#   STOW_LOCAL_SIGNING_IDENTITY = "stow-admin-local"
+```
+
+Setting the variable re-links `stow-admin` once (the build script's
+`rerun-if-env-changed` fires, and the new `--ld-path` flag changes that
+one unit's command line); afterwards the mechanism costs one `codesign`
+call per `stow-admin` link. Unset the variable to return to unsigned
+ad-hoc links. Linux and Windows are untouched — their credential stores
+do not bind access to the caller's signature, and the build script
+gates on `CARGO_CFG_TARGET_OS`.

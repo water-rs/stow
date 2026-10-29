@@ -51,7 +51,7 @@ walkdir = "2"
 flate2.workspace = true
 tar.workspace = true
 skyzen = { version = "0.5.0", default-features = false, features = ["json", "hyper", "query"] }
-heel = { version = "0.5.1", default-features = false }
+heel = { version = "0.7.1", default-features = false }
 utoipa.workspace = true
 executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread", "sync"] }
@@ -63,6 +63,10 @@ async-net = "2"
 # Mach-O, PE, XCOFF and Unix archives; `wasm` would pull wasmparser for a
 # format the check passes through unchecked anyway).
 object = { version = "0.39", default-features = false, features = ["read", "std"] }
+
+# `fclonefileat`, so a handle-based output copy clones on APFS.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { version = "0.2.189", default-features = false }
 
 # The MSVC lookup rustc performs for itself — run out here on the host,
 # because it cannot run inside the sandbox. Maintained by the `cc`

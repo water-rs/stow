@@ -8,9 +8,7 @@ use stow_types::capture::{
     CapturedDependencyIdentity, CapturedRustcArtifact, CapturedRustcOutput, CapturedRustcOutputKind,
 };
 use stow_types::error::Context;
-use stow_types::public_cache::{
-    StableRegistryArtifactIdentity, stable_registry_artifact_identity_for_package,
-};
+use stow_types::public_cache::{StableUnitIdentity, stable_unit_identity_for_package};
 use stow_types::rustc::ParsedRustcArgs;
 
 pub use stow_shim::CAPTURE_DIR_ENV as STOW_BUILD_CAPTURE_DIR_ENV;
@@ -258,7 +256,7 @@ async fn rustc_output(
 async fn record_compiled_capture(
     original_parsed: &ParsedRustcArgs,
     effective_parsed: Option<ParsedRustcArgs>,
-    stable_identity: Option<&StableRegistryArtifactIdentity>,
+    stable_identity: Option<&StableUnitIdentity>,
     host: &str,
     capture_dir: &std::path::Path,
     started: Instant,
@@ -436,7 +434,7 @@ fn elapsed_millis(started: Instant) -> u64 {
 async fn serve_consumed_artifact(
     original_parsed: &ParsedRustcArgs,
     rewritten_parsed: &ParsedRustcArgs,
-    stable_identity: &StableRegistryArtifactIdentity,
+    stable_identity: &StableUnitIdentity,
     effective_target: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<Option<CapturedRustcArtifact>> {
@@ -515,7 +513,7 @@ async fn consumed_capture_record(
     original_parsed: &ParsedRustcArgs,
     rewritten_parsed: &ParsedRustcArgs,
     original_alias_source: Option<&ParsedRustcArgs>,
-    stable_identity: &StableRegistryArtifactIdentity,
+    stable_identity: &StableUnitIdentity,
     effective_target: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<CapturedRustcArtifact> {
@@ -681,7 +679,7 @@ async fn prepare_stable_rustc_invocation(
 ) -> stow_types::error::Result<(
     Vec<std::ffi::OsString>,
     Option<ParsedRustcArgs>,
-    Option<StableRegistryArtifactIdentity>,
+    Option<StableUnitIdentity>,
     String,
 )> {
     let toolchain = detect_rustc_toolchain(rustc).await?;
@@ -730,7 +728,25 @@ async fn prepare_stable_rustc_invocation(
             original_parsed.input_path,
         ));
     };
-    let identity = stable_registry_artifact_identity_for_package(
+    // A published node is a dev-profile build with no cfg of its own, no
+    // extra codegen and no `embed-metadata`; the CLI's semantic match
+    // relies on exactly that to prove a stand-in against its key
+    // (stow#1047). An invocation outside it must not be published.
+    let build_script = stow_types::upload_plan::BuildScriptInputs::of_out_dir(
+        &original_parsed.crate_name,
+        original_parsed.build_script_out_dir.as_deref(),
+    )?;
+    let consumer = stow_types::upload_plan::ConsumerInputs::of(original_parsed, &build_script);
+    if !consumer.is_publishable_shape() {
+        return Err(stow_types::stow_error!(
+            "`{}` was invoked with cfgs {:?}, extra codegen {:?} or embed-metadata {:?} no published node may carry",
+            original_parsed.crate_name,
+            consumer.cfgs,
+            consumer.extra_codegen,
+            consumer.embed_metadata,
+        ));
+    }
+    let identity = stable_unit_identity_for_package(
         original_parsed,
         &package_name,
         &package_version,
@@ -874,7 +890,7 @@ fn rewrite_codegen_identity_args(
 async fn materialize_original_output_aliases(
     original_parsed: &ParsedRustcArgs,
     rewritten_parsed: &ParsedRustcArgs,
-    identity: &StableRegistryArtifactIdentity,
+    identity: &StableUnitIdentity,
     host: &str,
     capture_dir: &std::path::Path,
 ) -> stow_types::error::Result<()> {
@@ -949,7 +965,8 @@ async fn materialize_optional_alias(
                 )
             })?;
         }
-        reflink_copy::reflink_or_copy(&source_for_copy, &alias_for_copy).wrap_err_with(|| {
+        let mut source = stow_types::native_capture::open_regular_nofollow(&source_for_copy)?;
+        crate::handle_copy::copy_from_handle(&mut source, &alias_for_copy).wrap_err_with(|| {
             format!(
                 "materialize original cargo output alias {} from {}",
                 alias_for_copy.display(),
@@ -1340,13 +1357,14 @@ fn collect_output_path(
     }
     // Hash the bytes rustc just wrote, before anything else in the build can
     // touch them. The scan re-hashes the file it plans against this digest.
-    let bytes = std::fs::read(&path)
+    let mut file = stow_types::native_capture::open_regular_nofollow(&path)?;
+    let sha256 = stow_types::native_capture::hash_file(&mut file)
         .wrap_err_with(|| format!("read captured rustc output {}", path.display()))?;
     outputs.push(CapturedRustcOutput {
         kind,
         path,
         snapshot_path: None,
-        sha256: hex::encode(Sha256::digest(&bytes)),
+        sha256,
     });
     Ok(())
 }
@@ -1388,14 +1406,21 @@ async fn snapshot_outputs(
         let snapshot_path = snapshot_dir.join(file_name);
         let source_path = output.path.clone();
         let snapshot_for_copy = snapshot_path.clone();
+        let expected_sha256 = output.sha256.clone();
         smol::unblock(move || {
-            reflink_copy::reflink_or_copy(&source_path, &snapshot_for_copy).wrap_err_with(|| {
-                format!(
-                    "snapshot rustc output {} into {}",
-                    source_path.display(),
-                    snapshot_for_copy.display()
-                )
-            })
+            // The copy reads the handle that was just verified against the
+            // rustc-exit digest, never the path a build could have re-pointed.
+            let mut source =
+                stow_types::native_capture::open_verified_nofollow(&source_path, &expected_sha256)?;
+            crate::handle_copy::copy_from_handle(&mut source, &snapshot_for_copy).wrap_err_with(
+                || {
+                    format!(
+                        "snapshot rustc output {} into {}",
+                        source_path.display(),
+                        snapshot_for_copy.display()
+                    )
+                },
+            )
         })
         .await?;
         // The recorded digest describes the output at rustc exit; the snapshot
@@ -1643,6 +1668,7 @@ mod tests {
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::new(),
             cfgs: BTreeSet::default(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::from([
                 "dep-info".to_owned(),
                 "link".to_owned(),
@@ -1665,9 +1691,61 @@ mod tests {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
-            has_custom_codegen: false,
-            link_options: std::collections::BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         }
+    }
+
+    /// stow#1063: a build script that planted a symlink at an artifact's
+    /// name must not have the link's target hashed as rustc's output.
+    #[cfg(unix)]
+    #[test]
+    fn collect_outputs_refuses_a_symlink_planted_at_an_output_name() {
+        let tempdir = tempdir().expect("tempdir");
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create out dir");
+        let stable = parsed_lib("chrono", out_dir, "-47d1962f861b84d6");
+        let secret = tempdir.path().join("secret");
+        std::fs::write(&secret, b"host secret").expect("write secret");
+        let rlib = stable.output_rlib_path().expect("rlib");
+        std::os::unix::fs::symlink(&secret, &rlib).expect("plant symlink");
+
+        let error = collect_outputs(&stable, None, "aarch64-apple-darwin")
+            .expect_err("a symlinked output must be refused");
+        assert!(
+            error.to_string().contains("without following symlinks"),
+            "{error}"
+        );
+    }
+
+    /// stow#1063: a path swapped for a link between hashing and the
+    /// snapshot copy must not be followed by the copy.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_an_output_swapped_for_a_symlink_after_hashing() {
+        let tempdir = tempdir().expect("tempdir");
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create out dir");
+        let stable = parsed_lib("chrono", out_dir, "-47d1962f861b84d6");
+        let rlib = stable.output_rlib_path().expect("rlib");
+        std::fs::write(&rlib, b"rustc bytes").expect("write rlib");
+        let outputs =
+            collect_outputs(&stable, None, "aarch64-apple-darwin").expect("collect outputs");
+
+        // The link's target carries the very bytes that were hashed, so only
+        // refusing to follow it tells the copy apart from a clean one.
+        let target = tempdir.path().join("target-bytes");
+        std::fs::write(&target, b"rustc bytes").expect("write target");
+        std::fs::remove_file(&rlib).expect("remove rlib");
+        std::os::unix::fs::symlink(&target, &rlib).expect("swap in symlink");
+
+        let capture_dir = tempdir.path().join("capture");
+        let error = smol::block_on(super::snapshot_outputs(&capture_dir, &stable, outputs))
+            .expect_err("a swapped-in symlink must be refused");
+        assert!(
+            error.to_string().contains("without following symlinks"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1860,6 +1938,7 @@ mod tests {
             crate_types: vec!["proc-macro".to_owned()],
             features: BTreeSet::new(),
             cfgs: BTreeSet::default(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::from(["dep-info".to_owned(), "metadata".to_owned()]),
             json: BTreeSet::new(),
             input_path: None,
@@ -1878,8 +1957,8 @@ mod tests {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
-            has_custom_codegen: false,
-            link_options: std::collections::BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         }
     }
 
@@ -2208,16 +2287,20 @@ mod tests {
         // The identity a record registers under is the dependency-side one
         // every real dependent computes — the value a client lookup keys
         // on — not cargo's ephemeral `-C metadata` for the unit.
-        let via_path = stow_types::public_cache::stable_registry_artifact_identity(
+        let via_path = stow_types::public_cache::stable_unit_identity(
             &parsed,
+            &stow_types::public_cache::UnitSource::CratesIo {
+                package: "itoa".to_owned(),
+                version: "1.0.15".to_owned(),
+            },
+            stow_types::public_cache::Reach::Public,
             "aarch64-apple-darwin",
             "1.91.1",
             "[]",
             "[]",
         )
-        .expect("stable identity")
-        .expect("registry path detected");
-        let via_package = stow_types::public_cache::stable_registry_artifact_identity_for_package(
+        .expect("stable identity");
+        let via_package = stow_types::public_cache::stable_unit_identity_for_package(
             &parsed,
             "itoa",
             "1.0.15",
@@ -2304,7 +2387,7 @@ mod tests {
             ParsedRustcArgs::parse(&pinned)
                 .expect("pinned args still parse")
                 .link_options
-                .contains("link-arg=-fuse-ld=mold"),
+                .contains(&"link-arg=-fuse-ld=mold".to_owned()),
             "the appended arg must land in the link options the compile key reads"
         );
 

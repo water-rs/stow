@@ -7,11 +7,12 @@
 //! `[profile.dev]` — or every dependency through
 //! `[profile.dev.package."*"]` — is not disqualified: its lookups carry the
 //! tuned profile and hit whenever the pool holds artifacts built under it,
-//! which is what project-source seeding produces. The one knob no identity
-//! can express is `lto`: cargo then compiles every dependency with
-//! `-C linker-plugin-lto`, which `stow_types::rustc` treats as custom
-//! codegen, so every unit is ineligible and stow degrades to a transparent
-//! cargo passthrough instead of paying analysis overhead for zero hits.
+//! which is what project-source seeding produces. The one knob the public
+//! identity cannot share is `lto`: cargo then compiles every dependency
+//! with `-C linker-plugin-lto`, which keys into extra-codegen and makes
+//! every unit local-only (stow#1006), so the build disables the public
+//! half and keeps only its local cache instead of paying analysis and
+//! remote-fetch overhead for zero hits.
 
 use std::path::Path;
 

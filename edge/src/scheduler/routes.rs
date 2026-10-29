@@ -119,7 +119,7 @@ pub(super) async fn commit_trees(
     })
 }
 
-/// `POST /tasks/submit[/trusted]`: the pending-depth cap gates
+/// `POST /tasks/submit[/trusted]`: the miss-lane pending-depth cap gates
 /// miss-lane trees (`enforce_pending_cap`), then every tree's parts
 /// land in one turn before the merge — the single transaction the ack
 /// follows.
@@ -141,7 +141,7 @@ pub(super) async fn submit(
             .iter()
             .map(|tree| u64::try_from(tree.nodes.len()).unwrap_or(u64::MAX))
             .sum();
-        let depth = graph.with(|graph| graph.pending_depth());
+        let depth = graph.with(|graph| graph.miss_pending_depth());
         if u64::from(depth).saturating_add(incoming) > u64::from(settings.max_queue_pending) {
             return Err(QueueError::QueueFull {
                 pending: depth,
@@ -233,7 +233,9 @@ pub(super) async fn demand(
 /// its matched dependency edges.
 ///
 /// # Errors
-/// `QueueError::Sql` on a failed append.
+/// `QueueError::SliceReportConflict` when a delta does not extend its
+/// slice's live generation, `QueueError::Invariant` on a slice named
+/// twice, `QueueError::Sql` on a failed append.
 pub(super) async fn slice_reports(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
@@ -241,6 +243,24 @@ pub(super) async fn slice_reports(
     actor: Option<&str>,
     now: i64,
 ) -> Result<(), QueueError> {
+    // Every slice extends its live generation, or nothing appends.
+    graph.with(|graph| {
+        let mut seen = std::collections::BTreeSet::new();
+        slices.iter().try_for_each(|slice| {
+            if !seen.insert((slice.target.as_str(), slice.rustc_version.as_str())) {
+                return Err(QueueError::Invariant(format!(
+                    "slice report names {}/{} twice",
+                    slice.target, slice.rustc_version
+                )));
+            }
+            graph.check_slice_report(
+                slice.target.as_str(),
+                slice.rustc_version.as_str(),
+                slice.base_generation,
+                slice.generation,
+            )
+        })
+    })?;
     let events: Vec<SchedulerEvent> = slices
         .iter()
         .map(|slice| SchedulerEvent::SliceReport {
@@ -1116,6 +1136,50 @@ mod inline_dispatch_tests {
         );
     }
 
+    /// A delta that leaves a gap is refused before anything appends,
+    /// and a woken graph replays the generation each accepted report
+    /// set (stow#1049).
+    #[tokio::test]
+    async fn a_slice_report_gap_is_refused_and_generations_replay() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let slice = |base_generation, generation| stow_types::api::PublishedSlice {
+            target: stow_types::identity::TargetTriple::parse(
+                stow_types::api::CI_TARGET_TRIPLES[8],
+            )
+            .expect("target"),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.84.0").expect("rustc"),
+            base_generation,
+            generation,
+            added: fixture::full_slice_report(),
+            retired: Vec::new(),
+        };
+        let before = log_rows(&db).await;
+        let error = slice_reports(cell, &db, &[slice(Some(4), 5)], None, HOST_NOW_MS)
+            .await
+            .expect_err("a delta on an unreported slice");
+        assert!(
+            matches!(error, QueueError::SliceReportConflict(_)),
+            "{error}"
+        );
+        assert_eq!(
+            log_rows(&db).await,
+            before,
+            "a refused report appends nothing"
+        );
+        slice_reports(cell, &db, &[slice(None, 4)], None, HOST_NOW_MS)
+            .await
+            .expect("a full report");
+        slice_reports(cell, &db, &[slice(Some(4), 5)], None, HOST_NOW_MS)
+            .await
+            .expect("the next delta");
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        let live = woken
+            .with(|graph| graph.slice_generation(stow_types::api::CI_TARGET_TRIPLES[8], "1.84.0"));
+        assert_eq!(live, Some(5));
+    }
+
     /// A bounded claim is a prefix of the unbounded claim — the bound
     /// never reorders the rank.
     #[tokio::test]
@@ -1459,6 +1523,65 @@ mod attribution_tests {
                 Some("octo-operator".to_owned())
             ]
         );
+    }
+}
+
+/// The miss lane's pending cap bounds the miss lane alone (stow#1058).
+#[cfg(test)]
+mod miss_cap_tests {
+    use super::*;
+    use crate::scheduler::drives::HOST_NOW_MS;
+    use crate::scheduler::fixture;
+    use crate::scheduler::graph::GraphCell;
+    use crate::scheduler::test_db;
+    use stow_types::api::SubmissionSource;
+
+    /// Fixture rows far outside the seeded range, so every node is new.
+    const FIRST_ROW: u32 = 6_000_000;
+
+    fn tree(source: SubmissionSource, first: u32, nodes: u32) -> SubmissionTree {
+        SubmissionTree {
+            source,
+            roots: Vec::new(),
+            nodes: (first..first + nodes)
+                .map(|n| fixture::fixture_node(n, Vec::new()))
+                .collect(),
+        }
+    }
+
+    /// A preheat backlog far above the cap leaves a CLI miss admitted
+    /// and pending; the cap still refuses a miss batch past its own
+    /// lane's depth.
+    #[tokio::test]
+    async fn preheat_backlog_does_not_count_against_the_miss_cap() {
+        let db = test_db::memory_db().await.expect("db");
+        let owner = GraphCell::default();
+        let cell = owner.install(Graph::default());
+        let settings = SchedulerSettings {
+            max_queue_pending: 3,
+            ..SchedulerSettings::default()
+        };
+        let backlog = tree(SubmissionSource::Preheat, FIRST_ROW, 50);
+        submit(cell, &db, &settings, &[backlog], false, None, HOST_NOW_MS)
+            .await
+            .expect("preheat backlog");
+        assert!(cell.with(|graph| graph.status().pending) > settings.max_queue_pending);
+
+        let miss = tree(SubmissionSource::CacheMiss, FIRST_ROW + 100, 3);
+        let (inserted, _) = submit(cell, &db, &settings, &[miss], true, None, HOST_NOW_MS)
+            .await
+            .expect("a miss is admitted under a preheat backlog");
+        assert_eq!(inserted, 3);
+        assert_eq!(cell.with(|graph| graph.miss_pending_depth()), 3);
+
+        let over = tree(SubmissionSource::CacheMiss, FIRST_ROW + 200, 1);
+        let refused = submit(cell, &db, &settings, &[over], true, None, HOST_NOW_MS)
+            .await
+            .expect_err("the miss lane's own depth still hits the cap");
+        assert!(matches!(
+            refused,
+            QueueError::QueueFull { pending: 3, cap: 3 }
+        ));
     }
 }
 

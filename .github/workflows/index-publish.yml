@@ -108,6 +108,21 @@ jobs:
               | python3 -c 'import sys, tomllib; print(tomllib.load(sys.stdin.buffer)["pkg"]["rust"]["version"].split()[0])')"
           fi
           echo "RUSTC_VERSION=$rustc_version" >> "$GITHUB_ENV"
+      # A published generation the scheduler never received — the report
+      # of an earlier run failed, or that run died between a slice's
+      # index and folded tags — is reported in full before this run's
+      # delta, which builds on what the scheduler holds. Without it a
+      # slice no later export re-emits would stay unreported.
+      - name: Report the published slices the scheduler does not hold
+        if: inputs.report
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          stow-admin index reconcile --rustc-version "$RUSTC_VERSION"
       # One export pass for every slice of this rustc: `index export
       # --out-dir --rustc-version` lists the registry once, pulls the
       # published `index`/`folded` pairs for R's slices, and verifies
@@ -187,7 +202,9 @@ jobs:
                   print(f"::error::index publish failed for {s['tag']}", flush=True)
                   failed.append(s["tag"])
           # Slices are independent: publish failures are reported, but
-          # every slice that did go live is still reported.
+          # every slice that did go live is still reported. A failed
+          # report fails the run like a failed publish: the next run's
+          # reconcile step reports whatever the scheduler still lacks.
           if report:
               step = ["stow-admin", "index", "report"] + report
               if os.environ.get("INPUT_FULL") == "true":
@@ -197,6 +214,7 @@ jobs:
               print("::endgroup::", flush=True)
               if not ok:
                   print("::error::index report failed", flush=True)
+                  failed.append("report")
           if failed:
               print(f"::error::index publish incomplete: {' '.join(failed)}", flush=True)
               sys.exit(1)

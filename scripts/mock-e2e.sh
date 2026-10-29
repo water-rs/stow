@@ -1288,6 +1288,166 @@ done
 # covered graph queues no build once the slice report lands.
 fg publish_slices "itoa"
 
+# --- stow#1039: operator dispatch caps --------------------------------
+# `dispatch-cap set` then `status` round-trips through the operations
+# lane; an edge restart keeps the setting; a lowered cap claims nothing
+# until the in-flight runs drain below it — and cancels none of them.
+# The three feature-set spellings of the itoa task are the wave's only
+# queue content; the queue was drained above and every task completes.
+cap_json() {
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
+        "$BIN/stow-admin" --json dispatch-cap "$@"
+}
+
+echo "[mock-e2e] dispatch-cap: status reads the deploy bindings"
+cap_json status >"$WORK_DIR/dispatch-cap-status.json" 2>&1 \
+    || die "dispatch-cap status failed — see $WORK_DIR/dispatch-cap-status.json"
+jq -e '.max_concurrent_jobs == 3 and .max_concurrent_macos_jobs == 11
+       and (.setting | not)' "$WORK_DIR/dispatch-cap-status.json" >/dev/null \
+    || die "dispatch-cap status before set: $(cat "$WORK_DIR/dispatch-cap-status.json")"
+
+# Without `--yes` the command prints the plan and changes nothing.
+cap_json set --jobs 2 >"$WORK_DIR/dispatch-cap-plan.json" 2>&1 \
+    || die "dispatch-cap set (plan only) failed — see $WORK_DIR/dispatch-cap-plan.json"
+jq -e '.dry_run == true and .plan.max_concurrent_jobs == 2' \
+    "$WORK_DIR/dispatch-cap-plan.json" >/dev/null \
+    || die "dispatch-cap set without --yes applied a change"
+cap_json status | jq -e '.max_concurrent_jobs == 3' >/dev/null \
+    || die "a plan-only set changed the caps"
+
+# Two real tasks in flight, then the cap drops below them: both runs
+# finish — none is cancelled — and later work runs one at a time.
+# memchr carries the three distinct feature sets the cap test needs;
+# itoa has only `[]` and `["no-panic"]`.
+CAP_CRATE=memchr
+CAP_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
+    'https://index.crates.io/me/mc/memchr' \
+    | jq -rs '[.[] | select(.yanked | not) | .vers | select(startswith("2."))]
+              | sort_by(split(".") | map(tonumber)) | last // empty')"
+[ -n "$CAP_VERSION" ] || die "no non-yanked memchr 2.x found on crates.io"
+cap_submit() { # features-json out-log
+    isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
+        "$BIN/stow-admin" submit \
+        --crate-name "$CAP_CRATE" --version "$CAP_VERSION" \
+        --features-json "$1" --target "$HOST_TARGET" \
+        --rustc-version "$RUSTC_VERSION" --yes >"$2" 2>&1
+}
+# The wave's completed baseline: the four cap-test tasks must each
+# add one.
+completed_base="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" | jq -r '.completed')"
+fg cap_submit '["alloc"]' "$LOG_DIR/cap-submit-alloc.log" \
+    || die "dispatch-cap submit alloc failed — see $LOG_DIR/cap-submit-alloc.log"
+fg cap_submit '["std"]' "$LOG_DIR/cap-submit-std.log" \
+    || die "dispatch-cap submit std failed — see $LOG_DIR/cap-submit-std.log"
+deadline=$((SECONDS + 300))
+while :; do
+    inflight="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" \
+        | jq -r '.dispatched + .running')"
+    [ "$inflight" -ge 2 ] && break
+    [ "$SECONDS" -ge "$deadline" ] \
+        && die "dispatch-cap: only $inflight tasks in flight (status: $(curl -fsS --max-time 10 "$SCHEDULER_URL/status" || echo unreachable))"
+    sleep 5
+done
+
+cap_json set --jobs 1 --macos 1 --yes >"$WORK_DIR/dispatch-cap-set.json" 2>&1 \
+    || die "dispatch-cap set failed — see $WORK_DIR/dispatch-cap-set.json"
+jq -e '.dry_run == false and .result.max_concurrent_jobs == 1
+       and .result.max_concurrent_macos_jobs == 1
+       and .result.setting.actor != null' "$WORK_DIR/dispatch-cap-set.json" >/dev/null \
+    || die "dispatch-cap set answer: $(cat "$WORK_DIR/dispatch-cap-set.json")"
+
+# The two runs claimed before the set drain without being cancelled.
+# They finish before the edge restarts: their `completed` webhooks are
+# posted once, so a restart under them would lose the delivery.
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+    if [ -n "$status_json" ]; then
+        [ "$(jq -r '.failed' <<<"$status_json")" -gt "$BASE_FAILED" ] \
+            && die "dispatch-cap: a run claimed before the set failed: $status_json"
+        [ "$(jq -r '.completed' <<<"$status_json")" -ge "$((completed_base + 2))" ] \
+            && [ "$(jq -r '.dispatched + .running' <<<"$status_json")" -eq 0 ] && break
+    fi
+    [ "$SECONDS" -ge "$deadline" ] \
+        && die "dispatch-cap: the pre-set runs never drained (status: $status_json)"
+    sleep 5
+done
+
+# Nothing is in flight here, so no run's webhook meets the down edge.
+# The setting is the scheduler's log, not the isolate's memory: a
+# restart of the edge must keep it — the restart keeps the persisted
+# DO store, never a scheduler reset.
+echo "[mock-e2e] dispatch-cap: restarting the edge — the setting must survive"
+edge_index=-1
+for i in "${!CHILD_NAMES[@]}"; do
+    [ "${CHILD_NAMES[$i]}" = edge ] && edge_index=$i
+done
+[ "$edge_index" -ge 0 ] || die "edge service not tracked"
+kill -- "-${CHILD_PIDS[$edge_index]}" 2>/dev/null || true
+sleep 2
+kill -9 -- "-${CHILD_PIDS[$edge_index]}" 2>/dev/null || true
+(
+    cd "$REPO_ROOT/edge"
+    exec wrangler dev --local --config .skyzen/gen/wrangler.toml \
+        --port "$EDGE_PORT" --inspector-port "$INSPECTOR_PORT" \
+        --persist-to "$WORK_DIR/edge-state"
+# Appended to the one edge log every later check greps.
+) >>"$LOG_DIR/edge.log" 2>&1 &
+CHILD_PIDS[$edge_index]=$!
+wait_for "edge listener (restart)" "$READY_DEADLINE" "${CHILD_PIDS[$edge_index]}" \
+    http_listening "$SCHEDULER_URL/status"
+wait_for "edge scheduler status (restart)" "$READY_DEADLINE" "${CHILD_PIDS[$edge_index]}" \
+    curl -fsS "$SCHEDULER_URL/status"
+cap_json status >"$WORK_DIR/dispatch-cap-restart.json" 2>&1 \
+    || die "dispatch-cap status after restart failed"
+jq -e '.max_concurrent_jobs == 1 and .max_concurrent_macos_jobs == 1
+       and .setting.actor != null' "$WORK_DIR/dispatch-cap-restart.json" >/dev/null \
+    || die "dispatch caps did not survive the restart: $(cat "$WORK_DIR/dispatch-cap-restart.json")"
+
+# Under cap 1, two tasks submitted together run one at a time: the
+# second stays queued while the first is in flight, and in-flight work
+# never passes the cap.
+pending_base="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" | jq -r '.pending')"
+fg cap_submit '["use_std"]' "$LOG_DIR/cap-submit-usestd.log" \
+    || die "dispatch-cap submit use_std failed — see $LOG_DIR/cap-submit-usestd.log"
+fg cap_submit '["logging"]' "$LOG_DIR/cap-submit-logging.log" \
+    || die "dispatch-cap submit logging failed — see $LOG_DIR/cap-submit-logging.log"
+deadline=$((SECONDS + TASK_DEADLINE))
+saw_capped_wait=false
+while :; do
+    check_children_alive
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+    if [ -z "$status_json" ]; then
+        sleep 2
+        continue
+    fi
+    inflight="$(jq -r '.dispatched + .running' <<<"$status_json")"
+    pending="$(jq -r '.pending' <<<"$status_json")"
+    echo "[mock-e2e] dispatch-cap scheduler: $status_json"
+    [ "$inflight" -gt 1 ] \
+        && die "in-flight count $inflight exceeded cap 1: $status_json"
+    [ "$inflight" -eq 1 ] && [ "$pending" -gt "$pending_base" ] && saw_capped_wait=true
+    [ "$(jq -r '.completed' <<<"$status_json")" -ge "$((completed_base + 4))" ] && break
+    [ "$(jq -r '.failed' <<<"$status_json")" -gt "$BASE_FAILED" ] \
+        && die "dispatch-cap wave reported a failed task: $status_json"
+    [ "$SECONDS" -ge "$deadline" ] \
+        && die "dispatch-cap: the capped tasks never completed (status: $status_json)"
+    sleep 2
+done
+$saw_capped_wait \
+    || die "no task was seen queued behind an in-flight run under cap 1"
+
+# Restore the binding values: a set has no clear, so the recorded
+# setting names exactly what the bindings say — the later waves read
+# the same caps either way.
+cap_json set --jobs 3 --macos 11 --yes >"$WORK_DIR/dispatch-cap-restore.json" 2>&1 \
+    || die "dispatch-cap restore failed — see $WORK_DIR/dispatch-cap-restore.json"
+jq -e '.dry_run == false and .result.max_concurrent_jobs == 3
+       and .result.max_concurrent_macos_jobs == 11' \
+    "$WORK_DIR/dispatch-cap-restore.json" >/dev/null \
+    || die "dispatch-cap restore answer: $(cat "$WORK_DIR/dispatch-cap-restore.json")"
+
 # Exercise the consumer-facing commands before `check`: refresh pulls and
 # verifies the signed slice, status reports the cached row set the
 # resolver will read.

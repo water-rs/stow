@@ -1,23 +1,33 @@
-//! The opt-in heel sandbox a `stow` cargo build runs inside (stow#779).
+//! The heel sandbox a `stow` cargo build runs inside (stow#779, stow#1000).
 //!
 //! Build scripts and proc macros are untrusted code: every dependency's
 //! build script, every proc-macro expansion and every linker a build
 //! script selects runs as a descendant of the cargo stow starts, so they
 //! all inherit one sandbox. The stow process that starts cargo stays
 //! outside — it resolves, prefetches and supervises on the open side of
-//! the boundary, then `cargo fetch` lands the dependencies before the
-//! sandboxed cargo runs offline.
+//! the boundary. The isolation level decides what the sandbox is:
 //!
-//! The grant set below is the whole contract: reads for the workspace,
-//! the target directory, cargo's registry and git sources, cargo's
-//! configuration (never its credentials files), the toolchain and the
-//! system paths compilers need; writes for the target directory — also
-//! executable, since cargo runs the build scripts it compiles there —
-//! and the sandbox's own temporary directory; nothing else. Environment
-//! is an allowlist, so tokens and other variables outside it never reach
-//! the build. The network choice is carried in the sandbox's type — a
-//! `Sandbox<AllowAll>` or a `Sandbox<DenyAll>` — rather than in a flag a
-//! caller could mis-set.
+//! - `protect` reads and writes the machine as usual except for heel's
+//!   fixed denylists — credential stores unreadable, persistence
+//!   locations unwritable — and strips credential variables from the
+//!   environment. Cargo runs online inside it and fetches for itself
+//!   through heel's proxy.
+//! - `strict` and `offline` are an allowlist. The grant set below is the
+//!   whole contract: reads for the workspace, the target directory,
+//!   cargo's registry and git sources, cargo's configuration (never its
+//!   credentials files), the toolchain and the system paths compilers
+//!   need; writes for the target directory — also executable, since
+//!   cargo runs the build scripts it compiles there — and the sandbox's
+//!   own temporary directory; nothing else. Environment is an
+//!   allowlist, so tokens and other variables outside it never reach the
+//!   build. Dependencies are fetched before the sandboxed cargo runs
+//!   offline. A crate's `[[isolation.grant]]` widens the set while that
+//!   crate is in the build.
+//!
+//! Every sandboxed build records its network destinations and the accesses
+//! the sandbox denied to the audit log. The network choice is carried in
+//! the sandbox's type — a `Sandbox<Audited<AllowAll>>` or a
+//! `Sandbox<DenyAll>` — rather than in a flag a caller could mis-set.
 //!
 //! The toolchain roots every build reads the same way — the rustup home,
 //! cargo's `registry`/`git`/`bin` and the MSVC installation roots — ride
@@ -31,61 +41,25 @@ use std::path::{Path, PathBuf};
 
 use futures_util::StreamExt;
 use heel::{
-    Access, Grant, Identity, IpcRouter, IpcUnconfigured, Sandbox, SandboxConfig,
-    SandboxConfigBuilder, SecurityConfig,
+    Access, AllowAll, Audited, DenyAll, Grant, Identity, IpcRouter, IpcUnconfigured,
+    NetworkAuditLog, NetworkPolicy, ReadDenylist, Sandbox, SandboxConfig, SandboxConfigBuilder,
+    SecurityConfig, SecurityConfigBuilder, WriteDenylist,
 };
 use stow_types::env_name;
 use stow_types::error::Context;
 
-/// Whether heel has a backend for this platform (Linux, macOS, Windows).
-/// A `--sandbox` invocation anywhere else fails with this check's error
-/// rather than discovering the missing backend mid-build.
-pub const SANDBOX_SUPPORTED: bool = cfg!(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "windows"
-));
-
-/// The network policy a sandboxed build gets — resolved once from the
-/// `--sandbox`/`--sandbox-deny-network` flags and the `experimental`
-/// config, then carried in [`BuildSandbox`]'s type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SandboxNetwork {
-    /// The default for `--sandbox`: outbound traffic goes through heel's
-    /// proxy and a build that downloads at build time keeps working.
-    Allow,
-    /// `--sandbox-deny-network`: the kernel refuses every connection;
-    /// the supervisor's IPC socket is the only channel out.
-    Deny,
-}
-
-impl SandboxNetwork {
-    /// The request one switch pair makes: deny implies the sandbox.
-    pub const fn from_flags(sandbox: bool, deny_network: bool) -> Option<Self> {
-        if deny_network {
-            Some(Self::Deny)
-        } else if sandbox {
-            Some(Self::Allow)
-        } else {
-            None
-        }
-    }
-
-    /// Merge the flag answer with the config's: either source turns the
-    /// sandbox on, and deny in either wins.
-    pub const fn merge(flags: Option<Self>, config: Option<Self>) -> Option<Self> {
-        match (flags, config) {
-            (Some(Self::Deny), _) | (_, Some(Self::Deny)) => Some(Self::Deny),
-            (Some(Self::Allow), _) | (_, Some(Self::Allow)) => Some(Self::Allow),
-            (None, None) => None,
-        }
-    }
-}
+use crate::isolation::{Confinement, Isolation};
 
 /// What a sandboxed build needs besides its grant list.
 pub struct SandboxRequest<'a> {
-    /// The policy the sandbox enforces on outbound connections.
-    pub network: SandboxNetwork,
+    /// The level the sandbox enforces.
+    pub confinement: Confinement,
+    /// The resolved isolation, whose config carries the per-crate grants
+    /// and the audit settings.
+    pub isolation: &'a Isolation,
+    /// The directory whose `Cargo.lock` names the crates in the build —
+    /// the crates whose `[[isolation.grant]]` entries apply.
+    pub lockfile_root: &'a Path,
     /// The sources cargo compiles — the workspace root, plus the real
     /// workspace on a mirror build, whose sources the mirror links into.
     /// Read-only: a build must not plant sources that a later,
@@ -122,14 +96,20 @@ pub struct SandboxRequest<'a> {
     pub ipc: Option<IpcRouter>,
 }
 
-/// The sandbox one build's cargo runs in — the network policy spelled
-/// in the variant so [`Self::status`] needs no flag to know which it
-/// holds.
-pub enum BuildSandbox {
-    /// `SandboxNetwork::Allow`: heel's proxy passes every request.
-    AllowNetwork(Sandbox<heel::AllowAll>),
-    /// `SandboxNetwork::Deny`: no proxy; outbound is refused outright.
-    DenyNetwork(Sandbox<heel::DenyAll>),
+/// The network policy the sandbox holds, spelled in the variant so
+/// [`BuildSandbox::status`] needs no flag to know which.
+enum Network {
+    /// Heel's proxy passes every request, each recorded in the audit log.
+    Allowed(Sandbox<Audited<AllowAll>>),
+    /// No proxy; outbound is refused outright.
+    Denied(Sandbox<DenyAll>),
+}
+
+/// The sandbox one build's cargo runs in, with the audit log its denied
+/// accesses are written to.
+pub struct BuildSandbox {
+    network: Network,
+    audit: DeniedAccessLog,
 }
 
 /// A command as heel spells it: UTF-8 argv and environment — stow works
@@ -181,70 +161,63 @@ impl SandboxedCommand {
 }
 
 fn utf8(value: &OsStr, what: &str) -> stow_types::error::Result<String> {
-    value
-        .to_str()
-        .map(str::to_owned)
-        .ok_or_else(|| stow_types::stow_error!("{what} {value:?} is not UTF-8 under --sandbox"))
+    value.to_str().map(str::to_owned).ok_or_else(|| {
+        stow_types::stow_error!("{what} {value:?} is not UTF-8 under a sandboxed level")
+    })
 }
 
 impl BuildSandbox {
     /// Create the sandbox one cargo build runs in.
     ///
     /// A sandbox that cannot be set up is an error here — there is no
-    /// unsandboxed fallback (stow#779). `runtime_executable` doubles as
-    /// the `heel` binary the IPC layout bakes into its launcher shims
-    /// and so gets the execute grant the shims and the facades both
-    /// need, the same trick `stow-build` plays in CI.
+    /// unsandboxed fallback and no weaker level (stow#779, stow#1000).
+    /// `runtime_executable` doubles as the `heel` binary the IPC layout
+    /// bakes into its launcher shims and so gets the execute grant the
+    /// shims and the facades both need, the same trick `stow-build` plays
+    /// in CI.
     ///
     /// # Errors
     ///
-    /// A grant path that does not resolve, or the sandbox's own
-    /// construction failure.
+    /// A grant path that does not resolve, an audit directory that cannot
+    /// be prepared, or the sandbox's own construction failure — including
+    /// heel refusing a level the platform cannot enforce.
     pub async fn create(mut request: SandboxRequest<'_>) -> stow_types::error::Result<Self> {
-        let mut builder = SandboxConfigBuilder::default()
-            .filesystem_strict(true)
-            .security(SecurityConfig::strict())
-            .identity(stow_identity()?)
-            .env_passthroughs(sandbox_env_names(
-                std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
-            ))
-            .heel_binary(request.runtime_executable);
-        for (path, access, reason) in sandbox_grants(&request).await? {
-            // The kernel resolves paths through `/var` → `/private/var`
-            // and friends; a grant spelled through a symlink does not
-            // cover the resolved path, so every grant is canonicalized
-            // before heel writes the rule.
-            let path = path.canonicalize().map_err(|error| {
-                stow_types::stow_error!("canonicalize sandbox grant {}: {error}", path.display())
-            })?;
-            tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
-            builder = builder.grant(path, access);
-        }
+        let audit_dir = crate::config::audit_dir()?;
+        std::fs::create_dir_all(&audit_dir).map_err(|error| {
+            stow_types::stow_error!(
+                "create the audit directory {}: {error}",
+                audit_dir.display()
+            )
+        })?;
+        let audit = DeniedAccessLog {
+            dir: audit_dir,
+            files: request.isolation.config.audit_files,
+            level: request.isolation.level.as_str(),
+        };
         let ipc = request.ipc.take();
-        Ok(match request.network {
-            SandboxNetwork::Allow => Self::AllowNetwork(
-                Sandbox::with_config(build_config(builder.network(heel::AllowAll), ipc))
-                    .await
-                    .map_err(|error| {
-                        stow_types::stow_error!("create the cargo build sandbox: {error}")
-                    })?,
-            ),
-            SandboxNetwork::Deny => Self::DenyNetwork(
-                Sandbox::with_config(build_config(builder.network(heel::DenyAll), ipc))
-                    .await
-                    .map_err(|error| {
-                        stow_types::stow_error!("create the cargo build sandbox: {error}")
-                    })?,
-            ),
-        })
+        let level = request.isolation.level.as_str();
+        let network = if request.confinement.network_allowed() {
+            let log = NetworkAuditLog::rolling_daily(&audit.dir, audit.files)
+                .map_err(|error| stow_types::stow_error!("open the network audit log: {error}"))?;
+            let builder = confined_builder(
+                SandboxConfigBuilder::default().network(Audited::new(AllowAll, log)),
+                &request,
+            )
+            .await?;
+            Network::Allowed(create_sandbox(build_config(builder, ipc), level).await?)
+        } else {
+            let builder = confined_builder(SandboxConfigBuilder::default(), &request).await?;
+            Network::Denied(create_sandbox(build_config(builder, ipc), level).await?)
+        };
+        Ok(Self { network, audit })
     }
 
     /// heel's IPC socket, when a router was configured — the endpoint
     /// the facades inside reach the supervisor through.
     pub fn ipc_endpoint(&self) -> Option<&Path> {
-        match self {
-            Self::AllowNetwork(sandbox) => sandbox.ipc_endpoint(),
-            Self::DenyNetwork(sandbox) => sandbox.ipc_endpoint(),
+        match &self.network {
+            Network::Allowed(sandbox) => sandbox.ipc_endpoint(),
+            Network::Denied(sandbox) => sandbox.ipc_endpoint(),
         }
     }
 
@@ -252,18 +225,305 @@ impl BuildSandbox {
     /// sandboxed cargo's own status, which travels up to the caller the
     /// same way the unsandboxed one's does (stow#652).
     ///
+    /// The accesses the sandbox denies while it runs are written to the
+    /// audit log on platforms that report them.
+    ///
     /// # Errors
     ///
-    /// A spawn failure; a non-zero cargo status is an `Ok` value.
+    /// A spawn failure, or a denied-access recording that cannot start or
+    /// be written; a non-zero cargo status is an `Ok` value.
     pub async fn status(
         &self,
         command: &SandboxedCommand,
     ) -> stow_types::error::Result<std::process::ExitStatus> {
-        match self {
-            Self::AllowNetwork(sandbox) => run(sandbox, command).await,
-            Self::DenyNetwork(sandbox) => run(sandbox, command).await,
+        match &self.network {
+            Network::Allowed(sandbox) => self.audited(sandbox, command).await,
+            Network::Denied(sandbox) => self.audited(sandbox, command).await,
         }
     }
+
+    async fn audited<N: NetworkPolicy>(
+        &self,
+        sandbox: &Sandbox<N>,
+        command: &SandboxedCommand,
+    ) -> stow_types::error::Result<std::process::ExitStatus> {
+        let recorder = match sandbox.record_denials().await {
+            Ok(recorder) => Some(recorder),
+            // The platform's kernel reports no denials a process can follow.
+            // The boundary is unaffected; only this record of it is absent.
+            Err(heel::Error::UnsupportedSetting { platform, .. }) => {
+                tracing::warn!(
+                    platform,
+                    "denied accesses are not recorded on this platform; network destinations still are"
+                );
+                None
+            }
+            Err(error) => {
+                return Err(stow_types::stow_error!(
+                    "record the accesses the build sandbox denies: {error}"
+                ));
+            }
+        };
+        let status = run(sandbox, command).await;
+        if let Some(recorder) = recorder {
+            let denials = recorder.finish().await.map_err(|error| {
+                stow_types::stow_error!("collect the accesses the build sandbox denied: {error}")
+            })?;
+            self.audit.record(&denials)?;
+        }
+        status
+    }
+}
+
+async fn create_sandbox<N: NetworkPolicy>(
+    config: SandboxConfig<N>,
+    level: &str,
+) -> stow_types::error::Result<Sandbox<N>> {
+    Sandbox::with_config(config).await.map_err(|error| {
+        let cause = match &error {
+            // Landlock and the seccomp broker need kernel 6.7.
+            heel::Error::UnsupportedPlatformVersion { .. } => {
+                "the kernel is too old for the sandbox (Linux 6.7 or newer is required)"
+            }
+            // heel's own message names the value found and the value needed.
+            heel::Error::PtraceScopeTooStrict { .. } => {
+                "the host's Yama setting forbids the sandbox broker"
+            }
+            heel::Error::SeccompNotifyUnavailable(_) => {
+                "the host offers no seccomp user notification for the sandbox broker"
+            }
+            heel::Error::UnsupportedSetting { .. } => {
+                "this platform cannot enforce a setting the level needs"
+            }
+            _ => "the sandbox could not be set up",
+        };
+        stow_types::stow_error!(
+            "isolation level `{level}` cannot be enforced, and stow never runs a build with weaker protection: {cause}: {error}"
+        )
+    })
+}
+
+/// Where a build's denied accesses are written: one line of JSON per denial in
+/// a daily file beside heel's network audit files, the oldest removed past
+/// `files`.
+struct DeniedAccessLog {
+    dir: PathBuf,
+    files: usize,
+    level: &'static str,
+}
+
+/// One denied access as the audit log spells it.
+#[derive(serde::Serialize)]
+struct DeniedAccessRecord<'a> {
+    level: &'static str,
+    #[serde(flatten)]
+    denial: &'a heel::Denial,
+}
+
+impl DeniedAccessLog {
+    const PREFIX: &'static str = "denied-access";
+
+    fn record(&self, denials: &[heel::Denial]) -> stow_types::error::Result<()> {
+        if denials.is_empty() {
+            return Ok(());
+        }
+        let today = time::OffsetDateTime::now_utc().date();
+        let path = self.dir.join(format!(
+            "{}.{:04}-{:02}-{:02}.jsonl",
+            Self::PREFIX,
+            today.year(),
+            u8::from(today.month()),
+            today.day()
+        ));
+        let mut lines = String::new();
+        for denial in denials {
+            lines.push_str(
+                &serde_json::to_string(&DeniedAccessRecord {
+                    level: self.level,
+                    denial,
+                })
+                .map_err(|error| stow_types::stow_error!("serialize a denied access: {error}"))?,
+            );
+            lines.push('\n');
+        }
+        {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut file| file.write_all(lines.as_bytes()))
+                .map_err(|error| {
+                    stow_types::stow_error!("write the audit log {}: {error}", path.display())
+                })?;
+        }
+        tracing::info!(
+            denied = denials.len(),
+            log = %path.display(),
+            "the build sandbox denied accesses"
+        );
+        self.prune()
+    }
+
+    /// Remove the oldest daily files past the configured count.
+    fn prune(&self) -> stow_types::error::Result<()> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&self.dir)
+            .map_err(|error| {
+                stow_types::stow_error!("read the audit directory {}: {error}", self.dir.display())
+            })?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(Self::PREFIX))
+            })
+            .collect();
+        // The date is in the name, so the names sort oldest first.
+        files.sort();
+        let excess = files.len().saturating_sub(self.files);
+        for path in files.into_iter().take(excess) {
+            std::fs::remove_file(&path).map_err(|error| {
+                stow_types::stow_error!("remove the old audit log {}: {error}", path.display())
+            })?;
+        }
+        Ok(())
+    }
+}
+
+/// The part of the sandbox configuration that does not depend on the
+/// network policy: the level's file and environment policy, the grants and
+/// the stable identity.
+async fn confined_builder<N: NetworkPolicy>(
+    builder: SandboxConfigBuilder<N, IpcUnconfigured>,
+    request: &SandboxRequest<'_>,
+) -> stow_types::error::Result<SandboxConfigBuilder<N, IpcUnconfigured>> {
+    let mut builder = builder.heel_binary(request.runtime_executable);
+    let (env_names, grants): (Vec<String>, Vec<(PathBuf, Access, &'static str)>) = match request
+        .confinement
+    {
+        Confinement::Protect => {
+            builder = builder
+                .filesystem_strict(false)
+                .security(
+                    // The denylists are the whole read and write policy; the
+                    // home-directory data protections of the strict preset
+                    // would deny toolchain state a build reads, so they are
+                    // off, and the hardware toggles stay closed.
+                    SecurityConfigBuilder::from_permissive()
+                        .allow_tcc_prompts(false)
+                        .allow_hardware(false)
+                        .build(),
+                )
+                .writable_file_system(true)
+                .read_denylist(ReadDenylist::credentials())
+                .write_denylist(WriteDenylist::persistence().except(
+                    // Cargo's private git clones: their hooks are never run
+                    // by a user, and cargo creates and removes them itself.
+                    crate::config::require_cargo_home()?.join("git"),
+                ));
+            let env_names = protect_env_names(
+                std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+            );
+            // Every grant must canonicalize, and cargo has not run to create
+            // the target directory — a fresh checkout, or right after
+            // `cargo clean` (stow#823).
+            std::fs::create_dir_all(request.target_dir).map_err(|error| {
+                stow_types::stow_error!(
+                    "create the target directory {}: {error}",
+                    request.target_dir.display()
+                )
+            })?;
+            let mut grants = protect_grants(request);
+            grants.extend(
+                toolchain_grants(
+                    request,
+                    &crate::config::require_cargo_home()?,
+                    rustup_home().as_deref(),
+                )
+                .await?,
+            );
+            (env_names, grants)
+        }
+        Confinement::Strict | Confinement::Offline => {
+            builder = builder
+                .filesystem_strict(true)
+                .security(SecurityConfig::strict())
+                .identity(stow_identity()?);
+            let mut env_names = sandbox_env_names(
+                std::env::vars_os().filter_map(|(name, _)| name.into_string().ok()),
+            );
+            let mut allowlist = sandbox_grants(request).await?;
+            let crates = crate::isolation::locked_crates(request.lockfile_root)?;
+            for grant in crate::isolation::applicable_grants(&request.isolation.config, &crates) {
+                tracing::debug!(crate_name = %grant.crate_name, "isolation grant applies");
+                env_names.extend(grant.env.iter().cloned());
+                for (paths, access) in [
+                    (&grant.read, Access::READ),
+                    (&grant.write, Access::WRITE),
+                    (&grant.exec, Access::READ | Access::EXEC),
+                ] {
+                    allowlist.extend(paths.iter().map(|path| {
+                        (
+                            path.clone(),
+                            access,
+                            "an [[isolation.grant]] entry for a crate in the build",
+                        )
+                    }));
+                }
+            }
+            (env_names, allowlist)
+        }
+    };
+    builder = builder.env_passthroughs(env_names);
+    for (path, access, reason) in grants {
+        // The kernel resolves paths through `/var` → `/private/var`
+        // and friends; a grant spelled through a symlink does not
+        // cover the resolved path, so every grant is canonicalized
+        // before heel writes the rule.
+        let path = path.canonicalize().map_err(|error| {
+            stow_types::stow_error!("canonicalize sandbox grant {}: {error}", path.display())
+        })?;
+        tracing::debug!(path = %path.display(), ?access, reason, "sandbox grant");
+        builder = builder.grant(path, access);
+    }
+    Ok(builder)
+}
+
+/// What `protect` grants for stow's own paths. The machine is otherwise
+/// open and the registry needs no grant, but the toolchain does on Linux,
+/// where heel executes only under the system trees and the home directory:
+/// `toolchain_grants` adds it, read and execute. The target directory is
+/// written and executed, and the scratch, shim and stow binary paths may
+/// sit under a temporary directory heel does not let a process execute from.
+fn protect_grants(request: &SandboxRequest<'_>) -> Vec<(PathBuf, Access, &'static str)> {
+    let mut grants = vec![
+        (
+            request.target_dir.to_path_buf(),
+            Access::WRITE | Access::EXEC,
+            "the target directory — build scripts and proc macros are compiled here and must execute",
+        ),
+        (
+            request.runtime_executable.to_path_buf(),
+            Access::READ | Access::EXEC,
+            "the stow binary the wrapper shims resolve to",
+        ),
+    ];
+    if let Some(dir) = request.scratch_dir {
+        grants.push((
+            dir.to_path_buf(),
+            Access::READ,
+            "the build's scratch tables — serve map, cache policy, expanded graph, extra args",
+        ));
+    }
+    if let Some(dir) = request.shims_dir {
+        grants.push((
+            dir.to_path_buf(),
+            Access::READ | Access::EXEC,
+            "the rustc/cc wrapper shims cargo invokes",
+        ));
+    }
+    grants
 }
 
 async fn run<N: heel::NetworkPolicy>(
@@ -403,7 +663,44 @@ async fn sandbox_grants(
         ));
     }
 
-    conditional_grants(&cargo_home, rustup_home.as_deref(), &mut grants);
+    conditional_grants(&cargo_home, &mut grants);
+    grants.extend(toolchain_grants(request, &cargo_home, rustup_home.as_deref()).await?);
+
+    Ok(grants)
+}
+
+/// Everything under which the build finds and executes its toolchain:
+/// rustup's home, cargo's `bin` proxies, the compilers' directories, the
+/// rustc sysroot, the SDK roots and compiler/linker env vars, stow's own
+/// tools directory, and the driver, linker and `COMPILER_PATH` trees the
+/// drivers report. Read and execute only. The single source of "toolchain
+/// paths": `strict`/`offline` grant it as part of a closed filesystem, and
+/// `protect` grants it because heel's Linux rules execute only under the
+/// system trees and the home directory, so a toolchain outside them (the
+/// managed mold, a `/opt` or `/nix` install) would otherwise be denied.
+async fn toolchain_grants(
+    request: &SandboxRequest<'_>,
+    cargo_home: &Path,
+    rustup_home: Option<&Path>,
+) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
+    let mut grants: Vec<(PathBuf, Access, &'static str)> = Vec::new();
+    let bin = cargo_home.join("bin");
+    if bin.exists() {
+        grants.push((
+            bin,
+            Access::READ | Access::EXEC,
+            "the rustup proxy shims `cargo`/`rustc` when PATH leads there",
+        ));
+    }
+    if let Some(home) = rustup_home
+        && home.exists()
+    {
+        grants.push((
+            home.to_path_buf(),
+            Access::READ | Access::EXEC,
+            "toolchain binaries and the Rust std library sources under the toolchain lib dir",
+        ));
+    }
     grants.extend(compiler_search_grants(request.rustc_executable));
     grants.extend(toolchain_grant_dirs());
     // The process-spawning halves — rustc's sysroot probe and the
@@ -423,7 +720,6 @@ async fn sandbox_grants(
         ));
     }
     grants.extend(toolchain?);
-
     Ok(grants)
 }
 
@@ -432,11 +728,7 @@ async fn sandbox_grants(
 /// `/usr/include` exists only on a host with C headers. Each is pushed
 /// only when its path exists: a grant must resolve to a real path.
 /// cargo's `credentials`/`credentials.toml` are never among them.
-fn conditional_grants(
-    cargo_home: &Path,
-    rustup_home: Option<&Path>,
-    grants: &mut Vec<(PathBuf, Access, &'static str)>,
-) {
+fn conditional_grants(cargo_home: &Path, grants: &mut Vec<(PathBuf, Access, &'static str)>) {
     grants.push((
         cargo_home.join(".package-cache"),
         Access::READ | Access::WRITE,
@@ -452,11 +744,6 @@ fn conditional_grants(
             cargo_home.join("git"),
             Access::READ,
             "git dependency database and checkouts fetched on the host — read-only like the registry",
-        ),
-        (
-            cargo_home.join("bin"),
-            Access::READ | Access::EXEC,
-            "the rustup proxy shims `cargo`/`rustc` when PATH leads there",
         ),
         (
             cargo_home.join("config.toml"),
@@ -477,15 +764,6 @@ fn conditional_grants(
         if path.exists() {
             grants.push((path, access, reason));
         }
-    }
-    if let Some(home) = rustup_home
-        && home.exists()
-    {
-        grants.push((
-            home.to_path_buf(),
-            Access::READ | Access::EXEC,
-            "toolchain binaries and the Rust std library sources under the toolchain lib dir",
-        ));
     }
 
     // The distro C header root every build script's `cc`/`c++` reads.
@@ -1140,6 +1418,21 @@ fn sandbox_env_names(names: impl Iterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// What `protect` passes through: every host variable except credentials
+/// (`isolation::is_credential_variable`), the variables stow sets for the
+/// build itself, and the proxy variables heel points at its own proxy.
+fn protect_env_names(names: impl Iterator<Item = String>) -> Vec<String> {
+    names
+        .filter(|name| {
+            !crate::isolation::is_credential_variable(name)
+                && !env_name::eq_any(name, &["CARGO_TARGET_DIR", "CARGO_HOME", "RUSTUP_HOME"])
+                && !["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"]
+                    .iter()
+                    .any(|proxy| name.eq_ignore_ascii_case(proxy))
+        })
+        .collect()
+}
+
 /// Create cargo's package-cache lock file before the sandbox starts.
 /// Cargo takes a lock on it on every invocation, `--offline` included,
 /// so it has to exist and be writable inside the sandbox.
@@ -1639,6 +1932,27 @@ mod tests {
     }
 
     #[test]
+    fn protect_passes_the_host_environment_minus_credentials_and_proxies() {
+        let names = [
+            "PATH",
+            "EDITOR",
+            "GITHUB_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "SSH_AUTH_SOCK",
+            "https_proxy",
+            "ALL_PROXY",
+            "CARGO_HOME",
+            "CARGO_TARGET_DIR",
+            "MY_APP_FLAG",
+        ]
+        .map(String::from);
+        assert_eq!(
+            protect_env_names(names.into_iter()),
+            ["PATH", "EDITOR", "MY_APP_FLAG"]
+        );
+    }
+
+    #[test]
     fn a_cross_target_keeps_the_real_host_for_the_build_scripts() {
         // A wasm32 consumer build names a target outside every CI
         // family, but its build scripts and proc macros still compile
@@ -1646,12 +1960,15 @@ mod tests {
         // spelled target AND the host the driver resolved, not a
         // runner-family mapping of the consumer target.
         let dummy = PathBuf::from("/usr/bin/true");
+        let isolation = Isolation::off();
         let args = vec![
             OsString::from("--target"),
             OsString::from("wasm32-unknown-unknown"),
         ];
         let request = SandboxRequest {
-            network: SandboxNetwork::Deny,
+            confinement: Confinement::Offline,
+            isolation: &isolation,
+            lockfile_root: Path::new("/tmp"),
             source_roots: &[],
             target_dir: Path::new("/tmp"),
             scratch_dir: None,
@@ -1683,13 +2000,16 @@ mod tests {
         // signature is the enforcement, and the requests below stand in
         // for the builds.
         let dummy = PathBuf::from("/usr/bin/true");
+        let isolation = Isolation::off();
         let host_args = vec![OsString::from("--release")];
         let cross_args = vec![
             OsString::from("--target"),
             OsString::from("wasm32-unknown-unknown"),
         ];
         let host_build = SandboxRequest {
-            network: SandboxNetwork::Allow,
+            confinement: Confinement::Strict,
+            isolation: &isolation,
+            lockfile_root: Path::new("/tmp"),
             source_roots: &[],
             target_dir: Path::new("/tmp/host-target"),
             scratch_dir: None,
@@ -1702,7 +2022,9 @@ mod tests {
             ipc: None,
         };
         let cross_build = SandboxRequest {
-            network: SandboxNetwork::Deny,
+            confinement: Confinement::Offline,
+            isolation: &isolation,
+            lockfile_root: Path::new("/tmp"),
             source_roots: &[],
             target_dir: Path::new("/tmp/cross-target"),
             scratch_dir: None,

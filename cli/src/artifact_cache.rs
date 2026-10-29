@@ -14,7 +14,7 @@ use stow_types::error::Context;
 use stow_types::identity::{CrateName, DependencyCompileKeyIdentity};
 use stow_types::platform::Profile;
 use stow_types::public_cache::{
-    StableRegistryArtifactIdentity, normalized_cache_profile, stable_c_metadata_for_compile_key,
+    StableUnitIdentity, normalized_cache_profile, stable_c_metadata_for_compile_key,
 };
 use stow_types::versioning::is_semver_compatible_upgrade;
 
@@ -91,8 +91,11 @@ pub struct LocalBuildArtifact {
     pub target: String,
     /// The rustc version that produced the outputs.
     pub rustc_version: String,
-    /// The stable registry identity (`compile_key` + 16-hex `c_metadata`).
-    pub identity: StableRegistryArtifactIdentity,
+    /// The stable unit identity (`compile_key` + 16-hex `c_metadata`).
+    pub identity: StableUnitIdentity,
+    /// How far this artifact's identity may travel — a local-only unit
+    /// records rows its dependents fold to `LocalOnly` (stow#1006).
+    pub reach: stow_types::public_cache::Reach,
     /// Canonical features JSON as fed into the compile key.
     pub features_json: String,
     /// The unit's `--extern` deps resolved against `materialized_outputs`,
@@ -115,11 +118,14 @@ impl LocalBuildArtifact {
 
 /// One digest identifying exactly which bytes a unit instance is: blake3
 /// under `stow.unit-instance.v1` over the unit's output files' sha256s —
-/// the set `artifact_cache_outputs` records for an entry — sorted, so the
-/// output ordering of a bundle manifest never perturbs it.
+/// the set `artifact_cache_outputs` records for an entry — sorted and
+/// deduplicated, so neither the output ordering of a bundle manifest nor a
+/// merged bundle's differently-named copy of the same bytes perturbs it
+/// (stow#1044).
 pub fn outputs_instance_digest<'a>(sha256s: impl IntoIterator<Item = &'a str>) -> String {
     let mut sha256s: Vec<&str> = sha256s.into_iter().collect();
     sha256s.sort_unstable();
+    sha256s.dedup();
     let mut hasher = blake3::Hasher::new_derive_key("stow.unit-instance.v1");
     for sha256 in &sha256s {
         hasher.update(sha256.as_bytes());
@@ -204,6 +210,10 @@ pub struct CachedArtifactBundle {
     /// local entry was compiled against; `'[]'` on remote entries, whose
     /// binding is the published instance by construction (stow#836).
     pub dependency_instances_json: String,
+    /// How far this entry's identity may travel — recorded at store
+    /// time, so a served local-only bundle keeps marking its outputs
+    /// (and therefore its consumers) `LocalOnly` (stow#1006).
+    pub reach: stow_types::public_cache::Reach,
     /// Compile time the publisher recorded for this artifact — `0` for
     /// locally produced entries, which carry no measurement.
     pub compile_millis: u64,
@@ -328,6 +338,12 @@ pub async fn load_cached_bundle(
     let shape = EntryShape::parse(&entry, &rustc_version, &cache_key)?;
     Ok(Some(CachedArtifactBundle {
         provenance: ArtifactProvenance::from_column(&entry.provenance)?,
+        reach: stow_types::public_cache::Reach::from_int(entry.reach).ok_or_else(|| {
+            stow_types::stow_error!(
+                "artifact cache entry {cache_key} for rustc {rustc_version} has unknown reach {}",
+                entry.reach
+            )
+        })?,
         oci_reference: entry.oci_reference,
         oci_digest: entry.oci_digest,
         compile_key: entry.compile_key,
@@ -485,6 +501,7 @@ pub fn load_bundle_entry_dir(
     let lease_lock = acquire_entry_shared_lock(lease_dir, cache_key)?;
     Ok(Some(CachedArtifactBundle {
         provenance: ArtifactProvenance::Remote,
+        reach: stow_types::public_cache::Reach::Public,
         oci_reference: manifest.oci_reference,
         oci_digest: manifest.oci_digest,
         compile_key: manifest.config.compile_key,
@@ -556,10 +573,12 @@ pub async fn load_semantic_cached_bundle(
     // keeps containment while the chain check that gates a move ran
     // upstream at prefetch-staging time.
     let rows = sqlx::query_as::<_, SemanticCacheCandidateRow>(
-        "SELECT c_metadata, crate_version, emit_json, features_json \
+        "SELECT c_metadata, crate_version, emit_json, features_json, crate_name, \
+                compile_key, dependency_c_metadata_json \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND target = ? AND crate_name = ? \
-           AND profile_json = ? AND kind_json = ? AND crate_types_json = ?",
+           AND profile_json = ? AND kind_json = ? AND crate_types_json = ? \
+           AND reach = ?",
     )
     .bind(&request.rustc_version)
     .bind(&request.target)
@@ -567,6 +586,7 @@ pub async fn load_semantic_cached_bundle(
     .bind(profile_json)
     .bind(kind_json)
     .bind(crate_types_json)
+    .bind(stow_types::public_cache::Reach::Public.to_int())
     .fetch_all(&connection)
     .await?;
     let mut candidates = rows
@@ -585,18 +605,89 @@ pub async fn load_semantic_cached_bundle(
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
     candidates.sort_by(compare_semantic_candidates);
-    let Some(candidate) = candidates.into_iter().next() else {
-        return Ok(None);
+    // The first candidate in order that was also compiled with the
+    // request's own cfgs, codegen and link options (stow#1047). One that
+    // was not is a plain miss for this request, never an eviction: it is
+    // a sound artifact for the requests it does match.
+    for candidate in candidates {
+        let loaded = load_cached_bundle(
+            config,
+            &FetchRequest {
+                target: &request.target,
+                rustc_version: &request.rustc_version,
+                c_metadata: &candidate.c_metadata,
+            },
+        )
+        .await?;
+        let Some(loaded) = loaded else {
+            continue;
+        };
+        if semantic_candidate_honours_consumer(request, &candidate, &loaded)? {
+            return Ok(Some(loaded));
+        }
+        tracing::debug!(
+            crate_name = %request.crate_name,
+            candidate_version = %candidate.row.crate_version,
+            candidate_compile_key = %candidate.row.compile_key,
+            "local semantic candidate was compiled with different cfgs, codegen or link options"
+        );
+    }
+    Ok(None)
+}
+
+/// Whether `loaded`, a semantic candidate of `request`, was compiled with
+/// the request's own cfgs, extra codegen and link options.
+///
+/// A candidate of the request's version and feature set differs in its
+/// emit set alone and ran the request's own build script. Any other was
+/// built with its own build script's output, which a stored entry carries
+/// only in the manifest a downloaded bundle keeps beside its files; a
+/// locally compiled entry has none, so it is judged as having no
+/// build-script inputs.
+fn semantic_candidate_honours_consumer(
+    request: &SemanticFetchRequest,
+    candidate: &SemanticCacheCandidate,
+    loaded: &CachedArtifactBundle,
+) -> stow_types::error::Result<bool> {
+    let build_script = match request
+        .build_script_of_same_build(&candidate.row.crate_version, &candidate.row.features_json)
+    {
+        Some(own) => std::borrow::Cow::Borrowed(own),
+        None => std::borrow::Cow::Owned(stow_types::upload_plan::BuildScriptInputs::of(
+            read_entry_native(&loaded.entry_dir)?.as_ref(),
+        )),
     };
-    load_cached_bundle(
-        config,
-        &FetchRequest {
-            target: &request.target,
-            rustc_version: &request.rustc_version,
-            c_metadata: &candidate.c_metadata,
+    request.candidate_honours_consumer(
+        &crate::fetch::SemanticCandidate {
+            crate_name: &candidate.row.crate_name,
+            crate_version: &candidate.row.crate_version,
+            features_json: &candidate.row.features_json,
+            dependency_c_metadata_json: &candidate.row.dependency_c_metadata_json,
+            emit: &candidate.emit,
+            compile_key: &candidate.row.compile_key,
         },
+        &build_script,
     )
-    .await
+}
+
+/// The captured build-script output of the bundle an entry was stored
+/// from; `None` for an entry with no manifest (a local build).
+fn read_entry_native(
+    entry_dir: &Path,
+) -> stow_types::error::Result<Option<stow_types::artifact::NativeArtifacts>> {
+    let manifest_path = entry_dir.join(STOW_BUNDLE_MANIFEST_PATH);
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).wrap_err_with(|| {
+                format!("read bundle entry manifest {}", manifest_path.display())
+            });
+        }
+    };
+    let manifest = serde_json::from_slice::<stow_types::bundle::ArtifactBundleManifest>(&bytes)
+        .wrap_err_with(|| format!("parse bundle entry manifest {}", manifest_path.display()))?;
+    Ok(manifest.config.native)
 }
 
 pub async fn store_downloaded_bundle(
@@ -630,13 +721,13 @@ pub async fn store_downloaded_bundle(
     // second download of the same identity must not interleave temp dirs or
     // row writes.
     let mut write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
-    let entry_has_row = loop {
+    let existing = loop {
         let existing =
             load_artifact_cache_entry(&connection, &request.rustc_version, &cache_key).await?;
         // Local-first: a self-produced entry already serves this identity, so
         // a later remote bundle must not displace it.
         if !local_entry_covers(existing.as_ref(), &entry_dir)? {
-            break existing.is_some();
+            break existing;
         }
         // The reload goes through the normal read path, which needs the
         // shared lock — the exclusive lock has to be dropped first or the
@@ -650,10 +741,30 @@ pub async fn store_downloaded_bundle(
         write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
     };
 
+    // A remote row whose directory exists already serves this identity: a
+    // further bundle of the same compile key merges its original-named
+    // files and output rows into the entry instead of replacing the row —
+    // the replacement was what left the row naming files the directory
+    // never held (stow#1044).
+    if let Some(entry) = existing
+        && entry_dir.exists()
+    {
+        return merge_downloaded_bundle_into_entry(
+            config,
+            &connection,
+            &request,
+            &bundle,
+            &entry,
+            entry_dir,
+            write_lease,
+        )
+        .await;
+    }
+
     // A leftover entry dir with no row is a crashed writer's stage output:
     // it is not an entry, and must not be silently adopted by the row the
     // insert below is about to write.
-    if !entry_has_row && entry_dir.exists() {
+    if entry_dir.exists() {
         remove_orphaned_entry_dir(entry_dir.clone()).await?;
     }
 
@@ -722,6 +833,7 @@ fn cached_bundle_for_entry(
 ) -> CachedArtifactBundle {
     CachedArtifactBundle {
         provenance: ArtifactProvenance::Remote,
+        reach: stow_types::public_cache::Reach::Public,
         oci_reference: bundle.manifest.oci_reference.clone(),
         oci_digest: bundle.manifest.oci_digest.clone(),
         compile_key: bundle.manifest.config.compile_key.clone(),
@@ -749,6 +861,330 @@ fn cached_bundle_for_entry(
         verified_marker_policy: None,
         _lease_lock: lease_lock,
     }
+}
+
+/// Merge a further remote bundle of an already-cached compile key into the
+/// existing entry — the two index rows name the same bytes under different
+/// original file names (the builder's cargo hash), so the entry keeps its
+/// row and gains the incoming bundle's names instead of replacing them.
+/// The merge runs entirely under the caller's exclusive entry lock, so no
+/// state ever names a file the directory does not hold (stow#1044).
+async fn merge_downloaded_bundle_into_entry(
+    config: &StowConfig,
+    connection: &sqlx::SqlitePool,
+    request: &OwnedFetchRequest,
+    bundle: &ArtifactBundle,
+    entry: &ArtifactCacheEntryRow,
+    entry_dir: PathBuf,
+    write_lease: FileLock,
+) -> stow_types::error::Result<CachedArtifactBundle> {
+    let version_dir = config.artifact_cache_version_dir(&request.rustc_version);
+    let cache_key = cache_key_owned(request);
+    let recorded = load_artifact_outputs(connection, &request.rustc_version, &cache_key).await?;
+    let merge = tokio::task::spawn_blocking({
+        let entry_dir = entry_dir.clone();
+        let bundle = bundle.clone();
+        let entry_bundle = format!("{}@{}", entry.oci_reference, entry.oci_digest);
+        move || merge_bundle_entry_files_blocking(&entry_dir, &bundle, &recorded, &entry_bundle)
+    })
+    .await
+    .wrap_err("join store_downloaded_bundle merge task")??;
+    merge_artifact_cache_outputs(
+        connection,
+        &request.rustc_version,
+        &cache_key,
+        &merge.added_outputs,
+        merge.size_bytes,
+        now_millis(),
+    )
+    .await?;
+    drop(write_lease);
+    // Same post-store discipline as the fresh path: the shared lease before
+    // eviction, so the entry this call hands out cannot be deleted from
+    // under the caller.
+    let lease_lock = tokio::task::spawn_blocking({
+        let version_dir = version_dir.clone();
+        let cache_key = cache_key.clone();
+        move || acquire_entry_shared_lock(&version_dir, &cache_key)
+    })
+    .await
+    .wrap_err("join store_downloaded_bundle lock task")??;
+    evict_entries(
+        connection,
+        &request.rustc_version,
+        &version_dir,
+        &config.cc_cache_dir(),
+        config.artifact_cache_max_bytes,
+        &ProtectedEntry::Rustc(&cache_key),
+    )
+    .await?;
+    Ok(cached_bundle_for_entry(
+        bundle,
+        entry_dir,
+        request.rustc_version.clone(),
+        cache_key,
+        merge.size_bytes,
+        lease_lock,
+    ))
+}
+
+/// What the blocking merge pass over an entry's `files/` produced: the
+/// incoming bundle's newly-recorded output names and the entry's size now
+/// on disk.
+struct BundleEntryMerge {
+    added_outputs: Vec<ArtifactBundleFile>,
+    size_bytes: u64,
+}
+
+/// Fail a merge whose bundle disagrees with the entry under one compile
+/// key — the error names both published bundles so the defect is traceable
+/// to the pair of OCI objects, never resolved by a silent pick (stow#1044).
+fn bundle_identity_conflict(
+    entry_bundle: &str,
+    bundle: &ArtifactBundle,
+    detail: &str,
+) -> stow_types::error::Error {
+    stow_types::stow_error!(
+        "bundle {}@{} conflicts with cache entry {entry_bundle} under one compile key: {detail}",
+        bundle.manifest.oci_reference,
+        bundle.manifest.oci_digest,
+    )
+}
+
+/// Check every incoming output against the entry's recorded ones — a
+/// different digest under one compile key is an identity defect. Returns
+/// the recorded outputs by name.
+fn validate_incoming_outputs<'a>(
+    bundle: &ArtifactBundle,
+    recorded: &'a [ArtifactBundleFile],
+    entry_bundle: &str,
+) -> stow_types::error::Result<BTreeMap<&'a str, &'a ArtifactBundleFile>> {
+    let recorded_by_name: BTreeMap<&str, &ArtifactBundleFile> = recorded
+        .iter()
+        .map(|file| (file.file_name.as_str(), file))
+        .collect();
+    let recorded_digests: BTreeSet<&str> =
+        recorded.iter().map(|file| file.sha256.as_str()).collect();
+    let incoming = &bundle.manifest.config.outputs;
+    for output in incoming {
+        match recorded_by_name.get(output.file_name.as_str()) {
+            Some(existing) if existing.sha256 == output.sha256 => {}
+            Some(existing) => {
+                return Err(bundle_identity_conflict(
+                    entry_bundle,
+                    bundle,
+                    &format!(
+                        "output {} carries sha256 {}, the entry records it as {}",
+                        output.file_name, output.sha256, existing.sha256
+                    ),
+                ));
+            }
+            None if !recorded_digests.contains(output.sha256.as_str()) => {
+                return Err(bundle_identity_conflict(
+                    entry_bundle,
+                    bundle,
+                    &format!(
+                        "output {} carries sha256 {} the entry does not record",
+                        output.file_name, output.sha256
+                    ),
+                ));
+            }
+            None => {}
+        }
+    }
+    Ok(recorded_by_name)
+}
+
+/// The sha256 of every file an entry's `files/` holds, by name. A crashed
+/// merge's temp files are swept in the same pass.
+fn scan_entry_files(files_dir: &Path) -> stow_types::error::Result<BTreeMap<String, String>> {
+    let mut on_disk: BTreeMap<String, String> = BTreeMap::new();
+    if files_dir.exists() {
+        for dir_entry in std::fs::read_dir(files_dir)
+            .wrap_err_with(|| format!("read cache entry files dir {}", files_dir.display()))?
+        {
+            let dir_entry = dir_entry?;
+            if !dir_entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = dir_entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(".merge-") {
+                std::fs::remove_file(dir_entry.path()).wrap_err_with(|| {
+                    format!(
+                        "remove stale merge temp file {}",
+                        dir_entry.path().display()
+                    )
+                })?;
+                continue;
+            }
+            let (sha256, _) = sha256_file_bytes(&dir_entry.path())?;
+            on_disk.insert(name, sha256);
+        }
+    }
+    Ok(on_disk)
+}
+
+/// The file half of a merge: validate the incoming bundle's digests against
+/// the entry's recorded outputs — a different digest under one compile key
+/// is an identity defect and fails with both bundles named — then write
+/// every recorded- or incoming-named file the directory lacks from an
+/// equal-digest source: another file the entry already holds, or this
+/// bundle's own verified bytes. Each write lands through a temp file and
+/// rename inside `files/`, so a reader never sees a partial file.
+fn merge_bundle_entry_files_blocking(
+    entry_dir: &Path,
+    bundle: &ArtifactBundle,
+    recorded: &[ArtifactBundleFile],
+    entry_bundle: &str,
+) -> stow_types::error::Result<BundleEntryMerge> {
+    let recorded_by_name = validate_incoming_outputs(bundle, recorded, entry_bundle)?;
+    let incoming = &bundle.manifest.config.outputs;
+
+    // Hash every file the entry holds once: the merge's copy sources and
+    // the proof a needed file is already there. A crashed merge's temp
+    // files are swept in the same pass.
+    let files_dir = entry_dir.join("files");
+    let on_disk = scan_entry_files(&files_dir)?;
+    let mut by_digest: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for (name, sha256) in &on_disk {
+        by_digest
+            .entry(sha256.clone())
+            .or_insert_with(|| files_dir.join(name));
+    }
+
+    // Everything the row and the incoming bundle name must exist on disk —
+    // recorded names missing or holding different bytes are repaired here
+    // the same way new incoming names are written (stow#1044).
+    let mut needed: BTreeMap<&str, &str> = BTreeMap::new();
+    for file in recorded {
+        needed.insert(file.file_name.as_str(), file.sha256.as_str());
+    }
+    for file in incoming {
+        needed.insert(file.file_name.as_str(), file.sha256.as_str());
+    }
+    let incoming_by_digest: BTreeMap<&str, &ArtifactBundleFile> = incoming
+        .iter()
+        .map(|file| (file.sha256.as_str(), file))
+        .collect();
+    let mut counter = 0u32;
+    for (name, sha256) in &needed {
+        if on_disk.get(*name) == Some(&(*sha256).to_owned()) {
+            continue;
+        }
+        let temp = files_dir.join(format!(".merge-{}-{counter}-{name}", std::process::id()));
+        counter += 1;
+        if let Some(source) = by_digest.get(*sha256) {
+            reflink_copy::reflink_or_copy(source, &temp).wrap_err_with(|| {
+                format!(
+                    "clone equal-digest cache file {} into {}",
+                    source.display(),
+                    temp.display()
+                )
+            })?;
+        } else if let Some(output) = incoming_by_digest.get(sha256) {
+            let contents = bundle
+                .files
+                .get(&bundle_file_path(&output.file_name))
+                .ok_or_else(|| {
+                    stow_types::stow_error!(
+                        "bundle {}@{} is missing its output file {}",
+                        bundle.manifest.oci_reference,
+                        bundle.manifest.oci_digest,
+                        output.file_name
+                    )
+                })?;
+            let decoded = decode_bundle_output_bytes(output, contents)?;
+            std::fs::write(&temp, &decoded)
+                .wrap_err_with(|| format!("write merged cache file {}", temp.display()))?;
+        } else {
+            return Err(bundle_identity_conflict(
+                entry_bundle,
+                bundle,
+                &format!(
+                    "file {name} with sha256 {sha256} has no equal-digest source in the entry or the bundle"
+                ),
+            ));
+        }
+        std::fs::rename(&temp, files_dir.join(name))
+            .wrap_err_with(|| format!("move merged cache file {} into place", temp.display()))?;
+        by_digest.insert((*sha256).to_owned(), files_dir.join(name));
+    }
+
+    let added_outputs = incoming
+        .iter()
+        .filter(|output| !recorded_by_name.contains_key(output.file_name.as_str()))
+        .cloned()
+        .collect();
+    Ok(BundleEntryMerge {
+        added_outputs,
+        size_bytes: directory_size(entry_dir)?,
+    })
+}
+
+/// Append a merge's newly-named outputs to an existing entry and refresh
+/// its size and LRU stamp — an update of the same row, never the
+/// INSERT OR REPLACE that cascaded the recorded output names away
+/// (stow#1044). The whole append commits atomically, so the database never
+/// names a file the merge did not already write.
+async fn merge_artifact_cache_outputs(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    cache_key: &str,
+    added_outputs: &[ArtifactBundleFile],
+    size_bytes: u64,
+    last_accessed_ms: u64,
+) -> stow_types::error::Result<()> {
+    let mut transaction = connection.begin().await?;
+    let mut ordinal = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT MAX(ordinal) + 1 \
+         FROM artifact_cache_outputs \
+         WHERE rustc_version = ? AND cache_key = ?",
+    )
+    .bind(rustc_version)
+    .bind(cache_key)
+    .fetch_one(&mut *transaction)
+    .await?
+    .unwrap_or(0);
+    for file in added_outputs {
+        sqlx::query(
+            "INSERT INTO artifact_cache_outputs \
+             (rustc_version, cache_key, ordinal, file_name, media_type, sha256) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(rustc_version)
+        .bind(cache_key)
+        .bind(ordinal)
+        .bind(&file.file_name)
+        .bind(&file.media_type)
+        .bind(&file.sha256)
+        .execute(&mut *transaction)
+        .await?;
+        ordinal += 1;
+    }
+    let updated = sqlx::query(
+        "UPDATE artifact_cache_entries \
+         SET size_bytes = ?, last_accessed_ms = ? \
+         WHERE rustc_version = ? AND cache_key = ?",
+    )
+    .bind(db_int::<_, i64>(
+        size_bytes,
+        "artifact cache entry size_bytes",
+    )?)
+    .bind(db_int::<_, i64>(
+        last_accessed_ms,
+        "artifact cache entry last_accessed_ms",
+    )?)
+    .bind(rustc_version)
+    .bind(cache_key)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(stow_types::stow_error!(
+            "artifact cache entry {cache_key} for rustc {rustc_version} is missing from the state database"
+        ));
+    }
+    transaction.commit().await?;
+    Ok(())
 }
 
 /// Cache the outputs of a successful rustc passthrough build under the same
@@ -993,6 +1429,7 @@ async fn record_local_entry_metadata(
             dependency_c_metadata_json: build.dependencies.c_metadata_json.clone(),
             dependency_compile_keys_json: &binding.compile_keys_json,
             dependency_instances_json: &binding.instances_json,
+            reach: build.reach,
             compile_millis: 0,
             target: &build.target,
             profile: &profile,
@@ -1019,16 +1456,15 @@ pub async fn record_materialized_bundle_outputs(
     let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
     let stable_c_metadata = stable_c_metadata_for_compile_key(&bundle.compile_key)?;
     let dependency_identity = stable_c_metadata.as_str();
+    let stable_extra_filename = format!("-{stable_c_metadata}");
     let instance =
         outputs_instance_digest(bundle.outputs.iter().map(|output| output.sha256.as_str()));
-    let stable_identity = StableRegistryArtifactIdentity {
-        compile_key: bundle.compile_key.clone(),
-        c_metadata: stable_c_metadata.clone(),
-        extra_filename: format!("-{stable_c_metadata}"),
-        crate_name: bundle.crate_name.clone(),
-        version: bundle.crate_version.clone(),
-    };
-    let stable_parsed = parsed_with_stable_identity(parsed, &stable_identity);
+    // The entry's own reach: a served local-only bundle keeps marking
+    // its materialized outputs local-only, so its consumers fold to
+    // `LocalOnly` exactly as if it had compiled here (stow#1006).
+    let reach = bundle.reach;
+    let stable_parsed =
+        parsed_with_stable_identity(parsed, &stable_c_metadata, &stable_extra_filename);
 
     for file in &bundle.outputs {
         let output_path = crate::inject::expected_output_path(parsed, out_dir, file, host)?;
@@ -1037,6 +1473,7 @@ pub async fn record_materialized_bundle_outputs(
             &output_path,
             dependency_identity,
             &instance,
+            reach,
             updated_at_ms,
         )
         .await?;
@@ -1047,6 +1484,7 @@ pub async fn record_materialized_bundle_outputs(
                 &original_path,
                 dependency_identity,
                 &instance,
+                reach,
                 updated_at_ms,
             )
             .await?;
@@ -1059,6 +1497,7 @@ pub async fn record_materialized_bundle_outputs(
                 &stable_output_path,
                 dependency_identity,
                 &instance,
+                reach,
                 updated_at_ms,
             )
             .await?;
@@ -1090,6 +1529,7 @@ pub async fn record_materialized_closure_outputs(
             &original_path,
             bundle.c_metadata.as_str(),
             &instance,
+            bundle.reach,
             updated_at_ms,
         )
         .await?;
@@ -1136,7 +1576,11 @@ pub async fn record_materialized_local_build_outputs(
     let updated_at_ms: i64 = db_int(now_millis(), "materialized output timestamp")?;
     let dependency_identity = build.identity.c_metadata.as_str();
     let instance = build.instance();
-    let stable_parsed = parsed_with_stable_identity(parsed, &build.identity);
+    let stable_parsed = parsed_with_stable_identity(
+        parsed,
+        &build.identity.c_metadata,
+        &build.identity.extra_filename,
+    );
 
     // The stable-named invocation is the same unit under another file
     // name, so it names the same outputs: a shape present under one name
@@ -1158,6 +1602,7 @@ pub async fn record_materialized_local_build_outputs(
             path,
             dependency_identity,
             &instance,
+            build.reach,
             updated_at_ms,
         )
         .await?;
@@ -1290,6 +1735,9 @@ pub struct ResolvedDependencies {
     /// Each extern's crate, stable identity and recorded instance digest,
     /// in `c_metadata_json` order.
     pub externs: Vec<MaterializedDependency>,
+    /// The tightest reach any extern's row recorded — `LocalOnly` when a
+    /// dependency is git-sourced or codegen-keyed (stow#1006).
+    pub reach: stow_types::public_cache::Reach,
 }
 
 /// One resolved `--extern`: which stable identity the extern path belongs
@@ -1315,6 +1763,7 @@ pub async fn resolve_dependency_c_metadata_json(
             ResolvedDependencies {
                 c_metadata_json: "[]".to_owned(),
                 externs: Vec::new(),
+                reach: stow_types::public_cache::Reach::Public,
             },
         ));
     }
@@ -1327,18 +1776,26 @@ pub async fn resolve_dependency_c_metadata_json(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT output_path, c_metadata, instance FROM materialized_outputs \
+        "SELECT output_path, c_metadata, instance, reach FROM materialized_outputs \
          WHERE output_path IN ({placeholders})"
     );
-    let mut rows = sqlx::query_as::<_, (String, String, String)>(sqlx::AssertSqlSafe(sql));
+    let mut rows = sqlx::query_as::<_, (String, String, String, i64)>(sqlx::AssertSqlSafe(sql));
     for output_path in identities.iter().map(|(_, output_path)| output_path) {
         rows = rows.bind(output_path);
     }
     let rows = rows.fetch_all(&connection).await?;
-    let metadata_by_path: BTreeMap<String, (String, String)> = rows
-        .into_iter()
-        .map(|(path, c_metadata, instance)| (path, (c_metadata, instance)))
-        .collect();
+    let mut reach = stow_types::public_cache::Reach::Public;
+    let mut metadata_by_path = BTreeMap::new();
+    for (path, c_metadata, instance, row_reach) in rows {
+        // A reach value the table cannot decode is an inconsistent
+        // schema — fail fast rather than misclassify a local-only dep
+        // as public.
+        let row_reach = stow_types::public_cache::Reach::from_int(row_reach).ok_or_else(|| {
+            stow_types::stow_error!("materialized_outputs.reach has unknown value {row_reach}")
+        })?;
+        reach = reach.fold(row_reach);
+        metadata_by_path.insert(path, (c_metadata, instance));
+    }
     let mut resolved = Vec::with_capacity(identities.len());
     let mut externs = Vec::with_capacity(identities.len());
     for (crate_name, output_path) in identities {
@@ -1360,6 +1817,7 @@ pub async fn resolve_dependency_c_metadata_json(
         ResolvedDependencies {
             c_metadata_json: serde_json::to_string(&resolved)?,
             externs,
+            reach,
         },
     ))
 }
@@ -1369,19 +1827,22 @@ async fn record_materialized_output(
     path: &Path,
     c_metadata: &str,
     instance: &str,
+    reach: stow_types::public_cache::Reach,
     updated_at_ms: i64,
 ) -> stow_types::error::Result<()> {
     sqlx::query(
-        "INSERT INTO materialized_outputs (output_path, c_metadata, instance, updated_at_ms) \
-         VALUES (?, ?, ?, ?) \
+        "INSERT INTO materialized_outputs (output_path, c_metadata, instance, reach, updated_at_ms) \
+         VALUES (?, ?, ?, ?, ?) \
          ON CONFLICT(output_path) DO UPDATE SET \
              c_metadata = excluded.c_metadata, \
              instance = excluded.instance, \
+             reach = excluded.reach, \
              updated_at_ms = excluded.updated_at_ms",
     )
     .bind(path_to_string(path)?)
     .bind(c_metadata)
     .bind(instance)
+    .bind(reach.to_int())
     .bind(updated_at_ms)
     .execute(connection)
     .await?;
@@ -2914,6 +3375,7 @@ struct ArtifactCacheEntryRow {
     verified_marker_version: Option<i64>,
     verified_marker_policy: Option<String>,
     provenance: String,
+    reach: i64,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -2922,6 +3384,9 @@ struct SemanticCacheCandidateRow {
     crate_version: String,
     emit_json: String,
     features_json: String,
+    crate_name: String,
+    compile_key: String,
+    dependency_c_metadata_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2933,6 +3398,8 @@ struct SemanticCacheCandidate {
     /// smallest staged set containing it (stow#881), so the order keys
     /// on this.
     features: Vec<String>,
+    emit: Vec<String>,
+    row: SemanticCacheCandidateRow,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2966,7 +3433,7 @@ async fn load_artifact_cache_entry(
                 compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, \
                 compile_millis, size_bytes, \
                 profile_json, emit_json, kind_json, crate_types_json, \
-                verified_marker_version, verified_marker_policy, provenance \
+                verified_marker_version, verified_marker_policy, provenance, reach \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND cache_key = ?",
     )
@@ -3043,9 +3510,11 @@ fn semantic_candidate_from_row(
     }
     Ok(Some(SemanticCacheCandidate {
         version: candidate_version,
-        c_metadata: row.c_metadata,
+        c_metadata: row.c_metadata.clone(),
         emit_len: candidate_emit.len(),
         features: candidate_features,
+        emit: candidate_emit,
+        row,
     }))
 }
 
@@ -3133,6 +3602,9 @@ struct CacheEntryMetadata<'a> {
     dependency_c_metadata_json: String,
     dependency_compile_keys_json: &'a str,
     dependency_instances_json: &'a str,
+    /// `Public` for remote bundles; the local build's folded reach for
+    /// self-produced entries.
+    reach: stow_types::public_cache::Reach,
     /// Publisher-recorded compile time; `0` for locally produced entries.
     compile_millis: u64,
     target: &'a str,
@@ -3159,6 +3631,7 @@ impl<'a> CacheEntryMetadata<'a> {
             dependency_c_metadata_json: bundle.manifest.config.dependency_c_metadata_json.raw(),
             dependency_compile_keys_json: &bundle.manifest.config.dependency_compile_keys_json,
             dependency_instances_json: "[]",
+            reach: stow_types::public_cache::Reach::Public,
             compile_millis: bundle.manifest.config.compile_millis,
             target: bundle.manifest.config.target.as_str(),
             profile: &bundle.manifest.config.profile,
@@ -3221,8 +3694,8 @@ async fn insert_artifact_cache_entry(
 ) -> stow_types::error::Result<()> {
     sqlx::query(
         "INSERT OR REPLACE INTO artifact_cache_entries \
-         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)",
+         (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance, reach) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
     )
     .bind(rustc_version)
     .bind(cache_key)
@@ -3252,6 +3725,7 @@ async fn insert_artifact_cache_entry(
     .bind(serde_json::to_string(metadata.kind)?)
     .bind(serde_json::to_string(metadata.crate_types)?)
     .bind(metadata.provenance.as_column())
+    .bind(metadata.reach.to_int())
     .execute(connection)
     .await?;
     Ok(())
@@ -3490,15 +3964,15 @@ pub mod tests {
     use stow_types::bundle::{
         ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, SigstoreSignature,
     };
-    use stow_types::public_cache::StableRegistryArtifactIdentity;
+    use stow_types::public_cache::StableUnitIdentity;
 
     use stow_types::rustc::ParsedExternCrate;
 
     use super::{
-        STAGING_DIR, cache_key, join_relative_path, list_artifact_cache_entries,
-        load_bundle_entry_dir, load_semantic_cached_bundle, prepare_local_cache,
-        prepare_local_cache_blocking, store_bundle_entry_dir, touch_artifact_cache_entry,
-        write_downloaded_bundle_to_entry,
+        CachedArtifactBundle, STAGING_DIR, cache_key, join_relative_path,
+        list_artifact_cache_entries, load_bundle_entry_dir, load_semantic_cached_bundle,
+        prepare_local_cache, prepare_local_cache_blocking, store_bundle_entry_dir,
+        touch_artifact_cache_entry, write_downloaded_bundle_to_entry,
     };
     use crate::config::{StowConfig, VerifyMode};
     use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path};
@@ -3857,6 +4331,139 @@ pub mod tests {
         });
     }
 
+    /// A second published bundle of the sample unit: the same bytes under
+    /// another original file name (the builder's cargo hash) and another
+    /// OCI digest — the shape two index rows of one compile key carry
+    /// (stow#1044).
+    fn renamed_sample_bundle(
+        source: &ArtifactBundle,
+        file_name: &str,
+        oci_digest: &str,
+    ) -> ArtifactBundle {
+        let mut bundle = source.clone();
+        let old_name = bundle.manifest.config.outputs[0].file_name.clone();
+        let contents = bundle
+            .files
+            .remove(&bundle_file_path(&old_name))
+            .expect("sample output file");
+        bundle.files.insert(bundle_file_path(file_name), contents);
+        bundle.manifest.config.outputs[0].file_name = file_name.to_owned();
+        bundle.manifest.oci_digest = oci_digest.to_owned();
+        bundle
+    }
+
+    fn assert_entry_serves_names(
+        loaded: &CachedArtifactBundle,
+        expected: &[&str],
+        expected_bytes: &[u8],
+    ) {
+        let names: BTreeSet<&str> = loaded
+            .outputs
+            .iter()
+            .map(|file| file.file_name.as_str())
+            .collect();
+        assert_eq!(names, expected.iter().copied().collect::<BTreeSet<_>>());
+        for name in expected {
+            let path = loaded.entry_dir.join("files").join(name);
+            assert_eq!(
+                std::fs::read(&path).unwrap_or_else(|error| {
+                    panic!(
+                        "row names {name} but {} is unreadable: {error}",
+                        path.display()
+                    )
+                }),
+                expected_bytes,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_bundles_of_one_compile_key_merge_in_either_order() {
+        let first = sample_bundle("aabbccddeeff0011", "libdemo-d294755568193717.rmeta");
+        let second =
+            renamed_sample_bundle(&first, "libdemo-d889e926a647c184.rmeta", "sha256:second");
+        for (a, b) in [(&first, &second), (&second, &first)] {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let config = test_config(tempdir.path());
+            let request = fetch_request("aabbccddeeff0011");
+            run_async(async {
+                prepare_local_cache(&config, "1.91.1")
+                    .await
+                    .expect("prepare cache");
+                drop(
+                    super::store_downloaded_bundle(&config, &request, a)
+                        .await
+                        .expect("store first bundle"),
+                );
+                drop(
+                    super::store_downloaded_bundle(&config, &request, b)
+                        .await
+                        .expect("store second bundle"),
+                );
+                // A repeat of an already-merged bundle changes nothing.
+                drop(
+                    super::store_downloaded_bundle(&config, &request, b)
+                        .await
+                        .expect("store second bundle again"),
+                );
+                let loaded = super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("load bundle")
+                    .expect("cached bundle");
+                // The row keeps its first bundle's identity and gains the
+                // second bundle's names; every name is on disk.
+                assert_eq!(loaded.oci_digest, a.manifest.oci_digest);
+                assert_entry_serves_names(
+                    &loaded,
+                    &[
+                        "libdemo-d294755568193717.rmeta",
+                        "libdemo-d889e926a647c184.rmeta",
+                    ],
+                    b"demo-artifact",
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn a_bundle_whose_digests_differ_under_one_compile_key_fails_naming_both() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let request = fetch_request("aabbccddeeff0011");
+        let first = sample_bundle("aabbccddeeff0011", "libdemo-d294755568193717.rmeta");
+        let mut second =
+            renamed_sample_bundle(&first, "libdemo-d889e926a647c184.rmeta", "sha256:second");
+        second.manifest.config.outputs[0].sha256 = hex::encode(sha2::Sha256::digest(b"other"));
+        run_async(async {
+            prepare_local_cache(&config, "1.91.1")
+                .await
+                .expect("prepare cache");
+            drop(
+                super::store_downloaded_bundle(&config, &request, &first)
+                    .await
+                    .expect("store first bundle"),
+            );
+            let error = super::store_downloaded_bundle(&config, &request, &second)
+                .await
+                .map(drop)
+                .expect_err("a different digest under one compile key is an identity defect")
+                .to_string();
+            assert!(error.contains("sha256:second"), "{error}");
+            assert!(error.contains("sha256:test"), "{error}");
+            // The entry is untouched.
+            let loaded = super::load_cached_bundle(&config, &request)
+                .await
+                .expect("load bundle")
+                .expect("cached bundle");
+            assert_entry_serves_names(
+                &loaded,
+                &["libdemo-d294755568193717.rmeta"],
+                b"demo-artifact",
+            );
+        });
+    }
+
     #[test]
     fn store_and_load_cached_bundle_round_trip() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -3981,50 +4588,175 @@ pub mod tests {
         );
     }
 
+    /// A stored `ignore` 0.4.24 bundle whose compile key is the one it
+    /// would carry under `build_script`, and the request for 0.4.22 the
+    /// semantic lookup answers.
+    fn semantic_fixture(
+        features: &[&str],
+        build_script: &stow_types::upload_plan::BuildScriptInputs,
+    ) -> (ArtifactBundle, SemanticFetchRequest) {
+        let mut bundle = sample_bundle("11223344aabbccdd", "libdemo-11223344aabbccdd.rmeta");
+        let config = &mut bundle.manifest.config;
+        config.crate_name = stow_types::identity::CrateName::parse("ignore").unwrap();
+        config.crate_version =
+            stow_types::identity::CrateVersion::new(semver::Version::parse("0.4.24").unwrap());
+        config.features_json = stow_types::identity::FeaturesJson::canonicalize(
+            features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+        )
+        .unwrap();
+        config.compile_key = stow_types::upload_plan::candidate_compile_key(
+            &stow_types::upload_plan::CandidateIdentity {
+                crate_name: "ignore",
+                crate_version: "0.4.24",
+                target: "aarch64-apple-darwin",
+                rustc_version: "1.91.1",
+                features_json: &config.features_json.raw(),
+                dependency_c_metadata_json: &config.dependency_c_metadata_json.raw(),
+                kind: &config.kind,
+                profile: &config.profile,
+                crate_types: &config.crate_types,
+                emit: &config.emit,
+            },
+            &stow_types::upload_plan::ConsumerInputs::stock(),
+            build_script,
+        )
+        .expect("compile key");
+        bundle.manifest.oci_reference = "ghcr.io/water-rs/stow-cache-1.91.1:ignore.test".to_owned();
+        let config = &bundle.manifest.config;
+        let request = SemanticFetchRequest {
+            crate_name: "ignore".to_owned(),
+            version: "0.4.22".to_owned(),
+            features_json: "[\"default\"]".to_owned(),
+            dependency_c_metadata_json: "[]".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+            profile: config.profile.clone(),
+            emit: config.emit.clone(),
+            kind: config.kind.clone(),
+            crate_types: config.crate_types.clone(),
+            consumer: stow_types::upload_plan::ConsumerInputs::stock(),
+            build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+        };
+        (bundle, request)
+    }
+
+    async fn store_and_load_semantic(
+        config: &StowConfig,
+        bundle: &ArtifactBundle,
+        request: &SemanticFetchRequest,
+    ) -> Option<super::CachedArtifactBundle> {
+        prepare_local_cache(config, "1.91.1")
+            .await
+            .expect("prepare cache");
+        super::store_downloaded_bundle(config, &fetch_request("11223344aabbccdd"), bundle)
+            .await
+            .expect("store bundle");
+        load_semantic_cached_bundle(config, request)
+            .await
+            .expect("load semantic bundle")
+    }
+
     #[test]
     fn load_semantic_cached_bundle_matches_compatible_version_with_different_metadata() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
-        let request = fetch_request("11223344aabbccdd");
-        let mut bundle = sample_bundle("11223344aabbccdd", "libdemo-11223344aabbccdd.rmeta");
-        bundle.manifest.config.crate_name =
-            stow_types::identity::CrateName::parse("ignore").unwrap();
-        bundle.manifest.config.crate_version =
-            stow_types::identity::CrateVersion::new(semver::Version::parse("0.4.24").unwrap());
-        bundle.manifest.config.features_json =
-            stow_types::identity::FeaturesJson::canonicalize(vec!["default".to_owned()]).unwrap();
-        bundle.manifest.config.compile_key = "semantic-compile-key".to_owned();
-        bundle.manifest.oci_reference = "ghcr.io/water-rs/stow-cache-1.91.1:ignore.test".to_owned();
+        let (bundle, request) = semantic_fixture(
+            &["default"],
+            &stow_types::upload_plan::BuildScriptInputs::default(),
+        );
 
         run_async(async {
-            prepare_local_cache(&config, "1.91.1")
+            let loaded = store_and_load_semantic(&config, &bundle, &request)
                 .await
-                .expect("prepare cache");
-            super::store_downloaded_bundle(&config, &request, &bundle)
-                .await
-                .expect("store bundle");
-
-            let loaded = load_semantic_cached_bundle(
-                &config,
-                &SemanticFetchRequest {
-                    crate_name: "ignore".to_owned(),
-                    version: "0.4.22".to_owned(),
-                    features_json: "[\"default\"]".to_owned(),
-                    dependency_c_metadata_json: "[]".to_owned(),
-                    target: "aarch64-apple-darwin".to_owned(),
-                    rustc_version: "1.91.1".to_owned(),
-                    profile: bundle.manifest.config.profile.clone(),
-                    emit: bundle.manifest.config.emit.clone(),
-                    kind: bundle.manifest.config.kind.clone(),
-                    crate_types: bundle.manifest.config.crate_types.clone(),
-                },
-            )
-            .await
-            .expect("load semantic bundle")
-            .expect("semantic cache hit");
+                .expect("semantic cache hit");
             assert_eq!(loaded.crate_name, "ignore");
             assert_eq!(loaded.crate_version, "0.4.24");
             assert_eq!(loaded.c_metadata, "11223344aabbccdd");
+        });
+    }
+
+    /// stow#1047: an entry compiled without the request's own `--cfg`
+    /// answers the requests that carry none, never one that does.
+    #[test]
+    fn a_semantic_entry_compiled_without_the_requests_cfg_is_a_miss() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let (bundle, mut request) = semantic_fixture(
+            &["default"],
+            &stow_types::upload_plan::BuildScriptInputs::default(),
+        );
+        request.consumer.cfgs = vec!["custom".to_owned()];
+
+        run_async(async {
+            assert!(
+                store_and_load_semantic(&config, &bundle, &request)
+                    .await
+                    .is_none()
+            );
+        });
+    }
+
+    /// Superset serving stays intact when the serving set's own build
+    /// script set a cfg the request's set never saw (stow#881): the cfg
+    /// is read from the candidate's captured build-script output.
+    #[test]
+    fn a_superset_entry_keeps_serving_with_its_own_build_script_cfg() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let own = stow_types::upload_plan::BuildScriptInputs::from_directives(&[
+            "cargo:rustc-cfg=has_extra".to_owned(),
+        ]);
+        let (mut bundle, request) = semantic_fixture(&["default", "extra"], &own);
+        bundle.manifest.config.native = Some(stow_types::artifact::NativeArtifacts {
+            static_libs: Vec::new(),
+            cargo_directives: vec!["cargo:rustc-cfg=has_extra".to_owned()],
+            dep_env_vars: BTreeMap::new(),
+            out_dir_files: Vec::new(),
+            original_out_dir: PathBuf::from("/out"),
+        });
+
+        run_async(async {
+            let loaded = store_and_load_semantic(&config, &bundle, &request)
+                .await
+                .expect("the superset serves the request");
+            assert_eq!(loaded.features_json, "[\"default\",\"extra\"]");
+        });
+    }
+
+    /// stow#1047: a local entry keyed before the check defaults were
+    /// corrected, labeled `opt-level=3` with checks on, is never served to
+    /// a request that spells those checks out.
+    #[test]
+    fn a_stale_optimized_entry_is_not_served_for_explicit_checks() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let (mut bundle, mut request) = semantic_fixture(
+            &["default"],
+            &stow_types::upload_plan::BuildScriptInputs::default(),
+        );
+        let stale_profile = stow_types::platform::Profile {
+            opt_level: "3".to_owned(),
+            debug_assertions: true,
+            overflow_checks: true,
+            ..bundle.manifest.config.profile.clone()
+        };
+        // The key the entry for a plain `-C opt-level=3` was stored under
+        // before the correction: the same hash without the check-defaults
+        // tag, as computed by the code of that day.
+        bundle.manifest.config.profile = stale_profile.clone();
+        bundle.manifest.config.compile_key =
+            "3bdb535cb0261859019abc13bebfbdf50ff3f48647bd89270f7e4e0318c48645".to_owned();
+        request.profile = stale_profile;
+
+        run_async(async {
+            assert!(
+                store_and_load_semantic(&config, &bundle, &request)
+                    .await
+                    .is_none()
+            );
         });
     }
 
@@ -4222,6 +4954,7 @@ pub mod tests {
         let lease_path = tempdir.path().join("local.lock");
         let bundle = super::CachedArtifactBundle {
             provenance: super::ArtifactProvenance::Local,
+            reach: stow_types::public_cache::Reach::Public,
             oci_reference: "local".to_owned(),
             oci_digest: "local".to_owned(),
             compile_key: "compile-key".to_owned(),
@@ -4391,6 +5124,82 @@ pub mod tests {
                 resolved.c_metadata_json,
                 r#"[{"crate_name":"colorchoice","c_metadata":"0123456789abcdef"}]"#
             );
+        });
+    }
+
+    #[test]
+    fn dependency_reach_folds_local_only_rows_whatever_recorded_them() {
+        use stow_types::public_cache::Reach;
+
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+        // A local build recorded local-only, and a served bundle whose
+        // entry was stored local-only, both mark their outputs so.
+        let built = parsed_rustc_args(
+            "colorchoice",
+            "abc123",
+            out_dir.clone(),
+            Vec::new(),
+            vec!["lib".to_owned()],
+        );
+        let mut local_build = local_build_artifact(&built, "stable-colorchoice");
+        local_build.reach = Reach::LocalOnly;
+        let served = parsed_rustc_args(
+            "anstyle",
+            "compile-key",
+            out_dir,
+            Vec::new(),
+            vec!["lib".to_owned()],
+        );
+        let mut artifact_bundle =
+            sample_bundle("0123456789abcdef", "libanstyle-0123456789abcdef.rmeta");
+        artifact_bundle.manifest.config.compile_key =
+            "0123456789abcdeffedcba98765432100123456789abcdeffedcba9876543210".to_owned();
+        let mut bundle = remote_cached_bundle(&artifact_bundle, tempdir.path());
+        bundle.reach = Reach::LocalOnly;
+
+        run_async(async {
+            super::record_materialized_local_build_outputs(
+                &config,
+                &built,
+                &local_build,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record local build outputs");
+            super::record_materialized_bundle_outputs(
+                &config,
+                &served,
+                &bundle,
+                "aarch64-apple-darwin",
+            )
+            .await
+            .expect("record bundle outputs");
+
+            for dependency in [&built, &served] {
+                let consumer = consumer_parsed_args(
+                    tempdir.path(),
+                    dependency
+                        .output_rmeta_path()
+                        .expect("dependency rmeta path"),
+                );
+                let super::DependencyCMetadataResolution::Resolved(resolved) =
+                    super::resolve_dependency_c_metadata_json(&config, &consumer)
+                        .await
+                        .expect("resolve dependency metadata")
+                else {
+                    panic!("the dependency's bookkeeping resolved");
+                };
+                assert_eq!(
+                    resolved.reach,
+                    Reach::LocalOnly,
+                    "a consumer of {} did not fold local-only",
+                    dependency.crate_name
+                );
+            }
         });
     }
 
@@ -5807,7 +6616,6 @@ pub mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 
@@ -5915,6 +6723,7 @@ pub mod tests {
             crate_types,
             features: BTreeSet::default(),
             cfgs: BTreeSet::default(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: Some(out_dir.join(format!("{crate_name}.rs"))),
@@ -5933,8 +6742,8 @@ pub mod tests {
             extern_crates,
             embed_metadata: None,
             embed_bitcode: false,
-            has_custom_codegen: false,
-            link_options: std::collections::BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         }
     }
 
@@ -5963,7 +6772,7 @@ pub mod tests {
         parsed: &ParsedRustcArgs,
         stable_c_metadata: &str,
     ) -> super::LocalBuildArtifact {
-        let identity = StableRegistryArtifactIdentity {
+        let identity = StableUnitIdentity {
             // Real compile keys are hex; the stable c_metadata is the
             // first 16 hex digits of the key.
             compile_key: format!("{stable_c_metadata}{stable_c_metadata}"),
@@ -5971,12 +6780,21 @@ pub mod tests {
             extra_filename: format!("-{stable_c_metadata}"),
             crate_name: parsed.crate_name.clone(),
             version: "1.0.0".to_owned(),
+            source: stow_types::public_cache::UnitSource::CratesIo {
+                package: parsed.crate_name.clone(),
+                version: "1.0.0".to_owned(),
+            },
+            reach: stow_types::public_cache::Reach::Public,
         };
         // The fixture mirrors the resolve path's hashing, except it
         // tolerates a missing source — the skips-missing-output test
         // needs an artifact whose outputs rustc never wrote, which the
         // real resolve path can never produce.
-        let stable_parsed = crate::inject::parsed_with_stable_identity(parsed, &identity);
+        let stable_parsed = crate::inject::parsed_with_stable_identity(
+            parsed,
+            &identity.c_metadata,
+            &identity.extra_filename,
+        );
         let mut outputs =
             super::local_build_output_specs(parsed, &stable_parsed, "aarch64-apple-darwin")
                 .expect("local build output specs");
@@ -5991,10 +6809,12 @@ pub mod tests {
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
             identity,
+            reach: stow_types::public_cache::Reach::Public,
             features_json: "[]".to_owned(),
             dependencies: super::ResolvedDependencies {
                 c_metadata_json: "[]".to_owned(),
                 externs: Vec::new(),
+                reach: stow_types::public_cache::Reach::Public,
             },
             outputs,
         }
@@ -6009,6 +6829,7 @@ pub mod tests {
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::default(),
             cfgs: BTreeSet::default(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: None,
@@ -6030,8 +6851,8 @@ pub mod tests {
             }],
             embed_metadata: None,
             embed_bitcode: false,
-            has_custom_codegen: false,
-            link_options: std::collections::BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         }
     }
 
@@ -6045,6 +6866,7 @@ pub mod tests {
         let lease_path = temp_dir.join("bundle.lock");
         super::CachedArtifactBundle {
             provenance: super::ArtifactProvenance::Remote,
+            reach: stow_types::public_cache::Reach::Public,
             oci_reference: artifact_bundle.manifest.oci_reference.clone(),
             oci_digest: artifact_bundle.manifest.oci_digest.clone(),
             compile_key: artifact_bundle.manifest.config.compile_key.clone(),

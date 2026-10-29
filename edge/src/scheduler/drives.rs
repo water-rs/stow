@@ -2190,9 +2190,9 @@ pub const DRIVES: &[Drive] = &[
                     db,
                     &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
-                        rustc_version: WireRustcVersion::parse("1.86.0").map_err(text)?,
+                        rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
-                        generation: None,
+                        generation: 1,
                         added: fixture::full_slice_report(),
                         retired: Vec::new(),
                     }],
@@ -2224,9 +2224,9 @@ pub const DRIVES: &[Drive] = &[
                     db,
                     &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
-                        rustc_version: WireRustcVersion::parse("1.86.0").map_err(text)?,
+                        rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
-                        generation: None,
+                        generation: 1,
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
                     }],
@@ -2248,14 +2248,15 @@ pub const DRIVES: &[Drive] = &[
         run: |db, shape, settings, ctx| {
             Box::pin(async move {
                 let (added, retired) = fixture::delta_slice_report(shape);
+                let live = delta_slice_generation(ctx)?;
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
                     &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
-                        base_generation: None,
-                        generation: None,
+                        base_generation: Some(live),
+                        generation: live + 1,
                         added,
                         retired,
                     }],
@@ -2282,14 +2283,15 @@ pub const DRIVES: &[Drive] = &[
                     .collect();
                 restore_claimed(ctx, db, ids).await?;
                 let (added, retired) = fixture::delta_slice_report(shape);
+                let live = delta_slice_generation(ctx)?;
                 routes::slice_reports(
                     ctx.loaded(),
                     db,
                     &[PublishedSlice {
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
-                        base_generation: None,
-                        generation: None,
+                        base_generation: Some(live),
+                        generation: live + 1,
                         added: retired,
                         retired: added,
                     }],
@@ -2390,6 +2392,91 @@ pub const DRIVES: &[Drive] = &[
             })
         },
         cleanup: None,
+    },
+    Drive {
+        // The operator's caps read (stow#1039): one read of state the
+        // graph holds — the same shape as `GET /admin/status`.
+        name: "GET /dispatch-cap",
+        setup: None,
+        run: |_db, _shape, settings, ctx| {
+            Box::pin(async move {
+                ctx.loaded().with(|graph| {
+                    graph.dispatch_cap_view(&settings.with_dispatch_cap(graph.dispatch_cap()))
+                });
+                Ok(())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The operator's `set` (stow#1039): one `DispatchCap` append,
+        // then the route's own tail — the dispatch pass a raised cap's
+        // freed slots run and the wake re-plan, both under the settings
+        // the object builds after the append (the stored setting
+        // replacing the bindings' caps). The setting is sized two slots
+        // above the fixture's in-flight count so the pass claims like
+        // production's raise does. The seed stores no setting and a
+        // `set` has no clear, so the cleanup restores that state
+        // exactly: the claimed tasks return, the in-memory setting is
+        // dropped, and a snapshot makes that the store's state — the
+        // log row it covered goes with the prefix, so no later wake
+        // replays it.
+        name: "POST /dispatch-cap",
+        setup: Some(|_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                if ctx.loaded().with(|graph| graph.dispatch_cap().is_some()) {
+                    return Err("POST /dispatch-cap drive expects the seed's unset caps".to_owned());
+                }
+                Ok(())
+            })
+        }),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                let (inflight, macos_inflight) = ctx.loaded().with(|graph| graph.inflight());
+                routes::commit_as(
+                    ctx.loaded(),
+                    db,
+                    Some(DRIVE_ACTOR),
+                    &[SchedulerEvent::DispatchCap {
+                        setting: Box::new(stow_types::api::DispatchCapSetting {
+                            max_concurrent_jobs: inflight + 2,
+                            max_concurrent_macos_jobs: Some(macos_inflight + 2),
+                            set_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                            actor: DRIVE_ACTOR.to_owned(),
+                        }),
+                    }],
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                let raised = ctx
+                    .loaded()
+                    .with(|graph| settings.with_dispatch_cap(graph.dispatch_cap()));
+                let claimed = pass(db, &raised, ctx).await?;
+                let _plan = routes::wake_plan(ctx.loaded(), &raised, now_ms());
+                ctx.set_bound(BoundRun {
+                    task: claimed.join(","),
+                    run: 0,
+                });
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let claimed = ctx.bound_run()?.task;
+                let ids = claimed
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                restore_claimed(ctx, db, ids).await?;
+                ctx.loaded()
+                    .with(super::graph::Graph::restore_unset_dispatch_cap);
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)
+            })
+        }),
     },
     // The per-task run drives (stow#876). Each setup claims one window
     // node and binds it to a run, so the drive prices what a bound
@@ -2612,7 +2699,7 @@ pub const DRIVES: &[Drive] = &[
                     target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                     rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
                     base_generation: None,
-                    generation: None,
+                    generation: 1,
                     added: fixture::full_slice_report(),
                     retired: Vec::new(),
                 };
@@ -2694,7 +2781,7 @@ pub const DRIVES: &[Drive] = &[
                         target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
                         rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
                         base_generation: None,
-                        generation: None,
+                        generation: 1,
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
                     }],
@@ -3319,6 +3406,14 @@ fn snapshot_merge_tree(shape: FixtureShape) -> SubmissionTree {
     }
 }
 
+/// The live generation of the slice the delta drives report on — a
+/// delta applies only on top of it.
+fn delta_slice_generation(ctx: &DriveContext) -> Result<i64, String> {
+    ctx.loaded()
+        .with(|graph| graph.slice_generation(stow_types::api::CI_TARGET_TRIPLES[0], "1.85.0"))
+        .ok_or_else(|| "the fixture's delta slice was never reported".to_owned())
+}
+
 /// The delta slice report the snapshot batch carries, or, with `undo`,
 /// its inverse, which the cleanup applies.
 async fn snapshot_slice_report(
@@ -3333,14 +3428,15 @@ async fn snapshot_slice_report(
     } else {
         (added, retired)
     };
+    let live = delta_slice_generation(ctx)?;
     routes::slice_reports(
         ctx.loaded(),
         db,
         &[PublishedSlice {
             target: TargetTriple::parse(CI_TARGET_TRIPLES[0]).map_err(text)?,
             rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
-            base_generation: None,
-            generation: None,
+            base_generation: Some(live),
+            generation: live + 1,
             added,
             retired,
         }],

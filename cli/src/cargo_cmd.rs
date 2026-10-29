@@ -247,21 +247,40 @@ async fn run_inner(
     args: CargoCommandArgs,
     state_db: &StateDb,
 ) -> stow_types::error::Result<ExitStatus> {
-    let mut invocation = CargoInvocation::new(command, args);
+    // The level is settled before anything runs: a config that cannot be read,
+    // or a level this platform cannot enforce, fails the command here and never
+    // lets a build start at some other level (stow#1000).
+    let isolation = crate::isolation::Isolation::resolve(
+        args.isolation.isolation,
+        crate::config::load_isolation_config()?,
+    )?;
+    let invocation = CargoInvocation::new(command, args, isolation);
     let config =
         tracing::debug_span!("stow.precargo.config_load").in_scope(|| load_stow_config(state_db));
-    invocation.sandbox = resolve_sandbox_request(&invocation, config.as_ref())?;
     let project = begin_project(config.as_ref(), &invocation).await?;
-    let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
+    let mut public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
         write_stdout(&format!("{message}\n"))?;
     }
 
-    if let Some(status) = run_divergent_profile_passthrough(&project, &invocation)
-        .instrument(tracing::debug_span!("stow.precargo.profile_guard"))
-        .await?
+    // Dev-profile LTO used to mean no cache could serve this build —
+    // `-C linker-plugin-lto` had no identity. Now the flag keys into
+    // extra-codegen, so the workspace keeps its *local* cache and loses
+    // only the remote half: every unit is local-only by construction
+    // (stow#1006).
+    if public_cache_mode.is_enabled()
+        && let Some(divergence) =
+            crate::profile_guard::dev_profile_divergence(&project.workspace_root).await?
     {
-        return Ok(status);
+        let message = format!(
+            "warning: stow public cache is disabled for this build because {divergence}; \
+             the local cache still serves its own entries"
+        );
+        write_stdout(&format!("{message}\n"))?;
+        public_cache_mode = PublicCacheMode::Disabled {
+            reason: "profile",
+            message,
+        };
     }
 
     if let Some(status) = Box::pin(try_resolver_fast_path(
@@ -327,38 +346,6 @@ async fn run_inner(
         ))
         .await
     }
-}
-
-/// No-slowdown floor, part 1: a workspace whose dev profile turns on LTO
-/// compiles every dependency with `-C linker-plugin-lto`, which no cache
-/// identity expresses, so no unit can ever hit. Detect that early, skip the
-/// entire resolver/analysis/prefetch machinery, and behave exactly like
-/// cargo. Every other profile knob is part of the compile identity and is
-/// served when the pool holds artifacts built under it. Returns
-/// `Some` with cargo's exit status when the passthrough ran.
-async fn run_divergent_profile_passthrough(
-    project: &ProjectContext,
-    invocation: &CargoInvocation,
-) -> stow_types::error::Result<Option<ExitStatus>> {
-    let Some(divergence) =
-        crate::profile_guard::dev_profile_divergence(&project.workspace_root).await?
-    else {
-        return Ok(None);
-    };
-    tracing::info!(
-        %divergence,
-        "workspace dev profile enables LTO, which no cache identity expresses; \
-         running plain cargo (no acceleration possible for this workspace)"
-    );
-    run_cargo_passthrough(
-        project,
-        &invocation.action,
-        &invocation.cargo_args,
-        project.current_dir(),
-        invocation.sandbox,
-    )
-    .await
-    .map(Some)
 }
 
 /// Phase 0: stow-resolver fast path. When `--no-stow-resolver` is NOT set
@@ -485,7 +472,7 @@ async fn run_uncovered_passthrough(
         &invocation.action,
         &invocation.cargo_args,
         project.current_dir(),
-        invocation.sandbox,
+        &invocation.isolation,
     )
     .await
     .map(Some)
@@ -537,7 +524,7 @@ async fn run_original_workspace_build(
         deferred_analysis: config.is_some(),
         semantic_fallback_enabled,
         covered_units,
-        sandbox: invocation.sandbox,
+        isolation: &invocation.isolation,
     })
     .await
 }
@@ -631,7 +618,7 @@ async fn run_mirrored_upgrade_build(
         deferred_analysis: false,
         semantic_fallback_enabled: mirror_semantic_fallback,
         covered_units: mirror_prefetch.as_ref().map_or(0, Vec::len),
-        sandbox: invocation.sandbox,
+        isolation: &invocation.isolation,
     })
     .await
 }
@@ -689,7 +676,9 @@ async fn analyze_for_prediction(
     args: CargoCommandArgs,
     state_db: &StateDb,
 ) -> stow_types::error::Result<Option<WorkspacePrediction>> {
-    let invocation = CargoInvocation::new("predict", args);
+    // `predict` reads cargo's metadata and unit graph and compiles nothing, so
+    // there is no build script or proc macro to isolate.
+    let invocation = CargoInvocation::new("predict", args, crate::isolation::Isolation::off());
     let project = ProjectContext::load(&invocation).await?;
     let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
     if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
@@ -725,14 +714,13 @@ struct CargoInvocation {
     cargo_args: Vec<OsString>,
     silent_compatible_upgrades: bool,
     use_stow_resolver: bool,
-    /// The resolved sandbox request — `None` unless the flags or the
-    /// config opted in (stow#779). `new` carries the flags' answer,
-    /// which `run_inner` merges with the config's `experimental` table.
-    sandbox: Option<crate::sandbox::SandboxNetwork>,
+    /// The level this run's cargo, build scripts and proc macros run at,
+    /// resolved from `--isolation` and the config (stow#1000).
+    isolation: crate::isolation::Isolation,
 }
 
 impl CargoInvocation {
-    fn new(action: &str, args: CargoCommandArgs) -> Self {
+    fn new(action: &str, args: CargoCommandArgs, isolation: crate::isolation::Isolation) -> Self {
         Self {
             action: action.to_owned(),
             cargo_args: args.cargo_args,
@@ -742,42 +730,9 @@ impl CargoInvocation {
             // Users opt out with `--no-stow-resolver` when they specifically
             // want cargo's own resolver to pick versions.
             use_stow_resolver: !args.no_stow_resolver,
-            sandbox: crate::sandbox::SandboxNetwork::from_flags(
-                args.sandbox.sandbox,
-                args.sandbox.sandbox_deny_network,
-            ),
+            isolation,
         }
     }
-}
-
-/// Merge the invocation's `--sandbox*` flags with the config's
-/// `experimental` table: either source turns the sandbox on, and either
-/// source's deny switch makes it deny-all (which implies sandbox). A
-/// `--sandbox` invocation on a platform heel has no backend for fails
-/// the command here, before any cargo runs (stow#779).
-fn resolve_sandbox_request(
-    invocation: &CargoInvocation,
-    config: Option<&StowConfig>,
-) -> stow_types::error::Result<Option<crate::sandbox::SandboxNetwork>> {
-    let sandbox = crate::sandbox::SandboxNetwork::merge(
-        invocation.sandbox,
-        config.and_then(|config| {
-            crate::sandbox::SandboxNetwork::from_flags(
-                config.experimental.sandbox,
-                config.experimental.sandbox_deny_network,
-            )
-        }),
-    );
-    if sandbox.is_none() {
-        return Ok(None);
-    }
-    if !crate::sandbox::SANDBOX_SUPPORTED {
-        return Err(stow_types::stow_error!(
-            "--sandbox is not supported on {}: the heel sandbox backend exists for Linux, macOS and Windows",
-            std::env::consts::OS
-        ));
-    }
-    Ok(sandbox)
 }
 
 #[derive(Debug, Clone)]
@@ -2622,7 +2577,7 @@ async fn run_pinned_mirror_build(
         deferred_analysis: false,
         semantic_fallback_enabled: mirror_semantic_fallback,
         covered_units: mirror_prefetch.len(),
-        sandbox: invocation.sandbox,
+        isolation: &invocation.isolation,
     })
     .await
 }
@@ -3635,11 +3590,18 @@ async fn run_cargo_passthrough(
     action: &str,
     cargo_args: &[OsString],
     current_dir: &Path,
-    sandbox: Option<crate::sandbox::SandboxNetwork>,
+    isolation: &crate::isolation::Isolation,
 ) -> stow_types::error::Result<ExitStatus> {
-    if let Some(network) = sandbox {
-        return run_cargo_passthrough_sandboxed(project, action, cargo_args, current_dir, network)
-            .await;
+    if let Some(confinement) = isolation.level.confinement() {
+        return run_cargo_passthrough_sandboxed(
+            project,
+            action,
+            cargo_args,
+            current_dir,
+            confinement,
+            isolation,
+        )
+        .await;
     }
     let status = passthrough_command(project, action, cargo_args, current_dir)
         .await?
@@ -3654,18 +3616,22 @@ async fn run_cargo_passthrough(
 }
 
 /// The passthrough's sandboxed form (stow#779): no `RUSTC_WRAPPER`, no
-/// supervisor — the sandbox alone enforces the boundary. Dependencies
-/// are fetched on the host first, then cargo runs `--offline` inside.
-/// With no facades there is no IPC router either: a denied-network
-/// build's only channel out does not exist, which is the point.
+/// supervisor — the sandbox alone enforces the boundary. At `strict` and
+/// `offline` the dependencies are fetched on the host first and cargo
+/// runs `--offline` inside; at `protect` cargo fetches for itself through
+/// the sandbox's proxy. With no facades there is no IPC router either: an
+/// `offline` build's only channel out does not exist, which is the point.
 async fn run_cargo_passthrough_sandboxed(
     project: &ProjectContext,
     action: &str,
     cargo_args: &[OsString],
     current_dir: &Path,
-    network: crate::sandbox::SandboxNetwork,
+    confinement: crate::isolation::Confinement,
+    isolation: &crate::isolation::Isolation,
 ) -> stow_types::error::Result<ExitStatus> {
-    crate::sandbox::fetch_dependencies(current_dir, cargo_args).await?;
+    if confinement.is_allowlist() {
+        crate::sandbox::fetch_dependencies(current_dir, cargo_args).await?;
+    }
     let mold_args = project.mold.config_args().await?;
     let mut argv = Vec::with_capacity(cargo_args.len() + mold_args.len() * 2 + 2);
     argv.push(OsString::from(action));
@@ -3674,9 +3640,10 @@ async fn run_cargo_passthrough_sandboxed(
         argv.push(OsString::from(config_arg));
     }
     argv.extend(cargo_args.iter().cloned());
-    if !argv
-        .iter()
-        .any(|arg| arg == "--offline" || arg == "--frozen")
+    if confinement.is_allowlist()
+        && !argv
+            .iter()
+            .any(|arg| arg == "--offline" || arg == "--frozen")
     {
         argv.push(OsString::from("--offline"));
     }
@@ -3699,7 +3666,9 @@ async fn run_cargo_passthrough_sandboxed(
         source_roots.push(manifest_root);
     }
     let request = crate::sandbox::SandboxRequest {
-        network,
+        confinement,
+        isolation,
+        lockfile_root: &project.workspace_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
         scratch_dir: None,
@@ -3804,9 +3773,9 @@ struct CargoRunPlan<'a> {
     deferred_analysis: bool,
     semantic_fallback_enabled: bool,
     covered_units: usize,
-    /// The heel sandbox cargo runs inside, `None` for the default
-    /// unsandboxed build (stow#779).
-    sandbox: Option<crate::sandbox::SandboxNetwork>,
+    /// The level the build's cargo, build scripts and proc macros run at
+    /// (stow#1000).
+    isolation: &'a crate::isolation::Isolation,
 }
 
 /// The build's cargo run under the wrapper. Returns cargo's own exit
@@ -3924,6 +3893,9 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
             policy_ready: std::sync::Arc::clone(&policy_ready),
             in_flight: in_flight.clone(),
+            registry_sources: std::sync::OnceLock::from(
+                crate::RegistrySources::from_lockfile(&project.workspace_root).await?,
+            ),
         },
         env_base,
         resolution_done.clone(),
@@ -4110,7 +4082,7 @@ async fn cargo_argv(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<Vec<Os
 }
 
 /// One build's cargo spawn — a plain child process, or the same launch
-/// inside the heel sandbox `--sandbox` asked for (stow#779).
+/// inside the heel sandbox the isolation level asks for (stow#1000).
 enum CargoRun {
     /// The unsandboxed spawn.
     Plain(Command),
@@ -4161,7 +4133,7 @@ impl SupervisorHandle {
 
 /// How `run_cargo` starts cargo: the supervisor on the transport the
 /// facades reach — the socket a plain build's facades dial, or heel's
-/// IPC socket inside the sandbox a `--sandbox` build's facades get —
+/// IPC socket inside the sandbox a sandboxed build's facades get —
 /// then the spawn on the matching command (stow#779).
 /// The argv and environment a build's cargo launches with — one value
 /// so the plain and sandboxed spawns stay identical below the transport.
@@ -4178,7 +4150,7 @@ async fn spawn_cargo_run(
     mut launch: CargoLaunch,
     scratch: &Path,
 ) -> stow_types::error::Result<(CargoRun, SupervisorHandle)> {
-    match plan.sandbox {
+    match plan.isolation.level.confinement() {
         None => {
             let supervisor = start_supervisor(handler, in_flight, wrappers)?;
             launch.envs.extend(
@@ -4196,37 +4168,51 @@ async fn spawn_cargo_run(
                 SupervisorHandle::Socket(supervisor),
             ))
         }
-        Some(network) => {
-            sandboxed_cargo_run(plan, network, handler, in_flight, wrappers, launch, scratch).await
+        Some(confinement) => {
+            sandboxed_cargo_run(
+                plan,
+                confinement,
+                handler,
+                in_flight,
+                wrappers,
+                launch,
+                scratch,
+            )
+            .await
         }
     }
 }
 
-/// The sandboxed half of `run_cargo`: the dependencies land on the host
-/// first — `cargo fetch` needs network and cargo-home writes the
-/// sandbox denies — the supervisor is served over heel's IPC socket,
-/// and the same argv and env go to a `SandboxedCommand` that runs
-/// `--offline`, so no cargo network call can even be attempted.
+/// The sandboxed half of `run_cargo`. At `strict` and `offline` the
+/// dependencies land on the host first — `cargo fetch` needs network and
+/// cargo-home writes the sandbox denies — and the sandboxed cargo runs
+/// `--offline`, so no cargo network call can even be attempted; `protect`
+/// leaves both to cargo, which has the network through the sandbox's proxy
+/// and a writable cargo home. The supervisor is served over heel's IPC
+/// socket either way, the one channel every level leaves open.
 async fn sandboxed_cargo_run(
     plan: &CargoRunPlan<'_>,
-    network: crate::sandbox::SandboxNetwork,
+    confinement: crate::isolation::Confinement,
     handler: &std::sync::Arc<crate::BuildSupervisor>,
     in_flight: crate::supervisor::server::InFlightUnits,
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
     scratch: &Path,
 ) -> stow_types::error::Result<(CargoRun, SupervisorHandle)> {
-    crate::sandbox::fetch_dependencies(plan.current_dir, plan.cargo_args).await?;
+    if confinement.is_allowlist() {
+        crate::sandbox::fetch_dependencies(plan.current_dir, plan.cargo_args).await?;
+    }
     let (pending, router) = crate::supervisor::ipc::start(
         std::sync::Arc::clone(handler),
         in_flight,
         &wrappers.runtime_executable,
     )
     .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
-    if !launch
-        .argv
-        .iter()
-        .any(|arg| arg == "--offline" || arg == "--frozen")
+    if confinement.is_allowlist()
+        && !launch
+            .argv
+            .iter()
+            .any(|arg| arg == "--offline" || arg == "--frozen")
     {
         launch.argv.push(OsString::from("--offline"));
     }
@@ -4245,7 +4231,9 @@ async fn sandboxed_cargo_run(
         ]
     };
     let request = crate::sandbox::SandboxRequest {
-        network,
+        confinement,
+        isolation: plan.isolation,
+        lockfile_root: plan.source_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
         scratch_dir: Some(scratch),
@@ -5270,7 +5258,6 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 
@@ -5571,7 +5558,7 @@ mod tests {
                 deferred_analysis: false,
                 semantic_fallback_enabled: false,
                 covered_units: 0,
-                sandbox: None,
+                isolation: &crate::isolation::Isolation::off(),
             };
             super::cargo_command(&plan).await
         });
@@ -5699,7 +5686,7 @@ mod tests {
             "build",
             &cargo_args,
             &mirror.current_dir(),
-            None,
+            &crate::isolation::Isolation::off(),
         )
         .await
         .expect("run cargo");
@@ -5824,9 +5811,9 @@ mod tests {
         sqlx::query(sqlx::AssertSqlSafe(
             "INSERT INTO artifact_cache_entries \
              (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, \
-              oci_reference, oci_digest, crate_name, crate_version, target, provenance) \
+              oci_reference, oci_digest, crate_name, crate_version, target, provenance, reach) \
              VALUES ('1.91.1', 'key', 'dir', 0, 0, '', '', 'cfg-if', '1.0.0', \
-              'aarch64-apple-darwin', 'local')",
+              'aarch64-apple-darwin', 'local', 0)",
         ))
         .execute(&pool)
         .await
@@ -6123,7 +6110,6 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 
@@ -6207,7 +6193,7 @@ mod tests {
             semantic_fallback_enabled: true,
             deferred_analysis: false,
             covered_units: ledger.len(),
-            sandbox: None,
+            isolation: &crate::isolation::Isolation::off(),
         };
         let mut envs = Vec::new();
         smol::block_on(super::export_wrapper_env(

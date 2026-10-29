@@ -7,21 +7,99 @@ use crate::platform::{Profile, StripLevel};
 use crate::rustc::ParsedRustcArgs;
 use crate::upload_plan::{CompileKeyInputs, compute_compile_key};
 
-/// The cache identity a registry-crate rustc invocation resolves to under
-/// stow's stable-identity rewrite.
+/// Where a cached unit's immutable source of truth lives.
+///
+/// Every keyed source pins content identity without content hashing:
+/// crates.io's `(package, version)` pair and a git checkout's `(commit,
+/// manifest path inside the repository)` pair each name exactly one
+/// source tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StableRegistryArtifactIdentity {
+pub enum UnitSource {
+    /// A crates.io package.
+    CratesIo {
+        /// Package name as it appears in the registry path (hyphenated
+        /// form).
+        package: String,
+        /// Package version parsed from the registry path.
+        version: String,
+    },
+    /// A remote git checkout under cargo's `git/checkouts/` root. The
+    /// repository URL is not part of the identity: the commit already
+    /// fixes the tree.
+    Git {
+        /// The full commit id the checkout is reset to.
+        commit: String,
+        /// The manifest directory's path inside the repository (`""` for
+        /// the repository root).
+        manifest_path_in_repo: String,
+    },
+}
+
+/// How far a unit's identity may travel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// The identity may be looked up against the remote cache and
+    /// reported as a miss.
+    Public,
+    /// The identity is machine-local: never looked up remotely, never
+    /// journaled as a miss, never reported. A git unit, a crates.io unit
+    /// with extra codegen, and any unit compiled against a `LocalOnly`
+    /// dependency is local-only.
+    LocalOnly,
+}
+
+impl Reach {
+    /// The storage integer of one reach value.
+    #[must_use]
+    pub const fn to_int(self) -> i64 {
+        match self {
+            Self::Public => 0,
+            Self::LocalOnly => 1,
+        }
+    }
+
+    /// Decode one stored integer back into a reach; `None` on any value
+    /// the table cannot carry.
+    #[must_use]
+    pub const fn from_int(value: i64) -> Option<Self> {
+        match value {
+            0 => Some(Self::Public),
+            1 => Some(Self::LocalOnly),
+            _ => None,
+        }
+    }
+
+    /// The tighter of two reaches — a unit is `LocalOnly` when any input
+    /// it depends on is.
+    #[must_use]
+    pub const fn fold(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Public, Self::Public) => Self::Public,
+            _ => Self::LocalOnly,
+        }
+    }
+}
+
+/// The cache identity a rustc invocation resolves to under stow's
+/// stable-identity rewrite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StableUnitIdentity {
     /// BLAKE3 hash of the full rustc invocation identity.
     pub compile_key: String,
     /// 16-hex-char prefix of `compile_key`, used as `-C metadata`.
     pub c_metadata: String,
     /// `-C extra-filename` matching `c_metadata` (`-{c_metadata}`).
     pub extra_filename: String,
-    /// crates.io package name as it appears in the registry path (hyphenated
-    /// form).
+    /// The package name for a crates.io unit; the rustc crate name for a
+    /// git unit.
     pub crate_name: String,
-    /// Crate version detected from the registry source path.
+    /// Crate version for a crates.io unit; `""` for a git unit, which no
+    /// crates.io version can be.
     pub version: String,
+    /// The immutable source the identity keys under.
+    pub source: UnitSource,
+    /// How far the identity may travel.
+    pub reach: Reach,
 }
 
 /// Fold a crates.io package name into rustc `--crate-name` form (`-` → `_`).
@@ -30,8 +108,23 @@ pub fn canonical_crate_name(name: &str) -> String {
     name.replace('-', "_")
 }
 
-/// Detect `(crate_name, version)` for an invocation whose input file lives
-/// under a cargo registry `src/` directory (`<name>-<version>/src/lib.rs`).
+/// A registry package slot found on an invocation's input path: the
+/// `<package>-<version>` directory under `…/registry/src/<index>/`,
+/// decomposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryPackageSlot {
+    /// Package name as it appears in the registry path (hyphenated
+    /// form).
+    pub package: String,
+    /// Package version parsed from the directory name.
+    pub version: String,
+    /// The `<index>` directory name (`index.crates.io-<hash>`,
+    /// `<host>-<hash>`) the slot sits under.
+    pub index_dir: String,
+}
+
+/// Detect the registry slot an invocation's input file lives under
+/// (`<name>-<version>/src/lib.rs` below `…/registry/src/<index>/`).
 ///
 /// The identity comes from the directory at the canonical registry slot
 /// `…/registry/src/<index>/<package>-<version>` — both sides see that
@@ -46,9 +139,9 @@ pub fn canonical_crate_name(name: &str) -> String {
 /// # Errors
 /// Never fails today; the `Result` shape lets callers `?` it uniformly
 /// alongside the fallible identity steps.
-pub fn detect_registry_crate_version(
+pub fn detect_registry_package_slot(
     parsed: &ParsedRustcArgs,
-) -> crate::error::Result<Option<(String, String)>> {
+) -> crate::error::Result<Option<RegistryPackageSlot>> {
     let Some(input_path) = parsed.input_path.as_ref() else {
         return Ok(None);
     };
@@ -59,46 +152,112 @@ pub fn detect_registry_crate_version(
         let Some(component) = ancestor.file_name().and_then(|value| value.to_str()) else {
             return Ok(None);
         };
-        return Ok(split_package_version_component(component));
+        let Some((package, version)) = split_package_version_component(component) else {
+            return Ok(None);
+        };
+        let Some(index_dir) = ancestor
+            .parent()
+            .and_then(|index| index.file_name())
+            .and_then(|name| name.to_str())
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(RegistryPackageSlot {
+            package,
+            version,
+            index_dir: index_dir.to_owned(),
+        }));
     }
     Ok(None)
 }
 
-/// Compute the stable cache identity for one captured rustc invocation.
+/// Detect `(crate_name, version)` for an invocation whose input file lives
+/// under a cargo registry `src/` directory — see
+/// [`detect_registry_package_slot`].
 ///
-/// Returns `Ok(None)` when the invocation does not compile a registry crate
-/// (see [`detect_registry_crate_version`]). Otherwise derives the compile key
-/// over the normalized profile, emit set, and dependency identities, then the
-/// stable `c_metadata` / `extra_filename` from that key.
+/// # Errors
+/// Never fails today; the `Result` shape lets callers `?` it uniformly
+/// alongside the fallible identity steps.
+pub fn detect_registry_crate_version(
+    parsed: &ParsedRustcArgs,
+) -> crate::error::Result<Option<(String, String)>> {
+    Ok(detect_registry_package_slot(parsed)?.map(|slot| (slot.package, slot.version)))
+}
+
+/// The remote git checkout an invocation's input path sits under.
+///
+/// Finds the checkout root at `<…>/git/checkouts/<ident>/<short id>` and
+/// reads the `<short id>` directory name — a prefix of the commit the
+/// checkout must resolve to. `None` when no ancestor sits at cargo's
+/// checkout slot. Pure path math: the manifest directory's path inside
+/// the repository comes from the invocation's `CARGO_MANIFEST_DIR`,
+/// which cargo sets on every rustc call.
+#[must_use]
+pub fn detect_git_checkout(parsed: &ParsedRustcArgs) -> Option<GitCheckout> {
+    let input_path = parsed.input_path.as_ref()?;
+    for checkout_root in input_path.ancestors() {
+        let is_checkout_slot = checkout_root
+            .parent()
+            .and_then(|ident| ident.parent())
+            .is_some_and(|checkouts| {
+                checkouts.file_name() == Some(std::ffi::OsStr::new("checkouts"))
+            })
+            && checkout_root
+                .parent()
+                .and_then(|ident| ident.parent())
+                .and_then(|checkouts| checkouts.parent())
+                .is_some_and(|git| git.file_name() == Some(std::ffi::OsStr::new("git")));
+        if !is_checkout_slot {
+            continue;
+        }
+        let short_id = checkout_root.file_name()?.to_str()?.to_owned();
+        return Some(GitCheckout {
+            root: checkout_root.to_path_buf(),
+            short_id,
+        });
+    }
+    None
+}
+
+/// A cargo git checkout slot found on an invocation's input path.
+#[derive(Debug, Clone)]
+pub struct GitCheckout {
+    /// `<…>/git/checkouts/<ident>/<short id>` — the checkout root.
+    pub root: std::path::PathBuf,
+    /// The `<short id>` directory name — a prefix of the commit the
+    /// checkout resolves to.
+    pub short_id: String,
+}
+
+/// Compute the stable cache identity for one captured rustc invocation
+/// under its detected source.
 ///
 /// # Errors
 /// Returns an error when the captured crate types or profile values are
 /// outside stow's known set, or when the compile-key inputs fail to
 /// serialize.
-pub fn stable_registry_artifact_identity(
+pub fn stable_unit_identity(
     parsed: &ParsedRustcArgs,
+    source: &UnitSource,
+    reach: Reach,
     target: &str,
     rustc_version: &str,
     features_json: &str,
     dependency_c_metadata_json: &str,
-) -> crate::error::Result<Option<StableRegistryArtifactIdentity>> {
-    let Some((crate_name, version)) = detect_registry_crate_version(parsed)? else {
-        return Ok(None);
-    };
-    stable_registry_artifact_identity_for_package(
+) -> crate::error::Result<StableUnitIdentity> {
+    stable_unit_identity_for_source(
         parsed,
-        &crate_name,
-        &version,
+        source,
+        reach,
         target,
         rustc_version,
         features_json,
         dependency_c_metadata_json,
     )
-    .map(Some)
 }
 
 /// Compute the stable cache identity for one captured rustc invocation under
-/// an explicitly supplied registry package identity.
+/// an explicitly supplied crates.io package identity.
 ///
 /// Used by the trusted-build capture path, where the task package is mirrored
 /// to a content-addressed directory and cargo hands rustc a relative
@@ -110,7 +269,7 @@ pub fn stable_registry_artifact_identity(
 /// Returns an error when the captured crate types or profile values are
 /// outside stow's known set, or when the compile-key inputs fail to
 /// serialize.
-pub fn stable_registry_artifact_identity_for_package(
+pub fn stable_unit_identity_for_package(
     parsed: &ParsedRustcArgs,
     crate_name: &str,
     version: &str,
@@ -118,17 +277,54 @@ pub fn stable_registry_artifact_identity_for_package(
     rustc_version: &str,
     features_json: &str,
     dependency_c_metadata_json: &str,
-) -> crate::error::Result<StableRegistryArtifactIdentity> {
-    let crate_name = crate_name.to_owned();
-    let version = version.to_owned();
-    let profile = normalized_cache_profile(parsed)?;
-    let kind = parsed_artifact_kind(parsed)?;
-    let crate_types = parsed_crate_types(parsed)?;
-    let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
+) -> crate::error::Result<StableUnitIdentity> {
+    let source = UnitSource::CratesIo {
+        package: crate_name.to_owned(),
+        version: version.to_owned(),
+    };
+    stable_unit_identity_for_source(
+        parsed,
+        &source,
+        Reach::Public,
+        target,
+        rustc_version,
+        features_json,
+        dependency_c_metadata_json,
+    )
+}
+
+fn stable_unit_identity_for_source(
+    parsed: &ParsedRustcArgs,
+    source: &UnitSource,
+    reach: Reach,
+    target: &str,
+    rustc_version: &str,
+    features_json: &str,
+    dependency_c_metadata_json: &str,
+) -> crate::error::Result<StableUnitIdentity> {
+    let (crate_name, version, git_source) = match source {
+        UnitSource::CratesIo { package, version } => (package.clone(), version.clone(), None),
+        UnitSource::Git {
+            commit,
+            manifest_path_in_repo,
+        } => (
+            parsed.crate_name.clone(),
+            String::new(),
+            Some(crate::upload_plan::GitSourceInputs {
+                commit: commit.as_str(),
+                manifest_path_in_repo: manifest_path_in_repo.as_str(),
+            }),
+        ),
+    };
+    let extra_codegen = parsed.extra_codegen.clone();
     let cfgs = parsed.cfgs.iter().cloned().collect::<Vec<_>>();
     // Empty unless this unit actually links, which keeps every rlib's key
     // exactly what it was before the linker was part of identity.
     let link_options = parsed.link_options_reaching_the_linker();
+    let profile = normalized_cache_profile(parsed)?;
+    let kind = parsed_artifact_kind(parsed)?;
+    let crate_types = parsed_crate_types(parsed)?;
+    let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
     let compile_key = compute_compile_key(&CompileKeyInputs {
         crate_name: &crate_name,
         crate_version: &version,
@@ -144,14 +340,18 @@ pub fn stable_registry_artifact_identity_for_package(
         cfgs: &cfgs,
         embed_bitcode: parsed.embed_bitcode,
         link_options: &link_options,
+        git_source,
+        extra_codegen: &extra_codegen,
     })?;
     let c_metadata = stable_c_metadata_for_compile_key(&compile_key)?;
-    Ok(StableRegistryArtifactIdentity {
+    Ok(StableUnitIdentity {
         compile_key,
         extra_filename: format!("-{c_metadata}"),
         c_metadata,
         crate_name,
         version,
+        source: source.clone(),
+        reach,
     })
 }
 
@@ -607,6 +807,8 @@ mod tests {
             cfgs: &[],
             embed_bitcode: true,
             link_options: &[],
+            git_source: None,
+            extra_codegen: &[],
         })
         .expect("compile key");
         assert_eq!(
@@ -648,6 +850,8 @@ mod tests {
                 cfgs: &[],
                 embed_bitcode: true,
                 link_options,
+                git_source: None,
+                extra_codegen: &[],
             })
             .expect("compile key")
         };
@@ -659,18 +863,531 @@ mod tests {
         );
     }
 
+    /// The git-source and extra-codegen inputs only ever extend the key —
+    /// their absence is byte-for-byte the pre-#1006 stream, which the
+    /// golden above already pins. Their presence must tag the key: two
+    /// commits of one crate, and two codegen flag sets of one crates.io
+    /// unit, are different artifacts.
+    #[test]
+    fn git_source_and_extra_codegen_change_the_key() {
+        let profile = crate::platform::Profile {
+            opt_level: "0".to_owned(),
+            debuginfo: 2,
+            debug_assertions: true,
+            overflow_checks: true,
+            panic: crate::platform::PanicStrategy::Unwind,
+            strip: crate::platform::StripLevel::None,
+        };
+        let key_for = |git: Option<(&str, &str)>, codegen: &[String]| {
+            crate::upload_plan::compute_compile_key(&crate::upload_plan::CompileKeyInputs {
+                crate_name: "demo",
+                crate_version: "0.1.0",
+                target: "aarch64-apple-darwin",
+                rustc_version: "1.91.1",
+                profile: &profile,
+                crate_types: &[crate::artifact::RustCrateType::Rlib],
+                emit: &["link".to_owned()],
+                features_json: "[]",
+                dependency_c_metadata_json: "[]",
+                kind: &crate::artifact::ArtifactKind::Rlib,
+                embed_metadata: None,
+                cfgs: &[],
+                embed_bitcode: false,
+                link_options: &[],
+                git_source: git.map(|(commit, manifest_path_in_repo)| {
+                    crate::upload_plan::GitSourceInputs {
+                        commit,
+                        manifest_path_in_repo,
+                    }
+                }),
+                extra_codegen: codegen,
+            })
+            .expect("compile key")
+        };
+        let no_tags = key_for(None, &[]);
+        let commit_a = ("1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b", "demo");
+        let commit_b = ("0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b", "demo");
+        let subdir = (commit_a.0, "tools/demo");
+        assert_ne!(
+            no_tags,
+            key_for(Some(commit_a), &[]),
+            "a git unit shares the plain crates.io key shape"
+        );
+        assert_ne!(
+            key_for(Some(commit_a), &[]),
+            key_for(Some(commit_b), &[]),
+            "two commits of one crate must not share a key"
+        );
+        assert_ne!(
+            key_for(Some(commit_a), &[]),
+            key_for(Some(subdir), &[]),
+            "two manifest paths inside one commit must not share a key"
+        );
+        let lto = ["-C linker-plugin-lto".to_owned()];
+        assert_ne!(
+            no_tags,
+            key_for(None, &lto),
+            "an extra-codegen unit shares the plain crates.io key"
+        );
+        let ordered = [
+            "-C link-dead-code=y".to_owned(),
+            "-C linker-plugin-lto".to_owned(),
+        ];
+        assert_ne!(
+            key_for(None, &lto),
+            key_for(None, &ordered),
+            "different codegen flag sets must not share a key"
+        );
+    }
+
     use std::collections::BTreeSet;
     use std::ffi::OsString;
 
     use super::{
-        ExplicitSpelling, UnitInvocation, UnitKind, UnitShape, UnitSide,
-        detect_registry_crate_version, normalized_cache_profile, required_unit_shapes,
-        stable_registry_artifact_identity,
+        ExplicitSpelling, Reach, StableUnitIdentity, UnitInvocation, UnitKind, UnitShape, UnitSide,
+        UnitSource, detect_git_checkout, detect_registry_crate_version,
+        detect_registry_package_slot, normalized_cache_profile, required_unit_shapes,
+        stable_unit_identity, stable_unit_identity_for_package,
     };
     use crate::rustc::ParsedRustcArgs;
 
     fn args(parts: &[&str]) -> Vec<OsString> {
         parts.iter().map(OsString::from).collect()
+    }
+
+    /// The identity a crates.io unicode-ident invocation resolves to —
+    /// detects the registry slot, then keys it.
+    fn test_registry_identity(
+        parsed: &ParsedRustcArgs,
+    ) -> crate::error::Result<StableUnitIdentity> {
+        let (package, version) =
+            detect_registry_crate_version(parsed)?.expect("registry crate identity");
+        stable_unit_identity_for_package(
+            parsed,
+            &package,
+            &version,
+            "aarch64-apple-darwin",
+            "1.91.1",
+            "[]",
+            "[]",
+        )
+    }
+
+    fn lib_args(codegen: &[&str]) -> Vec<OsString> {
+        let mut parts = vec![
+            "--crate-name",
+            "unicode_ident",
+            "--edition=2021",
+            "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "-C",
+            "metadata=a52ee596848c66ca",
+            "-C",
+            "extra-filename=-aa4980adf969014b",
+            "--out-dir",
+            "/tmp/out",
+        ];
+        parts.extend_from_slice(codegen);
+        args(&parts)
+    }
+
+    /// stow#1047: at a non-zero opt-level an absent `-C debug-assertions`
+    /// and `-C overflow-checks` are off, so spelling them on is a
+    /// different compile and must be a different key.
+    #[test]
+    fn optimized_check_defaults_key_apart_from_explicit_checks() {
+        let plain = ParsedRustcArgs::parse(&lib_args(&["-C", "opt-level=3"])).expect("parse");
+        let checked = ParsedRustcArgs::parse(&lib_args(&[
+            "-C",
+            "opt-level=3",
+            "-C",
+            "debug-assertions=yes",
+            "-C",
+            "overflow-checks=yes",
+        ]))
+        .expect("parse");
+        let plain_profile = normalized_cache_profile(&plain).expect("profile");
+        assert!(!plain_profile.debug_assertions, "{plain_profile:?}");
+        assert!(!plain_profile.overflow_checks, "{plain_profile:?}");
+        assert_ne!(
+            test_registry_identity(&plain)
+                .expect("identity")
+                .compile_key,
+            test_registry_identity(&checked)
+                .expect("identity")
+                .compile_key,
+        );
+    }
+
+    /// stow#1047: rustc applies `-C target-feature` in argv order, so the
+    /// same two flags in the other order are a different compile.
+    #[test]
+    fn extra_codegen_keeps_its_argv_order_in_the_key() {
+        let off_on = ParsedRustcArgs::parse(&lib_args(&[
+            "-C",
+            "target-feature=-avx2",
+            "-C",
+            "target-feature=+avx2",
+        ]))
+        .expect("parse");
+        let on_off = ParsedRustcArgs::parse(&lib_args(&[
+            "-C",
+            "target-feature=+avx2",
+            "-C",
+            "target-feature=-avx2",
+        ]))
+        .expect("parse");
+        assert_ne!(
+            test_registry_identity(&off_on)
+                .expect("identity")
+                .compile_key,
+            test_registry_identity(&on_off)
+                .expect("identity")
+                .compile_key,
+        );
+    }
+
+    /// The key `parsed`'s own identity recomputes to when the candidate is
+    /// checked under `consumer` and `build_script`.
+    fn recomputed_key(
+        parsed: &ParsedRustcArgs,
+        consumer: &crate::upload_plan::ConsumerInputs,
+        build_script: &crate::upload_plan::BuildScriptInputs,
+    ) -> String {
+        let profile = normalized_cache_profile(parsed).expect("profile");
+        let kind = super::parsed_artifact_kind(parsed).expect("kind");
+        let crate_types = super::parsed_crate_types(parsed).expect("crate types");
+        let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
+        crate::upload_plan::candidate_compile_key(
+            &crate::upload_plan::CandidateIdentity {
+                crate_name: "unicode-ident",
+                crate_version: "1.0.24",
+                target: "aarch64-apple-darwin",
+                rustc_version: "1.91.1",
+                features_json: "[]",
+                dependency_c_metadata_json: "[]",
+                kind: &kind,
+                profile: &profile,
+                crate_types: &crate_types,
+                emit: &emit,
+            },
+            consumer,
+            build_script,
+        )
+        .expect("candidate key")
+    }
+
+    fn consumer_of(
+        parsed: &ParsedRustcArgs,
+        own: &crate::upload_plan::BuildScriptInputs,
+    ) -> crate::upload_plan::ConsumerInputs {
+        crate::upload_plan::ConsumerInputs::of(parsed, own)
+    }
+
+    /// A candidate compiled with exactly the consumer's inputs recomputes
+    /// to its own key; one compiled without the consumer's `--cfg`, extra
+    /// codegen or bitcode setting does not (stow#1047).
+    #[test]
+    fn a_candidate_serves_only_the_inputs_it_was_compiled_with() {
+        use crate::upload_plan::BuildScriptInputs;
+        let none = BuildScriptInputs::default();
+        let candidate = ParsedRustcArgs::parse(&lib_args(&[])).expect("parse");
+        let key = test_registry_identity(&candidate)
+            .expect("identity")
+            .compile_key;
+        assert_eq!(
+            recomputed_key(&candidate, &consumer_of(&candidate, &none), &none),
+            key
+        );
+        for flags in [
+            &["--cfg", "custom"][..],
+            &["-C", "target-cpu=znver4"],
+            &["-C", "embed-bitcode=no"],
+            &["-Z", "embed-metadata=yes"],
+        ] {
+            let request = ParsedRustcArgs::parse(&lib_args(flags)).expect("parse");
+            assert_ne!(
+                recomputed_key(&candidate, &consumer_of(&request, &none), &none),
+                key,
+                "{flags:?} was served an artifact compiled without it"
+            );
+        }
+        // And the other direction: a candidate compiled with a cfg is not
+        // served to a request without it.
+        let with_cfg = ParsedRustcArgs::parse(&lib_args(&["--cfg", "custom"])).expect("parse");
+        let cfg_key = test_registry_identity(&with_cfg)
+            .expect("identity")
+            .compile_key;
+        assert_eq!(
+            recomputed_key(&with_cfg, &consumer_of(&with_cfg, &none), &none),
+            cfg_key
+        );
+        assert_ne!(
+            recomputed_key(&with_cfg, &consumer_of(&candidate, &none), &none),
+            cfg_key
+        );
+    }
+
+    /// A cfg the candidate's own build script set is part of its key, and
+    /// a request whose build script set it too (as a superset or version
+    /// substitution may) still matches: the build-script cfgs come from
+    /// the candidate's captured output, never from the request.
+    #[test]
+    fn a_build_scripts_cfg_is_the_candidates_own_not_the_consumers() {
+        use crate::upload_plan::BuildScriptInputs;
+        let built = ParsedRustcArgs::parse(&lib_args(&["--cfg", "probe_ok"])).expect("parse");
+        let key = test_registry_identity(&built)
+            .expect("identity")
+            .compile_key;
+        let candidate_script =
+            BuildScriptInputs::from_directives(&["cargo:rustc-cfg=probe_ok".to_owned()]);
+        // The request (here without the cfg: a different feature set whose
+        // build script emitted none) is served by the candidate, whose
+        // cfg comes from its own captured build script output.
+        let request = ParsedRustcArgs::parse(&lib_args(&[])).expect("parse");
+        assert_eq!(
+            recomputed_key(
+                &built,
+                &consumer_of(&request, &BuildScriptInputs::default()),
+                &candidate_script
+            ),
+            key
+        );
+        // The same request, whose OWN build script emitted the cfg that is
+        // therefore on its argv, subtracts it as the build script's and
+        // still matches the same key.
+        let request = ParsedRustcArgs::parse(&lib_args(&["--cfg", "probe_ok"])).expect("parse");
+        let own = BuildScriptInputs::from_directives(&["cargo::rustc-cfg=probe_ok".to_owned()]);
+        assert_eq!(
+            recomputed_key(&built, &consumer_of(&request, &own), &own),
+            key
+        );
+        // A cfg both RUSTFLAGS and the build script set appears twice on
+        // argv; one occurrence is the consumer's and survives.
+        let request =
+            ParsedRustcArgs::parse(&lib_args(&["--cfg", "probe_ok", "--cfg", "probe_ok"]))
+                .expect("parse");
+        let consumer = consumer_of(&request, &own);
+        assert_eq!(consumer.cfgs, ["probe_ok"]);
+        // A feature cfg is never a build-script cfg.
+        assert_eq!(
+            BuildScriptInputs::from_directives(&["cargo:rustc-cfg=feature=\"x\"".to_owned()]),
+            BuildScriptInputs::default()
+        );
+    }
+
+    /// Published linking keys keep the serialization they were published
+    /// under: cargo's cross-target `-C linker=` comes first on argv and
+    /// the pinned mold argument last, and the key carries the argument
+    /// first (stow#1047).
+    #[test]
+    fn a_cross_linking_unit_keeps_its_published_key_shape() {
+        let proc_macro = |codegen: &[&str]| {
+            let mut parts = vec![
+                "--crate-name",
+                "serde_derive",
+                "--crate-type",
+                "proc-macro",
+                "--emit",
+                "dep-info,link",
+                "-C",
+                "metadata=a52ee596848c66ca",
+                "-C",
+                "extra-filename=-aa4980adf969014b",
+                "--out-dir",
+                "/tmp/out",
+                "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.210/src/lib.rs",
+            ];
+            parts.extend_from_slice(codegen);
+            ParsedRustcArgs::parse(&args(&parts)).expect("parse")
+        };
+        let parsed = proc_macro(&[
+            "-C",
+            "linker=aarch64-linux-gnu-gcc",
+            "-C",
+            "link-arg=-fuse-ld=mold",
+        ]);
+        let key = test_registry_identity(&parsed)
+            .expect("identity")
+            .compile_key;
+        let profile = normalized_cache_profile(&parsed).expect("profile");
+        let published =
+            crate::upload_plan::compute_compile_key(&crate::upload_plan::CompileKeyInputs {
+                crate_name: "serde_derive",
+                crate_version: "1.0.210",
+                target: "aarch64-apple-darwin",
+                rustc_version: "1.91.1",
+                profile: &profile,
+                crate_types: &[crate::artifact::RustCrateType::ProcMacro],
+                emit: &["dep-info".to_owned(), "link".to_owned()],
+                features_json: "[]",
+                dependency_c_metadata_json: "[]",
+                kind: &super::parsed_artifact_kind(&parsed).expect("kind"),
+                embed_metadata: None,
+                cfgs: &[],
+                embed_bitcode: true,
+                link_options: &[
+                    "link-arg=-fuse-ld=mold".to_owned(),
+                    "linker=aarch64-linux-gnu-gcc".to_owned(),
+                ],
+                git_source: None,
+                extra_codegen: &[],
+            })
+            .expect("compile key");
+        assert_eq!(key, published);
+    }
+
+    #[test]
+    fn reach_folds_to_the_tightest_value() {
+        assert_eq!(Reach::Public.fold(Reach::Public), Reach::Public);
+        assert_eq!(Reach::Public.fold(Reach::LocalOnly), Reach::LocalOnly);
+        assert_eq!(Reach::LocalOnly.fold(Reach::Public), Reach::LocalOnly);
+        assert_eq!(Reach::from_int(0), Some(Reach::Public));
+        assert_eq!(Reach::from_int(1), Some(Reach::LocalOnly));
+        assert_eq!(Reach::from_int(2), None);
+    }
+
+    #[test]
+    fn the_registry_slot_names_its_index_dir() {
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "itoa",
+            "--crate-type",
+            "rlib",
+            "--out-dir",
+            "/tmp/out",
+            "/home/user/.cargo/registry/src/index.crates.io-0123abcd/itoa-1.0.0/src/lib.rs",
+        ]))
+        .expect("parse");
+        assert_eq!(
+            detect_registry_package_slot(&parsed)
+                .expect("slot")
+                .map(|slot| slot.index_dir)
+                .as_deref(),
+            Some("index.crates.io-0123abcd")
+        );
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "mycrate",
+            "--crate-type",
+            "rlib",
+            "--out-dir",
+            "/tmp/out",
+            "/home/user/.cargo/registry/src/my-mirror.example.com-deadbeef/mycrate-0.2.0/src/lib.rs",
+        ]))
+        .expect("parse");
+        assert_eq!(
+            detect_registry_package_slot(&parsed)
+                .expect("slot")
+                .map(|slot| slot.index_dir)
+                .as_deref(),
+            Some("my-mirror.example.com-deadbeef")
+        );
+    }
+
+    #[test]
+    fn git_and_registry_identities_of_one_crate_never_share_a_key() {
+        // The production git identity keys under an empty version, the
+        // registry one under the slot's: the same crate name and version
+        // text on both sides must still key apart.
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "demo",
+            "--crate-type",
+            "rlib",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=abc123",
+        ]))
+        .expect("parse");
+        let identity = |source: &UnitSource| {
+            stable_unit_identity(
+                &parsed,
+                source,
+                Reach::Public,
+                "aarch64-apple-darwin",
+                "1.91.1",
+                "[]",
+                "[]",
+            )
+            .expect("identity")
+        };
+        let registry = identity(&UnitSource::CratesIo {
+            package: "demo".to_owned(),
+            version: "0.1.0".to_owned(),
+        });
+        let git = identity(&UnitSource::Git {
+            commit: "1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b".to_owned(),
+            manifest_path_in_repo: String::new(),
+        });
+        assert_eq!(git.version, "", "a git unit carries no registry version");
+        assert_ne!(registry.compile_key, git.compile_key);
+        assert_ne!(registry.c_metadata, git.c_metadata);
+    }
+
+    #[test]
+    fn detect_git_checkout_reads_the_slot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let checkout = temp
+            .path()
+            .join("git/checkouts/demo-9f9f9f/1a2b3c4d/tools/demo");
+        std::fs::create_dir_all(checkout.join("src")).expect("src dir");
+        std::fs::write(
+            checkout.join("Cargo.toml"),
+            "[package]\nname=\"demo\"\nversion=\"0.1.0\"\n",
+        )
+        .expect("write manifest");
+        let input = checkout.join("src/lib.rs");
+        std::fs::write(&input, "pub fn leaf() {}\n").expect("write lib");
+
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "demo",
+            "--crate-type",
+            "rlib",
+            "--out-dir",
+            "/tmp/out",
+            input.to_str().expect("utf8 path"),
+        ]))
+        .expect("parse");
+        let found = detect_git_checkout(&parsed).expect("checkout slot detected");
+        assert_eq!(found.short_id, "1a2b3c4d");
+        assert!(
+            found.root.ends_with("git/checkouts/demo-9f9f9f/1a2b3c4d"),
+            "checkout root names the commit slot: {}",
+            found.root.display()
+        );
+
+        // A path under neither slot is no source at all.
+        let local = temp.path().join("local/demo");
+        std::fs::create_dir_all(local.join("src")).expect("local src");
+        std::fs::write(
+            local.join("Cargo.toml"),
+            "[package]\nname=\"local\"\nversion=\"0.1.0\"\n",
+        )
+        .expect("write local manifest");
+        let local_input = local.join("src/lib.rs");
+        std::fs::write(&local_input, "pub fn leaf() {}\n").expect("write local lib");
+        let parsed = ParsedRustcArgs::parse(&args(&[
+            "--crate-name",
+            "local",
+            "--crate-type",
+            "rlib",
+            "--out-dir",
+            "/tmp/out",
+            local_input.to_str().expect("utf8 path"),
+        ]))
+        .expect("parse");
+        assert!(detect_git_checkout(&parsed).is_none());
+        assert!(
+            detect_registry_package_slot(&parsed)
+                .expect("slot")
+                .is_none()
+        );
     }
 
     #[test]
@@ -871,15 +1588,7 @@ mod tests {
         ]))
         .expect("parse unicode-ident rustc args");
 
-        let identity = stable_registry_artifact_identity(
-            &parsed,
-            "aarch64-apple-darwin",
-            "1.91.1",
-            "[]",
-            "[]",
-        )
-        .expect("compute stable registry identity")
-        .expect("registry crate identity");
+        let identity = test_registry_identity(&parsed).expect("compute stable registry identity");
 
         assert_eq!(identity.c_metadata, "0e63365407e7f07c");
     }
@@ -911,26 +1620,11 @@ mod tests {
         flagged_invocation.extend(["-Z", "embed-metadata=no"]);
         let flagged = ParsedRustcArgs::parse(&args(&flagged_invocation))
             .expect("parse flagged unicode-ident rustc args");
-        assert!(!flagged.has_custom_codegen);
+        assert_eq!(flagged.extra_codegen, Vec::<String>::new());
 
-        let baseline_identity = stable_registry_artifact_identity(
-            &baseline,
-            "aarch64-apple-darwin",
-            "1.91.1",
-            "[]",
-            "[]",
-        )
-        .expect("compute baseline identity")
-        .expect("registry crate identity");
-        let flagged_identity = stable_registry_artifact_identity(
-            &flagged,
-            "aarch64-apple-darwin",
-            "1.91.1",
-            "[]",
-            "[]",
-        )
-        .expect("compute flagged identity")
-        .expect("registry crate identity");
+        let baseline_identity =
+            test_registry_identity(&baseline).expect("compute baseline identity");
+        let flagged_identity = test_registry_identity(&flagged).expect("compute flagged identity");
 
         // The flag changes the produced rlib, so it must change the key; an
         // invocation without it keeps the pre-existing key the CI identity
@@ -967,11 +1661,8 @@ mod tests {
         assert_eq!(probed.cfgs, BTreeSet::from(["has_atomics".to_owned()]));
         assert_eq!(probed.features, BTreeSet::from(["std".to_owned()]));
 
-        let identity = |parsed: &ParsedRustcArgs| {
-            stable_registry_artifact_identity(parsed, "aarch64-apple-darwin", "1.91.1", "[]", "[]")
-                .expect("compute identity")
-                .expect("registry crate identity")
-        };
+        let identity =
+            |parsed: &ParsedRustcArgs| test_registry_identity(parsed).expect("compute identity");
         // The cfg selects code in the compiled crate, so the artifact built
         // under CI's probe result must not serve a unit whose local build
         // script probed differently; an invocation without cfgs keeps the
@@ -1016,18 +1707,10 @@ mod tests {
             let mut invocation = base_invocation.to_vec();
             invocation.extend_from_slice(extra);
             let parsed = ParsedRustcArgs::parse(&args(&invocation)).expect("parse invocation");
-            assert!(!parsed.has_custom_codegen);
+            assert_eq!(parsed.extra_codegen, Vec::<String>::new());
             (
                 parsed.embed_bitcode,
-                stable_registry_artifact_identity(
-                    &parsed,
-                    "aarch64-apple-darwin",
-                    "1.91.1",
-                    "[]",
-                    "[]",
-                )
-                .expect("compute identity")
-                .expect("registry crate identity"),
+                test_registry_identity(&parsed).expect("compute identity"),
             )
         };
         let (absent_bitcode, absent) = identity(&[]);

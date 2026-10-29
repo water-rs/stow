@@ -73,6 +73,73 @@ pub struct SemanticFetchRequest {
     pub emit: Vec<String>,
     pub kind: stow_types::artifact::ArtifactKind,
     pub crate_types: Vec<stow_types::artifact::RustCrateType>,
+    /// What the requesting invocation compiles with beyond the typed
+    /// fields above: its own cfgs, extra codegen and link options.
+    pub consumer: stow_types::upload_plan::ConsumerInputs,
+    /// What the requesting invocation's own build script put on its
+    /// command line.
+    pub build_script: stow_types::upload_plan::BuildScriptInputs,
+}
+
+/// The recorded identity of an artifact a semantic match proposes to
+/// serve, as the proof it was compiled like the request needs it.
+#[derive(Debug)]
+pub struct SemanticCandidate<'a> {
+    pub crate_name: &'a str,
+    pub crate_version: &'a str,
+    pub features_json: &'a str,
+    pub dependency_c_metadata_json: &'a str,
+    pub emit: &'a [String],
+    pub compile_key: &'a str,
+}
+
+impl SemanticFetchRequest {
+    /// The build-script inputs a candidate is judged under when they are
+    /// known without opening it: a candidate of the request's own version
+    /// and feature set differs from the request in its emit set alone, so
+    /// it ran the same build script and the request's output stands for
+    /// it. Any other candidate was built with its own build-script output,
+    /// which only its captured native block says (`None` here).
+    #[must_use]
+    pub fn build_script_of_same_build(
+        &self,
+        crate_version: &str,
+        features_json: &str,
+    ) -> Option<&stow_types::upload_plan::BuildScriptInputs> {
+        (crate_version == self.version && features_json == self.features_json)
+            .then_some(&self.build_script)
+    }
+
+    /// Whether `candidate` was compiled with exactly the inputs the
+    /// request carries that no typed match compares (stow#1047): the key
+    /// it would have carried under the consumer's cfgs, codegen and link
+    /// options plus `build_script` is the key it does carry.
+    ///
+    /// # Errors
+    /// Fails when the recomputed identity cannot be serialized.
+    pub fn candidate_honours_consumer(
+        &self,
+        candidate: &SemanticCandidate<'_>,
+        build_script: &stow_types::upload_plan::BuildScriptInputs,
+    ) -> stow_types::error::Result<bool> {
+        let recomputed = stow_types::upload_plan::candidate_compile_key(
+            &stow_types::upload_plan::CandidateIdentity {
+                crate_name: candidate.crate_name,
+                crate_version: candidate.crate_version,
+                target: &self.target,
+                rustc_version: &self.rustc_version,
+                features_json: candidate.features_json,
+                dependency_c_metadata_json: candidate.dependency_c_metadata_json,
+                kind: &self.kind,
+                profile: &self.profile,
+                crate_types: &self.crate_types,
+                emit: candidate.emit,
+            },
+            &self.consumer,
+            build_script,
+        )?;
+        Ok(recomputed == candidate.compile_key)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +401,35 @@ pub fn validate_semantic_bundle_identity(
             "downloaded semantic bundle crate mismatch: expected {}, got {}",
             request.crate_name,
             bundle.manifest.config.crate_name
+        ));
+    }
+    let config = &bundle.manifest.config;
+    let features_json = config.features_json.raw();
+    let crate_version = config.crate_version.to_string();
+    let dependency_c_metadata_json = config.dependency_c_metadata_json.raw();
+    let build_script = request
+        .build_script_of_same_build(&crate_version, &features_json)
+        .map_or_else(
+            || {
+                std::borrow::Cow::Owned(stow_types::upload_plan::BuildScriptInputs::of(
+                    config.native.as_ref(),
+                ))
+            },
+            std::borrow::Cow::Borrowed,
+        );
+    if !request.candidate_honours_consumer(
+        &SemanticCandidate {
+            crate_name: config.crate_name.as_str(),
+            crate_version: &crate_version,
+            features_json: &features_json,
+            dependency_c_metadata_json: &dependency_c_metadata_json,
+            emit: &config.emit,
+            compile_key: &config.compile_key,
+        },
+        &build_script,
+    )? {
+        return Err(stow_types::stow_error!(
+            "downloaded semantic bundle was compiled with different cfgs, codegen or link options than the request"
         ));
     }
     Ok(())
@@ -680,6 +776,52 @@ mod tests {
         validate_oci_manifest, validate_output_entries_present, validate_semantic_bundle_version,
     };
 
+    /// stow#1047: a downloaded stand-in is accepted only when its key is
+    /// the one it would carry under the request's own cfgs, codegen and
+    /// link options.
+    #[test]
+    fn a_downloaded_semantic_bundle_must_carry_the_requests_cfgs() {
+        let mut bundle = crate::artifact_cache::tests::sample_bundle("aaaabbbbccccdddd", "x.rmeta");
+        let config = &mut bundle.manifest.config;
+        let consumer = stow_types::upload_plan::ConsumerInputs::stock();
+        let build_script = stow_types::upload_plan::BuildScriptInputs::default();
+        config.compile_key = stow_types::upload_plan::candidate_compile_key(
+            &stow_types::upload_plan::CandidateIdentity {
+                crate_name: "demo",
+                crate_version: "1.0.0",
+                target: "aarch64-apple-darwin",
+                rustc_version: "1.91.1",
+                features_json: &config.features_json.raw(),
+                dependency_c_metadata_json: &config.dependency_c_metadata_json.raw(),
+                kind: &config.kind,
+                profile: &config.profile,
+                crate_types: &config.crate_types,
+                emit: &config.emit,
+            },
+            &consumer,
+            &build_script,
+        )
+        .expect("key");
+        let config = &bundle.manifest.config;
+        let mut request = super::SemanticFetchRequest {
+            crate_name: "demo".to_owned(),
+            version: "1.0.0".to_owned(),
+            features_json: config.features_json.raw(),
+            dependency_c_metadata_json: config.dependency_c_metadata_json.raw(),
+            target: "aarch64-apple-darwin".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+            profile: config.profile.clone(),
+            emit: config.emit.clone(),
+            kind: config.kind.clone(),
+            crate_types: config.crate_types.clone(),
+            consumer,
+            build_script,
+        };
+        super::validate_semantic_bundle_identity(&bundle, &request).expect("same inputs serve");
+        request.consumer.cfgs = vec!["custom".to_owned()];
+        assert!(super::validate_semantic_bundle_identity(&bundle, &request).is_err());
+    }
+
     /// One canned answer from the stub edge for any request it serves.
     fn serve_once(status: &'static str, body: &[u8]) -> crate::test_edge::StubEdge {
         crate::test_edge::serve(vec![crate::test_edge::Route {
@@ -705,7 +847,6 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 

@@ -47,8 +47,8 @@ use std::time::Duration;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{
-    AdminStatus, ChannelOutcome, DispatchFreeze, DispatchFreezeTrigger, FreezeTransitionEvent,
-    SchedulerSubmitResponse,
+    AdminStatus, ChannelOutcome, DispatchCapSet, DispatchCaps, DispatchFreeze,
+    DispatchFreezeTrigger, FreezeTransitionEvent, SchedulerSubmitResponse,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -124,6 +124,10 @@ enum Command {
     /// Read or clear the scheduler's dispatch freeze — the manual
     /// recovery path after a systematic-failure or cost trip.
     DispatchFreeze(DispatchFreezeArgs),
+    /// Read or adjust the scheduler's dispatch caps — the in-flight
+    /// bounds the deploy bindings `STOW_MAX_CONCURRENT_JOBS` /
+    /// `STOW_MAX_CONCURRENT_MACOS_JOBS` set until the first `set`.
+    DispatchCap(DispatchCapArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
     /// Regenerate the checked-in launch traffic model from production
@@ -173,6 +177,39 @@ enum DispatchFreezeAction {
     Status,
     Engage,
     Clear,
+}
+
+#[derive(Args)]
+struct DispatchCapArgs {
+    /// `status` prints the caps in force and where each comes from;
+    /// `set` replaces the deploy bindings' values until the next set —
+    /// there is no clear.
+    #[command(subcommand)]
+    command: DispatchCapCommand,
+}
+
+#[derive(Subcommand)]
+enum DispatchCapCommand {
+    /// Print the caps in force and whether each comes from the deploy
+    /// binding or the operator setting.
+    Status,
+    /// Set the caps; without `--yes` prints the plan and exits 0.
+    Set(DispatchCapSetArgs),
+}
+
+#[derive(Args)]
+struct DispatchCapSetArgs {
+    /// The in-flight bound across all runner families — 0 pauses
+    /// dispatch. No ceiling is checked.
+    #[arg(long)]
+    jobs: u32,
+    /// The in-flight bound for the macOS runner family; omitted, the
+    /// cap keeps reading its deploy binding.
+    #[arg(long)]
+    macos: Option<u32>,
+    /// Apply the change.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Args)]
@@ -278,6 +315,9 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         Command::Watchdog(args) => watchdog::run(&Edge::connect(&*store)?, args, output).await,
         Command::DispatchFreeze(args) => {
             dispatch_freeze_switch(&Edge::connect(&*store)?, args, output).await
+        }
+        Command::DispatchCap(args) => {
+            dispatch_cap_command(&Edge::connect(&*store)?, args, output).await
         }
         Command::Index(args) => index_cmd::run(args, &*store).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
@@ -778,6 +818,75 @@ async fn dispatch_freeze_switch(
         }),
     )
     .await
+}
+
+/// `stow-admin dispatch-cap status|set` — read the caps in force or
+/// write the operator setting that replaces the deploy bindings'
+/// `STOW_MAX_CONCURRENT_JOBS` / `STOW_MAX_CONCURRENT_MACOS_JOBS` at
+/// claim time (stow#1039). `set` is a mutation: it prints the plan and
+/// only applies under `--yes`.
+async fn dispatch_cap_command(
+    edge: &Edge,
+    args: DispatchCapArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    match args.command {
+        DispatchCapCommand::Status => {
+            let caps: DispatchCaps = edge.get_json("/api/v1/admin/dispatch-cap").await?;
+            render::emit(output, &caps, render_caps)
+        }
+        DispatchCapCommand::Set(args) => {
+            let plan = DispatchCapSet {
+                max_concurrent_jobs: args.jobs,
+                max_concurrent_macos_jobs: args.macos,
+            };
+            render::mutation(
+                output,
+                plan,
+                |envelope: &render::Planned<DispatchCapSet, DispatchCaps>| {
+                    let mut out = "set dispatch caps\n".to_owned();
+                    if let Some(result) = &envelope.result {
+                        let _ = writeln!(out, "{}", render_caps(result));
+                    }
+                    let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
+                    out
+                },
+                args.yes.then_some(async move |plan: &DispatchCapSet| {
+                    edge.post_json("/api/v1/admin/dispatch-cap", plan).await
+                }),
+            )
+            .await
+        }
+    }
+}
+
+/// Human rendering of the caps in force — each cap's value and whether
+/// it comes from the deploy binding or the operator setting, plus the
+/// setting's own record.
+fn render_caps(caps: &DispatchCaps) -> String {
+    let source = |operator: bool| {
+        if operator {
+            "operator"
+        } else {
+            "deploy binding"
+        }
+    };
+    let mut out = format!(
+        "jobs       {} ({})\nmacos jobs {} ({})",
+        caps.max_concurrent_jobs,
+        source(caps.setting.is_some()),
+        caps.max_concurrent_macos_jobs,
+        source(
+            caps.setting
+                .as_ref()
+                .is_some_and(|set| set.max_concurrent_macos_jobs.is_some())
+        ),
+    );
+    if let Some(setting) = &caps.setting {
+        let _ = write!(out, "\nset at     {}", setting.set_at);
+        let _ = write!(out, "\nset by     {}", setting.actor);
+    }
+    out
 }
 
 /// Human rendering of the freeze state — the flag line, the stored

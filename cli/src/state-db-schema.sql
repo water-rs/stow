@@ -33,6 +33,13 @@ CREATE TABLE artifact_cache_entries (
     verified_marker_version INTEGER,
     verified_marker_policy TEXT,
     provenance TEXT NOT NULL DEFAULT 'remote',
+    -- `Reach` (`stow_types::public_cache`) as its small integer: a serve
+    -- writes this entry's reach onto its `materialized_outputs` rows, so
+    -- a local-only entry keeps marking its consumers local-only
+    -- (stow#1006). Remote bundles are always `Public`; the semantic
+    -- stage also restricts its candidates to `Public` rows, which are
+    -- exactly the standard-codegen crates.io entries.
+    reach INTEGER NOT NULL,
     PRIMARY KEY (rustc_version, cache_key)
 );
 
@@ -131,6 +138,10 @@ CREATE TABLE materialized_outputs (
     -- `outputs_instance_digest` of the artifact instance at this path —
     -- which exact bytes a dependent's `--extern` resolves to.
     instance TEXT NOT NULL,
+    -- `Reach` (`stow_types::public_cache`) as its small integer: a
+    -- dependent folds this column into its own reach, so a git-sourced
+    -- or codegen-keyed dep marks every consumer local-only (stow#1006).
+    reach INTEGER NOT NULL,
     updated_at_ms INTEGER NOT NULL
 );
 

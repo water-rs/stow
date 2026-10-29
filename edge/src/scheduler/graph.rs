@@ -88,6 +88,18 @@ fn node_published_mask(host_side: bool, target: &str, explicit: ExplicitSpelling
 /// leading bytes of the BLAKE3 hash of its canonical string.
 type IdKey = [u8; 16];
 
+/// An index slice: its target and rustc ids.
+type SliceId = (u8, u8);
+
+/// One published task id's entry: the unit shapes it serves and the
+/// slice that reported them, so a full report can replace its slice's
+/// set.
+#[derive(Debug, Clone, Copy)]
+struct Published {
+    mask: u8,
+    slice: SliceId,
+}
+
 /// The probe keys of one canonical task id.
 #[derive(Debug, Clone, Copy)]
 struct IdKeys {
@@ -147,6 +159,9 @@ impl TargetInfo {
 /// One operand class's candidate in a claim's k-way merge: its claim
 /// key (rank, then request instant, then arrival — descending) and the
 /// node index.
+/// One ready queue: rank operand → age-ordered `(first_requested, ix)`.
+type ReadyClasses = BTreeMap<i64, BTreeSet<(i64, u32)>>;
+
 type Candidate = ((i128, std::cmp::Reverse<i64>, std::cmp::Reverse<u32>), u32);
 
 /// The class a failed attempt is counted under — the error's first
@@ -359,7 +374,13 @@ pub struct Graph {
     /// Forward edges and the reverse index.
     edges: Edges,
     /// Published unit-shape mask per task id.
-    published: HashMap<IdKey, u8>,
+    published: HashMap<IdKey, Published>,
+    /// The task ids each slice serves, derived from `published`: a full
+    /// report retires the slice's stale ids from here, so its cost is
+    /// the slice's own size rather than the whole map's.
+    slice_members: HashMap<SliceId, HashSet<IdKey>>,
+    /// The generation of the index each reported slice last applied.
+    slice_generations: BTreeMap<SliceId, i64>,
     /// Dispatchable pending nodes, one age-ordered queue per rank
     /// operand (the node's priority, stow#879): `operand →
     /// BTreeSet<(first_requested, ix)>`. Within a class the oldest
@@ -367,7 +388,16 @@ pub struct Graph {
     /// eligible entry — O(classes) per pick instead of an O(ready)
     /// re-rank, and the operand re-keys only when a merge raises the
     /// priority.
-    ready: BTreeMap<i64, BTreeSet<(i64, u32)>>,
+    ///
+    /// Split by runner family where a family has its own dispatch cap:
+    /// this holds every node outside the macOS family, `ready_macos`
+    /// the macOS ones, so a claim pass leaves a full family's queue
+    /// untouched (stow#1052). Both are derived from node state and
+    /// rebuilt by the same `refresh_ready` calls on replay — neither
+    /// is persisted.
+    ready: ReadyClasses,
+    /// The macOS family's share of the ready set.
+    ready_macos: ReadyClasses,
     /// Dispatched and running nodes.
     inflight: BTreeSet<u32>,
     /// Nodes per [`Status`].
@@ -377,6 +407,10 @@ pub struct Graph {
     /// [`Graph::index_pending`] keeps, so the status reads never walk
     /// the arena (stow#932).
     pending_blocked: u32,
+    /// Pending nodes on the miss lane — what `STOW_MAX_QUEUE_PENDING`
+    /// bounds, so preheat, operations and human backlog never count
+    /// against a CLI miss.
+    pending_miss: u32,
     /// Pending nodes on the human lane: `GET /status`'s
     /// `human_pending` is its length, and a human node's lane position
     /// compares only these.
@@ -394,6 +428,11 @@ pub struct Graph {
     freeze_history: std::collections::VecDeque<stow_types::api::DispatchFreezeTransition>,
     /// The admission floor (`min_dispatch_value`).
     floor: i64,
+    /// The operator's dispatch-cap setting (stow#1039): replaces the
+    /// deploy bindings' `STOW_MAX_CONCURRENT_JOBS` /
+    /// `STOW_MAX_CONCURRENT_MACOS_JOBS` at claim time until the next
+    /// `set`. `None` until the first one.
+    dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
 
     /// Completions and failures per UTC hour and target byte — the
     /// admin status's trailing-day tally, since a published node keeps
@@ -653,12 +692,33 @@ impl Graph {
         }
         let operand = self.operand_of(ix);
         let key = (self.state(ix).first_requested, ix);
-        if let Some(class) = self.ready.get_mut(&operand) {
+        let ready = if self.is_macos(ix) {
+            &mut self.ready_macos
+        } else {
+            &mut self.ready
+        };
+        if let Some(class) = ready.get_mut(&operand) {
             class.remove(&key);
             if class.is_empty() {
-                self.ready.remove(&operand);
+                ready.remove(&operand);
             }
         }
+    }
+
+    /// Whether the node builds on the macOS runner family.
+    fn is_macos(&self, ix: u32) -> bool {
+        self.targets[usize::from(self.node(ix).target)].family == Some(RunnerFamily::MacOs)
+    }
+
+    /// Whether any node is dispatchable.
+    fn has_ready(&self) -> bool {
+        !(self.ready.is_empty() && self.ready_macos.is_empty())
+    }
+
+    /// Every ready queue entry set, both families.
+    #[cfg(test)]
+    fn ready_sets(&self) -> impl Iterator<Item = &BTreeSet<(i64, u32)>> {
+        self.ready.values().chain(self.ready_macos.values())
     }
 
     /// Re-evaluate a node's ready-set membership: enters it under its
@@ -667,7 +727,12 @@ impl Graph {
         if self.dispatchable(ix) {
             let operand = self.operand_of(ix);
             let first = self.state(ix).first_requested;
-            self.ready.entry(operand).or_default().insert((first, ix));
+            let ready = if self.is_macos(ix) {
+                &mut self.ready_macos
+            } else {
+                &mut self.ready
+            };
+            ready.entry(operand).or_default().insert((first, ix));
         } else {
             self.remove_ready(ix);
         }
@@ -706,15 +771,18 @@ impl Graph {
         }
         let blocked = u32::from(node.flags.blocked());
         let human = node.flags.lane() == Lane::Human;
+        let miss = u32::from(node.flags.lane() == Lane::Miss);
         let first = self.state(ix).first_requested;
         if on {
             self.pending_blocked += blocked;
+            self.pending_miss += miss;
             if human {
                 self.human_pending.insert(ix);
             }
             *self.pending_ages.entry(first).or_default() += 1;
         } else {
             self.pending_blocked -= blocked;
+            self.pending_miss -= miss;
             if human {
                 assert!(
                     self.human_pending.remove(&ix),
@@ -845,6 +913,17 @@ impl Graph {
         self.ids.candidates(u64::from(keys.tag)).find(|&ix| {
             let node = self.node(ix);
             node.id_tag == keys.tag && node.status != Status::Free && self.task_id_of(ix) == task_id
+        })
+    }
+
+    /// The live node whose canonical task id hashes to `key`.
+    fn find_key(&self, key: IdKey) -> Option<u32> {
+        let tag = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+        self.ids.candidates(u64::from(tag)).find(|&ix| {
+            let node = self.node(ix);
+            node.id_tag == tag
+                && node.status != Status::Free
+                && IdKeys::of(&self.task_id_of(ix)).key == key
         })
     }
 
@@ -992,18 +1071,20 @@ impl Graph {
             write += 1;
         }
         self.nodes.truncate(write);
-        self.ready = std::mem::take(&mut self.ready)
-            .into_iter()
-            .map(|(operand, class)| {
-                (
-                    operand,
-                    class
-                        .into_iter()
-                        .map(|(first, ix)| (first, remap[ix as usize]))
-                        .collect(),
-                )
-            })
-            .collect();
+        for ready in [&mut self.ready, &mut self.ready_macos] {
+            *ready = std::mem::take(ready)
+                .into_iter()
+                .map(|(operand, class)| {
+                    (
+                        operand,
+                        class
+                            .into_iter()
+                            .map(|(first, ix)| (first, remap[ix as usize]))
+                            .collect(),
+                    )
+                })
+                .collect();
+        }
         self.inflight = self
             .inflight
             .iter()
@@ -1207,7 +1288,7 @@ impl Graph {
         let target = self.target_id(sub.target.as_str())?;
         let own = self.targets[usize::from(target)].own_masks[usize::from(sub.host_side)]
             [usize::from(explicit)];
-        let published = self.published.get(&keys.key).copied().unwrap_or(0);
+        let published = self.published.get(&keys.key).map_or(0, |entry| entry.mask);
         let state = (published & own != own).then_some(State {
             first_requested: now,
             updated: now,
@@ -1289,8 +1370,7 @@ impl Graph {
             let published = self
                 .published
                 .get(&ids[dep_at as usize].key)
-                .copied()
-                .unwrap_or(0);
+                .map_or(0, |entry| entry.mask);
             let met = published & required == required;
             if !met {
                 unmet = unmet.checked_add(1).ok_or_else(|| {
@@ -1300,9 +1380,9 @@ impl Graph {
             let edge = self.edges.push(owner, dep_ix, required, met)?;
             self.touch_edge(edge);
             self.node_mut(dep_ix).refs += 1;
-            // A fresh node is blocked when any dep is a live failed
-            // node.
-            blocked |= self.node(dep_ix).status == Status::Failed;
+            // A fresh node is blocked when an unmet dep is a live
+            // failed node.
+            blocked |= !met && self.node(dep_ix).status == Status::Failed;
         }
         let edges_len = u16::try_from(self.edges.len() - edges_start as usize).map_err(|_| {
             QueueError::Invariant(format!("task {} has more than 65535 edges", sub.task_id))
@@ -1334,34 +1414,133 @@ impl Graph {
         );
     }
 
-    /// Apply a published-slice report: add/retire unit shapes, flip the
-    /// edges they touch, and drop nodes whose own shapes are served.
-    /// Returns the number of edge flips.
+    /// Whether a slice report extends its slice's live generation. A
+    /// full report (`base_generation` unset) always does — it replaces
+    /// the set and restarts the sequence. A delta applies only on top
+    /// of exactly the generation it was diffed against, and publishes
+    /// the next one; anything else is a gap the reporter resyncs.
+    ///
+    /// # Errors
+    /// `QueueError::SliceReportConflict` naming the live generation.
+    pub fn check_slice_report(
+        &self,
+        target: &str,
+        rustc_version: &str,
+        base_generation: Option<i64>,
+        generation: i64,
+    ) -> Result<(), QueueError> {
+        let Some(base) = base_generation else {
+            return Ok(());
+        };
+        let live = self.slice_generation(target, rustc_version);
+        if live != Some(base) {
+            return Err(QueueError::SliceReportConflict(format!(
+                "slice report base generation {base} conflicts with the live generation {}",
+                live.map_or_else(|| "none".to_owned(), |live| live.to_string()),
+            )));
+        }
+        if generation != base + 1 {
+            return Err(QueueError::SliceReportConflict(format!(
+                "slice report generation {generation} is not the generation after its base {base}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The generation a slice last applied, if it was ever reported.
+    pub fn slice_generation(&self, target: &str, rustc_version: &str) -> Option<i64> {
+        let slice = self
+            .target_lookup(target)
+            .zip(self.rustc_lookup(rustc_version))?;
+        self.slice_generations.get(&slice).copied()
+    }
+
+    /// The generation each reported slice last applied, by name.
+    pub fn slice_generations(&self) -> Vec<(String, String, i64)> {
+        self.slice_generations
+            .iter()
+            .map(|(&(target, rustc), &generation)| {
+                (
+                    self.targets[usize::from(target)].name.to_string(),
+                    self.rustcs[usize::from(rustc)].to_string(),
+                    generation,
+                )
+            })
+            .collect()
+    }
+
+    /// Apply a published-slice report: a delta adds and retires unit
+    /// shapes; a full report (`base_generation` unset) makes `added`
+    /// the slice's whole set, retiring every shape the slice held that
+    /// it no longer lists. Flips the edges they touch and drops nodes
+    /// whose own shapes are served. Returns the number of edge flips.
+    ///
+    /// # Panics
+    /// When the graph holds more than 256 targets or rustcs — the same
+    /// bound every node insert enforces.
     pub fn apply_slice_report(
         &mut self,
         target: &str,
         rustc_version: &str,
+        base_generation: Option<i64>,
+        generation: i64,
         added: &[PublishedSliceRow],
         retired: &[PublishedSliceRow],
     ) -> u32 {
+        let slice = (
+            self.target_id(target).expect("target ids fit u8"),
+            self.rustc_id(rustc_version).expect("rustc ids fit u8"),
+        );
+        self.slice_generations.insert(slice, generation);
         let mut flips = 0;
-        for row in retired {
-            flips += self.apply_slice_row(target, rustc_version, row, false);
-        }
-        for row in added {
-            flips += self.apply_slice_row(target, rustc_version, row, true);
+        if base_generation.is_none() {
+            flips += self.replace_slice(slice, target, rustc_version, added);
+        } else {
+            for row in retired {
+                flips += self.apply_slice_row(slice, target, rustc_version, row, false);
+            }
+            for row in added {
+                flips += self.apply_slice_row(slice, target, rustc_version, row, true);
+            }
         }
         self.maybe_compact();
         flips
     }
 
-    fn apply_slice_row(
+    /// A full report: `rows` become the slice's whole set. Cost is the
+    /// report's rows plus the slice's own members.
+    fn replace_slice(
         &mut self,
+        slice: SliceId,
         target: &str,
         rustc: &str,
-        row: &PublishedSliceRow,
-        added: bool,
+        rows: &[PublishedSliceRow],
     ) -> u32 {
+        let mut next: HashMap<IdKey, u8> = HashMap::new();
+        for row in rows {
+            let (keys, bit) = Self::slice_row_key(target, rustc, row);
+            *next.entry(keys.key).or_default() |= bit;
+        }
+        let mut flips = 0;
+        let stale: Vec<IdKey> = self
+            .slice_members
+            .get(&slice)
+            .into_iter()
+            .flatten()
+            .filter(|key| !next.contains_key(*key))
+            .copied()
+            .collect();
+        for key in stale {
+            flips += self.set_published(slice, key, 0);
+        }
+        for (key, mask) in next {
+            flips += self.set_published(slice, key, mask);
+        }
+        flips
+    }
+
+    /// A slice row's published-map key and shape bit.
+    fn slice_row_key(target: &str, rustc: &str, row: &PublishedSliceRow) -> (IdKeys, u8) {
         let task_id = canonical_task_id(
             row.crate_name.as_str(),
             &row.version.to_string(),
@@ -1371,23 +1550,47 @@ impl Graph {
             row.dependency_identity.as_str(),
             row.unit_shape.side == stow_types::public_cache::UnitSide::Host,
         );
-        let keys = IdKeys::of(&task_id);
-        let bit = shape_bit(row.unit_shape);
-        let old = self.published.get(&keys.key).copied().unwrap_or(0);
+        (IdKeys::of(&task_id), shape_bit(row.unit_shape))
+    }
+
+    fn apply_slice_row(
+        &mut self,
+        slice: SliceId,
+        target: &str,
+        rustc: &str,
+        row: &PublishedSliceRow,
+        added: bool,
+    ) -> u32 {
+        let (keys, bit) = Self::slice_row_key(target, rustc, row);
+        let old = self.published.get(&keys.key).map_or(0, |entry| entry.mask);
         let mask = if added { old | bit } else { old & !bit };
+        self.set_published(slice, keys.key, mask)
+    }
+
+    /// Set one task id's published mask, flip the edges that depend on
+    /// it and release the node when its own shapes are covered.
+    fn set_published(&mut self, slice: SliceId, key: IdKey, mask: u8) -> u32 {
+        let old = self.published.get(&key).map_or(0, |entry| entry.mask);
         if mask != old {
             if mask == 0 {
-                self.published.remove(&keys.key);
+                self.published.remove(&key);
+                if let Some(members) = self.slice_members.get_mut(&slice) {
+                    members.remove(&key);
+                }
             } else {
-                self.published.insert(keys.key, mask);
+                self.published.insert(key, Published { mask, slice });
+                self.slice_members.entry(slice).or_default().insert(key);
             }
-            self.touch_published(&keys.key);
+            self.touch_published(&key);
         }
-        let Some(ix) = self.find_id(&task_id, keys) else {
+        let Some(ix) = self.find_key(key) else {
             return 0;
         };
         let mut flips = 0;
-        for owner in self.dependents_of(ix) {
+        let was_failed = self.node(ix).status == Status::Failed;
+        let owners = self.dependents_of(ix);
+        let mut touched = Vec::new();
+        for &owner in &owners {
             let mut flipped = false;
             for edge in self.edge_range(owner) {
                 if self.edges.dep(edge) != ix {
@@ -1410,16 +1613,22 @@ impl Graph {
                 flipped = true;
             }
             if flipped {
-                self.refresh_ready(owner);
+                touched.push(owner);
             }
         }
         // A live node whose own published shapes are now covered
         // leaves the queue.
-        if added && self.node(ix).status.has_state() {
+        if mask != 0 && self.node(ix).status.has_state() {
             let own = self.own_mask(ix);
             if mask & own == own {
                 self.publish(ix);
             }
+        }
+        // Edges flipped or the dep left `failed`: recompute blocked
+        // from the dependencies still failed.
+        let recompute = if was_failed { &owners } else { &touched };
+        for &owner in recompute {
+            self.refresh_blocked(owner);
         }
         flips
     }
@@ -1431,7 +1640,7 @@ impl Graph {
             && self
                 .published
                 .get(&IdKeys::of(task_id).key)
-                .is_some_and(|&mask| mask != 0)
+                .is_some_and(|entry| entry.mask != 0)
     }
 
     /// The ids among `ids` that [`Self::is_published`] answers for.
@@ -1461,6 +1670,19 @@ impl Graph {
         now: i64,
         stale_ms: i64,
     ) -> Result<Vec<Claimed>, QueueError> {
+        self.claim_scanned(total_free, macos_free, now, stale_ms, &mut 0)
+    }
+
+    /// [`Self::claim`], adding the ready entries the pass examined to
+    /// `scans` — the pass's cost, which tests bound.
+    fn claim_scanned(
+        &mut self,
+        total_free: u32,
+        macos_free: u32,
+        now: i64,
+        stale_ms: i64,
+        scans: &mut u64,
+    ) -> Result<Vec<Claimed>, QueueError> {
         // Stale-lease recovery first: in-flight nodes whose claim
         // outlived the lease return to pending.
         let stale: Vec<u32> = self
@@ -1488,49 +1710,68 @@ impl Graph {
         // node of each class is its oldest eligible one and the claim
         // is a k-way merge over class heads — O(classes) per pick,
         // never a re-rank of the ready bulk.
-        let mut skipped: BTreeSet<(i64, u32)> = BTreeSet::new();
+        //
+        // Each (family queue, operand) class keeps a cursor that only
+        // moves forward: entries not yet due are examined once per
+        // pass, and a family whose cap is spent is left out of the
+        // pass whole, so the pass is linear in the entries it examines
+        // (stow#1052).
+        let mut cursors: BTreeMap<(bool, i64), Option<(i64, u32)>> = BTreeMap::new();
         let mut claimed = Vec::new();
         let mut macos_taken = 0u32;
         while claimed.len() < total_free as usize {
-            let mut best: Option<Candidate> = None;
-            for (&operand, class) in &self.ready {
-                let candidate = class
-                    .iter()
-                    .copied()
-                    .find(|key| !skipped.contains(key) && self.not_before_of(key.1) <= now);
-                let Some((first, ix)) = candidate else {
+            let mut best: Option<(Candidate, bool)> = None;
+            for (macos, ready) in [(false, &self.ready), (true, &self.ready_macos)] {
+                if macos && macos_taken >= macos_free {
                     continue;
-                };
-                // Higher rank first; ties fall to the older
-                // first_requested, then the earlier arrival (stow#879).
-                let key = (
-                    i128::from(operand) * i128::from(now - first),
-                    std::cmp::Reverse(first),
-                    std::cmp::Reverse(ix),
-                );
-                if best.is_none_or(|(top, _)| key > top) {
-                    best = Some((key, ix));
+                }
+                for (&operand, class) in ready {
+                    let cursor = cursors
+                        .entry((macos, operand))
+                        .or_insert(Some((i64::MIN, 0)));
+                    let Some(from) = *cursor else {
+                        continue;
+                    };
+                    let mut found = None;
+                    for &key in class.range(from..) {
+                        *scans += 1;
+                        if self.not_before_of(key.1) <= now {
+                            found = Some(key);
+                            break;
+                        }
+                    }
+                    *cursor = found;
+                    let Some((first, ix)) = found else {
+                        continue;
+                    };
+                    // Higher rank first; ties fall to the older
+                    // first_requested, then the earlier arrival
+                    // (stow#879).
+                    let key = (
+                        i128::from(operand) * i128::from(now - first),
+                        std::cmp::Reverse(first),
+                        std::cmp::Reverse(ix),
+                    );
+                    if best.is_none_or(|((top, _), _)| key > top) {
+                        best = Some(((key, ix), macos));
+                    }
                 }
             }
-            let Some((_, ix)) = best else {
+            let Some(((_, ix), family_is_macos)) = best else {
                 break;
             };
             let target = &self.targets[usize::from(self.node(ix).target)];
-            let family = target.family.ok_or_else(|| {
+            target.family.ok_or_else(|| {
                 QueueError::Invariant(format!(
                     "pending task {} targets `{}`, no runner family",
                     self.task_id_of(ix),
                     target.name
                 ))
             })?;
-            if family == RunnerFamily::MacOs && macos_taken >= macos_free {
-                skipped.insert((self.state(ix).first_requested, ix));
-                continue;
-            }
             let generation = self.next_generation + 1;
             self.mark_claimed(ix, generation, now);
             self.settling.insert(generation);
-            if family == RunnerFamily::MacOs {
+            if family_is_macos {
                 macos_taken += 1;
             }
             claimed.push(Claimed {
@@ -1812,10 +2053,9 @@ impl Graph {
             self.set_status(ix, Status::Failed);
             self.edit_extra(ix, |extra| extra.error = error.map(Into::into));
             self.tally_outcome(now, target, false);
-            // Dependents of a failed dep become blocked.
+            // Dependents waiting on the failed dep become blocked.
             for owner in self.dependents_of(ix) {
-                self.edit_flags(owner, |flags| flags.set_blocked(true));
-                self.refresh_ready(owner);
+                self.refresh_blocked(owner);
             }
         } else {
             self.set_status(ix, Status::Pending);
@@ -2017,18 +2257,21 @@ impl Graph {
             // blocked flag.
             if rose || fell {
                 for owner in self.dependents_of(ix) {
-                    let waits = self
-                        .edge_range(owner)
-                        .any(|edge| self.edges.dep(edge) == ix && !self.edges.met(edge));
-                    if waits && self.node(owner).status == Status::Pending {
-                        let blocked = fell || self.has_failed_dep(owner);
-                        self.edit_flags(owner, |flags| flags.set_blocked(blocked));
-                        self.refresh_ready(owner);
-                    }
+                    self.refresh_blocked(owner);
                 }
             }
             if op == MutationKind::Purge {
+                // A purged failed node leaves `failed` by publishing;
+                // its dependents recompute once it has.
+                let owners = if status == Status::Failed {
+                    self.dependents_of(ix)
+                } else {
+                    Vec::new()
+                };
                 self.publish(ix);
+                for owner in owners {
+                    self.refresh_blocked(owner);
+                }
             } else {
                 self.refresh_ready(ix);
             }
@@ -2036,6 +2279,19 @@ impl Graph {
         }
         self.maybe_compact();
         affected
+    }
+
+    /// Recompute `owner`'s blocked flag from its unmet failed
+    /// dependencies and re-evaluate its ready-set membership —
+    /// O(`owner`'s edges). Every path that changes a dependency's
+    /// failed state or an edge's met state ends here.
+    fn refresh_blocked(&mut self, owner: u32) {
+        if !self.node(owner).status.has_state() {
+            return;
+        }
+        let blocked = self.has_failed_dep(owner);
+        self.edit_flags(owner, |flags| flags.set_blocked(blocked));
+        self.refresh_ready(owner);
     }
 
     /// Whether any unmet edge of `owner` points at a live failed node.
@@ -2195,8 +2451,45 @@ impl Graph {
         }
     }
 
+    /// The operator's stored `dispatch-cap set` (stow#1039), `None`
+    /// until the first one. Only the scheduler object reads it, to
+    /// build the settings a request or the alarm runs under
+    /// ([`queue::SchedulerSettings::with_dispatch_cap`]); the graph's
+    /// own cap reads take those settings as given.
+    pub const fn dispatch_cap(&self) -> Option<&stow_types::api::DispatchCapSetting> {
+        self.dispatch_cap.as_ref()
+    }
+
+    /// Drop the stored dispatch-cap setting — the budget drives'
+    /// restore of the unset state the fixture seed wrote, made the
+    /// store's state by the snapshot the caller writes next. No route
+    /// reaches it: an operator `set` has no clear.
+    pub fn restore_unset_dispatch_cap(&mut self) {
+        self.dispatch_cap = None;
+    }
+
+    /// `GET /dispatch-cap`'s body: the caps `settings` carries — the
+    /// ones a claim under them reads — and the stored operator setting
+    /// behind them, if any (stow#1039).
+    pub fn dispatch_cap_view(
+        &self,
+        settings: &queue::SchedulerSettings,
+    ) -> stow_types::api::DispatchCaps {
+        let max_concurrent_jobs = match settings.dispatch {
+            queue::Dispatch::Limited(limit) => limit.get(),
+            queue::Dispatch::Paused => 0,
+        };
+        stow_types::api::DispatchCaps {
+            setting: self.dispatch_cap.clone(),
+            max_concurrent_jobs,
+            max_concurrent_macos_jobs: settings.max_concurrent_macos_jobs,
+        }
+    }
+
     /// Dispatch slots free under `settings`: the cap minus in-flight and
-    /// external occupancy, in total and for the macOS family.
+    /// external occupancy, in total and for the macOS family. A cap
+    /// below the in-flight count saturates at zero — nothing in flight
+    /// is moved.
     pub fn free_slots(&self, settings: &queue::SchedulerSettings) -> (u32, u32) {
         let (inflight, macos_inflight) = self.inflight();
         let total = match settings.dispatch {
@@ -2249,13 +2542,14 @@ impl Graph {
         let (free, macos_free) = self.free_slots(settings);
         let mut wake: Option<i64> = None;
         if free > 0 {
-            for &(_, ix) in self.ready.values().flatten() {
+            let macos_queue = (macos_free > 0).then_some(&self.ready_macos);
+            for &(_, ix) in self
+                .ready
+                .values()
+                .chain(macos_queue.into_iter().flat_map(BTreeMap::values))
+                .flatten()
+            {
                 let node = self.node(ix);
-                let macos =
-                    self.targets[usize::from(node.target)].family == Some(RunnerFamily::MacOs);
-                if macos && macos_free == 0 {
-                    continue;
-                }
                 let age_gate = if node.flags.lane() == Lane::Human {
                     0
                 } else {
@@ -2319,9 +2613,10 @@ impl Graph {
         )
     }
 
-    /// The pending-queue depth `STOW_MAX_QUEUE_PENDING` gates.
-    pub const fn pending_depth(&self) -> u32 {
-        self.counts[Status::Pending.index()]
+    /// The miss lane's pending depth, which `STOW_MAX_QUEUE_PENDING`
+    /// gates: work other lanes queued is not the miss lane's to bound.
+    pub const fn miss_pending_depth(&self) -> u32 {
+        self.pending_miss
     }
 
     /// External occupancy by runner family (stow#877).
@@ -2364,8 +2659,7 @@ impl Graph {
     pub fn reconcile_due(&self, now: i64, settings: &queue::SchedulerSettings) -> bool {
         now - self.reconcile_attempted_at >= Self::STATUS_RECONCILE_MS
             && (!self.inflight.is_empty()
-                || (!self.ready.is_empty()
-                    && !matches!(settings.dispatch, queue::Dispatch::Paused)))
+                || (self.has_ready() && !matches!(settings.dispatch, queue::Dispatch::Paused)))
     }
 
     /// A listing attempt that failed: the next one waits the interval
@@ -2389,9 +2683,11 @@ impl Graph {
             + self.nodes.capacity() * size_of::<Node>()
             + self.states.capacity() * size_of::<State>()
             + self.edges.heap_bytes()
-            + self.published.capacity() * (size_of::<IdKey>() + 1)
-            + self.ready.len() * (size_of::<i64>() + size_of::<BTreeSet<(i64, u32)>>())
-            + self.ready.values().map(BTreeSet::len).sum::<usize>() * (size_of::<(i64, u32)>() + 32)
+            + self.published.capacity() * (size_of::<IdKey>() + size_of::<Published>())
+            + self.published.len() * size_of::<IdKey>()
+            + (self.ready.len() + self.ready_macos.len())
+                * (size_of::<i64>() + size_of::<BTreeSet<(i64, u32)>>())
+            + self.ready_sets().map(BTreeSet::len).sum::<usize>() * (size_of::<(i64, u32)>() + 32)
     }
 }
 
@@ -2447,11 +2743,19 @@ impl Graph {
             SchedulerEvent::SliceReport {
                 target,
                 rustc_version,
+                base_generation,
+                generation,
                 added,
                 retired,
-                ..
             } => {
-                self.apply_slice_report(target.as_str(), rustc_version.as_str(), added, retired);
+                self.apply_slice_report(
+                    target.as_str(),
+                    rustc_version.as_str(),
+                    *base_generation,
+                    *generation,
+                    added,
+                    retired,
+                );
             }
             SchedulerEvent::Claims { claims } => {
                 for claim in claims {
@@ -2526,6 +2830,9 @@ impl Graph {
                         i64::try_from(entries.len()).unwrap_or(i64::MAX),
                     ),
                 );
+            }
+            SchedulerEvent::DispatchCap { setting } => {
+                self.dispatch_cap = Some((**setting).clone());
             }
             SchedulerEvent::Freeze {
                 record,
@@ -3132,6 +3439,19 @@ impl Graph {
             in_flight,
             targets,
             dispatch_frozen: self.freeze.is_some(),
+            index_slices: self
+                .slice_generations()
+                .into_iter()
+                .map(|(target, rustc_version, generation)| {
+                    Ok(stow_types::api::AdminIndexSlice {
+                        target: stow_types::identity::TargetTriple::parse(&target)?,
+                        rustc_version: stow_types::identity::WireRustcVersion::parse(
+                            &rustc_version,
+                        )?,
+                        generation,
+                    })
+                })
+                .collect::<Result<Vec<_>, QueueError>>()?,
         })
     }
 }
@@ -3481,9 +3801,12 @@ mod tests {
     }
 
     fn publish(graph: &mut Graph, name: &str) -> u32 {
+        let live = graph.slice_generation(TARGET, RUSTC);
         graph.apply_slice_report(
             TARGET,
             RUSTC,
+            live,
+            live.map_or(1, |live| live + 1),
             &[
                 published_row(name, UnitKind::Linked),
                 published_row(name, UnitKind::Unlinked),
@@ -3492,19 +3815,127 @@ mod tests {
         )
     }
 
+    fn report(
+        graph: &mut Graph,
+        base: Option<i64>,
+        generation: i64,
+        added: &[&str],
+        retired: &[&str],
+    ) -> Result<(), QueueError> {
+        graph.check_slice_report(TARGET, RUSTC, base, generation)?;
+        let rows = |names: &[&str]| -> Vec<PublishedSliceRow> {
+            names
+                .iter()
+                .flat_map(|name| {
+                    [
+                        published_row(name, UnitKind::Linked),
+                        published_row(name, UnitKind::Unlinked),
+                    ]
+                })
+                .collect()
+        };
+        graph.apply_slice_report(
+            TARGET,
+            RUSTC,
+            base,
+            generation,
+            &rows(added),
+            &rows(retired),
+        );
+        Ok(())
+    }
+
+    fn is_ready(graph: &Graph, name: &str) -> bool {
+        let ix = graph.node_ix(&id(name)).expect("node");
+        graph
+            .ready_sets()
+            .any(|set| set.iter().any(|&(_, at)| at == ix))
+    }
+
+    /// A delta that does not extend the slice's live generation is
+    /// refused — the gap a lost report leaves — and a full report
+    /// restarts the sequence (stow#1049).
+    #[test]
+    fn a_slice_report_that_leaves_a_gap_is_refused() {
+        let mut graph = Graph::default();
+        let conflict = |result: Result<(), QueueError>| {
+            assert!(
+                matches!(result, Err(QueueError::SliceReportConflict(_))),
+                "{result:?}"
+            );
+        };
+        // A delta on a slice the scheduler never saw.
+        conflict(report(&mut graph, Some(1), 2, &["a"], &[]));
+        report(&mut graph, None, 1, &["a"], &[]).expect("a full report");
+        assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(1));
+        report(&mut graph, Some(1), 2, &["b"], &[]).expect("the next delta");
+        // A lost generation 3: the delta based on it names a base the
+        // scheduler never received.
+        conflict(report(&mut graph, Some(3), 4, &["c"], &[]));
+        // A replayed delta is stale.
+        conflict(report(&mut graph, Some(1), 2, &["b"], &[]));
+        // A base that skips ahead of its own generation.
+        conflict(report(&mut graph, Some(2), 4, &["c"], &[]));
+        assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(2));
+        assert!(graph.is_published(&id("a")) && graph.is_published(&id("b")));
+        assert!(!graph.is_published(&id("c")));
+        // The resync a conflict asks for: a full report whose
+        // generation restarts below the live one.
+        report(&mut graph, None, 1, &["a", "b", "c"], &[]).expect("resync");
+        assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(1));
+        assert!(graph.is_published(&id("c")));
+    }
+
+    /// A full report replaces the slice's set: what the slice held and
+    /// the report no longer lists is retired, and the nodes waiting on
+    /// it wait again.
+    #[test]
+    fn a_full_report_replaces_the_slice_set() {
+        let mut graph = Graph::default();
+        report(&mut graph, None, 1, &["a", "b"], &[]).expect("first report");
+        assert!(graph.is_published(&id("a")) && graph.is_published(&id("b")));
+        report(&mut graph, None, 1, &["b", "c"], &[]).expect("replacing report");
+        assert!(!graph.is_published(&id("a")), "a left the slice");
+        assert!(graph.is_published(&id("b")) && graph.is_published(&id("c")));
+        // A live dependent flips back to waiting when its dependency
+        // leaves the slice.
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        report(&mut graph, None, 1, &["c"], &[]).expect("c published");
+        assert!(is_ready(&graph, "b"), "b is released by c");
+        report(&mut graph, None, 1, &[], &[]).expect("empty replacement");
+        assert!(!is_ready(&graph, "b"), "b waits on c again");
+        assert!(!graph.is_published(&id("c")));
+    }
+
+    /// Generations and slice membership survive the snapshot.
+    #[test]
+    fn slice_generations_and_members_round_trip_the_snapshot() {
+        let mut graph = Graph::default();
+        report(&mut graph, None, 1, &["a", "b"], &[]).expect("full");
+        report(&mut graph, Some(1), 2, &["c"], &["a"]).expect("delta");
+        let mut restored = round_trip(&graph);
+        assert_eq!(restored.slice_generation(TARGET, RUSTC), Some(2));
+        assert!(restored.is_published(&id("c")) && !restored.is_published(&id("a")));
+        // The restored members index drives a replacement.
+        report(&mut restored, None, 1, &["c"], &[]).expect("replace");
+        assert!(!restored.is_published(&id("b")));
+    }
+
     fn status_of(graph: &Graph, name: &str) -> Option<Status> {
         graph.node_ix(&id(name)).map(|ix| graph.node(ix).status)
     }
 
     /// Nodes in the ready set — the operand-class map's total entries.
     fn ready_count(graph: &Graph) -> usize {
-        graph.ready.values().map(BTreeSet::len).sum()
+        graph.ready_sets().map(BTreeSet::len).sum()
     }
 
     /// The pending index recomputed by walking the arena — what
     /// `index_pending` keeps through every transition must equal it.
     fn assert_pending_index(graph: &Graph) {
         let mut blocked = 0u32;
+        let mut miss = 0u32;
         let mut human = BTreeSet::new();
         let mut ages: BTreeMap<i64, u32> = BTreeMap::new();
         for (ix, node) in (0u32..).zip(&graph.nodes) {
@@ -3512,12 +3943,14 @@ mod tests {
                 continue;
             }
             blocked += u32::from(node.flags.blocked());
+            miss += u32::from(node.flags.lane() == Lane::Miss);
             if node.flags.lane() == Lane::Human {
                 human.insert(ix);
             }
             *ages.entry(graph.state(ix).first_requested).or_default() += 1;
         }
         assert_eq!(graph.pending_blocked, blocked, "blocked pending nodes");
+        assert_eq!(graph.pending_miss, miss, "pending miss nodes");
         assert_eq!(graph.human_pending, human, "pending human nodes");
         assert_eq!(graph.pending_ages, ages, "pending request instants");
     }
@@ -3651,7 +4084,7 @@ mod tests {
             "everything the index serves is born published"
         );
         assert_eq!(ready_count(&graph), 0);
-        assert_eq!(graph.pending_depth(), 0);
+        assert_eq!(graph.status().pending, 0);
         // Born published and unreferenced: nothing stays.
         graph.compact();
         assert_eq!(graph.sizes().0, 0);
@@ -3949,6 +4382,54 @@ mod tests {
         assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::Delete);
     }
 
+    /// stow#1039: the operator's `set` replaces the binding caps in the
+    /// settings the scheduler object builds — a `--macos`-less set
+    /// leaves that cap on its binding, a lowered cap frees nothing in
+    /// flight, and `0` pauses dispatch like the binding's `"0"`. The
+    /// graph reads only the settings it is passed: a caller's explicit
+    /// settings stay authoritative over the stored setting.
+    #[test]
+    fn the_operator_cap_replaces_the_bindings_in_built_settings() {
+        let bindings = queue::SchedulerSettings::default();
+        let macos = bindings.max_concurrent_macos_jobs;
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let built = |graph: &Graph| bindings.with_dispatch_cap(graph.dispatch_cap());
+        // No setting yet: the bindings rule.
+        assert_eq!(graph.free_slots(&built(&graph)), (45, macos));
+
+        let set = |jobs: u32, macos: Option<u32>| SchedulerEvent::DispatchCap {
+            setting: Box::new(stow_types::api::DispatchCapSetting {
+                max_concurrent_jobs: jobs,
+                max_concurrent_macos_jobs: macos,
+                set_at: "2026-01-01T00:00:00Z".to_owned(),
+                actor: "ops".to_owned(),
+            }),
+        };
+        graph.apply(&set(3, None), 0);
+        assert_eq!(graph.free_slots(&built(&graph)), (3, macos));
+        // Explicit settings are never second-guessed by the stored one.
+        assert_eq!(graph.free_slots(&bindings), (45, macos));
+
+        // A lowered cap moves nothing in flight — the claimed row
+        // holds its slot and the count saturates at zero, not a free
+        // slot it must yield.
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 1, 0);
+        assert_eq!(graph.free_slots(&built(&graph)), (2, macos));
+        graph.apply(&set(1, Some(1)), 0);
+        assert_eq!(graph.free_slots(&built(&graph)), (0, 1));
+        graph.apply(&set(0, None), 0);
+        let paused = built(&graph);
+        assert_eq!(paused.dispatch, queue::Dispatch::Paused);
+        assert_eq!(graph.free_slots(&paused), (0, macos));
+
+        let view = graph.dispatch_cap_view(&paused);
+        assert_eq!(view.max_concurrent_jobs, 0);
+        assert_eq!(view.max_concurrent_macos_jobs, macos);
+        assert_eq!(view.setting.map(|set| set.max_concurrent_jobs), Some(0));
+    }
+
     /// stow#940: a `running` state the reconcile restored stamps its
     /// sighting — the staleness rule trips once the bound runs out
     /// with no delivery, exactly as it did for a delivered
@@ -4055,6 +4536,127 @@ mod tests {
         );
     }
 
+    /// A leaf node `name` on `target`, minted under that target's id.
+    fn sub_on(name: &str, target: &str) -> SubmissionNode {
+        let mut node = sub(name);
+        node.target = TargetTriple::parse(target).expect("target");
+        node.task_id = minted_id(&node);
+        node
+    }
+
+    /// `nodes` as independent roots of one `source` tree.
+    fn forest(source: SubmissionSource, nodes: Vec<SubmissionNode>) -> SubmissionTree {
+        SubmissionTree {
+            source,
+            roots: (0..u32::try_from(nodes.len()).expect("fits")).collect(),
+            nodes,
+        }
+    }
+
+    const MACOS_TARGET: &str = "aarch64-apple-darwin";
+
+    /// stow#1052: with the macOS cap spent, thousands of ready macOS
+    /// nodes cost the pass nothing; the non-macOS work is claimed in
+    /// scans linear in its own queue.
+    #[test]
+    fn a_full_macos_family_costs_the_pass_nothing() {
+        const MACOS: usize = 4_000;
+        const LINUX: usize = 50;
+        let mut graph = Graph::default();
+        let macos: Vec<_> = (0..MACOS)
+            .map(|n| sub_on(&format!("m{n}"), MACOS_TARGET))
+            .collect();
+        let macos_ids: HashSet<String> = macos.iter().map(|n| n.task_id.clone()).collect();
+        graph
+            .merge(&forest(SubmissionSource::HumanRequest, macos), 0)
+            .expect("macos merge");
+        let linux = (0..LINUX).map(|n| sub(&format!("l{n}"))).collect();
+        graph
+            .merge(&forest(SubmissionSource::CacheMiss, linux), 1)
+            .expect("linux merge");
+        let mut scans = 0;
+        let claimed = graph
+            .claim_scanned(45, 0, 10_000, 3_600_000, &mut scans)
+            .expect("claim");
+        assert_eq!(claimed.len(), 45);
+        assert!(
+            claimed
+                .iter()
+                .all(|claim| !macos_ids.contains(&claim.task_id)),
+            "the full family claims nothing"
+        );
+        // One head examined per class and pick: linear in the claims,
+        // independent of the 4,000 macOS entries.
+        assert!(scans <= 45, "scans {scans}");
+    }
+
+    /// stow#1052: a cap that fills mid-pass leaves the family out from
+    /// there; ranks across families still interleave exactly as one
+    /// queue's would, and the scan count stays linear.
+    #[test]
+    fn a_macos_cap_filling_mid_pass_keeps_the_rank_order() {
+        let mut graph = Graph::default();
+        // Human macOS nodes outrank the miss-lane Linux ones; the
+        // macOS cap of 2 admits only the two oldest of them.
+        let macos: Vec<_> = (0..1_000)
+            .map(|n| sub_on(&format!("m{n}"), MACOS_TARGET))
+            .collect();
+        let macos_ids: HashSet<String> = macos.iter().map(|n| n.task_id.clone()).collect();
+        graph
+            .merge(&forest(SubmissionSource::HumanRequest, macos), 0)
+            .expect("macos merge");
+        graph
+            .merge(
+                &forest(
+                    SubmissionSource::CacheMiss,
+                    vec![sub("l0"), sub("l1"), sub("l2")],
+                ),
+                0,
+            )
+            .expect("linux merge");
+        let mut scans = 0;
+        let claimed = graph
+            .claim_scanned(5, 2, 60_000, 3_600_000, &mut scans)
+            .expect("claim");
+        let darwin = |claim: &Claimed| macos_ids.contains(&claim.task_id);
+        assert_eq!(claimed.iter().filter(|claim| darwin(claim)).count(), 2);
+        assert_eq!(claimed.len(), 5, "the Linux nodes fill the rest");
+        assert!(darwin(&claimed[0]) && darwin(&claimed[1]), "human leads");
+        assert!(scans <= 2 * 5 + 2, "scans {scans}");
+        assert_eq!(ready_count(&graph), 998, "unclaimed macOS stay ready");
+    }
+
+    /// stow#1052: entries not yet due are examined once per pass, not
+    /// once per pick.
+    #[test]
+    fn deferred_entries_are_scanned_once_per_pass() {
+        let mut graph = Graph::default();
+        let nodes: Vec<_> = (0..500).map(|n| sub(&format!("d{n}"))).collect();
+        let later: Vec<String> = nodes.iter().map(|node| node.task_id.clone()).collect();
+        graph
+            .merge(&forest(SubmissionSource::CacheMiss, nodes), 0)
+            .expect("merge deferred");
+        for task_id in &later {
+            let ix = graph.node_ix(task_id).expect("node");
+            graph.edit_extra(ix, |extra| extra.not_before = 1_000_000);
+        }
+        graph
+            .merge(
+                &forest(
+                    SubmissionSource::CacheMiss,
+                    (0..30).map(|n| sub(&format!("due{n}"))).collect(),
+                ),
+                5,
+            )
+            .expect("merge due");
+        let mut scans = 0;
+        let claimed = graph
+            .claim_scanned(30, 16, 10_000, 3_600_000, &mut scans)
+            .expect("claim");
+        assert_eq!(claimed.len(), 30);
+        assert!(scans <= 500 + 30 + 30, "scans {scans}");
+    }
+
     /// stow#879: waited time is uncapped — a preheat node (operand 10)
     /// eventually outranks misses (operand 100) submitted after it.
     #[test]
@@ -4137,6 +4739,121 @@ mod tests {
         let affected = graph.mutate(MutationKind::Retry, &[id("c")], 6_000);
         assert_eq!(affected, 1);
         assert!(!graph.node(b).flags.blocked());
+    }
+
+    /// `top` depends on the leaves `x` and `y`.
+    fn fork() -> SubmissionTree {
+        let x = sub("x");
+        let y = sub("y");
+        let mut top = sub("top");
+        top.deps = vec![0, 1];
+        SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![2],
+            nodes: vec![x, y, top],
+        }
+    }
+
+    /// Put `name` in `failed` the way the failure path leaves it.
+    fn fail(graph: &mut Graph, name: &str) {
+        let ix = graph.node_ix(&id(name)).expect("node");
+        graph.set_status(ix, Status::Failed);
+        graph.remove_ready(ix);
+        for owner in graph.dependents_of(ix) {
+            graph.refresh_blocked(owner);
+        }
+    }
+
+    fn top_state(graph: &Graph) -> (bool, bool) {
+        let top = graph.node_ix(&id("top")).expect("top");
+        (graph.node(top).flags.blocked(), graph.dispatchable(top))
+    }
+
+    /// stow#1050: the only failed dependency publishes.
+    #[test]
+    fn a_consumer_unblocks_when_its_only_failed_dep_publishes() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        fail(&mut graph, "c");
+        let b = graph.node_ix(&id("b")).expect("b");
+        assert!(graph.node(b).flags.blocked());
+        publish(&mut graph, "c");
+        assert_eq!(graph.node(b).unmet, 0);
+        assert!(!graph.node(b).flags.blocked());
+        assert!(graph.dispatchable(b));
+        assert_eq!(ready_count(&graph), 1);
+        assert_pending_index(&graph);
+    }
+
+    /// stow#1050: one of two failed dependencies publishes.
+    #[test]
+    fn a_consumer_stays_blocked_on_its_other_failed_dep() {
+        let mut graph = Graph::default();
+        graph.merge(&fork(), 0).expect("merge");
+        fail(&mut graph, "x");
+        fail(&mut graph, "y");
+        assert_eq!(top_state(&graph), (true, false));
+        publish(&mut graph, "x");
+        assert_eq!(top_state(&graph), (true, false), "y is still failed");
+        assert_pending_index(&graph);
+        publish(&mut graph, "y");
+        assert_eq!(top_state(&graph), (false, true));
+        assert_pending_index(&graph);
+    }
+
+    /// A slice retirement re-opens an edge onto a failed dep: the
+    /// consumer is blocked again.
+    #[test]
+    fn a_retired_dep_row_blocks_the_consumer_on_a_failed_dep() {
+        let mut graph = Graph::default();
+        graph.merge(&fork(), 0).expect("merge");
+        publish(&mut graph, "x");
+        fail(&mut graph, "y");
+        assert_eq!(top_state(&graph), (true, false));
+        let live = graph.slice_generation(TARGET, RUSTC);
+        graph.apply_slice_report(
+            TARGET,
+            RUSTC,
+            live,
+            live.map_or(1, |live| live + 1),
+            &[],
+            &[
+                published_row("x", UnitKind::Linked),
+                published_row("x", UnitKind::Unlinked),
+            ],
+        );
+        assert_eq!(top_state(&graph), (true, false));
+        publish(&mut graph, "y");
+        assert!(!top_state(&graph).0, "y published; x still unmet");
+        assert!(!top_state(&graph).1, "x's edge is unmet");
+        assert_pending_index(&graph);
+    }
+
+    /// Purging a failed dep publishes it; its consumers are unblocked.
+    #[test]
+    fn purging_a_failed_dep_unblocks_its_consumers() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        fail(&mut graph, "c");
+        let b = graph.node_ix(&id("b")).expect("b");
+        assert!(graph.node(b).flags.blocked());
+        assert_eq!(graph.mutate(MutationKind::Purge, &[id("c")], 1_000), 1);
+        assert!(!graph.node(b).flags.blocked());
+        assert_pending_index(&graph);
+    }
+
+    /// A retry clears the flag only when no other dep is failed.
+    #[test]
+    fn retry_unblocks_only_when_no_other_dep_is_failed() {
+        let mut graph = Graph::default();
+        graph.merge(&fork(), 0).expect("merge");
+        fail(&mut graph, "x");
+        fail(&mut graph, "y");
+        assert_eq!(graph.mutate(MutationKind::Retry, &[id("x")], 1_000), 1);
+        assert_eq!(top_state(&graph), (true, false), "y is still failed");
+        assert_eq!(graph.mutate(MutationKind::Retry, &[id("y")], 1_000), 1);
+        assert!(!top_state(&graph).0);
+        assert_pending_index(&graph);
     }
 
     /// The status reads come from the pending index, so it must match

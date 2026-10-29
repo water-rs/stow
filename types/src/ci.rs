@@ -17,27 +17,6 @@
 
 use crate::api::{RunnerFamily, runner_family, task_id_segment};
 
-/// The org's GitHub-hosted runner capacity: 60 runners, 20 macOS.
-///
-/// Every stow caller shares it with the rest of the organisation; stow
-/// cannot count the other repositories' runs, so callers keep the
-/// margins below rather than treating the full pools as theirs.
-pub const GITHUB_ORG_RUNNERS: u32 = 60;
-/// The macOS pool inside [`GITHUB_ORG_RUNNERS`].
-pub const GITHUB_ORG_MACOS_RUNNERS: u32 = 20;
-/// Runners left for the rest of the organisation — the margin every
-/// caller keeps under [`GITHUB_ORG_RUNNERS`].
-pub const RUNNER_MARGIN: u32 = 15;
-/// macOS runners left free — the margin under
-/// [`GITHUB_ORG_MACOS_RUNNERS`].
-pub const MACOS_RUNNER_MARGIN: u32 = 4;
-/// Runner slots stow may hold across all runner families — the default
-/// `STOW_MAX_CONCURRENT_JOBS` and `preheat manual --in-flight` share.
-pub const STOW_RUNNER_BUDGET: u32 = GITHUB_ORG_RUNNERS - RUNNER_MARGIN;
-/// Runner slots stow may hold on the macOS family — the default
-/// `STOW_MAX_CONCURRENT_MACOS_JOBS`.
-pub const STOW_MACOS_RUNNER_BUDGET: u32 = GITHUB_ORG_MACOS_RUNNERS - MACOS_RUNNER_MARGIN;
-
 /// `build-crate.yml` runs `queued` or `in_progress`, per runner family.
 ///
 /// The interface's `status` answer. A run is one runner slot while it
@@ -73,20 +52,6 @@ impl Occupancy {
     #[must_use]
     pub const fn total(&self) -> u32 {
         self.linux + self.macos + self.windows + self.unknown
-    }
-
-    /// Runner slots this family may still admit under the shared
-    /// budgets — `STOW_RUNNER_BUDGET` total and
-    /// `STOW_MACOS_RUNNER_BUDGET` on the macOS pool.
-    #[must_use]
-    pub fn free_for(&self, family: RunnerFamily) -> u32 {
-        let family_free = match family {
-            RunnerFamily::MacOs => STOW_MACOS_RUNNER_BUDGET.saturating_sub(self.macos),
-            _ => u32::MAX,
-        };
-        STOW_RUNNER_BUDGET
-            .saturating_sub(self.total())
-            .min(family_free)
     }
 
     /// A slot on `family`.
@@ -702,8 +667,8 @@ pub enum DispatchError {
 #[cfg(test)]
 mod tests {
     use super::{
-        CiInterface, CiRequest, CiResponse, DispatchError, Occupancy, RunnerFamily,
-        family_of_run_title, scoped_url, workflow_dispatch_path,
+        CiInterface, CiRequest, CiResponse, DispatchError, RunnerFamily, family_of_run_title,
+        scoped_url, workflow_dispatch_path,
     };
     use std::future::Future;
     use std::sync::Mutex;
@@ -804,27 +769,6 @@ mod tests {
         ] {
             assert_eq!(family_of_run_title(title), None, "{title}");
         }
-    }
-
-    #[test]
-    fn occupancy_budgets_share_one_margin() {
-        assert_eq!(super::STOW_RUNNER_BUDGET, 45);
-        assert_eq!(super::STOW_MACOS_RUNNER_BUDGET, 16);
-        let mut occupancy = Occupancy::EMPTY;
-        for _ in 0..44 {
-            occupancy.add(RunnerFamily::Linux);
-        }
-        assert_eq!(occupancy.free_for(RunnerFamily::Linux), 1);
-        assert_eq!(occupancy.free_for(RunnerFamily::MacOs), 1);
-        occupancy.add(RunnerFamily::Linux);
-        assert_eq!(occupancy.free_for(RunnerFamily::Linux), 0);
-        assert_eq!(occupancy.free_for(RunnerFamily::MacOs), 0);
-        let mut macos = Occupancy::EMPTY;
-        for _ in 0..16 {
-            macos.add(RunnerFamily::MacOs);
-        }
-        assert_eq!(macos.free_for(RunnerFamily::MacOs), 0);
-        assert_eq!(macos.free_for(RunnerFamily::Linux), 29);
     }
 
     #[test]

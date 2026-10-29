@@ -245,7 +245,7 @@ fn miss_admissions_post_stateless_tickets_to_the_enqueue_endpoint() {
     let target_dir = dir.path().join("target");
     let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     build
-        .arg("build")
+        .args(["build", "--isolation", "off"])
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path());
     hermetic_stow_env(
@@ -352,7 +352,7 @@ fn a_failed_admission_is_named_in_the_drain_log_and_the_journal_stays() {
     let target_dir = dir.path().join("target");
     let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     build
-        .arg("build")
+        .args(["build", "--isolation", "off"])
         .current_dir(dir.path())
         .env("CARGO_HOME", cargo_home.path());
     hermetic_stow_env(

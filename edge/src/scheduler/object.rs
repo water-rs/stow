@@ -12,7 +12,7 @@ use skyzen::{Error, Result, StatusCode};
 use skyzen_services::durable::{Alarm, DurableDb};
 use wasm_bindgen::JsValue;
 
-use stow_types::api::SchedulerResetReport;
+use stow_types::api::{SchedulerEvent, SchedulerResetReport};
 
 use crate::errors::QueueError;
 use crate::freeze::{self, FreezeSettings};
@@ -50,7 +50,9 @@ fn route_error(error: QueueError) -> Error {
         | QueueError::EmptySelector
         | QueueError::PurgeRequiresAge => StatusCode::BAD_REQUEST,
         QueueError::UnknownRequest(_) => StatusCode::NOT_FOUND,
-        QueueError::RequestAttemptSuperseded { .. } => StatusCode::CONFLICT,
+        QueueError::RequestAttemptSuperseded { .. } | QueueError::SliceReportConflict(_) => {
+            StatusCode::CONFLICT
+        }
         QueueError::QueueFull { .. } | QueueError::HumanDailyBudgetExhausted { .. } => {
             StatusCode::TOO_MANY_REQUESTS
         }
@@ -75,7 +77,7 @@ async fn ensure_graph<'a>(
         .map_err(to_error)?;
     // The admission floor is a deploy binding, never persisted: every
     // wake plan and claim reads the one stamped here.
-    let floor = scheduler_settings(env)?.min_dispatch_value;
+    let floor = binding_settings(env)?.min_dispatch_value;
     loaded.with(|graph| graph.set_floor(floor));
     if cell.take_reconcile() {
         // The CI `status` listing is the truth for runs a snapshot's
@@ -99,7 +101,24 @@ async fn ensure_graph<'a>(
     Ok(loaded)
 }
 
-fn scheduler_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
+/// The settings a request or the alarm runs under: the deploy
+/// bindings, with the operator's stored `dispatch-cap set` replacing
+/// their caps (stow#1039). The one place the stored setting enters the
+/// caps — every claim, free-slot count, reconcile gate and status view
+/// downstream reads only the settings it is handed, so a caller that
+/// passes its own (a budget drive) stays authoritative. Taking the
+/// loaded graph makes the order a type fact: the setting is read after
+/// the wake has replayed it.
+fn scheduler_settings(env: &WasmEnv, graph: graph::LoadedGraph<'_>) -> Result<SchedulerSettings> {
+    let bindings = binding_settings(env)?;
+    Ok(graph.with(|graph| bindings.with_dispatch_cap(graph.dispatch_cap())))
+}
+
+/// The deploy bindings alone, with no operator setting applied — for
+/// the wake's admission floor (no operator setting touches it) and the
+/// budget probe, whose fixture seed wipes any stored setting before a
+/// drive runs.
+fn binding_settings(env: &WasmEnv) -> Result<SchedulerSettings> {
     // The local-CI dispatcher only exists beside the budget probe: a
     // deploy carrying `STOW_LOCAL_CI_URL` without the probe marker is
     // misconfigured — every scheduler route fails on it here rather
@@ -260,6 +279,11 @@ impl DurableObject for Scheduler {
                 "/dispatch-freeze"
                     .at(read_dispatch_freeze)
                     .post(write_dispatch_freeze),
+                // The operator's runtime dispatch caps (stow#1039):
+                // reached from `GET`/`POST /api/v1/admin/dispatch-cap`.
+                "/dispatch-cap"
+                    .at(read_dispatch_cap)
+                    .post(write_dispatch_cap),
                 // The edge's health probe (stow#860): one read of held
                 // state, reached from `GET /api/v1/scheduler/health`.
                 "/health".at(health),
@@ -408,7 +432,7 @@ async fn scheduler_budget(
                 .set_status(StatusCode::NOT_FOUND),
         );
     }
-    let settings = scheduler_settings(&env)?;
+    let settings = binding_settings(&env)?;
     Ok(Json(
         budget::run(&db, &graph, &settings, &env, &alarm, &request)
             .await
@@ -454,8 +478,8 @@ async fn scheduler_demand(
     actor: Actor,
     Json(request): Json<stow_types::api::SchedulerDemandRequest>,
 ) -> Result<Json<stow_types::api::SchedulerDemandReport>> {
-    let (now_ms, settings) = alarm_inputs(&env)?;
     let graph = ensure_graph(&env, &db, &graph).await?;
+    let (now_ms, settings) = alarm_inputs(&env, graph)?;
     let (report, plan) = routes::demand(graph, &db, &request, &settings, Some(&actor.0), now_ms)
         .await
         .map_err(route_error)?;
@@ -556,8 +580,8 @@ async fn demand_feed_deliver(
     actor: Actor,
     Json(request): Json<stow_types::api::DemandFeedDeliverRequest>,
 ) -> Result<Json<stow_types::api::DemandFeedDeliverReport>> {
-    let (now_ms, settings) = alarm_inputs(&env)?;
     let graph = ensure_graph(&env, &db, &graph).await?;
+    let (now_ms, settings) = alarm_inputs(&env, graph)?;
     let (report, plan) =
         routes::feed_deliver(graph, &db, &request.hour, &settings, &actor.0, now_ms)
             .await
@@ -667,8 +691,8 @@ async fn submit(
     enforce_pending_cap: bool,
     actor: Option<&str>,
 ) -> Result<Json<InsertedResponse>> {
-    let settings = scheduler_settings(env)?;
     let graph = ensure_graph(env, db, graph).await?;
+    let settings = scheduler_settings(env, graph)?;
     if !enforce_pending_cap && graph.with(|graph| graph.freeze().is_some()) {
         return Err(Error::msg("dispatch is frozen").set_status(StatusCode::SERVICE_UNAVAILABLE));
     }
@@ -768,8 +792,8 @@ pub(super) async fn complete_run_pass(
     alarm: &Alarm,
     report: &stow_types::api::WorkflowRunComplete,
 ) -> Result<Vec<String>> {
-    let settings = scheduler_settings(env)?;
     let graph = ensure_graph(env, db, graph).await?;
+    let settings = scheduler_settings(env, graph)?;
     let now = now_ms();
     // The finish is durable before anything fallible: parse, append
     // and apply `RunFinished` ahead of every binding read, mint,
@@ -1030,7 +1054,7 @@ async fn admit_request(
     Json(admission): Json<stow_types::api::RequestAdmission>,
 ) -> Result<Json<stow_types::api::CrateRequestStatus>> {
     let graph = ensure_graph(&env, &db, &graph).await?;
-    let settings = scheduler_settings(&env)?;
+    let settings = scheduler_settings(&env, graph)?;
     // `Date::now()` returns whole milliseconds well below 2^53; the
     // payload's `dispatched_at` wants unix seconds.
     #[allow(clippy::cast_possible_truncation)]
@@ -1382,6 +1406,82 @@ async fn write_dispatch_freeze(
     Ok(Json(freeze_view(graph)))
 }
 
+/// `GET /dispatch-cap` — the caps in force and the operator setting
+/// behind them (stow#1039): until the first `set` the deploy bindings
+/// alone apply.
+async fn read_dispatch_cap(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::DispatchCaps>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    let settings = scheduler_settings(&env, graph)?;
+    Ok(Json(graph.with(|graph| graph.dispatch_cap_view(&settings))))
+}
+
+/// `POST /dispatch-cap` — the operator's `set`.
+async fn write_dispatch_cap(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    alarm: Alarm,
+    actor: Actor,
+    Json(set): Json<stow_types::api::DispatchCapSet>,
+) -> Result<Json<stow_types::api::DispatchCaps>> {
+    dispatch_cap_pass(&graph, &env, &db, &alarm, &set, &actor.0)
+        .await
+        .map(Json)
+}
+
+/// The `set`'s work: one `DispatchCap` event appended — in force until
+/// the next `set`, there is no clear — then a dispatch pass, because a
+/// raised cap frees slots the queue may already wait on, like every
+/// slot-freeing mutation.
+pub(super) async fn dispatch_cap_pass(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+    db: &DurableDb,
+    alarm: &Alarm,
+    set: &stow_types::api::DispatchCapSet,
+    actor: &str,
+) -> Result<stow_types::api::DispatchCaps> {
+    let graph = ensure_graph(env, db, graph).await?;
+    let now = now_ms();
+    routes::commit_as(
+        graph,
+        db,
+        Some(actor),
+        &[SchedulerEvent::DispatchCap {
+            setting: Box::new(stow_types::api::DispatchCapSetting {
+                max_concurrent_jobs: set.max_concurrent_jobs,
+                max_concurrent_macos_jobs: set.max_concurrent_macos_jobs,
+                set_at: iso_now(),
+                actor: actor.to_owned(),
+            }),
+        }],
+        now,
+    )
+    .await
+    .map_err(to_error)?;
+    dispatch_pending(env, db, graph.cell())
+        .await
+        .map_err(|error| {
+            tracing::error!(%error, "scheduler dispatch-cap dispatch_pending failed");
+            error
+        })?;
+    schedule_alarm(env, db, alarm, graph.cell()).await?;
+    tracing::warn!(
+        jobs = set.max_concurrent_jobs,
+        macos = ?set.max_concurrent_macos_jobs,
+        %actor,
+        "dispatch caps set by operator"
+    );
+    // Built after the append, so the answer carries the caps the new
+    // setting puts in force.
+    let settings = scheduler_settings(env, graph)?;
+    Ok(graph.with(|graph| graph.dispatch_cap_view(&settings)))
+}
+
 /// `Date#toISOString` — the timestamp format the record and alert
 /// bodies carry.
 fn iso_now() -> String {
@@ -1602,11 +1702,11 @@ pub(super) async fn published_index_pass(
     slices: &[stow_types::api::PublishedSlice],
     actor: &str,
 ) -> Result<Vec<String>> {
-    let _settings = scheduler_settings(env)?;
+    binding_settings(env)?;
     let graph = ensure_graph(env, db, graph).await?;
     // The run's slices append in one commit; their flips land on the
-    // same turn (stow#878 — no generation fencing: reports apply to
-    // in-memory masks, deltas stay idempotent on re-application).
+    // same turn. A report that does not extend a slice's live
+    // generation is refused before anything appends.
     routes::slice_reports(graph, db, slices, Some(actor), now_ms())
         .await
         .map_err(route_error)?;
@@ -1716,7 +1816,7 @@ async fn dispatch_pending(
         tracing::info!("dispatch frozen — skipping dispatch pass");
         return Ok(Vec::new());
     }
-    let settings = scheduler_settings(env)?;
+    let settings = scheduler_settings(env, graph)?;
     dispatch_pass(
         graph.cell(),
         env,
@@ -1966,8 +2066,8 @@ async fn schedule_alarm(
     alarm: &Alarm,
     graph: &graph::GraphCell,
 ) -> Result<()> {
-    let (now_ms, settings) = alarm_inputs(env)?;
     let graph = ensure_graph(env, db, graph).await?;
+    let (now_ms, settings) = alarm_inputs(env, graph)?;
     let plan = routes::wake_plan(graph, &settings, now_ms);
     queue::arm_alarm(alarm, plan).await.map_err(|error| {
         let error = to_error(error);
@@ -1986,8 +2086,8 @@ async fn schedule_alarm(
 
 /// The instant and settings every alarm plan is decided under — read
 /// once per pass so a route's plan and its arm see one clock.
-fn alarm_inputs(env: &WasmEnv) -> Result<(i64, SchedulerSettings)> {
-    Ok((now_ms(), scheduler_settings(env)?))
+fn alarm_inputs(env: &WasmEnv, graph: graph::LoadedGraph<'_>) -> Result<(i64, SchedulerSettings)> {
+    Ok((now_ms(), scheduler_settings(env, graph)?))
 }
 
 fn read_string_binding(env: &WasmEnv, binding_name: &str) -> Result<String> {
