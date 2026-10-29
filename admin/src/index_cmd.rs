@@ -2318,8 +2318,11 @@ mod tests {
         let rows: Vec<_> = (0..12_000)
             .map(|i| record_to_index_row(&shared_unit_record(&[&format!("dep-{i}")])))
             .collect();
-        std::fs::write(&file, encode(&prev_index(rows, 7)).expect("encode index"))
-            .expect("write index file");
+        std::fs::write(
+            &file,
+            stow_shim::encode_index(&prev_index(rows, 7)).expect("encode index"),
+        )
+        .expect("write index file");
         let server = crate::test_server::Loopback::start(Vec::new()).await;
         index_report(
             &Edge::for_test(server.url.clone()),
