@@ -1590,3 +1590,74 @@ fn watchdog_entry_points_pass_the_history_levels() {
         }
     }
 }
+
+// ===========================================================================
+// index-publish.yml (stow#1104)
+// ===========================================================================
+
+/// Position of the step named `name` (exact) and its `if:` gate.
+fn index_publish_step(steps: &[support::Step], name: &str) -> (usize, String) {
+    let index = steps
+        .iter()
+        .position(|s| s.name == name)
+        .unwrap_or_else(|| panic!("index-publish.yml has no step {name:?}"));
+    (index, steps[index].if_cond.clone().unwrap_or_default())
+}
+
+/// Evaluate the `if:` gates of the reconcile steps for one dispatch
+/// shape: the gates are the two conjunctions of `inputs.report` and
+/// `inputs.full` the workflow declares.
+fn gate_runs(gate: &str, report: bool, full: bool) -> bool {
+    let gate = gate.replace("${{", "").replace("}}", "");
+    match gate.trim() {
+        "inputs.report && !inputs.full" => report && !full,
+        "inputs.report && inputs.full" => report && full,
+        other => panic!("unexpected reconcile gate {other:?}"),
+    }
+}
+
+#[test]
+fn index_publish_reconciles_after_the_publish_under_full() {
+    let wf = load_workflow("index-publish.yml");
+    let steps = job_steps(&wf, "publish");
+    let reconcile_steps: Vec<_> = steps
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| {
+            s.run
+                .as_deref()
+                .is_some_and(|r| r.contains("stow-admin index reconcile"))
+        })
+        .collect();
+    assert_eq!(
+        reconcile_steps.len(),
+        2,
+        "one reconcile before the export, one after the publish"
+    );
+    let (export, _) = index_publish_step(&steps, "Export every index slice in one pass");
+    let (publish, _) = index_publish_step(&steps, "Publish and sign each changed slice");
+    assert!(export < publish);
+
+    let (before, after) = (reconcile_steps[0], reconcile_steps[1]);
+    assert!(before.0 < export, "the plain reconcile precedes the export");
+    assert!(after.0 > publish, "the full reconcile follows the publish");
+    let before_gate = before.1.if_cond.as_deref().unwrap_or_default();
+    let after_gate = after.1.if_cond.as_deref().unwrap_or_default();
+    assert_eq!(before.1.run, after.1.run, "both placements run one command");
+
+    for (report, full) in [(false, false), (false, true), (true, false), (true, true)] {
+        let ran_before = gate_runs(before_gate, report, full);
+        let ran_after = gate_runs(after_gate, report, full);
+        match (report, full) {
+            (false, _) => assert!(!ran_before && !ran_after, "no reconcile without report"),
+            (true, false) => assert!(
+                ran_before && !ran_after,
+                "report without full reconciles before the export"
+            ),
+            (true, true) => assert!(
+                !ran_before && ran_after,
+                "report with full reconciles after the publish"
+            ),
+        }
+    }
+}
