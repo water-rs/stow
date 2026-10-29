@@ -59,11 +59,18 @@ fn assert_no_network_and_no_warning(output: &Output, connections: &Arc<AtomicUsi
         0,
         "{label} made a network request"
     );
+    // Only the network path's warnings count: an unrelated warning, such as
+    // SQLite reporting a slow statement on a loaded runner, says nothing about
+    // whether the mode kept the build off the network.
     let stderr = stderr_of(output);
     assert!(
         !stderr.lines().any(|line| {
             let line = line.to_ascii_lowercase();
-            line.contains("warn") || line.contains("unreachable")
+            line.contains("unreachable")
+                || (line.contains("warn")
+                    && ["registry", "index", "edge", "network", "public cache"]
+                        .iter()
+                        .any(|word| line.contains(word)))
         }),
         "{label} warned about a network it was told not to use:\n{stderr}"
     );
