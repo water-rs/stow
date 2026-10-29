@@ -175,7 +175,8 @@ pub async fn download_bundle_bytes(
     bundle: &BundleRef<'_>,
 ) -> Result<Vec<u8>, FetchError> {
     let url = artifact_url(bundle, &config.edge_url);
-    let mut client = crate::edge_client::client(config);
+    let mut client =
+        crate::edge_client::client(config).map_err(|error| FetchError::Other(error.to_string()))?;
     let response = client
         .get(&url)
         .map_err(classify_transport_error)?
@@ -833,6 +834,7 @@ mod tests {
 
     fn stub_config(edge_url: String) -> crate::config::StowConfig {
         crate::config::StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url,
             registry_base_url: String::new(),
             cache_dir: std::path::PathBuf::new(),

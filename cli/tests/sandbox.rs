@@ -434,13 +434,15 @@ fn probe_env(with_macro: bool, net_target: &str) -> ProbeEnv {
 /// `stow-cli build` in the fixture with the probe's environment: the
 /// temporary HOME, the secret token the `read-env` probe must not see,
 /// and a `RUSTUP_HOME` so the toolchain resolves despite the moved HOME.
-fn run_build(env: &ProbeEnv, args: &[&str]) -> std::process::Output {
-    run_build_with(env, args, &[])
+/// Write `cache_mode = "off"` into the global config the probe build reads.
+fn turn_cache_off(env: &ProbeEnv) {
+    support::write_global_config(
+        &[&env.home, &env.dir.join("stow-home")],
+        "cache_mode = \"off\"\n",
+    );
 }
 
-/// [`run_build`] with more environment variables, such as the switch that
-/// turns the public cache off.
-fn run_build_with(env: &ProbeEnv, args: &[&str], more: &[(&str, &str)]) -> std::process::Output {
+fn run_build(env: &ProbeEnv, args: &[&str]) -> std::process::Output {
     let rustup_home = std::env::var("RUSTUP_HOME")
         .ok()
         .or_else(|| {
@@ -459,7 +461,6 @@ fn run_build_with(env: &ProbeEnv, args: &[&str], more: &[(&str, &str)]) -> std::
     let extra: Vec<(&str, &str)> = extra
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
-        .chain(more.iter().copied())
         .collect();
     build_fixture::stow_build_in_default_isolation(
         &env.dir,
@@ -638,16 +639,14 @@ fn outcome(stderr: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// Run the probe build at `level` and return what it refused and what it
-/// let through. `cache_off` runs it with the public cache disabled: the
-/// boundary must not depend on it (stow#1059).
+/// let through. `cache_off` runs it with `cache_mode = "off"` in the global
+/// config: the boundary must not depend on the cache (stow#1059).
 fn probe_level(level: &str, cache_off: bool) -> (Vec<String>, Vec<String>) {
     let (target, _pong) = spawn_pong_listener();
     let env = probe_env(false, &target);
-    let more: &[(&str, &str)] = if cache_off {
-        &[("STOW_DISABLE_PUBLIC_CACHE", "1")]
-    } else {
-        &[]
-    };
+    if cache_off {
+        turn_cache_off(&env);
+    }
     let mut args = vec!["build", "--isolation", level];
     // `protect` runs cargo online; the fixture has only path dependencies,
     // so nothing needs the network, and `--offline` would be a second,
@@ -655,7 +654,7 @@ fn probe_level(level: &str, cache_off: bool) -> (Vec<String>, Vec<String>) {
     if level != "protect" {
         args.push("--offline");
     }
-    let output = run_build_with(&env, &args, more);
+    let output = run_build(&env, &args);
     assert!(
         !output.status.success(),
         "a build with refused probes unexpectedly succeeded at {level}:\n{}",
@@ -813,11 +812,8 @@ fn offline_holds_with_the_cache_off() {
 fn off_lets_everything_through() {
     let (target, _pong) = spawn_pong_listener();
     let env = probe_env(false, &target);
-    let output = run_build_with(
-        &env,
-        &["build", "--isolation", "off", "--offline"],
-        &[("STOW_DISABLE_PUBLIC_CACHE", "1")],
-    );
+    turn_cache_off(&env);
+    let output = run_build(&env, &["build", "--isolation", "off", "--offline"]);
     assert!(
         output.status.success(),
         "an `off` build failed:\n{}",

@@ -43,8 +43,52 @@ const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
 /// eight stalled attempts (stow#977). Publishing keeps
 /// [`stow_oci::TransportPolicy::PATIENT`].
 const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// What the cache is allowed to touch (stow#1059): the `cache_mode` option of
+/// the global config, read by every stow process. It is independent of the
+/// build isolation level: a build with the cache off still runs its build
+/// scripts and proc macros at the configured level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheMode {
+    /// The public cache and the local cache. The default.
+    #[default]
+    Public,
+    /// The local cache only: no stow process makes a network request.
+    Local,
+    /// No cache at all: the local cache is neither read nor written, and no
+    /// stow process makes a network request.
+    Off,
+}
+
+impl CacheMode {
+    /// The name the config file spells.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Local => "local",
+            Self::Off => "off",
+        }
+    }
+
+    /// Whether stow may reach the index registry and the edge: the one
+    /// predicate every network call site is gated on.
+    pub const fn reaches_network(self) -> bool {
+        matches!(self, Self::Public)
+    }
+
+    /// Whether the local artifact and C/C++ caches are read and written.
+    pub const fn uses_local_cache(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
+    /// The global config's `cache_mode`. Every network request goes through
+    /// [`Self::registry_http`] or [`crate::edge_client::client`], which both
+    /// refuse a mode that does not reach the network.
+    #[serde(default)]
+    pub cache_mode: CacheMode,
     pub edge_url: String,
     /// OCI registry root every index/artifact pull hits, in
     /// `scheme://host[:port]` form — the pull appends `/v2/<repository>`
@@ -127,12 +171,31 @@ impl StowConfig {
         Ok(Arc::clone(material))
     }
 
+    /// Refuse a network request in a cache mode that does not reach the
+    /// network. Callers gate on [`CacheMode::reaches_network`] first, so the
+    /// failure is a wiring bug, never a path a build takes.
+    ///
+    /// # Errors
+    ///
+    /// The cache mode is `local` or `off`.
+    pub fn require_network(&self, what: &str) -> stow_types::error::Result<()> {
+        if self.cache_mode.reaches_network() {
+            return Ok(());
+        }
+        Err(stow_types::stow_error!(
+            "{what} needs the network, but `cache_mode` is `{}`; set `cache_mode = \"public\"` in the stow config to allow it",
+            self.cache_mode.as_str()
+        ))
+    }
+
     /// Get (lazily building) the registry HTTP client for this config.
     ///
     /// # Errors
     ///
-    /// Whatever building the client fails with.
+    /// The cache mode does not reach the network, or whatever building the
+    /// client fails with.
     pub async fn registry_http(&self) -> stow_types::error::Result<stow_oci::RegistryHttp> {
+        self.require_network("a registry request")?;
         let http = self
             .registry_http
             .get_or_try_init(|| {
@@ -249,6 +312,10 @@ impl StowConfig {
         let verify_mode = load_verify_mode(file_config.as_ref())?;
 
         Ok(Self {
+            cache_mode: file_config
+                .as_ref()
+                .and_then(|config| config.cache_mode)
+                .unwrap_or_default(),
             edge_url,
             registry_base_url: resolve_registry_base_url(file_config.as_ref()),
             cache_dir: local_cache_dir,
@@ -291,6 +358,10 @@ impl StowConfig {
         let file_config = load_user_config()?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         Ok(Self {
+            cache_mode: file_config
+                .as_ref()
+                .and_then(|config| config.cache_mode)
+                .unwrap_or_default(),
             edge_url: resolve_edge_url(file_config.as_ref()),
             registry_base_url: resolve_registry_base_url(file_config.as_ref()),
             cache_dir: resolve_cache_dir(file_config.as_ref())?,
@@ -372,6 +443,33 @@ pub fn config_file_path() -> stow_types::error::Result<PathBuf> {
 pub fn load_isolation_config() -> stow_types::error::Result<crate::isolation::IsolationConfig> {
     Ok(load_user_config()?
         .and_then(|config| config.isolation)
+        .unwrap_or_default())
+}
+
+/// The `cache_mode` of the global config, `public` when the file or the
+/// option is absent. A driver's `STOW_CONFIG_BLOB` carries it already, so a
+/// wrapper under a driver never re-reads the file.
+///
+/// # Errors
+///
+/// A config file that exists and cannot be read or parsed, or a blob that
+/// cannot be decoded.
+pub fn load_cache_mode() -> stow_types::error::Result<CacheMode> {
+    #[derive(serde::Deserialize)]
+    struct Blob {
+        #[serde(default)]
+        cache_mode: CacheMode,
+    }
+    if let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) {
+        let raw = raw
+            .into_string()
+            .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
+        let blob: Blob = serde_json::from_str(&raw)
+            .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
+        return Ok(blob.cache_mode);
+    }
+    Ok(load_user_config()?
+        .and_then(|config| config.cache_mode)
         .unwrap_or_default())
 }
 
@@ -523,6 +621,7 @@ fn load_user_config() -> stow_types::error::Result<Option<StowUserConfig>> {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct StowUserConfig {
+    cache_mode: Option<CacheMode>,
     edge_url: Option<String>,
     registry_base_url: Option<String>,
     cache_dir: Option<String>,

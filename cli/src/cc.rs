@@ -877,6 +877,7 @@ mod tests {
     #[cfg(unix)]
     fn test_config(cache_dir: PathBuf) -> StowConfig {
         StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:8787".to_owned(),
             registry_base_url: "http://127.0.0.1:8787".to_owned(),
             cache_dir,

@@ -158,7 +158,7 @@ async fn increment_builds(config: &StowConfig) -> stow_types::error::Result<()> 
 /// Count one build. A failure warns quietly and drops the increment:
 /// the report must never fail the operation that observed it.
 pub async fn bump_build(config: &StowConfig) {
-    if crate::edge_client::analytics_opted_out() {
+    if !reports_enabled(config) {
         return;
     }
     if let Err(error) = increment_builds(config).await {
@@ -208,7 +208,7 @@ fn report_due(watermark: &Watermark, today: &str) -> bool {
 /// foreground runs before deciding to spawn the drain. The claim
 /// itself is the atomic transaction inside [`maybe_report`].
 pub async fn report_due_today(config: &StowConfig) -> bool {
-    if crate::edge_client::analytics_opted_out() {
+    if !reports_enabled(config) {
         return false;
     }
     match read_watermark(config).await {
@@ -298,12 +298,18 @@ async fn clear_pending(config: &StowConfig, claim: &Claim) -> stow_types::error:
     Ok(())
 }
 
+/// Whether this install reports at all: not opted out, and a cache mode that
+/// reaches the network (the report is the only thing it counts for).
+fn reports_enabled(config: &StowConfig) -> bool {
+    !crate::edge_client::analytics_opted_out() && config.cache_mode.reaches_network()
+}
+
 /// Post the deltas since the last accepted report when a new UTC day
 /// started. Best-effort end to end: any failure warns quietly and
 /// leaves `pending` stored, so the next day's claim folds it into the
 /// next report.
 pub async fn maybe_report(config: &StowConfig) {
-    if crate::edge_client::analytics_opted_out() {
+    if !reports_enabled(config) {
         return;
     }
     if let Err(error) = report_once(config).await {
@@ -332,7 +338,7 @@ async fn report_once(config: &StowConfig) -> stow_types::error::Result<()> {
         "{}/api/v1/build-report",
         config.edge_url.trim_end_matches('/')
     );
-    let mut client = crate::edge_client::client(config);
+    let mut client = crate::edge_client::client(config)?;
     let response = client
         .post(&url)
         .and_then(|request| request.json_body(&claim.pending))
@@ -357,6 +363,7 @@ mod tests {
 
     fn test_config(cache_dir: PathBuf) -> StowConfig {
         StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "https://stow.waterui.dev".to_owned(),
             registry_base_url: stow_types::registry::GHCR_REGISTRY_URL.to_owned(),
             cache_dir,

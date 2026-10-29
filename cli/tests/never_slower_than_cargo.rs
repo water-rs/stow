@@ -1049,8 +1049,8 @@ fn a_covered_unit_still_takes_the_plan_path() {
     );
 }
 
-/// `STOW_DISABLE_PUBLIC_CACHE` disables the public edge, not the local
-/// artifact cache: a stored entry still serves while the kill switch is set.
+/// `cache_mode = "local"` disables the public edge, not the local artifact
+/// cache: a stored entry still serves in that mode.
 #[test]
 fn a_disabled_public_cache_still_serves_local_entries() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -1067,9 +1067,9 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         listener.local_addr().expect("local addr").port()
     };
     let edge_url = format!("http://127.0.0.1:{port}");
-    let kill_switch = [("STOW_DISABLE_PUBLIC_CACHE", "1")];
+    support::write_global_config(&[&dir.path().join("stow-home")], "cache_mode = \"local\"\n");
 
-    // First build under the kill switch: no public lookup happens, but the
+    // First build in local-only mode: no public lookup happens, but the
     // passthrough still stores cfg-if in the local artifact cache.
     let output = cargo_build_in(
         dir.path(),
@@ -1077,7 +1077,7 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         cache.path(),
         &wrapper,
         target_a.path(),
-        &kill_switch,
+        &[],
         cargo_home.path(),
     );
     assert!(
@@ -1096,7 +1096,7 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         "the passthrough build must store cfg-if as a local entry"
     );
 
-    // Second build, fresh target dir, kill switch still set: cfg-if is served
+    // Second build, fresh target dir, local-only mode still set: cfg-if is served
     // from the local entry — it is not a public artifact.
     let output = cargo_build_in(
         dir.path(),
@@ -1104,7 +1104,7 @@ fn a_disabled_public_cache_still_serves_local_entries() {
         cache.path(),
         &wrapper,
         target_b.path(),
-        &kill_switch,
+        &[],
         cargo_home.path(),
     );
     assert!(

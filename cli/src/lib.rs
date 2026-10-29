@@ -42,6 +42,8 @@ mod lockfile_graph_cache;
 mod lockfile_resolver;
 mod miss_journal;
 mod mold;
+#[cfg(test)]
+mod network_gate;
 mod prefetch;
 mod profile_guard;
 mod provenance;
@@ -465,6 +467,9 @@ struct PostCompile {
     /// the `Plan`/`Observed` frame's values under a supervised build, this
     /// process's own under a standalone one.
     env: supervisor::protocol::InvocationEnv,
+    /// How long the real rustc ran, set once it has: the compile time a later
+    /// local hit on the stored unit reports as saved.
+    compile_time: std::time::Duration,
 }
 
 impl PostCompile {
@@ -474,6 +479,7 @@ impl PostCompile {
             executable: executable.clone(),
             parsed: None,
             env: supervisor::protocol::InvocationEnv::default(),
+            compile_time: std::time::Duration::ZERO,
         }
     }
 }
@@ -513,6 +519,7 @@ async fn compile(
         executable: executable.clone(),
         parsed: Some(parsed.clone()),
         env: invocation_env.clone(),
+        compile_time: std::time::Duration::ZERO,
     }))
 }
 
@@ -555,7 +562,8 @@ async fn finish_rustc_compile(
             .await
             {
                 Ok(LocalBuildResolution::Resolved(build)) => {
-                    let build = *build;
+                    let mut build = *build;
+                    build.compile_millis = duration_millis(post.compile_time);
                     log_nonfatal_result(
                         "failed to materialize stable local build aliases after successful rustc build",
                         inject::materialize_local_build_stable_aliases(
@@ -753,9 +761,13 @@ pub(crate) struct BuildContext {
     /// its wrappers they build for — a fallback for invocations that do
     /// not spell `--target`.
     pub(crate) public_cache_target: Option<String>,
-    /// `STOW_DISABLE_PUBLIC_CACHE`, or the rustc-version gate the driver
-    /// encodes into it: the public cache is off, local lookups still run.
+    /// The public cache is off — the global config's `cache_mode`, or a gate
+    /// the driver decided (an unsupported toolchain, a profile the cache
+    /// cannot key): local lookups still run.
     pub(crate) public_cache_disabled: bool,
+    /// The `off` cache mode: the local cache is neither read nor written, so
+    /// every unit compiles and nothing is recorded.
+    pub(crate) local_cache_disabled: bool,
     /// The facts the full graph analysis contributes once it lands. A
     /// supervised build starts the cell empty — the driver's analysis
     /// runs while cargo builds and commits it — while the standalone
@@ -1144,6 +1156,7 @@ impl BuildContext {
     /// A set-but-unreadable or malformed table file is a wiring bug and
     /// fails loudly, as a malformed inline payload did.
     fn from_env() -> stow_types::error::Result<Self> {
+        let cache_mode = crate::config::load_cache_mode()?;
         let unit_nodes =
             read_build_json_table_env::<unit_node::UnitNodeTable>(STOW_EXPANDED_GRAPH_PATH_ENV)?;
         let prefetch_candidates = read_build_json_table_env::<Vec<resolve::PrefetchArtifactRow>>(
@@ -1160,7 +1173,8 @@ impl BuildContext {
             public_cache_target: std::env::var(rustc_args::STOW_PUBLIC_CACHE_TARGET_ENV)
                 .ok()
                 .filter(|target| !target.trim().is_empty()),
-            public_cache_disabled: std::env::var_os("STOW_DISABLE_PUBLIC_CACHE").is_some(),
+            public_cache_disabled: !cache_mode.reaches_network(),
+            local_cache_disabled: !cache_mode.uses_local_cache(),
             analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                 semantic_fallback_enabled: std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV)
                     .is_some_and(|value| value != "0"),
@@ -1369,7 +1383,13 @@ impl supervisor::server::Handler for BuildSupervisor {
         }
     }
 
-    async fn compiled(self: &std::sync::Arc<Self>, pending: Self::Pending, success: bool) {
+    async fn compiled(
+        self: &std::sync::Arc<Self>,
+        mut pending: Self::Pending,
+        success: bool,
+        compile_time: std::time::Duration,
+    ) {
+        pending.compile_time = compile_time;
         let local_base = self.env_cache.local_base(&pending.executable).await;
         self.finish_and_observe(&pending, success, local_base.as_deref())
             .await;
@@ -1395,6 +1415,9 @@ impl supervisor::server::Handler for BuildSupervisor {
         };
         if is_compile_unit(&parsed) {
             self.resolution_done.complete();
+        }
+        if self.ctx.local_cache_disabled {
+            return;
         }
         let Some(local_base) = self.env_cache.local_base(&observation.executable).await else {
             return;
@@ -1457,10 +1480,17 @@ impl supervisor::server::Handler for BuildSupervisor {
             executable: observation.executable,
             parsed: Some(parsed),
             env: observation.env,
+            compile_time: observation.compile_time,
         };
         self.finish_and_observe(&post, success, Some(&local_base))
             .await;
     }
+}
+
+/// A duration in whole milliseconds, the unit the cache records compile time
+/// in.
+pub(crate) fn duration_millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).expect("a compile's milliseconds fit in u64")
 }
 
 /// The rustc facade.
@@ -1519,9 +1549,11 @@ async fn delegate_to_supervisor(
         }
         supervisor::client::Decision::Compile(ticket) => ticket,
     };
+    let started = std::time::Instant::now();
     let status = run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
+    let compile_time = started.elapsed();
     connection
-        .report(&ticket, status.success())
+        .report(&ticket, status.success(), compile_time)
         .await
         .map_err(|error| stow_types::stow_error!("{error}"))?;
     connection
@@ -1552,15 +1584,6 @@ async fn run_rustc_standalone(
             return run_passthrough_status(&command.executable, &[], &command.wrapped_args).await;
         }
     };
-    // No supervising stow owns this build's misses: the wrappers
-    // journal them, and the first invocation after the journaling cargo
-    // exits kicks the detached drain (stow#317). Checked before the
-    // decision so a fully-served build drains too.
-    if let Some(out_dir) = parsed.out_dir.as_deref() {
-        miss_journal::drain_finished_builds(out_dir);
-        miss_journal::note_consumer_context(out_dir);
-    }
-    let env_cache = WrapperEnvCache::new(state_db.clone());
     let ctx = match BuildContext::from_env() {
         Ok(ctx) => ctx,
         Err(error) => {
@@ -1570,6 +1593,18 @@ async fn run_rustc_standalone(
             return run_passthrough_status(&command.executable, &[], &command.wrapped_args).await;
         }
     };
+    // No supervising stow owns this build's misses: the wrappers
+    // journal them, and the first invocation after the journaling cargo
+    // exits kicks the detached drain (stow#317). Checked before the
+    // decision so a fully-served build drains too. Misses exist only to
+    // reach the network, so the local-only and off modes keep none.
+    if !ctx.public_cache_disabled
+        && let Some(out_dir) = parsed.out_dir.as_deref()
+    {
+        miss_journal::drain_finished_builds(out_dir);
+        miss_journal::note_consumer_context(out_dir);
+    }
+    let env_cache = WrapperEnvCache::new(state_db.clone());
     match decide_rustc_invocation(
         &command.executable,
         parsed,
@@ -1583,9 +1618,11 @@ async fn run_rustc_standalone(
             write_served_artifact_notifications(&notifications)?;
             Ok(std::process::ExitStatus::default())
         }
-        Outcome::Compile(post) => {
+        Outcome::Compile(mut post) => {
+            let started = std::time::Instant::now();
             let status =
                 run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
+            post.compile_time = started.elapsed();
             let local_base = env_cache.local_base(&command.executable).await;
             if let Ok(Some(build)) = finish_rustc_compile(
                 &post,
@@ -1595,6 +1632,7 @@ async fn run_rustc_standalone(
                 &ctx,
             )
             .await
+                && !ctx.public_cache_disabled
                 && let (Some(parsed), Some(base)) = (post.parsed.as_ref(), local_base.as_deref())
             {
                 miss_journal::record_observation(
@@ -1622,6 +1660,11 @@ async fn decide_rustc_invocation(
     ctx: &BuildContext,
     invocation_env: &supervisor::protocol::InvocationEnv,
 ) -> Outcome {
+    if ctx.local_cache_disabled {
+        // The `off` cache mode: nothing is looked up, recorded or stored, so
+        // the unit compiles and owes no bookkeeping.
+        return Outcome::Compile(Box::new(PostCompile::raw(rustc)));
+    }
     let class = match classify_unit_invocation(rustc, &mut parsed, env_cache, ctx, invocation_env)
         .await
     {
@@ -2562,7 +2605,7 @@ enum RemoteServe {
 enum UnitPreparation<'a> {
     /// Remote-capable: the identity folded to `Public`.
     Public(WrapperEnvironment<'a>),
-    /// Local-only by construction — the kill switch, a git source,
+    /// Local-only by construction — the public cache being off, a git source,
     /// extra codegen, or a `LocalOnly` dependency.
     LocalOnly(LocalOnlyPreparation),
 }
@@ -2590,7 +2633,7 @@ async fn prepare_unit_environment<'a>(
         unreachable!("prepare_unit_environment only runs for a keyed unit");
     };
     if ctx.public_cache_disabled || class.source_local_only() {
-        // The kill switch disables the *public* cache; a self-produced
+        // An off public cache disables the *public* cache; a self-produced
         // local entry is not public. A git source or extra codegen is
         // local-only by construction — it can never be looked up
         // remotely or reported (stow#1006).
@@ -2688,7 +2731,7 @@ async fn prepare_unit_environment<'a>(
 /// The local-only preparation: the local base plus the stable identity
 /// — resolved against the same `materialized_outputs` table either
 /// config reads — for the local serve and store the decision runs.
-/// `source_local_only` is the identity's own reach input — a kill-switch
+/// `source_local_only` is the identity's own reach input — a public-cache-off
 /// detour passes `false`, since the recorded reach must reflect the
 /// identity, not this build's cache policy.
 async fn prepare_local_only(
@@ -3373,6 +3416,9 @@ async fn run_cc_wrapper(
             return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
+    if !config.cache_mode.uses_local_cache() {
+        return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
+    }
     if let Err(error) = config.ensure_dirs().await {
         tracing::warn!(error = %error, "failed to prepare stow cache directories, bypassing C/C++ cache");
         return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
@@ -5118,6 +5164,7 @@ async fn resolve_local_build_artifact(
     let outputs = artifact_cache::hash_local_build_outputs(outputs).await?;
     Ok(LocalBuildResolution::Resolved(Box::new(
         artifact_cache::LocalBuildArtifact {
+            compile_millis: 0,
             target,
             rustc_version,
             identity,
@@ -6118,6 +6165,7 @@ mod tests {
                 executable: OsString::from("rustc"),
                 args: args(&["-vV"]),
                 success: None,
+                compile_time: std::time::Duration::ZERO,
                 env: crate::supervisor::protocol::InvocationEnv::default(),
             },
         )
@@ -6141,6 +6189,7 @@ mod tests {
                     "metadata=abc123",
                 ]),
                 success: None,
+                compile_time: std::time::Duration::ZERO,
                 env: crate::supervisor::protocol::InvocationEnv::default(),
             },
         )
@@ -6436,6 +6485,7 @@ mod tests {
     /// sets it to zero (stow#806).
     fn env_base_test_config(dir: &tempfile::TempDir) -> crate::config::StowConfig {
         crate::config::StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: dir.path().join("cache"),
@@ -6850,6 +6900,7 @@ mod tests {
             policy_dir: None,
             public_cache_target: None,
             public_cache_disabled: false,
+            local_cache_disabled: false,
             analysis: std::sync::Arc::new(std::sync::OnceLock::from(super::AnalysisFacts {
                 semantic_fallback_enabled: false,
                 unit_nodes: None,
@@ -7081,6 +7132,7 @@ mod tests {
     async fn the_compile_key_is_the_command_lines_scan() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = crate::config::StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: tempdir.path().to_path_buf(),
@@ -7330,6 +7382,7 @@ mod tests {
 
         fn test_config(root: &Path) -> crate::config::StowConfig {
             crate::config::StowConfig {
+                cache_mode: crate::config::CacheMode::Public,
                 edge_url: "http://127.0.0.1:9".to_owned(),
                 registry_base_url: "http://127.0.0.1:9".to_owned(),
                 cache_dir: root.join(".stow"),
@@ -7420,6 +7473,7 @@ mod tests {
                 policy_dir: None,
                 public_cache_target: Some(HOST_TARGET.to_owned()),
                 public_cache_disabled: false,
+                local_cache_disabled: false,
                 analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                     semantic_fallback_enabled: false,
                     unit_nodes: None,
@@ -7516,6 +7570,7 @@ mod tests {
                 OsStr::new("rustc"),
                 args,
                 success,
+                0,
                 crate::supervisor::protocol::InvocationEnv::default(),
             );
             write_frame(&mut *stream, &Request::Observed(frame))
@@ -7571,6 +7626,7 @@ mod tests {
                 policy_dir: Some(policy_dir),
                 public_cache_target: Some(HOST_TARGET.to_owned()),
                 public_cache_disabled: false,
+                local_cache_disabled: false,
                 analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                     semantic_fallback_enabled: false,
                     unit_nodes: None,
