@@ -159,6 +159,9 @@ impl TargetInfo {
 /// One operand class's candidate in a claim's k-way merge: its claim
 /// key (rank, then request instant, then arrival — descending) and the
 /// node index.
+/// One ready queue: rank operand → age-ordered `(first_requested, ix)`.
+type ReadyClasses = BTreeMap<i64, BTreeSet<(i64, u32)>>;
+
 type Candidate = ((i128, std::cmp::Reverse<i64>, std::cmp::Reverse<u32>), u32);
 
 /// The class a failed attempt is counted under — the error's first
@@ -385,7 +388,16 @@ pub struct Graph {
     /// eligible entry — O(classes) per pick instead of an O(ready)
     /// re-rank, and the operand re-keys only when a merge raises the
     /// priority.
-    ready: BTreeMap<i64, BTreeSet<(i64, u32)>>,
+    ///
+    /// Split by runner family where a family has its own dispatch cap:
+    /// this holds every node outside the macOS family, `ready_macos`
+    /// the macOS ones, so a claim pass leaves a full family's queue
+    /// untouched (stow#1052). Both are derived from node state and
+    /// rebuilt by the same `refresh_ready` calls on replay — neither
+    /// is persisted.
+    ready: ReadyClasses,
+    /// The macOS family's share of the ready set.
+    ready_macos: ReadyClasses,
     /// Dispatched and running nodes.
     inflight: BTreeSet<u32>,
     /// Nodes per [`Status`].
@@ -680,12 +692,33 @@ impl Graph {
         }
         let operand = self.operand_of(ix);
         let key = (self.state(ix).first_requested, ix);
-        if let Some(class) = self.ready.get_mut(&operand) {
+        let ready = if self.is_macos(ix) {
+            &mut self.ready_macos
+        } else {
+            &mut self.ready
+        };
+        if let Some(class) = ready.get_mut(&operand) {
             class.remove(&key);
             if class.is_empty() {
-                self.ready.remove(&operand);
+                ready.remove(&operand);
             }
         }
+    }
+
+    /// Whether the node builds on the macOS runner family.
+    fn is_macos(&self, ix: u32) -> bool {
+        self.targets[usize::from(self.node(ix).target)].family == Some(RunnerFamily::MacOs)
+    }
+
+    /// Whether any node is dispatchable.
+    fn has_ready(&self) -> bool {
+        !(self.ready.is_empty() && self.ready_macos.is_empty())
+    }
+
+    /// Every ready queue entry set, both families.
+    #[cfg(test)]
+    fn ready_sets(&self) -> impl Iterator<Item = &BTreeSet<(i64, u32)>> {
+        self.ready.values().chain(self.ready_macos.values())
     }
 
     /// Re-evaluate a node's ready-set membership: enters it under its
@@ -694,7 +727,12 @@ impl Graph {
         if self.dispatchable(ix) {
             let operand = self.operand_of(ix);
             let first = self.state(ix).first_requested;
-            self.ready.entry(operand).or_default().insert((first, ix));
+            let ready = if self.is_macos(ix) {
+                &mut self.ready_macos
+            } else {
+                &mut self.ready
+            };
+            ready.entry(operand).or_default().insert((first, ix));
         } else {
             self.remove_ready(ix);
         }
@@ -1033,18 +1071,20 @@ impl Graph {
             write += 1;
         }
         self.nodes.truncate(write);
-        self.ready = std::mem::take(&mut self.ready)
-            .into_iter()
-            .map(|(operand, class)| {
-                (
-                    operand,
-                    class
-                        .into_iter()
-                        .map(|(first, ix)| (first, remap[ix as usize]))
-                        .collect(),
-                )
-            })
-            .collect();
+        for ready in [&mut self.ready, &mut self.ready_macos] {
+            *ready = std::mem::take(ready)
+                .into_iter()
+                .map(|(operand, class)| {
+                    (
+                        operand,
+                        class
+                            .into_iter()
+                            .map(|(first, ix)| (first, remap[ix as usize]))
+                            .collect(),
+                    )
+                })
+                .collect();
+        }
         self.inflight = self
             .inflight
             .iter()
@@ -1621,6 +1661,19 @@ impl Graph {
         now: i64,
         stale_ms: i64,
     ) -> Result<Vec<Claimed>, QueueError> {
+        self.claim_scanned(total_free, macos_free, now, stale_ms, &mut 0)
+    }
+
+    /// [`Self::claim`], adding the ready entries the pass examined to
+    /// `scans` — the pass's cost, which tests bound.
+    fn claim_scanned(
+        &mut self,
+        total_free: u32,
+        macos_free: u32,
+        now: i64,
+        stale_ms: i64,
+        scans: &mut u64,
+    ) -> Result<Vec<Claimed>, QueueError> {
         // Stale-lease recovery first: in-flight nodes whose claim
         // outlived the lease return to pending.
         let stale: Vec<u32> = self
@@ -1648,49 +1701,66 @@ impl Graph {
         // node of each class is its oldest eligible one and the claim
         // is a k-way merge over class heads — O(classes) per pick,
         // never a re-rank of the ready bulk.
-        let mut skipped: BTreeSet<(i64, u32)> = BTreeSet::new();
+        //
+        // Each (family queue, operand) class keeps a cursor that only
+        // moves forward: entries not yet due are examined once per
+        // pass, and a family whose cap is spent is left out of the
+        // pass whole, so the pass is linear in the entries it examines
+        // (stow#1052).
+        let mut cursors: BTreeMap<(bool, i64), Option<(i64, u32)>> = BTreeMap::new();
         let mut claimed = Vec::new();
         let mut macos_taken = 0u32;
         while claimed.len() < total_free as usize {
-            let mut best: Option<Candidate> = None;
-            for (&operand, class) in &self.ready {
-                let candidate = class
-                    .iter()
-                    .copied()
-                    .find(|key| !skipped.contains(key) && self.not_before_of(key.1) <= now);
-                let Some((first, ix)) = candidate else {
+            let mut best: Option<(Candidate, bool)> = None;
+            for (macos, ready) in [(false, &self.ready), (true, &self.ready_macos)] {
+                if macos && macos_taken >= macos_free {
                     continue;
-                };
-                // Higher rank first; ties fall to the older
-                // first_requested, then the earlier arrival (stow#879).
-                let key = (
-                    i128::from(operand) * i128::from(now - first),
-                    std::cmp::Reverse(first),
-                    std::cmp::Reverse(ix),
-                );
-                if best.is_none_or(|(top, _)| key > top) {
-                    best = Some((key, ix));
+                }
+                for (&operand, class) in ready {
+                    let cursor = cursors.entry((macos, operand)).or_insert(Some((i64::MIN, 0)));
+                    let Some(from) = *cursor else {
+                        continue;
+                    };
+                    let mut found = None;
+                    for &key in class.range(from..) {
+                        *scans += 1;
+                        if self.not_before_of(key.1) <= now {
+                            found = Some(key);
+                            break;
+                        }
+                    }
+                    *cursor = found;
+                    let Some((first, ix)) = found else {
+                        continue;
+                    };
+                    // Higher rank first; ties fall to the older
+                    // first_requested, then the earlier arrival
+                    // (stow#879).
+                    let key = (
+                        i128::from(operand) * i128::from(now - first),
+                        std::cmp::Reverse(first),
+                        std::cmp::Reverse(ix),
+                    );
+                    if best.is_none_or(|((top, _), _)| key > top) {
+                        best = Some(((key, ix), macos));
+                    }
                 }
             }
-            let Some((_, ix)) = best else {
+            let Some(((_, ix), family_is_macos)) = best else {
                 break;
             };
             let target = &self.targets[usize::from(self.node(ix).target)];
-            let family = target.family.ok_or_else(|| {
+            target.family.ok_or_else(|| {
                 QueueError::Invariant(format!(
                     "pending task {} targets `{}`, no runner family",
                     self.task_id_of(ix),
                     target.name
                 ))
             })?;
-            if family == RunnerFamily::MacOs && macos_taken >= macos_free {
-                skipped.insert((self.state(ix).first_requested, ix));
-                continue;
-            }
             let generation = self.next_generation + 1;
             self.mark_claimed(ix, generation, now);
             self.settling.insert(generation);
-            if family == RunnerFamily::MacOs {
+            if family_is_macos {
                 macos_taken += 1;
             }
             claimed.push(Claimed {
@@ -2446,13 +2516,14 @@ impl Graph {
         let (free, macos_free) = self.free_slots(settings);
         let mut wake: Option<i64> = None;
         if free > 0 {
-            for &(_, ix) in self.ready.values().flatten() {
+            let macos_queue = (macos_free > 0).then_some(&self.ready_macos);
+            for &(_, ix) in self
+                .ready
+                .values()
+                .chain(macos_queue.into_iter().flat_map(BTreeMap::values))
+                .flatten()
+            {
                 let node = self.node(ix);
-                let macos =
-                    self.targets[usize::from(node.target)].family == Some(RunnerFamily::MacOs);
-                if macos && macos_free == 0 {
-                    continue;
-                }
                 let age_gate = if node.flags.lane() == Lane::Human {
                     0
                 } else {
@@ -2562,7 +2633,7 @@ impl Graph {
     pub fn reconcile_due(&self, now: i64, settings: &queue::SchedulerSettings) -> bool {
         now - self.reconcile_attempted_at >= Self::STATUS_RECONCILE_MS
             && (!self.inflight.is_empty()
-                || (!self.ready.is_empty()
+                || (self.has_ready()
                     && !matches!(settings.dispatch, queue::Dispatch::Paused)))
     }
 
@@ -2589,8 +2660,9 @@ impl Graph {
             + self.edges.heap_bytes()
             + self.published.capacity() * (size_of::<IdKey>() + size_of::<Published>())
             + self.published.len() * size_of::<IdKey>()
-            + self.ready.len() * (size_of::<i64>() + size_of::<BTreeSet<(i64, u32)>>())
-            + self.ready.values().map(BTreeSet::len).sum::<usize>() * (size_of::<(i64, u32)>() + 32)
+            + (self.ready.len() + self.ready_macos.len())
+                * (size_of::<i64>() + size_of::<BTreeSet<(i64, u32)>>())
+            + self.ready_sets().map(BTreeSet::len).sum::<usize>() * (size_of::<(i64, u32)>() + 32)
     }
 }
 
@@ -3751,8 +3823,7 @@ mod tests {
     fn is_ready(graph: &Graph, name: &str) -> bool {
         let ix = graph.node_ix(&id(name)).expect("node");
         graph
-            .ready
-            .values()
+            .ready_sets()
             .any(|set| set.iter().any(|&(_, at)| at == ix))
     }
 
@@ -3832,7 +3903,7 @@ mod tests {
 
     /// Nodes in the ready set — the operand-class map's total entries.
     fn ready_count(graph: &Graph) -> usize {
-        graph.ready.values().map(BTreeSet::len).sum()
+        graph.ready_sets().map(BTreeSet::len).sum()
     }
 
     /// The pending index recomputed by walking the arena — what
@@ -4438,6 +4509,127 @@ mod tests {
             vec![id("missed"), id("asked")],
             "tied rank, older first"
         );
+    }
+
+    /// A leaf node `name` on `target`, minted under that target's id.
+    fn sub_on(name: &str, target: &str) -> SubmissionNode {
+        let mut node = sub(name);
+        node.target = TargetTriple::parse(target).expect("target");
+        node.task_id = minted_id(&node);
+        node
+    }
+
+    /// `nodes` as independent roots of one `source` tree.
+    fn forest(source: SubmissionSource, nodes: Vec<SubmissionNode>) -> SubmissionTree {
+        SubmissionTree {
+            source,
+            roots: (0..u32::try_from(nodes.len()).expect("fits")).collect(),
+            nodes,
+        }
+    }
+
+    const MACOS_TARGET: &str = "aarch64-apple-darwin";
+
+    /// stow#1052: with the macOS cap spent, thousands of ready macOS
+    /// nodes cost the pass nothing; the non-macOS work is claimed in
+    /// scans linear in its own queue.
+    #[test]
+    fn a_full_macos_family_costs_the_pass_nothing() {
+        const MACOS: usize = 4_000;
+        const LINUX: usize = 50;
+        let mut graph = Graph::default();
+        let macos: Vec<_> = (0..MACOS)
+            .map(|n| sub_on(&format!("m{n}"), MACOS_TARGET))
+            .collect();
+        let macos_ids: HashSet<String> = macos.iter().map(|n| n.task_id.clone()).collect();
+        graph
+            .merge(&forest(SubmissionSource::HumanRequest, macos), 0)
+            .expect("macos merge");
+        let linux = (0..LINUX).map(|n| sub(&format!("l{n}"))).collect();
+        graph
+            .merge(&forest(SubmissionSource::CacheMiss, linux), 1)
+            .expect("linux merge");
+        let mut scans = 0;
+        let claimed = graph
+            .claim_scanned(45, 0, 10_000, 3_600_000, &mut scans)
+            .expect("claim");
+        assert_eq!(claimed.len(), 45);
+        assert!(
+            claimed
+                .iter()
+                .all(|claim| !macos_ids.contains(&claim.task_id)),
+            "the full family claims nothing"
+        );
+        // One head examined per class and pick: linear in the claims,
+        // independent of the 4,000 macOS entries.
+        assert!(scans <= 45, "scans {scans}");
+    }
+
+    /// stow#1052: a cap that fills mid-pass leaves the family out from
+    /// there; ranks across families still interleave exactly as one
+    /// queue's would, and the scan count stays linear.
+    #[test]
+    fn a_macos_cap_filling_mid_pass_keeps_the_rank_order() {
+        let mut graph = Graph::default();
+        // Human macOS nodes outrank the miss-lane Linux ones; the
+        // macOS cap of 2 admits only the two oldest of them.
+        let macos: Vec<_> = (0..1_000)
+            .map(|n| sub_on(&format!("m{n}"), MACOS_TARGET))
+            .collect();
+        let macos_ids: HashSet<String> = macos.iter().map(|n| n.task_id.clone()).collect();
+        graph
+            .merge(&forest(SubmissionSource::HumanRequest, macos), 0)
+            .expect("macos merge");
+        graph
+            .merge(
+                &forest(
+                    SubmissionSource::CacheMiss,
+                    vec![sub("l0"), sub("l1"), sub("l2")],
+                ),
+                0,
+            )
+            .expect("linux merge");
+        let mut scans = 0;
+        let claimed = graph
+            .claim_scanned(5, 2, 60_000, 3_600_000, &mut scans)
+            .expect("claim");
+        let darwin = |claim: &Claimed| macos_ids.contains(&claim.task_id);
+        assert_eq!(claimed.iter().filter(|claim| darwin(claim)).count(), 2);
+        assert_eq!(claimed.len(), 5, "the Linux nodes fill the rest");
+        assert!(darwin(&claimed[0]) && darwin(&claimed[1]), "human leads");
+        assert!(scans <= 2 * 5 + 2, "scans {scans}");
+        assert_eq!(ready_count(&graph), 998, "unclaimed macOS stay ready");
+    }
+
+    /// stow#1052: entries not yet due are examined once per pass, not
+    /// once per pick.
+    #[test]
+    fn deferred_entries_are_scanned_once_per_pass() {
+        let mut graph = Graph::default();
+        let nodes: Vec<_> = (0..500).map(|n| sub(&format!("d{n}"))).collect();
+        let later: Vec<String> = nodes.iter().map(|node| node.task_id.clone()).collect();
+        graph
+            .merge(&forest(SubmissionSource::CacheMiss, nodes), 0)
+            .expect("merge deferred");
+        for task_id in &later {
+            let ix = graph.node_ix(task_id).expect("node");
+            graph.edit_extra(ix, |extra| extra.not_before = 1_000_000);
+        }
+        graph
+            .merge(
+                &forest(
+                    SubmissionSource::CacheMiss,
+                    (0..30).map(|n| sub(&format!("due{n}"))).collect(),
+                ),
+                5,
+            )
+            .expect("merge due");
+        let mut scans = 0;
+        let claimed = graph
+            .claim_scanned(30, 16, 10_000, 3_600_000, &mut scans)
+            .expect("claim");
+        assert_eq!(claimed.len(), 30);
+        assert!(scans <= 500 + 30 + 30, "scans {scans}");
     }
 
     /// stow#879: waited time is uncapped — a preheat node (operand 10)
