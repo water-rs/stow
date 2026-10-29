@@ -187,23 +187,7 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
         if record.bundle_digest.is_empty() {
             continue;
         }
-        let row = ArtifactIndexRow {
-            crate_name: record.crate_name,
-            version: record.version,
-            features_json: record.features_json,
-            dependency_c_metadata_json: record.dependency_c_metadata_json,
-            dependency_task_ids: record.dependency_task_ids,
-            c_metadata: record.c_metadata,
-            compile_key: record.compile_key,
-            bundle_digest: record.bundle_digest,
-            bundle_size: record.bundle_size,
-            artifact_kind: record.artifact_kind,
-            crate_types: record.crate_types,
-            profile: record.profile,
-            emit: record.emit,
-            min_glibc: record.min_glibc,
-            unit_shape: record.unit_shape,
-        };
+        let row = stow_types::records::record_to_index_row(&record);
         slices
             .entry((record.target, record.rustc_version))
             .or_default()

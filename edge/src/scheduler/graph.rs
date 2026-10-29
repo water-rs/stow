@@ -377,6 +377,10 @@ pub struct Graph {
     /// [`Graph::index_pending`] keeps, so the status reads never walk
     /// the arena (stow#932).
     pending_blocked: u32,
+    /// Pending nodes on the miss lane — what `STOW_MAX_QUEUE_PENDING`
+    /// bounds, so preheat, operations and human backlog never count
+    /// against a CLI miss.
+    pending_miss: u32,
     /// Pending nodes on the human lane: `GET /status`'s
     /// `human_pending` is its length, and a human node's lane position
     /// compares only these.
@@ -711,15 +715,18 @@ impl Graph {
         }
         let blocked = u32::from(node.flags.blocked());
         let human = node.flags.lane() == Lane::Human;
+        let miss = u32::from(node.flags.lane() == Lane::Miss);
         let first = self.state(ix).first_requested;
         if on {
             self.pending_blocked += blocked;
+            self.pending_miss += miss;
             if human {
                 self.human_pending.insert(ix);
             }
             *self.pending_ages.entry(first).or_default() += 1;
         } else {
             self.pending_blocked -= blocked;
+            self.pending_miss -= miss;
             if human {
                 assert!(
                     self.human_pending.remove(&ix),
@@ -2361,9 +2368,10 @@ impl Graph {
         )
     }
 
-    /// The pending-queue depth `STOW_MAX_QUEUE_PENDING` gates.
-    pub const fn pending_depth(&self) -> u32 {
-        self.counts[Status::Pending.index()]
+    /// The miss lane's pending depth, which `STOW_MAX_QUEUE_PENDING`
+    /// gates: work other lanes queued is not the miss lane's to bound.
+    pub const fn miss_pending_depth(&self) -> u32 {
+        self.pending_miss
     }
 
     /// External occupancy by runner family (stow#877).
@@ -3550,6 +3558,7 @@ mod tests {
     /// `index_pending` keeps through every transition must equal it.
     fn assert_pending_index(graph: &Graph) {
         let mut blocked = 0u32;
+        let mut miss = 0u32;
         let mut human = BTreeSet::new();
         let mut ages: BTreeMap<i64, u32> = BTreeMap::new();
         for (ix, node) in (0u32..).zip(&graph.nodes) {
@@ -3557,12 +3566,14 @@ mod tests {
                 continue;
             }
             blocked += u32::from(node.flags.blocked());
+            miss += u32::from(node.flags.lane() == Lane::Miss);
             if node.flags.lane() == Lane::Human {
                 human.insert(ix);
             }
             *ages.entry(graph.state(ix).first_requested).or_default() += 1;
         }
         assert_eq!(graph.pending_blocked, blocked, "blocked pending nodes");
+        assert_eq!(graph.pending_miss, miss, "pending miss nodes");
         assert_eq!(graph.human_pending, human, "pending human nodes");
         assert_eq!(graph.pending_ages, ages, "pending request instants");
     }
@@ -3696,7 +3707,7 @@ mod tests {
             "everything the index serves is born published"
         );
         assert_eq!(ready_count(&graph), 0);
-        assert_eq!(graph.pending_depth(), 0);
+        assert_eq!(graph.status().pending, 0);
         // Born published and unreferenced: nothing stays.
         graph.compact();
         assert_eq!(graph.sizes().0, 0);

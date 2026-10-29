@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -416,21 +417,21 @@ async fn build_native_archive(
     let archive_path = snapshot_dir.join(&file_name);
 
     let out_dir = out_dir.clone();
-    let relative_paths = native
-        .out_dir_files
-        .iter()
-        .map(|file| file.relative_path.clone())
-        .collect::<Vec<_>>();
+    let files = native.out_dir_files.clone();
     let archive_path_for_task = archive_path.clone();
     let bytes = smol::unblock(move || {
+        // The tree is untrusted build output: open the root without following
+        // a symlink and every file relative to it, checked against the digest
+        // taken at capture, so a path swapped in between cannot escape.
+        let root = stow_types::native_capture::OutDirRoot::open(&out_dir)?.ok_or_else(|| {
+            stow_types::stow_error!("native out dir {} is gone since capture", out_dir.display())
+        })?;
         let mut builder = tar::Builder::new(Vec::new());
         // `out_dir_files` is already sorted by relative path, so the archive
         // is byte-identical across runs with identical inputs.
-        for relative_path in &relative_paths {
-            let source = out_dir.join(relative_path);
-            let mut file = std::fs::File::open(&source).map_err(|error| {
-                stow_types::stow_error!("read native out dir file {}: {error}", source.display())
-            })?;
+        for captured in &files {
+            let relative_path = captured.relative_path.as_str();
+            let mut file = root.open_verified(relative_path, &captured.sha256)?;
             // What a consumer links out of an `OUT_DIR` is its static
             // libraries; loose objects and helper programs beside them
             // are never on a link line, and a build script may build
@@ -438,20 +439,20 @@ async fn build_native_archive(
             if let Some(expected) = expected
                 && stow_types::native_capture::is_static_library(Path::new(relative_path))
             {
-                let contents = std::fs::read(&source).map_err(|error| {
-                    stow_types::stow_error!(
-                        "read native out dir file {}: {error}",
-                        source.display()
-                    )
+                let mut contents = Vec::new();
+                file.read_to_end(&mut contents).map_err(|error| {
+                    stow_types::stow_error!("read native out dir file {relative_path}: {error}")
                 })?;
                 object_arch::check(&contents, relative_path, expected)?;
+                file.seek(std::io::SeekFrom::Start(0)).map_err(|error| {
+                    stow_types::stow_error!("rewind native out dir file {relative_path}: {error}")
+                })?;
             }
             builder
                 .append_file(relative_path, &mut file)
                 .map_err(|error| {
                     stow_types::stow_error!(
-                        "append native out dir file {} to archive: {error}",
-                        source.display()
+                        "append native out dir file {relative_path} to archive: {error}"
                     )
                 })?;
         }
@@ -496,7 +497,20 @@ async fn build_outputs(
                 file_name
             ));
         }
-        let bytes = async_fs::read(&output.source_path).await?;
+        let source_path = output.source_path.clone();
+        let expected_sha256 = output.sha256.clone();
+        let bytes = smol::unblock(move || {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut stow_types::native_capture::open_verified_nofollow(
+                    &source_path,
+                    &expected_sha256,
+                )?,
+                &mut bytes,
+            )?;
+            stow_types::error::Result::Ok(bytes)
+        })
+        .await?;
         if let Some(expected) = expected {
             object_arch::check(&bytes, &file_name, expected)?;
         }
@@ -732,6 +746,9 @@ mod tests {
             outputs: vec![ScannedArtifactOutput {
                 kind: ParsedFileKind::Rlib,
                 path: output_path.clone(),
+                sha256: hex::encode(Sha256::digest(
+                    std::fs::read(&output_path).expect("read fixture output"),
+                )),
                 source_path: output_path,
             }],
             build_script_out_dir: None,

@@ -140,7 +140,7 @@ fn a_wall_breach_is_reported_not_gated() {
 /// is claimable by the next pass, and a slot it took changes the next
 /// capacity read.
 fn claimable_surface(cell: LoadedGraph<'_>) -> (u32, (u32, u32)) {
-    cell.with(|graph| (graph.pending_depth(), graph.inflight()))
+    cell.with(|graph| (graph.status().pending, graph.inflight()))
 }
 
 /// One drive's unmetered hooks plus its metered pass, measured. The

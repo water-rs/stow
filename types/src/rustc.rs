@@ -1,7 +1,7 @@
 //! Parser for the rustc command line the wrapper observes, plus helpers that
 //! decide cacheability and predict output paths from the parsed arguments.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -37,6 +37,11 @@ pub struct ParsedRustcArgs {
     /// they are compile identity, kept separate from features because the
     /// semantic tuple registries index on is features only.
     pub cfgs: BTreeSet<String>,
+    /// The same non-feature `--cfg` values in argv order with duplicates
+    /// kept. Cargo emits one `--cfg` per build-script directive, so a cfg
+    /// set by both `RUSTFLAGS` and the build script appears twice; telling
+    /// the two sources apart needs the count, which the set loses.
+    pub cfg_args: Vec<String>,
     /// `--emit` kinds, deduplicated.
     pub emit: BTreeSet<String>,
     /// `--json` kinds, deduplicated.
@@ -90,16 +95,20 @@ pub struct ParsedRustcArgs {
     /// the variables, so argv is the one stream that says which flags the
     /// unit actually compiled with — a host unit under `--target` gets no
     /// env flags on argv precisely because cargo did not apply them.
-    /// Sorted and folded into the compile key, so two invocations with the
-    /// same extra options share one local identity.
-    pub extra_codegen: BTreeSet<String>,
+    /// Kept in argv order and folded into the compile key in that order:
+    /// rustc applies repeated options left to right (`-C target-feature=-a
+    /// -C target-feature=+a` and the reverse compile differently), so two
+    /// invocations share one identity only when they spell the same
+    /// options in the same order.
+    pub extra_codegen: Vec<String>,
     /// The `-C` options that steer only the final link step, normalized to
-    /// their `key=value` spelling and sorted. Inert for a unit that never
+    /// their `key=value` spelling, in argv order (the linker sees them in
+    /// that order). Inert for a unit that never
     /// reaches the linker, and part of the compile key for one that does —
     /// see [`ParsedRustcArgs::link_options_reaching_the_linker`]. An
     /// artifact linked with mold and one linked with lld are different
     /// bytes, so they are different keys rather than both being refused.
-    pub link_options: BTreeSet<String>,
+    pub link_options: Vec<String>,
 }
 
 impl ParsedRustcArgs {
@@ -120,6 +129,7 @@ impl ParsedRustcArgs {
             crate_types: Vec::new(),
             features: BTreeSet::new(),
             cfgs: BTreeSet::new(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::new(),
             json: BTreeSet::new(),
             input_path: None,
@@ -138,8 +148,8 @@ impl ParsedRustcArgs {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: true,
-            extra_codegen: BTreeSet::new(),
-            link_options: BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         };
 
         let mut iter = args.iter();
@@ -200,7 +210,7 @@ impl ParsedRustcArgs {
             Err(reason) => UnitClass::Uncached(reason),
             Ok(source) => UnitClass::Keyed {
                 source,
-                extra_codegen: self.extra_codegen.iter().cloned().collect(),
+                extra_codegen: self.extra_codegen.clone(),
             },
         }
     }
@@ -226,7 +236,7 @@ impl ParsedRustcArgs {
     #[must_use]
     pub fn link_options_reaching_the_linker(&self) -> Vec<String> {
         if self.invokes_the_linker() {
-            self.link_options.iter().cloned().collect()
+            canonical_link_options(&self.link_options)
         } else {
             Vec::new()
         }
@@ -417,21 +427,25 @@ impl ParsedRustcArgs {
         ))))
     }
 
-    /// The cargo profile this invocation compiles with, defaulting absent
-    /// flags to cargo's debug values (`opt-level=0`, debug assertions and
-    /// overflow checks on, `panic=unwind`).
+    /// The profile this invocation compiles with, absent flags defaulting
+    /// to rustc's own values: `opt-level=0`, debug assertions on only at
+    /// `opt-level=0`, overflow checks following debug assertions, and
+    /// `panic=unwind`. Every consumer of a profile — the compile key, the
+    /// index rows, the unit graph comparison — reads it here.
     ///
     /// # Errors
     /// Returns an error when `-C debuginfo`, `-C panic` or `-C strip` carry
     /// values outside the set rustc documents.
     pub fn profile(&self) -> Result<Profile, String> {
+        let opt_level = self.opt_level.clone().unwrap_or_else(|| "0".to_owned());
+        let debug_assertions = self.debug_assertions.unwrap_or(opt_level == "0");
         Ok(Profile {
-            opt_level: self.opt_level.clone().unwrap_or_else(|| "0".to_owned()),
             debuginfo: parse_debuginfo_level(self.debuginfo.as_deref())?,
-            debug_assertions: self.debug_assertions.unwrap_or(true),
-            overflow_checks: self.overflow_checks.unwrap_or(true),
+            debug_assertions,
+            overflow_checks: self.overflow_checks.unwrap_or(debug_assertions),
             panic: parse_panic_strategy(self.panic_strategy.as_deref())?,
             strip: parse_strip_level(self.strip.as_deref())?,
+            opt_level,
         })
     }
 }
@@ -656,13 +670,11 @@ fn apply_target(value: &str, parsed: &mut ParsedRustcArgs) {
 }
 
 fn apply_cfg(value: &str, parsed: &mut ParsedRustcArgs) {
-    match parse_feature_cfg(value) {
-        Some(feature) => {
-            parsed.features.insert(feature);
-        }
-        None => {
-            parsed.cfgs.insert(value.to_owned());
-        }
+    if let Some(feature) = parse_feature_cfg(value) {
+        parsed.features.insert(feature);
+    } else {
+        parsed.cfgs.insert(value.to_owned());
+        parsed.cfg_args.push(value.to_owned());
     }
 }
 
@@ -705,7 +717,7 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
         match option {
             "prefer-dynamic" => {}
             _ => {
-                parsed.extra_codegen.insert(format!("-C {option}"));
+                parsed.extra_codegen.push(format!("-C {option}"));
             }
         }
         return Ok(());
@@ -723,10 +735,10 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
         "embed-bitcode" => parsed.embed_bitcode = parse_bool(value)?,
         "codegen-units" | "split-debuginfo" => {}
         _ if is_link_only_codegen_option(option) => {
-            parsed.link_options.insert(option.to_owned());
+            parsed.link_options.push(option.to_owned());
         }
         _ => {
-            parsed.extra_codegen.insert(format!("-C {option}"));
+            parsed.extra_codegen.push(format!("-C {option}"));
         }
     }
 
@@ -745,6 +757,39 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
 /// depends on whether the unit reaches the linker, which this function
 /// cannot see. [`ParsedRustcArgs::link_options_reach_the_linker`] makes
 /// that call.
+/// Normalize link-steering `-C` options by rustc's own semantics.
+///
+/// `link-arg` and `link-args` accumulate, so they keep their argv order
+/// (the linker sees them in that order). `linker`, `linker-flavor` and
+/// `link-self-contained` are single settings where the last occurrence
+/// wins, so only that value is kept, listed after the link arguments and
+/// sorted by its `key=value` text. Two spellings that link the same way
+/// normalize to the same list, and a list with at most one link argument
+/// and no repeated setting is exactly what the sorted set it replaces
+/// serialized to.
+#[must_use]
+pub fn canonical_link_options(raw: &[String]) -> Vec<String> {
+    let mut accumulated = Vec::new();
+    let mut settings: BTreeMap<&str, &str> = BTreeMap::new();
+    for option in raw {
+        let key = option
+            .split_once('=')
+            .map_or(option.as_str(), |(key, _)| key);
+        if matches!(key, "link-arg" | "link-args") {
+            accumulated.push(option.clone());
+        } else {
+            settings.insert(key, option);
+        }
+    }
+    let mut settings = settings
+        .into_values()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    settings.sort();
+    accumulated.extend(settings);
+    accumulated
+}
+
 fn is_link_only_codegen_option(option: &str) -> bool {
     let key = option.split_once('=').map_or(option, |(key, _)| key);
     matches!(
@@ -762,7 +807,7 @@ fn parse_unstable_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<(
             parsed.embed_metadata = Some(parse_bool(value)?);
         }
         _ => {
-            parsed.extra_codegen.insert(format!("-Z {option}"));
+            parsed.extra_codegen.push(format!("-Z {option}"));
         }
     }
     Ok(())
@@ -825,7 +870,11 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     }
 }
 
-fn parse_feature_cfg(cfg: &str) -> Option<String> {
+/// The feature name of a `feature="…"` cfg value; `None` for every other
+/// cfg. The one reading of a cfg value, shared by the argv parser and the
+/// build-script directive reader so both sort a cfg the same way.
+#[must_use]
+pub fn parse_feature_cfg(cfg: &str) -> Option<String> {
     let feature = cfg.strip_prefix("feature=\"")?;
     let feature = feature.strip_suffix('"')?;
     Some(feature.to_owned())
@@ -896,6 +945,84 @@ mod tests {
             package: "itoa".to_owned(),
             version: "1.0.0".to_owned(),
         }
+    }
+
+    /// rustc's own defaults for the check flags: debug assertions are on
+    /// only at `opt-level=0`, overflow checks follow debug assertions,
+    /// and an explicit flag wins over either default (stow#1047).
+    #[test]
+    fn profile_defaults_follow_rustc_not_cargos_debug_profile() {
+        let profile = |codegen: &[&str]| {
+            let mut parts = vec!["--crate-name", "itoa"];
+            parts.extend_from_slice(codegen);
+            ParsedRustcArgs::parse(&args(&parts))
+                .expect("parse")
+                .profile()
+                .expect("profile")
+        };
+        let bare = profile(&[]);
+        assert_eq!(bare.opt_level, "0");
+        assert!(bare.debug_assertions && bare.overflow_checks, "{bare:?}");
+        let optimized = profile(&["-C", "opt-level=3"]);
+        assert!(
+            !optimized.debug_assertions && !optimized.overflow_checks,
+            "{optimized:?}"
+        );
+        let size = profile(&["-C", "opt-level=s"]);
+        assert!(!size.debug_assertions && !size.overflow_checks, "{size:?}");
+        let asserted = profile(&["-C", "opt-level=3", "-C", "debug-assertions=yes"]);
+        assert!(
+            asserted.debug_assertions && asserted.overflow_checks,
+            "overflow checks follow debug assertions: {asserted:?}"
+        );
+        let overflow_only = profile(&["-C", "opt-level=3", "-C", "overflow-checks=yes"]);
+        assert!(
+            !overflow_only.debug_assertions && overflow_only.overflow_checks,
+            "{overflow_only:?}"
+        );
+        let unchecked = profile(&["-C", "overflow-checks=no"]);
+        assert!(
+            unchecked.debug_assertions && !unchecked.overflow_checks,
+            "{unchecked:?}"
+        );
+    }
+
+    /// `link-arg` accumulates in argv order while `linker`,
+    /// `linker-flavor` and `link-self-contained` are last-wins settings,
+    /// listed after the arguments (stow#1047). One argument plus a linker
+    /// keeps the order the sorted set it replaces serialized to, which is
+    /// what keeps every published linking key (cross `linker=` with the
+    /// pinned mold argument) unchanged.
+    #[test]
+    fn link_options_follow_rustc_accumulate_and_last_wins_semantics() {
+        let link_options = |options: &[&str]| {
+            let mut invocation = vec!["--crate-name", "derive", "--crate-type", "proc-macro"];
+            for option in options {
+                invocation.extend(["-C", option]);
+            }
+            ParsedRustcArgs::parse(&args(&invocation))
+                .expect("parse")
+                .link_options_reaching_the_linker()
+        };
+        assert_eq!(
+            link_options(&["link-arg=-b", "link-arg=-a"]),
+            ["link-arg=-b", "link-arg=-a"]
+        );
+        // Cargo's cross-target `-C linker=` comes first and the pinned
+        // mold argument last; the published serialization has the
+        // argument first.
+        assert_eq!(
+            link_options(&["linker=aarch64-linux-gnu-gcc", "link-arg=-fuse-ld=mold"]),
+            ["link-arg=-fuse-ld=mold", "linker=aarch64-linux-gnu-gcc"]
+        );
+        assert_eq!(
+            link_options(&["link-arg=-fuse-ld=mold", "linker=aarch64-linux-gnu-gcc"]),
+            ["link-arg=-fuse-ld=mold", "linker=aarch64-linux-gnu-gcc"]
+        );
+        assert_eq!(
+            link_options(&["linker=gcc", "linker=clang", "linker-flavor=gcc"]),
+            ["linker-flavor=gcc", "linker=clang"]
+        );
     }
 
     /// Whether the invocation classifies as a keyed unit.
@@ -1143,7 +1270,7 @@ mod tests {
         // concrete CPU before classifying. A `native` that survives to
         // the classifier means resolution failed — never cached.
         assert_eq!(
-            parsed.extra_codegen.iter().next().map(String::as_str),
+            parsed.extra_codegen.first().map(String::as_str),
             Some("-C target-cpu=native")
         );
         assert_eq!(
@@ -1179,7 +1306,11 @@ mod tests {
             ]))
             .expect("parser should succeed");
 
-            assert!(parsed.extra_codegen.is_empty(), "{option} marked custom");
+            assert_eq!(
+                parsed.extra_codegen,
+                Vec::<String>::new(),
+                "{option} marked custom"
+            );
             assert!(keyed(&parsed), "{option} made unit uncacheable");
         }
     }
@@ -1213,8 +1344,9 @@ mod tests {
                 vec!["link-arg=-L/opt/custom/lib".to_owned()],
                 "{crate_type} lost the link option the key needs"
             );
-            assert!(
-                parsed.extra_codegen.is_empty(),
+            assert_eq!(
+                parsed.extra_codegen,
+                Vec::<String>::new(),
                 "{crate_type} was misfiled as custom codegen"
             );
             assert!(
@@ -1251,7 +1383,7 @@ mod tests {
 
         assert_eq!(
             parsed.link_options,
-            BTreeSet::from(["link-arg=-fuse-ld=mold".to_owned()]),
+            ["link-arg=-fuse-ld=mold".to_owned()],
             "the option was not parsed"
         );
         assert!(
@@ -1477,7 +1609,7 @@ mod tests {
             let parsed = ParsedRustcArgs::parse(&args(&invocation)).expect("parser should succeed");
 
             assert_eq!(parsed.embed_metadata, Some(false));
-            assert!(parsed.extra_codegen.is_empty());
+            assert_eq!(parsed.extra_codegen, Vec::<String>::new());
             assert!(keyed(&parsed));
         }
     }
@@ -1501,7 +1633,7 @@ mod tests {
         .expect("parser should succeed");
 
         assert_eq!(parsed.embed_metadata, Some(true));
-        assert!(parsed.extra_codegen.is_empty());
+        assert_eq!(parsed.extra_codegen, Vec::<String>::new());
     }
 
     #[test]
@@ -1524,7 +1656,7 @@ mod tests {
 
             assert_eq!(parsed.embed_metadata, None);
             assert!(keyed(&parsed));
-            assert!(!parsed.extra_codegen.is_empty());
+            assert_ne!(parsed.extra_codegen, Vec::<String>::new());
         }
     }
 
@@ -1563,7 +1695,7 @@ mod tests {
 
         assert!(keyed(&parsed));
         assert!(parsed.is_proc_macro());
-        assert!(parsed.extra_codegen.is_empty());
+        assert_eq!(parsed.extra_codegen, Vec::<String>::new());
     }
 
     #[test]
@@ -1587,7 +1719,7 @@ mod tests {
         // An unknown codegen flag is byte-representable: it keys
         // into extra-codegen and the unit is local-only (stow#1006).
         assert!(keyed(&parsed));
-        assert!(parsed.extra_codegen.contains("-C mystery-flag"));
+        assert!(parsed.extra_codegen.contains(&"-C mystery-flag".to_owned()));
     }
 
     #[test]
@@ -1611,7 +1743,7 @@ mod tests {
         .expect("parser should succeed");
 
         assert!(keyed(&parsed));
-        assert!(parsed.extra_codegen.is_empty());
+        assert_eq!(parsed.extra_codegen, Vec::<String>::new());
     }
 
     #[test]
@@ -1902,7 +2034,7 @@ mod tests {
         }
 
         assert!(keyed(&parsed));
-        assert!(parsed.extra_codegen.is_empty());
+        assert_eq!(parsed.extra_codegen, Vec::<String>::new());
     }
 
     #[test]
@@ -1939,12 +2071,14 @@ mod tests {
             }
 
             assert!(keyed(&parsed), "{value} made unit uncacheable");
-            assert!(
-                parsed.extra_codegen.is_empty(),
+            assert_eq!(
+                parsed.extra_codegen,
+                Vec::<String>::new(),
                 "{value} entered the key without being on argv"
             );
-            assert!(
-                parsed.link_options.is_empty(),
+            assert_eq!(
+                parsed.link_options,
+                Vec::<String>::new(),
                 "{value} entered link options without being on argv"
             );
         }
@@ -1977,8 +2111,8 @@ mod tests {
         }
 
         assert!(keyed(&parsed));
-        assert!(parsed.extra_codegen.is_empty());
-        assert!(parsed.link_options.is_empty());
+        assert_eq!(parsed.extra_codegen, Vec::<String>::new());
+        assert_eq!(parsed.link_options, Vec::<String>::new());
     }
 
     #[test]
@@ -2005,7 +2139,7 @@ mod tests {
         }
 
         assert!(keyed(&parsed));
-        assert!(parsed.extra_codegen.is_empty());
+        assert_eq!(parsed.extra_codegen, Vec::<String>::new());
     }
 
     #[test]
@@ -2069,7 +2203,7 @@ mod tests {
             "strip=debuginfo",
         ]))
         .expect("parser should succeed");
-        assert!(parsed.extra_codegen.is_empty());
+        assert_eq!(parsed.extra_codegen, Vec::<String>::new());
         assert_eq!(parsed.strip.as_deref(), Some("debuginfo"));
         assert_eq!(
             parsed.profile().expect("profile").strip,

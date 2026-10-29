@@ -316,15 +316,15 @@ fn stable_unit_identity_for_source(
             }),
         ),
     };
-    let extra_codegen: Vec<String> = parsed.extra_codegen.iter().cloned().collect();
-    let profile = normalized_cache_profile(parsed)?;
-    let kind = parsed_artifact_kind(parsed)?;
-    let crate_types = parsed_crate_types(parsed)?;
-    let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
+    let extra_codegen = parsed.extra_codegen.clone();
     let cfgs = parsed.cfgs.iter().cloned().collect::<Vec<_>>();
     // Empty unless this unit actually links, which keeps every rlib's key
     // exactly what it was before the linker was part of identity.
     let link_options = parsed.link_options_reaching_the_linker();
+    let profile = normalized_cache_profile(parsed)?;
+    let kind = parsed_artifact_kind(parsed)?;
+    let crate_types = parsed_crate_types(parsed)?;
+    let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
     let compile_key = compute_compile_key(&CompileKeyInputs {
         crate_name: &crate_name,
         crate_version: &version,
@@ -973,6 +973,273 @@ mod tests {
         )
     }
 
+    fn lib_args(codegen: &[&str]) -> Vec<OsString> {
+        let mut parts = vec![
+            "--crate-name",
+            "unicode_ident",
+            "--edition=2021",
+            "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/unicode-ident-1.0.24/src/lib.rs",
+            "--crate-type",
+            "lib",
+            "--emit",
+            "dep-info,metadata,link",
+            "-C",
+            "metadata=a52ee596848c66ca",
+            "-C",
+            "extra-filename=-aa4980adf969014b",
+            "--out-dir",
+            "/tmp/out",
+        ];
+        parts.extend_from_slice(codegen);
+        args(&parts)
+    }
+
+    /// stow#1047: at a non-zero opt-level an absent `-C debug-assertions`
+    /// and `-C overflow-checks` are off, so spelling them on is a
+    /// different compile and must be a different key.
+    #[test]
+    fn optimized_check_defaults_key_apart_from_explicit_checks() {
+        let plain = ParsedRustcArgs::parse(&lib_args(&["-C", "opt-level=3"])).expect("parse");
+        let checked = ParsedRustcArgs::parse(&lib_args(&[
+            "-C",
+            "opt-level=3",
+            "-C",
+            "debug-assertions=yes",
+            "-C",
+            "overflow-checks=yes",
+        ]))
+        .expect("parse");
+        let plain_profile = normalized_cache_profile(&plain).expect("profile");
+        assert!(!plain_profile.debug_assertions, "{plain_profile:?}");
+        assert!(!plain_profile.overflow_checks, "{plain_profile:?}");
+        assert_ne!(
+            test_registry_identity(&plain)
+                .expect("identity")
+                .compile_key,
+            test_registry_identity(&checked)
+                .expect("identity")
+                .compile_key,
+        );
+    }
+
+    /// stow#1047: rustc applies `-C target-feature` in argv order, so the
+    /// same two flags in the other order are a different compile.
+    #[test]
+    fn extra_codegen_keeps_its_argv_order_in_the_key() {
+        let off_on = ParsedRustcArgs::parse(&lib_args(&[
+            "-C",
+            "target-feature=-avx2",
+            "-C",
+            "target-feature=+avx2",
+        ]))
+        .expect("parse");
+        let on_off = ParsedRustcArgs::parse(&lib_args(&[
+            "-C",
+            "target-feature=+avx2",
+            "-C",
+            "target-feature=-avx2",
+        ]))
+        .expect("parse");
+        assert_ne!(
+            test_registry_identity(&off_on)
+                .expect("identity")
+                .compile_key,
+            test_registry_identity(&on_off)
+                .expect("identity")
+                .compile_key,
+        );
+    }
+
+    /// The key `parsed`'s own identity recomputes to when the candidate is
+    /// checked under `consumer` and `build_script`.
+    fn recomputed_key(
+        parsed: &ParsedRustcArgs,
+        consumer: &crate::upload_plan::ConsumerInputs,
+        build_script: &crate::upload_plan::BuildScriptInputs,
+    ) -> String {
+        let profile = normalized_cache_profile(parsed).expect("profile");
+        let kind = super::parsed_artifact_kind(parsed).expect("kind");
+        let crate_types = super::parsed_crate_types(parsed).expect("crate types");
+        let emit = parsed.emit.iter().cloned().collect::<Vec<_>>();
+        crate::upload_plan::candidate_compile_key(
+            &crate::upload_plan::CandidateIdentity {
+                crate_name: "unicode-ident",
+                crate_version: "1.0.24",
+                target: "aarch64-apple-darwin",
+                rustc_version: "1.91.1",
+                features_json: "[]",
+                dependency_c_metadata_json: "[]",
+                kind: &kind,
+                profile: &profile,
+                crate_types: &crate_types,
+                emit: &emit,
+            },
+            consumer,
+            build_script,
+        )
+        .expect("candidate key")
+    }
+
+    fn consumer_of(
+        parsed: &ParsedRustcArgs,
+        own: &crate::upload_plan::BuildScriptInputs,
+    ) -> crate::upload_plan::ConsumerInputs {
+        crate::upload_plan::ConsumerInputs::of(parsed, own)
+    }
+
+    /// A candidate compiled with exactly the consumer's inputs recomputes
+    /// to its own key; one compiled without the consumer's `--cfg`, extra
+    /// codegen or bitcode setting does not (stow#1047).
+    #[test]
+    fn a_candidate_serves_only_the_inputs_it_was_compiled_with() {
+        use crate::upload_plan::BuildScriptInputs;
+        let none = BuildScriptInputs::default();
+        let candidate = ParsedRustcArgs::parse(&lib_args(&[])).expect("parse");
+        let key = test_registry_identity(&candidate)
+            .expect("identity")
+            .compile_key;
+        assert_eq!(
+            recomputed_key(&candidate, &consumer_of(&candidate, &none), &none),
+            key
+        );
+        for flags in [
+            &["--cfg", "custom"][..],
+            &["-C", "target-cpu=znver4"],
+            &["-C", "embed-bitcode=no"],
+            &["-Z", "embed-metadata=yes"],
+        ] {
+            let request = ParsedRustcArgs::parse(&lib_args(flags)).expect("parse");
+            assert_ne!(
+                recomputed_key(&candidate, &consumer_of(&request, &none), &none),
+                key,
+                "{flags:?} was served an artifact compiled without it"
+            );
+        }
+        // And the other direction: a candidate compiled with a cfg is not
+        // served to a request without it.
+        let with_cfg = ParsedRustcArgs::parse(&lib_args(&["--cfg", "custom"])).expect("parse");
+        let cfg_key = test_registry_identity(&with_cfg)
+            .expect("identity")
+            .compile_key;
+        assert_eq!(
+            recomputed_key(&with_cfg, &consumer_of(&with_cfg, &none), &none),
+            cfg_key
+        );
+        assert_ne!(
+            recomputed_key(&with_cfg, &consumer_of(&candidate, &none), &none),
+            cfg_key
+        );
+    }
+
+    /// A cfg the candidate's own build script set is part of its key, and
+    /// a request whose build script set it too (as a superset or version
+    /// substitution may) still matches: the build-script cfgs come from
+    /// the candidate's captured output, never from the request.
+    #[test]
+    fn a_build_scripts_cfg_is_the_candidates_own_not_the_consumers() {
+        use crate::upload_plan::BuildScriptInputs;
+        let built = ParsedRustcArgs::parse(&lib_args(&["--cfg", "probe_ok"])).expect("parse");
+        let key = test_registry_identity(&built)
+            .expect("identity")
+            .compile_key;
+        let candidate_script =
+            BuildScriptInputs::from_directives(&["cargo:rustc-cfg=probe_ok".to_owned()]);
+        // The request (here without the cfg: a different feature set whose
+        // build script emitted none) is served by the candidate, whose
+        // cfg comes from its own captured build script output.
+        let request = ParsedRustcArgs::parse(&lib_args(&[])).expect("parse");
+        assert_eq!(
+            recomputed_key(
+                &built,
+                &consumer_of(&request, &BuildScriptInputs::default()),
+                &candidate_script
+            ),
+            key
+        );
+        // The same request, whose OWN build script emitted the cfg that is
+        // therefore on its argv, subtracts it as the build script's and
+        // still matches the same key.
+        let request = ParsedRustcArgs::parse(&lib_args(&["--cfg", "probe_ok"])).expect("parse");
+        let own = BuildScriptInputs::from_directives(&["cargo::rustc-cfg=probe_ok".to_owned()]);
+        assert_eq!(
+            recomputed_key(&built, &consumer_of(&request, &own), &own),
+            key
+        );
+        // A cfg both RUSTFLAGS and the build script set appears twice on
+        // argv; one occurrence is the consumer's and survives.
+        let request =
+            ParsedRustcArgs::parse(&lib_args(&["--cfg", "probe_ok", "--cfg", "probe_ok"]))
+                .expect("parse");
+        let consumer = consumer_of(&request, &own);
+        assert_eq!(consumer.cfgs, ["probe_ok"]);
+        // A feature cfg is never a build-script cfg.
+        assert_eq!(
+            BuildScriptInputs::from_directives(&["cargo:rustc-cfg=feature=\"x\"".to_owned()]),
+            BuildScriptInputs::default()
+        );
+    }
+
+    /// Published linking keys keep the serialization they were published
+    /// under: cargo's cross-target `-C linker=` comes first on argv and
+    /// the pinned mold argument last, and the key carries the argument
+    /// first (stow#1047).
+    #[test]
+    fn a_cross_linking_unit_keeps_its_published_key_shape() {
+        let proc_macro = |codegen: &[&str]| {
+            let mut parts = vec![
+                "--crate-name",
+                "serde_derive",
+                "--crate-type",
+                "proc-macro",
+                "--emit",
+                "dep-info,link",
+                "-C",
+                "metadata=a52ee596848c66ca",
+                "-C",
+                "extra-filename=-aa4980adf969014b",
+                "--out-dir",
+                "/tmp/out",
+                "/Users/lexoliu/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde_derive-1.0.210/src/lib.rs",
+            ];
+            parts.extend_from_slice(codegen);
+            ParsedRustcArgs::parse(&args(&parts)).expect("parse")
+        };
+        let parsed = proc_macro(&[
+            "-C",
+            "linker=aarch64-linux-gnu-gcc",
+            "-C",
+            "link-arg=-fuse-ld=mold",
+        ]);
+        let key = test_registry_identity(&parsed)
+            .expect("identity")
+            .compile_key;
+        let profile = normalized_cache_profile(&parsed).expect("profile");
+        let published =
+            crate::upload_plan::compute_compile_key(&crate::upload_plan::CompileKeyInputs {
+                crate_name: "serde_derive",
+                crate_version: "1.0.210",
+                target: "aarch64-apple-darwin",
+                rustc_version: "1.91.1",
+                profile: &profile,
+                crate_types: &[crate::artifact::RustCrateType::ProcMacro],
+                emit: &["dep-info".to_owned(), "link".to_owned()],
+                features_json: "[]",
+                dependency_c_metadata_json: "[]",
+                kind: &super::parsed_artifact_kind(&parsed).expect("kind"),
+                embed_metadata: None,
+                cfgs: &[],
+                embed_bitcode: true,
+                link_options: &[
+                    "link-arg=-fuse-ld=mold".to_owned(),
+                    "linker=aarch64-linux-gnu-gcc".to_owned(),
+                ],
+                git_source: None,
+                extra_codegen: &[],
+            })
+            .expect("compile key");
+        assert_eq!(key, published);
+    }
+
     #[test]
     fn reach_folds_to_the_tightest_value() {
         assert_eq!(Reach::Public.fold(Reach::Public), Reach::Public);
@@ -1353,7 +1620,7 @@ mod tests {
         flagged_invocation.extend(["-Z", "embed-metadata=no"]);
         let flagged = ParsedRustcArgs::parse(&args(&flagged_invocation))
             .expect("parse flagged unicode-ident rustc args");
-        assert!(flagged.extra_codegen.is_empty());
+        assert_eq!(flagged.extra_codegen, Vec::<String>::new());
 
         let baseline_identity =
             test_registry_identity(&baseline).expect("compute baseline identity");
@@ -1440,7 +1707,7 @@ mod tests {
             let mut invocation = base_invocation.to_vec();
             invocation.extend_from_slice(extra);
             let parsed = ParsedRustcArgs::parse(&args(&invocation)).expect("parse invocation");
-            assert!(parsed.extra_codegen.is_empty());
+            assert_eq!(parsed.extra_codegen, Vec::<String>::new());
             (
                 parsed.embed_bitcode,
                 test_registry_identity(&parsed).expect("compute identity"),
