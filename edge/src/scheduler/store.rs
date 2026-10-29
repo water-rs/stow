@@ -1024,6 +1024,8 @@ mod tests {
                 rustc_version: WireRustcVersion::parse("1.85.0").expect("rustc"),
                 base_generation: Some(live),
                 generation: live + 1,
+                part: 0,
+                parts: 1,
                 added,
                 retired,
             });

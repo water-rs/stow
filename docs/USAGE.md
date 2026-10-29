@@ -550,7 +550,9 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   slice's membership to the scheduler. `index-publish.yml`
   runs this loop after every `build-crate` run, preceded by `index
   reconcile`, which reports in full every published slice whose
-  generation the scheduler does not hold. `index targets` lists
+  generation the scheduler does not hold (a full membership over one
+  request body posts in parts; a delta too large for one part is
+  reported as the slice's full membership). `index targets` lists
   the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the

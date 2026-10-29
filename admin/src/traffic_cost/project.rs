@@ -364,6 +364,10 @@ const EVENT_COSTS: &[EventCost] = &[
         // inline. Worker requests: the report plus the
         // `index-publish.yml` run's own deliveries, which the webhook
         // consumes without a forward (`forwards::INDEX_PUBLISH_RUN`).
+        // A routine run is deltas in one body; a full membership over
+        // one body (reset recovery, a first publish) is one request per
+        // body, each a `(part)` drive plus the last one's `(full)`, a
+        // rare operator-triggered cost the monthly model does not price.
         forwards: &[call("POST /index/published (full)", 1)],
         claims: 0.0,
         worker_requests: 1.0 + RUN_DELIVERIES,
