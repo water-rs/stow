@@ -434,7 +434,16 @@ async fn confined_builder<N: NetworkPolicy>(
                     request.target_dir.display()
                 )
             })?;
-            (env_names, protect_grants(request))
+            let mut grants = protect_grants(request);
+            grants.extend(
+                toolchain_grants(
+                    request,
+                    &crate::config::require_cargo_home()?,
+                    rustup_home().as_deref(),
+                )
+                .await?,
+            );
+            (env_names, grants)
         }
         Confinement::Strict | Confinement::Offline => {
             builder = builder
@@ -481,11 +490,12 @@ async fn confined_builder<N: NetworkPolicy>(
     Ok(builder)
 }
 
-/// What `protect` grants: only what stow itself puts in the build's way.
-/// The machine is otherwise open, so the toolchain and the registry need
-/// no grants; the target directory is written and executed, and the
-/// scratch, shim and stow binary paths may sit under a temporary directory
-/// heel does not let a process execute from.
+/// What `protect` grants for stow's own paths. The machine is otherwise
+/// open and the registry needs no grant, but the toolchain does on Linux,
+/// where heel executes only under the system trees and the home directory:
+/// `toolchain_grants` adds it, read and execute. The target directory is
+/// written and executed, and the scratch, shim and stow binary paths may
+/// sit under a temporary directory heel does not let a process execute from.
 fn protect_grants(request: &SandboxRequest<'_>) -> Vec<(PathBuf, Access, &'static str)> {
     let mut grants = vec![
         (
@@ -653,7 +663,44 @@ async fn sandbox_grants(
         ));
     }
 
-    conditional_grants(&cargo_home, rustup_home.as_deref(), &mut grants);
+    conditional_grants(&cargo_home, &mut grants);
+    grants.extend(toolchain_grants(request, &cargo_home, rustup_home.as_deref()).await?);
+
+    Ok(grants)
+}
+
+/// Everything under which the build finds and executes its toolchain:
+/// rustup's home, cargo's `bin` proxies, the compilers' directories, the
+/// rustc sysroot, the SDK roots and compiler/linker env vars, stow's own
+/// tools directory, and the driver, linker and `COMPILER_PATH` trees the
+/// drivers report. Read and execute only. The single source of "toolchain
+/// paths": `strict`/`offline` grant it as part of a closed filesystem, and
+/// `protect` grants it because heel's Linux rules execute only under the
+/// system trees and the home directory, so a toolchain outside them (the
+/// managed mold, a `/opt` or `/nix` install) would otherwise be denied.
+async fn toolchain_grants(
+    request: &SandboxRequest<'_>,
+    cargo_home: &Path,
+    rustup_home: Option<&Path>,
+) -> stow_types::error::Result<Vec<(PathBuf, Access, &'static str)>> {
+    let mut grants: Vec<(PathBuf, Access, &'static str)> = Vec::new();
+    let bin = cargo_home.join("bin");
+    if bin.exists() {
+        grants.push((
+            bin,
+            Access::READ | Access::EXEC,
+            "the rustup proxy shims `cargo`/`rustc` when PATH leads there",
+        ));
+    }
+    if let Some(home) = rustup_home
+        && home.exists()
+    {
+        grants.push((
+            home.to_path_buf(),
+            Access::READ | Access::EXEC,
+            "toolchain binaries and the Rust std library sources under the toolchain lib dir",
+        ));
+    }
     grants.extend(compiler_search_grants(request.rustc_executable));
     grants.extend(toolchain_grant_dirs());
     // The process-spawning halves — rustc's sysroot probe and the
@@ -673,7 +720,6 @@ async fn sandbox_grants(
         ));
     }
     grants.extend(toolchain?);
-
     Ok(grants)
 }
 
@@ -684,7 +730,6 @@ async fn sandbox_grants(
 /// cargo's `credentials`/`credentials.toml` are never among them.
 fn conditional_grants(
     cargo_home: &Path,
-    rustup_home: Option<&Path>,
     grants: &mut Vec<(PathBuf, Access, &'static str)>,
 ) {
     grants.push((
@@ -702,11 +747,6 @@ fn conditional_grants(
             cargo_home.join("git"),
             Access::READ,
             "git dependency database and checkouts fetched on the host — read-only like the registry",
-        ),
-        (
-            cargo_home.join("bin"),
-            Access::READ | Access::EXEC,
-            "the rustup proxy shims `cargo`/`rustc` when PATH leads there",
         ),
         (
             cargo_home.join("config.toml"),
@@ -727,15 +767,6 @@ fn conditional_grants(
         if path.exists() {
             grants.push((path, access, reason));
         }
-    }
-    if let Some(home) = rustup_home
-        && home.exists()
-    {
-        grants.push((
-            home.to_path_buf(),
-            Access::READ | Access::EXEC,
-            "toolchain binaries and the Rust std library sources under the toolchain lib dir",
-        ));
     }
 
     // The distro C header root every build script's `cc`/`c++` reads.

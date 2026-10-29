@@ -364,17 +364,25 @@ mod tests {
 
     #[test]
     fn grants_parse_and_validate() {
-        let config: IsolationConfig = toml::from_str(
+        // A TOML literal string (single quotes) keeps Windows backslashes
+        // unescaped; the path is absolute on the platform under test.
+        let openssl = if cfg!(windows) {
+            r"C:\opt\openssl"
+        } else {
+            "/opt/homebrew/opt/openssl"
+        };
+        let config: IsolationConfig = toml::from_str(&format!(
             r#"
             level = "strict"
 
             [[grant]]
             crate = "openssl-sys"
-            read = ["/opt/homebrew/opt/openssl"]
+            read = ['{openssl}']
             env = ["OPENSSL_DIR"]
             "#,
-        )
+        ))
         .unwrap();
+        assert_eq!(config.grants[0].read, [PathBuf::from(openssl)]);
         assert_eq!(config.grants[0].crate_name, "openssl-sys");
         config.grants[0].validate().unwrap();
     }
