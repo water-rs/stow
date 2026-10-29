@@ -277,6 +277,9 @@ pub struct ParsedCcInvocation {
     pub depfile: Option<DepfileRequest>,
     pub preprocess_args: Vec<OsString>,
     pub compile_hash_args: Vec<OsString>,
+    /// Whether the object records the compile-time working directory
+    /// (`DW_AT_comp_dir`), so the directory is part of its identity.
+    pub records_working_dir: bool,
 }
 
 pub async fn try_compile(
@@ -300,7 +303,8 @@ pub async fn try_compile(
             .wrap_err_with(|| format!("create C depfile directory {}", parent.display()))?;
     }
     let preprocessed = preprocess_source(compiler, &parsed).await?;
-    let cache_key = cache_key(&compiler_fingerprint, &parsed, &preprocessed);
+    let working_dir = std::env::current_dir().wrap_err("read the compiler working directory")?;
+    let cache_key = cache_key(&compiler_fingerprint, &parsed, &working_dir, &preprocessed);
     let cache_path = cc_cache_path(config, &cache_key);
 
     if let Some(parent) = cache_path.parent() {
@@ -685,19 +689,39 @@ async fn preprocess_source(
     Ok(output.stdout)
 }
 
+/// The key covers everything that shapes the object. `preprocessed` keeps
+/// its line markers (`# <line> "<file>"`): they carry the source and header
+/// paths and the line numbers `__builtin_LINE()`, `__builtin_FILE()` and
+/// the `.file` / debug line tables are compiled from, none of which survive
+/// `-P`. The working directory enters only when the object records it.
 fn cache_key(
     compiler_fingerprint: &[u8],
     parsed: &ParsedCcInvocation,
+    working_dir: &Path,
     preprocessed: &[u8],
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"stow-cc-v1");
+    hasher.update(b"stow-cc-v2");
     hasher.update(compiler_fingerprint);
     for arg in &parsed.compile_hash_args {
         hash_os_string(&mut hasher, arg);
     }
+    if parsed.records_working_dir {
+        hasher.update(b"cwd");
+        hash_os_string(&mut hasher, working_dir.as_os_str());
+    }
     hasher.update(preprocessed);
     hex::encode(hasher.finalize())
+}
+
+/// Whether the last debug-info flag in `args` leaves debug info on. Any
+/// `-g` spelling other than `-g0` counts (`-gline-tables-only` still records
+/// the compilation directory); an over-approximation only costs hits.
+fn debug_info_enabled(args: &[OsString]) -> bool {
+    args.iter()
+        .filter_map(|arg| arg.to_str())
+        .rfind(|arg| arg.starts_with("-g"))
+        .is_some_and(|arg| arg != "-g0")
 }
 
 fn hash_os_string(hasher: &mut Sha256, value: &OsStr) {
@@ -805,14 +829,16 @@ impl ParsedCcInvocation {
         }
         let depfile = depfile_options.build(&output_path);
 
+        // No `-P`: the line markers stay in the preprocessed text the key hashes.
         preprocess_args.push(OsString::from("-E"));
-        preprocess_args.push(OsString::from("-P"));
+        let records_working_dir = debug_info_enabled(&compile_hash_args);
 
         Ok(Some(Self {
             output_path,
             depfile,
             preprocess_args,
             compile_hash_args,
+            records_working_dir,
         }))
     }
 }
@@ -1058,7 +1084,7 @@ mod tests {
         assert_eq!(parsed.compile_hash_args, args(&["-Xpreprocessor", "-MD"]));
         assert_eq!(
             parsed.preprocess_args,
-            args(&["-Xpreprocessor", "-MD", "src/foo.c", "-E", "-P"])
+            args(&["-Xpreprocessor", "-MD", "src/foo.c", "-E"])
         );
     }
 
@@ -1073,7 +1099,7 @@ mod tests {
         assert_eq!(parsed.compile_hash_args, args(&["-Xclang", "-MF"]));
         assert_eq!(
             parsed.preprocess_args,
-            args(&["-Xclang", "-MF", "x.d", "-E", "-P"])
+            args(&["-Xclang", "-MF", "x.d", "-E"])
         );
     }
 
@@ -1235,6 +1261,93 @@ mod tests {
             std::fs::read(&served).expect("read served"),
             b"object bytes"
         );
+    }
+
+    /// Two sources whose preprocessed text is identical but that sit at
+    /// different files and lines must not share an object: the
+    /// `__builtin_LINE()`/`__builtin_FILE()` they compile in differ (stow#1048).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sources_at_different_file_and_line_get_different_keys() {
+        let cc = super::ResolvedCompiler::explicit(OsString::from("cc"));
+        if let Err(error) = async_process::Command::new(&cc.program)
+            .arg("--version")
+            .output()
+            .await
+        {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return;
+            }
+            panic!("spawn cc --version: {error}");
+        }
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let dir = tempdir.path();
+        let body = "const char *where_file(void) { return __builtin_FILE(); }\n\
+                    int where_line(void) { return __builtin_LINE(); }\n";
+        std::fs::write(dir.join("a.c"), format!("{}{body}", "// pad\n".repeat(10)))
+            .expect("write a.c");
+        std::fs::write(dir.join("b.c"), format!("{}{body}", "// pad\n".repeat(28)))
+            .expect("write b.c");
+        let config = test_config(dir.join("stow-cache"));
+        let compile_args = |name: &str| {
+            vec![
+                OsString::from("-c"),
+                dir.join(name).into_os_string(),
+                OsString::from("-o"),
+                dir.join(format!("{name}.o")).into_os_string(),
+            ]
+        };
+
+        let first_args = compile_args("a.c");
+        let first = super::try_compile(&config, &cc, &first_args)
+            .await
+            .expect("first try_compile");
+        let CcOutcome::Miss {
+            cache_path,
+            output_path,
+            ..
+        } = first
+        else {
+            panic!("first compile must be a cache miss");
+        };
+        let status = async_process::Command::new(&cc.program)
+            .args(&first_args)
+            .status()
+            .await
+            .expect("spawn cc");
+        assert!(status.success());
+        super::store_compiled_object(&config, &cache_path, &output_path)
+            .await
+            .expect("store compiled object");
+
+        let second = super::try_compile(&config, &cc, &compile_args("b.c"))
+            .await
+            .expect("second try_compile");
+        assert!(
+            matches!(second, CcOutcome::Miss { .. }),
+            "b.c at another file and line must not be served a.c's object"
+        );
+    }
+
+    /// The working directory keys an object only when debug info records it.
+    #[test]
+    fn working_dir_keys_only_objects_with_debug_info() {
+        let key = |flags: &[&str], dir: &str| {
+            let mut all = flags.to_vec();
+            all.extend(["-c", "a.c", "-o", "a.o"]);
+            let parsed = ParsedCcInvocation::parse(&args(&all))
+                .expect("parse")
+                .expect("cacheable");
+            super::cache_key(b"cc 1", &parsed, std::path::Path::new(dir), b"int x;")
+        };
+        assert_ne!(key(&["-g"], "/one"), key(&["-g"], "/two"));
+        assert_ne!(
+            key(&["-O2", "-gline-tables-only"], "/one"),
+            key(&["-O2", "-gline-tables-only"], "/two")
+        );
+        assert_eq!(key(&["-O2"], "/one"), key(&["-O2"], "/two"));
+        assert_eq!(key(&["-g", "-g0"], "/one"), key(&["-g", "-g0"], "/two"));
+        assert_ne!(key(&["-g0", "-g"], "/one"), key(&["-g0", "-g"], "/two"));
     }
 
     #[cfg(unix)]
