@@ -628,6 +628,11 @@ pub fn drain_finished_builds(out_dir: &Path) {
 /// (stow#667).
 pub async fn drain(target_dir: &Path, state_db: &StateDb) -> stow_types::error::Result<()> {
     let config = StowConfig::load_local(state_db.clone())?;
+    if !config.cache_mode.reaches_network() {
+        // Journals were written under a mode that reached the network; they
+        // wait for it to return.
+        return Ok(());
+    }
     let journals = finished_journals(target_dir);
     // The drain runs detached with stderr in `stow-drain.log`: one line
     // naming how many journals it found is what separates "the drain
@@ -1423,6 +1428,7 @@ mod tests {
 
     fn test_config(cache_dir: &Path) -> StowConfig {
         StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: cache_dir.to_path_buf(),

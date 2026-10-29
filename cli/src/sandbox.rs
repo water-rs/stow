@@ -1387,7 +1387,6 @@ fn sandbox_env_names(names: impl Iterator<Item = String>) -> Vec<String> {
         "STOW_TRACE_WRAPPED_COMPILERS",
         "STOW_IDENTITY_TRACE",
         "STOW_TRACE_FILE",
-        "STOW_DISABLE_PUBLIC_CACHE",
         "NO_COLOR",
         "CARGO_TERM_COLOR",
     ];

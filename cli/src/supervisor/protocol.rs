@@ -133,6 +133,9 @@ pub struct Compiled {
     pub ticket: u64,
     /// Whether rustc exited successfully.
     pub success: bool,
+    /// How long rustc ran, in milliseconds: the compile time a later local
+    /// hit on this unit saves.
+    pub compile_millis: u64,
 }
 
 /// The facade telling the supervisor about a compile it ran without
@@ -154,6 +157,9 @@ pub struct Observed {
     /// decision, carried as a frame because this unit never asked for a
     /// decision. `Some` reports the finished compile's exit status.
     pub success: Option<bool>,
+    /// How long the finished compile ran, in milliseconds; `0` on the mark
+    /// frame, which precedes the compile.
+    pub compile_millis: u64,
     /// The invocation's environment the supervisor cannot see.
     pub env: InvocationEnv,
 }
@@ -166,6 +172,7 @@ impl Observed {
         executable: &std::ffi::OsStr,
         args: &[OsString],
         success: Option<bool>,
+        compile_millis: u64,
         env: InvocationEnv,
     ) -> Self {
         Self {
@@ -173,6 +180,7 @@ impl Observed {
             executable: os_bytes::encode(executable),
             args: args.iter().map(|arg| os_bytes::encode(arg)).collect(),
             success,
+            compile_millis,
             env,
         }
     }

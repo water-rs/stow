@@ -27,11 +27,12 @@ const CI_HEADER: &str = "x-stow-ci";
 
 /// Build the edge HTTP client: configured request timeout plus the
 /// [`EdgeHeaders`] middleware that stamps identity and opt-out headers on
-/// every request.
-pub fn client(config: &StowConfig) -> impl Client {
-    zenwave::client()
+/// every request. Refuses a cache mode that does not reach the network.
+pub fn client(config: &StowConfig) -> stow_types::error::Result<impl Client> {
+    config.require_network("an edge request")?;
+    Ok(zenwave::client()
         .timeout(config.request_timeout)
-        .with(EdgeHeaders::new())
+        .with(EdgeHeaders::new()))
 }
 
 /// Whether `STOW_NO_ANALYTICS` is set to `1`.

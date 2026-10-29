@@ -384,7 +384,13 @@ fn scan_nonces(
 /// (stow#929).
 async fn submit_ticket(config: &StowConfig, ticket: EnqueueTicket) -> Option<String> {
     let url = format!("{}/api/v1/enqueue", config.edge_url.trim_end_matches('/'));
-    let mut client = crate::edge_client::client(config);
+    let mut client = match crate::edge_client::client(config) {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(task_id = %ticket.task_id, %error, "enqueue admission needs the network");
+            return Some(ticket.task_id);
+        }
+    };
     let result = client
         .post(&url)
         .and_then(|request| request.json_body(&ticket));
@@ -577,6 +583,7 @@ mod tests {
 
     fn test_config() -> StowConfig {
         StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: std::path::PathBuf::from("/tmp/stow-admission-test"),

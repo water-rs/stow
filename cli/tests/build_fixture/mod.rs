@@ -577,3 +577,56 @@ pub fn journal_files(target_dir: &Path) -> Vec<String> {
         })
         .unwrap_or_default()
 }
+
+/// Write the stow global config the fixture's child processes read: the
+/// home they share is the fixture's.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn write_fixture_config(dir: &Path, contents: &str) {
+    crate::support::write_global_config(&[&fixture_home(dir)], contents);
+}
+
+/// A listener that counts the connections it is offered and answers none,
+/// so a request made against it shows up in the count. Returns its URL and
+/// the counter.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn tripwire_url() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the tripwire");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("tripwire address")
+    );
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&connections);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if stream.is_err() {
+                break;
+            }
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    (url, connections)
+}
+
+/// `stow-cli <args>` in the fixture's hermetic environment, for the
+/// commands that are not builds (`stats`).
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn stow_cli_in(dir: &Path, args: &[&str], cache_dir: &Path, cargo_home: &Path) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
+    hermetic_stow_env(&mut command, &refused_url(), cache_dir, &fixture_home(dir));
+    command
+        .args(args)
+        .current_dir(dir)
+        .env("CARGO_HOME", cargo_home)
+        .env_remove("RUST_LOG");
+    command.output().expect("run stow-cli")
+}
