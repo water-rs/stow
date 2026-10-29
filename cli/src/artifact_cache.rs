@@ -102,6 +102,9 @@ pub struct LocalBuildArtifact {
     /// post-compile resolution hashed once — the local store records them
     /// verbatim instead of re-hashing the staged copy.
     pub outputs: Vec<LocalBuildOutput>,
+    /// How long rustc took to build the outputs, in milliseconds: the compile
+    /// time a later local hit on this entry reports as saved.
+    pub compile_millis: u64,
 }
 
 impl LocalBuildArtifact {
@@ -1426,7 +1429,7 @@ async fn record_local_entry_metadata(
             dependency_compile_keys_json: &binding.compile_keys_json,
             dependency_instances_json: &binding.instances_json,
             reach: build.reach,
-            compile_millis: 0,
+            compile_millis: build.compile_millis,
             target: &build.target,
             profile: &profile,
             emit: &emit,
@@ -6587,6 +6590,7 @@ pub mod tests {
 
     fn test_config(root: &std::path::Path) -> StowConfig {
         StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:8787".to_owned(),
             registry_base_url: "http://127.0.0.1:8787".to_owned(),
             cache_dir: root.join(".stow"),
@@ -6601,7 +6605,6 @@ pub mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 
@@ -6789,6 +6792,7 @@ pub mod tests {
             }
         }
         super::LocalBuildArtifact {
+            compile_millis: 0,
             target: "aarch64-apple-darwin".to_owned(),
             rustc_version: "1.91.1".to_owned(),
             identity,

@@ -889,6 +889,7 @@ mod tests {
 
     fn test_config(cache_dir: &Path) -> StowConfig {
         StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:8787".to_owned(),
             registry_base_url: "http://127.0.0.1:8787".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
@@ -903,7 +904,6 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 
@@ -1215,6 +1215,7 @@ mod tests {
             }
         });
         let config = StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             registry_base_url: format!("http://{address}"),
             ..test_config(tempdir.path())
         };
@@ -1285,6 +1286,7 @@ mod tests {
             }
         });
         let config = StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             registry_base_url: format!("http://{address}"),
             ..test_config(tempdir.path())
         };

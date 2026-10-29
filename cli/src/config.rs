@@ -43,8 +43,52 @@ const DEFAULT_INDEX_REFRESH_SECS: u64 = 600;
 /// eight stalled attempts (stow#977). Publishing keeps
 /// [`stow_oci::TransportPolicy::PATIENT`].
 const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// What the cache is allowed to touch (stow#1059): the `cache_mode` option of
+/// the global config, read by every stow process. It is independent of the
+/// build isolation level: a build with the cache off still runs its build
+/// scripts and proc macros at the configured level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheMode {
+    /// The public cache and the local cache. The default.
+    #[default]
+    Public,
+    /// The local cache only: no stow process makes a network request.
+    Local,
+    /// No cache at all: the local cache is neither read nor written, and no
+    /// stow process makes a network request.
+    Off,
+}
+
+impl CacheMode {
+    /// The name the config file spells.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Local => "local",
+            Self::Off => "off",
+        }
+    }
+
+    /// Whether stow may reach the index registry and the edge: the one
+    /// predicate every network call site is gated on.
+    pub const fn reaches_network(self) -> bool {
+        matches!(self, Self::Public)
+    }
+
+    /// Whether the local artifact and C/C++ caches are read and written.
+    pub const fn uses_local_cache(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StowConfig {
+    /// The global config's `cache_mode`. Every network request goes through
+    /// [`Self::registry_http`] or [`crate::edge_client::client`], which both
+    /// refuse a mode that does not reach the network.
+    #[serde(default)]
+    pub cache_mode: CacheMode,
     pub edge_url: String,
     /// OCI registry root every index/artifact pull hits, in
     /// `scheme://host[:port]` form — the pull appends `/v2/<repository>`
@@ -95,28 +139,6 @@ pub struct StowConfig {
     /// paid for eagerly.
     #[serde(skip, default = "Arc::default")]
     pub artifact_cache_staging: Arc<OnceCell<Arc<crate::artifact_cache::StagingDir>>>,
-    /// Experimental opt-ins, from the config file's `[experimental]`
-    /// table: the heel sandbox a build's cargo runs inside (stow#779).
-    #[serde(default)]
-    pub experimental: ExperimentalConfig,
-}
-
-/// The `[experimental]` table: features a user opts into knowing they
-/// may still change shape.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ExperimentalConfig {
-    /// `experimental.sandbox = true`: run the cargo build inside a heel
-    /// sandbox (stow#779). The `--sandbox` flag enables the same thing
-    /// for one invocation.
-    #[serde(default)]
-    pub sandbox: bool,
-    /// `experimental.sandbox_deny_network = true`: the sandbox above,
-    /// plus a deny on every network connection the build attempts —
-    /// only the rustc wrapper's socket to this stow process stays
-    /// reachable. The `--sandbox-deny-network` flag enables it for one
-    /// invocation and implies `--sandbox`.
-    #[serde(default)]
-    pub sandbox_deny_network: bool,
 }
 
 impl StowConfig {
@@ -149,12 +171,31 @@ impl StowConfig {
         Ok(Arc::clone(material))
     }
 
+    /// Refuse a network request in a cache mode that does not reach the
+    /// network. Callers gate on [`CacheMode::reaches_network`] first, so the
+    /// failure is a wiring bug, never a path a build takes.
+    ///
+    /// # Errors
+    ///
+    /// The cache mode is `local` or `off`.
+    pub fn require_network(&self, what: &str) -> stow_types::error::Result<()> {
+        if self.cache_mode.reaches_network() {
+            return Ok(());
+        }
+        Err(stow_types::stow_error!(
+            "{what} needs the network, but `cache_mode` is `{}`; set `cache_mode = \"public\"` in the stow config to allow it",
+            self.cache_mode.as_str()
+        ))
+    }
+
     /// Get (lazily building) the registry HTTP client for this config.
     ///
     /// # Errors
     ///
-    /// Whatever building the client fails with.
+    /// The cache mode does not reach the network, or whatever building the
+    /// client fails with.
     pub async fn registry_http(&self) -> stow_types::error::Result<stow_oci::RegistryHttp> {
+        self.require_network("a registry request")?;
         let http = self
             .registry_http
             .get_or_try_init(|| {
@@ -271,6 +312,10 @@ impl StowConfig {
         let verify_mode = load_verify_mode(file_config.as_ref())?;
 
         Ok(Self {
+            cache_mode: file_config
+                .as_ref()
+                .and_then(|config| config.cache_mode)
+                .unwrap_or_default(),
             edge_url,
             registry_base_url: resolve_registry_base_url(file_config.as_ref()),
             cache_dir: local_cache_dir,
@@ -303,9 +348,6 @@ impl StowConfig {
             trust_material: Arc::default(),
             registry_http: Arc::default(),
             artifact_cache_staging: Arc::default(),
-            experimental: file_config
-                .and_then(|config| config.experimental)
-                .unwrap_or_default(),
         })
     }
 
@@ -316,6 +358,10 @@ impl StowConfig {
         let file_config = load_user_config()?;
         let verify_mode = load_verify_mode(file_config.as_ref())?;
         Ok(Self {
+            cache_mode: file_config
+                .as_ref()
+                .and_then(|config| config.cache_mode)
+                .unwrap_or_default(),
             edge_url: resolve_edge_url(file_config.as_ref()),
             registry_base_url: resolve_registry_base_url(file_config.as_ref()),
             cache_dir: resolve_cache_dir(file_config.as_ref())?,
@@ -348,9 +394,6 @@ impl StowConfig {
             trust_material: Arc::default(),
             registry_http: Arc::default(),
             artifact_cache_staging: Arc::default(),
-            experimental: file_config
-                .and_then(|config| config.experimental)
-                .unwrap_or_default(),
         })
     }
 
@@ -385,6 +428,62 @@ pub fn config_file_path() -> stow_types::error::Result<PathBuf> {
     let config_dir =
         dirs::config_dir().ok_or_else(|| stow_types::stow_error!("resolve config directory"))?;
     Ok(config_dir.join("stow").join("config.toml"))
+}
+
+/// The `[isolation]` table of the global config, the defaults when the file
+/// or the table is absent.
+///
+/// Read on its own rather than through [`StowConfig`], so a config that cannot
+/// be parsed fails the build instead of leaving it to run at a level the user
+/// did not choose.
+///
+/// # Errors
+///
+/// A config file that exists and cannot be read or parsed.
+pub fn load_isolation_config() -> stow_types::error::Result<crate::isolation::IsolationConfig> {
+    Ok(load_user_config()?
+        .and_then(|config| config.isolation)
+        .unwrap_or_default())
+}
+
+/// The `cache_mode` of the global config, `public` when the file or the
+/// option is absent. A driver's `STOW_CONFIG_BLOB` carries it already, so a
+/// wrapper under a driver never re-reads the file.
+///
+/// # Errors
+///
+/// A config file that exists and cannot be read or parsed, or a blob that
+/// cannot be decoded.
+pub fn load_cache_mode() -> stow_types::error::Result<CacheMode> {
+    #[derive(serde::Deserialize)]
+    struct Blob {
+        #[serde(default)]
+        cache_mode: CacheMode,
+    }
+    if let Some(raw) = std::env::var_os(STOW_CONFIG_BLOB_ENV) {
+        let raw = raw
+            .into_string()
+            .map_err(|_| stow_types::stow_error!("{STOW_CONFIG_BLOB_ENV} must be valid UTF-8"))?;
+        let blob: Blob = serde_json::from_str(&raw)
+            .wrap_err_with(|| format!("parse {STOW_CONFIG_BLOB_ENV} as JSON"))?;
+        return Ok(blob.cache_mode);
+    }
+    Ok(load_user_config()?
+        .and_then(|config| config.cache_mode)
+        .unwrap_or_default())
+}
+
+/// The directory the isolation audit logs are written to: the per-user data
+/// directory, apart from the artifact cache, since an audit trail is written
+/// at every cache mode.
+///
+/// # Errors
+///
+/// No per-user data directory on this platform.
+pub fn audit_dir() -> stow_types::error::Result<PathBuf> {
+    let data_dir = dirs::data_local_dir()
+        .ok_or_else(|| stow_types::stow_error!("resolve the per-user data directory"))?;
+    Ok(data_dir.join("stow").join("audit"))
 }
 
 pub fn cache_dir() -> stow_types::error::Result<PathBuf> {
@@ -522,6 +621,7 @@ fn load_user_config() -> stow_types::error::Result<Option<StowUserConfig>> {
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct StowUserConfig {
+    cache_mode: Option<CacheMode>,
     edge_url: Option<String>,
     registry_base_url: Option<String>,
     cache_dir: Option<String>,
@@ -532,7 +632,7 @@ struct StowUserConfig {
     artifact_cache_max_bytes: Option<u64>,
     index_refresh_secs: Option<u64>,
     verify_mode: Option<String>,
-    experimental: Option<ExperimentalConfig>,
+    isolation: Option<crate::isolation::IsolationConfig>,
     #[cfg(feature = "mock-verify")]
     mock_public_key_path: Option<String>,
 }

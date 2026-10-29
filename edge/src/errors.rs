@@ -97,6 +97,12 @@ pub enum QueueError {
     /// has no record for.
     #[error("request report for unknown request `{0}`")]
     UnknownRequest(String),
+    /// A slice report that does not extend the slice's live generation:
+    /// a delta whose base is not the live generation, or whose
+    /// generation is not the next one. Handlers map this to
+    /// `409 Conflict`: the reporter resyncs with a full report.
+    #[error("{0}")]
+    SliceReportConflict(String),
     /// A request-lane report claimed an attempt that is not the record's
     /// live one — a stale report from a superseded run. Handlers map
     /// this to `409 Conflict`: retrying it unchanged can never apply.

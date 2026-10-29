@@ -79,7 +79,7 @@ glob = "0.3"
 reflink-copy = { version = "0.1.30", default-features = false }
 walkdir = "2"
 shell-words = "1.1"
-heel = { version = "0.5.1", default-features = false }
+heel = { version = "0.7.1", default-features = false }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "tls-rustls", "macros"] }
 axoupdater = "0.10"
 which = "8"

@@ -12,6 +12,13 @@ file values. Keys the file does not model are ignored, not rejected.
 ## Schema
 
 ```toml
+# What the cache may touch; every stow process reads it.
+# - "public": the public cache and the local cache. Default.
+# - "local":  the local cache only; no stow process makes a network request.
+# - "off":    no cache: the local cache is neither read nor written, and no
+#            network request is made. Build isolation is unaffected.
+cache_mode = "public"
+
 # HTTPS URL of the edge worker that mints miss admissions.
 # Defaults to the production edge, https://stow.waterui.dev; set it only for
 # mock or staging runs. May also be set via $STOW_EDGE_URL.

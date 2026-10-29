@@ -45,34 +45,105 @@ workspace mirror instead of prompting. Recommended for CI.
 stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 ```
 
-`--sandbox` (experimental) runs the cargo build inside a heel sandbox:
-cargo, rustc, every build script, proc-macro and linker it spawns are cut
-off from the machine outside a declared grant set — the workspace and the
-target directory are read/write (writes under the target directory only;
-sources stay read-only), the toolchain, cargo registry and stow's wrapper
-shims are read, credentials files (`credentials`/`credentials.toml`) and
-the home directory are never granted, the clipboard is denied, and the
-environment is an allowlist. Stow fetches dependencies first, then the
-sandboxed cargo runs offline; a sandbox that cannot be set up fails the
-command — there is no unsandboxed fallback.
+## Cache mode
 
-`--sandbox-deny-network` goes further and denies the build all network
-access: the only channel out of the sandbox is the socket the rustc
-wrapper uses to reach the supervising stow process.
+One option in the config file ([`CONFIG.md`](CONFIG.md)) decides what the cache
+may touch, and every stow process reads it: `stow build`, the rustc wrapper
+plain `cargo` runs, and `stow stats`.
+
+| `cache_mode` | Public cache | Local cache | Network |
+| --- | --- | --- | --- |
+| `public` (default) | Used | Used | Index pulls, bundle downloads, admissions and the daily usage report |
+| `local` | Not used | Used | None: no stow process makes a request |
+| `off` | Not used | Neither read nor written | None |
+
+The mode is independent of build isolation: with the cache `off`, `stow build`
+still runs every build script and proc macro at the configured isolation level
+(below). `stow stats` reports the compile time local hits saved in every mode.
+Commands that exist to talk to the public cache (`stow predict`,
+`stow index refresh`, `stow check-artifact`, `stow fetch-artifact`) fail with a
+message naming the mode; `stow setup` skips the index fetch.
+
+## Build isolation
+
+Every cargo-running command confines the build — cargo, rustc, every build
+script, proc-macro and linker it spawns — at one of four levels. The level
+is independent of the cache mode: it holds with the public cache on or off.
+
+| Level | Files | Network | Environment |
+| --- | --- | --- | --- |
+| `protect` (default except on Windows) | The machine is open except credential stores, which cannot be read, and persistence locations, which cannot be written | Allowed through an audited proxy | Host variables, minus credential variables |
+| `strict` (default on Windows) | An allowlist: the workspace and target directory, the toolchain and registry, stow's shims | Allowed through an audited proxy | An allowlist |
+| `offline` | As `strict` | None; the only channel out is the socket the rustc wrapper uses to reach stow | An allowlist |
+| `off` | No confinement | Unrestricted | Unrestricted |
 
 ```sh
-stow build --sandbox
-stow build --sandbox-deny-network
+stow build                       # protect (strict on Windows)
+stow build --isolation strict
+stow build --isolation offline
+stow build --isolation off
 ```
 
-The same switches exist in the config file, so an `experimental` table
-enables them for every cargo-running command:
+The config file sets the default for every cargo-running command; the flag
+overrides it:
 
 ```toml
-[experimental]
-sandbox = true
-sandbox_deny_network = true
+[isolation]
+level = "strict"
+audit_files = 30
 ```
+
+`protect` does not fetch ahead of the build: cargo runs online inside the
+sandbox, with a writable cargo home. `strict` and `offline` fetch
+dependencies first and run cargo offline inside.
+
+What `protect` denies is a fixed list:
+
+- Reads of credential stores: SSH and GPG keys and agents, forge and
+  registry tokens (`gh`, `glab`, `~/.cargo/credentials*`, `.npmrc`, `.pypirc`,
+  `.netrc`, `.git-credentials`, Docker, Terraform, Vault, 1Password and
+  `pass` data), cloud-provider configuration (AWS, Azure, gcloud, kube, OCI,
+  DigitalOcean, Heroku, Fly, Wrangler), browser profiles and cookies, and
+  the macOS keychains with the Security service. The `SSH_AUTH_SOCK` and
+  `GNUPGHOME` targets are denied wherever they point.
+- Writes to persistence locations: shell startup files, `~/.ssh`,
+  `~/.gitconfig` and `~/.config/git`, `~/.cargo/bin`, `~/.cargo/config*`,
+  `~/.local/bin`, launch agent and daemon directories, systemd and autostart
+  units, and `.git/hooks` in any repository except cargo's own git cache.
+
+A refused access fails the build script, and a build script that needs a
+path or variable `strict` or `offline` withholds gets it through a grant:
+
+```toml
+[[isolation.grant]]
+crate = "openssl-sys"
+read = ["/opt/homebrew/opt/openssl"]
+write = []
+exec = []
+env = ["OPENSSL_DIR"]
+```
+
+A grant applies at `strict` and `offline` only when the crate is in the
+build's `Cargo.lock`; paths must be absolute. `protect` is open outside the
+denylists and takes no grants.
+
+Every network destination and every denied access is recorded under
+`<local data dir>/stow/audit`: `network-audit.<date>.jsonl` files from the proxy and
+`denied-access.<date>.jsonl` with one JSON line per denial. `audit_files`
+(default 30) is the number of daily files kept of each. Denied accesses are
+recorded on macOS and Linux; Windows reports none.
+
+`protect` is enforced on macOS and Linux through heel's credential and
+persistence denylists. On Linux it, like `strict` and `offline`, needs kernel
+6.7 or newer, and the denylists also need `kernel.yama.ptrace_scope` of 1 or
+lower; a host that fails either makes the command fail with an error naming
+the isolation level and the cause, never a build with less protection. On
+Windows heel refuses the denylists, so `protect` fails when the sandbox is
+created; `strict`, `offline` and `off` work there, and `strict` is the
+default on Windows (it reads and writes only the granted paths, so
+credentials are unreachable). An explicit `protect` on Windows still fails and
+is never replaced by `strict`. No level falls back to
+another. A sandbox that cannot be set up fails the command.
 
 ## `stow predict`
 
@@ -469,14 +540,17 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   `--projects`.
 - `stow-admin index export --out-dir <dir>` /
   `index publish --file <index> --folded <folded>` /
-  `index report --file <index>` / `index targets` — export
+  `index report --file <index>` / `index reconcile --rustc-version <r>` /
+  `index targets` — export
   every changed index slice in one pass from the registry's verified
   records artifacts (each `index.<t>.<r>` plus its `folded.<t>.<r>`
   companion; only the records tags no folded set covers are pulled),
   push both to GHCR signed under the index workflow (mock deploys
   delegate to `stow-mock-registry publish-index`), and report each
   slice's membership to the scheduler. `index-publish.yml`
-  runs this loop after every `build-crate` run. `index targets` lists
+  runs this loop after every `build-crate` run, preceded by `index
+  reconcile`, which reports in full every published slice whose
+  generation the scheduler does not hold. `index targets` lists
   the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/water-rs/stow/compare/stow-cli-v0.9.2...stow-cli-v0.10.0) - 2026-10-29
+
+### Added
+
+- *(cli)* isolation levels for build scripts and proc macros ([#1073](https://github.com/water-rs/stow/pull/1073))
+- *(cli)* key remote git units and extra codegen flags in the local cache ([#1043](https://github.com/water-rs/stow/pull/1043))
+
+### Fixed
+
+- *(cli)* key optimized check defaults, keep option order, recompute semantic candidate keys ([#1065](https://github.com/water-rs/stow/pull/1065))
+- *(cli)* key C/C++ objects on line markers, file identity and debug cwd ([#1057](https://github.com/water-rs/stow/pull/1057))
+- *(cli)* merge further bundles of one compile key into its local entry ([#1054](https://github.com/water-rs/stow/pull/1054))
+
 ## [0.9.2](https://github.com/water-rs/stow/compare/stow-cli-v0.9.1...stow-cli-v0.9.2) - 2026-10-28
 
 ### Fixed

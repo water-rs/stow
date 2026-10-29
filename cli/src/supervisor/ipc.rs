@@ -4,7 +4,7 @@
 //! unix socket or loopback listener: heel's `deny network*` profile
 //! leaves exactly one outbound channel — the sandbox's own IPC socket —
 //! and on Windows an `AppContainer` without a network capability cannot
-//! open loopback at all. So under `--sandbox` the supervisor's frames
+//! open loopback at all. So under `--isolation` the supervisor's frames
 //! ride heel's IPC instead: one `IpcCall` per supervisor `Request`,
 //! answered with the `Answer` the socket transport would have written.
 //!

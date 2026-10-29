@@ -50,7 +50,9 @@ fn route_error(error: QueueError) -> Error {
         | QueueError::EmptySelector
         | QueueError::PurgeRequiresAge => StatusCode::BAD_REQUEST,
         QueueError::UnknownRequest(_) => StatusCode::NOT_FOUND,
-        QueueError::RequestAttemptSuperseded { .. } => StatusCode::CONFLICT,
+        QueueError::RequestAttemptSuperseded { .. } | QueueError::SliceReportConflict(_) => {
+            StatusCode::CONFLICT
+        }
         QueueError::QueueFull { .. } | QueueError::HumanDailyBudgetExhausted { .. } => {
             StatusCode::TOO_MANY_REQUESTS
         }
@@ -1703,8 +1705,8 @@ pub(super) async fn published_index_pass(
     binding_settings(env)?;
     let graph = ensure_graph(env, db, graph).await?;
     // The run's slices append in one commit; their flips land on the
-    // same turn (stow#878 — no generation fencing: reports apply to
-    // in-memory masks, deltas stay idempotent on re-application).
+    // same turn. A report that does not extend a slice's live
+    // generation is refused before anything appends.
     routes::slice_reports(graph, db, slices, Some(actor), now_ms())
         .await
         .map_err(route_error)?;

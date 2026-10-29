@@ -1956,12 +1956,12 @@ pub struct RequestStatus {
 ///
 /// - **Delta** — `base_generation` is the index generation the report's
 ///   base was taken from; `added`/`retired` carry only what moved. The
-///   scheduler 409s when its live generation moved past the base —
-///   `index report` then resyncs once with a full report; a stale
-///   delta is never retried.
+///   scheduler 409s unless the base is exactly the slice's live
+///   generation and `generation` is the next one — `index report` then
+///   resyncs once with a full report; a stale delta is never retried.
 /// - **Full** — `base_generation` is `None`, `added` carries the slice's
-///   whole membership and `retired` is empty; the scheduler computes the
-///   delta itself. This is the first-publish path, the
+///   whole membership and `retired` is empty; the scheduler replaces the
+///   slice's set with it. This is the first-publish path, the
 ///   `stow-admin index report --full` resync, and the resync a refused
 ///   delta triggers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1971,13 +1971,10 @@ pub struct PublishedSliceReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_generation: Option<i64>,
     /// The generation of the index this report publishes — the value
-    /// stamped in the index header. Present on every report the
-    /// current reporter sends; absent from older reporters. The
-    /// scheduler records it as the slice's applied generation so a
-    /// full resync brings the optimistic-lock counter back into sync
-    /// with the index sequence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<i64>,
+    /// stamped in the index header. The scheduler records it as the
+    /// slice's live generation: a delta applies only on top of it, and
+    /// a full report replaces the slice's set and sets it.
+    pub generation: i64,
     /// Rows entering the slice (a delta's additions, or the whole
     /// membership on a full report).
     pub added: Vec<PublishedSliceRow>,
@@ -2026,8 +2023,7 @@ pub struct PublishedSlice {
     pub base_generation: Option<i64>,
     /// The generation of the index this report publishes — the value
     /// stamped in the index header.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub generation: Option<i64>,
+    pub generation: i64,
     /// Rows entering the slice.
     pub added: Vec<PublishedSliceRow>,
     /// Rows leaving the slice — always empty on a full report.
@@ -3034,6 +3030,21 @@ pub struct AdminStatus {
     /// Whether the dispatch-freeze breaker is engaged — dispatch stopped,
     /// enqueue still open.
     pub dispatch_frozen: bool,
+    /// The live generation of every index slice the scheduler has been
+    /// reported — what `stow-admin index report --reconcile` compares
+    /// the published slices against.
+    pub index_slices: Vec<AdminIndexSlice>,
+}
+
+/// One reported index slice inside [`AdminStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AdminIndexSlice {
+    /// The slice's compilation target.
+    pub target: TargetTriple,
+    /// The slice's rustc.
+    pub rustc_version: WireRustcVersion,
+    /// The index generation the scheduler last applied for the slice.
+    pub generation: i64,
 }
 
 /// Response of `POST /api/v1/scheduler/tasks/submit` — what a request batch
@@ -5575,8 +5586,7 @@ pub enum SchedulerEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_generation: Option<i64>,
         /// The index generation this report publishes.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        generation: Option<i64>,
+        generation: i64,
         /// Membership rows the report adds.
         added: Vec<PublishedSliceRow>,
         /// Membership rows the report retires.

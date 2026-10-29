@@ -247,13 +247,28 @@ async fn run_inner(
     args: CargoCommandArgs,
     state_db: &StateDb,
 ) -> stow_types::error::Result<ExitStatus> {
-    let mut invocation = CargoInvocation::new(command, args);
+    // The level is settled before anything runs: a config that cannot be read,
+    // or a level this platform cannot enforce, fails the command here and never
+    // lets a build start at some other level (stow#1000).
+    let isolation = crate::isolation::Isolation::resolve(
+        args.isolation.isolation,
+        crate::config::load_isolation_config()?,
+    )?;
+    let invocation = CargoInvocation::new(command, args, isolation);
     let config =
         tracing::debug_span!("stow.precargo.config_load").in_scope(|| load_stow_config(state_db));
-    invocation.sandbox = resolve_sandbox_request(&invocation, config.as_ref())?;
     let project = begin_project(config.as_ref(), &invocation).await?;
-    let mut public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
-    if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
+    let mut public_cache_mode = PublicCacheMode::for_build(
+        &project.rustc_version,
+        config
+            .as_ref()
+            .map(|config| config.cache_mode)
+            .unwrap_or_default(),
+    );
+    if let PublicCacheMode::Disabled {
+        message: Some(message),
+    } = &public_cache_mode
+    {
         write_stdout(&format!("{message}\n"))?;
     }
 
@@ -272,8 +287,7 @@ async fn run_inner(
         );
         write_stdout(&format!("{message}\n"))?;
         public_cache_mode = PublicCacheMode::Disabled {
-            reason: "profile",
-            message,
+            message: Some(message),
         };
     }
 
@@ -466,7 +480,7 @@ async fn run_uncovered_passthrough(
         &invocation.action,
         &invocation.cargo_args,
         project.current_dir(),
-        invocation.sandbox,
+        &invocation.isolation,
     )
     .await
     .map(Some)
@@ -515,10 +529,10 @@ async fn run_original_workspace_build(
             .map(|analysis| analysis.inexact_entries.as_slice()),
         // A configured build's facts came from the filesystem-only pass:
         // the full graph analysis is owed to the build while cargo runs.
-        deferred_analysis: config.is_some(),
+        deferred_analysis: config.is_some_and(|config| config.cache_mode.reaches_network()),
         semantic_fallback_enabled,
         covered_units,
-        sandbox: invocation.sandbox,
+        isolation: &invocation.isolation,
     })
     .await
 }
@@ -612,7 +626,7 @@ async fn run_mirrored_upgrade_build(
         deferred_analysis: false,
         semantic_fallback_enabled: mirror_semantic_fallback,
         covered_units: mirror_prefetch.as_ref().map_or(0, Vec::len),
-        sandbox: invocation.sandbox,
+        isolation: &invocation.isolation,
     })
     .await
 }
@@ -670,14 +684,10 @@ async fn analyze_for_prediction(
     args: CargoCommandArgs,
     state_db: &StateDb,
 ) -> stow_types::error::Result<Option<WorkspacePrediction>> {
-    let invocation = CargoInvocation::new("predict", args);
+    // `predict` reads cargo's metadata and unit graph and compiles nothing, so
+    // there is no build script or proc macro to isolate.
+    let invocation = CargoInvocation::new("predict", args, crate::isolation::Isolation::off());
     let project = ProjectContext::load(&invocation).await?;
-    let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
-    if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
-        write_stdout(&format!("{message}\n"))?;
-        return Ok(None);
-    }
-
     // Unlike `check`/`build`, `predict` has no cargo run to protect: an
     // analysis it cannot compute is the command failing, and callers rely
     // on the exit status saying so.
@@ -686,6 +696,14 @@ async fn analyze_for_prediction(
             "stow predict is unavailable because stow is not configured.\nreason: {error}"
         )
     })?;
+    config.require_network("stow predict")?;
+    if let PublicCacheMode::Disabled {
+        message: Some(message),
+    } = PublicCacheMode::for_build(&project.rustc_version, config.cache_mode)
+    {
+        write_stdout(&format!("{message}\n"))?;
+        return Ok(None);
+    }
     analyze_workspace_prediction(
         &project,
         project.current_dir(),
@@ -706,14 +724,13 @@ struct CargoInvocation {
     cargo_args: Vec<OsString>,
     silent_compatible_upgrades: bool,
     use_stow_resolver: bool,
-    /// The resolved sandbox request — `None` unless the flags or the
-    /// config opted in (stow#779). `new` carries the flags' answer,
-    /// which `run_inner` merges with the config's `experimental` table.
-    sandbox: Option<crate::sandbox::SandboxNetwork>,
+    /// The level this run's cargo, build scripts and proc macros run at,
+    /// resolved from `--isolation` and the config (stow#1000).
+    isolation: crate::isolation::Isolation,
 }
 
 impl CargoInvocation {
-    fn new(action: &str, args: CargoCommandArgs) -> Self {
+    fn new(action: &str, args: CargoCommandArgs, isolation: crate::isolation::Isolation) -> Self {
         Self {
             action: action.to_owned(),
             cargo_args: args.cargo_args,
@@ -723,42 +740,9 @@ impl CargoInvocation {
             // Users opt out with `--no-stow-resolver` when they specifically
             // want cargo's own resolver to pick versions.
             use_stow_resolver: !args.no_stow_resolver,
-            sandbox: crate::sandbox::SandboxNetwork::from_flags(
-                args.sandbox.sandbox,
-                args.sandbox.sandbox_deny_network,
-            ),
+            isolation,
         }
     }
-}
-
-/// Merge the invocation's `--sandbox*` flags with the config's
-/// `experimental` table: either source turns the sandbox on, and either
-/// source's deny switch makes it deny-all (which implies sandbox). A
-/// `--sandbox` invocation on a platform heel has no backend for fails
-/// the command here, before any cargo runs (stow#779).
-fn resolve_sandbox_request(
-    invocation: &CargoInvocation,
-    config: Option<&StowConfig>,
-) -> stow_types::error::Result<Option<crate::sandbox::SandboxNetwork>> {
-    let sandbox = crate::sandbox::SandboxNetwork::merge(
-        invocation.sandbox,
-        config.and_then(|config| {
-            crate::sandbox::SandboxNetwork::from_flags(
-                config.experimental.sandbox,
-                config.experimental.sandbox_deny_network,
-            )
-        }),
-    );
-    if sandbox.is_none() {
-        return Ok(None);
-    }
-    if !crate::sandbox::SANDBOX_SUPPORTED {
-        return Err(stow_types::stow_error!(
-            "--sandbox is not supported on {}: the heel sandbox backend exists for Linux, macOS and Windows",
-            std::env::consts::OS
-        ));
-    }
-    Ok(sandbox)
 }
 
 #[derive(Debug, Clone)]
@@ -2054,7 +2038,7 @@ async fn query_admissions(
         entries: entries.to_vec(),
         expanded_entries: expanded_entries.to_vec(),
     };
-    let mut client = crate::edge_client::client(config);
+    let mut client = crate::edge_client::client(config)?;
     let response = client
         .post(&url)?
         .json_body(&request)?
@@ -2374,7 +2358,7 @@ async fn try_stow_resolver(
         return Ok(None);
     };
 
-    let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
+    let public_cache_mode = PublicCacheMode::for_build(&project.rustc_version, config.cache_mode);
     let Some(pinned) = prepare_pinned_mirror(project, invocation, &stow_lockfile_toml).await?
     else {
         return Ok(None);
@@ -2603,7 +2587,7 @@ async fn run_pinned_mirror_build(
         deferred_analysis: false,
         semantic_fallback_enabled: mirror_semantic_fallback,
         covered_units: mirror_prefetch.len(),
-        sandbox: invocation.sandbox,
+        isolation: &invocation.isolation,
     })
     .await
 }
@@ -3616,11 +3600,18 @@ async fn run_cargo_passthrough(
     action: &str,
     cargo_args: &[OsString],
     current_dir: &Path,
-    sandbox: Option<crate::sandbox::SandboxNetwork>,
+    isolation: &crate::isolation::Isolation,
 ) -> stow_types::error::Result<ExitStatus> {
-    if let Some(network) = sandbox {
-        return run_cargo_passthrough_sandboxed(project, action, cargo_args, current_dir, network)
-            .await;
+    if let Some(confinement) = isolation.level.confinement() {
+        return run_cargo_passthrough_sandboxed(
+            project,
+            action,
+            cargo_args,
+            current_dir,
+            confinement,
+            isolation,
+        )
+        .await;
     }
     let status = passthrough_command(project, action, cargo_args, current_dir)
         .await?
@@ -3635,18 +3626,22 @@ async fn run_cargo_passthrough(
 }
 
 /// The passthrough's sandboxed form (stow#779): no `RUSTC_WRAPPER`, no
-/// supervisor — the sandbox alone enforces the boundary. Dependencies
-/// are fetched on the host first, then cargo runs `--offline` inside.
-/// With no facades there is no IPC router either: a denied-network
-/// build's only channel out does not exist, which is the point.
+/// supervisor — the sandbox alone enforces the boundary. At `strict` and
+/// `offline` the dependencies are fetched on the host first and cargo
+/// runs `--offline` inside; at `protect` cargo fetches for itself through
+/// the sandbox's proxy. With no facades there is no IPC router either: an
+/// `offline` build's only channel out does not exist, which is the point.
 async fn run_cargo_passthrough_sandboxed(
     project: &ProjectContext,
     action: &str,
     cargo_args: &[OsString],
     current_dir: &Path,
-    network: crate::sandbox::SandboxNetwork,
+    confinement: crate::isolation::Confinement,
+    isolation: &crate::isolation::Isolation,
 ) -> stow_types::error::Result<ExitStatus> {
-    crate::sandbox::fetch_dependencies(current_dir, cargo_args).await?;
+    if confinement.is_allowlist() {
+        crate::sandbox::fetch_dependencies(current_dir, cargo_args).await?;
+    }
     let mold_args = project.mold.config_args().await?;
     let mut argv = Vec::with_capacity(cargo_args.len() + mold_args.len() * 2 + 2);
     argv.push(OsString::from(action));
@@ -3655,9 +3650,10 @@ async fn run_cargo_passthrough_sandboxed(
         argv.push(OsString::from(config_arg));
     }
     argv.extend(cargo_args.iter().cloned());
-    if !argv
-        .iter()
-        .any(|arg| arg == "--offline" || arg == "--frozen")
+    if confinement.is_allowlist()
+        && !argv
+            .iter()
+            .any(|arg| arg == "--offline" || arg == "--frozen")
     {
         argv.push(OsString::from("--offline"));
     }
@@ -3680,7 +3676,9 @@ async fn run_cargo_passthrough_sandboxed(
         source_roots.push(manifest_root);
     }
     let request = crate::sandbox::SandboxRequest {
-        network,
+        confinement,
+        isolation,
+        lockfile_root: &project.workspace_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
         scratch_dir: None,
@@ -3785,9 +3783,9 @@ struct CargoRunPlan<'a> {
     deferred_analysis: bool,
     semantic_fallback_enabled: bool,
     covered_units: usize,
-    /// The heel sandbox cargo runs inside, `None` for the default
-    /// unsandboxed build (stow#779).
-    sandbox: Option<crate::sandbox::SandboxNetwork>,
+    /// The level the build's cargo, build scripts and proc macros run at
+    /// (stow#1000).
+    isolation: &'a crate::isolation::Isolation,
 }
 
 /// The build's cargo run under the wrapper. Returns cargo's own exit
@@ -3900,7 +3898,9 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         crate::BuildContext {
             policy_dir: cache_policy_path.clone(),
             public_cache_target: Some(project.target.clone()),
-            public_cache_disabled: public_cache_mode.disable_reason().is_some(),
+            public_cache_disabled: !public_cache_mode.is_enabled(),
+            local_cache_disabled: config
+                .is_some_and(|config| !config.cache_mode.uses_local_cache()),
             analysis: std::sync::Arc::clone(&analysis_cell),
             serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
             policy_ready: std::sync::Arc::clone(&policy_ready),
@@ -4007,31 +4007,12 @@ async fn finish_cargo_run(
         if status.success() {
             report_cache_coverage(config, before, covered_units).await;
         }
-        // The build's compile observations are its miss list (stow#317)
-        // — a failed build's units are real misses too, whatever its
-        // last unit did. They land in the same journal a plain-cargo
-        // wrapper writes, and a detached drain posts the admission —
-        // this command returns as soon as cargo does. The hold is
-        // given up first: the drain this build spawns must find the
-        // gate open (stow#667).
         plan.project.foreground.release();
-        // The day's usage report posts from the detached drain — never
-        // on the build's wall clock — so a due report is a reason to
-        // spawn that drain even when this build leaves no journal
-        // (stow#889).
-        let report_due = crate::report::report_due_today(config).await;
-        journal_and_drain_misses(
-            plan.project,
-            plan.cargo_args,
-            plan.current_dir,
-            &handler.observations(),
-            plan.inexact_entries.unwrap_or(&[]),
-            report_due,
-        );
-        // One supervised run is one build the install ran — counted
-        // here rather than by the journal, whose supervised files the
-        // drain skips to keep the count single.
-        crate::report::bump_build(config).await;
+        // Misses, admissions and the usage report exist only to reach the
+        // network; the local-only and off cache modes keep none of them.
+        if config.cache_mode.reaches_network() {
+            admit_build_misses(plan, config, handler).await;
+        }
     }
     // Nothing writes into the scratch directory any more — cargo has
     // exited, the analysis is gone and the supervisor has drained — so
@@ -4041,6 +4022,35 @@ async fn finish_cargo_run(
         tracing::warn!(%error, "could not remove the build scratch directory");
     }
     Ok(status)
+}
+
+/// The build's compile observations are its miss list (stow#317) — a failed
+/// build's units are real misses too, whatever its last unit did. They land
+/// in the same journal a plain-cargo wrapper writes, and a detached drain
+/// posts the admission — the command returns as soon as cargo does. The
+/// caller has given up the foreground hold first: the drain this build
+/// spawns must find the gate open (stow#667).
+async fn admit_build_misses(
+    plan: &CargoRunPlan<'_>,
+    config: &StowConfig,
+    handler: &std::sync::Arc<crate::BuildSupervisor>,
+) {
+    // The day's usage report posts from the detached drain — never on the
+    // build's wall clock — so a due report is a reason to spawn that drain
+    // even when this build leaves no journal (stow#889).
+    let report_due = crate::report::report_due_today(config).await;
+    journal_and_drain_misses(
+        plan.project,
+        plan.cargo_args,
+        plan.current_dir,
+        &handler.observations(),
+        plan.inexact_entries.unwrap_or(&[]),
+        report_due,
+    );
+    // One supervised run is one build the install ran — counted here rather
+    // than by the journal, whose supervised files the drain skips to keep
+    // the count single.
+    crate::report::bump_build(config).await;
 }
 
 /// The build's supervisor, bound beside the handler it shares the
@@ -4094,7 +4104,7 @@ async fn cargo_argv(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<Vec<Os
 }
 
 /// One build's cargo spawn — a plain child process, or the same launch
-/// inside the heel sandbox `--sandbox` asked for (stow#779).
+/// inside the heel sandbox the isolation level asks for (stow#1000).
 enum CargoRun {
     /// The unsandboxed spawn.
     Plain(Command),
@@ -4145,7 +4155,7 @@ impl SupervisorHandle {
 
 /// How `run_cargo` starts cargo: the supervisor on the transport the
 /// facades reach — the socket a plain build's facades dial, or heel's
-/// IPC socket inside the sandbox a `--sandbox` build's facades get —
+/// IPC socket inside the sandbox a sandboxed build's facades get —
 /// then the spawn on the matching command (stow#779).
 /// The argv and environment a build's cargo launches with — one value
 /// so the plain and sandboxed spawns stay identical below the transport.
@@ -4162,7 +4172,7 @@ async fn spawn_cargo_run(
     mut launch: CargoLaunch,
     scratch: &Path,
 ) -> stow_types::error::Result<(CargoRun, SupervisorHandle)> {
-    match plan.sandbox {
+    match plan.isolation.level.confinement() {
         None => {
             let supervisor = start_supervisor(handler, in_flight, wrappers)?;
             launch.envs.extend(
@@ -4180,37 +4190,51 @@ async fn spawn_cargo_run(
                 SupervisorHandle::Socket(supervisor),
             ))
         }
-        Some(network) => {
-            sandboxed_cargo_run(plan, network, handler, in_flight, wrappers, launch, scratch).await
+        Some(confinement) => {
+            sandboxed_cargo_run(
+                plan,
+                confinement,
+                handler,
+                in_flight,
+                wrappers,
+                launch,
+                scratch,
+            )
+            .await
         }
     }
 }
 
-/// The sandboxed half of `run_cargo`: the dependencies land on the host
-/// first — `cargo fetch` needs network and cargo-home writes the
-/// sandbox denies — the supervisor is served over heel's IPC socket,
-/// and the same argv and env go to a `SandboxedCommand` that runs
-/// `--offline`, so no cargo network call can even be attempted.
+/// The sandboxed half of `run_cargo`. At `strict` and `offline` the
+/// dependencies land on the host first — `cargo fetch` needs network and
+/// cargo-home writes the sandbox denies — and the sandboxed cargo runs
+/// `--offline`, so no cargo network call can even be attempted; `protect`
+/// leaves both to cargo, which has the network through the sandbox's proxy
+/// and a writable cargo home. The supervisor is served over heel's IPC
+/// socket either way, the one channel every level leaves open.
 async fn sandboxed_cargo_run(
     plan: &CargoRunPlan<'_>,
-    network: crate::sandbox::SandboxNetwork,
+    confinement: crate::isolation::Confinement,
     handler: &std::sync::Arc<crate::BuildSupervisor>,
     in_flight: crate::supervisor::server::InFlightUnits,
     wrappers: &crate::commands::WrapperCommands,
     mut launch: CargoLaunch,
     scratch: &Path,
 ) -> stow_types::error::Result<(CargoRun, SupervisorHandle)> {
-    crate::sandbox::fetch_dependencies(plan.current_dir, plan.cargo_args).await?;
+    if confinement.is_allowlist() {
+        crate::sandbox::fetch_dependencies(plan.current_dir, plan.cargo_args).await?;
+    }
     let (pending, router) = crate::supervisor::ipc::start(
         std::sync::Arc::clone(handler),
         in_flight,
         &wrappers.runtime_executable,
     )
     .map_err(|error| stow_types::stow_error!("start the build supervisor: {error}"))?;
-    if !launch
-        .argv
-        .iter()
-        .any(|arg| arg == "--offline" || arg == "--frozen")
+    if confinement.is_allowlist()
+        && !launch
+            .argv
+            .iter()
+            .any(|arg| arg == "--offline" || arg == "--frozen")
     {
         launch.argv.push(OsString::from("--offline"));
     }
@@ -4229,7 +4253,9 @@ async fn sandboxed_cargo_run(
         ]
     };
     let request = crate::sandbox::SandboxRequest {
-        network,
+        confinement,
+        isolation: plan.isolation,
+        lockfile_root: plan.source_root,
         source_roots: &source_roots,
         target_dir: &target_dir,
         scratch_dir: Some(scratch),
@@ -4465,7 +4491,6 @@ async fn export_wrapper_env(
         config,
         cargo_args,
         source_root,
-        public_cache_mode,
         unit_nodes,
         prefetch_artifacts,
         semantic_fallback_enabled,
@@ -4534,12 +4559,6 @@ async fn export_wrapper_env(
     if let Some(path) = cache_policy_path {
         let (key, value) = cache_policy::cache_policy_env(path);
         envs.push((OsString::from(key), value));
-    }
-    if let Some(reason) = public_cache_mode.disable_reason() {
-        envs.push((
-            OsString::from("STOW_DISABLE_PUBLIC_CACHE"),
-            OsString::from(reason),
-        ));
     }
     if std::env::var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
         envs.push((
@@ -5151,35 +5170,32 @@ fn percentage(numerator: usize, denominator: usize) -> f64 {
 #[derive(Debug, Clone)]
 enum PublicCacheMode {
     Enabled,
+    /// The public cache is off for this build. `message` is the warning for a
+    /// cause the user did not choose; the config's `cache_mode` is the user's
+    /// own choice and prints nothing.
     Disabled {
-        reason: &'static str,
-        message: String,
+        message: Option<String>,
     },
 }
 
 impl PublicCacheMode {
-    fn for_rustc(rustc_version: &str) -> Self {
+    fn for_build(rustc_version: &str, cache_mode: crate::config::CacheMode) -> Self {
+        if !cache_mode.reaches_network() {
+            return Self::Disabled { message: None };
+        }
         let Some(reason) = unsupported_public_cache_reason(rustc_version) else {
             return Self::Enabled;
         };
 
         Self::Disabled {
-            reason,
-            message: format!(
+            message: Some(format!(
                 "warning: stow public cache is disabled for rustc `{rustc_version}` because only the most recent two stable toolchains are supported. {reason} toolchains currently invalidate public cache."
-            ),
+            )),
         }
     }
 
     const fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled)
-    }
-
-    const fn disable_reason(&self) -> Option<&'static str> {
-        match self {
-            Self::Enabled => None,
-            Self::Disabled { reason, .. } => Some(reason),
-        }
     }
 }
 
@@ -5240,6 +5256,7 @@ mod tests {
 
     fn test_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
@@ -5254,7 +5271,6 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 
@@ -5555,7 +5571,7 @@ mod tests {
                 deferred_analysis: false,
                 semantic_fallback_enabled: false,
                 covered_units: 0,
-                sandbox: None,
+                isolation: &crate::isolation::Isolation::off(),
             };
             super::cargo_command(&plan).await
         });
@@ -5683,7 +5699,7 @@ mod tests {
             "build",
             &cargo_args,
             &mirror.current_dir(),
-            None,
+            &crate::isolation::Isolation::off(),
         )
         .await
         .expect("run cargo");
@@ -6093,6 +6109,7 @@ mod tests {
 
     fn stow_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:1".to_owned(),
             registry_base_url: "http://127.0.0.1:1".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
@@ -6107,7 +6124,6 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 
@@ -6191,7 +6207,7 @@ mod tests {
             semantic_fallback_enabled: true,
             deferred_analysis: false,
             covered_units: ledger.len(),
-            sandbox: None,
+            isolation: &crate::isolation::Isolation::off(),
         };
         let mut envs = Vec::new();
         smol::block_on(super::export_wrapper_env(

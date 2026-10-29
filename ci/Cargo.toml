@@ -51,7 +51,7 @@ walkdir = "2"
 flate2.workspace = true
 tar.workspace = true
 skyzen = { version = "0.5.0", default-features = false, features = ["json", "hyper", "query"] }
-heel = { version = "0.5.1", default-features = false }
+heel = { version = "0.7.1", default-features = false }
 utoipa.workspace = true
 executor-core = { version = "0.7", features = ["tokio"] }
 tokio = { version = "1", features = ["io-std", "macros", "net", "rt-multi-thread", "sync"] }
