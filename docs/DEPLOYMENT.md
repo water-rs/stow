@@ -646,7 +646,7 @@ scheduler dispatches them to GitHub Actions in parallel as
 `build-crate.yml` runs (subject to
 `STOW_MAX_CONCURRENT_JOBS`, default 45 — runner slots, one per
 in-flight run — the per-family
-`STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and
+`STOW_MAX_CONCURRENT_MACOS_JOBS`, default 11, and
 `STOW_DISPATCH_MIN_AGE_MINUTES`; an operator's
 `stow-admin dispatch-cap set --jobs N [--macos M]` replaces the two
 cap bindings at claim time until the next `set` — the setting lives

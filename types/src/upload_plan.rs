@@ -218,6 +218,25 @@ pub struct CompileKeyInputs<'a> {
     /// — so an empty list hashes to the same key invocations produced
     /// before the linker was modeled.
     pub link_options: &'a [String],
+    /// The git source the unit's identity keys under, for a unit whose
+    /// input lives in a cargo `git/checkouts/` slot. `None` for a crates.io
+    /// unit — hashed only when present, so every published crates.io key
+    /// is byte-identical to what it was before git sources were modeled.
+    pub git_source: Option<GitSourceInputs<'a>>,
+    /// The sorted, normalized `-C`/`-Z` options the registry identity does
+    /// not model. Empty for a stock invocation — hashed only when
+    /// non-empty, so every published crates.io key is byte-identical.
+    pub extra_codegen: &'a [String],
+}
+
+/// The git-source identity inputs hashed into a compile key under the
+/// `git-source` tag.
+#[derive(Debug)]
+pub struct GitSourceInputs<'a> {
+    /// The full commit id the checkout is reset to.
+    pub commit: &'a str,
+    /// The manifest directory's path inside the repository.
+    pub manifest_path_in_repo: &'a str,
 }
 
 /// Compute the BLAKE3 compile key over an invocation's identity inputs.
@@ -296,6 +315,24 @@ pub fn compute_compile_key(inputs: &CompileKeyInputs<'_>) -> crate::error::Resul
     }
     if inputs.embed_bitcode {
         update_str(&mut hasher, "embed-bitcode=yes");
+    }
+    if let Some(git_source) = &inputs.git_source {
+        update_str(&mut hasher, "git-source");
+        update_str(&mut hasher, git_source.commit);
+        update_str(&mut hasher, git_source.manifest_path_in_repo);
+    }
+    if !inputs.extra_codegen.is_empty() {
+        update_str(&mut hasher, "extra-codegen");
+        update_str(
+            &mut hasher,
+            &serde_json::to_string(inputs.extra_codegen).map_err(|error| {
+                crate::stow_error!(
+                    "serialize extra codegen options for {} {}: {error}",
+                    inputs.crate_name,
+                    inputs.crate_version
+                )
+            })?,
+        );
     }
     Ok(hasher.finalize().to_hex().to_string())
 }

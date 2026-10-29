@@ -1302,7 +1302,7 @@ cap_json() {
 echo "[mock-e2e] dispatch-cap: status reads the deploy bindings"
 cap_json status >"$WORK_DIR/dispatch-cap-status.json" 2>&1 \
     || die "dispatch-cap status failed — see $WORK_DIR/dispatch-cap-status.json"
-jq -e '.max_concurrent_jobs == 3 and .max_concurrent_macos_jobs == 16
+jq -e '.max_concurrent_jobs == 3 and .max_concurrent_macos_jobs == 11
        and (.setting | not)' "$WORK_DIR/dispatch-cap-status.json" >/dev/null \
     || die "dispatch-cap status before set: $(cat "$WORK_DIR/dispatch-cap-status.json")"
 
@@ -1438,10 +1438,10 @@ $saw_capped_wait \
 # Restore the binding values: a set has no clear, so the recorded
 # setting names exactly what the bindings say — the later waves read
 # the same caps either way.
-cap_json set --jobs 3 --macos 16 --yes >"$WORK_DIR/dispatch-cap-restore.json" 2>&1 \
+cap_json set --jobs 3 --macos 11 --yes >"$WORK_DIR/dispatch-cap-restore.json" 2>&1 \
     || die "dispatch-cap restore failed — see $WORK_DIR/dispatch-cap-restore.json"
 jq -e '.dry_run == false and .result.max_concurrent_jobs == 3
-       and .result.max_concurrent_macos_jobs == 16' \
+       and .result.max_concurrent_macos_jobs == 11' \
     "$WORK_DIR/dispatch-cap-restore.json" >/dev/null \
     || die "dispatch-cap restore answer: $(cat "$WORK_DIR/dispatch-cap-restore.json")"
 

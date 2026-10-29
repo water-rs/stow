@@ -90,7 +90,12 @@ impl Connection {
         executable: &std::ffi::OsStr,
         args: &[OsString],
     ) -> Result<Decision, String> {
-        let plan = Plan::new(self.token.clone(), executable, args);
+        let plan = Plan::new(
+            self.token.clone(),
+            executable,
+            args,
+            super::protocol::InvocationEnv::current(),
+        );
         match self.exchange(&Request::Plan(plan)).await? {
             Answer::Served(notifications) => Ok(Decision::Served(notifications)),
             Answer::Compile { ticket } => Ok(Decision::Compile(Ticket { ticket })),
