@@ -727,14 +727,8 @@ fn validate_output_entries_present(
                 path
             ));
         }
-        let contents = files
-            .get(&path)
-            .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing {path}"))?;
-        if contents.is_empty() {
-            return Err(stow_types::stow_error!(
-                "artifact bundle contains empty output payload for {}",
-                file.file_name
-            ));
+        if !files.contains_key(&path) {
+            return Err(stow_types::stow_error!("artifact bundle is missing {path}"));
         }
     }
     Ok(())
@@ -981,6 +975,21 @@ mod tests {
         assert!(
             !bundle.files.contains_key(STOW_BUNDLE_PACK_PATH),
             "the pack is replaced by its files"
+        );
+    }
+
+    /// An empty output is a valid output: the pack verifies every file
+    /// against the hash the signed config records, so an empty file the
+    /// config declares is exactly what was built and signed.
+    #[test]
+    fn an_empty_declared_output_is_accepted() {
+        let (manifest, files) = bundle_parts(b"", b"");
+        let bundle = finalize_bundle(Some(manifest), files).expect("empty output must pass");
+        assert_eq!(
+            bundle
+                .files
+                .get(&bundle_file_path("libdemo-aabbccddeeff0011.rmeta")),
+            Some(&Vec::new())
         );
     }
 
