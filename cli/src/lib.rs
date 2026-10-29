@@ -37,6 +37,7 @@ mod fetch;
 mod file_lock;
 mod index;
 mod inject;
+mod isolation;
 mod lockfile_graph_cache;
 mod lockfile_resolver;
 mod miss_journal;
@@ -6449,7 +6450,6 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         }
     }
 
@@ -7095,7 +7095,6 @@ mod tests {
             trust_material: std::sync::Arc::default(),
             registry_http: std::sync::Arc::default(),
             artifact_cache_staging: std::sync::Arc::default(),
-            experimental: crate::config::ExperimentalConfig::default(),
         };
         // A scan shaped like a build-script crate's: `default` resolved
         // plus `probe_from_build_script` the script printed itself.
@@ -7347,7 +7346,6 @@ mod tests {
                 trust_material: std::sync::Arc::default(),
                 registry_http: std::sync::Arc::default(),
                 artifact_cache_staging: std::sync::Arc::default(),
-                experimental: crate::config::ExperimentalConfig::default(),
             }
         }
 

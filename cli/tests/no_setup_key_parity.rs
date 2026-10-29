@@ -53,7 +53,7 @@ fn write_probe_project(dir: &Path, extra_manifest: &str) {
 fn verbose_build(project: &Path, cargo_home: &Path, edge_url: &str, cache_dir: &Path) -> String {
     let mut build = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     build
-        .args(["build", "-v"])
+        .args(["build", "--isolation", "off", "-v"])
         .current_dir(project)
         .env("CARGO_HOME", cargo_home);
     hermetic_stow_env(&mut build, edge_url, cache_dir, &project.join("stow-home"));
