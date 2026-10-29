@@ -383,7 +383,7 @@ fn build_completed(
                 finished_at(now, n - completed_first),
             );
         }
-        for report in slice_reports(lo, hi) {
+        for report in slice_reports(graph, lo, hi) {
             graph.apply(&report, now);
         }
     }
@@ -485,8 +485,9 @@ pub fn build(shape: FixtureShape, now: i64) -> Result<Graph, QueueError> {
 }
 
 /// `SliceReport` events publishing completed nodes `lo..=hi`, grouped by
-/// the `(target, rustc)` slice each belongs to.
-fn slice_reports(lo: u32, hi: u32) -> Vec<SchedulerEvent> {
+/// the `(target, rustc)` slice each belongs to: a slice's first report
+/// is full, every later one a delta on the graph's live generation.
+fn slice_reports(graph: &Graph, lo: u32, hi: u32) -> Vec<SchedulerEvent> {
     let mut groups: std::collections::BTreeMap<
         (&'static str, &'static str),
         Vec<PublishedSliceRow>,
@@ -501,13 +502,16 @@ fn slice_reports(lo: u32, hi: u32) -> Vec<SchedulerEvent> {
     }
     groups
         .into_iter()
-        .map(|((target, rustc), added)| SchedulerEvent::SliceReport {
-            target: TargetTriple::parse(target).expect("fixture target"),
-            rustc_version: WireRustcVersion::parse(rustc).expect("fixture rustc"),
-            base_generation: None,
-            generation: Some(1),
-            added,
-            retired: Vec::new(),
+        .map(|((target, rustc), added)| {
+            let live = graph.slice_generation(target, rustc);
+            SchedulerEvent::SliceReport {
+                target: TargetTriple::parse(target).expect("fixture target"),
+                rustc_version: WireRustcVersion::parse(rustc).expect("fixture rustc"),
+                base_generation: live,
+                generation: live.map_or(1, |live| live + 1),
+                added,
+                retired: Vec::new(),
+            }
         })
         .collect()
 }

@@ -88,6 +88,18 @@ fn node_published_mask(host_side: bool, target: &str, explicit: ExplicitSpelling
 /// leading bytes of the BLAKE3 hash of its canonical string.
 type IdKey = [u8; 16];
 
+/// An index slice: its target and rustc ids.
+type SliceId = (u8, u8);
+
+/// One published task id's entry: the unit shapes it serves and the
+/// slice that reported them, so a full report can replace its slice's
+/// set.
+#[derive(Debug, Clone, Copy)]
+struct Published {
+    mask: u8,
+    slice: SliceId,
+}
+
 /// The probe keys of one canonical task id.
 #[derive(Debug, Clone, Copy)]
 struct IdKeys {
@@ -359,7 +371,13 @@ pub struct Graph {
     /// Forward edges and the reverse index.
     edges: Edges,
     /// Published unit-shape mask per task id.
-    published: HashMap<IdKey, u8>,
+    published: HashMap<IdKey, Published>,
+    /// The task ids each slice serves, derived from `published`: a full
+    /// report retires the slice's stale ids from here, so its cost is
+    /// the slice's own size rather than the whole map's.
+    slice_members: HashMap<SliceId, HashSet<IdKey>>,
+    /// The generation of the index each reported slice last applied.
+    slice_generations: BTreeMap<SliceId, i64>,
     /// Dispatchable pending nodes, one age-ordered queue per rank
     /// operand (the node's priority, stow#879): `operand →
     /// BTreeSet<(first_requested, ix)>`. Within a class the oldest
@@ -860,6 +878,17 @@ impl Graph {
         })
     }
 
+    /// The live node whose canonical task id hashes to `key`.
+    fn find_key(&self, key: IdKey) -> Option<u32> {
+        let tag = u32::from_le_bytes([key[0], key[1], key[2], key[3]]);
+        self.ids.candidates(u64::from(tag)).find(|&ix| {
+            let node = self.node(ix);
+            node.id_tag == tag
+                && node.status != Status::Free
+                && IdKeys::of(&self.task_id_of(ix)).key == key
+        })
+    }
+
     /// Look up a node index by task id string.
     fn node_ix(&self, task_id: &str) -> Option<u32> {
         self.find_id(task_id, IdKeys::of(task_id))
@@ -1219,7 +1248,7 @@ impl Graph {
         let target = self.target_id(sub.target.as_str())?;
         let own = self.targets[usize::from(target)].own_masks[usize::from(sub.host_side)]
             [usize::from(explicit)];
-        let published = self.published.get(&keys.key).copied().unwrap_or(0);
+        let published = self.published.get(&keys.key).map_or(0, |entry| entry.mask);
         let state = (published & own != own).then_some(State {
             first_requested: now,
             updated: now,
@@ -1301,8 +1330,7 @@ impl Graph {
             let published = self
                 .published
                 .get(&ids[dep_at as usize].key)
-                .copied()
-                .unwrap_or(0);
+                .map_or(0, |entry| entry.mask);
             let met = published & required == required;
             if !met {
                 unmet = unmet.checked_add(1).ok_or_else(|| {
@@ -1346,34 +1374,133 @@ impl Graph {
         );
     }
 
-    /// Apply a published-slice report: add/retire unit shapes, flip the
-    /// edges they touch, and drop nodes whose own shapes are served.
-    /// Returns the number of edge flips.
+    /// Whether a slice report extends its slice's live generation. A
+    /// full report (`base_generation` unset) always does — it replaces
+    /// the set and restarts the sequence. A delta applies only on top
+    /// of exactly the generation it was diffed against, and publishes
+    /// the next one; anything else is a gap the reporter resyncs.
+    ///
+    /// # Errors
+    /// `QueueError::SliceReportConflict` naming the live generation.
+    pub fn check_slice_report(
+        &self,
+        target: &str,
+        rustc_version: &str,
+        base_generation: Option<i64>,
+        generation: i64,
+    ) -> Result<(), QueueError> {
+        let Some(base) = base_generation else {
+            return Ok(());
+        };
+        let live = self.slice_generation(target, rustc_version);
+        if live != Some(base) {
+            return Err(QueueError::SliceReportConflict(format!(
+                "slice report base generation {base} conflicts with the live generation {}",
+                live.map_or_else(|| "none".to_owned(), |live| live.to_string()),
+            )));
+        }
+        if generation != base + 1 {
+            return Err(QueueError::SliceReportConflict(format!(
+                "slice report generation {generation} is not the generation after its base {base}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The generation a slice last applied, if it was ever reported.
+    pub fn slice_generation(&self, target: &str, rustc_version: &str) -> Option<i64> {
+        let slice = self
+            .target_lookup(target)
+            .zip(self.rustc_lookup(rustc_version))?;
+        self.slice_generations.get(&slice).copied()
+    }
+
+    /// The generation each reported slice last applied, by name.
+    pub fn slice_generations(&self) -> Vec<(String, String, i64)> {
+        self.slice_generations
+            .iter()
+            .map(|(&(target, rustc), &generation)| {
+                (
+                    self.targets[usize::from(target)].name.to_string(),
+                    self.rustcs[usize::from(rustc)].to_string(),
+                    generation,
+                )
+            })
+            .collect()
+    }
+
+    /// Apply a published-slice report: a delta adds and retires unit
+    /// shapes; a full report (`base_generation` unset) makes `added`
+    /// the slice's whole set, retiring every shape the slice held that
+    /// it no longer lists. Flips the edges they touch and drops nodes
+    /// whose own shapes are served. Returns the number of edge flips.
+    ///
+    /// # Panics
+    /// When the graph holds more than 256 targets or rustcs — the same
+    /// bound every node insert enforces.
     pub fn apply_slice_report(
         &mut self,
         target: &str,
         rustc_version: &str,
+        base_generation: Option<i64>,
+        generation: i64,
         added: &[PublishedSliceRow],
         retired: &[PublishedSliceRow],
     ) -> u32 {
+        let slice = (
+            self.target_id(target).expect("target ids fit u8"),
+            self.rustc_id(rustc_version).expect("rustc ids fit u8"),
+        );
+        self.slice_generations.insert(slice, generation);
         let mut flips = 0;
-        for row in retired {
-            flips += self.apply_slice_row(target, rustc_version, row, false);
-        }
-        for row in added {
-            flips += self.apply_slice_row(target, rustc_version, row, true);
+        if base_generation.is_none() {
+            flips += self.replace_slice(slice, target, rustc_version, added);
+        } else {
+            for row in retired {
+                flips += self.apply_slice_row(slice, target, rustc_version, row, false);
+            }
+            for row in added {
+                flips += self.apply_slice_row(slice, target, rustc_version, row, true);
+            }
         }
         self.maybe_compact();
         flips
     }
 
-    fn apply_slice_row(
+    /// A full report: `rows` become the slice's whole set. Cost is the
+    /// report's rows plus the slice's own members.
+    fn replace_slice(
         &mut self,
+        slice: SliceId,
         target: &str,
         rustc: &str,
-        row: &PublishedSliceRow,
-        added: bool,
+        rows: &[PublishedSliceRow],
     ) -> u32 {
+        let mut next: HashMap<IdKey, u8> = HashMap::new();
+        for row in rows {
+            let (keys, bit) = Self::slice_row_key(target, rustc, row);
+            *next.entry(keys.key).or_default() |= bit;
+        }
+        let mut flips = 0;
+        let stale: Vec<IdKey> = self
+            .slice_members
+            .get(&slice)
+            .into_iter()
+            .flatten()
+            .filter(|key| !next.contains_key(*key))
+            .copied()
+            .collect();
+        for key in stale {
+            flips += self.set_published(slice, key, 0);
+        }
+        for (key, mask) in next {
+            flips += self.set_published(slice, key, mask);
+        }
+        flips
+    }
+
+    /// A slice row's published-map key and shape bit.
+    fn slice_row_key(target: &str, rustc: &str, row: &PublishedSliceRow) -> (IdKeys, u8) {
         let task_id = canonical_task_id(
             row.crate_name.as_str(),
             &row.version.to_string(),
@@ -1383,19 +1510,40 @@ impl Graph {
             row.dependency_identity.as_str(),
             row.unit_shape.side == stow_types::public_cache::UnitSide::Host,
         );
-        let keys = IdKeys::of(&task_id);
-        let bit = shape_bit(row.unit_shape);
-        let old = self.published.get(&keys.key).copied().unwrap_or(0);
+        (IdKeys::of(&task_id), shape_bit(row.unit_shape))
+    }
+
+    fn apply_slice_row(
+        &mut self,
+        slice: SliceId,
+        target: &str,
+        rustc: &str,
+        row: &PublishedSliceRow,
+        added: bool,
+    ) -> u32 {
+        let (keys, bit) = Self::slice_row_key(target, rustc, row);
+        let old = self.published.get(&keys.key).map_or(0, |entry| entry.mask);
         let mask = if added { old | bit } else { old & !bit };
+        self.set_published(slice, keys.key, mask)
+    }
+
+    /// Set one task id's published mask, flip the edges that depend on
+    /// it and release the node when its own shapes are covered.
+    fn set_published(&mut self, slice: SliceId, key: IdKey, mask: u8) -> u32 {
+        let old = self.published.get(&key).map_or(0, |entry| entry.mask);
         if mask != old {
             if mask == 0 {
-                self.published.remove(&keys.key);
+                self.published.remove(&key);
+                if let Some(members) = self.slice_members.get_mut(&slice) {
+                    members.remove(&key);
+                }
             } else {
-                self.published.insert(keys.key, mask);
+                self.published.insert(key, Published { mask, slice });
+                self.slice_members.entry(slice).or_default().insert(key);
             }
-            self.touch_published(&keys.key);
+            self.touch_published(&key);
         }
-        let Some(ix) = self.find_id(&task_id, keys) else {
+        let Some(ix) = self.find_key(key) else {
             return 0;
         };
         let mut flips = 0;
@@ -1427,7 +1575,7 @@ impl Graph {
         }
         // A live node whose own published shapes are now covered
         // leaves the queue.
-        if added && self.node(ix).status.has_state() {
+        if mask != 0 && self.node(ix).status.has_state() {
             let own = self.own_mask(ix);
             if mask & own == own {
                 self.publish(ix);
@@ -1443,7 +1591,7 @@ impl Graph {
             && self
                 .published
                 .get(&IdKeys::of(task_id).key)
-                .is_some_and(|&mask| mask != 0)
+                .is_some_and(|entry| entry.mask != 0)
     }
 
     /// The ids among `ids` that [`Self::is_published`] answers for.
@@ -2439,7 +2587,8 @@ impl Graph {
             + self.nodes.capacity() * size_of::<Node>()
             + self.states.capacity() * size_of::<State>()
             + self.edges.heap_bytes()
-            + self.published.capacity() * (size_of::<IdKey>() + 1)
+            + self.published.capacity() * (size_of::<IdKey>() + size_of::<Published>())
+            + self.published.len() * size_of::<IdKey>()
             + self.ready.len() * (size_of::<i64>() + size_of::<BTreeSet<(i64, u32)>>())
             + self.ready.values().map(BTreeSet::len).sum::<usize>() * (size_of::<(i64, u32)>() + 32)
     }
@@ -2497,11 +2646,19 @@ impl Graph {
             SchedulerEvent::SliceReport {
                 target,
                 rustc_version,
+                base_generation,
+                generation,
                 added,
                 retired,
-                ..
             } => {
-                self.apply_slice_report(target.as_str(), rustc_version.as_str(), added, retired);
+                self.apply_slice_report(
+                    target.as_str(),
+                    rustc_version.as_str(),
+                    *base_generation,
+                    *generation,
+                    added,
+                    retired,
+                );
             }
             SchedulerEvent::Claims { claims } => {
                 for claim in claims {
@@ -3185,6 +3342,19 @@ impl Graph {
             in_flight,
             targets,
             dispatch_frozen: self.freeze.is_some(),
+            index_slices: self
+                .slice_generations()
+                .into_iter()
+                .map(|(target, rustc_version, generation)| {
+                    Ok(stow_types::api::AdminIndexSlice {
+                        target: stow_types::identity::TargetTriple::parse(&target)?,
+                        rustc_version: stow_types::identity::WireRustcVersion::parse(
+                            &rustc_version,
+                        )?,
+                        generation,
+                    })
+                })
+                .collect::<Result<Vec<_>, QueueError>>()?,
         })
     }
 }
@@ -3534,15 +3704,126 @@ mod tests {
     }
 
     fn publish(graph: &mut Graph, name: &str) -> u32 {
+        let live = graph.slice_generation(TARGET, RUSTC);
         graph.apply_slice_report(
             TARGET,
             RUSTC,
+            live,
+            live.map_or(1, |live| live + 1),
             &[
                 published_row(name, UnitKind::Linked),
                 published_row(name, UnitKind::Unlinked),
             ],
             &[],
         )
+    }
+
+    fn report(
+        graph: &mut Graph,
+        base: Option<i64>,
+        generation: i64,
+        added: &[&str],
+        retired: &[&str],
+    ) -> Result<(), QueueError> {
+        graph.check_slice_report(TARGET, RUSTC, base, generation)?;
+        let rows = |names: &[&str]| -> Vec<PublishedSliceRow> {
+            names
+                .iter()
+                .flat_map(|name| {
+                    [
+                        published_row(name, UnitKind::Linked),
+                        published_row(name, UnitKind::Unlinked),
+                    ]
+                })
+                .collect()
+        };
+        graph.apply_slice_report(
+            TARGET,
+            RUSTC,
+            base,
+            generation,
+            &rows(added),
+            &rows(retired),
+        );
+        Ok(())
+    }
+
+    fn is_ready(graph: &Graph, name: &str) -> bool {
+        let ix = graph.node_ix(&id(name)).expect("node");
+        graph
+            .ready
+            .values()
+            .any(|set| set.iter().any(|&(_, at)| at == ix))
+    }
+
+    /// A delta that does not extend the slice's live generation is
+    /// refused — the gap a lost report leaves — and a full report
+    /// restarts the sequence (stow#1049).
+    #[test]
+    fn a_slice_report_that_leaves_a_gap_is_refused() {
+        let mut graph = Graph::default();
+        let conflict = |result: Result<(), QueueError>| {
+            assert!(
+                matches!(result, Err(QueueError::SliceReportConflict(_))),
+                "{result:?}"
+            );
+        };
+        // A delta on a slice the scheduler never saw.
+        conflict(report(&mut graph, Some(1), 2, &["a"], &[]));
+        report(&mut graph, None, 1, &["a"], &[]).expect("a full report");
+        assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(1));
+        report(&mut graph, Some(1), 2, &["b"], &[]).expect("the next delta");
+        // A lost generation 3: the delta based on it names a base the
+        // scheduler never received.
+        conflict(report(&mut graph, Some(3), 4, &["c"], &[]));
+        // A replayed delta is stale.
+        conflict(report(&mut graph, Some(1), 2, &["b"], &[]));
+        // A base that skips ahead of its own generation.
+        conflict(report(&mut graph, Some(2), 4, &["c"], &[]));
+        assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(2));
+        assert!(graph.is_published(&id("a")) && graph.is_published(&id("b")));
+        assert!(!graph.is_published(&id("c")));
+        // The resync a conflict asks for: a full report whose
+        // generation restarts below the live one.
+        report(&mut graph, None, 1, &["a", "b", "c"], &[]).expect("resync");
+        assert_eq!(graph.slice_generation(TARGET, RUSTC), Some(1));
+        assert!(graph.is_published(&id("c")));
+    }
+
+    /// A full report replaces the slice's set: what the slice held and
+    /// the report no longer lists is retired, and the nodes waiting on
+    /// it wait again.
+    #[test]
+    fn a_full_report_replaces_the_slice_set() {
+        let mut graph = Graph::default();
+        report(&mut graph, None, 1, &["a", "b"], &[]).expect("first report");
+        assert!(graph.is_published(&id("a")) && graph.is_published(&id("b")));
+        report(&mut graph, None, 1, &["b", "c"], &[]).expect("replacing report");
+        assert!(!graph.is_published(&id("a")), "a left the slice");
+        assert!(graph.is_published(&id("b")) && graph.is_published(&id("c")));
+        // A live dependent flips back to waiting when its dependency
+        // leaves the slice.
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        report(&mut graph, None, 1, &["c"], &[]).expect("c published");
+        assert!(is_ready(&graph, "b"), "b is released by c");
+        report(&mut graph, None, 1, &[], &[]).expect("empty replacement");
+        assert!(!is_ready(&graph, "b"), "b waits on c again");
+        assert!(!graph.is_published(&id("c")));
+    }
+
+    /// Generations and slice membership survive the snapshot.
+    #[test]
+    fn slice_generations_and_members_round_trip_the_snapshot() {
+        let mut graph = Graph::default();
+        report(&mut graph, None, 1, &["a", "b"], &[]).expect("full");
+        report(&mut graph, Some(1), 2, &["c"], &["a"]).expect("delta");
+        let mut restored = round_trip(&graph);
+        assert_eq!(restored.slice_generation(TARGET, RUSTC), Some(2));
+        assert!(restored.is_published(&id("c")) && !restored.is_published(&id("a")));
+        // The restored members index drives a replacement.
+        report(&mut restored, None, 1, &["c"], &[]).expect("replace");
+        assert!(!restored.is_published(&id("b")));
     }
 
     fn status_of(graph: &Graph, name: &str) -> Option<Status> {

@@ -233,7 +233,9 @@ pub(super) async fn demand(
 /// its matched dependency edges.
 ///
 /// # Errors
-/// `QueueError::Sql` on a failed append.
+/// `QueueError::SliceReportConflict` when a delta does not extend its
+/// slice's live generation, `QueueError::Invariant` on a slice named
+/// twice, `QueueError::Sql` on a failed append.
 pub(super) async fn slice_reports(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
@@ -241,6 +243,24 @@ pub(super) async fn slice_reports(
     actor: Option<&str>,
     now: i64,
 ) -> Result<(), QueueError> {
+    // Every slice extends its live generation, or nothing appends.
+    graph.with(|graph| {
+        let mut seen = std::collections::BTreeSet::new();
+        slices.iter().try_for_each(|slice| {
+            if !seen.insert((slice.target.as_str(), slice.rustc_version.as_str())) {
+                return Err(QueueError::Invariant(format!(
+                    "slice report names {}/{} twice",
+                    slice.target, slice.rustc_version
+                )));
+            }
+            graph.check_slice_report(
+                slice.target.as_str(),
+                slice.rustc_version.as_str(),
+                slice.base_generation,
+                slice.generation,
+            )
+        })
+    })?;
     let events: Vec<SchedulerEvent> = slices
         .iter()
         .map(|slice| SchedulerEvent::SliceReport {
@@ -1114,6 +1134,50 @@ mod inline_dispatch_tests {
             claims.len() > usize::try_from(BOUND).expect("bound"),
             "the pass is not held to the completion's round"
         );
+    }
+
+    /// A delta that leaves a gap is refused before anything appends,
+    /// and a woken graph replays the generation each accepted report
+    /// set (stow#1049).
+    #[tokio::test]
+    async fn a_slice_report_gap_is_refused_and_generations_replay() {
+        let (db, owner) = seeded().await;
+        let cell = owner.loaded().expect("seeded");
+        let slice = |base_generation, generation| stow_types::api::PublishedSlice {
+            target: stow_types::identity::TargetTriple::parse(
+                stow_types::api::CI_TARGET_TRIPLES[8],
+            )
+            .expect("target"),
+            rustc_version: stow_types::identity::WireRustcVersion::parse("1.84.0").expect("rustc"),
+            base_generation,
+            generation,
+            added: fixture::full_slice_report(),
+            retired: Vec::new(),
+        };
+        let before = log_rows(&db).await;
+        let error = slice_reports(cell, &db, &[slice(Some(4), 5)], None, HOST_NOW_MS)
+            .await
+            .expect_err("a delta on an unreported slice");
+        assert!(
+            matches!(error, QueueError::SliceReportConflict(_)),
+            "{error}"
+        );
+        assert_eq!(
+            log_rows(&db).await,
+            before,
+            "a refused report appends nothing"
+        );
+        slice_reports(cell, &db, &[slice(None, 4)], None, HOST_NOW_MS)
+            .await
+            .expect("a full report");
+        slice_reports(cell, &db, &[slice(Some(4), 5)], None, HOST_NOW_MS)
+            .await
+            .expect("the next delta");
+        let woken_owner = wake(&db).await;
+        let woken = woken_owner.loaded().expect("woken");
+        let live = woken
+            .with(|graph| graph.slice_generation(stow_types::api::CI_TARGET_TRIPLES[8], "1.84.0"));
+        assert_eq!(live, Some(5));
     }
 
     /// A bounded claim is a prefix of the unbounded claim — the bound

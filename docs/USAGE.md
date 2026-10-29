@@ -469,14 +469,17 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   `--projects`.
 - `stow-admin index export --out-dir <dir>` /
   `index publish --file <index> --folded <folded>` /
-  `index report --file <index>` / `index targets` — export
+  `index report --file <index>` / `index reconcile --rustc-version <r>` /
+  `index targets` — export
   every changed index slice in one pass from the registry's verified
   records artifacts (each `index.<t>.<r>` plus its `folded.<t>.<r>`
   companion; only the records tags no folded set covers are pulled),
   push both to GHCR signed under the index workflow (mock deploys
   delegate to `stow-mock-registry publish-index`), and report each
   slice's membership to the scheduler. `index-publish.yml`
-  runs this loop after every `build-crate` run. `index targets` lists
+  runs this loop after every `build-crate` run, preceded by `index
+  reconcile`, which reports in full every published slice whose
+  generation the scheduler does not hold. `index targets` lists
   the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the
