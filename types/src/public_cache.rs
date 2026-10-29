@@ -994,6 +994,289 @@ mod tests {
         args(&parts)
     }
 
+    /// stow#1066: the compile keys of the argv CI hands rustc for a
+    /// representative dev-profile unit are pinned byte for byte — the
+    /// published nodes' keys. They were captured from the parser before
+    /// `-O`, `-g`, `--remap-path-prefix`, `-C codegen-units` and
+    /// `-C split-debuginfo` reached the key, so a change that moves one
+    /// would strand every published node. CI's rustflags carry the
+    /// workspace and target-dir remaps and the wrapper appends the mold
+    /// link argument; none of them may change a key.
+    #[test]
+    fn ci_argv_keys_are_pinned() {
+        let ci_flags = |split: &[&'static str]| {
+            let mut flags = vec!["-C", "embed-bitcode=no", "-C", "debuginfo=2"];
+            flags.extend_from_slice(split);
+            flags.extend_from_slice(&[
+                "--remap-path-prefix=/run/work/ws=stow-ci://workspace",
+                "--remap-path-prefix=/run/work/target=stow-ci://target",
+                "-C",
+                "link-arg=-fuse-ld=mold",
+            ]);
+            flags
+        };
+        let key = |parsed: &ParsedRustcArgs, target: &str| {
+            stable_unit_identity_for_package(
+                parsed,
+                "unicode-ident",
+                "1.0.24",
+                target,
+                "1.91.1",
+                "[]",
+                "[]",
+            )
+            .expect("identity")
+            .compile_key
+        };
+        let mut apple = ci_flags(&["-C", "split-debuginfo=unpacked"]);
+        apple.extend_from_slice(&["--target", "aarch64-apple-darwin"]);
+        let apple = ParsedRustcArgs::parse(&lib_args(&apple)).expect("parse");
+        assert_eq!(
+            key(&apple, "aarch64-apple-darwin"),
+            "e5bd73e81ce55ad3154de51bd6b2878a0f9cfb7363decee2aea8952e3f3be621",
+        );
+        let mut linux = ci_flags(&[]);
+        linux.extend_from_slice(&["--target", "x86_64-unknown-linux-gnu"]);
+        let linux = ParsedRustcArgs::parse(&lib_args(&linux)).expect("parse");
+        assert_eq!(
+            key(&linux, "x86_64-unknown-linux-gnu"),
+            "d8870d567564eb5aece0400b1ca94e4dc368dfeceee85f716c18eededb998c63",
+        );
+        let mut linked = ci_flags(&[]);
+        linked.extend_from_slice(&[
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "--crate-type",
+            "cdylib",
+        ]);
+        let linked = ParsedRustcArgs::parse(&lib_args(&linked)).expect("parse");
+        assert_eq!(
+            key(&linked, "x86_64-unknown-linux-gnu"),
+            "553f338fc2fbe3da87a9e8ded69d11cbc33eb84cd734a33e35cce12203e4b46e",
+        );
+    }
+
+    /// The compile key of the dev-profile unit `lib_args` spells, plus
+    /// `flags`, compiled for `target`.
+    fn flagged_key(flags: &[&str], target: &str) -> String {
+        let mut all = flags.to_vec();
+        all.extend_from_slice(&["--target", target]);
+        let parsed = ParsedRustcArgs::parse(&lib_args(&all)).expect("parse");
+        stable_unit_identity_for_package(
+            &parsed,
+            "unicode-ident",
+            "1.0.24",
+            target,
+            "1.91.1",
+            "[]",
+            "[]",
+        )
+        .expect("identity")
+        .compile_key
+    }
+
+    fn key_of(flags: &[&str]) -> String {
+        flagged_key(flags, "x86_64-unknown-linux-gnu")
+    }
+
+    #[track_caller]
+    fn assert_keys_apart(left: &[&str], right: &[&str]) {
+        assert_ne!(key_of(left), key_of(right), "{left:?} vs {right:?}");
+    }
+
+    #[track_caller]
+    fn assert_keys_equal(left: &[&str], right: &[&str]) {
+        assert_eq!(key_of(left), key_of(right), "{left:?} vs {right:?}");
+    }
+
+    /// stow#1066: `-O` is `-C opt-level=3` (rustc --help), and between it
+    /// and `-C opt-level` the later flag wins.
+    #[test]
+    fn optimization_shorthand_keys_as_the_level_it_sets() {
+        assert_keys_apart(&["-O"], &[]);
+        assert_keys_equal(&["-O"], &["-C", "opt-level=3"]);
+        assert_keys_equal(&["-O"], &["--codegen", "opt-level=3"]);
+        assert_keys_equal(&["-C", "opt-level=0", "-O"], &["-C", "opt-level=3"]);
+        assert_keys_equal(&["-O", "-C", "opt-level=0"], &[]);
+        assert_keys_apart(&["-O"], &["-C", "opt-level=2"]);
+    }
+
+    /// stow#1066: `-g` is `-C debuginfo=2` (rustc --help), and between it
+    /// and `-C debuginfo` the later flag wins.
+    #[test]
+    fn debuginfo_shorthand_keys_as_the_level_it_sets() {
+        assert_keys_apart(&["-g"], &[]);
+        assert_keys_equal(&["-g"], &["-C", "debuginfo=2"]);
+        assert_keys_equal(&["-C", "debuginfo=0", "-g"], &["-g"]);
+        assert_keys_equal(&["-g", "-C", "debuginfo=0"], &["-C", "debuginfo=0"]);
+        assert_keys_apart(&["-g"], &["-C", "debuginfo=1"]);
+    }
+
+    /// stow#1066: a boolean `-C` option with no value is `yes`, so it
+    /// reaches the profile instead of the unmodelled options.
+    #[test]
+    fn bare_boolean_codegen_options_mean_yes() {
+        for option in ["debug-assertions", "overflow-checks"] {
+            let optimized = ["-C", "opt-level=3"];
+            let bare = [optimized[0], optimized[1], "-C", option];
+            let yes_value = format!("{option}=yes");
+            let yes = [optimized[0], optimized[1], "-C", yes_value.as_str()];
+            assert_keys_equal(&bare, &yes);
+            assert_keys_apart(&bare, &optimized);
+            let parsed = ParsedRustcArgs::parse(&lib_args(&bare)).expect("parse");
+            assert_eq!(parsed.extra_codegen, Vec::<String>::new(), "{option}");
+        }
+        let parsed = ParsedRustcArgs::parse(&lib_args(&["-C", "embed-bitcode"])).expect("parse");
+        assert!(parsed.embed_bitcode);
+        assert_keys_equal(&["-C", "embed-bitcode"], &[]);
+        assert_keys_apart(&["-C", "embed-bitcode=no"], &["-C", "embed-bitcode"]);
+    }
+
+    /// stow#1066: remappings change the paths embedded in the output, so
+    /// they key — in argv order, because rustc applies the last one that
+    /// matches a path.
+    #[test]
+    fn remap_path_prefix_keys_in_argv_order() {
+        assert_keys_apart(&["--remap-path-prefix=/a=/b"], &[]);
+        assert_keys_apart(
+            &["--remap-path-prefix=/a=/b"],
+            &["--remap-path-prefix=/a=/c"],
+        );
+        assert_keys_apart(
+            &["--remap-path-prefix=/a=/b"],
+            &["--remap-path-prefix=/z=/b"],
+        );
+        assert_keys_equal(
+            &["--remap-path-prefix=/a=/b"],
+            &["--remap-path-prefix", "/a=/b"],
+        );
+        assert_keys_apart(
+            &["--remap-path-prefix=/a=/x", "--remap-path-prefix=/a/b=/y"],
+            &["--remap-path-prefix=/a/b=/y", "--remap-path-prefix=/a=/x"],
+        );
+        // An earlier repeat of a remapping never wins, so it is not part of
+        // the identity.
+        assert_keys_equal(
+            &[
+                "--remap-path-prefix=/a=/b",
+                "--remap-path-prefix=/c=/d",
+                "--remap-path-prefix=/a=/b",
+            ],
+            &["--remap-path-prefix=/c=/d", "--remap-path-prefix=/a=/b"],
+        );
+        // FROM is everything before the last `=`.
+        assert_keys_apart(
+            &["--remap-path-prefix=/a=b=/c"],
+            &["--remap-path-prefix=/a=/c"],
+        );
+        assert!(ParsedRustcArgs::parse(&lib_args(&["--remap-path-prefix=/a"])).is_err());
+    }
+
+    /// stow#1066: the remaps CI's rustflags and a consumer's wrapper add
+    /// carry the machine's own paths as FROM and a stow virtual root as
+    /// TO. They are on both sides of every match and never enter the key,
+    /// whatever the paths; a remap of the consumer's own still does.
+    #[test]
+    fn stow_virtual_root_remaps_stay_out_of_the_key() {
+        let plain = key_of(&[]);
+        assert_eq!(
+            plain,
+            key_of(&["--remap-path-prefix=/run/ci/ws=stow-ci://workspace"])
+        );
+        assert_eq!(
+            plain,
+            key_of(&[
+                "--remap-path-prefix=/Users/me/ws=stow-ci://workspace",
+                "--remap-path-prefix=/run/target=stow-ci://target",
+            ])
+        );
+        assert_keys_apart(
+            &[
+                "--remap-path-prefix=/run/ws=stow-ci://workspace",
+                "--remap-path-prefix=/a=/b",
+            ],
+            &["--remap-path-prefix=/run/ws=stow-ci://workspace"],
+        );
+    }
+
+    /// stow#1066: `--remap-path-scope` picks which paths the remappings
+    /// reach; the last one wins.
+    #[test]
+    fn remap_path_scope_keys_with_the_last_value() {
+        let remap = "--remap-path-prefix=/a=/b";
+        assert_keys_apart(&[remap, "--remap-path-scope=macro"], &[remap]);
+        assert_keys_apart(
+            &[remap, "--remap-path-scope=macro"],
+            &[remap, "--remap-path-scope=debuginfo"],
+        );
+        assert_keys_equal(
+            &[
+                remap,
+                "--remap-path-scope=object",
+                "--remap-path-scope=macro",
+            ],
+            &[remap, "--remap-path-scope=macro"],
+        );
+    }
+
+    /// stow#1066: the codegen unit count changes the object code; the
+    /// last `-C codegen-units` wins.
+    #[test]
+    fn codegen_units_key_with_the_last_value() {
+        assert_keys_apart(&["-C", "codegen-units=1"], &[]);
+        assert_keys_apart(&["-C", "codegen-units=1"], &["-C", "codegen-units=16"]);
+        assert_keys_equal(
+            &["-C", "codegen-units=16", "-C", "codegen-units=1"],
+            &["-C", "codegen-units=1"],
+        );
+        assert_keys_equal(&["-Ccodegen-units=1"], &["-C", "codegen-units=1"]);
+    }
+
+    /// stow#1066: `-C split-debuginfo` changes where debug info lands. The
+    /// value cargo's dev profile gives every unit on the target (`unpacked`
+    /// on Apple targets, rustc's default elsewhere) is what each published
+    /// node has, so it keys like no flag at all.
+    #[test]
+    fn split_debuginfo_keys_unless_it_is_the_cargo_default() {
+        let key = |flag: &str, target: &str| {
+            let value = format!("split-debuginfo={flag}");
+            flagged_key(&["-C", value.as_str()], target)
+        };
+        let apple = "aarch64-apple-darwin";
+        assert_eq!(key("unpacked", apple), flagged_key(&[], apple));
+        assert_ne!(key("packed", apple), flagged_key(&[], apple));
+        assert_ne!(key("off", apple), flagged_key(&[], apple));
+        assert_ne!(key("packed", apple), key("off", apple));
+
+        let linux = "x86_64-unknown-linux-gnu";
+        assert_eq!(key("off", linux), flagged_key(&[], linux));
+        assert_ne!(key("unpacked", linux), flagged_key(&[], linux));
+        assert_ne!(key("packed", linux), flagged_key(&[], linux));
+
+        let msvc = "x86_64-pc-windows-msvc";
+        assert_eq!(key("packed", msvc), flagged_key(&[], msvc));
+        assert_ne!(key("off", msvc), flagged_key(&[], msvc));
+        assert_ne!(key("unpacked", msvc), flagged_key(&[], msvc));
+    }
+
+    /// stow#1066: `-C prefer-dynamic` decides how a dylib, cdylib or bin
+    /// links std, so it keys there; cargo adds it to every proc-macro and
+    /// it does nothing to an rlib, so it keys nowhere else.
+    #[test]
+    fn prefer_dynamic_keys_only_where_it_links_std() {
+        let key = |crate_type: &str, prefer: bool| {
+            let mut flags = vec!["--crate-type", crate_type];
+            if prefer {
+                flags.extend_from_slice(&["-C", "prefer-dynamic"]);
+            }
+            flagged_key(&flags, "x86_64-unknown-linux-gnu")
+        };
+        assert_eq!(key("proc-macro", true), key("proc-macro", false));
+        assert_eq!(key("rlib", true), key("rlib", false));
+        assert_ne!(key("dylib", true), key("dylib", false));
+        assert_ne!(key("cdylib", true), key("cdylib", false));
+    }
+
     /// stow#1047: at a non-zero opt-level an absent `-C debug-assertions`
     /// and `-C overflow-checks` are off, so spelling them on is a
     /// different compile and must be a different key.

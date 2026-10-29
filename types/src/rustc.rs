@@ -166,6 +166,8 @@ impl ParsedRustcArgs {
         if parsed.crate_name.is_empty() {
             return Err("missing --crate-name in rustc arguments".to_owned());
         }
+        parsed.drop_cargo_default_split_debuginfo();
+        parsed.drop_inert_prefer_dynamic();
 
         Ok(parsed)
     }
@@ -570,8 +572,16 @@ fn apply_rustc_arg<'a>(
         "--json" => {
             parse_json_kinds(next_str(iter, "--json")?, parsed);
         }
-        "-C" => {
-            parse_codegen_option(next_str(iter, "-C")?, parsed)?;
+        "-C" | "--codegen" => {
+            parse_codegen_option(next_str(iter, arg)?, parsed)?;
+        }
+        "-O" => parsed.opt_level = Some("3".to_owned()),
+        "-g" => parsed.debuginfo = Some("2".to_owned()),
+        "--remap-path-prefix" => {
+            apply_remap_path_prefix(next_str(iter, "--remap-path-prefix")?, parsed)?;
+        }
+        "--remap-path-scope" => {
+            apply_remap_path_scope(next_str(iter, "--remap-path-scope")?, parsed);
         }
         "-L" => {
             parse_library_search(next_str(iter, "-L")?, parsed);
@@ -622,6 +632,16 @@ fn apply_attached_arg<'a>(
     if let Some(value) = arg.strip_prefix("--json=") {
         parse_json_kinds(value, parsed);
         return Ok(());
+    }
+    if let Some(value) = arg.strip_prefix("--remap-path-prefix=") {
+        return apply_remap_path_prefix(value, parsed);
+    }
+    if let Some(value) = arg.strip_prefix("--remap-path-scope=") {
+        apply_remap_path_scope(value, parsed);
+        return Ok(());
+    }
+    if let Some(option) = arg.strip_prefix("--codegen=") {
+        return parse_codegen_option(option, parsed);
     }
     if let Some(option) = arg.strip_prefix("-C") {
         return parse_codegen_option(option, parsed);
@@ -712,29 +732,79 @@ fn executable_suffix(target: &str) -> Result<&'static str, String> {
     })
 }
 
-fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<(), String> {
-    let Some((key, value)) = option.split_once('=') else {
-        match option {
-            "prefer-dynamic" => {}
-            _ => {
-                parsed.extra_codegen.push(format!("-C {option}"));
-            }
-        }
+/// The prefix of the virtual roots stow's wrappers map real paths to.
+///
+/// Those roots are `stow-ci://workspace` and `stow-ci://target`. A
+/// `--remap-path-prefix`
+/// whose target is one of them is stow's determinism remap, not a choice
+/// of the consumer: CI's rustflags and the consumer's wrapper both apply
+/// it, with the `FROM` of their own machine, so it is part of what every
+/// node is — identity-neutral by construction — and never enters the
+/// key. Any other remap changes the paths embedded in the output.
+pub const STOW_VIRTUAL_ROOT_PREFIX: &str = "stow-ci://";
+
+const REMAP_PATH_PREFIX: &str = "--remap-path-prefix=";
+const REMAP_PATH_SCOPE: &str = "--remap-path-scope=";
+
+/// Record a `--remap-path-prefix FROM=TO`. rustc splits at the last `=`
+/// and, when several remappings match a path, applies the last one, so
+/// the options keep argv order in `extra_codegen`; an earlier repeat of
+/// the same remapping is redundant (the later copy wins wherever it
+/// would) and is dropped so spelling a remap twice keys like once.
+fn apply_remap_path_prefix(value: &str, parsed: &mut ParsedRustcArgs) -> Result<(), String> {
+    let Some((_, to)) = value.rsplit_once('=') else {
+        return Err(format!(
+            "invalid --remap-path-prefix `{value}`: expected FROM=TO"
+        ));
+    };
+    if to.starts_with(STOW_VIRTUAL_ROOT_PREFIX) {
         return Ok(());
+    }
+    let option = format!("{REMAP_PATH_PREFIX}{value}");
+    parsed.extra_codegen.retain(|seen| *seen != option);
+    parsed.extra_codegen.push(option);
+    Ok(())
+}
+
+/// Record a `--remap-path-scope`: which kinds of paths the remappings
+/// apply to. A single setting, the last one wins.
+fn apply_remap_path_scope(value: &str, parsed: &mut ParsedRustcArgs) {
+    replace_codegen_setting(parsed, REMAP_PATH_SCOPE, value);
+}
+
+/// Set a single-valued option in `extra_codegen`, replacing an earlier
+/// occurrence: rustc keeps the last value of such an option.
+fn replace_codegen_setting(parsed: &mut ParsedRustcArgs, prefix: &str, value: &str) {
+    parsed
+        .extra_codegen
+        .retain(|seen| !seen.starts_with(prefix));
+    parsed.extra_codegen.push(format!("{prefix}{value}"));
+}
+
+fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<(), String> {
+    let (key, value) = match option.split_once('=') {
+        Some((key, value)) => (key, Some(value)),
+        None => (option, None),
     };
 
-    match key {
-        "metadata" => parsed.c_metadata = Some(value.to_owned()),
-        "extra-filename" => value.clone_into(&mut parsed.extra_filename),
-        "opt-level" => parsed.opt_level = Some(value.to_owned()),
-        "debuginfo" => parsed.debuginfo = Some(value.to_owned()),
-        "panic" => parsed.panic_strategy = Some(value.to_owned()),
-        "debug-assertions" => parsed.debug_assertions = Some(parse_bool(value)?),
-        "overflow-checks" => parsed.overflow_checks = Some(parse_bool(value)?),
-        "strip" => parsed.strip = Some(value.to_owned()),
-        "embed-bitcode" => parsed.embed_bitcode = parse_bool(value)?,
-        "codegen-units" | "split-debuginfo" => {}
-        _ if is_link_only_codegen_option(option) => {
+    match (key, value) {
+        // rustc reads a boolean option with no value as `yes`.
+        ("debug-assertions", value) => parsed.debug_assertions = Some(parse_codegen_bool(value)?),
+        ("overflow-checks", value) => parsed.overflow_checks = Some(parse_codegen_bool(value)?),
+        ("embed-bitcode", value) => parsed.embed_bitcode = parse_codegen_bool(value)?,
+        ("metadata", Some(value)) => parsed.c_metadata = Some(value.to_owned()),
+        ("extra-filename", Some(value)) => value.clone_into(&mut parsed.extra_filename),
+        ("opt-level", Some(value)) => parsed.opt_level = Some(value.to_owned()),
+        ("debuginfo", Some(value)) => parsed.debuginfo = Some(value.to_owned()),
+        ("panic", Some(value)) => parsed.panic_strategy = Some(value.to_owned()),
+        ("strip", Some(value)) => parsed.strip = Some(value.to_owned()),
+        ("codegen-units", Some(value)) => {
+            replace_codegen_setting(parsed, "-C codegen-units=", value);
+        }
+        ("split-debuginfo", Some(value)) => {
+            replace_codegen_setting(parsed, SPLIT_DEBUGINFO_OPTION, value);
+        }
+        (_, Some(_)) if is_link_only_codegen_option(option) => {
             parsed.link_options.push(option.to_owned());
         }
         _ => {
@@ -743,6 +813,67 @@ fn parse_codegen_option(option: &str, parsed: &mut ParsedRustcArgs) -> Result<()
     }
 
     Ok(())
+}
+
+const SPLIT_DEBUGINFO_OPTION: &str = "-C split-debuginfo=";
+
+/// The `-C split-debuginfo` value cargo's dev profile gives `target`.
+///
+/// It is what each published node was built with: `unpacked` on Apple targets (cargo chooses it for the macOS dev
+/// profile) and rustc's own default everywhere else, where cargo passes
+/// nothing — `packed` on msvc, `off` otherwise.
+#[must_use]
+pub fn cargo_default_split_debuginfo(target: &str) -> &'static str {
+    if target.contains("-apple-") {
+        "unpacked"
+    } else if target.ends_with("-msvc") {
+        "packed"
+    } else {
+        "off"
+    }
+}
+
+impl ParsedRustcArgs {
+    /// Drop `-C split-debuginfo` when it is [`cargo_default_split_debuginfo`]
+    /// for the unit's target. Any other value changes how debug info is
+    /// laid out in the output, so it stays in `extra_codegen`.
+    ///
+    /// With no `--target` the unit compiles for the host this process
+    /// runs on, which is the host of the rustc cargo drives.
+    fn drop_cargo_default_split_debuginfo(&mut self) {
+        let host = target_lexicon::HOST.to_string();
+        let target = self.target.as_deref().unwrap_or(&host);
+        let option = format!(
+            "{SPLIT_DEBUGINFO_OPTION}{}",
+            cargo_default_split_debuginfo(target)
+        );
+        self.extra_codegen.retain(|seen| *seen != option);
+    }
+}
+
+impl ParsedRustcArgs {
+    /// Drop `-C prefer-dynamic` from a unit it cannot affect. Cargo adds it
+    /// to every proc-macro itself (a proc-macro is a dylib the compiler
+    /// loads, and the crate type is already in the key); it has no effect
+    /// on an rlib or staticlib, which rustc does not link. For a `dylib`,
+    /// `cdylib` or `bin` it decides how std is linked, so there it stays
+    /// in `extra_codegen`; cargo never passes it for those, so a unit
+    /// carrying it was configured by the consumer.
+    fn drop_inert_prefer_dynamic(&mut self) {
+        let links_std = self
+            .crate_types
+            .iter()
+            .any(|kind| matches!(kind.as_str(), "dylib" | "cdylib" | "bin"));
+        if !links_std {
+            self.extra_codegen
+                .retain(|seen| seen != "-C prefer-dynamic");
+        }
+    }
+}
+
+/// A `-C` boolean as rustc reads it: no value means `yes`.
+fn parse_codegen_bool(value: Option<&str>) -> Result<bool, String> {
+    value.map_or(Ok(true), parse_bool)
 }
 
 /// `-C` options that steer only the final link step.
@@ -2008,8 +2139,8 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn env_remap_rustflags_do_not_enter_the_key() {
-        // `--remap-path-prefix` on argv is ignored by the parser, and in
-        // env it is not the invocation's: either way nothing keys.
+        // `--remap-path-prefix` in env is not the invocation's: nothing
+        // keys.
         unsafe {
             std::env::set_var(
                 "RUSTFLAGS",
