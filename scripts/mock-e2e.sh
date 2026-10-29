@@ -2180,3 +2180,46 @@ echo "[mock-e2e] OK — $HOST_DEPS_CRATE $HOST_DEPS_VERSION's host deps built as
 else
 echo "[mock-e2e] skipping stow#774 host-side node legs on $(uname -s) — linux-gnu host units need mold"
 fi
+
+# --- oversized slice report (stow#1081) ---------------------------------
+#
+# The last export pass is behind us, so the registry takes one more
+# signed slice the scheduler has never been told about: the catalog's
+# real records re-keyed onto a CI target no scenario above builds, each
+# copy under its own dependency context, until the slice's full
+# membership serializes to well over the edge's 2 MiB request body and
+# over one report part. `index reconcile` finds it unreported and must
+# post it in parts the scheduler stages and applies with the last one;
+# a single POST of it answered 413, and the client saw a stream reset.
+# The scheduler then holds the slice at its published generation.
+OVERSIZED_TARGET="aarch64-apple-ios"
+OVERSIZED_ROWS=12000
+jq --arg target "$OVERSIZED_TARGET" --argjson rows "$OVERSIZED_ROWS" '
+    [.[] | select((.bundle_digest // "") != "")] as $base
+    | [range($rows) as $i
+        | $base[$i % ($base | length)]
+        | .target = $target
+        | .dependency_task_ids = ["oversized-report-\($i)"]]' \
+    "$WORK_DIR/catalog.json" >"$WORK_DIR/oversized-records.json" \
+    || die "building the oversized slice's records failed"
+isolated_env "$BIN/stow-mock-registry" index-from-records \
+    --records "$WORK_DIR/oversized-records.json" \
+    --registry-root "$WORK_DIR/mock-registry" \
+    --private-key "$WORK_DIR/keys/private.pem" \
+    >"$LOG_DIR/oversized-index.log" 2>&1 \
+    || die "publishing the oversized slice failed — see $LOG_DIR/oversized-index.log"
+isolated_env \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
+    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+    STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc index-publish.yml)" \
+    "$BIN/stow-admin" index reconcile --rustc-version "$RUSTC_VERSION" \
+    >"$LOG_DIR/index-reconcile-oversized.log" 2>&1 \
+    || die "stow-admin index reconcile failed on the oversized slice — see $LOG_DIR/index-reconcile-oversized.log"
+cat "$LOG_DIR/index-reconcile-oversized.log"
+oversized_generation="$(curl -fsS --max-time 30 "$EDGE_URL/api/v1/admin/status" \
+    -H "authorization: Bearer $EDGE_BEARER" \
+    | jq -r --arg target "$OVERSIZED_TARGET" --arg rustc "$RUSTC_VERSION" \
+        '[.index_slices[] | select(.target == $target and .rustc_version == $rustc)] | .[0].generation // "none"')"
+[ "$oversized_generation" = "1" ] \
+    || die "the scheduler holds the oversized slice at generation $oversized_generation, expected 1"
+echo "[mock-e2e] OK — a $OVERSIZED_ROWS-row slice report over the request-body limit reconciled in parts and the scheduler holds it at generation $oversized_generation"

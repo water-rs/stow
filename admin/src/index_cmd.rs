@@ -988,62 +988,99 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
     Ok(())
 }
 
-/// `stow-admin index report` — post every slice the run published to
-/// the edge admin route in ONE report per publish run (stow#940), so
-/// the scheduler applies them in one append and one dispatch pass.
+/// The edge route a publish run's slices are reported to.
+const REPORT_PATH: &str = "/api/v1/admin/index/published";
+
+/// POST a run's slices in the consecutive bodies
+/// [`stow_types::api::PublishedRunReport::into_bodies`] splits them
+/// into - each under the edge's request limit, a large full report in
+/// parts the scheduler stages and applies with the last - and answer
+/// the first refusal typed, so a caller can match its status. The outer
+/// `Err` covers a slice that cannot split and build/auth failures.
+async fn post_report_unchecked(
+    edge: &Edge,
+    slices: &[stow_types::api::PublishedSlice],
+) -> stow_types::error::Result<std::result::Result<(), zenwave::Error>> {
+    let bodies = stow_types::api::PublishedRunReport::into_bodies(
+        slices.to_vec(),
+        stow_types::api::SLICE_REPORT_PART_BYTES,
+        stow_types::api::REQUEST_BODY_LIMIT_BYTES,
+    )?;
+    let url = format!("{}{REPORT_PATH}", edge.base());
+    for (at, body) in bodies.iter().enumerate() {
+        match edge.post_unchecked(REPORT_PATH, body).await? {
+            Ok(response) => {
+                response
+                    .into_json::<serde_json::Value>()
+                    .await
+                    .map_err(|error| stow_error!("decode {url}: {error}"))?;
+            }
+            Err(error) => return Ok(Err(error)),
+        }
+        tracing::debug!(
+            body = at + 1,
+            of = bodies.len(),
+            "posted a slice report body"
+        );
+    }
+    Ok(Ok(()))
+}
+
+/// [`post_report_unchecked`] where any refusal is an error naming the
+/// route.
+async fn post_report(
+    edge: &Edge,
+    slices: &[stow_types::api::PublishedSlice],
+) -> stow_types::error::Result<()> {
+    post_report_unchecked(edge, slices)
+        .await?
+        .map_err(|error| stow_error!("POST {}{REPORT_PATH}: {error}", edge.base()))
+}
+
+/// `stow-admin index report` - post every slice the run published to
+/// the edge admin route (stow#940), so the scheduler applies a run's
+/// slices in one append and one dispatch pass when they fit one body,
+/// and a full membership in parts when they do not.
 /// Each slice's set is the servable subset of its export: a row whose
 /// measured glibc floor exceeds the builder baseline publishes in the
 /// index but a baseline host cannot load it, so it releases no
 /// dependent — the same rule the catalog's coverage oracle applies.
 async fn index_report(edge: &Edge, args: IndexReportArgs) -> stow_types::error::Result<()> {
-    let mut report = stow_types::api::PublishedRunReport {
-        slices: Vec::with_capacity(args.file.len()),
-    };
+    let mut slices = Vec::with_capacity(args.file.len());
     for file in &args.file {
-        report.slices.push(slice_report_for(file, args.full).await?);
+        slices.push(slice_report_for(file, args.full).await?);
     }
-    let path = "/api/v1/admin/index/published";
-    let url = format!("{}{path}", edge.base());
-    match edge.post_unchecked(path, &report).await? {
-        Ok(response) => {
-            response
-                .into_json::<serde_json::Value>()
-                .await
-                .map_err(|error| stow_error!("decode {url}: {error}"))?;
-        }
+    match post_report_unchecked(edge, &slices).await? {
+        Ok(()) => {}
         // A refused delta resyncs once with every slice sent as the
-        // explicit full shape — the resync a per-slice 409 asked for;
+        // explicit full shape - the resync a per-slice 409 asked for;
         // a refused full report is an error.
         Err(zenwave::Error::Http {
             status, message, ..
         }) if status == zenwave::StatusCode::CONFLICT
-            && report
-                .slices
-                .iter()
-                .any(|slice| slice.base_generation.is_some()) =>
+            && slices.iter().any(|slice| slice.base_generation.is_some()) =>
         {
             tracing::warn!(
                 answer = %message,
-                "slice report refused — resyncing with a full report"
+                "slice report refused - resyncing with a full report"
             );
-            report.slices.clear();
+            slices.clear();
             for file in &args.file {
-                report.slices.push(slice_report_for(file, true).await?);
+                slices.push(slice_report_for(file, true).await?);
             }
-            edge.post_json::<_, serde_json::Value>(path, &report)
+            post_report(edge, &slices)
                 .await
                 .map_err(|error| error.wrap_err("full slice report"))?;
         }
-        Err(error) => return Err(stow_error!("POST {url}: {error}")),
+        Err(error) => {
+            return Err(stow_error!("POST {}{REPORT_PATH}: {error}", edge.base()));
+        }
     }
     let summary = IndexReportSummary {
-        slices: report.slices.len(),
-        added: report.slices.iter().map(|slice| slice.added.len()).sum(),
-        retired: report.slices.iter().map(|slice| slice.retired.len()).sum(),
-        full: report
-            .slices
-            .iter()
-            .all(|slice| slice.base_generation.is_none()),
+        slices: slices.len(),
+        added: slices.iter().map(|slice| slice.added.len()).sum(),
+        retired: slices.iter().map(|slice| slice.retired.len()).sum(),
+        full: slices.iter().all(|slice| slice.base_generation.is_none()),
     };
     tracing::info!(
         slices = summary.slices,
@@ -1093,14 +1130,23 @@ async fn slice_report_for(
         .into_iter()
         .filter(|row| !current.contains(&row_key(row)))
         .collect();
-    Ok(stow_types::api::PublishedSlice {
-        target: index.header.target,
-        rustc_version: index.header.rustc_version,
+    let delta = stow_types::api::PublishedSlice {
+        target: index.header.target.clone(),
+        rustc_version: index.header.rustc_version.clone(),
         base_generation: Some(prev.header.generation),
         generation: index.header.generation,
+        part: 0,
+        parts: 1,
         added,
         retired,
-    })
+    };
+    // A delta is one scheduler log row and cannot split: one that
+    // outgrows a part (a long gap between publishes) is reported as the
+    // slice's full membership, which does.
+    if stow_types::api::json_len(&delta)? > stow_types::api::SLICE_REPORT_PART_BYTES {
+        return Ok(full_slice(index, rows));
+    }
+    Ok(delta)
 }
 
 /// The explicit full report of a slice: its whole servable membership,
@@ -1114,6 +1160,8 @@ fn full_slice(
         rustc_version: index.header.rustc_version,
         base_generation: None,
         generation: index.header.generation,
+        part: 0,
+        parts: 1,
         added: rows,
         retired: Vec::new(),
     }
@@ -1168,7 +1216,7 @@ async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::e
         "published slices the scheduler does not hold at their live generation"
     );
     if !report.slices.is_empty() {
-        edge.post_json::<_, serde_json::Value>("/api/v1/admin/index/published", &report)
+        post_report(edge, &report.slices)
             .await
             .map_err(|error| error.wrap_err("reconcile slice report"))?;
     }
@@ -2255,6 +2303,68 @@ mod tests {
             full.get("retired").is_none(),
             "a full report carries no retired rows"
         );
+    }
+
+    /// A full report over the edge's request limit posts as consecutive
+    /// bodies, each under it: the slice's parts arrive in order with one
+    /// generation and part count, and together carry every row once.
+    #[tokio::test]
+    async fn a_full_report_over_the_body_limit_posts_in_parts() {
+        let dir = tempfile::tempdir().expect("report dir");
+        let file = dir.path().join(index_tag(TARGET, RUSTC));
+        let rows: Vec<_> = (0..12_000)
+            .map(|i| record_to_index_row(&shared_unit_record(&[&format!("dep-{i}")])))
+            .collect();
+        std::fs::write(&file, encode(&prev_index(rows, 7)).expect("encode index"))
+            .expect("write index file");
+        let server = crate::test_server::Loopback::start(Vec::new()).await;
+        index_report(
+            &Edge::for_test(server.url.clone()),
+            IndexReportArgs {
+                file: vec![file],
+                full: true,
+            },
+        )
+        .await
+        .expect("the parts post");
+        let requests = server.join().await;
+        assert!(requests.len() > 1, "the report needs several bodies");
+        let mut identities = BTreeSet::new();
+        for (at, request) in requests.iter().enumerate() {
+            assert!(request.body.len() <= stow_types::api::REQUEST_BODY_LIMIT_BYTES);
+            let slice = posted_report(request);
+            assert_eq!(slice["part"], at);
+            assert_eq!(slice["parts"], requests.len());
+            assert_eq!(slice["generation"], 7);
+            assert!(slice.get("base_generation").is_none());
+            for row in slice["added"].as_array().expect("added rows") {
+                assert!(identities.insert(row["dependency_identity"].to_string()));
+            }
+        }
+        assert_eq!(identities.len(), 12_000);
+    }
+
+    /// A body over the edge's limit fails on the client naming the
+    /// route and the size, and nothing is sent.
+    #[tokio::test]
+    async fn a_body_over_the_edge_limit_is_refused_before_sending() {
+        let server = crate::test_server::Loopback::start(Vec::new()).await;
+        let edge = Edge::for_test(server.url.clone());
+        let body = "x".repeat(stow_types::api::REQUEST_BODY_LIMIT_BYTES);
+        let error = edge
+            .post_json::<_, serde_json::Value>("/api/v1/admin/index/published", &body)
+            .await
+            .expect_err("an oversized body");
+        let message = error.to_string();
+        assert!(
+            message.contains("/api/v1/admin/index/published"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("{}-byte body", body.len() + 2)),
+            "{message}"
+        );
+        assert!(server.join().await.is_empty(), "nothing was sent");
     }
 
     /// A full report refused the same way stays an error — the resync

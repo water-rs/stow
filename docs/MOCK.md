@@ -17,7 +17,11 @@ from the cache. It then exercises the host-side node pipeline:
 `snafu-derive`'s proc-macro tree submits as host-side tasks gated on
 published slices, builds wave by wave with an export → publish → report →
 sync pass between layers, and serves a second consumer both natively and
-under `--target wasm32-unknown-unknown`. For the edge it runs
+under `--target wasm32-unknown-unknown`. A final step publishes a
+12,000-row slice (the catalog's records re-keyed onto an unused CI target)
+and runs `index reconcile`, whose full report is over the edge's request
+body and one report part, so it posts in parts and the scheduler must
+hold the slice afterwards. For the edge it runs
 `skyzen build` once and supervises
 `wrangler dev` itself, because `skyzen dev`'s file watcher rebuilds in
 a loop on Linux — inotify reports opens of the watched manifest and

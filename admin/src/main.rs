@@ -520,6 +520,18 @@ impl Edge {
         timeout: Duration,
     ) -> stow_types::error::Result<std::result::Result<zenwave::Response, zenwave::Error>> {
         let url = format!("{}{path}", self.base);
+        // The edge answers a larger body 413 while the client is still
+        // writing it, and over HTTP/3 the answer is lost as a stream
+        // reset - so the one place every JSON POST shares refuses it
+        // first, naming the route and the size.
+        let bytes = stow_types::api::json_len(body)?;
+        if bytes > stow_types::api::REQUEST_BODY_LIMIT_BYTES {
+            return Err(stow_error!(
+                "POST {url}: the {bytes}-byte body is over the edge's {}-byte request limit; \
+                 split it before sending",
+                stow_types::api::REQUEST_BODY_LIMIT_BYTES
+            ));
+        }
         let bearer = self.bearer().await?;
         // The timeout middleware is stacked by hand — `Client::timeout`
         // hides it behind `impl Client`'s associated `Error`, and the
@@ -970,8 +982,8 @@ fn summarize_notify(notify: &ChannelOutcome) -> String {
     }
 }
 
-/// `stow-admin submit` — one `EnqueueRequest` batch, one POST. The
-/// endpoint takes the whole `Vec<EnqueueRequest>`; there is no
+/// `stow-admin submit` — one `EnqueueRequest` batch, posted through the
+/// shared split path: bodies under the edge's request bound, with no
 /// per-request loop and no local retry — the response reports what the
 /// batch became.
 async fn submit_command(
@@ -1038,7 +1050,7 @@ async fn submit_command(
         trees,
         |envelope: &render::Planned<
             Vec<stow_types::api::SubmissionTree>,
-            SchedulerSubmitResponse,
+            projects::SubmitOutcome,
         >| {
             let nodes: usize = envelope.plan.iter().map(|tree| tree.nodes.len()).sum();
             let mut out = format!("{nodes} task(s)\n");
@@ -1065,7 +1077,7 @@ async fn submit_command(
         },
         args.yes
             .then_some(async move |trees: &Vec<stow_types::api::SubmissionTree>| {
-                submit(edge, trees).await
+                projects::submit_chunked(edge, trees).await
             }),
     )
     .await

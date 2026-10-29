@@ -466,7 +466,19 @@ The scheduler holds each reported slice's generation. A delta report
 applies only on top of exactly that generation and publishes the next
 one, else the route answers 409 and `index report` resends the slice in
 full; a full report replaces the slice's set and restarts the sequence.
-A run whose report failed fails, and the next run's `index reconcile`
+A full report larger than the edge's 2 MiB request body (a store-reset
+reconcile, a first publish) is sent in parts: each part names its slice,
+generation, index and part count and carries a share of the membership
+bounded at 512 KiB, parts of one slice never share a body, and bodies
+post in order. The scheduler appends one log row per part and stages the
+parts of a slice in memory (and in the snapshot, so an eviction in the
+middle of a report loses nothing); it applies the whole membership as
+one replacement only when the last part arrives, so no reader sees a
+partial set. A newer part 0 for the slice supersedes an incomplete
+report, a delta is refused with a 409 while one is staged, and a part
+that does not continue its staged report (or contradicts its part count)
+is refused. `stow-admin` refuses any JSON body over the request limit
+before sending it. A run whose report failed fails, and the next run's `index reconcile`
 (which reads the generations from `GET /api/v1/admin/status`) reports
 every published slice the scheduler does not hold before its own delta.
 
@@ -886,7 +898,7 @@ unauthorized POSTs short-circuit before deserialization.
 | POST `/api/v1/scheduler/tasks/submit-ids` | Bearer: `operations.yml` or `preheat-admin.yml` OIDC on `main` | `SubmitTaskIdsRequest` | `SubmitTaskIdsResponse` | Submit stored subgraphs by task id — `preheat projects submit` |
 | POST `/api/v1/admin/scheduler/reset` | Bearer: `operations.yml` OIDC on `main` | — | `SchedulerResetReport` | Drop and recreate the scheduler store — `scheduler reset` |
 | POST `/api/v1/admin/scheduler/demand`, `…/demand-feed/{query\|begin\|page\|complete\|cleanup\|deliver}` | Bearer: `operations.yml` or `demand-feed.yml` OIDC on `main` | demand-feed request types | demand-feed reports | The demand ledger's input lane — `scheduler demand-feed` |
-| POST `/api/v1/admin/index/published` | Bearer: `index-publish.yml` OIDC on `main` | `PublishedRunReport` | `OkResponse` | One publish run's slice membership — `index report` |
+| POST `/api/v1/admin/index/published` | Bearer: `index-publish.yml` OIDC on `main` | `PublishedRunReport` | `OkResponse` | One body of a publish run's slice membership (a large full report arrives as several, in order) — `index report`, `index reconcile` |
 | POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-crate.yml` run completed; the edge parses `display_title` (`<rustc>-<task_id>`) → task id and forwards the run's identity to the scheduler's `POST /tasks/complete-run`; the alarm's resolution completes the task only once the records artifact its publish job pushed verifies in GHCR |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection — lane depths for `stow-admin status --watch` (stow#853); `Cache-Control: no-store` |
 | GET `/api/v1/scheduler/health` | none | — | `SchedulerHealth` | Uncached liveness for uptime monitors (stow#860): worker/scheduler verdict, dispatch-freeze state and last `workflow_run` delivery age; any unhealthy component answers 503, all under `Cache-Control: no-store` |
