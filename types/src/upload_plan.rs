@@ -388,6 +388,7 @@ impl BuildScriptInputs {
     /// # Errors
     /// Fails when `out_dir` is set and its build script output cannot be
     /// read (see [`crate::native_capture::read_build_script_directives`]).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn of_out_dir(
         crate_name: &str,
         out_dir: Option<&std::path::Path>,
