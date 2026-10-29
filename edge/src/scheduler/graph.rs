@@ -1717,7 +1717,9 @@ impl Graph {
                     continue;
                 }
                 for (&operand, class) in ready {
-                    let cursor = cursors.entry((macos, operand)).or_insert(Some((i64::MIN, 0)));
+                    let cursor = cursors
+                        .entry((macos, operand))
+                        .or_insert(Some((i64::MIN, 0)));
                     let Some(from) = *cursor else {
                         continue;
                     };
@@ -2633,8 +2635,7 @@ impl Graph {
     pub fn reconcile_due(&self, now: i64, settings: &queue::SchedulerSettings) -> bool {
         now - self.reconcile_attempted_at >= Self::STATUS_RECONCILE_MS
             && (!self.inflight.is_empty()
-                || (self.has_ready()
-                    && !matches!(settings.dispatch, queue::Dispatch::Paused)))
+                || (self.has_ready() && !matches!(settings.dispatch, queue::Dispatch::Paused)))
     }
 
     /// A listing attempt that failed: the next one waits the interval
