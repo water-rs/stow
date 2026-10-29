@@ -573,7 +573,8 @@ pub async fn load_semantic_cached_bundle(
     // keeps containment while the chain check that gates a move ran
     // upstream at prefetch-staging time.
     let rows = sqlx::query_as::<_, SemanticCacheCandidateRow>(
-        "SELECT c_metadata, crate_version, emit_json, features_json \
+        "SELECT c_metadata, crate_version, emit_json, features_json, crate_name, \
+                compile_key, dependency_c_metadata_json \
          FROM artifact_cache_entries \
          WHERE rustc_version = ? AND target = ? AND crate_name = ? \
            AND profile_json = ? AND kind_json = ? AND crate_types_json = ? \
@@ -604,18 +605,89 @@ pub async fn load_semantic_cached_bundle(
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
     candidates.sort_by(compare_semantic_candidates);
-    let Some(candidate) = candidates.into_iter().next() else {
-        return Ok(None);
+    // The first candidate in order that was also compiled with the
+    // request's own cfgs, codegen and link options (stow#1047). One that
+    // was not is a plain miss for this request, never an eviction: it is
+    // a sound artifact for the requests it does match.
+    for candidate in candidates {
+        let loaded = load_cached_bundle(
+            config,
+            &FetchRequest {
+                target: &request.target,
+                rustc_version: &request.rustc_version,
+                c_metadata: &candidate.c_metadata,
+            },
+        )
+        .await?;
+        let Some(loaded) = loaded else {
+            continue;
+        };
+        if semantic_candidate_honours_consumer(request, &candidate, &loaded)? {
+            return Ok(Some(loaded));
+        }
+        tracing::debug!(
+            crate_name = %request.crate_name,
+            candidate_version = %candidate.row.crate_version,
+            candidate_compile_key = %candidate.row.compile_key,
+            "local semantic candidate was compiled with different cfgs, codegen or link options"
+        );
+    }
+    Ok(None)
+}
+
+/// Whether `loaded`, a semantic candidate of `request`, was compiled with
+/// the request's own cfgs, extra codegen and link options.
+///
+/// A candidate of the request's version and feature set differs in its
+/// emit set alone and ran the request's own build script. Any other was
+/// built with its own build script's output, which a stored entry carries
+/// only in the manifest a downloaded bundle keeps beside its files; a
+/// locally compiled entry has none, so it is judged as having no
+/// build-script inputs.
+fn semantic_candidate_honours_consumer(
+    request: &SemanticFetchRequest,
+    candidate: &SemanticCacheCandidate,
+    loaded: &CachedArtifactBundle,
+) -> stow_types::error::Result<bool> {
+    let build_script = match request
+        .build_script_of_same_build(&candidate.row.crate_version, &candidate.row.features_json)
+    {
+        Some(own) => std::borrow::Cow::Borrowed(own),
+        None => std::borrow::Cow::Owned(stow_types::upload_plan::BuildScriptInputs::of(
+            read_entry_native(&loaded.entry_dir)?.as_ref(),
+        )),
     };
-    load_cached_bundle(
-        config,
-        &FetchRequest {
-            target: &request.target,
-            rustc_version: &request.rustc_version,
-            c_metadata: &candidate.c_metadata,
+    request.candidate_honours_consumer(
+        &crate::fetch::SemanticCandidate {
+            crate_name: &candidate.row.crate_name,
+            crate_version: &candidate.row.crate_version,
+            features_json: &candidate.row.features_json,
+            dependency_c_metadata_json: &candidate.row.dependency_c_metadata_json,
+            emit: &candidate.emit,
+            compile_key: &candidate.row.compile_key,
         },
+        &build_script,
     )
-    .await
+}
+
+/// The captured build-script output of the bundle an entry was stored
+/// from; `None` for an entry with no manifest (a local build).
+fn read_entry_native(
+    entry_dir: &Path,
+) -> stow_types::error::Result<Option<stow_types::artifact::NativeArtifacts>> {
+    let manifest_path = entry_dir.join(STOW_BUNDLE_MANIFEST_PATH);
+    let bytes = match std::fs::read(&manifest_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).wrap_err_with(|| {
+                format!("read bundle entry manifest {}", manifest_path.display())
+            });
+        }
+    };
+    let manifest = serde_json::from_slice::<stow_types::bundle::ArtifactBundleManifest>(&bytes)
+        .wrap_err_with(|| format!("parse bundle entry manifest {}", manifest_path.display()))?;
+    Ok(manifest.config.native)
 }
 
 pub async fn store_downloaded_bundle(
@@ -3312,6 +3384,9 @@ struct SemanticCacheCandidateRow {
     crate_version: String,
     emit_json: String,
     features_json: String,
+    crate_name: String,
+    compile_key: String,
+    dependency_c_metadata_json: String,
 }
 
 #[derive(Debug, Clone)]
@@ -3323,6 +3398,8 @@ struct SemanticCacheCandidate {
     /// smallest staged set containing it (stow#881), so the order keys
     /// on this.
     features: Vec<String>,
+    emit: Vec<String>,
+    row: SemanticCacheCandidateRow,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -3433,9 +3510,11 @@ fn semantic_candidate_from_row(
     }
     Ok(Some(SemanticCacheCandidate {
         version: candidate_version,
-        c_metadata: row.c_metadata,
+        c_metadata: row.c_metadata.clone(),
         emit_len: candidate_emit.len(),
         features: candidate_features,
+        emit: candidate_emit,
+        row,
     }))
 }
 
@@ -4509,50 +4588,175 @@ pub mod tests {
         );
     }
 
+    /// A stored `ignore` 0.4.24 bundle whose compile key is the one it
+    /// would carry under `build_script`, and the request for 0.4.22 the
+    /// semantic lookup answers.
+    fn semantic_fixture(
+        features: &[&str],
+        build_script: &stow_types::upload_plan::BuildScriptInputs,
+    ) -> (ArtifactBundle, SemanticFetchRequest) {
+        let mut bundle = sample_bundle("11223344aabbccdd", "libdemo-11223344aabbccdd.rmeta");
+        let config = &mut bundle.manifest.config;
+        config.crate_name = stow_types::identity::CrateName::parse("ignore").unwrap();
+        config.crate_version =
+            stow_types::identity::CrateVersion::new(semver::Version::parse("0.4.24").unwrap());
+        config.features_json = stow_types::identity::FeaturesJson::canonicalize(
+            features
+                .iter()
+                .map(|feature| (*feature).to_owned())
+                .collect(),
+        )
+        .unwrap();
+        config.compile_key = stow_types::upload_plan::candidate_compile_key(
+            &stow_types::upload_plan::CandidateIdentity {
+                crate_name: "ignore",
+                crate_version: "0.4.24",
+                target: "aarch64-apple-darwin",
+                rustc_version: "1.91.1",
+                features_json: &config.features_json.raw(),
+                dependency_c_metadata_json: &config.dependency_c_metadata_json.raw(),
+                kind: &config.kind,
+                profile: &config.profile,
+                crate_types: &config.crate_types,
+                emit: &config.emit,
+            },
+            &stow_types::upload_plan::ConsumerInputs::stock(),
+            build_script,
+        )
+        .expect("compile key");
+        bundle.manifest.oci_reference = "ghcr.io/water-rs/stow-cache-1.91.1:ignore.test".to_owned();
+        let config = &bundle.manifest.config;
+        let request = SemanticFetchRequest {
+            crate_name: "ignore".to_owned(),
+            version: "0.4.22".to_owned(),
+            features_json: "[\"default\"]".to_owned(),
+            dependency_c_metadata_json: "[]".to_owned(),
+            target: "aarch64-apple-darwin".to_owned(),
+            rustc_version: "1.91.1".to_owned(),
+            profile: config.profile.clone(),
+            emit: config.emit.clone(),
+            kind: config.kind.clone(),
+            crate_types: config.crate_types.clone(),
+            consumer: stow_types::upload_plan::ConsumerInputs::stock(),
+            build_script: stow_types::upload_plan::BuildScriptInputs::default(),
+        };
+        (bundle, request)
+    }
+
+    async fn store_and_load_semantic(
+        config: &StowConfig,
+        bundle: &ArtifactBundle,
+        request: &SemanticFetchRequest,
+    ) -> Option<super::CachedArtifactBundle> {
+        prepare_local_cache(config, "1.91.1")
+            .await
+            .expect("prepare cache");
+        super::store_downloaded_bundle(config, &fetch_request("11223344aabbccdd"), bundle)
+            .await
+            .expect("store bundle");
+        load_semantic_cached_bundle(config, request)
+            .await
+            .expect("load semantic bundle")
+    }
+
     #[test]
     fn load_semantic_cached_bundle_matches_compatible_version_with_different_metadata() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
-        let request = fetch_request("11223344aabbccdd");
-        let mut bundle = sample_bundle("11223344aabbccdd", "libdemo-11223344aabbccdd.rmeta");
-        bundle.manifest.config.crate_name =
-            stow_types::identity::CrateName::parse("ignore").unwrap();
-        bundle.manifest.config.crate_version =
-            stow_types::identity::CrateVersion::new(semver::Version::parse("0.4.24").unwrap());
-        bundle.manifest.config.features_json =
-            stow_types::identity::FeaturesJson::canonicalize(vec!["default".to_owned()]).unwrap();
-        bundle.manifest.config.compile_key = "semantic-compile-key".to_owned();
-        bundle.manifest.oci_reference = "ghcr.io/water-rs/stow-cache-1.91.1:ignore.test".to_owned();
+        let (bundle, request) = semantic_fixture(
+            &["default"],
+            &stow_types::upload_plan::BuildScriptInputs::default(),
+        );
 
         run_async(async {
-            prepare_local_cache(&config, "1.91.1")
+            let loaded = store_and_load_semantic(&config, &bundle, &request)
                 .await
-                .expect("prepare cache");
-            super::store_downloaded_bundle(&config, &request, &bundle)
-                .await
-                .expect("store bundle");
-
-            let loaded = load_semantic_cached_bundle(
-                &config,
-                &SemanticFetchRequest {
-                    crate_name: "ignore".to_owned(),
-                    version: "0.4.22".to_owned(),
-                    features_json: "[\"default\"]".to_owned(),
-                    dependency_c_metadata_json: "[]".to_owned(),
-                    target: "aarch64-apple-darwin".to_owned(),
-                    rustc_version: "1.91.1".to_owned(),
-                    profile: bundle.manifest.config.profile.clone(),
-                    emit: bundle.manifest.config.emit.clone(),
-                    kind: bundle.manifest.config.kind.clone(),
-                    crate_types: bundle.manifest.config.crate_types.clone(),
-                },
-            )
-            .await
-            .expect("load semantic bundle")
-            .expect("semantic cache hit");
+                .expect("semantic cache hit");
             assert_eq!(loaded.crate_name, "ignore");
             assert_eq!(loaded.crate_version, "0.4.24");
             assert_eq!(loaded.c_metadata, "11223344aabbccdd");
+        });
+    }
+
+    /// stow#1047: an entry compiled without the request's own `--cfg`
+    /// answers the requests that carry none, never one that does.
+    #[test]
+    fn a_semantic_entry_compiled_without_the_requests_cfg_is_a_miss() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let (bundle, mut request) = semantic_fixture(
+            &["default"],
+            &stow_types::upload_plan::BuildScriptInputs::default(),
+        );
+        request.consumer.cfgs = vec!["custom".to_owned()];
+
+        run_async(async {
+            assert!(
+                store_and_load_semantic(&config, &bundle, &request)
+                    .await
+                    .is_none()
+            );
+        });
+    }
+
+    /// Superset serving stays intact when the serving set's own build
+    /// script set a cfg the request's set never saw (stow#881): the cfg
+    /// is read from the candidate's captured build-script output.
+    #[test]
+    fn a_superset_entry_keeps_serving_with_its_own_build_script_cfg() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let own = stow_types::upload_plan::BuildScriptInputs::from_directives(&[
+            "cargo:rustc-cfg=has_extra".to_owned(),
+        ]);
+        let (mut bundle, request) = semantic_fixture(&["default", "extra"], &own);
+        bundle.manifest.config.native = Some(stow_types::artifact::NativeArtifacts {
+            static_libs: Vec::new(),
+            cargo_directives: vec!["cargo:rustc-cfg=has_extra".to_owned()],
+            dep_env_vars: BTreeMap::new(),
+            out_dir_files: Vec::new(),
+            original_out_dir: PathBuf::from("/out"),
+        });
+
+        run_async(async {
+            let loaded = store_and_load_semantic(&config, &bundle, &request)
+                .await
+                .expect("the superset serves the request");
+            assert_eq!(loaded.features_json, "[\"default\",\"extra\"]");
+        });
+    }
+
+    /// stow#1047: a local entry keyed before the check defaults were
+    /// corrected, labeled `opt-level=3` with checks on, is never served to
+    /// a request that spells those checks out.
+    #[test]
+    fn a_stale_optimized_entry_is_not_served_for_explicit_checks() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        let (mut bundle, mut request) = semantic_fixture(
+            &["default"],
+            &stow_types::upload_plan::BuildScriptInputs::default(),
+        );
+        let stale_profile = stow_types::platform::Profile {
+            opt_level: "3".to_owned(),
+            debug_assertions: true,
+            overflow_checks: true,
+            ..bundle.manifest.config.profile.clone()
+        };
+        // The key the entry for a plain `-C opt-level=3` was stored under
+        // before the correction: the same hash without the check-defaults
+        // tag, as computed by the code of that day.
+        bundle.manifest.config.profile = stale_profile.clone();
+        bundle.manifest.config.compile_key =
+            "3bdb535cb0261859019abc13bebfbdf50ff3f48647bd89270f7e4e0318c48645".to_owned();
+        request.profile = stale_profile;
+
+        run_async(async {
+            assert!(
+                store_and_load_semantic(&config, &bundle, &request)
+                    .await
+                    .is_none()
+            );
         });
     }
 
@@ -6520,6 +6724,7 @@ pub mod tests {
             crate_types,
             features: BTreeSet::default(),
             cfgs: BTreeSet::default(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: Some(out_dir.join(format!("{crate_name}.rs"))),
@@ -6538,8 +6743,8 @@ pub mod tests {
             extern_crates,
             embed_metadata: None,
             embed_bitcode: false,
-            extra_codegen: std::collections::BTreeSet::new(),
-            link_options: std::collections::BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         }
     }
 
@@ -6625,6 +6830,7 @@ pub mod tests {
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::default(),
             cfgs: BTreeSet::default(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: None,
@@ -6646,8 +6852,8 @@ pub mod tests {
             }],
             embed_metadata: None,
             embed_bitcode: false,
-            extra_codegen: std::collections::BTreeSet::new(),
-            link_options: std::collections::BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         }
     }
 

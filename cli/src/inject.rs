@@ -637,6 +637,7 @@ mod tests {
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::default(),
             cfgs: BTreeSet::default(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::default(),
             json: BTreeSet::default(),
             input_path: Some(PathBuf::from(
@@ -657,8 +658,8 @@ mod tests {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
-            extra_codegen: std::collections::BTreeSet::new(),
-            link_options: std::collections::BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         }
     }
 

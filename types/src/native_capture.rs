@@ -44,6 +44,43 @@ pub fn capture_native_artifacts(
     let Some(out_dir) = build_script_out_dir else {
         return Ok(None);
     };
+    let (build_dir, out_dir_name) = open_build_dir(crate_name, out_dir)?;
+    let cargo_directives = read_directives_in(crate_name, &build_dir, out_dir)?;
+    let (static_libs, out_dir_files) = match OutDirRoot::open_in(&build_dir, out_dir_name)? {
+        Some(root) => root.collect()?,
+        None => (Vec::new(), Vec::new()),
+    };
+    Ok(Some(NativeArtifacts {
+        static_libs,
+        cargo_directives,
+        dep_env_vars: BTreeMap::new(),
+        out_dir_files,
+        original_out_dir: out_dir.to_path_buf(),
+    }))
+}
+
+/// The `cargo:` directive lines the build script that owns `out_dir` wrote
+/// to its `output` file, which sits beside `out_dir`, read without following
+/// a symlink.
+///
+/// # Errors
+///
+/// An `out_dir` with no sibling `output` file is an error: cargo always
+/// runs the build script (and writes `output`) before compiling the
+/// crate, so its absence means the directory is not what cargo promised.
+pub fn read_build_script_directives(
+    crate_name: &str,
+    out_dir: &Path,
+) -> crate::error::Result<Vec<String>> {
+    let (build_dir, _) = open_build_dir(crate_name, out_dir)?;
+    read_directives_in(crate_name, &build_dir, out_dir)
+}
+
+/// The build dir that holds `out_dir`, as a handle, and `out_dir`'s name in it.
+fn open_build_dir<'a>(
+    crate_name: &str,
+    out_dir: &'a Path,
+) -> crate::error::Result<(Dir, &'a OsStr)> {
     let build_dir_path = out_dir.parent().ok_or_else(|| {
         crate::stow_error!(
             "build script OUT_DIR {} for {crate_name} has no parent build dir",
@@ -58,9 +95,17 @@ pub fn capture_native_artifacts(
     })?;
     let build_dir = Dir::open_ambient_dir(build_dir_path, ambient_authority())
         .wrap_err_with(|| format!("open build dir {}", build_dir_path.display()))?;
+    Ok((build_dir, out_dir_name))
+}
 
-    let output_path = build_dir_path.join("output");
-    let mut output_file = open_regular(&build_dir, OsStr::new("output")).map_err(|error| {
+/// Parse the `output` file in `build_dir`, refusing a symlink.
+fn read_directives_in(
+    crate_name: &str,
+    build_dir: &Dir,
+    out_dir: &Path,
+) -> crate::error::Result<Vec<String>> {
+    let output_path = out_dir.with_file_name("output");
+    let mut output_file = open_regular(build_dir, OsStr::new("output")).map_err(|error| {
         crate::stow_error!(
             "build script output file {} for {crate_name} is unreadable or missing: {error}",
             output_path.display()
@@ -70,18 +115,7 @@ pub fn capture_native_artifacts(
     output_file
         .read_to_string(&mut raw)
         .wrap_err_with(|| format!("read build script output {}", output_path.display()))?;
-    let cargo_directives = parse_build_script_output(&raw);
-    let (static_libs, out_dir_files) = match OutDirRoot::open_in(&build_dir, out_dir_name)? {
-        Some(root) => root.collect()?,
-        None => (Vec::new(), Vec::new()),
-    };
-    Ok(Some(NativeArtifacts {
-        static_libs,
-        cargo_directives,
-        dep_env_vars: BTreeMap::new(),
-        out_dir_files,
-        original_out_dir: out_dir.to_path_buf(),
-    }))
+    Ok(parse_build_script_output(&raw))
 }
 
 /// A build script's `OUT_DIR`, held as a directory handle.
@@ -165,17 +199,7 @@ impl OutDirRoot {
         }
         let file = open_regular(dir.as_ref().unwrap_or(&self.dir), OsStr::new(name))
             .wrap_err_with(|| format!("open native out dir file {relative_path}"))?;
-        let mut file = file.into_std();
-        let actual = hash_file(&mut file)
-            .wrap_err_with(|| format!("hash native out dir file {relative_path}"))?;
-        if actual != expected_sha256 {
-            return Err(crate::stow_error!(
-                "native out dir file {relative_path} changed since capture: sha256 {actual}, captured {expected_sha256}"
-            ));
-        }
-        file.seek(SeekFrom::Start(0))
-            .wrap_err_with(|| format!("rewind native out dir file {relative_path}"))?;
-        Ok(file)
+        verify_digest(file.into_std(), relative_path, expected_sha256)
     }
 
     /// Walk the tree and hash every regular file. `.a`/`.lib` files
@@ -252,8 +276,73 @@ fn open_regular(dir: &Dir, name: &OsStr) -> std::io::Result<cap_std::fs::File> {
     Ok(file)
 }
 
+/// Open the regular file at `path` without following a symlink at its final
+/// component, and check the opened handle (not the path) is a regular file.
+///
+/// The parent directory is the host's own (cargo's `deps/`), so only the
+/// file name is untrusted: it resolves relative to a directory handle with
+/// the same no-follow discipline as [`OutDirRoot`].
+///
+/// # Errors
+///
+/// A symlink at `path`, a non-regular file, or any I/O failure.
+pub fn open_regular_nofollow(path: &Path) -> crate::error::Result<std::fs::File> {
+    let (dir, name) = parent_handle(path)?;
+    let file = open_regular(&dir, name)
+        .wrap_err_with(|| format!("open {} without following symlinks", path.display()))?;
+    Ok(file.into_std())
+}
+
+/// [`open_regular_nofollow`], additionally requiring the bytes to hash to
+/// `expected_sha256`; the handle is returned rewound, so a copy of it carries
+/// exactly the verified bytes.
+///
+/// # Errors
+///
+/// As [`open_regular_nofollow`], or a digest mismatch.
+pub fn open_verified_nofollow(
+    path: &Path,
+    expected_sha256: &str,
+) -> crate::error::Result<std::fs::File> {
+    let file = open_regular_nofollow(path)?;
+    verify_digest(file, &path.display().to_string(), expected_sha256)
+}
+
+fn parent_handle(path: &Path) -> crate::error::Result<(Dir, &OsStr)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::stow_error!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| crate::stow_error!("{} has no file name", path.display()))?;
+    let dir = Dir::open_ambient_dir(parent, ambient_authority())
+        .wrap_err_with(|| format!("open directory {}", parent.display()))?;
+    Ok((dir, name))
+}
+
+/// Hash `file` from its start, require `expected_sha256`, and rewind it.
+fn verify_digest(
+    mut file: std::fs::File,
+    what: &str,
+    expected_sha256: &str,
+) -> crate::error::Result<std::fs::File> {
+    let actual = hash_file(&mut file).wrap_err_with(|| format!("hash {what}"))?;
+    if actual != expected_sha256 {
+        return Err(crate::stow_error!(
+            "{what} changed since capture: sha256 {actual}, captured {expected_sha256}"
+        ));
+    }
+    file.seek(SeekFrom::Start(0))
+        .wrap_err_with(|| format!("rewind {what}"))?;
+    Ok(file)
+}
+
 /// Hex SHA-256 of everything `file` yields from its current position.
-fn hash_file(file: &mut std::fs::File) -> std::io::Result<String> {
+///
+/// # Errors
+///
+/// Any read failure.
+pub fn hash_file(file: &mut std::fs::File) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1 << 16];
     loop {
@@ -298,6 +387,8 @@ pub fn is_static_library(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use sha2::Digest as _;
+
     use super::capture_native_artifacts;
 
     #[test]
@@ -320,6 +411,29 @@ mod tests {
                 .map(|file| file.relative_path.as_str())
                 .collect::<Vec<_>>(),
             vec!["gen/bindings.rs"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_open_refuses_a_symlink_and_checks_the_digest() {
+        use super::{open_regular_nofollow, open_verified_nofollow};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real.rlib");
+        std::fs::write(&real, b"bytes").expect("write");
+        let link = dir.path().join("link.rlib");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let sha = hex::encode(sha2::Sha256::digest(b"bytes"));
+
+        assert!(open_regular_nofollow(&link).is_err());
+        assert!(open_verified_nofollow(&link, &sha).is_err());
+        assert!(open_regular_nofollow(dir.path()).is_err());
+        assert!(open_verified_nofollow(&real, &sha).is_ok());
+        let error = open_verified_nofollow(&real, "00").expect_err("digest mismatch");
+        assert!(
+            error.to_string().contains("changed since capture"),
+            "{error}"
         );
     }
 

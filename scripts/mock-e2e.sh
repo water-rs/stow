@@ -1356,6 +1356,25 @@ jq -e '.dry_run == false and .result.max_concurrent_jobs == 1
        and .result.setting.actor != null' "$WORK_DIR/dispatch-cap-set.json" >/dev/null \
     || die "dispatch-cap set answer: $(cat "$WORK_DIR/dispatch-cap-set.json")"
 
+# The two runs claimed before the set drain without being cancelled.
+# They finish before the edge restarts: their `completed` webhooks are
+# posted once, so a restart under them would lose the delivery.
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
+    if [ -n "$status_json" ]; then
+        [ "$(jq -r '.failed' <<<"$status_json")" -gt "$BASE_FAILED" ] \
+            && die "dispatch-cap: a run claimed before the set failed: $status_json"
+        [ "$(jq -r '.completed' <<<"$status_json")" -ge "$((completed_base + 2))" ] \
+            && [ "$(jq -r '.dispatched + .running' <<<"$status_json")" -eq 0 ] && break
+    fi
+    [ "$SECONDS" -ge "$deadline" ] \
+        && die "dispatch-cap: the pre-set runs never drained (status: $status_json)"
+    sleep 5
+done
+
+# Nothing is in flight here, so no run's webhook meets the down edge.
 # The setting is the scheduler's log, not the isolate's memory: a
 # restart of the edge must keep it — the restart keeps the persisted
 # DO store, never a scheduler reset.
@@ -1385,22 +1404,6 @@ cap_json status >"$WORK_DIR/dispatch-cap-restart.json" 2>&1 \
 jq -e '.max_concurrent_jobs == 1 and .max_concurrent_macos_jobs == 1
        and .setting.actor != null' "$WORK_DIR/dispatch-cap-restart.json" >/dev/null \
     || die "dispatch caps did not survive the restart: $(cat "$WORK_DIR/dispatch-cap-restart.json")"
-
-# The two runs claimed before the set drain without being cancelled.
-deadline=$((SECONDS + TASK_DEADLINE))
-while :; do
-    check_children_alive
-    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
-    if [ -n "$status_json" ]; then
-        [ "$(jq -r '.failed' <<<"$status_json")" -gt "$BASE_FAILED" ] \
-            && die "dispatch-cap: a run claimed before the set failed: $status_json"
-        [ "$(jq -r '.completed' <<<"$status_json")" -ge "$((completed_base + 2))" ] \
-            && [ "$(jq -r '.dispatched + .running' <<<"$status_json")" -eq 0 ] && break
-    fi
-    [ "$SECONDS" -ge "$deadline" ] \
-        && die "dispatch-cap: the pre-set runs never drained (status: $status_json)"
-    sleep 5
-done
 
 # Under cap 1, two tasks submitted together run one at a time: the
 # second stays queued while the first is in flight, and in-flight work
