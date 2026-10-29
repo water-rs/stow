@@ -12,7 +12,9 @@ name: Preheat the public cache
 # `preheat-admin.yml` for it (stow#880). This lane is the other half: a
 # once-per-UTC-day refresh for the moving lists. The marker is an
 # actions/cache entry keyed by version and day, which makes a same-day
-# re-run a no-op.
+# re-run a no-op. The schedule ticks every four hours off the top of the
+# hour, so a delayed or missed tick costs a few hours rather than a day;
+# every tick after the day's first is that no-op.
 #
 # Re-submitting the whole list is cheap on purpose: the scheduler
 # deduplicates on task identity, leaves completed tasks completed, and
@@ -20,7 +22,7 @@ name: Preheat the public cache
 # only builds what is genuinely missing or previously failed.
 on:
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "17 */4 * * *"
   workflow_dispatch:
 
 permissions:

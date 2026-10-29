@@ -168,7 +168,7 @@ fn cron_declarations() {
             .and_then(|s| field(&s[0], "cron"))
             .map(scalar)
             .as_deref(),
-        Some("0 0 * * *")
+        Some("17 */4 * * *")
     );
     // The tick both schedules and dispatches manually.
     assert!(at(&wf, "on.workflow_dispatch").is_some());
