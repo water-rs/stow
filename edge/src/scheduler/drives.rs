@@ -2391,6 +2391,91 @@ pub const DRIVES: &[Drive] = &[
         },
         cleanup: None,
     },
+    Drive {
+        // The operator's caps read (stow#1039): one read of state the
+        // graph holds — the same shape as `GET /admin/status`.
+        name: "GET /dispatch-cap",
+        setup: None,
+        run: |_db, _shape, settings, ctx| {
+            Box::pin(async move {
+                ctx.loaded().with(|graph| {
+                    graph.dispatch_cap_view(&settings.with_dispatch_cap(graph.dispatch_cap()))
+                });
+                Ok(())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The operator's `set` (stow#1039): one `DispatchCap` append,
+        // then the route's own tail — the dispatch pass a raised cap's
+        // freed slots run and the wake re-plan, both under the settings
+        // the object builds after the append (the stored setting
+        // replacing the bindings' caps). The setting is sized two slots
+        // above the fixture's in-flight count so the pass claims like
+        // production's raise does. The seed stores no setting and a
+        // `set` has no clear, so the cleanup restores that state
+        // exactly: the claimed tasks return, the in-memory setting is
+        // dropped, and a snapshot makes that the store's state — the
+        // log row it covered goes with the prefix, so no later wake
+        // replays it.
+        name: "POST /dispatch-cap",
+        setup: Some(|_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                if ctx.loaded().with(|graph| graph.dispatch_cap().is_some()) {
+                    return Err("POST /dispatch-cap drive expects the seed's unset caps".to_owned());
+                }
+                Ok(())
+            })
+        }),
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                let (inflight, macos_inflight) = ctx.loaded().with(|graph| graph.inflight());
+                routes::commit_as(
+                    ctx.loaded(),
+                    db,
+                    Some(DRIVE_ACTOR),
+                    &[SchedulerEvent::DispatchCap {
+                        setting: Box::new(stow_types::api::DispatchCapSetting {
+                            max_concurrent_jobs: inflight + 2,
+                            max_concurrent_macos_jobs: Some(macos_inflight + 2),
+                            set_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                            actor: DRIVE_ACTOR.to_owned(),
+                        }),
+                    }],
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                let raised = ctx
+                    .loaded()
+                    .with(|graph| settings.with_dispatch_cap(graph.dispatch_cap()));
+                let claimed = pass(db, &raised, ctx).await?;
+                let _plan = routes::wake_plan(ctx.loaded(), &raised, now_ms());
+                ctx.set_bound(BoundRun {
+                    task: claimed.join(","),
+                    run: 0,
+                });
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let claimed = ctx.bound_run()?.task;
+                let ids = claimed
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                restore_claimed(ctx, db, ids).await?;
+                ctx.loaded()
+                    .with(super::graph::Graph::restore_unset_dispatch_cap);
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)
+            })
+        }),
+    },
     // The per-task run drives (stow#876). Each setup claims one window
     // node and binds it to a run, so the drive prices what a bound
     // in-flight task costs — event-sized, never the graph.

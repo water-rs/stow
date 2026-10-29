@@ -535,7 +535,7 @@ lists live in `edge/src/api.rs` (the
 
 | Routes | Workflows |
 |---|---|
-| `POST /api/v1/admin/dispatch-freeze`, `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`, `POST /api/v1/admin/scheduler/reset`, the mock-only `POST /api/v1/admin/scheduler/budget[/seed,/rearm]` | `operations.yml` |
+| `POST /api/v1/admin/dispatch-freeze`, `POST /api/v1/admin/dispatch-cap`, `POST /api/v1/admin/queue/{retry,cancel,promote,purge}`, `POST /api/v1/admin/scheduler/reset`, the mock-only `POST /api/v1/admin/scheduler/budget[/seed,/rearm]` | `operations.yml` |
 | `POST /api/v1/scheduler/tasks/submit` | `operations.yml`, `preheat-admin.yml`, `preheat-missed.yml` |
 | `POST /api/v1/scheduler/tasks/submit-ids` | `operations.yml`, `preheat-admin.yml` |
 | `POST /api/v1/admin/scheduler/demand`, `POST /api/v1/admin/scheduler/demand-feed/{query,begin,page,complete,cleanup,deliver}` | `operations.yml`, `demand-feed.yml` |
@@ -576,7 +576,8 @@ rest get the edge URL and audience alone.
 `stow-admin` dispatches the workflow for these mutating commands, each
 under `--yes` where the command takes it: `scheduler reset`,
 `scheduler demand-feed`, `queue retry|cancel|promote|purge`,
-`dispatch-freeze engage|clear`, `submit`, `maintenance ensure|on|off|status`,
+`dispatch-freeze engage|clear`, `dispatch-cap set`, `submit`,
+`maintenance ensure|on|off|status`,
 `watchdog` (not `--dry-run`), `preheat binary|top-binaries|missed|manual`
 and `preheat projects submit`. It sends the argument list as a JSON array
 the workflow replays without a shell, plus the contents of the files
@@ -646,7 +647,12 @@ scheduler dispatches them to GitHub Actions in parallel as
 `STOW_MAX_CONCURRENT_JOBS`, default 45 — runner slots, one per
 in-flight run — the per-family
 `STOW_MAX_CONCURRENT_MACOS_JOBS`, default 16, and
-`STOW_DISPATCH_MIN_AGE_MINUTES`; failed dispatches retry with
+`STOW_DISPATCH_MIN_AGE_MINUTES`; an operator's
+`stow-admin dispatch-cap set --jobs N [--macos M]` replaces the two
+cap bindings at claim time until the next `set` — the setting lives
+in the scheduler's log, so it survives restarts and redeploys, there
+is no clear, and a lowered cap cancels nothing already running
+(stow#1039); failed dispatches retry with
 exponential backoff, and a task's lease — renewed by each `status`
 reconcile that lists its run queued or in progress — expires after
 `STOW_STALE_DISPATCH_MINUTES`, default 60, returning the task to

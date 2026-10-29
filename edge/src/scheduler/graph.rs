@@ -394,6 +394,11 @@ pub struct Graph {
     freeze_history: std::collections::VecDeque<stow_types::api::DispatchFreezeTransition>,
     /// The admission floor (`min_dispatch_value`).
     floor: i64,
+    /// The operator's dispatch-cap setting (stow#1039): replaces the
+    /// deploy bindings' `STOW_MAX_CONCURRENT_JOBS` /
+    /// `STOW_MAX_CONCURRENT_MACOS_JOBS` at claim time until the next
+    /// `set`. `None` until the first one.
+    dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
 
     /// Completions and failures per UTC hour and target byte — the
     /// admin status's trailing-day tally, since a published node keeps
@@ -2195,8 +2200,45 @@ impl Graph {
         }
     }
 
+    /// The operator's stored `dispatch-cap set` (stow#1039), `None`
+    /// until the first one. Only the scheduler object reads it, to
+    /// build the settings a request or the alarm runs under
+    /// ([`queue::SchedulerSettings::with_dispatch_cap`]); the graph's
+    /// own cap reads take those settings as given.
+    pub const fn dispatch_cap(&self) -> Option<&stow_types::api::DispatchCapSetting> {
+        self.dispatch_cap.as_ref()
+    }
+
+    /// Drop the stored dispatch-cap setting — the budget drives'
+    /// restore of the unset state the fixture seed wrote, made the
+    /// store's state by the snapshot the caller writes next. No route
+    /// reaches it: an operator `set` has no clear.
+    pub fn restore_unset_dispatch_cap(&mut self) {
+        self.dispatch_cap = None;
+    }
+
+    /// `GET /dispatch-cap`'s body: the caps `settings` carries — the
+    /// ones a claim under them reads — and the stored operator setting
+    /// behind them, if any (stow#1039).
+    pub fn dispatch_cap_view(
+        &self,
+        settings: &queue::SchedulerSettings,
+    ) -> stow_types::api::DispatchCaps {
+        let max_concurrent_jobs = match settings.dispatch {
+            queue::Dispatch::Limited(limit) => limit.get(),
+            queue::Dispatch::Paused => 0,
+        };
+        stow_types::api::DispatchCaps {
+            setting: self.dispatch_cap.clone(),
+            max_concurrent_jobs,
+            max_concurrent_macos_jobs: settings.max_concurrent_macos_jobs,
+        }
+    }
+
     /// Dispatch slots free under `settings`: the cap minus in-flight and
-    /// external occupancy, in total and for the macOS family.
+    /// external occupancy, in total and for the macOS family. A cap
+    /// below the in-flight count saturates at zero — nothing in flight
+    /// is moved.
     pub fn free_slots(&self, settings: &queue::SchedulerSettings) -> (u32, u32) {
         let (inflight, macos_inflight) = self.inflight();
         let total = match settings.dispatch {
@@ -2526,6 +2568,9 @@ impl Graph {
                         i64::try_from(entries.len()).unwrap_or(i64::MAX),
                     ),
                 );
+            }
+            SchedulerEvent::DispatchCap { setting } => {
+                self.dispatch_cap = Some((**setting).clone());
             }
             SchedulerEvent::Freeze {
                 record,
@@ -3947,6 +3992,53 @@ mod tests {
         let now = Graph::STATUS_RECONCILE_MS;
         assert!(!graph.reconcile_due(now, &settings));
         assert_eq!(graph.wake_plan(now, &settings), queue::AlarmPlan::Delete);
+    }
+
+    /// stow#1039: the operator's `set` replaces the binding caps in the
+    /// settings the scheduler object builds — a `--macos`-less set
+    /// leaves that cap on its binding, a lowered cap frees nothing in
+    /// flight, and `0` pauses dispatch like the binding's `"0"`. The
+    /// graph reads only the settings it is passed: a caller's explicit
+    /// settings stay authoritative over the stored setting.
+    #[test]
+    fn the_operator_cap_replaces_the_bindings_in_built_settings() {
+        let bindings = queue::SchedulerSettings::default();
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let built = |graph: &Graph| bindings.with_dispatch_cap(graph.dispatch_cap());
+        // No setting yet: the bindings rule.
+        assert_eq!(graph.free_slots(&built(&graph)), (45, 16));
+
+        let set = |jobs: u32, macos: Option<u32>| SchedulerEvent::DispatchCap {
+            setting: Box::new(stow_types::api::DispatchCapSetting {
+                max_concurrent_jobs: jobs,
+                max_concurrent_macos_jobs: macos,
+                set_at: "2026-01-01T00:00:00Z".to_owned(),
+                actor: "ops".to_owned(),
+            }),
+        };
+        graph.apply(&set(3, None), 0);
+        assert_eq!(graph.free_slots(&built(&graph)), (3, 16));
+        // Explicit settings are never second-guessed by the stored one.
+        assert_eq!(graph.free_slots(&bindings), (45, 16));
+
+        // A lowered cap moves nothing in flight — the claimed row
+        // holds its slot and the count saturates at zero, not a free
+        // slot it must yield.
+        let ix = graph.node_ix(&id("solo")).expect("node");
+        graph.mark_claimed(ix, 1, 0);
+        assert_eq!(graph.free_slots(&built(&graph)), (2, 16));
+        graph.apply(&set(1, Some(1)), 0);
+        assert_eq!(graph.free_slots(&built(&graph)), (0, 1));
+        graph.apply(&set(0, None), 0);
+        let paused = built(&graph);
+        assert_eq!(paused.dispatch, queue::Dispatch::Paused);
+        assert_eq!(graph.free_slots(&paused), (0, 16));
+
+        let view = graph.dispatch_cap_view(&paused);
+        assert_eq!(view.max_concurrent_jobs, 0);
+        assert_eq!(view.max_concurrent_macos_jobs, 16);
+        assert_eq!(view.setting.map(|set| set.max_concurrent_jobs), Some(0));
     }
 
     /// stow#940: a `running` state the reconcile restored stamps its

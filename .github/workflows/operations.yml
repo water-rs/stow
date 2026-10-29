@@ -95,7 +95,7 @@ jobs:
                 class=edge
               fi
               ;;
-            scheduler|queue|dispatch-freeze|submit) class=edge ;;
+            scheduler|queue|dispatch-freeze|dispatch-cap|submit) class=edge ;;
             *) echo "::error::stow-admin $command does not run through operations"; exit 1 ;;
           esac
           if [ -n "$FILES" ]; then

@@ -339,7 +339,8 @@ acting unless `--yes` is given.
 
 Run outside GitHub Actions, the mutating commands — `scheduler reset`,
 `scheduler demand-feed`, `queue retry|cancel|promote|purge`,
-`dispatch-freeze engage|clear`, `submit`, `maintenance`, `watchdog`
+`dispatch-freeze engage|clear`, `dispatch-cap set`, `submit`,
+`maintenance`, `watchdog`
 (not `--dry-run`), and the `preheat` lanes under `--yes` — do not call
 the edge or Cloudflare themselves: they dispatch
 `.github/workflows/operations.yml` on `main` with the `stow-admin login`
@@ -376,6 +377,16 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   any missing rule disabled (`ensure`/`on`/`off` are mutations). Every
   invocation, `status` included, runs in `operations.yml`, which holds
   the Cloudflare token.
+- `stow-admin dispatch-cap status` — the dispatch caps in force
+  (in-flight `build-crate.yml` runs overall and on macOS runners) and
+  where each comes from: the deploy bindings or the operator setting.
+  `stow-admin dispatch-cap set --jobs N [--macos M]` replaces the
+  `STOW_MAX_CONCURRENT_JOBS` / `STOW_MAX_CONCURRENT_MACOS_JOBS` binding
+  values at claim time until the next `set` — there is no clear and no
+  expiry, `--macos` omitted leaves that cap on its binding, `--jobs 0`
+  pauses dispatch, and no ceiling is checked. A lowered cap cancels
+  nothing in flight: new claims pause until the in-flight count drops
+  below it.
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`

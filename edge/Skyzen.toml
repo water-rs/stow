@@ -16,10 +16,8 @@ GITHUB_APP_SLUG = "stow-ci"
 GITHUB_REPO = "water-rs/stow"
 GHCR_BASE_URL = "https://ghcr.io"
 STOW_DISPATCH_MIN_AGE_MINUTES = "5"
-# Dispatch ceilings against the org's 60 GitHub-hosted runners (20 of them
-# macOS): 45 total leaves 15 runners for the repo's own CI, and the macOS
-# cap keeps a full wave from queueing on the smallest pool while leaving
-# 4 macOS runners free.
+# Dispatch ceilings: the in-flight bounds until an operator's
+# `stow-admin dispatch-cap set` replaces them.
 STOW_MAX_CONCURRENT_JOBS = "45"
 STOW_MAX_CONCURRENT_MACOS_JOBS = "16"
 STOW_STALE_DISPATCH_MINUTES = "60"
