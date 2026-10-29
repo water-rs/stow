@@ -202,7 +202,12 @@ pub fn commit_git_repo(repo: &Path, home: &Path) -> String {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    format!("file://{}", repo.display())
+    // A drive-letter path is `file:///C:/...` with forward slashes;
+    // spelling the path into the URL by hand leaves backslashes a TOML
+    // basic string reads as escapes.
+    url::Url::from_file_path(repo)
+        .unwrap_or_else(|()| panic!("{} is not an absolute path", repo.display()))
+        .to_string()
 }
 
 /// `cargo fetch` in `dir` against the isolated `cargo_home`, so the
