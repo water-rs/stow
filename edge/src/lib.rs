@@ -37,6 +37,8 @@ mod miss_logger;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod no_store;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+mod periodic;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod registry_auth;
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod rust_channel;

@@ -292,6 +292,10 @@ impl DurableObject for Scheduler {
                 // the object dispatches `preheat-admin.yml` for its
                 // claimed rustc.
                 "/preheat/release".post(preheat_release),
+                // The edge's Cron Trigger (stow#1100): the Worker's
+                // scheduled handler names one due periodic workflow,
+                // and the object dispatches it on `main`.
+                "/periodic/dispatch".post(periodic_dispatch),
             )),
         ))
         // The alarm endpoint runs without the router's middleware, so it
@@ -1642,34 +1646,80 @@ pub(super) async fn preheat_release_pass(
     env: &WasmEnv,
     request: &stow_types::api::PreheatReleaseRequest,
 ) -> Result<()> {
+    let interface = unloaded_ci_interface(graph, env).await?;
+    interface
+        .submit_preheat(request.rustc_version.as_str())
+        .await
+        .map_err(|error| {
+            let error = to_error(error.to_string());
+            tracing::error!(%error, "preheat release dispatch failed");
+            error.set_status(StatusCode::BAD_GATEWAY)
+        })
+}
+
+/// The CI interface a route that reads no stored row resolves: the
+/// credential arm plus the cached installation token, minted inline on
+/// expiry. A failed mint answers 502, like a failed dispatch.
+async fn unloaded_ci_interface(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+) -> Result<dispatch::CiInterface<dispatch::CfTransport>> {
     let pool = crate::fetch_guard::OutboundPool::new();
-    let outcome = match credential_source(env)? {
-        CredentialSource::LocalCi(url) => {
-            dispatch::CiInterface::local_ci(&url, dispatch::CfTransport::new(pool))
-                .submit_preheat(request.rustc_version.as_str())
-                .await
-        }
+    match credential_source(env)? {
+        CredentialSource::LocalCi(url) => Ok(dispatch::CiInterface::local_ci(
+            &url,
+            dispatch::CfTransport::new(pool),
+        )),
         CredentialSource::GitHub(config) => {
-            match github_app::installation_token(graph.tokens(), &config).await {
-                Ok(token) => {
-                    let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
-                    dispatch::CiInterface::github(
-                        &github_repo,
-                        &token.token,
-                        dispatch::CfTransport::new(pool),
-                    )
-                    .submit_preheat(request.rustc_version.as_str())
-                    .await
-                }
-                Err(error) => Err(dispatch::DispatchError::TokenMint(error.to_string())),
-            }
+            let token = github_app::installation_token(graph.tokens(), &config)
+                .await
+                .map_err(|error| {
+                    let error =
+                        to_error(dispatch::DispatchError::TokenMint(error.to_string()).to_string());
+                    tracing::error!(%error, "installation token mint failed");
+                    error.set_status(StatusCode::BAD_GATEWAY)
+                })?;
+            let github_repo = read_string_binding(env, GITHUB_REPO_BINDING)?;
+            Ok(dispatch::CiInterface::github(
+                &github_repo,
+                &token.token,
+                dispatch::CfTransport::new(pool),
+            ))
         }
-    };
-    outcome.map_err(|error| {
-        let error = to_error(error.to_string());
-        tracing::error!(%error, "preheat release dispatch failed");
-        error.set_status(StatusCode::BAD_GATEWAY)
-    })
+    }
+}
+
+/// `POST /periodic/dispatch` — the edge's Cron Trigger names one due
+/// periodic workflow (stow#1100). Like `/preheat/release` the route
+/// creates nothing and touches no store row: its cost is the binding
+/// reads, the token cache read and one `workflow_dispatch` POST. A
+/// dispatch failure answers 502 so the Worker's handler reports it.
+async fn periodic_dispatch(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    Json(request): Json<stow_types::periodic::PeriodicDispatchRequest>,
+) -> Result<Json<OkResponse>> {
+    periodic_dispatch_pass(&graph, &env, &request).await?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+/// The dispatch, shared with the budget probe's `POST
+/// /periodic/dispatch` drive so the probe prices the route's whole
+/// pass.
+pub(super) async fn periodic_dispatch_pass(
+    graph: &graph::GraphCell,
+    env: &WasmEnv,
+    request: &stow_types::periodic::PeriodicDispatchRequest,
+) -> Result<()> {
+    let interface = unloaded_ci_interface(graph, env).await?;
+    interface
+        .submit_periodic(&request.workflow)
+        .await
+        .map_err(|error| {
+            let error = to_error(error.to_string());
+            tracing::error!(%error, workflow = request.workflow.as_str(), "periodic dispatch failed");
+            error.set_status(StatusCode::BAD_GATEWAY)
+        })
 }
 
 /// `POST /index/published` — the index-publish path's report that a

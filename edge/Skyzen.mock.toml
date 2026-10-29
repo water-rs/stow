@@ -67,6 +67,12 @@ STOW_STATS_SALT_SECRET = "mock-stats-salt"
 # union row every stats_*.sql query decodes. Loopback-only by the same
 # rule as STOW_LOCAL_CI_URL — the token rides in Authorization.
 STOW_STATS_SQL_URL = "http://127.0.0.1:28123/analytics_engine/sql"
+# Same cadence map as the production manifest (stow#1100); the local CI
+# server records the dispatch each scheduled event produces.
+STOW_PERIODIC_WORKFLOWS = '{"*/15 * * * *": ["watchdog.yml"], "17 0 * * *": ["preheat-cron.yml"]}'
+
+[cloudflare.triggers]
+crons = ["*/15 * * * *", "17 0 * * *"]
 
 
 [[cloudflare.durable_objects.bindings]]

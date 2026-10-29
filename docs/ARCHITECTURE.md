@@ -791,15 +791,16 @@ Four workflows keep it warm:
   itself: `preheat projects submit` resolves every repository the
   reviewed `preheat/projects.toml` lists and enqueues its crates.io
   graph.
-- `preheat-cron.yml` (every two hours plus manual) is the unattended
+- `preheat-cron.yml` (dispatched daily at 00:17 UTC by the edge's Cron
+  Trigger, plus manual) is the unattended
   lane: nothing about it waits for a user's miss. It polls
   `channel-rust-stable.toml` and dispatches `preheat-admin.yml`
   (the top binaries and the projects lane) once per UTC day, and
   immediately when the stable channel moves — the two things that
   change what the pool should hold. An `actions/cache` entry keyed
   `preheat-<version>-<day>` is the already-dispatched marker, so the
-  polls in between are no-ops and a
-  failed dispatch simply retries on the next tick. Re-submitting the
+  manual re-runs the same day are no-ops and a
+  failed dispatch retries on the next day's tick or a manual run. Re-submitting the
   whole list is cheap: `enqueue` deduplicates on task identity and
   leaves a completed task completed, so a wave builds only what is
   missing — a failed build retries on its own `not_before` backoff.

@@ -7,8 +7,10 @@
 //! GitHub-shaped run endpoints the edge's `LocalCiBuildRuns` drives on
 //! the same loopback base (`GET/POST …/actions/runs/{id}` plus the
 //! attempt-jobs listing and `…/cancel`), `GET /tasks`, the run-state
-//! list the mock e2e polls, and the `preheat` event the scheduler's
-//! new-stable dispatch posts (stow#880).
+//! list the mock e2e polls, the `preheat` event the scheduler's
+//! new-stable dispatch posts (stow#880), and the `watchdog` /
+//! `preheat-cron` events the edge's Cron Trigger posts (stow#1100),
+//! recorded for `GET /periodic`.
 //!
 //! A run mirrors the production shape exactly: one run id for the task,
 //! an event file carrying the dispatch input, a build in one process,
@@ -105,6 +107,9 @@ pub struct LocalServerState {
     /// promoted or superseded run's webhook and job names need it long
     /// after the dispatch handler returned.
     task_payloads: Arc<Mutex<BTreeMap<u64, BuildTaskPayload>>>,
+    /// The periodic workflows the edge's Cron Trigger dispatched
+    /// (stow#1100), in arrival order, served by `GET /periodic`.
+    periodic: Arc<Mutex<Vec<String>>>,
     /// The local equivalent of GitHub assigning a fresh id to every
     /// workflow dispatch and every job.
     next_id: Arc<AtomicU64>,
@@ -150,6 +155,7 @@ impl LocalServerState {
             undriven: Arc::new(Mutex::new(BTreeSet::new())),
             groups: Arc::new(Mutex::new(BTreeMap::new())),
             task_payloads: Arc::new(Mutex::new(BTreeMap::new())),
+            periodic: Arc::new(Mutex::new(Vec::new())),
             next_id: Arc::new(AtomicU64::new(1)),
             runners: Arc::new(Semaphore::new(
                 std::thread::available_parallelism()
@@ -732,6 +738,7 @@ fn build_router(state: LocalServerState) -> Router {
         "/dispatch".post(dispatch),
         "/seeded-runs".post(seed_runs),
         "/tasks".at(list_tasks),
+        "/periodic".at(list_periodic),
         // The GitHub Actions control plane the edge's
         // `LocalCiBuildRuns` drives on the loopback base — the same
         // paths and shapes api.github.com serves, for run ids this
@@ -748,6 +755,17 @@ fn build_router(state: LocalServerState) -> Router {
 /// `GET /tasks` — the run list the mock e2e polls, answering the same
 /// shape the GitHub runs API does (`status`/`conclusion`/`display_title`
 /// semantics), one row per dispatched task.
+/// `GET /periodic` — the periodic workflows dispatched so far, oldest
+/// first.
+async fn list_periodic(State(state): State<LocalServerState>) -> Response {
+    let dispatched = state
+        .periodic
+        .lock()
+        .expect("periodic mutex poisoned")
+        .clone();
+    json_response(&dispatched, StatusCode::OK)
+}
+
 async fn list_tasks(State(state): State<LocalServerState>) -> Response {
     let tasks = state
         .runs
@@ -1138,6 +1156,17 @@ async fn dispatch(
                     StatusCode::BAD_REQUEST,
                 ),
             }
+        }
+        // The edge Cron Trigger's periodic dispatch (stow#1100): the
+        // mock runs no watchdog or preheat tick, so the event is only
+        // recorded for `GET /periodic`.
+        periodic @ ("watchdog" | "preheat-cron") => {
+            state
+                .periodic
+                .lock()
+                .expect("periodic mutex poisoned")
+                .push(periodic.to_owned());
+            json_response(&serde_json::json!({ "ok": true }), StatusCode::OK)
         }
         other => json_response(
             &bad_request(&format!("unknown event_type `{other}`")),

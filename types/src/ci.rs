@@ -333,32 +333,38 @@ impl<T: CiTransport> CiInterface<T> {
     /// have landed.
     pub async fn submit_preheat(&self, rustc_version: &str) -> Result<(), DispatchError> {
         let inputs = serde_json::json!({ "rustc_version": rustc_version });
-        let request = match &self.endpoint {
-            CiEndpoint::GitHub { repo, .. } => {
-                let payload = serde_json::json!({
-                    "ref": crate::trusted_builder::BRANCH,
-                    "inputs": inputs,
-                });
-                let url = self.resolve(&workflow_dispatch_path(
-                    repo,
-                    crate::trusted_builder::PREHEAT_WORKFLOW_FILE,
-                ))?;
-                let body = serde_json::to_vec(&payload)
-                    .map_err(|error| DispatchError::Network(error.to_string()))?;
-                self.api_request("POST", &url, Some(body))
-            }
-            CiEndpoint::Local { base } => {
-                let payload = serde_json::json!({
-                    "event_type": "preheat",
-                    "client_payload": inputs,
-                });
-                let body = serde_json::to_vec(&payload)
-                    .map_err(|error| DispatchError::Network(error.to_string()))?;
-                self.api_request("POST", &format!("{base}/dispatch"), Some(body))
-            }
-        };
+        let request = self.plain_dispatch_request(
+            crate::trusted_builder::PREHEAT_WORKFLOW_FILE,
+            "preheat",
+            &inputs,
+        )?;
         self.send_checked(request).await.map(|_| ()).inspect(|()| {
             tracing::info!(rustc_version, "submitted preheat run");
+        })
+    }
+
+    /// `workflow_dispatch` of a periodic workflow (stow#1100) on
+    /// [`crate::trusted_builder::BRANCH`], with no inputs — the edge's
+    /// Cron Trigger fires `watchdog.yml` and `preheat-cron.yml` this
+    /// way, since GitHub's own `schedule` skips ticks. The dispatch
+    /// needs only its HTTP status.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DispatchError`] for the call's refusal kinds —
+    /// `RateLimited`/`Api` provably did not happen, `Network` may
+    /// have landed.
+    pub async fn submit_periodic(
+        &self,
+        workflow: &crate::periodic::WorkflowFile,
+    ) -> Result<(), DispatchError> {
+        let request = self.plain_dispatch_request(
+            workflow.as_str(),
+            workflow.stem(),
+            &serde_json::json!({}),
+        )?;
+        self.send_checked(request).await.map(|_| ()).inspect(|()| {
+            tracing::info!(workflow = workflow.as_str(), "submitted periodic run");
         })
     }
 
@@ -483,6 +489,38 @@ impl<T: CiTransport> CiInterface<T> {
             url: url.to_owned(),
             headers,
             body,
+        }
+    }
+
+    /// The `workflow_dispatch` request for a workflow whose inputs are
+    /// plain named values (GitHub's `inputs` object as given), or the
+    /// local server's `event_type` event carrying them as its payload.
+    fn plain_dispatch_request(
+        &self,
+        workflow_file: &str,
+        event_type: &str,
+        inputs: &serde_json::Value,
+    ) -> Result<CiRequest, DispatchError> {
+        match &self.endpoint {
+            CiEndpoint::GitHub { repo, .. } => {
+                let mut payload = serde_json::json!({ "ref": crate::trusted_builder::BRANCH });
+                if inputs.as_object().is_some_and(|inputs| !inputs.is_empty()) {
+                    payload["inputs"] = inputs.clone();
+                }
+                let url = self.resolve(&workflow_dispatch_path(repo, workflow_file))?;
+                let body = serde_json::to_vec(&payload)
+                    .map_err(|error| DispatchError::Network(error.to_string()))?;
+                Ok(self.api_request("POST", &url, Some(body)))
+            }
+            CiEndpoint::Local { base } => {
+                let payload = serde_json::json!({
+                    "event_type": event_type,
+                    "client_payload": inputs,
+                });
+                let body = serde_json::to_vec(&payload)
+                    .map_err(|error| DispatchError::Network(error.to_string()))?;
+                Ok(self.api_request("POST", &format!("{base}/dispatch"), Some(body)))
+            }
         }
     }
 
@@ -826,5 +864,42 @@ mod tests {
                 retry_after_secs: Some(30)
             }
         ));
+    }
+
+    /// A periodic dispatch is the workflow file on `main` with no
+    /// inputs on GitHub, and the file's stem as the local event.
+    #[test]
+    fn a_periodic_dispatch_names_the_workflow_and_the_default_branch() {
+        let workflow: crate::periodic::WorkflowFile = "watchdog.yml".parse().expect("workflow");
+        let stub = || Stub {
+            requests: Mutex::new(Vec::new()),
+            answers: Mutex::new(Vec::new()),
+        };
+        let github = CiInterface::github("water-rs/stow", "token", stub());
+        let request = github
+            .plain_dispatch_request(workflow.as_str(), workflow.stem(), &serde_json::json!({}))
+            .expect("request");
+        assert_eq!(
+            request.url,
+            "https://api.github.com/repos/water-rs/stow/actions/workflows/watchdog.yml/dispatches"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body.expect("body")).expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({ "ref": crate::trusted_builder::BRANCH })
+        );
+
+        let local = CiInterface::local_ci("http://127.0.0.1:28124/", stub());
+        let request = local
+            .plain_dispatch_request(workflow.as_str(), workflow.stem(), &serde_json::json!({}))
+            .expect("request");
+        assert_eq!(request.url, "http://127.0.0.1:28124/dispatch");
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body.expect("body")).expect("json");
+        assert_eq!(
+            body,
+            serde_json::json!({ "event_type": "watchdog", "client_payload": {} })
+        );
     }
 }

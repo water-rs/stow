@@ -2051,6 +2051,43 @@ pub const DRIVES: &[Drive] = &[
         cleanup: None,
     },
     Drive {
+        // The edge Cron Trigger's per-workflow dispatch (stow#1100):
+        // on wasm the real `periodic_dispatch_pass` — credential arm
+        // plus the `workflow_dispatch` POST to the local-CI
+        // dispatcher; on host the arm is a no-op `Ok(())` — no store
+        // work runs and there is nothing to measure.
+        name: "POST /periodic/dispatch",
+        setup: None,
+        run: |_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let env = ctx
+                        .env
+                        .as_ref()
+                        .ok_or_else(|| "periodic dispatch drive needs a Worker env".to_owned())?;
+                    super::object::periodic_dispatch_pass(
+                        &ctx.graph,
+                        env,
+                        &stow_types::periodic::PeriodicDispatchRequest {
+                            workflow: "watchdog.yml"
+                                .parse()
+                                .map_err(|error| format!("periodic dispatch workflow: {error}"))?,
+                        },
+                    )
+                    .await
+                    .map_err(text)
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = ctx;
+                    Ok(())
+                }
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
         name: "POST /tasks/submit (inexact-hit)",
         setup: None,
         run: |db, _shape, settings, ctx| {

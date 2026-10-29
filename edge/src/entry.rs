@@ -4,6 +4,7 @@
 use skyzen::routing::{CreateRouteNode, Route, RouteNode, Router};
 use skyzen::runtime::wasm;
 use skyzen::utils::State;
+use skyzen_cloudflare::worker::send::{IntoSendFuture as _, SendWrapper};
 use skyzen_cloudflare::{CfCache, CfDurableNamespace};
 
 use stow_types::admission;
@@ -50,6 +51,54 @@ pub async fn fetch(
 ) -> Result<wasm::Response, skyzen::wasm_bindgen::JsValue> {
     crate::console_log::init();
     wasm::launch(|env| async move { worker(&env) }, request, env, ctx).await
+}
+
+/// The Cloudflare Cron Trigger's `scheduled` export (stow#1100):
+/// dispatches the workflows the deployed `STOW_PERIODIC_WORKFLOWS` names
+/// for the cron expression that fired. Binding reads fail the tick —
+/// the invocation shows as failed in Workers Logs — and a failed
+/// dispatch is mailed; see [`crate::periodic`].
+#[::skyzen::scheduled]
+pub async fn scheduled(
+    event: skyzen::events::ScheduledTick,
+    env: wasm::Env,
+) -> Result<(), crate::periodic::TickFailed> {
+    crate::console_log::init();
+    let schedule = env_binding::required_string(&env, stow_types::periodic::SCHEDULE_BINDING)
+        .parse::<stow_types::periodic::PeriodicSchedule>()
+        .unwrap_or_else(|error| panic!("{error}"));
+    let scheduler = CfDurableNamespace::from_env(&env, SCHEDULER_BINDING).unwrap_or_else(|error| {
+        panic!("failed to load Durable Object binding '{SCHEDULER_BINDING}': {error}")
+    });
+    let alerter = crate::email::EdgeAlerter::new(&env);
+    crate::periodic::run_tick(
+        &schedule,
+        &event.cron,
+        &SchedulerDispatcher(SendWrapper::new(scheduler)),
+        &alerter,
+    )
+    .await
+}
+
+/// Dispatches a due workflow through the scheduler Durable Object, which
+/// holds the GitHub App token cache.
+struct SchedulerDispatcher(SendWrapper<CfDurableNamespace>);
+
+impl crate::periodic::Dispatcher for SchedulerDispatcher {
+    fn dispatch(
+        &self,
+        workflow: &stow_types::periodic::WorkflowFile,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let request = stow_types::periodic::PeriodicDispatchRequest {
+            workflow: workflow.clone(),
+        };
+        async move {
+            crate::scheduler_client::send_periodic_dispatch(&self.0, &request)
+                .into_send()
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 fn worker(
