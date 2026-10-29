@@ -1165,8 +1165,27 @@ fn build_crate_declarations() {
     );
     assert_eq!(
         at(&wf, "jobs.publish.if").map(scalar).as_deref(),
-        Some("needs.build.result == 'success'")
+        Some("inputs.repack_rustc == '' && needs.build.result == 'success'")
     );
+    // The operator's repack job runs only in a repack run and republishes
+    // under the builder identity, so it holds the publish job's rights.
+    assert_eq!(
+        at(&wf, "jobs.repack.if").map(scalar).as_deref(),
+        Some("inputs.repack_rustc != ''")
+    );
+    for (permission, level) in [
+        ("contents", "read"),
+        ("packages", "write"),
+        ("id-token", "write"),
+    ] {
+        assert_eq!(
+            at(&wf, &format!("jobs.repack.permissions.{permission}"))
+                .map(scalar)
+                .as_deref(),
+            Some(level),
+            "repack job permission {permission}"
+        );
+    }
 }
 
 /// The five entrypoints' every job runs on a Linux runner — the
