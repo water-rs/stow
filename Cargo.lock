@@ -8084,6 +8084,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "http",
+ "libc",
  "object 0.39.1",
  "reflink-copy",
  "rustls",

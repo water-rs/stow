@@ -273,12 +273,25 @@ async fn read_verified_output(
     recorded: &str,
     crate_name: &str,
 ) -> stow_types::error::Result<Vec<u8>> {
-    let bytes = async_fs::read(source_path).await.map_err(|error| {
-        stow_types::stow_error!(
-            "read captured output {} for digest verification: {error}",
-            source_path.display()
-        )
-    })?;
+    let path = source_path.to_owned();
+    let bytes = smol::unblock(move || {
+        let mut file =
+            stow_types::native_capture::open_regular_nofollow(&path).map_err(|error| {
+                stow_types::stow_error!(
+                    "open captured output {} for digest verification: {error}",
+                    path.display()
+                )
+            })?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes).map_err(|error| {
+            stow_types::stow_error!(
+                "read captured output {} for digest verification: {error}",
+                path.display()
+            )
+        })?;
+        stow_types::error::Result::Ok(bytes)
+    })
+    .await?;
     let actual = hex::encode(sha2::Sha256::digest(&bytes));
     if actual != recorded {
         return Err(stow_types::stow_error!(
@@ -1088,12 +1101,20 @@ async fn build_scanned_artifact(
             .snapshot_path
             .clone()
             .unwrap_or_else(|| output.path.clone());
-        let metadata = async_fs::metadata(&source_path).await?;
-        artifact_size = artifact_size.saturating_add(metadata.len());
+        let size_path = source_path.clone();
+        let size = smol::unblock(move || {
+            stow_types::native_capture::open_regular_nofollow(&size_path)?
+                .metadata()
+                .map(|metadata| metadata.len())
+                .map_err(stow_types::error::Error::from)
+        })
+        .await?;
+        artifact_size = artifact_size.saturating_add(size);
         outputs.push(ScannedArtifactOutput {
             kind: parsed_file_kind(output.kind),
             path: output.path.clone(),
             source_path,
+            sha256: output.sha256.clone(),
         });
     }
     Ok(ScannedArtifact {
@@ -1778,6 +1799,8 @@ pub struct ScannedArtifactOutput {
     pub(crate) kind: ParsedFileKind,
     pub(crate) path: PathBuf,
     pub(crate) source_path: PathBuf,
+    /// The digest recorded at rustc exit, which `source_path` is read against.
+    pub(crate) sha256: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3308,6 +3331,30 @@ mod tests {
             assert!(
                 message.contains(&output_path.display().to_string()),
                 "error names the file: {message}"
+            );
+        });
+    }
+
+    /// stow#1063: a symlink at the output's name verifies nothing, even when
+    /// its target carries the recorded bytes.
+    #[cfg(unix)]
+    #[test]
+    fn scan_verification_refuses_a_symlinked_output() {
+        smol::block_on(async {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let target = tempdir.path().join("target.rlib");
+            std::fs::write(&target, b"rustc-exit bytes").expect("write target");
+            let output_path = tempdir.path().join("libitoa-47d1962f861b84d6.rlib");
+            std::os::unix::fs::symlink(&target, &output_path).expect("plant symlink");
+            let recorded = hex::encode(sha2::Sha256::digest(b"rustc-exit bytes"));
+
+            let selected = [selected_with_output(output_path, None, recorded)];
+            let error = super::verify_output_digests(selected.iter().map(|s| &s.captured))
+                .await
+                .expect_err("a symlinked output must be refused");
+            assert!(
+                error.to_string().contains("without following symlinks"),
+                "{error}"
             );
         });
     }
