@@ -445,11 +445,11 @@ impl ConsumerInputs {
     /// a cfg set by both `RUSTFLAGS` and the build script appears twice
     /// on argv and once after removing the build script's.
     #[must_use]
-    pub fn of(parsed: &ParsedRustcArgs, own: &BuildScriptInputs) -> Self {
+    pub fn of(parsed: &ParsedRustcArgs, own: &BuildScriptInputs, target: &str) -> Self {
         Self {
             embed_metadata: parsed.embed_metadata,
             embed_bitcode: parsed.embed_bitcode,
-            extra_codegen: parsed.extra_codegen.clone(),
+            extra_codegen: parsed.extra_codegen_for(target),
             cfgs: without_each(&parsed.cfg_args, &own.cfgs),
             link_options: without_each(&parsed.link_options, &own.link_args),
         }
