@@ -2464,6 +2464,7 @@ impl ProtectedEntry<'_> {
 }
 
 /// Where an eviction candidate's bytes live.
+#[derive(Clone, Copy)]
 enum EvictionLocation {
     /// An `artifact_cache_entries` row; its `relative_dir` in the pass's
     /// listing names the entry dir under `version_dir`.
@@ -2474,7 +2475,7 @@ enum EvictionLocation {
 
 impl EvictionLocation {
     /// Deterministic order between candidates tied on stamp and key.
-    const fn rank(&self) -> u8 {
+    const fn rank(self) -> u8 {
         match self {
             Self::Rustc => 0,
             Self::Cc => 1,
@@ -2487,7 +2488,6 @@ impl EvictionLocation {
 /// (stow#980), ordered by `last_accessed_ms`.
 struct EvictionCandidate {
     cache_key: String,
-    size_bytes: u64,
     last_accessed_ms: u64,
     location: EvictionLocation,
 }
@@ -2520,91 +2520,152 @@ pub async fn evict_after_cc_store(
     .await
 }
 
-/// The dependency-closure view of one pass's `artifact_cache_entries`
-/// listing (stow#1005): `providers` maps a compile key to the cache keys
-/// of the entries carrying it, and `dependents_of` maps it to the cache
-/// keys of the entries whose `dependency_compile_keys_json` names it, so a
-/// victim carries out every entry its removal would leave without a
-/// dependency entry. Remote and local rows both record the column, so the
-/// rule is provenance-agnostic.
-struct ClosureGraph {
-    /// Compile key → cache keys of the listed entries carrying it.
-    providers: BTreeMap<String, BTreeSet<String>>,
-    /// Compile key → cache keys of the listed entries depending on it.
-    dependents_of: BTreeMap<String, BTreeSet<String>>,
-    /// Cache key → the entry's own compile key.
-    compile_key_of: BTreeMap<String, String>,
-    /// Cache key → the compile keys the entry depends on.
-    dep_keys_of: BTreeMap<String, Vec<String>>,
+/// One entry of the closure walk: what an eviction pass needs of an
+/// `artifact_cache_entries` row besides its LRU position.
+#[derive(Clone)]
+struct GraphRow {
+    relative_dir: String,
+    size_bytes: u64,
+    compile_key: String,
 }
 
-impl ClosureGraph {
-    /// Build the closure view over a listing's rows; a row whose
-    /// `dependency_compile_keys_json` does not parse is a corrupt store
-    /// and fails the pass.
-    fn build(
-        entries: &BTreeMap<String, ArtifactCacheIndexEntry>,
-    ) -> stow_types::error::Result<Self> {
-        let mut graph = Self {
+/// The dependency-closure view of one eviction pass (stow#1005), read
+/// lazily (stow#1053): each question — the row of a cache key, the
+/// compile keys it depends on, the entries providing or depending on a
+/// compile key — is one indexed query, remembered for the rest of the
+/// pass, so a pass reads the entries its victims touch and not the
+/// table. A victim carries out every entry its removal would leave
+/// without a dependency entry. Remote and local rows both record the
+/// columns, so the rule is provenance-agnostic.
+struct ClosureGraph<'a> {
+    connection: &'a sqlx::SqlitePool,
+    rustc_version: &'a str,
+    /// Cache key → its row; `None` once another process removed it.
+    rows: BTreeMap<String, Option<GraphRow>>,
+    /// Cache key → the compile keys the entry depends on.
+    dep_keys_of: BTreeMap<String, Vec<String>>,
+    /// Compile key → cache keys of the entries carrying it.
+    providers: BTreeMap<String, BTreeSet<String>>,
+    /// Compile key → cache keys of the entries depending on it.
+    dependents_of: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl<'a> ClosureGraph<'a> {
+    const fn new(connection: &'a sqlx::SqlitePool, rustc_version: &'a str) -> Self {
+        Self {
+            connection,
+            rustc_version,
+            rows: BTreeMap::new(),
+            dep_keys_of: BTreeMap::new(),
             providers: BTreeMap::new(),
             dependents_of: BTreeMap::new(),
-            compile_key_of: BTreeMap::new(),
-            dep_keys_of: BTreeMap::new(),
-        };
-        for (cache_key, entry) in entries {
-            graph
-                .providers
-                .entry(entry.compile_key.clone())
-                .or_default()
-                .insert(cache_key.clone());
-            let dep_keys = serde_json::from_str::<Vec<DependencyCompileKeyIdentity>>(
-                &entry.dependency_compile_keys_json,
-            )
-            .wrap_err_with(|| {
-                format!(
-                    "parse artifact cache dependency_compile_keys_json for cache key {cache_key}"
-                )
-            })?;
-            for dep in &dep_keys {
-                graph
-                    .dependents_of
-                    .entry(dep.compile_key.clone())
-                    .or_default()
-                    .insert(cache_key.clone());
-            }
-            graph
-                .compile_key_of
-                .insert(cache_key.clone(), entry.compile_key.clone());
-            graph.dep_keys_of.insert(
-                cache_key.clone(),
-                dep_keys.into_iter().map(|dep| dep.compile_key).collect(),
-            );
         }
-        Ok(graph)
+    }
+
+    async fn row(&mut self, cache_key: &str) -> stow_types::error::Result<Option<GraphRow>> {
+        if let Some(row) = self.rows.get(cache_key) {
+            return Ok(row.clone());
+        }
+        let row = sqlx::query_as::<_, (String, i64, String)>(
+            "SELECT relative_dir, size_bytes, compile_key FROM artifact_cache_entries \
+             WHERE rustc_version = ? AND cache_key = ?",
+        )
+        .bind(self.rustc_version)
+        .bind(cache_key)
+        .fetch_optional(self.connection)
+        .await?
+        .map(|(relative_dir, size_bytes, compile_key)| {
+            Ok::<_, stow_types::error::Error>(GraphRow {
+                relative_dir,
+                size_bytes: db_int(size_bytes, "artifact cache entry size_bytes")?,
+                compile_key,
+            })
+        })
+        .transpose()?;
+        self.rows.insert(cache_key.to_owned(), row.clone());
+        Ok(row)
+    }
+
+    async fn dep_keys(&mut self, cache_key: &str) -> stow_types::error::Result<Vec<String>> {
+        if let Some(dep_keys) = self.dep_keys_of.get(cache_key) {
+            return Ok(dep_keys.clone());
+        }
+        let dep_keys: Vec<String> = sqlx::query_scalar(
+            "SELECT dependency_compile_key FROM artifact_cache_dependencies \
+             WHERE rustc_version = ? AND cache_key = ?",
+        )
+        .bind(self.rustc_version)
+        .bind(cache_key)
+        .fetch_all(self.connection)
+        .await?;
+        self.dep_keys_of
+            .insert(cache_key.to_owned(), dep_keys.clone());
+        Ok(dep_keys)
+    }
+
+    async fn providers(
+        &mut self,
+        compile_key: &str,
+    ) -> stow_types::error::Result<BTreeSet<String>> {
+        if let Some(providers) = self.providers.get(compile_key) {
+            return Ok(providers.clone());
+        }
+        let providers: BTreeSet<String> = sqlx::query_scalar(
+            "SELECT cache_key FROM artifact_cache_entries \
+             WHERE rustc_version = ? AND compile_key = ?",
+        )
+        .bind(self.rustc_version)
+        .bind(compile_key)
+        .fetch_all(self.connection)
+        .await?
+        .into_iter()
+        .collect();
+        self.providers
+            .insert(compile_key.to_owned(), providers.clone());
+        Ok(providers)
+    }
+
+    async fn dependents(
+        &mut self,
+        compile_key: &str,
+    ) -> stow_types::error::Result<BTreeSet<String>> {
+        if let Some(dependents) = self.dependents_of.get(compile_key) {
+            return Ok(dependents.clone());
+        }
+        let dependents: BTreeSet<String> = sqlx::query_scalar(
+            "SELECT cache_key FROM artifact_cache_dependencies \
+             WHERE rustc_version = ? AND dependency_compile_key = ?",
+        )
+        .bind(self.rustc_version)
+        .bind(compile_key)
+        .fetch_all(self.connection)
+        .await?
+        .into_iter()
+        .collect();
+        self.dependents_of
+            .insert(compile_key.to_owned(), dependents.clone());
+        Ok(dependents)
     }
 
     /// The cache keys no victim group may touch: the protected entry and
     /// every entry it transitively depends on — evicting inside that
     /// closure would orphan the just-stored entry on the spot.
-    fn untouchable_closure(&self, protected_key: &str) -> BTreeSet<String> {
+    async fn untouchable_closure(
+        &mut self,
+        protected_key: &str,
+    ) -> stow_types::error::Result<BTreeSet<String>> {
         let mut closure = BTreeSet::from([protected_key.to_owned()]);
         let mut frontier = vec![protected_key.to_owned()];
         while let Some(cache_key) = frontier.pop() {
-            let Some(dep_keys) = self.dep_keys_of.get(&cache_key) else {
-                continue;
-            };
-            for dep_key in dep_keys {
-                let Some(providers) = self.providers.get(dep_key) else {
-                    continue;
-                };
-                for provider in providers {
+            for dep_key in self.dep_keys(&cache_key).await? {
+                for provider in self.providers(&dep_key).await? {
                     if closure.insert(provider.clone()) {
-                        frontier.push(provider.clone());
+                        frontier.push(provider);
                     }
                 }
             }
         }
-        closure
+        Ok(closure)
     }
 
     /// The victim's eviction group: the victim plus every entry that
@@ -2613,51 +2674,208 @@ impl ClosureGraph {
     /// provider of a compile key it needs. `None` when a member would be
     /// in the protected entry's closure, which is never a victim: the
     /// group cannot complete, so the victim keeps its place.
-    fn victim_group(
-        &self,
+    async fn victim_group(
+        &mut self,
         victim: &str,
         evicted: &BTreeSet<String>,
         untouchable: &BTreeSet<String>,
-    ) -> Option<BTreeSet<String>> {
+    ) -> stow_types::error::Result<Option<BTreeSet<String>>> {
         let mut group = BTreeSet::from([victim.to_owned()]);
         let mut frontier = vec![victim.to_owned()];
         while let Some(member) = frontier.pop() {
-            // `member` is a listed rustc entry, so it has a compile key.
-            let compile_key = &self.compile_key_of[&member];
+            // A member another process removed meanwhile provides nothing.
+            let Some(row) = self.row(&member).await? else {
+                continue;
+            };
             let last_provider = self
-                .providers
-                .get(compile_key)
-                .into_iter()
-                .flatten()
+                .providers(&row.compile_key)
+                .await?
+                .iter()
                 .all(|provider| group.contains(provider) || evicted.contains(provider));
             if !last_provider {
                 continue;
             }
-            for dependent in self.dependents_of.get(compile_key).into_iter().flatten() {
-                if group.contains(dependent) || evicted.contains(dependent) {
+            for dependent in self.dependents(&row.compile_key).await? {
+                if group.contains(&dependent) || evicted.contains(&dependent) {
                     continue;
                 }
-                if untouchable.contains(dependent) {
-                    return None;
+                if untouchable.contains(&dependent) {
+                    return Ok(None);
                 }
                 group.insert(dependent.clone());
-                frontier.push(dependent.clone());
+                frontier.push(dependent);
             }
         }
-        Some(group)
+        Ok(Some(group))
+    }
+
+    /// `(cache_key, relative_dir)` for each member of a victim group, in
+    /// cache-key order — the order `try_lock_entry_group` takes the locks
+    /// in — and the group's byte total. A member another process removed
+    /// meanwhile has no dir to remove and no bytes to count.
+    async fn group_members(
+        &mut self,
+        group: &BTreeSet<String>,
+    ) -> stow_types::error::Result<(Vec<(String, String)>, u64)> {
+        let mut members = Vec::with_capacity(group.len());
+        let mut bytes = 0u64;
+        for cache_key in group {
+            if let Some(row) = self.row(cache_key).await? {
+                bytes = bytes.saturating_add(row.size_bytes);
+                members.push((cache_key.clone(), row.relative_dir));
+            }
+        }
+        Ok((members, bytes))
     }
 }
 
-/// `(cache_key, relative_dir)` for each member of a victim group, in
-/// cache-key order — the order `try_lock_entry_group` takes the locks in.
-fn entry_group_members(
-    entries: &BTreeMap<String, ArtifactCacheIndexEntry>,
-    group: &BTreeSet<String>,
-) -> Vec<(String, String)> {
-    group
-        .iter()
-        .map(|cache_key| (cache_key.clone(), entries[cache_key].relative_dir.clone()))
-        .collect()
+/// Candidates fetched from the LRU indexes per round trip.
+const EVICTION_BATCH: i64 = 64;
+
+/// The resident bytes of the shared budget: the active version's rustc
+/// entries plus every C/C++ object, read from the totals the state
+/// database's triggers keep in the transaction of every row change —
+/// two primary-key lookups, whatever the entry count.
+async fn resident_bytes(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+) -> stow_types::error::Result<u64> {
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE((SELECT total_bytes FROM artifact_cache_totals \
+                          WHERE rustc_version = ?), 0) \
+                + (SELECT total_bytes FROM cc_cache_totals)",
+    )
+    .bind(rustc_version)
+    .fetch_one(connection)
+    .await?;
+    db_int(total, "artifact cache resident bytes")
+}
+
+/// A position in the shared LRU order: `last_accessed_ms`, then cache
+/// key, then location rank.
+struct LruPosition {
+    last_accessed_ms: i64,
+    cache_key: String,
+    location: EvictionLocation,
+}
+
+impl LruPosition {
+    /// Before every row: stamps are never negative.
+    const START: Self = Self {
+        last_accessed_ms: -1,
+        cache_key: String::new(),
+        location: EvictionLocation::Cc,
+    };
+
+    fn of(candidate: &EvictionCandidate) -> stow_types::error::Result<Self> {
+        Ok(Self {
+            last_accessed_ms: db_int(
+                candidate.last_accessed_ms,
+                "eviction cursor last_accessed_ms",
+            )?,
+            cache_key: candidate.cache_key.clone(),
+            location: candidate.location,
+        })
+    }
+}
+
+/// The next `EVICTION_BATCH` candidates in LRU order strictly after
+/// `after`, merged from the two LRU indexes.
+async fn next_eviction_candidates(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    after: &LruPosition,
+) -> stow_types::error::Result<Vec<EvictionCandidate>> {
+    let stamp = after.last_accessed_ms;
+    // A cc row ties with the cursor on stamp and key only behind a rustc
+    // cursor (rank 0 before rank 1); a rustc row never ties after one.
+    let cc_comparison = match after.location {
+        EvictionLocation::Rustc => ">=",
+        EvictionLocation::Cc => ">",
+    };
+    let rustc_rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT cache_key, last_accessed_ms FROM artifact_cache_entries \
+         WHERE rustc_version = ? AND (last_accessed_ms, cache_key) > (?, ?) \
+         ORDER BY last_accessed_ms, cache_key LIMIT ?",
+    )
+    .bind(rustc_version)
+    .bind(stamp)
+    .bind(&after.cache_key)
+    .bind(EVICTION_BATCH)
+    .fetch_all(connection)
+    .await?;
+    let cc_rows = sqlx::query_as::<_, (String, i64)>(sqlx::AssertSqlSafe(format!(
+        "SELECT cache_key, last_accessed_ms FROM cc_cache_entries \
+         WHERE (last_accessed_ms, cache_key) {cc_comparison} (?, ?) \
+         ORDER BY last_accessed_ms, cache_key LIMIT ?"
+    )))
+    .bind(stamp)
+    .bind(&after.cache_key)
+    .bind(EVICTION_BATCH)
+    .fetch_all(connection)
+    .await?;
+    let mut candidates = Vec::with_capacity(rustc_rows.len() + cc_rows.len());
+    for (rows, location) in [
+        (rustc_rows, EvictionLocation::Rustc),
+        (cc_rows, EvictionLocation::Cc),
+    ] {
+        for (cache_key, last_accessed_ms) in rows {
+            candidates.push(EvictionCandidate {
+                cache_key,
+                last_accessed_ms: db_int(last_accessed_ms, "eviction candidate last_accessed_ms")?,
+                location,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.last_accessed_ms
+            .cmp(&right.last_accessed_ms)
+            .then_with(|| left.cache_key.cmp(&right.cache_key))
+            .then_with(|| left.location.rank().cmp(&right.location.rank()))
+    });
+    candidates.truncate(usize::try_from(EVICTION_BATCH).expect("batch size fits usize"));
+    Ok(candidates)
+}
+
+/// The store's own entry as a candidate, if its row is still there.
+async fn protected_candidate(
+    connection: &sqlx::SqlitePool,
+    rustc_version: &str,
+    protected: &ProtectedEntry<'_>,
+) -> stow_types::error::Result<Option<EvictionCandidate>> {
+    let (row, location) = match protected {
+        ProtectedEntry::Rustc(cache_key) => (
+            sqlx::query_as::<_, (i64,)>(
+                "SELECT last_accessed_ms FROM artifact_cache_entries \
+                 WHERE rustc_version = ? AND cache_key = ?",
+            )
+            .bind(rustc_version)
+            .bind(*cache_key)
+            .fetch_optional(connection)
+            .await?,
+            EvictionLocation::Rustc,
+        ),
+        ProtectedEntry::Cc(cache_key) => (
+            sqlx::query_as::<_, (i64,)>(
+                "SELECT last_accessed_ms FROM cc_cache_entries WHERE cache_key = ?",
+            )
+            .bind(*cache_key)
+            .fetch_optional(connection)
+            .await?,
+            EvictionLocation::Cc,
+        ),
+    };
+    let cache_key = match protected {
+        ProtectedEntry::Rustc(key) | ProtectedEntry::Cc(key) => (*key).to_owned(),
+    };
+    row.map(|(last_accessed_ms,)| {
+        Ok(EvictionCandidate {
+            cache_key,
+            last_accessed_ms: db_int(last_accessed_ms, "protected entry last_accessed_ms")?,
+            location,
+        })
+    })
+    .transpose()
 }
 
 async fn evict_entries(
@@ -2668,31 +2886,10 @@ async fn evict_entries(
     max_bytes: u64,
     protected: &ProtectedEntry<'_>,
 ) -> stow_types::error::Result<()> {
-    let entries = list_artifact_cache_entries(connection, rustc_version).await?;
-    let mut candidates: Vec<EvictionCandidate> = entries
-        .iter()
-        .map(|(cache_key, entry)| EvictionCandidate {
-            cache_key: cache_key.clone(),
-            size_bytes: entry.size_bytes,
-            last_accessed_ms: entry.last_accessed_ms,
-            location: EvictionLocation::Rustc,
-        })
-        .chain(
-            crate::cc::list_cc_cache_entries(connection)
-                .await?
-                .into_iter()
-                .map(|(cache_key, entry)| EvictionCandidate {
-                    cache_key,
-                    size_bytes: entry.size_bytes,
-                    last_accessed_ms: entry.last_accessed_ms,
-                    location: EvictionLocation::Cc,
-                }),
-        )
-        .collect();
-    let mut total_bytes = candidates.iter().fold(0u64, |sum, candidate| {
-        sum.saturating_add(candidate.size_bytes)
-    });
-    if total_bytes <= max_bytes {
+    // stow#1053: under the cap a store reads the maintained totals and
+    // nothing else; over it, candidates stream in LRU order, a batch at
+    // a time, and the total is re-read after each removal.
+    if resident_bytes(connection, rustc_version).await? <= max_bytes {
         return Ok(());
     }
 
@@ -2704,56 +2901,48 @@ async fn evict_entries(
         connection,
         rustc_version,
         version_dir,
-        graph: ClosureGraph::build(&entries)?,
-        entries,
+        graph: ClosureGraph::new(connection, rustc_version),
         evicted: BTreeSet::new(),
     };
-    candidates.sort_by(|left, right| {
-        left.last_accessed_ms
-            .cmp(&right.last_accessed_ms)
-            .then_with(|| left.cache_key.cmp(&right.cache_key))
-            .then_with(|| left.location.rank().cmp(&right.location.rank()))
-    });
-    let protected_index = candidates
-        .iter()
-        .position(|candidate| protected.matches(candidate));
     let untouchable: BTreeSet<String> = match protected {
-        ProtectedEntry::Rustc(cache_key) => pass.graph.untouchable_closure(cache_key),
+        ProtectedEntry::Rustc(cache_key) => pass.graph.untouchable_closure(cache_key).await?,
         ProtectedEntry::Cc(_) => BTreeSet::new(),
     };
-    for (index, candidate) in candidates.iter().enumerate() {
-        if Some(index) == protected_index
-            || untouchable.contains(&candidate.cache_key)
-            || pass.evicted.contains(&candidate.cache_key)
-        {
-            continue;
-        }
-        let evicted_bytes = match &candidate.location {
-            EvictionLocation::Rustc => {
-                let Some(bytes) = pass
-                    .try_evict_lru_victim(&candidate.cache_key, &untouchable)
-                    .await?
-                else {
-                    continue;
-                };
-                bytes
-            }
-            EvictionLocation::Cc => {
-                evict_cc_object(connection, cc_dir, &candidate.cache_key).await?;
-                candidate.size_bytes
-            }
+    let mut cursor = LruPosition::START;
+    loop {
+        let batch = next_eviction_candidates(connection, rustc_version, &cursor).await?;
+        let Some(last) = batch.last() else {
+            break;
         };
-        total_bytes = total_bytes.saturating_sub(evicted_bytes);
-        if total_bytes <= max_bytes {
-            return Ok(());
+        cursor = LruPosition::of(last)?;
+        for candidate in &batch {
+            if protected.matches(candidate)
+                || untouchable.contains(&candidate.cache_key)
+                || pass.evicted.contains(&candidate.cache_key)
+            {
+                continue;
+            }
+            match &candidate.location {
+                EvictionLocation::Rustc => {
+                    if !pass
+                        .try_evict_lru_victim(&candidate.cache_key, &untouchable)
+                        .await?
+                    {
+                        continue;
+                    }
+                }
+                EvictionLocation::Cc => {
+                    evict_cc_object(connection, cc_dir, &candidate.cache_key).await?;
+                }
+            }
+            if resident_bytes(connection, rustc_version).await? <= max_bytes {
+                return Ok(());
+            }
         }
     }
 
-    if total_bytes > max_bytes
-        && let Some(protected_index) = protected_index
-    {
-        let candidate = &candidates[protected_index];
-        pass.evict_protected_entry(cc_dir, candidate).await?;
+    if let Some(candidate) = protected_candidate(connection, rustc_version, protected).await? {
+        pass.evict_protected_entry(cc_dir, &candidate).await?;
         return Err(stow_types::stow_error!(
             "artifact cache entry {} exceeds max local cache size {} bytes",
             candidate.cache_key,
@@ -2766,47 +2955,48 @@ async fn evict_entries(
     ))
 }
 
-/// One eviction pass's working state (stow#1005): the listing it runs
-/// over, the closure graph built from it, and the cache keys already
-/// removed — group computation treats them as gone.
+/// One eviction pass's working state (stow#1005): the lazily read closure
+/// graph and the cache keys already removed — group computation treats
+/// them as gone.
 struct EvictionPass<'a> {
     connection: &'a sqlx::SqlitePool,
     rustc_version: &'a str,
     version_dir: &'a Path,
-    graph: ClosureGraph,
-    entries: BTreeMap<String, ArtifactCacheIndexEntry>,
+    graph: ClosureGraph<'a>,
     evicted: BTreeSet<String>,
 }
 
 impl EvictionPass<'_> {
     /// One victim's group eviction — the victim plus every entry its
-    /// removal would orphan, returned as the group's byte total. `None`
-    /// when the group cannot go — it would touch the protected closure,
-    /// or another process holds a member's lock — in which case no
-    /// member is removed, so no pass leaves a dependent without its
-    /// dependency.
+    /// removal would orphan. `false` when the group cannot go — it would
+    /// touch the protected closure, or another process holds a member's
+    /// lock — in which case no member is removed, so no pass leaves a
+    /// dependent without its dependency.
     async fn try_evict_lru_victim(
         &mut self,
         victim: &str,
         untouchable: &BTreeSet<String>,
-    ) -> stow_types::error::Result<Option<u64>> {
-        let Some(group) = self.graph.victim_group(victim, &self.evicted, untouchable) else {
-            return Ok(None);
+    ) -> stow_types::error::Result<bool> {
+        let Some(group) = self
+            .graph
+            .victim_group(victim, &self.evicted, untouchable)
+            .await?
+        else {
+            return Ok(false);
         };
+        let (members, _) = self.graph.group_members(&group).await?;
         if !try_evict_rustc_entry_group(
             self.connection,
             self.rustc_version,
             self.version_dir,
-            &entry_group_members(&self.entries, &group),
+            &members,
         )
         .await?
         {
-            return Ok(None);
+            return Ok(false);
         }
-        self.evicted.extend(group.iter().cloned());
-        Ok(Some(group.iter().fold(0u64, |sum, cache_key| {
-            sum.saturating_add(self.entries[cache_key].size_bytes)
-        })))
+        self.evicted.extend(group);
+        Ok(true)
     }
 
     /// Evict the store's own entry — the last resort when every other
@@ -2814,7 +3004,7 @@ impl EvictionPass<'_> {
     /// its whole victim group, like any other group; a member another
     /// process has locked fails here rather than being skipped.
     async fn evict_protected_entry(
-        &self,
+        &mut self,
         cc_dir: &Path,
         candidate: &EvictionCandidate,
     ) -> stow_types::error::Result<()> {
@@ -2823,8 +3013,9 @@ impl EvictionPass<'_> {
                 let group = self
                     .graph
                     .victim_group(&candidate.cache_key, &self.evicted, &BTreeSet::new())
+                    .await?
                     .expect("the protected entry's group has no untouchable member");
-                let members = entry_group_members(&self.entries, &group);
+                let (members, _) = self.graph.group_members(&group).await?;
                 let Some(eviction_locks) = tokio::task::spawn_blocking({
                     let version_dir = self.version_dir.to_path_buf();
                     let members = members.clone();
@@ -3321,16 +3512,13 @@ impl From<&FetchRequest<'_>> for OwnedFetchRequest {
     }
 }
 
+/// One `artifact_cache_entries` row as the tests read the whole table.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct ArtifactCacheIndexEntry {
-    relative_dir: String,
     size_bytes: u64,
     last_accessed_ms: u64,
-    /// The compile key this entry provides — what a dependent's
-    /// `dependency_compile_keys_json` names (stow#1005).
     compile_key: String,
-    /// `[{crate_name, compile_key}]` — the direct dependencies the entry
-    /// was compiled against, as stored.
     dependency_compile_keys_json: String,
 }
 
@@ -3432,12 +3620,13 @@ async fn load_artifact_cache_entry(
     .map_err(Into::into)
 }
 
+#[cfg(test)]
 async fn list_artifact_cache_entries(
     connection: &sqlx::SqlitePool,
     rustc_version: &str,
 ) -> stow_types::error::Result<BTreeMap<String, ArtifactCacheIndexEntry>> {
-    let rows = sqlx::query_as::<_, (String, String, i64, i64, String, String)>(
-        "SELECT cache_key, relative_dir, size_bytes, last_accessed_ms, compile_key, \
+    let rows = sqlx::query_as::<_, (String, i64, i64, String, String)>(
+        "SELECT cache_key, size_bytes, last_accessed_ms, compile_key, \
                 dependency_compile_keys_json \
          FROM artifact_cache_entries \
          WHERE rustc_version = ?",
@@ -3446,19 +3635,18 @@ async fn list_artifact_cache_entries(
     .fetch_all(connection)
     .await?;
     let mut entries = BTreeMap::new();
-    for (cache_key, relative_dir, size_bytes, last_accessed_ms, compile_key, dep_keys_json) in rows
+    for (cache_key, size_bytes, last_accessed_ms, compile_key, dependency_compile_keys_json) in rows
     {
         entries.insert(
             cache_key,
             ArtifactCacheIndexEntry {
-                relative_dir,
                 size_bytes: db_int(size_bytes, "artifact cache entry size_bytes")?,
                 last_accessed_ms: db_int(
                     last_accessed_ms,
                     "artifact cache entry last_accessed_ms",
                 )?,
                 compile_key,
-                dependency_compile_keys_json: dep_keys_json,
+                dependency_compile_keys_json,
             },
         );
     }
@@ -3680,8 +3868,16 @@ async fn insert_artifact_cache_entry(
     last_accessed_ms: u64,
     metadata: &CacheEntryMetadata<'_>,
 ) -> stow_types::error::Result<()> {
+    // Delete-then-insert rather than `INSERT OR REPLACE`: a REPLACE's
+    // implicit delete fires no delete trigger, and the triggers are what
+    // keep `artifact_cache_totals` and the dependency edges exact.
+    sqlx::query("DELETE FROM artifact_cache_entries WHERE rustc_version = ? AND cache_key = ?")
+        .bind(rustc_version)
+        .bind(cache_key)
+        .execute(&mut *connection)
+        .await?;
     sqlx::query(
-        "INSERT OR REPLACE INTO artifact_cache_entries \
+        "INSERT INTO artifact_cache_entries \
          (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, oci_reference, oci_digest, compile_key, crate_name, crate_version, c_metadata, features_json, dependency_c_metadata_json, dependency_compile_keys_json, dependency_instances_json, compile_millis, target, profile_json, emit_json, kind_json, crate_types_json, verified_marker_version, verified_marker_policy, provenance, reach) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)",
     )
@@ -6559,6 +6755,272 @@ pub mod tests {
             assert!(index.contains_key(&leaf_key));
             assert_closure_complete(&index);
         });
+    }
+
+    /// `n` entries of one byte each, stamps `1..=n`, each its own compile
+    /// key and depending on nothing, in one statement.
+    async fn seed_entries(pool: &sqlx::SqlitePool, n: i64) {
+        sqlx::query(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?) \
+             INSERT INTO artifact_cache_entries \
+             (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, \
+              oci_reference, oci_digest, compile_key, reach) \
+             SELECT '1.91.1', 'key-' || i, 'dir-' || i, 1, i, '', '', 'ck-' || i, 0 FROM n",
+        )
+        .bind(n)
+        .execute(pool)
+        .await
+        .expect("seed entries");
+    }
+
+    /// The SQLite VM instructions `work` runs on the pool's connection —
+    /// deterministic for given data, and proportional to the rows a
+    /// statement reads, which wall time is not.
+    async fn vm_instructions<T>(
+        pool: &sqlx::SqlitePool,
+        work: impl std::future::Future<Output = T>,
+    ) -> (u64, T) {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let mut connection = pool.acquire().await.expect("acquire connection");
+            let mut handle = connection.lock_handle().await.expect("lock handle");
+            let counter = counter.clone();
+            handle.set_progress_handler(1, move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                true
+            });
+        }
+        let output = work.await;
+        {
+            let mut connection = pool.acquire().await.expect("acquire connection");
+            let mut handle = connection.lock_handle().await.expect("lock handle");
+            handle.set_progress_handler(0, || true);
+        }
+        (counter.load(std::sync::atomic::Ordering::Relaxed), output)
+    }
+
+    async fn counted_total(pool: &sqlx::SqlitePool) -> (i64, i64) {
+        let rustc: i64 = sqlx::query_scalar(
+            "SELECT COALESCE((SELECT total_bytes FROM artifact_cache_totals \
+                              WHERE rustc_version = '1.91.1'), 0)",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("rustc total");
+        let cc: i64 = sqlx::query_scalar("SELECT total_bytes FROM cc_cache_totals")
+            .fetch_one(pool)
+            .await
+            .expect("cc total");
+        (rustc, cc)
+    }
+
+    async fn summed_total(pool: &sqlx::SqlitePool) -> (i64, i64) {
+        let rustc: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(size_bytes), 0) FROM artifact_cache_entries \
+             WHERE rustc_version = '1.91.1'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("rustc sum");
+        let cc: i64 =
+            sqlx::query_scalar("SELECT COALESCE(SUM(size_bytes), 0) FROM cc_cache_entries")
+                .fetch_one(pool)
+                .await
+                .expect("cc sum");
+        (rustc, cc)
+    }
+
+    /// stow#1053: the maintained totals equal the sum of the rows after
+    /// every kind of row change — insert, replace, resize, delete, a
+    /// rolled-back transaction, a cascade — for both tables.
+    #[test]
+    fn the_cached_totals_track_every_row_change() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        run_async(async {
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            seed_entries(&pool, 5).await;
+            assert_eq!(counted_total(&pool).await, summed_total(&pool).await);
+            assert_eq!(counted_total(&pool).await, (5, 0));
+
+            // A replace through the production path swaps one byte for 200.
+            let bundle = sample_bundle("11223344aabbccdd", "libdemo-11223344aabbccdd.rmeta");
+            super::replace_artifact_cache_metadata(
+                &pool,
+                "1.91.1",
+                "key-3",
+                "replacement",
+                200,
+                10,
+                &super::CacheEntryMetadata::remote(&bundle),
+            )
+            .await
+            .expect("replace entry");
+            assert_eq!(counted_total(&pool).await, (204, 0));
+
+            sqlx::query(
+                "UPDATE artifact_cache_entries SET size_bytes = 7 WHERE cache_key = 'key-1'",
+            )
+            .execute(&pool)
+            .await
+            .expect("resize");
+            super::delete_artifact_cache_entry(&pool, "1.91.1", "key-2")
+                .await
+                .expect("delete");
+            assert_eq!(counted_total(&pool).await, summed_total(&pool).await);
+            assert_eq!(counted_total(&pool).await, (209, 0));
+
+            // A transaction that does not commit leaves the total alone.
+            let mut transaction = pool.begin().await.expect("begin");
+            sqlx::query("DELETE FROM artifact_cache_entries")
+                .execute(&mut *transaction)
+                .await
+                .expect("delete all");
+            drop(transaction);
+            assert_eq!(counted_total(&pool).await, summed_total(&pool).await);
+
+            // A different rustc version keeps its own total.
+            sqlx::query(
+                "INSERT INTO artifact_cache_entries \
+                 (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, \
+                  oci_reference, oci_digest, reach) \
+                 VALUES ('1.90.0', 'old', 'old', 1000, 0, '', '', 0)",
+            )
+            .execute(&pool)
+            .await
+            .expect("old version entry");
+            assert_eq!(counted_total(&pool).await, summed_total(&pool).await);
+
+            for (key, size, stamp) in [("a", 30, 1), ("a", 50, 2), ("b", 5, 3)] {
+                crate::cc::upsert_cc_cache_entry(&pool, key, size, stamp)
+                    .await
+                    .expect("upsert cc");
+            }
+            crate::cc::delete_cc_cache_entry(&pool, "b")
+                .await
+                .expect("delete cc");
+            assert_eq!(counted_total(&pool).await.1, 50);
+            assert_eq!(counted_total(&pool).await, summed_total(&pool).await);
+            assert_eq!(
+                super::resident_bytes(&pool, "1.91.1")
+                    .await
+                    .expect("resident"),
+                u64::try_from(counted_total(&pool).await.0 + 50).expect("non-negative"),
+            );
+        });
+    }
+
+    /// stow#1053: the dependency edges follow the entry row — inserted
+    /// with it from `dependency_compile_keys_json`, gone with it.
+    #[test]
+    fn dependency_edges_follow_their_entry() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let config = test_config(tempdir.path());
+        run_async(async {
+            let pool = connect(&config.cache_dir).await.expect("connect state db");
+            sqlx::query(
+                "INSERT INTO artifact_cache_entries \
+                 (rustc_version, cache_key, relative_dir, size_bytes, last_accessed_ms, \
+                  oci_reference, oci_digest, dependency_compile_keys_json, reach) \
+                 VALUES ('1.91.1', 'dependent', 'dir', 1, 1, '', '', \
+                  '[{\"crate_name\":\"serde\",\"compile_key\":\"aa\"},\
+                    {\"crate_name\":\"cfg-if\",\"compile_key\":\"bb\"}]', 0)",
+            )
+            .execute(&pool)
+            .await
+            .expect("insert dependent");
+            let edges = |pool: sqlx::SqlitePool| async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT dependency_compile_key FROM artifact_cache_dependencies \
+                     ORDER BY dependency_compile_key",
+                )
+                .fetch_all(&pool)
+                .await
+                .expect("edges")
+            };
+            assert_eq!(edges(pool.clone()).await, ["aa", "bb"]);
+            super::delete_artifact_cache_entry(&pool, "1.91.1", "dependent")
+                .await
+                .expect("delete");
+            assert_eq!(edges(pool.clone()).await.len(), 0);
+        });
+    }
+
+    /// stow#1053: a store's eviction pass under the cap does the same
+    /// work whatever the number of cached entries — counted in SQLite VM
+    /// instructions, not wall time — and so does a pass over the cap that
+    /// removes one victim, which reads one LRU batch and the victim's
+    /// closure and not the table.
+    #[test]
+    fn eviction_work_does_not_grow_with_the_entry_count() {
+        let mut under_cap = Vec::new();
+        let mut over_cap = Vec::new();
+        for entries in [1_i64, 500, 5_000] {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let config = test_config(tempdir.path());
+            let version_dir = config.artifact_cache_version_dir("1.91.1");
+            std::fs::create_dir_all(version_dir.join("locks")).expect("locks dir");
+            run_async(async {
+                let pool = connect(&config.cache_dir).await.expect("connect state db");
+                seed_entries(&pool, entries).await;
+                let protected_key = format!("key-{entries}");
+                let (instructions, result) = vm_instructions(
+                    &pool,
+                    super::evict_entries(
+                        &pool,
+                        "1.91.1",
+                        &version_dir,
+                        &config.cc_cache_dir(),
+                        u64::try_from(entries).expect("count"),
+                        &super::ProtectedEntry::Rustc(&protected_key),
+                    ),
+                )
+                .await;
+                result.expect("a pass at the cap");
+                assert_eq!(
+                    list_artifact_cache_entries(&pool, "1.91.1")
+                        .await
+                        .expect("list")
+                        .len(),
+                    usize::try_from(entries).expect("count"),
+                    "nothing is evicted at the cap"
+                );
+                under_cap.push(instructions);
+
+                if entries > 1 {
+                    let (instructions, result) = vm_instructions(
+                        &pool,
+                        super::evict_entries(
+                            &pool,
+                            "1.91.1",
+                            &version_dir,
+                            &config.cc_cache_dir(),
+                            u64::try_from(entries - 1).expect("count"),
+                            &super::ProtectedEntry::Rustc(&protected_key),
+                        ),
+                    )
+                    .await;
+                    result.expect("a pass one byte over the cap");
+                    let index = list_artifact_cache_entries(&pool, "1.91.1")
+                        .await
+                        .expect("list");
+                    assert_eq!(index.len(), usize::try_from(entries - 1).expect("count"));
+                    assert!(
+                        !index.contains_key("key-1"),
+                        "the oldest entry is the victim"
+                    );
+                    over_cap.push(instructions);
+                }
+            });
+        }
+        assert!(
+            under_cap.windows(2).all(|pair| pair[0] == pair[1]),
+            "a store under the cap does work independent of the entry count: {under_cap:?}"
+        );
+        assert!(
+            over_cap.windows(2).all(|pair| pair[0] == pair[1]),
+            "a one-victim pass does work independent of the entry count: {over_cap:?}"
+        );
     }
 
     #[test]
