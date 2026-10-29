@@ -1039,7 +1039,7 @@ pub async fn submit_chunked(
     };
     let bodies = stow_types::api::SubmissionTree::into_bodies(
         trees,
-        stow_types::api::SUBMIT_BODY_LIMIT_BYTES,
+        stow_types::api::REQUEST_BODY_LIMIT_BYTES,
     )?;
     for body in &bodies {
         let response: SchedulerSubmitResponse = crate::submit(edge, body).await?;

@@ -408,6 +408,13 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
+        name: "POST /index/published (part)",
+        statements: 4,
+        rows_read: 6,
+        rows_written: 6,
+        wall_ms: 500,
+    },
+    DriveBudget {
         name: "POST /index/published (delta)",
         statements: 4,
         rows_read: 6,

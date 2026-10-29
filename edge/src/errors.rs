@@ -451,14 +451,14 @@ mod tests {
     use super::{GetArtifactError, ResolverError, SchedulerClientError};
     use skyzen::{HttpError as _, StatusCode};
 
-    /// Submitters split their batches at `SUBMIT_BODY_LIMIT_BYTES`; the
+    /// Submitters split their batches at `REQUEST_BODY_LIMIT_BYTES`; the
     /// submit route and the scheduler forward both parse at skyzen's
     /// default body limit and answer a larger body 413, so the two must
     /// stay one number.
     #[test]
     fn submit_body_bound_is_the_extractor_limit() {
         assert_eq!(
-            stow_types::api::SUBMIT_BODY_LIMIT_BYTES,
+            stow_types::api::REQUEST_BODY_LIMIT_BYTES,
             skyzen::RequestBodyLimit::DEFAULT
         );
     }

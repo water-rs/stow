@@ -1942,48 +1942,7 @@ pub struct RequestStatus {
     pub blocked_by: Option<String>,
 }
 
-/// The index-publish path's report of what a slice serves.
-///
-/// One slice of a [`PublishedRunReport`], the body of
-/// `POST /api/v1/admin/index/published`, sent after the run's slices go
-/// live. The scheduler stores the set as the
-/// membership the dependency gate checks a dependent's edges against —
-/// a dependent dispatches only when every dependency resolves to a row
-/// the latest report for that dependency's own `(target, rustc_version)`
-/// covers.
-///
-/// Two report shapes share the wire:
-///
-/// - **Delta** — `base_generation` is the index generation the report's
-///   base was taken from; `added`/`retired` carry only what moved. The
-///   scheduler 409s unless the base is exactly the slice's live
-///   generation and `generation` is the next one — `index report` then
-///   resyncs once with a full report; a stale delta is never retried.
-/// - **Full** — `base_generation` is `None`, `added` carries the slice's
-///   whole membership and `retired` is empty; the scheduler replaces the
-///   slice's set with it. This is the first-publish path, the
-///   `stow-admin index report --full` resync, and the resync a refused
-///   delta triggers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PublishedSliceReport {
-    /// The index generation this report's delta is based on — `None`
-    /// marks the explicit full report.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub base_generation: Option<i64>,
-    /// The generation of the index this report publishes — the value
-    /// stamped in the index header. The scheduler records it as the
-    /// slice's live generation: a delta applies only on top of it, and
-    /// a full report replaces the slice's set and sets it.
-    pub generation: i64,
-    /// Rows entering the slice (a delta's additions, or the whole
-    /// membership on a full report).
-    pub added: Vec<PublishedSliceRow>,
-    /// Rows leaving the slice — always empty on a full report.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub retired: Vec<PublishedSliceRow>,
-}
-
-/// One servable identity inside a [`PublishedSliceReport`]: the semantic
+/// One servable identity inside a [`PublishedSlice`]: the semantic
 /// identity a dependency edge names plus the unit shape that row serves.
 ///
 /// The same semantic identity legitimately appears once per unit shape —
@@ -2007,9 +1966,45 @@ pub struct PublishedSliceRow {
     pub dependency_identity: DependencyIdentity,
 }
 
-/// Body the edge forwards to the scheduler's `/index/published` — one
-/// [`PublishedSliceReport`] plus the `(target, rustc_version)` slice it
-/// describes.
+/// The largest serialized part of a full slice report, in bytes.
+///
+/// Each part becomes one scheduler log row and, while its report is
+/// incomplete, one snapshot item; half a mebibyte keeps both far under
+/// the platform's ~2 MB row bound and lets several parts share one
+/// request body under [`REQUEST_BODY_LIMIT_BYTES`].
+pub const SLICE_REPORT_PART_BYTES: usize = 512 * 1024;
+
+/// The index-publish path's report of what a slice serves.
+///
+/// One slice of a [`PublishedRunReport`], the body of
+/// `POST /api/v1/admin/index/published`, sent after the run's slices go
+/// live. The scheduler stores the set as the
+/// membership the dependency gate checks a dependent's edges against —
+/// a dependent dispatches only when every dependency resolves to a row
+/// the latest report for that dependency's own `(target, rustc_version)`
+/// covers.
+///
+/// Two report shapes share the wire:
+///
+/// - **Delta** — `base_generation` is the index generation the report's
+///   base was taken from; `added`/`retired` carry only what moved. The
+///   scheduler 409s unless the base is exactly the slice's live
+///   generation and `generation` is the next one — `index report` then
+///   resyncs once with a full report; a stale delta is never retried.
+/// - **Full** — `base_generation` is `None`, `added` carries the slice's
+///   whole membership and `retired` is empty; the scheduler replaces the
+///   slice's set with it. This is the first-publish path, the
+///   `stow-admin index report --full` resync, and the resync a refused
+///   delta triggers.
+///
+/// A full report whose membership does not fit one
+/// [`SLICE_REPORT_PART_BYTES`] part arrives as `parts` consecutive
+/// parts (`part` `0..parts`), each carrying a disjoint share of
+/// `added` and the same `target`, `rustc_version`, `generation` and
+/// `parts`. The scheduler stages the parts and replaces the slice's set
+/// only when the last one arrives; a newer part 0 supersedes an
+/// incomplete earlier report, and a delta is refused while one is
+/// staged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PublishedSlice {
     /// The slice's compilation target triple.
@@ -2024,20 +2019,161 @@ pub struct PublishedSlice {
     /// The generation of the index this report publishes — the value
     /// stamped in the index header.
     pub generation: i64,
-    /// Rows entering the slice.
+    /// This part's index inside its report; `0` for a single-part
+    /// report.
+    pub part: u32,
+    /// How many parts the report was split into; `1` for a delta and
+    /// for a full report that fits one part.
+    pub parts: u32,
+    /// Rows entering the slice — on a part of a full report, that
+    /// part's share of the membership.
     pub added: Vec<PublishedSliceRow>,
     /// Rows leaving the slice — always empty on a full report.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub retired: Vec<PublishedSliceRow>,
 }
-/// A publish run's one report: every slice the run published, carried
-/// in a single `POST /api/v1/admin/index/published` so the scheduler
-/// applies them in one append and one inline pass (stow#940).
+
+/// A publish run's report: the slices of one
+/// `POST /api/v1/admin/index/published` body.
+///
+/// The body carries every slice the run published so the scheduler
+/// applies them in one append and one inline pass (stow#940). A run
+/// whose slices exceed one body is sent as the consecutive bodies of
+/// [`PublishedRunReport::into_bodies`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct PublishedRunReport {
     /// The run's slices — each a [`PublishedSlice`]: the
     /// `(target, rustc_version)` pair, the delta or full membership.
+    /// A body names a slice at most once.
     pub slices: Vec<PublishedSlice>,
+}
+
+impl PublishedRunReport {
+    /// Split a run's slices into consecutive request bodies, each at
+    /// most `body_bytes` serialized, to be posted in order. A full
+    /// report over `part_bytes` becomes several parts of at most
+    /// `part_bytes` each, in order, no two in one body; a delta, or a
+    /// full report that fits, travels whole.
+    ///
+    /// # Errors
+    /// When a row alone is larger than a part, a delta or whole report
+    /// is larger than a body, or a slice is already split.
+    pub fn into_bodies(
+        slices: Vec<PublishedSlice>,
+        part_bytes: usize,
+        body_bytes: usize,
+    ) -> crate::error::Result<Vec<Self>> {
+        let envelope = json_len(&Self { slices: Vec::new() })?;
+        let budget = body_bytes
+            .checked_sub(envelope)
+            .ok_or_else(|| stow_error!("a {body_bytes}-byte body cannot hold a slice report"))?;
+        let mut parts: Vec<(PublishedSlice, usize)> = Vec::new();
+        for slice in slices {
+            if slice.part != 0 || slice.parts != 1 {
+                return Err(stow_error!(
+                    "slice {}/{} is already split ({}/{})",
+                    slice.target,
+                    slice.rustc_version,
+                    slice.part,
+                    slice.parts
+                ));
+            }
+            let whole = json_len(&slice)?;
+            if slice.base_generation.is_some() || whole <= part_bytes {
+                if whole > budget {
+                    return Err(stow_error!(
+                        "slice {}/{} serializes to {whole} bytes, over the {body_bytes}-byte body",
+                        slice.target,
+                        slice.rustc_version
+                    ));
+                }
+                parts.push((slice, whole));
+            } else {
+                parts.extend(slice.into_parts(part_bytes)?);
+            }
+        }
+        let mut bodies = Vec::new();
+        let mut body: Vec<PublishedSlice> = Vec::new();
+        let mut body_len = 0;
+        for (part, bytes) in parts {
+            let repeats = body
+                .iter()
+                .any(|held| held.target == part.target && held.rustc_version == part.rustc_version);
+            // A body's slices are `,`-separated.
+            if !body.is_empty() && (repeats || body_len + 1 + bytes > budget) {
+                bodies.push(Self {
+                    slices: std::mem::take(&mut body),
+                });
+                body_len = 0;
+            }
+            body_len += if body.is_empty() { bytes } else { 1 + bytes };
+            body.push(part);
+        }
+        if !body.is_empty() {
+            bodies.push(Self { slices: body });
+        }
+        Ok(bodies)
+    }
+}
+
+impl PublishedSlice {
+    /// Split a full report into parts of at most `part_bytes`
+    /// serialized each, with each part's size bound (the part index
+    /// and count counted at their widest).
+    fn into_parts(self, part_bytes: usize) -> crate::error::Result<Vec<(Self, usize)>> {
+        let Self {
+            target,
+            rustc_version,
+            base_generation,
+            generation,
+            added,
+            retired,
+            ..
+        } = self;
+        let shell = |part, parts, added| Self {
+            target: target.clone(),
+            rustc_version: rustc_version.clone(),
+            base_generation,
+            generation,
+            part,
+            parts,
+            added,
+            retired: retired.clone(),
+        };
+        let envelope = json_len(&shell(u32::MAX, u32::MAX, Vec::new()))?;
+        let mut shares: Vec<(Vec<PublishedSliceRow>, usize)> = Vec::new();
+        let mut share = Vec::new();
+        let mut share_len = envelope;
+        for row in added {
+            let bytes = json_len(&row)?;
+            if envelope + bytes > part_bytes {
+                return Err(stow_error!(
+                    "a row of slice {target}/{rustc_version} serializes to {bytes} bytes, \
+                     over the {part_bytes}-byte part"
+                ));
+            }
+            // A part's rows are `,`-separated.
+            if !share.is_empty() && share_len + 1 + bytes > part_bytes {
+                shares.push((std::mem::take(&mut share), share_len));
+                share_len = envelope;
+            }
+            share_len += if share.is_empty() { bytes } else { 1 + bytes };
+            share.push(row);
+        }
+        shares.push((share, share_len));
+        let parts = u32::try_from(shares.len())
+            .map_err(|_| stow_error!("slice report part count overflows u32"))?;
+        Ok(shares
+            .into_iter()
+            .enumerate()
+            .map(|(part, (added, bytes))| {
+                (
+                    shell(u32::try_from(part).expect("part fits u32"), parts, added),
+                    bytes,
+                )
+            })
+            .collect())
+    }
 }
 
 // ===== Operations API (`stow-admin` under `/api/v1/admin/*`) =====
@@ -3260,7 +3396,9 @@ pub struct ArtifactPruneResponse {
 mod tests {
     use super::{
         CI_TARGET_TRIPLES, DEMAND_FEED_PAGE_MAX_BYTES, DEMAND_FEED_PAGE_MAX_ENTRIES,
-        DemandFeedHour, DemandFeedPageBuilder, RunnerFamily, SchedulerDemandEntry, runner_family,
+        DemandFeedHour, DemandFeedPageBuilder, PublishedRunReport, PublishedSlice,
+        PublishedSliceRow, REQUEST_BODY_LIMIT_BYTES, RunnerFamily, SLICE_REPORT_PART_BYTES,
+        SchedulerDemandEntry, json_len, runner_family,
     };
     use crate::artifact::ArtifactKind;
     use crate::identity::{DependencyCMetadataJson, FeaturesJson};
@@ -3615,7 +3753,7 @@ mod tests {
         let whole = shared_dependency_tree();
         let bodies = crate::api::SubmissionTree::into_bodies(
             std::slice::from_ref(&whole),
-            crate::api::SUBMIT_BODY_LIMIT_BYTES,
+            crate::api::REQUEST_BODY_LIMIT_BYTES,
         )
         .unwrap();
         assert_eq!(bodies, vec![vec![whole]]);
@@ -4249,6 +4387,98 @@ mod tests {
             "the host endpoint stays too"
         );
     }
+
+    fn report_row(i: usize) -> PublishedSliceRow {
+        PublishedSliceRow {
+            crate_name: format!("report-crate-{i}").parse().expect("crate"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: crate::identity::FeaturesJson::default(),
+            unit_shape: crate::public_cache::UnitShape {
+                side: crate::public_cache::UnitSide::Target,
+                invocation: crate::public_cache::UnitInvocation::Native,
+                kind: crate::public_cache::UnitKind::Linked,
+            },
+            dependency_identity: format!("{i:064x}").parse().expect("digest"),
+        }
+    }
+
+    fn full_report(target: &str, rows: usize) -> PublishedSlice {
+        PublishedSlice {
+            target: target.parse().expect("target"),
+            rustc_version: "1.99.1".parse().expect("rustc"),
+            base_generation: None,
+            generation: 7,
+            part: 0,
+            parts: 1,
+            added: (0..rows).map(report_row).collect(),
+            retired: Vec::new(),
+        }
+    }
+
+    /// A full report over the part bound splits into disjoint, ordered
+    /// parts that each fit, and together carry every row once.
+    #[test]
+    fn a_full_slice_report_splits_into_bounded_parts() {
+        let whole = full_report("x86_64-unknown-linux-gnu", 400);
+        let part_bytes = json_len(&whole).unwrap() / 3;
+        let body_bytes = part_bytes * 2 + 1024;
+        let bodies = PublishedRunReport::into_bodies(vec![whole.clone()], part_bytes, body_bytes)
+            .expect("split");
+        assert!(bodies.len() > 1, "parts of one slice never share a body");
+        let mut next = 0;
+        let mut rows = Vec::new();
+        let mut parts = None;
+        for body in &bodies {
+            assert!(json_len(body).unwrap() <= body_bytes);
+            assert_eq!(body.slices.len(), 1);
+            for part in &body.slices {
+                assert!(json_len(part).unwrap() <= part_bytes);
+                assert_eq!(part.part, next);
+                assert_eq!(*parts.get_or_insert(part.parts), part.parts);
+                assert_eq!(part.generation, whole.generation);
+                assert_eq!(part.base_generation, None);
+                next += 1;
+                rows.extend(part.added.clone());
+            }
+        }
+        assert_eq!(Some(next), parts);
+        assert_eq!(rows, whole.added);
+    }
+
+    /// Slices that fit travel whole and share a body; a delta is never
+    /// split.
+    #[test]
+    fn fitting_slices_share_a_body_and_a_delta_stays_whole() {
+        let a = full_report("x86_64-unknown-linux-gnu", 3);
+        let mut b = full_report("aarch64-apple-darwin", 3);
+        b.base_generation = Some(6);
+        b.retired = vec![report_row(99)];
+        let bodies = PublishedRunReport::into_bodies(
+            vec![a.clone(), b.clone()],
+            SLICE_REPORT_PART_BYTES,
+            REQUEST_BODY_LIMIT_BYTES,
+        )
+        .expect("bodies");
+        assert_eq!(bodies, vec![PublishedRunReport { slices: vec![a, b] }]);
+    }
+
+    /// A delta over the body, and a row over the part, fail on the
+    /// client with a message naming the slice.
+    #[test]
+    fn an_unsplittable_slice_is_an_error() {
+        let mut delta = full_report("x86_64-unknown-linux-gnu", 400);
+        delta.base_generation = Some(6);
+        let error = PublishedRunReport::into_bodies(vec![delta], 1 << 10, 4 << 10)
+            .expect_err("delta over the body");
+        assert!(error.to_string().contains("x86_64-unknown-linux-gnu"));
+        let error = PublishedRunReport::into_bodies(
+            vec![full_report("x86_64-unknown-linux-gnu", 400)],
+            64,
+            1 << 20,
+        )
+        .expect_err("row over the part");
+        assert!(error.to_string().contains("over the 64-byte part"));
+    }
 }
 /// Public aggregate usage statistics served by `GET /api/v1/stats`.
 ///
@@ -4405,18 +4635,22 @@ pub struct SubmissionNode {
     pub downloads: u64,
 }
 
-/// The largest `POST /api/v1/scheduler/tasks/submit` body, in bytes.
+/// The largest JSON request body any edge route accepts, in bytes.
 ///
-/// The edge parses the body, and the scheduler parses the edge's
-/// forward of the same trees, with skyzen's `Json` extractor at its
-/// default request-body limit; `stow-edge` pins this constant to that
-/// default. Submitters split a batch with
-/// [`SubmissionTree::into_bodies`].
-pub const SUBMIT_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+/// The edge parses a body, and the scheduler parses the edge's forward
+/// of it, with skyzen's `Json` extractor at its default request-body
+/// limit; `stow-edge` pins this constant to that default. Submitters
+/// split a batch with [`SubmissionTree::into_bodies`], index reporters
+/// split a run's report with [`PublishedRunReport::into_bodies`], and
+/// `stow-admin` refuses to send a body over it.
+pub const REQUEST_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
 /// The length of `value`'s JSON serialization, counted without
 /// buffering it.
-fn json_len(value: &impl Serialize) -> crate::error::Result<usize> {
+///
+/// # Errors
+/// When `value` fails to serialize.
+pub fn json_len(value: &impl Serialize) -> crate::error::Result<usize> {
     struct Count(usize);
     impl std::io::Write for Count {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -4429,7 +4663,7 @@ fn json_len(value: &impl Serialize) -> crate::error::Result<usize> {
     }
     let mut count = Count(0);
     serde_json::to_writer(&mut count, value)
-        .map_err(|error| stow_error!("serialize a submission tree: {error}"))?;
+        .map_err(|error| stow_error!("serialize a JSON value: {error}"))?;
     Ok(count.0)
 }
 
@@ -5587,7 +5821,13 @@ pub enum SchedulerEvent {
         base_generation: Option<i64>,
         /// The index generation this report publishes.
         generation: i64,
-        /// Membership rows the report adds.
+        /// This part's index inside its report.
+        part: u32,
+        /// Total parts of the report; `1` for a delta or a whole
+        /// report.
+        parts: u32,
+        /// Membership rows the report adds — on a part of a full
+        /// report, that part's share.
         added: Vec<PublishedSliceRow>,
         /// Membership rows the report retires.
         retired: Vec<PublishedSliceRow>,
