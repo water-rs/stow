@@ -7,12 +7,15 @@
 //! `[profile.dev]` — or every dependency through
 //! `[profile.dev.package."*"]` — is not disqualified: its lookups carry the
 //! tuned profile and hit whenever the pool holds artifacts built under it,
-//! which is what project-source seeding produces. The one knob the public
-//! identity cannot share is `lto`: cargo then compiles every dependency
-//! with `-C linker-plugin-lto`, which keys into extra-codegen and makes
-//! every unit local-only (stow#1006), so the build disables the public
-//! half and keeps only its local cache instead of paying analysis and
-//! remote-fetch overhead for zero hits.
+//! which is what project-source seeding produces. The knobs the public
+//! identity cannot share are the ones that key into extra-codegen and make
+//! every unit local-only (stow#1006): `lto` (cargo then compiles every
+//! dependency with `-C linker-plugin-lto`), `codegen-units` (cargo passes
+//! `-C codegen-units` only when the profile sets it, whatever the value)
+//! and `split-debuginfo` other than cargo's dev default for a target the
+//! build compiles for. The build then disables the public half and keeps
+//! only its local cache instead of paying analysis and remote-fetch
+//! overhead for zero hits.
 
 use std::path::Path;
 
@@ -37,8 +40,10 @@ impl std::fmt::Display for ProfileDivergence {
 /// Inspect the workspace root manifest's `[profile.dev]` (including the
 /// wildcard package override) and report the first setting that makes
 /// every dependency unit ineligible, or `None` when the cache can apply.
+/// `targets` are the triples the build compiles units for.
 pub async fn dev_profile_divergence(
     workspace_root: &Path,
+    targets: &[&str],
 ) -> stow_types::error::Result<Option<ProfileDivergence>> {
     let manifest_path = workspace_root.join("Cargo.toml");
     let contents = async_fs::read_to_string(&manifest_path)
@@ -55,7 +60,7 @@ pub async fn dev_profile_divergence(
         return Ok(None);
     };
 
-    if let Some(divergence) = table_divergence(dev, "profile.dev") {
+    if let Some(divergence) = table_divergence(dev, "profile.dev", targets) {
         return Ok(Some(divergence));
     }
     // Only the wildcard override reaches every dependency. A named-package
@@ -67,7 +72,7 @@ pub async fn dev_profile_divergence(
         .and_then(toml::Value::as_table)
         .and_then(|packages| packages.get("*"))
         .and_then(toml::Value::as_table)
-        && let Some(divergence) = table_divergence(wildcard, "profile.dev.package.\"*\"")
+        && let Some(divergence) = table_divergence(wildcard, "profile.dev.package.\"*\"", targets)
     {
         return Ok(Some(divergence));
     }
@@ -75,22 +80,43 @@ pub async fn dev_profile_divergence(
 }
 
 /// `lto = false` and `lto = "off"` are cargo's dev default; anything else
-/// turns on linker-plugin LTO for every dependency.
+/// turns on linker-plugin LTO for every dependency. Any `codegen-units`
+/// makes cargo pass the flag, which keys; `split-debuginfo` keys unless it
+/// is cargo's dev default for every target in `targets`.
 fn table_divergence(
     table: &toml::map::Map<String, toml::Value>,
     section: &str,
+    targets: &[&str],
 ) -> Option<ProfileDivergence> {
-    let lto = table.get("lto")?;
-    let default = lto.as_bool() == Some(false) || lto.as_str() == Some("off");
-    (!default).then(|| ProfileDivergence {
+    let diverges = |key: &str| ProfileDivergence {
         section: section.to_owned(),
-        key: "lto".to_owned(),
-    })
+        key: key.to_owned(),
+    };
+    if let Some(lto) = table.get("lto")
+        && !(lto.as_bool() == Some(false) || lto.as_str() == Some("off"))
+    {
+        return Some(diverges("lto"));
+    }
+    if table.contains_key("codegen-units") {
+        return Some(diverges("codegen-units"));
+    }
+    if let Some(split) = table.get("split-debuginfo")
+        && !targets.iter().all(|target| {
+            split.as_str() == Some(stow_types::rustc::cargo_default_split_debuginfo(target))
+        })
+    {
+        return Some(diverges("split-debuginfo"));
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::table_divergence;
+
+    const LINUX: &str = "x86_64-unknown-linux-gnu";
+    const APPLE: &str = "aarch64-apple-darwin";
+    const MSVC: &str = "x86_64-pc-windows-msvc";
 
     fn table(source: &str) -> toml::map::Map<String, toml::Value> {
         toml::from_str::<toml::Value>(source)
@@ -110,24 +136,60 @@ mod tests {
             debug-assertions = false
             overflow-checks = false
             panic = "abort"
-            codegen-units = 1
             incremental = false
-            split-debuginfo = "packed"
             lto = false
             "#,
         );
-        assert!(table_divergence(&dev, "profile.dev").is_none());
+        assert!(table_divergence(&dev, "profile.dev", &[LINUX]).is_none());
         let dev = table(r#"lto = "off""#);
-        assert!(table_divergence(&dev, "profile.dev").is_none());
+        assert!(table_divergence(&dev, "profile.dev", &[LINUX]).is_none());
     }
 
     #[test]
     fn lto_diverges() {
         for source in ["lto = true", r#"lto = "fat""#, r#"lto = "thin""#] {
             let dev = table(source);
-            let divergence = table_divergence(&dev, "profile.dev").expect("divergent");
+            let divergence = table_divergence(&dev, "profile.dev", &[LINUX]).expect("divergent");
             assert_eq!(divergence.key, "lto");
         }
+    }
+
+    #[test]
+    fn codegen_units_diverge_whatever_the_value() {
+        for value in ["1", "16", "256"] {
+            let dev = table(&format!("codegen-units = {value}"));
+            let divergence = table_divergence(&dev, "profile.dev", &[LINUX]).expect("divergent");
+            assert_eq!(divergence.key, "codegen-units");
+        }
+    }
+
+    #[test]
+    fn split_debuginfo_is_judged_against_every_compiled_target() {
+        let judged = |value: &str, targets: &[&str]| {
+            let dev = table(&format!(r#"split-debuginfo = "{value}""#));
+            table_divergence(&dev, "profile.dev", targets).map(|found| found.key)
+        };
+        assert_eq!(judged("off", &[LINUX]), None);
+        assert_eq!(judged("unpacked", &[APPLE]), None);
+        assert_eq!(judged("packed", &[MSVC]), None);
+        for (value, target) in [
+            ("packed", LINUX),
+            ("unpacked", LINUX),
+            ("packed", APPLE),
+            ("off", APPLE),
+            ("off", MSVC),
+        ] {
+            assert_eq!(
+                judged(value, &[target]).as_deref(),
+                Some("split-debuginfo"),
+                "{value} on {target}"
+            );
+        }
+        // A `--target` build also compiles host units.
+        assert_eq!(
+            judged("unpacked", &[APPLE, LINUX]).as_deref(),
+            Some("split-debuginfo")
+        );
     }
 
     #[test]
@@ -140,7 +202,7 @@ mod tests {
         )
         .unwrap();
         let dev = manifest["profile"]["dev"].as_table().unwrap();
-        assert!(table_divergence(dev, "profile.dev").is_none());
+        assert!(table_divergence(dev, "profile.dev", &[LINUX]).is_none());
         let wildcard = dev
             .get("package")
             .and_then(toml::Value::as_table)

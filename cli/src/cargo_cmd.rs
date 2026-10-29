@@ -277,9 +277,16 @@ async fn run_inner(
     // extra-codegen, so the workspace keeps its *local* cache and loses
     // only the remote half: every unit is local-only by construction
     // (stow#1006).
+    // Units compile for the target and, under `--target`, for the host.
+    let compiled_targets = if project.target_given {
+        vec![project.target.as_str(), project.host_target.as_str()]
+    } else {
+        vec![project.target.as_str()]
+    };
     if public_cache_mode.is_enabled()
         && let Some(divergence) =
-            crate::profile_guard::dev_profile_divergence(&project.workspace_root).await?
+            crate::profile_guard::dev_profile_divergence(&project.workspace_root, &compiled_targets)
+                .await?
     {
         let message = format!(
             "warning: stow public cache is disabled for this build because {divergence}; \
