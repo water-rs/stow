@@ -1368,7 +1368,9 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         // Bounded by held quantities: the outcome ring is capped, and
         // the in-flight section by the dispatch cap — neither tracks the
-        // stored node bulk.
+        // stored node bulk. `ready` sums the lengths of the ready
+        // queues, one per rank-operand class: memory only, no statement,
+        // so the budget row is unchanged (stow#1096).
         name: "GET /admin/status",
         setup: None,
         run: |_db, _shape, _settings, ctx| {
