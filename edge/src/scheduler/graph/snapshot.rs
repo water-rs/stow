@@ -257,6 +257,9 @@ struct SnapshotHead {
     /// statement the replay cannot re-count.
     seeded_rows: Option<u32>,
     freeze: Option<stow_types::api::DispatchFreezeRecord>,
+    /// The operator's dispatch-cap setting (stow#1039) — `None` until
+    /// the first `set`, when the deploy bindings apply.
+    dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
     external_runs: Vec<(u64, u8)>,
     human_budget: (i64, i64),
     freeze_history: std::collections::VecDeque<stow_types::api::DispatchFreezeTransition>,
@@ -814,6 +817,7 @@ impl Graph {
             meter_ops: self.meter.ops.clone(),
             seeded_rows: self.seeded_rows,
             freeze: self.freeze.clone(),
+            dispatch_cap: self.dispatch_cap.clone(),
             external_runs: self.external_runs.iter().map(|(&k, &v)| (k, v)).collect(),
             human_budget: self.human_budget,
             freeze_history: self.freeze_history.clone(),
@@ -1026,6 +1030,7 @@ impl SnapshotLoader {
         graph.meter.ops = head.meter_ops;
         graph.seeded_rows = head.seeded_rows;
         graph.freeze = head.freeze;
+        graph.dispatch_cap = head.dispatch_cap;
         graph.external_runs = head.external_runs.into_iter().collect();
         graph.human_budget = head.human_budget;
         graph.freeze_history = head.freeze_history;

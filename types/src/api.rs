@@ -1387,6 +1387,61 @@ pub enum ChannelOutcome {
     },
 }
 
+/// The dispatch caps the scheduler enforces — wire shape of
+/// `GET`/`POST /api/v1/admin/dispatch-cap` and of the scheduler
+/// object's `/dispatch-cap` routes (stow#1039).
+///
+/// `STOW_MAX_CONCURRENT_JOBS` / `STOW_MAX_CONCURRENT_MACOS_JOBS` are
+/// deploy bindings, so moving them took a redeploy; an operator
+/// `set` replaces them at claim time until the next `set`. There is
+/// no clear and no expiry: until the first `set` the bindings apply,
+/// and a cap a `set` did not name keeps reading its binding. A
+/// lowered cap cancels nothing in flight — dispatch pauses until the
+/// in-flight count drops below it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchCaps {
+    /// The operator setting in force — absent until the first `set`,
+    /// when the deploy bindings alone apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<DispatchCapSetting>,
+    /// The in-flight bound across all runner families in force —
+    /// `0` means dispatch is paused.
+    pub max_concurrent_jobs: u32,
+    /// The in-flight bound for the macOS runner family in force.
+    pub max_concurrent_macos_jobs: u32,
+}
+
+/// What an operator's `dispatch-cap set` wrote — `POST`'s request
+/// body. No ceiling is checked on the values: the operator is trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchCapSet {
+    /// The in-flight bound across all runner families — `0` pauses
+    /// dispatch like the binding's `STOW_MAX_CONCURRENT_JOBS = "0"`.
+    pub max_concurrent_jobs: u32,
+    /// The in-flight bound for the macOS runner family, when the set
+    /// names one — absent, that cap keeps reading its deploy binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_macos_jobs: Option<u32>,
+}
+
+/// The operator setting a `set` appended to the scheduler's log.
+///
+/// The `SchedulerEvent::DispatchCap` payload, the graph's in-memory
+/// copy and the snapshot's field. In force until the next `set`; a
+/// `None` field defers to the deploy binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct DispatchCapSetting {
+    /// The total in-flight bound the set named.
+    pub max_concurrent_jobs: u32,
+    /// The macOS bound the set named, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_macos_jobs: Option<u32>,
+    /// ISO 8601 timestamp of the set.
+    pub set_at: String,
+    /// The verified `actor` claim of the operations run that set it.
+    pub actor: String,
+}
+
 /// One component's health as `GET /api/v1/scheduler/health` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -5613,6 +5668,14 @@ pub enum SchedulerEvent {
         hour: String,
         /// The step.
         kind: FeedEvent,
+    },
+    /// An operator's dispatch-cap setting (stow#1039): replaces the
+    /// `STOW_MAX_CONCURRENT_JOBS` / `STOW_MAX_CONCURRENT_MACOS_JOBS`
+    /// deploy bindings at claim time until the next `set`. There is no
+    /// clear — the event always carries a full setting.
+    DispatchCap {
+        /// The setting the log row recorded.
+        setting: Box<DispatchCapSetting>,
     },
     /// The dispatch freeze's transition record (`None` = cleared).
     Freeze {

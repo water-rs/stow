@@ -64,6 +64,10 @@ async-net = "2"
 # format the check passes through unchecked anyway).
 object = { version = "0.39", default-features = false, features = ["read", "std"] }
 
+# `fclonefileat`, so a handle-based output copy clones on APFS.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { version = "0.2.189", default-features = false }
+
 # The MSVC lookup rustc performs for itself — run out here on the host,
 # because it cannot run inside the sandbox. Maintained by the `cc`
 # maintainers, which is where `cc::windows_registry` now lives.

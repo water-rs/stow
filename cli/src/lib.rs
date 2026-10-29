@@ -1739,6 +1739,9 @@ async fn classify_unit_invocation(
     let manifest_dir = invocation_env
         .manifest_dir()
         .map_err(stow_types::error::Error::msg)?;
+    parsed.build_script_out_dir = invocation_env
+        .out_dir()
+        .map_err(stow_types::error::Error::msg)?;
     // `target-cpu=native` resolves to the host's concrete CPU before
     // classification; a `native` that survives is unfoldable.
     resolve_native_target_cpu(rustc, parsed, env_cache).await;
@@ -1923,7 +1926,7 @@ struct WrapperEnvironment<'a> {
     request_c_metadata: String,
     /// Semantic fallback request, only built when
     /// `STOW_ENABLE_SEMANTIC_FALLBACK` opts in.
-    semantic_request: Option<fetch::SemanticFetchRequest>,
+    semantic_request: Option<Box<fetch::SemanticFetchRequest>>,
     /// The host's glibc release, read once and passed to every lookup —
     /// no global. `None` on musl and non-Linux hosts, where the index
     /// row's `min_glibc` is not applicable.
@@ -2660,7 +2663,7 @@ async fn prepare_unit_environment<'a>(
         )
         .await
         {
-            Ok(request) => request,
+            Ok(request) => request.map(Box::new),
             Err(error) => {
                 tracing::warn!(error = %error, "failed to build semantic fetch request, continuing without semantic fallback");
                 None
@@ -2996,6 +2999,16 @@ async fn try_remote_semantic_serve(
     slice: &index::IndexSlice,
     tally: &mut LookupTally,
 ) -> RemoteServe {
+    // Published nodes are built without a consumer's cfgs, extra codegen or
+    // `embed-metadata`, so none can answer a request that carries them; the
+    // download-and-reject round trip is skipped (stow#1047).
+    if !semantic_request.consumer.is_publishable_shape() {
+        tracing::debug!(
+            crate_name = %parsed.crate_name,
+            "request carries cfgs, extra codegen or embed-metadata no published node has; compiling locally"
+        );
+        return RemoteServe::Miss;
+    }
     let row = match resolve::find_semantic_artifact(
         &slice.index.rows,
         semantic_request,
@@ -4803,6 +4816,11 @@ async fn build_semantic_fetch_request(
     let profile = semantic_request_profile(parsed)?;
     let kind = parsed_artifact_kind(parsed)?;
     let crate_types = parsed_crate_types(parsed)?;
+    let build_script = stow_types::upload_plan::BuildScriptInputs::of_out_dir(
+        &parsed.crate_name,
+        parsed.build_script_out_dir.as_deref(),
+    )?;
+    let consumer = stow_types::upload_plan::ConsumerInputs::of(parsed, &build_script);
     tracing::debug!(
         crate_name = %crate_name,
         version = %version,
@@ -4827,6 +4845,8 @@ async fn build_semantic_fetch_request(
         emit,
         kind,
         crate_types,
+        consumer,
+        build_script,
     }))
 }
 
@@ -5274,12 +5294,20 @@ async fn resolve_native_target_cpu(
     parsed: &mut rustc_args::ParsedRustcArgs,
     env_cache: &WrapperEnvCache,
 ) {
-    if !parsed.extra_codegen.contains("-C target-cpu=native") {
+    if !parsed
+        .extra_codegen
+        .iter()
+        .any(|option| option == "-C target-cpu=native")
+    {
         return;
     }
     if let Some(cpu) = env_cache.native_cpu(rustc).await {
-        parsed.extra_codegen.remove("-C target-cpu=native");
-        parsed.extra_codegen.insert(format!("-C target-cpu={cpu}"));
+        // Replaced where it stood: option order is compile identity.
+        for option in &mut parsed.extra_codegen {
+            if option == "-C target-cpu=native" {
+                *option = format!("-C target-cpu={cpu}");
+            }
+        }
     }
 }
 
@@ -6373,6 +6401,8 @@ mod tests {
             emit: bundle.manifest.config.emit.clone(),
             kind: bundle.manifest.config.kind.clone(),
             crate_types: bundle.manifest.config.crate_types.clone(),
+            consumer: stow_types::upload_plan::ConsumerInputs::stock(),
+            build_script: stow_types::upload_plan::BuildScriptInputs::default(),
         };
 
         let mut tally = super::LookupTally::default();

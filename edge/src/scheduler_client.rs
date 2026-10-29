@@ -15,6 +15,7 @@ const SCHEDULER_STATUS_URL: &str = "https://scheduler.internal/status";
 const SCHEDULER_HEALTH_URL: &str = "https://scheduler.internal/health";
 const SCHEDULER_PUBLISHED_INDEX_URL: &str = "https://scheduler.internal/index/published";
 const SCHEDULER_FREEZE_URL: &str = "https://scheduler.internal/dispatch-freeze";
+const SCHEDULER_DISPATCH_CAP_URL: &str = "https://scheduler.internal/dispatch-cap";
 const SCHEDULER_ADMIN_STATUS_URL: &str = "https://scheduler.internal/admin/status";
 const SCHEDULER_TASKS_URL: &str = "https://scheduler.internal/tasks";
 const SCHEDULER_RESET_URL: &str = "https://scheduler.internal/reset";
@@ -230,6 +231,24 @@ pub async fn set_dispatch_freeze(
         actor,
     )
     .await
+}
+
+/// The dispatch caps in force — the operator setting behind them when
+/// one was set, the deploy bindings' values otherwise (stow#1039).
+pub async fn get_dispatch_caps(
+    namespace: &CfDurableNamespace,
+) -> Result<stow_types::api::DispatchCaps, SchedulerClientError> {
+    get_json(namespace, SCHEDULER_DISPATCH_CAP_URL).await
+}
+
+/// The operator's `dispatch-cap set` — in force until the next `set`;
+/// the object answers the caps it now enforces.
+pub async fn set_dispatch_caps(
+    namespace: &CfDurableNamespace,
+    set: &stow_types::api::DispatchCapSet,
+    actor: &str,
+) -> Result<stow_types::api::DispatchCaps, SchedulerClientError> {
+    post_json_as(namespace, SCHEDULER_DISPATCH_CAP_URL, set, actor).await
 }
 
 /// The operator view behind `stow-admin status`.

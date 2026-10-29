@@ -40,7 +40,7 @@ use askama::Template;
 use clap::{Args, Subcommand};
 use futures_util::{StreamExt as _, TryStreamExt as _};
 use stow_types::analytics;
-use stow_types::api::{AdminStatus, DispatchFreeze};
+use stow_types::api::{AdminStatus, DispatchCaps, DispatchFreeze};
 use stow_types::identity::WireRustcVersion;
 use stow_types::runs::{RunFailure, RunJobRow};
 use stow_types::stow_error;
@@ -541,9 +541,6 @@ const HOURLY_ALERT_ENV: &str = "STOW_WATCHDOG_HOURLY_ALERT_PERCENTS";
 /// The levels used while [`HOURLY_ALERT_ENV`] is unset or empty:
 /// 200% and 300% of the hourly pace.
 const DEFAULT_HOURLY_ALERT_PERCENTS: [f64; 2] = [200.0, 300.0];
-/// Actions runner capacity, used by the dispatch-stall signal —
-/// AGENTS.md states 60 concurrent runners.
-const RUNNER_CAPACITY: usize = 60;
 
 /// Dispatching workflows a trip touches — everything that can start a
 /// build wave or move the index: `build-crate` (the per-task workflow
@@ -933,11 +930,17 @@ impl Watcher<'_> {
     /// dispatch-stall check: pending work, free slots, and no in-flight
     /// row touched inside the window.
     async fn queue_readings(&self) -> Result<Vec<Reading>, String> {
-        let status: AdminStatus = self
-            .edge
-            .get_json("/api/v1/admin/status")
-            .await
-            .map_err(|error| error.to_string())?;
+        // The cap in force is the operator's to set, so a stall is
+        // judged against it rather than against any fixed pool size.
+        let (status, caps) = futures_util::join!(
+            self.edge.get_json::<AdminStatus>("/api/v1/admin/status"),
+            self.edge
+                .get_json::<DispatchCaps>("/api/v1/admin/dispatch-cap"),
+        );
+        let status = status.map_err(|error| error.to_string())?;
+        let caps = caps.map_err(|error| error.to_string())?;
+        let cap = usize::try_from(caps.max_concurrent_jobs)
+            .map_err(|error| format!("dispatch cap does not fit usize: {error}"))?;
         let pending = status.pending_miss + status.pending_human;
         let cutoff = sqlite_now_minus(self.now, HOUR);
         let freshest = status
@@ -947,11 +950,12 @@ impl Watcher<'_> {
             .max()
             .map(str::to_owned);
         let stalled = pending > 0
-            && status.in_flight.len() < RUNNER_CAPACITY
+            && status.in_flight.len() < cap
             && freshest.as_deref().is_none_or(|at| at < cutoff.as_str());
         let mut stall_evidence = vec![
             format!("pending={pending}"),
             format!("in_flight={}", status.in_flight.len()),
+            format!("dispatch_cap={cap}"),
         ];
         if let Some(freshest) = freshest {
             stall_evidence.push(format!("newest dispatch {freshest}"));

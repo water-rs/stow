@@ -1945,6 +1945,8 @@ mod tests {
             emit: vec!["link".to_owned()],
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Rlib],
+            consumer: stow_types::upload_plan::ConsumerInputs::stock(),
+            build_script: stow_types::upload_plan::BuildScriptInputs::default(),
         };
 
         let found = find_semantic_artifact(&rows, &request, None)
@@ -2014,6 +2016,8 @@ mod tests {
             emit: vec!["link".to_owned()],
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Rlib],
+            consumer: stow_types::upload_plan::ConsumerInputs::stock(),
+            build_script: stow_types::upload_plan::BuildScriptInputs::default(),
         };
         let found = find_semantic_artifact(&rows, &request, host)
             .expect("lookup")

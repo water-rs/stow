@@ -7,10 +7,11 @@ use stow_types::identity::TargetTriple;
 
 use crate::errors::QueueError;
 
-// Dispatch ceilings, sized against the org's 60 GitHub-hosted runners (15
-// of them macOS): 45 total leaves 15 runners for the repo's own CI, and
-// the macOS cap keeps a full wave from queueing on the smallest pool
-// while leaving 4 macOS runners free.
+// Dispatch ceiling defaults, used when neither a deploy binding nor an
+// operator `dispatch-cap set` names one. Sized against the org's 60
+// GitHub-hosted runners (15 of them macOS): 45 total leaves 15 runners
+// for the repo's own CI, and the macOS cap keeps a full wave from
+// queueing on the smallest pool while leaving 4 macOS runners free.
 const DEFAULT_MAX_CONCURRENT_JOBS: NonZeroU32 = NonZeroU32::new(45).unwrap();
 const DEFAULT_MAX_CONCURRENT_MACOS_JOBS: u32 = 11;
 const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
@@ -20,8 +21,7 @@ const DEFAULT_DISPATCH_MIN_AGE_MINUTES: u32 = 5;
 // exceed the slowest expected build or long builds get double-dispatched.
 const DEFAULT_STALE_DISPATCH_MINUTES: u32 = 60;
 // A single `build-crate.yml` run claims one runner slot; the caps
-// count in-flight tasks. The defaults live in `stow_types::api` so
-// `preheat manual` reads the same values the bindings fall back to.
+// count in-flight tasks.
 // Exponential dispatch-failure backoff cap.
 const MAX_DISPATCH_BACKOFF_MINUTES: u32 = 60;
 
@@ -56,7 +56,7 @@ pub const fn source_priority(source: stow_types::api::SubmissionSource) -> i64 {
     }
 }
 
-/// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
+/// Default for `STOW_MAX_QUEUE_PENDING` — miss-lane pending depth at which
 /// miss-lane submits start being refused. The edge handler reads the same
 /// binding for its pre-forward check, so this constant is the shared
 /// default for both.
@@ -144,6 +144,32 @@ impl Default for SchedulerSettings {
             max_queue_pending: DEFAULT_MAX_QUEUE_PENDING,
             human_daily_task_budget: DEFAULT_HUMAN_DAILY_TASK_BUDGET,
             min_dispatch_value: DEFAULT_MIN_DISPATCH_VALUE,
+        }
+    }
+}
+
+impl SchedulerSettings {
+    /// These binding settings under the operator's `dispatch-cap set`
+    /// (stow#1039): its values replace the bindings' caps, and a
+    /// `--macos`-less set leaves the macOS cap on its binding. The one
+    /// place a stored setting enters the caps — the scheduler object
+    /// applies it when it builds a request's or the alarm's settings,
+    /// and everything downstream reads only the settings it is passed.
+    #[must_use]
+    pub const fn with_dispatch_cap(
+        self,
+        setting: Option<&stow_types::api::DispatchCapSetting>,
+    ) -> Self {
+        let Some(setting) = setting else {
+            return self;
+        };
+        Self {
+            dispatch: Dispatch::from_max_concurrent_jobs(setting.max_concurrent_jobs),
+            max_concurrent_macos_jobs: match setting.max_concurrent_macos_jobs {
+                Some(macos) => macos,
+                None => self.max_concurrent_macos_jobs,
+            },
+            ..self
         }
     }
 }

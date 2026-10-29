@@ -96,6 +96,24 @@ invocation without them keeps the key it produced before they were modeled:
   `embed-bitcode=no` to every unit no LTO consumer needs bitcode from, and
   a unit whose consumer runs LTO carries `-C linker-plugin-lto`, which is
   custom codegen and never cached.
+- `rustc-check-defaults` only when the profile differs from the dev profile
+  (`opt-level` other than `0`, or debug assertions off). rustc turns debug
+  assertions on only at `opt-level=0` and overflow checks follow them; keys
+  stored while those defaults were mislabeled carry no tag and so never
+  answer a request keyed after the correction.
+- `extra_codegen` keeps its argv order: rustc applies repeated `-C
+  target-feature` options left to right.
+
+A semantic match (version upgrade, emit cover, feature superset) compares
+the typed fields the rows carry, then proves the stand-in was compiled with
+the request's own cfgs, extra codegen and link options: the key it would
+carry under them (`types/src/upload_plan.rs::candidate_compile_key`) must be
+the key it does carry. The candidate's build-script cfgs and link arguments
+come from its captured `cargo:` output (the request's own for a candidate
+of the same version and feature set), so a feature-dependent cfg never
+blocks superset serving. Published nodes never carry a consumer cfg, extra
+codegen or `embed-metadata`; the capture wrapper refuses to build one that
+does, and the CLI does not download for a request that does.
 
 Link-affecting options sit in a grid on the key rather than refusing the
 cache: the grid applies only where the unit actually links (proc-macro,
@@ -155,7 +173,7 @@ the Analytics Engine point — and a forged or tampered request cannot
 verify.
 
 The miss lane is also depth-capped: once the scheduler reports
-`pending >= STOW_MAX_QUEUE_PENDING` the handler refuses tickets with 429
+`pending >= STOW_MAX_QUEUE_PENDING` (the miss lane's own pending nodes; other lanes' backlog never counts) the handler refuses tickets with 429
 and `Retry-After: 600`, and the Durable Object repeats the check inside
 `enqueue` so a race of concurrent redemptions cannot overshoot by more
 than one submit batch. Human-lane and workflow-trusted submits
@@ -210,15 +228,20 @@ Dispatch is additionally capped per GitHub Actions runner family —
 onto the pool its `runs-on` entry in `build-crate.yml` resolves to
 (Linux, macOS, or Windows). `STOW_MAX_CONCURRENT_JOBS` bounds total
 in-flight runner slots — one per claimed `build-crate.yml`
-run — against the org's
-60-runner fleet (`0` pauses dispatch
+run (`0` pauses dispatch
 entirely — see `DEPLOYMENT.md`), and
 `STOW_MAX_CONCURRENT_MACOS_JOBS` bounds macOS-family slots so a
-full wave cannot occupy the whole 20-runner macOS pool. Within a lane,
+full wave cannot occupy the whole macOS pool. Within a lane,
 Windows-family rows claim first regardless of request age because the
 Windows tasks are the slowest in a wave; rows whose family is saturated
 stay pending, and the alarm then wakes at the earliest in-flight lease
-expiry rather than re-firing immediately.
+expiry rather than re-firing immediately. Operators move both caps at
+runtime — `stow-admin dispatch-cap set --jobs N [--macos M]` appends a
+setting to the scheduler's log that replaces the binding values at
+claim time until the next `set` (stow#1039): there is no clear, a
+`--macos`-less `set` leaves that cap on its binding, no ceiling is
+checked, and a lowered cap cancels nothing in flight — new claims
+pause until the in-flight count drops below it.
 
 The handler resolves the requested version (newest non-prerelease,
 non-yanked release when the body omits it) and the current stable rustc,
@@ -830,6 +853,8 @@ unauthorized POSTs short-circuit before deserialization.
 | GET `/api/v1/bundles/{rustc_version}/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Byte fetch — the only artifact-serving route; the `{rustc_version}` segment names the artifact's GHCR package and the `sha256:<64 hex>` segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: `operations.yml` OIDC on `main` | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
+| GET `/api/v1/admin/dispatch-cap` | Bearer: repo-workflow OIDC or push user | — | `DispatchCaps` | The dispatch caps in force plus the operator setting behind them (stow#1039) |
+| POST `/api/v1/admin/dispatch-cap` | Bearer: `operations.yml` OIDC on `main` | `DispatchCapSet` | `DispatchCaps` | The operator's `set` — replaces the cap bindings at claim time until the next `set` (`stow-admin dispatch-cap status\|set`) |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: `operations.yml` OIDC on `main` | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
@@ -969,7 +994,7 @@ is unset or malformed.
 | `STOW_OIDC_AUDIENCE` | `https://stow.waterui.dev` | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests |
 | `STOW_POW_CHALLENGE_SECRET` | required (secret) | HMAC key minting and verifying enqueue-admission challenges |
 | `STOW_POW_MIN_BITS` | `12` | Leading-zero bits of enqueue proof-of-work, minted into every admission and required of every ticket. About 0.27 ms of expected work at a measured 66 ns/hash. Capped at 24 bits, which guards a misconfiguration rather than load |
-| `STOW_MAX_QUEUE_PENDING` | `2000` | Pending depth at which miss-lane enqueues are refused (429 + `Retry-After: 600`); checked in the edge handler and in the scheduler object. Human-lane and trusted submits are exempt |
+| `STOW_MAX_QUEUE_PENDING` | `2000` | Miss-lane pending depth (other lanes' backlog not counted) at which miss-lane enqueues are refused (429 + `Retry-After: 600`); checked in the edge handler and in the scheduler object. Human-lane and trusted submits are exempt |
 | `STOW_HUMAN_MAX_CLOSURE` | `150` | Largest dependency closure `POST /api/v1/requests` accepts per target; larger closures get 422 |
 | `STOW_HUMAN_DAILY_TASK_BUDGET` | `2000` | Human-lane tasks accepted per UTC day, counted in the scheduler object's `human_daily_task_budget` table; overspending submits get 429 + `Retry-After` to 00:00 UTC |
 | `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the request page's invisible Turnstile widget |

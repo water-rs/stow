@@ -38,6 +38,11 @@ utoipa.workspace = true
 # encode/decode helpers are cfg-gated the same way.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.14"
+# Capability-style directory handles: the host reads untrusted build output
+# only relative to a handle, never through a followed symlink
+# (`native_capture`; wasm32 has no filesystem, so the module is gated too).
+cap-std = { version = "4.0.3", default-features = false }
+cap-fs-ext = { version = "4.0.3", default-features = false, features = ["std"] }
 # ELF verneed parsing for `glibc::min_glibc_of_elf_bytes` — read-only,
 # ELF-only features; the wasm consumer never measures bytes.
 object = { version = "0.39.1", default-features = false, features = [
