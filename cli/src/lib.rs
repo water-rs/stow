@@ -4573,8 +4573,8 @@ async fn try_serve_semantic_downloaded_bundle(
         // the circuit breaker meant a handful of legitimately-unmatched units
         // (the proc-macro host graph, typically) tripped it five invocations
         // in, and every remaining crate in the build then bypassed the cache
-        // for the full reset window. Only transport and materialization
-        // failures say the cache path itself is unhealthy.
+        // for the full reset window. Only transport failures say the cache
+        // path itself is unhealthy (stow#1044).
         return None;
     }
 
@@ -4597,6 +4597,8 @@ async fn try_serve_verified_downloaded_bundle(
     let cached_bundle = match cache_verified_downloaded_bundle(config, request, bundle).await {
         Ok(cached_bundle) => cached_bundle,
         Err(error) => {
+            // A local store or verification failure — the transport worked,
+            // so the circuit counts nothing for it (stow#1044).
             tracing::debug!(
                 error = %error,
                 crate_name = %parsed.crate_name,
@@ -4604,7 +4606,6 @@ async fn try_serve_verified_downloaded_bundle(
                 rustc_version = %request.rustc_version,
                 "failed to cache verified stow bundle"
             );
-            env.env_cache.record_circuit_failure(config).await;
             tally.failed = true;
             return None;
         }
@@ -4634,7 +4635,8 @@ async fn try_serve_verified_downloaded_bundle(
                 "failed to evict downloaded stow bundle with incomplete dependency closure aliases",
             )
             .await;
-                env.env_cache.record_circuit_failure(config).await;
+                // A local materialization failure — the transport worked,
+                // so the circuit counts nothing for it (stow#1044).
                 tally.failed = true;
                 return None;
             }
@@ -4645,7 +4647,7 @@ async fn try_serve_verified_downloaded_bundle(
 
 /// Write a verified downloaded bundle's artifacts into the target dir.
 /// `false` means the freshly cached entry could not be materialized — it is
-/// evicted and counted against the circuit breaker.
+/// evicted; a local failure like this never opens the circuit (stow#1044).
 async fn materialize_downloaded_bundle(
     env: &WrapperEnvironment<'_>,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -4679,7 +4681,8 @@ async fn materialize_downloaded_bundle(
                 "failed to evict verified-but-unusable stow cache entry",
             )
             .await;
-            env.env_cache.record_circuit_failure(config).await;
+            // A local materialization failure — the transport worked, so
+            // the circuit counts nothing for it (stow#1044).
             tally.failed = true;
             None
         }
@@ -4717,7 +4720,8 @@ async fn finish_downloaded_serve(
             "failed to evict downloaded stow bundle missing materialized output metadata",
         )
         .await;
-        env.env_cache.record_circuit_failure(config).await;
+        // A local bookkeeping failure — the transport worked, so the
+        // circuit counts nothing for it (stow#1044).
         tally.failed = true;
         return None;
     }
@@ -4739,7 +4743,8 @@ async fn finish_downloaded_serve(
                 "failed to evict downloaded stow bundle missing rustc artifact notifications",
             )
             .await;
-            env.env_cache.record_circuit_failure(config).await;
+            // A local bookkeeping failure — the transport worked, so the
+            // circuit counts nothing for it (stow#1044).
             tally.failed = true;
             return None;
         }
@@ -6845,6 +6850,50 @@ mod tests {
             OsString::from(target),
             OsString::from("lib.rs"),
         ]
+    }
+
+    /// stow#1044: a downloaded bundle that cannot be materialized locally
+    /// is a local failure — the transport worked — so it is reported and
+    /// evicted but never counted against the circuit breaker (threshold 1
+    /// here, so a single recorded failure would trip it).
+    #[tokio::test]
+    async fn a_local_materialization_failure_leaves_the_circuit_closed() {
+        const TARGET: &str = "aarch64-apple-darwin";
+        const RUSTC: &str = "1.91.1";
+        const C_METADATA: &str = "aabbccddeeff0011";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = env_base_test_config(&dir);
+        config.artifact_cache_max_bytes = u64::MAX;
+        let env_cache = test_cache(std::ffi::OsStr::new(""));
+        let env = serve_env(&config, &env_cache, TARGET, RUSTC, C_METADATA).await;
+        let request = crate::fetch::FetchRequest {
+            target: TARGET,
+            rustc_version: RUSTC,
+            c_metadata: C_METADATA,
+        };
+        let bundle = crate::artifact_cache::tests::sample_bundle(
+            C_METADATA,
+            "libdemo-aabbccddeeff0011.rmeta",
+        );
+        let cached = crate::artifact_cache::store_downloaded_bundle(&config, &request, &bundle)
+            .await
+            .expect("store the bundle");
+        // The argv carries no `--out-dir`, so materializing must fail.
+        let parsed =
+            ParsedRustcArgs::parse(&serve_args(TARGET, C_METADATA)).expect("parse the unit args");
+        let mut tally = super::LookupTally::default();
+
+        let served =
+            super::materialize_downloaded_bundle(&env, &parsed, &request, cached, &mut tally).await;
+
+        assert!(served.is_none());
+        assert!(tally.failed, "the failure is still reported");
+        assert!(
+            !crate::circuit::is_tripped(&config)
+                .await
+                .expect("read the circuit"),
+            "a local materialization failure opened the circuit"
+        );
     }
 
     /// stow#797: a lookup that misses on a stale slice whose fetch is
