@@ -128,10 +128,70 @@ pub fn stow_build_in_with_env(
     target_dir: &Path,
     env: &[(&str, &str)],
 ) -> Output {
+    run_stow_build(
+        dir,
+        args,
+        edge_url,
+        registry_url,
+        cache_dir,
+        cargo_home,
+        target_dir,
+        env,
+        true,
+    )
+}
+
+/// [`stow_build_in_with_env`] that leaves the isolation level to stow's
+/// own default, for the tests whose subject is that default.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn stow_build_in_default_isolation(
+    dir: &Path,
+    args: &[&str],
+    edge_url: &str,
+    registry_url: &str,
+    cache_dir: &Path,
+    cargo_home: &Path,
+    target_dir: &Path,
+    env: &[(&str, &str)],
+) -> Output {
+    run_stow_build(
+        dir,
+        args,
+        edge_url,
+        registry_url,
+        cache_dir,
+        cargo_home,
+        target_dir,
+        env,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_stow_build(
+    dir: &Path,
+    args: &[&str],
+    edge_url: &str,
+    registry_url: &str,
+    cache_dir: &Path,
+    cargo_home: &Path,
+    target_dir: &Path,
+    env: &[(&str, &str)],
+    isolation_off: bool,
+) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stow-cli"));
     hermetic_stow_env(&mut command, edge_url, cache_dir, &fixture_home(dir));
+    // Isolation is not what these builds test, and the default level is
+    // not available on every platform; a test of isolation names its own.
+    // The flag belongs right after the subcommand: stow hands everything
+    // from the first cargo argument on to cargo.
+    let (subcommand, rest) = args.split_first().expect("a stow subcommand");
+    command.arg(subcommand);
+    if isolation_off && !args.contains(&"--isolation") {
+        command.args(["--isolation", "off"]);
+    }
+    command.args(rest);
     command
-        .args(args)
         .current_dir(dir)
         .env("CARGO_HOME", cargo_home)
         .env("STOW_REGISTRY_BASE_URL", registry_url)

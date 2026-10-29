@@ -62,7 +62,7 @@ pub struct CargoCommandArgs {
     #[arg(long)]
     pub no_stow_resolver: bool,
     #[command(flatten)]
-    pub sandbox: SandboxArgs,
+    pub isolation: IsolationArgs,
     #[arg(
         value_name = "CARGO_ARGS",
         num_args = 0..,
@@ -72,24 +72,19 @@ pub struct CargoCommandArgs {
     pub cargo_args: Vec<OsString>,
 }
 
-/// The experimental heel-sandbox switches, flattened into the commands
-/// that run cargo (stow#779). Both default off.
+/// The build isolation switch, flattened into the commands that run cargo
+/// (stow#1000).
 #[derive(Debug, Clone, Args)]
-pub struct SandboxArgs {
-    /// Run the cargo build inside a heel sandbox: build scripts, proc
-    /// macros and the linkers build scripts select are cut off from the
-    /// home directory's credentials and every write outside the target
-    /// directory, while dependencies are fetched before the sandboxed
-    /// cargo runs offline. Experimental; also enabled by
-    /// `experimental.sandbox = true` in the stow config.
-    #[arg(long)]
-    pub sandbox: bool,
-    /// Like `--sandbox`, but additionally deny the build all network
-    /// access: the only channel out of the sandbox is the socket the
-    /// rustc wrapper uses to reach this stow process. Also enabled by
-    /// `experimental.sandbox_deny_network = true` in the stow config.
-    #[arg(long)]
-    pub sandbox_deny_network: bool,
+pub struct IsolationArgs {
+    /// How much of the machine the build's cargo, build scripts and proc
+    /// macros can reach, for this run: `protect` (the default) keeps
+    /// credential stores unreadable and persistence locations unwritable and
+    /// strips credential variables, `strict` grants only the workspace, the
+    /// target directory and the toolchain, `offline` is `strict` without the
+    /// network, and `off` is no isolation. Overrides `[isolation] level` in the
+    /// stow config.
+    #[arg(long, value_enum, value_name = "LEVEL")]
+    pub isolation: Option<crate::isolation::Level>,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -1,4 +1,4 @@
-//! The `--sandbox` contract, end to end on this machine (stow#779).
+//! The `--isolation` contract, end to end on this machine (stow#779, stow#1000).
 //!
 //! A fixture workspace depends on a crate whose build script — and, for
 //! the second fixture, a crate whose proc-macro — attempts each action
@@ -109,6 +109,14 @@ fn attempt(probe: &str, conf: &BTreeMap<String, String>) -> bool {
                         .ok_or_else(|| std::io::Error::other("pasteboard read denied"))
                 }),
         ),
+        "read-credential" => report(
+            "read-credential",
+            std::fs::read_to_string(&conf["credential_file"]).map(|_| ()),
+        ),
+        "write-persistence" => report(
+            "write-persistence",
+            std::fs::write(&conf["persistence_file"], "pwned\n"),
+        ),
         "network" => network(&conf["net_target"]),
         other => panic!("unknown probe {other}"),
     }
@@ -124,7 +132,7 @@ fn report<E: std::fmt::Display>(probe: &str, result: Result<(), E>) -> bool {
 /// The network probe: with heel's proxy environment present, CONNECT
 /// through it to the test's listener — the only outbound channel a
 /// network-allowed sandbox leaves; without it, attempt a direct
-/// connection, which is what `--sandbox-deny-network` must refuse.
+/// connection, which is what `--isolation offline` must refuse.
 fn network(target: &str) -> bool {
     let proxy = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
         .iter()
@@ -300,6 +308,8 @@ fn conf_text(home: &Path, workspace: &Path, net_target: &str) -> String {
         "write-workspace",
         "write-home",
         "network",
+        "read-credential",
+        "write-persistence",
     ];
     // The clipboard probe uses pbpaste; only macOS has one to deny.
     if cfg!(target_os = "macos") {
@@ -310,11 +320,15 @@ fn conf_text(home: &Path, workspace: &Path, net_target: &str) -> String {
          home_file={}\n\
          home_write={}\n\
          workspace_write={}\n\
+         credential_file={}\n\
+         persistence_file={}\n\
          net_target={net_target}\n",
         probes.join(","),
         home.join("secret-token.txt").display(),
         home.join("pwned.txt").display(),
         workspace.join("planted.txt").display(),
+        home.join(".ssh").join("id_ed25519").display(),
+        home.join(".zshrc").display(),
     )
 }
 
@@ -375,6 +389,10 @@ fn probe_env(with_macro: bool, net_target: &str) -> ProbeEnv {
     let cache = tempfile::tempdir().expect("cache dir");
     let target = tempfile::tempdir().expect("target dir");
     std::fs::write(home.path().join("secret-token.txt"), "hunter2\n").expect("home secret");
+    std::fs::create_dir_all(home.path().join(".ssh")).expect("ssh dir");
+    std::fs::write(home.path().join(".ssh").join("id_ed25519"), "fake key\n")
+        .expect("fake credential");
+    std::fs::write(home.path().join(".zshrc"), "# startup\n").expect("fake startup file");
     write_fixture(dir.path(), with_macro);
     // An empty `probes=` line makes the build-script probe inert so the
     // proc-macro probe is the only actor under test.
@@ -417,6 +435,12 @@ fn probe_env(with_macro: bool, net_target: &str) -> ProbeEnv {
 /// temporary HOME, the secret token the `read-env` probe must not see,
 /// and a `RUSTUP_HOME` so the toolchain resolves despite the moved HOME.
 fn run_build(env: &ProbeEnv, args: &[&str]) -> std::process::Output {
+    run_build_with(env, args, &[])
+}
+
+/// [`run_build`] with more environment variables, such as the switch that
+/// turns the public cache off.
+fn run_build_with(env: &ProbeEnv, args: &[&str], more: &[(&str, &str)]) -> std::process::Output {
     let rustup_home = std::env::var("RUSTUP_HOME")
         .ok()
         .or_else(|| {
@@ -435,8 +459,9 @@ fn run_build(env: &ProbeEnv, args: &[&str]) -> std::process::Output {
     let extra: Vec<(&str, &str)> = extra
         .iter()
         .map(|(key, value)| (*key, value.as_str()))
+        .chain(more.iter().copied())
         .collect();
-    build_fixture::stow_build_in_with_env(
+    build_fixture::stow_build_in_default_isolation(
         &env.dir,
         args,
         &build_fixture::refused_url(),
@@ -464,7 +489,7 @@ fn denial(stderr: &str) -> Option<String> {
 #[test]
 fn denied_sandbox_refuses_every_forbidden_action() {
     let env = probe_env(false, "127.0.0.1:9");
-    let output = run_build(&env, &["build", "--sandbox-deny-network", "--offline"]);
+    let output = run_build(&env, &["build", "--isolation", "offline", "--offline"]);
     assert!(
         !output.status.success(),
         "sandboxed build unexpectedly succeeded:\n{}",
@@ -497,14 +522,14 @@ fn denied_sandbox_refuses_every_forbidden_action() {
     );
 }
 
-/// With `--sandbox` the build's outbound traffic rides heel's proxy, so
+/// With `--isolation strict` the build's outbound traffic rides heel's proxy, so
 /// the CONNECT to the test listener succeeds — and everything else is
 /// still refused.
 #[test]
 fn allowed_network_sandbox_refuses_everything_but_the_connection() {
     let (target, _pong) = spawn_pong_listener();
     let env = probe_env(false, &target);
-    let output = run_build(&env, &["build", "--sandbox", "--offline"]);
+    let output = run_build(&env, &["build", "--isolation", "strict", "--offline"]);
     assert!(
         !output.status.success(),
         "sandboxed build unexpectedly succeeded:\n{}",
@@ -525,7 +550,7 @@ fn allowed_network_sandbox_refuses_everything_but_the_connection() {
 #[test]
 fn denied_sandbox_reaches_proc_macro_expansion() {
     let env = probe_env(true, "127.0.0.1:9");
-    let output = run_build(&env, &["build", "--sandbox-deny-network", "--offline"]);
+    let output = run_build(&env, &["build", "--isolation", "offline", "--offline"]);
     assert!(
         !output.status.success(),
         "sandboxed build unexpectedly succeeded:\n{}",
@@ -553,7 +578,7 @@ fn unsandboxed_build_lets_the_same_actions_through() {
     let env = probe_env(false, &target);
     // The unsandboxed probe reads its token and connects directly — the
     // proxy env isn't needed, so unset it for the direct-connect path.
-    let output = run_build(&env, &["build", "--offline"]);
+    let output = run_build(&env, &["build", "--isolation", "off", "--offline"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -577,7 +602,7 @@ fn sandboxed_build_creates_its_missing_target_directory() {
         "probes=\n",
     )
     .expect("inert probe conf");
-    let output = run_build(&env, &["build", "--sandbox-deny-network", "--offline"]);
+    let output = run_build(&env, &["build", "--isolation", "offline", "--offline"]);
     assert!(
         output.status.success(),
         "sandboxed build without a target directory failed:\n{}",
@@ -587,5 +612,207 @@ fn sandboxed_build_creates_its_missing_target_directory() {
         env.target.is_dir(),
         "the target directory {} was not created",
         env.target.display()
+    );
+}
+
+/// The probes the build script reported refused and succeeded, read out of
+/// the `PROBE-DENIED:` line (`refused=["a", "b"] succeeded=["c"]`).
+fn outcome(stderr: &str) -> (Vec<String>, Vec<String>) {
+    let line =
+        denial(stderr).unwrap_or_else(|| panic!("no probe denial in failing build:\n{stderr}"));
+    let list = |key: &str| -> Vec<String> {
+        let start = line
+            .find(key)
+            .unwrap_or_else(|| panic!("no {key} in {line}"))
+            + key.len();
+        let rest = &line[start..];
+        let end = rest.find(']').expect("closing bracket");
+        rest[..end]
+            .split('"')
+            .enumerate()
+            .filter(|(index, _)| index % 2 == 1)
+            .map(|(_, name)| name.to_owned())
+            .collect()
+    };
+    (list("refused=["), list("succeeded=["))
+}
+
+/// Run the probe build at `level` and return what it refused and what it
+/// let through. `cache_off` runs it with the public cache disabled: the
+/// boundary must not depend on it (stow#1059).
+fn probe_level(level: &str, cache_off: bool) -> (Vec<String>, Vec<String>) {
+    let (target, _pong) = spawn_pong_listener();
+    let env = probe_env(false, &target);
+    let more: &[(&str, &str)] = if cache_off {
+        &[("STOW_DISABLE_PUBLIC_CACHE", "1")]
+    } else {
+        &[]
+    };
+    let mut args = vec!["build", "--isolation", level];
+    // `protect` runs cargo online; the fixture has only path dependencies,
+    // so nothing needs the network, and `--offline` would be a second,
+    // unrelated restriction on what is being tested.
+    if level != "protect" {
+        args.push("--offline");
+    }
+    let output = run_build_with(&env, &args, more);
+    assert!(
+        !output.status.success(),
+        "a build with refused probes unexpectedly succeeded at {level}:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    outcome(&String::from_utf8_lossy(&output.stderr))
+}
+
+fn assert_contains_all(actual: &[String], expected: &[&str], what: &str) {
+    for name in expected {
+        assert!(
+            actual.iter().any(|actual| actual == name),
+            "{name} missing from {what}: {actual:?}"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn assert_protect(cache_off: bool) {
+    let (refused, succeeded) = probe_level("protect", cache_off);
+    assert_contains_all(
+        &refused,
+        &["read-credential", "write-persistence", "read-env"],
+        "refused",
+    );
+    // The machine is otherwise open, and the build still downloads.
+    assert_contains_all(
+        &succeeded,
+        &["read-home", "write-home", "write-workspace", "network"],
+        "succeeded",
+    );
+}
+
+/// The default level: a build script cannot read a credential store or
+/// write a persistence location, and still reads and writes the rest of the
+/// machine and reaches the network through the audited proxy.
+#[cfg(target_os = "macos")]
+#[test]
+fn protect_refuses_credentials_and_persistence_but_still_downloads() {
+    assert_protect(false);
+}
+
+/// Isolation does not depend on cache mode: the same refusals hold with
+/// the public cache off.
+#[cfg(target_os = "macos")]
+#[test]
+fn protect_holds_with_the_cache_off() {
+    assert_protect(true);
+}
+
+/// No flag and no config means `protect`.
+#[cfg(target_os = "macos")]
+#[test]
+fn protect_is_the_default_level() {
+    let (target, _pong) = spawn_pong_listener();
+    let env = probe_env(false, &target);
+    let output = run_build(&env, &["build"]);
+    assert!(!output.status.success());
+    let (refused, succeeded) = outcome(&String::from_utf8_lossy(&output.stderr));
+    assert_contains_all(
+        &refused,
+        &["read-credential", "write-persistence"],
+        "refused",
+    );
+    assert_contains_all(&succeeded, &["read-home", "write-home"], "succeeded");
+}
+
+fn assert_strict(cache_off: bool) {
+    let (refused, succeeded) = probe_level("strict", cache_off);
+    assert_contains_all(
+        &refused,
+        &[
+            "read-home",
+            "read-env",
+            "write-workspace",
+            "write-home",
+            "read-credential",
+            "write-persistence",
+        ],
+        "refused",
+    );
+    assert_eq!(succeeded, ["network"], "strict leaves only the proxy");
+}
+
+/// `strict` is the allowlist: everything but the proxied network is
+/// refused.
+#[test]
+fn strict_refuses_everything_but_the_connection() {
+    assert_strict(false);
+}
+
+#[test]
+fn strict_holds_with_the_cache_off() {
+    assert_strict(true);
+}
+
+fn assert_offline(cache_off: bool) {
+    let (_, succeeded) = probe_level("offline", cache_off);
+    assert!(
+        succeeded.is_empty(),
+        "offline let an action through: {succeeded:?}"
+    );
+}
+
+/// `offline` is `strict` without the network.
+#[test]
+fn offline_refuses_everything() {
+    assert_offline(false);
+}
+
+#[test]
+fn offline_holds_with_the_cache_off() {
+    assert_offline(true);
+}
+
+/// `off` is the unconfined control: every attempt succeeds.
+#[test]
+fn off_lets_everything_through() {
+    let (target, _pong) = spawn_pong_listener();
+    let env = probe_env(false, &target);
+    let output = run_build_with(
+        &env,
+        &["build", "--isolation", "off", "--offline"],
+        &[("STOW_DISABLE_PUBLIC_CACHE", "1")],
+    );
+    assert!(
+        output.status.success(),
+        "an `off` build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// An unknown level is an error, never a fallback to another level.
+#[test]
+fn an_unknown_level_fails() {
+    let env = probe_env(false, "127.0.0.1:9");
+    let output = run_build(&env, &["build", "--isolation", "loose"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("loose") && stderr.contains("protect"),
+        "the error should name the bad value and the valid levels:\n{stderr}"
+    );
+}
+
+/// On a platform whose sandbox cannot enforce the read and write
+/// denylists, the default level is an explicit error naming the levels that
+/// are available there — never a silent downgrade.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn protect_is_refused_where_it_cannot_be_enforced() {
+    let env = probe_env(false, "127.0.0.1:9");
+    let output = run_build(&env, &["build"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--isolation"),
+        "the error should point at the available levels:\n{stderr}"
     );
 }
