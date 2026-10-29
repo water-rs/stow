@@ -16,6 +16,7 @@ use crate::identity::{
     TargetTriple, WireRustcVersion,
 };
 use crate::platform::Profile;
+use crate::rustc::ParsedRustcArgs;
 
 /// One artifact CI plans to upload after a build.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -316,6 +317,14 @@ pub fn compute_compile_key(inputs: &CompileKeyInputs<'_>) -> crate::error::Resul
     if inputs.embed_bitcode {
         update_str(&mut hasher, "embed-bitcode=yes");
     }
+    // rustc's check defaults (debug assertions on only at opt-level 0) were
+    // once mislabeled as cargo's debug values, so a profile that differs
+    // from the dev profile is tagged: a local entry keyed before the
+    // correction can never answer a request keyed after it. The dev
+    // profile, which every published node has, hashes exactly as before.
+    if inputs.profile.opt_level != "0" || !inputs.profile.debug_assertions {
+        update_str(&mut hasher, "rustc-check-defaults");
+    }
     if let Some(git_source) = &inputs.git_source {
         update_str(&mut hasher, "git-source");
         update_str(&mut hasher, git_source.commit);
@@ -335,6 +344,226 @@ pub fn compute_compile_key(inputs: &CompileKeyInputs<'_>) -> crate::error::Resul
         );
     }
     Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// The compile inputs one build script's output contributes to an
+/// invocation: the `--cfg` and link arguments cargo adds from its
+/// `cargo:rustc-cfg` and `cargo:rustc-link-arg` directives.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BuildScriptInputs {
+    /// Non-feature `--cfg` values, in directive order.
+    pub cfgs: Vec<String>,
+    /// Link arguments, in `link-arg=…` spelling and directive order.
+    pub link_args: Vec<String>,
+}
+
+impl BuildScriptInputs {
+    /// Read the inputs from a build script's captured `cargo:` lines.
+    /// `cfg` values go through the argv parser's own reading, so a cfg is
+    /// sorted into feature or other exactly as it is on a command line.
+    #[must_use]
+    pub fn from_directives(directives: &[String]) -> Self {
+        let mut inputs = Self::default();
+        for directive in directives {
+            let Some(body) = directive
+                .strip_prefix("cargo::")
+                .or_else(|| directive.strip_prefix("cargo:"))
+            else {
+                continue;
+            };
+            match body.split_once('=') {
+                Some(("rustc-cfg", cfg)) if crate::rustc::parse_feature_cfg(cfg).is_none() => {
+                    inputs.cfgs.push(cfg.to_owned());
+                }
+                Some(("rustc-link-arg", arg)) => inputs.link_args.push(format!("link-arg={arg}")),
+                _ => {}
+            }
+        }
+        inputs
+    }
+
+    /// The inputs of the build script that owns `out_dir`, read from the
+    /// `output` file beside it; none for a crate without a build script.
+    ///
+    /// # Errors
+    /// Fails when `out_dir` is set and its build script output cannot be
+    /// read (see [`crate::native_capture::read_build_script_directives`]).
+    pub fn of_out_dir(
+        crate_name: &str,
+        out_dir: Option<&std::path::Path>,
+    ) -> crate::error::Result<Self> {
+        let Some(out_dir) = out_dir else {
+            return Ok(Self::default());
+        };
+        Ok(Self::from_directives(
+            &crate::native_capture::read_build_script_directives(crate_name, out_dir)?,
+        ))
+    }
+
+    /// The inputs of a published artifact's captured build-script output;
+    /// none for a crate without a build script.
+    #[must_use]
+    pub fn of(native: Option<&NativeArtifacts>) -> Self {
+        native.map_or_else(Self::default, |native| {
+            Self::from_directives(&native.cargo_directives)
+        })
+    }
+}
+
+/// The compile inputs a consumer's own invocation carries, apart from its
+/// build script's output (stow#1047).
+///
+/// Published nodes are built in the dev profile with no extra flags, so
+/// none of these are ever part of one. A semantic match stands a published
+/// artifact in for a request and must prove it was compiled with the same
+/// ones: [`candidate_compile_key`] recomputes the candidate's key under
+/// these inputs and the match holds only when it is the key the candidate
+/// carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsumerInputs {
+    /// `-Z embed-metadata`, when the invocation carried the flag.
+    pub embed_metadata: Option<bool>,
+    /// Whether the object files carry LLVM bitcode.
+    pub embed_bitcode: bool,
+    /// The `-C`/`-Z` options the registry identity does not model, in
+    /// argv order.
+    pub extra_codegen: Vec<String>,
+    /// Non-feature `--cfg` values in argv order, build-script output
+    /// removed.
+    pub cfgs: Vec<String>,
+    /// Link-steering `-C` options in argv order, build-script output
+    /// removed.
+    pub link_options: Vec<String>,
+}
+
+impl ConsumerInputs {
+    /// The consumer's inputs: the invocation's, minus what `own` — the
+    /// output of the invocation's own build script — contributed.
+    ///
+    /// Cargo emits one argument per directive, so the subtraction counts:
+    /// a cfg set by both `RUSTFLAGS` and the build script appears twice
+    /// on argv and once after removing the build script's.
+    #[must_use]
+    pub fn of(parsed: &ParsedRustcArgs, own: &BuildScriptInputs) -> Self {
+        Self {
+            embed_metadata: parsed.embed_metadata,
+            embed_bitcode: parsed.embed_bitcode,
+            extra_codegen: parsed.extra_codegen.clone(),
+            cfgs: without_each(&parsed.cfg_args, &own.cfgs),
+            link_options: without_each(&parsed.link_options, &own.link_args),
+        }
+    }
+
+    /// The inputs of a stock invocation: nothing of the consumer's own
+    /// beyond the bitcode every default compile embeds.
+    #[must_use]
+    pub const fn stock() -> Self {
+        Self {
+            embed_metadata: None,
+            embed_bitcode: true,
+            extra_codegen: Vec::new(),
+            cfgs: Vec::new(),
+            link_options: Vec::new(),
+        }
+    }
+
+    /// Whether the inputs have a shape a published node can have: no cfg
+    /// of the consumer's own, no extra codegen, no `embed-metadata` flag.
+    /// A request that does not can only be answered by a local build.
+    #[must_use]
+    pub const fn is_publishable_shape(&self) -> bool {
+        self.cfgs.is_empty() && self.extra_codegen.is_empty() && self.embed_metadata.is_none()
+    }
+}
+
+/// `all` with one occurrence of each of `removed` taken out.
+fn without_each(all: &[String], removed: &[String]) -> Vec<String> {
+    let mut remaining = all.to_vec();
+    for value in removed {
+        if let Some(position) = remaining.iter().position(|candidate| candidate == value) {
+            remaining.remove(position);
+        }
+    }
+    remaining
+}
+
+/// The recorded identity of an artifact a semantic match proposes to
+/// serve.
+#[derive(Debug)]
+pub struct CandidateIdentity<'a> {
+    /// crates.io package name.
+    pub crate_name: &'a str,
+    /// Crate version string.
+    pub crate_version: &'a str,
+    /// Compilation target triple.
+    pub target: &'a str,
+    /// rustc version string.
+    pub rustc_version: &'a str,
+    /// Canonical JSON-encoded features list the key hashed.
+    pub features_json: &'a str,
+    /// Canonical JSON-encoded dependency `c_metadata` identities.
+    pub dependency_c_metadata_json: &'a str,
+    /// Primary artifact kind.
+    pub kind: &'a ArtifactKind,
+    /// Normalized compile profile.
+    pub profile: &'a Profile,
+    /// Declared crate types.
+    pub crate_types: &'a [RustCrateType],
+    /// Sorted, deduplicated `--emit` kinds.
+    pub emit: &'a [String],
+}
+
+/// The compile key `candidate` would carry had it been compiled with the
+/// consumer's inputs and `build_script`'s output.
+///
+/// Every input the key hashes is either the candidate's own recorded
+/// identity or one of the two arguments, so equality with the key the
+/// candidate carries proves the candidate was compiled with exactly them.
+/// Cfgs are the consumer's and the build script's together; link options
+/// count only for a crate type that reaches the linker.
+///
+/// # Errors
+/// Returns an error when the identity fails to serialize for hashing.
+pub fn candidate_compile_key(
+    candidate: &CandidateIdentity<'_>,
+    consumer: &ConsumerInputs,
+    build_script: &BuildScriptInputs,
+) -> crate::error::Result<String> {
+    let mut cfgs = consumer.cfgs.clone();
+    cfgs.extend(build_script.cfgs.iter().cloned());
+    cfgs.sort();
+    cfgs.dedup();
+    let links = candidate.crate_types.iter().any(|crate_type| {
+        matches!(
+            crate_type,
+            RustCrateType::ProcMacro | RustCrateType::Dylib | RustCrateType::Cdylib
+        )
+    });
+    let link_options = if links {
+        let mut raw = consumer.link_options.clone();
+        raw.extend(build_script.link_args.iter().cloned());
+        crate::rustc::canonical_link_options(&raw)
+    } else {
+        Vec::new()
+    };
+    compute_compile_key(&CompileKeyInputs {
+        crate_name: candidate.crate_name,
+        crate_version: candidate.crate_version,
+        target: candidate.target,
+        rustc_version: candidate.rustc_version,
+        profile: candidate.profile,
+        crate_types: candidate.crate_types,
+        emit: candidate.emit,
+        features_json: candidate.features_json,
+        dependency_c_metadata_json: candidate.dependency_c_metadata_json,
+        kind: candidate.kind,
+        embed_metadata: consumer.embed_metadata,
+        cfgs: &cfgs,
+        embed_bitcode: consumer.embed_bitcode,
+        link_options: &link_options,
+        git_source: None,
+        extra_codegen: &consumer.extra_codegen,
+    })
 }
 
 fn update_str(hasher: &mut Hasher, value: &str) {

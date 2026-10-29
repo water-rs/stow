@@ -33,6 +33,33 @@ pub fn capture_native_artifacts(
     let Some(out_dir) = build_script_out_dir else {
         return Ok(None);
     };
+    let cargo_directives = read_build_script_directives(crate_name, out_dir)?;
+    let (static_libs, out_dir_files) = if out_dir.exists() {
+        collect_out_dir(out_dir)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    Ok(Some(NativeArtifacts {
+        static_libs,
+        cargo_directives,
+        dep_env_vars: BTreeMap::new(),
+        out_dir_files,
+        original_out_dir: out_dir.to_path_buf(),
+    }))
+}
+
+/// The `cargo:` directive lines the build script that owns `out_dir` wrote
+/// to its `output` file, which sits beside `out_dir`.
+///
+/// # Errors
+///
+/// An `out_dir` with no sibling `output` file is an error: cargo always
+/// runs the build script (and writes `output`) before compiling the
+/// crate, so its absence means the directory is not what cargo promised.
+pub fn read_build_script_directives(
+    crate_name: &str,
+    out_dir: &Path,
+) -> crate::error::Result<Vec<String>> {
     let build_dir = out_dir.parent().ok_or_else(|| {
         crate::stow_error!(
             "build script OUT_DIR {} for {crate_name} has no parent build dir",
@@ -46,22 +73,9 @@ pub fn capture_native_artifacts(
             output_path.display()
         ));
     }
-
     let raw = std::fs::read_to_string(&output_path)
         .wrap_err_with(|| format!("read build script output {}", output_path.display()))?;
-    let cargo_directives = parse_build_script_output(&raw);
-    let (static_libs, out_dir_files) = if out_dir.exists() {
-        collect_out_dir(out_dir)?
-    } else {
-        (Vec::new(), Vec::new())
-    };
-    Ok(Some(NativeArtifacts {
-        static_libs,
-        cargo_directives,
-        dep_env_vars: BTreeMap::new(),
-        out_dir_files,
-        original_out_dir: out_dir.to_path_buf(),
-    }))
+    Ok(parse_build_script_output(&raw))
 }
 
 /// Keep the `cargo:` directive lines of a build script's `output` file.

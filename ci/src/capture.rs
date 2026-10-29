@@ -728,6 +728,24 @@ async fn prepare_stable_rustc_invocation(
             original_parsed.input_path,
         ));
     };
+    // A published node is a dev-profile build with no cfg of its own, no
+    // extra codegen and no `embed-metadata`; the CLI's semantic match
+    // relies on exactly that to prove a stand-in against its key
+    // (stow#1047). An invocation outside it must not be published.
+    let build_script = stow_types::upload_plan::BuildScriptInputs::of_out_dir(
+        &original_parsed.crate_name,
+        original_parsed.build_script_out_dir.as_deref(),
+    )?;
+    let consumer = stow_types::upload_plan::ConsumerInputs::of(original_parsed, &build_script);
+    if !consumer.is_publishable_shape() {
+        return Err(stow_types::stow_error!(
+            "`{}` was invoked with cfgs {:?}, extra codegen {:?} or embed-metadata {:?} no published node may carry",
+            original_parsed.crate_name,
+            consumer.cfgs,
+            consumer.extra_codegen,
+            consumer.embed_metadata,
+        ));
+    }
     let identity = stable_unit_identity_for_package(
         original_parsed,
         &package_name,
@@ -1641,6 +1659,7 @@ mod tests {
             crate_types: vec!["lib".to_owned()],
             features: BTreeSet::new(),
             cfgs: BTreeSet::default(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::from([
                 "dep-info".to_owned(),
                 "link".to_owned(),
@@ -1663,8 +1682,8 @@ mod tests {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
-            extra_codegen: std::collections::BTreeSet::new(),
-            link_options: std::collections::BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         }
     }
 
@@ -1858,6 +1877,7 @@ mod tests {
             crate_types: vec!["proc-macro".to_owned()],
             features: BTreeSet::new(),
             cfgs: BTreeSet::default(),
+            cfg_args: Vec::new(),
             emit: BTreeSet::from(["dep-info".to_owned(), "metadata".to_owned()]),
             json: BTreeSet::new(),
             input_path: None,
@@ -1876,8 +1896,8 @@ mod tests {
             extern_crates: Vec::new(),
             embed_metadata: None,
             embed_bitcode: false,
-            extra_codegen: std::collections::BTreeSet::new(),
-            link_options: std::collections::BTreeSet::new(),
+            extra_codegen: Vec::new(),
+            link_options: Vec::new(),
         }
     }
 
@@ -2306,7 +2326,7 @@ mod tests {
             ParsedRustcArgs::parse(&pinned)
                 .expect("pinned args still parse")
                 .link_options
-                .contains("link-arg=-fuse-ld=mold"),
+                .contains(&"link-arg=-fuse-ld=mold".to_owned()),
             "the appended arg must land in the link options the compile key reads"
         );
 
