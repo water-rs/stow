@@ -285,9 +285,12 @@ async fn create_sandbox<N: NetworkPolicy>(
             heel::Error::UnsupportedPlatformVersion { .. } => {
                 "the kernel is too old for the sandbox (Linux 6.7 or newer is required)"
             }
-            // heel's own message names `ptrace_scope` and the value it needs.
-            heel::Error::InitFailed(message) if message.contains("ptrace_scope") => {
-                "the sandbox broker needs kernel.yama.ptrace_scope of 1 or lower"
+            // heel's own message names the value found and the value needed.
+            heel::Error::PtraceScopeTooStrict { .. } => {
+                "the host's Yama setting forbids the sandbox broker"
+            }
+            heel::Error::SeccompNotifyUnavailable(_) => {
+                "the host offers no seccomp user notification for the sandbox broker"
             }
             heel::Error::UnsupportedSetting { .. } => {
                 "this platform cannot enforce a setting the level needs"
