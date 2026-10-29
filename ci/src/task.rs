@@ -15,8 +15,8 @@ use zenwave::{Client, ResponseExt};
 
 use crate::capture::{
     CaptureCollector, STOW_BUILD_CAPTURE_DIR_ENV, STOW_BUILD_CAPTURE_IPC_ENV,
-    STOW_BUILD_CONSUME_STORE_ENV, STOW_BUILD_LINK_ARG_CROSS_ENV, STOW_BUILD_LINK_ARG_ENV,
-    STOW_BUILD_TARGET_DIR_REMAP_ENV, STOW_BUILD_WRAPPER_CRATE_NAME_ENV, StowCaptureCommand,
+    STOW_BUILD_CONSUME_STORE_ENV, STOW_BUILD_TARGET_DIR_REMAP_ENV,
+    STOW_BUILD_WRAPPER_CRATE_NAME_ENV, StowCaptureCommand,
 };
 use crate::consume;
 use crate::dep_scan;
@@ -1420,12 +1420,7 @@ pub async fn run_sandboxed_phase(
     // argv the boundary drops it from (MSVC CodeView S_OBJNAME embeds the
     // object's own absolute output path; without the remap the two phase
     // dirs hash differently on Windows even though the unit is identical).
-    let rustflags = format!(
-        "{} --remap-path-prefix={}={}",
-        setup.rustflags,
-        target_dir.display(),
-        TARGET_DIR_VIRTUAL_ROOT
-    );
+    let rustflags = phase_rustflags(setup.rustflags, task.target.as_str(), target_dir);
 
     let mut command = run
         .sandbox
@@ -1468,26 +1463,7 @@ pub async fn run_sandboxed_phase(
                 runner_host_triple(task)?,
             );
     }
-    // A linux-gnu task's units link with mold, and the pin is part of what
-    // the compile key records, so it is a choice the builder makes — the
-    // workflow installs mold — not an observation of whatever linker the
-    // runner image happens to ship. It cannot arrive through rustflags:
-    // under `--target`, `RUSTFLAGS` and `CARGO_TARGET_<triple>_RUSTFLAGS`
-    // stop at the target boundary and never reach the build scripts and
-    // proc macros that do most of a dependency build's linking. The
-    // capture wrapper appends it to the rustc argv itself, which reaches
-    // host and target units alike and lands in the parsed link options
-    // the key is built from. `STOW_BUILD_LINK_ARG_CROSS` narrows the pin
-    // to `--target` units when this invocation spells one — a consumer's
-    // rustflags stop at the same boundary, so a host unit is pinned only
-    // under a native invocation.
     let passes_target = invocation_passes_target(task, invocation).await?;
-    if task.target.as_str().ends_with("-linux-gnu") {
-        command = command.env(STOW_BUILD_LINK_ARG_ENV, "-fuse-ld=mold");
-        if passes_target {
-            command = command.env(STOW_BUILD_LINK_ARG_CROSS_ENV, "1");
-        }
-    }
     let status = command.status().await.map_err(|error| {
         stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
     })?;
@@ -2367,6 +2343,41 @@ fn create_dir_all_sync(path: &Path) -> stow_types::error::Result<()> {
         .map_err(|error| stow_types::stow_error!("create directory {}: {error}", path.display()))
 }
 
+/// The link option a linux-gnu task's units link with: mold, pinned by
+/// the builder rather than observed from whatever linker the runner image
+/// ships. The compile key records it, and the workflow installs mold.
+const PINNED_LINK_ARG_RUSTFLAGS: &str = "-C link-arg=-fuse-ld=mold";
+
+/// The `RUSTFLAGS` of one cargo phase: the task's merged flags, the mold
+/// pin on a linux-gnu task, and the remap of the phase's target dir to
+/// the one virtual root.
+///
+/// The pin rides `RUSTFLAGS` because that is how a consumer gets it —
+/// `stow setup` writes it into `target.'cfg(target_os = "linux")'.rustflags`
+/// — and cargo places rustflags before the link arguments a build script
+/// emits (`cargo:rustc-link-arg*`). Link arguments are keyed in argv
+/// order, so a pin appended after the build script's arguments keyed such
+/// a unit differently from every consumer (stow#1067). Cargo applies
+/// `RUSTFLAGS` to host units only under a native invocation and to target
+/// units only when `--target` is passed, which is exactly the reach a
+/// consumer's target rustflags have, so no host unit of a cross-spelled
+/// invocation is pinned on either side.
+///
+/// The target-dir remap also stays in the flags; units the flags do not
+/// reach receive it from the capture wrapper (`STOW_BUILD_TARGET_DIR_REMAP`).
+fn phase_rustflags(task_rustflags: &str, target: &str, target_dir: &Path) -> String {
+    let pin = if target.ends_with("-linux-gnu") {
+        format!(" {PINNED_LINK_ARG_RUSTFLAGS}")
+    } else {
+        String::new()
+    };
+    format!(
+        "{task_rustflags}{pin} --remap-path-prefix={}={}",
+        target_dir.display(),
+        TARGET_DIR_VIRTUAL_ROOT
+    )
+}
+
 pub fn merged_rustflags(remap_flag: &str) -> String {
     match std::env::var("RUSTFLAGS") {
         Ok(existing) if !existing.trim().is_empty() => format!("{existing} {remap_flag}"),
@@ -2707,10 +2718,156 @@ mod tests {
 
     use super::{
         BuildWorkspace, CargoInvocation, CargoSubcommand, STOW_PROBE_FORBIDDEN_PATH_ENV,
-        cargo_home, phase_invocations, phase_target_dir, pin_alias, sandbox_grants,
-        targets_android, toolchain_env_names, toolchain_grant_dirs, unpack_crate_archive,
-        verify_preserved_lockfile, wrapper_lockfile, wrapper_manifest,
+        cargo_home, phase_invocations, phase_rustflags, phase_target_dir, pin_alias,
+        sandbox_grants, targets_android, toolchain_env_names, toolchain_grant_dirs,
+        unpack_crate_archive, verify_preserved_lockfile, wrapper_lockfile, wrapper_manifest,
     };
+
+    /// The rustc argv cargo builds for a proc-macro unit: the base
+    /// arguments, then the rustflags, then the link arguments the unit's
+    /// build script emitted (`cargo:rustc-link-arg`). Cargo places them in
+    /// this order whatever the flags are: the rustflags are added with the
+    /// base arguments and the build script's outputs after the
+    /// dependencies.
+    fn linking_unit_argv(rustflags: &[&str], build_script_link_args: &[&str]) -> Vec<OsString> {
+        let mut argv: Vec<String> = [
+            "--crate-name",
+            "serde_derive",
+            "--edition=2021",
+            "src/lib.rs",
+            "--crate-type",
+            "proc-macro",
+            "--emit",
+            "dep-info,link",
+            "-C",
+            "debuginfo=2",
+            "-C",
+            "metadata=a52ee596848c66ca",
+            "-C",
+            "extra-filename=-aa4980adf969014b",
+            "--out-dir",
+            "/out/deps",
+            "-L",
+            "dependency=/out/deps",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        argv.extend(rustflags.iter().map(|flag| (*flag).to_owned()));
+        for arg in build_script_link_args {
+            argv.extend(["-C".to_owned(), format!("link-arg={arg}")]);
+        }
+        argv.into_iter().map(OsString::from).collect()
+    }
+
+    fn linux_compile_key(argv: &[OsString]) -> String {
+        let parsed = stow_types::rustc::ParsedRustcArgs::parse(argv).expect("parse argv");
+        stow_types::public_cache::stable_unit_identity_for_package(
+            &parsed,
+            "serde_derive",
+            "1.0.210",
+            "x86_64-unknown-linux-gnu",
+            "1.98.1",
+            "[]",
+            "[]",
+        )
+        .expect("identity")
+        .compile_key
+    }
+
+    /// What `stow setup` writes into the consumer's
+    /// `target.'cfg(target_os = "linux")'.rustflags`, before the stow
+    /// CLI's wrapper appends the workspace remap.
+    const CONSUMER_RUSTFLAGS: [&str; 2] = ["-C", "link-arg=-fuse-ld=mold"];
+
+    /// stow#1067: a unit whose build script emits link arguments keys the
+    /// same on the builder and on a consumer, because the builder's mold
+    /// pin sits where the consumer's rustflags put it: ahead of the build
+    /// script's arguments.
+    #[test]
+    fn a_build_script_link_arg_keys_the_same_on_the_builder_and_the_consumer() {
+        let build_script = ["-Wl,--export-dynamic", "-Wl,-z,relro"];
+        let phase = phase_rustflags("", "x86_64-unknown-linux-gnu", Path::new("/phase/target"));
+        let builder_flags: Vec<&str> = phase.split_whitespace().collect();
+        let builder = linking_unit_argv(&builder_flags, &build_script);
+        let consumer = linking_unit_argv(&CONSUMER_RUSTFLAGS, &build_script);
+
+        let parsed = |argv: &[OsString]| {
+            stow_types::rustc::ParsedRustcArgs::parse(argv).expect("parse argv")
+        };
+        assert_eq!(
+            parsed(&builder).link_options,
+            [
+                "link-arg=-fuse-ld=mold",
+                "link-arg=-Wl,--export-dynamic",
+                "link-arg=-Wl,-z,relro",
+            ]
+        );
+        assert_eq!(
+            parsed(&builder).link_options,
+            parsed(&consumer).link_options
+        );
+        assert_eq!(linux_compile_key(&builder), linux_compile_key(&consumer));
+
+        // The consumer's semantic lookup splits the argv into its own
+        // options and the build script's and rebuilds the order from the
+        // two; that order is the builder's argv order as well.
+        let own = stow_types::upload_plan::BuildScriptInputs::from_directives(&[
+            "cargo:rustc-link-arg=-Wl,--export-dynamic".to_owned(),
+            "cargo:rustc-link-arg=-Wl,-z,relro".to_owned(),
+        ]);
+        let split = stow_types::upload_plan::ConsumerInputs::of(&parsed(&consumer), &own);
+        assert_eq!(split.link_options, ["link-arg=-fuse-ld=mold"]);
+        let mut rejoined = split.link_options;
+        rejoined.extend(own.link_args);
+        assert_eq!(rejoined, parsed(&builder).link_options);
+
+        // The order the pin used to have, after the build script's
+        // arguments, keys differently: the miss this change removes.
+        let mut after = build_script.to_vec();
+        after.push("-fuse-ld=mold");
+        let old_builder = linking_unit_argv(&[], &after);
+        assert_ne!(
+            linux_compile_key(&old_builder),
+            linux_compile_key(&consumer)
+        );
+    }
+
+    /// A linking unit without build-script link arguments keeps the key it
+    /// was published under, whichever side of the argv the pin sat on. The
+    /// literal is the key published before the pin moved into `RUSTFLAGS`.
+    #[test]
+    fn a_linking_unit_without_build_script_link_args_keeps_its_published_key() {
+        let phase = phase_rustflags("", "x86_64-unknown-linux-gnu", Path::new("/phase/target"));
+        let builder_flags: Vec<&str> = phase.split_whitespace().collect();
+        let key = linux_compile_key(&linking_unit_argv(&builder_flags, &[]));
+        let previous = linux_compile_key(&linking_unit_argv(&[], &["-fuse-ld=mold"]));
+        assert_eq!(key, previous);
+        assert_eq!(
+            key,
+            "f2ca0f3dc52e71c1a855ac589c178463826917982b38da46fd269112e890229e"
+        );
+    }
+
+    /// The pin is part of a linux-gnu task's flags and of no other
+    /// task's, and the remap stays last.
+    #[test]
+    fn the_mold_pin_rides_the_rustflags_of_linux_gnu_tasks_only() {
+        let dir = Path::new("/phase/target");
+        assert_eq!(
+            phase_rustflags("--cfg a", "aarch64-unknown-linux-gnu", dir),
+            "--cfg a -C link-arg=-fuse-ld=mold --remap-path-prefix=/phase/target=stow-ci://target"
+        );
+        for target in [
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc",
+            "aarch64-linux-android",
+        ] {
+            assert_eq!(
+                phase_rustflags("--cfg a", target, dir),
+                "--cfg a --remap-path-prefix=/phase/target=stow-ci://target"
+            );
+        }
+    }
 
     #[test]
     fn unpack_crate_archive_keeps_the_bundled_lockfile() {
