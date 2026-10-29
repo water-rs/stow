@@ -1,14 +1,17 @@
 //! `stow-admin watchdog` — the external breaker of issue #450.
 //!
-//! Each run measures four signal groups — Cloudflare usage against the
-//! hourly share of the monthly included allowances, edge health (Worker
+//! Each run measures four signal groups — Cloudflare usage over the
+//! current month against the 80% line of the monthly included
+//! allowances (with the last hour's pace as alert-only context), edge health (Worker
 //! invocation statuses, DO resource failures, `overloaded` events), the
 //! build pipeline (build-crate failed-task share, dispatch retries,
 //! pending age, dispatch stalls), and the public endpoints — then acts on the
 //! verdict: `Trip` breaches disable the dispatching workflows that read
 //! `active` — the exact set, recorded on the incident issue for `clear`
 //! to restore — and enable
-//! the zone's `stow maintenance: anonymous` WAF rule, and any breach opens
+//! the zone's WAF rule for the widest scope the breaching signals name
+//! (`lanes` for scheduler-DO costs, `anonymous` for Worker costs), and
+//! any breach opens
 //! or updates the `incident`
 //! issue and mails the alert. Health and latency signals alert without
 //! tripping; the watchdog never un-trips on its own — recovery is the
@@ -20,7 +23,9 @@
 //! never because it saw an incident.
 //!
 //! Costs (AGENTS.md "resources are spent deliberately"): one run is one
-//! GraphQL POST, one Analytics Engine SQL POST, ≤3 admin/endpoint calls,
+//! GraphQL POST for the hour and health windows plus one day-bounded
+//! GraphQL POST per elapsed UTC day of the month (≤31, at most
+//! [`MONTH_QUERY_CONCURRENCY`] in flight), one Analytics Engine SQL POST, ≤3 admin/endpoint calls,
 //! one GHCR verified pull for the bundle probe (tag list + index
 //! manifest + signature + blob), ≤ `1 + completed-runs +
 //! MAX_CLASSIFIED_TASKS` GitHub REST reads (a run's jobs live only on
@@ -33,7 +38,7 @@ use std::fmt::Write as _;
 
 use askama::Template;
 use clap::{Args, Subcommand};
-use futures_util::StreamExt as _;
+use futures_util::{StreamExt as _, TryStreamExt as _};
 use stow_types::analytics;
 use stow_types::api::{AdminStatus, DispatchFreeze};
 use stow_types::identity::WireRustcVersion;
@@ -84,14 +89,41 @@ pub async fn run(edge: &Edge, args: WatchdogArgs, output: Output) -> stow_types:
 // ===== The signal table =====
 
 /// What a breach of a signal does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Effect {
-    /// Breach trips the breaker: maintenance rule on, dispatching workflows
-    /// disabled.
-    Trip,
+    /// Breach trips the breaker: the zone's maintenance rule for this
+    /// scope on, dispatching workflows disabled. The scope is what the
+    /// breach costs: a cost the scheduler Durable Object bills sheds
+    /// only the lanes that reach it, so bundle downloads and index
+    /// routes keep serving.
+    Trip(MaintenanceScope),
     /// Breach opens/updates the incident and alerts; nothing is cut.
     Alert,
+}
+
+/// The scopes a trip can enable, narrowest first — `clear` lifts every
+/// one of them, and a trip with several breaching signals enables the
+/// widest of their scopes.
+const TRIP_SCOPES: [MaintenanceScope; 2] = [MaintenanceScope::Lanes, MaintenanceScope::Anonymous];
+
+/// How much of the edge a scope sheds — the order "widest wins" reads.
+const fn scope_width(scope: MaintenanceScope) -> u8 {
+    match scope {
+        MaintenanceScope::Lanes => 0,
+        MaintenanceScope::Anonymous => 1,
+        MaintenanceScope::All => 2,
+    }
+}
+
+/// The history a signal's measurement covers.
+#[derive(Debug, Clone, Copy)]
+enum Window {
+    /// A point-in-time check.
+    Now,
+    /// The last this-many seconds.
+    Last(u64),
+    /// From the start of the current UTC calendar month to now.
+    MonthToDate,
 }
 
 /// One line of the threshold table — the single typed place a signal's
@@ -103,26 +135,22 @@ struct Signal {
     id: &'static str,
     /// What the value means, for the rendered tables.
     label: &'static str,
-    /// Seconds of history the measurement covers; `0` is a point-in-time
-    /// check.
-    window_secs: u64,
+    /// The history the measurement covers.
+    window: Window,
     /// Smallest sample the measurement needs before its verdict counts —
     /// below it the signal reports `skipped`, never `clear` or `breach`.
     /// For rates the sample is the denominator (requests, runs); for
     /// counts and point checks it is `0`.
     min_sample: u64,
-    /// Observed value at or above which the signal breaches.
+    /// Observed value at or above which the signal breaches. The
+    /// hourly-pace alerts carry `0.0` here: their level is an operator
+    /// setting read at run time, so each reading brings its own
+    /// threshold ([`Reading::threshold`]).
     threshold: f64,
     /// Unit for rendered values ("rows", "%", "ms", "s", "runs").
     unit: &'static str,
     effect: Effect,
 }
-
-/// Hours in the monthly allowance window — the hourly budget each usage
-/// signal compares last-hour consumption against is `monthly / 720`.
-/// Thirty days is the convention `edge/src/scheduler/meter.rs` (#451)
-/// uses for its daily budgets, so both layers share the allowance model.
-const HOURS_PER_MONTH: f64 = 720.0;
 
 // Monthly included allowances, per Cloudflare's published pricing
 // (verified against the docs 2026-09-28;  carries the
@@ -135,15 +163,15 @@ const HOURS_PER_MONTH: f64 = 720.0;
 //   25G rows read/mo, 50M rows written/mo (SQLite storage billing).
 //   `activeTime` and `cpuTime` are collected as diagnostics.
 //   <https://developers.cloudflare.com/durable-objects/platform/pricing/>
+use stow_types::do_budgets::ALLOWANCE_FRACTION;
 pub use stow_types::do_budgets::{DO_ROWS_READ_MONTHLY, DO_ROWS_WRITTEN_MONTHLY};
 pub const DO_REQUESTS_MONTHLY: f64 = 1e6;
 pub const DO_DURATION_GB_S_MONTHLY: f64 = 400e3;
 pub const WORKER_REQUESTS_MONTHLY: f64 = 10e6;
 pub const WORKER_CPU_MS_MONTHLY: f64 = 30e6;
 
-/// One hour — the usage window. An hourly window trips a sustained burn
-/// to the monthly allowance's hourly share within an hour instead of
-/// end-of-month; point checks and the 15-minute health window are the
+/// One hour — the window of the health signals and of the hourly-pace
+/// usage alerts; point checks and the 15-minute health window are the
 /// exceptions below.
 const HOUR: u64 = 3600;
 /// The edge-health window — 15 minutes, matching the run cadence, so a
@@ -153,66 +181,123 @@ const QUARTER_HOUR: u64 = 900;
 /// The threshold table — every signal's window, minimum sample,
 /// threshold and trip/alert effect in one place.
 const SIGNALS: &[Signal] = &[
-    // ── Cloudflare usage, billed dimensions — breach trips ──
+    // ── Cloudflare usage, billed dimensions: the month to date against the
+    // 80% line of the monthly allowance — breach trips ──
     Signal {
         id: "cf.do.rows_read",
-        label: "DO rows read/h vs hourly share of the 25G/mo allowance",
-        window_secs: HOUR,
+        label: "DO rows read this month vs 80% of the 25G/mo allowance",
+        window: Window::MonthToDate,
         min_sample: 0,
-        threshold: DO_ROWS_READ_MONTHLY / HOURS_PER_MONTH,
+        threshold: DO_ROWS_READ_MONTHLY * ALLOWANCE_FRACTION,
         unit: "rows",
-        effect: Effect::Trip,
+        effect: Effect::Trip(MaintenanceScope::Lanes),
     },
     Signal {
         id: "cf.do.rows_written",
-        label: "DO rows written/h vs hourly share of the 50M/mo allowance",
-        window_secs: HOUR,
+        label: "DO rows written this month vs 80% of the 50M/mo allowance",
+        window: Window::MonthToDate,
         min_sample: 0,
-        threshold: DO_ROWS_WRITTEN_MONTHLY / HOURS_PER_MONTH,
+        threshold: DO_ROWS_WRITTEN_MONTHLY * ALLOWANCE_FRACTION,
         unit: "rows",
-        effect: Effect::Trip,
+        effect: Effect::Trip(MaintenanceScope::Lanes),
     },
     Signal {
         id: "cf.do.duration_gb_s",
-        label: "DO billed duration/h vs hourly share of the 400k GB-s/mo allowance",
-        window_secs: HOUR,
+        label: "DO billed duration this month vs 80% of the 400k GB-s/mo allowance",
+        window: Window::MonthToDate,
         min_sample: 0,
-        threshold: DO_DURATION_GB_S_MONTHLY / HOURS_PER_MONTH,
+        threshold: DO_DURATION_GB_S_MONTHLY * ALLOWANCE_FRACTION,
         unit: "GB-s",
-        effect: Effect::Trip,
+        effect: Effect::Trip(MaintenanceScope::Lanes),
     },
     Signal {
         id: "cf.do.requests",
-        label: "DO requests/h vs hourly share of the 1M/mo allowance",
-        window_secs: HOUR,
+        label: "DO requests this month vs 80% of the 1M/mo allowance",
+        window: Window::MonthToDate,
         min_sample: 0,
-        threshold: DO_REQUESTS_MONTHLY / HOURS_PER_MONTH,
+        threshold: DO_REQUESTS_MONTHLY * ALLOWANCE_FRACTION,
         unit: "requests",
-        effect: Effect::Trip,
+        effect: Effect::Trip(MaintenanceScope::Lanes),
     },
     Signal {
         id: "cf.worker.requests",
-        label: "Worker requests/h vs hourly share of the 10M/mo allowance",
-        window_secs: HOUR,
+        label: "Worker requests this month vs 80% of the 10M/mo allowance",
+        window: Window::MonthToDate,
         min_sample: 0,
-        threshold: WORKER_REQUESTS_MONTHLY / HOURS_PER_MONTH,
+        threshold: WORKER_REQUESTS_MONTHLY * ALLOWANCE_FRACTION,
         unit: "requests",
-        effect: Effect::Trip,
+        effect: Effect::Trip(MaintenanceScope::Anonymous),
     },
     Signal {
         id: "cf.worker.cpu_ms",
-        label: "Worker CPU/h vs hourly share of the 30M ms/mo allowance",
-        window_secs: HOUR,
+        label: "Worker CPU this month vs 80% of the 30M ms/mo allowance",
+        window: Window::MonthToDate,
         min_sample: 0,
-        threshold: WORKER_CPU_MS_MONTHLY / HOURS_PER_MONTH,
+        threshold: WORKER_CPU_MS_MONTHLY * ALLOWANCE_FRACTION,
         unit: "ms",
-        effect: Effect::Trip,
+        effect: Effect::Trip(MaintenanceScope::Anonymous),
+    },
+    // ── the last hour's pace against the allowance's hourly pace, at the
+    // operator-set levels — breach alerts, never trips ──
+    Signal {
+        id: "cf.do.rows_read.hourly",
+        label: "DO rows read in the last hour vs the hourly pace of the 25G/mo allowance",
+        window: Window::Last(HOUR),
+        min_sample: 0,
+        threshold: 0.0,
+        unit: "rows",
+        effect: Effect::Alert,
+    },
+    Signal {
+        id: "cf.do.rows_written.hourly",
+        label: "DO rows written in the last hour vs the hourly pace of the 50M/mo allowance",
+        window: Window::Last(HOUR),
+        min_sample: 0,
+        threshold: 0.0,
+        unit: "rows",
+        effect: Effect::Alert,
+    },
+    Signal {
+        id: "cf.do.duration_gb_s.hourly",
+        label: "DO billed duration in the last hour vs the hourly pace of the 400k GB-s/mo allowance",
+        window: Window::Last(HOUR),
+        min_sample: 0,
+        threshold: 0.0,
+        unit: "GB-s",
+        effect: Effect::Alert,
+    },
+    Signal {
+        id: "cf.do.requests.hourly",
+        label: "DO requests in the last hour vs the hourly pace of the 1M/mo allowance",
+        window: Window::Last(HOUR),
+        min_sample: 0,
+        threshold: 0.0,
+        unit: "requests",
+        effect: Effect::Alert,
+    },
+    Signal {
+        id: "cf.worker.requests.hourly",
+        label: "Worker requests in the last hour vs the hourly pace of the 10M/mo allowance",
+        window: Window::Last(HOUR),
+        min_sample: 0,
+        threshold: 0.0,
+        unit: "requests",
+        effect: Effect::Alert,
+    },
+    Signal {
+        id: "cf.worker.cpu_ms.hourly",
+        label: "Worker CPU in the last hour vs the hourly pace of the 30M ms/mo allowance",
+        window: Window::Last(HOUR),
+        min_sample: 0,
+        threshold: 0.0,
+        unit: "ms",
+        effect: Effect::Alert,
     },
     // ── edge health — breach alerts, never trips ──
     Signal {
         id: "edge.worker.errors",
         label: "Worker non-success share (scriptThrewException + internalError + exceededResources)",
-        window_secs: QUARTER_HOUR,
+        window: Window::Last(QUARTER_HOUR),
         min_sample: 100,
         threshold: 2.0,
         unit: "%",
@@ -221,7 +306,7 @@ const SIGNALS: &[Signal] = &[
     Signal {
         id: "edge.worker.exceeded",
         label: "Worker exceededResources + internalError invocations",
-        window_secs: QUARTER_HOUR,
+        window: Window::Last(QUARTER_HOUR),
         min_sample: 0,
         threshold: 1.0,
         unit: "invocations",
@@ -230,7 +315,7 @@ const SIGNALS: &[Signal] = &[
     Signal {
         id: "edge.do.exceeded",
         label: "DO exceededCpu + exceededMemory + fatalInternalErrors",
-        window_secs: HOUR,
+        window: Window::Last(HOUR),
         min_sample: 0,
         threshold: 1.0,
         unit: "errors",
@@ -242,7 +327,7 @@ const SIGNALS: &[Signal] = &[
     Signal {
         id: "edge.dispatch_frozen",
         label: "scheduler dispatch freeze engaged (the DO's own breaker fired)",
-        window_secs: 0,
+        window: Window::Now,
         min_sample: 1,
         threshold: 1.0,
         unit: "frozen",
@@ -251,7 +336,7 @@ const SIGNALS: &[Signal] = &[
     Signal {
         id: "edge.do.overloaded",
         label: "`overloaded` fault events (Analytics Engine stow_cache_misses)",
-        window_secs: HOUR,
+        window: Window::Last(HOUR),
         min_sample: 0,
         threshold: 1.0,
         unit: "events",
@@ -262,25 +347,25 @@ const SIGNALS: &[Signal] = &[
     Signal {
         id: "pipeline.failure_rate",
         label: "build-crate failed-task share of completed tasks",
-        window_secs: HOUR,
+        window: Window::Last(HOUR),
         min_sample: 20,
         threshold: 50.0,
         unit: "%",
-        effect: Effect::Trip,
+        effect: Effect::Trip(MaintenanceScope::Lanes),
     },
     Signal {
         id: "pipeline.retry_storm",
         label: "build-crate runs at dispatch attempt ≥3",
-        window_secs: HOUR,
+        window: Window::Last(HOUR),
         min_sample: 0,
         threshold: 10.0,
         unit: "runs",
-        effect: Effect::Trip,
+        effect: Effect::Trip(MaintenanceScope::Lanes),
     },
     Signal {
         id: "pipeline.oldest_pending",
         label: "oldest pending queue task age",
-        window_secs: 0,
+        window: Window::Now,
         min_sample: 1,
         threshold: 86400.0,
         unit: "s",
@@ -289,7 +374,7 @@ const SIGNALS: &[Signal] = &[
     Signal {
         id: "pipeline.dispatch_stall",
         label: "pending tasks with free slots and nothing dispatched",
-        window_secs: HOUR,
+        window: Window::Last(HOUR),
         min_sample: 1,
         threshold: 1.0,
         unit: "stalled",
@@ -299,7 +384,7 @@ const SIGNALS: &[Signal] = &[
     Signal {
         id: "endpoint.stats",
         label: "GET /api/v1/stats answers 200",
-        window_secs: 0,
+        window: Window::Now,
         min_sample: 1,
         threshold: 5000.0,
         unit: "ms",
@@ -308,7 +393,7 @@ const SIGNALS: &[Signal] = &[
     Signal {
         id: "endpoint.artifact",
         label: "GET of a real bundle byte path answers 200",
-        window_secs: 0,
+        window: Window::Now,
         min_sample: 1,
         threshold: 5000.0,
         unit: "ms",
@@ -336,6 +421,9 @@ struct Reading {
     sample: u64,
     /// The measured value in the signal's unit.
     value: f64,
+    /// A threshold that replaces the signal's own — set by the readings
+    /// whose level is an operator setting read at run time.
+    threshold: Option<f64>,
     /// One-line evidence for the incident body — top routes, run links,
     /// statuses.
     evidence: Vec<String>,
@@ -360,10 +448,17 @@ enum Verdict {
     Breach,
 }
 
+impl Reading {
+    /// The value at or above which this reading breaches.
+    fn threshold(&self) -> f64 {
+        self.threshold.unwrap_or(self.signal.threshold)
+    }
+}
+
 fn verdict(reading: &Reading) -> Verdict {
     if reading.sample < reading.signal.min_sample {
         Verdict::Skipped
-    } else if reading.value >= reading.signal.threshold {
+    } else if reading.value >= reading.threshold() {
         Verdict::Breach
     } else {
         Verdict::Clear
@@ -375,6 +470,9 @@ fn verdict(reading: &Reading) -> Verdict {
 struct Decision {
     /// Breaching `Trip` signals — indices into the readings vec.
     tripped: Vec<usize>,
+    /// The maintenance scope the trip enables: the widest of the
+    /// breaching `Trip` signals' scopes; `None` when nothing tripped.
+    trip_scope: Option<MaintenanceScope>,
     /// Breaching `Alert` signals.
     alerting: Vec<usize>,
     /// Signals below their minimum sample — reported, never acted on.
@@ -392,13 +490,23 @@ fn decide(readings: &[Reading], collect_failures: &[CollectFailure]) -> Decision
     let mut skipped = Vec::new();
     for (index, reading) in readings.iter().enumerate() {
         match verdict(reading) {
-            Verdict::Breach if reading.signal.effect == Effect::Trip => tripped.push(index),
+            Verdict::Breach if matches!(reading.signal.effect, Effect::Trip(_)) => {
+                tripped.push(index);
+            }
             Verdict::Breach => alerting.push(index),
             Verdict::Skipped => skipped.push(index),
             Verdict::Clear => {}
         }
     }
+    let trip_scope = tripped
+        .iter()
+        .filter_map(|&index| match readings[index].signal.effect {
+            Effect::Trip(scope) => Some(scope),
+            Effect::Alert => None,
+        })
+        .max_by_key(|&scope| scope_width(scope));
     Decision {
+        trip_scope,
         incident: !tripped.is_empty() || !alerting.is_empty() || !collect_failures.is_empty(),
         tripped,
         alerting,
@@ -422,6 +530,17 @@ const MAX_CLASSIFIED_TASKS: usize = 25;
 /// Independent jobs-page reads in flight at once — the same bound
 /// `github::runs_in_range` uses for its subdivision reads.
 const JOBS_READ_CONCURRENCY: usize = 8;
+/// Day-bounded usage queries in flight at once. A month is at most 31
+/// of them; eight keeps a run's wall time at a few round trips without
+/// a burst against the analytics API.
+const MONTH_QUERY_CONCURRENCY: usize = 8;
+/// The repository variable (passed into the watchdog's environment)
+/// that sets the hourly-pace alert levels, as comma-separated percents
+/// of the hourly pace.
+const HOURLY_ALERT_ENV: &str = "STOW_WATCHDOG_HOURLY_ALERT_PERCENTS";
+/// The levels used while [`HOURLY_ALERT_ENV`] is unset or empty:
+/// 200% and 300% of the hourly pace.
+const DEFAULT_HOURLY_ALERT_PERCENTS: [f64; 2] = [200.0, 300.0];
 /// Actions runner capacity, used by the dispatch-stall signal —
 /// AGENTS.md states 60 concurrent runners.
 const RUNNER_CAPACITY: usize = 60;
@@ -476,7 +595,7 @@ impl Watcher<'_> {
     /// Gather every signal; a collector that fails records a
     /// [`CollectFailure`] — one blind spot never hides the signals that
     /// did read.
-    async fn collect(&self) -> (Vec<Reading>, Vec<CollectFailure>) {
+    async fn collect(&self, hourly: &HourlyAlertLevels) -> (Vec<Reading>, Vec<CollectFailure>) {
         let mut readings = Vec::new();
         let mut failures = Vec::new();
         // Sequential collectors keep a run at ~20 outbound calls total —
@@ -493,7 +612,7 @@ impl Watcher<'_> {
                 }
             };
         }
-        gather!("cloudflare-usage", self.cf_readings());
+        gather!("cloudflare-usage", self.cf_readings(hourly));
         gather!("overloaded-events", self.overloaded_reading());
         gather!("pipeline", self.pipeline_readings());
         gather!("queue", self.queue_readings());
@@ -511,9 +630,11 @@ impl Watcher<'_> {
 
     // ----- Cloudflare GraphQL -----
 
-    /// One GraphQL POST yields every Cloudflare reading: the billed-usage
-    /// trips plus the DO/Worker health alerts.
-    async fn cf_readings(&self) -> Result<Vec<Reading>, String> {
+    /// Every Cloudflare reading: the month-to-date billed-usage trips,
+    /// the last hour's pace alerts and the DO/Worker health alerts. One
+    /// GraphQL POST covers the hour and health windows; the month is
+    /// summed from day-bounded POSTs ([`Self::month_to_date`]).
+    async fn cf_readings(&self, hourly: &HourlyAlertLevels) -> Result<Vec<Reading>, String> {
         let since_hour = self
             .now
             .checked_sub(time::Duration::seconds(
@@ -526,17 +647,19 @@ impl Watcher<'_> {
                 i64::try_from(QUARTER_HOUR).unwrap_or(i64::MAX),
             ))
             .ok_or("window underflow")?;
-        let usage = self
-            .cf_graphql(
+        let (recent, month) = futures_util::future::try_join(
+            self.cf_graphql(
                 &format_time(since_hour),
                 &format_time(since_quarter),
                 &format_time(self.now),
-            )
-            .await?;
-        Ok(usage.readings())
+            ),
+            self.month_to_date(),
+        )
+        .await?;
+        Ok(recent.readings(&month, hourly, self.now))
     }
 
-    /// POST the usage query and decode it into a typed snapshot. A
+    /// POST the hour/health query and decode it into a typed snapshot. A
     /// GraphQL `errors` array is a hard error — never a partial read.
     async fn cf_graphql(
         &self,
@@ -554,6 +677,34 @@ impl Watcher<'_> {
         let account: AccountGroups =
             cloudflare::query_account(self.cf_token, WATCHDOG_QUERY, &variables).await?;
         Ok(CfSnapshot::from(account))
+    }
+
+    /// The billed dimensions summed from the start of the current UTC
+    /// month to now: one POST per UTC day, at most
+    /// [`MONTH_QUERY_CONCURRENCY`] in flight. Cloudflare publishes no
+    /// per-query time-range limit for these datasets, so no query asks
+    /// for more than a day; any failed day fails the whole read rather
+    /// than understating the month.
+    async fn month_to_date(&self) -> Result<MonthTotals, String> {
+        let windows = month_day_windows(self.now)?;
+        futures_util::stream::iter(windows.into_iter().map(|(since, until)| async move {
+            let variables = MonthQueryVars {
+                account_tag: self.account.to_owned(),
+                script_name: WORKER_SCRIPT_NAME.to_owned(),
+                since: format_time(since),
+                until: format_time(until),
+            };
+            let account: AccountGroups =
+                cloudflare::query_account(self.cf_token, WATCHDOG_MONTH_QUERY, &variables)
+                    .await
+                    .map_err(|error| format!("usage {since}..{until}: {error}"))?;
+            Ok::<_, String>(MonthTotals::from(&CfSnapshot::from(account)))
+        }))
+        .buffer_unordered(MONTH_QUERY_CONCURRENCY)
+        .try_fold(MonthTotals::default(), |total, day| async move {
+            Ok(total + day)
+        })
+        .await
     }
 
     // ----- Analytics Engine: DO overloaded events -----
@@ -594,6 +745,7 @@ impl Watcher<'_> {
         let signal = signal("edge.do.overloaded");
         Ok(vec![Reading {
             signal,
+            threshold: None,
             sample: row.points,
             value: row.events,
             evidence: vec![format!(
@@ -705,12 +857,14 @@ impl Watcher<'_> {
         Ok(vec![
             Reading {
                 signal: signal("pipeline.failure_rate"),
+                threshold: None,
                 sample: completed_tasks,
                 value: failure_rate,
                 evidence: evidence_rate,
             },
             Reading {
                 signal: signal("pipeline.retry_storm"),
+                threshold: None,
                 sample: u64::try_from(runs.len()).unwrap_or(u64::MAX),
                 value: retried,
                 evidence: evidence_retry,
@@ -807,12 +961,14 @@ impl Watcher<'_> {
         Ok(vec![
             Reading {
                 signal: signal("pipeline.oldest_pending"),
+                threshold: None,
                 sample: u64::from(status.oldest_pending_seconds.is_some()),
                 value: oldest_pending,
                 evidence: vec![format!("pending={pending}")],
             },
             Reading {
                 signal: signal("pipeline.dispatch_stall"),
+                threshold: None,
                 sample: u64::from(pending),
                 value: f64::from(u8::from(stalled)),
                 evidence: stall_evidence,
@@ -854,6 +1010,7 @@ impl Watcher<'_> {
         }
         Ok(vec![Reading {
             signal: signal("edge.dispatch_frozen"),
+            threshold: None,
             sample: 1,
             value: f64::from(u8::from(freeze.enabled)),
             evidence,
@@ -892,6 +1049,7 @@ impl Watcher<'_> {
             }
             Ok(None) => readings.push(Reading {
                 signal: signal("endpoint.artifact"),
+                threshold: None,
                 sample: 0,
                 value: 0.0,
                 evidence: vec!["no artifacts in the published index".to_owned()],
@@ -933,6 +1091,7 @@ impl Watcher<'_> {
         };
         Reading {
             signal: spec,
+            threshold: None,
             sample: 1,
             value,
             evidence: vec![format!("{path} → {status_text} in {latency_ms:.0}ms")],
@@ -984,6 +1143,105 @@ impl Watcher<'_> {
         }
         Ok(None)
     }
+}
+
+/// The operator-set levels of the hourly-pace alerts, in percent of the
+/// hourly pace, ascending.
+#[derive(Debug, Clone, PartialEq)]
+struct HourlyAlertLevels(Vec<f64>);
+
+impl HourlyAlertLevels {
+    /// Read [`HOURLY_ALERT_ENV`]; unset or empty is the default pair.
+    fn from_env() -> stow_types::error::Result<Self> {
+        match std::env::var(HOURLY_ALERT_ENV) {
+            Ok(text) if !text.trim().is_empty() => Self::parse(&text),
+            _ => Ok(Self(DEFAULT_HOURLY_ALERT_PERCENTS.to_vec())),
+        }
+    }
+
+    /// Parse comma-separated percents. The values carry no ceiling or
+    /// floor — they are the operator's call — but each must be a
+    /// number.
+    fn parse(text: &str) -> stow_types::error::Result<Self> {
+        let mut levels = text
+            .split(',')
+            .map(|part| {
+                part.trim()
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|level| level.is_finite())
+                    .ok_or_else(|| {
+                        stow_error!("{HOURLY_ALERT_ENV}: `{}` is not a number", part.trim())
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        levels.sort_by(f64::total_cmp);
+        Ok(Self(levels))
+    }
+}
+
+/// The billed dimensions summed over a span of the month.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct MonthTotals {
+    do_rows_read: f64,
+    do_rows_written: f64,
+    do_duration_gb_s: f64,
+    do_requests: f64,
+    worker_requests: f64,
+    worker_cpu_ms: f64,
+}
+
+impl From<&CfSnapshot> for MonthTotals {
+    fn from(snapshot: &CfSnapshot) -> Self {
+        Self {
+            do_rows_read: snapshot.do_periodic.rows_read,
+            do_rows_written: snapshot.do_periodic.rows_written,
+            do_duration_gb_s: snapshot.do_periodic.duration,
+            do_requests: snapshot.do_invoke.requests,
+            worker_requests: snapshot.worker.requests,
+            worker_cpu_ms: snapshot.worker.cpu_time_us / 1000.0,
+        }
+    }
+}
+
+impl std::ops::Add for MonthTotals {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            do_rows_read: self.do_rows_read + other.do_rows_read,
+            do_rows_written: self.do_rows_written + other.do_rows_written,
+            do_duration_gb_s: self.do_duration_gb_s + other.do_duration_gb_s,
+            do_requests: self.do_requests + other.do_requests,
+            worker_requests: self.worker_requests + other.worker_requests,
+            worker_cpu_ms: self.worker_cpu_ms + other.worker_cpu_ms,
+        }
+    }
+}
+
+/// The day-bounded `[since, until)` windows from the start of `now`'s
+/// UTC calendar month to `now` — the billing-month anchor: the code
+/// knows no account billing anchor, and Cloudflare's included
+/// allowances are stated per month, so the UTC calendar month is the
+/// month. The last window ends at `now`.
+fn month_day_windows(now: OffsetDateTime) -> Result<Vec<(OffsetDateTime, OffsetDateTime)>, String> {
+    let mut since = now
+        .replace_day(1)
+        .map_err(|error| error.to_string())?
+        .replace_time(time::Time::MIDNIGHT);
+    let mut windows = Vec::new();
+    while since < now {
+        let until = (since + time::Duration::days(1)).min(now);
+        windows.push((since, until));
+        since = until;
+    }
+    Ok(windows)
+}
+
+/// Hours in `now`'s UTC calendar month — the divisor of the hourly
+/// pace.
+fn hours_in_month(now: OffsetDateTime) -> f64 {
+    f64::from(time::util::days_in_month(now.month(), now.year())) * 24.0
 }
 
 /// `now` minus `secs`, rendered the way SQL writes `datetime('now')` —
@@ -1045,7 +1303,22 @@ struct QueryVars {
     now: String,
 }
 
-/// The aliased groups of [`WATCHDOG_QUERY`].
+/// The day-bounded month-to-date usage query — see
+/// [`Watcher::month_to_date`].
+const WATCHDOG_MONTH_QUERY: &str = include_str!("../queries/watchdog_month.graphql");
+
+/// Variables of [`WATCHDOG_MONTH_QUERY`].
+#[derive(Debug, serde::Serialize)]
+struct MonthQueryVars {
+    #[serde(rename = "accountTag")]
+    account_tag: String,
+    #[serde(rename = "scriptName")]
+    script_name: String,
+    since: String,
+    until: String,
+}
+
+/// The aliased groups of [`WATCHDOG_QUERY`] and [`WATCHDOG_MONTH_QUERY`].
 #[derive(Debug, serde::Deserialize)]
 struct AccountGroups {
     #[serde(rename = "doPeriodic", default)]
@@ -1237,16 +1510,145 @@ impl From<AccountGroups> for CfSnapshot {
     }
 }
 
+/// The month-to-date trip reading of one billed dimension.
+fn month_reading(id: &str, allowance: f64, total: f64) -> Reading {
+    let line = allowance * ALLOWANCE_FRACTION;
+    Reading {
+        signal: signal(id),
+        sample: 1,
+        value: total,
+        threshold: None,
+        evidence: vec![format!(
+            "{:.1}% of the 80% line this UTC month ({:.1}% of the allowance)",
+            total / line * 100.0,
+            total / allowance * 100.0
+        )],
+    }
+}
+
+/// The hourly-pace alert reading of one billed dimension: the last
+/// hour's usage against the highest operator level it crossed, or the
+/// lowest level while it crossed none. The hourly pace is the
+/// allowance over the hours of the current month.
+fn hourly_reading(
+    id: &str,
+    allowance: f64,
+    hours: f64,
+    last_hour: f64,
+    levels: &HourlyAlertLevels,
+    context: String,
+) -> Reading {
+    let pace = allowance / hours;
+    let percent = last_hour / pace * 100.0;
+    let level = levels
+        .0
+        .iter()
+        .copied()
+        .rfind(|level| percent >= *level)
+        .or_else(|| levels.0.first().copied())
+        .expect("hourly alert levels are never empty");
+    let mut evidence = vec![format!(
+        "{percent:.0}% of the hourly pace ({pace:.0} per hour); alert level {level}%"
+    )];
+    if !context.is_empty() {
+        evidence.push(context);
+    }
+    Reading {
+        signal: signal(&format!("{id}.hourly")),
+        sample: 1,
+        value: last_hour,
+        threshold: Some(pace * level / 100.0),
+        evidence,
+    }
+}
+
 /// Invocation statuses that mean the Worker failed the request.
 const WORKER_BAD_STATUSES: &[&str] =
     &["scriptThrewException", "internalError", "exceededResources"];
 
 impl CfSnapshot {
-    /// Expand the snapshot into the run's Cloudflare readings — billed
-    /// usage as trips, health as alerts, unbilled diagnostics as
-    /// evidence on the readings that fire.
+    /// Expand the last-hour snapshot and the month-to-date totals into
+    /// the run's Cloudflare readings — the month's billed usage as
+    /// trips, the last hour's pace and health as alerts, unbilled
+    /// diagnostics as evidence on the readings that fire.
     #[allow(clippy::too_many_lines)]
-    fn readings(&self) -> Vec<Reading> {
+    fn readings(
+        &self,
+        month: &MonthTotals,
+        hourly: &HourlyAlertLevels,
+        now: OffsetDateTime,
+    ) -> Vec<Reading> {
+        let hours = hours_in_month(now);
+        let dimensions = [
+            (
+                "cf.do.rows_read",
+                DO_ROWS_READ_MONTHLY,
+                month.do_rows_read,
+                self.do_periodic.rows_read,
+                String::new(),
+            ),
+            (
+                "cf.do.rows_written",
+                DO_ROWS_WRITTEN_MONTHLY,
+                month.do_rows_written,
+                self.do_periodic.rows_written,
+                String::new(),
+            ),
+            (
+                "cf.do.duration_gb_s",
+                DO_DURATION_GB_S_MONTHLY,
+                month.do_duration_gb_s,
+                self.do_periodic.duration,
+                format!(
+                    "activeTime={:.0} cpuTime={:.0} storage: read_units={:.0} write_units={:.0} deletes={:.0} (unbilled context)",
+                    self.do_periodic.active_time,
+                    self.do_periodic.cpu_time,
+                    self.do_periodic.storage_read_units,
+                    self.do_periodic.storage_write_units,
+                    self.do_periodic.storage_deletes,
+                ),
+            ),
+            (
+                "cf.do.requests",
+                DO_REQUESTS_MONTHLY,
+                month.do_requests,
+                self.do_invoke.requests,
+                format!(
+                    "wallTime={:.0} errors={:.0} subrequests={:.0}",
+                    self.do_invoke.wall_time, self.do_invoke.errors, self.do_periodic.subrequests,
+                ),
+            ),
+            (
+                "cf.worker.requests",
+                WORKER_REQUESTS_MONTHLY,
+                month.worker_requests,
+                self.worker.requests,
+                format!(
+                    "subrequests={:.0} (not billed per Workers pricing)",
+                    self.worker.subrequests
+                ),
+            ),
+            (
+                "cf.worker.cpu_ms",
+                WORKER_CPU_MS_MONTHLY,
+                month.worker_cpu_ms,
+                self.worker.cpu_time_us / 1000.0,
+                format!("errors={:.0}", self.worker.errors),
+            ),
+        ];
+        let mut usage = Vec::new();
+        for (id, allowance, month_total, last_hour, context) in dimensions {
+            usage.push(month_reading(id, allowance, month_total));
+            usage.push(hourly_reading(
+                id, allowance, hours, last_hour, hourly, context,
+            ));
+        }
+        usage.extend(self.health_readings());
+        usage
+    }
+
+    /// The DO/Worker health alerts over the last 15 minutes and hour.
+    fn health_readings(&self) -> Vec<Reading> {
         let do_exceeded = self.do_periodic.exceeded_cpu_errors
             + self.do_periodic.exceeded_memory_errors
             + self.do_periodic.fatal_internal_errors;
@@ -1279,68 +1681,22 @@ impl CfSnapshot {
             .join(" ");
         vec![
             Reading {
-                signal: signal("cf.do.rows_read"),
-                sample: 1,
-                value: self.do_periodic.rows_read,
-                evidence: vec![],
-            },
-            Reading {
-                signal: signal("cf.do.rows_written"),
-                sample: 1,
-                value: self.do_periodic.rows_written,
-                evidence: vec![],
-            },
-            Reading {
-                signal: signal("cf.do.duration_gb_s"),
-                sample: 1,
-                value: self.do_periodic.duration,
-                evidence: vec![format!(
-                    "activeTime={:.0} cpuTime={:.0} storage: read_units={:.0} write_units={:.0} deletes={:.0} (unbilled context)",
-                    self.do_periodic.active_time,
-                    self.do_periodic.cpu_time,
-                    self.do_periodic.storage_read_units,
-                    self.do_periodic.storage_write_units,
-                    self.do_periodic.storage_deletes,
-                )],
-            },
-            Reading {
-                signal: signal("cf.do.requests"),
-                sample: 1,
-                value: self.do_invoke.requests,
-                evidence: vec![format!(
-                    "wallTime={:.0} errors={:.0} subrequests={:.0}",
-                    self.do_invoke.wall_time, self.do_invoke.errors, self.do_periodic.subrequests,
-                )],
-            },
-            Reading {
-                signal: signal("cf.worker.requests"),
-                sample: 1,
-                value: self.worker.requests,
-                evidence: vec![format!(
-                    "subrequests={:.0} (not billed per Workers pricing)",
-                    self.worker.subrequests
-                )],
-            },
-            Reading {
-                signal: signal("cf.worker.cpu_ms"),
-                sample: 1,
-                value: self.worker.cpu_time_us / 1000.0,
-                evidence: vec![format!("errors={:.0}", self.worker.errors)],
-            },
-            Reading {
                 signal: signal("edge.worker.errors"),
+                threshold: None,
                 sample: request_sample,
                 value: error_share,
                 evidence: vec![status_evidence.clone()],
             },
             Reading {
                 signal: signal("edge.worker.exceeded"),
+                threshold: None,
                 sample: request_sample,
                 value: exceeded_requests,
                 evidence: vec![status_evidence],
             },
             Reading {
                 signal: signal("edge.do.exceeded"),
+                threshold: None,
                 sample: 1,
                 value: do_exceeded,
                 evidence: vec![format!(
@@ -1497,13 +1853,18 @@ fn select_trip_set(reads: &[TripState]) -> (BTreeSet<String>, Vec<String>) {
 /// Trip the breaker: disable every dispatching workflow that reads
 /// `active` — the returned set is the trip's record, which the incident
 /// issue carries for `clear` to restore — then enable the
-/// zone's `stow maintenance: anonymous` WAF rule — the shed happens in the
+/// zone's WAF rule for `scope`, the widest scope of the breaching
+/// signals — the shed happens in the
 /// security phase, before the Worker, so a broken edge cannot keep the
 /// breaker open. Both kinds of failure are collected — one failed disable
 /// never skips the rule enable. A workflow whose disable write failed
 /// stays in the record regardless: it read `active`, so enabling it is
 /// always the right restore.
-async fn apply_trip(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) -> BTreeSet<String> {
+async fn apply_trip(
+    watcher: &Watcher<'_>,
+    scope: MaintenanceScope,
+    outcome: &mut ApplyOutcome,
+) -> BTreeSet<String> {
     let (disabled, read_failures) = select_trip_set(&read_trip_states(watcher.gh_token).await);
     outcome.failures.extend(read_failures);
     let writes = disabled.iter().map(|workflow| async move {
@@ -1522,18 +1883,11 @@ async fn apply_trip(watcher: &Watcher<'_>, outcome: &mut ApplyOutcome) -> BTreeS
                 .push(format!("disable {workflow}: {error}")),
         }
     }
-    match maintenance::set_scope(
-        watcher.cf_token,
-        watcher.zone,
-        MaintenanceScope::Anonymous,
-        true,
-        watcher.host,
-    )
-    .await
-    {
-        Ok(_) => outcome
-            .actions
-            .push("maintenance rule `stow maintenance: anonymous` enabled".to_owned()),
+    match maintenance::set_scope(watcher.cf_token, watcher.zone, scope, true, watcher.host).await {
+        Ok(_) => outcome.actions.push(format!(
+            "maintenance rule `{}` enabled",
+            scope.description()
+        )),
         Err(error) => outcome
             .failures
             .push(format!("enable maintenance rule: {error}")),
@@ -1550,21 +1904,24 @@ async fn apply_clear(
     restore: &BTreeSet<String>,
     outcome: &mut ApplyOutcome,
 ) {
-    match maintenance::set_scope(
-        watcher.cf_token,
-        watcher.zone,
-        MaintenanceScope::Anonymous,
-        false,
-        watcher.host,
-    )
-    .await
-    {
-        Ok(_) => outcome
-            .actions
-            .push("maintenance rule `stow maintenance: anonymous` disabled".to_owned()),
-        Err(error) => outcome
-            .failures
-            .push(format!("disable maintenance rule: {error}")),
+    // Each scope is its own rule, patched by id, so the lifts are independent.
+    let lifts = TRIP_SCOPES.map(|scope| async move {
+        let result =
+            maintenance::set_scope(watcher.cf_token, watcher.zone, scope, false, watcher.host)
+                .await;
+        (scope, result)
+    });
+    for (scope, result) in futures_util::future::join_all(lifts).await {
+        match result {
+            Ok(_) => outcome.actions.push(format!(
+                "maintenance rule `{}` disabled",
+                scope.description()
+            )),
+            Err(error) => outcome.failures.push(format!(
+                "disable maintenance rule `{}`: {error}",
+                scope.description()
+            )),
+        }
     }
     let enables = restore.iter().map(|workflow| async move {
         let result = github::put(
@@ -1954,23 +2311,22 @@ fn fmt_value(value: f64, unit: &str) -> String {
 
 /// `Reading` → `BreachView`.
 fn breach_view(reading: &Reading) -> BreachView<'_> {
-    let window = if reading.signal.window_secs == 0 {
-        "now".to_owned()
-    } else if reading.signal.window_secs.is_multiple_of(3600) {
-        format!("{}h", reading.signal.window_secs / 3600)
-    } else {
-        format!("{}m", reading.signal.window_secs / 60)
+    let window = match reading.signal.window {
+        Window::Now => "now".to_owned(),
+        Window::MonthToDate => "month".to_owned(),
+        Window::Last(secs) if secs.is_multiple_of(3600) => format!("{}h", secs / 3600),
+        Window::Last(secs) => format!("{}m", secs / 60),
     };
     BreachView {
         id: reading.signal.id,
         label: reading.signal.label,
         effect: match reading.signal.effect {
-            Effect::Trip => "trip",
+            Effect::Trip(_) => "trip",
             Effect::Alert => "alert",
         },
         window,
         observed: fmt_value(reading.value, reading.signal.unit),
-        threshold: fmt_value(reading.signal.threshold, reading.signal.unit),
+        threshold: fmt_value(reading.threshold(), reading.signal.unit),
         evidence: &reading.evidence,
     }
 }
@@ -2231,6 +2587,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
     let zone = maintenance::zone_id()?;
     let host = maintenance::host_from_url(edge.base()).map_err(|error| stow_error!("{error}"))?;
     let sql_base = cloudflare::analytics_sql_base()?;
+    let hourly_levels = HourlyAlertLevels::from_env()?;
     let watcher = Watcher {
         edge,
         gh_token: &gh_token,
@@ -2242,7 +2599,7 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         now: OffsetDateTime::now_utc(),
     };
 
-    let (readings, collect_failures) = watcher.collect().await;
+    let (readings, collect_failures) = watcher.collect(&hourly_levels).await;
     let decision = decide(&readings, &collect_failures);
     let mut outcome = ApplyOutcome::default();
     let now_text = format_time(watcher.now);
@@ -2280,11 +2637,17 @@ async fn watch(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
                 }
             }
             outcome.failures.extend(read_failures);
+            let scope = decision
+                .trip_scope
+                .expect("a tripped decision carries a scope");
             outcome
                 .actions
-                .push("would enable `stow maintenance: anonymous`".to_owned());
+                .push(format!("would enable `{}`", scope.description()));
         } else {
-            disabled = apply_trip(&watcher, &mut outcome).await;
+            let scope = decision
+                .trip_scope
+                .expect("a tripped decision carries a scope");
+            disabled = apply_trip(&watcher, scope, &mut outcome).await;
         }
 
         let mut failure_lines: Vec<String> = collect_failures
@@ -2573,9 +2936,11 @@ async fn clear(edge: &Edge, dry_run: bool, output: Output) -> stow_types::error:
         }
     };
     if dry_run {
-        outcome
-            .actions
-            .push("would disable `stow maintenance: anonymous`".to_owned());
+        for scope in TRIP_SCOPES {
+            outcome
+                .actions
+                .push(format!("would disable `{}`", scope.description()));
+        }
         for workflow in &restore {
             outcome.actions.push(format!("would enable {workflow}"));
         }
@@ -2942,25 +3307,209 @@ mod tests {
     fn reading(id: &str, sample: u64, value: f64) -> Reading {
         Reading {
             signal: signal(id),
+            threshold: None,
             sample,
             value,
             evidence: vec![],
         }
     }
 
-    /// Trip: a billed usage dimension over its hourly share → the
-    /// decision is incident + tripped.
+    /// Trip: a billed usage dimension's month-to-date total over the 80%
+    /// line → the decision is incident + tripped.
     #[test]
-    fn usage_over_allowance_trips() {
+    fn month_over_the_line_trips() {
         let readings = vec![reading(
             "cf.do.rows_written",
             1,
-            DO_ROWS_WRITTEN_MONTHLY / HOURS_PER_MONTH * 2.0,
+            DO_ROWS_WRITTEN_MONTHLY * ALLOWANCE_FRACTION,
         )];
         let decision = decide(&readings, &[]);
         assert!(decision.incident);
         assert_eq!(decision.tripped.len(), 1);
         assert_eq!(decision.alerting, [] as [usize; 0]);
+    }
+
+    /// Every billed dimension trips on a month total at the line and
+    /// stays clear just under it.
+    #[test]
+    fn every_billed_dimension_trips_at_the_line() {
+        for (id, allowance) in [
+            ("cf.do.rows_read", DO_ROWS_READ_MONTHLY),
+            ("cf.do.rows_written", DO_ROWS_WRITTEN_MONTHLY),
+            ("cf.do.duration_gb_s", DO_DURATION_GB_S_MONTHLY),
+            ("cf.do.requests", DO_REQUESTS_MONTHLY),
+            ("cf.worker.requests", WORKER_REQUESTS_MONTHLY),
+            ("cf.worker.cpu_ms", WORKER_CPU_MS_MONTHLY),
+        ] {
+            let line = allowance * ALLOWANCE_FRACTION;
+            let under = decide(&[reading(id, 1, line * 0.99)], &[]);
+            assert!(!under.incident, "{id} just under the line");
+            let over = decide(&[reading(id, 1, line)], &[]);
+            assert_eq!(over.tripped.len(), 1, "{id} at the line");
+        }
+    }
+
+    /// The DO duration guard can fire: a month of one 128 MB object
+    /// billed continuously is 0.125 GB x 3600 s x 24 x 30 = 324k GB-s,
+    /// past the 320k line — and the guard reads exactly that total.
+    #[test]
+    fn duration_guard_can_fire() {
+        let month = MonthTotals {
+            do_duration_gb_s: 0.125 * 3600.0 * 24.0 * 30.0,
+            ..MonthTotals::default()
+        };
+        let readings = CfSnapshot::default().readings(&month, &levels(), october_29());
+        let tripped: Vec<_> = decide(&readings, &[])
+            .tripped
+            .iter()
+            .map(|&i| readings[i].signal.id)
+            .collect();
+        assert_eq!(tripped, ["cf.do.duration_gb_s"]);
+    }
+
+    fn levels() -> HourlyAlertLevels {
+        HourlyAlertLevels(DEFAULT_HOURLY_ALERT_PERCENTS.to_vec())
+    }
+
+    fn october_29() -> OffsetDateTime {
+        time::Date::from_calendar_date(2026, time::Month::October, 29)
+            .unwrap()
+            .with_hms(0, 38, 0)
+            .unwrap()
+            .assume_utc()
+    }
+
+    /// A snapshot whose last hour used `multiple` x the hourly pace of
+    /// every DO and Worker dimension.
+    fn hour_at(multiple: f64, now: OffsetDateTime) -> CfSnapshot {
+        let hours = hours_in_month(now);
+        let mut snapshot = CfSnapshot::default();
+        snapshot.do_periodic.rows_read = DO_ROWS_READ_MONTHLY / hours * multiple;
+        snapshot.do_periodic.rows_written = DO_ROWS_WRITTEN_MONTHLY / hours * multiple;
+        snapshot.do_periodic.duration = DO_DURATION_GB_S_MONTHLY / hours * multiple;
+        snapshot.do_invoke.requests = DO_REQUESTS_MONTHLY / hours * multiple;
+        snapshot.worker.requests = WORKER_REQUESTS_MONTHLY / hours * multiple;
+        snapshot.worker.cpu_time_us = WORKER_CPU_MS_MONTHLY * 1000.0 / hours * multiple;
+        snapshot
+    }
+
+    /// The 2026-10-29 incident: 1.4k DO requests in an hour against
+    /// 1,389 tripped the old hourly share. A peak hour or a wave with
+    /// the month under the line alerts at its pace level and never
+    /// trips.
+    #[test]
+    fn a_within_budget_peak_hour_alerts_and_never_trips() {
+        let now = october_29();
+        // The month so far is at 10% of the line on every dimension.
+        let month = MonthTotals {
+            do_rows_read: DO_ROWS_READ_MONTHLY * 0.08,
+            do_rows_written: DO_ROWS_WRITTEN_MONTHLY * 0.08,
+            do_duration_gb_s: DO_DURATION_GB_S_MONTHLY * 0.08,
+            do_requests: DO_REQUESTS_MONTHLY * 0.08,
+            worker_requests: WORKER_REQUESTS_MONTHLY * 0.08,
+            worker_cpu_ms: WORKER_CPU_MS_MONTHLY * 0.08,
+        };
+        let readings = hour_at(10.0, now).readings(&month, &levels(), now);
+        let decision = decide(&readings, &[]);
+        assert_eq!(decision.tripped, [] as [usize; 0]);
+        assert_eq!(decision.trip_scope, None);
+        let alerting: BTreeSet<_> = decision
+            .alerting
+            .iter()
+            .map(|&i| readings[i].signal.id)
+            .collect();
+        assert_eq!(alerting.len(), 6);
+        assert!(alerting.iter().all(|id| id.ends_with(".hourly")));
+    }
+
+    /// The hourly view alerts at 200% and again at 300% of the pace
+    /// (reporting the higher level), and not below 200%.
+    #[test]
+    fn hourly_pace_alerts_at_the_set_levels() {
+        let now = october_29();
+        let month = MonthTotals::default();
+        let breaches = |multiple: f64, levels: &HourlyAlertLevels| {
+            let readings = hour_at(multiple, now).readings(&month, levels, now);
+            let decision = decide(&readings, &[]);
+            assert_eq!(decision.tripped, [] as [usize; 0]);
+            decision
+                .alerting
+                .iter()
+                .map(|&i| (readings[i].signal.id, readings[i].threshold()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(breaches(1.9, &levels()), []);
+        let at_200 = breaches(2.5, &levels());
+        assert_eq!(at_200.len(), 6);
+        let pace = DO_REQUESTS_MONTHLY / hours_in_month(now);
+        let requests = at_200
+            .iter()
+            .find(|(id, _)| *id == "cf.do.requests.hourly")
+            .unwrap();
+        assert!(pace.mul_add(-2.0, requests.1).abs() < 1e-6);
+        let at_300 = breaches(3.5, &levels());
+        let requests = at_300
+            .iter()
+            .find(|(id, _)| *id == "cf.do.requests.hourly")
+            .unwrap();
+        assert!(pace.mul_add(-3.0, requests.1).abs() < 1e-6);
+        // An operator-set level replaces the default with no guard.
+        let custom = HourlyAlertLevels::parse("50, 1000").unwrap();
+        assert_eq!(custom, HourlyAlertLevels(vec![50.0, 1000.0]));
+        assert_eq!(breaches(0.6, &custom).len(), 6);
+        assert!(HourlyAlertLevels::parse("two hundred").is_err());
+    }
+
+    /// The month window starts at the UTC month's first midnight, is cut
+    /// in contiguous day-bounded windows and ends at `now`.
+    #[test]
+    fn month_windows_are_day_bounded_and_contiguous() {
+        let now = october_29();
+        let windows = month_day_windows(now).unwrap();
+        assert_eq!(windows.len(), 29);
+        assert_eq!(
+            windows[0].0,
+            time::Date::from_calendar_date(2026, time::Month::October, 1)
+                .unwrap()
+                .midnight()
+                .assume_utc()
+        );
+        assert_eq!(windows.last().unwrap().1, now);
+        for pair in windows.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+        for (since, until) in &windows {
+            assert!(*until - *since <= time::Duration::days(1));
+        }
+        assert_eq!(hours_in_month(now), 31.0 * 24.0);
+    }
+
+    fn scope_of(ids: &[&str]) -> Option<MaintenanceScope> {
+        let readings: Vec<_> = ids.iter().map(|id| reading(id, 1_000_000, 1e18)).collect();
+        decide(&readings, &[]).trip_scope
+    }
+
+    /// A DO-billed breach sheds only the scheduler lanes; a Worker-billed
+    /// one sheds the anonymous surface; mixed breaches take the widest.
+    #[test]
+    fn trip_scope_follows_the_cost() {
+        assert_eq!(
+            scope_of(&["cf.do.rows_read", "cf.do.requests"]),
+            Some(MaintenanceScope::Lanes)
+        );
+        assert_eq!(
+            scope_of(&["cf.worker.cpu_ms"]),
+            Some(MaintenanceScope::Anonymous)
+        );
+        assert_eq!(
+            scope_of(&["cf.do.duration_gb_s", "cf.worker.requests"]),
+            Some(MaintenanceScope::Anonymous)
+        );
+        assert_eq!(
+            scope_of(&["pipeline.failure_rate"]),
+            Some(MaintenanceScope::Lanes)
+        );
+        assert_eq!(scope_of(&["endpoint.stats"]), None);
     }
 
     /// Below threshold → clear, no incident.
@@ -3044,11 +3593,17 @@ mod tests {
         let envelope: cloudflare::Envelope<AccountGroups> = serde_json::from_str(json).unwrap();
         let account = envelope.into_account().unwrap();
         let snapshot = CfSnapshot::from(account);
-        let readings = snapshot.readings();
+        // Read as the month so far: rows_read 40G is past the 20G line.
+        let month = MonthTotals::from(&snapshot);
+        let readings = snapshot.readings(&month, &levels(), october_29());
         let decision = decide(&readings, &[]);
         assert!(decision.incident);
-        // rows_read 40G > 34.7M threshold and worker 15k req > 13.9k → trips
-        assert!(decision.tripped.len() >= 2);
+        let tripped: Vec<_> = decision
+            .tripped
+            .iter()
+            .map(|&i| readings[i].signal.id)
+            .collect();
+        assert_eq!(tripped, ["cf.do.rows_read"]);
         // 4/104 scriptThrew = 3.8% > 2% → alert
         assert_eq!(
             decision
@@ -3056,7 +3611,7 @@ mod tests {
                 .iter()
                 .map(|&i| readings[i].signal.id)
                 .collect::<Vec<_>>(),
-            vec!["edge.worker.errors"]
+            vec!["cf.do.rows_read.hourly", "edge.worker.errors"]
         );
     }
 
@@ -3230,6 +3785,7 @@ mod tests {
     fn non_200_is_a_breach() {
         let reading = Reading {
             signal: signal("endpoint.stats"),
+            threshold: None,
             sample: 1,
             value: 5000.0,
             evidence: vec![],
