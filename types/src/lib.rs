@@ -27,6 +27,7 @@ pub mod identity;
 pub mod index;
 pub mod launch_model;
 pub mod local_ci;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod native_capture;
 pub mod platform;
 pub mod pow;
