@@ -96,6 +96,24 @@ invocation without them keeps the key it produced before they were modeled:
   `embed-bitcode=no` to every unit no LTO consumer needs bitcode from, and
   a unit whose consumer runs LTO carries `-C linker-plugin-lto`, which is
   custom codegen and never cached.
+- `rustc-check-defaults` only when the profile differs from the dev profile
+  (`opt-level` other than `0`, or debug assertions off). rustc turns debug
+  assertions on only at `opt-level=0` and overflow checks follow them; keys
+  stored while those defaults were mislabeled carry no tag and so never
+  answer a request keyed after the correction.
+- `extra_codegen` keeps its argv order: rustc applies repeated `-C
+  target-feature` options left to right.
+
+A semantic match (version upgrade, emit cover, feature superset) compares
+the typed fields the rows carry, then proves the stand-in was compiled with
+the request's own cfgs, extra codegen and link options: the key it would
+carry under them (`types/src/upload_plan.rs::candidate_compile_key`) must be
+the key it does carry. The candidate's build-script cfgs and link arguments
+come from its captured `cargo:` output (the request's own for a candidate
+of the same version and feature set), so a feature-dependent cfg never
+blocks superset serving. Published nodes never carry a consumer cfg, extra
+codegen or `embed-metadata`; the capture wrapper refuses to build one that
+does, and the CLI does not download for a request that does.
 
 Link-affecting options sit in a grid on the key rather than refusing the
 cache: the grid applies only where the unit actually links (proc-macro,

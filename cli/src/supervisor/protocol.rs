@@ -66,6 +66,11 @@ pub struct InvocationEnv {
     /// reads the manifest path inside the checkout from it rather than
     /// probing ancestor directories for a `Cargo.toml`.
     pub manifest_dir: Option<Vec<u8>>,
+    /// The invocation's `OUT_DIR` — set on the units of a crate with a
+    /// build script — OS-encoded like the argv. The output file beside it
+    /// says which `--cfg` and link arguments the build script, rather than
+    /// the consumer, put on the command line (stow#1047).
+    pub out_dir: Option<Vec<u8>>,
 }
 
 impl InvocationEnv {
@@ -77,6 +82,7 @@ impl InvocationEnv {
             primary_package: std::env::var_os("CARGO_PRIMARY_PACKAGE").is_some(),
             manifest_dir: std::env::var_os("CARGO_MANIFEST_DIR")
                 .map(|value| os_bytes::encode(&value)),
+            out_dir: std::env::var_os("OUT_DIR").map(|value| os_bytes::encode(&value)),
         }
     }
 
@@ -87,6 +93,18 @@ impl InvocationEnv {
     /// When the peer's encoding is not decodable on this platform.
     pub fn manifest_dir(&self) -> Result<Option<std::path::PathBuf>, String> {
         self.manifest_dir
+            .as_ref()
+            .map(|bytes| os_bytes::decode(bytes).map(std::path::PathBuf::from))
+            .transpose()
+    }
+
+    /// The decoded `OUT_DIR`.
+    ///
+    /// # Errors
+    ///
+    /// When the peer's encoding is not decodable on this platform.
+    pub fn out_dir(&self) -> Result<Option<std::path::PathBuf>, String> {
+        self.out_dir
             .as_ref()
             .map(|bytes| os_bytes::decode(bytes).map(std::path::PathBuf::from))
             .transpose()

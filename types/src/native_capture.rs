@@ -44,6 +44,43 @@ pub fn capture_native_artifacts(
     let Some(out_dir) = build_script_out_dir else {
         return Ok(None);
     };
+    let (build_dir, out_dir_name) = open_build_dir(crate_name, out_dir)?;
+    let cargo_directives = read_directives_in(crate_name, &build_dir, out_dir)?;
+    let (static_libs, out_dir_files) = match OutDirRoot::open_in(&build_dir, out_dir_name)? {
+        Some(root) => root.collect()?,
+        None => (Vec::new(), Vec::new()),
+    };
+    Ok(Some(NativeArtifacts {
+        static_libs,
+        cargo_directives,
+        dep_env_vars: BTreeMap::new(),
+        out_dir_files,
+        original_out_dir: out_dir.to_path_buf(),
+    }))
+}
+
+/// The `cargo:` directive lines the build script that owns `out_dir` wrote
+/// to its `output` file, which sits beside `out_dir`, read without following
+/// a symlink.
+///
+/// # Errors
+///
+/// An `out_dir` with no sibling `output` file is an error: cargo always
+/// runs the build script (and writes `output`) before compiling the
+/// crate, so its absence means the directory is not what cargo promised.
+pub fn read_build_script_directives(
+    crate_name: &str,
+    out_dir: &Path,
+) -> crate::error::Result<Vec<String>> {
+    let (build_dir, _) = open_build_dir(crate_name, out_dir)?;
+    read_directives_in(crate_name, &build_dir, out_dir)
+}
+
+/// The build dir that holds `out_dir`, as a handle, and `out_dir`'s name in it.
+fn open_build_dir<'a>(
+    crate_name: &str,
+    out_dir: &'a Path,
+) -> crate::error::Result<(Dir, &'a OsStr)> {
     let build_dir_path = out_dir.parent().ok_or_else(|| {
         crate::stow_error!(
             "build script OUT_DIR {} for {crate_name} has no parent build dir",
@@ -58,9 +95,17 @@ pub fn capture_native_artifacts(
     })?;
     let build_dir = Dir::open_ambient_dir(build_dir_path, ambient_authority())
         .wrap_err_with(|| format!("open build dir {}", build_dir_path.display()))?;
+    Ok((build_dir, out_dir_name))
+}
 
-    let output_path = build_dir_path.join("output");
-    let mut output_file = open_regular(&build_dir, OsStr::new("output")).map_err(|error| {
+/// Parse the `output` file in `build_dir`, refusing a symlink.
+fn read_directives_in(
+    crate_name: &str,
+    build_dir: &Dir,
+    out_dir: &Path,
+) -> crate::error::Result<Vec<String>> {
+    let output_path = out_dir.with_file_name("output");
+    let mut output_file = open_regular(build_dir, OsStr::new("output")).map_err(|error| {
         crate::stow_error!(
             "build script output file {} for {crate_name} is unreadable or missing: {error}",
             output_path.display()
@@ -70,18 +115,7 @@ pub fn capture_native_artifacts(
     output_file
         .read_to_string(&mut raw)
         .wrap_err_with(|| format!("read build script output {}", output_path.display()))?;
-    let cargo_directives = parse_build_script_output(&raw);
-    let (static_libs, out_dir_files) = match OutDirRoot::open_in(&build_dir, out_dir_name)? {
-        Some(root) => root.collect()?,
-        None => (Vec::new(), Vec::new()),
-    };
-    Ok(Some(NativeArtifacts {
-        static_libs,
-        cargo_directives,
-        dep_env_vars: BTreeMap::new(),
-        out_dir_files,
-        original_out_dir: out_dir.to_path_buf(),
-    }))
+    Ok(parse_build_script_output(&raw))
 }
 
 /// A build script's `OUT_DIR`, held as a directory handle.

@@ -176,9 +176,9 @@ pub struct UnitEvidence<'a> {
     /// `cargo:rustc-cfg=feature="…"` lines the unit's build script
     /// printed. Evidence only; the resolved set is the graph's (stow#615).
     pub feature_scan: &'a BTreeSet<String>,
-    /// The profile the invocation compiles with — normalized the way the
-    /// unit graph states it (`unit.profile`), so the two compare like
-    /// for like (stow#596).
+    /// The profile the invocation compiles with — rustc's real flag
+    /// defaults applied, the way the unit graph states `unit.profile`,
+    /// so the two compare like for like (stow#596).
     pub profile: Profile,
 }
 
@@ -199,25 +199,9 @@ impl<'a> UnitEvidence<'a> {
             version,
             spelled_target: parsed.target.is_some(),
             feature_scan: &parsed.features,
-            profile: invocation_profile(parsed)?,
+            profile: parsed.profile()?,
         })
     }
-}
-
-/// The profile the invocation compiles with, normalized like the unit
-/// graph's `unit.profile` — rustc's real flag defaults applied to
-/// absent codegen flags: `-C debug-assertions` is on only at
-/// `opt-level=0` and `-C overflow-checks` follows it.
-///
-/// [`ParsedRustcArgs::profile`] cannot supply this: it defaults both to
-/// `true` when the flag is absent, which no `opt-level != 0` unit runs
-/// with — its values ride the compile key, so the defect stays there
-/// and is corrected here instead (stow#596).
-fn invocation_profile(parsed: &ParsedRustcArgs) -> Result<Profile, String> {
-    let mut profile = parsed.profile()?;
-    profile.debug_assertions = parsed.debug_assertions.unwrap_or(profile.opt_level == "0");
-    profile.overflow_checks = parsed.overflow_checks.unwrap_or(profile.debug_assertions);
-    Ok(profile)
 }
 
 /// Which node of `nodes` the compiled unit `unit` is — the side it
