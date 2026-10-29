@@ -33,6 +33,10 @@ const DISPATCH_STUB = String.raw`
 const runs = new Map();
 let nextRunId = 4242;
 
+// The key set the mock OIDC issuer serves, and how often it was read.
+let jwks = { keys: [] };
+let jwksFetches = 0;
+
 // types/src/runs.rs VERDICT_STEPS — the steps that run the crate or
 // judge its outputs.
 const VERDICT_STEPS = [
@@ -122,6 +126,22 @@ export default {
 		// in its last-but-one leg, and that run's task is the only task
 		// the tag may answer for.
 		if (url.port === "28123") {
+			// The OIDC issuer's key set the bearer check fetches
+			// (STOW_GITHUB_API_URL), set and counted by oidc.test.ts through
+			// the control routes: the JWKS is the test's, and the fetch count
+			// shows what the edge's per-isolate key cache absorbed.
+			if (url.pathname === "/__control/jwks") {
+				if (request.method === "POST") {
+					jwks = await request.json();
+					jwksFetches = 0;
+					return new Response(null, { status: 204 });
+				}
+				return Response.json({ fetches: jwksFetches });
+			}
+			if (url.pathname === "/.well-known/jwks") {
+				jwksFetches++;
+				return Response.json(jwks);
+			}
 			const match = url.pathname.match(
 				/^\/v2\/[^/]+\/[^/]+\/manifests\/(records-.+)$/,
 			);

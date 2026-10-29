@@ -168,7 +168,7 @@ fn worker(
             oidc_audience: env_binding::required_string(env, STOW_OIDC_AUDIENCE_BINDING),
             probe_base_url,
         }))
-        .with(State(github_auth::Jwks::default()))
+        .with(State(github_auth::CfJwks::default()))
         .with(State(github_auth::PushVerdicts::default()))
         .with(State(webhook::WebhookSecret(env_binding::required_string(
             env,

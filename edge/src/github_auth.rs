@@ -24,10 +24,12 @@
 //!   re-probing GitHub on every request is what got the probe
 //!   rate-limited in production.
 //!
-//! Signature verification, claims validation, and the per-isolate caches
-//! (signing keys, push verdicts) are pure and host-tested; only the two
-//! upstream GETs (JWKS, repo permission) go through the injectable
-//! [`GitHubTrustApi`].
+//! Claims validation and the per-isolate caches (signing keys, push
+//! verdicts) are pure and host-tested. Everything that needs the platform
+//! goes through the injectable [`GitHubTrustApi`]: the two upstream GETs
+//! (JWKS, repo permission) and the RS256 check itself, which the Worker
+//! runs on `WebCrypto` (`crypto.subtle`) with the imported key cached
+//! beside the JWKS entry, so a known `kid` costs no key import.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -221,6 +223,18 @@ pub enum AuthError {
 /// host-verified. `Sync` + `Send` bounds mirror `CratesIo`: `&impl
 /// GitHubTrustApi` must stay sendable across awaits inside extractors.
 pub trait GitHubTrustApi: Sync {
+    /// A signing key imported for verification, cached per `kid`.
+    type Key: Clone + Send + Sync;
+    /// Import `jwk` as a key that only verifies RS256.
+    fn import_key(&self, jwk: &Jwk) -> impl Future<Output = Result<Self::Key, AuthError>> + Send;
+    /// Verify the RS256 `signature` over `signing_input` with `key`;
+    /// any failure is [`AuthError::Unauthorized`].
+    fn verify_rs256(
+        &self,
+        key: &Self::Key,
+        signing_input: &[u8],
+        signature: &[u8],
+    ) -> impl Future<Output = Result<(), AuthError>> + Send;
     /// The current GitHub Actions OIDC signing keys.
     fn jwks(&self) -> impl Future<Output = Result<JwkSet, AuthError>> + Send;
     /// A caller label for `token` when it has push access to `repo`,
@@ -239,10 +253,10 @@ pub trait GitHubTrustApi: Sync {
 /// repo's push capability. The probe's verdict is served from
 /// `push_verdicts` when fresh — a cached hit carries its caller label and
 /// makes zero GitHub calls.
-pub async fn authenticate(
+pub async fn authenticate<A: GitHubTrustApi>(
     config: &GitHubTrustConfig,
-    api: &impl GitHubTrustApi,
-    jwks: &Jwks,
+    api: &A,
+    jwks: &Jwks<A::Key>,
     push_verdicts: &PushVerdicts,
     bearer: &str,
     now_unix: i64,
@@ -269,30 +283,60 @@ pub async fn authenticate(
     }
 }
 
-/// The OIDC path: resolve the header `kid` against the cached keyset —
-/// fetching the JWKS once on a miss — verify RS256, then check every claim
-/// that pins the token to this deployment — issuer, audience, repo,
-/// expiry — and that the job's workflow lives in the repo.
-async fn authenticate_oidc(
+/// The OIDC path: pin the claims to this deployment, resolve the header
+/// `kid` against the cached keyset (fetching the JWKS once on a miss),
+/// then verify RS256.
+async fn authenticate_oidc<A: GitHubTrustApi>(
     config: &GitHubTrustConfig,
-    api: &impl GitHubTrustApi,
-    jwks: &Jwks,
+    api: &A,
+    jwks: &Jwks<A::Key>,
     token: &str,
     now_unix: i64,
 ) -> Result<TrustedCaller, AuthError> {
     let (header, signing_input, signature, claims) = decode_jwt(token)?;
-    // An unknown or expired `kid` refreshes the set exactly once; a `kid`
-    // still missing after the fresh fetch is a bad credential, not a
-    // refetch loop.
-    let key = if let Some(key) = jwks.key_for(&header.kid, now_unix) {
-        key
+    // The claims are checked before the signature: a token that does not
+    // name this deployment is refused without a key lookup or any crypto.
+    let caller = validate_claims(config, claims, now_unix)?;
+    let key = resolve_key(api, jwks, &header.kid, now_unix).await?;
+    api.verify_rs256(&key, signing_input.as_bytes(), &signature)
+        .await?;
+    Ok(caller)
+}
+
+/// The imported key for `kid`. An unknown or expired `kid` refreshes the
+/// set exactly once; a `kid` still missing after the fresh fetch is a bad
+/// credential, not a refetch loop. A listed key is imported on first use
+/// and kept beside its JWKS entry.
+async fn resolve_key<A: GitHubTrustApi>(
+    api: &A,
+    jwks: &Jwks<A::Key>,
+    kid: &str,
+    now_unix: i64,
+) -> Result<A::Key, AuthError> {
+    let lookup = if let Some(lookup) = jwks.lookup(kid, now_unix) {
+        lookup
     } else {
         jwks.replace_all(api.jwks().await?, now_unix);
-        jwks.key_for(&header.kid, now_unix)
-            .ok_or(AuthError::Unauthorized)?
+        jwks.lookup(kid, now_unix).ok_or(AuthError::Unauthorized)?
     };
-    verify_rs256(&key, signing_input.as_bytes(), &signature)?;
+    match lookup {
+        Lookup::Imported(key) => Ok(key),
+        Lookup::Listed(jwk) => {
+            let key = api.import_key(&jwk).await?;
+            jwks.keep_import(&jwk, &key);
+            Ok(key)
+        }
+    }
+}
 
+/// Every claim that pins the token to this deployment — issuer, audience,
+/// repo, expiry — and that the job's workflow lives in the repo. Pure:
+/// the signature is a separate check.
+fn validate_claims(
+    config: &GitHubTrustConfig,
+    claims: OidcClaims,
+    now_unix: i64,
+) -> Result<TrustedCaller, AuthError> {
     if claims.iss != OIDC_ISSUER
         || !claims.aud.contains(&config.oidc_audience)
         || claims.exp + CLOCK_LEEWAY_SECS <= now_unix
@@ -417,32 +461,76 @@ pub struct JwkSet {
 }
 
 /// A fetched signing key held in isolate memory until `expires_at_unix`
-/// (epoch seconds).
+/// (epoch seconds), with its imported form once a request has used it.
 #[derive(Debug, Clone)]
-struct CachedKey {
+struct CachedKey<K> {
     jwk: Jwk,
+    imported: Option<K>,
     expires_at_unix: i64,
 }
 
-/// Per-isolate cache of GitHub's OIDC signing keys keyed by `kid`.
+/// What the cache holds for a `kid`.
+enum Lookup<K> {
+    /// Listed and already imported: verification needs no import.
+    Imported(K),
+    /// Listed, not yet imported.
+    Listed(Jwk),
+}
+
+/// Per-isolate cache of GitHub's OIDC signing keys keyed by `kid`, each
+/// with the imported key (`K`) beside it and the same lifetime: the import
+/// leaves with the entry on expiry or on a refetch.
 ///
 /// `skyzen::utils::State` requires `Send + Sync + Clone`, so the map sits
 /// behind `Arc<Mutex<_>>` rather than `RefCell`. Workers run each isolate
 /// single-threaded and the guard is never held across an `.await`, so the
 /// lock can never contend and poisoning is unreachable.
-#[derive(Debug, Default, Clone)]
-pub struct Jwks {
-    inner: Arc<Mutex<HashMap<String, CachedKey>>>,
+#[derive(Debug)]
+pub struct Jwks<K> {
+    inner: Arc<Mutex<HashMap<String, CachedKey<K>>>>,
 }
 
-impl Jwks {
-    /// The cached key for `kid` while it is still valid at `now_unix`
+impl<K> Default for Jwks<K> {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+        }
+    }
+}
+
+impl<K> Clone for Jwks<K> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<K: Clone> Jwks<K> {
+    /// The cached entry for `kid` while it is still valid at `now_unix`
     /// (epoch seconds).
-    fn key_for(&self, kid: &str, now_unix: i64) -> Option<Jwk> {
+    fn lookup(&self, kid: &str, now_unix: i64) -> Option<Lookup<K>> {
         self.lock()
             .get(kid)
             .filter(|cached| cached.expires_at_unix > now_unix)
-            .map(|cached| cached.jwk.clone())
+            .map(|cached| {
+                cached.imported.as_ref().map_or_else(
+                    || Lookup::Listed(cached.jwk.clone()),
+                    |key| Lookup::Imported(key.clone()),
+                )
+            })
+    }
+
+    /// Keep `key` as the import of the entry that still lists `jwk`. A set
+    /// refetched while the import ran may have replaced the entry with
+    /// other key material; that entry is imported afresh on its first use.
+    fn keep_import(&self, jwk: &Jwk, key: &K) {
+        if let Some(cached) = self.lock().get_mut(&jwk.kid)
+            && cached.jwk.n == jwk.n
+            && cached.jwk.e == jwk.e
+        {
+            cached.imported.get_or_insert_with(|| key.clone());
+        }
     }
 
     /// Replace the whole cached set with a freshly fetched `jwks`; every
@@ -458,6 +546,7 @@ impl Jwks {
                     key.kid.clone(),
                     CachedKey {
                         jwk: key,
+                        imported: None,
                         expires_at_unix,
                     },
                 )
@@ -465,7 +554,7 @@ impl Jwks {
         }));
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedKey>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CachedKey<K>>> {
         self.inner.lock().expect("jwks cache mutex poisoned")
     }
 }
@@ -634,37 +723,6 @@ fn decode_jwt(token: &str) -> Result<(JwtHeader, String, Vec<u8>, OidcClaims), A
     ))
 }
 
-/// SHA-256's DER `DigestInfo` prefix — `Pkcs1v15Sign::new::<D>` would couple
-/// us to rsa's `digest` version, which edge's sha2 release does not match,
-/// so the `DigestInfo` is assembled from the published constant instead.
-const SHA256_DIGEST_INFO_PREFIX: [u8; 19] = [
-    0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05,
-    0x00, 0x04, 0x20,
-];
-
-/// The value RS256 actually signs: `DigestInfo(SHA-256) || digest`.
-fn sha256_digest_info(signing_input: &[u8]) -> Vec<u8> {
-    let digest = sha2::Sha256::digest(signing_input);
-    let mut framed = Vec::with_capacity(SHA256_DIGEST_INFO_PREFIX.len() + digest.len());
-    framed.extend_from_slice(&SHA256_DIGEST_INFO_PREFIX);
-    framed.extend_from_slice(&digest);
-    framed
-}
-
-/// Verify the RS256 signature — JWK modulus/exponent to a public key, then
-/// PKCS#1 v1.5 over the framed digest of `header.payload`.
-fn verify_rs256(jwk: &Jwk, signing_input: &[u8], signature: &[u8]) -> Result<(), AuthError> {
-    let n = rsa::BigUint::from_bytes_be(&b64url_decode(&jwk.n)?);
-    let e = rsa::BigUint::from_bytes_be(&b64url_decode(&jwk.e)?);
-    let key = rsa::RsaPublicKey::new(n, e).map_err(|_| AuthError::Unauthorized)?;
-    key.verify(
-        rsa::Pkcs1v15Sign::new_unprefixed(),
-        &sha256_digest_info(signing_input),
-        signature,
-    )
-    .map_err(|_| AuthError::Unauthorized)
-}
-
 /// Base64url-decode, tolerating the absent padding JWKS/JWT fields omit.
 fn b64url_decode(value: &str) -> Result<Vec<u8>, AuthError> {
     use base64::Engine;
@@ -795,7 +853,7 @@ fn jwks_url(base: Option<&str>) -> String {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub use cf_impl::CfGitHubTrust;
+pub use cf_impl::{CfGitHubTrust, CfJwks};
 
 /// The production [`GitHubTrustApi`]: two GETs through the worker fetch
 /// API. The JWKS fetch is only reached on a `Jwks` cache miss; a fetched
@@ -803,9 +861,89 @@ pub use cf_impl::CfGitHubTrust;
 /// beside stale keys.
 #[cfg(target_arch = "wasm32")]
 mod cf_impl {
-    use super::{AuthError, GitHubTrustApi, JwkSet};
+    use super::{AuthError, GitHubTrustApi, Jwk, JwkSet, Jwks};
     use crate::fetch_guard::OutboundPool;
-    use skyzen_cloudflare::worker::send::SendWrapper;
+    use skyzen_cloudflare::worker::send::{IntoSendFuture as _, SendWrapper};
+    use wasm_bindgen::{JsCast as _, JsValue};
+
+    /// A JWK imported through `WebCrypto` as a verify-only RS256 key. The
+    /// handle is a JS object, `Send` here because Workers run each isolate
+    /// on one thread.
+    pub type VerifyKey = SendWrapper<web_sys::CryptoKey>;
+
+    /// The per-isolate signing-key cache the Worker runs with.
+    pub type CfJwks = Jwks<VerifyKey>;
+
+    /// `{ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }` — RS256.
+    fn rs256_algorithm() -> Result<js_sys::Object, JsValue> {
+        let algorithm = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &algorithm,
+            &JsValue::from_str("name"),
+            &JsValue::from_str("RSASSA-PKCS1-v1_5"),
+        )?;
+        js_sys::Reflect::set(
+            &algorithm,
+            &JsValue::from_str("hash"),
+            &JsValue::from_str("SHA-256"),
+        )?;
+        Ok(algorithm)
+    }
+
+    fn subtle() -> Result<web_sys::SubtleCrypto, JsValue> {
+        let crypto: web_sys::Crypto =
+            js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("crypto"))?.unchecked_into();
+        Ok(crypto.subtle())
+    }
+
+    /// A rejected import or verify is a credential the edge cannot trust;
+    /// the JS reason is logged, never returned to the caller.
+    fn refused(error: &JsValue) -> AuthError {
+        tracing::warn!(?error, "oidc signature check refused by webcrypto");
+        AuthError::Unauthorized
+    }
+
+    async fn import_rs256(jwk: &Jwk) -> Result<VerifyKey, JsValue> {
+        let subtle = SendWrapper::new(subtle()?);
+        let algorithm = SendWrapper::new(rs256_algorithm()?);
+        let data = SendWrapper::new(js_sys::Object::new());
+        for (name, value) in [
+            ("kty", "RSA"),
+            ("alg", "RS256"),
+            ("n", jwk.n.as_str()),
+            ("e", jwk.e.as_str()),
+        ] {
+            js_sys::Reflect::set(&data, &JsValue::from_str(name), &JsValue::from_str(value))?;
+        }
+        js_sys::Reflect::set(&data, &JsValue::from_str("ext"), &JsValue::TRUE)?;
+        let usages: JsValue = js_sys::Array::of1(&JsValue::from_str("verify")).into();
+        let key = wasm_bindgen_futures::JsFuture::from(
+            subtle.import_key_with_object("jwk", &data, &algorithm, false, &usages)?,
+        )
+        .into_send()
+        .await?;
+        Ok(SendWrapper::new(key.unchecked_into()))
+    }
+
+    async fn verify_with(
+        key: &VerifyKey,
+        signing_input: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, JsValue> {
+        let subtle = SendWrapper::new(subtle()?);
+        let algorithm = SendWrapper::new(rs256_algorithm()?);
+        let verdict = wasm_bindgen_futures::JsFuture::from(
+            subtle.verify_with_object_and_u8_array_and_u8_array(
+                &algorithm,
+                key,
+                signature,
+                signing_input,
+            )?,
+        )
+        .into_send()
+        .await?;
+        Ok(verdict.is_truthy())
+    }
 
     /// Fetches GitHub's OIDC JWKS and repo-permission checks through the
     /// worker's outbound fetch, bounded by the [`OutboundPool`] of the
@@ -947,6 +1085,25 @@ mod cf_impl {
     }
 
     impl GitHubTrustApi for CfGitHubTrust {
+        type Key = VerifyKey;
+
+        async fn import_key(&self, jwk: &Jwk) -> Result<VerifyKey, AuthError> {
+            import_rs256(jwk).await.map_err(|error| refused(&error))
+        }
+
+        async fn verify_rs256(
+            &self,
+            key: &VerifyKey,
+            signing_input: &[u8],
+            signature: &[u8],
+        ) -> Result<(), AuthError> {
+            match verify_with(key, signing_input, signature).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(AuthError::Unauthorized),
+                Err(error) => Err(refused(&error)),
+            }
+        }
+
         async fn jwks(&self) -> Result<JwkSet, AuthError> {
             let url = super::jwks_url(self.probe_base_url.as_deref());
             get_json::<JwkSet>(&url, "", &self.pool)
@@ -977,25 +1134,31 @@ mod cf_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsa::pkcs8::DecodePrivateKey;
-    use rsa::traits::PublicKeyParts;
     use std::sync::Mutex;
 
     const NOW: i64 = 1_800_000_000;
 
-    /// Test-only RSA keypair — generated for this file, trusted by nobody.
-    const TEST_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEuwIBADANBgkqhkiG9w0BAQEFAASCBKUwggShAgEAAoIBAQCvpT7SKFU7bFwh\n00io+azXHJeHgs8ndSr8LwAddqeXzs4d2opqaHXKl4QctxMx7mDFNxv2odvluqGI\nYKmjRjlCgMOiCVNfxCCEZK+SMN2MMivKiXErYPBsixX4K0HHrg2ItispOz30EwKy\nNCK2QFYPZyxgRvxMbCx36/ZycTk3Yi89q9YfIHuYXZhYMYoiqg9Uxv780rKwiV9Z\na4e7wh13KApNgwrov3ane+L8qwmBg9laN/zxIII6Gq6gAKvn3Qe5LUwjdWIhlTgc\ncf1DSUR9V4grUoqIZfQTDJwIFgcnyGi/YIJmGebQjXBSuZUM8/31Gt1M9si8V4Mx\nQMpyxLPRAgMBAAECgf8ugN3ySzaAzIXdAnh8zk8ec6wXHoiD+xyaD3711+Mzrihp\nHJNS7JVDLi4YibiwODQmx8uJYOnZ8E07lareCErgtYp4slMUXf3RrS9O0aYlXRlT\noXdrLpVlYp7r+puep2BLe7SeAk7iXH7EFw6F/BtDGzLJfAHVazrHGRIuNal8s5fz\nXw7Yy02gUN13yjkX7GlGFGgTPwxVNqkwRM9rMxwMsPQbQZbXZNqGsAWnecEfLnQ+\nsPu8S0WeGG4pyo39xEdLBzE4hQ8ugvun20MjVgSVbAZjY/TCJ3xRWWh3ENpjfM4X\ntW9+/tHuxrz9o+e7hH5s6fHUFdj2uZjZ55DgYUECgYEA9pm79cZBar+hCpjJaR26\ndRKScFNIphax2axmAMhRhfHGT0uJAxZm3hdTg1HvXnPq8VMeP7lBFngZpPkDfbl7\n3O1yMlTXeVPyKFx88fu76lyplijhh1VoCqvkaVWjjPP+4/j6Uuq9nC7ESzEj0UN3\n0ChtUbAqorTzQt9pIEGoQuECgYEAtlcmWxMCvlgWQOsE6l3U9uKdxvx92lRb9VJZ\nUMie70QuntO3Hxh3KjTYjEfsNNX71p6TOtM+SiKZrf2/0QzOoA5gi3Ko6KjoDzoL\nXLkuRAX1jVQl178M0wc/5T5d9G+7RvNz/RlY2IpliPBcquHIUQZMfO7eu2XL9hcT\nNhPTfvECgYBrHlSbakc4S410wPGci6FXAX5C9Kp2Gx2eZFjatilTebae8zzM7oo4\npwFL5eeIq+m+clCNdbdkPz9EfjaaAlxfl3Unj9sZhPGHvsU3iBYUs7Om2pM86kiL\neid56g1lSQfLl3eFVRqQIXB7CRl56Ui+TxFNjqy2iMuynMFZlau1gQKBgGt/c6hr\ny8lGC1CYfdxiF0S6E4SVpOjLpS87LlbXAARVcRrH/ITDmrVyVFxXpqT7pq4/7NLY\naTexsGKIX8ayQzrPXxG3Nmd79NvNP5eZwPHvhXWdr3XDN59N/dh77U5HdOR+cNo9\nUEjRRsz1z9waoktKaFubRAq9GALsVbIi/CQxAoGBANLMLkjAW9TVkHkQuerUIbw9\nSI6VeqLtaMg5g9N1CHEm8/mwhqNLkeE+/o4SxKL7fsLaEMgwv07zPlyCAEPdxVUa\nhPh9XBM36onGbm78D+oRm9FzKkR1aZxP39prVbMaq0apQ62lrFcyWXDSSK0ErJsD\n9TEpEFsejdPB0ss9ISKC\n-----END PRIVATE KEY-----";
+    /// A stand-in signing identity. The host build carries no RS256
+    /// verifier (production verifies on `WebCrypto`, covered by the workerd
+    /// suite in `edge/tests/idle`), so these tests exercise the policy
+    /// around the signature with a double whose "signature" binds the key
+    /// and the exact signing input: a different key or a changed payload
+    /// fails the stub's check the way it fails the real one.
+    #[derive(Clone, Copy)]
+    struct TestKey(&'static str);
 
-    /// A second keypair, for tokens signed by a key the JWKS does not
-    /// advertise.
-    const FORGER_KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDAYlj/FX2agaBT\nVZ17cHcBQ1nnCslA//pKvLyWIYGQNaHsgfuA8Ltp6m1+TJThqGmo6gJblddDyFCs\np1OijdbE+kr1qmPieorZccmp7YVKUSJRfCD62X/vX70vglGvcB6qLzy+mWvL1C6s\nGAklpP/eogigiHxoXoIG91difgLqe7yxZi1yYOFWyLg/xgDBfOK47DF6OYyIjgNO\n1Wi4KwmKe3VgtGUHYq2rndeIMrhhzQrpsHoBlZ5jgDjmO6nDvS6TPgj21lJnktAZ\ngUVDxbX4/jWmNF8Q9WIJAXWQWxgw2FAUN9Zxc/xR42VWXxAExPRRdFs/6oO3HkDs\nL+he5AT1AgMBAAECggEAU/kZm44H2y8FihpuuPioGTcKwNxmaCbTW1fygR1y7j1a\nxl8eJnPtehfHXz+SJMVcCUzLZqqK4Z1ICXSn/uYmfqg5m+2Z17tha/RM8A0rBvtP\nHX4u7w+M1jFV5KzfdtJbsDEaNJ/G+5tMG/YJ2BKjVMwpM9kfZHcMDnpb/DPAlhRW\ngfk3D21ZhuCdP79ZN5yZBKmtvjKWkn79AquAyEPLw3/bz9bfDbGlNylMjwiv2e3s\nd/88tkPY5H+JHssXjckAWSgFZ7BWl2kClk20r9uHgTGMgX3da+Nfufw4AwzKEmZH\ngCa8d/TFz+/GeDGHUjx4DH1pIkCAlB7NzZI25vwW6QKBgQDrOhP1XdxzpKhxr87G\nMGjRoUQFYygjSpumzBni6AH2goGBt0SCFJ5/PWDkFxkPPvlaeqxgBcwgW6IOlx5N\nsStXSUCEk1+6YIbll/ydbUQbXehOkROcxB+71TWhhooXT9CiV60Zv2j46Y8dx92V\nOtRYy+d+rTPRYfA+67dOn5Y9VwKBgQDRX7KlZcET04FWU9uVyTWRG6RbMxyby4tg\n89hu9YJVR3uq0XzIgeSkDSKNqzkQeb5Hen3SYHE+POopG15hmGQAixVRIVldBNk+\n8EVANd3gJvzLQlqP/XdYp5AsUcvf3SSV2zMegPRkUhppGTM266Bd3wdlpEHd37NV\nULWO30wUkwKBgQCJa6mjTA1xZf2eRTZIpJln9o21lAMr8vdSD6UD4cTbzcx5Cqc0\nU3VxIluLhU73kDO+vzIa+ugQ81eOrIxgmSOX38yYZzyitqe4U/2Zvu7uCgOgerL5\nf76GTn4BeocMLW3WmeAfzao22MPqgwwZlX/ezGjWobtHFK91IuI5RZRRCwKBgF78\nb2uh8iowdijX+nLFyct/It1NHtl/Skg92B7eurY9q9kfGOFOLJBQdTCYUVcsJCsB\nYzuiDT4THJhxlivomtW0Q4N/Aa+1l2l6T7CFv5cFmQINpFBWyWIrArlYkomJJiPm\nQhbAoh8xMFIl4Jo145cyq4RtNISYDB/UccnTfAyJAoGAZSgHtjW1/S5aJeUghdC1\nOHJlLkG7gQilvCck/WhttBOkWzAFEXifBEgV39LRIFTJITe0g1EzuRCSQgFeENSJ\n06uLhQsXU8cFhEewDDOd1f+4fMYGCzeHyaqf3z4pl31D7MmCs9hx8h3dlOjEJfUa\natwqaJKjOz/vJfhUrJ2CE0Q=\n-----END PRIVATE KEY-----";
-
-    fn test_key() -> rsa::RsaPrivateKey {
-        rsa::RsaPrivateKey::from_pkcs8_pem(TEST_KEY_PEM).expect("test key")
+    fn test_key() -> TestKey {
+        TestKey("test-key")
     }
 
-    fn forger_key() -> rsa::RsaPrivateKey {
-        rsa::RsaPrivateKey::from_pkcs8_pem(FORGER_KEY_PEM).expect("forger key")
+    fn forger_key() -> TestKey {
+        TestKey("forger-key")
+    }
+
+    /// The stub "signature" of `signing_input` under the key whose JWK
+    /// modulus is `n`.
+    fn stub_signature(n: &str, signing_input: &str) -> Vec<u8> {
+        format!("{n}|{signing_input}").into_bytes()
     }
 
     fn test_config() -> GitHubTrustConfig {
@@ -1015,6 +1178,7 @@ mod tests {
         push_login: Mutex<Option<String>>,
         push_failure: Mutex<Option<StubPushFailure>>,
         jwks_fetches: Mutex<u32>,
+        imports: Mutex<u32>,
         push_calls: Mutex<u32>,
     }
 
@@ -1025,12 +1189,13 @@ mod tests {
     }
 
     impl StubTrust {
-        fn for_key(key: &rsa::RsaPrivateKey) -> Self {
+        fn for_key(key: &TestKey) -> Self {
             Self {
                 jwk: jwk_for(key, "test-kid"),
                 push_login: Mutex::new(None),
                 push_failure: Mutex::new(None),
                 jwks_fetches: Mutex::new(0),
+                imports: Mutex::new(0),
                 push_calls: Mutex::new(0),
             }
         }
@@ -1039,23 +1204,47 @@ mod tests {
             *self.jwks_fetches.lock().expect("lock")
         }
 
+        fn import_count(&self) -> u32 {
+            *self.imports.lock().expect("lock")
+        }
+
         fn push_call_count(&self) -> u32 {
             *self.push_calls.lock().expect("lock")
         }
     }
 
-    /// The JWK advertising `key`'s public half under `kid`.
-    fn jwk_for(key: &rsa::RsaPrivateKey, kid: &str) -> Jwk {
-        let public = key.to_public_key();
+    /// The JWK advertising `key` under `kid`.
+    fn jwk_for(key: &TestKey, kid: &str) -> Jwk {
         Jwk {
             kty: "RSA".to_owned(),
             kid: kid.to_owned(),
-            n: b64url_encode(&public.n().to_bytes_be()),
-            e: b64url_encode(&public.e().to_bytes_be()),
+            n: b64url_encode(key.0.as_bytes()),
+            e: "AQAB".to_owned(),
         }
     }
 
     impl GitHubTrustApi for StubTrust {
+        type Key = String;
+
+        fn import_key(&self, jwk: &Jwk) -> impl Future<Output = Result<String, AuthError>> + Send {
+            *self.imports.lock().expect("lock") += 1;
+            std::future::ready(Ok(jwk.n.clone()))
+        }
+
+        fn verify_rs256(
+            &self,
+            key: &String,
+            signing_input: &[u8],
+            signature: &[u8],
+        ) -> impl Future<Output = Result<(), AuthError>> + Send {
+            let signing_input = std::str::from_utf8(signing_input).expect("utf8 signing input");
+            std::future::ready(if signature == stub_signature(key, signing_input) {
+                Ok(())
+            } else {
+                Err(AuthError::Unauthorized)
+            })
+        }
+
         fn jwks(&self) -> impl Future<Output = Result<JwkSet, AuthError>> + Send {
             *self.jwks_fetches.lock().expect("lock") += 1;
             std::future::ready(Ok(JwkSet {
@@ -1084,18 +1273,14 @@ mod tests {
     }
 
     /// Mint a compact JWT under `test-kid`: JSON header + JSON claims,
-    /// RS256-signed.
-    fn mint_jwt(key: &rsa::RsaPrivateKey, claims: &serde_json::Value) -> String {
+    /// stub-signed.
+    fn mint_jwt(key: &TestKey, claims: &serde_json::Value) -> String {
         mint_jwt_with_kid(key, claims, "test-kid")
     }
 
     /// Mint a compact JWT whose header names `kid` — for tokens signed by a
     /// key the JWKS does not advertise.
-    fn mint_jwt_with_kid(
-        key: &rsa::RsaPrivateKey,
-        claims: &serde_json::Value,
-        kid: &str,
-    ) -> String {
+    fn mint_jwt_with_kid(key: &TestKey, claims: &serde_json::Value, kid: &str) -> String {
         let header = b64url_encode(
             serde_json::to_string(&serde_json::json!({
                 "alg": "RS256",
@@ -1107,12 +1292,7 @@ mod tests {
         );
         let payload = b64url_encode(serde_json::to_string(&claims).expect("claims").as_bytes());
         let signing_input = format!("{header}.{payload}");
-        let signature = key
-            .sign(
-                rsa::Pkcs1v15Sign::new_unprefixed(),
-                &sha256_digest_info(signing_input.as_bytes()),
-            )
-            .expect("sign jwt");
+        let signature = stub_signature(&b64url_encode(key.0.as_bytes()), &signing_input);
         format!("{signing_input}.{}", b64url_encode(&signature))
     }
 
@@ -1530,7 +1710,7 @@ mod tests {
 
     #[test]
     fn cached_key_serves_until_expiry() {
-        let jwks = Jwks::default();
+        let jwks = Jwks::<String>::default();
         jwks.replace_all(
             JwkSet {
                 keys: vec![jwk_for(&test_key(), "test-kid")],
@@ -1538,19 +1718,19 @@ mod tests {
             1_000,
         );
         assert!(
-            jwks.key_for("test-kid", 1_000 + JWKS_CACHE_TTL_SECS - 1)
+            jwks.lookup("test-kid", 1_000 + JWKS_CACHE_TTL_SECS - 1)
                 .is_some()
         );
         assert!(
-            jwks.key_for("test-kid", 1_000 + JWKS_CACHE_TTL_SECS)
+            jwks.lookup("test-kid", 1_000 + JWKS_CACHE_TTL_SECS)
                 .is_none()
         );
-        assert!(jwks.key_for("unknown-kid", 1_000).is_none());
+        assert!(jwks.lookup("unknown-kid", 1_000).is_none());
     }
 
     #[test]
     fn replace_all_drops_the_previous_set() {
-        let jwks = Jwks::default();
+        let jwks = Jwks::<String>::default();
         jwks.replace_all(
             JwkSet {
                 keys: vec![jwk_for(&test_key(), "kid-a")],
@@ -1563,22 +1743,22 @@ mod tests {
             },
             1,
         );
-        assert!(jwks.key_for("kid-a", 2).is_none());
-        assert!(jwks.key_for("kid-b", 2).is_some());
+        assert!(jwks.lookup("kid-a", 2).is_none());
+        assert!(jwks.lookup("kid-b", 2).is_some());
     }
 
     #[test]
     fn non_rsa_keys_are_not_cached() {
-        let jwks = Jwks::default();
+        let jwks = Jwks::<String>::default();
         let mut key = jwk_for(&test_key(), "okp-kid");
         key.kty = "OKP".to_owned();
         jwks.replace_all(JwkSet { keys: vec![key] }, 0);
-        assert!(jwks.key_for("okp-kid", 1).is_none());
+        assert!(jwks.lookup("okp-kid", 1).is_none());
     }
 
     #[test]
     fn cloned_caches_share_state() {
-        let jwks = Jwks::default();
+        let jwks = Jwks::<String>::default();
         let clone = jwks.clone();
         jwks.replace_all(
             JwkSet {
@@ -1586,11 +1766,34 @@ mod tests {
             },
             0,
         );
-        assert!(clone.key_for("test-kid", 1).is_some());
+        assert!(clone.lookup("test-kid", 1).is_some());
     }
 
     #[tokio::test]
     async fn cached_keyset_serves_repeat_verifications() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        let jwks = Jwks::<String>::default();
+        let token = mint_jwt(&key, &actions_claims());
+        for _ in 0..3 {
+            authenticate(
+                &test_config(),
+                &api,
+                &jwks,
+                &PushVerdicts::default(),
+                &token,
+                NOW,
+            )
+            .await
+            .expect("actions token");
+        }
+        assert_eq!(api.fetch_count(), 1, "one fetch fills the cache");
+    }
+
+    /// The imported key is kept beside the JWKS entry: a known `kid`
+    /// imports once, however many requests use it.
+    #[tokio::test]
+    async fn known_kid_imports_once() {
         let key = test_key();
         let api = StubTrust::for_key(&key);
         let jwks = Jwks::default();
@@ -1607,7 +1810,53 @@ mod tests {
             .await
             .expect("actions token");
         }
-        assert_eq!(api.fetch_count(), 1, "one fetch fills the cache");
+        assert_eq!(api.import_count(), 1);
+    }
+
+    /// The import leaves with the entry: past the TTL the refetched set
+    /// is imported again.
+    #[tokio::test]
+    async fn expired_entry_imports_again() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        let jwks = Jwks::default();
+        let mut claims = actions_claims();
+        claims["exp"] = serde_json::json!(NOW + JWKS_CACHE_TTL_SECS + 600);
+        let token = mint_jwt(&key, &claims);
+        for now in [NOW, NOW + JWKS_CACHE_TTL_SECS + 1] {
+            authenticate(
+                &test_config(),
+                &api,
+                &jwks,
+                &PushVerdicts::default(),
+                &token,
+                now,
+            )
+            .await
+            .expect("actions token");
+        }
+        assert_eq!(api.import_count(), 2);
+    }
+
+    /// A claim failure is refused before any key lookup, fetch or import.
+    #[tokio::test]
+    async fn bad_claims_cost_no_key_work() {
+        let key = test_key();
+        let api = StubTrust::for_key(&key);
+        let mut claims = actions_claims();
+        claims["repository"] = serde_json::json!("someone/else");
+        assert_unauthorized(
+            &authenticate(
+                &test_config(),
+                &api,
+                &Jwks::default(),
+                &PushVerdicts::default(),
+                &mint_jwt(&key, &claims),
+                NOW,
+            )
+            .await,
+        );
+        assert_eq!((api.fetch_count(), api.import_count()), (0, 0));
     }
 
     #[tokio::test]
