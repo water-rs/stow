@@ -4003,11 +4003,12 @@ mod tests {
     #[test]
     fn the_operator_cap_replaces_the_bindings_in_built_settings() {
         let bindings = queue::SchedulerSettings::default();
+        let macos = bindings.max_concurrent_macos_jobs;
         let mut graph = Graph::default();
         graph.merge(&solo(), 0).expect("merge");
         let built = |graph: &Graph| bindings.with_dispatch_cap(graph.dispatch_cap());
         // No setting yet: the bindings rule.
-        assert_eq!(graph.free_slots(&built(&graph)), (45, 16));
+        assert_eq!(graph.free_slots(&built(&graph)), (45, macos));
 
         let set = |jobs: u32, macos: Option<u32>| SchedulerEvent::DispatchCap {
             setting: Box::new(stow_types::api::DispatchCapSetting {
@@ -4018,26 +4019,26 @@ mod tests {
             }),
         };
         graph.apply(&set(3, None), 0);
-        assert_eq!(graph.free_slots(&built(&graph)), (3, 16));
+        assert_eq!(graph.free_slots(&built(&graph)), (3, macos));
         // Explicit settings are never second-guessed by the stored one.
-        assert_eq!(graph.free_slots(&bindings), (45, 16));
+        assert_eq!(graph.free_slots(&bindings), (45, macos));
 
         // A lowered cap moves nothing in flight — the claimed row
         // holds its slot and the count saturates at zero, not a free
         // slot it must yield.
         let ix = graph.node_ix(&id("solo")).expect("node");
         graph.mark_claimed(ix, 1, 0);
-        assert_eq!(graph.free_slots(&built(&graph)), (2, 16));
+        assert_eq!(graph.free_slots(&built(&graph)), (2, macos));
         graph.apply(&set(1, Some(1)), 0);
         assert_eq!(graph.free_slots(&built(&graph)), (0, 1));
         graph.apply(&set(0, None), 0);
         let paused = built(&graph);
         assert_eq!(paused.dispatch, queue::Dispatch::Paused);
-        assert_eq!(graph.free_slots(&paused), (0, 16));
+        assert_eq!(graph.free_slots(&paused), (0, macos));
 
         let view = graph.dispatch_cap_view(&paused);
         assert_eq!(view.max_concurrent_jobs, 0);
-        assert_eq!(view.max_concurrent_macos_jobs, 16);
+        assert_eq!(view.max_concurrent_macos_jobs, macos);
         assert_eq!(view.setting.map(|set| set.max_concurrent_jobs), Some(0));
     }
 
