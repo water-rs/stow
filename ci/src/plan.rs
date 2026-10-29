@@ -497,7 +497,20 @@ async fn build_outputs(
                 file_name
             ));
         }
-        let bytes = async_fs::read(&output.source_path).await?;
+        let source_path = output.source_path.clone();
+        let expected_sha256 = output.sha256.clone();
+        let bytes = smol::unblock(move || {
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut stow_types::native_capture::open_verified_nofollow(
+                    &source_path,
+                    &expected_sha256,
+                )?,
+                &mut bytes,
+            )?;
+            stow_types::error::Result::Ok(bytes)
+        })
+        .await?;
         if let Some(expected) = expected {
             object_arch::check(&bytes, &file_name, expected)?;
         }
@@ -733,6 +746,9 @@ mod tests {
             outputs: vec![ScannedArtifactOutput {
                 kind: ParsedFileKind::Rlib,
                 path: output_path.clone(),
+                sha256: hex::encode(Sha256::digest(
+                    std::fs::read(&output_path).expect("read fixture output"),
+                )),
                 source_path: output_path,
             }],
             build_script_out_dir: None,

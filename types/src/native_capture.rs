@@ -165,17 +165,7 @@ impl OutDirRoot {
         }
         let file = open_regular(dir.as_ref().unwrap_or(&self.dir), OsStr::new(name))
             .wrap_err_with(|| format!("open native out dir file {relative_path}"))?;
-        let mut file = file.into_std();
-        let actual = hash_file(&mut file)
-            .wrap_err_with(|| format!("hash native out dir file {relative_path}"))?;
-        if actual != expected_sha256 {
-            return Err(crate::stow_error!(
-                "native out dir file {relative_path} changed since capture: sha256 {actual}, captured {expected_sha256}"
-            ));
-        }
-        file.seek(SeekFrom::Start(0))
-            .wrap_err_with(|| format!("rewind native out dir file {relative_path}"))?;
-        Ok(file)
+        verify_digest(file.into_std(), relative_path, expected_sha256)
     }
 
     /// Walk the tree and hash every regular file. `.a`/`.lib` files
@@ -252,8 +242,73 @@ fn open_regular(dir: &Dir, name: &OsStr) -> std::io::Result<cap_std::fs::File> {
     Ok(file)
 }
 
+/// Open the regular file at `path` without following a symlink at its final
+/// component, and check the opened handle (not the path) is a regular file.
+///
+/// The parent directory is the host's own (cargo's `deps/`), so only the
+/// file name is untrusted: it resolves relative to a directory handle with
+/// the same no-follow discipline as [`OutDirRoot`].
+///
+/// # Errors
+///
+/// A symlink at `path`, a non-regular file, or any I/O failure.
+pub fn open_regular_nofollow(path: &Path) -> crate::error::Result<std::fs::File> {
+    let (dir, name) = parent_handle(path)?;
+    let file = open_regular(&dir, name)
+        .wrap_err_with(|| format!("open {} without following symlinks", path.display()))?;
+    Ok(file.into_std())
+}
+
+/// [`open_regular_nofollow`], additionally requiring the bytes to hash to
+/// `expected_sha256`; the handle is returned rewound, so a copy of it carries
+/// exactly the verified bytes.
+///
+/// # Errors
+///
+/// As [`open_regular_nofollow`], or a digest mismatch.
+pub fn open_verified_nofollow(
+    path: &Path,
+    expected_sha256: &str,
+) -> crate::error::Result<std::fs::File> {
+    let file = open_regular_nofollow(path)?;
+    verify_digest(file, &path.display().to_string(), expected_sha256)
+}
+
+fn parent_handle(path: &Path) -> crate::error::Result<(Dir, &OsStr)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| crate::stow_error!("{} has no parent directory", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| crate::stow_error!("{} has no file name", path.display()))?;
+    let dir = Dir::open_ambient_dir(parent, ambient_authority())
+        .wrap_err_with(|| format!("open directory {}", parent.display()))?;
+    Ok((dir, name))
+}
+
+/// Hash `file` from its start, require `expected_sha256`, and rewind it.
+fn verify_digest(
+    mut file: std::fs::File,
+    what: &str,
+    expected_sha256: &str,
+) -> crate::error::Result<std::fs::File> {
+    let actual = hash_file(&mut file).wrap_err_with(|| format!("hash {what}"))?;
+    if actual != expected_sha256 {
+        return Err(crate::stow_error!(
+            "{what} changed since capture: sha256 {actual}, captured {expected_sha256}"
+        ));
+    }
+    file.seek(SeekFrom::Start(0))
+        .wrap_err_with(|| format!("rewind {what}"))?;
+    Ok(file)
+}
+
 /// Hex SHA-256 of everything `file` yields from its current position.
-fn hash_file(file: &mut std::fs::File) -> std::io::Result<String> {
+///
+/// # Errors
+///
+/// Any read failure.
+pub fn hash_file(file: &mut std::fs::File) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1 << 16];
     loop {
@@ -298,6 +353,8 @@ pub fn is_static_library(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use sha2::Digest as _;
+
     use super::capture_native_artifacts;
 
     #[test]
@@ -320,6 +377,29 @@ mod tests {
                 .map(|file| file.relative_path.as_str())
                 .collect::<Vec<_>>(),
             vec!["gen/bindings.rs"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nofollow_open_refuses_a_symlink_and_checks_the_digest() {
+        use super::{open_regular_nofollow, open_verified_nofollow};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real.rlib");
+        std::fs::write(&real, b"bytes").expect("write");
+        let link = dir.path().join("link.rlib");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let sha = hex::encode(sha2::Sha256::digest(b"bytes"));
+
+        assert!(open_regular_nofollow(&link).is_err());
+        assert!(open_verified_nofollow(&link, &sha).is_err());
+        assert!(open_regular_nofollow(dir.path()).is_err());
+        assert!(open_verified_nofollow(&real, &sha).is_ok());
+        let error = open_verified_nofollow(&real, "00").expect_err("digest mismatch");
+        assert!(
+            error.to_string().contains("changed since capture"),
+            "{error}"
         );
     }
 

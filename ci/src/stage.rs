@@ -18,7 +18,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use async_fs::{copy, create_dir_all, read, read_to_string, write};
+use async_fs::{create_dir_all, read, read_to_string, write};
 use sha2::{Digest, Sha256};
 use stow_types::api::BuildTaskPayload;
 use stow_types::error::Context;
@@ -66,13 +66,29 @@ pub async fn write_build_output(
         {
             let blob_name = blob_name(output)?;
             let destination = blobs_dir.join(&blob_name);
-            copy(&output.path, &destination).await.wrap_err_with(|| {
-                format!(
-                    "copy planned output {} to {}",
-                    output.path.display(),
-                    destination.display()
-                )
-            })?;
+            // Blobs are named by digest, so one already written holds these
+            // exact bytes.
+            if !destination.exists() {
+                let source = output.path.clone();
+                let blob = destination.clone();
+                let expected_sha256 = output.bundle_file.sha256.clone();
+                smol::unblock(move || {
+                    let mut file = stow_types::native_capture::open_verified_nofollow(
+                        &source,
+                        &expected_sha256,
+                    )?;
+                    crate::handle_copy::copy_from_handle(&mut file, &blob)
+                        .map_err(stow_types::error::Error::from)
+                })
+                .await
+                .wrap_err_with(|| {
+                    format!(
+                        "copy planned output {} to {}",
+                        output.path.display(),
+                        destination.display()
+                    )
+                })?;
+            }
             // Written with a forward slash so the plan reads the same on every
             // platform; `Path` equality on the read side compares components,
             // not separators.
