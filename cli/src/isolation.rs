@@ -8,8 +8,8 @@
 //!
 //! | level | files | environment | network |
 //! |---|---|---|---|
-//! | `protect` (default) | denylist: credential stores unreadable, persistence locations unwritable, everything else as usual | credential variables stripped | allowed through heel's proxy, destinations recorded |
-//! | `strict` | allowlist: workspace, target dir, toolchain, cargo registry and stow's shims; home never granted | allowlist | allowed through the proxy, recorded |
+//! | `protect` (default except on Windows) | denylist: credential stores unreadable, persistence locations unwritable, everything else as usual | credential variables stripped | allowed through heel's proxy, destinations recorded |
+//! | `strict` (default on Windows) | allowlist: workspace, target dir, toolchain, cargo registry and stow's shims; home never granted | allowlist | allowed through the proxy, recorded |
 //! | `offline` | as `strict` | as `strict` | denied; the supervisor's IPC socket is the only channel |
 //! | `off` | no isolation | untouched | unrestricted |
 //!
@@ -28,20 +28,34 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 /// How much of the machine a build's cargo process tree can reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
     /// Credential stores unreadable, persistence locations unwritable, the
-    /// network open through heel's proxy and recorded.
-    #[default]
+    /// network open through heel's proxy and recorded. The default everywhere
+    /// but Windows.
     Protect,
     /// An allowlist of files and environment; the network open through the
-    /// proxy and recorded.
+    /// proxy and recorded. The default on Windows.
     Strict,
     /// `strict`, with the network denied.
     Offline,
     /// No isolation.
     Off,
+}
+
+impl Default for Level {
+    /// `protect`, except on Windows: heel cannot enforce `protect` there, and
+    /// `strict` reads and writes only the granted paths, so credentials stay
+    /// unreachable. An explicit `protect` on Windows fails; it is never
+    /// replaced.
+    fn default() -> Self {
+        if cfg!(windows) {
+            Self::Strict
+        } else {
+            Self::Protect
+        }
+    }
 }
 
 impl Level {
@@ -223,39 +237,27 @@ pub fn resolve(flag: Option<Level>, config: &IsolationConfig) -> stow_types::err
     Ok(level)
 }
 
-/// Fail when this platform cannot enforce `level`, naming the levels it can.
+/// Fail when this platform has no sandbox backend for `level`.
 ///
-/// `protect` rests on heel's credential denylist and persistence guard, which
-/// its macOS backend enforces; the Linux and Windows backends refuse to build a
-/// sandbox that carries them. Nothing here falls back to a weaker level.
+/// Whether a backend can enforce the level on this host (kernel version,
+/// `ptrace_scope`, a setting the platform refuses) is heel's answer when the
+/// sandbox is created, which fails the build; nothing here falls back to a
+/// weaker level.
 fn ensure_supported(level: Level) -> stow_types::error::Result<()> {
-    match level {
-        Level::Off => Ok(()),
-        Level::Strict | Level::Offline => {
-            if cfg!(any(
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "windows"
-            )) {
-                Ok(())
-            } else {
-                Err(stow_types::stow_error!(
-                    "isolation level `{}` is not supported on {}: heel has a sandbox backend for Linux, macOS and Windows only; use `--isolation off`",
-                    level.as_str(),
-                    std::env::consts::OS
-                ))
-            }
-        }
-        Level::Protect => {
-            if cfg!(target_os = "macos") {
-                Ok(())
-            } else {
-                Err(stow_types::stow_error!(
-                    "isolation level `protect` is not supported on {}: heel enforces the credential denylist and the persistence guard on macOS only. Choose the level explicitly with `[isolation] level` in the stow config or `--isolation strict`, `--isolation offline` or `--isolation off`",
-                    std::env::consts::OS
-                ))
-            }
-        }
+    if level == Level::Off
+        || cfg!(any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "windows"
+        ))
+    {
+        Ok(())
+    } else {
+        Err(stow_types::stow_error!(
+            "isolation level `{}` is not supported on {}: heel has a sandbox backend for Linux, macOS and Windows only; use `--isolation off`",
+            level.as_str(),
+            std::env::consts::OS
+        ))
     }
 }
 
@@ -334,8 +336,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_default_level_is_protect() {
-        assert_eq!(IsolationConfig::default().level, Level::Protect);
+    fn the_default_level_is_strict_on_windows_and_protect_elsewhere() {
+        let expected = if cfg!(windows) {
+            Level::Strict
+        } else {
+            Level::Protect
+        };
+        assert_eq!(Level::default(), expected);
+        assert_eq!(IsolationConfig::default().level, expected);
     }
 
     #[test]
@@ -409,14 +417,12 @@ mod tests {
     }
 
     #[test]
-    fn a_level_the_platform_cannot_enforce_is_an_error_and_never_a_weaker_level() {
-        let outcome = resolve(Some(Level::Protect), &IsolationConfig::default());
-        if cfg!(target_os = "macos") {
-            assert_eq!(outcome.unwrap(), Level::Protect);
-        } else {
-            let message = outcome.unwrap_err().to_string();
-            assert!(message.contains("`protect`"), "{message}");
-            assert!(message.contains("--isolation strict"), "{message}");
+    fn every_level_resolves_on_a_platform_with_a_backend() {
+        for level in [Level::Protect, Level::Strict, Level::Offline, Level::Off] {
+            assert_eq!(
+                resolve(Some(level), &IsolationConfig::default()).unwrap(),
+                level
+            );
         }
     }
 

@@ -53,13 +53,13 @@ is independent of the cache mode: it holds with the public cache on or off.
 
 | Level | Files | Network | Environment |
 | --- | --- | --- | --- |
-| `protect` (default) | The machine is open except credential stores, which cannot be read, and persistence locations, which cannot be written | Allowed through an audited proxy | Host variables, minus credential variables |
-| `strict` | An allowlist: the workspace and target directory, the toolchain and registry, stow's shims | Allowed through an audited proxy | An allowlist |
+| `protect` (default except on Windows) | The machine is open except credential stores, which cannot be read, and persistence locations, which cannot be written | Allowed through an audited proxy | Host variables, minus credential variables |
+| `strict` (default on Windows) | An allowlist: the workspace and target directory, the toolchain and registry, stow's shims | Allowed through an audited proxy | An allowlist |
 | `offline` | As `strict` | None; the only channel out is the socket the rustc wrapper uses to reach stow | An allowlist |
 | `off` | No confinement | Unrestricted | Unrestricted |
 
 ```sh
-stow build                       # protect
+stow build                       # protect (strict on Windows)
 stow build --isolation strict
 stow build --isolation offline
 stow build --isolation off
@@ -112,13 +112,19 @@ Every network destination and every denied access is recorded under
 `<local data dir>/stow/audit`: `network-audit.<date>.jsonl` files from the proxy and
 `denied-access.<date>.jsonl` with one JSON line per denial. `audit_files`
 (default 30) is the number of daily files kept of each. Denied accesses are
-recorded on macOS only.
+recorded on macOS and Linux; Windows reports none.
 
-`protect` is enforced on macOS. Linux and Windows cannot express its
-denylists, so there it fails with an error naming `--isolation
-strict|offline|off`; it never falls back to another level. `strict`,
-`offline` and `off` work on Linux, macOS and Windows. A sandbox that cannot
-be set up fails the command.
+`protect` is enforced on macOS and Linux through heel's credential and
+persistence denylists. On Linux it, like `strict` and `offline`, needs kernel
+6.7 or newer, and the denylists also need `kernel.yama.ptrace_scope` of 1 or
+lower; a host that fails either makes the command fail with an error naming
+the isolation level and the cause, never a build with less protection. On
+Windows heel refuses the denylists, so `protect` fails when the sandbox is
+created; `strict`, `offline` and `off` work there, and `strict` is the
+default on Windows (it reads and writes only the granted paths, so
+credentials are unreachable). An explicit `protect` on Windows still fails and
+is never replaced by `strict`. No level falls back to
+another. A sandbox that cannot be set up fails the command.
 
 ## `stow predict`
 

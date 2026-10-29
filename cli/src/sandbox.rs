@@ -195,6 +195,7 @@ impl BuildSandbox {
             level: request.isolation.level.as_str(),
         };
         let ipc = request.ipc.take();
+        let level = request.isolation.level.as_str();
         let network = if request.confinement.network_allowed() {
             let log = NetworkAuditLog::rolling_daily(&audit.dir, audit.files)
                 .map_err(|error| stow_types::stow_error!("open the network audit log: {error}"))?;
@@ -203,10 +204,10 @@ impl BuildSandbox {
                 &request,
             )
             .await?;
-            Network::Allowed(create_sandbox(build_config(builder, ipc)).await?)
+            Network::Allowed(create_sandbox(build_config(builder, ipc), level).await?)
         } else {
             let builder = confined_builder(SandboxConfigBuilder::default(), &request).await?;
-            Network::Denied(create_sandbox(build_config(builder, ipc)).await?)
+            Network::Denied(create_sandbox(build_config(builder, ipc), level).await?)
         };
         Ok(Self { network, audit })
     }
@@ -250,7 +251,7 @@ impl BuildSandbox {
             Ok(recorder) => Some(recorder),
             // The platform's kernel reports no denials a process can follow.
             // The boundary is unaffected; only this record of it is absent.
-            Err(heel::Error::UnsupportedPolicy { platform, .. }) => {
+            Err(heel::Error::UnsupportedSetting { platform, .. }) => {
                 tracing::warn!(
                     platform,
                     "denied accesses are not recorded on this platform; network destinations still are"
@@ -276,10 +277,27 @@ impl BuildSandbox {
 
 async fn create_sandbox<N: NetworkPolicy>(
     config: SandboxConfig<N>,
+    level: &str,
 ) -> stow_types::error::Result<Sandbox<N>> {
-    Sandbox::with_config(config)
-        .await
-        .map_err(|error| stow_types::stow_error!("create the cargo build sandbox: {error}"))
+    Sandbox::with_config(config).await.map_err(|error| {
+        let cause = match &error {
+            // Landlock and the seccomp broker need kernel 6.7.
+            heel::Error::UnsupportedPlatformVersion { .. } => {
+                "the kernel is too old for the sandbox (Linux 6.7 or newer is required)"
+            }
+            // heel's own message names `ptrace_scope` and the value it needs.
+            heel::Error::InitFailed(message) if message.contains("ptrace_scope") => {
+                "the sandbox broker needs kernel.yama.ptrace_scope of 1 or lower"
+            }
+            heel::Error::UnsupportedSetting { .. } => {
+                "this platform cannot enforce a setting the level needs"
+            }
+            _ => "the sandbox could not be set up",
+        };
+        stow_types::stow_error!(
+            "isolation level `{level}` cannot be enforced, and stow never runs a build with weaker protection: {cause}: {error}"
+        )
+    })
 }
 
 /// Where a build's denied accesses are written: one line of JSON per denial in

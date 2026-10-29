@@ -77,9 +77,10 @@ pub struct CargoCommandArgs {
 #[derive(Debug, Clone, Args)]
 pub struct IsolationArgs {
     /// How much of the machine the build's cargo, build scripts and proc
-    /// macros can reach, for this run: `protect` (the default) keeps
-    /// credential stores unreadable and persistence locations unwritable and
-    /// strips credential variables, `strict` grants only the workspace, the
+    /// macros can reach, for this run: `protect` (the default, except on
+    /// Windows, where heel cannot enforce it and the default is `strict`)
+    /// keeps credential stores unreadable and persistence locations
+    /// unwritable and strips credential variables, `strict` grants only the workspace, the
     /// target directory and the toolchain, `offline` is `strict` without the
     /// network, and `off` is no isolation. Overrides `[isolation] level` in the
     /// stow config.

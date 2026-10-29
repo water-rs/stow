@@ -673,7 +673,7 @@ fn assert_contains_all(actual: &[String], expected: &[&str], what: &str) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
 fn assert_protect(cache_off: bool) {
     let (refused, succeeded) = probe_level("protect", cache_off);
     assert_contains_all(
@@ -692,7 +692,7 @@ fn assert_protect(cache_off: bool) {
 /// The default level: a build script cannot read a credential store or
 /// write a persistence location, and still reads and writes the rest of the
 /// machine and reaches the network through the audited proxy.
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
 #[test]
 fn protect_refuses_credentials_and_persistence_but_still_downloads() {
     assert_protect(false);
@@ -700,14 +700,14 @@ fn protect_refuses_credentials_and_persistence_but_still_downloads() {
 
 /// Isolation does not depend on cache mode: the same refusals hold with
 /// the public cache off.
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
 #[test]
 fn protect_holds_with_the_cache_off() {
     assert_protect(true);
 }
 
 /// No flag and no config means `protect`.
-#[cfg(target_os = "macos")]
+#[cfg(not(windows))]
 #[test]
 fn protect_is_the_default_level() {
     let (target, _pong) = spawn_pong_listener();
@@ -721,6 +721,43 @@ fn protect_is_the_default_level() {
         "refused",
     );
     assert_contains_all(&succeeded, &["read-home", "write-home"], "succeeded");
+}
+
+/// On Windows no flag and no config means `strict`: heel cannot enforce
+/// `protect` there, and the allowlist keeps credentials unreachable.
+#[cfg(windows)]
+#[test]
+fn strict_is_the_default_level_on_windows() {
+    let (target, _pong) = spawn_pong_listener();
+    let env = probe_env(false, &target);
+    let output = run_build(&env, &["build", "--offline"]);
+    assert!(!output.status.success());
+    let (refused, succeeded) = outcome(&String::from_utf8_lossy(&output.stderr));
+    assert_contains_all(
+        &refused,
+        &["read-home", "read-credential", "write-persistence"],
+        "refused",
+    );
+    assert_eq!(succeeded, ["network"], "strict leaves only the proxy");
+}
+
+/// An explicit `protect` on Windows fails naming the level; it is never
+/// replaced by `strict`.
+#[cfg(windows)]
+#[test]
+fn explicit_protect_is_refused_on_windows() {
+    let env = probe_env(false, "127.0.0.1:9");
+    let output = run_build(&env, &["build", "--isolation", "protect"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("`protect`") && stderr.contains("cannot be enforced"),
+        "the error should name the level and say it cannot be enforced:\n{stderr}"
+    );
+    assert!(
+        denial(&stderr).is_none(),
+        "no build may have run at another level:\n{stderr}"
+    );
 }
 
 fn assert_strict(cache_off: bool) {
@@ -798,21 +835,5 @@ fn an_unknown_level_fails() {
     assert!(
         stderr.contains("loose") && stderr.contains("protect"),
         "the error should name the bad value and the valid levels:\n{stderr}"
-    );
-}
-
-/// On a platform whose sandbox cannot enforce the read and write
-/// denylists, the default level is an explicit error naming the levels that
-/// are available there — never a silent downgrade.
-#[cfg(not(target_os = "macos"))]
-#[test]
-fn protect_is_refused_where_it_cannot_be_enforced() {
-    let env = probe_env(false, "127.0.0.1:9");
-    let output = run_build(&env, &["build"]);
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--isolation"),
-        "the error should point at the available levels:\n{stderr}"
     );
 }

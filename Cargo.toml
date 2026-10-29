@@ -100,7 +100,6 @@ lto = "thin"
 # in a release yet; the pin is the exact commit on zenwave's dev and moves to
 # a crates.io version once one carries them.
 zenwave = { git = "https://github.com/zen-rs/zenwave", rev = "776f9fd7d7626406b6300961e3a856e8f5297c69" }
-heel = { path = "/Users/lexoliu/Coding/heel-wt-106" }
 # cargo 0.99 (stow-resolver) pins rusqlite 0.40 → libsqlite3-sys ^0.38;
 # sqlx-sqlite releases cap below it, so two `links = "sqlite3"` crates
 # would conflict. sqlx main at this rev is 0.9.0 and allows
