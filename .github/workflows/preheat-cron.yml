@@ -12,15 +12,19 @@ name: Preheat the public cache
 # `preheat-admin.yml` for it (stow#880). This lane is the other half: a
 # once-per-UTC-day refresh for the moving lists. The marker is an
 # actions/cache entry keyed by version and day, which makes a same-day
-# re-run a no-op. The schedule ticks every four hours off the top of the
-# hour, so a delayed or missed tick costs a few hours rather than a day;
-# every tick after the day's first is that no-op.
+# re-run a no-op. The edge Worker's Cron Trigger dispatches this workflow
+# once a day at 00:17 UTC, off the top of the hour (stow#1100; GitHub's
+# own `schedule` skipped ticks); the newreleases.io wake covers a new
+# stable rustc in between, and a manual dispatch the same day is that
+# no-op.
 #
 # Re-submitting the whole list is cheap on purpose: the scheduler
 # deduplicates on task identity, leaves completed tasks completed, and
 # retires pending tasks the artifact catalog already covers, so a wave
 # only builds what is genuinely missing or previously failed.
 on:
+  # Kept until the edge Cron Trigger is deployed and seen dispatching;
+  # the day marker makes the overlap a no-op.
   schedule:
     - cron: "17 */4 * * *"
   workflow_dispatch:

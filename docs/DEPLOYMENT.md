@@ -465,6 +465,38 @@ The crucial property: CI never holds a Cloudflare API token, and no
 shared secret exists anywhere on the edge write surface — every trusted
 call is a GitHub identity, verified as described below.
 
+### Periodic workflows — the edge Cron Trigger
+
+GitHub's `schedule` trigger is best-effort and skipped most ticks
+(`watchdog.yml` ran 5 of 96 expected times in a day, stow#1100), so the
+edge Worker's Cloudflare Cron Trigger dispatches the two periodic
+workflows; their `schedule` blocks stay only until a deployed edge is seen
+dispatching them, and are then removed. The Cron Trigger dispatches them on `main` through the GitHub App arm the
+build dispatch uses. `edge/Skyzen.toml` declares the cadences in
+`[cloudflare.triggers] crons` (`*/15 * * * *` for `watchdog.yml`,
+`17 0 * * *` (daily, 00:17) for `preheat-cron.yml`, both UTC) and the
+`STOW_PERIODIC_WORKFLOWS` var maps each cron expression to the workflow
+files due when it fires. The Worker's `scheduled` handler looks the
+event's cron up in that map and posts one `workflow_dispatch` per due
+workflow through the scheduler object (`POST /periodic/dispatch`),
+concurrently under a bound of four. To change a cadence, edit the cron
+in both places; `admin/tests/workflow_entrypoints.rs` keeps the two
+sets equal. Both workflows keep `workflow_dispatch` for manual runs.
+
+A failed dispatch (or a tick whose cron the map does not name) is logged,
+mailed from `alerts@stow.waterui.dev` through the same `send_email`
+binding as the freeze alerts, and fails the invocation in Workers Logs.
+The edge cannot open the `incident` issue (the App carries no `issues`
+grant), and the next tick retries. While the watchdog's breaker has
+`preheat-cron.yml` disabled, that tick's dispatch is refused and mailed.
+
+Cost: 96 watchdog plus 1 preheat-cron tick a day, each one Worker
+invocation, one scheduler-object request, at most one token mint and one
+dispatch POST — at most 291 subrequests a day, 2,910 Worker requests and
+2,910 object requests a month (0.03% of 10M and 0.3% of 1M included),
+and no stored rows. The `POST /periodic/dispatch` drive in
+`edge/src/scheduler/drives.rs` pins the zero-row budget.
+
 ### GitHub webhook — `workflow_run`
 
 Task completion reaches the scheduler through GitHub's webhook, not
@@ -628,7 +660,8 @@ their own tokens.
 ## Initial cache population
 
 The cache preheats itself — `preheat-cron.yml` dispatches a wave
-daily, and the newreleases.io webhook wakes one on every new stable
+daily (the edge's Cron Trigger fires it at 00:17 UTC;
+[Periodic workflows](#periodic-workflows--the-edge-cron-trigger)), and the newreleases.io webhook wakes one on every new stable
 rustc. To seed a wave by hand, `preheat manual` dispatches
 `operations.yml` ([Operator mutations](#operator-mutations)), which
 resolves the graph on the runner from the carried `--crates` /

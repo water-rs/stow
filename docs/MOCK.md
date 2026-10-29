@@ -416,3 +416,13 @@ The mock registry, wrangler, and stow-build endpoints are plain
 processes; `kill <pid>` is enough. State on disk
 (`/tmp/stow-bench/{mock-registry,edge-state}`) persists across restarts;
 delete those directories to start fresh.
+## Scheduled events
+
+The edge's Cron Trigger (`[cloudflare.triggers]` in the manifests,
+stow#1100) dispatches `watchdog.yml` and `preheat-cron.yml`. On the mock
+stack the `scheduled` handler posts the same dispatch to
+`STOW_LOCAL_CI_URL`, where `stow-build serve` records it for
+`GET /periodic`; `wrangler dev --test-scheduled` fires one on demand with
+`curl "http://127.0.0.1:8788/__scheduled?cron=*/15+*+*+*+*"`. The edge idle
+suite (`edge/tests/idle/scheduled.test.ts`) fires scheduled events against
+the real workerd build and asserts exactly the due workflows are dispatched.

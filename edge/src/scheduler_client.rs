@@ -29,6 +29,7 @@ const SCHEDULER_DEMAND_URL: &str = "https://scheduler.internal/demand";
 /// (stow#955). Only the edge builds requests to the object.
 pub const ACTOR_HEADER: &str = "x-stow-actor";
 const SCHEDULER_PREHEAT_RELEASE_URL: &str = "https://scheduler.internal/preheat/release";
+const SCHEDULER_PERIODIC_DISPATCH_URL: &str = "https://scheduler.internal/periodic/dispatch";
 
 pub async fn send_enqueue(
     namespace: &CfDurableNamespace,
@@ -328,6 +329,17 @@ pub async fn send_preheat_release(
     request: &stow_types::api::PreheatReleaseRequest,
 ) -> Result<(), SchedulerClientError> {
     send_json(namespace, SCHEDULER_PREHEAT_RELEASE_URL, request).await
+}
+
+/// `POST /periodic/dispatch` — one periodic workflow the Worker's
+/// Cron Trigger found due (stow#1100). The object dispatches it on
+/// `main` through the CI interface; a dispatch failure is the
+/// caller's error.
+pub async fn send_periodic_dispatch(
+    namespace: &CfDurableNamespace,
+    request: &stow_types::periodic::PeriodicDispatchRequest,
+) -> Result<(), SchedulerClientError> {
+    send_json(namespace, SCHEDULER_PERIODIC_DISPATCH_URL, request).await
 }
 
 /// `POST /demand-feed/begin` — open or rotate the hour's staging

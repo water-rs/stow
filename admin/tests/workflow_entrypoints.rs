@@ -156,21 +156,10 @@ fn preheat_cron() -> serde_yml::Value {
 #[test]
 fn cron_declarations() {
     let wf = preheat_cron();
-    assert_eq!(
-        at(&wf, "on.schedule")
-            .and_then(|s| s.as_sequence())
-            .map(Vec::len),
-        Some(1)
-    );
-    assert_eq!(
-        at(&wf, "on.schedule")
-            .and_then(|s| s.as_sequence())
-            .and_then(|s| field(&s[0], "cron"))
-            .map(scalar)
-            .as_deref(),
-        Some("17 */4 * * *")
-    );
-    // The tick both schedules and dispatches manually.
+    // The cadence is the edge Cron Trigger's (stow#1100), pinned by
+    // `periodic_schedule.rs`; GitHub's `schedule` stays only until that
+    // trigger is deployed.
+    // The edge's Cron Trigger and an operator both dispatch it.
     assert!(at(&wf, "on.workflow_dispatch").is_some());
     // `gh workflow run` needs actions:write; nothing else is granted.
     assert_eq!(
