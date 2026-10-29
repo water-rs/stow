@@ -173,7 +173,7 @@ the Analytics Engine point — and a forged or tampered request cannot
 verify.
 
 The miss lane is also depth-capped: once the scheduler reports
-`pending >= STOW_MAX_QUEUE_PENDING` the handler refuses tickets with 429
+`pending >= STOW_MAX_QUEUE_PENDING` (the miss lane's own pending nodes; other lanes' backlog never counts) the handler refuses tickets with 429
 and `Retry-After: 600`, and the Durable Object repeats the check inside
 `enqueue` so a race of concurrent redemptions cannot overshoot by more
 than one submit batch. Human-lane and workflow-trusted submits
@@ -228,15 +228,20 @@ Dispatch is additionally capped per GitHub Actions runner family —
 onto the pool its `runs-on` entry in `build-crate.yml` resolves to
 (Linux, macOS, or Windows). `STOW_MAX_CONCURRENT_JOBS` bounds total
 in-flight runner slots — one per claimed `build-crate.yml`
-run — against the org's
-60-runner fleet (`0` pauses dispatch
+run (`0` pauses dispatch
 entirely — see `DEPLOYMENT.md`), and
 `STOW_MAX_CONCURRENT_MACOS_JOBS` bounds macOS-family slots so a
-full wave cannot occupy the whole 20-runner macOS pool. Within a lane,
+full wave cannot occupy the whole macOS pool. Within a lane,
 Windows-family rows claim first regardless of request age because the
 Windows tasks are the slowest in a wave; rows whose family is saturated
 stay pending, and the alarm then wakes at the earliest in-flight lease
-expiry rather than re-firing immediately.
+expiry rather than re-firing immediately. Operators move both caps at
+runtime — `stow-admin dispatch-cap set --jobs N [--macos M]` appends a
+setting to the scheduler's log that replaces the binding values at
+claim time until the next `set` (stow#1039): there is no clear, a
+`--macos`-less `set` leaves that cap on its binding, no ceiling is
+checked, and a lowered cap cancels nothing in flight — new claims
+pause until the in-flight count drops below it.
 
 The handler resolves the requested version (newest non-prerelease,
 non-yanked release when the body omits it) and the current stable rustc,
@@ -848,6 +853,8 @@ unauthorized POSTs short-circuit before deserialization.
 | GET `/api/v1/bundles/{rustc_version}/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Byte fetch — the only artifact-serving route; the `{rustc_version}` segment names the artifact's GHCR package and the `sha256:<64 hex>` segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: `operations.yml` OIDC on `main` | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
+| GET `/api/v1/admin/dispatch-cap` | Bearer: repo-workflow OIDC or push user | — | `DispatchCaps` | The dispatch caps in force plus the operator setting behind them (stow#1039) |
+| POST `/api/v1/admin/dispatch-cap` | Bearer: `operations.yml` OIDC on `main` | `DispatchCapSet` | `DispatchCaps` | The operator's `set` — replaces the cap bindings at claim time until the next `set` (`stow-admin dispatch-cap status\|set`) |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: `operations.yml` OIDC on `main` | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |
@@ -903,7 +910,10 @@ bundle bytes keep serving; and `stow maintenance: all` blocks the
 whole hostname. `stow-admin maintenance on --scope anonymous` (run by
 `operations.yml`, which holds the Cloudflare token) flips the
 rule's `enabled` flag through the Rulesets API; the watchdog (#450)
-trips by enabling `anonymous`. Blocked requests are answered in the
+trips by enabling the scope its breach costs — `lanes` for the
+scheduler Durable Object's billed dimensions and the build-pipeline
+signals, `anonymous` for the Worker's — and the widest when several
+breach. Blocked requests are answered in the
 security phase — they never invoke the Worker and never reach the
 Durable Object, so the shed costs nothing and a broken edge cannot
 silence the breaker. The trusted prefixes and the GitHub webhook route
@@ -956,8 +966,8 @@ freeze state and transition log off the admin route every 15 minutes,
 writes and closes the issue, and posts the hourly still-frozen digest —
 the edge's `stow-ci` App token carries no `issues` grant by design (the
 edge is untrusted serving infrastructure). Account-wide cost and
-edge-health signals (request error rate, exceeded CPU/memory, usage
-percentages) are the watchdog's too — the GraphQL Analytics API is only
+edge-health signals (request error rate, exceeded CPU/memory, billed
+usage over the current UTC month against the 80% line) are the watchdog's too — the GraphQL Analytics API is only
 read from Actions, never from the edge.
 
 Which builds failed is a third channel neither of those owns: the
@@ -984,7 +994,7 @@ is unset or malformed.
 | `STOW_OIDC_AUDIENCE` | `https://stow.waterui.dev` | `aud` the edge pins on Actions OIDC tokens; must equal the repo variable CI requests |
 | `STOW_POW_CHALLENGE_SECRET` | required (secret) | HMAC key minting and verifying enqueue-admission challenges |
 | `STOW_POW_MIN_BITS` | `12` | Leading-zero bits of enqueue proof-of-work, minted into every admission and required of every ticket. About 0.27 ms of expected work at a measured 66 ns/hash. Capped at 24 bits, which guards a misconfiguration rather than load |
-| `STOW_MAX_QUEUE_PENDING` | `2000` | Pending depth at which miss-lane enqueues are refused (429 + `Retry-After: 600`); checked in the edge handler and in the scheduler object. Human-lane and trusted submits are exempt |
+| `STOW_MAX_QUEUE_PENDING` | `2000` | Miss-lane pending depth (other lanes' backlog not counted) at which miss-lane enqueues are refused (429 + `Retry-After: 600`); checked in the edge handler and in the scheduler object. Human-lane and trusted submits are exempt |
 | `STOW_HUMAN_MAX_CLOSURE` | `150` | Largest dependency closure `POST /api/v1/requests` accepts per target; larger closures get 422 |
 | `STOW_HUMAN_DAILY_TASK_BUDGET` | `2000` | Human-lane tasks accepted per UTC day, counted in the scheduler object's `human_daily_task_budget` table; overspending submits get 429 + `Retry-After` to 00:00 UTC |
 | `TURNSTILE_SITE_KEY` | `0x4AAAAAAE8LjhnMsqdVhiSp` | Public site key of the request page's invisible Turnstile widget |
