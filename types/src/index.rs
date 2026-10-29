@@ -292,21 +292,26 @@ impl std::error::Error for IndexDecodeError {
     }
 }
 
-/// Serialize `index` as JSON and zstd-compress it — the bytes the OCI
-/// layer carries.
+/// Serialize `index` as JSON and compress it with `compress` — the bytes
+/// the OCI layer carries.
 ///
-/// Not compiled for `wasm32`: `zstd` does not build there and the edge
-/// never encodes indexes — producers (admin, CI) and the CLI consumer are
-/// all native.
+/// The compressor is the caller's because the level lives in `stow-shim`,
+/// which depends on this crate: producers pass
+/// `stow_shim::compress`, through `stow_shim::encode_index`.
+///
+/// Not compiled for `wasm32`: the edge never encodes indexes — producers
+/// (admin, CI) and the CLI consumer are all native.
 ///
 /// # Errors
 ///
 /// [`IndexError::Serialize`] or [`IndexError::Compress`].
 #[cfg(not(target_arch = "wasm32"))]
-pub fn encode(index: &ArtifactIndex) -> Result<Vec<u8>, IndexError> {
+pub fn encode(
+    index: &ArtifactIndex,
+    compress: impl FnOnce(&[u8]) -> std::io::Result<Vec<u8>>,
+) -> Result<Vec<u8>, IndexError> {
     let json = serde_json::to_vec(index).map_err(IndexError::Serialize)?;
-    zstd::stream::encode_all(std::io::Cursor::new(json), zstd::DEFAULT_COMPRESSION_LEVEL)
-        .map_err(IndexError::Compress)
+    compress(&json).map_err(IndexError::Compress)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -403,6 +408,11 @@ mod tests {
     use crate::platform::{PanicStrategy, StripLevel};
     use crate::registry::{cache_repository, oci_reference_tag};
 
+    /// The compressor is the caller's; the round trip needs any zstd one.
+    fn encode_for_test(index: &ArtifactIndex) -> Result<Vec<u8>, IndexError> {
+        encode(index, |json| zstd::bulk::compress(json, 3))
+    }
+
     fn index(rows: Vec<ArtifactIndexRow>) -> ArtifactIndex {
         ArtifactIndex {
             header: ArtifactIndexHeader {
@@ -452,7 +462,7 @@ mod tests {
     #[test]
     fn encode_decode_round_trips() {
         let index = index(vec![row("aaaa"), row("bbbb")]);
-        let bytes = encode(&index).expect("encode");
+        let bytes = encode_for_test(&index).expect("encode");
         assert_eq!(ArtifactIndex::decode(&bytes).expect("decode"), index);
     }
 
@@ -460,7 +470,7 @@ mod tests {
     fn decode_rejects_a_foreign_format_version() {
         let mut index = index(Vec::new());
         index.header.format_version = 99;
-        let bytes = encode(&index).expect("encode");
+        let bytes = encode_for_test(&index).expect("encode");
         let error = ArtifactIndex::decode(&bytes).expect_err("foreign format_version must fail");
         assert!(matches!(
             error,
@@ -482,7 +492,7 @@ mod tests {
         let current = ARTIFACT_INDEX_FORMAT_VERSION;
         let mut index = index(Vec::new());
         index.header.format_version = current - 1;
-        let bytes = encode(&index).expect("encode");
+        let bytes = encode_for_test(&index).expect("encode");
         let error = ArtifactIndex::decode(&bytes).expect_err("an older format fails");
         assert_eq!(
             error.to_string(),
@@ -493,7 +503,7 @@ mod tests {
             )
         );
         index.header.format_version = current + 1;
-        let bytes = encode(&index).expect("encode");
+        let bytes = encode_for_test(&index).expect("encode");
         let error = ArtifactIndex::decode(&bytes).expect_err("a newer format fails");
         assert_eq!(
             error.to_string(),
@@ -508,7 +518,7 @@ mod tests {
     fn decode_rejects_a_row_count_that_disagrees_with_the_body() {
         let mut index = index(vec![row("aaaa")]);
         index.header.row_count = 7;
-        let bytes = encode(&index).expect("encode");
+        let bytes = encode_for_test(&index).expect("encode");
         let error = ArtifactIndex::decode(&bytes).expect_err("a lying row_count must fail");
         assert!(matches!(
             error,

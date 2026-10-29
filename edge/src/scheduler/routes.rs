@@ -228,14 +228,17 @@ pub(super) async fn demand(
     Ok((report, plan))
 }
 
-/// `POST /index/published`: one `SliceReport` event per slice of the
-/// publish run, committed in ONE append (stow#940); each apply flips
-/// its matched dependency edges.
+/// `POST /index/published`: one `SliceReport` event per slice (or per
+/// part of a multi-part full report) in the body, committed in ONE
+/// append (stow#940); each apply flips its matched dependency edges,
+/// and a multi-part report applies with its last part only.
 ///
 /// # Errors
 /// `QueueError::SliceReportConflict` when a delta does not extend its
-/// slice's live generation, `QueueError::Invariant` on a slice named
-/// twice, `QueueError::Sql` on a failed append.
+/// slice's live generation or lands on a staged report, or a part
+/// does not continue its staged report, `QueueError::Invariant` on a
+/// slice named twice or contradictory part metadata,
+/// `QueueError::Sql` on a failed append.
 pub(super) async fn slice_reports(
     graph: LoadedGraph<'_>,
     db: &DurableDb,
@@ -258,6 +261,8 @@ pub(super) async fn slice_reports(
                 slice.rustc_version.as_str(),
                 slice.base_generation,
                 slice.generation,
+                slice.part,
+                slice.parts,
             )
         })
     })?;
@@ -268,6 +273,8 @@ pub(super) async fn slice_reports(
             rustc_version: slice.rustc_version.clone(),
             base_generation: slice.base_generation,
             generation: slice.generation,
+            part: slice.part,
+            parts: slice.parts,
             added: slice.added.clone(),
             retired: slice.retired.clone(),
         })
@@ -1151,6 +1158,8 @@ mod inline_dispatch_tests {
             rustc_version: stow_types::identity::WireRustcVersion::parse("1.84.0").expect("rustc"),
             base_generation,
             generation,
+            part: 0,
+            parts: 1,
             added: fixture::full_slice_report(),
             retired: Vec::new(),
         };
@@ -1178,6 +1187,142 @@ mod inline_dispatch_tests {
         let live = woken
             .with(|graph| graph.slice_generation(stow_types::api::CI_TARGET_TRIPLES[8], "1.84.0"));
         assert_eq!(live, Some(5));
+    }
+
+    /// A run's three full slice reports of 4,000, 3,000 and 2,500 rows -
+    /// distinct identities at production's row width, so the run is over
+    /// one request body and its first slice over one part.
+    fn oversized_run(rustc: &str, generations: [i64; 3]) -> Vec<stow_types::api::PublishedSlice> {
+        use stow_types::api::{PublishedSlice, PublishedSliceRow};
+        use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+
+        let row = |slice: usize, i: usize| PublishedSliceRow {
+            crate_name: format!("report-{slice}-crate-{i}").parse().expect("crate"),
+            version: "1.0.0".parse().expect("version"),
+            features_json: stow_types::identity::FeaturesJson::default(),
+            unit_shape: UnitShape {
+                side: UnitSide::Target,
+                invocation: UnitInvocation::Native,
+                kind: UnitKind::Linked,
+            },
+            dependency_identity: format!("{:064x}", slice * 100_000 + i)
+                .parse()
+                .expect("digest"),
+        };
+        [4_000, 3_000, 2_500]
+            .into_iter()
+            .zip(generations)
+            .enumerate()
+            .map(|(at, (rows, generation))| PublishedSlice {
+                target: stow_types::identity::TargetTriple::parse(
+                    stow_types::api::CI_TARGET_TRIPLES[at],
+                )
+                .expect("target"),
+                rustc_version: stow_types::identity::WireRustcVersion::parse(rustc).expect("rustc"),
+                base_generation: None,
+                generation,
+                part: 0,
+                parts: 1,
+                added: (0..rows).map(|i| row(at, i)).collect(),
+                retired: Vec::new(),
+            })
+            .collect()
+    }
+
+    /// A run's full report well over the request-body limit, with a
+    /// slice larger than one part, lands as bounded log rows in the
+    /// bodies the client splits it into: nothing applies before a
+    /// slice's last part, a wake in the middle of the report (after a
+    /// snapshot) resumes it, and every slice ends at its generation.
+    #[tokio::test]
+    async fn a_full_report_over_the_body_limit_lands_in_parts() {
+        use stow_types::api::{
+            PublishedRunReport, PublishedSlice, REQUEST_BODY_LIMIT_BYTES, SLICE_REPORT_PART_BYTES,
+        };
+
+        const RUSTC: &str = "1.99.1";
+        const GENERATIONS: [i64; 3] = [10, 11, 12];
+        let slices = oversized_run(RUSTC, GENERATIONS);
+        let whole = |slice: &PublishedSlice| serde_json::to_vec(slice).expect("encode").len();
+        assert!(
+            slices.iter().map(whole).sum::<usize>() > REQUEST_BODY_LIMIT_BYTES,
+            "the report is over one request body"
+        );
+        assert!(
+            whole(&slices[0]) > SLICE_REPORT_PART_BYTES,
+            "one slice is over one part"
+        );
+        let bodies = PublishedRunReport::into_bodies(
+            slices.clone(),
+            SLICE_REPORT_PART_BYTES,
+            REQUEST_BODY_LIMIT_BYTES,
+        )
+        .expect("split");
+        assert!(bodies.len() > 2);
+        for body in &bodies {
+            assert!(serde_json::to_vec(body).expect("encode").len() <= REQUEST_BODY_LIMIT_BYTES);
+        }
+
+        let (db, mut owner) = seeded().await;
+        let generation = |owner: &GraphCell, at: usize| {
+            owner
+                .loaded()
+                .expect("loaded")
+                .with(|graph| graph.slice_generation(stow_types::api::CI_TARGET_TRIPLES[at], RUSTC))
+        };
+        let staged = |owner: &GraphCell| {
+            owner
+                .loaded()
+                .expect("loaded")
+                .with(|g| g.staged_part_count())
+        };
+        for (at, body) in bodies.iter().enumerate() {
+            slice_reports(
+                owner.loaded().expect("loaded"),
+                &db,
+                &body.slices,
+                None,
+                HOST_NOW_MS,
+            )
+            .await
+            .expect("a part of the report");
+            if at == 0 {
+                // The first body leaves slice 0 staged and unapplied;
+                // the isolate is evicted after a snapshot, and the
+                // woken one resumes the report.
+                assert!(staged(&owner) > 0);
+                assert_eq!(generation(&owner, 0), None);
+                let before = staged(&owner);
+                snapshot(owner.loaded().expect("loaded"), &db, HOST_NOW_MS)
+                    .await
+                    .expect("snapshot");
+                owner = wake(&db).await;
+                assert_eq!(staged(&owner), before, "the staged parts survive the wake");
+            }
+        }
+        for (at, generation_at) in GENERATIONS.into_iter().enumerate() {
+            assert_eq!(generation(&owner, at), Some(generation_at), "slice {at}");
+        }
+        assert_eq!(staged(&owner), 0);
+        let widest: i64 = db
+            .query("SELECT max(length(event)) FROM event_log")
+            .fetch_scalar()
+            .await
+            .expect("widest row");
+        assert!(
+            widest < i64::try_from(SLICE_REPORT_PART_BYTES * 2).expect("bound"),
+            "a log row is a part, not a slice: {widest}"
+        );
+        // A snapshot after the completion rewrites the staged rows
+        // away; a final wake replays the rest into the same state.
+        snapshot(owner.loaded().expect("loaded"), &db, HOST_NOW_MS)
+            .await
+            .expect("snapshot");
+        let woken = wake(&db).await;
+        for (at, generation_at) in GENERATIONS.into_iter().enumerate() {
+            assert_eq!(generation(&woken, at), Some(generation_at), "slice {at}");
+        }
+        assert_eq!(staged(&woken), 0);
     }
 
     /// A bounded claim is a prefix of the unbounded claim — the bound

@@ -45,6 +45,7 @@ pub trait Handler: Send + Sync + 'static {
         self: &Arc<Self>,
         pending: Self::Pending,
         success: bool,
+        compile_time: Duration,
     ) -> impl Future<Output = ()> + Send;
 
     /// The bookkeeping a facade-owned compile still needs: the mark before
@@ -86,6 +87,8 @@ pub struct Observation {
     /// `None` marks the unit as compiling locally; `Some` reports how the
     /// finished compile exited.
     pub success: Option<bool>,
+    /// How long the finished compile ran; zero on the mark.
+    pub compile_time: Duration,
     /// The invocation's environment the supervisor cannot see.
     pub env: crate::supervisor::protocol::InvocationEnv,
 }
@@ -826,6 +829,7 @@ async fn answer_observation<H: Handler>(
             executable,
             args,
             success: observed.success,
+            compile_time: Duration::from_millis(observed.compile_millis),
             env: observed.env,
         })
         .await;
@@ -859,7 +863,13 @@ async fn answer_report<H: Handler>(
                 .iter()
                 .position(|mark| mark.ticket == Some(report.ticket))
                 .map(|index| marks.remove(index).completion);
-            handler.compiled(pending, report.success).await;
+            handler
+                .compiled(
+                    pending,
+                    report.success,
+                    Duration::from_millis(report.compile_millis),
+                )
+                .await;
             Answer::Recorded
         }
         Ok(None) => Answer::Failed {
@@ -876,6 +886,7 @@ mod tests {
     use std::ffi::OsString;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use super::{Decision, Handler, start};
     use crate::supervisor::client::{Connection, Decision as ClientDecision};
@@ -913,6 +924,7 @@ mod tests {
             self: &Arc<Self>,
             _pending: Self::Pending,
             success: bool,
+            _compile_time: Duration,
         ) -> impl std::future::Future<Output = ()> + Send {
             if success {
                 self.reports.fetch_add(1, Ordering::SeqCst);
@@ -969,7 +981,10 @@ mod tests {
         let ClientDecision::Compile(ticket) = decision else {
             panic!("the stub asks for a compile");
         };
-        connection.report(&ticket, true).await.expect("report");
+        connection
+            .report(&ticket, true, Duration::ZERO)
+            .await
+            .expect("report");
         assert_eq!(handler.reports.load(Ordering::SeqCst), 1);
     }
 
@@ -1029,6 +1044,7 @@ mod tests {
                 self: &Arc<Self>,
                 _pending: Self::Pending,
                 _success: bool,
+                _compile_time: Duration,
             ) -> impl std::future::Future<Output = ()> + Send {
                 std::future::ready(())
             }
@@ -1220,6 +1236,7 @@ mod tests {
             self: &Arc<Self>,
             _pending: Self::Pending,
             _success: bool,
+            _compile_time: Duration,
         ) -> impl std::future::Future<Output = ()> + Send {
             std::future::ready(())
         }
@@ -1297,6 +1314,7 @@ mod tests {
                 OsString::from("lib"),
             ],
             Some(true),
+            0,
             crate::supervisor::protocol::InvocationEnv::default(),
         );
         write_frame(&mut *stream, &Request::Observed(report))

@@ -45,6 +45,25 @@ workspace mirror instead of prompting. Recommended for CI.
 stow check --silent-compatible-upgrades --manifest-path Cargo.toml
 ```
 
+## Cache mode
+
+One option in the config file ([`CONFIG.md`](CONFIG.md)) decides what the cache
+may touch, and every stow process reads it: `stow build`, the rustc wrapper
+plain `cargo` runs, and `stow stats`.
+
+| `cache_mode` | Public cache | Local cache | Network |
+| --- | --- | --- | --- |
+| `public` (default) | Used | Used | Index pulls, bundle downloads, admissions and the daily usage report |
+| `local` | Not used | Used | None: no stow process makes a request |
+| `off` | Not used | Neither read nor written | None |
+
+The mode is independent of build isolation: with the cache `off`, `stow build`
+still runs every build script and proc macro at the configured isolation level
+(below). `stow stats` reports the compile time local hits saved in every mode.
+Commands that exist to talk to the public cache (`stow predict`,
+`stow index refresh`, `stow check-artifact`, `stow fetch-artifact`) fail with a
+message naming the mode; `stow setup` skips the index fetch.
+
 ## Build isolation
 
 Every cargo-running command confines the build — cargo, rustc, every build
@@ -531,7 +550,9 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   slice's membership to the scheduler. `index-publish.yml`
   runs this loop after every `build-crate` run, preceded by `index
   reconcile`, which reports in full every published slice whose
-  generation the scheduler does not hold. `index targets` lists
+  generation the scheduler does not hold (a full membership over one
+  request body posts in parts; a delta too large for one part is
+  reported as the slice's full membership). `index targets` lists
   the `(target, rustc)` pairs a published index covers.
 
 None of this has to be run by hand. `preheat-cron.yml` dispatches the

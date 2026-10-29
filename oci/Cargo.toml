@@ -17,7 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 async-process = "2"
 smol = "2"
-zstd = "0.14"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 fastrand = "2"
 # Canonical JSON for manifest bytes — the same formatter oci-client's own
 # push uses, so digests match what it produced.

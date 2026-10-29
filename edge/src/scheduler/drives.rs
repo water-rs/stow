@@ -2193,6 +2193,8 @@ pub const DRIVES: &[Drive] = &[
                         rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
                         generation: 1,
+                        part: 0,
+                        parts: 1,
                         added: fixture::full_slice_report(),
                         retired: Vec::new(),
                     }],
@@ -2227,8 +2229,82 @@ pub const DRIVES: &[Drive] = &[
                         rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
                         base_generation: None,
                         generation: 1,
+                        part: 0,
+                        parts: 1,
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
+                    }],
+                    Some(DRIVE_ACTOR),
+                    now_ms(),
+                )
+                .await
+                .map_err(text)
+            })
+        }),
+    },
+    Drive {
+        // The part path of a full report larger than one request body
+        // (a store-reset reconcile, a first publish): every body but a
+        // slice's last stages its part - one bounded `SliceReport`
+        // append, no flips, the same `dispatch_pending` tail. The final
+        // part costs what the `(full)` drive measures (its append plus
+        // the flips of the whole membership), so the report's cost is
+        // one `(part)` per staged body plus one `(full)`. Part 0 of two
+        // on the dedicated slice stages the fixture's membership; the
+        // cleanup supersedes it with the empty whole report the `(full)`
+        // drive leaves, so nothing stays staged.
+        name: "POST /index/published (part)",
+        setup: None,
+        run: |db, _shape, settings, ctx| {
+            Box::pin(async move {
+                routes::slice_reports(
+                    ctx.loaded(),
+                    db,
+                    &[PublishedSlice {
+                        target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
+                        rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
+                        base_generation: None,
+                        generation: 2,
+                        part: 0,
+                        parts: 2,
+                        added: fixture::full_slice_report(),
+                        retired: Vec::new(),
+                    }],
+                    Some(DRIVE_ACTOR),
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                let claimed = focused_claim_pass(db, settings, ctx).await?;
+                *ctx.bound.lock().expect("drive binding") = None;
+                ctx.set_bound(BoundRun {
+                    task: claimed.join(","),
+                    run: 0,
+                });
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                let claimed = ctx.bound_run()?.task;
+                let ids = claimed
+                    .split(',')
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                restore_claimed(ctx, db, ids).await?;
+                routes::slice_reports(
+                    ctx.loaded(),
+                    db,
+                    &[PublishedSlice {
+                        target: TargetTriple::parse(CI_TARGET_TRIPLES[8]).map_err(text)?,
+                        rustc_version: WireRustcVersion::parse("1.84.0").map_err(text)?,
+                        base_generation: None,
+                        generation: 1,
+                        part: 0,
+                        parts: 1,
+                        added: Vec::new(),
+                        retired: Vec::new(),
                     }],
                     Some(DRIVE_ACTOR),
                     now_ms(),
@@ -2257,6 +2333,8 @@ pub const DRIVES: &[Drive] = &[
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
                         base_generation: Some(live),
                         generation: live + 1,
+                        part: 0,
+                        parts: 1,
                         added,
                         retired,
                     }],
@@ -2292,6 +2370,8 @@ pub const DRIVES: &[Drive] = &[
                         rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
                         base_generation: Some(live),
                         generation: live + 1,
+                        part: 0,
+                        parts: 1,
                         added: retired,
                         retired: added,
                     }],
@@ -2700,6 +2780,8 @@ pub const DRIVES: &[Drive] = &[
                     rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
                     base_generation: None,
                     generation: 1,
+                    part: 0,
+                    parts: 1,
                     added: fixture::full_slice_report(),
                     retired: Vec::new(),
                 };
@@ -2782,6 +2864,8 @@ pub const DRIVES: &[Drive] = &[
                         rustc_version: WireRustcVersion::parse("1.87.0").map_err(text)?,
                         base_generation: None,
                         generation: 1,
+                        part: 0,
+                        parts: 1,
                         added: Vec::new(),
                         retired: fixture::full_slice_report(),
                     }],
@@ -3437,6 +3521,8 @@ async fn snapshot_slice_report(
             rustc_version: WireRustcVersion::parse("1.85.0").map_err(text)?,
             base_generation: Some(live),
             generation: live + 1,
+            part: 0,
+            parts: 1,
             added,
             retired,
         }],

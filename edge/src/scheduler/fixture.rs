@@ -509,6 +509,8 @@ fn slice_reports(graph: &Graph, lo: u32, hi: u32) -> Vec<SchedulerEvent> {
                 rustc_version: WireRustcVersion::parse(rustc).expect("fixture rustc"),
                 base_generation: live,
                 generation: live.map_or(1, |live| live + 1),
+                part: 0,
+                parts: 1,
                 added,
                 retired: Vec::new(),
             }

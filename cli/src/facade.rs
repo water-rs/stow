@@ -234,14 +234,17 @@ fn run_uncovered(
             executable,
             wrapped_args,
             None,
+            0,
             crate::supervisor::protocol::InvocationEnv::current(),
         )),
     )
     .map_err(|error| stow_types::stow_error!("{error}"))?;
+    let started = std::time::Instant::now();
     let status = std::process::Command::new(executable)
         .args(wrapped_args)
         .status()
         .wrap_err("failed to spawn wrapped compiler")?;
+    let compile_time = started.elapsed();
     let success = status.success();
     send(
         &mut wire,
@@ -250,6 +253,7 @@ fn run_uncovered(
             executable,
             wrapped_args,
             Some(success),
+            crate::duration_millis(compile_time),
             crate::supervisor::protocol::InvocationEnv::current(),
         )),
     )

@@ -46,6 +46,11 @@ CREATE TABLE artifact_cache_entries (
 CREATE INDEX idx_artifact_cache_entries_lru
 ON artifact_cache_entries (rustc_version, last_accessed_ms, cache_key);
 
+-- The closure walk of an eviction pass finds the providers of a compile
+-- key through this index (stow#1053).
+CREATE INDEX idx_artifact_cache_entries_compile_key
+ON artifact_cache_entries (rustc_version, compile_key);
+
 CREATE INDEX idx_artifact_cache_entries_semantic
 ON artifact_cache_entries (
     rustc_version,
@@ -73,6 +78,67 @@ CREATE TABLE artifact_cache_outputs (
         ON DELETE CASCADE
 );
 
+-- stow#1053: one row per compile key an entry's
+-- `dependency_compile_keys_json` names, derived by the insert trigger
+-- below and removed with the entry, so an eviction pass finds the
+-- dependents of a compile key through `idx_artifact_cache_dependencies`
+-- instead of listing every entry.
+CREATE TABLE artifact_cache_dependencies (
+    rustc_version TEXT NOT NULL,
+    cache_key TEXT NOT NULL,
+    dependency_compile_key TEXT NOT NULL,
+    PRIMARY KEY (rustc_version, cache_key, dependency_compile_key),
+    FOREIGN KEY (rustc_version, cache_key)
+        REFERENCES artifact_cache_entries (rustc_version, cache_key)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX idx_artifact_cache_dependencies
+ON artifact_cache_dependencies (rustc_version, dependency_compile_key);
+
+CREATE TRIGGER artifact_cache_entries_dependencies
+AFTER INSERT ON artifact_cache_entries
+BEGIN
+    INSERT OR IGNORE INTO artifact_cache_dependencies
+        (rustc_version, cache_key, dependency_compile_key)
+    SELECT NEW.rustc_version, NEW.cache_key, json_extract(value, '$.compile_key')
+    FROM json_each(NEW.dependency_compile_keys_json);
+END;
+
+-- stow#1053: the resident bytes of each rustc version's entries, kept by
+-- the triggers below in the very transaction that inserts, resizes or
+-- deletes a row, so the total is a function of the rows at every commit
+-- and a store under the cap reads one row instead of the table.
+CREATE TABLE artifact_cache_totals (
+    rustc_version TEXT PRIMARY KEY,
+    total_bytes INTEGER NOT NULL
+);
+
+CREATE TRIGGER artifact_cache_entries_total_insert
+AFTER INSERT ON artifact_cache_entries
+BEGIN
+    INSERT INTO artifact_cache_totals (rustc_version, total_bytes)
+    VALUES (NEW.rustc_version, NEW.size_bytes)
+    ON CONFLICT (rustc_version)
+    DO UPDATE SET total_bytes = total_bytes + NEW.size_bytes;
+END;
+
+CREATE TRIGGER artifact_cache_entries_total_resize
+AFTER UPDATE OF size_bytes ON artifact_cache_entries
+BEGIN
+    UPDATE artifact_cache_totals
+    SET total_bytes = total_bytes + NEW.size_bytes - OLD.size_bytes
+    WHERE rustc_version = NEW.rustc_version;
+END;
+
+CREATE TRIGGER artifact_cache_entries_total_delete
+AFTER DELETE ON artifact_cache_entries
+BEGIN
+    UPDATE artifact_cache_totals
+    SET total_bytes = total_bytes - OLD.size_bytes
+    WHERE rustc_version = OLD.rustc_version;
+END;
+
 CREATE TABLE artifact_cache_sigstore_signatures (
     rustc_version TEXT NOT NULL,
     cache_key TEXT NOT NULL,
@@ -99,6 +165,34 @@ CREATE TABLE cc_cache_entries (
 
 CREATE INDEX idx_cc_cache_entries_lru
 ON cc_cache_entries (last_accessed_ms, cache_key);
+
+-- stow#1053: the resident bytes of every C/C++ object, kept by triggers
+-- like `artifact_cache_totals`.
+CREATE TABLE cc_cache_totals (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    total_bytes INTEGER NOT NULL
+);
+
+INSERT INTO cc_cache_totals (singleton, total_bytes) VALUES (1, 0);
+
+CREATE TRIGGER cc_cache_entries_total_insert
+AFTER INSERT ON cc_cache_entries
+BEGIN
+    UPDATE cc_cache_totals SET total_bytes = total_bytes + NEW.size_bytes;
+END;
+
+CREATE TRIGGER cc_cache_entries_total_resize
+AFTER UPDATE OF size_bytes ON cc_cache_entries
+BEGIN
+    UPDATE cc_cache_totals
+    SET total_bytes = total_bytes + NEW.size_bytes - OLD.size_bytes;
+END;
+
+CREATE TRIGGER cc_cache_entries_total_delete
+AFTER DELETE ON cc_cache_entries
+BEGIN
+    UPDATE cc_cache_totals SET total_bytes = total_bytes - OLD.size_bytes;
+END;
 
 CREATE TABLE metadata_values (
     key TEXT PRIMARY KEY,

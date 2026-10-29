@@ -27,7 +27,6 @@ pub fn hermetic_stow_env(command: &mut Command, edge_url: &str, cache_dir: &Path
         .env_remove("STOW_INDEX_REFRESH_SECS")
         .env_remove("STOW_ARTIFACT_CACHE_MAX_BYTES")
         .env_remove("STOW_MOCK_PUBLIC_KEY_PATH")
-        .env_remove("STOW_DISABLE_PUBLIC_CACHE")
         .env_remove("STOW_ENABLE_SEMANTIC_FALLBACK")
         .env_remove("STOW_PUBLIC_CACHE_RUSTC_VERSION")
         .env_remove("STOW_PUBLIC_CACHE_TARGET")
@@ -163,4 +162,30 @@ fn real_rustup_home() -> Option<PathBuf> {
     }
     let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(key).map(|home| PathBuf::from(home).join(".rustup"))
+}
+
+/// Write the stow global config under each of `homes`: the directory the
+/// platform's config dir resolves to for a child whose home is sealed there
+/// (`$XDG_CONFIG_HOME` on Linux, `Library/Application Support` on macOS,
+/// `AppData/Roaming` on Windows). Every spelling is written, since a test
+/// cannot tell which home the child will resolve against.
+#[allow(
+    dead_code,
+    reason = "each test crate compiles this module whole; only some call it"
+)]
+pub fn write_global_config(homes: &[&Path], contents: &str) {
+    for home in homes {
+        for config_dir in [
+            home.join(".config"),
+            home.join("Library").join("Application Support"),
+            home.join("AppData").join("Roaming"),
+        ] {
+            let dir = config_dir.join("stow");
+            std::fs::create_dir_all(&dir)
+                .unwrap_or_else(|error| panic!("create {}: {error}", dir.display()));
+            std::fs::write(dir.join("config.toml"), contents).unwrap_or_else(|error| {
+                panic!("write the stow config in {}: {error}", dir.display())
+            });
+        }
+    }
 }

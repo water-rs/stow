@@ -60,7 +60,7 @@ hex.workspace = true
 tar = "0.4"
 flate2.workspace = true
 stow-types.workspace = true
-stow-shim.workspace = true
+stow-shim = { workspace = true, features = ["zstd"] }
 stow-oci.workspace = true
 # Same `default-features = false` selection as stow-oci: `rustls-tls` pins
 # aws-lc-rs, which conflicts with the ring provider this crate installs.
@@ -78,7 +78,6 @@ cargo-lock = "11"
 glob = "0.3"
 reflink-copy = { version = "0.1.30", default-features = false }
 walkdir = "2"
-zstd = "0.14"
 shell-words = "1.1"
 heel = { version = "0.7.1", default-features = false }
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio", "tls-rustls", "macros"] }

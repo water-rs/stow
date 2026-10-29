@@ -14,14 +14,6 @@ use stow_types::rustc::ParsedRustcArgs;
 pub use stow_shim::CAPTURE_DIR_ENV as STOW_BUILD_CAPTURE_DIR_ENV;
 pub const STOW_BUILD_CAPTURE_IPC_ENV: &str = "STOW_BUILD_CAPTURE_IPC";
 pub const STOW_BUILD_WRAPPER_CRATE_NAME_ENV: &str = "STOW_BUILD_WRAPPER_CRATE_NAME";
-pub const STOW_BUILD_LINK_ARG_ENV: &str = "STOW_BUILD_LINK_ARG";
-/// Set alongside [`STOW_BUILD_LINK_ARG_ENV`] when the cargo invocation
-/// carries `--target`: under a cross invocation the pin reaches only units
-/// whose argv names a linux-gnu `--target`, never a host unit — mirroring
-/// how a consumer's `cfg(target_os = "linux")` rustflags stop at the
-/// host/target boundary. A native invocation leaves it unset so host units
-/// (no `--target` of their own) take the pin the way rustflags reach them.
-pub const STOW_BUILD_LINK_ARG_CROSS_ENV: &str = "STOW_BUILD_LINK_ARG_CROSS";
 /// The virtual root the phase's `CARGO_TARGET_DIR` maps to in
 /// `--remap-path-prefix`. The phase's rustflags already carry the flag, but
 /// they stop at cargo's host/target boundary under `--target`: host units —
@@ -57,11 +49,7 @@ pub async fn run_rustc_capture_wrapper(
         std::process::exit(code);
     }
     let args = remapped_target_dir_args(
-        &pinned_link_args(
-            &args[3..],
-            std::env::var_os(STOW_BUILD_LINK_ARG_ENV).as_deref(),
-            std::env::var_os(STOW_BUILD_LINK_ARG_CROSS_ENV).is_some(),
-        ),
+        &args[3..],
         std::env::var_os(STOW_BUILD_TARGET_DIR_REMAP_ENV).as_deref(),
         std::env::var_os("CARGO_TARGET_DIR").as_deref(),
     );
@@ -310,66 +298,6 @@ async fn record_compiled_capture(
     )
     .await?;
     send_capture_record(record).await
-}
-
-/// The link option the build pins for linux-gnu units travels inside the
-/// rustc argv — the one channel that reaches every unit. Cargo's rustflag
-/// plumbing cannot carry it: under `--target` the unit graph splits at the
-/// host/target boundary and `RUSTFLAGS`, `CARGO_TARGET_<triple>_RUSTFLAGS`
-/// and `.cargo/config.toml` all stop on the target side, so the build
-/// scripts and proc macros that do most of a dependency build's linking
-/// would inherit whatever linker the runner image happened to ship.
-/// Appending it here also lands it in `ParsedRustcArgs`' link options, the
-/// compile-key term that records which link choice produced the artifact.
-fn pinned_link_args(
-    args: &[std::ffi::OsString],
-    link_arg: Option<&std::ffi::OsStr>,
-    cross: bool,
-) -> Vec<std::ffi::OsString> {
-    let Some(link_arg) = link_arg else {
-        return args.to_vec();
-    };
-    if !unit_targets_linux_gnu(args, cross) {
-        return args.to_vec();
-    }
-    let mut pinned = Vec::with_capacity(args.len() + 2);
-    pinned.extend_from_slice(args);
-    pinned.push(std::ffi::OsString::from("-C"));
-    pinned.push(std::ffi::OsString::from(format!(
-        "link-arg={}",
-        link_arg.to_string_lossy()
-    )));
-    pinned
-}
-
-/// Whether a rustc invocation compiles for a linux-gnu triple under this
-/// build's link-arg pinning: always an explicit linux-gnu `--target`, or a
-/// host unit (no `--target` of its own — build scripts and proc macros
-/// always compile for the linux build host) when the build is *native*.
-/// Under a cross build (`STOW_BUILD_LINK_ARG_CROSS`) a host unit is on the
-/// far side of the boundary a consumer's target rustflags cannot cross, so
-/// it takes no pin.
-///
-/// Every such unit gets the pin, not only the ones that reach the linker.
-/// That is deliberate: a user selects mold in `.cargo/config.toml`, which
-/// applies to every unit too, and the key a user computes has to be the
-/// key the builder computed. The option is inert for an rlib on both
-/// sides — rustc never runs the linker to produce one, and
-/// `link_options_reaching_the_linker` leaves it out of the key — so the
-/// uniform append is what makes the two sides agree.
-fn unit_targets_linux_gnu(args: &[std::ffi::OsString], cross: bool) -> bool {
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if arg.to_str() == Some("--target") {
-            return iter
-                .next()
-                .is_some_and(|target| target.to_string_lossy().ends_with("-linux-gnu"));
-        }
-        if let Some(target) = arg.to_str().and_then(|arg| arg.strip_prefix("--target=")) {
-            return target.ends_with("-linux-gnu");
-        }
-    }
-    !cross
 }
 
 /// Append the phase target-dir remap to invocations the rustflags never
@@ -671,6 +599,33 @@ async fn replay_rustc_output(output: &async_process::Output) -> stow_types::erro
     .await
 }
 
+/// A published node is a dev-profile build with no cfg of its own, no
+/// extra codegen and no `embed-metadata`; the CLI's semantic match
+/// relies on exactly that to prove a stand-in against its key
+/// (stow#1047). An invocation outside it must not be published.
+/// `target` is the triple the unit is keyed under, against which the
+/// cargo-default options are judged.
+fn ensure_publishable_shape(
+    parsed: &ParsedRustcArgs,
+    target: &str,
+) -> stow_types::error::Result<()> {
+    let build_script = stow_types::upload_plan::BuildScriptInputs::of_out_dir(
+        &parsed.crate_name,
+        parsed.build_script_out_dir.as_deref(),
+    )?;
+    let consumer = stow_types::upload_plan::ConsumerInputs::of(parsed, &build_script, target);
+    if !consumer.is_publishable_shape() {
+        return Err(stow_types::stow_error!(
+            "`{}` was invoked with cfgs {:?}, extra codegen {:?} or embed-metadata {:?} no published node may carry",
+            parsed.crate_name,
+            consumer.cfgs,
+            consumer.extra_codegen,
+            consumer.embed_metadata,
+        ));
+    }
+    Ok(())
+}
+
 async fn prepare_stable_rustc_invocation(
     rustc: &std::ffi::OsString,
     original_args: &[std::ffi::OsString],
@@ -728,24 +683,7 @@ async fn prepare_stable_rustc_invocation(
             original_parsed.input_path,
         ));
     };
-    // A published node is a dev-profile build with no cfg of its own, no
-    // extra codegen and no `embed-metadata`; the CLI's semantic match
-    // relies on exactly that to prove a stand-in against its key
-    // (stow#1047). An invocation outside it must not be published.
-    let build_script = stow_types::upload_plan::BuildScriptInputs::of_out_dir(
-        &original_parsed.crate_name,
-        original_parsed.build_script_out_dir.as_deref(),
-    )?;
-    let consumer = stow_types::upload_plan::ConsumerInputs::of(original_parsed, &build_script);
-    if !consumer.is_publishable_shape() {
-        return Err(stow_types::stow_error!(
-            "`{}` was invoked with cfgs {:?}, extra codegen {:?} or embed-metadata {:?} no published node may carry",
-            original_parsed.crate_name,
-            consumer.cfgs,
-            consumer.extra_codegen,
-            consumer.embed_metadata,
-        ));
-    }
+    ensure_publishable_shape(original_parsed, &effective_target)?;
     let identity = stable_unit_identity_for_package(
         original_parsed,
         &package_name,
@@ -2240,6 +2178,38 @@ mod tests {
         });
     }
 
+    /// stow#1066: the mock answers as the task's runner, so a target-less
+    /// host unit of an Apple task is keyed under `aarch64-apple-darwin`
+    /// whatever machine the wrapper runs on; the cargo-default
+    /// `-C split-debuginfo=unpacked` it carries is then no extra codegen
+    /// and the unit publishes. Under a Linux host the same flag stays.
+    #[test]
+    fn a_target_less_apple_host_unit_with_the_cargo_default_split_debuginfo_publishes() {
+        let argv = [
+            "--crate-name",
+            "unicode_ident",
+            "--crate-type",
+            "lib",
+            "--out-dir",
+            "/tmp/out",
+            "-C",
+            "metadata=fd828ed38da2eccd",
+            "-C",
+            "extra-filename=-d1c4311f6644f7fa",
+            "-C",
+            "split-debuginfo=unpacked",
+        ]
+        .map(std::ffi::OsString::from);
+        let parsed = ParsedRustcArgs::parse(&argv).expect("parse");
+        assert_eq!(parsed.target, None);
+
+        super::ensure_publishable_shape(&parsed, "aarch64-apple-darwin")
+            .expect("the apple default is not extra codegen");
+        let error = super::ensure_publishable_shape(&parsed, "x86_64-unknown-linux-gnu")
+            .expect_err("`unpacked` is not the Linux default");
+        assert!(error.to_string().contains("extra codegen"), "{error}");
+    }
+
     #[test]
     fn restorable_unit_without_stable_identity_is_fatal() {
         smol::block_on(async {
@@ -2356,114 +2326,6 @@ mod tests {
             Some(wrapper_name),
             true
         ));
-    }
-
-    #[test]
-    fn pinned_link_args_appends_only_for_linux_gnu_units() {
-        let mold = std::ffi::OsStr::new("-fuse-ld=mold");
-        let host_args: Vec<std::ffi::OsString> = [
-            "rustc",
-            "--crate-name",
-            "pm",
-            "--crate-type",
-            "proc-macro",
-            "src/lib.rs",
-        ]
-        .iter()
-        .map(std::ffi::OsString::from)
-        .collect();
-
-        assert_eq!(super::pinned_link_args(&host_args, None, false), host_args);
-
-        // A unit without `--target` builds for the host — linux on the jobs
-        // that set the pin — so it gets the flag.
-        let pinned = super::pinned_link_args(&host_args, Some(mold), false);
-        let tail: Vec<&str> = pinned[pinned.len() - 2..]
-            .iter()
-            .map(|arg| arg.to_str().expect("pinned arg"))
-            .collect();
-        assert_eq!(tail, ["-C", "link-arg=-fuse-ld=mold"]);
-        assert!(
-            ParsedRustcArgs::parse(&pinned)
-                .expect("pinned args still parse")
-                .link_options
-                .contains(&"link-arg=-fuse-ld=mold".to_owned()),
-            "the appended arg must land in the link options the compile key reads"
-        );
-
-        // The task target itself is linux-gnu in every job that arms the
-        // env, in both `--target` spellings.
-        for spelling in [
-            vec!["--target", "aarch64-unknown-linux-gnu"],
-            vec!["--target=aarch64-unknown-linux-gnu"],
-        ] {
-            let mut args = host_args.clone();
-            args.extend(spelling.iter().map(std::ffi::OsString::from));
-            assert!(
-                super::pinned_link_args(&args, Some(mold), false).ends_with(&[
-                    std::ffi::OsString::from("-C"),
-                    std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
-                ])
-            );
-        }
-
-        // A unit for anything else — an android or wasm triple — never
-        // sees the pin, env or not.
-        for target in ["aarch64-linux-android", "wasm32-unknown-unknown"] {
-            let mut args = host_args.clone();
-            args.push(std::ffi::OsString::from("--target"));
-            args.push(std::ffi::OsString::from(target));
-            assert_eq!(super::pinned_link_args(&args, Some(mold), false), args);
-        }
-    }
-
-    #[test]
-    fn cross_mode_pins_target_units_but_never_host_units() {
-        let mold = std::ffi::OsStr::new("-fuse-ld=mold");
-        let mut host_args: Vec<std::ffi::OsString> = [
-            "rustc",
-            "--crate-name",
-            "heck",
-            "--crate-type",
-            "lib",
-            "src/lib.rs",
-        ]
-        .iter()
-        .map(std::ffi::OsString::from)
-        .collect();
-
-        // Under a cross invocation a host unit sits beyond the rustflag
-        // boundary — a consumer's `cfg(target_os = "linux")` selection
-        // cannot reach it either, so it builds unpinned.
-        assert_eq!(
-            super::pinned_link_args(&host_args, Some(mold), true),
-            host_args
-        );
-
-        // A linux-gnu `--target` unit still takes the pin in both
-        // spellings; anything else never does.
-        for spelling in [
-            vec!["--target", "x86_64-unknown-linux-gnu"],
-            vec!["--target=x86_64-unknown-linux-gnu"],
-        ] {
-            let mut args = host_args.clone();
-            args.extend(spelling.iter().map(std::ffi::OsString::from));
-            assert!(
-                super::pinned_link_args(&args, Some(mold), true).ends_with(&[
-                    std::ffi::OsString::from("-C"),
-                    std::ffi::OsString::from("link-arg=-fuse-ld=mold"),
-                ])
-            );
-        }
-        host_args.extend(
-            ["--target", "wasm32-unknown-unknown"]
-                .iter()
-                .map(std::ffi::OsString::from),
-        );
-        assert_eq!(
-            super::pinned_link_args(&host_args, Some(mold), true),
-            host_args
-        );
     }
 
     /// The production shape behind `fix/msvc-host-capture-collision`: under

@@ -258,8 +258,17 @@ async fn run_inner(
     let config =
         tracing::debug_span!("stow.precargo.config_load").in_scope(|| load_stow_config(state_db));
     let project = begin_project(config.as_ref(), &invocation).await?;
-    let mut public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
-    if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
+    let mut public_cache_mode = PublicCacheMode::for_build(
+        &project.rustc_version,
+        config
+            .as_ref()
+            .map(|config| config.cache_mode)
+            .unwrap_or_default(),
+    );
+    if let PublicCacheMode::Disabled {
+        message: Some(message),
+    } = &public_cache_mode
+    {
         write_stdout(&format!("{message}\n"))?;
     }
 
@@ -268,9 +277,16 @@ async fn run_inner(
     // extra-codegen, so the workspace keeps its *local* cache and loses
     // only the remote half: every unit is local-only by construction
     // (stow#1006).
+    // Units compile for the target and, under `--target`, for the host.
+    let compiled_targets = if project.target_given {
+        vec![project.target.as_str(), project.host_target.as_str()]
+    } else {
+        vec![project.target.as_str()]
+    };
     if public_cache_mode.is_enabled()
         && let Some(divergence) =
-            crate::profile_guard::dev_profile_divergence(&project.workspace_root).await?
+            crate::profile_guard::dev_profile_divergence(&project.workspace_root, &compiled_targets)
+                .await?
     {
         let message = format!(
             "warning: stow public cache is disabled for this build because {divergence}; \
@@ -278,8 +294,7 @@ async fn run_inner(
         );
         write_stdout(&format!("{message}\n"))?;
         public_cache_mode = PublicCacheMode::Disabled {
-            reason: "profile",
-            message,
+            message: Some(message),
         };
     }
 
@@ -521,7 +536,7 @@ async fn run_original_workspace_build(
             .map(|analysis| analysis.inexact_entries.as_slice()),
         // A configured build's facts came from the filesystem-only pass:
         // the full graph analysis is owed to the build while cargo runs.
-        deferred_analysis: config.is_some(),
+        deferred_analysis: config.is_some_and(|config| config.cache_mode.reaches_network()),
         semantic_fallback_enabled,
         covered_units,
         isolation: &invocation.isolation,
@@ -680,12 +695,6 @@ async fn analyze_for_prediction(
     // there is no build script or proc macro to isolate.
     let invocation = CargoInvocation::new("predict", args, crate::isolation::Isolation::off());
     let project = ProjectContext::load(&invocation).await?;
-    let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
-    if let PublicCacheMode::Disabled { message, .. } = &public_cache_mode {
-        write_stdout(&format!("{message}\n"))?;
-        return Ok(None);
-    }
-
     // Unlike `check`/`build`, `predict` has no cargo run to protect: an
     // analysis it cannot compute is the command failing, and callers rely
     // on the exit status saying so.
@@ -694,6 +703,14 @@ async fn analyze_for_prediction(
             "stow predict is unavailable because stow is not configured.\nreason: {error}"
         )
     })?;
+    config.require_network("stow predict")?;
+    if let PublicCacheMode::Disabled {
+        message: Some(message),
+    } = PublicCacheMode::for_build(&project.rustc_version, config.cache_mode)
+    {
+        write_stdout(&format!("{message}\n"))?;
+        return Ok(None);
+    }
     analyze_workspace_prediction(
         &project,
         project.current_dir(),
@@ -2028,7 +2045,7 @@ async fn query_admissions(
         entries: entries.to_vec(),
         expanded_entries: expanded_entries.to_vec(),
     };
-    let mut client = crate::edge_client::client(config);
+    let mut client = crate::edge_client::client(config)?;
     let response = client
         .post(&url)?
         .json_body(&request)?
@@ -2348,7 +2365,7 @@ async fn try_stow_resolver(
         return Ok(None);
     };
 
-    let public_cache_mode = PublicCacheMode::for_rustc(&project.rustc_version);
+    let public_cache_mode = PublicCacheMode::for_build(&project.rustc_version, config.cache_mode);
     let Some(pinned) = prepare_pinned_mirror(project, invocation, &stow_lockfile_toml).await?
     else {
         return Ok(None);
@@ -3888,7 +3905,9 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
         crate::BuildContext {
             policy_dir: cache_policy_path.clone(),
             public_cache_target: Some(project.target.clone()),
-            public_cache_disabled: public_cache_mode.disable_reason().is_some(),
+            public_cache_disabled: !public_cache_mode.is_enabled(),
+            local_cache_disabled: config
+                .is_some_and(|config| !config.cache_mode.uses_local_cache()),
             analysis: std::sync::Arc::clone(&analysis_cell),
             serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
             policy_ready: std::sync::Arc::clone(&policy_ready),
@@ -3995,31 +4014,12 @@ async fn finish_cargo_run(
         if status.success() {
             report_cache_coverage(config, before, covered_units).await;
         }
-        // The build's compile observations are its miss list (stow#317)
-        // — a failed build's units are real misses too, whatever its
-        // last unit did. They land in the same journal a plain-cargo
-        // wrapper writes, and a detached drain posts the admission —
-        // this command returns as soon as cargo does. The hold is
-        // given up first: the drain this build spawns must find the
-        // gate open (stow#667).
         plan.project.foreground.release();
-        // The day's usage report posts from the detached drain — never
-        // on the build's wall clock — so a due report is a reason to
-        // spawn that drain even when this build leaves no journal
-        // (stow#889).
-        let report_due = crate::report::report_due_today(config).await;
-        journal_and_drain_misses(
-            plan.project,
-            plan.cargo_args,
-            plan.current_dir,
-            &handler.observations(),
-            plan.inexact_entries.unwrap_or(&[]),
-            report_due,
-        );
-        // One supervised run is one build the install ran — counted
-        // here rather than by the journal, whose supervised files the
-        // drain skips to keep the count single.
-        crate::report::bump_build(config).await;
+        // Misses, admissions and the usage report exist only to reach the
+        // network; the local-only and off cache modes keep none of them.
+        if config.cache_mode.reaches_network() {
+            admit_build_misses(plan, config, handler).await;
+        }
     }
     // Nothing writes into the scratch directory any more — cargo has
     // exited, the analysis is gone and the supervisor has drained — so
@@ -4029,6 +4029,35 @@ async fn finish_cargo_run(
         tracing::warn!(%error, "could not remove the build scratch directory");
     }
     Ok(status)
+}
+
+/// The build's compile observations are its miss list (stow#317) — a failed
+/// build's units are real misses too, whatever its last unit did. They land
+/// in the same journal a plain-cargo wrapper writes, and a detached drain
+/// posts the admission — the command returns as soon as cargo does. The
+/// caller has given up the foreground hold first: the drain this build
+/// spawns must find the gate open (stow#667).
+async fn admit_build_misses(
+    plan: &CargoRunPlan<'_>,
+    config: &StowConfig,
+    handler: &std::sync::Arc<crate::BuildSupervisor>,
+) {
+    // The day's usage report posts from the detached drain — never on the
+    // build's wall clock — so a due report is a reason to spawn that drain
+    // even when this build leaves no journal (stow#889).
+    let report_due = crate::report::report_due_today(config).await;
+    journal_and_drain_misses(
+        plan.project,
+        plan.cargo_args,
+        plan.current_dir,
+        &handler.observations(),
+        plan.inexact_entries.unwrap_or(&[]),
+        report_due,
+    );
+    // One supervised run is one build the install ran — counted here rather
+    // than by the journal, whose supervised files the drain skips to keep
+    // the count single.
+    crate::report::bump_build(config).await;
 }
 
 /// The build's supervisor, bound beside the handler it shares the
@@ -4469,7 +4498,6 @@ async fn export_wrapper_env(
         config,
         cargo_args,
         source_root,
-        public_cache_mode,
         unit_nodes,
         prefetch_artifacts,
         semantic_fallback_enabled,
@@ -4538,12 +4566,6 @@ async fn export_wrapper_env(
     if let Some(path) = cache_policy_path {
         let (key, value) = cache_policy::cache_policy_env(path);
         envs.push((OsString::from(key), value));
-    }
-    if let Some(reason) = public_cache_mode.disable_reason() {
-        envs.push((
-            OsString::from("STOW_DISABLE_PUBLIC_CACHE"),
-            OsString::from(reason),
-        ));
     }
     if std::env::var_os("CARGO_TARGET_DIR").is_none() && !has_explicit_target_dir(cargo_args) {
         envs.push((
@@ -5155,35 +5177,32 @@ fn percentage(numerator: usize, denominator: usize) -> f64 {
 #[derive(Debug, Clone)]
 enum PublicCacheMode {
     Enabled,
+    /// The public cache is off for this build. `message` is the warning for a
+    /// cause the user did not choose; the config's `cache_mode` is the user's
+    /// own choice and prints nothing.
     Disabled {
-        reason: &'static str,
-        message: String,
+        message: Option<String>,
     },
 }
 
 impl PublicCacheMode {
-    fn for_rustc(rustc_version: &str) -> Self {
+    fn for_build(rustc_version: &str, cache_mode: crate::config::CacheMode) -> Self {
+        if !cache_mode.reaches_network() {
+            return Self::Disabled { message: None };
+        }
         let Some(reason) = unsupported_public_cache_reason(rustc_version) else {
             return Self::Enabled;
         };
 
         Self::Disabled {
-            reason,
-            message: format!(
+            message: Some(format!(
                 "warning: stow public cache is disabled for rustc `{rustc_version}` because only the most recent two stable toolchains are supported. {reason} toolchains currently invalidate public cache."
-            ),
+            )),
         }
     }
 
     const fn is_enabled(&self) -> bool {
         matches!(self, Self::Enabled)
-    }
-
-    const fn disable_reason(&self) -> Option<&'static str> {
-        match self {
-            Self::Enabled => None,
-            Self::Disabled { reason, .. } => Some(reason),
-        }
     }
 }
 
@@ -5244,6 +5263,7 @@ mod tests {
 
     fn test_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
@@ -6096,6 +6116,7 @@ mod tests {
 
     fn stow_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
+            cache_mode: crate::config::CacheMode::Public,
             edge_url: "http://127.0.0.1:1".to_owned(),
             registry_base_url: "http://127.0.0.1:1".to_owned(),
             cache_dir: cache_dir.to_path_buf(),

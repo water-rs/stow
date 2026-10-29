@@ -112,11 +112,17 @@ impl Connection {
     ///
     /// Transport failures, and a supervisor that answers with a failure of
     /// its own.
-    pub async fn report(&mut self, ticket: &Ticket, success: bool) -> Result<(), String> {
+    pub async fn report(
+        &mut self,
+        ticket: &Ticket,
+        success: bool,
+        compile_time: std::time::Duration,
+    ) -> Result<(), String> {
         let report = Compiled {
             token: self.token.clone(),
             ticket: ticket.ticket,
             success,
+            compile_millis: crate::duration_millis(compile_time),
         };
         match self.exchange(&Request::Compiled(report)).await? {
             Answer::Recorded => Ok(()),

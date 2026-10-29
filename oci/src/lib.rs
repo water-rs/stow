@@ -10,13 +10,14 @@ mod client;
 mod index;
 mod records;
 mod registry;
+mod repack;
 pub mod retry;
 mod sign;
 pub mod verify;
 
 pub use artifacts::{
-    UploadOutcome, pull_pushed_signature_materials, pull_signature_materials, push_artifacts,
-    push_artifacts_with,
+    UploadOutcome, publish_packed, pull_pushed_signature_materials, pull_signature_materials,
+    push_artifacts, push_artifacts_with, verify_artifact_signature,
 };
 pub use client::{
     OPERATOR_LOG_FILTER, RegistryError, RegistryHttp, RegistrySession, TransportPolicy,
@@ -31,4 +32,5 @@ pub use records::{
     push_records, push_records_with,
 };
 pub use registry::{RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest};
+pub use repack::repack_record;
 pub use sign::{put_signed_manifest, sign_artifact};

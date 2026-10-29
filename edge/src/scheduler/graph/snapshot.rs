@@ -35,7 +35,9 @@ use serde::{Deserialize, Serialize};
 
 use super::index::hash_of;
 use super::node::{Extra, Flags, NO_STATE, Node, State, Status};
-use super::{AttemptOutcome, FeedSession, Graph, IdKey, Published, RequestRecord, SliceId};
+use super::{
+    AttemptOutcome, FeedSession, Graph, IdKey, Published, RequestRecord, SliceId, StagedSlice,
+};
 use crate::errors::QueueError;
 
 /// The payload text one row carries, about: a range's row closes once
@@ -90,6 +92,13 @@ const FEED_BUCKETS: u32 = 16;
 /// ~93% of a row, and the object hits its memory bound first.
 const BATCHES_BUCKETS: u32 = 64;
 
+/// Staged-report buckets, by slice: an incomplete multi-part full
+/// report lives only until its last part arrives or a newer one
+/// supersedes it, so the staged set is a few slices' parts. Each part
+/// is at most `SLICE_REPORT_PART_BYTES` (half a mebibyte), so a row
+/// that closes at `CHUNK_TEXT_BYTES` holds under 1.5 MiB.
+const STAGED_BUCKETS: u32 = 16;
+
 /// How a row's payload is encoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Encoding {
@@ -115,6 +124,7 @@ enum ChunkKind {
     Requests,
     Feed,
     Batches,
+    Staged,
 }
 
 impl ChunkKind {
@@ -133,6 +143,7 @@ impl ChunkKind {
             Self::Requests => "requests",
             Self::Feed => "feed",
             Self::Batches => "batches",
+            Self::Staged => "staged",
         }
     }
 
@@ -147,6 +158,7 @@ impl ChunkKind {
             6 => Self::Requests,
             7 => Self::Feed,
             8 => Self::Batches,
+            9 => Self::Staged,
             other => {
                 return Err(QueueError::Invariant(format!(
                     "unknown snapshot kind {other}"
@@ -159,9 +171,12 @@ impl ChunkKind {
         match self {
             Self::Nodes | Self::Edges | Self::Published => Encoding::Raw,
             Self::Outcomes => Encoding::Packed,
-            Self::Meta | Self::Intern | Self::Requests | Self::Feed | Self::Batches => {
-                Encoding::Json
-            }
+            Self::Meta
+            | Self::Intern
+            | Self::Requests
+            | Self::Feed
+            | Self::Batches
+            | Self::Staged => Encoding::Json,
         }
     }
 }
@@ -220,6 +235,8 @@ pub(super) struct Dirty {
     pub feed: BTreeSet<u32>,
     /// Demand-batch buckets.
     pub batches: BTreeSet<u32>,
+    /// Staged-report buckets.
+    pub staged: BTreeSet<u32>,
     /// The bounded outcome ring — one range, so one flag.
     pub outcomes: bool,
 }
@@ -227,6 +244,11 @@ pub(super) struct Dirty {
 /// The published map's bucket of one key — its leading bytes.
 const fn published_bucket(key: &IdKey) -> u32 {
     u32::from_le_bytes([key[0], key[1], key[2], key[3]]) % PUBLISHED_BUCKETS
+}
+
+/// The staged-report map's bucket of one slice.
+fn staged_bucket(slice: SliceId) -> u32 {
+    (u32::from(slice.0) * 31 + u32::from(slice.1)) % STAGED_BUCKETS
 }
 
 /// A keyed map's bucket — the key's hash modulo the bucket count.
@@ -294,6 +316,7 @@ struct SectionLens {
     requests: usize,
     feed_pages: usize,
     batches: usize,
+    staged_parts: usize,
 }
 
 /// One row being encoded.
@@ -517,6 +540,16 @@ fn decode_raw(
     Ok(())
 }
 
+/// One persisted staged part: its slice, report generation and part
+/// count, its index, and its rows.
+type StagedItem = (
+    SliceId,
+    i64,
+    u32,
+    u32,
+    Vec<stow_types::api::PublishedSliceRow>,
+);
+
 /// One keyed span's materialized entries — collected sorted at the
 /// encoder's creation, bounded by the bucket's own size (the graph is
 /// never copied whole).
@@ -525,6 +558,13 @@ enum SpanItem {
     Requests(String, RequestRecord),
     Feed(String, usize, Vec<stow_types::api::SchedulerDemandEntry>),
     Batches(String, (String, i64)),
+    Staged(
+        SliceId,
+        i64,
+        u32,
+        u32,
+        Vec<stow_types::api::PublishedSliceRow>,
+    ),
     Outcomes(AttemptOutcome),
 }
 
@@ -608,6 +648,12 @@ impl SpanEncoder {
                 SpanItem::Batches(id, batch) => (id, batch),
                 _ => unreachable!("a batches span holds batch items"),
             }))?,
+            ChunkKind::Staged => writer.fill(self.items[at..].iter().map(|item| match item {
+                SpanItem::Staged(slice, generation, parts, part, rows) => {
+                    (slice, generation, parts, part, rows)
+                }
+                _ => unreachable!("a staged span holds staged items"),
+            }))?,
             ChunkKind::Outcomes => writer.fill(self.items[at..].iter().map(|item| match item {
                 SpanItem::Outcomes(outcome) => outcome,
                 _ => unreachable!("an outcomes span holds outcome items"),
@@ -667,6 +713,11 @@ impl Graph {
         self.dirty
             .batches
             .insert(keyed_bucket(batch_id, BATCHES_BUCKETS));
+    }
+
+    /// Mark the staged bucket of `slice` dirty.
+    pub(super) fn touch_staged(&mut self, slice: SliceId) {
+        self.dirty.staged.insert(staged_bucket(slice));
     }
 
     /// The ranges the next snapshot rewrites — always the meta row,
@@ -744,6 +795,12 @@ impl Graph {
             BATCHES_BUCKETS,
             &self.dirty.batches,
         );
+        add(
+            &mut spans,
+            ChunkKind::Staged,
+            STAGED_BUCKETS,
+            &self.dirty.staged,
+        );
         Ok(SnapshotPlan { all, spans })
     }
 
@@ -791,6 +848,22 @@ impl Graph {
                 .iter()
                 .filter(|(id, _)| keyed_bucket(id, BATCHES_BUCKETS) == bucket)
                 .map(|(id, batch)| SpanItem::Batches(id.clone(), batch.clone()))
+                .collect(),
+            ChunkKind::Staged => self
+                .staged_slices
+                .iter()
+                .filter(|(slice, _)| staged_bucket(**slice) == bucket)
+                .flat_map(|(&slice, staged)| {
+                    staged.rows.iter().enumerate().map(move |(part, rows)| {
+                        SpanItem::Staged(
+                            slice,
+                            staged.generation,
+                            staged.parts,
+                            u32::try_from(part).expect("part fits u32"),
+                            rows.clone(),
+                        )
+                    })
+                })
                 .collect(),
             ChunkKind::Outcomes => self
                 .attempt_outcomes
@@ -879,6 +952,11 @@ impl Graph {
                 .map(|session| session.staged.len())
                 .sum(),
             batches: self.demand_batches.len(),
+            staged_parts: self
+                .staged_slices
+                .values()
+                .map(|staged| staged.rows.len())
+                .sum(),
         }
     }
 }
@@ -964,7 +1042,41 @@ impl SnapshotLoader {
                     Ok(())
                 })
             }
+            ChunkKind::Staged => decode_items(kind, payload, |item| Self::load_staged(graph, item)),
         }
+    }
+
+    /// Join one staged part to the report its earlier parts started.
+    fn load_staged(
+        graph: &mut Graph,
+        (slice, generation, parts, part, rows): StagedItem,
+    ) -> Result<(), QueueError> {
+        if part == 0 {
+            let staged = StagedSlice {
+                generation,
+                parts,
+                rows: vec![rows],
+            };
+            if graph.staged_slices.insert(slice, staged).is_some() {
+                return Err(QueueError::Invariant(format!(
+                    "snapshot stages slice {slice:?} twice"
+                )));
+            }
+            return Ok(());
+        }
+        let staged = graph.staged_slices.get_mut(&slice).ok_or_else(|| {
+            QueueError::Invariant(format!("staged part {part} of unknown slice {slice:?}"))
+        })?;
+        if staged.generation != generation
+            || staged.parts != parts
+            || staged.rows.len() != part as usize
+        {
+            return Err(QueueError::Invariant(format!(
+                "staged part {part} of slice {slice:?} out of order"
+            )));
+        }
+        staged.rows.push(rows);
+        Ok(())
     }
 
     fn load_node(graph: &mut Graph, bytes: &mut Bytes<'_>) -> Result<(), QueueError> {

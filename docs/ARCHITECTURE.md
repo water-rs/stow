@@ -387,13 +387,21 @@ tag gives, so a fresh rustc's first builds can start it and a deleted
 package reads as reset (stow#844).
 
 Each artifact is two OCI images on that package. The signed image is the
-tag above: its config is the `ArtifactBlobConfig` and it carries one
-zstd-compressed layer per output file plus, when the build script produced
-one, the native `OUT_DIR` archive; cosign signs this image. Next to it the
+tag above: its config is the `ArtifactBlobConfig` and it carries one layer,
+the pack: a deterministic tar (fixed order, mtime 0, owner 0:0, mode 0644)
+of every output file plus, when the build script produced one, the native
+`OUT_DIR` archive, compressed as a single zstd stream at level 19 with
+long-distance matching and a 2^27 window, on every core of the publishing
+runner (`stow_shim::pack`). One stream shares redundancy across files — an
+rlib embeds the metadata its rmeta carries. The config records each file's
+SHA-256; the CLI unpacks the pack with the 2^27 window bound and verifies
+every file against it. Decompression speed does not depend on the level,
+so the cost is paid once, at publish. Index slices are compressed at the
+same level, multithreaded; cosign signs this image. Next to it the
 trusted publish stage pushes `<tag>.bundle`, a single-layer image whose
 layer is the bundle tar a CLI consumes (`stow_types::bundle::assemble_bundle`).
 The bundle needs no signature of its own: it embeds the signed manifest and
-config, the signature materials, and the layers byte-for-byte, and the CLI
+config, the signature materials, and the pack byte-for-byte, and the CLI
 verifies that material after download. The build's records artifact
 carries the bundle layer's digest and size (`bundle_digest`,
 `bundle_size`), republished verbatim into the index row; the CLI asks the
@@ -412,12 +420,28 @@ ever assembles, buffers or inspects it. The publish stage validated the tar
 | `oci/manifest.json` | OCI image manifest of the signed image (registry bytes verbatim) |
 | `oci/config.json` | OCI image config of the signed image (registry bytes verbatim) |
 | `sigstore/payload-<n>.json` | Cosign simple-signing payloads, one per signature layer |
-| `files/<name>` | One entry per layer in manifest order: `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll`, the native archive |
+| `files/pack.tar.zst` | The signed image's one layer, the pack, verbatim; it holds `lib<crate>-<extra>.rlib`, `.rmeta`, `.so`/`.dylib`/`.dll` and the native archive in `ArtifactBlobConfig` order |
 
 A record always carries its pushed bundle's digest — the publish
 writes it — so every record maps to one index row.
 
 Constants (media types, paths) are defined in `types/src/bundle.rs`.
+
+The CLI reads only this layout. A node published before it stored one zstd
+layer per file; `build-crate.yml` repacks those without rebuilding. A
+dispatch with `repack_rustc` set (and `repack_concurrency`, tasks in
+flight, default 4) runs the `repack` job under the same signing identity as
+a build: `stow-build repack` lists the rustc's `records-*` artifacts,
+verifies each task's records and each node still in the old layout under
+the pinned builder identity, checks every file's SHA-256 against the signed
+config, publishes the single-layer artifact and bundle through the build's
+publish path, and pushes a new signed records artifact per task changed.
+The config blob is carried over byte for byte, so a node's identity does
+not change. The next index export folds the new records over the old rows.
+A sweep only touches nodes still in the old layout, so it is safe to rerun,
+and a second sweep after in-flight old-layout builds drain finishes the
+cutover. Its run is titled `<rustc>-repack`; no scheduler task carries that
+id, so the scheduler logs the completion as an orphan run.
 
 ## Artifact index
 
@@ -466,7 +490,19 @@ The scheduler holds each reported slice's generation. A delta report
 applies only on top of exactly that generation and publishes the next
 one, else the route answers 409 and `index report` resends the slice in
 full; a full report replaces the slice's set and restarts the sequence.
-A run whose report failed fails, and the next run's `index reconcile`
+A full report larger than the edge's 2 MiB request body (a store-reset
+reconcile, a first publish) is sent in parts: each part names its slice,
+generation, index and part count and carries a share of the membership
+bounded at 512 KiB, parts of one slice never share a body, and bodies
+post in order. The scheduler appends one log row per part and stages the
+parts of a slice in memory (and in the snapshot, so an eviction in the
+middle of a report loses nothing); it applies the whole membership as
+one replacement only when the last part arrives, so no reader sees a
+partial set. A newer part 0 for the slice supersedes an incomplete
+report, a delta is refused with a 409 while one is staged, and a part
+that does not continue its staged report (or contradicts its part count)
+is refused. `stow-admin` refuses any JSON body over the request limit
+before sending it. A run whose report failed fails, and the next run's `index reconcile`
 (which reads the generations from `GET /api/v1/admin/status`) reports
 every published slice the scheduler does not hold before its own delta.
 
@@ -886,7 +922,7 @@ unauthorized POSTs short-circuit before deserialization.
 | POST `/api/v1/scheduler/tasks/submit-ids` | Bearer: `operations.yml` or `preheat-admin.yml` OIDC on `main` | `SubmitTaskIdsRequest` | `SubmitTaskIdsResponse` | Submit stored subgraphs by task id — `preheat projects submit` |
 | POST `/api/v1/admin/scheduler/reset` | Bearer: `operations.yml` OIDC on `main` | — | `SchedulerResetReport` | Drop and recreate the scheduler store — `scheduler reset` |
 | POST `/api/v1/admin/scheduler/demand`, `…/demand-feed/{query\|begin\|page\|complete\|cleanup\|deliver}` | Bearer: `operations.yml` or `demand-feed.yml` OIDC on `main` | demand-feed request types | demand-feed reports | The demand ledger's input lane — `scheduler demand-feed` |
-| POST `/api/v1/admin/index/published` | Bearer: `index-publish.yml` OIDC on `main` | `PublishedRunReport` | `OkResponse` | One publish run's slice membership — `index report` |
+| POST `/api/v1/admin/index/published` | Bearer: `index-publish.yml` OIDC on `main` | `PublishedRunReport` | `OkResponse` | One body of a publish run's slice membership (a large full report arrives as several, in order) — `index report`, `index reconcile` |
 | POST `/api/v1/github/workflow-run` | `X-Hub-Signature-256` HMAC (`STOW_GITHUB_WEBHOOK_SECRET`) | GitHub `workflow_run` webhook payload | `OkResponse` | GitHub reports a `build-crate.yml` run completed; the edge parses `display_title` (`<rustc>-<task_id>`) → task id and forwards the run's identity to the scheduler's `POST /tasks/complete-run`; the alarm's resolution completes the task only once the records artifact its publish job pushed verifies in GHCR |
 | GET `/api/v1/scheduler/status` | none | — | `SchedulerStatus` | Queue introspection — lane depths for `stow-admin status --watch` (stow#853); `Cache-Control: no-store` |
 | GET `/api/v1/scheduler/health` | none | — | `SchedulerHealth` | Uncached liveness for uptime monitors (stow#860): worker/scheduler verdict, dispatch-freeze state and last `workflow_run` delivery age; any unhealthy component answers 503, all under `Cache-Control: no-store` |
