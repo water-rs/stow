@@ -965,7 +965,8 @@ async fn materialize_optional_alias(
                 )
             })?;
         }
-        reflink_copy::reflink_or_copy(&source_for_copy, &alias_for_copy).wrap_err_with(|| {
+        let mut source = stow_types::native_capture::open_regular_nofollow(&source_for_copy)?;
+        crate::handle_copy::copy_from_handle(&mut source, &alias_for_copy).wrap_err_with(|| {
             format!(
                 "materialize original cargo output alias {} from {}",
                 alias_for_copy.display(),
@@ -1356,13 +1357,14 @@ fn collect_output_path(
     }
     // Hash the bytes rustc just wrote, before anything else in the build can
     // touch them. The scan re-hashes the file it plans against this digest.
-    let bytes = std::fs::read(&path)
+    let mut file = stow_types::native_capture::open_regular_nofollow(&path)?;
+    let sha256 = stow_types::native_capture::hash_file(&mut file)
         .wrap_err_with(|| format!("read captured rustc output {}", path.display()))?;
     outputs.push(CapturedRustcOutput {
         kind,
         path,
         snapshot_path: None,
-        sha256: hex::encode(Sha256::digest(&bytes)),
+        sha256,
     });
     Ok(())
 }
@@ -1404,14 +1406,21 @@ async fn snapshot_outputs(
         let snapshot_path = snapshot_dir.join(file_name);
         let source_path = output.path.clone();
         let snapshot_for_copy = snapshot_path.clone();
+        let expected_sha256 = output.sha256.clone();
         smol::unblock(move || {
-            reflink_copy::reflink_or_copy(&source_path, &snapshot_for_copy).wrap_err_with(|| {
-                format!(
-                    "snapshot rustc output {} into {}",
-                    source_path.display(),
-                    snapshot_for_copy.display()
-                )
-            })
+            // The copy reads the handle that was just verified against the
+            // rustc-exit digest, never the path a build could have re-pointed.
+            let mut source =
+                stow_types::native_capture::open_verified_nofollow(&source_path, &expected_sha256)?;
+            crate::handle_copy::copy_from_handle(&mut source, &snapshot_for_copy).wrap_err_with(
+                || {
+                    format!(
+                        "snapshot rustc output {} into {}",
+                        source_path.display(),
+                        snapshot_for_copy.display()
+                    )
+                },
+            )
         })
         .await?;
         // The recorded digest describes the output at rustc exit; the snapshot
@@ -1685,6 +1694,58 @@ mod tests {
             extra_codegen: Vec::new(),
             link_options: Vec::new(),
         }
+    }
+
+    /// stow#1063: a build script that planted a symlink at an artifact's
+    /// name must not have the link's target hashed as rustc's output.
+    #[cfg(unix)]
+    #[test]
+    fn collect_outputs_refuses_a_symlink_planted_at_an_output_name() {
+        let tempdir = tempdir().expect("tempdir");
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create out dir");
+        let stable = parsed_lib("chrono", out_dir, "-47d1962f861b84d6");
+        let secret = tempdir.path().join("secret");
+        std::fs::write(&secret, b"host secret").expect("write secret");
+        let rlib = stable.output_rlib_path().expect("rlib");
+        std::os::unix::fs::symlink(&secret, &rlib).expect("plant symlink");
+
+        let error = collect_outputs(&stable, None, "aarch64-apple-darwin")
+            .expect_err("a symlinked output must be refused");
+        assert!(
+            error.to_string().contains("without following symlinks"),
+            "{error}"
+        );
+    }
+
+    /// stow#1063: a path swapped for a link between hashing and the
+    /// snapshot copy must not be followed by the copy.
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_refuses_an_output_swapped_for_a_symlink_after_hashing() {
+        let tempdir = tempdir().expect("tempdir");
+        let out_dir = tempdir.path().join("deps");
+        std::fs::create_dir_all(&out_dir).expect("create out dir");
+        let stable = parsed_lib("chrono", out_dir, "-47d1962f861b84d6");
+        let rlib = stable.output_rlib_path().expect("rlib");
+        std::fs::write(&rlib, b"rustc bytes").expect("write rlib");
+        let outputs =
+            collect_outputs(&stable, None, "aarch64-apple-darwin").expect("collect outputs");
+
+        // The link's target carries the very bytes that were hashed, so only
+        // refusing to follow it tells the copy apart from a clean one.
+        let target = tempdir.path().join("target-bytes");
+        std::fs::write(&target, b"rustc bytes").expect("write target");
+        std::fs::remove_file(&rlib).expect("remove rlib");
+        std::os::unix::fs::symlink(&target, &rlib).expect("swap in symlink");
+
+        let capture_dir = tempdir.path().join("capture");
+        let error = smol::block_on(super::snapshot_outputs(&capture_dir, &stable, outputs))
+            .expect_err("a swapped-in symlink must be refused");
+        assert!(
+            error.to_string().contains("without following symlinks"),
+            "{error}"
+        );
     }
 
     #[test]

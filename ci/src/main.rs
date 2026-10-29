@@ -26,6 +26,7 @@ mod consume;
 #[cfg(test)]
 mod context_tests;
 mod dep_scan;
+mod handle_copy;
 mod local_server;
 #[cfg(feature = "mock-compile")]
 mod mock_compile;
@@ -414,7 +415,17 @@ fn measure_glibc_floors(
     for plan in plans {
         let mut floor = None;
         for output in &plan.outputs {
-            let bytes = std::fs::read(&output.path).map_err(|error| {
+            // Opened without following a symlink and held to the digest the
+            // plan recorded, like every other host read of a build's output.
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(
+                &mut stow_types::native_capture::open_verified_nofollow(
+                    &output.path,
+                    &output.bundle_file.sha256,
+                )?,
+                &mut bytes,
+            )
+            .map_err(|error| {
                 stow_types::stow_error!(
                     "read {} to measure its glibc floor: {error}",
                     output.path.display()
