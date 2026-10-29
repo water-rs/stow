@@ -56,7 +56,7 @@ pub const fn source_priority(source: stow_types::api::SubmissionSource) -> i64 {
     }
 }
 
-/// Default for `STOW_MAX_QUEUE_PENDING` — pending-queue depth at which
+/// Default for `STOW_MAX_QUEUE_PENDING` — miss-lane pending depth at which
 /// miss-lane submits start being refused. The edge handler reads the same
 /// binding for its pre-forward check, so this constant is the shared
 /// default for both.
