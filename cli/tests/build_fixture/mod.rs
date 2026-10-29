@@ -445,7 +445,7 @@ pub fn seed_index_slice(
         },
         rows,
     };
-    let blob = stow_types::index::encode(&index).expect("encode index");
+    let blob = stow_shim::encode_index(&index).expect("encode index");
     let manifest_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
     let dir = cache_dir.join("index").join(target).join(rustc_version);
     std::fs::create_dir_all(&dir).expect("create slice dir");

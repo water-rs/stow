@@ -1,8 +1,11 @@
 name: build-crate
 
 # The webhook completion parses `display_title` back into the run's
-# rustc and task id (`stow_types::records::run_title`).
-run-name: ${{ fromJSON(inputs.task).rustc_version }}-${{ fromJSON(inputs.task).task_id }}
+# rustc and task id (`stow_types::records::run_title`). A repack run
+# titles itself `<rustc>-repack`: no scheduler task carries that id, so
+# the completion is an orphan run the scheduler answers with a logged
+# 404, the way it answers any run it never dispatched.
+run-name: ${{ inputs.repack_rustc != '' && format('{0}-repack', inputs.repack_rustc) || format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(inputs.task).task_id) }}
 
 # The scheduler (or `stow-admin preheat manual`) dispatches this workflow on
 # `main` with the whole task as one JSON input. Two jobs, two trust levels,
@@ -20,6 +23,15 @@ run-name: ${{ fromJSON(inputs.task).rustc_version }}-${{ fromJSON(inputs.task).t
 #             `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag).
 #             GHCR is the only record store; the task talks to no edge route.
 #
+#   repack  — dispatched by an operator instead of a task. Compiles
+#             nothing: it reads published nodes back from GHCR, verifies
+#             their signatures and every file's hash, repacks nodes still
+#             stored one layer per file into the single-pack layout, and
+#             publishes them and their records under this workflow's
+#             identity (`stow-build repack`). The identity clients trust
+#             is a property of this file on main, so the re-signature has
+#             to come from here and from no other workflow.
+#
 # Completion reaches the scheduler through GitHub itself: `run-name`
 # above stamps `<rustc>-<task_id>`, so the `workflow_run` `completed`
 # webhook the edge receives carries both in `display_title` — no
@@ -34,14 +46,27 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: JSON-encoded BuildTaskPayload
-        required: true
+        description: JSON-encoded BuildTaskPayload (a build run; unused by a repack run)
+        required: false
         type: string
+        default: '{}'
+      repack_rustc:
+        description: Rustc whose published nodes are repacked into the single-pack layout (a repack run)
+        required: false
+        type: string
+        default: ''
+      repack_concurrency:
+        description: Tasks a repack run repacks at once
+        required: false
+        type: string
+        default: '4'
 
 permissions: {}
 
+# A repack run serializes per rustc: a second dispatch for the same rustc
+# queues behind the sweep in flight instead of racing it.
 concurrency:
-  group: build-crate-${{ fromJSON(inputs.task).task_id }}
+  group: ${{ inputs.repack_rustc != '' && format('repack-{0}', inputs.repack_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}
   cancel-in-progress: false
 
 env:
@@ -55,6 +80,7 @@ env:
 # `env`, so the map is inline in both jobs.
 jobs:
   build:
+    if: inputs.repack_rustc == ''
     name: build ${{ fromJSON(inputs.task).crate_name }} ${{ fromJSON(inputs.task).version }} (${{ fromJSON(inputs.task).target }})
     outputs:
       records-exist: ${{ steps.records-exist.outputs.found }}
@@ -279,7 +305,7 @@ jobs:
   publish:
     name: publish
     needs: build
-    if: needs.build.result == 'success'
+    if: inputs.repack_rustc == '' && needs.build.result == 'success'
     runs-on: ${{ fromJSON('{"aarch64-apple-darwin":"macos-14","aarch64-apple-ios":"macos-14","aarch64-apple-ios-sim":"macos-14","aarch64-linux-android":"ubuntu-26.04","x86_64-unknown-linux-gnu":"ubuntu-26.04","aarch64-unknown-linux-gnu":"ubuntu-26.04","x86_64-pc-windows-msvc":"windows-latest","aarch64-pc-windows-msvc":"windows-latest","wasm32-unknown-unknown":"ubuntu-26.04"}')[fromJSON(inputs.task).target] }}
     permissions:
       contents: read
@@ -314,3 +340,31 @@ jobs:
         env:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  repack:
+    name: repack ${{ inputs.repack_rustc }}
+    if: inputs.repack_rustc != ''
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    # A sweep is idempotent and resumes where the last stopped, so the
+    # job's bound is GitHub's own job limit rather than an estimate of
+    # the registry's size.
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/stow-toolchain
+        with:
+          binaries: stow-build
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Repack the published nodes
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPACK_RUSTC: ${{ inputs.repack_rustc }}
+          REPACK_CONCURRENCY: ${{ inputs.repack_concurrency }}
+        run: stow-build repack --rustc-version "$REPACK_RUSTC" --concurrency "$REPACK_CONCURRENCY"

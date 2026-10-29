@@ -31,7 +31,7 @@ use stow_types::api::{ArtifactRecord, CI_TARGET_TRIPLES, PublishedSliceRow};
 use stow_types::identity::{DependencyIdentity, TargetTriple, WireRustcVersion};
 use stow_types::index::{
     ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
-    IndexDecodeError, content_sha256, encode, folded_tag, folded_tag_parts, index_tag,
+    IndexDecodeError, content_sha256, folded_tag, folded_tag_parts, index_tag,
 };
 use stow_types::public_cache::UnitShape;
 use stow_types::records::{parse_records_tag, record_to_index_row};
@@ -257,14 +257,15 @@ pub async fn verify_artifact(
     manifest_digest: &str,
     cert_url: &str,
 ) -> stow_types::error::Result<()> {
-    let materials = stow_oci::pull_signature_materials(session, reference, manifest_digest).await?;
-    stow_oci::verify::verify_materials(
+    stow_oci::verify_artifact_signature(
+        session,
         trust,
+        reference,
         identity_reference,
         manifest_digest,
-        &materials,
         cert_url,
     )
+    .await
 }
 
 /// The state a slice was published with on the last pass: the index as
@@ -726,7 +727,8 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
         .map_err(|error| stow_error!("create {}: {error}", args.out_dir.display()))?;
     let mut summaries = Vec::new();
     for slice in &pass.slices {
-        let bytes = encode(&slice.index).map_err(|error| stow_error!("encode index: {error}"))?;
+        let bytes = stow_shim::encode_index(&slice.index)
+            .map_err(|error| stow_error!("encode index: {error}"))?;
         let index_name = index_tag(slice.target.as_str(), slice.rustc_version.as_str());
         let folded_name = folded_tag(slice.target.as_str(), slice.rustc_version.as_str());
         let index_file = args.out_dir.join(&index_name);
@@ -740,8 +742,8 @@ async fn index_export(args: IndexExportArgs) -> stow_types::error::Result<()> {
         // The `.prev` sidecar is the report's delta base — the index
         // this pass extended, captured while the tag still named it.
         if let Some(prev) = &slice.prev {
-            let prev_bytes =
-                encode(prev).map_err(|error| stow_error!("encode previous index: {error}"))?;
+            let prev_bytes = stow_shim::encode_index(prev)
+                .map_err(|error| stow_error!("encode previous index: {error}"))?;
             tokio::fs::write(prev_path(&index_file), &prev_bytes)
                 .await
                 .map_err(|error| stow_error!("write previous-index sidecar: {error}"))?;
@@ -2054,12 +2056,13 @@ mod tests {
         let right = record_to_index_row(&shared_unit_record(&["dep-right"]));
         std::fs::write(
             &file,
-            encode(&prev_index(vec![left.clone(), right], 3)).expect("encode index"),
+            stow_shim::encode_index(&prev_index(vec![left.clone(), right], 3))
+                .expect("encode index"),
         )
         .expect("write index file");
         std::fs::write(
             prev_path(&file),
-            encode(&prev_index(vec![left], 2)).expect("encode prev"),
+            stow_shim::encode_index(&prev_index(vec![left], 2)).expect("encode prev"),
         )
         .expect("write prev sidecar");
         (dir, file)

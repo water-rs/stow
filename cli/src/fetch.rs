@@ -8,7 +8,8 @@ use semver::Version;
 use sha2::{Digest, Sha256};
 use stow_types::bundle::{
     ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH,
-    STOW_OCI_CONFIG_PATH, STOW_OCI_MANIFEST_PATH, STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
+    STOW_BUNDLE_PACK_PATH, STOW_OCI_CONFIG_PATH, STOW_OCI_MANIFEST_PATH, STOW_PACK_MEDIA_TYPE,
+    STOW_SIGSTORE_PAYLOAD_DIR, SigstoreSignature,
 };
 use stow_types::error::Context;
 use stow_types::versioning::is_semver_compatible_upgrade;
@@ -407,7 +408,7 @@ fn parse_bundle_sync(bytes: Vec<u8>) -> stow_types::error::Result<ArtifactBundle
 
 fn finalize_bundle(
     manifest: Option<ArtifactBundleManifest>,
-    files: BTreeMap<String, Vec<u8>>,
+    mut files: BTreeMap<String, Vec<u8>>,
 ) -> stow_types::error::Result<ArtifactBundle> {
     let manifest = manifest
         .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing manifest.json"))?;
@@ -415,6 +416,7 @@ fn finalize_bundle(
     validate_output_file_names(&manifest)?;
     validate_declared_bundle_entries(&manifest, &files)?;
     validate_oci_manifest(&manifest, &files)?;
+    unpack_outputs(&manifest, &mut files)?;
     validate_output_entries_present(
         &manifest.config.outputs,
         manifest.config.native_archive.as_ref(),
@@ -424,23 +426,17 @@ fn finalize_bundle(
 }
 
 /// The exact set of tar entry paths a bundle may carry besides
-/// `manifest.json`: the signature-bound OCI manifest and config, every layer
-/// payload the config declares, and the sigstore payload blobs. Tar entries
-/// outside this set are unsigned data the serving edge appended on top of a
-/// validly signed bundle, so `files` must match this set exactly.
+/// `manifest.json`: the signature-bound OCI manifest and config, the pack
+/// holding every file the config declares, and the sigstore payload blobs.
+/// Tar entries outside this set are unsigned data the serving edge
+/// appended on top of a validly signed bundle, so `files` must match this
+/// set exactly.
 fn declared_bundle_paths(manifest: &ArtifactBundleManifest) -> BTreeSet<String> {
     let mut paths = BTreeSet::from([
         STOW_OCI_MANIFEST_PATH.to_owned(),
         STOW_OCI_CONFIG_PATH.to_owned(),
+        STOW_BUNDLE_PACK_PATH.to_owned(),
     ]);
-    for file in manifest
-        .config
-        .outputs
-        .iter()
-        .chain(manifest.config.native_archive.as_ref())
-    {
-        paths.insert(bundle_file_path(&file.file_name));
-    }
     for signature in &manifest.sigstore_signatures {
         paths.insert(signature.payload_path.clone());
     }
@@ -575,46 +571,48 @@ fn validate_oci_manifest(
         ));
     }
 
-    // `outputs` first, then the native archive when the config declares one.
-    // The archive is a layer like any other, so the cosign signature covers it
-    // through the manifest digest exactly as it covers the compiled outputs.
-    let expected_layers = bundle_manifest
-        .config
-        .outputs
-        .iter()
-        .chain(bundle_manifest.config.native_archive.as_ref())
-        .collect::<Vec<_>>();
-    if manifest.layers().len() != expected_layers.len() {
+    // One layer: the pack. The cosign signature covers it through the
+    // manifest digest, and the config's per-file hashes cover what it
+    // unpacks to.
+    let [descriptor] = manifest.layers().as_slice() else {
         return Err(stow_types::stow_error!(
-            "bundle OCI manifest layer count {} does not match config outputs {}",
-            manifest.layers().len(),
-            expected_layers.len()
+            "bundle OCI manifest carries {} layers, expected the one pack layer",
+            manifest.layers().len()
+        ));
+    };
+    if descriptor.media_type().to_string() != STOW_PACK_MEDIA_TYPE {
+        return Err(stow_types::stow_error!(
+            "bundle OCI layer is {}, expected {STOW_PACK_MEDIA_TYPE}",
+            descriptor.media_type()
+        ));
+    }
+    let pack = files
+        .get(STOW_BUNDLE_PACK_PATH)
+        .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing the pack"))?;
+    if descriptor.digest().to_string() != sha256_prefixed(pack) {
+        return Err(stow_types::stow_error!(
+            "bundle OCI pack layer digest mismatch"
         ));
     }
 
-    for (file, descriptor) in expected_layers.into_iter().zip(manifest.layers().iter()) {
-        let media_type = descriptor.media_type().to_string();
-        let expected_media_type = file.storage_media_type();
-        if media_type != expected_media_type {
-            return Err(stow_types::stow_error!(
-                "bundle OCI layer media type mismatch for {}: expected {}, got {}",
-                file.file_name,
-                expected_media_type,
-                media_type
-            ));
-        }
-        let bundle_path = bundle_file_path(&file.file_name);
-        let contents = files
-            .get(&bundle_path)
-            .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing {bundle_path}"))?;
-        if descriptor.digest().to_string() != sha256_prefixed(contents) {
-            return Err(stow_types::stow_error!(
-                "bundle OCI layer digest mismatch for {}",
-                file.file_name
-            ));
-        }
-    }
+    Ok(())
+}
 
+/// Replace the pack in `files` with the files it unpacks to, each under
+/// `files/<name>` and verified against the SHA-256 the signature-bound
+/// config records.
+fn unpack_outputs(
+    manifest: &ArtifactBundleManifest,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> stow_types::error::Result<()> {
+    let pack = files
+        .remove(STOW_BUNDLE_PACK_PATH)
+        .ok_or_else(|| stow_types::stow_error!("artifact bundle is missing the pack"))?;
+    let declared = manifest.config.packed_files().collect::<Vec<_>>();
+    let unpacked = stow_shim::unpack(&pack, &declared)?;
+    for (file, contents) in declared.into_iter().zip(unpacked) {
+        files.insert(bundle_file_path(&file.file_name), contents);
+    }
     Ok(())
 }
 
@@ -649,18 +647,6 @@ pub fn bundle_file_path(file_name: &str) -> String {
     format!("files/{file_name}")
 }
 
-pub fn decode_bundle_output_bytes(
-    file: &ArtifactBundleFile,
-    contents: &[u8],
-) -> stow_types::error::Result<Vec<u8>> {
-    zstd::stream::decode_all(std::io::Cursor::new(contents)).map_err(|error| {
-        stow_types::stow_error!(
-            "zstd decompress bundled artifact {}: {error}",
-            file.file_name
-        )
-    })
-}
-
 fn sha256_prefixed(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
@@ -669,10 +655,11 @@ fn sha256_prefixed(bytes: &[u8]) -> String {
 mod tests {
     use std::collections::BTreeMap;
 
+    use sha2::{Digest as _, Sha256};
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::bundle::{
-        ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_OCI_CONFIG_PATH,
-        STOW_OCI_MANIFEST_PATH, SigstoreSignature,
+        ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_BUNDLE_PACK_PATH,
+        STOW_OCI_CONFIG_PATH, STOW_OCI_MANIFEST_PATH, STOW_PACK_MEDIA_TYPE, SigstoreSignature,
     };
 
     use super::{
@@ -840,16 +827,65 @@ mod tests {
     #[test]
     fn bundle_with_exactly_declared_entries_is_accepted() {
         let (manifest, files) = declared_bundle_parts();
-        finalize_bundle(Some(manifest), files).expect("declared bundle must pass");
+        let bundle = finalize_bundle(Some(manifest), files).expect("declared bundle must pass");
+        assert_eq!(
+            bundle
+                .files
+                .get(&bundle_file_path("libdemo-aabbccddeeff0011.rmeta")),
+            Some(&b"demo-artifact".to_vec()),
+            "the pack unpacks to the verified file"
+        );
+        assert!(
+            !bundle.files.contains_key(STOW_BUNDLE_PACK_PATH),
+            "the pack is replaced by its files"
+        );
+    }
+
+    /// The pack is verified against the hashes the signed config records:
+    /// a pack holding other bytes than the config declares is refused
+    /// even though its layer digest matches the signed manifest.
+    #[test]
+    fn a_packed_file_that_differs_from_the_config_hash_is_rejected() {
+        let (manifest, files) = bundle_parts(b"demo-artifact", b"tampered-artifact");
+        let error = finalize_bundle(Some(manifest), files).expect_err("hash mismatch must fail");
+        assert!(error.to_string().contains("hashes to"), "{error}");
+    }
+
+    /// A bundle in the retired one-layer-per-file layout is not read.
+    #[test]
+    fn a_per_file_layer_bundle_is_rejected() {
+        let (manifest, mut files) = declared_bundle_parts();
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": sha256_prefixed(&files[STOW_OCI_CONFIG_PATH]),
+                "size": files[STOW_OCI_CONFIG_PATH].len(),
+            },
+            "layers": [{
+                "mediaType": "application/vnd.stow.rmeta.v1+zstd",
+                "digest": sha256_prefixed(&files[STOW_BUNDLE_PACK_PATH]),
+                "size": files[STOW_BUNDLE_PACK_PATH].len(),
+            }],
+        }))
+        .expect("serialize OCI manifest");
+        let mut manifest = manifest;
+        manifest.oci_digest = sha256_prefixed(&manifest_bytes);
+        files.insert(STOW_OCI_MANIFEST_PATH.to_owned(), manifest_bytes);
+        let error = finalize_bundle(Some(manifest), files).expect_err("old layout must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("expected application/vnd.stow.pack.v1+tar+zstd"),
+            "{error}"
+        );
     }
 
     #[test]
     fn traversing_output_file_name_is_rejected() {
-        let (mut manifest, mut files) = declared_bundle_parts();
-        let declared = bundle_file_path(&manifest.config.outputs[0].file_name);
-        let bytes = files.remove(&declared).expect("declared output present");
+        let (mut manifest, files) = declared_bundle_parts();
         manifest.config.outputs[0].file_name = "../escape.rlib".to_owned();
-        files.insert(bundle_file_path("../escape.rlib"), bytes);
         let error = finalize_bundle(Some(manifest), files).expect_err("traversal must fail");
         assert!(
             error.to_string().contains("is not a single path component"),
@@ -951,7 +987,18 @@ mod tests {
     /// manifest and config digests consistent enough to pass
     /// `validate_oci_manifest`.
     fn declared_bundle_parts() -> (ArtifactBundleManifest, BTreeMap<String, Vec<u8>>) {
-        let output_contents = b"demo-artifact".to_vec();
+        bundle_parts(b"demo-artifact", b"demo-artifact")
+    }
+
+    /// [`declared_bundle_parts`] with the pack holding `packed` where the
+    /// signed config declares `declared`.
+    fn bundle_parts(
+        declared: &[u8],
+        packed: &[u8],
+    ) -> (ArtifactBundleManifest, BTreeMap<String, Vec<u8>>) {
+        let output_contents = declared.to_vec();
+        let pack = stow_shim::pack(&[("libdemo-aabbccddeeff0011.rmeta", packed)])
+            .expect("pack the fixture");
         let config = ArtifactBlobConfig {
             dependency_identity: stow_types::identity::DependencyIdentity::leaf()
                 .expect("leaf identity"),
@@ -983,7 +1030,7 @@ mod tests {
             outputs: vec![ArtifactBundleFile {
                 file_name: "libdemo-aabbccddeeff0011.rmeta".to_owned(),
                 media_type: stow_types::bundle::STOW_RMETA_MEDIA_TYPE.to_owned(),
-                sha256: sha256_prefixed(&output_contents),
+                sha256: hex::encode(Sha256::digest(&output_contents)),
             }],
             native: None,
             native_archive: None,
@@ -998,9 +1045,9 @@ mod tests {
                 "size": config_bytes.len(),
             },
             "layers": [{
-                "mediaType": config.outputs[0].storage_media_type(),
-                "digest": sha256_prefixed(&output_contents),
-                "size": output_contents.len(),
+                "mediaType": STOW_PACK_MEDIA_TYPE,
+                "digest": sha256_prefixed(&pack),
+                "size": pack.len(),
             }],
         }))
         .expect("serialize OCI manifest");
@@ -1018,10 +1065,7 @@ mod tests {
         let files = BTreeMap::from([
             (STOW_OCI_MANIFEST_PATH.to_owned(), oci_manifest_bytes),
             (STOW_OCI_CONFIG_PATH.to_owned(), config_bytes),
-            (
-                bundle_file_path("libdemo-aabbccddeeff0011.rmeta"),
-                output_contents,
-            ),
+            (STOW_BUNDLE_PACK_PATH.to_owned(), pack),
             ("sigstore/payload-0.json".to_owned(), b"{}".to_vec()),
         ]);
         (manifest, files)

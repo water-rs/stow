@@ -65,7 +65,7 @@ fn seed_empty_index_slice(cache_dir: &Path) {
         },
         rows: Vec::new(),
     };
-    let blob = stow_types::index::encode(&index).expect("encode index");
+    let blob = stow_shim::encode_index(&index).expect("encode index");
     let manifest_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
     let dir = cache_dir.join("index").join(TARGET).join(RUSTC_VERSION);

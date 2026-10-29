@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 strip-ansi-escapes = "0.2"
 stow-types.workspace = true
+stow-shim = { workspace = true, features = ["zstd"] }
 stow-oci = { workspace = true, features = ["mock-verify"] }
 stow-resolver.workspace = true
 rustls.workspace = true

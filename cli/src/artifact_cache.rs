@@ -19,10 +19,7 @@ use stow_types::public_cache::{
 use stow_types::versioning::is_semver_compatible_upgrade;
 
 use crate::config::StowConfig;
-use crate::fetch::{
-    ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path,
-    decode_bundle_output_bytes,
-};
+use crate::fetch::{ArtifactBundle, FetchRequest, SemanticFetchRequest, bundle_file_path};
 use crate::file_lock::FileLock;
 use crate::inject::parsed_with_stable_identity;
 use crate::rustc_args::ParsedRustcArgs;
@@ -1021,8 +1018,7 @@ fn merge_bundle_entry_files_blocking(
                         output.file_name
                     )
                 })?;
-            let decoded = decode_bundle_output_bytes(output, contents)?;
-            std::fs::write(&temp, &decoded)
+            std::fs::write(&temp, contents)
                 .wrap_err_with(|| format!("write merged cache file {}", temp.display()))?;
         } else {
             return Err(bundle_identity_conflict(
@@ -2879,13 +2875,6 @@ fn write_downloaded_bundle_to_entry(
     bundle: &ArtifactBundle,
 ) -> stow_types::error::Result<u64> {
     let mut total_bytes = 0u64;
-    let output_files = bundle
-        .manifest
-        .config
-        .outputs
-        .iter()
-        .map(|file| (bundle_file_path(&file.file_name), file))
-        .collect::<BTreeMap<_, _>>();
     // `manifest.json` is what makes an entry loadable, so it is written
     // last. Anything that stops this function part-way — the disk filling
     // up mid-write, the process dying — then leaves an
@@ -2898,13 +2887,9 @@ fn write_downloaded_bundle_to_entry(
             std::fs::create_dir_all(parent)
                 .wrap_err_with(|| format!("create cache parent {}", parent.display()))?;
         }
-        let decoded = match output_files.get(relative_path) {
-            Some(file) => decode_bundle_output_bytes(file, contents)?,
-            None => contents.clone(),
-        };
-        std::fs::write(&path, &decoded)
+        std::fs::write(&path, contents)
             .wrap_err_with(|| format!("write cached bundle file {}", path.display()))?;
-        stow_types::error::Result::Ok(decoded.len() as u64)
+        stow_types::error::Result::Ok(contents.len() as u64)
     };
     // The native archive is signature-covered bytes the fetch verified
     // and nothing reads from an entry: it is not stored (stow#640).
@@ -6426,9 +6411,6 @@ pub mod tests {
 
     pub fn sample_bundle(c_metadata: &str, file_name: &str) -> ArtifactBundle {
         let file_contents = b"demo-artifact".to_vec();
-        let compression_level = *zstd::compression_level_range().end();
-        let stored_contents = zstd::bulk::compress(&file_contents, compression_level)
-            .expect("compress sample artifact bundle output");
         ArtifactBundle {
             manifest: ArtifactBundleManifest {
                 oci_reference: "ghcr.io/water-rs/stow-cache-1.91.1:demo.test".to_owned(),
@@ -6479,7 +6461,7 @@ pub mod tests {
                 }],
             },
             files: BTreeMap::from([
-                (bundle_file_path(file_name), stored_contents),
+                (bundle_file_path(file_name), file_contents),
                 (
                     "sigstore/payload.json".to_owned(),
                     serde_json::to_vec(&serde_json::json!({

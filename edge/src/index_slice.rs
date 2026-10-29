@@ -267,7 +267,7 @@ mod tests {
 
     #[test]
     fn zstd_blob_transcodes_to_gzip_byte_exact() {
-        // The real producer: `stow_types::index::encode` emits exactly
+        // The real producer: `stow_shim::encode_index` emits exactly
         // the zstd bytes a published slice carries.
         let index = stow_types::index::ArtifactIndex {
             header: stow_types::index::ArtifactIndexHeader {
@@ -281,7 +281,7 @@ mod tests {
             rows: Vec::new(),
         };
         let payload = serde_json::to_vec(&index).expect("index json");
-        let zstd = stow_types::index::encode(&index).expect("index encodes");
+        let zstd = stow_shim::encode_index(&index).expect("index encodes");
 
         let gzip = zstd_to_gzip(&zstd).expect("transcode");
 

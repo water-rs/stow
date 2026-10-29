@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use async_fs::read;
@@ -7,15 +6,16 @@ use oci_client::Reference;
 use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::OciImageManifest;
 use stow_types::bundle::{
-    ArtifactBlobConfig, BundleArtifactConfig, BundleLayer, BundleParts, BundleSignatureMaterial,
+    ArtifactBlobConfig, BundleArtifactConfig, BundleParts, BundleSignatureMaterial,
     SIGSTORE_BUNDLE_ANNOTATION, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
     SIGSTORE_SIGNATURE_ANNOTATION, STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_BUNDLE_CONFIG_MEDIA_TYPE,
-    STOW_BUNDLE_MEDIA_TYPE, assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
+    STOW_BUNDLE_MEDIA_TYPE, STOW_PACK_MEDIA_TYPE, assemble_bundle, sigstore_payload_path,
+    sigstore_signature_tag,
 };
 use stow_types::bundle_schema::validate_bundle_schema;
 use stow_types::identity::WireRustcVersion;
 use stow_types::registry::{bundle_oci_reference, cache_repository, sha256_digest};
-use stow_types::upload_plan::{PlannedArtifact, PlannedArtifactOutput, PublishedArtifact};
+use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
 
 use crate::client::{RegistryError, RegistryHttp, RegistrySession, canonical_manifest_bytes};
 use crate::registry::RegistryCredentials;
@@ -96,35 +96,66 @@ where
     S: Fn(String, String) -> Fut + Send + Sync,
     Fut: Future<Output = stow_types::error::Result<()>> + Send,
 {
-    let reference: Reference = plan.oci_reference.parse().map_err(|error| {
-        stow_types::stow_error!("parse OCI reference {}: {error}", plan.oci_reference)
-    })?;
     let config = artifact_config(plan);
     let config_bytes = serde_json::to_vec(&config)?;
-    let layers = build_layers(plan).await?;
+    let pack = build_pack(plan).await?;
+    publish_packed(
+        session,
+        &plan.oci_reference,
+        &config,
+        &config_bytes,
+        &pack,
+        sign,
+    )
+    .await
+}
 
-    // Push order matches the manifest the bytes describe: every layer, then
+/// Push a signed artifact whose one layer is `pack`, and the bundle
+/// artifact assembled from it.
+///
+/// The artifact build and the repack of an already-published node both end
+/// here: the same layer, manifest, signature and bundle, whichever bytes
+/// the files came from. `config_bytes` are the config blob exactly as
+/// they are (to be) stored — a repack passes the published bytes so the
+/// config digest, and with it the node's identity, does not move.
+///
+/// # Errors
+///
+/// Returns an error when a push, the signature, or the signature read-back
+/// fails.
+pub async fn publish_packed<S, Fut>(
+    session: &RegistrySession,
+    oci_reference: &str,
+    config: &ArtifactBlobConfig,
+    config_bytes: &[u8],
+    pack: &[u8],
+    sign: &S,
+) -> stow_types::error::Result<PublishedArtifact>
+where
+    S: Fn(String, String) -> Fut + Send + Sync,
+    Fut: Future<Output = stow_types::error::Result<()>> + Send,
+{
+    let reference: Reference = oci_reference
+        .parse()
+        .map_err(|error| stow_types::stow_error!("parse OCI reference {oci_reference}: {error}"))?;
+    let layer = ImageLayer::new(pack.to_vec(), STOW_PACK_MEDIA_TYPE.to_owned(), None);
+
+    // Push order matches the manifest the bytes describe: the layer, then
     // the config blob, then the manifest. A blob already stored under its
     // digest is skipped by `push_blob`'s HEAD — content addressing means it
     // can only be the same bytes.
-    for layer in &layers {
-        session
-            .push_blob(&layer.sha256_digest(), &layer.data)
-            .await
-            .map_err(|error| {
-                stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
-            })?;
-    }
     session
-        .push_blob(&sha256_digest(&config_bytes), &config_bytes)
+        .push_blob(&layer.sha256_digest(), &layer.data)
         .await
-        .map_err(|error| {
-            stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
-        })?;
+        .map_err(|error| stow_types::stow_error!("push OCI artifact {oci_reference}: {error}"))?;
+    session
+        .push_blob(&sha256_digest(config_bytes), config_bytes)
+        .await
+        .map_err(|error| stow_types::stow_error!("push OCI artifact {oci_reference}: {error}"))?;
     let manifest = OciImageManifest::build(
-        &layers,
+        std::slice::from_ref(&layer),
         &Config::new(
-            config_bytes.clone(),
+            config_bytes.to_vec(),
             STOW_ARTIFACT_CONFIG_MEDIA_TYPE.to_owned(),
             None,
         ),
@@ -132,14 +163,12 @@ where
     );
     let manifest_bytes = canonical_manifest_bytes(&manifest)?;
     let oci_digest = sign::put_signed_manifest(session, &reference, &manifest_bytes, |digest| {
-        sign(plan.oci_reference.clone(), digest)
+        sign(oci_reference.to_owned(), digest)
     })
     .await
-    .map_err(|error| {
-        stow_types::stow_error!("push OCI artifact {}: {error}", plan.oci_reference)
-    })?;
+    .map_err(|error| stow_types::stow_error!("push OCI artifact {oci_reference}: {error}"))?;
     tracing::info!(
-        oci_reference = %plan.oci_reference,
+        oci_reference = %oci_reference,
         digest = %oci_digest,
         "pushed and signed OCI artifact on GHCR"
     );
@@ -149,19 +178,13 @@ where
     let (bundle_digest, bundle_size) = push_bundle(
         session,
         &BundleParts {
-            oci_reference: &plan.oci_reference,
+            oci_reference,
             oci_digest: &oci_digest,
             manifest_bytes: &manifest_bytes,
-            config_bytes: &config_bytes,
-            config: &config,
+            config_bytes,
+            config,
             signatures: &signatures,
-            layers: &layers
-                .iter()
-                .map(|layer| BundleLayer {
-                    media_type: &layer.media_type,
-                    bytes: &layer.data,
-                })
-                .collect::<Vec<_>>(),
+            pack,
         },
     )
     .await?;
@@ -272,6 +295,37 @@ pub async fn pull_signature_materials(
         &manifest_bytes,
     ))
     .await
+}
+
+/// Verify that a signature under `certificate_identity` binds
+/// `identity_reference` at `manifest_digest`, reading the signature
+/// image next to `reference`.
+///
+/// `reference` is the transport pull reference the signature materials
+/// are fetched through; the signature itself binds the canonical
+/// `ghcr.io/<repository>:<tag>` the publisher signed, which is what
+/// `identity_reference` names.
+///
+/// # Errors
+///
+/// Returns an error when the signature image cannot be read or no layer
+/// verifies.
+pub async fn verify_artifact_signature(
+    session: &RegistrySession,
+    trust: &crate::verify::Trust,
+    reference: &Reference,
+    identity_reference: &str,
+    manifest_digest: &str,
+    certificate_identity: &str,
+) -> stow_types::error::Result<()> {
+    let materials = pull_signature_materials(session, reference, manifest_digest).await?;
+    crate::verify::verify_materials(
+        trust,
+        identity_reference,
+        manifest_digest,
+        &materials,
+        certificate_identity,
+    )
 }
 
 /// How many times the read-back of a signature this publish just pushed
@@ -430,47 +484,29 @@ fn artifact_config(plan: &PlannedArtifact) -> ArtifactBlobConfig {
     }
 }
 
-async fn build_layers(plan: &PlannedArtifact) -> stow_types::error::Result<Vec<ImageLayer>> {
-    let mut layers = Vec::new();
-
-    // Layer order is part of the contract: consumers zip `config.outputs`
-    // against the leading layers and take the native archive, when the config
-    // declares one, as the trailing layer.
+/// The plan's files — outputs, then the native archive — as the pack.
+async fn build_pack(plan: &PlannedArtifact) -> stow_types::error::Result<Vec<u8>> {
+    let mut named = Vec::new();
     for output in plan.outputs.iter().chain(plan.native_archive.as_ref()) {
-        let media_type = output.bundle_file.storage_media_type();
-        layers.push(ImageLayer::new(
-            read_output(output).await?,
-            media_type,
-            None,
+        named.push((
+            output.bundle_file.file_name.clone(),
+            read(&output.path).await?,
         ));
     }
-
-    if layers.is_empty() {
+    if named.is_empty() {
         return Err(stow_types::stow_error!(
-            "artifact {} has no uploadable layers",
+            "artifact {} has no uploadable files",
             plan.oci_reference
         ));
     }
-
-    Ok(layers)
-}
-
-async fn read_output(output: &PlannedArtifactOutput) -> stow_types::error::Result<Vec<u8>> {
-    let bytes = read(&output.path).await?;
-    compress_zstd(bytes, output.path.clone()).await
-}
-
-/// Asynchronously compress `bytes` with the workspace-wide stow zstd level
-/// using smol's blocking-task pool.
-async fn compress_zstd(bytes: Vec<u8>, path: PathBuf) -> stow_types::error::Result<Vec<u8>> {
+    let oci_reference = plan.oci_reference.clone();
     smol::unblock(move || {
-        zstd::bulk::compress(&bytes, stow_shim::STOW_ZSTD_COMPRESSION_LEVEL).map_err(|error| {
-            stow_types::stow_error!(
-                "zstd compress {} at level {}: {error}",
-                path.display(),
-                stow_shim::STOW_ZSTD_COMPRESSION_LEVEL
-            )
-        })
+        let files = named
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        stow_shim::pack(&files)
+            .map_err(|error| error.wrap_err(format!("pack artifact {oci_reference}")))
     })
     .await
 }

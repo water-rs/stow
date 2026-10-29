@@ -36,10 +36,10 @@ use sigstore::crypto::SigningScheme;
 use sigstore::crypto::signing_key::SigStoreKeyPair;
 use sigstore::crypto::signing_key::ecdsa::{ECDSAKeys, EllipticCurve};
 use stow_types::bundle::{
-    ArtifactBlobConfig, ArtifactBundleFile, BundleLayer, BundleParts, BundleSignatureMaterial,
+    ArtifactBlobConfig, ArtifactBundleFile, BundleParts, BundleSignatureMaterial,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
-    SIGSTORE_SIGNATURE_ANNOTATION, STOW_ARTIFACT_CONFIG_MEDIA_TYPE, assemble_bundle,
-    sigstore_payload_path, sigstore_signature_tag,
+    SIGSTORE_SIGNATURE_ANNOTATION, STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_PACK_MEDIA_TYPE,
+    assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
 };
 use stow_types::identity::{DependencyIdentity, TargetTriple, WireRustcVersion};
 use stow_types::index::{
@@ -388,8 +388,8 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
     let oci_reference = repository.reference("test.bundle");
 
     // The published artifact: the config the trusted build would write
-    // (identity from the local row, `cfg-if` being a leaf), each output
-    // zstd-compressed as one layer, and the OCI manifest over them.
+    // (identity from the local row, `cfg-if` being a leaf), the outputs
+    // packed as one layer, and the OCI manifest over it.
     let config = ArtifactBlobConfig {
         compile_key: unit.compile_key.clone(),
         crate_name: unit.crate_name.parse().expect("crate name"),
@@ -414,14 +414,19 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
     };
     let oci_config_bytes = serde_json::to_vec(&config).expect("config bytes");
     let oci_config_digest = sha256_digest(&oci_config_bytes);
-    let compressed: Vec<Vec<u8>> = outputs
+    let raw: Vec<Vec<u8>> = outputs
         .iter()
         .map(|file| {
-            let raw = std::fs::read(entry.join("files").join(&file.file_name))
-                .unwrap_or_else(|error| panic!("read output {}: {error}", file.file_name));
-            zstd::bulk::compress(&raw, 3).expect("compress output")
+            std::fs::read(entry.join("files").join(&file.file_name))
+                .unwrap_or_else(|error| panic!("read output {}: {error}", file.file_name))
         })
         .collect();
+    let named: Vec<(&str, &[u8])> = outputs
+        .iter()
+        .zip(&raw)
+        .map(|(file, bytes)| (file.file_name.as_str(), bytes.as_slice()))
+        .collect();
+    let pack = stow_shim::pack(&named).expect("pack outputs");
     let oci_manifest_bytes = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 2,
         "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
@@ -430,11 +435,11 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
             "digest": oci_config_digest,
             "size": oci_config_bytes.len(),
         },
-        "layers": outputs.iter().zip(&compressed).map(|(file, bytes)| serde_json::json!({
-            "mediaType": file.storage_media_type(),
-            "digest": sha256_digest(bytes),
-            "size": bytes.len(),
-        })).collect::<Vec<_>>(),
+        "layers": [{
+            "mediaType": STOW_PACK_MEDIA_TYPE,
+            "digest": sha256_digest(&pack),
+            "size": pack.len(),
+        }],
     }))
     .expect("oci manifest");
     let oci_digest = sha256_digest(&oci_manifest_bytes);
@@ -468,17 +473,8 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
     };
 
     // The bundle the edge byte path streams: manifest, config, mock
-    // signature and the layers.
+    // signature and the pack.
     let material = sign(&oci_reference, &oci_digest);
-    let media_types: Vec<String> = outputs
-        .iter()
-        .map(ArtifactBundleFile::storage_media_type)
-        .collect();
-    let layers: Vec<BundleLayer<'_>> = media_types
-        .iter()
-        .zip(&compressed)
-        .map(|(media_type, bytes)| BundleLayer { media_type, bytes })
-        .collect();
     let signatures = [material];
     let bundle_bytes = assemble_bundle(&BundleParts {
         oci_reference: &oci_reference,
@@ -487,7 +483,7 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
         config_bytes: &oci_config_bytes,
         config: &config,
         signatures: &signatures,
-        layers: &layers,
+        pack: &pack,
     })
     .expect("assemble bundle");
     let bundle_digest = sha256_digest(&bundle_bytes);
@@ -526,7 +522,7 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
         },
         rows: vec![row],
     };
-    let index_blob = stow_types::index::encode(&index).expect("encode index");
+    let index_blob = stow_shim::encode_index(&index).expect("encode index");
     let index_blob_digest = sha256_digest(&index_blob);
 
     // The OCI manifest/signature pair the slice fetch pulls — the same

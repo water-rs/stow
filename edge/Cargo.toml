@@ -84,5 +84,7 @@ tar.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 sqlx = { version = "0.9", default-features = false, features = ["sqlite", "runtime-tokio"] }
 skyzen-services = { version = "0.3.0", default-features = false, features = ["sqlite", "runtime-tokio"] }
+# The real index producer, so the transcode test decodes what a publish writes.
+stow-shim = { workspace = true, features = ["zstd"] }
 [lints]
 workspace = true
