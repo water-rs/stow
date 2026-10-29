@@ -38,6 +38,11 @@ pub const ALLOWANCE_FRACTION: f64 = 0.8;
 
 /// One UTC day's share of the line — `ALLOWANCE_FRACTION / 30`.
 ///
+/// A 31-day month at this pace reaches 82.7% of the allowance, not 80%;
+/// the watchdog's month-to-date usage trips judge the real month total
+/// against `ALLOWANCE_FRACTION`, so that overshoot is caught at the line
+/// at run time and the breaker's daily share stays an early guard.
+///
 /// The in-edge cost breaker freezes dispatch once a UTC day's billed
 /// rows pass this share of the monthly allowance
 /// (`edge/src/scheduler/meter.rs`, [`daily_budget`]), so a sustained

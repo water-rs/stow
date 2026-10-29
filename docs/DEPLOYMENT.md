@@ -216,6 +216,18 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    - `stow maintenance: all` — `http.host eq "<edge host>"`,
      action `block`. The whole site down at zero usage.
 
+   The #450 watchdog trips one of them, chosen by what the breach
+   costs: `scheduler lanes` when a Durable Object billed dimension
+   (`cf.do.*`) or a build-pipeline signal breaches — bundle downloads and
+   index routes keep serving — and `anonymous` when a Worker billed
+   dimension (`cf.worker.*`) breaches; with several breaches the widest
+   scope wins. Each billed dimension trips when its total over the
+   current UTC calendar month passes 80% of its monthly allowance; the
+   last hour at 200% and 300% of the hourly pace (levels set by the
+   `STOW_WATCHDOG_HOURLY_ALERT_PERCENTS` repository variable) only
+   alerts. `stow-admin watchdog clear` disables both scopes the
+   watchdog can enable.
+
    `<edge host>` is the host of `STOW_EDGE_URL` — the rules follow
    whichever edge they were ensured against. `deploy-edge.yml` runs
    `stow-admin maintenance ensure --yes` with the deployed commit's
