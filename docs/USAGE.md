@@ -552,7 +552,8 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   reconcile`, which reports in full every published slice whose
   generation the scheduler does not hold (a full membership over one
   request body posts in parts; a delta too large for one part is
-  reported as the slice's full membership). `index targets` lists
+  reported as the slice's full membership). Under `full` the reconcile runs after the
+  publish step instead, once every slice it reads is regenerated. `index targets` lists
   the `(target, rustc)` pairs a published index covers.
   `index published-rustcs` prints every stable rustc release
   (`static.rust-lang.org/manifests.txt`) whose `stow-cache-<rustc>`
