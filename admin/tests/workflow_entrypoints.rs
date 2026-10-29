@@ -1167,8 +1167,13 @@ fn build_crate_declarations() {
         at(&wf, "jobs.publish.if").map(scalar).as_deref(),
         Some("inputs.repack_rustc == '' && needs.build.result == 'success'")
     );
-    // The operator's repack job runs only in a repack run and republishes
-    // under the builder identity, so it holds the publish job's rights.
+}
+
+/// The operator's repack job runs only in a repack run and republishes
+/// under the builder identity, so it holds the publish job's rights.
+#[test]
+fn build_crate_repack_job() {
+    let wf = load_workflow("build-crate.yml");
     assert_eq!(
         at(&wf, "jobs.repack.if").map(scalar).as_deref(),
         Some("inputs.repack_rustc != ''")
