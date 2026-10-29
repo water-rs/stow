@@ -824,7 +824,7 @@ pub async fn write_cached_test_slice(
     index: &ArtifactIndex,
 ) -> stow_types::error::Result<String> {
     let dir = slice_dir(config, target, rustc_version);
-    let blob = stow_types::index::encode(index)
+    let blob = stow_shim::encode_index(index)
         .map_err(|error| stow_types::stow_error!("encode test index slice: {error}"))?;
     let digest = "sha256:test-slice-manifest".to_owned();
     commit_slice(&dir, &digest, blob, index.rows.len() as u64).await?;
@@ -976,7 +976,7 @@ mod tests {
         let config = test_config(tempdir.path());
         let dir = slice_dir(&config, TARGET, RUSTC);
         let index = test_index(vec![test_row("aaaa"), test_row("bbbb")]);
-        let blob = stow_types::index::encode(&index).expect("encode");
+        let blob = stow_shim::encode_index(&index).expect("encode");
         let digest = "sha256:deadbeef".to_owned();
 
         commit_slice(&dir, &digest, blob, 2).await.expect("commit");
@@ -1005,7 +1005,7 @@ mod tests {
         let dir = slice_dir(&config, TARGET, RUSTC);
         let mut index = test_index(vec![test_row("aaaa")]);
         index.header.format_version += 1;
-        let blob = stow_types::index::encode(&index).expect("encode");
+        let blob = stow_shim::encode_index(&index).expect("encode");
         commit_slice(&dir, "sha256:aaaa", blob, 1)
             .await
             .expect("commit");
@@ -1024,7 +1024,7 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = test_config(tempdir.path());
         let dir = slice_dir(&config, TARGET, RUSTC);
-        let blob = stow_types::index::encode(&test_index(vec![test_row("aaaa")])).expect("encode");
+        let blob = stow_shim::encode_index(&test_index(vec![test_row("aaaa")])).expect("encode");
 
         commit_slice(&dir, "sha256:aaaa", blob.clone(), 1)
             .await
@@ -1064,7 +1064,7 @@ mod tests {
         );
         assert!(!dir.exists(), "a read never creates the slice directory");
 
-        let blob = stow_types::index::encode(&test_index(vec![test_row("aaaa")])).expect("encode");
+        let blob = stow_shim::encode_index(&test_index(vec![test_row("aaaa")])).expect("encode");
         smol::block_on(commit_slice(&dir, "sha256:aaaa", blob, 1)).expect("commit");
         let probe = std::fs::File::open(dir.join(LOCK_FILE)).expect("open the lock file");
 
@@ -1096,7 +1096,7 @@ mod tests {
         let config = test_config(tempdir.path());
         let dir = slice_dir(&config, TARGET, RUSTC);
         let index = test_index(vec![test_row("aaaa")]);
-        let blob = stow_types::index::encode(&index).expect("encode");
+        let blob = stow_shim::encode_index(&index).expect("encode");
         commit_slice(&dir, "sha256:aaaa", blob, 1)
             .await
             .expect("commit");
@@ -1220,7 +1220,7 @@ mod tests {
             ..test_config(tempdir.path())
         };
         let dir = slice_dir(&config, TARGET, RUSTC);
-        let blob = stow_types::index::encode(&test_index(vec![test_row("aaaa")])).expect("encode");
+        let blob = stow_shim::encode_index(&test_index(vec![test_row("aaaa")])).expect("encode");
         commit_slice(&dir, "sha256:aaaa", blob, 1)
             .await
             .expect("seed the cache");
@@ -1309,7 +1309,7 @@ mod tests {
     fn generation_slice(generation: usize) -> (String, Vec<u8>) {
         let mut index = test_index(vec![test_row("aaaa")]);
         index.header.generation = i64::try_from(generation).expect("generation");
-        let blob = stow_types::index::encode(&index).expect("encode");
+        let blob = stow_shim::encode_index(&index).expect("encode");
         (generation_digest(generation), blob)
     }
 

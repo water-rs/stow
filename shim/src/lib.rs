@@ -4,13 +4,17 @@
 //!   runner; both processes need a stable filesystem path that resolves to
 //!   the current stow binary so cargo can be told `RUSTC_WRAPPER` once).
 //!   Native targets only.
-//! * Shared zstd compression level (used by ci and mock-registry; gated
-//!   behind the `zstd` feature).
+//! * The bundle pack format and the zstd settings every producer shares
+//!   (gated behind the `zstd` feature).
 
-/// Default zstd compression level for stow OCI layers. Used by ci's upload
-/// path and the mock registry so they produce identically-shaped layers.
 #[cfg(feature = "zstd")]
-pub const STOW_ZSTD_COMPRESSION_LEVEL: i32 = zstd::DEFAULT_COMPRESSION_LEVEL;
+pub mod pack;
+
+#[cfg(feature = "zstd")]
+pub use pack::{
+    STOW_ZSTD_COMPRESSION_LEVEL, STOW_ZSTD_JOB_SIZE, STOW_ZSTD_OVERLAP_LOG, STOW_ZSTD_WINDOW_LOG,
+    compress, decompress, encode_index, pack, unpack,
+};
 
 // Wrapper-shim materialization is meaningless on wasm32 (the edge worker
 // target) — no filesystem, no rustc to wrap. Gate everything below so the

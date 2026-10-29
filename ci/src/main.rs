@@ -32,6 +32,7 @@ mod local_server;
 mod mock_compile;
 mod object_arch;
 mod plan;
+mod repack;
 mod rlib_members;
 mod stage;
 mod task;
@@ -79,6 +80,19 @@ enum Stage {
         #[arg(long)]
         input_dir: PathBuf,
     },
+    /// Rewrite the published nodes of one rustc that still store each
+    /// output as its own layer into the single-pack layout, republishing
+    /// them under this workflow's identity. Idempotent; it only touches
+    /// nodes still in the old layout.
+    Repack {
+        /// The rustc whose published nodes are swept.
+        #[arg(long)]
+        rustc_version: String,
+        /// Tasks repacked at once. Each node's compression already uses
+        /// every core; this bounds registry round trips and memory.
+        #[arg(long)]
+        concurrency: std::num::NonZeroUsize,
+    },
     /// Print `true` or `false` — whether the dispatched task's signed
     /// records already exist under its `built-<rustc>-<task_id hash>`
     /// marker (stow#877). `build-crate.yml` runs this before the
@@ -114,6 +128,10 @@ fn main() -> stow_types::error::Result<()> {
         // reactor; the build stage is smol-only because cargo/rustc
         // capture never touches HTTP.
         Stage::Publish { input_dir } => tokio_runtime()?.block_on(publish_stage(&input_dir)),
+        Stage::Repack {
+            rustc_version,
+            concurrency,
+        } => tokio_runtime()?.block_on(repack_stage(&rustc_version, concurrency.get())),
         Stage::RecordsExist => tokio_runtime()?.block_on(records_exist_stage()),
         Stage::Serve { listen } => tokio_runtime()?.block_on(serve_stage(listen)),
     }
@@ -167,6 +185,16 @@ async fn publish_stage(input_dir: &std::path::Path) -> stow_types::error::Result
         error
     })?;
     tracing::info!(task_id = %task.task_id, pushed, "artifacts pushed");
+    Ok(())
+}
+
+/// The `build-crate.yml` repack job: sweep one rustc's published nodes
+/// into the single-pack layout and print the sweep's counts as JSON.
+async fn repack_stage(rustc_version: &str, concurrency: usize) -> stow_types::error::Result<()> {
+    let rustc_version = stow_types::identity::WireRustcVersion::parse(rustc_version)
+        .map_err(|error| stow_types::stow_error!("--rustc-version: {error}"))?;
+    let sweep = repack::run(&rustc_version, concurrency, build_run_from_env()?).await?;
+    println!("{}", serde_json::to_string(&sweep)?);
     Ok(())
 }
 

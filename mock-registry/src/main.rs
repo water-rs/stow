@@ -26,10 +26,11 @@ use sigstore::crypto::signing_key::SigStoreKeyPair;
 use sigstore::crypto::{SigStoreSigner, SigningScheme};
 use stow_types::api::{ArtifactRecord, DemandFeedHour};
 use stow_types::bundle::{
-    ArtifactBlobConfig, BundleArtifactConfig, BundleLayer, BundleParts, BundleSignatureMaterial,
+    ArtifactBlobConfig, BundleArtifactConfig, BundleParts, BundleSignatureMaterial,
     OCI_IMAGE_MANIFEST_MEDIA_TYPE, SIGSTORE_CERT_ANNOTATION, SIGSTORE_OCI_MEDIA_TYPE,
     SIGSTORE_SIGNATURE_ANNOTATION, STOW_ARTIFACT_CONFIG_MEDIA_TYPE, STOW_BUNDLE_CONFIG_MEDIA_TYPE,
-    STOW_BUNDLE_MEDIA_TYPE, assemble_bundle, sigstore_payload_path, sigstore_signature_tag,
+    STOW_BUNDLE_MEDIA_TYPE, STOW_PACK_MEDIA_TYPE, assemble_bundle, sigstore_payload_path,
+    sigstore_signature_tag,
 };
 use stow_types::bundle_schema::validate_bundle_schema;
 use stow_types::identity::{TargetTriple, WireRustcVersion};
@@ -208,7 +209,7 @@ async fn index_from_records(request: IndexFromRecordsArgs) -> stow_types::error:
             },
             rows,
         };
-        let index_bytes = stow_types::index::encode(&index)
+        let index_bytes = stow_shim::encode_index(&index)
             .map_err(|error| stow_types::stow_error!("encode index: {error}"))?;
         write_signed_index(
             &request.registry_root,
@@ -853,33 +854,30 @@ async fn write_mock_registry_entry(
     let config_digest = sha256_digest(&config_bytes);
     write_blob(registry_root, &config_digest, &config_bytes).await?;
 
-    let mut layers = Vec::with_capacity(plan.outputs.len() + 1);
-    let mut layer_blobs = Vec::with_capacity(plan.outputs.len() + 1);
-    // Same order as CI pushes: outputs, then the native archive.
+    // Same order as CI packs: outputs, then the native archive.
+    let mut named = Vec::with_capacity(plan.outputs.len() + 1);
     for output in plan.outputs.iter().chain(plan.native_archive.as_ref()) {
         let bytes = read(&output.path).await.map_err(|error| {
             stow_types::stow_error!("read artifact output {}: {error}", output.path.display())
         })?;
-        let path_for_error = output.path.clone();
-        let compressed = smol::unblock(move || {
-            zstd::bulk::compress(&bytes, stow_shim::STOW_ZSTD_COMPRESSION_LEVEL).map_err(|error| {
-                stow_types::stow_error!(
-                    "zstd compress {} at level {}: {error}",
-                    path_for_error.display(),
-                    stow_shim::STOW_ZSTD_COMPRESSION_LEVEL
-                )
-            })
-        })
-        .await?;
-        let digest = sha256_digest(&compressed);
-        write_blob(registry_root, &digest, &compressed).await?;
-        layers.push(serde_json::json!({
-            "mediaType": output.bundle_file.storage_media_type(),
-            "digest": digest,
-            "size": compressed.len(),
-        }));
-        layer_blobs.push((output.bundle_file.storage_media_type(), compressed));
+        named.push((output.bundle_file.file_name.clone(), bytes));
     }
+    let oci_reference = plan.oci_reference.clone();
+    let pack = smol::unblock(move || {
+        let files = named
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect::<Vec<_>>();
+        stow_shim::pack(&files).map_err(|error| error.wrap_err(format!("pack {oci_reference}")))
+    })
+    .await?;
+    let pack_digest = sha256_digest(&pack);
+    write_blob(registry_root, &pack_digest, &pack).await?;
+    let layers = [serde_json::json!({
+        "mediaType": STOW_PACK_MEDIA_TYPE,
+        "digest": pack_digest,
+        "size": pack.len(),
+    })];
 
     let manifest_bytes = serde_json::to_vec(&serde_json::json!({
         "schemaVersion": 2,
@@ -909,10 +907,6 @@ async fn write_mock_registry_entry(
         certificate_pem: MOCK_CERTIFICATE.to_owned(),
         rekor_bundle_json: None,
     };
-    let bundle_layers = layer_blobs
-        .iter()
-        .map(|(media_type, bytes)| BundleLayer { media_type, bytes })
-        .collect::<Vec<_>>();
     let bundle_bytes = assemble_bundle(&BundleParts {
         oci_reference: &plan.oci_reference,
         oci_digest: &manifest_digest,
@@ -920,7 +914,7 @@ async fn write_mock_registry_entry(
         config_bytes: &config_bytes,
         config: &config,
         signatures: std::slice::from_ref(&signature_material),
-        layers: &bundle_layers,
+        pack: &pack,
     })
     .map_err(|error| {
         stow_types::stow_error!("assemble bundle for {}: {error}", plan.oci_reference)
@@ -2463,16 +2457,19 @@ impl RegistryAsset {
 mod tests {
     use axum::body::to_bytes;
     use axum::http::{Method, Request, StatusCode, header};
+    use sha2::Digest as _;
+    use stow_types::api::ArtifactRecord;
     use stow_types::artifact::{ArtifactKind, RustCrateType};
     use stow_types::bundle::{
-        ArtifactBundleFile, STOW_BUNDLE_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, sigstore_signature_tag,
+        ArtifactBundleFile, OCI_IMAGE_MANIFEST_MEDIA_TYPE, STOW_ARTIFACT_CONFIG_MEDIA_TYPE,
+        STOW_BUNDLE_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, sigstore_signature_tag,
     };
     use stow_types::identity::{
         CMetadata, CrateName, DependencyCMetadataJson, FeaturesJson, WireRustcVersion,
     };
     use stow_types::index::{
         ARTIFACT_INDEX_FORMAT_VERSION, ArtifactIndex, ArtifactIndexHeader, ArtifactIndexRow,
-        STOW_INDEX_MEDIA_TYPE, encode, index_tag,
+        STOW_INDEX_MEDIA_TYPE, index_tag,
     };
     use stow_types::platform::{PanicStrategy, Profile, StripLevel};
     use stow_types::registry::{CacheRepository, cache_repository, sha256_digest};
@@ -2884,7 +2881,7 @@ mod tests {
                 min_glibc: None,
             }],
         };
-        let index_bytes = encode(&index).expect("encode index");
+        let index_bytes = stow_shim::encode_index(&index).expect("encode index");
         let layer_digest = sha256_digest(&index_bytes);
         write_blob(root, &layer_digest, &index_bytes)
             .await
@@ -3064,7 +3061,7 @@ mod tests {
                 bundle_file: ArtifactBundleFile {
                     file_name,
                     media_type: STOW_RLIB_MEDIA_TYPE.to_owned(),
-                    sha256: sha256_digest(&output_bytes),
+                    sha256: hex::encode(sha2::Sha256::digest(&output_bytes)),
                 },
             }],
             native: None,
@@ -3442,6 +3439,247 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("{tag} must verify: {error}"));
         }
+    }
+
+    // ---- repack of nodes published one layer per file ----
+
+    /// A mock signer with a known key, and the trust that accepts it.
+    async fn keyed_signer(
+        root: &std::path::Path,
+    ) -> (
+        impl Fn(
+            String,
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = stow_types::error::Result<()>> + Send>,
+        >,
+        stow_oci::verify::Trust,
+    ) {
+        let key_pair = SigStoreKeyPair::ECDSA(
+            sigstore::crypto::signing_key::ecdsa::ECDSAKeys::new(
+                sigstore::crypto::signing_key::ecdsa::EllipticCurve::P256,
+            )
+            .expect("ecdsa key pair"),
+        );
+        let public_key_path = root.join("trusted.pem");
+        write_public_key(&public_key_path, &key_pair)
+            .await
+            .expect("public key");
+        let root = root.to_path_buf();
+        let sign = move |oci_reference: String, manifest_digest: String| {
+            let root = root.clone();
+            let signer = key_pair
+                .to_sigstore_signer(&SigningScheme::ECDSA_P256_SHA256_ASN1)
+                .expect("mock signer");
+            Box::pin(async move {
+                write_mock_signature(&root, &signer, &oci_reference, &manifest_digest)
+                    .await
+                    .map(|_| ())
+            })
+                as std::pin::Pin<
+                    Box<dyn std::future::Future<Output = stow_types::error::Result<()>> + Send>,
+                >
+        };
+        (sign, stow_oci::verify::Trust::MockKey(public_key_path))
+    }
+
+    /// Re-publish `record`'s tag as the retired layout — one zstd layer
+    /// per file, `layer_bytes` standing in for the files' contents —
+    /// signed by `sign`. Returns the record naming the retired manifest.
+    async fn publish_retired_layout<S, Fut>(
+        session: &stow_oci::RegistrySession,
+        plan: &PlannedArtifact,
+        packed: &ArtifactRecord,
+        layer_bytes: &[u8],
+        sign: &S,
+    ) -> ArtifactRecord
+    where
+        S: Fn(String, String) -> Fut,
+        Fut: std::future::Future<Output = stow_types::error::Result<()>>,
+    {
+        let (packed_manifest, _) = session
+            .pull_manifest(
+                &session
+                    .digest_reference(&packed.oci_digest)
+                    .expect("reference"),
+            )
+            .await
+            .expect("packed manifest");
+        let packed_manifest: serde_json::Value =
+            serde_json::from_slice(&packed_manifest).expect("manifest json");
+        let config_digest = packed_manifest["config"]["digest"]
+            .as_str()
+            .expect("config digest");
+        let config_size = packed_manifest["config"]["size"].clone();
+
+        let stored = stow_shim::compress(layer_bytes).expect("compress layer");
+        let layer_digest = sha256_digest(&stored);
+        session
+            .push_blob(&layer_digest, &stored)
+            .await
+            .expect("push retired layer");
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "config": {
+                "mediaType": STOW_ARTIFACT_CONFIG_MEDIA_TYPE,
+                "digest": config_digest,
+                "size": config_size,
+            },
+            "layers": [{
+                "mediaType": format!("{}+zstd", plan.outputs[0].bundle_file.media_type),
+                "digest": layer_digest,
+                "size": stored.len(),
+            }],
+        }))
+        .expect("manifest bytes");
+        let reference = session
+            .reference(
+                packed
+                    .oci_reference
+                    .rsplit_once(':')
+                    .expect("tagged reference")
+                    .1,
+            )
+            .expect("reference");
+        let oci_digest = stow_oci::put_signed_manifest(session, &reference, &manifest, |digest| {
+            sign(packed.oci_reference.clone(), digest)
+        })
+        .await
+        .expect("publish retired layout");
+        ArtifactRecord {
+            oci_digest,
+            ..packed.clone()
+        }
+    }
+
+    /// A node stored one layer per file is repacked into exactly what a
+    /// build now publishes — same pack, same manifest, same bundle — and
+    /// a node already packed is left alone.
+    #[tokio::test]
+    async fn repack_turns_a_per_file_node_into_what_a_build_publishes() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let (listen, _probe) = serve_probe_registry(root.path()).await;
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let session = push_session(&listen, &http);
+        let (sign, trust) = keyed_signer(root.path()).await;
+
+        let outcome = stow_oci::push_artifacts_with(&session, std::slice::from_ref(&plan), &sign)
+            .await
+            .expect("a build publishes");
+        let packed = stow_types::upload_plan::build_artifact_records(
+            std::slice::from_ref(&plan),
+            &outcome.published_by_reference,
+            &std::collections::BTreeMap::from([(plan.oci_reference.clone(), None)]),
+        )
+        .expect("records")
+        .remove(0);
+
+        assert_eq!(
+            stow_oci::repack_record(&session, &trust, "", &packed, &sign)
+                .await
+                .expect("a packed node is accepted"),
+            None,
+            "a node already packed is not rewritten"
+        );
+
+        let retired = publish_retired_layout(
+            &session,
+            &plan,
+            &packed,
+            b"the rlib the mock uploads",
+            &sign,
+        )
+        .await;
+        assert_ne!(retired.oci_digest, packed.oci_digest);
+        let repacked = stow_oci::repack_record(&session, &trust, "", &retired, &sign)
+            .await
+            .expect("the retired layout repacks")
+            .expect("and is rewritten");
+        assert_eq!(
+            repacked, packed,
+            "repack publishes what the build published"
+        );
+
+        assert_eq!(
+            stow_oci::repack_record(&session, &trust, "", &repacked, &sign)
+                .await
+                .expect("the repacked node is accepted"),
+            None,
+            "a second sweep finds nothing to do"
+        );
+    }
+
+    /// The repack signs nothing it has not checked: a file that differs
+    /// from the hash the signed config records, and a signature that is
+    /// not the trusted one, each stop it before anything is published.
+    #[tokio::test]
+    async fn repack_refuses_a_tampered_file_and_an_untrusted_signature() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = tempfile::tempdir().expect("registry root");
+        let plan = test_plan(root.path());
+        let (listen, probe) = serve_probe_registry(root.path()).await;
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let session = push_session(&listen, &http);
+        let (sign, trust) = keyed_signer(root.path()).await;
+
+        let outcome = stow_oci::push_artifacts_with(&session, std::slice::from_ref(&plan), &sign)
+            .await
+            .expect("a build publishes");
+        let packed = stow_types::upload_plan::build_artifact_records(
+            std::slice::from_ref(&plan),
+            &outcome.published_by_reference,
+            &std::collections::BTreeMap::from([(plan.oci_reference.clone(), None)]),
+        )
+        .expect("records")
+        .remove(0);
+
+        let tampered =
+            publish_retired_layout(&session, &plan, &packed, b"not the rlib", &sign).await;
+        let manifest_puts = || {
+            probe
+                .request_log()
+                .iter()
+                .filter(|record| {
+                    record.method == Method::PUT && record.path.contains("/manifests/")
+                })
+                .count()
+        };
+        let puts_before = manifest_puts();
+        let error = stow_oci::repack_record(&session, &trust, "", &tampered, &sign)
+            .await
+            .expect_err("a file the config does not record is refused");
+        assert!(
+            error.to_string().contains("the signed config records"),
+            "{error}"
+        );
+
+        let untrusted = publish_retired_layout(
+            &session,
+            &plan,
+            &packed,
+            b"the rlib the mock uploads",
+            &mock_sign(root.path()),
+        )
+        .await;
+        let error = stow_oci::repack_record(&session, &trust, "", &untrusted, &sign)
+            .await
+            .expect_err("a signature of another key is refused");
+        assert!(
+            error.to_string().contains("verify the signature"),
+            "{error}"
+        );
+        assert_eq!(
+            manifest_puts(),
+            puts_before + 2,
+            "a refused node pushes nothing; only the untrusted node's own manifest went up"
+        );
     }
 
     // ---- stow#709 pushed-signature read-back tests ----

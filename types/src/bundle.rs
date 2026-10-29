@@ -4,6 +4,11 @@
 //! wire types the CLI reads after signature verification, and the assembler
 //! that builds the bundle tar the trusted publish stage pushes and the edge
 //! streams byte-for-byte.
+//!
+//! A bundle's files are one OCI layer: the pack, a deterministic tar of the
+//! node's outputs compressed as a single zstd stream (`stow_shim::pack`).
+//! The config records each file's SHA-256; readers unpack and verify every
+//! file against it.
 
 use std::io::Cursor;
 
@@ -19,6 +24,9 @@ use crate::platform::Profile;
 
 /// Media type of the single-artifact bundle tar layer.
 pub const STOW_BUNDLE_MEDIA_TYPE: &str = "application/vnd.stow.bundle.v1+tar";
+/// Media type of the one layer of a signed artifact: the pack, a tar of
+/// the node's outputs compressed as a single zstd stream.
+pub const STOW_PACK_MEDIA_TYPE: &str = "application/vnd.stow.pack.v1+tar+zstd";
 /// Media type of an `.rlib` file inside a bundle.
 pub const STOW_RLIB_MEDIA_TYPE: &str = "application/vnd.stow.rlib.v1";
 /// Media type of an `.rmeta` file inside a bundle.
@@ -27,10 +35,8 @@ pub const STOW_RMETA_MEDIA_TYPE: &str = "application/vnd.stow.rmeta.v1";
 pub const STOW_DYLIB_MEDIA_TYPE: &str = "application/vnd.stow.dylib.v1";
 /// Media type of a proc-macro dynamic library inside a bundle.
 pub const STOW_PROC_MACRO_MEDIA_TYPE: &str = "application/vnd.stow.proc-macro.v1";
-/// A tar of the build script's `OUT_DIR` tree, carried as its own layer.
+/// A tar of the build script's `OUT_DIR` tree, carried as a file of the pack.
 pub const STOW_NATIVE_ARCHIVE_MEDIA_TYPE: &str = "application/vnd.stow.native-out-dir.v1+tar";
-/// Media type suffix marking a zstd-compressed blob.
-pub const STOW_ZSTD_MEDIA_TYPE_SUFFIX: &str = "+zstd";
 /// Path of the per-artifact manifest inside a bundle tar.
 pub const STOW_BUNDLE_MANIFEST_PATH: &str = "manifest.json";
 /// Path of the OCI manifest JSON inside a bundle tar.
@@ -40,8 +46,9 @@ pub const STOW_OCI_MANIFEST_PATH: &str = "oci/manifest.json";
 pub const STOW_OCI_CONFIG_PATH: &str = "oci/config.json";
 /// Directory inside a bundle tar holding Sigstore signature material.
 pub const STOW_SIGSTORE_PAYLOAD_DIR: &str = "sigstore";
-/// Directory inside a bundle tar holding the artifact's layer payloads.
-pub const STOW_BUNDLE_FILES_DIR: &str = "files";
+/// Path of the pack inside a bundle tar — the artifact's one layer, stored
+/// verbatim.
+pub const STOW_BUNDLE_PACK_PATH: &str = "files/pack.tar.zst";
 /// Media type of the signed artifact's OCI config blob.
 pub const STOW_ARTIFACT_CONFIG_MEDIA_TYPE: &str = "application/vnd.stow.artifact.config.v1+json";
 /// Media type of the `<tag>.bundle` artifact's OCI config blob.
@@ -62,12 +69,6 @@ pub const SIGSTORE_CERT_ANNOTATION: &str = "dev.sigstore.cosign/certificate";
 #[must_use]
 pub fn sigstore_signature_tag(oci_digest: &str) -> String {
     format!("{}.sig", oci_digest.replace(':', "-"))
-}
-
-/// In-tar path of a layer payload.
-#[must_use]
-pub fn bundle_file_path(file_name: &str) -> String {
-    format!("{STOW_BUNDLE_FILES_DIR}/{file_name}")
 }
 
 /// In-tar path of the `index`-th sigstore payload.
@@ -106,7 +107,7 @@ pub struct BundleSignatureMaterial {
 ///
 /// The signed artifact's raw manifest and config bytes (stored verbatim so
 /// the CLI can re-hash them against the cosign payload), the signature
-/// materials, and every layer's stored bytes in manifest order.
+/// materials, and the pack — the artifact's one layer.
 #[derive(Debug, Clone)]
 pub struct BundleParts<'a> {
     /// Canonical stow reference of the signed artifact.
@@ -121,22 +122,12 @@ pub struct BundleParts<'a> {
     pub config: &'a ArtifactBlobConfig,
     /// Signature materials in signature-image layer order.
     pub signatures: &'a [BundleSignatureMaterial],
-    /// Layer payloads in manifest order: the config's `outputs`, then the
-    /// native archive when the config declares one. Each entry is the layer's
-    /// stored (zstd) bytes; the media type is the file's storage media type.
-    pub layers: &'a [BundleLayer<'a>],
+    /// The pack as the registry stores it: the config's `outputs`, then the
+    /// native archive when the config declares one, as one zstd stream.
+    pub pack: &'a [u8],
 }
 
-/// One layer payload handed to [`assemble_bundle`].
-#[derive(Debug, Clone)]
-pub struct BundleLayer<'a> {
-    /// Media type of the layer as the registry stores it.
-    pub media_type: &'a str,
-    /// Stored bytes of the layer.
-    pub bytes: &'a [u8],
-}
-
-/// Assembly failed: the parts do not describe one consistent artifact.
+/// Assembly failed.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleAssemblyError {
     /// The bundle manifest could not be serialized.
@@ -145,45 +136,18 @@ pub enum BundleAssemblyError {
     /// A tar entry could not be written.
     #[error("build bundle tar: {0}")]
     BuildTar(std::io::Error),
-    /// The layer list does not match the config's declared files.
-    #[error("bundle layers do not match config outputs: {0}")]
-    LayerMismatch(String),
 }
 
 /// Assemble the bundle tar for one signed artifact.
 ///
 /// Entry order is part of the format: `manifest.json`, `oci/manifest.json`,
-/// `oci/config.json`, each `sigstore/payload-N.json`, then `files/<name>`
-/// for every layer in manifest order. Every entry is a regular file with
-/// mode `0644`, so the same parts always produce the same bytes.
+/// `oci/config.json`, each `sigstore/payload-N.json`, then the pack at
+/// `files/pack.tar.zst`. Every entry is a regular file with mode `0644`,
+/// so the same parts always produce the same bytes.
 ///
 /// # Errors
-/// Returns [`BundleAssemblyError`] when the layer count or a layer media
-/// type disagrees with the config's declared files, or a tar write fails.
+/// Returns [`BundleAssemblyError`] when a tar write fails.
 pub fn assemble_bundle(parts: &BundleParts<'_>) -> Result<Vec<u8>, BundleAssemblyError> {
-    let expected = parts
-        .config
-        .outputs
-        .iter()
-        .chain(parts.config.native_archive.as_ref())
-        .collect::<Vec<_>>();
-    if expected.len() != parts.layers.len() {
-        return Err(BundleAssemblyError::LayerMismatch(format!(
-            "{} layers for {} declared files",
-            parts.layers.len(),
-            expected.len()
-        )));
-    }
-    for (file, layer) in expected.iter().zip(parts.layers) {
-        let storage_media_type = file.storage_media_type();
-        if layer.media_type != storage_media_type {
-            return Err(BundleAssemblyError::LayerMismatch(format!(
-                "{} is stored as {} but the layer is {}",
-                file.file_name, storage_media_type, layer.media_type
-            )));
-        }
-    }
-
     let mut tar = Builder::new(Vec::new());
     let manifest = ArtifactBundleManifest {
         oci_reference: parts.oci_reference.to_owned(),
@@ -208,9 +172,7 @@ pub fn assemble_bundle(parts: &BundleParts<'_>) -> Result<Vec<u8>, BundleAssembl
     for material in parts.signatures {
         append_entry(&mut tar, &material.payload_path, &material.payload_bytes)?;
     }
-    for (file, layer) in expected.iter().zip(parts.layers) {
-        append_entry(&mut tar, &bundle_file_path(&file.file_name), layer.bytes)?;
-    }
+    append_entry(&mut tar, STOW_BUNDLE_PACK_PATH, parts.pack)?;
     tar.into_inner().map_err(BundleAssemblyError::BuildTar)
 }
 
@@ -289,8 +251,8 @@ pub struct ArtifactBlobConfig {
     ///
     /// Kept out of `outputs` because those are rustc products with a
     /// materialization path in the target directory; this is replay input for
-    /// a build script. It rides as a normal zstd-compressed OCI layer, so the
-    /// cosign signature covers it exactly as it covers every other layer.
+    /// a build script. It rides in the pack after the outputs, so the cosign
+    /// signature covers it exactly as it covers every other file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_archive: Option<ArtifactBundleFile>,
 }
@@ -306,12 +268,11 @@ pub struct ArtifactBundleFile {
     pub sha256: String,
 }
 
-impl ArtifactBundleFile {
-    /// Media type this file is stored under in the OCI layer — the plain
-    /// media type plus the `+zstd` compression suffix.
-    #[must_use]
-    pub fn storage_media_type(&self) -> String {
-        format!("{}{}", self.media_type, STOW_ZSTD_MEDIA_TYPE_SUFFIX)
+impl ArtifactBlobConfig {
+    /// The files of the pack in pack order: `outputs`, then the native
+    /// archive when there is one.
+    pub fn packed_files(&self) -> impl Iterator<Item = &ArtifactBundleFile> {
+        self.outputs.iter().chain(self.native_archive.as_ref())
     }
 }
 

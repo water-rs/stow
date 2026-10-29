@@ -8051,6 +8051,7 @@ dependencies = [
  "sha2 0.11.0",
  "stow-oci",
  "stow-resolver",
+ "stow-shim",
  "stow-types",
  "strip-ansi-escapes",
  "tar",
@@ -8173,7 +8174,6 @@ dependencies = [
  "windows-sys 0.60.2",
  "x509-cert",
  "zenwave",
- "zstd",
 ]
 
 [[package]]
@@ -8250,7 +8250,6 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
- "zstd",
 ]
 
 [[package]]
@@ -8263,6 +8262,7 @@ dependencies = [
  "const-oid 0.10.2",
  "dirs 7.0.0",
  "fastrand",
+ "futures-util",
  "hex",
  "oci-client 0.16.1",
  "olpc-cjson",
@@ -8285,7 +8285,6 @@ dependencies = [
  "tokio",
  "tracing",
  "x509-cert",
- "zstd",
 ]
 
 [[package]]
@@ -8320,8 +8319,11 @@ name = "stow-shim"
 version = "0.10.0"
 dependencies = [
  "dirs 7.0.0",
+ "hex",
  "same-file",
+ "sha2 0.11.0",
  "stow-types",
+ "tar",
  "zstd",
 ]
 

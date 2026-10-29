@@ -1028,24 +1028,37 @@ fn index_publish_title_with_extra_dashes_keeps_rustc_prefix() {
 // build-crate.yml — the dispatched per-task build
 // ---------------------------------------------------------------------------
 
-/// The scheduler's deliveries-stopped bound (stow#860) is the sum of
-/// `build-crate.yml`'s job timeouts; a timeout change must move it.
+/// The scheduler's deliveries-stopped bound (stow#860) is the sum of the
+/// timeouts of the `build-crate.yml` jobs a task run executes; a timeout
+/// change must move it. The operator's repack job never runs in a task
+/// run, so its bound is not part of the scheduler's.
 #[test]
 fn build_crate_run_timeout_matches_the_jobs() {
     let wf = load_workflow("build-crate.yml");
     let jobs = field(&wf, "jobs")
         .and_then(serde_yml::Value::as_mapping)
         .expect("jobs mapping");
-    let minutes: i64 = jobs
-        .values()
-        .map(|job| {
-            field(job, "timeout-minutes")
-                .map(scalar)
-                .expect("every build-crate.yml job sets timeout-minutes")
-                .parse::<i64>()
-                .expect("timeout-minutes is an integer")
-        })
-        .sum();
+    let mut minutes = 0;
+    for (name, job) in jobs {
+        let condition = field(job, "if")
+            .map(scalar)
+            .expect("every build-crate.yml job states which run kind executes it");
+        let timeout = field(job, "timeout-minutes")
+            .map(scalar)
+            .expect("every build-crate.yml job sets timeout-minutes")
+            .parse::<i64>()
+            .expect("timeout-minutes is an integer");
+        if condition.starts_with("inputs.repack_rustc == ''") {
+            minutes += timeout;
+        } else {
+            assert_eq!(
+                condition,
+                "inputs.repack_rustc != ''",
+                "job {} runs in neither a task run nor a repack run",
+                scalar(name)
+            );
+        }
+    }
     assert_eq!(minutes, stow_types::api::BUILD_CRATE_RUN_TIMEOUT_MINUTES);
 }
 
@@ -1068,22 +1081,36 @@ fn build_crate_declarations() {
         ["workflow_dispatch"],
         "build-crate.yml is dispatched only: {triggers:?}"
     );
+    // A task run carries the payload in `task`; a repack run names its
+    // rustc in `repack_rustc` instead and leaves `task` at its default.
     assert_eq!(
-        at(&wf, "on.workflow_dispatch.inputs.task.required")
+        at(&wf, "on.workflow_dispatch.inputs.task.default")
             .map(scalar)
             .as_deref(),
-        Some("true")
+        Some("{}")
+    );
+    assert_eq!(
+        at(&wf, "on.workflow_dispatch.inputs.repack_rustc.default")
+            .map(scalar)
+            .as_deref(),
+        Some("")
     );
     // Per-task run-name binds the `workflow_run` completion: the
     // scheduler's webhook parses `<rustc>-<task_id>` off `display_title`.
+    // A repack run's `<rustc>-repack` names no task.
     assert_eq!(
         at(&wf, "run-name").map(scalar).as_deref(),
-        Some("${{ fromJSON(inputs.task).rustc_version }}-${{ fromJSON(inputs.task).task_id }}")
+        Some(
+            "${{ inputs.repack_rustc != '' && format('{0}-repack', inputs.repack_rustc) || format('{0}-{1}', fromJSON(inputs.task).rustc_version, fromJSON(inputs.task).task_id) }}"
+        )
     );
-    // Per-task concurrency, never cancelling an earlier run.
+    // Per-task concurrency, and one repack sweep per rustc, never
+    // cancelling an earlier run.
     assert_eq!(
         at(&wf, "concurrency.group").map(scalar).as_deref(),
-        Some("build-crate-${{ fromJSON(inputs.task).task_id }}")
+        Some(
+            "${{ inputs.repack_rustc != '' && format('repack-{0}', inputs.repack_rustc) || format('build-crate-{0}', fromJSON(inputs.task).task_id) }}"
+        )
     );
     assert_eq!(
         at(&wf, "concurrency.cancel-in-progress")
@@ -1138,8 +1165,32 @@ fn build_crate_declarations() {
     );
     assert_eq!(
         at(&wf, "jobs.publish.if").map(scalar).as_deref(),
-        Some("needs.build.result == 'success'")
+        Some("inputs.repack_rustc == '' && needs.build.result == 'success'")
     );
+}
+
+/// The operator's repack job runs only in a repack run and republishes
+/// under the builder identity, so it holds the publish job's rights.
+#[test]
+fn build_crate_repack_job() {
+    let wf = load_workflow("build-crate.yml");
+    assert_eq!(
+        at(&wf, "jobs.repack.if").map(scalar).as_deref(),
+        Some("inputs.repack_rustc != ''")
+    );
+    for (permission, level) in [
+        ("contents", "read"),
+        ("packages", "write"),
+        ("id-token", "write"),
+    ] {
+        assert_eq!(
+            at(&wf, &format!("jobs.repack.permissions.{permission}"))
+                .map(scalar)
+                .as_deref(),
+            Some(level),
+            "repack job permission {permission}"
+        );
+    }
 }
 
 /// The five entrypoints' every job runs on a Linux runner — the

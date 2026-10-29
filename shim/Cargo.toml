@@ -11,7 +11,12 @@ categories = ["caching", "development-tools::build-utils"]
 
 [dependencies]
 stow-types.workspace = true
-zstd = { version = "0.14", optional = true }
+# `zstdmt` is the multithreaded compressor every bundle and index slice
+# is written with.
+zstd = { version = "0.14", optional = true, default-features = false, features = ["zstdmt"] }
+tar = { workspace = true, optional = true }
+sha2 = { version = "0.11", optional = true }
+hex = { workspace = true, optional = true }
 
 # `dirs` backs `tools_dir()`, which lives in the wrapper module that is only
 # compiled for native targets — `stow-edge` builds this crate for
@@ -26,10 +31,7 @@ same-file = "1"
 
 [features]
 default = []
-# Enables `STOW_ZSTD_COMPRESSION_LEVEL` and any zstd-related helpers. Off by
-# default because zstd-sys doesn't build for `wasm32-unknown-unknown` (the
-# edge worker target).
-zstd = ["dep:zstd"]
-
-[lints]
-workspace = true
+# Enables the zstd constants and the `pack` module (the bundle format and
+# the index compressor). Off by default because zstd-sys doesn't build for
+# `wasm32-unknown-unknown` (the edge worker target).
+zstd = ["dep:zstd", "dep:tar", "dep:sha2", "dep:hex"]
