@@ -1340,9 +1340,9 @@ impl Graph {
             let edge = self.edges.push(owner, dep_ix, required, met)?;
             self.touch_edge(edge);
             self.node_mut(dep_ix).refs += 1;
-            // A fresh node is blocked when any dep is a live failed
-            // node.
-            blocked |= self.node(dep_ix).status == Status::Failed;
+            // A fresh node is blocked when an unmet dep is a live
+            // failed node.
+            blocked |= !met && self.node(dep_ix).status == Status::Failed;
         }
         let edges_len = u16::try_from(self.edges.len() - edges_start as usize).map_err(|_| {
             QueueError::Invariant(format!("task {} has more than 65535 edges", sub.task_id))
@@ -1547,7 +1547,10 @@ impl Graph {
             return 0;
         };
         let mut flips = 0;
-        for owner in self.dependents_of(ix) {
+        let was_failed = self.node(ix).status == Status::Failed;
+        let owners = self.dependents_of(ix);
+        let mut touched = Vec::new();
+        for &owner in &owners {
             let mut flipped = false;
             for edge in self.edge_range(owner) {
                 if self.edges.dep(edge) != ix {
@@ -1570,7 +1573,7 @@ impl Graph {
                 flipped = true;
             }
             if flipped {
-                self.refresh_ready(owner);
+                touched.push(owner);
             }
         }
         // A live node whose own published shapes are now covered
@@ -1580,6 +1583,12 @@ impl Graph {
             if mask & own == own {
                 self.publish(ix);
             }
+        }
+        // Edges flipped or the dep left `failed`: recompute blocked
+        // from the dependencies still failed.
+        let recompute = if was_failed { &owners } else { &touched };
+        for &owner in recompute {
+            self.refresh_blocked(owner);
         }
         flips
     }
@@ -1972,10 +1981,9 @@ impl Graph {
             self.set_status(ix, Status::Failed);
             self.edit_extra(ix, |extra| extra.error = error.map(Into::into));
             self.tally_outcome(now, target, false);
-            // Dependents of a failed dep become blocked.
+            // Dependents waiting on the failed dep become blocked.
             for owner in self.dependents_of(ix) {
-                self.edit_flags(owner, |flags| flags.set_blocked(true));
-                self.refresh_ready(owner);
+                self.refresh_blocked(owner);
             }
         } else {
             self.set_status(ix, Status::Pending);
@@ -2177,18 +2185,21 @@ impl Graph {
             // blocked flag.
             if rose || fell {
                 for owner in self.dependents_of(ix) {
-                    let waits = self
-                        .edge_range(owner)
-                        .any(|edge| self.edges.dep(edge) == ix && !self.edges.met(edge));
-                    if waits && self.node(owner).status == Status::Pending {
-                        let blocked = fell || self.has_failed_dep(owner);
-                        self.edit_flags(owner, |flags| flags.set_blocked(blocked));
-                        self.refresh_ready(owner);
-                    }
+                    self.refresh_blocked(owner);
                 }
             }
             if op == MutationKind::Purge {
+                // A purged failed node leaves `failed` by publishing;
+                // its dependents recompute once it has.
+                let owners = if status == Status::Failed {
+                    self.dependents_of(ix)
+                } else {
+                    Vec::new()
+                };
                 self.publish(ix);
+                for owner in owners {
+                    self.refresh_blocked(owner);
+                }
             } else {
                 self.refresh_ready(ix);
             }
@@ -2196,6 +2207,19 @@ impl Graph {
         }
         self.maybe_compact();
         affected
+    }
+
+    /// Recompute `owner`'s blocked flag from its unmet failed
+    /// dependencies and re-evaluate its ready-set membership —
+    /// O(`owner`'s edges). Every path that changes a dependency's
+    /// failed state or an edge's met state ends here.
+    fn refresh_blocked(&mut self, owner: u32) {
+        if !self.node(owner).status.has_state() {
+            return;
+        }
+        let blocked = self.has_failed_dep(owner);
+        self.edit_flags(owner, |flags| flags.set_blocked(blocked));
+        self.refresh_ready(owner);
     }
 
     /// Whether any unmet edge of `owner` points at a live failed node.
@@ -4522,6 +4546,121 @@ mod tests {
         let affected = graph.mutate(MutationKind::Retry, &[id("c")], 6_000);
         assert_eq!(affected, 1);
         assert!(!graph.node(b).flags.blocked());
+    }
+
+    /// `top` depends on the leaves `x` and `y`.
+    fn fork() -> SubmissionTree {
+        let x = sub("x");
+        let y = sub("y");
+        let mut top = sub("top");
+        top.deps = vec![0, 1];
+        SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![2],
+            nodes: vec![x, y, top],
+        }
+    }
+
+    /// Put `name` in `failed` the way the failure path leaves it.
+    fn fail(graph: &mut Graph, name: &str) {
+        let ix = graph.node_ix(&id(name)).expect("node");
+        graph.set_status(ix, Status::Failed);
+        graph.remove_ready(ix);
+        for owner in graph.dependents_of(ix) {
+            graph.refresh_blocked(owner);
+        }
+    }
+
+    fn top_state(graph: &Graph) -> (bool, bool) {
+        let top = graph.node_ix(&id("top")).expect("top");
+        (graph.node(top).flags.blocked(), graph.dispatchable(top))
+    }
+
+    /// stow#1050: the only failed dependency publishes.
+    #[test]
+    fn a_consumer_unblocks_when_its_only_failed_dep_publishes() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        fail(&mut graph, "c");
+        let b = graph.node_ix(&id("b")).expect("b");
+        assert!(graph.node(b).flags.blocked());
+        publish(&mut graph, "c");
+        assert_eq!(graph.node(b).unmet, 0);
+        assert!(!graph.node(b).flags.blocked());
+        assert!(graph.dispatchable(b));
+        assert_eq!(ready_count(&graph), 1);
+        assert_pending_index(&graph);
+    }
+
+    /// stow#1050: one of two failed dependencies publishes.
+    #[test]
+    fn a_consumer_stays_blocked_on_its_other_failed_dep() {
+        let mut graph = Graph::default();
+        graph.merge(&fork(), 0).expect("merge");
+        fail(&mut graph, "x");
+        fail(&mut graph, "y");
+        assert_eq!(top_state(&graph), (true, false));
+        publish(&mut graph, "x");
+        assert_eq!(top_state(&graph), (true, false), "y is still failed");
+        assert_pending_index(&graph);
+        publish(&mut graph, "y");
+        assert_eq!(top_state(&graph), (false, true));
+        assert_pending_index(&graph);
+    }
+
+    /// A slice retirement re-opens an edge onto a failed dep: the
+    /// consumer is blocked again.
+    #[test]
+    fn a_retired_dep_row_blocks_the_consumer_on_a_failed_dep() {
+        let mut graph = Graph::default();
+        graph.merge(&fork(), 0).expect("merge");
+        publish(&mut graph, "x");
+        fail(&mut graph, "y");
+        assert_eq!(top_state(&graph), (true, false));
+        let live = graph.slice_generation(TARGET, RUSTC);
+        graph.apply_slice_report(
+            TARGET,
+            RUSTC,
+            live,
+            live.map_or(1, |live| live + 1),
+            &[],
+            &[
+                published_row("x", UnitKind::Linked),
+                published_row("x", UnitKind::Unlinked),
+            ],
+        );
+        assert_eq!(top_state(&graph), (true, false));
+        publish(&mut graph, "y");
+        assert!(!top_state(&graph).0, "y published; x still unmet");
+        assert!(!top_state(&graph).1, "x's edge is unmet");
+        assert_pending_index(&graph);
+    }
+
+    /// Purging a failed dep publishes it; its consumers are unblocked.
+    #[test]
+    fn purging_a_failed_dep_unblocks_its_consumers() {
+        let mut graph = Graph::default();
+        graph.merge(&chain(), 0).expect("merge");
+        fail(&mut graph, "c");
+        let b = graph.node_ix(&id("b")).expect("b");
+        assert!(graph.node(b).flags.blocked());
+        assert_eq!(graph.mutate(MutationKind::Purge, &[id("c")], 1_000), 1);
+        assert!(!graph.node(b).flags.blocked());
+        assert_pending_index(&graph);
+    }
+
+    /// A retry clears the flag only when no other dep is failed.
+    #[test]
+    fn retry_unblocks_only_when_no_other_dep_is_failed() {
+        let mut graph = Graph::default();
+        graph.merge(&fork(), 0).expect("merge");
+        fail(&mut graph, "x");
+        fail(&mut graph, "y");
+        assert_eq!(graph.mutate(MutationKind::Retry, &[id("x")], 1_000), 1);
+        assert_eq!(top_state(&graph), (true, false), "y is still failed");
+        assert_eq!(graph.mutate(MutationKind::Retry, &[id("y")], 1_000), 1);
+        assert!(!top_state(&graph).0);
+        assert_pending_index(&graph);
     }
 
     /// The status reads come from the pending index, so it must match
