@@ -161,6 +161,10 @@ pub fn traced(
         {
             &[]
         }
+        crate::Command::DispatchCap(a) => match &a.command {
+            crate::DispatchCapCommand::Set(a) if a.yes => &[],
+            _ => return None,
+        },
         crate::Command::Submit(a) if a.yes => &[],
         crate::Command::Maintenance(_) => &[],
         crate::Command::Watchdog(a) if !a.dry_run => &[],

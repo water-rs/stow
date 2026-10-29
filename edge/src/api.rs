@@ -347,6 +347,33 @@ pub async fn set_dispatch_freeze(
     Ok(Json(stored))
 }
 
+/// GET /api/v1/admin/dispatch-cap
+///
+/// The dispatch caps in force — the operator setting behind them when
+/// `stow-admin dispatch-cap set` wrote one, the deploy bindings'
+/// `STOW_MAX_CONCURRENT_JOBS` / `STOW_MAX_CONCURRENT_MACOS_JOBS`
+/// otherwise (stow#1039).
+pub async fn get_dispatch_cap(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::DispatchCaps>, GetArtifactError> {
+    Ok(Json(scheduler_client::get_dispatch_caps(&scheduler).await?))
+}
+
+/// POST /api/v1/admin/dispatch-cap
+///
+/// The operator's `set` — replaces the deploy bindings' caps at claim
+/// time until the next `set`; a lowered cap cancels nothing in flight.
+pub async fn set_dispatch_cap(
+    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
+    Json(set): Json<stow_types::api::DispatchCapSet>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::DispatchCaps>, GetArtifactError> {
+    let stored = scheduler_client::set_dispatch_caps(&scheduler, &set, &actor).await?;
+    tracing::warn!(jobs = stored.max_concurrent_jobs, %caller, "dispatch caps set via admin endpoint");
+    Ok(Json(stored))
+}
+
 /// POST /`api/v1/admin/index/published`
 ///
 /// The index-publish path's report that this run's slices went live,

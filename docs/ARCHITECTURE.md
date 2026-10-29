@@ -210,15 +210,20 @@ Dispatch is additionally capped per GitHub Actions runner family —
 onto the pool its `runs-on` entry in `build-crate.yml` resolves to
 (Linux, macOS, or Windows). `STOW_MAX_CONCURRENT_JOBS` bounds total
 in-flight runner slots — one per claimed `build-crate.yml`
-run — against the org's
-60-runner fleet (`0` pauses dispatch
+run (`0` pauses dispatch
 entirely — see `DEPLOYMENT.md`), and
 `STOW_MAX_CONCURRENT_MACOS_JOBS` bounds macOS-family slots so a
-full wave cannot occupy the whole 20-runner macOS pool. Within a lane,
+full wave cannot occupy the whole macOS pool. Within a lane,
 Windows-family rows claim first regardless of request age because the
 Windows tasks are the slowest in a wave; rows whose family is saturated
 stay pending, and the alarm then wakes at the earliest in-flight lease
-expiry rather than re-firing immediately.
+expiry rather than re-firing immediately. Operators move both caps at
+runtime — `stow-admin dispatch-cap set --jobs N [--macos M]` appends a
+setting to the scheduler's log that replaces the binding values at
+claim time until the next `set` (stow#1039): there is no clear, a
+`--macos`-less `set` leaves that cap on its binding, no ceiling is
+checked, and a lowered cap cancels nothing in flight — new claims
+pause until the in-flight count drops below it.
 
 The handler resolves the requested version (newest non-prerelease,
 non-yanked release when the body omits it) and the current stable rustc,
@@ -830,6 +835,8 @@ unauthorized POSTs short-circuit before deserialization.
 | GET `/api/v1/bundles/{rustc_version}/{digest}` | none | — | the `<tag>.bundle` blob, streamed | Byte fetch — the only artifact-serving route; the `{rustc_version}` segment names the artifact's GHCR package and the `sha256:<64 hex>` segment is the index row's `bundle_digest`, served from GHCR behind Workers Cache |
 | GET `/api/v1/admin/dispatch-freeze` | Bearer: repo-workflow OIDC or push user | — | `DispatchFreeze` | Read the dispatch freeze: flag plus the stored record (what tripped it, whether the alert got out) |
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: `operations.yml` OIDC on `main` | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
+| GET `/api/v1/admin/dispatch-cap` | Bearer: repo-workflow OIDC or push user | — | `DispatchCaps` | The dispatch caps in force plus the operator setting behind them (stow#1039) |
+| POST `/api/v1/admin/dispatch-cap` | Bearer: `operations.yml` OIDC on `main` | `DispatchCapSet` | `DispatchCaps` | The operator's `set` — replaces the cap bindings at claim time until the next `set` (`stow-admin dispatch-cap status\|set`) |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: `operations.yml` OIDC on `main` | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |

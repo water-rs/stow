@@ -436,6 +436,24 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 300,
     },
     DriveBudget {
+        name: "GET /dispatch-cap",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
+        wall_ms: 300,
+    },
+    DriveBudget {
+        // stow#1039 provisional: the `DispatchCap` append plus the
+        // freed slots' `Claims` and `Bindings` — the same shape as
+        // `POST /tasks/complete-run (dispatching)`; the workerd
+        // absolute awaits a probe run.
+        name: "POST /dispatch-cap",
+        statements: 5,
+        rows_read: 7,
+        rows_written: 7,
+        wall_ms: 500,
+    },
+    DriveBudget {
         name: "POST /tasks/complete-run (success)",
         statements: 3,
         rows_read: 5,
