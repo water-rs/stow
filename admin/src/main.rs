@@ -48,7 +48,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use keyring_core::api::CredentialStoreApi;
 use stow_types::api::{
     AdminStatus, ChannelOutcome, DispatchCapSet, DispatchCaps, DispatchFreeze,
-    DispatchFreezeTrigger, FreezeTransitionEvent, SchedulerSubmitResponse,
+    DispatchFreezeTrigger, FreezeTransitionEvent, ReleasePriority, ReleasePrioritySet,
+    SchedulerSubmitResponse,
 };
 use stow_types::identity::{
     CrateName, CrateVersion as TypedCrateVersion, FeaturesJson, TargetTriple, WireRustcVersion,
@@ -128,6 +129,9 @@ enum Command {
     /// bounds the deploy bindings `STOW_MAX_CONCURRENT_JOBS` /
     /// `STOW_MAX_CONCURRENT_MACOS_JOBS` set until the first `set`.
     DispatchCap(DispatchCapArgs),
+    /// Read or adjust the multiplier release-profile nodes rank under
+    /// in the scheduler's aging rank (stow#1012).
+    ReleasePriority(ReleasePriorityArgs),
     /// Publish the signed artifact index.
     Index(index_cmd::IndexArgs),
     /// Regenerate the checked-in launch traffic model from production
@@ -207,6 +211,34 @@ struct DispatchCapSetArgs {
     /// cap keeps reading its deploy binding.
     #[arg(long)]
     macos: Option<u32>,
+    /// Apply the change.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Args)]
+struct ReleasePriorityArgs {
+    /// `status` prints the multiplier in force; `set` replaces it
+    /// until the next set — there is no clear.
+    #[command(subcommand)]
+    command: ReleasePriorityCommand,
+}
+
+#[derive(Subcommand)]
+enum ReleasePriorityCommand {
+    /// Print the multiplier in force and whether it is the default or
+    /// the operator setting.
+    Status,
+    /// Set the multiplier; without `--yes` prints the plan and exits 0.
+    Set(ReleasePrioritySetArgs),
+}
+
+#[derive(Args)]
+struct ReleasePrioritySetArgs {
+    /// A release node's rank priority as a percent of its entry
+    /// point's: `25` ranks it at a quarter. No ceiling is checked.
+    #[arg(long)]
+    percent: u32,
     /// Apply the change.
     #[arg(long)]
     yes: bool,
@@ -318,6 +350,9 @@ async fn dispatch(command: Command, output: Output) -> stow_types::error::Result
         }
         Command::DispatchCap(args) => {
             dispatch_cap_command(&Edge::connect(&*store)?, args, output).await
+        }
+        Command::ReleasePriority(args) => {
+            release_priority_command(&Edge::connect(&*store)?, args, output).await
         }
         Command::Index(args) => index_cmd::run(args, &*store).await,
         Command::LaunchModel(args) => launch_model::run(args, output).await,
@@ -872,6 +907,62 @@ async fn dispatch_cap_command(
     }
 }
 
+/// `stow-admin release-priority status|set` — read the multiplier
+/// release-profile nodes rank under or write the operator setting that
+/// replaces its default (stow#1012). `set` is a mutation: it prints the
+/// plan and only applies under `--yes`.
+async fn release_priority_command(
+    edge: &Edge,
+    args: ReleasePriorityArgs,
+    output: Output,
+) -> stow_types::error::Result<()> {
+    match args.command {
+        ReleasePriorityCommand::Status => {
+            let view: ReleasePriority = edge.get_json("/api/v1/admin/release-priority").await?;
+            render::emit(output, &view, render_release_priority)
+        }
+        ReleasePriorityCommand::Set(args) => {
+            let plan = ReleasePrioritySet {
+                percent: args.percent,
+            };
+            render::mutation(
+                output,
+                plan,
+                |envelope: &render::Planned<ReleasePrioritySet, ReleasePriority>| {
+                    let mut out = "set release priority\n".to_owned();
+                    if let Some(result) = &envelope.result {
+                        let _ = writeln!(out, "{}", render_release_priority(result));
+                    }
+                    let _ = write!(out, "{}", render::plan_footer(envelope.dry_run));
+                    out
+                },
+                args.yes.then_some(async move |plan: &ReleasePrioritySet| {
+                    edge.post_json("/api/v1/admin/release-priority", plan).await
+                }),
+            )
+            .await
+        }
+    }
+}
+
+/// Human rendering of the release multiplier in force and its source.
+fn render_release_priority(view: &ReleasePriority) -> String {
+    let mut out = format!(
+        "release priority {}% ({})",
+        view.percent,
+        if view.setting.is_some() {
+            "operator"
+        } else {
+            "default"
+        }
+    );
+    if let Some(setting) = &view.setting {
+        let _ = write!(out, "\nset at {}", setting.set_at);
+        let _ = write!(out, "\nset by {}", setting.actor);
+    }
+    out
+}
+
 /// Human rendering of the caps in force — each cap's value and whether
 /// it comes from the deploy binding or the operator setting, plus the
 /// setting's own record.
@@ -1026,6 +1117,7 @@ async fn submit_command(
                 &rustc_version,
                 stow_types::api::EnqueueSource::CacheMiss,
                 args.downloads,
+                stow_types::node_profile::NodeProfile::Dev,
             )
             .map_err(|error| stow_error!("submit task graph: {error:#}"))?;
             for task in &mut tasks {

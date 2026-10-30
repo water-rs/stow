@@ -419,7 +419,7 @@ acting unless `--yes` is given.
 
 Run outside GitHub Actions, the mutating commands — `scheduler reset`,
 `scheduler demand-feed`, `queue retry|cancel|promote|purge`,
-`dispatch-freeze engage|clear`, `dispatch-cap set`, `submit`,
+`dispatch-freeze engage|clear`, `dispatch-cap set`, `release-priority set`, `submit`,
 `maintenance`, `watchdog`
 (not `--dry-run`), and the `preheat` lanes under `--yes` — do not call
 the edge or Cloudflare themselves: they dispatch
@@ -467,6 +467,12 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   pauses dispatch, and no ceiling is checked. A lowered cap cancels
   nothing in flight: new claims pause until the in-flight count drops
   below it.
+- `stow-admin release-priority status` — the multiplier release-profile
+  library builds rank under (percent of the entry point's priority) and
+  whether it is the default (`25`) or the operator setting.
+  `stow-admin release-priority set --percent N` replaces it until the
+  next `set` — there is no clear and no expiry, no ceiling is checked,
+  and the new value re-ranks queued release nodes at the next claim.
 - `stow-admin submit --crate-name X --version 1.2.3 --features-json '["default"]' --target aarch64-apple-darwin --rustc-version 1.91.1 --yes`
   — enqueue one specific build task.
 - `stow-admin preheat binary <crate>[@version] [--targets a,b] [--rustc-version ...] --yes`

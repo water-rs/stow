@@ -638,17 +638,21 @@ fn resolve_requests(cargo_home: &Path, manifest: &Path) -> Vec<EnqueueRequest> {
         .expect("host triple resolve")
         .1
         .units;
-    stow_resolver::resolved_task_graph(units, pinned_rustc_version())
-        .and_then(|graph| {
-            stow_resolver::enqueue_requests_inner(
-                &graph,
-                &std::collections::BTreeSet::new(),
-                stow_types::api::EnqueueSource::CacheMiss,
-                0,
-            )
-        })
-        .map(|(requests, _uncovered)| requests)
-        .expect("enqueue requests")
+    stow_resolver::resolved_task_graph(
+        units,
+        pinned_rustc_version(),
+        stow_types::node_profile::NodeProfile::Dev,
+    )
+    .and_then(|graph| {
+        stow_resolver::enqueue_requests_inner(
+            &graph,
+            &std::collections::BTreeSet::new(),
+            stow_types::api::EnqueueSource::CacheMiss,
+            0,
+        )
+    })
+    .map(|(requests, _uncovered)| requests)
+    .expect("enqueue requests")
 }
 
 /// The host triple this test binary runs on — the native target.
@@ -1626,8 +1630,12 @@ fn platform_gated_dependencies_match_the_cargo_unit_graph() {
                 .iter()
                 .find(|(t, _)| t == target)
                 .unwrap_or_else(|| panic!("resolver emits {target}"));
-            let resolver_graph = stow_resolver::resolved_task_graph(&out.units, rustc)
-                .unwrap_or_else(|error| panic!("{target} resolver graph: {error}"));
+            let resolver_graph = stow_resolver::resolved_task_graph(
+                &out.units,
+                rustc,
+                stow_types::node_profile::NodeProfile::Dev,
+            )
+            .unwrap_or_else(|error| panic!("{target} resolver graph: {error}"));
             let graph = stow_cli::resolve_exact_dependency_graph(
                 &manifest,
                 "check",

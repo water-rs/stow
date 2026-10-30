@@ -203,6 +203,20 @@ lane and raises its priority to the human class; a node reached from
 several entry points keeps the highest priority and its first-requested
 time.
 
+Release-profile nodes (stow#1012) rank inside the same aging rank at a
+fixed share of their entry point's priority: a release node's rank is
+`priority × multiplier × time waited`, the multiplier an operator
+setting (default 10%, `stow-admin release-priority set --percent N`,
+read at claim time so a change re-ranks queued nodes). Release work
+therefore queues behind dev work of the same age and entry point, while
+a release node that keeps waiting — a popular library many `--release`
+consumers miss — overtakes fresher dev work instead of starving behind
+it. Preheat submits every source's dev and release node sets; a CLI
+cache miss of a release-profile unit enters as a release node at the
+CLI miss's priority. A `--release` consumer's host units (proc macros,
+build-dependency libraries) are release-profile nodes of their own,
+distinct from the dev host nodes.
+
 The crate named in the request is itself only a name source: the
 expansion drops any package crates.io's version record marks
 `has_lib: false` — the requested root and a bin-only package reachable
@@ -908,6 +922,8 @@ unauthorized POSTs short-circuit before deserialization.
 | POST `/api/v1/admin/dispatch-freeze` | Bearer: `operations.yml` OIDC on `main` | `DispatchFreeze` | `DispatchFreeze` | The manual transition — engage the freeze, or lift it and resume dispatch of misses queued during it (`stow-admin dispatch-freeze status\|engage\|clear`) |
 | GET `/api/v1/admin/dispatch-cap` | Bearer: repo-workflow OIDC or push user | — | `DispatchCaps` | The dispatch caps in force plus the operator setting behind them (stow#1039) |
 | POST `/api/v1/admin/dispatch-cap` | Bearer: `operations.yml` OIDC on `main` | `DispatchCapSet` | `DispatchCaps` | The operator's `set` — replaces the cap bindings at claim time until the next `set` (`stow-admin dispatch-cap status\|set`) |
+| GET `/api/v1/admin/release-priority` | Bearer: repo-workflow OIDC or push user | — | `ReleasePriority` | The multiplier release-profile nodes rank under plus the operator setting behind it (stow#1012) |
+| POST `/api/v1/admin/release-priority` | Bearer: `operations.yml` OIDC on `main` | `ReleasePrioritySet` | `ReleasePriority` | The operator's `set` — the multiplier in force until the next `set` (`stow-admin release-priority status\|set`) |
 | GET `/api/v1/admin/status` | Bearer: repo-workflow OIDC or push user | — | `AdminStatus` | Operator view: lane depths, oldest pending age, in-flight rows with GitHub run ids, per-target 24 h outcomes — `stow-admin status` |
 | GET `/api/v1/admin/queue?task_ids=…&status=&target=&rustc=&crate=&older_than=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<QueueTask>` | Selector-filtered queue rows (≤500), newest transition first — `queue list` and the mutation preview |
 | POST `/api/v1/admin/queue/{retry\|cancel\|promote\|purge}` | Bearer: `operations.yml` OIDC on `main` | `QueueSelector` | `QueueMutationResult` | Queue transitions; the verb's domain predicates conjoin with the selector — `queue retry\|cancel\|promote\|purge` |

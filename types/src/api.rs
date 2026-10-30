@@ -1473,6 +1473,46 @@ pub struct DispatchCapSetting {
     pub actor: String,
 }
 
+/// The release multiplier the scheduler ranks release-profile nodes
+/// under — wire shape of `GET`/`POST /api/v1/admin/release-priority`
+/// and of the scheduler object's `/release-priority` routes
+/// (stow#1012).
+///
+/// A release node's rank is `priority × percent / 100 × time waited`,
+/// so it queues behind equally-aged dev work yet overtakes fresher dev
+/// work once it has waited long enough. Until the first `set` the
+/// scheduler's default applies; there is no clear and no expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReleasePriority {
+    /// The operator setting in force — absent until the first `set`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<ReleasePrioritySetting>,
+    /// The multiplier in force, in percent of the dev profile's
+    /// priority (`25` is a quarter).
+    pub percent: u32,
+}
+
+/// What an operator's `release-priority set` wrote — `POST`'s request
+/// body. No ceiling is checked: the operator is trusted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReleasePrioritySet {
+    /// The multiplier, in percent of the dev profile's priority.
+    pub percent: u32,
+}
+
+/// The operator setting a `set` appended to the scheduler's log — the
+/// `SchedulerEvent::ReleasePriority` payload, the graph's in-memory
+/// copy and the snapshot's field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ReleasePrioritySetting {
+    /// The multiplier the set named, in percent.
+    pub percent: u32,
+    /// ISO 8601 timestamp of the set.
+    pub set_at: String,
+    /// The verified `actor` claim of the operations run that set it.
+    pub actor: String,
+}
+
 /// One component's health as `GET /api/v1/scheduler/health` reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -5995,6 +6035,13 @@ pub enum SchedulerEvent {
     DispatchCap {
         /// The setting the log row recorded.
         setting: Box<DispatchCapSetting>,
+    },
+    /// An operator's release-priority setting (stow#1012): the
+    /// multiplier release-profile nodes rank under, in force until the
+    /// next `set`. There is no clear.
+    ReleasePriority {
+        /// The setting the log row recorded.
+        setting: Box<ReleasePrioritySetting>,
     },
     /// The dispatch freeze's transition record (`None` = cleared).
     Freeze {

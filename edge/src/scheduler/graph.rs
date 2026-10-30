@@ -28,6 +28,7 @@ use stow_types::api::{
     SubmissionNode, SubmissionTree, SubmitTaskIdEntry, TaskSubgraph, runner_family,
 };
 use stow_types::ci::{CiRunListing, CiRunStatus};
+use stow_types::node_profile::NodeProfile;
 use stow_types::public_cache::{ExplicitSpelling, UnitShape};
 use stow_types::task_graph::{TaskIdFields, canonical_task_id};
 
@@ -224,8 +225,15 @@ impl TargetInfo {
 /// One operand class's candidate in a claim's k-way merge: its claim
 /// key (rank, then request instant, then arrival — descending) and the
 /// node index.
-/// One ready queue: rank operand → age-ordered `(first_requested, ix)`.
-type ReadyClasses = BTreeMap<i64, BTreeSet<(i64, u32)>>;
+/// One ready queue: rank class → age-ordered `(first_requested, ix)`.
+///
+/// A class is the node's rank operand (its priority) and its profile,
+/// so the operator's release multiplier scales a whole class at claim
+/// time and never re-keys the queue (stow#1012).
+type ReadyClasses = BTreeMap<ReadyClass, BTreeSet<(i64, u32)>>;
+
+/// The key of one ready queue: `(operand, profile)`.
+type ReadyClass = (i64, NodeProfile);
 
 type Candidate = ((i128, std::cmp::Reverse<i64>, std::cmp::Reverse<u32>), u32);
 
@@ -502,6 +510,11 @@ pub struct Graph {
     /// `STOW_MAX_CONCURRENT_MACOS_JOBS` at claim time until the next
     /// `set`. `None` until the first one.
     dispatch_cap: Option<stow_types::api::DispatchCapSetting>,
+    /// The operator's release-priority setting (stow#1012): the
+    /// multiplier release-profile nodes rank under. `None` until the
+    /// first `set`, when [`queue::DEFAULT_RELEASE_PRIORITY_PERCENT`]
+    /// applies.
+    release_priority: Option<stow_types::api::ReleasePrioritySetting>,
 
     /// Completions and failures per UTC hour and target byte — the
     /// admin status's trailing-day tally, since a published node keeps
@@ -739,8 +752,40 @@ impl Graph {
     /// The node's claim rank: `operand × (now − first_requested)`,
     /// exact in i128 (stow#879).
     fn rank_at(&self, ix: u32, now: i64) -> i128 {
-        i128::from(self.operand_of(ix))
-            * i128::from(now.saturating_sub(self.state(ix).first_requested).max(0))
+        let (operand, profile) = self.ready_class_of(ix);
+        self.rank_of_class(operand, profile, self.state(ix).first_requested, now)
+    }
+
+    /// The rank class a node queues under.
+    fn ready_class_of(&self, ix: u32) -> ReadyClass {
+        (self.operand_of(ix), self.node(ix).flags.profile())
+    }
+
+    /// The claim rank of a node of `(operand, profile)` first requested
+    /// at `first`: `operand × weight(profile) × waited`, exact in i128.
+    /// The weight is the profile's share of the priority scale — the
+    /// dev profile's is the whole scale, the release profile's is the
+    /// operator's multiplier (stow#1012) — so every rank carries the
+    /// same constant factor and dev ranks order as `operand × waited`.
+    fn rank_of_class(&self, operand: i64, profile: NodeProfile, first: i64, now: i64) -> i128 {
+        i128::from(operand)
+            * i128::from(queue::profile_weight(
+                profile,
+                self.release_priority_percent(),
+            ))
+            * i128::from(now.saturating_sub(first).max(0))
+    }
+
+    /// Whether the node's weighted value, `priority × weight / 100`,
+    /// reaches the admission floor — the value the rank multiplies by
+    /// time waited (stow#1012). Compared cross-multiplied, so the dev
+    /// weight (the whole scale) reduces to `priority >= floor`.
+    fn meets_floor(&self, ix: u32) -> bool {
+        let (operand, profile) = self.ready_class_of(ix);
+        let weight = queue::profile_weight(profile, self.release_priority_percent());
+        let weighted = i128::from(operand) * i128::from(weight);
+        let floor = i128::from(self.floor) * i128::from(queue::PRIORITY_SCALE);
+        weighted >= floor
     }
 
     /// Whether a node may dispatch apart from its age/backoff gate.
@@ -749,7 +794,7 @@ impl Graph {
         node.status == Status::Pending
             && node.unmet == 0
             && !node.flags.blocked()
-            && (node.flags.lane() == Lane::Human || self.operand_of(ix) >= self.floor)
+            && (node.flags.lane() == Lane::Human || self.meets_floor(ix))
     }
 
     /// Drop a node's ready-set entry, whatever class it sits in.
@@ -760,17 +805,17 @@ impl Graph {
         if !self.node(ix).status.has_state() {
             return;
         }
-        let operand = self.operand_of(ix);
+        let class_key = self.ready_class_of(ix);
         let key = (self.state(ix).first_requested, ix);
         let ready = if self.is_macos(ix) {
             &mut self.ready_macos
         } else {
             &mut self.ready
         };
-        if let Some(class) = ready.get_mut(&operand) {
+        if let Some(class) = ready.get_mut(&class_key) {
             class.remove(&key);
             if class.is_empty() {
-                ready.remove(&operand);
+                ready.remove(&class_key);
             }
         }
     }
@@ -801,14 +846,14 @@ impl Graph {
     /// current operand when dispatchable, leaves it otherwise.
     fn refresh_ready(&mut self, ix: u32) {
         if self.dispatchable(ix) {
-            let operand = self.operand_of(ix);
+            let class = self.ready_class_of(ix);
             let first = self.state(ix).first_requested;
             let ready = if self.is_macos(ix) {
                 &mut self.ready_macos
             } else {
                 &mut self.ready
             };
-            ready.entry(operand).or_default().insert((first, ix));
+            ready.entry(class).or_default().insert((first, ix));
         } else {
             self.remove_ready(ix);
         }
@@ -1940,7 +1985,7 @@ impl Graph {
         // pass, and a family whose cap is spent is left out of the
         // pass whole, so the pass is linear in the entries it examines
         // (stow#1052).
-        let mut cursors: BTreeMap<(bool, i64), Option<(i64, u32)>> = BTreeMap::new();
+        let mut cursors: BTreeMap<(bool, ReadyClass), Option<(i64, u32)>> = BTreeMap::new();
         let mut claimed = Vec::new();
         let mut macos_taken = 0u32;
         while claimed.len() < total_free as usize {
@@ -1949,9 +1994,9 @@ impl Graph {
                 if macos && macos_taken >= macos_free {
                     continue;
                 }
-                for (&operand, class) in ready {
+                for (&(operand, profile), class) in ready {
                     let cursor = cursors
-                        .entry((macos, operand))
+                        .entry((macos, (operand, profile)))
                         .or_insert(Some((i64::MIN, 0)));
                     let Some(from) = *cursor else {
                         continue;
@@ -1972,7 +2017,7 @@ impl Graph {
                     // first_requested, then the earlier arrival
                     // (stow#879).
                     let key = (
-                        i128::from(operand) * i128::from(now - first),
+                        self.rank_of_class(operand, profile, first, now),
                         std::cmp::Reverse(first),
                         std::cmp::Reverse(ix),
                     );
@@ -2686,6 +2731,36 @@ impl Graph {
         self.dispatch_cap.as_ref()
     }
 
+    /// The release multiplier in force, in percent of the dev
+    /// profile's priority: the operator's stored `release-priority set`
+    /// or the default.
+    pub fn release_priority_percent(&self) -> u32 {
+        self.release_priority
+            .as_ref()
+            .map_or(queue::DEFAULT_RELEASE_PRIORITY_PERCENT, |set| set.percent)
+    }
+
+    /// The operator's stored `release-priority set` (stow#1012), `None`
+    /// until the first one.
+    pub const fn release_priority(&self) -> Option<&stow_types::api::ReleasePrioritySetting> {
+        self.release_priority.as_ref()
+    }
+
+    /// `GET /release-priority`'s body.
+    pub fn release_priority_view(&self) -> stow_types::api::ReleasePriority {
+        stow_types::api::ReleasePriority {
+            setting: self.release_priority.clone(),
+            percent: self.release_priority_percent(),
+        }
+    }
+
+    /// Drop the stored release-priority setting — the budget drives'
+    /// restore of the unset state the fixture seed wrote. No route
+    /// reaches it: an operator `set` has no clear.
+    pub fn restore_unset_release_priority(&mut self) {
+        self.release_priority = None;
+    }
+
     /// Drop the stored dispatch-cap setting — the budget drives'
     /// restore of the unset state the fixture seed wrote, made the
     /// store's state by the snapshot the caller writes next. No route
@@ -3045,6 +3120,16 @@ impl Graph {
             }
             SchedulerEvent::DispatchCap { setting } => {
                 self.dispatch_cap = Some((**setting).clone());
+            }
+            SchedulerEvent::ReleasePriority { setting } => {
+                self.release_priority = Some((**setting).clone());
+                // The floor reads the weighted value, so a moved
+                // multiplier re-evaluates every node's admission.
+                if self.floor > 0 {
+                    for ix in 0..u32::try_from(self.nodes.len()).expect("node indexes fit u32") {
+                        self.refresh_ready(ix);
+                    }
+                }
             }
             SchedulerEvent::Freeze {
                 record,
@@ -4926,6 +5011,142 @@ mod tests {
             ids,
             vec![id("missed"), id("asked")],
             "tied rank, older first"
+        );
+    }
+
+    /// A release-profile leaf `name`, minted under its own id.
+    fn release_single(name: &str, source: SubmissionSource) -> SubmissionTree {
+        let mut node = sub(name);
+        node.profile = stow_types::node_profile::NodeProfile::Release;
+        node.task_id = minted_id(&node);
+        SubmissionTree {
+            source,
+            roots: vec![0],
+            nodes: vec![node],
+        }
+    }
+
+    fn release_id(name: &str) -> String {
+        release_single(name, SubmissionSource::CacheMiss).nodes[0]
+            .task_id
+            .clone()
+    }
+
+    fn first_claim(graph: &mut Graph, now: i64) -> String {
+        graph
+            .claim(1, 16, now, 3_600_000)
+            .expect("claim")
+            .remove(0)
+            .task_id
+    }
+
+    /// stow#1012: a release node ranks at the multiplier's share of its
+    /// entry point's priority inside the same aging rank. At the default
+    /// 10% a release miss first requested at 0 leads a dev miss first
+    /// requested at 3 minutes until 3m20s (`10 × t == 100 × (t − 3)`),
+    /// and trails it after — a waiting release node overtakes fresher dev
+    /// work, equally old dev work stays ahead of it.
+    #[test]
+    fn a_release_node_ranks_at_the_multiplier_inside_the_aging_rank() {
+        let build = || {
+            let mut graph = Graph::default();
+            graph
+                .merge(&release_single("lib", SubmissionSource::CacheMiss), 0)
+                .expect("release merge");
+            graph
+                .merge(&single("dev", SubmissionSource::CacheMiss), 3 * 60_000)
+                .expect("dev merge");
+            graph
+        };
+        assert_eq!(first_claim(&mut build(), 190_000), release_id("lib"));
+        assert_eq!(first_claim(&mut build(), 300_000), id("dev"));
+
+        // Equal age: the dev node leads whatever the wait.
+        let mut graph = Graph::default();
+        graph
+            .merge(&release_single("lib", SubmissionSource::CacheMiss), 0)
+            .expect("release merge");
+        graph
+            .merge(&single("dev", SubmissionSource::CacheMiss), 0)
+            .expect("dev merge");
+        assert_eq!(first_claim(&mut graph, 3_600_000), id("dev"));
+    }
+
+    /// stow#1012: the operator's `release-priority set` is read at claim
+    /// time — it re-ranks nodes already queued, with no re-keying, and a
+    /// release multiplier of 100% ties the dev rank (the older node
+    /// leads).
+    #[test]
+    fn the_operator_multiplier_reranks_queued_release_nodes() {
+        let mut graph = Graph::default();
+        graph
+            .merge(&single("dev", SubmissionSource::CacheMiss), 0)
+            .expect("dev merge");
+        graph
+            .merge(&release_single("lib", SubmissionSource::CacheMiss), 60_000)
+            .expect("release merge");
+        assert_eq!(
+            graph.release_priority_percent(),
+            queue::DEFAULT_RELEASE_PRIORITY_PERCENT
+        );
+        assert!(graph.release_priority().is_none());
+        graph.apply(
+            &SchedulerEvent::ReleasePriority {
+                setting: Box::new(stow_types::api::ReleasePrioritySetting {
+                    percent: 1_000,
+                    set_at: "2026-01-01T00:00:00Z".to_owned(),
+                    actor: "ops".to_owned(),
+                }),
+            },
+            0,
+        );
+        assert_eq!(graph.release_priority_percent(), 1_000);
+        let view = graph.release_priority_view();
+        assert_eq!(view.percent, 1_000);
+        assert_eq!(view.setting.expect("setting").actor, "ops");
+        // 1000% makes the one-minute-younger release node outrank the
+        // dev node after two minutes.
+        assert_eq!(first_claim(&mut graph, 180_000), release_id("lib"));
+    }
+
+    /// stow#1012: the admission floor compares the weighted value. At
+    /// the default 10% a release miss (value 10) is held by a floor of
+    /// 50 while a dev miss (value 100) passes, and a raised multiplier
+    /// admits the held node.
+    #[test]
+    fn the_floor_holds_a_release_node_below_it_and_admits_the_dev_node() {
+        let mut graph = Graph::default();
+        graph
+            .merge(&release_single("lib", SubmissionSource::CacheMiss), 0)
+            .expect("release merge");
+        graph
+            .merge(&single("dev", SubmissionSource::CacheMiss), 0)
+            .expect("dev merge");
+        graph.set_floor(50);
+        assert_eq!(
+            graph
+                .claim(2, 16, 3_600_000, 3_600_000)
+                .expect("claim")
+                .len(),
+            1
+        );
+        assert!(graph.has_task(&release_id("lib")));
+        let ix = graph.node_ix(&release_id("lib")).expect("node");
+        assert_eq!(graph.node(ix).status, Status::Pending, "held by the floor");
+        graph.apply(
+            &SchedulerEvent::ReleasePriority {
+                setting: Box::new(stow_types::api::ReleasePrioritySetting {
+                    percent: 50,
+                    set_at: "2026-01-01T00:00:00Z".to_owned(),
+                    actor: "ops".to_owned(),
+                }),
+            },
+            0,
+        );
+        assert_eq!(
+            first_claim(&mut graph, 3_600_000),
+            release_id("lib"),
+            "a raised multiplier admits it"
         );
     }
 

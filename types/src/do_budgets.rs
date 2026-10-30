@@ -480,6 +480,22 @@ pub const DO_BUDGETS: &[DriveBudget] = &[
         wall_ms: 500,
     },
     DriveBudget {
+        name: "GET /release-priority",
+        statements: 2,
+        rows_read: 4,
+        rows_written: 4,
+        wall_ms: 300,
+    },
+    DriveBudget {
+        // stow#1012 provisional: one `ReleasePriority` append and no
+        // dispatch pass — ranks are read at claim time.
+        name: "POST /release-priority",
+        statements: 3,
+        rows_read: 5,
+        rows_written: 5,
+        wall_ms: 400,
+    },
+    DriveBudget {
         name: "POST /tasks/complete-run (success)",
         statements: 3,
         rows_read: 5,

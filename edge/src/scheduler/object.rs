@@ -284,6 +284,11 @@ impl DurableObject for Scheduler {
                 "/dispatch-cap"
                     .at(read_dispatch_cap)
                     .post(write_dispatch_cap),
+                // The operator's release multiplier (stow#1012):
+                // reached from `GET`/`POST /api/v1/admin/release-priority`.
+                "/release-priority"
+                    .at(read_release_priority)
+                    .post(write_release_priority),
                 // The edge's health probe (stow#860): one read of held
                 // state, reached from `GET /api/v1/scheduler/health`.
                 "/health".at(health),
@@ -1484,6 +1489,49 @@ pub(super) async fn dispatch_cap_pass(
     // setting puts in force.
     let settings = scheduler_settings(env, graph)?;
     Ok(graph.with(|graph| graph.dispatch_cap_view(&settings)))
+}
+
+/// `GET /release-priority` — the multiplier in force and the operator
+/// setting behind it (stow#1012).
+async fn read_release_priority(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+) -> Result<Json<stow_types::api::ReleasePriority>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    Ok(Json(graph.with(|graph| graph.release_priority_view())))
+}
+
+/// `POST /release-priority` — the operator's `set`: one
+/// `ReleasePriority` event appended, in force until the next `set`.
+/// Ranks are read at claim time, so no queue is re-keyed and the
+/// route runs no dispatch pass: the alarm's next claim ranks under the
+/// new multiplier.
+async fn write_release_priority(
+    State(graph): State<graph::GraphCell>,
+    env: WasmEnv,
+    db: DurableDb,
+    actor: Actor,
+    Json(set): Json<stow_types::api::ReleasePrioritySet>,
+) -> Result<Json<stow_types::api::ReleasePriority>> {
+    let graph = ensure_graph(&env, &db, &graph).await?;
+    routes::commit_as(
+        graph,
+        &db,
+        Some(&actor.0),
+        &[SchedulerEvent::ReleasePriority {
+            setting: Box::new(stow_types::api::ReleasePrioritySetting {
+                percent: set.percent,
+                set_at: iso_now(),
+                actor: actor.0.clone(),
+            }),
+        }],
+        now_ms(),
+    )
+    .await
+    .map_err(to_error)?;
+    tracing::warn!(percent = set.percent, actor = %actor.0, "release priority set by operator");
+    Ok(Json(graph.with(|graph| graph.release_priority_view())))
 }
 
 /// `Date#toISOString` — the timestamp format the record and alert

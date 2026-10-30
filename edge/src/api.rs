@@ -374,6 +374,33 @@ pub async fn set_dispatch_cap(
     Ok(Json(stored))
 }
 
+/// GET /api/v1/admin/release-priority
+///
+/// The multiplier release-profile nodes rank under — the operator
+/// setting behind it when `stow-admin release-priority set` wrote one
+/// (stow#1012).
+pub async fn get_release_priority(
+    SchedulerCaller(_caller): SchedulerCaller,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::ReleasePriority>, GetArtifactError> {
+    Ok(Json(
+        scheduler_client::get_release_priority(&scheduler).await?,
+    ))
+}
+
+/// POST /api/v1/admin/release-priority
+///
+/// The operator's `set` — the multiplier in force until the next `set`.
+pub async fn set_release_priority(
+    Mutator { caller, actor, .. }: Mutator<OperatorRoute>,
+    Json(set): Json<stow_types::api::ReleasePrioritySet>,
+    State(scheduler): State<CfDurableNamespace>,
+) -> Result<Json<stow_types::api::ReleasePriority>, GetArtifactError> {
+    let stored = scheduler_client::set_release_priority(&scheduler, &set, &actor).await?;
+    tracing::warn!(percent = stored.percent, %caller, "release priority set via admin endpoint");
+    Ok(Json(stored))
+}
+
 /// POST /`api/v1/admin/index/published`
 ///
 /// The index-publish path's report that this run's slices went live,

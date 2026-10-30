@@ -25,16 +25,17 @@ use crate::units::{StowSide, StowUnit, StowUnitKind};
 /// The lean unit model the shared projection reads — `stow-resolver`'s
 /// cargo-typed [`StowUnit`] converted once at the boundary so
 /// `stow-build`'s real `--unit-graph` resolves project onto the same
-/// task identities (stow#588).
-fn lean_unit(unit: &StowUnit) -> TaskUnit {
+/// task identities (stow#588). `profile` is the profile every unit of
+/// this projection builds under: the resolve fixes the feature graph,
+/// and each profile projects that graph onto its own nodes (stow#1012).
+fn lean_unit(unit: &StowUnit, profile: NodeProfile) -> TaskUnit {
     TaskUnit {
         key: lean_key(&unit.key),
         name: unit.name.clone(),
         version: unit.version.clone(),
         features: unit.features.clone(),
         is_crates_io: unit.is_crates_io,
-        // The resolve models the profile published nodes build under.
-        profile: NodeProfile::Dev,
+        profile,
         deps: unit
             .deps
             .iter()
@@ -70,15 +71,16 @@ fn lean_key(key: &crate::units::StowUnitKey) -> TaskUnitKey {
 
 /// The Merkle task identity of one resolve's unit graph (stow#588) —
 /// the shared projection in `stow-types` run over this resolve's
-/// converted units.
+/// converted units, every node built under `profile`.
 ///
 /// # Errors
 /// As [`stow_types::unit_graph::resolved_task_graph`].
 pub fn resolved_task_graph(
     units: &[StowUnit],
     rustc_version: &WireRustcVersion,
+    profile: NodeProfile,
 ) -> CargoResult<ResolvedTaskGraph> {
-    let lean: Vec<TaskUnit> = units.iter().map(lean_unit).collect();
+    let lean: Vec<TaskUnit> = units.iter().map(|unit| lean_unit(unit, profile)).collect();
     stow_types::unit_graph::resolved_task_graph(&lean, rustc_version)
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
@@ -115,7 +117,9 @@ pub fn request_plan_parts(
     target: &str,
     rustc_version: &WireRustcVersion,
 ) -> CargoResult<RequestPlanParts> {
-    let graph = resolved_task_graph(units, rustc_version)?;
+    // A request is served at the dev profile; the release nodes of a
+    // source enter through the preheat lanes (stow#1012).
+    let graph = resolved_task_graph(units, rustc_version, NodeProfile::Dev)?;
     let root_key = roots.iter().find(|key| key.kind == StowUnitKind::Lib);
     let root_task_id = root_key
         .map(|key| {
@@ -127,7 +131,7 @@ pub fn request_plan_parts(
                     key.side,
                 )
             })?;
-            let node = stow_types::unit_graph::task_node(&lean_unit(unit))
+            let node = stow_types::unit_graph::task_node(&lean_unit(unit, NodeProfile::Dev))
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
             let identity = stow_types::unit_graph::task_identity(&node, rustc_version)
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -160,8 +164,8 @@ pub fn request_plan_parts(
     })
 }
 
-/// Assemble the enqueue batch for one resolve output: `(requests,
-/// uncovered task ids)`.
+/// Assemble the enqueue batch for one resolve output under `profile`:
+/// `(requests, uncovered task ids)`.
 ///
 /// # Errors
 /// As [`resolved_task_graph`].
@@ -170,8 +174,9 @@ pub fn enqueue_requests_from_output(
     rustc_version: &WireRustcVersion,
     source: EnqueueSource,
     downloads: u64,
+    profile: NodeProfile,
 ) -> CargoResult<(Vec<EnqueueRequest>, BTreeSet<String>)> {
-    let graph = resolved_task_graph(units, rustc_version)?;
+    let graph = resolved_task_graph(units, rustc_version, profile)?;
     enqueue_requests_inner(&graph, &BTreeSet::new(), source, downloads)
 }
 
