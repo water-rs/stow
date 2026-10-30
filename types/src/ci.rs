@@ -336,6 +336,7 @@ impl<T: CiTransport> CiInterface<T> {
         let request = self.plain_dispatch_request(
             crate::trusted_builder::PREHEAT_WORKFLOW_FILE,
             "preheat",
+            crate::trusted_builder::BRANCH,
             &inputs,
         )?;
         self.send_checked(request).await.map(|_| ()).inspect(|()| {
@@ -343,10 +344,10 @@ impl<T: CiTransport> CiInterface<T> {
         })
     }
 
-    /// `workflow_dispatch` of a periodic workflow (stow#1100) on
-    /// [`crate::trusted_builder::BRANCH`], with no inputs — the edge's
-    /// Cron Trigger fires `watchdog.yml` and `preheat-cron.yml` this
-    /// way, since GitHub's own `schedule` skips ticks. The dispatch
+    /// `workflow_dispatch` of a periodic workflow (stow#1100) on the
+    /// branch its schedule entry names, with no inputs — the edge's
+    /// Cron Trigger fires the periodic workflows this way, since
+    /// GitHub's own `schedule` skips ticks. The dispatch
     /// needs only its HTTP status.
     ///
     /// # Errors
@@ -356,15 +357,20 @@ impl<T: CiTransport> CiInterface<T> {
     /// have landed.
     pub async fn submit_periodic(
         &self,
-        workflow: &crate::periodic::WorkflowFile,
+        periodic: &crate::periodic::PeriodicWorkflow,
     ) -> Result<(), DispatchError> {
         let request = self.plain_dispatch_request(
-            workflow.as_str(),
-            workflow.stem(),
+            periodic.workflow.as_str(),
+            periodic.workflow.stem(),
+            periodic.dispatch_ref.as_str(),
             &serde_json::json!({}),
         )?;
         self.send_checked(request).await.map(|_| ()).inspect(|()| {
-            tracing::info!(workflow = workflow.as_str(), "submitted periodic run");
+            tracing::info!(
+                workflow = periodic.workflow.as_str(),
+                dispatch_ref = periodic.dispatch_ref.as_str(),
+                "submitted periodic run"
+            );
         })
     }
 
@@ -499,11 +505,12 @@ impl<T: CiTransport> CiInterface<T> {
         &self,
         workflow_file: &str,
         event_type: &str,
+        dispatch_ref: &str,
         inputs: &serde_json::Value,
     ) -> Result<CiRequest, DispatchError> {
         match &self.endpoint {
             CiEndpoint::GitHub { repo, .. } => {
-                let mut payload = serde_json::json!({ "ref": crate::trusted_builder::BRANCH });
+                let mut payload = serde_json::json!({ "ref": dispatch_ref });
                 if inputs.as_object().is_some_and(|inputs| !inputs.is_empty()) {
                     payload["inputs"] = inputs.clone();
                 }
@@ -877,7 +884,12 @@ mod tests {
         };
         let github = CiInterface::github("water-rs/stow", "token", stub());
         let request = github
-            .plain_dispatch_request(workflow.as_str(), workflow.stem(), &serde_json::json!({}))
+            .plain_dispatch_request(
+                workflow.as_str(),
+                workflow.stem(),
+                crate::trusted_builder::BRANCH,
+                &serde_json::json!({}),
+            )
             .expect("request");
         assert_eq!(
             request.url,
@@ -889,10 +901,26 @@ mod tests {
             body,
             serde_json::json!({ "ref": crate::trusted_builder::BRANCH })
         );
+        let request = github
+            .plain_dispatch_request(
+                "test.yml",
+                "test",
+                crate::periodic::DispatchRef::Dev.as_str(),
+                &serde_json::json!({}),
+            )
+            .expect("request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body.expect("body")).expect("json");
+        assert_eq!(body, serde_json::json!({ "ref": "dev" }));
 
         let local = CiInterface::local_ci("http://127.0.0.1:28124/", stub());
         let request = local
-            .plain_dispatch_request(workflow.as_str(), workflow.stem(), &serde_json::json!({}))
+            .plain_dispatch_request(
+                workflow.as_str(),
+                workflow.stem(),
+                crate::trusted_builder::BRANCH,
+                &serde_json::json!({}),
+            )
             .expect("request");
         assert_eq!(request.url, "http://127.0.0.1:28124/dispatch");
         let body: serde_json::Value =

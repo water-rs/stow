@@ -1157,10 +1157,17 @@ async fn dispatch(
                 ),
             }
         }
-        // The edge Cron Trigger's periodic dispatch (stow#1100): the
-        // mock runs no watchdog or preheat tick, so the event is only
-        // recorded for `GET /periodic`.
-        periodic @ ("watchdog" | "preheat-cron") => {
+        // The edge Cron Trigger's periodic dispatch (stow#1100,
+        // stow#1121): the mock runs none of these workflows, so the
+        // event is only recorded for `GET /periodic`.
+        periodic @ ("watchdog"
+        | "preheat-cron"
+        | "index-publish-cron"
+        | "demand-feed"
+        | "build-failure-digest"
+        | "test"
+        | "preheat-projects"
+        | "preheat-missed") => {
             state
                 .periodic
                 .lock()

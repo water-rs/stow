@@ -31,6 +31,18 @@ const DISPATCH_STUB = String.raw`
 // in arrival order — scheduled.test.ts reads and clears them through
 // /__control/periodic.
 const periodic = [];
+// The stems of the workflows STOW_PERIODIC_WORKFLOWS names in
+// edge/Skyzen.mock.toml (stow#1121).
+const PERIODIC_EVENTS = new Set([
+	"watchdog",
+	"preheat-cron",
+	"index-publish-cron",
+	"demand-feed",
+	"build-failure-digest",
+	"test",
+	"preheat-projects",
+	"preheat-missed",
+]);
 
 // The runs this isolate has dispatched, run id → BuildTaskPayload.
 // One in-flight run per test makes collisions impossible, but the
@@ -99,7 +111,7 @@ export default {
 			}
 			if (request.method === "POST" && url.pathname === "/dispatch") {
 				const body = await request.json();
-				if (body.event_type === "watchdog" || body.event_type === "preheat-cron") {
+				if (PERIODIC_EVENTS.has(body.event_type)) {
 					periodic.push(body.event_type);
 					return Response.json({ ok: true });
 				}

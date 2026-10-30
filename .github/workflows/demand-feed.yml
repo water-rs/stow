@@ -18,12 +18,11 @@ name: Demand feed
 # pull or at clap — there is no per-hour toolchain build and no
 # silent legacy fallback, by design.
 
+# The edge Cron Trigger dispatches it on `main` at five past every hour
+# (`5 * * * *`, `STOW_PERIODIC_WORKFLOWS`, stow#1121): Analytics Engine
+# closes a hour's writes at the boundary, and the small skew absorbs the
+# delay Cloudflare reports on sampled rows.
 on:
-  schedule:
-    # Five past the hour: Analytics Engine closes a hour's writes at the
-    # boundary, and the small skew absorbs the delay Cloudflare reports
-    # on sampled rows.
-    - cron: "5 * * * *"
   workflow_dispatch:
 
 permissions: {}

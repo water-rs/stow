@@ -7,11 +7,10 @@ name: Preheat missed crates
 # to the edge with the run's Actions OIDC identity, the same way
 # preheat-admin.yml does, and reads Analytics Engine with a dedicated
 # account-scoped API token (`CF_ACCOUNT_ID` variable + `CF_ANALYTICS_TOKEN`
-# secret — see DEPLOYMENT.md). Runs weekly, ahead of the Monday-morning
-# build wave.
+# secret — see DEPLOYMENT.md). The edge Cron Trigger dispatches it on
+# `main` weekly (`0 6 * * 1`, `STOW_PERIODIC_WORKFLOWS`, stow#1121),
+# ahead of the Monday-morning build wave.
 on:
-  schedule:
-    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       limit:
