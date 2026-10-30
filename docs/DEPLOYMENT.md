@@ -414,7 +414,7 @@ Trusted builds are `.github/workflows/build-crate.yml` on `main` of
 (`ref: main`, one `task` input carrying the JSON `BuildTaskPayload`) —
 one task is one run — and the workflow stays the signing identity;
 the runner is picked from the task's target (`ubuntu-latest`,
-`macos-14`, `windows-latest`). Add a target by extending the
+`macos-26`, `windows-latest`). Add a target by extending the
 `runs-on` map in `build-crate.yml`.
 
 The workflow is two jobs and needs no edge URL: `build` compiles the
