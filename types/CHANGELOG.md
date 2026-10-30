@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/water-rs/stow/compare/stow-types-v0.13.1...stow-types-v0.14.0) - 2026-10-30
+
+### Added
+
+- cache release library builds at an operator-set lower priority ([#1133](https://github.com/water-rs/stow/pull/1133))
+- [**breaking**] make the profile a typed field of every node's identity and task id ([#1132](https://github.com/water-rs/stow/pull/1132))
+
 ## [0.13.0](https://github.com/water-rs/stow/compare/stow-types-v0.12.1...stow-types-v0.13.0) - 2026-10-30
 
 ### Other

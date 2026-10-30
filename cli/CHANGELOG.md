@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/water-rs/stow/compare/stow-cli-v0.13.1...stow-cli-v0.14.0) - 2026-10-30
+
+### Added
+
+- [**breaking**] make the profile a typed field of every node's identity and task id ([#1132](https://github.com/water-rs/stow/pull/1132))
+- *(cli)* [**breaking**] switch each cache layer through the [cache] table and flags ([#1128](https://github.com/water-rs/stow/pull/1128))
+
 ## [0.13.1](https://github.com/water-rs/stow/compare/stow-cli-v0.13.0...stow-cli-v0.13.1) - 2026-10-30
 
 ### Other
