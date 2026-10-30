@@ -91,17 +91,18 @@ STOW_ALERT_TO = "me@lexo.cool"
 # no scheduled probe, so nothing here costs while idle. Lower it to
 # trip earlier on a shared account.
 STOW_COST_BUDGET_MULTIPLIER = "1.0"
-# Periodic workflows (stow#1100): GitHub's `schedule` trigger skipped most
-# ticks, so the Worker's Cron Trigger dispatches them on `main` through the
-# App. This JSON object maps each cron expression of `[cloudflare.triggers]
-# crons` below to the workflow files due when it fires; a tick whose cron is
-# missing here fails and is mailed. Retuning a cadence edits the cron in both
-# places, and `admin/tests/workflow_entrypoints.rs` pins the two sets equal.
-# UTC.
-STOW_PERIODIC_WORKFLOWS = '{"*/15 * * * *": ["watchdog.yml"], "17 0 * * *": ["preheat-cron.yml"]}'
+# Periodic workflows (stow#1100, stow#1121): GitHub's `schedule` trigger
+# skipped most ticks, so the Worker's Cron Trigger dispatches them through
+# the App, on `main` unless an entry says `{"workflow": ..., "ref": "dev"}`.
+# This JSON object maps each cron expression of `[cloudflare.triggers]
+# crons` below to the workflow entries due when it fires; a tick whose cron
+# is missing here fails and is mailed. Retuning a cadence edits the cron in
+# both places, and `admin/tests/periodic_schedule.rs` pins the two sets
+# equal. UTC.
+STOW_PERIODIC_WORKFLOWS = '{"*/15 * * * *": ["watchdog.yml"], "17 0 * * *": ["preheat-cron.yml"], "*/10 * * * *": [{"workflow": "index-publish-cron.yml", "ref": "dev"}], "5 * * * *": ["demand-feed.yml"], "0 13 * * *": [{"workflow": "build-failure-digest.yml", "ref": "dev"}], "0 7 * * *": [{"workflow": "test.yml", "ref": "dev"}], "30 5 * * 1": [{"workflow": "preheat-projects.yml", "ref": "dev"}], "0 6 * * 1": ["preheat-missed.yml"]}'
 
 [cloudflare.triggers]
-crons = ["*/15 * * * *", "17 0 * * *"]
+crons = ["*/15 * * * *", "17 0 * * *", "*/10 * * * *", "5 * * * *", "0 13 * * *", "0 7 * * *", "30 5 * * 1", "0 6 * * 1"]
 
 
 [[cloudflare.durable_objects.bindings]]

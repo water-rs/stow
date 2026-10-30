@@ -499,18 +499,32 @@ call is a GitHub identity, verified as described below.
 
 GitHub's `schedule` trigger is best-effort and skipped most ticks
 (`watchdog.yml` ran 5 of 96 expected times in a day, stow#1100), so the
-edge Worker's Cloudflare Cron Trigger dispatches the two periodic
-workflows, which carry no `schedule`, on `main` through the GitHub App arm the
-build dispatch uses. `edge/Skyzen.toml` declares the cadences in
-`[cloudflare.triggers] crons` (`*/15 * * * *` for `watchdog.yml`,
-`17 0 * * *` (daily, 00:17) for `preheat-cron.yml`, both UTC) and the
-`STOW_PERIODIC_WORKFLOWS` var maps each cron expression to the workflow
-files due when it fires. The Worker's `scheduled` handler looks the
+edge Worker's Cloudflare Cron Trigger dispatches the periodic
+workflows, which carry no `schedule`, through the GitHub App arm the
+build dispatch uses (stow#1121 moved the last of them over, bar
+`release-gate.yml`). `edge/Skyzen.toml` declares the cadences in
+`[cloudflare.triggers] crons` and the `STOW_PERIODIC_WORKFLOWS` var maps each
+cron expression to the workflow entries due when it fires. All UTC:
+
+| Cron | Workflow | Branch |
+| --- | --- | --- |
+| `*/15 * * * *` | `watchdog.yml` | `main` |
+| `17 0 * * *` | `preheat-cron.yml` | `main` |
+| `*/10 * * * *` | `index-publish-cron.yml` (also runs on `workflow_run`) | `dev` |
+| `5 * * * *` | `demand-feed.yml` (its OIDC identity is admitted on `main` only) | `main` |
+| `0 13 * * *` | `build-failure-digest.yml` | `dev` |
+| `0 7 * * *` | `test.yml` (the nightly run, every leg) | `dev` |
+| `30 5 * * 1` | `preheat-projects.yml` (its PR opens against the checked-out branch) | `dev` |
+| `0 6 * * 1` | `preheat-missed.yml` (its OIDC identity is admitted on `main` only) | `main` |
+
+An entry is a bare file name (dispatched on `main`) or
+`{"workflow": "test.yml", "ref": "dev"}`. The Worker's `scheduled` handler looks the
 event's cron up in that map and posts one `workflow_dispatch` per due
 workflow through the scheduler object (`POST /periodic/dispatch`),
 concurrently under a bound of four. To change a cadence, edit the cron
-in both places; `admin/tests/workflow_entrypoints.rs` keeps the two
-sets equal. Both workflows keep `workflow_dispatch` for manual runs.
+in both places; `admin/tests/periodic_schedule.rs` keeps the two
+sets equal. Each workflow keeps `workflow_dispatch` for manual runs. The dispatch
+carries no inputs, so a workflow's input defaults apply.
 
 A failed dispatch (or a tick whose cron the map does not name) is logged,
 mailed from `alerts@stow.waterui.dev` through the same `send_email`
@@ -519,11 +533,16 @@ The edge cannot open the `incident` issue (the App carries no `issues`
 grant), and the next tick retries. While the watchdog's breaker has
 `preheat-cron.yml` disabled, that tick's dispatch is refused and mailed.
 
-Cost: 96 watchdog plus 1 preheat-cron tick a day, each one Worker
-invocation, one scheduler-object request, at most one token mint and one
-dispatch POST — at most 291 subrequests a day, 2,910 Worker requests and
-2,910 object requests a month (0.03% of 10M and 0.3% of 1M included),
-and no stored rows. The `POST /periodic/dispatch` drive in
+Cost: one Worker invocation per fired cron, and per due workflow one
+scheduler-object request, at most one token mint and one dispatch POST.
+Workflows a day: 96 watchdog, 144 index-publish-cron, 24 demand-feed, 1
+each of preheat-cron, build-failure-digest and test, plus two a week —
+267 a day, so at most 534 subrequests a day, about 8,100 Worker requests
+and 8,100 object requests a month (0.08% of 10M and 0.8% of 1M included),
+and no stored rows. The eight distinct cron expressions sit far under
+the Workers Paid account allowance of 250 Cron Triggers
+(<https://developers.cloudflare.com/workers/platform/limits/>, "Number of
+Cron Triggers per account"). The `POST /periodic/dispatch` drive in
 `edge/src/scheduler/drives.rs` pins the zero-row budget.
 
 ### GitHub webhook — `workflow_run`

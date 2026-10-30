@@ -8,6 +8,12 @@
 //! JSON object from cron expression to the workflow files due on that
 //! tick. A scheduled event carries the expression that fired it, so the
 //! Worker looks the due workflows up by that string.
+//!
+//! An entry is a bare file name, dispatched on the trusted builder's
+//! branch (`main`), or `{"workflow": "<file>", "ref": "dev"}` for a
+//! workflow whose run belongs on the default branch `dev` — what its
+//! `schedule` trigger gave it — such as the nightly test run and the
+//! projects-list regeneration PR.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -91,24 +97,75 @@ impl<'de> Deserialize<'de> for WorkflowFile {
     }
 }
 
-/// The scheduler route's body: one periodic workflow to dispatch on the
-/// default branch.
+/// The branch a periodic workflow is dispatched on.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchRef {
+    /// The trusted builder's branch ([`crate::trusted_builder::BRANCH`]).
+    Main,
+    /// The default branch, where a `schedule` trigger would have run.
+    Dev,
+}
+
+impl DispatchRef {
+    /// The branch name `workflow_dispatch` takes as its `ref`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Main => crate::trusted_builder::BRANCH,
+            Self::Dev => "dev",
+        }
+    }
+}
+
+/// One periodic workflow and the branch it is dispatched on; also the
+/// scheduler route's body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-pub struct PeriodicDispatchRequest {
+pub struct PeriodicWorkflow {
     /// The workflow to dispatch.
     pub workflow: WorkflowFile,
+    /// The branch to dispatch it on.
+    #[serde(rename = "ref")]
+    pub dispatch_ref: DispatchRef,
+}
+
+/// A schedule entry: a bare file name (dispatched on `main`) or the
+/// full object.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Entry {
+    Main(WorkflowFile),
+    Full(PeriodicWorkflow),
+}
+
+impl From<Entry> for PeriodicWorkflow {
+    fn from(entry: Entry) -> Self {
+        match entry {
+            Entry::Main(workflow) => Self {
+                workflow,
+                dispatch_ref: DispatchRef::Main,
+            },
+            Entry::Full(full) => full,
+        }
+    }
 }
 
 /// Cron expression to the workflows due when it fires.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeriodicSchedule(BTreeMap<String, Vec<WorkflowFile>>);
+pub struct PeriodicSchedule(BTreeMap<String, Vec<PeriodicWorkflow>>);
 
 impl FromStr for PeriodicSchedule {
     type Err = PeriodicError;
 
     fn from_str(json: &str) -> Result<Self, Self::Err> {
-        let map: BTreeMap<String, Vec<WorkflowFile>> = serde_json::from_str(json)
+        let entries: BTreeMap<String, Vec<Entry>> = serde_json::from_str(json)
             .map_err(|error| PeriodicError::BadSchedule(error.to_string()))?;
+        let map: BTreeMap<String, Vec<PeriodicWorkflow>> = entries
+            .into_iter()
+            .map(|(cron, entries)| (cron, entries.into_iter().map(Into::into).collect()))
+            .collect();
         if map.is_empty() {
             return Err(PeriodicError::EmptySchedule);
         }
@@ -127,7 +184,7 @@ impl PeriodicSchedule {
     /// [`PeriodicError::UnknownCron`] when the schedule does not name
     /// `cron` — a manifest whose triggers and schedule disagree fails
     /// the tick instead of silently dispatching nothing.
-    pub fn due(&self, cron: &str) -> Result<&[WorkflowFile], PeriodicError> {
+    pub fn due(&self, cron: &str) -> Result<&[PeriodicWorkflow], PeriodicError> {
         self.0
             .get(cron)
             .map(Vec::as_slice)
@@ -152,13 +209,44 @@ mod tests {
         let schedule: PeriodicSchedule = SCHEDULE.parse().expect("schedule parses");
         let due = schedule.due("*/15 * * * *").expect("known cron");
         assert_eq!(
-            due.iter().map(WorkflowFile::as_str).collect::<Vec<_>>(),
+            due.iter()
+                .map(|entry| entry.workflow.as_str())
+                .collect::<Vec<_>>(),
             ["watchdog.yml"]
         );
         let due = schedule.due("17 */4 * * *").expect("known cron");
         assert_eq!(
-            due.iter().map(WorkflowFile::as_str).collect::<Vec<_>>(),
+            due.iter()
+                .map(|entry| entry.workflow.as_str())
+                .collect::<Vec<_>>(),
             ["preheat-cron.yml"]
+        );
+    }
+
+    #[test]
+    fn an_entry_names_its_branch_and_a_bare_name_means_main() {
+        let schedule: PeriodicSchedule =
+            r#"{"0 7 * * *":["a.yml",{"workflow":"test.yml","ref":"dev"},{"workflow":"b.yml","ref":"main"}]}"#
+                .parse()
+                .expect("schedule parses");
+        let due = schedule.due("0 7 * * *").expect("known cron");
+        let refs = due
+            .iter()
+            .map(|entry| (entry.workflow.as_str(), entry.dispatch_ref.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            refs,
+            [("a.yml", "main"), ("test.yml", "dev"), ("b.yml", "main")]
+        );
+        assert!(
+            r#"{"0 7 * * *":[{"workflow":"a.yml","ref":"feature"}]}"#
+                .parse::<PeriodicSchedule>()
+                .is_err(),
+            "only the named branches are dispatchable"
+        );
+        assert!(
+            r#"{"0 7 * * *":[{"workflow":"a.yml"}]}"#.parse::<PeriodicSchedule>().is_err(),
+            "an object entry states its branch"
         );
     }
 

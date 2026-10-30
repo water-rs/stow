@@ -56,12 +56,12 @@ fn actions_ctx() -> Val {
     for (k, v) in pairs {
         set_path(&mut ctx, k, Val::Str(v.to_owned()));
     }
-    // A scheduled/manual run has no `workflow_run` payload; the
+    // An edge-dispatched/manual run has no `workflow_run` payload; the
     // dispatch scenario sets one explicitly.
     set_path(
         &mut ctx,
         "github.event_name",
-        Val::Str("schedule".to_owned()),
+        Val::Str("workflow_dispatch".to_owned()),
     );
     set_path(
         &mut ctx,
@@ -616,14 +616,10 @@ fn preheat_missed() -> serde_yml::Value {
 #[test]
 fn missed_declarations() {
     let wf = preheat_missed();
-    assert_eq!(
-        at(&wf, "on.schedule")
-            .and_then(|s| s.as_sequence())
-            .and_then(|s| field(&s[0], "cron"))
-            .map(scalar)
-            .as_deref(),
-        Some("0 6 * * 1")
-    );
+    // The cadence is the edge Cron Trigger's (stow#1121), pinned by
+    // `periodic_schedule.rs`; the workflow carries no `schedule`.
+    assert!(at(&wf, "on.schedule").is_none());
+    assert!(at(&wf, "on.workflow_dispatch").is_some());
     assert_eq!(
         at(&wf, "concurrency.group").map(scalar).as_deref(),
         Some("preheat-missed")
@@ -669,10 +665,10 @@ fn missed_calls(scn: &Scenario) -> Vec<Vec<String>> {
 
 #[test]
 fn missed_scheduled_run_uses_declared_defaults() {
-    // A `schedule` run carries an empty `inputs` context — the `||`
+    // A dispatched run carries an empty `inputs` context — the `||`
     // fallbacks in the step env are what produce 50/7/"".
     let scn = Scenario::new();
-    let ctx = actions_ctx(); // schedule; no inputs set
+    let ctx = actions_ctx(); // dispatch; no inputs set
     let runner = missed_runner(&scn, ctx);
     assert_eq!(runner.status(), Status::Ok, "{:?}", runner.outcomes);
 
@@ -755,14 +751,10 @@ fn preheat_projects() -> serde_yml::Value {
 #[test]
 fn projects_delegates_to_signed_action_only() {
     let wf = preheat_projects();
-    assert_eq!(
-        at(&wf, "on.schedule")
-            .and_then(|s| s.as_sequence())
-            .and_then(|s| field(&s[0], "cron"))
-            .map(scalar)
-            .as_deref(),
-        Some("30 5 * * 1")
-    );
+    // The cadence is the edge Cron Trigger's (stow#1121), pinned by
+    // `periodic_schedule.rs`; the workflow carries no `schedule`.
+    assert!(at(&wf, "on.schedule").is_none());
+    assert!(at(&wf, "on.workflow_dispatch").is_some());
     assert_eq!(
         at(&wf, "concurrency.group").map(scalar).as_deref(),
         Some("preheat-projects")
@@ -898,7 +890,7 @@ fn index_publish_cron() -> serde_yml::Value {
 #[test]
 fn index_publish_declarations() {
     let wf = index_publish_cron();
-    // Fires on a completed build-crate run, on the backstop schedule,
+    // Fires on a completed build-crate run, on the edge's backstop dispatch,
     // and manually.
     assert_eq!(
         at(&wf, "on.workflow_run.workflows")
@@ -912,14 +904,9 @@ fn index_publish_declarations() {
             .map(|s| s.iter().map(scalar).collect::<Vec<_>>()),
         Some(vec!["completed".to_owned()])
     );
-    assert_eq!(
-        at(&wf, "on.schedule")
-            .and_then(|s| s.as_sequence())
-            .and_then(|s| field(&s[0], "cron"))
-            .map(scalar)
-            .as_deref(),
-        Some("*/10 * * * *")
-    );
+    // The cadence is the edge Cron Trigger's (stow#1121), pinned by
+    // `periodic_schedule.rs`; the workflow carries no `schedule`.
+    assert!(at(&wf, "on.schedule").is_none());
     assert!(at(&wf, "on.workflow_dispatch").is_some());
     // Tick/publisher concurrency: one pending tick, superseded freely.
     assert_eq!(
@@ -1001,26 +988,25 @@ fn index_publish_completion_forwards_title_rustc() {
 }
 
 #[test]
-fn index_publish_schedule_and_manual_carry_no_rustc() {
-    for event in ["schedule", "workflow_dispatch"] {
-        let scn = Scenario::new();
-        let runner = index_runner(&scn, event, None);
-        assert_eq!(
-            runner.outcome_of("Dispatch index-publish on main"),
-            &Outcome::Ran(0)
-        );
-        let gh = scn.calls_of("gh");
-        assert_eq!(gh.len(), 1);
-        let args = gh_dispatch_args(&gh[0]);
-        let fields = input_fields(&args);
-        assert!(
-            !fields.contains_key("rustc_version"),
-            "{event} forwarded a rustc: {fields:?}"
-        );
-        assert_eq!(fields.get("report").map(String::as_str), Some("true"));
-        let ref_idx = args.iter().position(|a| a == "--ref").expect("--ref");
-        assert_eq!(args[ref_idx + 1], "main");
-    }
+fn index_publish_cron_trigger_and_manual_carry_no_rustc() {
+    let event = "workflow_dispatch";
+    let scn = Scenario::new();
+    let runner = index_runner(&scn, event, None);
+    assert_eq!(
+        runner.outcome_of("Dispatch index-publish on main"),
+        &Outcome::Ran(0)
+    );
+    let gh = scn.calls_of("gh");
+    assert_eq!(gh.len(), 1);
+    let args = gh_dispatch_args(&gh[0]);
+    let fields = input_fields(&args);
+    assert!(
+        !fields.contains_key("rustc_version"),
+        "{event} forwarded a rustc: {fields:?}"
+    );
+    assert_eq!(fields.get("report").map(String::as_str), Some("true"));
+    let ref_idx = args.iter().position(|a| a == "--ref").expect("--ref");
+    assert_eq!(args[ref_idx + 1], "main");
 }
 
 #[test]

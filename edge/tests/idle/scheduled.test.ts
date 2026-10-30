@@ -29,14 +29,19 @@ async function dispatched(): Promise<string[]> {
 describe("scheduled handler", () => {
 	const schedule = JSON.parse(
 		(env as unknown as Record<string, string>).STOW_PERIODIC_WORKFLOWS,
-	) as Record<string, string[]>;
+	) as Record<string, (string | { workflow: string; ref: string })[]>;
+	// A bare name dispatches on main; an object names its ref (the local-CI
+	// stub records only the workflow stem, so the ref is pinned by the host
+	// tests of types/src/periodic.rs and types/src/ci.rs).
+	const file = (entry: string | { workflow: string }) =>
+		typeof entry === "string" ? entry : entry.workflow;
 
 	it("dispatches exactly the workflows due for each cron", async () => {
 		for (const [cron, workflows] of Object.entries(schedule)) {
 			await reset();
 			await exports.default.scheduled({ cron, scheduledTime: Date.now() });
 			expect((await dispatched()).sort()).toEqual(
-				workflows.map((file) => file.replace(/\.ya?ml$/, "")).sort(),
+				workflows.map((entry) => file(entry).replace(/\.ya?ml$/, "")).sort(),
 			);
 		}
 	});
