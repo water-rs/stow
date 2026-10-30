@@ -500,8 +500,7 @@ call is a GitHub identity, verified as described below.
 GitHub's `schedule` trigger is best-effort and skipped most ticks
 (`watchdog.yml` ran 5 of 96 expected times in a day, stow#1100), so the
 edge Worker's Cloudflare Cron Trigger dispatches the two periodic
-workflows; their `schedule` blocks stay only until a deployed edge is seen
-dispatching them, and are then removed. The Cron Trigger dispatches them on `main` through the GitHub App arm the
+workflows, which carry no `schedule`, on `main` through the GitHub App arm the
 build dispatch uses. `edge/Skyzen.toml` declares the cadences in
 `[cloudflare.triggers] crons` (`*/15 * * * *` for `watchdog.yml`,
 `17 0 * * *` (daily, 00:17) for `preheat-cron.yml`, both UTC) and the

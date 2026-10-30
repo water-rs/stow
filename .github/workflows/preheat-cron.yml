@@ -24,10 +24,6 @@ name: Preheat the public cache
 # retires pending tasks the artifact catalog already covers, so a wave
 # only builds what is genuinely missing or previously failed.
 on:
-  # Kept until the edge Cron Trigger is deployed and seen dispatching;
-  # the day marker makes the overlap a no-op.
-  schedule:
-    - cron: "17 */4 * * *"
   workflow_dispatch:
     inputs:
       refresh:

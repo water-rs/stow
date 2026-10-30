@@ -1,8 +1,8 @@
 name: Watchdog
 
 # The external incident watchdog (stow#450): every 15 minutes (dispatched
-# by the edge Worker's Cron Trigger, stow#1100, rather than the `schedule` below —
-# GitHub skipped most scheduled ticks) it reads
+# by the edge Worker's Cron Trigger, stow#1100; GitHub's own `schedule`
+# skipped most ticks) it reads
 # the Cloudflare usage/health signals, the build-pipeline failure rate,
 # the scheduler queue, the liveness of preheat and builds, failed
 # operations runs and a missed watchdog dispatch, and the public
@@ -18,9 +18,6 @@ name: Watchdog
 # `stow-admin watchdog clear` un-trips — the watchdog never un-trips on
 # its own.
 on:
-  # Kept until the edge Cron Trigger is deployed and seen dispatching.
-  schedule:
-    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       dry_run:
