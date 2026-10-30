@@ -1,0 +1,191 @@
+name: Repack follow-up
+
+# A repack sweep (`build-crate.yml` dispatched with `repack_rustc`, run
+# title `<rustc>-repack`) is resumable and its `repack` job has a hard
+# 350-minute limit, so a registry larger than one job needs several runs.
+# This lane closes the loop on the default branch (`dev`), dispatching
+# onto `main` with the run's own GITHUB_TOKEN like `index-publish-cron.yml`
+# (the index signing identity and the `operations` environment live on
+# `main` only):
+#
+# - `resume`, on a completed `build-crate` run titled `<rustc>-repack`:
+#   - success: dispatch `index-publish.yml` (which folds the repacked
+#     records into the index and reports the slices) and then
+#     `preheat-cron.yml` with `refresh=true` (the queue is otherwise empty
+#     until the next daily preheat; the wave's first builds start ~14
+#     minutes after the dispatch, the fold takes ~7).
+#   - failure, or the job's own timeout: dispatch the sweep again with the
+#     same rustc. A run an operator cancelled early is never resumed.
+#     At most `STOW_REPACK_MAX_RUNS_PER_DAY` repack runs per rustc are
+#     started in 24 hours; past it the job fails so the run list and the
+#     watchdog's failure path show a sweep that does not converge.
+# - `retry`, on a successful `Index publish` run: for each rustc whose
+#   newest `<rustc>-repack` run (last 24 hours) concluded success, retry
+#   that rustc's `failed` queue nodes, the ones parked by builds that ran
+#   against old-layout bundles. It acts only when (a) the index publish
+#   was created after the repack run completed, so its fold covers the
+#   repacked records, and (b) no `operations.yml` run carrying that retry
+#   argv was created since the repack completed: the one-shot marker, so
+#   a node that keeps failing is not retried on every later publish.
+#   The retry waits for a fold instead of being dispatched beside the
+#   publish because `queue retry` resets a node to `pending` with its
+#   attempt count at 1 and no backoff (`Graph::mutate`,
+#   edge/src/scheduler/graph.rs): the retried build is dispatched at once
+#   and would race the fold. The 2/4/8/16-minute backoff
+#   (`MAX_BUILD_ATTEMPTS`, queue.rs) delays only a build that has failed
+#   again, so it does not cover this race. `index-publish.yml` runs from
+#   `main` and takes no input marking its origin, so the retry reads the
+#   run list instead. Serialised by the concurrency group, a publish that
+#   completes while the previous retry runs sees its operations run.
+#
+# How a timed-out job shows up: the Actions REST docs list `timed_out` and
+# `cancelled` as separate job and run conclusions but do not say which one
+# a `timeout-minutes` expiry produces
+# (https://docs.github.com/en/rest/actions/workflow-jobs, "conclusion":
+# success, failure, neutral, cancelled, skipped, timed_out,
+# action_required; the `timeout-minutes` syntax reference gives no
+# conclusion either). The job is therefore classed a timeout when its
+# conclusion is `timed_out`, or `cancelled` after running within
+# REPACK_TIMEOUT_SLACK_MINUTES of its limit; a `cancelled` job that
+# stopped earlier is an operator cancel.
+
+on:
+  workflow_run:
+    workflows: [build-crate, Index publish]
+    types: [completed]
+
+permissions:
+  contents: read
+  # `gh workflow run` mints the dispatch with the run's own GITHUB_TOKEN.
+  actions: write
+
+# One follow-up per completed run title at a time: a redelivered completion
+# queues behind the first and then finds the resumed run active (or the
+# retry marker set).
+concurrency:
+  group: repack-followup-${{ github.event.workflow_run.display_title }}
+  cancel-in-progress: false
+
+jobs:
+  resume:
+    if: github.event.workflow_run.name == 'build-crate' && endsWith(github.event.workflow_run.display_title, '-repack')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Follow up the repack run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_TITLE: ${{ github.event.workflow_run.display_title }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          STOW_REPACK_CONCURRENCY: ${{ vars.STOW_REPACK_CONCURRENCY }}
+          STOW_REPACK_MAX_RUNS_PER_DAY: ${{ vars.STOW_REPACK_MAX_RUNS_PER_DAY }}
+          # `timeout-minutes` of build-crate.yml's `repack` job, and how
+          # far under it a `cancelled` job still counts as its timeout.
+          REPACK_JOB_TIMEOUT_MINUTES: "350"
+          REPACK_TIMEOUT_SLACK_MINUTES: "15"
+        run: |
+          set -euo pipefail
+          if [[ ! "$RUN_TITLE" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-repack$ ]]; then
+            echo "run title '$RUN_TITLE' is not a repack run"
+            exit 0
+          fi
+          rustc="${BASH_REMATCH[1]}"
+          repo_args=(--repo "$GITHUB_REPOSITORY" --ref main)
+
+          if [ "$RUN_CONCLUSION" = success ]; then
+            gh workflow run index-publish.yml "${repo_args[@]}" \
+              -f report=true -f "rustc_version=$rustc"
+            gh workflow run preheat-cron.yml "${repo_args[@]}" -f refresh=true
+            exit 0
+          fi
+
+          case "$RUN_CONCLUSION" in
+            failure|timed_out) ;;
+            cancelled)
+              floor=$(( (REPACK_JOB_TIMEOUT_MINUTES - REPACK_TIMEOUT_SLACK_MINUTES) * 60 ))
+              kind=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/jobs?per_page=100" \
+                | jq -r --arg name "repack $rustc" --argjson floor "$floor" '
+                    [.jobs[] | select(.name == $name)] | first // empty
+                    | if .conclusion == "timed_out"
+                         or (.conclusion == "cancelled"
+                             and ((.completed_at | fromdateiso8601)
+                                  - (.started_at | fromdateiso8601)) >= $floor)
+                      then "timeout" else "cancelled" end')
+              if [ "$kind" != timeout ]; then
+                echo "repack run $RUN_ID was cancelled before its job's timeout (${kind:-no repack job}); not resuming"
+                exit 0
+              fi
+              ;;
+            *)
+              echo "repack run $RUN_ID concluded '$RUN_CONCLUSION'; nothing to follow up"
+              exit 0
+              ;;
+          esac
+
+          concurrency="${STOW_REPACK_CONCURRENCY:-32}"
+          max_runs="${STOW_REPACK_MAX_RUNS_PER_DAY:-8}"
+          [[ "$concurrency" =~ ^[1-9][0-9]*$ ]] \
+            || { echo "::error::STOW_REPACK_CONCURRENCY='$concurrency' is not a positive integer"; exit 1; }
+          [[ "$max_runs" =~ ^[0-9]+$ ]] \
+            || { echo "::error::STOW_REPACK_MAX_RUNS_PER_DAY='$max_runs' is not a whole number"; exit 1; }
+
+          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          read -r created active < <(
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/build-crate.yml/runs?created=%3E%3D$since&per_page=100" \
+              | jq -s -r --arg title "$rustc-repack" '
+                  [.[].workflow_runs[] | select(.display_title == $title)]
+                  | "\(length) \([.[] | select(.status != "completed")] | length)"')
+          if [ "$created" -ge "$max_runs" ]; then
+            echo "::error::$created '$rustc-repack' runs started in the last 24 hours (limit $max_runs, STOW_REPACK_MAX_RUNS_PER_DAY); the sweep is not converging, not resuming run $RUN_ID"
+            exit 1
+          fi
+          if [ "$active" -gt 0 ]; then
+            echo "a '$rustc-repack' run is already queued or running; not dispatching another"
+            exit 0
+          fi
+          gh workflow run build-crate.yml "${repo_args[@]}" \
+            -f "repack_rustc=$rustc" -f "repack_concurrency=$concurrency"
+
+  retry:
+    if: github.event.workflow_run.name == 'Index publish' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Retry the failed nodes of repacked rustcs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INDEX_CREATED: ${{ github.event.workflow_run.created_at }}
+        run: |
+          set -euo pipefail
+          since=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+          # Newest repack run per rustc, kept when it succeeded:
+          # `<rustc> <completion time>` (the run's `updated_at`).
+          repacks=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/build-crate.yml/runs?created=%3E%3D$since&per_page=100" \
+            | jq -s -r '
+                [.[].workflow_runs[]
+                 | select(.display_title | test("^[0-9]+\\.[0-9]+\\.[0-9]+-repack$"))]
+                | group_by(.display_title)[] | max_by(.created_at)
+                | select(.conclusion == "success")
+                | "\(.display_title | rtrimstr("-repack")) \(.updated_at)"')
+          while read -r rustc completed; do
+            [ -n "$rustc" ] || continue
+            if [[ ! "$INDEX_CREATED" > "$completed" ]]; then
+              echo "$rustc: this index publish ($INDEX_CREATED) predates the repack's completion ($completed)"
+              continue
+            fi
+            argv=$(jq -nc --arg rustc "$rustc" \
+              '["queue","retry","--status","failed","--rustc",$rustc,"--yes"]')
+            # `operations.yml` titles its runs `stow-admin <argv> (by <actor>)`.
+            done_before=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/operations.yml/runs?created=%3E%3D$completed&per_page=100" \
+              | jq -s -r --arg argv "$argv" \
+                  '[.[].workflow_runs[] | select(.display_title | contains($argv))] | length')
+            if [ "$done_before" -gt 0 ]; then
+              echo "$rustc: failed nodes already retried since the repack completed"
+              continue
+            fi
+            gh workflow run operations.yml --repo "$GITHUB_REPOSITORY" --ref main -f "argv=$argv"
+          done <<<"$repacks"
