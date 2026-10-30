@@ -46,6 +46,7 @@ use x509_cert::Certificate;
 use x509_cert::der::{DecodePem as _, Encode as _, EncodePem as _, pem::LineEnding};
 
 use crate::client::{RegistryHttp, RegistrySession, Response, SessionRequest};
+use crate::retry::retry_with_backoff;
 use crate::verify::{TrustMaterial, verify_logged_signature, verify_payload_identity};
 
 /// Push `manifest` so that `reference`'s tag never names an unsigned
@@ -116,6 +117,20 @@ const OIDC_AUDIENCE: &str = "sigstore";
 /// retries, each waiting at most 30 seconds — so the entry is integrated
 /// while the certificate it names is still valid.
 const RENEWAL_MARGIN: Duration = Duration::from_mins(4);
+
+/// Rekor's `409` names an entry its read path may not serve yet: the
+/// public-good log has answered `404` — the same empty answer as for an
+/// entry it never logged — at the very `Location` it named, seconds after
+/// the entry's integrated time, and served the entry there later. The
+/// read-back retries that `404` this many times, waiting
+/// [`REKOR_READ_BACK_INITIAL_DELAY`] doubled each time (about a minute in
+/// all), before the entry's absence is final. The entry is already
+/// integrated, so the wait does not count against the certificate's
+/// [`RENEWAL_MARGIN`].
+const REKOR_READ_BACK_MAX_ATTEMPTS: u32 = 8;
+
+/// The first wait of the Rekor read-back's retries.
+const REKOR_READ_BACK_INITIAL_DELAY: Duration = Duration::from_millis(500);
 
 /// The go-containerregistry zero time every layer's history and the
 /// config's `created` carry in a cosign signature image.
@@ -457,7 +472,8 @@ impl KeylessSigner {
     ///
     /// A submission whose answer was lost and is retried finds the entry
     /// already logged — Rekor answers `409` with its `Location` — and the
-    /// existing entry is read back rather than logged twice.
+    /// existing entry is read back there rather than logged twice, waiting
+    /// out the `404` Rekor answers until its read path serves the entry.
     async fn log(
         &self,
         identity: &SigningIdentity,
@@ -506,25 +522,53 @@ impl KeylessSigner {
                     .and_then(|base| base.join(location))
                     .wrap_err_with(|| format!("resolve Rekor entry Location {location}"))?
                     .to_string();
-                let response = self
-                    .send(
-                        "read back the logged Rekor entry",
-                        SessionRequest::new(Method::GET, existing.clone()),
-                    )
-                    .await?;
-                if !response.status.is_success() {
-                    return Err(refused(
-                        "Rekor",
-                        "read back the entry",
-                        &existing,
-                        &response,
-                    ));
-                }
-                response
+                self.read_back(&existing)
+                    .await
+                    .map_err(|error| match error {
+                        EntryRead::NotReadable(response) => stow_types::stow_error!(
+                            "Rekor answered 409 for {url} naming the existing entry {existing}, \
+                         which was still not readable there after \
+                         {REKOR_READ_BACK_MAX_ATTEMPTS} reads: {}: {}",
+                            response.status,
+                            String::from_utf8_lossy(&response.body)
+                        ),
+                        EntryRead::Refused(response) => {
+                            refused("Rekor", "read back the entry", &existing, &response)
+                        }
+                        EntryRead::Failed(error) => error,
+                    })?
             }
             _ => return Err(refused("Rekor", "log the signature", &url, &response)),
         };
         rekor_bundle(&response.body)
+    }
+
+    /// Read the logged entry at `url`, retrying the `404` Rekor answers
+    /// while an entry it already reported is not yet readable.
+    async fn read_back(&self, url: &str) -> Result<Response, EntryRead> {
+        retry_with_backoff(
+            "read back the logged Rekor entry",
+            REKOR_READ_BACK_MAX_ATTEMPTS,
+            REKOR_READ_BACK_INITIAL_DELAY,
+            || async {
+                let response = self
+                    .send(
+                        "read back the logged Rekor entry",
+                        SessionRequest::new(Method::GET, url.to_owned()),
+                    )
+                    .await
+                    .map_err(EntryRead::Failed)?;
+                match response.status {
+                    status if status.is_success() => Ok(response),
+                    reqwest::StatusCode::NOT_FOUND => {
+                        Err(EntryRead::NotReadable(Box::new(response)))
+                    }
+                    _ => Err(EntryRead::Refused(Box::new(response))),
+                }
+            },
+            |error| matches!(error, EntryRead::NotReadable(_)),
+        )
+        .await
     }
 
     /// One Sigstore exchange through the process's retry loop.
@@ -538,6 +582,30 @@ impl KeylessSigner {
             .send(what, request, None)
             .await
             .map_err(|error| stow_types::stow_error!("{error}"))
+    }
+}
+
+/// A failed read of the Rekor entry a `409` named.
+enum EntryRead {
+    /// Rekor does not serve the entry (yet).
+    NotReadable(Box<Response>),
+    /// Rekor refused the read with another status.
+    Refused(Box<Response>),
+    /// The exchange itself failed.
+    Failed(stow_types::error::Error),
+}
+
+impl std::fmt::Display for EntryRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReadable(response) | Self::Refused(response) => write!(
+                f,
+                "{}: {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            ),
+            Self::Failed(error) => write!(f, "{error}"),
+        }
     }
 }
 
