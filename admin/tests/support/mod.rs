@@ -625,6 +625,16 @@ case "$tool" in
     if [ -n "${STUB_FAIL_RE-}" ] && [[ "$*" =~ $STUB_FAIL_RE ]]; then exit 1; fi
     exit "${STUB_ADMIN_EXIT:-0}";;
   gh)
+    # `gh api` answers with the raw REST JSON the scenario plans: a run's
+    # jobs (`STUB_GH_JOBS`), the build-crate run list (`STUB_GH_RUNS`) or the operations run list
+    # (`STUB_GH_OPS_RUNS`).
+    if [ "${1-}" = api ]; then
+      case "$*" in
+        */jobs*) printf '%s' "${STUB_GH_JOBS-}";;
+        */operations.yml/runs*) printf '%s' "${STUB_GH_OPS_RUNS-}";;
+        */runs*) printf '%s' "${STUB_GH_RUNS-}";;
+      esac
+    fi
     if [ -n "${STUB_FAIL_RE-}" ] && [[ "$*" =~ $STUB_FAIL_RE ]]; then exit 1; fi
     exit "${STUB_TOOL_EXIT:-0}";;
   cargo|cosign|oras|docker)
