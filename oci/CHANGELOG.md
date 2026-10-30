@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/water-rs/stow/compare/stow-oci-v0.12.1...stow-oci-v0.13.0) - 2026-10-30
+
+### Fixed
+
+- *(oci)* wait for a Rekor entry a 409 names to become readable ([#1120](https://github.com/water-rs/stow/pull/1120))
+
 ## [0.12.0](https://github.com/water-rs/stow/compare/stow-oci-v0.11.0...stow-oci-v0.12.0) - 2026-10-30
 
 ### Added
