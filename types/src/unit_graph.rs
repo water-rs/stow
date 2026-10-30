@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::error::Result;
 use crate::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
+use crate::node_profile::NodeProfile;
 use crate::stow_error;
 use crate::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
 
@@ -93,6 +94,8 @@ pub struct TaskUnit {
     /// Whether the package came from crates.io — only crates.io units
     /// mint task nodes; everything else is a way into the graph.
     pub is_crates_io: bool,
+    /// The named profile cargo builds the unit under.
+    pub profile: NodeProfile,
     /// The unit's dependency edges.
     pub deps: Vec<TaskUnitDep>,
 }
@@ -117,6 +120,8 @@ pub struct TaskNode {
     pub target: String,
     /// Whether the unit lives on the host side of the build graph.
     pub host_side: bool,
+    /// The named profile the unit builds under.
+    pub profile: NodeProfile,
 }
 
 /// The lib-unit graph the wave machinery works on: every task node and
@@ -517,7 +522,7 @@ pub fn explicit_spellings(
 /// caller shares — then [`ResolvedTaskGraph::resolve`] derives each
 /// node's dependency digest and task id bottom-up. Compute this on the
 /// output of ONE resolve, before merging graphs from different sources:
-/// two resolves can mint the same six-field [`TaskNode`] over different
+/// two resolves can mint the same seven-field [`TaskNode`] over different
 /// dependency subgraphs, and only per-resolve ids keep the contexts
 /// separate.
 ///
@@ -656,7 +661,7 @@ fn dedup_shadow_edges<'u>(
     Ok(extra_edges)
 }
 
-/// A unit's raw six-field task node.
+/// A unit's raw seven-field task node.
 ///
 /// # Errors
 /// A unit name/version/features the typed identity cannot carry.
@@ -673,6 +678,7 @@ pub fn task_node(unit: &TaskUnit) -> Result<TaskNode> {
         )?,
         target: unit.key.platform.clone(),
         host_side: unit.key.side == TaskUnitSide::Host,
+        profile: unit.profile,
     })
 }
 
@@ -691,6 +697,7 @@ pub fn task_identity(
         target: TargetTriple::parse(&node.target)?,
         rustc_version: rustc_version.clone(),
         host_side: node.host_side,
+        profile: node.profile,
     })
 }
 
@@ -732,6 +739,7 @@ mod tests {
                 .collect(),
             is_crates_io: true,
             deps: Vec::new(),
+            profile: crate::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -936,6 +944,7 @@ mod tests {
             features: Vec::new(),
             is_crates_io: true,
             deps: vec![dep_on(&bd)],
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         let mut x_h = crates_io_lib("x", "1.0.0", TaskUnitSide::Host, &[]);
         x_h.deps.push(pm_dep.clone());

@@ -15,6 +15,7 @@ use stow_types::identity::{
     CMetadata, CrateName, CrateVersion, DependencyCMetadataIdentity, DependencyCMetadataJson,
     DependencyCompileKeyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
 };
+use stow_types::node_profile::NodeProfile;
 use stow_types::platform::{Profile, RustcVersion, Target};
 use stow_types::public_cache::UnitSide;
 use stow_types::registry::oci_reference;
@@ -30,6 +31,7 @@ pub async fn build_upload_plan(
     scanned: &[ScannedArtifact],
     consumed: &[ConsumedArtifact],
     dependency_task_ids: &[String],
+    node_profile: NodeProfile,
 ) -> stow_types::error::Result<Vec<PlannedArtifact>> {
     validate_dependency_graph(scanned, consumed)?;
     let mut plans_by_compile_key =
@@ -78,6 +80,7 @@ pub async fn build_upload_plan(
             target: target_typed,
             rustc_version: rustc_version_typed,
             profile: artifact.profile.clone(),
+            node_profile,
             emit: artifact.emit.clone(),
             oci_reference: oci_reference(&key, &artifact.c_metadata),
             kind: artifact.kind.clone(),
@@ -649,9 +652,14 @@ mod tests {
             "[\"default\",\"derive\",\"serde_derive\",\"std\"]".to_owned();
         let scanned = vec![serde_artifact];
 
-        let planned = build_upload_plan(&scanned, &[], &dependency_task_ids())
-            .await
-            .expect("build upload plan");
+        let planned = build_upload_plan(
+            &scanned,
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+        )
+        .await
+        .expect("build upload plan");
         let plan = planned.first().expect("planned artifact");
 
         assert_eq!(plan.compile_key, "original-compile-key");
@@ -684,9 +692,14 @@ mod tests {
             scanned_bitflags_artifact("dba7ec857b47436d", stable_output_path.clone(), 29),
         ];
 
-        let planned = build_upload_plan(&scanned, &[], &dependency_task_ids())
-            .await
-            .expect("build upload plan");
+        let planned = build_upload_plan(
+            &scanned,
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+        )
+        .await
+        .expect("build upload plan");
 
         assert_eq!(planned.len(), 2);
         assert!(planned.iter().any(|plan| {
@@ -812,9 +825,14 @@ mod tests {
             rand_core,
         ];
 
-        let planned = build_upload_plan(&scanned, &[], &dependency_task_ids())
-            .await
-            .expect("build upload plan");
+        let planned = build_upload_plan(
+            &scanned,
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+        )
+        .await
+        .expect("build upload plan");
         let rand_core = planned
             .iter()
             .find(|plan| plan.crate_name == "rand_core")
@@ -877,15 +895,25 @@ mod tests {
             rustc_version: "1.91.1".to_owned(),
             emit: vec!["link".to_owned()],
         }];
-        build_upload_plan(&scanned, &served, &dependency_task_ids())
-            .await
-            .expect("consumed dependency resolves the plan");
+        build_upload_plan(
+            &scanned,
+            &served,
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+        )
+        .await
+        .expect("consumed dependency resolves the plan");
 
         let mut mismatched = served.clone();
         mismatched[0].c_metadata = "ffffffffffffffff".to_owned();
-        let error = build_upload_plan(&scanned, &mismatched, &dependency_task_ids())
-            .await
-            .expect_err("an identity the claim does not carry must not satisfy the edge");
+        let error = build_upload_plan(
+            &scanned,
+            &mismatched,
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+        )
+        .await
+        .expect_err("an identity the claim does not carry must not satisfy the edge");
         assert!(
             error
                 .to_string()
@@ -933,9 +961,14 @@ mod tests {
             original_out_dir: out_dir,
         });
 
-        let error = build_upload_plan(&[artifact], &[], &dependency_task_ids())
-            .await
-            .expect_err("an x86-64 object must not publish under an arm64 task");
+        let error = build_upload_plan(
+            &[artifact],
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Dev,
+        )
+        .await
+        .expect_err("an x86-64 object must not publish under an arm64 task");
         let message = error.to_string();
         assert!(
             message.contains("winarm-probe"),

@@ -1979,6 +1979,7 @@ mod tests {
             preserve_lockfile: false,
             host_side: false,
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         stow_types::api::EnqueueAdmission {
             task_id: "once_cell-task".to_owned(),

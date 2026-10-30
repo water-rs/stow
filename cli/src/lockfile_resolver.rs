@@ -932,6 +932,7 @@ mod tests {
                 invocation: stow_types::public_cache::UnitInvocation::Target,
                 kind: stow_types::public_cache::UnitKind::Linked,
             },
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 

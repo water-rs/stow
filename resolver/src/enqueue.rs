@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use cargo::CargoResult;
 use stow_types::api::{EnqueueRequest, EnqueueSource};
 use stow_types::identity::WireRustcVersion;
+use stow_types::node_profile::NodeProfile;
 use stow_types::task_graph::ResolvedTaskGraph;
 use stow_types::unit_graph::{TaskUnit, TaskUnitDep, TaskUnitKey, TaskUnitKind, TaskUnitSide};
 
@@ -32,6 +33,8 @@ fn lean_unit(unit: &StowUnit) -> TaskUnit {
         version: unit.version.clone(),
         features: unit.features.clone(),
         is_crates_io: unit.is_crates_io,
+        // The resolve models the profile published nodes build under.
+        profile: NodeProfile::Dev,
         deps: unit
             .deps
             .iter()
@@ -216,6 +219,7 @@ pub fn enqueue_requests_inner(
                 .map_err(|error| anyhow::anyhow!("{error}"))?,
             preserve_lockfile: false,
             host_side: node.identity.host_side,
+            profile: node.identity.profile,
             explicit_spelling: node.explicit_spelling,
         });
     }

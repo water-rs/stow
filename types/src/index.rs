@@ -119,6 +119,12 @@ pub struct ArtifactIndexRow {
     pub crate_types: Vec<RustCrateType>,
     /// Compilation profile observed from the captured rustc invocation.
     pub profile: Profile,
+    /// The named profile of the node that built the artifact.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::node_profile::NodeProfile::is_dev"
+    )]
+    pub node_profile: crate::node_profile::NodeProfile,
     /// Sorted, deduplicated `--emit` modes observed from the invocation.
     pub emit: Vec<String>,
     /// The unit shape the builder recorded for this artifact — which side
@@ -456,6 +462,7 @@ mod tests {
                 invocation: crate::public_cache::UnitInvocation::Native,
                 kind: crate::public_cache::UnitKind::Linked,
             },
+            node_profile: crate::node_profile::NodeProfile::Dev,
         }
     }
 

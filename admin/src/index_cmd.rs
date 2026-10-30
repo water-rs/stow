@@ -889,6 +889,7 @@ fn semantic_rows(index: &ArtifactIndex) -> stow_types::error::Result<Vec<Publish
                 crate_name: row.crate_name.clone(),
                 version: row.version.clone(),
                 features_json: row.features_json.clone(),
+                node_profile: row.node_profile,
                 unit_shape: row.unit_shape,
                 dependency_identity: row.dependency_identity()?,
             })
@@ -1639,6 +1640,7 @@ mod tests {
                 kind: stow_types::public_cache::UnitKind::Linked,
             },
             min_glibc: None,
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 

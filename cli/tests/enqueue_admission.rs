@@ -43,6 +43,7 @@ const ADMISSIONS_RESPONSE: &str = r#"[{
             "target": "x86_64-unknown-linux-gnu",
             "rustc_version": "1.85.0",
             "explicit_spelling": "keys-as-native",
+            "profile": "dev",
             "dependency_identity": "0000000000000000000000000000000000000000000000000000000000000000"
         }]
     }

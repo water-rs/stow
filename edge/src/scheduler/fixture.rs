@@ -129,6 +129,7 @@ pub fn fixture_node(n: u32, deps: Vec<u32>) -> SubmissionNode {
         dependency_identity: digest_of(u64::from(n)),
         deps,
         downloads: u64::from(n % 7) * 1_000,
+        profile: stow_types::node_profile::NodeProfile::Dev,
     }
 }
 
@@ -150,6 +151,7 @@ pub fn named_node(name: &str, seed: u64, target: &str, deps: Vec<u32>) -> Submis
         dependency_identity: digest_of(seed),
         deps,
         downloads: 1,
+        profile: stow_types::node_profile::NodeProfile::Dev,
     }
 }
 
@@ -162,6 +164,7 @@ fn slice_row(n: u32, unit_shape: UnitShape) -> PublishedSliceRow {
         version: CrateVersion::new(semver::Version::parse(&version).expect("fixture version")),
         features_json: FeaturesJson::default(),
         unit_shape,
+        node_profile: stow_types::node_profile::NodeProfile::Dev,
     }
 }
 
@@ -787,6 +790,7 @@ pub fn full_slice_report() -> Vec<PublishedSliceRow> {
                     version: "1.0.0".parse().expect("full version"),
                     features_json: FeaturesJson::default(),
                     unit_shape: shape,
+                    node_profile: stow_types::node_profile::NodeProfile::Dev,
                 })
         })
         .collect()
@@ -824,6 +828,7 @@ pub fn delta_slice_report(shape: FixtureShape) -> (Vec<PublishedSliceRow>, Vec<P
                     version: "9.9.9".parse().expect("delta version"),
                     features_json: FeaturesJson::default(),
                     unit_shape: shape,
+                    node_profile: stow_types::node_profile::NodeProfile::Dev,
                 }),
         );
     }

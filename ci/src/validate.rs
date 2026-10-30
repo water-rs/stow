@@ -18,6 +18,23 @@ use crate::closure::DependencyClosure;
 use crate::dep_scan::ConsumedArtifact;
 use crate::plan::planned_artifact_key;
 
+/// A planned artifact belongs to the task's own node, so it carries the
+/// profile the task was dispatched with.
+fn validate_profile(
+    task: &BuildTaskPayload,
+    artifact: &PlannedArtifact,
+) -> stow_types::error::Result<()> {
+    if artifact.node_profile == task.profile {
+        return Ok(());
+    }
+    Err(stow_types::stow_error!(
+        "planned artifact {} was built under profile {} but the task requires {}",
+        artifact.oci_reference,
+        artifact.node_profile,
+        task.profile
+    ))
+}
+
 /// Reject the plan unless every entry — and every cache-consumption claim —
 /// belongs to `task`. The build stage only produces output when every phase
 /// finished and no foreign unit compiled, so a plan that reaches the
@@ -77,6 +94,7 @@ pub fn validate_plan(
                 task.rustc_version
             ));
         }
+        validate_profile(task, artifact)?;
         // stow#588: the digest claim is the claim that matters most —
         // an artifact built under a different dependency context is a
         // different artifact the cache must never serve under this
@@ -319,6 +337,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -383,6 +402,7 @@ mod tests {
             }],
             native: None,
             native_archive: None,
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         };
         artifact.oci_reference = oci_reference(
             &planned_artifact_key(&artifact).unwrap(),

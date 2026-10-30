@@ -470,6 +470,7 @@ fn expanded_dependency_identities(
                 target: TargetTriple::parse(if entry.host_side { host_triple } else { target })?,
                 rustc_version: rustc_version_typed.clone(),
                 host_side: entry.host_side,
+                profile: entry.profile,
             })
         })
         .collect::<stow_types::error::Result<Vec<_>>>()?;
@@ -1527,6 +1528,7 @@ mod tests {
                 invocation: stow_types::public_cache::UnitInvocation::Native,
                 kind: stow_types::public_cache::UnitKind::Linked,
             },
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -1551,9 +1553,11 @@ mod tests {
                         crate_name: libm_key.crate_name.clone(),
                         version: libm_key.version.clone(),
                         host_side: false,
+                        profile: stow_types::node_profile::NodeProfile::Dev,
                     }],
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                     explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: libm_key.crate_name.clone(),
@@ -1563,6 +1567,7 @@ mod tests {
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                     explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 },
             ],
             TARGET,
@@ -1883,9 +1888,11 @@ mod tests {
                     crate_name: dep_b.crate_name.clone(),
                     version: dep_b.version.clone(),
                     host_side: false,
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 }],
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
@@ -1895,6 +1902,7 @@ mod tests {
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
             ResolvedDependencyGraphEntry {
                 crate_name: missing.crate_name.clone(),
@@ -1904,6 +1912,7 @@ mod tests {
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
         ];
         let analysis =
@@ -2080,9 +2089,11 @@ mod tests {
                     crate_name: dep_b.crate_name.clone(),
                     version: dep_b.version.clone(),
                     host_side: false,
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 }],
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
             ResolvedDependencyGraphEntry {
                 crate_name: dep_b.crate_name.clone(),
@@ -2092,6 +2103,7 @@ mod tests {
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
                 explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
         ];
         let host = Some(GlibcVersion {
@@ -2132,6 +2144,7 @@ mod tests {
             dependencies: Vec::new(),
             dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         let dep_subgraph = stow_types::api::TaskSubgraph {
             root_deps: vec![0],
@@ -2142,6 +2155,7 @@ mod tests {
                 host_side: false,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             }],
         };
         let entries = vec![DependencyGraphEntry {
@@ -2154,6 +2168,7 @@ mod tests {
             crate_name: dep_b.crate_name.clone(),
             version: dep_b.version.clone(),
             host_side: false,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }];
         dep_a_entry.dependency_subgraph = dep_subgraph.clone();
         let expanded_entries = vec![dep_a_entry, leaf_entry(&dep_b)];
@@ -2169,6 +2184,7 @@ mod tests {
                     rustc_version: stow_types::identity::WireRustcVersion::parse(RUSTC)
                         .expect("rustc"),
                     host_side: false,
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 },
                 stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             )

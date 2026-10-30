@@ -151,7 +151,7 @@ impl Profile {
 }
 
 /// Panic strategy used during compilation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, utoipa::ToSchema)]
 pub enum PanicStrategy {
     /// `panic=unwind` — rustc's default.
     Unwind,

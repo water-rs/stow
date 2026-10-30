@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use stow_types::api::SubmissionSource;
+use stow_types::node_profile::NodeProfile;
 
 use crate::errors::QueueError;
 
@@ -93,8 +94,13 @@ impl Lane {
     }
 }
 
+const _: () = assert!(
+    NodeProfile::ALL.len() <= 4,
+    "the flags byte holds a profile ordinal in two bits"
+);
+
 /// Which side of the build a node compiles for, the two spelling flags,
-/// the blocked bit and the lane, packed into one byte.
+/// the blocked bit, the lane and the profile, packed into one byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Flags(pub(super) u8);
 
@@ -105,9 +111,18 @@ impl Flags {
     const BLOCKED: u8 = 1 << 3;
     const LANE_SHIFT: u8 = 4;
     const LANE_MASK: u8 = 0b11 << Self::LANE_SHIFT;
+    const PROFILE_SHIFT: u8 = 6;
+    const PROFILE_MASK: u8 = 0b11 << Self::PROFILE_SHIFT;
 
-    pub(super) const fn new(host: bool, explicit: bool, preserve: bool, lane: Lane) -> Self {
+    pub(super) const fn new(
+        host: bool,
+        explicit: bool,
+        preserve: bool,
+        lane: Lane,
+        profile: NodeProfile,
+    ) -> Self {
         let mut flags = Self(lane.bits() << Self::LANE_SHIFT);
+        flags.0 |= profile.ordinal() << Self::PROFILE_SHIFT;
         flags.set(Self::HOST, host);
         flags.set(Self::EXPLICIT, explicit);
         flags.set(Self::PRESERVE, preserve);
@@ -136,6 +151,18 @@ impl Flags {
 
     pub(super) const fn preserve(self) -> bool {
         self.has(Self::PRESERVE)
+    }
+
+    /// The node's named profile.
+    ///
+    /// # Panics
+    /// When the stored ordinal names no defined profile — the byte is
+    /// written only from a [`NodeProfile`].
+    pub(super) const fn profile(self) -> NodeProfile {
+        match NodeProfile::from_ordinal((self.0 & Self::PROFILE_MASK) >> Self::PROFILE_SHIFT) {
+            Some(profile) => profile,
+            None => panic!("node flags carry a profile ordinal no profile is defined for"),
+        }
     }
 
     pub(super) const fn blocked(self) -> bool {

@@ -706,6 +706,7 @@ fn payload_for(request: &EnqueueRequest) -> BuildTaskPayload {
         host_side: request.host_side,
         explicit_spelling: request.explicit_spelling,
         dependency_subgraph: request.dependency_subgraph.clone(),
+        profile: stow_types::node_profile::NodeProfile::Dev,
     }
 }
 

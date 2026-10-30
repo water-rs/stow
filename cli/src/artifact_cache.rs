@@ -4933,7 +4933,7 @@ pub mod tests {
             opt_level: "3".to_owned(),
             debug_assertions: true,
             overflow_checks: true,
-            ..bundle.manifest.config.profile.clone()
+            ..bundle.manifest.config.profile
         };
         // The key the entry for a plain `-C opt-level=3` was stored under
         // before the correction: the same hash without the check-defaults

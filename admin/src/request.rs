@@ -453,6 +453,7 @@ mod tests {
                 target: TargetTriple::parse(target).expect("target"),
                 rustc_version: WireRustcVersion::parse("1.99.0").expect("rustc"),
                 host_side,
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
             dependencies: vec![],

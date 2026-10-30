@@ -164,8 +164,13 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
         .verified_dependency_graph()?
         .dependency_task_ids(0)
         .ok_or_else(|| stow_types::stow_error!("verified dependency graph has no root node"))?;
-    let upload_plan =
-        plan::build_upload_plan(&report.artifacts, &report.consumed, &dependency_task_ids).await?;
+    let upload_plan = plan::build_upload_plan(
+        &report.artifacts,
+        &report.consumed,
+        &dependency_task_ids,
+        task.profile,
+    )
+    .await?;
     stage::write_build_output(output_dir, &task, &report, &upload_plan).await?;
     tracing::info!(
         task_id = %task.task_id,
@@ -611,6 +616,7 @@ mod task_fixture {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 

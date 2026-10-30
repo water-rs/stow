@@ -1208,6 +1208,7 @@ mod inline_dispatch_tests {
             dependency_identity: format!("{:064x}", slice * 100_000 + i)
                 .parse()
                 .expect("digest"),
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         };
         [4_000, 3_000, 2_500]
             .into_iter()

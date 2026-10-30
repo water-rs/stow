@@ -288,6 +288,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -308,6 +309,7 @@ mod tests {
             features: Vec::new(),
             is_crates_io: true,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -326,6 +328,7 @@ mod tests {
             features: Vec::new(),
             is_crates_io: false,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
