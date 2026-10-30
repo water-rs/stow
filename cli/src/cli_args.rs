@@ -63,6 +63,8 @@ pub struct CargoCommandArgs {
     pub no_stow_resolver: bool,
     #[command(flatten)]
     pub isolation: IsolationArgs,
+    #[command(flatten)]
+    pub cache: CacheSwitchArgs,
     #[arg(
         value_name = "CARGO_ARGS",
         num_args = 0..,
@@ -86,6 +88,40 @@ pub struct IsolationArgs {
     /// stow config.
     #[arg(long, value_enum, value_name = "LEVEL")]
     pub isolation: Option<crate::isolation::Level>,
+}
+
+/// The cache layer switches, flattened into the commands that run cargo
+/// (stow#1007). Each flag turns its layer off for this run, over the
+/// `[cache]` table of the stow config.
+#[derive(Debug, Clone, Copy, Default, Args)]
+pub struct CacheSwitchArgs {
+    /// Turn the remote cache off for this run: no edge or registry request,
+    /// no miss journal, no inexact report, and no entry downloaded earlier is
+    /// served; those units compile locally and are stored as local entries.
+    /// Overrides `[cache] remote` in the stow config.
+    #[arg(long)]
+    pub no_remote_cache: bool,
+    /// Turn the local cache of crates.io units off for this run: none is
+    /// looked up or stored. Overrides `[cache] local_crates_io`.
+    #[arg(long)]
+    pub no_local_crates_io_cache: bool,
+    /// Turn the local cache of git units off for this run: none is looked up
+    /// or stored. Overrides `[cache] local_git`.
+    #[arg(long)]
+    pub no_local_git_cache: bool,
+}
+
+impl CacheSwitchArgs {
+    /// The config's layers with this run's flags applied: a flag only turns a
+    /// layer off.
+    #[must_use]
+    pub const fn over(self, layers: crate::config::CacheLayers) -> crate::config::CacheLayers {
+        crate::config::CacheLayers {
+            remote: layers.remote && !self.no_remote_cache,
+            local_crates_io: layers.local_crates_io && !self.no_local_crates_io_cache,
+            local_git: layers.local_git && !self.no_local_git_cache,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -197,6 +233,62 @@ mod tests {
                 OsString::from("Cargo.toml"),
             ]
         );
+    }
+
+    #[test]
+    fn each_cache_flag_turns_off_its_own_layer_over_the_config() {
+        use crate::config::CacheLayers;
+        let parse = |flag: &str| {
+            let cli = Cli::try_parse_from(["stow", "build", flag]).expect("parse build command");
+            let Command::Build(args) = cli.command else {
+                panic!("expected build command");
+            };
+            args.cache
+        };
+        let on = CacheLayers::default();
+        assert_eq!(
+            parse("--no-remote-cache").over(on),
+            CacheLayers {
+                remote: false,
+                ..on
+            }
+        );
+        assert_eq!(
+            parse("--no-local-crates-io-cache").over(on),
+            CacheLayers {
+                local_crates_io: false,
+                ..on
+            }
+        );
+        assert_eq!(
+            parse("--no-local-git-cache").over(on),
+            CacheLayers {
+                local_git: false,
+                ..on
+            }
+        );
+        // A flag never turns a layer the config switched off back on.
+        let all_off = CacheLayers {
+            remote: false,
+            local_crates_io: false,
+            local_git: false,
+        };
+        assert_eq!(CacheSwitchArgs::default().over(all_off), all_off);
+        assert_eq!(parse("--no-local-git-cache").over(all_off), all_off);
+    }
+
+    #[test]
+    fn every_cargo_running_command_takes_the_cache_flags() {
+        for command in ["check", "build", "test", "predict"] {
+            Cli::try_parse_from([
+                "stow",
+                command,
+                "--no-remote-cache",
+                "--no-local-crates-io-cache",
+                "--no-local-git-cache",
+            ])
+            .unwrap_or_else(|error| panic!("{command} rejects a cache flag: {error}"));
+        }
     }
 
     #[test]

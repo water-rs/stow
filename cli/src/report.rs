@@ -301,7 +301,7 @@ async fn clear_pending(config: &StowConfig, claim: &Claim) -> stow_types::error:
 /// Whether this install reports at all: not opted out, and a cache mode that
 /// reaches the network (the report is the only thing it counts for).
 fn reports_enabled(config: &StowConfig) -> bool {
-    !crate::edge_client::analytics_opted_out() && config.cache_mode.reaches_network()
+    !crate::edge_client::analytics_opted_out() && config.cache.reaches_network()
 }
 
 /// Post the deltas since the last accepted report when a new UTC day
@@ -363,7 +363,7 @@ mod tests {
 
     fn test_config(cache_dir: PathBuf) -> StowConfig {
         StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "https://stow.waterui.dev".to_owned(),
             registry_base_url: stow_types::registry::GHCR_REGISTRY_URL.to_owned(),
             cache_dir,

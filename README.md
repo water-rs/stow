@@ -35,6 +35,18 @@ For the full surface area:
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — wire protocol, schema, trust boundaries.
 - [`PRIVACY.md`](PRIVACY.md) — exactly which anonymous usage statistics are collected and how to opt out (`STOW_NO_ANALYTICS=1`).
 
+## Switching a cache layer off
+
+The cache has three layers, each switched off on its own in the `[cache]` table of the [config file](docs/CONFIG.md) or for one run with a flag on `stow check`, `build`, `test` and `predict`:
+
+| Layer | Config | Flag | Off means |
+| --- | --- | --- | --- |
+| Remote cache | `remote = false` | `--no-remote-cache` | No request leaves the machine, no miss is reported, and entries downloaded earlier are not served: those units compile locally and are stored as local entries |
+| Local crates.io cache | `local_crates_io = false` | `--no-local-crates-io-cache` | Units built from crates.io are neither looked up nor stored locally |
+| Local git cache | `local_git = false` | `--no-local-git-cache` | Units built from git dependencies are neither looked up nor stored locally |
+
+If a git dependency reads files outside its own package, switch the local git cache off. [`docs/USAGE.md`](docs/USAGE.md) has the details.
+
 ## On Linux, mold is the linker
 
 When stow serves a project's dependencies, their compilation disappears and what is left in an edit-rebuild round is your own crate plus the link — so the link stops being noise and starts being the thing you wait for. [mold](https://github.com/rui314/mold) is a modern parallel linker, and the two effects compound: the more stow removes, the larger the link's share of what remains.

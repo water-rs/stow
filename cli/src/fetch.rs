@@ -815,7 +815,7 @@ mod tests {
 
     fn stub_config(edge_url: String) -> crate::config::StowConfig {
         crate::config::StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url,
             registry_base_url: String::new(),
             cache_dir: std::path::PathBuf::new(),

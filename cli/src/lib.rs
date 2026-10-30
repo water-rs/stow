@@ -587,17 +587,19 @@ async fn finish_rustc_compile(
                     // A resolved unit is keyed by construction — the
                     // classification inside `resolve_local_build_artifact`
                     // already excluded every uncached shape.
-                    log_nonfatal_result(
-                        "failed to store locally built artifact in the stow cache",
-                        artifact_cache::store_local_build_outputs(
-                            &base.config,
-                            parsed,
-                            &build,
-                            &base.host_target,
-                        )
-                        .await
-                        .map(|_| ()),
-                    );
+                    if base.config.cache.local(&build.identity.source) {
+                        log_nonfatal_result(
+                            "failed to store locally built artifact in the stow cache",
+                            artifact_cache::store_local_build_outputs(
+                                &base.config,
+                                parsed,
+                                &build,
+                                &base.host_target,
+                            )
+                            .await
+                            .map(|_| ()),
+                        );
+                    }
                     artifact = Some(build);
                 }
                 // A dependency whose bookkeeping genuinely never landed —
@@ -761,13 +763,14 @@ pub(crate) struct BuildContext {
     /// its wrappers they build for — a fallback for invocations that do
     /// not spell `--target`.
     pub(crate) public_cache_target: Option<String>,
-    /// The public cache is off — the global config's `cache_mode`, or a gate
+    /// The public cache is off — the remote cache layer being off, or a gate
     /// the driver decided (an unsupported toolchain, a profile the cache
     /// cannot key): local lookups still run.
     pub(crate) public_cache_disabled: bool,
-    /// The `off` cache mode: the local cache is neither read nor written, so
-    /// every unit compiles and nothing is recorded.
-    pub(crate) local_cache_disabled: bool,
+    /// The resolved cache layers (config, then flags). With every layer off
+    /// each unit compiles and nothing is recorded; a single layer off gates
+    /// its own lookups and stores where they happen.
+    pub(crate) cache: crate::config::CacheLayers,
     /// The facts the full graph analysis contributes once it lands. A
     /// supervised build starts the cell empty — the driver's analysis
     /// runs while cargo builds and commits it — while the standalone
@@ -1156,7 +1159,7 @@ impl BuildContext {
     /// A set-but-unreadable or malformed table file is a wiring bug and
     /// fails loudly, as a malformed inline payload did.
     fn from_env() -> stow_types::error::Result<Self> {
-        let cache_mode = crate::config::load_cache_mode()?;
+        let cache = crate::config::load_cache_layers()?;
         let unit_nodes =
             read_build_json_table_env::<unit_node::UnitNodeTable>(STOW_EXPANDED_GRAPH_PATH_ENV)?;
         let prefetch_candidates = read_build_json_table_env::<Vec<resolve::PrefetchArtifactRow>>(
@@ -1173,8 +1176,8 @@ impl BuildContext {
             public_cache_target: std::env::var(rustc_args::STOW_PUBLIC_CACHE_TARGET_ENV)
                 .ok()
                 .filter(|target| !target.trim().is_empty()),
-            public_cache_disabled: !cache_mode.reaches_network(),
-            local_cache_disabled: !cache_mode.uses_local_cache(),
+            public_cache_disabled: !cache.reaches_network(),
+            cache,
             analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                 semantic_fallback_enabled: std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV)
                     .is_some_and(|value| value != "0"),
@@ -1416,7 +1419,7 @@ impl supervisor::server::Handler for BuildSupervisor {
         if is_compile_unit(&parsed) {
             self.resolution_done.complete();
         }
-        if self.ctx.local_cache_disabled {
+        if self.ctx.cache.is_off() {
             return;
         }
         let Some(local_base) = self.env_cache.local_base(&observation.executable).await else {
@@ -1660,8 +1663,8 @@ async fn decide_rustc_invocation(
     ctx: &BuildContext,
     invocation_env: &supervisor::protocol::InvocationEnv,
 ) -> Outcome {
-    if ctx.local_cache_disabled {
-        // The `off` cache mode: nothing is looked up, recorded or stored, so
+    if ctx.cache.is_off() {
+        // Every cache layer is off: nothing is looked up, recorded or stored, so
         // the unit compiles and owes no bookkeeping.
         return Outcome::Compile(Box::new(PostCompile::raw(rustc)));
     }
@@ -1914,13 +1917,15 @@ async fn lookup_chain(
         c_metadata: env.request_c_metadata.as_str(),
     };
     if let Some(notifications) =
-        try_serve_local_cached_bundle(&env.env_base.config, parsed, &request, tally).await
+        try_serve_local_cached_bundle(&env.env_base.config, parsed, &env.source, &request, tally)
+            .await
     {
         return RemoteServe::Served(notifications);
     }
     if let Some(notifications) = try_serve_local_prefetched_graph_bundle(
         &env.env_base.config,
         parsed,
+        &env.source,
         &env.target,
         &env.rustc_version,
         ctx,
@@ -1934,6 +1939,7 @@ async fn lookup_chain(
         && let Some(notifications) = try_serve_local_semantic_cached_bundle(
             &env.env_base.config,
             parsed,
+            &env.source,
             semantic_request,
             tally,
         )
@@ -1969,6 +1975,9 @@ struct WrapperEnvironment<'a> {
     /// the breaker. Read once per build and kept in step by this build's
     /// own recordings (stow#347).
     circuit_tripped: bool,
+    /// The unit's source, which decides the local cache layer its lookups
+    /// and stores belong to.
+    source: UnitSource,
     target: String,
     rustc_version: String,
     /// `target/rustc_version/c_metadata`, the negative-cache key.
@@ -2728,6 +2737,7 @@ async fn prepare_unit_environment<'a>(
         env_base,
         env_cache,
         circuit_tripped,
+        source: source.clone(),
         target,
         rustc_version,
         cache_key,
@@ -3287,6 +3297,9 @@ async fn decide_local_only(
     ctx: &BuildContext,
     invocation_env: &supervisor::protocol::InvocationEnv,
 ) -> Outcome {
+    let UnitClass::Keyed { source, .. } = class else {
+        unreachable!("decide_local_only only runs for a keyed unit");
+    };
     let target = prep.target;
     if must_build_locally(parsed, &target, ctx.policy_dir.as_deref()) {
         // A remote-missable unit records the build against stats; a
@@ -3316,9 +3329,14 @@ async fn decide_local_only(
             c_metadata: identity.c_metadata.as_str(),
         };
         let mut tally = LookupTally::default();
-        let served =
-            try_serve_local_cached_bundle(&prep.env_base.config, parsed, &request, &mut tally)
-                .await;
+        let served = try_serve_local_cached_bundle(
+            &prep.env_base.config,
+            parsed,
+            source,
+            &request,
+            &mut tally,
+        )
+        .await;
         // A miss is never counted here: this path serves units the
         // public cache does not carry, so an unmet local lookup means
         // nothing was promised. A serve and a failed lookup are the
@@ -3425,7 +3443,7 @@ async fn run_cc_wrapper(
             return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
-    if !config.cache_mode.uses_local_cache() {
+    if !config.cache.uses_cc_cache() {
         return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
     }
     if let Err(error) = config.ensure_dirs().await {
@@ -3510,6 +3528,7 @@ async fn run_cc_wrapper(
 async fn try_serve_local_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
     request: &FetchRequest<'_>,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
@@ -3531,6 +3550,7 @@ async fn try_serve_local_cached_bundle(
     try_serve_loaded_local_cached_bundle(
         config,
         parsed,
+        source,
         request,
         EntryOrigin::ExactKey,
         cached_bundle,
@@ -3542,6 +3562,7 @@ async fn try_serve_local_cached_bundle(
 async fn try_serve_local_prefetched_graph_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
     target: &str,
     rustc_version: &str,
     ctx: &BuildContext,
@@ -3619,6 +3640,7 @@ async fn try_serve_local_prefetched_graph_bundle(
         if let Some(notifications) = try_serve_loaded_local_cached_bundle(
             config,
             parsed,
+            source,
             &request,
             EntryOrigin::GraphCandidate,
             cached_bundle,
@@ -3651,11 +3673,20 @@ enum EntryOrigin {
 async fn try_serve_loaded_local_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
     request: &FetchRequest<'_>,
     origin: EntryOrigin,
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
+    if !config.cache.serves(cached_bundle.provenance, source) {
+        tracing::debug!(
+            crate_name = %parsed.crate_name,
+            provenance = cached_bundle.provenance.as_column(),
+            "cache layer off for this entry, compiling the unit locally"
+        );
+        return None;
+    }
     if let Some(mismatch) = bundle_mismatch(
         parsed,
         &cached_bundle.profile,
@@ -4440,6 +4471,7 @@ async fn try_serve_downloaded_bundle(
 async fn try_serve_local_semantic_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
     semantic_request: &fetch::SemanticFetchRequest,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
@@ -4460,6 +4492,9 @@ async fn try_serve_local_semantic_cached_bundle(
         }
     };
     let cached_bundle = cached_bundle?;
+    if !config.cache.serves(cached_bundle.provenance, source) {
+        return None;
+    }
     if let Some(mismatch) = bundle_mismatch(
         parsed,
         &cached_bundle.profile,
@@ -6467,6 +6502,10 @@ mod tests {
         let served = super::try_serve_local_semantic_cached_bundle(
             &config,
             &parsed,
+            &super::UnitSource::CratesIo {
+                package: "anyhow".to_owned(),
+                version: "1.0.103".to_owned(),
+            },
             &semantic_request,
             &mut tally,
         )
@@ -6494,7 +6533,7 @@ mod tests {
     /// sets it to zero (stow#806).
     fn env_base_test_config(dir: &tempfile::TempDir) -> crate::config::StowConfig {
         crate::config::StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: dir.path().join("cache"),
@@ -6897,6 +6936,10 @@ mod tests {
             request_c_metadata: c_metadata.to_owned(),
             semantic_request: None,
             host_glibc: None,
+            source: super::UnitSource::CratesIo {
+                package: "anyhow".to_owned(),
+                version: "1.0.104".to_owned(),
+            },
         }
     }
 
@@ -6909,7 +6952,7 @@ mod tests {
             policy_dir: None,
             public_cache_target: None,
             public_cache_disabled: false,
-            local_cache_disabled: false,
+            cache: crate::config::CacheLayers::default(),
             analysis: std::sync::Arc::new(std::sync::OnceLock::from(super::AnalysisFacts {
                 semantic_fallback_enabled: false,
                 unit_nodes: None,
@@ -7141,7 +7184,7 @@ mod tests {
     async fn the_compile_key_is_the_command_lines_scan() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = crate::config::StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: tempdir.path().to_path_buf(),
@@ -7391,7 +7434,7 @@ mod tests {
 
         fn test_config(root: &Path) -> crate::config::StowConfig {
             crate::config::StowConfig {
-                cache_mode: crate::config::CacheMode::Public,
+                cache: crate::config::CacheLayers::default(),
                 edge_url: "http://127.0.0.1:9".to_owned(),
                 registry_base_url: "http://127.0.0.1:9".to_owned(),
                 cache_dir: root.join(".stow"),
@@ -7482,7 +7525,7 @@ mod tests {
                 policy_dir: None,
                 public_cache_target: Some(HOST_TARGET.to_owned()),
                 public_cache_disabled: false,
-                local_cache_disabled: false,
+                cache: crate::config::CacheLayers::default(),
                 analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                     semantic_fallback_enabled: false,
                     unit_nodes: None,
@@ -7635,7 +7678,7 @@ mod tests {
                 policy_dir: Some(policy_dir),
                 public_cache_target: Some(HOST_TARGET.to_owned()),
                 public_cache_disabled: false,
-                local_cache_disabled: false,
+                cache: crate::config::CacheLayers::default(),
                 analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                     semantic_fallback_enabled: false,
                     unit_nodes: None,

@@ -434,11 +434,11 @@ fn probe_env(with_macro: bool, net_target: &str) -> ProbeEnv {
 /// `stow-cli build` in the fixture with the probe's environment: the
 /// temporary HOME, the secret token the `read-env` probe must not see,
 /// and a `RUSTUP_HOME` so the toolchain resolves despite the moved HOME.
-/// Write `cache_mode = "off"` into the global config the probe build reads.
+/// Write the `[cache]` table with every layer off into the global config the probe build reads.
 fn turn_cache_off(env: &ProbeEnv) {
     support::write_global_config(
         &[&env.home, &env.dir.join("stow-home")],
-        "cache_mode = \"off\"\n",
+        "[cache]\nremote = false\nlocal_crates_io = false\nlocal_git = false\n",
     );
 }
 
@@ -639,7 +639,7 @@ fn outcome(stderr: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// Run the probe build at `level` and return what it refused and what it
-/// let through. `cache_off` runs it with `cache_mode = "off"` in the global
+/// let through. `cache_off` runs it with every cache layer off in the global
 /// config: the boundary must not depend on the cache (stow#1059).
 fn probe_level(level: &str, cache_off: bool) -> (Vec<String>, Vec<String>) {
     let (target, _pong) = spawn_pong_listener();
