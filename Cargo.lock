@@ -8053,7 +8053,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stow-admin"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "apple-native-keyring-store",
  "askama 0.14.0",
@@ -8102,7 +8102,7 @@ dependencies = [
 
 [[package]]
 name = "stow-build"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "async-fs",
  "async-net",
@@ -8150,7 +8150,7 @@ dependencies = [
 
 [[package]]
 name = "stow-cli"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "async-fs",
  "async-process",
@@ -8212,7 +8212,7 @@ dependencies = [
 
 [[package]]
 name = "stow-edge"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "askama 0.14.0",
@@ -8257,7 +8257,7 @@ dependencies = [
 
 [[package]]
 name = "stow-mock-registry"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "async-fs",
  "axum",
@@ -8289,7 +8289,7 @@ dependencies = [
 
 [[package]]
 name = "stow-oci"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "async-fs",
  "base64 0.23.1",
@@ -8351,7 +8351,7 @@ dependencies = [
 
 [[package]]
 name = "stow-shim"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "dirs 7.0.0",
  "hex",
@@ -8364,7 +8364,7 @@ dependencies = [
 
 [[package]]
 name = "stow-types"
-version = "0.12.1"
+version = "0.13.0"
 dependencies = [
  "blake3",
  "cap-fs-ext",
