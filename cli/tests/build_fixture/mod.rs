@@ -312,6 +312,7 @@ pub struct StoredEntry {
     pub compile_key: String,
     pub c_metadata: String,
     pub reach: i64,
+    pub provenance: String,
 }
 
 /// Every entry the state db at `db` stores; empty when the build stored
@@ -333,7 +334,7 @@ pub fn stored_entries(db: &Path) -> Vec<StoredEntry> {
                 .await
                 .expect("open the state db read-only");
             let rows = sqlx::query_as::<_, StoredEntry>(sqlx::AssertSqlSafe(
-                "SELECT crate_name, compile_key, c_metadata, reach FROM artifact_cache_entries"
+                "SELECT crate_name, compile_key, c_metadata, reach, provenance FROM artifact_cache_entries"
                     .to_owned(),
             ))
             .fetch_all(&pool)

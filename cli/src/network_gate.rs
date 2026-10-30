@@ -1,15 +1,15 @@
-//! Every network entry point refuses a cache mode that does not reach the
-//! network (stow#1059).
+//! Every network entry point refuses a config whose remote cache layer is off
+//! (stow#1059, stow#1007).
 //!
 //! The registry and the edge both point at a listener that counts the
-//! connections it is offered; each entry point runs under `local` and `off`,
-//! and the count must stay zero.
+//! connections it is offered; each entry point runs with the remote layer off,
+//! whatever the local layers say, and the count must stay zero.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::config::{CacheMode, StowConfig, VerifyMode};
+use crate::config::{CacheLayers, StowConfig, VerifyMode};
 use crate::fetch::BundleRef;
 
 /// A loopback listener that counts the connections it accepts, so a
@@ -44,9 +44,9 @@ impl Tripwire {
     }
 }
 
-fn config(cache_dir: &Path, cache_mode: CacheMode, tripwire: &Tripwire) -> StowConfig {
+fn config(cache_dir: &Path, cache: CacheLayers, tripwire: &Tripwire) -> StowConfig {
     StowConfig {
-        cache_mode,
+        cache,
         edge_url: tripwire.url.clone(),
         registry_base_url: tripwire.url.clone(),
         cache_dir: cache_dir.to_path_buf(),
@@ -65,10 +65,16 @@ fn config(cache_dir: &Path, cache_mode: CacheMode, tripwire: &Tripwire) -> StowC
 }
 
 #[tokio::test]
-async fn no_entry_point_reaches_the_network_outside_the_public_mode() {
+async fn no_entry_point_reaches_the_network_with_the_remote_cache_off() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let tripwire = Tripwire::set();
-    for mode in [CacheMode::Local, CacheMode::Off] {
+    for (local_crates_io, local_git) in [(true, true), (true, false), (false, true), (false, false)]
+    {
+        let mode = CacheLayers {
+            remote: false,
+            local_crates_io,
+            local_git,
+        };
         let dir = tempfile::tempdir().expect("cache dir");
         let config = config(dir.path(), mode, &tripwire);
         let bundle = BundleRef {
@@ -120,35 +126,52 @@ async fn no_entry_point_reaches_the_network_outside_the_public_mode() {
     assert_eq!(
         tripwire.connections(),
         0,
-        "a network entry point made a request outside the public cache mode"
+        "a network entry point made a request with the remote cache off"
     );
 }
 
 #[tokio::test]
-async fn the_public_mode_reaches_the_network() {
+async fn the_default_layers_reach_the_network() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let tripwire = Tripwire::set();
     let dir = tempfile::tempdir().expect("cache dir");
-    let config = config(dir.path(), CacheMode::Public, &tripwire);
+    let config = config(dir.path(), CacheLayers::default(), &tripwire);
     assert!(config.registry_http().await.is_ok());
     assert!(crate::edge_client::client(&config).is_ok());
 }
 
 #[test]
-fn the_cache_mode_is_read_from_the_config_file_spelling() {
+fn the_cache_layers_are_read_from_the_cache_table_of_the_config_file() {
     #[derive(serde::Deserialize)]
     struct File {
-        cache_mode: CacheMode,
+        cache: CacheLayers,
     }
-    for (spelled, mode) in [
-        ("public", CacheMode::Public),
-        ("local", CacheMode::Local),
-        ("off", CacheMode::Off),
-    ] {
-        let file: File = toml::from_str(&format!("cache_mode = \"{spelled}\"")).expect("parse");
-        assert_eq!(file.cache_mode, mode);
-        assert_eq!(mode.as_str(), spelled);
-    }
-    assert!(toml::from_str::<File>("cache_mode = \"remote\"").is_err());
-    assert_eq!(CacheMode::default(), CacheMode::Public);
+    let file: File = toml::from_str("[cache]\nremote = false\n").expect("parse");
+    assert_eq!(
+        file.cache,
+        CacheLayers {
+            remote: false,
+            local_crates_io: true,
+            local_git: true,
+        }
+    );
+    let file: File =
+        toml::from_str("[cache]\nlocal_crates_io = false\nlocal_git = false\n").expect("parse");
+    assert_eq!(
+        file.cache,
+        CacheLayers {
+            remote: true,
+            local_crates_io: false,
+            local_git: false,
+        }
+    );
+    assert!(toml::from_str::<File>("[cache]\nlocal = false\n").is_err());
+    assert_eq!(
+        CacheLayers::default(),
+        CacheLayers {
+            remote: true,
+            local_crates_io: true,
+            local_git: true,
+        }
+    );
 }

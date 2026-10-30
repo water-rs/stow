@@ -7,18 +7,11 @@ when set). Stow resolves the directory via the [`dirs` crate](https://docs.rs/di
 so the path follows your OS's conventions exactly.
 
 Environment variables (see [`ENVIRONMENT.md`](ENVIRONMENT.md)) override
-file values. Keys the file does not model are ignored, not rejected.
+file values. A key the file does not model fails the command.
 
 ## Schema
 
 ```toml
-# What the cache may touch; every stow process reads it.
-# - "public": the public cache and the local cache. Default.
-# - "local":  the local cache only; no stow process makes a network request.
-# - "off":    no cache: the local cache is neither read nor written, and no
-#            network request is made. Build isolation is unaffected.
-cache_mode = "public"
-
 # HTTPS URL of the edge worker that mints miss admissions.
 # Defaults to the production edge, https://stow.waterui.dev; set it only for
 # mock or staging runs. May also be set via $STOW_EDGE_URL.
@@ -66,6 +59,20 @@ verify_mode = "github-ci"
 
 # Circuit breaker reset window (seconds). Default 60.
 # circuit_reset_secs = 60
+
+# Which cache layers stow may use; every stow process reads it. Each layer
+# is on unless set to false, and a flag on the cargo-running commands turns
+# it off for one run (see USAGE.md).
+# - remote:          the remote cache. Off: no stow process makes a network
+#                    request, nothing about the build's graph is reported,
+#                    and entries downloaded earlier are not served.
+# - local_crates_io: lookup and store of locally built crates.io units.
+# - local_git:       lookup and store of locally built git units.
+# Build isolation is unaffected by every layer being off.
+[cache]
+remote = true
+local_crates_io = true
+local_git = true
 ```
 
 ## Resolution order

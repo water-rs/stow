@@ -242,6 +242,21 @@ async fn enter_foreground_hold() -> stow_types::error::Result<crate::derive_gate
     crate::derive_gate::ForegroundHold::enter(&gate_dir).await
 }
 
+/// The run's flags settle the cache layers before anything reads them: the
+/// config blob every wrapper decodes carries the result.
+fn settle_cache_layers(
+    config: Option<&mut StowConfig>,
+    switches: crate::cli_args::CacheSwitchArgs,
+) -> crate::config::CacheLayers {
+    match config {
+        Some(config) => {
+            config.cache = switches.over(config.cache);
+            config.cache
+        }
+        None => switches.over(crate::config::CacheLayers::default()),
+    }
+}
+
 async fn run_inner(
     command: &str,
     args: CargoCommandArgs,
@@ -254,17 +269,13 @@ async fn run_inner(
         args.isolation.isolation,
         crate::config::load_isolation_config()?,
     )?;
+    let cache_switches = args.cache;
     let invocation = CargoInvocation::new(command, args, isolation);
-    let config =
+    let mut config =
         tracing::debug_span!("stow.precargo.config_load").in_scope(|| load_stow_config(state_db));
+    let cache_layers = settle_cache_layers(config.as_mut(), cache_switches);
     let project = begin_project(config.as_ref(), &invocation).await?;
-    let mut public_cache_mode = PublicCacheMode::for_build(
-        &project.rustc_version,
-        config
-            .as_ref()
-            .map(|config| config.cache_mode)
-            .unwrap_or_default(),
-    );
+    let mut public_cache_mode = PublicCacheMode::for_build(&project.rustc_version, cache_layers);
     if let PublicCacheMode::Disabled {
         message: Some(message),
     } = &public_cache_mode
@@ -346,7 +357,6 @@ async fn run_inner(
             &invocation,
             &public_cache_mode,
             maybe_analysis,
-            state_db,
         )
         .await
     } else {
@@ -357,7 +367,6 @@ async fn run_inner(
             &public_cache_mode,
             &budget,
             &selected,
-            state_db,
         ))
         .await
     }
@@ -501,7 +510,6 @@ async fn run_original_workspace_build(
     invocation: &CargoInvocation,
     public_cache_mode: &PublicCacheMode,
     analysis: Option<WorkspacePrediction>,
-    state_db: &StateDb,
 ) -> stow_types::error::Result<ExitStatus> {
     let unit_nodes = analysis
         .as_ref()
@@ -521,7 +529,6 @@ async fn run_original_workspace_build(
     run_cargo(&CargoRunPlan {
         project,
         config,
-        state_db,
         action: &invocation.action,
         cargo_args: &invocation.cargo_args,
         source_root: &project.workspace_root,
@@ -536,7 +543,7 @@ async fn run_original_workspace_build(
             .map(|analysis| analysis.inexact_entries.as_slice()),
         // A configured build's facts came from the filesystem-only pass:
         // the full graph analysis is owed to the build while cargo runs.
-        deferred_analysis: config.is_some_and(|config| config.cache_mode.reaches_network()),
+        deferred_analysis: config.is_some_and(|config| config.cache.reaches_network()),
         semantic_fallback_enabled,
         covered_units,
         isolation: &invocation.isolation,
@@ -554,7 +561,6 @@ async fn run_mirrored_upgrade_build(
     public_cache_mode: &PublicCacheMode,
     budget: &CacheBudget,
     selected: &[CompatibleUpgrade],
-    state_db: &StateDb,
 ) -> stow_types::error::Result<ExitStatus> {
     let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
     apply_selected_upgrades(project, &mirror, selected).await?;
@@ -619,7 +625,6 @@ async fn run_mirrored_upgrade_build(
     run_cargo(&CargoRunPlan {
         project,
         config,
-        state_db,
         action: &invocation.action,
         cargo_args: &mirror_args,
         source_root: mirror.root(),
@@ -693,20 +698,22 @@ async fn analyze_for_prediction(
 ) -> stow_types::error::Result<Option<WorkspacePrediction>> {
     // `predict` reads cargo's metadata and unit graph and compiles nothing, so
     // there is no build script or proc macro to isolate.
+    let cache_switches = args.cache;
     let invocation = CargoInvocation::new("predict", args, crate::isolation::Isolation::off());
     let project = ProjectContext::load(&invocation).await?;
     // Unlike `check`/`build`, `predict` has no cargo run to protect: an
     // analysis it cannot compute is the command failing, and callers rely
     // on the exit status saying so.
-    let config = StowConfig::load(state_db.clone()).map_err(|error| {
+    let mut config = StowConfig::load(state_db.clone()).map_err(|error| {
         stow_types::stow_error!(
             "stow predict is unavailable because stow is not configured.\nreason: {error}"
         )
     })?;
+    config.cache = cache_switches.over(config.cache);
     config.require_network("stow predict")?;
     if let PublicCacheMode::Disabled {
         message: Some(message),
-    } = PublicCacheMode::for_build(&project.rustc_version, config.cache_mode)
+    } = PublicCacheMode::for_build(&project.rustc_version, config.cache)
     {
         write_stdout(&format!("{message}\n"))?;
         return Ok(None);
@@ -2365,7 +2372,7 @@ async fn try_stow_resolver(
         return Ok(None);
     };
 
-    let public_cache_mode = PublicCacheMode::for_build(&project.rustc_version, config.cache_mode);
+    let public_cache_mode = PublicCacheMode::for_build(&project.rustc_version, config.cache);
     let Some(pinned) = prepare_pinned_mirror(project, invocation, &stow_lockfile_toml).await?
     else {
         return Ok(None);
@@ -2580,7 +2587,6 @@ async fn run_pinned_mirror_build(
     run_cargo(&CargoRunPlan {
         project,
         config: Some(config),
-        state_db: &config.state_db,
         action: &invocation.action,
         cargo_args: &pinned.args,
         source_root: pinned.mirror.root(),
@@ -3753,10 +3759,6 @@ async fn passthrough_command(
 struct CargoRunPlan<'a> {
     project: &'a ProjectContext,
     config: Option<&'a StowConfig>,
-    /// The process's state-database handle — `config`'s own when there
-    /// is one — for the configs the build's supervisor loads itself
-    /// (stow#682).
-    state_db: &'a StateDb,
     action: &'a str,
     cargo_args: &'a [OsString],
     source_root: &'a Path,
@@ -3869,7 +3871,6 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     let CargoRunPlan {
         project,
         config,
-        state_db,
         action,
         public_cache_mode,
         covered_units,
@@ -3906,8 +3907,7 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
             policy_dir: cache_policy_path.clone(),
             public_cache_target: Some(project.target.clone()),
             public_cache_disabled: !public_cache_mode.is_enabled(),
-            local_cache_disabled: config
-                .is_some_and(|config| !config.cache_mode.uses_local_cache()),
+            cache: config.map_or_else(crate::config::CacheLayers::default, |config| config.cache),
             analysis: std::sync::Arc::clone(&analysis_cell),
             serve_map_ready: std::sync::Arc::clone(&serve_map_ready),
             policy_ready: std::sync::Arc::clone(&policy_ready),
@@ -3916,9 +3916,9 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
                 crate::RegistrySources::from_lockfile(&project.workspace_root).await?,
             ),
         },
+        config.cloned(),
         env_base,
         resolution_done.clone(),
-        state_db.clone(),
     ));
     let (mut cargo_run, mut supervisor) =
         spawn_cargo_run(plan, &handler, in_flight, &wrappers, launch, scratch.path()).await?;
@@ -4017,7 +4017,7 @@ async fn finish_cargo_run(
         plan.project.foreground.release();
         // Misses, admissions and the usage report exist only to reach the
         // network; the local-only and off cache modes keep none of them.
-        if config.cache_mode.reaches_network() {
+        if config.cache.reaches_network() {
             admit_build_misses(plan, config, handler).await;
         }
     }
@@ -5178,16 +5178,16 @@ fn percentage(numerator: usize, denominator: usize) -> f64 {
 enum PublicCacheMode {
     Enabled,
     /// The public cache is off for this build. `message` is the warning for a
-    /// cause the user did not choose; the config's `cache_mode` is the user's
-    /// own choice and prints nothing.
+    /// cause the user did not choose; the remote cache layer being off is the
+    /// user's own choice and prints nothing.
     Disabled {
         message: Option<String>,
     },
 }
 
 impl PublicCacheMode {
-    fn for_build(rustc_version: &str, cache_mode: crate::config::CacheMode) -> Self {
-        if !cache_mode.reaches_network() {
+    fn for_build(rustc_version: &str, cache: crate::config::CacheLayers) -> Self {
+        if !cache.reaches_network() {
             return Self::Disabled { message: None };
         }
         let Some(reason) = unsupported_public_cache_reason(rustc_version) else {
@@ -5263,7 +5263,7 @@ mod tests {
 
     fn test_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
@@ -5564,7 +5564,6 @@ mod tests {
             let plan = CargoRunPlan {
                 project: &project,
                 config: None,
-                state_db: &crate::state_db::StateDb::default(),
                 action: "check",
                 cargo_args: &cargo_args,
                 source_root: &project.workspace_root,
@@ -6116,7 +6115,7 @@ mod tests {
 
     fn stow_config(cache_dir: &Path) -> crate::config::StowConfig {
         crate::config::StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:1".to_owned(),
             registry_base_url: "http://127.0.0.1:1".to_owned(),
             cache_dir: cache_dir.to_path_buf(),
@@ -6200,7 +6199,6 @@ mod tests {
         let plan = CargoRunPlan {
             project: &project,
             config: Some(&config),
-            state_db: &config.state_db,
             action: "check",
             cargo_args: &[],
             source_root: &project.workspace_root,

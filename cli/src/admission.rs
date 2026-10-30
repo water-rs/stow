@@ -583,7 +583,7 @@ mod tests {
 
     fn test_config() -> StowConfig {
         StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: std::path::PathBuf::from("/tmp/stow-admission-test"),

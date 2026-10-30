@@ -1247,11 +1247,19 @@ pub async fn store_local_build_outputs(
     let existing = load_artifact_cache_entry(&connection, &build.rustc_version, &cache_key).await?;
     if let Some(entry) = existing.as_ref() {
         // Surface corrupt rows even when the entry is already covered.
-        ArtifactProvenance::from_column(&entry.provenance)?;
+        let provenance = ArtifactProvenance::from_column(&entry.provenance)?;
         if entry_dir.exists() {
-            // Another writer — a local store or a completed download — already
-            // covers this identity; either provenance serves future hits.
-            return Ok(false);
+            if provenance == ArtifactProvenance::Remote && !config.cache.remote {
+                // With the remote cache off the downloaded entry serves
+                // nothing, and one row holds the key: this build's own
+                // compile replaces it as a local entry.
+                remove_orphaned_entry_dir(entry_dir.clone()).await?;
+            } else {
+                // Another writer — a local store or a completed download —
+                // already covers this identity; either provenance serves
+                // future hits.
+                return Ok(false);
+            }
         }
     }
     if existing.is_none() && entry_dir.exists() {
@@ -6199,6 +6207,74 @@ pub mod tests {
         });
     }
 
+    /// stow#1007: with the remote cache off an entry downloaded earlier is
+    /// replaced by this build's own compile, stored as a local entry; with it
+    /// on the download keeps the key.
+    #[test]
+    fn a_local_store_replaces_a_downloaded_entry_only_with_the_remote_off() {
+        for remote in [true, false] {
+            let tempdir = tempfile::tempdir().expect("tempdir");
+            let mut config = test_config(tempdir.path());
+            config.cache.remote = remote;
+            let out_dir = tempdir.path().join("deps");
+            std::fs::create_dir_all(&out_dir).expect("create dep out dir");
+
+            let stable_c_metadata = "1122334455667788";
+            let parsed = local_build_parsed("demo", "cargo-meta-5", out_dir, &["link"]);
+            std::fs::write(
+                parsed.output_rlib_path().expect("rlib output path"),
+                b"locally-built",
+            )
+            .expect("write rlib");
+            let build = local_build_artifact(&parsed, stable_c_metadata);
+            let request = fetch_request(stable_c_metadata);
+            let bundle = sample_bundle(stable_c_metadata, "libdemo-1122334455667788.rlib");
+
+            run_async(async {
+                prepare_local_cache(&config, "1.91.1")
+                    .await
+                    .expect("prepare cache");
+                drop(
+                    super::store_downloaded_bundle(&config, &request, &bundle)
+                        .await
+                        .expect("download"),
+                );
+                let stored = super::store_local_build_outputs(
+                    &config,
+                    &parsed,
+                    &build,
+                    "aarch64-apple-darwin",
+                )
+                .await
+                .expect("store local build");
+                assert_eq!(stored, !remote, "remote {remote}: store outcome");
+
+                let pool = connect(&config.cache_dir).await.expect("connect state db");
+                let provenance: String = sqlx::query_scalar(
+                    "SELECT provenance FROM artifact_cache_entries \
+                     WHERE rustc_version = '1.91.1' AND cache_key = ?",
+                )
+                .bind(cache_key(&request))
+                .fetch_one(&pool)
+                .await
+                .expect("load provenance row");
+                assert_eq!(
+                    provenance,
+                    if remote { "remote" } else { "local" },
+                    "remote {remote}: provenance"
+                );
+                let served = super::load_cached_bundle(&config, &request)
+                    .await
+                    .expect("reload")
+                    .expect("the entry stays cached");
+                assert_eq!(
+                    served.provenance == super::ArtifactProvenance::Local,
+                    !remote
+                );
+            });
+        }
+    }
+
     #[test]
     fn local_entry_is_evicted_by_shared_lru_budget() {
         let tempdir = tempfile::tempdir().expect("tempdir");
@@ -7052,7 +7128,7 @@ pub mod tests {
 
     fn test_config(root: &std::path::Path) -> StowConfig {
         StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:8787".to_owned(),
             registry_base_url: "http://127.0.0.1:8787".to_owned(),
             cache_dir: root.join(".stow"),

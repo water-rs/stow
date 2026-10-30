@@ -587,17 +587,19 @@ async fn finish_rustc_compile(
                     // A resolved unit is keyed by construction — the
                     // classification inside `resolve_local_build_artifact`
                     // already excluded every uncached shape.
-                    log_nonfatal_result(
-                        "failed to store locally built artifact in the stow cache",
-                        artifact_cache::store_local_build_outputs(
-                            &base.config,
-                            parsed,
-                            &build,
-                            &base.host_target,
-                        )
-                        .await
-                        .map(|_| ()),
-                    );
+                    if base.config.cache.local(&build.identity.source) {
+                        log_nonfatal_result(
+                            "failed to store locally built artifact in the stow cache",
+                            artifact_cache::store_local_build_outputs(
+                                &base.config,
+                                parsed,
+                                &build,
+                                &base.host_target,
+                            )
+                            .await
+                            .map(|_| ()),
+                        );
+                    }
                     artifact = Some(build);
                 }
                 // A dependency whose bookkeeping genuinely never landed —
@@ -761,13 +763,14 @@ pub(crate) struct BuildContext {
     /// its wrappers they build for — a fallback for invocations that do
     /// not spell `--target`.
     pub(crate) public_cache_target: Option<String>,
-    /// The public cache is off — the global config's `cache_mode`, or a gate
+    /// The public cache is off — the remote cache layer being off, or a gate
     /// the driver decided (an unsupported toolchain, a profile the cache
     /// cannot key): local lookups still run.
     pub(crate) public_cache_disabled: bool,
-    /// The `off` cache mode: the local cache is neither read nor written, so
-    /// every unit compiles and nothing is recorded.
-    pub(crate) local_cache_disabled: bool,
+    /// The resolved cache layers (config, then flags). With every layer off
+    /// each unit compiles and nothing is recorded; a single layer off gates
+    /// its own lookups and stores where they happen.
+    pub(crate) cache: crate::config::CacheLayers,
     /// The facts the full graph analysis contributes once it lands. A
     /// supervised build starts the cell empty — the driver's analysis
     /// runs while cargo builds and commits it — while the standalone
@@ -1156,7 +1159,7 @@ impl BuildContext {
     /// A set-but-unreadable or malformed table file is a wiring bug and
     /// fails loudly, as a malformed inline payload did.
     fn from_env() -> stow_types::error::Result<Self> {
-        let cache_mode = crate::config::load_cache_mode()?;
+        let cache = crate::config::load_cache_layers()?;
         let unit_nodes =
             read_build_json_table_env::<unit_node::UnitNodeTable>(STOW_EXPANDED_GRAPH_PATH_ENV)?;
         let prefetch_candidates = read_build_json_table_env::<Vec<resolve::PrefetchArtifactRow>>(
@@ -1173,8 +1176,8 @@ impl BuildContext {
             public_cache_target: std::env::var(rustc_args::STOW_PUBLIC_CACHE_TARGET_ENV)
                 .ok()
                 .filter(|target| !target.trim().is_empty()),
-            public_cache_disabled: !cache_mode.reaches_network(),
-            local_cache_disabled: !cache_mode.uses_local_cache(),
+            public_cache_disabled: !cache.reaches_network(),
+            cache,
             analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                 semantic_fallback_enabled: std::env::var_os(STOW_ENABLE_SEMANTIC_FALLBACK_ENV)
                     .is_some_and(|value| value != "0"),
@@ -1293,17 +1296,19 @@ impl BuildSupervisor {
     /// the driver computed before cargo spawned — the facts the lazy
     /// loader would have probed on the first facade's critical path —
     /// seeded into the env cache so `compiled` answers immediately
-    /// (stow#608). `state_db` is the process's handle: a base the cache
-    /// has to load for a spelling the seed does not cover opens the same
-    /// database the driver's own config does (stow#682).
+    /// (stow#608). `config` is the driver's resolved config: a base the
+    /// cache has to prepare for a spelling the seed does not cover
+    /// carries it — the run's cache-layer flags and the driver's state
+    /// database included — rather than one re-read from the config file
+    /// (stow#682, stow#1007).
     pub(crate) fn new(
         ctx: BuildContext,
+        config: Option<StowConfig>,
         base: Option<std::sync::Arc<WrapperEnvBase>>,
         resolution_done: ResolutionDone,
-        state_db: StateDb,
     ) -> Self {
         let supervisor = Self {
-            env_cache: WrapperEnvCache::new(state_db),
+            env_cache: WrapperEnvCache::for_build(config),
             ctx,
             resolution_done,
             observations: std::sync::Mutex::default(),
@@ -1390,7 +1395,7 @@ impl supervisor::server::Handler for BuildSupervisor {
         compile_time: std::time::Duration,
     ) {
         pending.compile_time = compile_time;
-        let local_base = self.env_cache.local_base(&pending.executable).await;
+        let local_base = self.env_cache.base(&pending.executable).await;
         self.finish_and_observe(&pending, success, local_base.as_deref())
             .await;
     }
@@ -1416,10 +1421,10 @@ impl supervisor::server::Handler for BuildSupervisor {
         if is_compile_unit(&parsed) {
             self.resolution_done.complete();
         }
-        if self.ctx.local_cache_disabled {
+        if self.ctx.cache.is_off() {
             return;
         }
-        let Some(local_base) = self.env_cache.local_base(&observation.executable).await else {
+        let Some(local_base) = self.env_cache.base(&observation.executable).await else {
             return;
         };
         // The mark's key is the target decide computes: the unit's own
@@ -1623,7 +1628,7 @@ async fn run_rustc_standalone(
             let status =
                 run_passthrough_status(&command.executable, &[], &command.wrapped_args).await?;
             post.compile_time = started.elapsed();
-            let local_base = env_cache.local_base(&command.executable).await;
+            let local_base = env_cache.base(&command.executable).await;
             if let Ok(Some(build)) = finish_rustc_compile(
                 &post,
                 status.success(),
@@ -1660,8 +1665,8 @@ async fn decide_rustc_invocation(
     ctx: &BuildContext,
     invocation_env: &supervisor::protocol::InvocationEnv,
 ) -> Outcome {
-    if ctx.local_cache_disabled {
-        // The `off` cache mode: nothing is looked up, recorded or stored, so
+    if ctx.cache.is_off() {
+        // Every cache layer is off: nothing is looked up, recorded or stored, so
         // the unit compiles and owes no bookkeeping.
         return Outcome::Compile(Box::new(PostCompile::raw(rustc)));
     }
@@ -1914,13 +1919,15 @@ async fn lookup_chain(
         c_metadata: env.request_c_metadata.as_str(),
     };
     if let Some(notifications) =
-        try_serve_local_cached_bundle(&env.env_base.config, parsed, &request, tally).await
+        try_serve_local_cached_bundle(&env.env_base.config, parsed, &env.source, &request, tally)
+            .await
     {
         return RemoteServe::Served(notifications);
     }
     if let Some(notifications) = try_serve_local_prefetched_graph_bundle(
         &env.env_base.config,
         parsed,
+        &env.source,
         &env.target,
         &env.rustc_version,
         ctx,
@@ -1934,6 +1941,7 @@ async fn lookup_chain(
         && let Some(notifications) = try_serve_local_semantic_cached_bundle(
             &env.env_base.config,
             parsed,
+            &env.source,
             semantic_request,
             tally,
         )
@@ -1969,6 +1977,9 @@ struct WrapperEnvironment<'a> {
     /// the breaker. Read once per build and kept in step by this build's
     /// own recordings (stow#347).
     circuit_tripped: bool,
+    /// The unit's source, which decides the local cache layer its lookups
+    /// and stores belong to.
+    source: UnitSource,
     target: String,
     rustc_version: String,
     /// `target/rustc_version/c_metadata`, the negative-cache key.
@@ -2048,12 +2059,17 @@ pub(crate) struct WrapperEnvCache {
     /// or a symlinked path otherwise, and all of them can name the one
     /// toolchain file the seed probed.
     seeded: std::sync::Mutex<Option<std::sync::Arc<WrapperEnvBase>>>,
-    /// The remote path's bases (`StowConfig::load`), one memoized cell
-    /// per executable spelling the facades report.
-    env_bases: MemoizedBaseMap,
-    /// The local path's bases (`StowConfig::load_local`), shared by
-    /// `decide_local_only` and the post-compile finish.
-    local_bases: MemoizedBaseMap,
+    /// The config every base this cache prepares carries. A build's
+    /// supervisor sets it to the driver's resolved config — the run's
+    /// cache-layer flags included — so no spelling the seed does not cover
+    /// re-reads the config file and loses them (stow#1007); a standalone
+    /// invocation loads it from its own environment on first use, where
+    /// the driver's `STOW_CONFIG_BLOB` carries the same value. `None`: no
+    /// config, and every invocation bypasses.
+    config: std::sync::OnceLock<Option<StowConfig>>,
+    /// One memoized base per executable spelling the facades report,
+    /// shared by the remote and local paths and the post-compile finish.
+    bases: MemoizedBaseMap,
     /// Each spelling's `rustc -vV` host triple — config-independent, so
     /// the in-flight marks a dependent's bookkeeping waits on never
     /// depend on an env base that can legitimately be absent (stow#618);
@@ -2075,8 +2091,8 @@ pub(crate) struct WrapperEnvCache {
     /// step by the build's own recordings — plus the open broadcast an
     /// in-flight download abandons on (stow#977).
     circuit: circuit::BuildCircuit,
-    /// The process's state-database handle, given to every config the
-    /// base loaders read (stow#682).
+    /// The process's state-database handle, given to the config a
+    /// standalone invocation loads (stow#682).
     state_db: StateDb,
     /// The resolved commit of each cargo git checkout a git-sourced unit
     /// named — one `gix` read per checkout per build (stow#1006).
@@ -2210,13 +2226,25 @@ async fn resolves_to_same_file(spelling: &OsStr, target: &OsStr, path: &OsStr) -
 }
 
 impl WrapperEnvCache {
-    /// An empty memo reading this process's `PATH`, whose loaders hand
-    /// `state_db` to every config they read.
+    /// An empty memo reading this process's `PATH`, which loads its
+    /// config from this process's environment on first use and hands it
+    /// `state_db`.
     fn new(state_db: StateDb) -> Self {
+        Self::with_config(std::sync::OnceLock::new(), state_db)
+    }
+
+    /// A build's memo: every base carries `config`, the driver's resolved
+    /// config, and nothing is loaded from the environment — the closed
+    /// handle fails any such load instead of opening a second database.
+    fn for_build(config: Option<StowConfig>) -> Self {
+        Self::with_config(std::sync::OnceLock::from(config), StateDb::closed())
+    }
+
+    fn with_config(config: std::sync::OnceLock<Option<StowConfig>>, state_db: StateDb) -> Self {
         Self {
             seeded: std::sync::Mutex::new(None),
-            env_bases: MemoizedBaseMap::default(),
-            local_bases: MemoizedBaseMap::default(),
+            config,
+            bases: MemoizedBaseMap::default(),
             host_targets: MemoizedHostMap::default(),
             path: std::env::var_os("PATH").unwrap_or_default(),
             slices: MemoizedSliceMap::default(),
@@ -2313,19 +2341,29 @@ impl WrapperEnvCache {
         cpu
     }
 
-    /// The base `load` prepares for the executable `rustc` as the
-    /// facade spelled it — memoized per spelling, so no spelling is
-    /// probed twice in one build. A spelling that resolves to the seeded
-    /// base's file adopts it; one that resolves elsewhere is probed
-    /// once. A `None` means every invocation bypasses — the wrapper
+    /// The config this cache's bases carry: the build's, or this
+    /// process's own loaded once.
+    fn config(&self) -> Option<&StowConfig> {
+        self.config
+            .get_or_init(|| match StowConfig::load_local(self.state_db.clone()) {
+                Ok(config) => Some(config),
+                Err(error) => {
+                    tracing::warn!(error = %error, "stow config unavailable, bypassing rust cache");
+                    None
+                }
+            })
+            .as_ref()
+    }
+
+    /// The base for the executable `rustc` as the facade spelled it —
+    /// memoized per spelling, so no spelling is probed twice in one
+    /// build. A spelling that resolves to the seeded base's file adopts
+    /// it; one that resolves elsewhere is probed once, under this cache's
+    /// config. A `None` means every invocation bypasses — the wrapper
     /// exists to accelerate builds, never to break them.
-    async fn base(
-        &self,
-        map: &MemoizedBaseMap,
-        rustc: &OsStr,
-        load: impl Fn(StateDb) -> stow_types::error::Result<StowConfig> + Send + Sync,
-    ) -> Option<std::sync::Arc<WrapperEnvBase>> {
-        let cell = map
+    pub(crate) async fn base(&self, rustc: &OsStr) -> Option<std::sync::Arc<WrapperEnvBase>> {
+        let cell = self
+            .bases
             .lock()
             .expect("env base map mutex")
             .entry(rustc.to_os_string())
@@ -2338,28 +2376,13 @@ impl WrapperEnvCache {
             {
                 return Some(seed);
             }
-            let config = match load(self.state_db.clone()) {
-                Ok(config) => config,
-                Err(error) => {
-                    tracing::warn!(error = %error, "stow config unavailable, bypassing rust cache");
-                    return None;
-                }
-            };
+            let config = self.config()?.clone();
             load_wrapper_env_base(rustc, config, self.rustc_host_target(rustc))
                 .await
                 .map(std::sync::Arc::new)
         })
         .await
         .clone()
-    }
-
-    async fn env_base(&self, rustc: &OsStr) -> Option<std::sync::Arc<WrapperEnvBase>> {
-        self.base(&self.env_bases, rustc, StowConfig::load).await
-    }
-
-    pub(crate) async fn local_base(&self, rustc: &OsStr) -> Option<std::sync::Arc<WrapperEnvBase>> {
-        self.base(&self.local_bases, rustc, StowConfig::load_local)
-            .await
     }
 
     /// The host triple `rustc` compiles target-less units for — one
@@ -2650,7 +2673,7 @@ async fn prepare_unit_environment<'a>(
             .await
             .map(UnitPreparation::LocalOnly);
     }
-    let env_base = env_cache.env_base(rustc).await?;
+    let env_base = env_cache.base(rustc).await?;
     let target = parsed
         .target
         .clone()
@@ -2677,7 +2700,7 @@ async fn prepare_unit_environment<'a>(
     if reach == Reach::LocalOnly {
         // A crates.io unit over a local-only dependency is local-only
         // itself: local lookups only, no remote, no miss (stow#1006).
-        let local_base = env_cache.local_base(rustc).await?;
+        let local_base = env_cache.base(rustc).await?;
         return Some(UnitPreparation::LocalOnly(LocalOnlyPreparation {
             env_base: local_base,
             target,
@@ -2728,6 +2751,7 @@ async fn prepare_unit_environment<'a>(
         env_base,
         env_cache,
         circuit_tripped,
+        source: source.clone(),
         target,
         rustc_version,
         cache_key,
@@ -2750,7 +2774,7 @@ async fn prepare_local_only(
     source_local_only: bool,
     env_cache: &WrapperEnvCache,
 ) -> Option<LocalOnlyPreparation> {
-    let local_base = env_cache.local_base(rustc).await?;
+    let local_base = env_cache.base(rustc).await?;
     let target = parsed
         .target
         .clone()
@@ -3287,6 +3311,9 @@ async fn decide_local_only(
     ctx: &BuildContext,
     invocation_env: &supervisor::protocol::InvocationEnv,
 ) -> Outcome {
+    let UnitClass::Keyed { source, .. } = class else {
+        unreachable!("decide_local_only only runs for a keyed unit");
+    };
     let target = prep.target;
     if must_build_locally(parsed, &target, ctx.policy_dir.as_deref()) {
         // A remote-missable unit records the build against stats; a
@@ -3316,9 +3343,14 @@ async fn decide_local_only(
             c_metadata: identity.c_metadata.as_str(),
         };
         let mut tally = LookupTally::default();
-        let served =
-            try_serve_local_cached_bundle(&prep.env_base.config, parsed, &request, &mut tally)
-                .await;
+        let served = try_serve_local_cached_bundle(
+            &prep.env_base.config,
+            parsed,
+            source,
+            &request,
+            &mut tally,
+        )
+        .await;
         // A miss is never counted here: this path serves units the
         // public cache does not carry, so an unmet local lookup means
         // nothing was promised. A serve and a failed lookup are the
@@ -3425,7 +3457,7 @@ async fn run_cc_wrapper(
             return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
         }
     };
-    if !config.cache_mode.uses_local_cache() {
+    if !config.cache.uses_cc_cache() {
         return run_passthrough_status(&compiler.program, &compiler.env, compiler_args).await;
     }
     if let Err(error) = config.ensure_dirs().await {
@@ -3510,6 +3542,7 @@ async fn run_cc_wrapper(
 async fn try_serve_local_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
     request: &FetchRequest<'_>,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
@@ -3531,6 +3564,7 @@ async fn try_serve_local_cached_bundle(
     try_serve_loaded_local_cached_bundle(
         config,
         parsed,
+        source,
         request,
         EntryOrigin::ExactKey,
         cached_bundle,
@@ -3542,6 +3576,7 @@ async fn try_serve_local_cached_bundle(
 async fn try_serve_local_prefetched_graph_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
     target: &str,
     rustc_version: &str,
     ctx: &BuildContext,
@@ -3619,6 +3654,7 @@ async fn try_serve_local_prefetched_graph_bundle(
         if let Some(notifications) = try_serve_loaded_local_cached_bundle(
             config,
             parsed,
+            source,
             &request,
             EntryOrigin::GraphCandidate,
             cached_bundle,
@@ -3651,11 +3687,20 @@ enum EntryOrigin {
 async fn try_serve_loaded_local_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
     request: &FetchRequest<'_>,
     origin: EntryOrigin,
     cached_bundle: artifact_cache::CachedArtifactBundle,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
+    if !config.cache.serves(cached_bundle.provenance, source) {
+        tracing::debug!(
+            crate_name = %parsed.crate_name,
+            provenance = cached_bundle.provenance.as_column(),
+            "cache layer off for this entry, compiling the unit locally"
+        );
+        return None;
+    }
     if let Some(mismatch) = bundle_mismatch(
         parsed,
         &cached_bundle.profile,
@@ -4440,6 +4485,7 @@ async fn try_serve_downloaded_bundle(
 async fn try_serve_local_semantic_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
     semantic_request: &fetch::SemanticFetchRequest,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
@@ -4460,6 +4506,9 @@ async fn try_serve_local_semantic_cached_bundle(
         }
     };
     let cached_bundle = cached_bundle?;
+    if !config.cache.serves(cached_bundle.provenance, source) {
+        return None;
+    }
     if let Some(mismatch) = bundle_mismatch(
         parsed,
         &cached_bundle.profile,
@@ -6102,8 +6151,8 @@ mod tests {
         let handler = std::sync::Arc::new(super::BuildSupervisor::new(
             super::BuildContext::default(),
             None,
+            None,
             resolution_done.clone(),
-            crate::state_db::StateDb::default(),
         ));
 
         let _ = crate::supervisor::server::Handler::plan(
@@ -6164,8 +6213,8 @@ mod tests {
         let handler = std::sync::Arc::new(super::BuildSupervisor::new(
             super::BuildContext::default(),
             None,
+            None,
             resolution_done.clone(),
-            crate::state_db::StateDb::default(),
         ));
 
         crate::supervisor::server::Handler::observed(
@@ -6467,6 +6516,10 @@ mod tests {
         let served = super::try_serve_local_semantic_cached_bundle(
             &config,
             &parsed,
+            &super::UnitSource::CratesIo {
+                package: "anyhow".to_owned(),
+                version: "1.0.103".to_owned(),
+            },
             &semantic_request,
             &mut tally,
         )
@@ -6494,7 +6547,7 @@ mod tests {
     /// sets it to zero (stow#806).
     fn env_base_test_config(dir: &tempfile::TempDir) -> crate::config::StowConfig {
         crate::config::StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: dir.path().join("cache"),
@@ -6524,17 +6577,27 @@ mod tests {
         which::which("rustc").expect("the test machine has rustc on PATH")
     }
 
-    /// A `WrapperEnvCache` whose `PATH` is the test's injected value.
+    /// A `WrapperEnvCache` with no config whose `PATH` is the test's
+    /// injected value.
     fn test_cache(path: &std::ffi::OsStr) -> super::WrapperEnvCache {
+        test_cache_with(path, None)
+    }
+
+    /// A build's `WrapperEnvCache` over `config` whose `PATH` is the
+    /// test's injected value.
+    fn test_cache_with(
+        path: &std::ffi::OsStr,
+        config: Option<&crate::config::StowConfig>,
+    ) -> super::WrapperEnvCache {
         super::WrapperEnvCache {
             seeded: std::sync::Mutex::new(None),
-            env_bases: super::MemoizedBaseMap::default(),
-            local_bases: super::MemoizedBaseMap::default(),
+            config: std::sync::OnceLock::from(config.cloned()),
+            bases: super::MemoizedBaseMap::default(),
             host_targets: super::MemoizedHostMap::default(),
             path: path.to_os_string(),
             slices: super::MemoizedSliceMap::default(),
             circuit: crate::circuit::BuildCircuit::new(),
-            state_db: crate::state_db::StateDb::default(),
+            state_db: crate::state_db::StateDb::closed(),
             git_commits: std::sync::Mutex::new(std::collections::HashMap::new()),
             native_cpus: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
@@ -6574,7 +6637,9 @@ mod tests {
     }
 
     /// A spelling that does not resolve to the seeded file is probed —
-    /// but exactly once, however many frames carry it (stow#608 A1).
+    /// but exactly once, however many frames carry it (stow#608 A1) —
+    /// and its base carries the build's config, the run's cache layers
+    /// included, never one re-read from the config file (stow#1007).
     #[cfg(unix)]
     #[tokio::test]
     async fn an_unseeded_spelling_loads_its_base_exactly_once() {
@@ -6600,31 +6665,35 @@ mod tests {
                 .expect("chmod fake rustc");
         }
 
-        let cache = test_cache(std::ffi::OsStr::new(""));
-        cache.seed(std::sync::Arc::new(seeded));
-        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = {
-            let loads = loads.clone();
-            let config = config.clone();
-            move |_state_db| {
-                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(config.clone())
-            }
-        };
-        for _ in 0..4 {
+        // The run turned the remote layer off: the seed and the build's
+        // config both carry it, and no config file says so.
+        let mut build_config = config.clone();
+        build_config.cache.remote = false;
+        let cache = test_cache_with(std::ffi::OsStr::new(""), Some(&build_config));
+        let seeded = std::sync::Arc::new(seeded);
+        cache.seed(seeded.clone());
+        let first = cache
+            .base(fake.as_os_str())
+            .await
+            .expect("the unseeded spelling still resolves a base");
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &seeded),
+            "a spelling naming another file does not adopt the seed"
+        );
+        assert_eq!(
+            first.config.cache, build_config.cache,
+            "the unseeded spelling's base carries the build's cache layers"
+        );
+        for _ in 0..3 {
             let base = cache
-                .base(&cache.env_bases, fake.as_os_str(), &counted)
-                .await;
+                .base(fake.as_os_str())
+                .await
+                .expect("the unseeded spelling still resolves a base");
             assert!(
-                base.is_some(),
-                "the unseeded spelling still resolves a base"
+                std::sync::Arc::ptr_eq(&base, &first),
+                "every frame shares the spelling's one base"
             );
         }
-        assert_eq!(
-            loads.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "four frames loaded the unseeded spelling's base exactly once"
-        );
     }
 
     /// A spelling that reaches the seed's file through a symlinked
@@ -6653,25 +6722,16 @@ mod tests {
         .expect("symlink bin dir");
         let spelling = link_dir.path().join("bin").join("rustc");
 
-        let cache = test_cache(std::ffi::OsStr::new(""));
+        let cache = test_cache_with(std::ffi::OsStr::new(""), Some(&config));
         cache.seed(seeded.clone());
-        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = {
-            let loads = loads.clone();
-            move |_state_db| {
-                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                unreachable!("the adopted seed never loads")
-            }
-        };
         let base = cache
-            .base(&cache.env_bases, spelling.as_os_str(), &counted)
+            .base(spelling.as_os_str())
             .await
             .expect("the symlinked spelling adopts the seed");
         assert!(
             std::sync::Arc::ptr_eq(&base, &seeded),
             "the adopted base IS the seeded base"
         );
-        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// A bare `rustc` found on the injected `PATH` adopts the seed —
@@ -6693,22 +6753,13 @@ mod tests {
 
         let path =
             std::env::join_paths([rustc.parent().expect("rustc has a parent")]).expect("join PATH");
-        let cache = test_cache(&path);
+        let cache = test_cache_with(&path, Some(&config));
         cache.seed(seeded.clone());
-        let loads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = {
-            let loads = loads.clone();
-            move |_state_db| {
-                loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                unreachable!("the adopted seed never loads")
-            }
-        };
         let base = cache
-            .base(&cache.env_bases, std::ffi::OsStr::new("rustc"), &counted)
+            .base(std::ffi::OsStr::new("rustc"))
             .await
             .expect("the bare spelling adopts the seed");
         assert!(std::sync::Arc::ptr_eq(&base, &seeded));
-        assert_eq!(loads.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     /// An empty index under the fixture header — the slice-memo tests
@@ -6897,6 +6948,10 @@ mod tests {
             request_c_metadata: c_metadata.to_owned(),
             semantic_request: None,
             host_glibc: None,
+            source: super::UnitSource::CratesIo {
+                package: "anyhow".to_owned(),
+                version: "1.0.104".to_owned(),
+            },
         }
     }
 
@@ -6909,7 +6964,7 @@ mod tests {
             policy_dir: None,
             public_cache_target: None,
             public_cache_disabled: false,
-            local_cache_disabled: false,
+            cache: crate::config::CacheLayers::default(),
             analysis: std::sync::Arc::new(std::sync::OnceLock::from(super::AnalysisFacts {
                 semantic_fallback_enabled: false,
                 unit_nodes: None,
@@ -7141,7 +7196,7 @@ mod tests {
     async fn the_compile_key_is_the_command_lines_scan() {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let config = crate::config::StowConfig {
-            cache_mode: crate::config::CacheMode::Public,
+            cache: crate::config::CacheLayers::default(),
             edge_url: "http://127.0.0.1:9".to_owned(),
             registry_base_url: "http://127.0.0.1:9".to_owned(),
             cache_dir: tempdir.path().to_path_buf(),
@@ -7391,7 +7446,7 @@ mod tests {
 
         fn test_config(root: &Path) -> crate::config::StowConfig {
             crate::config::StowConfig {
-                cache_mode: crate::config::CacheMode::Public,
+                cache: crate::config::CacheLayers::default(),
                 edge_url: "http://127.0.0.1:9".to_owned(),
                 registry_base_url: "http://127.0.0.1:9".to_owned(),
                 cache_dir: root.join(".stow"),
@@ -7482,7 +7537,7 @@ mod tests {
                 policy_dir: None,
                 public_cache_target: Some(HOST_TARGET.to_owned()),
                 public_cache_disabled: false,
-                local_cache_disabled: false,
+                cache: crate::config::CacheLayers::default(),
                 analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                     semantic_fallback_enabled: false,
                     unit_nodes: None,
@@ -7521,18 +7576,14 @@ mod tests {
                     .expect("prepare local cache"),
             });
             let in_flight = server::InFlightUnits::default();
-            let env_cache = crate::WrapperEnvCache::new(config.state_db.clone());
-            // Both base maps get the fixture's cell: an unset cell loads
-            // through `StowConfig::load`, which reads the developer's
-            // `~/.stow` — a real index slice for the host there would
-            // serve the fixture's units from state the test never wrote
-            // (stow#800).
-            let cell = Arc::new(tokio::sync::OnceCell::from(Some(base)));
-            for map in [&env_cache.local_bases, &env_cache.env_bases] {
-                map.lock()
-                    .expect("env base map mutex")
-                    .insert(OsString::from("rustc"), Arc::clone(&cell));
-            }
+            let env_cache = crate::WrapperEnvCache::for_build(Some(config.clone()));
+            // The fixture's base answers the `rustc` spelling directly: its
+            // facts are the fixture's, not the machine rustc's a probe
+            // would read.
+            env_cache.bases.lock().expect("env base map mutex").insert(
+                OsString::from("rustc"),
+                Arc::new(tokio::sync::OnceCell::from(Some(base))),
+            );
             let handler = Arc::new(BuildSupervisor {
                 env_cache,
                 ctx: ctx(&in_flight),
@@ -7635,7 +7686,7 @@ mod tests {
                 policy_dir: Some(policy_dir),
                 public_cache_target: Some(HOST_TARGET.to_owned()),
                 public_cache_disabled: false,
-                local_cache_disabled: false,
+                cache: crate::config::CacheLayers::default(),
                 analysis: std::sync::Arc::new(std::sync::OnceLock::from(AnalysisFacts {
                     semantic_fallback_enabled: false,
                     unit_nodes: None,
