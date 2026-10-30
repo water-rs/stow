@@ -12,6 +12,9 @@ use sha2::{Digest as _, Sha256};
 use stow_resolver::{ResolveOptions, Resolver, StowSide, StowUnit};
 use stow_types::identity::WireRustcVersion;
 
+/// The profile these offline resolves project their graphs under.
+const DEV: stow_types::node_profile::NodeProfile = stow_types::node_profile::NodeProfile::Dev;
+
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 /// One fixture crate in the local registry.
@@ -1288,6 +1291,7 @@ fn a_host_tasks_closure_pins_deduped_packages_at_target_sides() {
         pinned_rustc_version(),
         stow_types::api::EnqueueSource::CrateUpdate,
         0,
+        DEV,
     )
     .unwrap();
 
@@ -3036,7 +3040,7 @@ fn merkle_context_propagates_from_offline_resolve() {
     assert_eq!(dep_features(&unsafe_), vec!["unsafe".to_owned()]);
 
     let parent = |out: &[(String, stow_resolver::StowResolveOutput)]| {
-        let graph = stow_resolver::resolved_task_graph(&out[0].1.units, rustc).unwrap();
+        let graph = stow_resolver::resolved_task_graph(&out[0].1.units, rustc, DEV).unwrap();
         let index = graph
             .nodes()
             .iter()
@@ -3132,7 +3136,7 @@ fn explicit_spelling_marks_proc_macro_closures() {
         )
         .unwrap();
     let graph =
-        stow_resolver::resolved_task_graph(&out[0].1.units, pinned_rustc_version()).unwrap();
+        stow_resolver::resolved_task_graph(&out[0].1.units, pinned_rustc_version(), DEV).unwrap();
     let apart = stow_types::public_cache::ExplicitSpelling::KeysApart;
     let native = stow_types::public_cache::ExplicitSpelling::KeysAsNative;
     assert_eq!(

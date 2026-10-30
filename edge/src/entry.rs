@@ -250,6 +250,9 @@ fn trusted_nodes(gate: &github_auth::TrustRateLimitGate) -> [RouteNode; 2] {
                 "/dispatch-cap"
                     .at(api::get_dispatch_cap)
                     .post(api::set_dispatch_cap),
+                "/release-priority"
+                    .at(api::get_release_priority)
+                    .post(api::set_release_priority),
                 "/queue".at(api::admin_queue_list),
                 "/queue/retry".post(api::admin_queue_retry),
                 "/queue/cancel".post(api::admin_queue_cancel),

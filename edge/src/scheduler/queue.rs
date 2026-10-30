@@ -42,6 +42,29 @@ pub const PREHEAT_PRIORITY: i64 = 10;
 /// The inexact-hit report — a hundredth of the CLI's priority.
 pub const INEXACT_PRIORITY: i64 = 1;
 
+/// The scale a profile's weight is a share of: the dev profile ranks at
+/// the whole scale, so a rank is `priority × weight × waited` with the
+/// weight a whole number of hundredths (stow#1012).
+pub const PRIORITY_SCALE: u32 = 100;
+/// Default for the operator's `release-priority set`: release-profile
+/// nodes rank at this percent of their entry point's priority, inside
+/// the same aging rank as every other node. Provisional.
+pub const DEFAULT_RELEASE_PRIORITY_PERCENT: u32 = 10;
+
+/// A node's weight in the claim rank: its profile's share of
+/// [`PRIORITY_SCALE`], `release_percent` being the operator's release
+/// multiplier.
+pub const fn profile_weight(
+    profile: stow_types::node_profile::NodeProfile,
+    release_percent: u32,
+) -> u32 {
+    use stow_types::node_profile::NodeProfile as P;
+    match profile {
+        P::Dev => PRIORITY_SCALE,
+        P::Release => release_percent,
+    }
+}
+
 /// The priority operand a submission tree's nodes enter the rank with
 /// (stow#879): the source's class, or the caller's own value for
 /// operations. The operand is what `rank = operand × waited` reads.

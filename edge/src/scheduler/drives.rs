@@ -2598,6 +2598,73 @@ pub const DRIVES: &[Drive] = &[
             })
         }),
     },
+    Drive {
+        // The operator's multiplier read (stow#1012): one read of
+        // state the graph holds.
+        name: "GET /release-priority",
+        setup: None,
+        run: |_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.loaded().with(|graph| graph.release_priority_view());
+                Ok(())
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The operator's `set` (stow#1012): one `ReleasePriority`
+        // append and nothing after it — ranks are read at claim time,
+        // so the route re-keys no queue and runs no dispatch pass. The
+        // seed stores no setting and a `set` has no clear, so the
+        // cleanup drops the in-memory setting and a snapshot makes that
+        // the store's state, the log row it covered going with the
+        // prefix.
+        name: "POST /release-priority",
+        setup: Some(|_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                if ctx
+                    .loaded()
+                    .with(|graph| graph.release_priority().is_some())
+                {
+                    return Err(
+                        "POST /release-priority drive expects the seed's unset multiplier"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            })
+        }),
+        run: |db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                routes::commit_as(
+                    ctx.loaded(),
+                    db,
+                    Some(DRIVE_ACTOR),
+                    &[SchedulerEvent::ReleasePriority {
+                        setting: Box::new(stow_types::api::ReleasePrioritySetting {
+                            percent: 50,
+                            set_at: "2026-01-01T00:00:00.000Z".to_owned(),
+                            actor: DRIVE_ACTOR.to_owned(),
+                        }),
+                    }],
+                    now_ms(),
+                )
+                .await
+                .map_err(text)?;
+                ctx.loaded().with(|graph| graph.release_priority_view());
+                Ok(())
+            })
+        },
+        cleanup: Some(|db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                ctx.loaded()
+                    .with(super::graph::Graph::restore_unset_release_priority);
+                routes::snapshot(ctx.loaded(), db, now_ms())
+                    .await
+                    .map_err(text)
+            })
+        }),
+    },
     // The per-task run drives (stow#876). Each setup claims one window
     // node and binds it to a run, so the drive prices what a bound
     // in-flight task costs — event-sized, never the graph.
