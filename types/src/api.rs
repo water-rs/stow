@@ -56,7 +56,7 @@ pub fn is_ci_target(target: &str) -> bool {
 
 /// The GitHub Actions runner pool a CI target builds on.
 ///
-/// Mirrors the `runs-on` map in `build-crate.yml`: `macos-14` for the
+/// Mirrors the `runs-on` map in `build-crate.yml`: `macos-26` for the
 /// Apple targets, `windows-latest` for the MSVC targets, `ubuntu-latest`
 /// for the rest. The scheduler caps dispatches per family because the
 /// pools are sized very differently — the org's macOS pool is the
@@ -65,7 +65,7 @@ pub fn is_ci_target(target: &str) -> bool {
 pub enum RunnerFamily {
     /// `ubuntu-latest` — also hosts the Android and wasm builds.
     Linux,
-    /// `macos-14` — the smallest pool in the org's runner fleet.
+    /// `macos-26` — the smallest pool in the org's runner fleet.
     MacOs,
     /// `windows-latest` — the slowest legs of a full wave.
     Windows,
