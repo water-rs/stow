@@ -677,6 +677,45 @@ lanes (`preheat-admin.yml`, `preheat-missed.yml`, `demand-feed.yml`,
 `index-publish.yml`, `resolve-request.yml`) call their own routes with
 their own tokens.
 
+### Repack follow-up
+
+A repack sweep (`build-crate.yml` dispatched with `repack_rustc`, run title
+`<rustc>-repack`; see *OCI bundle layout* in `ARCHITECTURE.md`) is
+resumable, and its `repack` job is bound by GitHub's 350-minute job limit.
+`repack-followup.yml` runs on the completion of every `build-crate` run
+and acts only on a `<rustc>-repack` title, dispatching onto `main` with
+the run's own `GITHUB_TOKEN`:
+
+- Success: `index-publish.yml` for that rustc with `report=true` (the
+  fold), then `preheat-cron.yml` with `refresh=true`.
+- Retry of the parked nodes: on every successful `Index publish`
+  completion the same workflow looks at the `<rustc>-repack` runs of the
+  last 24 hours and, for each rustc whose newest repack run succeeded,
+  dispatches `operations.yml` with
+  `["queue","retry","--status","failed","--rustc","<rustc>","--yes"]`
+  (returning the nodes parked `failed` by builds against old-layout
+  bundles to `pending`) only when the index publish was created after
+  that repack run completed, so its fold covers the repacked records, and
+  no `operations.yml` run titled with that argv was created since the
+  repack completed. The second condition is the one-shot marker: a node
+  that keeps failing is not retried on every later publish. The retry
+  follows a fold instead of the preheat dispatch because a retried node
+  carries no backoff and is dispatched at once.
+- `failure` or `timed_out`: the sweep is dispatched again with
+  `repack_rustc` and `repack_concurrency` from `STOW_REPACK_CONCURRENCY`
+  (default 32). A `cancelled` run resumes only when its `repack` job
+  (read from the run's jobs API) is `timed_out`, or `cancelled` after
+  running to within 15 minutes of its 350-minute limit: GitHub's REST
+  documentation lists `timed_out` and `cancelled` as job conclusions
+  without saying which a `timeout-minutes` expiry reports, so both are
+  handled, and an operator cancel (a `cancelled` job well under the
+  limit) is never resumed. No resume starts while another `<rustc>-repack`
+  run is queued or running.
+- Bound: with `STOW_REPACK_MAX_RUNS_PER_DAY` (default 8) or more
+  `<rustc>-repack` runs created in the last 24 hours, the follow-up job
+  fails with that message instead of dispatching; the run list and the
+  watchdog's failure path show a sweep that does not converge.
+
 ## Initial cache population
 
 The cache preheats itself — `preheat-cron.yml` dispatches a wave

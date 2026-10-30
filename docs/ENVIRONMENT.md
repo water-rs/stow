@@ -152,6 +152,15 @@ task from the dispatch event file `GITHUB_EVENT_PATH` names
 | `STOW_LOCAL_CI_STUB` | serve | **Mock/test-only.** When set (any value), the local CI server short-circuits each task's build and publish work — the dispatch POST the budget probe and the launch-load run measure stays real, while a stubbed run still pushes the task's (empty) records artifact and completes through the same signed `workflow_run` webhook. |
 | `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), visible in CI logs here. |
 
+## Repack follow-up (`repack-followup.yml`)
+
+Repository variables (Settings, Actions, Variables), read by the workflow, not by a binary.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STOW_REPACK_CONCURRENCY` | `32` (unset or empty) | Operator setting: `repack_concurrency`, tasks in flight, of the repack run the follow-up dispatches to resume a sweep that failed or hit its job timeout. A positive whole number; anything else fails the job. |
+| `STOW_REPACK_MAX_RUNS_PER_DAY` | `8` (unset or empty) | Operator setting: resumes stop once this many `<rustc>-repack` runs were created for the rustc in the last 24 hours (the run that just ended counts); the follow-up job then fails. A whole number; no ceiling. |
+
 ## Local code signing (`admin/build.rs` + `scripts/signing-ld.sh`)
 
 | Variable | Default | Purpose |

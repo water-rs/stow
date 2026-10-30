@@ -1222,6 +1222,7 @@ fn entrypoints_run_on_linux_runners() {
         "preheat-projects.yml",
         "index-publish-cron.yml",
         "operations.yml",
+        "repack-followup.yml",
     ] {
         let workflow = load_workflow(file);
         let jobs = field(&workflow, "jobs")
@@ -1659,5 +1660,426 @@ fn index_publish_reconciles_after_the_publish_under_full() {
                 "report with full reconciles after the publish"
             ),
         }
+    }
+}
+
+// ===========================================================================
+// repack-followup.yml
+// ===========================================================================
+
+fn repack_followup() -> serde_yml::Value {
+    load_workflow("repack-followup.yml")
+}
+
+/// A completed `workflow_run` delivery for the follow-up's `job`.
+fn followup_runner<'a>(
+    scn: &'a Scenario,
+    job: &str,
+    title: &str,
+    conclusion: &str,
+    vars: &[(&str, &str)],
+    env: &[(&str, &str)],
+) -> support::Runner<'a> {
+    let mut ctx = actions_ctx();
+    set_path(
+        &mut ctx,
+        "github.event_name",
+        Val::Str("workflow_run".to_owned()),
+    );
+    for (key, value) in [
+        ("github.event.workflow_run.display_title", title),
+        ("github.event.workflow_run.conclusion", conclusion),
+        ("github.event.workflow_run.id", "4242"),
+    ] {
+        set_path(&mut ctx, key, Val::Str(value.to_owned()));
+    }
+    for (name, value) in vars {
+        set_path(
+            &mut ctx,
+            &format!("vars.{name}"),
+            Val::Str((*value).to_owned()),
+        );
+    }
+    run_job(scn, &repack_followup(), job, ctx, base_env(env))
+}
+
+fn resume_runner<'a>(
+    scn: &'a Scenario,
+    title: &str,
+    conclusion: &str,
+    vars: &[(&str, &str)],
+    env: &[(&str, &str)],
+) -> support::Runner<'a> {
+    followup_runner(scn, "resume", title, conclusion, vars, env)
+}
+
+const RESUME_STEP: &str = "Follow up the repack run";
+
+/// The run list the per-day bound reads: `n` repack runs for 1.99.0 inside
+/// the window (a far-future timestamp is always after the cutoff), the
+/// last of them in progress when `active`.
+fn runs_json(n: usize, active: bool) -> String {
+    let runs: Vec<_> = (0..n)
+        .map(|i| {
+            let status = if active && i + 1 == n { "in_progress" } else { "completed" };
+            format!(r#"{{"display_title":"1.99.0-repack","status":"{status}","created_at":"2099-01-01T00:00:00Z"}}"#)
+        })
+        .chain(std::iter::once(
+            r#"{"display_title":"1.99.0-0123456789ab","status":"completed"}"#.to_owned(),
+        ))
+        .collect();
+    format!(
+        r#"{{"total_count":{},"workflow_runs":[{}]}}"#,
+        runs.len(),
+        runs.join(",")
+    )
+}
+
+fn job_json(conclusion: &str, minutes: i64) -> String {
+    let end = format!("2026-01-01T{:02}:{:02}:00Z", minutes / 60, minutes % 60);
+    let start = "2026-01-01T00:00:00Z";
+    format!(
+        r#"{{"total_count":2,"jobs":[{{"name":"other","conclusion":"success","started_at":"{start}","completed_at":"{start}"}},{{"name":"repack 1.99.0","conclusion":"{conclusion}","started_at":"{start}","completed_at":"{end}"}}]}}"#,
+    )
+}
+
+#[test]
+fn followup_declarations() {
+    let wf = repack_followup();
+    assert_eq!(
+        at(&wf, "on.workflow_run.workflows")
+            .and_then(|s| s.as_sequence())
+            .map(|s| s.iter().map(scalar).collect::<Vec<_>>()),
+        Some(vec!["build-crate".to_owned(), "Index publish".to_owned()])
+    );
+    assert_eq!(
+        at(&wf, "on.workflow_run.types")
+            .and_then(|s| s.as_sequence())
+            .map(|s| s.iter().map(scalar).collect::<Vec<_>>()),
+        Some(vec!["completed".to_owned()])
+    );
+    assert!(at(&wf, "on.workflow_dispatch").is_none());
+    assert_eq!(
+        at(&wf, "permissions.actions").map(scalar).as_deref(),
+        Some("write")
+    );
+    assert_eq!(
+        at(&wf, "permissions.contents").map(scalar).as_deref(),
+        Some("read")
+    );
+    // One group per completed run title; completions queue, never cancel.
+    assert_eq!(
+        at(&wf, "concurrency.group").map(scalar).as_deref(),
+        Some("repack-followup-${{ github.event.workflow_run.display_title }}")
+    );
+    assert_eq!(
+        at(&wf, "concurrency.cancel-in-progress")
+            .map(scalar)
+            .as_deref(),
+        Some("false")
+    );
+    // The timeout the cancelled-job heuristic measures is the repack job's.
+    let steps = job_steps(&wf, "resume");
+    let env = &steps[0].env;
+    let build = load_workflow("build-crate.yml");
+    assert_eq!(
+        env.get("REPACK_JOB_TIMEOUT_MINUTES").map(String::as_str),
+        at(&build, "jobs.repack.timeout-minutes")
+            .map(scalar)
+            .as_deref()
+    );
+    // The retry follows the workflow `workflow_run` names, and the marker
+    // reads the title `operations.yml` renders for the argv.
+    let publish = load_workflow("index-publish.yml");
+    assert_eq!(
+        at(&publish, "name").map(scalar).as_deref(),
+        Some("Index publish")
+    );
+    assert!(at(&publish, "on.workflow_dispatch.inputs.after_repack").is_none());
+    let operations = load_workflow("operations.yml");
+    assert_eq!(
+        at(&operations, "run-name").map(scalar).as_deref(),
+        Some("stow-admin ${{ inputs.argv }} (by ${{ github.actor }})")
+    );
+}
+
+#[test]
+fn followup_success_publishes_the_index_then_refreshes_the_preheat() {
+    let scn = Scenario::new();
+    let runner = resume_runner(&scn, "1.99.0-repack", "success", &[], &[]);
+    assert_eq!(runner.outcome_of(RESUME_STEP), &Outcome::Ran(0));
+    let dispatches = refill_dispatches(&scn);
+    assert_eq!(
+        dispatches,
+        [
+            (
+                "index-publish.yml".to_owned(),
+                "main".to_owned(),
+                BTreeMap::from([
+                    ("report".to_owned(), "true".to_owned()),
+                    ("rustc_version".to_owned(), "1.99.0".to_owned()),
+                ])
+            ),
+            (
+                "preheat-cron.yml".to_owned(),
+                "main".to_owned(),
+                BTreeMap::from([("refresh".to_owned(), "true".to_owned())])
+            ),
+        ]
+    );
+}
+
+const RETRY_STEP: &str = "Retry the failed nodes of repacked rustcs";
+const REPACK_DONE: &str = "2026-03-01T10:00:00Z";
+const RETRY_ARGV: &str = r#"["queue","retry","--status","failed","--rustc","1.99.0","--yes"]"#;
+
+fn repack_run(title: &str, created: &str, conclusion: &str) -> String {
+    format!(
+        r#"{{"display_title":"{title}","created_at":"{created}","updated_at":"{REPACK_DONE}","status":"completed","conclusion":"{conclusion}"}}"#
+    )
+}
+
+fn run_list(runs: &[String]) -> String {
+    format!(r#"{{"workflow_runs":[{}]}}"#, runs.join(","))
+}
+
+/// A successful `Index publish` completion created at `index_created`,
+/// with the given build-crate and operations run lists.
+fn retry_runner<'a>(
+    scn: &'a Scenario,
+    index_created: &str,
+    repacks: &[String],
+    operations: &[String],
+) -> support::Runner<'a> {
+    let mut ctx = actions_ctx();
+    set_path(
+        &mut ctx,
+        "github.event_name",
+        Val::Str("workflow_run".to_owned()),
+    );
+    for (key, value) in [
+        ("github.event.workflow_run.name", "Index publish"),
+        ("github.event.workflow_run.conclusion", "success"),
+        ("github.event.workflow_run.created_at", index_created),
+    ] {
+        set_path(&mut ctx, key, Val::Str(value.to_owned()));
+    }
+    let repacks = run_list(repacks);
+    let operations = run_list(operations);
+    let runner = run_job(
+        scn,
+        &repack_followup(),
+        "retry",
+        ctx,
+        base_env(&[
+            ("STUB_GH_RUNS", &repacks),
+            ("STUB_GH_OPS_RUNS", &operations),
+        ]),
+    );
+    assert_eq!(runner.outcome_of(RETRY_STEP), &Outcome::Ran(0));
+    runner
+}
+
+fn retry_dispatches(scn: &Scenario) -> Vec<String> {
+    let dispatches = refill_dispatches(scn);
+    for (workflow, reference, _) in &dispatches {
+        assert_eq!(
+            (workflow.as_str(), reference.as_str()),
+            ("operations.yml", "main")
+        );
+    }
+    dispatches
+        .into_iter()
+        .map(|(_, _, fields)| fields["argv"].clone())
+        .collect()
+}
+
+#[test]
+fn followup_retry_fires_once_after_the_post_repack_fold() {
+    let scn = Scenario::new();
+    let repacks = [repack_run(
+        "1.99.0-repack",
+        "2026-03-01T06:00:00Z",
+        "success",
+    )];
+    retry_runner(&scn, "2026-03-01T10:05:00Z", &repacks, &[]);
+    assert_eq!(retry_dispatches(&scn), [RETRY_ARGV]);
+    let gate = at(&repack_followup(), "jobs.retry.if")
+        .map(scalar)
+        .expect("retry gate");
+    assert!(gate.contains("conclusion == 'success'"), "{gate}");
+}
+
+#[test]
+fn followup_retry_waits_for_a_publish_created_after_the_repack() {
+    let scn = Scenario::new();
+    let repacks = [repack_run(
+        "1.99.0-repack",
+        "2026-03-01T06:00:00Z",
+        "success",
+    )];
+    retry_runner(&scn, "2026-03-01T09:00:00Z", &repacks, &[]);
+    assert!(retry_dispatches(&scn).is_empty(), "{:?}", scn.calls());
+}
+
+#[test]
+fn followup_retry_is_one_shot() {
+    let scn = Scenario::new();
+    let repacks = [repack_run(
+        "1.99.0-repack",
+        "2026-03-01T06:00:00Z",
+        "success",
+    )];
+    let operations = [
+        r#"{"display_title":"stow-admin [\"scheduler\",\"reset\",\"--yes\"] (by a)"}"#.to_owned(),
+        format!(
+            r#"{{"display_title":{}}}"#,
+            serde_json::to_string(&format!("stow-admin {RETRY_ARGV} (by github-actions[bot])"))
+                .expect("json")
+        ),
+    ];
+    retry_runner(&scn, "2026-03-01T10:30:00Z", &repacks, &operations);
+    assert!(retry_dispatches(&scn).is_empty(), "{:?}", scn.calls());
+}
+
+#[test]
+fn followup_retry_ignores_rustcs_without_a_successful_newest_repack() {
+    let scn = Scenario::new();
+    let repacks = [
+        // 1.99.0: an older success, then a newer failure.
+        repack_run("1.99.0-repack", "2026-03-01T01:00:00Z", "success"),
+        repack_run("1.99.0-repack", "2026-03-01T06:00:00Z", "timed_out"),
+        // A build run and a non-repack title never count.
+        repack_run("1.99.1-0123456789ab", "2026-03-01T06:00:00Z", "success"),
+        repack_run("1.99.2-repack-x", "2026-03-01T06:00:00Z", "success"),
+    ];
+    retry_runner(&scn, "2026-03-01T10:05:00Z", &repacks, &[]);
+    assert!(retry_dispatches(&scn).is_empty(), "{:?}", scn.calls());
+}
+
+#[test]
+fn followup_timeout_resumes_with_the_variable_concurrency() {
+    // A `timed_out` run, and a `cancelled` run whose job ran to its limit
+    // (GitHub may report the job timeout either way), each resume.
+    for (conclusion, jobs) in [
+        ("timed_out", String::new()),
+        ("failure", String::new()),
+        ("cancelled", job_json("cancelled", 350)),
+        ("cancelled", job_json("timed_out", 350)),
+    ] {
+        let scn = Scenario::new();
+        let runs = runs_json(2, false);
+        let runner = resume_runner(
+            &scn,
+            "1.99.0-repack",
+            conclusion,
+            &[("STOW_REPACK_CONCURRENCY", "12")],
+            &[("STUB_GH_JOBS", &jobs), ("STUB_GH_RUNS", &runs)],
+        );
+        assert_eq!(
+            runner.outcome_of(RESUME_STEP),
+            &Outcome::Ran(0),
+            "{conclusion}"
+        );
+        let dispatches = refill_dispatches(&scn);
+        assert_eq!(dispatches.len(), 1, "{conclusion}: {dispatches:?}");
+        assert_eq!(dispatches[0].0, "build-crate.yml");
+        assert_eq!(dispatches[0].1, "main");
+        assert_eq!(
+            dispatches[0].2,
+            BTreeMap::from([
+                ("repack_rustc".to_owned(), "1.99.0".to_owned()),
+                ("repack_concurrency".to_owned(), "12".to_owned()),
+            ])
+        );
+    }
+}
+
+#[test]
+fn followup_unset_variables_default_to_32_and_8() {
+    let scn = Scenario::new();
+    let runs = runs_json(7, false);
+    resume_runner(
+        &scn,
+        "1.99.0-repack",
+        "failure",
+        &[("STOW_REPACK_CONCURRENCY", "")],
+        &[("STUB_GH_RUNS", &runs)],
+    );
+    let dispatches = refill_dispatches(&scn);
+    assert_eq!(dispatches.len(), 1, "7 runs is under the default 8");
+    assert_eq!(
+        dispatches[0]
+            .2
+            .get("repack_concurrency")
+            .map(String::as_str),
+        Some("32")
+    );
+}
+
+#[test]
+fn followup_operator_cancel_is_not_resumed() {
+    for jobs in [
+        job_json("cancelled", 20),
+        job_json("cancelled", 334),
+        String::new(),
+    ] {
+        let scn = Scenario::new();
+        let runs = runs_json(1, false);
+        let runner = resume_runner(
+            &scn,
+            "1.99.0-repack",
+            "cancelled",
+            &[],
+            &[("STUB_GH_JOBS", &jobs), ("STUB_GH_RUNS", &runs)],
+        );
+        assert_eq!(runner.outcome_of(RESUME_STEP), &Outcome::Ran(0));
+        assert!(refill_dispatches(&scn).is_empty(), "{:?}", scn.calls());
+    }
+}
+
+#[test]
+fn followup_per_day_bound_fails_the_job() {
+    let scn = Scenario::new();
+    let runs = runs_json(3, false);
+    let runner = resume_runner(
+        &scn,
+        "1.99.0-repack",
+        "timed_out",
+        &[("STOW_REPACK_MAX_RUNS_PER_DAY", "3")],
+        &[("STUB_GH_RUNS", &runs)],
+    );
+    assert_eq!(runner.outcome_of(RESUME_STEP), &Outcome::Ran(1));
+    assert!(refill_dispatches(&scn).is_empty(), "{:?}", scn.calls());
+}
+
+#[test]
+fn followup_does_not_double_dispatch_an_active_resume() {
+    let scn = Scenario::new();
+    let runs = runs_json(2, true);
+    let runner = resume_runner(
+        &scn,
+        "1.99.0-repack",
+        "failure",
+        &[],
+        &[("STUB_GH_RUNS", &runs)],
+    );
+    assert_eq!(runner.outcome_of(RESUME_STEP), &Outcome::Ran(0));
+    assert!(refill_dispatches(&scn).is_empty(), "{:?}", scn.calls());
+}
+
+#[test]
+fn followup_ignores_non_repack_titles() {
+    for title in [
+        "1.99.0-0123456789ab",
+        "1.99.0-repack-x",
+        "x1.99.0-repack",
+        "-repack",
+        "Index publish",
+    ] {
+        let scn = Scenario::new();
+        let runner = resume_runner(&scn, title, "success", &[], &[]);
+        assert_eq!(runner.outcome_of(RESUME_STEP), &Outcome::Ran(0), "{title}");
+        assert!(scn.calls_of("gh").is_empty(), "{title}: {:?}", scn.calls());
     }
 }
