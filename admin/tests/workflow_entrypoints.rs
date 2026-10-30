@@ -1762,6 +1762,13 @@ fn followup_runner<'a>(
         ("github.event.workflow_run.display_title", title),
         ("github.event.workflow_run.conclusion", conclusion),
         ("github.event.workflow_run.id", "4242"),
+        // The run object's `name` is the run-name, as in production.
+        ("github.event.workflow_run.name", title),
+        (
+            "github.event.workflow_run.path",
+            ".github/workflows/build-crate.yml",
+        ),
+        ("steps.app-token.outputs.token", "test-app-token"),
     ] {
         set_path(&mut ctx, key, Val::Str(value.to_owned()));
     }
@@ -1831,10 +1838,8 @@ fn followup_declarations() {
         Some(vec!["completed".to_owned()])
     );
     assert!(at(&wf, "on.workflow_dispatch").is_none());
-    assert_eq!(
-        at(&wf, "permissions.actions").map(scalar).as_deref(),
-        Some("write")
-    );
+    // Dispatches use the App token, so the run's own token needs no write.
+    assert!(at(&wf, "permissions.actions").is_none());
     assert_eq!(
         at(&wf, "permissions.contents").map(scalar).as_deref(),
         Some("read")
@@ -1850,9 +1855,39 @@ fn followup_declarations() {
             .as_deref(),
         Some("false")
     );
+    // Jobs match the triggering workflow by `path` (the run's `name` is its
+    // run-name) and dispatch with an App token scoped to actions:write.
+    for (job, path) in [
+        ("resume", "build-crate.yml"),
+        ("retry", "index-publish.yml"),
+    ] {
+        let gate = at(&wf, &format!("jobs.{job}.if"))
+            .map(scalar)
+            .expect("gate");
+        assert!(
+            gate.contains(&format!(
+                "github.event.workflow_run.path == '.github/workflows/{path}'"
+            )),
+            "{gate}"
+        );
+        assert!(!gate.contains("workflow_run.name"), "{gate}");
+        let steps = job_steps(&wf, job);
+        let mint = &steps[0];
+        assert_eq!(
+            mint.uses.as_deref(),
+            job_steps(&load_workflow("release-plz.yml"), "release-pr")[0]
+                .uses
+                .as_deref()
+        );
+        assert_eq!(mint.id.as_deref(), Some("app-token"));
+        assert_eq!(
+            steps[1].env.get("GH_TOKEN").map(String::as_str),
+            Some("${{ steps.app-token.outputs.token }}")
+        );
+    }
     // The timeout the cancelled-job heuristic measures is the repack job's.
     let steps = job_steps(&wf, "resume");
-    let env = &steps[0].env;
+    let env = &steps[1].env;
     let build = load_workflow("build-crate.yml");
     assert_eq!(
         env.get("REPACK_JOB_TIMEOUT_MINUTES").map(String::as_str),
@@ -1930,7 +1965,13 @@ fn retry_runner<'a>(
         Val::Str("workflow_run".to_owned()),
     );
     for (key, value) in [
+        // No `run-name`: the run object's `name` is the workflow name.
         ("github.event.workflow_run.name", "Index publish"),
+        (
+            "github.event.workflow_run.path",
+            ".github/workflows/index-publish.yml",
+        ),
+        ("steps.app-token.outputs.token", "test-app-token"),
         ("github.event.workflow_run.conclusion", "success"),
         ("github.event.workflow_run.created_at", index_created),
     ] {

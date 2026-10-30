@@ -4,9 +4,24 @@ name: Repack follow-up
 # title `<rustc>-repack`) is resumable and its `repack` job has a hard
 # 350-minute limit, so a registry larger than one job needs several runs.
 # This lane closes the loop on the default branch (`dev`), dispatching
-# onto `main` with the run's own GITHUB_TOKEN like `index-publish-cron.yml`
-# (the index signing identity and the `operations` environment live on
-# `main` only):
+# onto `main` (the index signing identity and the `operations` environment
+# live on `main` only) with a GitHub App installation token:
+#
+# - Every dispatch uses that token, never the run's own GITHUB_TOKEN. GitHub
+#   documents that "events triggered by the `GITHUB_TOKEN` will not create
+#   a new workflow run" (except `workflow_dispatch` and
+#   `repository_dispatch`, which only means the dispatched run exists:
+#   https://docs.github.com/en/actions/using-workflows/triggering-a-workflow),
+#   so with GITHUB_TOKEN the completion of a run dispatched here never
+#   triggers this workflow again and the chain stops after one hop. The
+#   `index-publish` run the `resume` job dispatches therefore emits the
+#   `completed` event the `retry` job chains on. (A publish dispatched by
+#   `index-publish-cron.yml` with its GITHUB_TOKEN emits none; the retry
+#   then waits for the next publish this lane or an operator dispatched.)
+# - Jobs match the triggering workflow on `workflow_run.path`: the run
+#   object's `name` is the run-name when the workflow sets `run-name`
+#   (`1.99.1-repack` for build-crate.yml), not the workflow name. Only the
+#   `on.workflow_run.workflows` filter matches the workflow name.
 #
 # - `resume`, on a completed `build-crate` run titled `<rustc>-repack`:
 #   - success: dispatch `index-publish.yml` (which folds the repacked
@@ -56,8 +71,6 @@ on:
 
 permissions:
   contents: read
-  # `gh workflow run` mints the dispatch with the run's own GITHUB_TOKEN.
-  actions: write
 
 # One follow-up per completed run title at a time: a redelivered completion
 # queues behind the first and then finds the resumed run active (or the
@@ -68,13 +81,21 @@ concurrency:
 
 jobs:
   resume:
-    if: github.event.workflow_run.name == 'build-crate' && endsWith(github.event.workflow_run.display_title, '-repack')
+    if: github.event.workflow_run.path == '.github/workflows/build-crate.yml' && endsWith(github.event.workflow_run.display_title, '-repack')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Dispatches made with the App token create runs whose completion
+      # triggers this workflow; GITHUB_TOKEN dispatches would not.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ vars.STOW_APP_ID }}
+          private-key: ${{ secrets.STOW_APP_PRIVATE_KEY }}
+          permission-actions: write
       - name: Follow up the repack run
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           RUN_TITLE: ${{ github.event.workflow_run.display_title }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
@@ -149,13 +170,21 @@ jobs:
             -f "repack_rustc=$rustc" -f "repack_concurrency=$concurrency"
 
   retry:
-    if: github.event.workflow_run.name == 'Index publish' && github.event.workflow_run.conclusion == 'success'
+    if: github.event.workflow_run.path == '.github/workflows/index-publish.yml' && github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Dispatches made with the App token create runs whose completion
+      # triggers this workflow; GITHUB_TOKEN dispatches would not.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ vars.STOW_APP_ID }}
+          private-key: ${{ secrets.STOW_APP_PRIVATE_KEY }}
+          permission-actions: write
       - name: Retry the failed nodes of repacked rustcs
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           INDEX_CREATED: ${{ github.event.workflow_run.created_at }}
         run: |
           set -euo pipefail

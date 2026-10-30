@@ -692,8 +692,15 @@ A repack sweep (`build-crate.yml` dispatched with `repack_rustc`, run title
 `<rustc>-repack`; see *OCI bundle layout* in `ARCHITECTURE.md`) is
 resumable, and its `repack` job is bound by GitHub's 350-minute job limit.
 `repack-followup.yml` runs on the completion of every `build-crate` run
-and acts only on a `<rustc>-repack` title, dispatching onto `main` with
-the run's own `GITHUB_TOKEN`:
+and acts only on a `<rustc>-repack` title, dispatching onto `main` with a
+GitHub App installation token (`STOW_APP_ID` / `STOW_APP_PRIVATE_KEY`,
+minted with `actions: write` only, as in `release-plz.yml`). The run's own
+`GITHUB_TOKEN` is not used: GitHub documents that "events triggered by the
+`GITHUB_TOKEN` will not create a new workflow run", so the completion of a
+run dispatched with it would never trigger the follow-up again and the
+chain would stop after one hop. Its jobs match the triggering workflow on
+the run's `path`, not its `name`, which is the run-name (`<rustc>-repack`)
+for `build-crate.yml`:
 
 - Success: `index-publish.yml` for that rustc with `report=true` (the
   fold), then `preheat-cron.yml` with `refresh=true`.
@@ -709,7 +716,10 @@ the run's own `GITHUB_TOKEN`:
   repack completed. The second condition is the one-shot marker: a node
   that keeps failing is not retried on every later publish. The retry
   follows a fold instead of the preheat dispatch because a retried node
-  carries no backoff and is dispatched at once.
+  carries no backoff and is dispatched at once. The `Index publish` it
+  chains on is the one the success branch above dispatches with the App
+  token, so its completion reaches the workflow; a publish dispatched by
+  `index-publish-cron.yml` with its `GITHUB_TOKEN` emits no such event.
 - `failure` or `timed_out`: the sweep is dispatched again with
   `repack_rustc` and `repack_concurrency` from `STOW_REPACK_CONCURRENCY`
   (default 32). A `cancelled` run resumes only when its `repack` job
