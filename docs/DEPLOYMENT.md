@@ -3,7 +3,7 @@
 This document describes how to deploy the production trust topology:
 
 ```
-GitHub Actions ──records artifact (cosign-signed)──► GHCR (OCI)
+GitHub Actions ──records artifact (keyless-signed)─► GHCR (OCI)
      ▲                                               │
      │ workflow_dispatch                             │ reads + verifies
      │                                               ▼
@@ -414,8 +414,10 @@ its output directory as a workflow artifact. `publish` runs only when
 task and an independently resolved dependency closure, and only then
 pushes the bundle plus the build's `Vec<ArtifactRecord>` (as one signed
 OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`,
-one per task) to GHCR, cosign-signing both
-(keyless, `id-token: write`). The job never calls the edge — GitHub's
+one per task) to GHCR, signing both keyless in process — one Fulcio
+certificate per validity window, one Rekor entry per signature, the
+job's `id-token: write` identity — with every registry write held under
+`STOW_GHCR_WRITES_PER_MINUTE` (see [`ENVIRONMENT.md`](ENVIRONMENT.md)). The job never calls the edge — GitHub's
 `workflow_run` webhook delivery reports the outcome instead, and the
 edge checks the records artifact each successful task published exists
 in GHCR before it forwards the completion. See
@@ -427,7 +429,7 @@ publisher checks.
 the run's rustc and task id.
 
 `GHCR_TOKEN` is the job's own `GITHUB_TOKEN` (`packages: write`), and
-cosign signs with the job's OIDC identity, so the certificate subject is
+the publish stage signs with the job's OIDC identity, so the certificate subject is
 `https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main`
 — the identity `stow_types::trusted_builder` pins and the CLI verifies.
 

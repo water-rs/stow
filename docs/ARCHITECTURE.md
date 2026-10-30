@@ -394,13 +394,15 @@ tag above: its config is the `ArtifactBlobConfig` and it carries one layer,
 the pack: a deterministic tar (fixed order, mtime 0, owner 0:0, mode 0644)
 of every output file plus, when the build script produced one, the native
 `OUT_DIR` archive, compressed as a single zstd stream at level 19 with
-long-distance matching and a 2^27 window, on every core of the publishing
-runner (`stow_shim::pack`). One stream shares redundancy across files — an
+long-distance matching and a 2^27 window (`stow_shim::pack`), split into
+32 MiB multithreading jobs — a node under 32 MiB is one job on one core,
+byte-identical to a single-threaded run. One stream shares redundancy across files — an
 rlib embeds the metadata its rmeta carries. The config records each file's
 SHA-256; the CLI unpacks the pack with the 2^27 window bound and verifies
 every file against it. Decompression speed does not depend on the level,
 so the cost is paid once, at publish. Index slices are compressed at the
-same level, multithreaded; cosign signs this image. Next to it the
+same level, multithreaded; the publish stage signs this image keyless.
+Next to it the
 trusted publish stage pushes `<tag>.bundle`, a single-layer image whose
 layer is the bundle tar a CLI consumes (`stow_types::bundle::assemble_bundle`).
 The bundle needs no signature of its own: it embeds the signed manifest and
@@ -484,7 +486,7 @@ reports a `content_sha256` over everything but the timestamp, the
 manifest carries it as the `dev.stow.index.content-sha256` annotation,
 and an equal annotation skips the push (and the signature, when its
 `.sig` tag is present; a missing one is signed in place) — an unchanged slice
-never churns the tag. Pushed indexes are cosign-signed keyless under
+never churns the tag. Pushed indexes are signed keyless under
 `index-publish.yml@refs/heads/main`
 (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), the same
 Fulcio chain the CLI verifies for artifact bundles.
@@ -560,7 +562,7 @@ charges whoever arrives next for a backlog everyone built — which is why
    │ contents: read, no secrets   │──────► │ packages: write, id-token    │
    │ stow-build build             │ artifact│ stow-build publish           │
    │ runs third-party build.rs    │        │ validates, pushes bundles +  │
-   └──────────────────────────────┘        │ records, cosign-signs        │
+   └──────────────────────────────┘        │ records, signs keyless       │
                                            └─┬────────────────────────────┘
                                              │
                                              ▼
@@ -591,7 +593,7 @@ What each hop is allowed to do:
 | edge worker (`edge/`) | crates.io, GHCR, Analytics Engine SQL API | scheduler queue (enqueue submits only); `stow_cache_misses` Analytics Engine points (every miss) |
 | scheduler DO | its SQLite store | its SQLite store; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
-| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — cosign) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
+| `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — keyless signing) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
 | `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/published` when its `report` input is set |
 
 The edge's remaining crates.io reads are the request route's version and
@@ -695,7 +697,7 @@ signature over the payload checked. A key leaked from a short-lived Fulcio
 certificate therefore cannot sign anything after that certificate expires.
 
 > **Records binding.** CI never calls the edge to record builds — each
-> build's records land in GHCR as a cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
+> build's records land in GHCR as a keyless-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`
 > artifact under the pinned `build-crate.yml` identity, and every reader
 > (`index export`, the task-resolution's manifest check) verifies
 > that signature

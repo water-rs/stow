@@ -10,7 +10,7 @@ name: Index publish
 # artifacts (`index.<target>.<rustc>` plus the `folded.<target>.<rustc>`
 # companion listing every records tag already folded, both on the
 # rustc's `ghcr.io/water-rs/stow-cache-<rustc>` package) and
-# cosign-signed keyless under this
+# signed keyless under this
 # workflow's identity on `main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
 # A `schedule` or `workflow_run` trigger would run on the default branch
@@ -51,7 +51,8 @@ permissions:
   # Pushes the index artifacts and their cosign signature images.
   packages: write
   # Mints the run's OIDC token — the edge bearer the admin index endpoint
-  # accepts — and the Fulcio identity cosign signs under.
+  # accepts — and the Fulcio identity `stow-admin index publish` signs
+  # under.
   id-token: write
 
 concurrency:
@@ -88,9 +89,6 @@ jobs:
           sha: ${{ github.sha }}
           binaries: stow-admin
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      # cosign is still what signs — `stow-admin index publish` shells out
-      # to it exactly as `stow-build publish` does.
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       # The export pass is scoped to one rustc: only `records-<rustc>-*`
       # artifacts and `index.<t>.<rustc>`/`folded.<t>.<rustc>` pairs are
       # touched. `index-publish-cron` forwards the rustc the completed

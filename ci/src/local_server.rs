@@ -1677,8 +1677,8 @@ async fn build_stage(run: &TaskRun) -> stow_types::error::Result<TaskLayout> {
 }
 
 /// The task's trusted publish stage: the checks `stow-build publish` makes
-/// before its push, then the mock registry standing in for GHCR and
-/// cosign, then the task's records artifact under `(run_id, 1)`.
+/// before its push, then the mock registry standing in for GHCR and the
+/// Sigstore signer, then the task's records artifact under `(run_id, 1)`.
 async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error::Result<()> {
     let task = &run.task;
     if !run.stub {
@@ -1690,7 +1690,7 @@ async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error:
             .expect("the runner pool is never closed");
         // The task is read back from the event file, as `stow-build
         // publish` reads it, and validated exactly as it validates it:
-        // the mock registry below stands in for GHCR and cosign, not for
+        // the mock registry below stands in for GHCR and the signer, not for
         // the validation that gates them.
         let event = async_fs::read(&run.event_path).await?;
         let dispatched = crate::task_from_event(&event, &run.event_path)?;
@@ -1814,7 +1814,7 @@ async fn populate_mock_registry(
 /// Write the build's records artifact into the mock registry — the same
 /// object the production publish stage pushes to GHCR under
 /// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`, signed by the
-/// mock key instead of cosign. The run is the dispatch's own
+/// mock key instead of the keyless signer. The run is the dispatch's own
 /// `workflow_run_id` at attempt 1 — the run identity the `workflow_run`
 /// webhook report below carries, so the edge's records check resolves
 /// to this tag.

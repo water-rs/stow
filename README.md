@@ -129,7 +129,7 @@ The trusted build runner, hosted on GitHub Actions. This is the root of trust �
 
 1. Receives its task as the `workflow_dispatch` `task` input from the scheduler — `build-crate.yml` reads its `BuildTaskPayload` out of the dispatch event file.
 2. `build` job (read-only token, no secrets): builds the crate with the specified features, target, and rustc version, and hands the outputs over as a workflow artifact. Third-party build scripts run here and nowhere else.
-3. `publish` job (GHCR token, OIDC): validates the build output against the task and a dependency closure it resolves itself, then pushes the artifacts to OCI storage (GHCR) and signs them with cosign.
+3. `publish` job (GHCR token, OIDC): validates the build output against the task and a dependency closure it resolves itself, then pushes the artifacts to OCI storage (GHCR) and signs them keyless (a Fulcio certificate and a Rekor entry, in cosign's signature format).
 4. Pushes the build's artifact records to GHCR as one cosign-signed `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` OCI artifact, under the same `build-crate.yml` identity. GitHub's `workflow_run` webhook — not the runner — reports the completed run to the edge; the scheduler then completes the task once its records artifact verifies in GHCR.
 
 ### Admin (`admin/`)

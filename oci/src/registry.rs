@@ -1,16 +1,16 @@
 use oci_client::Reference;
 use oci_client::manifest::{OciDescriptor, OciImageManifest};
 use stow_types::error::Context;
-use stow_types::registry::{CacheRepository, GHCR_REGISTRY_URL, verify_oci_digest};
+use stow_types::registry::{GHCR_REGISTRY_URL, verify_oci_digest};
 
-use crate::client::{RegistryHttp, RegistrySession};
+use crate::client::RegistrySession;
 
 const GHCR_USERNAME_ENV: &str = "GHCR_USERNAME";
 const GHCR_TOKEN_ENV: &str = "GHCR_TOKEN";
 
-/// The one registry credential the trusted publish stage holds: the OCI
-/// uploader and cosign push with the same pair, so a runner needs no Docker
-/// CLI or Docker config file.
+/// The one registry credential the trusted publish stage holds: the
+/// artifacts and their signature images push with the same pair, so a
+/// runner needs no Docker CLI or Docker config file.
 #[derive(Debug, Clone)]
 pub struct RegistryCredentials {
     /// Registry basic-auth username (`GHCR_USERNAME`).
@@ -30,21 +30,6 @@ impl RegistryCredentials {
             username: env_required(GHCR_USERNAME_ENV)?,
             password: env_required(GHCR_TOKEN_ENV)?,
         })
-    }
-
-    /// The credentialed publish session on the production registry — the
-    /// one every stow push path shares.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if [`GHCR_REGISTRY_URL`] is malformed — a bug, not
-    /// a runtime condition.
-    pub fn session(
-        &self,
-        repository: &CacheRepository,
-        http: &RegistryHttp,
-    ) -> stow_types::error::Result<RegistrySession> {
-        Ok(RegistryBase::production()?.push_session(repository, self, http))
     }
 }
 

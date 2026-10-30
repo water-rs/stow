@@ -153,6 +153,26 @@ pub enum Trust {
     MockKey(std::path::PathBuf),
 }
 
+impl Trust {
+    /// The Fulcio/Rekor trust a keyless signer checks its own signatures
+    /// against.
+    ///
+    /// # Errors
+    ///
+    /// The process resolved the mock registry's key, which no Fulcio
+    /// certificate chains to.
+    pub fn sigstore(&self) -> stow_types::error::Result<std::sync::Arc<TrustMaterial>> {
+        match self {
+            Self::GithubCi(material) => Ok(std::sync::Arc::clone(material)),
+            #[cfg(feature = "mock-verify")]
+            Self::MockKey(path) => Err(stow_types::stow_error!(
+                "keyless signing needs the Sigstore trust root, but {STOW_MOCK_PUBLIC_KEY_PATH_ENV} selected the mock key {}",
+                path.display()
+            )),
+        }
+    }
+}
+
 /// Verify `material` — signature, Rekor entry binding, Fulcio chain at
 /// integrated time — and pin its certificate to `certificate_identity`.
 ///
@@ -304,6 +324,21 @@ impl TrustMaterial {
         Self::from_parts(&fulcio_certs, &rekor_keys)
     }
 
+    /// A throwaway Sigstore's trust — the CA a mock Fulcio issues under
+    /// and the key a mock Rekor signs entry timestamps with, keyed by log
+    /// id — for tests that sign keyless against mock services.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_parts`].
+    #[cfg(feature = "mock-verify")]
+    pub fn from_mock_sigstore(
+        fulcio_certs: &[rustls_pki_types::CertificateDer<'static>],
+        rekor_keys: &[(String, Vec<u8>)],
+    ) -> stow_types::error::Result<Self> {
+        Self::from_parts(fulcio_certs, rekor_keys)
+    }
+
     /// Assemble the material from the pieces every trust-root source
     /// provides: Fulcio anchor certificates and Rekor keys (hex log id,
     /// SPKI DER).
@@ -385,7 +420,8 @@ fn trust_cache_dir() -> stow_types::error::Result<std::path::PathBuf> {
         .ok_or_else(|| stow_types::stow_error!("resolve the sigstore trust cache directory"))
 }
 
-/// Verify one cosign signature against the Fulcio/Rekor trust root.
+/// Verify one cosign signature against the Fulcio/Rekor trust root and
+/// pin its certificate to `identity_policy`.
 ///
 /// A Fulcio certificate lives for minutes, so "the certificate was valid
 /// at some point" proves nothing about a signature made later with a
@@ -406,6 +442,29 @@ pub fn verify_signature_material(
     material: &stow_types::bundle::SigstoreSignature,
     payload_bytes: &[u8],
 ) -> stow_types::error::Result<()> {
+    let cert = verify_logged_signature(trust, material, payload_bytes)?;
+    identity_policy.verify(&cert).map_err(|error| {
+        stow_types::stow_error!("certificate identity verification failed: {error}")
+    })
+}
+
+/// Every check [`verify_signature_material`] makes except the identity
+/// pin: the Rekor bundle's SET, the entry binding this signature,
+/// certificate and payload, the Fulcio chain at the log's integrated
+/// time, and the signature over the payload. Returns the certificate
+/// for the caller's identity check.
+///
+/// The keyless signer runs this on what it is about to publish, so a
+/// signature no reader would accept is never pushed.
+///
+/// # Errors
+///
+/// As [`verify_signature_material`], less the identity mismatch.
+pub(crate) fn verify_logged_signature(
+    trust: &TrustMaterial,
+    material: &stow_types::bundle::SigstoreSignature,
+    payload_bytes: &[u8],
+) -> stow_types::error::Result<Certificate> {
     let rekor_bundle_json = material.rekor_bundle_json.as_ref().ok_or_else(|| {
         stow_types::stow_error!(
             "signature carries no Rekor bundle; github-ci verification requires transparency-log proof of signing time"
@@ -422,16 +481,14 @@ pub fn verify_signature_material(
 
     let integrated_time = rekor_integrated_time(&rekor_bundle)?;
     verify_certificate_chain(&trust.fulcio_anchors, &cert, integrated_time)?;
-    identity_policy.verify(&cert).map_err(|error| {
-        stow_types::stow_error!("certificate identity verification failed: {error}")
-    })?;
 
     let verification_key =
         CosignVerificationKey::try_from(&cert.tbs_certificate.subject_public_key_info)
             .wrap_err("extract verification key from certificate")?;
     verification_key
         .verify_signature(Signature::Raw(&signature_bytes), payload_bytes)
-        .wrap_err("verify cosign signature against payload")
+        .wrap_err("verify cosign signature against payload")?;
+    Ok(cert)
 }
 
 /// The `hashedrekord` entry body cosign uploads to Rekor.

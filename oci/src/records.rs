@@ -19,10 +19,9 @@ use stow_types::records::{
 };
 use stow_types::registry::{cache_repository, sha256_digest};
 
-use crate::client::{RegistryHttp, RegistrySession, canonical_manifest_bytes};
-use crate::registry::{
-    RegistryBase, RegistryCredentials, pull_blob_verified, pull_tagged_manifest,
-};
+use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::publisher::Publisher;
+use crate::registry::{pull_blob_verified, pull_tagged_manifest};
 use crate::sign;
 
 /// What [`push_records`] did: the tag and manifest digest the records
@@ -58,28 +57,33 @@ pub struct PulledRecords {
 ///
 /// # Errors
 ///
-/// Returns an error when a blob or the manifest push fails, or the cosign
+/// Returns an error when a blob or the manifest push fails, or the
 /// signing does.
 pub async fn push_records(
-    credentials: &RegistryCredentials,
-    http: &RegistryHttp,
+    publisher: &Publisher,
     rustc_version: &WireRustcVersion,
     task_id: &str,
     build: BuildRun,
     records: &[ArtifactRecord],
 ) -> stow_types::error::Result<RecordsPublishOutcome> {
-    let repository = cache_repository(rustc_version);
-    let base = RegistryBase::production()?;
-    let session = base.push_session(&repository, credentials, http);
-    push_records_with(&session, rustc_version, task_id, build, records, |reference, digest| async move {
-        sign::sign_artifact(&reference, &digest, credentials).await
-    })
+    let session = publisher.session(&cache_repository(rustc_version))?;
+    let session = &session;
+    push_records_with(
+        session,
+        rustc_version,
+        task_id,
+        build,
+        records,
+        |reference, digest| async move {
+            publisher.signer().sign(session, &reference, &digest).await
+        },
+    )
     .await
 }
 
-/// [`push_records`] with the session, registry base and signer supplied —
-/// for in-process signers (tests, the mock registry's own writer) where
-/// no cosign binary is involved.
+/// [`push_records`] with the session and signer supplied — a caller that
+/// already holds a push session (the repack sweep), and the mock
+/// registry's key signer in tests.
 ///
 /// # Errors
 ///

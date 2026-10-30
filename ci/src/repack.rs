@@ -15,7 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use futures_util::StreamExt as _;
-use stow_oci::{RegistryCredentials, RegistryHttp, RegistrySession};
+use stow_oci::{Publisher, RegistryHttp, RegistrySession};
 use stow_types::api::ArtifactRecord;
 use stow_types::identity::WireRustcVersion;
 use stow_types::records::{BuildRun, parse_records_tag};
@@ -38,8 +38,7 @@ pub struct Sweep {
 /// Everything one task's repack reads from.
 struct Sweeper<'a> {
     session: &'a RegistrySession,
-    credentials: &'a RegistryCredentials,
-    http: &'a RegistryHttp,
+    publisher: &'a Publisher,
     trust: &'a stow_oci::verify::Trust,
     rustc_version: &'a WireRustcVersion,
     build: BuildRun,
@@ -48,8 +47,11 @@ struct Sweeper<'a> {
 /// Repack every task of `rustc_version`, at most `concurrency` tasks at
 /// once.
 ///
-/// `concurrency` bounds tasks in flight, not cores: each node's
-/// compression already uses every core of the machine.
+/// `concurrency` bounds tasks in flight. A node's pack is one zstd job —
+/// single-threaded — unless it exceeds the 32 MiB job size
+/// (`stow_shim::pack`), so the tasks in flight are what occupy the cores;
+/// the registry side is bounded by the publisher's write budget, which
+/// every task's writes share.
 ///
 /// # Errors
 ///
@@ -60,10 +62,10 @@ pub async fn run(
     concurrency: usize,
     build: BuildRun,
 ) -> stow_types::error::Result<Sweep> {
-    let credentials = RegistryCredentials::from_env()?;
     let http = RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
-    let session = credentials.session(&cache_repository(rustc_version), &http)?;
     let trust = stow_oci::verify::records_trust().await?;
+    let publisher = Publisher::from_env(http, &trust)?;
+    let session = publisher.session(&cache_repository(rustc_version))?;
     let tags = stow_oci::list_records_tags(&session)
         .await
         .map_err(|error| stow_types::stow_error!("list records tags: {error}"))?;
@@ -72,8 +74,7 @@ pub async fn run(
 
     let sweeper = Sweeper {
         session: &session,
-        credentials: &credentials,
-        http: &http,
+        publisher: &publisher,
         trust: &trust,
         rustc_version,
         build,
@@ -166,9 +167,11 @@ impl Sweeper<'_> {
             .filter(|record| seen.insert(record.oci_reference.as_str()))
             .collect::<Vec<_>>();
 
-        let sign = |reference: String, digest: String| {
-            let credentials = self.credentials.clone();
-            async move { stow_oci::sign_artifact(&reference, &digest, &credentials).await }
+        let sign = |reference: String, digest: String| async move {
+            self.publisher
+                .signer()
+                .sign(self.session, &reference, &digest)
+                .await
         };
         let mut rows: Vec<ArtifactRecord> = Vec::with_capacity(live.len());
         let mut repacked = 0;
@@ -189,13 +192,13 @@ impl Sweeper<'_> {
         if repacked == 0 {
             return Ok(0);
         }
-        let published = stow_oci::push_records(
-            self.credentials,
-            self.http,
+        let published = stow_oci::push_records_with(
+            self.session,
             self.rustc_version,
             &task_id,
             self.build,
             &rows,
+            sign,
         )
         .await?;
         tracing::info!(task_id, repacked, records_tag = %published.tag, "repacked task");

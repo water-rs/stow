@@ -649,6 +649,35 @@ impl RegistryProbe {
         );
     }
 
+    /// GHCR's write cap: a write arriving when `limit` writes already
+    /// arrived in the trailing `window` is answered `429 TOOMANYREQUESTS`
+    /// with a `retry-after:` hint, as GHCR answers its 2000-a-minute cap.
+    #[cfg(test)]
+    fn cap_writes(&self, limit: usize, window: Duration) {
+        self.toggles.writes.lock().expect("write log poisoned").cap = Some((limit, window));
+    }
+
+    /// Every write's arrival time, in order.
+    #[cfg(test)]
+    fn write_arrivals(&self) -> Vec<Instant> {
+        self.toggles
+            .writes
+            .lock()
+            .expect("write log poisoned")
+            .arrivals
+            .clone()
+    }
+
+    /// How many writes the cap refused.
+    #[cfg(test)]
+    fn throttled_writes(&self) -> usize {
+        self.toggles
+            .writes
+            .lock()
+            .expect("write log poisoned")
+            .throttled
+    }
+
     /// Behave like a registry without single-`POST` upload support: every
     /// `POST /blobs/uploads` opens a session (`202` + `Location`) that only
     /// the commit `PUT` completes.
@@ -728,6 +757,18 @@ struct ProbeToggles {
     forged_digests: Mutex<HashMap<String, String>>,
     /// Session ids for opened upload sessions.
     next_upload_id: AtomicU64,
+    /// GHCR's write cap, when a test sets one, and every write's arrival.
+    writes: Mutex<WriteLog>,
+}
+
+/// The writes (`POST`/`PUT`/`PATCH`) the registry has seen, and the cap a
+/// test set on them: at most `limit` writes in any `window`, counting
+/// refused ones the way GHCR counts them.
+#[derive(Debug, Default)]
+struct WriteLog {
+    cap: Option<(usize, Duration)>,
+    arrivals: Vec<Instant>,
+    throttled: usize,
 }
 
 impl ProbeToggles {
@@ -739,7 +780,28 @@ impl ProbeToggles {
             manifest_digest_header: AtomicBool::new(true),
             forged_digests: Mutex::new(HashMap::new()),
             next_upload_id: AtomicU64::new(0),
+            writes: Mutex::new(WriteLog::default()),
         }
+    }
+
+    /// Log a write arriving now; `true` when it exceeds the cap — the
+    /// `limit` writes already in the trailing window.
+    fn write_over_cap(&self) -> bool {
+        let mut log = self.writes.lock().expect("write log poisoned");
+        let now = Instant::now();
+        let over = log.cap.is_some_and(|(limit, window)| {
+            log.arrivals
+                .iter()
+                .rev()
+                .take_while(|arrival| now.duration_since(**arrival) < window)
+                .count()
+                >= limit
+        });
+        log.arrivals.push(now);
+        if over {
+            log.throttled += 1;
+        }
+        over
     }
 }
 
@@ -1530,6 +1592,9 @@ async fn serve_v2(
 ) -> Result<Response<Body>, StatusCode> {
     let path = format!("/v2/{rest}");
     state.record(&method, &path);
+    if let Some(refusal) = state.write_throttle(&method) {
+        return Ok(refusal);
+    }
     if let Some(refusal) = state.scripted_refusal(&method, &path) {
         return Ok(refusal);
     }
@@ -2271,6 +2336,32 @@ impl MockRegistryState {
         }
     }
 
+    /// GHCR's answer to a write over the cap a test set — `None` for a
+    /// read, a write under the cap, and a registry without a probe.
+    fn write_throttle(&self, method: &Method) -> Option<Response<Body>> {
+        let toggles = self.toggles.as_ref()?;
+        if !matches!(*method, Method::POST | Method::PUT | Method::PATCH)
+            || !toggles.write_over_cap()
+        {
+            return None;
+        }
+        let mut response = Response::new(Body::from(
+            serde_json::json!({
+                "errors": [{
+                    "code": "TOOMANYREQUESTS",
+                    "message": "retry-after: 100ms, allowed: 2000/minute",
+                }],
+            })
+            .to_string(),
+        ));
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        Some(response)
+    }
+
     /// The scripted refusal a matching rule still owes — drained one
     /// `remaining` per answer. `None` when no rule has hits left for this
     /// request.
@@ -2455,6 +2546,8 @@ impl RegistryAsset {
 
 #[cfg(test)]
 mod tests {
+    mod keyless;
+
     use axum::body::to_bytes;
     use axum::http::{Method, Request, StatusCode, header};
     use sha2::Digest as _;
@@ -3069,15 +3162,26 @@ mod tests {
         }
     }
 
-    /// A credentialed `pull,push` session on the served mock.
-    fn push_session(listen: &str, http: &stow_oci::RegistryHttp) -> stow_oci::RegistrySession {
+    /// A credentialed `pull,push` session on the served mock, its writes
+    /// spending `writes`.
+    fn push_session(
+        listen: &str,
+        http: &stow_oci::RegistryHttp,
+        writes: &stow_oci::WriteBudget,
+    ) -> stow_oci::RegistrySession {
         let base =
             stow_oci::RegistryBase::parse(&format!("http://{listen}")).expect("registry base");
         let credentials = stow_oci::RegistryCredentials {
             username: "mock".to_owned(),
             password: "mock".to_owned(),
         };
-        base.push_session(&test_cache_repository(), &credentials, http)
+        base.push_session(&test_cache_repository(), &credentials, http, writes)
+    }
+
+    /// The budget of the tests that do not exercise it: far above
+    /// anything they write.
+    fn ample_writes() -> stow_oci::WriteBudget {
+        stow_oci::WriteBudget::per_minute(std::num::NonZeroU32::new(6_000_000).expect("rate"))
     }
 
     /// The in-process signer the push tests inject: writes the signature
@@ -3120,7 +3224,7 @@ mod tests {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
-        let session = push_session(&listen, &http);
+        let session = push_session(&listen, &http, &ample_writes());
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push succeeds");
@@ -3199,7 +3303,7 @@ mod tests {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
-        let session = push_session(&listen, &http);
+        let session = push_session(&listen, &http, &ample_writes());
         stow_oci::push_artifacts_with(
             &session,
             &[plan],
@@ -3238,7 +3342,7 @@ mod tests {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
-        let session = push_session(&listen, &http);
+        let session = push_session(&listen, &http, &ample_writes());
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push succeeds after retries");
@@ -3267,7 +3371,7 @@ mod tests {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
-        let session = push_session(&listen, &http);
+        let session = push_session(&listen, &http, &ample_writes());
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push succeeds through commit PUTs");
@@ -3310,7 +3414,7 @@ mod tests {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
-        let session = push_session(&listen, &http);
+        let session = push_session(&listen, &http, &ample_writes());
         stow_oci::push_artifacts_with(&session, &[plan], mock_sign(root.path()))
             .await
             .expect("push verifies manifests by read-back");
@@ -3565,7 +3669,7 @@ mod tests {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
-        let session = push_session(&listen, &http);
+        let session = push_session(&listen, &http, &ample_writes());
         let (sign, trust) = keyed_signer(root.path()).await;
 
         let outcome = stow_oci::push_artifacts_with(&session, std::slice::from_ref(&plan), &sign)
@@ -3626,7 +3730,7 @@ mod tests {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
-        let session = push_session(&listen, &http);
+        let session = push_session(&listen, &http, &ample_writes());
         let (sign, trust) = keyed_signer(root.path()).await;
 
         let outcome = stow_oci::push_artifacts_with(&session, std::slice::from_ref(&plan), &sign)
@@ -3722,7 +3826,7 @@ mod tests {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
-        let session = push_session(&listen, &http);
+        let session = push_session(&listen, &http, &ample_writes());
         let reference = session.reference(tag).expect("reference");
         let materials = stow_oci::pull_pushed_signature_materials(&session, &reference, digest)
             .await
@@ -3755,7 +3859,7 @@ mod tests {
         let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
             .await
             .expect("registry http");
-        let session = push_session(&listen, &http);
+        let session = push_session(&listen, &http, &ample_writes());
         let tag = "serde.1.0.0-x86_64-linux-gnu-1_98.0-000000-aabbccddeeff0011";
         let reference = session.reference(tag).expect("reference");
         let error = stow_oci::pull_pushed_signature_materials(&session, &reference, digest)
