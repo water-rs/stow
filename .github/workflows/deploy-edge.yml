@@ -15,8 +15,10 @@ name: deploy-edge
 #                    wait timer IS the observation window (operator setup in
 #                    docs/DEPLOYMENT.md); the job starts only after it elapses
 #                    and runs `stow-admin deploy verdict --phase canary`.
-#   promote          `wrangler versions deploy <id>@100%`, then the Durable
-#                    Object workload against the candidate.
+#   promote          `wrangler versions deploy <id>@100%`, then
+#                    `wrangler triggers deploy` (Cron Triggers and the custom
+#                    domain), then the Durable Object workload against the
+#                    candidate.
 #   promoted-verdict `environment: deploy-promoted` (second wait timer), then
 #                    `--phase promoted`.
 #
@@ -201,6 +203,19 @@ jobs:
           STOW_NEWRELEASES_WEBHOOK_SECRET: ${{ secrets.STOW_NEWRELEASES_WEBHOOK_SECRET }}
           STOW_STATS_SALT_SECRET: ${{ secrets.STOW_STATS_SALT_SECRET }}
           CF_ANALYTICS_TOKEN: ${{ secrets.CF_ANALYTICS_TOKEN }}
+
+      # `wrangler versions upload` carries no triggers, so the `promote` job
+      # applies the config's `triggers.crons` and routes with `wrangler
+      # triggers deploy`. That job builds nothing, so the config this job
+      # generated travels to it as an artifact (vars only; secrets live in
+      # the upload's secrets file, not in the config).
+      - name: Keep the generated wrangler config for promotion
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: wrangler-config
+          path: edge/${{ env.WRANGLER_CONFIG }}
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Read the baseline and candidate version ids
         id: versions
@@ -414,6 +429,27 @@ jobs:
           set -euo pipefail
           npm install -g wrangler@4
           wrangler versions deploy --name stow-edge --yes "$CANDIDATE_VERSION@100%"
+
+      # Cron Triggers and routes belong to the whole Worker, not to a
+      # version, and `wrangler versions upload` never applies them. They are
+      # applied only here, once the candidate holds 100%: earlier, the
+      # scheduled handler would fire on whichever version Cloudflare routes
+      # during the canary. Same generated config the `prepare` job used, so
+      # the crons come from `[cloudflare.triggers]` in edge/Skyzen.toml.
+      - name: Download the generated wrangler config
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: wrangler-config
+          path: edge/.skyzen/gen
+
+      - name: Apply the Cron Triggers and routes
+        working-directory: edge
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          wrangler triggers deploy --config "$WRANGLER_CONFIG"
 
       # The promoted verdict's candidate DO window: the same workload
       # `prepare` drove against the baseline. Its warm-up absorbs the
