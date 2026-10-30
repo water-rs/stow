@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/water-rs/stow/compare/stow-oci-v0.11.0...stow-oci-v0.12.0) - 2026-10-30
+
+### Added
+
+- *(oci)* sign in-process and bound GHCR writes ([#1107](https://github.com/water-rs/stow/pull/1107))
+- *(ops)* refill the index report and the queue after a scheduler reset ([#1103](https://github.com/water-rs/stow/pull/1103))
+
 ## [0.11.0](https://github.com/water-rs/stow/compare/stow-oci-v0.10.0...stow-oci-v0.11.0) - 2026-10-29
 
 ### Added

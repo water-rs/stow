@@ -91,6 +91,17 @@ STOW_ALERT_TO = "me@lexo.cool"
 # no scheduled probe, so nothing here costs while idle. Lower it to
 # trip earlier on a shared account.
 STOW_COST_BUDGET_MULTIPLIER = "1.0"
+# Periodic workflows (stow#1100): GitHub's `schedule` trigger skipped most
+# ticks, so the Worker's Cron Trigger dispatches them on `main` through the
+# App. This JSON object maps each cron expression of `[cloudflare.triggers]
+# crons` below to the workflow files due when it fires; a tick whose cron is
+# missing here fails and is mailed. Retuning a cadence edits the cron in both
+# places, and `admin/tests/workflow_entrypoints.rs` pins the two sets equal.
+# UTC.
+STOW_PERIODIC_WORKFLOWS = '{"*/15 * * * *": ["watchdog.yml"], "17 0 * * *": ["preheat-cron.yml"]}'
+
+[cloudflare.triggers]
+crons = ["*/15 * * * *", "17 0 * * *"]
 
 
 [[cloudflare.durable_objects.bindings]]

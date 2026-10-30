@@ -110,7 +110,14 @@ jobs:
               jq -j --arg name "$name" '.[$name]' <<<"$FILES" >"/tmp/stow-ops-files/$name"
             done < <(jq -j 'keys[] | . + "\u0000"' <<<"$FILES")
           fi
+          # A scheduler reset empties the queue and the recorded slices;
+          # the refill step below runs only for it.
+          refill=false
+          if [ "$command" = scheduler ] && [ "$(jq -r '.[1] // ""' <<<"$ARGV")" = reset ]; then
+            refill=true
+          fi
           # Last, so a refused input leaves no class for a run step.
+          echo "refill=$refill" >> "$GITHUB_OUTPUT"
           echo "class=$class" >> "$GITHUB_OUTPUT"
       - name: Run (edge)
         if: steps.command.outputs.class == 'edge'
@@ -127,6 +134,33 @@ jobs:
           while IFS= read -r -d '' arg; do argv+=("$arg"); done \
             < <(jq -j '.[] | . + "\u0000"' <<<"$ARGV")
           stow-admin "${argv[@]}"
+      # A reset drops the queue and every recorded slice; the lanes that
+      # feed them would refill them only on their next tick, up to a day
+      # later. This step runs only after the reset step succeeded (the
+      # default `success()` gate), reports every published rustc's slices
+      # and forces a preheat wave, all on `main`; a failed enumeration or
+      # dispatch fails the run like a failed reset. The slices in GHCR
+      # are untouched by a reset, so the report is not `full`: a slice in
+      # an unreadable format is a format change's own recovery
+      # (`index-publish.yml` with `full`), and a full re-export would pull
+      # every records artifact of every rustc for nothing.
+      - name: Refill the index report and the queue after a reset
+        if: success() && steps.command.outputs.refill == 'true'
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Every stable rustc with a published cache package: the report
+          # covers the slices of the rustc the run scopes to.
+          rustcs="$(stow-admin index published-rustcs)"
+          while IFS= read -r rustc; do
+            gh workflow run index-publish.yml --ref main \
+              -f report=true -f "rustc_version=$rustc"
+          done <<<"$rustcs"
+          # `refresh` bypasses preheat-cron's per-day marker, which would
+          # turn a same-day dispatch into a no-op.
+          gh workflow run preheat-cron.yml --ref main -f refresh=true
       - name: Run (analytics)
         if: steps.command.outputs.class == 'analytics'
         env:
@@ -153,6 +187,18 @@ jobs:
           # Hourly-pace alert levels (percent of the hourly pace); unset
           # or empty is the default 200,300.
           STOW_WATCHDOG_HOURLY_ALERT_PERCENTS: ${{ vars.STOW_WATCHDOG_HOURLY_ALERT_PERCENTS }}
+          # Liveness levels in hours: the oldest acceptable successful
+          # preheat (default 26) and the longest ready work may wait
+          # with no build-crate run started (default 2); unset or empty
+          # is the default.
+          STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS: ${{ vars.STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS }}
+          STOW_WATCHDOG_BUILD_STALL_HOURS: ${{ vars.STOW_WATCHDOG_BUILD_STALL_HOURS }}
+          # History levels in hours: how long a failed operations.yml run stays
+          # reported (default 1; the time since the previous watchdog run
+          # reaches further back) and the longest gap since the previous
+          # watchdog run started (default 0.75); unset or empty is the default.
+          STOW_WATCHDOG_OPERATIONS_WINDOW_HOURS: ${{ vars.STOW_WATCHDOG_OPERATIONS_WINDOW_HOURS }}
+          STOW_WATCHDOG_RUN_GAP_HOURS: ${{ vars.STOW_WATCHDOG_RUN_GAP_HOURS }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           # The watchdog's GitHub REST calls (workflow re-enable, the
           # incident issue) use the run's own token.

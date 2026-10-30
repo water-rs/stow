@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/water-rs/stow/compare/stow-types-v0.11.0...stow-types-v0.12.0) - 2026-10-30
+
+### Added
+
+- *(edge)* dispatch the watchdog and the daily preheat from the Worker's Cron Trigger ([#1102](https://github.com/water-rs/stow/pull/1102))
+- *(watchdog)* alert on a stale preheat and on stalled builds ([#1101](https://github.com/water-rs/stow/pull/1101))
+
 ## [0.11.0](https://github.com/water-rs/stow/compare/stow-types-v0.10.0...stow-types-v0.11.0) - 2026-10-29
 
 ### Added

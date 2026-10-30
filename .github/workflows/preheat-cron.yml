@@ -12,16 +12,31 @@ name: Preheat the public cache
 # `preheat-admin.yml` for it (stow#880). This lane is the other half: a
 # once-per-UTC-day refresh for the moving lists. The marker is an
 # actions/cache entry keyed by version and day, which makes a same-day
-# re-run a no-op.
+# re-run a no-op unless dispatched with `refresh` (a scheduler reset's
+# refill, stow#1094). The edge Worker's Cron Trigger dispatches this
+# workflow once a day at 00:17 UTC, off the top of the hour (stow#1100;
+# GitHub's own `schedule` skipped ticks); the newreleases.io wake covers
+# a new stable rustc in between, and a manual dispatch the same day is
+# that no-op.
 #
 # Re-submitting the whole list is cheap on purpose: the scheduler
 # deduplicates on task identity, leaves completed tasks completed, and
 # retires pending tasks the artifact catalog already covers, so a wave
 # only builds what is genuinely missing or previously failed.
 on:
+  # Kept until the edge Cron Trigger is deployed and seen dispatching;
+  # the day marker makes the overlap a no-op.
   schedule:
-    - cron: "0 0 * * *"
+    - cron: "17 */4 * * *"
   workflow_dispatch:
+    inputs:
+      refresh:
+        description: >-
+          Submit the wave although this version already preheated today
+          (a scheduler reset, which emptied the queue, dispatches it so).
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
@@ -51,11 +66,11 @@ jobs:
           path: .preheat-marker
           key: preheat-${{ steps.channel.outputs.version }}-${{ steps.channel.outputs.day }}
       - name: Already preheated
-        if: steps.marker.outputs.cache-hit == 'true'
+        if: steps.marker.outputs.cache-hit == 'true' && !inputs.refresh
         run: |
           echo "rustc ${{ steps.channel.outputs.version }} already preheated on ${{ steps.channel.outputs.day }}"
       - name: Dispatch the preheat wave
-        if: steps.marker.outputs.cache-hit != 'true'
+        if: steps.marker.outputs.cache-hit != 'true' || inputs.refresh
         env:
           # `gh` resolves the repository from the checkout's git remote,
           # and this job has no checkout — without GH_REPO every dispatch

@@ -1,0 +1,8 @@
+stow could not dispatch periodic workflows on cron {{ cron }}.
+
+{% for failure in failures -%}
+- {{ failure.workflow }}: {{ failure.error }}
+{% endfor %}
+The Cron Trigger fires again on its next tick. Until a dispatch lands the
+workflow does not run; the dispatch is a plain workflow_dispatch on main
+through the edge's GitHub App credentials.

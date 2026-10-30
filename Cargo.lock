@@ -3657,6 +3657,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "governor"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9efcab3c1958580ff1f25a2a41be1668f7603d849bb63af523b208a3cc1223b8"
+dependencies = [
+ "cfg-if",
+ "futures-sink",
+ "futures-timer",
+ "futures-util",
+ "hashbrown 0.16.1",
+ "nonzero_ext",
+ "parking_lot",
+ "portable-atomic",
+ "smallvec",
+ "spinning_top",
+ "web-time",
+]
+
+[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5198,6 +5217,12 @@ name = "nonempty"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9737e026353e5cd0736f98eddae28665118eb6f6600902a7f50db585621fecb6"
+
+[[package]]
+name = "nonzero_ext"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 
 [[package]]
 name = "normpath"
@@ -7783,6 +7808,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "spinning_top"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d96d2d1d716fb500937168cc09353ffdc7a012be8475ac7308e1bdf0e3923300"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8019,7 +8053,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "stow-admin"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "apple-native-keyring-store",
  "askama 0.14.0",
@@ -8068,7 +8102,7 @@ dependencies = [
 
 [[package]]
 name = "stow-build"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-fs",
  "async-net",
@@ -8116,7 +8150,7 @@ dependencies = [
 
 [[package]]
 name = "stow-cli"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-fs",
  "async-process",
@@ -8178,7 +8212,7 @@ dependencies = [
 
 [[package]]
 name = "stow-edge"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "askama 0.14.0",
@@ -8223,14 +8257,17 @@ dependencies = [
 
 [[package]]
 name = "stow-mock-registry"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-fs",
  "axum",
  "base64 0.23.1",
  "blake3",
  "clap",
+ "futures-util",
  "hex",
+ "olpc-cjson",
+ "rcgen",
  "rsa",
  "rustls",
  "serde",
@@ -8252,15 +8289,15 @@ dependencies = [
 
 [[package]]
 name = "stow-oci"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "async-fs",
- "async-process",
  "base64 0.23.1",
  "const-oid 0.10.2",
  "dirs 7.0.0",
  "fastrand",
  "futures-util",
+ "governor",
  "hex",
  "oci-client 0.16.1",
  "olpc-cjson",
@@ -8314,7 +8351,7 @@ dependencies = [
 
 [[package]]
 name = "stow-shim"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "dirs 7.0.0",
  "hex",
@@ -8327,7 +8364,7 @@ dependencies = [
 
 [[package]]
 name = "stow-types"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "blake3",
  "cap-fs-ext",

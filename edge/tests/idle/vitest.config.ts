@@ -27,6 +27,11 @@ import { defineConfig } from "vitest/config";
 // records check requires. No cosign material is involved on this read
 // path — the check is manifest shape, not signature verification.
 const DISPATCH_STUB = String.raw`
+// The periodic workflows the edge's Cron Trigger dispatched (stow#1100),
+// in arrival order — scheduled.test.ts reads and clears them through
+// /__control/periodic.
+const periodic = [];
+
 // The runs this isolate has dispatched, run id → BuildTaskPayload.
 // One in-flight run per test makes collisions impossible, but the
 // counter keeps the run ids distinct anyway.
@@ -85,8 +90,19 @@ export default {
 		// STOW_LOCAL_CI_URL: the /dispatch event POST and the
 		// GitHub-shaped run endpoints under /repos/{owner}/{repo}/actions.
 		if (url.port === "28124") {
+			if (url.pathname === "/__control/periodic") {
+				if (request.method === "POST") {
+					periodic.length = 0;
+					return new Response(null, { status: 204 });
+				}
+				return Response.json(periodic);
+			}
 			if (request.method === "POST" && url.pathname === "/dispatch") {
 				const body = await request.json();
+				if (body.event_type === "watchdog" || body.event_type === "preheat-cron") {
+					periodic.push(body.event_type);
+					return Response.json({ ok: true });
+				}
 				if (body.event_type !== "build-crate" || !body.client_payload) {
 					return new Response("unexpected dispatch event", { status: 500 });
 				}

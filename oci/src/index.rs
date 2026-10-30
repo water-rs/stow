@@ -11,8 +11,9 @@ use stow_types::index::{
 };
 use stow_types::registry::{cache_repository, sha256_digest};
 
-use crate::client::{RegistryHttp, RegistrySession, canonical_manifest_bytes};
-use crate::registry::{RegistryCredentials, pull_blob_verified};
+use crate::client::{RegistrySession, canonical_manifest_bytes};
+use crate::publisher::Publisher;
+use crate::registry::pull_blob_verified;
 use crate::sign;
 
 /// Manifest annotation carrying the index's content digest — the
@@ -180,7 +181,7 @@ pub async fn pull_published_index(
 }
 
 /// Push `index_bytes` as the single-layer index artifact under the slice's
-/// tag and sign it with cosign.
+/// tag and sign it keyless.
 ///
 /// The manifest carries `dev.stow.index.content-sha256` so a later publish
 /// of byte-identical content — a re-export of unchanged rows — skips the
@@ -191,17 +192,16 @@ pub async fn pull_published_index(
 /// # Errors
 ///
 /// Returns an error when the manifest pull/push, the blob uploads, or the
-/// cosign signature fails.
+/// signature fails.
 pub async fn publish_index(
-    credentials: &RegistryCredentials,
-    http: &RegistryHttp,
+    publisher: &Publisher,
     index_bytes: &[u8],
     target: &str,
     rustc_version: &WireRustcVersion,
     content_sha256: &str,
 ) -> stow_types::error::Result<IndexPublishOutcome> {
     let repository = cache_repository(rustc_version);
-    let session = credentials.session(&repository, http)?;
+    let session = publisher.session(&repository)?;
     let reference = repository.reference(&index_tag(target, rustc_version.as_str()));
     let parsed_reference: Reference = reference
         .parse()
@@ -224,7 +224,10 @@ pub async fn publish_index(
             %manifest_digest,
             "published index carries this content but no signature tag; signing in place"
         );
-        sign::sign_artifact(&reference, &manifest_digest, credentials).await?;
+        publisher
+            .signer()
+            .sign(&session, &reference, &manifest_digest)
+            .await?;
         return Ok(IndexPublishOutcome::Resigned { manifest_digest });
     }
 
@@ -253,8 +256,8 @@ pub async fn publish_index(
     let manifest_bytes = canonical_manifest_bytes(&manifest)?;
     let manifest_digest =
         sign::put_signed_manifest(&session, &parsed_reference, &manifest_bytes, |digest| {
-            let reference = &reference;
-            async move { sign::sign_artifact(reference, &digest, credentials).await }
+            let (reference, session) = (&reference, &session);
+            async move { publisher.signer().sign(session, reference, &digest).await }
         })
         .await
         .map_err(|error| stow_types::stow_error!("push index artifact {reference}: {error}"))?;
@@ -386,14 +389,13 @@ pub async fn pull_folded(
 ///
 /// Same as [`publish_index`].
 pub async fn publish_folded(
-    credentials: &RegistryCredentials,
-    http: &RegistryHttp,
+    publisher: &Publisher,
     folded_bytes: &[u8],
     target: &str,
     rustc_version: &WireRustcVersion,
 ) -> stow_types::error::Result<IndexPublishOutcome> {
     let repository = cache_repository(rustc_version);
-    let session = credentials.session(&repository, http)?;
+    let session = publisher.session(&repository)?;
     let reference = repository.reference(&folded_tag(target, rustc_version.as_str()));
     let parsed_reference: Reference = reference
         .parse()
@@ -422,7 +424,10 @@ pub async fn publish_folded(
                     manifest_digest: published_digest,
                 });
             }
-            sign::sign_artifact(&reference, &published_digest, credentials).await?;
+            publisher
+                .signer()
+                .sign(&session, &reference, &published_digest)
+                .await?;
             return Ok(IndexPublishOutcome::Resigned {
                 manifest_digest: published_digest,
             });
@@ -446,8 +451,8 @@ pub async fn publish_folded(
         .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?;
     let manifest_digest =
         sign::put_signed_manifest(&session, &parsed_reference, &manifest_bytes, |digest| {
-            let reference = &reference;
-            async move { sign::sign_artifact(reference, &digest, credentials).await }
+            let (reference, session) = (&reference, &session);
+            async move { publisher.signer().sign(session, reference, &digest).await }
         })
         .await
         .map_err(|error| stow_types::stow_error!("push folded artifact {reference}: {error}"))?;

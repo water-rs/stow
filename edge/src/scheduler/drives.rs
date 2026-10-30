@@ -1368,7 +1368,9 @@ pub const DRIVES: &[Drive] = &[
     Drive {
         // Bounded by held quantities: the outcome ring is capped, and
         // the in-flight section by the dispatch cap — neither tracks the
-        // stored node bulk.
+        // stored node bulk. `ready` sums the lengths of the ready
+        // queues, one per rank-operand class: memory only, no statement,
+        // so the budget row is unchanged (stow#1096).
         name: "GET /admin/status",
         setup: None,
         run: |_db, _shape, _settings, ctx| {
@@ -2034,6 +2036,43 @@ pub const DRIVES: &[Drive] = &[
                             rustc_version: "1.90.0".parse().map_err(|error| {
                                 format!("preheat release rustc version: {error}")
                             })?,
+                        },
+                    )
+                    .await
+                    .map_err(text)
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = ctx;
+                    Ok(())
+                }
+            })
+        },
+        cleanup: None,
+    },
+    Drive {
+        // The edge Cron Trigger's per-workflow dispatch (stow#1100):
+        // on wasm the real `periodic_dispatch_pass` — credential arm
+        // plus the `workflow_dispatch` POST to the local-CI
+        // dispatcher; on host the arm is a no-op `Ok(())` — no store
+        // work runs and there is nothing to measure.
+        name: "POST /periodic/dispatch",
+        setup: None,
+        run: |_db, _shape, _settings, ctx| {
+            Box::pin(async move {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let env = ctx
+                        .env
+                        .as_ref()
+                        .ok_or_else(|| "periodic dispatch drive needs a Worker env".to_owned())?;
+                    super::object::periodic_dispatch_pass(
+                        &ctx.graph,
+                        env,
+                        &stow_types::periodic::PeriodicDispatchRequest {
+                            workflow: "watchdog.yml"
+                                .parse()
+                                .map_err(|error| format!("periodic dispatch workflow: {error}"))?,
                         },
                     )
                     .await

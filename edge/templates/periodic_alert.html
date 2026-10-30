@@ -1,0 +1,15 @@
+<!doctype html>
+<html>
+<body style="font-family: system-ui, sans-serif; color: #1a1a1a; line-height: 1.5">
+<p><strong>stow could not dispatch periodic workflows</strong> on cron
+<code>{{ cron }}</code>.</p>
+<ul>
+{% for failure in failures -%}
+  <li><code>{{ failure.workflow }}</code>: {{ failure.error }}</li>
+{% endfor %}
+</ul>
+<p>The Cron Trigger fires again on its next tick. Until a dispatch lands the
+workflow does not run; the dispatch is a plain workflow_dispatch on main
+through the edge's GitHub App credentials.</p>
+</body>
+</html>

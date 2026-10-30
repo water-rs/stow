@@ -3,7 +3,7 @@
 This document describes how to deploy the production trust topology:
 
 ```
-GitHub Actions ──records artifact (cosign-signed)──► GHCR (OCI)
+GitHub Actions ──records artifact (keyless-signed)─► GHCR (OCI)
      ▲                                               │
      │ workflow_dispatch                             │ reads + verifies
      │                                               ▼
@@ -74,7 +74,17 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    same pass is how a schema change lands: it drops every table,
    index and trigger in the store and re-executes
    `edge/src/scheduler/schema.sql`; the queue and recorded slices are
-   destroyed and refill from the lanes that feed them. A stored record
+   destroyed. The same run then refills them, so no other step follows
+   the reset: once the reset succeeds, `operations.yml` runs
+   `stow-admin index published-rustcs`, which probes every stable
+   release `static.rust-lang.org/manifests.txt` lists for a published
+   `stow-cache-<rustc>` package through the registry's anonymous tag
+   listing, then dispatches `index-publish.yml` on `main` with
+   `report=true` for each rustc found (not `full`: a reset leaves the
+   slices in GHCR as they were) and `preheat-cron.yml` on `main` with
+   `refresh=true`, which submits the wave although the day's marker
+   exists. A failed probe, dispatch or an empty enumeration fails the
+   run, which the watchdog reports as `operations.failed`. A stored record
    whose shape changes — the dispatch freeze's manual trigger carries
    its `actor` — is part of that schema, so a deploy that changes one is
    followed by the reset.
@@ -225,7 +235,20 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    current UTC calendar month passes 80% of its monthly allowance; the
    last hour at 200% and 300% of the hourly pace (levels set by the
    `STOW_WATCHDOG_HOURLY_ALERT_PERCENTS` repository variable) only
-   alerts. `stow-admin watchdog clear` disables both scopes the
+   alerts. Two liveness signals alert too: `pipeline.preheat_stale` (no
+   successful `preheat-admin.yml` run for 26 hours, set by
+   `STOW_WATCHDOG_PREHEAT_MAX_AGE_HOURS`) and `pipeline.builds_stalled`
+   (dispatchable tasks and a free slot, yet no `build-crate.yml` run
+   created for 2 hours, set by `STOW_WATCHDOG_BUILD_STALL_HOURS`). Two
+   history signals alert as well: `operations.failed` (an
+   `operations.yml` run concluded `failure`, `timed_out` or
+   `startup_failure` since the previous watchdog
+   run, or within `STOW_WATCHDOG_OPERATIONS_WINDOW_HOURS`, 1 hour by
+   default; the incident names the run and its argv) and
+   `watchdog.gap` (the previous watchdog run started 45 minutes or more
+   ago, set by `STOW_WATCHDOG_RUN_GAP_HOURS`, so a missed periodic
+   dispatch is reported after the fact).
+   `stow-admin watchdog clear` disables both scopes the
    watchdog can enable.
 
    `<edge host>` is the host of `STOW_EDGE_URL` — the rules follow
@@ -391,8 +414,10 @@ its output directory as a workflow artifact. `publish` runs only when
 task and an independently resolved dependency closure, and only then
 pushes the bundle plus the build's `Vec<ArtifactRecord>` (as one signed
 OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`,
-one per task) to GHCR, cosign-signing both
-(keyless, `id-token: write`). The job never calls the edge — GitHub's
+one per task) to GHCR, signing both keyless in process — one Fulcio
+certificate per validity window, one Rekor entry per signature, the
+job's `id-token: write` identity — with every registry write held under
+`STOW_GHCR_WRITES_PER_MINUTE` (see [`ENVIRONMENT.md`](ENVIRONMENT.md)). The job never calls the edge — GitHub's
 `workflow_run` webhook delivery reports the outcome instead, and the
 edge checks the records artifact each successful task published exists
 in GHCR before it forwards the completion. See
@@ -404,7 +429,7 @@ publisher checks.
 the run's rustc and task id.
 
 `GHCR_TOKEN` is the job's own `GITHUB_TOKEN` (`packages: write`), and
-cosign signs with the job's OIDC identity, so the certificate subject is
+the publish stage signs with the job's OIDC identity, so the certificate subject is
 `https://github.com/water-rs/stow/.github/workflows/build-crate.yml@refs/heads/main`
 — the identity `stow_types::trusted_builder` pins and the CLI verifies.
 
@@ -459,6 +484,38 @@ five minutes of validity remain.
 The crucial property: CI never holds a Cloudflare API token, and no
 shared secret exists anywhere on the edge write surface — every trusted
 call is a GitHub identity, verified as described below.
+
+### Periodic workflows — the edge Cron Trigger
+
+GitHub's `schedule` trigger is best-effort and skipped most ticks
+(`watchdog.yml` ran 5 of 96 expected times in a day, stow#1100), so the
+edge Worker's Cloudflare Cron Trigger dispatches the two periodic
+workflows; their `schedule` blocks stay only until a deployed edge is seen
+dispatching them, and are then removed. The Cron Trigger dispatches them on `main` through the GitHub App arm the
+build dispatch uses. `edge/Skyzen.toml` declares the cadences in
+`[cloudflare.triggers] crons` (`*/15 * * * *` for `watchdog.yml`,
+`17 0 * * *` (daily, 00:17) for `preheat-cron.yml`, both UTC) and the
+`STOW_PERIODIC_WORKFLOWS` var maps each cron expression to the workflow
+files due when it fires. The Worker's `scheduled` handler looks the
+event's cron up in that map and posts one `workflow_dispatch` per due
+workflow through the scheduler object (`POST /periodic/dispatch`),
+concurrently under a bound of four. To change a cadence, edit the cron
+in both places; `admin/tests/workflow_entrypoints.rs` keeps the two
+sets equal. Both workflows keep `workflow_dispatch` for manual runs.
+
+A failed dispatch (or a tick whose cron the map does not name) is logged,
+mailed from `alerts@stow.waterui.dev` through the same `send_email`
+binding as the freeze alerts, and fails the invocation in Workers Logs.
+The edge cannot open the `incident` issue (the App carries no `issues`
+grant), and the next tick retries. While the watchdog's breaker has
+`preheat-cron.yml` disabled, that tick's dispatch is refused and mailed.
+
+Cost: 96 watchdog plus 1 preheat-cron tick a day, each one Worker
+invocation, one scheduler-object request, at most one token mint and one
+dispatch POST — at most 291 subrequests a day, 2,910 Worker requests and
+2,910 object requests a month (0.03% of 10M and 0.3% of 1M included),
+and no stored rows. The `POST /periodic/dispatch` drive in
+`edge/src/scheduler/drives.rs` pins the zero-row budget.
 
 ### GitHub webhook — `workflow_run`
 
@@ -623,7 +680,8 @@ their own tokens.
 ## Initial cache population
 
 The cache preheats itself — `preheat-cron.yml` dispatches a wave
-daily, and the newreleases.io webhook wakes one on every new stable
+daily (the edge's Cron Trigger fires it at 00:17 UTC;
+[Periodic workflows](#periodic-workflows--the-edge-cron-trigger)), and the newreleases.io webhook wakes one on every new stable
 rustc. To seed a wave by hand, `preheat manual` dispatches
 `operations.yml` ([Operator mutations](#operator-mutations)), which
 resolves the graph on the runner from the carried `--crates` /

@@ -15,10 +15,13 @@ stow-shim = { workspace = true, features = ["zstd"] }
 tracing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-async-process = "2"
 smol = "2"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 fastrand = "2"
+# The process-wide registry write bucket (`throttle::WriteBudget`): a
+# lock-free GCRA limiter whose `until_ready` waits on `futures-timer`, so it
+# runs on any executor. `std` is the only feature it needs.
+governor = { version = "0.10.4", default-features = false, features = ["std"] }
 # Canonical JSON for manifest bytes — the same formatter oci-client's own
 # push uses, so digests match what it produced.
 olpc-cjson = "0.1"
@@ -67,7 +70,7 @@ mock-verify = []
 # process-global.
 serial_test = "4"
 time = { version = "0.3", features = ["formatting"] }
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt"] }
 # The protobuf types `sigstore` 0.14's `SigstoreTrustRoot` parsed
 # `trusted_root.json` into — the parity test replays the retired
 # extraction over the same bytes (stow#869).

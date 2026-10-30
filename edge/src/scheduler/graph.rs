@@ -785,9 +785,15 @@ impl Graph {
     }
 
     /// Every ready queue entry set, both families.
-    #[cfg(test)]
     fn ready_sets(&self) -> impl Iterator<Item = &BTreeSet<(i64, u32)>> {
         self.ready.values().chain(self.ready_macos.values())
+    }
+
+    /// Dispatchable nodes across both families — a sum of queue lengths
+    /// over the rank-operand classes, never a walk of the arena.
+    fn ready_count(&self) -> u32 {
+        u32::try_from(self.ready_sets().map(BTreeSet::len).sum::<usize>())
+            .expect("the ready sets index arena indexes, fewer than 2^32")
     }
 
     /// Re-evaluate a node's ready-set membership: enters it under its
@@ -3629,6 +3635,7 @@ impl Graph {
         Ok(stow_types::api::AdminStatus {
             pending_miss: status.pending.saturating_sub(status.human_pending),
             pending_human: status.human_pending,
+            ready: self.ready_count(),
             blocked: status.blocked,
             oldest_pending_seconds: oldest_pending,
             in_flight,
@@ -5253,6 +5260,8 @@ mod tests {
             "a and b from t=1000"
         );
         assert_eq!((status.pending_human, status.pending_miss), (2, 2));
+        assert_eq!(status.ready as usize, ready_count(&graph));
+        assert!(status.ready > 0, "the pending rows are dispatchable");
 
         let claimed = graph.claim(45, 16, 12_000, 3_600_000).expect("claim");
         for (run, task) in (100u64..).zip(&claimed) {

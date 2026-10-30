@@ -97,6 +97,14 @@ pub enum IndexCommand {
     /// later export re-emits; `index-publish.yml` runs this before each
     /// export so the next run converges on the published state.
     Reconcile(IndexReconcileArgs),
+    /// Print every stable rustc with a published
+    /// `ghcr.io/water-rs/stow-cache-<rustc>` package, one per line: the
+    /// releases `static.rust-lang.org/manifests.txt` lists, each probed
+    /// through the registry's anonymous tag listing. `operations.yml`
+    /// reports each one's slices after a scheduler reset. Fails when a
+    /// probe is refused or the transport fails, and when no release has
+    /// a package.
+    PublishedRustcs,
     /// Print every `CI_TARGET_TRIPLES` entry, one per line — the slice
     /// list `index-publish.yml` iterates, read from the binary so the
     /// workflow never carries its own copy.
@@ -162,9 +170,9 @@ struct IndexExportSummary {
 /// set the command delegates to `stow-mock-registry publish-index` —
 /// writing the signed artifacts into `STOW_MOCK_REGISTRY_ROOT` exactly as
 /// `stow-build` mock-populate does for bundles; without it the command
-/// pushes to GHCR through `stow-oci` and signs with the `cosign` binary
-/// (`GHCR_USERNAME`/`GHCR_TOKEN`), the production path
-/// `index-publish.yml` runs.
+/// pushes to GHCR through `stow-oci` (`GHCR_USERNAME`/`GHCR_TOKEN`) and
+/// signs keyless in process under the job's OIDC identity, the production
+/// path `index-publish.yml` runs.
 #[derive(Args)]
 pub struct IndexPublishArgs {
     /// The encoded index file (`index export --out-dir` wrote).
@@ -247,6 +255,7 @@ pub async fn run(
         IndexCommand::Publish(args) => index_publish(args).await,
         IndexCommand::Report(args) => index_report(&Edge::connect(store)?, args).await,
         IndexCommand::Reconcile(args) => index_reconcile(&Edge::connect(store)?, args).await,
+        IndexCommand::PublishedRustcs => published_rustcs().await,
         IndexCommand::Targets => {
             render::emit_line(&CI_TARGET_TRIPLES.join("\n"));
             Ok(())
@@ -944,11 +953,13 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
         if let Ok(private_key_path) = std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV) {
             publish_index_mock(&args.file, &args.folded, &private_key_path).await?
         } else {
-            let credentials = stow_oci::RegistryCredentials::from_env()?;
             let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
+            // The keyless signer checks every signature it makes against
+            // the trust readers verify with.
+            let trust = stow_oci::verify::records_trust().await?;
+            let publisher = stow_oci::Publisher::from_env(http, &trust)?;
             let outcome = stow_oci::publish_index(
-                &credentials,
-                &http,
+                &publisher,
                 &bytes,
                 &target,
                 &index.header.rustc_version,
@@ -959,8 +970,7 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
             // same step — the export that follows only ever sees pairs
             // this command pushed.
             stow_oci::publish_folded(
-                &credentials,
-                &http,
+                &publisher,
                 &serde_json::to_vec(&folded)?,
                 &target,
                 &index.header.rustc_version,
@@ -1228,6 +1238,56 @@ async fn index_reconcile(edge: &Edge, args: IndexReconcileArgs) -> stow_types::e
     .map_err(|error| stow_error!("serialize index reconcile summary: {error}"))?;
     render::emit_line(&line);
     Ok(())
+}
+
+/// Cache packages probed in flight — anonymous tag listings against the
+/// registry's rate limit, one pull token each.
+const PUBLISHED_PROBE_CONCURRENCY: usize = 8;
+
+/// `stow-admin index published-rustcs`.
+async fn published_rustcs() -> stow_types::error::Result<()> {
+    let releases = crate::rust_channel::stable_releases().await?;
+    let base = registry_base()?;
+    let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
+    let published = probe_published(&base, &http, releases, PUBLISHED_PROBE_CONCURRENCY).await?;
+    if published.is_empty() {
+        return Err(stow_error!(
+            "no stable rustc release has a published stow-cache package"
+        ));
+    }
+    for rustc in &published {
+        render::emit_line(rustc.as_ref());
+    }
+    Ok(())
+}
+
+/// The rustcs of `candidates` whose cache package holds tags, probed
+/// `concurrency` at a time, in candidate order. A package the registry
+/// reports absent (GHCR answers an unpublished or private repository
+/// `403`/`DENIED`, a spec registry `404`/`NAME_UNKNOWN`) is not
+/// published, and neither is an empty one; any other refusal or
+/// transport failure fails the probe.
+async fn probe_published(
+    base: &stow_oci::RegistryBase,
+    http: &stow_oci::RegistryHttp,
+    candidates: Vec<WireRustcVersion>,
+    concurrency: usize,
+) -> stow_types::error::Result<Vec<WireRustcVersion>> {
+    use futures_util::{StreamExt as _, TryStreamExt as _};
+    let published: Vec<WireRustcVersion> = futures_util::stream::iter(candidates)
+        .map(|rustc| async move {
+            let holds_tags = base
+                .session(&cache_repository(&rustc), http)
+                .has_tags()
+                .await
+                .map_err(|error| stow_error!("probe stow-cache-{rustc}: {error}"))?;
+            Ok::<_, stow_types::error::Error>(holds_tags.then_some(rustc))
+        })
+        .buffered(concurrency)
+        .try_filter_map(|rustc| async move { Ok(rustc) })
+        .try_collect()
+        .await?;
+    Ok(published)
 }
 
 /// The full report of every published slice the scheduler does not hold
@@ -2526,5 +2586,127 @@ mod tests {
         assert_eq!(joined[0].hits, 30.0);
         assert!(joined[1].identity.is_none());
         assert_eq!(joined[1].hits, 20.0);
+    }
+
+    /// The scripted answers of one anonymous probe: the challenge, the
+    /// token and the tag listing.
+    fn probe_steps(
+        base: &str,
+        token: crate::test_server::Step,
+        tags: crate::test_server::Step,
+    ) -> Vec<crate::test_server::Step> {
+        use crate::test_server::Step;
+        vec![
+            Step::RespondWith {
+                status: 401,
+                retry_after: None,
+                headers: vec![(
+                    "www-authenticate".to_owned(),
+                    format!("Bearer realm=\"{base}/token\",service=\"mock-registry\""),
+                )],
+                body: "",
+            },
+            token,
+            tags,
+        ]
+    }
+
+    fn respond(status: u16, body: &'static str) -> crate::test_server::Step {
+        crate::test_server::Step::Respond {
+            status,
+            retry_after: None,
+            body,
+        }
+    }
+
+    const TOKEN: &str = r#"{"token":"t"}"#;
+    const NAME_UNKNOWN: &str =
+        r#"{"errors":[{"code":"NAME_UNKNOWN","message":"repository name not known"}]}"#;
+    const DENIED: &str =
+        r#"{"errors":[{"code":"DENIED","message":"requested access to the resource is denied"}]}"#;
+
+    async fn probe(
+        script: impl FnOnce(&str) -> Vec<crate::test_server::Step>,
+        rustcs: &[&str],
+    ) -> stow_types::error::Result<Vec<String>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let server = crate::test_server::Loopback::start_on(listener, url.clone(), script(&url));
+        let base = stow_oci::RegistryBase::parse(&url).expect("registry base");
+        let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT)
+            .await
+            .expect("registry http");
+        let candidates = rustcs
+            .iter()
+            .map(|rustc| WireRustcVersion::parse(*rustc).expect("rustc"))
+            .collect();
+        // One in flight: the scripted server answers in arrival order.
+        let result = probe_published(&base, &http, candidates, 1).await;
+        let requests = server.join().await;
+        if let Ok(published) = &result {
+            // A package costs its token mint and one tag listing.
+            assert!(requests.len() >= 2 * rustcs.len() || published.is_empty());
+        }
+        result.map(|published| published.iter().map(ToString::to_string).collect())
+    }
+
+    /// Present packages publish; a `403`/`DENIED` (GHCR's answer for an
+    /// unpublished repository), a `404`/`NAME_UNKNOWN` and an empty tag
+    /// list do not.
+    #[test]
+    fn probe_published_keeps_only_packages_holding_tags() {
+        let published = block_on(probe(
+            |base| {
+                let mut steps = probe_steps(
+                    base,
+                    respond(200, TOKEN),
+                    respond(200, r#"{"tags":["index.x86_64-unknown-linux-gnu.1.98.0"]}"#),
+                );
+                steps.extend(probe_steps(
+                    base,
+                    respond(200, TOKEN),
+                    respond(404, NAME_UNKNOWN),
+                ));
+                // The token exchange is refused: the listing is never asked.
+                steps.extend(
+                    probe_steps(base, respond(403, DENIED), respond(200, TOKEN))
+                        .into_iter()
+                        .take(2),
+                );
+                steps.extend(probe_steps(
+                    base,
+                    respond(200, TOKEN),
+                    respond(200, r#"{"name":"water-rs/stow-cache-1.101.0","tags":null}"#),
+                ));
+                steps.extend(probe_steps(
+                    base,
+                    respond(200, TOKEN),
+                    respond(200, r#"{"tags":["records-1.99.1-a"]}"#),
+                ));
+                steps
+            },
+            &["1.98.0", "1.99.0", "1.100.0", "1.101.0", "1.99.1"],
+        ))
+        .expect("probe");
+        assert_eq!(published, ["1.98.0", "1.99.1"]);
+    }
+
+    /// Any other refusal fails the probe, naming the package.
+    #[test]
+    fn probe_published_fails_on_any_other_refusal() {
+        let error = block_on(probe(
+            |base| {
+                probe_steps(
+                    base,
+                    respond(200, TOKEN),
+                    respond(400, r#"{"errors":[{"code":"UNSUPPORTED","message":"no"}]}"#),
+                )
+            },
+            &["1.98.0"],
+        ))
+        .expect_err("a refusal is not 'unpublished'");
+        assert!(error.to_string().contains("stow-cache-1.98.0"), "{error}");
     }
 }

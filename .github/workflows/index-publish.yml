@@ -10,7 +10,7 @@ name: Index publish
 # artifacts (`index.<target>.<rustc>` plus the `folded.<target>.<rustc>`
 # companion listing every records tag already folded, both on the
 # rustc's `ghcr.io/water-rs/stow-cache-<rustc>` package) and
-# cosign-signed keyless under this
+# signed keyless under this
 # workflow's identity on `main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
 # A `schedule` or `workflow_run` trigger would run on the default branch
@@ -51,7 +51,8 @@ permissions:
   # Pushes the index artifacts and their cosign signature images.
   packages: write
   # Mints the run's OIDC token — the edge bearer the admin index endpoint
-  # accepts — and the Fulcio identity cosign signs under.
+  # accepts — and the Fulcio identity `stow-admin index publish` signs
+  # under.
   id-token: write
 
 concurrency:
@@ -88,9 +89,6 @@ jobs:
           sha: ${{ github.sha }}
           binaries: stow-admin
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      # cosign is still what signs — `stow-admin index publish` shells out
-      # to it exactly as `stow-build publish` does.
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       # The export pass is scoped to one rustc: only `records-<rustc>-*`
       # artifacts and `index.<t>.<rustc>`/`folded.<t>.<rustc>` pairs are
       # touched. `index-publish-cron` forwards the rustc the completed
@@ -113,8 +111,15 @@ jobs:
       # index and folded tags — is reported in full before this run's
       # delta, which builds on what the scheduler holds. Without it a
       # slice no later export re-emits would stay unreported.
+      #
+      # The reconcile decodes every published slice of the rustc, so a
+      # slice in an older index format fails it. A `full` run is the
+      # recovery for exactly that slice: it reconciles after the publish
+      # step below, when the export has regenerated every slice it reads.
+      # The same command therefore appears twice, under complementary
+      # `if:` gates; Actions has no way to place one step at two points.
       - name: Report the published slices the scheduler does not hold
-        if: inputs.report
+        if: inputs.report && !inputs.full
         env:
           STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
           STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
@@ -219,3 +224,18 @@ jobs:
               print(f"::error::index publish incomplete: {' '.join(failed)}", flush=True)
               sys.exit(1)
           EOF
+      # The `full` run's reconcile (see the gated step before the
+      # export): every slice of the rustc was just regenerated and
+      # published in the current format, so the decode cannot hit an
+      # old-format slice, and whatever the publish loop's own report
+      # left the scheduler without is reported here.
+      - name: Report the published slices the scheduler does not hold after a full pass
+        if: inputs.report && inputs.full
+        env:
+          STOW_EDGE_URL: ${{ vars.STOW_EDGE_URL }}
+          STOW_OIDC_AUDIENCE: ${{ vars.STOW_OIDC_AUDIENCE }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          stow-admin index reconcile --rustc-version "$RUSTC_VERSION"
