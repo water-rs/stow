@@ -4,9 +4,12 @@ name: Release gate
 # mock end-to-end, the traffic-cost and preheat-cost tests, the production
 # wave count, and the monthly projection over what those three measured.
 # They run three ways —
-# `workflow_dispatch` on any ref, nightly on dev's head (03:00 ET), and in
-# main's merge group, where the `main` ruleset requires this workflow's
-# `Release gate` check.
+# `workflow_dispatch` on any ref, nightly on dev's head (03:00 ET, which
+# the edge Cron Trigger dispatches through the App: `STOW_PERIODIC_WORKFLOWS`,
+# stow#1121), and in main's merge group, where the `main` ruleset requires
+# this workflow's `Release gate` check. The App's dispatch carries no
+# inputs, so the nightly is told from a manual dispatch by the dispatching
+# identity, `stow-ci[bot]`.
 #
 # A pull request into main and a dev merge group run only the gate job: the
 # required check still reports, and the legs run once, in main's merge
@@ -16,16 +19,12 @@ name: Release gate
 # the group's target branch).
 on:
   workflow_dispatch:
-  schedule:
-    # 03:00 America/New_York; scheduled runs land on the default branch,
-    # which is dev.
-    - cron: "0 7 * * *"
   pull_request:
     branches: [main]
   merge_group:
 
 # Same contract as test.yml: a pull request pushed several times in a row
-# only needs its newest run; scheduled and merge-group runs are records and
+# only needs its newest run; nightly and merge-group runs are records and
 # never cancel one another.
 concurrency:
   group: release-gate-${{ github.workflow }}-${{ github.ref }}
@@ -47,7 +46,7 @@ jobs:
   # nightly tick has no "changed paths" to scope to, and the nightly exists
   # to catch a drift no change drove.
   mock-e2e:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Mock end-to-end
     runs-on: ubuntu-26.04
     permissions:
@@ -126,7 +125,7 @@ jobs:
   # signal or 5xx under the drive. Its reports are what the `Monthly
   # projection` job prices the month from.
   traffic-cost:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Traffic cost
     runs-on: ubuntu-26.04
     timeout-minutes: 110
@@ -184,7 +183,7 @@ jobs:
   # production lanes outran this job's timeout beside the wave's builds,
   # so the `Production wave` job counts it.
   preheat-cost:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Preheat cost
     runs-on: ubuntu-26.04
     # The binaries-only top two pull in ~1,750 tasks: a cold build plus
@@ -244,7 +243,7 @@ jobs:
   # minutes for the projects lane, which is why it has a job of its own
   # and a timeout of its own. It fails when a lane fails or plans nothing.
   production-wave:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     name: Production wave
     runs-on: ubuntu-26.04
     # Measured 37 minutes (the projects lane dominates), plus half.
@@ -311,7 +310,7 @@ jobs:
   # project` prints the traffic, preheat and total beside the bound for
   # each product and fails when any total is over it.
   projection:
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event.merge_group.base_ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' || github.event.merge_group.base_ref == 'refs/heads/main'
     needs:
       - traffic-cost
       - preheat-cost
@@ -375,7 +374,7 @@ jobs:
       # The gate covers every job only because it needs every job; a new
       # job that forgets to join `needs:` would ship ungated. Read the
       # workflow itself and fail if any job other than this one and the
-      # schedule-only reporter — which needs the gate, so the gate cannot
+      # nightly-only reporter — which needs the gate, so the gate cannot
       # need it — is absent from the list.
       - name: Needs covers every job
         run: |
@@ -393,7 +392,8 @@ jobs:
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           echo "$NEEDS" | jq -e '[.[].result] | all(. == "success" or . == "skipped")' > /dev/null
 
-  # Schedule ticks alone, after the gate: a failure comments on the open
+  # The nightly tick alone (a dispatch by the App, `stow-ci[bot]`; an
+  # operator's manual dispatch is not one), after the gate: a failure comments on the open
   # `nightly` issue — filing one when none is open — and a pass closes
   # every open one. It needs the legs and the gate so `needs` carries
   # their results; `if: always()` because a failed leg must not silence
@@ -406,7 +406,7 @@ jobs:
       - production-wave
       - projection
       - gate
-    if: always() && github.event_name == 'schedule'
+    if: always() && github.event_name == 'workflow_dispatch' && github.triggering_actor == 'stow-ci[bot]'
     name: Nightly report
     runs-on: ubuntu-26.04
     permissions:

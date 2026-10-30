@@ -421,7 +421,7 @@ delete those directories to start fresh.
 The edge's Cron Trigger (`[cloudflare.triggers]` in the manifests,
 stow#1100) dispatches the periodic workflows (`watchdog.yml`, `preheat-cron.yml`,
 `index-publish-cron.yml`, `demand-feed.yml`, `build-failure-digest.yml`,
-`test.yml`, `preheat-projects.yml`, `preheat-missed.yml`). On the mock
+`test.yml`, `release-gate.yml`, `preheat-projects.yml`, `preheat-missed.yml`). On the mock
 stack the `scheduled` handler posts the same dispatch to
 `STOW_LOCAL_CI_URL`, where `stow-build serve` records it for
 `GET /periodic`; `wrangler dev --test-scheduled` fires one on demand with
