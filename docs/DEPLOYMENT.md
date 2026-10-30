@@ -320,6 +320,16 @@ the verdict's `--min-requests-per-version` floor is 200 on each side,
 below the suite count because Workers analytics is sampled — and
 finally shifts `canary_share`% of traffic onto it.
 
+`wrangler versions upload` does not apply triggers, so the `promote` job
+runs `wrangler triggers deploy` right after the candidate reaches `100%`,
+with the wrangler config `prepare` generated (passed as an artifact):
+that applies `[cloudflare.triggers] crons` and the custom domain route.
+They apply to the whole Worker rather than to a version, which is why they
+wait for promotion — earlier, the `scheduled` handler would fire on
+whichever version Cloudflare routes during the canary. A change to a cron
+or the route therefore takes effect only on a deploy that passes both
+verdicts' gate up to promotion.
+
 Promotion is gated on two verdict phases of
 `stow-admin deploy verdict`, each printing every metric's baseline and
 candidate values and exiting non-zero on a breach — which runs

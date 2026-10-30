@@ -1241,6 +1241,78 @@ fn entrypoints_run_on_linux_runners() {
 }
 
 // ===========================================================================
+// deploy-edge.yml (stow#1100)
+// ===========================================================================
+
+/// `wrangler versions upload` applies no triggers, so the crons declared in
+/// `edge/Skyzen.toml` reach production only through `wrangler triggers
+/// deploy`, which must follow the 100% promotion in the `promote` job and
+/// read the same generated config `prepare` produced.
+#[test]
+fn deploy_edge_applies_triggers_after_promotion() {
+    let wf = load_workflow("deploy-edge.yml");
+    let config = at(&wf, "env.WRANGLER_CONFIG")
+        .map(scalar)
+        .expect("WRANGLER_CONFIG");
+    let steps = at(&wf, "jobs.promote.steps")
+        .and_then(serde_yml::Value::as_sequence)
+        .expect("promote steps");
+    let run_of = |s: &serde_yml::Value| field(s, "run").map(scalar).unwrap_or_default();
+    let position = |needle: &str| {
+        steps
+            .iter()
+            .position(|s| run_of(s).contains(needle))
+            .unwrap_or_else(|| panic!("promote has no step running `{needle}`"))
+    };
+    let promote = position("versions deploy --name stow-edge --yes \"$CANDIDATE_VERSION@100%\"");
+    let triggers = position("wrangler triggers deploy");
+    assert!(
+        triggers > promote,
+        "triggers deploy (step {triggers}) must follow the 100% promotion (step {promote})"
+    );
+    assert!(
+        run_of(&steps[triggers]).contains("--config \"$WRANGLER_CONFIG\""),
+        "triggers deploy must use the shared generated config"
+    );
+    assert!(
+        !run_of(&steps[triggers]).contains("--triggers"),
+        "triggers come from the config, not a hardcoded list"
+    );
+    // The config the step reads is the artifact `prepare` generated.
+    let download = steps[promote + 1..triggers]
+        .iter()
+        .find(|s| {
+            field(s, "uses")
+                .map(scalar)
+                .is_some_and(|u| u.starts_with("actions/download-artifact@"))
+        })
+        .expect("a download of the generated config between promotion and triggers deploy");
+    assert_eq!(
+        at(download, "with.name").map(scalar).as_deref(),
+        Some("wrangler-config")
+    );
+    assert_eq!(
+        at(download, "with.path").map(scalar).as_deref(),
+        Some("edge/.skyzen/gen")
+    );
+    assert_eq!(config, ".skyzen/gen/wrangler.toml");
+    let prepare = at(&wf, "jobs.prepare.steps")
+        .and_then(serde_yml::Value::as_sequence)
+        .expect("prepare steps");
+    assert!(
+        prepare.iter().any(|s| {
+            field(s, "uses")
+                .map(scalar)
+                .is_some_and(|u| u.starts_with("actions/upload-artifact@"))
+                && at(s, "with.name").map(scalar).as_deref() == Some("wrangler-config")
+                && at(s, "with.path").map(scalar).as_deref()
+                    == Some("edge/${{ env.WRANGLER_CONFIG }}")
+        }),
+        "prepare must upload the generated config as `wrangler-config`"
+    );
+}
+
+// ===========================================================================
 // operations.yml (stow#955)
 // ===========================================================================
 
