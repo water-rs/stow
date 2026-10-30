@@ -15,10 +15,10 @@ run-name: ${{ inputs.repack_rustc != '' && format('{0}-repack', inputs.repack_ru
 #             no OIDC. Everything it produces is handed over as a workflow
 #             artifact.
 #   publish — success path only. Never runs third-party code. Holds the GHCR
-#             token and the OIDC grant (`id-token: write`) cosign's keyless
-#             signing uses. Validates the build output against the task and
+#             token and the OIDC grant (`id-token: write`) keyless signing
+#             uses. Validates the build output against the task and
 #             an independently resolved dependency closure, then pushes the
-#             bundles and the task's ArtifactRecord set — cosign-signed under
+#             bundles and the task's ArtifactRecord set — signed keyless under
 #             this workflow's identity — to GHCR (the
 #             `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag).
 #             GHCR is the only record store; the task talks to no edge route.

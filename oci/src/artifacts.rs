@@ -17,8 +17,8 @@ use stow_types::identity::WireRustcVersion;
 use stow_types::registry::{bundle_oci_reference, cache_repository, sha256_digest};
 use stow_types::upload_plan::{PlannedArtifact, PublishedArtifact};
 
-use crate::client::{RegistryError, RegistryHttp, RegistrySession, canonical_manifest_bytes};
-use crate::registry::RegistryCredentials;
+use crate::client::{RegistryError, RegistrySession, canonical_manifest_bytes};
+use crate::publisher::Publisher;
 use crate::retry::retry_with_backoff;
 use crate::sign;
 
@@ -39,24 +39,23 @@ pub struct UploadOutcome {
 ///
 /// # Errors
 ///
-/// Returns an error when a push, the cosign signature, or a bundle pull
-/// fails; the registry round-trip error names the plan's OCI reference.
+/// Returns an error when a push, the signature, or a bundle pull fails;
+/// the registry round-trip error names the plan's OCI reference.
 pub async fn push_artifacts(
     plans: &[PlannedArtifact],
     rustc_version: &WireRustcVersion,
-    credentials: &RegistryCredentials,
-    http: &RegistryHttp,
+    publisher: &Publisher,
 ) -> stow_types::error::Result<UploadOutcome> {
-    let session = credentials.session(&cache_repository(rustc_version), http)?;
-    push_artifacts_with(&session, plans, |reference, digest| async move {
-        sign::sign_artifact(&reference, &digest, credentials).await
+    let session = publisher.session(&cache_repository(rustc_version))?;
+    let session = &session;
+    push_artifacts_with(session, plans, |reference, digest| async move {
+        publisher.signer().sign(session, &reference, &digest).await
     })
     .await
 }
 
 /// [`push_artifacts`] with the session and signer supplied — the mock
-/// registry test pushes through this with an in-process signer so no cosign
-/// binary is involved.
+/// registry tests push through this with the mock key's signer.
 ///
 /// `sign` is invoked once per plan with `(oci_reference, manifest_digest)`.
 ///
@@ -263,7 +262,8 @@ async fn push_bundle(
 /// Pull every `sha256-<hex>.sig` signature layer for `oci_digest`.
 ///
 /// One material per simple-signing layer: payload path and bytes,
-/// signature, certificate, and the Rekor bundle when cosign uploaded one.
+/// signature, certificate, and the Rekor bundle when the signer logged
+/// one.
 /// Shared by the bundle republish path and the CLI's index verification.
 ///
 /// This is the read for a signature published earlier or by someone else:

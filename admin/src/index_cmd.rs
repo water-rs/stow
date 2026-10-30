@@ -170,9 +170,9 @@ struct IndexExportSummary {
 /// set the command delegates to `stow-mock-registry publish-index` —
 /// writing the signed artifacts into `STOW_MOCK_REGISTRY_ROOT` exactly as
 /// `stow-build` mock-populate does for bundles; without it the command
-/// pushes to GHCR through `stow-oci` and signs with the `cosign` binary
-/// (`GHCR_USERNAME`/`GHCR_TOKEN`), the production path
-/// `index-publish.yml` runs.
+/// pushes to GHCR through `stow-oci` (`GHCR_USERNAME`/`GHCR_TOKEN`) and
+/// signs keyless in process under the job's OIDC identity, the production
+/// path `index-publish.yml` runs.
 #[derive(Args)]
 pub struct IndexPublishArgs {
     /// The encoded index file (`index export --out-dir` wrote).
@@ -953,11 +953,13 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
         if let Ok(private_key_path) = std::env::var(STOW_MOCK_PRIVATE_KEY_PATH_ENV) {
             publish_index_mock(&args.file, &args.folded, &private_key_path).await?
         } else {
-            let credentials = stow_oci::RegistryCredentials::from_env()?;
             let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
+            // The keyless signer checks every signature it makes against
+            // the trust readers verify with.
+            let trust = stow_oci::verify::records_trust().await?;
+            let publisher = stow_oci::Publisher::from_env(http, &trust)?;
             let outcome = stow_oci::publish_index(
-                &credentials,
-                &http,
+                &publisher,
                 &bytes,
                 &target,
                 &index.header.rustc_version,
@@ -968,8 +970,7 @@ async fn index_publish(args: IndexPublishArgs) -> stow_types::error::Result<()> 
             // same step — the export that follows only ever sees pairs
             // this command pushed.
             stow_oci::publish_folded(
-                &credentials,
-                &http,
+                &publisher,
                 &serde_json::to_vec(&folded)?,
                 &target,
                 &index.header.rustc_version,

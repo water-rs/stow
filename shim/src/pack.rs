@@ -3,9 +3,9 @@
 //! A bundle's files travel as one OCI layer: a deterministic tar of the
 //! node's outputs, compressed as a single zstd stream so redundancy across
 //! files (an rlib embeds the metadata its rmeta carries) is paid for once.
-//! Compression runs once at publish time on every core of the machine;
-//! decompression speed does not depend on the level, so readers pay the
-//! same at any setting.
+//! Compression runs once at publish time, spread over the machine's cores
+//! in [`STOW_ZSTD_JOB_SIZE`] jobs; decompression speed does not depend on
+//! the level, so readers pay the same at any setting.
 
 use std::io::{Read as _, Write as _};
 
@@ -37,8 +37,9 @@ pub const STOW_ZSTD_JOB_SIZE: u32 = 32 << 20;
 pub const STOW_ZSTD_OVERLAP_LOG: u32 = 8;
 
 /// Compress `bytes` as one zstd stream at [`STOW_ZSTD_COMPRESSION_LEVEL`]
-/// with long-distance matching and a [`STOW_ZSTD_WINDOW_LOG`] window, on
-/// every core of the machine.
+/// with long-distance matching and a [`STOW_ZSTD_WINDOW_LOG`] window, in
+/// [`STOW_ZSTD_JOB_SIZE`] jobs over every core of the machine — an input
+/// under one job size is compressed by one worker.
 ///
 /// The frame records the content size, so the window a decoder commits is
 /// never larger than the content.

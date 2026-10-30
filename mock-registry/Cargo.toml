@@ -33,6 +33,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 tempfile = "3"
+# The keyless-signing tests' mock Sigstore: a Fulcio issuing under a
+# throwaway CA, a Rekor signing canonical entry timestamps, and the
+# concurrent sweep they publish.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+olpc-cjson = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 tower = { version = "0.5", features = ["util"] }
 stow-oci = { workspace = true, features = ["mock-verify"] }
 # The fixture example serializes QueueSelector task-id lists into the

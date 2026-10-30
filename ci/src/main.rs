@@ -9,7 +9,7 @@
 //!   [`stage`]). Third-party build scripts and proc-macros execute here, so
 //!   nothing this job produces is trusted by itself.
 //! * `stow-build publish` runs in a job that holds the GHCR token and the OIDC
-//!   grant for cosign — and nothing else. It reads the build output,
+//!   grant keyless signing needs — and nothing else. It reads the build output,
 //!   re-derives every digest, checks the plan against the task it was
 //!   dispatched with and a dependency closure it resolves itself, then pushes
 //!   and signs the artifacts and the task's records artifact into GHCR.
@@ -88,8 +88,10 @@ enum Stage {
         /// The rustc whose published nodes are swept.
         #[arg(long)]
         rustc_version: String,
-        /// Tasks repacked at once. Each node's compression already uses
-        /// every core; this bounds registry round trips and memory.
+        /// Tasks repacked at once. A node under 32 MiB compresses as one
+        /// single-threaded zstd job, so this is what spreads the sweep over
+        /// the cores; it also bounds memory. Registry writes are bounded
+        /// by `STOW_GHCR_WRITES_PER_MINUTE`.
         #[arg(long)]
         concurrency: std::num::NonZeroUsize,
     },
@@ -206,9 +208,14 @@ async fn records_exist_stage() -> stow_types::error::Result<()> {
     let task = load_task_payload()?;
     let credentials = stow_oci::RegistryCredentials::from_env()?;
     let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
-    let exists = published_manifest(&task, &credentials, &http)
-        .await?
-        .is_some();
+    let session = stow_oci::RegistryBase::production()?.push_session(
+        &stow_types::registry::cache_repository(&task.rustc_version),
+        &credentials,
+        &http,
+        &stow_oci::WriteBudget::from_env()?,
+    );
+    let trust = stow_oci::verify::records_trust().await?;
+    let exists = published_manifest(&task, &session, &trust).await?.is_some();
     println!("{exists}");
     Ok(())
 }
@@ -218,12 +225,9 @@ async fn records_exist_stage() -> stow_types::error::Result<()> {
 /// bytes are the value a re-tag puts under the run's own records tag.
 async fn published_manifest(
     task: &BuildTaskPayload,
-    credentials: &stow_oci::RegistryCredentials,
-    http: &stow_oci::RegistryHttp,
+    session: &stow_oci::RegistrySession,
+    trust: &stow_oci::verify::Trust,
 ) -> stow_types::error::Result<Option<Vec<u8>>> {
-    let repository = stow_types::registry::cache_repository(&task.rustc_version);
-    let session =
-        stow_oci::RegistryBase::production()?.push_session(&repository, credentials, http);
     let reference = session.reference(&stow_types::records::published_tag(
         task.rustc_version.as_str(),
         &task.task_id,
@@ -258,7 +262,7 @@ async fn published_manifest(
     // marker's manifest must carry a records signature bound to the
     // pinned builder identity — an unverifiable marker means build
     // normally (stow#877).
-    if !marker_signature_verified(&session, &reference, &manifest_digest).await? {
+    if !marker_signature_verified(session, trust, &reference, &manifest_digest).await? {
         return Ok(None);
     }
     Ok(Some(manifest))
@@ -272,10 +276,10 @@ async fn published_manifest(
 /// `records-` tag rather than the marker's own.
 async fn marker_signature_verified(
     session: &stow_oci::RegistrySession,
+    trust: &stow_oci::verify::Trust,
     reference: &stow_oci::Reference,
     manifest_digest: &str,
 ) -> stow_types::error::Result<bool> {
-    let trust = stow_oci::verify::records_trust().await?;
     let Ok(materials) =
         stow_oci::pull_signature_materials(session, reference, manifest_digest).await
     else {
@@ -300,7 +304,7 @@ async fn marker_signature_verified(
             rekor_bundle_json: material.rekor_bundle_json.clone(),
         };
         stow_oci::verify::verify_material(
-            &trust,
+            trust,
             &bound,
             manifest_digest,
             &signature,
@@ -315,18 +319,20 @@ async fn publish(
     task: &BuildTaskPayload,
     input_dir: &std::path::Path,
 ) -> stow_types::error::Result<u32> {
-    let credentials = stow_oci::RegistryCredentials::from_env()?;
     // One client for the whole publish: the artifact push and the
-    // records push share the trust-store load (stow#624).
+    // records push share the trust-store load (stow#624), and one
+    // publisher, so every signature rides one Fulcio certificate and every
+    // write spends one budget.
     let http = stow_oci::RegistryHttp::new(stow_oci::TransportPolicy::PATIENT).await?;
+    let trust = stow_oci::verify::records_trust().await?;
+    let publisher = stow_oci::Publisher::from_env(http, &trust)?;
+    let session =
+        publisher.session(&stow_types::registry::cache_repository(&task.rustc_version))?;
     // A run whose task's signed records already exist re-tags the
     // proven manifest under its own `records-<…>-<run_id>-<attempt>`
     // tag — the webhook's per-run check still resolves — instead of
     // validating and pushing a second build (stow#877).
-    if let Some(manifest) = published_manifest(task, &credentials, &http).await? {
-        let repository = stow_types::registry::cache_repository(&task.rustc_version);
-        let session =
-            stow_oci::RegistryBase::production()?.push_session(&repository, &credentials, &http);
+    if let Some(manifest) = published_manifest(task, &session, &trust).await? {
         let reference = session.reference(&stow_types::records::records_tag(
             task.rustc_version.as_str(),
             &task.task_id,
@@ -338,8 +344,13 @@ async fn publish(
         // in the shared `sha256-<digest>.sig` bundle (stow#877).
         let reference_string = reference.to_string();
         stow_oci::put_signed_manifest(&session, &reference, &manifest, |digest| {
-            let reference_string = reference_string.clone();
-            async move { stow_oci::sign_artifact(&reference_string, &digest, &credentials).await }
+            let (reference_string, session) = (&reference_string, &session);
+            async move {
+                publisher
+                    .signer()
+                    .sign(session, reference_string, &digest)
+                    .await
+            }
         })
         .await
         .map_err(|error| stow_types::stow_error!("retag records manifest {reference}: {error}"))?;
@@ -351,21 +362,20 @@ async fn publish(
     }
     let output = validated_build_output(task, input_dir).await?;
     let upload_outcome =
-        stow_oci::push_artifacts(&output.plan, &task.rustc_version, &credentials, &http).await?;
+        stow_oci::push_artifacts(&output.plan, &task.rustc_version, &publisher).await?;
     let artifact_records = stow_types::upload_plan::build_artifact_records(
         &output.plan,
         &upload_outcome.published_by_reference,
         &measure_glibc_floors(&output.plan)?,
     )?;
-    // The records artifact is the only record the run writes: cosigned by
+    // The records artifact is the only record the run writes: signed by
     // this workflow's identity under
     // `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` — the run
     // identity makes the tag per-build, so a rebuilt task never
     // overwrites an earlier build's rows — and the webhook handler reads
     // this run's tag back before marking the task done.
     let records = stow_oci::push_records(
-        &credentials,
-        &http,
+        &publisher,
         &task.rustc_version,
         &task.task_id,
         build_run_from_env()?,

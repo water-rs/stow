@@ -19,6 +19,16 @@
 //! a monolithic `POST …/uploads/?digest=` per missing blob, a push costs the
 //! minimum the OCI distribution spec allows: `2` requests to mint the token
 //! once, `1-2` per blob, `1` per manifest.
+//!
+//! A credentialed session also holds the process's [`WriteBudget`]: every
+//! write it dispatches — retries included — first takes a token, so the
+//! process stays under the operator's write rate instead of finding the
+//! cap through refusals.
+//!
+//! The Sigstore exchanges the keyless signer makes (OIDC token, Fulcio,
+//! Rekor) ride the same client and the same retry loop, without a
+//! session: they carry their own authorization and spend no registry
+//! write budget.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,6 +40,7 @@ use stow_types::error::Context;
 use stow_types::registry::sha256_digest;
 
 use crate::registry::{RegistryBase, RegistryCredentials};
+use crate::throttle::WriteBudget;
 
 /// Total dispatches a single request may make before the registry's refusal
 /// is returned verbatim — the first try plus `MAX_ATTEMPTS - 1` retries. With
@@ -60,17 +71,17 @@ const NOT_FOUND_CODES: [&str; 3] = ["MANIFEST_UNKNOWN", "BLOB_UNKNOWN", "NOT_FOU
 /// What a registry round trip produced: every completed HTTP exchange —
 /// including refused ones — comes back as this, so the caller keeps the
 /// status, headers and verbatim body the registry answered.
-struct Response {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Vec<u8>,
+pub struct Response {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Response {
     /// The refusal as an error: status plus the body's own text, so the
     /// message GHCR sent (e.g. `retry-after: 28.55879ms, allowed:
     /// 2000/minute`) reaches the caller unmodified.
-    fn refusal(&self, what: &str, url: &str) -> RegistryError {
+    pub(crate) fn refusal(&self, what: &str, url: &str) -> RegistryError {
         RegistryError {
             what: format!("{what} {url}"),
             kind: RegistryErrorKind::Refused {
@@ -118,7 +129,7 @@ impl RegistryError {
         matches!(self.kind, RegistryErrorKind::Transport(_))
     }
 
-    fn transport(what: &str, url: &str, error: impl std::fmt::Display) -> Self {
+    pub(crate) fn transport(what: &str, url: &str, error: impl std::fmt::Display) -> Self {
         Self {
             what: format!("{what} {url}"),
             kind: RegistryErrorKind::Transport(error.to_string()),
@@ -193,37 +204,34 @@ impl std::fmt::Display for RegistryError {
 impl std::error::Error for RegistryError {}
 
 /// A request `send` can replay: the verb's method, absolute URL, headers and
-/// body, plus how to authenticate. `authenticated` requests carry the
-/// session's bearer and may re-mint it once after a `401`.
-struct SessionRequest {
-    method: Method,
-    url: String,
-    headers: HeaderMap,
-    body: Option<Vec<u8>>,
+/// body, plus the basic-auth pair of the token exchange. Whether it carries
+/// a session bearer is the caller's choice of [`RegistryHttp::send`]'s
+/// session.
+pub struct SessionRequest {
+    pub(crate) method: Method,
+    pub(crate) url: String,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Option<Vec<u8>>,
     /// Basic-auth pair for the token exchange — the only request that
     /// authenticates with the username/password pair rather than a bearer.
     basic_auth: Option<(String, String)>,
-    authenticated: bool,
 }
 
 impl SessionRequest {
-    fn authenticated(method: Method, url: String) -> Self {
+    pub(crate) fn new(method: Method, url: String) -> Self {
         Self {
             method,
             url,
             headers: HeaderMap::new(),
             body: None,
             basic_auth: None,
-            authenticated: true,
         }
     }
+}
 
-    fn unauthenticated(method: Method, url: String) -> Self {
-        Self {
-            authenticated: false,
-            ..Self::authenticated(method, url)
-        }
-    }
+/// Whether `method` writes — the verbs GHCR counts against its write cap.
+const fn is_write(method: &Method) -> bool {
+    matches!(*method, Method::POST | Method::PUT | Method::PATCH)
 }
 
 /// How a registry client's transport treats connection setup.
@@ -305,6 +313,125 @@ impl RegistryHttp {
     pub fn same_client(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.client, &other.client)
     }
+
+    /// Dispatch `request`, retrying a transient answer until the server accepts
+    /// or [`MAX_ATTEMPTS`] dispatches have been refused — the only place the
+    /// whole push path handles backpressure, the bearer exchange and the
+    /// Sigstore exchanges included. A request that gets a definitive
+    /// answer — success or any other status — comes back as a
+    /// [`Response`]; only a transport failure that outlived every retry
+    /// returns `Err`, so the caller always sees the refusal the server
+    /// actually sent.
+    ///
+    /// With a `session`, the request carries the session bearer and may
+    /// re-mint it once after a `401`, and a write first takes a token from
+    /// the session's [`WriteBudget`] on every dispatch; without one (the
+    /// challenge ping, the token exchange, the Sigstore services) it is
+    /// retried identically but never mints and spends no write budget.
+    pub(crate) async fn send(
+        &self,
+        what: &str,
+        request: SessionRequest,
+        session: Option<&RegistrySession>,
+    ) -> Result<Response, RegistryError> {
+        let writes = session
+            .and_then(RegistrySession::write_budget)
+            .filter(|_| is_write(&request.method));
+        let mut reauthed = false;
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let mut builder = self.client.request(request.method.clone(), &request.url);
+            if let Some(session) = session
+                && let Some(bearer) = session.bearer().await?
+            {
+                builder = builder.bearer_auth(bearer);
+            }
+            if let Some((username, password)) = &request.basic_auth {
+                builder = builder.basic_auth(username, Some(password));
+            }
+            builder = builder.headers(request.headers.clone());
+            if let Some(body) = &request.body {
+                builder = builder.body(body.clone());
+            }
+            if let Some(writes) = writes {
+                writes.acquire().await;
+            }
+            let sent = async {
+                let response = builder.send().await?;
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response.bytes().await?.to_vec();
+                Ok::<_, reqwest::Error>((status, headers, body))
+            }
+            .await;
+            // A request that never produced a whole answer — the connection
+            // dropped, the stream reset mid-body — is transient: every
+            // request here is content-addressed or idempotent, so sending
+            // it again is safe.
+            let (status, headers, body) = match sent {
+                Ok(answer) => answer,
+                Err(error) => {
+                    // A connect or DNS failure answers reachability, not
+                    // congestion: a policy that declines to retry it
+                    // returns at once — the caller's circuit carries the
+                    // outage (stow#977). Every other transport failure
+                    // stays in the sweep. The timeout the policy sets is
+                    // the connect bound — this client has no request
+                    // timeout, so `is_timeout` can only be a connect
+                    // that outlived it, and reqwest's connect timeout
+                    // does not surface as `is_connect`.
+                    let retriable = self.transport.retry_connect_failures
+                        || !(error.is_connect() || error.is_dns() || error.is_timeout());
+                    let error = RegistryError::transport(what, &request.url, error);
+                    if !retriable || attempt >= MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+                    let delay = retry_delay(attempt, None);
+                    tracing::debug!(
+                        what,
+                        attempt,
+                        %error,
+                        delay_ms = delay.as_millis(),
+                        "registry request failed in transport; retrying"
+                    );
+                    smol::Timer::after(delay).await;
+                    continue;
+                }
+            };
+            if status == StatusCode::UNAUTHORIZED
+                && let Some(session) = session
+                && !reauthed
+            {
+                // The minted bearer was rejected mid-session — the mock TTL
+                // is minutes, GHCR's is not much longer — mint once more and
+                // replay the request rather than failing it.
+                reauthed = true;
+                session.refresh_bearer().await?;
+                continue;
+            }
+            let response = Response {
+                status,
+                headers,
+                body,
+            };
+            if !stow_types::transient::is_transient_status(status.as_u16()) {
+                return Ok(response);
+            }
+            if attempt >= MAX_ATTEMPTS {
+                return Ok(response);
+            }
+            let delay = retry_delay(attempt, retry_after_hint(&response));
+            tracing::debug!(
+                what,
+                attempt,
+                %status,
+                delay_ms = delay.as_millis(),
+                "registry answered a transient status; retrying"
+            );
+            smol::Timer::after(delay).await;
+        }
+    }
 }
 
 /// One HTTP session over a `RegistryBase` — holds the process's client
@@ -345,18 +472,27 @@ impl std::fmt::Debug for RegistrySession {
     }
 }
 
+/// How a session authenticates. Only a credentialed session writes, so it
+/// is the one that carries the process's [`WriteBudget`].
 pub enum SessionCredential {
     Anonymous,
-    Basic { username: String, password: String },
+    Basic {
+        username: String,
+        password: String,
+        writes: WriteBudget,
+    },
 }
 
 impl std::fmt::Debug for SessionCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Anonymous => f.write_str("Anonymous"),
-            Self::Basic { username, .. } => f
+            Self::Basic {
+                username, writes, ..
+            } => f
                 .debug_struct("Basic")
                 .field("username", username)
+                .field("writes_per_minute", &writes.writes_per_minute())
                 .finish_non_exhaustive(),
         }
     }
@@ -416,6 +552,14 @@ impl RegistrySession {
         &self.repository
     }
 
+    /// The write budget a credentialed session spends.
+    const fn write_budget(&self) -> Option<&WriteBudget> {
+        match &self.credential {
+            SessionCredential::Anonymous => None,
+            SessionCredential::Basic { writes, .. } => Some(writes),
+        }
+    }
+
     /// `<host>/<repository>:<tag>` — the pull reference of `tag` in this
     /// session's repository.
     ///
@@ -450,10 +594,7 @@ impl RegistrySession {
     pub async fn blob_exists(&self, digest: &str) -> Result<bool, RegistryError> {
         let url = self.api(&format!("blobs/{digest}"));
         let response = self
-            .send(
-                "head blob",
-                SessionRequest::authenticated(Method::HEAD, url.clone()),
-            )
+            .send("head blob", SessionRequest::new(Method::HEAD, url.clone()))
             .await?;
         match response.status {
             status if status.is_success() => Ok(true),
@@ -485,7 +626,7 @@ impl RegistrySession {
                 kind: RegistryErrorKind::Transport(error.to_string()),
             })?
             .to_string();
-        let mut request = SessionRequest::authenticated(Method::POST, url.clone());
+        let mut request = SessionRequest::new(Method::POST, url.clone());
         request.body = Some(bytes.to_vec());
         request.headers.insert(
             header::CONTENT_TYPE,
@@ -513,7 +654,7 @@ impl RegistrySession {
         bytes: &[u8],
     ) -> Result<(), RegistryError> {
         let url = upload_commit_url(&self.origin, &response.headers, digest)?;
-        let mut request = SessionRequest::authenticated(Method::PUT, url.clone());
+        let mut request = SessionRequest::new(Method::PUT, url.clone());
         request.body = Some(bytes.to_vec());
         request.headers.insert(
             header::CONTENT_TYPE,
@@ -543,7 +684,7 @@ impl RegistrySession {
     ) -> Result<String, RegistryError> {
         let selector = self.selector(reference)?;
         let url = self.api(&format!("manifests/{selector}"));
-        let mut request = SessionRequest::authenticated(Method::PUT, url.clone());
+        let mut request = SessionRequest::new(Method::PUT, url.clone());
         request.body = Some(manifest.to_vec());
         request.headers.insert(
             header::CONTENT_TYPE,
@@ -600,7 +741,7 @@ impl RegistrySession {
     ) -> Result<String, RegistryError> {
         let selector = self.selector(reference)?;
         let url = self.api(&format!("manifests/{selector}"));
-        let mut request = SessionRequest::authenticated(Method::HEAD, url.clone());
+        let mut request = SessionRequest::new(Method::HEAD, url.clone());
         request.headers.insert(
             header::ACCEPT,
             HeaderValue::from_static(stow_types::bundle::OCI_IMAGE_MANIFEST_MEDIA_TYPE),
@@ -681,10 +822,7 @@ impl RegistrySession {
             |last| format!("{url}?n={n}&last={last}"),
         );
         let response = match self
-            .send(
-                "list tags",
-                SessionRequest::authenticated(Method::GET, url.clone()),
-            )
+            .send("list tags", SessionRequest::new(Method::GET, url.clone()))
             .await
         {
             Ok(response) => response,
@@ -734,7 +872,7 @@ impl RegistrySession {
         selector: &str,
     ) -> Result<(Vec<u8>, String), RegistryError> {
         let url = self.api(&format!("manifests/{selector}"));
-        let mut request = SessionRequest::authenticated(Method::GET, url.clone());
+        let mut request = SessionRequest::new(Method::GET, url.clone());
         request.headers.insert(
             header::ACCEPT,
             HeaderValue::from_static(stow_types::bundle::OCI_IMAGE_MANIFEST_MEDIA_TYPE),
@@ -773,10 +911,7 @@ impl RegistrySession {
     pub async fn pull_blob(&self, digest: &str) -> Result<Vec<u8>, RegistryError> {
         let url = self.api(&format!("blobs/{digest}"));
         let response = self
-            .send(
-                "pull blob",
-                SessionRequest::authenticated(Method::GET, url.clone()),
-            )
+            .send("pull blob", SessionRequest::new(Method::GET, url.clone()))
             .await?;
         response.ensure_success("pull blob", &url)?;
         Ok(response.body)
@@ -808,107 +943,15 @@ impl RegistrySession {
         format!("{}/v2/{}/{}", self.origin, self.repository, path)
     }
 
-    /// Dispatch `request`, retrying a transient answer until the registry accepts
-    /// or [`MAX_ATTEMPTS`] dispatches have been refused — the only place the
-    /// whole push path handles backpressure, the bearer exchange included.
-    /// A request that gets a definitive answer — success or any other
-    /// status — comes back as a [`Response`]; only a transport failure that
-    /// outlived every retry returns `Err`, so the caller always sees the refusal GHCR actually
-    /// sent. An `authenticated` request carries the session bearer and may
-    /// re-mint it once after a `401`; an unauthenticated one (the challenge
-    /// ping, the token exchange) is retried identically but never mints.
-    async fn send(&self, what: &str, request: SessionRequest) -> Result<Response, RegistryError> {
-        let mut reauthed = false;
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let mut builder = self
-                .http
-                .client
-                .request(request.method.clone(), &request.url);
-            if request.authenticated
-                && let Some(bearer) = self.bearer().await?
-            {
-                builder = builder.bearer_auth(bearer);
-            }
-            if let Some((username, password)) = &request.basic_auth {
-                builder = builder.basic_auth(username, Some(password));
-            }
-            builder = builder.headers(request.headers.clone());
-            if let Some(body) = &request.body {
-                builder = builder.body(body.clone());
-            }
-            let sent = async {
-                let response = builder.send().await?;
-                let status = response.status();
-                let headers = response.headers().clone();
-                let body = response.bytes().await?.to_vec();
-                Ok::<_, reqwest::Error>((status, headers, body))
-            }
-            .await;
-            // A request that never produced a whole answer — the connection
-            // dropped, the stream reset mid-body — is transient: every
-            // request here is content-addressed or idempotent, so sending
-            // it again is safe.
-            let (status, headers, body) = match sent {
-                Ok(answer) => answer,
-                Err(error) => {
-                    // A connect or DNS failure answers reachability, not
-                    // congestion: a policy that declines to retry it
-                    // returns at once — the caller's circuit carries the
-                    // outage (stow#977). Every other transport failure
-                    // stays in the sweep. The timeout the policy sets is
-                    // the connect bound — this client has no request
-                    // timeout, so `is_timeout` can only be a connect
-                    // that outlived it, and reqwest's connect timeout
-                    // does not surface as `is_connect`.
-                    let retriable = self.http.transport.retry_connect_failures
-                        || !(error.is_connect() || error.is_dns() || error.is_timeout());
-                    let error = RegistryError::transport(what, &request.url, error);
-                    if !retriable || attempt >= MAX_ATTEMPTS {
-                        return Err(error);
-                    }
-                    let delay = retry_delay(attempt, None);
-                    tracing::debug!(
-                        what,
-                        attempt,
-                        %error,
-                        delay_ms = delay.as_millis(),
-                        "registry request failed in transport; retrying"
-                    );
-                    smol::Timer::after(delay).await;
-                    continue;
-                }
-            };
-            if status == StatusCode::UNAUTHORIZED && request.authenticated && !reauthed {
-                // The minted bearer was rejected mid-session — the mock TTL
-                // is minutes, GHCR's is not much longer — mint once more and
-                // replay the request rather than failing it.
-                reauthed = true;
-                self.refresh_bearer().await?;
-                continue;
-            }
-            let response = Response {
-                status,
-                headers,
-                body,
-            };
-            if !stow_types::transient::is_transient_status(status.as_u16()) {
-                return Ok(response);
-            }
-            if attempt >= MAX_ATTEMPTS {
-                return Ok(response);
-            }
-            let delay = retry_delay(attempt, retry_after_hint(&response));
-            tracing::debug!(
-                what,
-                attempt,
-                %status,
-                delay_ms = delay.as_millis(),
-                "registry answered a transient status; retrying"
-            );
-            smol::Timer::after(delay).await;
-        }
+    /// Dispatch `request` with the session's bearer — see
+    /// [`RegistryHttp::send`]. The loop's future is returned as is, so a
+    /// caller's future holds the request once.
+    fn send<'a>(
+        &'a self,
+        what: &'a str,
+        request: SessionRequest,
+    ) -> impl Future<Output = Result<Response, RegistryError>> + 'a {
+        self.http.send(what, request, Some(self))
     }
 
     /// The session's bearer, minting it on first use: challenge `GET /v2/`,
@@ -926,9 +969,10 @@ impl RegistrySession {
                 let url = format!("{}/v2/", self.origin);
                 // `Box::pin` breaks the `send → bearer → send` cycle for
                 // this in-loop call the same way the token exchange's is.
-                let response = Box::pin(self.send(
+                let response = Box::pin(self.http.send(
                     "registry challenge",
-                    SessionRequest::unauthenticated(Method::GET, url.clone()),
+                    SessionRequest::new(Method::GET, url.clone()),
+                    None,
                 ))
                 .await?;
                 let challenge = if response.status == StatusCode::UNAUTHORIZED {
@@ -995,13 +1039,16 @@ impl RegistrySession {
                 kind: RegistryErrorKind::Transport(error.to_string()),
             })?
             .to_string();
-        let mut request = SessionRequest::unauthenticated(Method::GET, url.clone());
-        if let SessionCredential::Basic { username, password } = &self.credential {
+        let mut request = SessionRequest::new(Method::GET, url.clone());
+        if let SessionCredential::Basic {
+            username, password, ..
+        } = &self.credential
+        {
             request.basic_auth = Some((username.clone(), password.clone()));
         }
         // `Box::pin` breaks the `send → refresh_bearer → exchange_token →
         // send` cycle — boxing makes this future's size finite.
-        let response = Box::pin(self.send("exchange bearer token", request)).await?;
+        let response = Box::pin(self.http.send("exchange bearer token", request, None)).await?;
         // GHCR answers the anonymous exchange for a package that does not
         // exist or is not public with `403 DENIED` — a bare envelope that
         // reads like an auth failure. Name the real cause so a refused
@@ -1236,13 +1283,14 @@ impl RegistryBase {
     }
 
     /// The credentialed publish session — `pull,push` scope over
-    /// `GHCR_USERNAME`/`GHCR_TOKEN`.
+    /// `GHCR_USERNAME`/`GHCR_TOKEN`, every write spending `writes`.
     #[must_use]
     pub fn push_session(
         &self,
         repository: &stow_types::registry::CacheRepository,
         credentials: &RegistryCredentials,
         http: &RegistryHttp,
+        writes: &WriteBudget,
     ) -> RegistrySession {
         RegistrySession::new(
             self,
@@ -1250,6 +1298,7 @@ impl RegistryBase {
             SessionCredential::Basic {
                 username: credentials.username.clone(),
                 password: credentials.password.clone(),
+                writes: writes.clone(),
             },
             "pull,push",
             http,
@@ -1285,6 +1334,7 @@ mod tests {
                 password: "p".to_owned(),
             },
             &http,
+            &crate::WriteBudget::per_minute(std::num::NonZeroU32::MIN),
         );
         assert!(pull.http.same_client(&http));
         assert!(push.http.same_client(&http));
