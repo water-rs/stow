@@ -40,6 +40,7 @@ const PERIODIC_EVENTS = new Set([
 	"demand-feed",
 	"build-failure-digest",
 	"test",
+	"release-gate",
 	"preheat-projects",
 	"preheat-missed",
 ]);

@@ -69,7 +69,7 @@ STOW_STATS_SALT_SECRET = "mock-stats-salt"
 STOW_STATS_SQL_URL = "http://127.0.0.1:28123/analytics_engine/sql"
 # Same cadence map as the production manifest (stow#1100); the local CI
 # server records the dispatch each scheduled event produces.
-STOW_PERIODIC_WORKFLOWS = '{"*/15 * * * *": ["watchdog.yml"], "17 0 * * *": ["preheat-cron.yml"], "*/10 * * * *": [{"workflow": "index-publish-cron.yml", "ref": "dev"}], "5 * * * *": ["demand-feed.yml"], "0 13 * * *": [{"workflow": "build-failure-digest.yml", "ref": "dev"}], "0 7 * * *": [{"workflow": "test.yml", "ref": "dev"}], "30 5 * * 1": [{"workflow": "preheat-projects.yml", "ref": "dev"}], "0 6 * * 1": ["preheat-missed.yml"]}'
+STOW_PERIODIC_WORKFLOWS = '{"*/15 * * * *": ["watchdog.yml"], "17 0 * * *": ["preheat-cron.yml"], "*/10 * * * *": [{"workflow": "index-publish-cron.yml", "ref": "dev"}], "5 * * * *": ["demand-feed.yml"], "0 13 * * *": [{"workflow": "build-failure-digest.yml", "ref": "dev"}], "0 7 * * *": [{"workflow": "test.yml", "ref": "dev"}, {"workflow": "release-gate.yml", "ref": "dev"}], "30 5 * * 1": [{"workflow": "preheat-projects.yml", "ref": "dev"}], "0 6 * * 1": ["preheat-missed.yml"]}'
 
 [cloudflare.triggers]
 crons = ["*/15 * * * *", "17 0 * * *", "*/10 * * * *", "5 * * * *", "0 13 * * *", "0 7 * * *", "30 5 * * 1", "0 6 * * 1"]

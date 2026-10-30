@@ -1166,6 +1166,7 @@ async fn dispatch(
         | "demand-feed"
         | "build-failure-digest"
         | "test"
+        | "release-gate"
         | "preheat-projects"
         | "preheat-missed") => {
             state

@@ -47,33 +47,41 @@ fn every_declared_cron_is_mapped_and_every_mapping_is_declared() {
     }
 }
 
-/// Every periodic workflow with its cadence and the branch it is
-/// dispatched on: the six moved by stow#1121 keep the branch their
+/// Every periodic cron with the workflows it drives and the branch each
+/// is dispatched on: the six moved by stow#1121 keep the branch their
 /// `schedule` ran on (`dev`), except `demand-feed.yml` and
 /// `preheat-missed.yml`, whose OIDC identity the edge admits on `main`
-/// only; the first two entries were already dispatched on `main`.
-const PRODUCTION: [(&str, &str, &str); 8] = [
-    ("*/15 * * * *", "watchdog.yml", "main"),
-    ("17 0 * * *", "preheat-cron.yml", "main"),
-    ("*/10 * * * *", "index-publish-cron.yml", "dev"),
-    ("5 * * * *", "demand-feed.yml", "main"),
-    ("0 13 * * *", "build-failure-digest.yml", "dev"),
-    ("0 7 * * *", "test.yml", "dev"),
-    ("30 5 * * 1", "preheat-projects.yml", "dev"),
-    ("0 6 * * 1", "preheat-missed.yml", "main"),
+/// only; the first two entries were already dispatched on `main`. The
+/// nightly `0 7 * * *` tick drives two workflows.
+const PRODUCTION: [(&str, &[&str], &str); 8] = [
+    ("*/15 * * * *", &["watchdog.yml"], "main"),
+    ("17 0 * * *", &["preheat-cron.yml"], "main"),
+    ("*/10 * * * *", &["index-publish-cron.yml"], "dev"),
+    ("5 * * * *", &["demand-feed.yml"], "main"),
+    ("0 13 * * *", &["build-failure-digest.yml"], "dev"),
+    ("0 7 * * *", &["test.yml", "release-gate.yml"], "dev"),
+    ("30 5 * * 1", &["preheat-projects.yml"], "dev"),
+    ("0 6 * * 1", &["preheat-missed.yml"], "main"),
 ];
 
 #[test]
 fn production_drives_every_periodic_workflow_at_its_cadence_and_branch() {
     for manifest in ["edge/Skyzen.toml", "edge/Skyzen.mock.toml"] {
         let (_, schedule) = manifest_schedule(manifest);
-        for (cron, file, branch) in PRODUCTION {
+        for (cron, files, branch) in PRODUCTION {
             let due = schedule
                 .due(cron)
                 .unwrap_or_else(|error| panic!("{manifest}: {error}"));
-            assert_eq!(due.len(), 1, "{manifest}: {cron} drives one workflow");
-            assert_eq!(due[0].workflow.as_str(), file, "{manifest}: {cron}");
-            assert_eq!(due[0].dispatch_ref.as_str(), branch, "{manifest}: {file}");
+            let driven: Vec<&str> = due.iter().map(|entry| entry.workflow.as_str()).collect();
+            assert_eq!(driven, files, "{manifest}: {cron}");
+            for entry in due {
+                assert_eq!(
+                    entry.dispatch_ref.as_str(),
+                    branch,
+                    "{manifest}: {}",
+                    entry.workflow.as_str()
+                );
+            }
         }
         assert_eq!(
             schedule.crons().count(),
@@ -113,8 +121,10 @@ fn a_driven_workflow_accepts_dispatch() {
 }
 
 /// A workflow that is also a push / pull request / merge group workflow
-/// ran its full legs on `github.event_name == 'schedule'`; once the edge
-/// dispatches it, no job may still wait for an event that never comes.
+/// once ran its full legs on `github.event_name == 'schedule'`; once the
+/// edge dispatches it, no job may still wait for an event that never
+/// comes. The nightly-only paths of `release-gate.yml` tell the edge's
+/// dispatch from a manual one by the App's bot login instead.
 #[test]
 fn a_driven_workflow_never_branches_on_the_schedule_event() {
     let (_, schedule) = manifest_schedule("edge/Skyzen.toml");
@@ -122,8 +132,7 @@ fn a_driven_workflow_never_branches_on_the_schedule_event() {
         for entry in schedule.due(cron).expect("mapped cron") {
             let text = repo_file(&format!(".github/workflows/{}", entry.workflow.as_str()));
             assert!(
-                !text.contains("event_name == 'schedule'")
-                    && !text.contains("event_name != 'schedule'"),
+                !text.contains("'schedule'"),
                 "{}: branches on the `schedule` event",
                 entry.workflow.as_str()
             );

@@ -61,7 +61,7 @@ jobs:
         include:
           - { os: ubuntu-24.04, key: linux-x64, bins: stow-build stow-cli stow-admin }
           - { os: windows-latest, key: windows-x64, bins: stow-build stow-cli }
-          - { os: macos-14, key: macos-arm64, bins: stow-build stow-cli stow-admin }
+          - { os: macos-26, key: macos-arm64, bins: stow-build stow-cli stow-admin }
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read

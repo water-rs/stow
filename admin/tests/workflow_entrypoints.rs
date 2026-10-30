@@ -2182,3 +2182,38 @@ fn followup_ignores_non_repack_titles() {
         assert!(scn.calls_of("gh").is_empty(), "{title}: {:?}", scn.calls());
     }
 }
+
+// ---------------------------------------------------------------------------
+// release-gate.yml: the nightly tick is the App's dispatch (stow#1121)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn release_gate_nightly_is_the_apps_dispatch() {
+    let wf = load_workflow("release-gate.yml");
+    // The cadence is the edge Cron Trigger's, pinned by
+    // `periodic_schedule.rs`; the workflow carries no `schedule`.
+    assert!(at(&wf, "on.schedule").is_none());
+    assert!(at(&wf, "on.workflow_dispatch").is_some());
+    // The App's dispatch carries no inputs, so the nightly report is told
+    // from an operator's manual dispatch by the dispatching identity.
+    assert_eq!(
+        at(&wf, "jobs.nightly-report.if").map(scalar).as_deref(),
+        Some(
+            "always() && github.event_name == 'workflow_dispatch' && github.triggering_actor == 'stow-ci[bot]'"
+        )
+    );
+    // Every leg runs on any dispatch, the nightly's included.
+    for job in [
+        "mock-e2e",
+        "traffic-cost",
+        "preheat-cost",
+        "production-wave",
+        "projection",
+    ] {
+        let condition = at(&wf, &format!("jobs.{job}.if")).map(scalar).expect(job);
+        assert!(
+            condition.starts_with("github.event_name == 'workflow_dispatch' ||"),
+            "{job}"
+        );
+    }
+}
