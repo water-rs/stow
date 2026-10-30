@@ -2069,10 +2069,11 @@ pub const DRIVES: &[Drive] = &[
                     super::object::periodic_dispatch_pass(
                         &ctx.graph,
                         env,
-                        &stow_types::periodic::PeriodicDispatchRequest {
+                        &stow_types::periodic::PeriodicWorkflow {
                             workflow: "watchdog.yml"
                                 .parse()
                                 .map_err(|error| format!("periodic dispatch workflow: {error}"))?,
+                            dispatch_ref: stow_types::periodic::DispatchRef::Main,
                         },
                     )
                     .await

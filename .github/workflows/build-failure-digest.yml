@@ -11,9 +11,10 @@ name: Build failure digest
 #
 # The job fails only when the issue channel failed; a window full of
 # failed builds is a normal exit.
+#
+# The edge Cron Trigger dispatches it on `dev` (`0 13 * * *`,
+# `STOW_PERIODIC_WORKFLOWS`, stow#1121).
 on:
-  schedule:
-    - cron: "0 13 * * *"
   workflow_dispatch:
     inputs:
       dry_run:

@@ -38,6 +38,10 @@ const SUBJECT: &str = "repo:water-rs/stow:ref:refs/heads/main";
 const REQUEST_TOKEN: &str = "mock-request-token";
 /// The mock Rekor's log id.
 const LOG_ID: &str = "6d6f636b2d7265";
+/// The mock Rekor's active tree id in hex — the 16-hex prefix of an entry
+/// UUID, as the public-good log's shard 1193050959916656506 prefixes its
+/// entries `108e9186e8c5677a`.
+const TREE_ID: &str = "108e9186e8c5677a";
 const FULCIO_OIDC_ISSUER_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 57264, 1, 1];
 /// What a P-256 `SubjectPublicKeyInfo` carries before the curve point.
 const P256_SPKI_PREFIX_LEN: usize = 26;
@@ -85,8 +89,15 @@ struct Sigstore {
     /// Log the next this-many entries but answer `503`, as an answer lost
     /// on the way back.
     lose_answers: usize,
+    /// Answer the next this-many reads of a logged entry `404` with an
+    /// empty body, as Rekor answered at the `Location` of a `409` before
+    /// its read path served the entry.
+    unreadable_reads: usize,
     certificates: usize,
-    /// Logged entries by uuid, and the uuid of each canonical body.
+    /// Entry reads Rekor answered, served or not.
+    reads: usize,
+    /// Logged entries by 64-hex entry hash, and the hash of each
+    /// canonical body.
     entries: BTreeMap<String, serde_json::Value>,
     by_body: HashMap<String, String>,
 }
@@ -114,7 +125,9 @@ impl MockSigstore {
             lifetime: Duration::from_secs(600),
             fulcio_refusal: None,
             lose_answers: 0,
+            unreadable_reads: 0,
             certificates: 0,
+            reads: 0,
             entries: BTreeMap::new(),
             by_body: HashMap::new(),
         }));
@@ -164,6 +177,10 @@ impl MockSigstore {
 
     fn entries(&self) -> usize {
         self.with(|state| state.entries.len())
+    }
+
+    fn reads(&self) -> usize {
+        self.with(|state| state.reads)
     }
 }
 
@@ -255,18 +272,22 @@ fn canonical(value: &impl serde::Serialize) -> Vec<u8> {
 
 /// `POST /api/v1/log/entries`: log a `hashedrekord` entry and answer
 /// `{uuid: entry}` with a signed entry timestamp; a body already logged
-/// answers `409` with the entry's `Location`, as Rekor does.
+/// answers `409` with the entry's `Location`, as Rekor does. The entry
+/// UUID is Rekor's: the tree id, then the RFC 6962 leaf hash of the
+/// canonical body.
 async fn log_entry(State(state): Shared, body: Bytes) -> Response {
     let mut state = state.lock().expect("sigstore state poisoned");
     let proposed: serde_json::Value = serde_json::from_slice(&body).expect("rekor request");
     assert_eq!(proposed["kind"], "hashedrekord");
-    let entry_body = base64::engine::general_purpose::STANDARD.encode(canonical(&proposed));
-    if let Some(uuid) = state.by_body.get(&entry_body) {
+    let canonical_body = canonical(&proposed);
+    let entry_body = base64::engine::general_purpose::STANDARD.encode(&canonical_body);
+    if let Some(hash) = state.by_body.get(&entry_body) {
         let mut response =
             (StatusCode::CONFLICT, "an equivalent entry already exists").into_response();
         response.headers_mut().insert(
             header::LOCATION,
-            HeaderValue::from_str(&format!("/rekor/api/v1/log/entries/{uuid}")).expect("location"),
+            HeaderValue::from_str(&format!("/rekor/api/v1/log/entries/{TREE_ID}{hash}"))
+                .expect("location"),
         );
         return response;
     }
@@ -277,7 +298,13 @@ async fn log_entry(State(state): Shared, body: Bytes) -> Response {
         log_id: LOG_ID.to_owned(),
     };
     let set = rcgen::SigningKey::sign(&state.rekor_key, &canonical(&payload)).expect("SET");
-    let uuid = hex::encode(sha2::Sha256::digest(entry_body.as_bytes()));
+    let hash = hex::encode(
+        sha2::Sha256::new()
+            .chain_update([0_u8])
+            .chain_update(&canonical_body)
+            .finalize(),
+    );
+    let uuid = format!("{TREE_ID}{hash}");
     let entry = serde_json::json!({
         "body": payload.body,
         "integratedTime": payload.integrated_time,
@@ -287,8 +314,8 @@ async fn log_entry(State(state): Shared, body: Bytes) -> Response {
             "signedEntryTimestamp": base64::engine::general_purpose::STANDARD.encode(set),
         },
     });
-    state.entries.insert(uuid.clone(), entry.clone());
-    state.by_body.insert(entry_body, uuid.clone());
+    state.entries.insert(hash.clone(), entry.clone());
+    state.by_body.insert(entry_body, hash);
     if state.lose_answers > 0 {
         state.lose_answers -= 1;
         return (StatusCode::SERVICE_UNAVAILABLE, "answer lost").into_response();
@@ -300,13 +327,22 @@ async fn log_entry(State(state): Shared, body: Bytes) -> Response {
         .into_response()
 }
 
-/// `GET /api/v1/log/entries/{uuid}`.
+/// `GET /api/v1/log/entries/{uuid}`: the entry by its 80-hex UUID or its
+/// 64-hex entry hash, answered under the 80-hex UUID as Rekor answers. An
+/// entry Rekor does not serve — never logged, or not yet readable — is a
+/// `404` with an empty body.
 async fn read_entry(State(state): Shared, AxumPath(uuid): AxumPath<String>) -> Response {
-    let state = state.lock().expect("sigstore state poisoned");
-    state.entries.get(&uuid).map_or_else(
-        || StatusCode::NOT_FOUND.into_response(),
-        |entry| axum::Json(serde_json::json!({ uuid: entry })).into_response(),
-    )
+    let mut state = state.lock().expect("sigstore state poisoned");
+    state.reads += 1;
+    let hash = uuid.strip_prefix(TREE_ID).unwrap_or(&uuid);
+    let Some(entry) = state.entries.get(hash).cloned() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if state.unreadable_reads > 0 {
+        state.unreadable_reads -= 1;
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    axum::Json(serde_json::json!({ format!("{TREE_ID}{hash}"): entry })).into_response()
 }
 
 /// A budget no test sweep reaches.
@@ -637,6 +673,31 @@ async fn a_lost_rekor_answer_reads_the_logged_entry_back() {
         .await
         .expect("publish");
     assert_eq!(stack.sigstore.entries(), 1);
+    assert_eq!(stack.sigstore.reads(), 1);
+    stack
+        .verify(&session, &plans[0], &digests[0])
+        .await
+        .expect("verifies");
+}
+
+/// Rekor's real shape after a lost answer: the retry meets `409`, and the
+/// entry its `Location` names answers `404` until Rekor's read path serves
+/// it. The read-back waits that out, and the signature completes with one
+/// entry and verifies.
+#[tokio::test]
+async fn a_logged_entry_not_yet_readable_is_read_back_once_it_is() {
+    let stack = Stack::new().await;
+    stack.sigstore.with(|state| {
+        state.lose_answers = 1;
+        state.unreadable_reads = 2;
+    });
+    let session = stack.session(&unbounded());
+    let plans = [plan(&stack.root, 0)];
+    let digests = Stack::publish(&session, &stack.signer(), &plans)
+        .await
+        .expect("publish");
+    assert_eq!(stack.sigstore.entries(), 1, "no signature was logged twice");
+    assert_eq!(stack.sigstore.reads(), 3, "two 404s, then the entry");
     stack
         .verify(&session, &plans[0], &digests[0])
         .await

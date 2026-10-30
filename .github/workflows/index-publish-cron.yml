@@ -1,7 +1,7 @@
 name: Index publish cron
 
-# Scheduled and `workflow_run` workflows run on the default branch (`dev`),
-# but the artifact index must be signed under
+# `workflow_run` workflows run on the default branch (`dev`), but the
+# artifact index must be signed under
 # `index-publish.yml@refs/heads/main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`), so this
 # lane only ticks: it dispatches `index-publish.yml` on `main`, the same
@@ -10,16 +10,15 @@ name: Index publish cron
 # The tick is event-driven: every completed `build-crate` run — the only
 # thing that lands records in GHCR — dispatches a publish, so a newly
 # pushed records artifact reaches the index within one publish run. The
-# schedule is the backstop for a `workflow_run` event GitHub failed to
-# deliver; GitHub delivers `*/10` ticks hours apart on
-# this repository, so it cannot be the primary trigger.
+# edge Cron Trigger is the backstop for a `workflow_run` event GitHub
+# failed to deliver (`*/10 * * * *`, dispatched on `dev` through
+# `STOW_PERIODIC_WORKFLOWS`, stow#1121): GitHub's own `schedule`
+# delivered those ticks hours apart, so it cannot be the primary trigger.
 
 on:
   workflow_run:
     workflows: [build-crate]
     types: [completed]
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -43,7 +42,7 @@ jobs:
       # reports each slice to the scheduler; unset, it publishes the
       # index and skips reporting — the workflow never probes.
       # A `workflow_run` tick also forwards the rustc the completed run's
-      # `<rustc>-<task_id>` title names; a schedule or manual tick leaves
+      # `<rustc>-<task_id>` title names; a Cron Trigger or manual tick leaves
       # the input empty and index-publish takes the stable channel.
       - name: Dispatch index-publish on main
         env:

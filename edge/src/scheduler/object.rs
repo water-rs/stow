@@ -1697,7 +1697,7 @@ async fn unloaded_ci_interface(
 async fn periodic_dispatch(
     State(graph): State<graph::GraphCell>,
     env: WasmEnv,
-    Json(request): Json<stow_types::periodic::PeriodicDispatchRequest>,
+    Json(request): Json<stow_types::periodic::PeriodicWorkflow>,
 ) -> Result<Json<OkResponse>> {
     periodic_dispatch_pass(&graph, &env, &request).await?;
     Ok(Json(OkResponse { ok: true }))
@@ -1709,15 +1709,15 @@ async fn periodic_dispatch(
 pub(super) async fn periodic_dispatch_pass(
     graph: &graph::GraphCell,
     env: &WasmEnv,
-    request: &stow_types::periodic::PeriodicDispatchRequest,
+    request: &stow_types::periodic::PeriodicWorkflow,
 ) -> Result<()> {
     let interface = unloaded_ci_interface(graph, env).await?;
     interface
-        .submit_periodic(&request.workflow)
+        .submit_periodic(request)
         .await
         .map_err(|error| {
             let error = to_error(error.to_string());
-            tracing::error!(%error, workflow = request.workflow.as_str(), "periodic dispatch failed");
+            tracing::error!(%error, workflow = request.workflow.as_str(), dispatch_ref = request.dispatch_ref.as_str(), "periodic dispatch failed");
             error.set_status(StatusCode::BAD_GATEWAY)
         })
 }

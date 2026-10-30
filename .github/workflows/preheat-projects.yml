@@ -14,9 +14,11 @@ name: Regenerate the projects list
 # (`sign-commits: true`), which GitHub signs itself. It also refreshes a
 # still-open regeneration PR in place and no-ops on an empty diff, which
 # replaces the hand-written branch/force-push/`gh pr` shell entirely.
+#
+# The edge Cron Trigger dispatches it on `dev` (`30 5 * * 1`,
+# `STOW_PERIODIC_WORKFLOWS`, stow#1121): the pull request opens against
+# the branch the run checked out.
 on:
-  schedule:
-    - cron: "30 5 * * 1"
   workflow_dispatch:
 
 permissions:
