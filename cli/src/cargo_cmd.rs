@@ -357,7 +357,6 @@ async fn run_inner(
             &invocation,
             &public_cache_mode,
             maybe_analysis,
-            state_db,
         )
         .await
     } else {
@@ -368,7 +367,6 @@ async fn run_inner(
             &public_cache_mode,
             &budget,
             &selected,
-            state_db,
         ))
         .await
     }
@@ -512,7 +510,6 @@ async fn run_original_workspace_build(
     invocation: &CargoInvocation,
     public_cache_mode: &PublicCacheMode,
     analysis: Option<WorkspacePrediction>,
-    state_db: &StateDb,
 ) -> stow_types::error::Result<ExitStatus> {
     let unit_nodes = analysis
         .as_ref()
@@ -532,7 +529,6 @@ async fn run_original_workspace_build(
     run_cargo(&CargoRunPlan {
         project,
         config,
-        state_db,
         action: &invocation.action,
         cargo_args: &invocation.cargo_args,
         source_root: &project.workspace_root,
@@ -565,7 +561,6 @@ async fn run_mirrored_upgrade_build(
     public_cache_mode: &PublicCacheMode,
     budget: &CacheBudget,
     selected: &[CompatibleUpgrade],
-    state_db: &StateDb,
 ) -> stow_types::error::Result<ExitStatus> {
     let mirror = create_workspace_mirror(project, &project.workspace_root).await?;
     apply_selected_upgrades(project, &mirror, selected).await?;
@@ -630,7 +625,6 @@ async fn run_mirrored_upgrade_build(
     run_cargo(&CargoRunPlan {
         project,
         config,
-        state_db,
         action: &invocation.action,
         cargo_args: &mirror_args,
         source_root: mirror.root(),
@@ -2593,7 +2587,6 @@ async fn run_pinned_mirror_build(
     run_cargo(&CargoRunPlan {
         project,
         config: Some(config),
-        state_db: &config.state_db,
         action: &invocation.action,
         cargo_args: &pinned.args,
         source_root: pinned.mirror.root(),
@@ -3766,10 +3759,6 @@ async fn passthrough_command(
 struct CargoRunPlan<'a> {
     project: &'a ProjectContext,
     config: Option<&'a StowConfig>,
-    /// The process's state-database handle — `config`'s own when there
-    /// is one — for the configs the build's supervisor loads itself
-    /// (stow#682).
-    state_db: &'a StateDb,
     action: &'a str,
     cargo_args: &'a [OsString],
     source_root: &'a Path,
@@ -3882,7 +3871,6 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
     let CargoRunPlan {
         project,
         config,
-        state_db,
         action,
         public_cache_mode,
         covered_units,
@@ -3928,9 +3916,9 @@ async fn run_cargo(plan: &CargoRunPlan<'_>) -> stow_types::error::Result<ExitSta
                 crate::RegistrySources::from_lockfile(&project.workspace_root).await?,
             ),
         },
+        config.cloned(),
         env_base,
         resolution_done.clone(),
-        state_db.clone(),
     ));
     let (mut cargo_run, mut supervisor) =
         spawn_cargo_run(plan, &handler, in_flight, &wrappers, launch, scratch.path()).await?;
@@ -5576,7 +5564,6 @@ mod tests {
             let plan = CargoRunPlan {
                 project: &project,
                 config: None,
-                state_db: &crate::state_db::StateDb::default(),
                 action: "check",
                 cargo_args: &cargo_args,
                 source_root: &project.workspace_root,
@@ -6212,7 +6199,6 @@ mod tests {
         let plan = CargoRunPlan {
             project: &project,
             config: Some(&config),
-            state_db: &config.state_db,
             action: "check",
             cargo_args: &[],
             source_root: &project.workspace_root,
