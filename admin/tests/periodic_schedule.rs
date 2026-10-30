@@ -81,6 +81,11 @@ fn a_driven_workflow_accepts_dispatch() {
                     "{}: the Cron Trigger dispatches it, so it needs workflow_dispatch",
                     workflow.as_str()
                 );
+                assert!(
+                    !triggers.contains_key("schedule"),
+                    "{}: the Cron Trigger is its only clock, so it carries no `schedule`",
+                    workflow.as_str()
+                );
             }
         }
     }

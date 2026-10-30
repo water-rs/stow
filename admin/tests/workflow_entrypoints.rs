@@ -157,8 +157,8 @@ fn preheat_cron() -> serde_yml::Value {
 fn cron_declarations() {
     let wf = preheat_cron();
     // The cadence is the edge Cron Trigger's (stow#1100), pinned by
-    // `periodic_schedule.rs`; GitHub's `schedule` stays only until that
-    // trigger is deployed.
+    // `periodic_schedule.rs`; the workflow carries no `schedule`.
+    assert!(at(&wf, "on.schedule").is_none());
     // The edge's Cron Trigger and an operator both dispatch it.
     assert!(at(&wf, "on.workflow_dispatch").is_some());
     // `gh workflow run` needs actions:write; nothing else is granted.
