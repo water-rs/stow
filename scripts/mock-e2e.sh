@@ -1876,6 +1876,7 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
                 features: [],
                 dependencies: [],
                 dependency_subgraph: {n: []},
+                profile: "dev",
                 explicit_spelling: "keys-as-native"
             }]
         }')")"
@@ -1904,6 +1905,7 @@ admissions="$(curl -fsS --max-time 30 -X POST "$EDGE_URL/api/v1/admissions" \
                 features: ["default"],
                 dependencies: [],
                 dependency_subgraph: {n: []},
+                profile: "dev",
                 explicit_spelling: "keys-as-native"
             }]
         }')")"

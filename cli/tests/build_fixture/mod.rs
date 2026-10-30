@@ -491,6 +491,7 @@ pub fn seed_index_slice(
                     kind: stow_types::public_cache::UnitKind::Linked,
                 },
                 min_glibc: None,
+                node_profile: stow_types::node_profile::NodeProfile::Dev,
             }
         })
         .collect();

@@ -3,7 +3,7 @@
 //! A node's task id commits to the task ids of its resolved direct
 //! dependencies — recursively to its whole dependency subgraph — the way
 //! cargo's `-C metadata` commits to the units it actually links. Two
-//! nodes sharing the six-field [`TaskNodeIdentity`] tuple but sitting
+//! nodes sharing the seven-field [`TaskNodeIdentity`] tuple but sitting
 //! over different dependency contexts are different tasks; two resolving
 //! to identical subgraphs deduplicate on the same id.
 //!
@@ -22,12 +22,13 @@ use utoipa::ToSchema;
 use crate::identity::{
     CrateName, CrateVersion, DependencyIdentity, FeaturesJson, TargetTriple, WireRustcVersion,
 };
+use crate::node_profile::NodeProfile;
 use crate::stow_error;
 
-/// A node's semantic identity — the six-field tuple one unit compiles at.
+/// A node's semantic identity — the seven-field tuple one unit compiles at.
 ///
-/// Crate, version, canonical feature set, target, rustc and compile
-/// side. Two nodes may share this tuple; their dependency identities are
+/// Crate, version, canonical feature set, target, rustc, compile side and
+/// profile. Two nodes may share this tuple; their dependency identities are
 /// what separate them.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, ToSchema)]
 pub struct TaskNodeIdentity {
@@ -43,24 +44,50 @@ pub struct TaskNodeIdentity {
     pub rustc_version: WireRustcVersion,
     /// Whether this is the host side of the consumer's unit graph.
     pub host_side: bool,
+    /// The named profile the unit builds under.
+    pub profile: NodeProfile,
 }
 
 impl TaskNodeIdentity {
     /// The canonical scheduler task id: the shared tuple prefix, then
     /// `-d<dependency digest>` committing to the node's whole dependency
-    /// subgraph, then `-host` for host-side nodes.
+    /// subgraph, then `-host` for host-side nodes and the profile's
+    /// segment for any profile but dev.
     #[must_use]
     pub fn task_id(&self, dependency_identity: &DependencyIdentity) -> String {
-        canonical_task_id(
-            self.crate_name.as_str(),
-            &self.version.to_string(),
-            &self.features_json.raw(),
-            self.target.as_str(),
-            self.rustc_version.as_str(),
-            dependency_identity.as_str(),
-            self.host_side,
-        )
+        canonical_task_id(&TaskIdFields {
+            crate_name: self.crate_name.as_str(),
+            version: &self.version.to_string(),
+            features_json: &self.features_json.raw(),
+            target: self.target.as_str(),
+            rustc_version: self.rustc_version.as_str(),
+            dependency_identity: dependency_identity.as_str(),
+            host_side: self.host_side,
+            profile: self.profile,
+        })
     }
+}
+
+/// The rendered fields of a node identity, as a holder that keeps them
+/// interned rather than typed spells them to [`canonical_task_id`].
+#[derive(Debug, Clone, Copy)]
+pub struct TaskIdFields<'a> {
+    /// Crate name.
+    pub crate_name: &'a str,
+    /// Crate version.
+    pub version: &'a str,
+    /// The canonical raw feature list.
+    pub features_json: &'a str,
+    /// Target triple.
+    pub target: &'a str,
+    /// Wire rustc version.
+    pub rustc_version: &'a str,
+    /// The 64-hex dependency digest.
+    pub dependency_identity: &'a str,
+    /// Whether the node is host-side.
+    pub host_side: bool,
+    /// The node's named profile.
+    pub profile: NodeProfile,
 }
 
 /// [`TaskNodeIdentity::task_id`] over the identity's rendered fields.
@@ -70,24 +97,29 @@ impl TaskNodeIdentity {
 /// `features_json` is the canonical raw list and `dependency_identity`
 /// its 64-hex digest.
 #[must_use]
-pub fn canonical_task_id(
-    crate_name: &str,
-    version: &str,
-    features_json: &str,
-    target: &str,
-    rustc_version: &str,
-    dependency_identity: &str,
-    host_side: bool,
-) -> String {
-    let base = format!(
+pub fn canonical_task_id(fields: &TaskIdFields<'_>) -> String {
+    let TaskIdFields {
+        crate_name,
+        version,
+        features_json,
+        target,
+        rustc_version,
+        dependency_identity,
+        host_side,
+        profile,
+    } = *fields;
+    let mut id = format!(
         "{}-d{dependency_identity}",
         crate::api::task_id_prefix(crate_name, version, features_json, target, rustc_version),
     );
     if host_side {
-        format!("{base}-host")
-    } else {
-        base
+        id.push_str("-host");
     }
+    if let Some(segment) = profile.id_segment() {
+        id.push('-');
+        id.push_str(segment);
+    }
+    id
 }
 
 /// One node of a resolved task graph.
@@ -268,6 +300,7 @@ struct UnionKey<'a> {
     target: &'a str,
     rustc_version: &'a str,
     host_side: bool,
+    profile: NodeProfile,
 }
 
 /// One expanded-graph entry's contribution to
@@ -292,7 +325,7 @@ pub struct DigestEntry<'a> {
 /// A node's digest is derived from its own identity and its
 /// dependencies' digests, so each distinct node is computed once.
 ///
-/// Wire nodes deduplicate on the six-field [`TaskNodeIdentity`]
+/// Wire nodes deduplicate on the seven-field [`TaskNodeIdentity`]
 /// [`crate::api::TaskSubgraph::resolve`] derives — crate, version,
 /// canonical features, the entry-root-scoped target, rustc and side —
 /// and a second occurrence of a node declaring a different dependency
@@ -348,6 +381,7 @@ pub fn shared_dependency_identities<'a>(
                     },
                     rustc_version: entry.identity.rustc_version.as_str(),
                     host_side: node.host_side,
+                    profile: node.profile,
                 },
                 || resolved_wire_node(node, entry.identity, host_triple),
             )?);
@@ -360,6 +394,7 @@ pub fn shared_dependency_identities<'a>(
             target: entry.identity.target.as_str(),
             rustc_version: entry.identity.rustc_version.as_str(),
             host_side: entry.identity.host_side,
+            profile: entry.identity.profile,
         };
         let root_index =
             intern_union_node(&mut index_of, &mut nodes, &mut declared, root_key, || {
@@ -427,6 +462,7 @@ fn resolved_wire_node(
             })?,
             rustc_version: root.rustc_version.clone(),
             host_side: node.host_side,
+            profile: node.profile,
         },
         explicit_spelling: if node.keys_apart {
             crate::public_cache::ExplicitSpelling::KeysApart
@@ -545,6 +581,7 @@ mod tests {
             target: TargetTriple::parse(target).unwrap(),
             rustc_version: WireRustcVersion::parse(rustc_version).unwrap(),
             host_side,
+            profile: crate::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -565,7 +602,7 @@ mod tests {
 
     /// stow#588's shape: `alloc-stdlib` 0.3.0 [] sits over
     /// `alloc-no-stdlib` 2.0.4 at [] in one consumer's graph and at
-    /// `[unsafe]` in another's — the same six-field tuple mints two task
+    /// `[unsafe]` in another's — the same seven-field tuple mints two task
     /// ids because the dependency subgraphs differ.
     #[test]
     fn dependency_context_separates_identical_tuples() {

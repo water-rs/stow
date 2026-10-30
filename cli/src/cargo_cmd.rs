@@ -5740,6 +5740,7 @@ mod tests {
             dependencies: Vec::new(),
             dependency_subgraph: stow_types::api::TaskSubgraph::default(),
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -6148,6 +6149,7 @@ mod tests {
                         format!("a-longer-feature-name-{index}"),
                     ],
                     profile: None,
+                    named: true,
                 })
                 .collect(),
         }

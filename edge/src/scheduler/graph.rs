@@ -29,7 +29,7 @@ use stow_types::api::{
 };
 use stow_types::ci::{CiRunListing, CiRunStatus};
 use stow_types::public_cache::{ExplicitSpelling, UnitShape};
-use stow_types::task_graph::canonical_task_id;
+use stow_types::task_graph::{TaskIdFields, canonical_task_id};
 
 use crate::errors::QueueError;
 use crate::scheduler::queue;
@@ -637,15 +637,16 @@ fn digest_bytes(identity: &stow_types::identity::DependencyIdentity) -> [u8; 32]
 
 /// The canonical task id a submission node's identity columns spell.
 fn minted_id(sub: &SubmissionNode) -> String {
-    canonical_task_id(
-        sub.crate_name.as_str(),
-        &sub.version.to_string(),
-        &sub.features_json.raw(),
-        sub.target.as_str(),
-        sub.rustc_version.as_str(),
-        sub.dependency_identity.as_str(),
-        sub.host_side,
-    )
+    canonical_task_id(&TaskIdFields {
+        crate_name: sub.crate_name.as_str(),
+        version: &sub.version.to_string(),
+        features_json: &sub.features_json.raw(),
+        target: sub.target.as_str(),
+        rustc_version: sub.rustc_version.as_str(),
+        dependency_identity: sub.dependency_identity.as_str(),
+        host_side: sub.host_side,
+        profile: sub.profile,
+    })
 }
 
 /// The identity-index hash of a node's five-field identity.
@@ -972,15 +973,16 @@ impl Graph {
     /// Re-mint a node's canonical task id from its fields.
     fn task_id_of(&self, ix: u32) -> String {
         let node = self.node(ix);
-        canonical_task_id(
-            self.intern.at(node.crate_name),
-            self.intern.at(node.version),
-            self.intern.at(node.features),
-            &self.targets[usize::from(node.target)].name,
-            &self.rustcs[usize::from(node.rustc)],
-            &hex::encode(node.digest),
-            node.flags.host(),
-        )
+        canonical_task_id(&TaskIdFields {
+            crate_name: self.intern.at(node.crate_name),
+            version: self.intern.at(node.version),
+            features_json: self.intern.at(node.features),
+            target: &self.targets[usize::from(node.target)].name,
+            rustc_version: &self.rustcs[usize::from(node.rustc)],
+            dependency_identity: &hex::encode(node.digest),
+            host_side: node.flags.host(),
+            profile: node.flags.profile(),
+        })
     }
 
     /// The live node whose canonical task id is `task_id`.
@@ -1381,7 +1383,13 @@ impl Graph {
             rustc: sub.rustc_version.as_str(),
             digest: digest_bytes(&sub.dependency_identity),
             keys,
-            flags: Flags::new(sub.host_side, explicit, sub.preserve_lockfile, lane),
+            flags: Flags::new(
+                sub.host_side,
+                explicit,
+                sub.preserve_lockfile,
+                lane,
+                sub.profile,
+            ),
             state,
         })
     }
@@ -1756,15 +1764,16 @@ impl Graph {
 
     /// A slice row's published-map key and shape bit.
     fn slice_row_key(target: &str, rustc: &str, row: &PublishedSliceRow) -> (IdKeys, u8) {
-        let task_id = canonical_task_id(
-            row.crate_name.as_str(),
-            &row.version.to_string(),
-            &row.features_json.raw(),
+        let task_id = canonical_task_id(&TaskIdFields {
+            crate_name: row.crate_name.as_str(),
+            version: &row.version.to_string(),
+            features_json: &row.features_json.raw(),
             target,
-            rustc,
-            row.dependency_identity.as_str(),
-            row.unit_shape.side == stow_types::public_cache::UnitSide::Host,
-        );
+            rustc_version: rustc,
+            dependency_identity: row.dependency_identity.as_str(),
+            host_side: row.unit_shape.side == stow_types::public_cache::UnitSide::Host,
+            profile: row.node_profile,
+        });
         (IdKeys::of(&task_id), shape_bit(row.unit_shape))
     }
 
@@ -2558,6 +2567,7 @@ impl Graph {
                 version: identity.version,
                 features_json: identity.features_json,
                 host_side: node.flags.host(),
+                profile: node.flags.profile(),
                 keys_apart: node.flags.explicit(),
                 deps: self.deps_of(dep).map(|child| seen[&child]).collect(),
             });
@@ -2574,6 +2584,7 @@ impl Graph {
             rustc_version: identity.rustc_version,
             preserve_lockfile: node.flags.preserve(),
             host_side: node.flags.host(),
+            profile: node.flags.profile(),
             explicit_spelling: if node.flags.explicit() {
                 ExplicitSpelling::KeysApart
             } else {
@@ -3956,6 +3967,7 @@ mod tests {
             dependency_identity: DependencyIdentity::from_task_ids([name]).expect("dep identity"),
             deps: Vec::new(),
             downloads: 10,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         node.task_id = minted_id(&node);
         node
@@ -3964,6 +3976,35 @@ mod tests {
     /// The canonical task id of the test node `name`.
     fn id(name: &str) -> String {
         sub(name).task_id
+    }
+
+    /// The profile is part of a node's identity: the same crate under two
+    /// profiles is two nodes with distinct ids, and a dispatched payload
+    /// carries the node's own profile (stow#1008).
+    #[test]
+    fn a_node_keeps_its_profile_in_its_id_and_payload() {
+        let mut graph = Graph::default();
+        let dev = sub("a");
+        let mut release = sub("a");
+        release.profile = stow_types::node_profile::NodeProfile::Release;
+        release.task_id = minted_id(&release);
+        assert_ne!(dev.task_id, release.task_id);
+        assert!(release.task_id.ends_with("-release"), "{}", release.task_id);
+        let tree = |node: SubmissionNode| SubmissionTree {
+            source: SubmissionSource::CacheMiss,
+            roots: vec![0],
+            nodes: vec![node],
+        };
+        graph.merge(&tree(dev.clone()), 0).expect("merge dev");
+        graph
+            .merge(&tree(release.clone()), 0)
+            .expect("merge release");
+        for node in [&dev, &release] {
+            let ix = graph.node_ix(&node.task_id).expect("node by id");
+            let payload = graph.task_payload(ix).expect("payload");
+            assert_eq!(payload.profile, node.profile);
+            assert_eq!(payload.task_id, node.task_id);
+        }
     }
 
     /// A → B → C chain (a depends on b, b on c), nodes in leaf order.
@@ -3999,6 +4040,7 @@ mod tests {
                 kind,
             },
             dependency_identity: DependencyIdentity::from_task_ids([name]).expect("dep identity"),
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 

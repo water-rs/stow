@@ -2972,6 +2972,7 @@ mod tests {
                 },
                 emit: vec!["link".to_owned()],
                 min_glibc: None,
+                node_profile: stow_types::node_profile::NodeProfile::Dev,
             }],
         };
         let index_bytes = stow_shim::encode_index(&index).expect("encode index");
@@ -3159,6 +3160,7 @@ mod tests {
             }],
             native: None,
             native_archive: None,
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 

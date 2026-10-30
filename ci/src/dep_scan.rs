@@ -2812,6 +2812,7 @@ mod tests {
                 .collect(),
             is_crates_io: true,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -2994,6 +2995,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -3554,6 +3556,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         let packages = super::consumable_packages(&task, &graph.entries);
         let found = packages
@@ -3606,7 +3609,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": [],
                 "dependencies": [
                     {"index": 1, "extern_crate_name": "stow_ci_wrapper"},
@@ -3618,7 +3621,7 @@ mod tests {
                 "target": {"kind": ["custom-build"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": [],
                 "dependencies": [
                     {"index": 4, "extern_crate_name": "host_dep"}
@@ -3629,7 +3632,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": ["std"],
                 "dependencies": [
                     {"index": 3, "extern_crate_name": "direct_dep"}
@@ -3640,7 +3643,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": ["compress"],
                 "dependencies": [
                     {"index": 5, "extern_crate_name": "transitive_dep"}
@@ -3651,7 +3654,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 0, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": [],
                 "dependencies": []
             },
@@ -3660,7 +3663,7 @@ mod tests {
                 "target": {"kind": ["lib"]},
                 "platform": "aarch64-apple-darwin",
                 "mode": "build",
-                "profile": {"opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
+                "profile": {"name": "dev", "opt_level": "0", "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "panic": "unwind", "strip": {"resolved": "None"}},
                 "features": [],
                 "dependencies": []
             }
@@ -3693,6 +3696,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         // The proc-macro dep was served, not compiled: a consumed record
         // whose dylib output is the path the own unit's `--extern` names.

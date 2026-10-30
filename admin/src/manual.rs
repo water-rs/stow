@@ -488,6 +488,7 @@ fn covered_slice_nodes(
             target: target.clone(),
             rustc_version: rustc_version.clone(),
             host_side,
+            profile: row.node_profile,
         };
         shapes
             .entry((identity, dependency_identity.clone()))
@@ -697,6 +698,7 @@ mod tests {
                 .expect("leaf identity"),
             deps: vec![],
             downloads: 0,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         let tree = SubmissionTree {
             source: SubmissionSource::Operations { priority: 3_000 },

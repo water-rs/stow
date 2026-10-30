@@ -238,6 +238,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -283,6 +284,7 @@ mod tests {
             }],
             native: None,
             native_archive: None,
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 

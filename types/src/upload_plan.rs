@@ -46,6 +46,8 @@ pub struct PlannedArtifact {
     pub rustc_version: WireRustcVersion,
     /// Cargo profile.
     pub profile: Profile,
+    /// The named profile of the task that builds the artifact.
+    pub node_profile: crate::node_profile::NodeProfile,
     /// Sorted, deduplicated emit modes.
     pub emit: Vec<String>,
     /// OCI reference where this artifact will be pushed.
@@ -149,6 +151,7 @@ pub fn build_artifact_records(
             target: plan.target.clone(),
             rustc_version: plan.rustc_version.clone(),
             profile: plan.profile.clone(),
+            node_profile: plan.node_profile,
             emit: plan.emit.clone(),
             crate_name: plan.crate_name.clone(),
             version: plan.crate_version.clone(),

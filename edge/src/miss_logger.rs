@@ -78,6 +78,7 @@ impl Miss {
                     target: dep.target.clone(),
                     rustc_version: dep.rustc_version.clone(),
                     host_side: dep.host_side,
+                    profile: dep.profile,
                     dependency_identity: dep.dependency_identity.clone(),
                     explicit_spelling: dep.explicit_spelling,
                 }
@@ -228,6 +229,7 @@ mod tests {
             preserve_lockfile: false,
             host_side: false,
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -282,6 +284,7 @@ mod tests {
                 host_side: false,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             }],
         };
         let tree = SubmissionTree::from_enqueue_requests(

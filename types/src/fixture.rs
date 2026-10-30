@@ -264,15 +264,16 @@ pub fn digest_hex(n: u64) -> String {
 pub fn fixture_task_id(n: u64) -> String {
     let row = u32::try_from(n).expect("fixture rows fit u32");
     let (crate_name, version) = crate_identity(row);
-    crate::task_graph::canonical_task_id(
-        &crate_name,
-        &version,
-        &crate::identity::FeaturesJson::default().raw(),
-        target_of(row),
-        seeded_rustc(n),
-        &digest_hex(n),
-        row.is_multiple_of(10),
-    )
+    crate::task_graph::canonical_task_id(&crate::task_graph::TaskIdFields {
+        crate_name: &crate_name,
+        version: &version,
+        features_json: &crate::identity::FeaturesJson::default().raw(),
+        target: target_of(row),
+        rustc_version: seeded_rustc(n),
+        dependency_identity: &digest_hex(n),
+        host_side: row.is_multiple_of(10),
+        profile: crate::node_profile::NodeProfile::Dev,
+    })
 }
 
 /// The canonical task id of a drive-owned node outside the fixture's
@@ -280,15 +281,16 @@ pub fn fixture_task_id(n: u64) -> String {
 /// `seed` as its dependency digest.
 #[must_use]
 pub fn named_task_id(name: &str, seed: u64, target: &str) -> String {
-    crate::task_graph::canonical_task_id(
-        name,
-        "1.0.0",
-        &crate::identity::FeaturesJson::default().raw(),
+    crate::task_graph::canonical_task_id(&crate::task_graph::TaskIdFields {
+        crate_name: name,
+        version: "1.0.0",
+        features_json: &crate::identity::FeaturesJson::default().raw(),
         target,
-        NAMED_RUSTC,
-        &digest_hex(seed),
-        false,
-    )
+        rustc_version: NAMED_RUSTC,
+        dependency_identity: &digest_hex(seed),
+        host_side: false,
+        profile: crate::node_profile::NodeProfile::Dev,
+    })
 }
 
 /// The rustc every drive-owned node compiles under.

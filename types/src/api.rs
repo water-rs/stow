@@ -16,6 +16,7 @@ use crate::identity::{
     TargetTriple, WireRustcVersion,
 };
 use crate::index::ArtifactIndexRow;
+use crate::node_profile::NodeProfile;
 use crate::platform::Profile;
 use crate::stow_error;
 use crate::task_graph::{ResolvedTaskGraph, ResolvedTaskNode, TaskNodeIdentity};
@@ -162,6 +163,9 @@ pub struct BuildTaskPayload {
     /// as target-side tasks.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// Whether this node keys differently under the explicit
     /// `--target <host>` spelling — `KeysApart` exactly when a proc-macro
     /// sits in its `--extern` closure (stow#736). A target-side task at
@@ -235,6 +239,10 @@ pub struct SubgraphNode {
     /// graph.
     #[serde(rename = "h", default, skip_serializing_if = "std::ops::Not::not")]
     pub host_side: bool,
+    /// The named profile the node builds under. Absent on the wire means
+    /// dev: the compact encoding writes only another profile.
+    #[serde(rename = "p", default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// Whether the node keys differently under the explicit `--target`
     /// spelling — `ExplicitSpelling::KeysApart` (stow#736). Absent on the
     /// wire means `KeysAsNative`: the compact encoding writes only `true`.
@@ -307,6 +315,7 @@ impl TaskSubgraph {
                 version: node.identity.version.clone(),
                 features_json: node.identity.features_json.clone(),
                 host_side: node.identity.host_side,
+                profile: node.identity.profile,
                 keys_apart: node.explicit_spelling
                     == crate::public_cache::ExplicitSpelling::KeysApart,
                 deps: node
@@ -375,6 +384,7 @@ impl TaskSubgraph {
                     })?,
                     rustc_version: root.rustc_version.clone(),
                     host_side: node.host_side,
+                    profile: node.profile,
                 },
                 explicit_spelling: if node.keys_apart {
                     crate::public_cache::ExplicitSpelling::KeysApart
@@ -406,6 +416,7 @@ impl BuildTaskPayload {
             target: self.target.clone(),
             rustc_version: self.rustc_version.clone(),
             host_side: self.host_side,
+            profile: self.profile,
         }
     }
 
@@ -577,6 +588,10 @@ pub struct ArtifactRecord {
     pub rustc_version: WireRustcVersion,
     /// Exact profile observed from the captured rustc invocation.
     pub profile: Profile,
+    /// The named profile of the task that built the artifact — the
+    /// profile field of its node identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub node_profile: NodeProfile,
     /// Exact `--emit` modes observed from the captured rustc invocation.
     /// Must be strictly sorted and deduplicated.
     pub emit: Vec<String>,
@@ -678,6 +693,9 @@ pub struct EnqueueRequest {
     /// decode as target-side tasks.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// Whether this node keys differently under the explicit
     /// `--target <host>` spelling — `KeysApart` exactly when a proc-macro
     /// sits in its `--extern` closure (stow#736). A target-side task at
@@ -713,6 +731,9 @@ pub struct EnqueueDependency {
     /// compile host units at. Defaults to false — a target-side dep.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// The dep's own dependency digest — the Merkle context its task id
     /// commits to (stow#588). No default: the digest is derived from the
     /// dep's actual resolved subgraph.
@@ -735,6 +756,7 @@ impl EnqueueDependency {
             target: self.target.clone(),
             rustc_version: self.rustc_version.clone(),
             host_side: self.host_side,
+            profile: self.profile,
         }
         .task_id(&self.dependency_identity)
     }
@@ -751,6 +773,7 @@ impl EnqueueRequest {
             target: self.target.clone(),
             rustc_version: self.rustc_version.clone(),
             host_side: self.host_side,
+            profile: self.profile,
         }
     }
 
@@ -810,6 +833,7 @@ impl EnqueueRequest {
                     target: node.identity.target.clone(),
                     rustc_version: node.identity.rustc_version.clone(),
                     host_side: node.identity.host_side,
+                    profile: node.identity.profile,
                     dependency_identity: graph.dependency_identity(dep).cloned().ok_or_else(
                         || stow_error!("resolved dependency graph yields no digest for node {dep}"),
                     )?,
@@ -965,7 +989,8 @@ pub fn task_id_segment(value: &str) -> String {
 
 /// The `<crate>-<version>-<features hash>-<target>-<rustc>` prefix every
 /// task id shares — [`crate::task_graph::TaskNodeIdentity::task_id`]
-/// inserts the `-d<dependency digest>` segment and appends `-host` —
+/// inserts the `-d<dependency digest>` segment and appends `-host` and the
+/// profile's segment —
 /// there is no digest-less spelling of a task id (stow#588).
 pub(crate) fn task_id_prefix(
     crate_name: &str,
@@ -1051,6 +1076,9 @@ pub struct ResolvedDependencyGraphDependency {
     /// keep minting the shape they always did.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
 }
 
 /// One exact crates.io package node resolved from the client's current lockfile graph.
@@ -1072,6 +1100,9 @@ pub struct ResolvedDependencyGraphEntry {
     /// Defaults to the target side for clients predating the flag.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under; part of its identity.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// Direct dependencies of this package.
     pub dependencies: Vec<ResolvedDependencyGraphDependency>,
     /// This node's dependency subgraph, projected from the build's own
@@ -1958,6 +1989,9 @@ pub struct PublishedSliceRow {
     pub version: CrateVersion,
     /// Canonicalized features list.
     pub features_json: FeaturesJson,
+    /// The named profile of the node the row serves.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub node_profile: NodeProfile,
     /// The unit shape the builder recorded for the row — its side, the
     /// cargo invocation spelling that produced it, and whether it links.
     pub unit_shape: crate::public_cache::UnitShape,
@@ -3695,6 +3729,7 @@ mod tests {
             dependency_identity: crate::identity::DependencyIdentity::leaf().expect("leaf digest"),
             deps: deps.to_vec(),
             downloads: 0,
+            profile: crate::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -3929,6 +3964,7 @@ mod tests {
                 kind: crate::public_cache::UnitKind::Linked,
             },
             min_glibc: None,
+            node_profile: crate::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -3953,6 +3989,7 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side: false,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         // The published slice: leaf `d` and `dep@{a,b}` built against it.
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
@@ -4065,6 +4102,7 @@ mod tests {
             },
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
         let lib_task_id = identity("lib", &[], false).task_id(&leaf);
@@ -4146,6 +4184,7 @@ mod tests {
             },
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
         let helper_host_id = identity("helper", &[], true).task_id(&leaf);
@@ -4220,6 +4259,7 @@ mod tests {
             },
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
         let helper_host_id = identity("helper", &[], true).task_id(&leaf);
@@ -4312,6 +4352,7 @@ mod tests {
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             host_side,
+            profile: crate::node_profile::NodeProfile::Dev,
         };
         let leaf = DependencyIdentity::leaf().expect("leaf digest");
         let target_id = identity(false).task_id(&leaf);
@@ -4403,6 +4444,7 @@ mod tests {
                 kind: crate::public_cache::UnitKind::Linked,
             },
             dependency_identity: format!("{i:064x}").parse().expect("digest"),
+            node_profile: crate::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -4622,6 +4664,9 @@ pub struct SubmissionNode {
     /// Whether the node compiles for the build host.
     #[serde(default)]
     pub host_side: bool,
+    /// The named profile the node builds under.
+    #[serde(default, skip_serializing_if = "NodeProfile::is_dev")]
+    pub profile: NodeProfile,
     /// The explicit `--target` spelling flag (stow#736).
     pub explicit_spelling: crate::public_cache::ExplicitSpelling,
     /// Build against the binary's published `Cargo.lock` (overlay lane).
@@ -4732,6 +4777,7 @@ impl SubmissionTree {
                     target: node.identity.target.clone(),
                     rustc_version: node.identity.rustc_version.clone(),
                     host_side: node.identity.host_side,
+                    profile: node.identity.profile,
                     explicit_spelling: node.explicit_spelling,
                     preserve_lockfile: request.preserve_lockfile && ix == 0,
                     dependency_identity,
@@ -5148,6 +5194,7 @@ type SubstitutionGroupKey = (
     TargetTriple,
     WireRustcVersion,
     bool,
+    NodeProfile,
 );
 
 fn substitution_group_key(node: &SubmissionNode) -> SubstitutionGroupKey {
@@ -5157,12 +5204,19 @@ fn substitution_group_key(node: &SubmissionNode) -> SubstitutionGroupKey {
         node.target.clone(),
         node.rustc_version.clone(),
         node.host_side,
+        node.profile,
     )
 }
 
 /// The `(crate, version, target, rustc)` a twin pair shares — the
 /// group key with the side stripped (stow#723).
-type TwinPairKey = (CrateName, CrateVersion, TargetTriple, WireRustcVersion);
+type TwinPairKey = (
+    CrateName,
+    CrateVersion,
+    TargetTriple,
+    WireRustcVersion,
+    NodeProfile,
+);
 
 /// stow#723: the two endpoints of a twin pair move to the same serving
 /// set or neither. A pair is named wherever an edge binds the
@@ -5196,6 +5250,7 @@ fn patch_twin_pair_serving(
             parent.version.clone(),
             parent.target.clone(),
             parent.rustc_version.clone(),
+            parent.profile,
         );
         if parent.host_side {
             for dep in deps {
@@ -5204,6 +5259,7 @@ fn patch_twin_pair_serving(
                     && dep.version == parent.version
                     && dep.target == parent.target
                     && dep.rustc_version == parent.rustc_version
+                    && dep.profile == parent.profile
                     && dep.features_json == parent.features_json
                 {
                     paired.insert((parent_key.clone(), parent.features_json.features().to_vec()));
@@ -5221,6 +5277,7 @@ fn patch_twin_pair_serving(
                         dep.version.clone(),
                         dep.target.clone(),
                         dep.rustc_version.clone(),
+                        dep.profile,
                     ),
                     dep.features_json.features().to_vec(),
                 ))
@@ -5247,6 +5304,7 @@ fn patch_twin_pair_serving(
                 target: node.target.clone(),
                 rustc_version: node.rustc_version.clone(),
                 host_side: node.host_side,
+                profile: node.profile,
             };
             let deps: Vec<TaskNodeIdentity> = node
                 .deps
@@ -5260,6 +5318,7 @@ fn patch_twin_pair_serving(
                         target: dep.target.clone(),
                         rustc_version: dep.rustc_version.clone(),
                         host_side: dep.host_side,
+                        profile: dep.profile,
                     }
                 })
                 .collect();
@@ -5297,6 +5356,7 @@ fn patch_twin_pair_serving(
                     key.2.clone(),
                     key.3.clone(),
                     host_side,
+                    key.4,
                 ))
                 .map(|map| {
                     map.iter()
@@ -5319,6 +5379,7 @@ fn patch_twin_pair_serving(
                 key.2.clone(),
                 key.3.clone(),
                 host_side,
+                key.4,
             )) && map.contains_key(&features)
             {
                 map.insert(features.clone(), joint.clone());
@@ -5339,6 +5400,7 @@ fn substitution_row_key(
         slice.target.clone(),
         slice.rustc_version.clone(),
         row.unit_shape.side == crate::public_cache::UnitSide::Host,
+        row.node_profile,
     )
 }
 
@@ -5352,6 +5414,7 @@ fn published_row_identity(slice: &PublishedIndexSlice, row: &ArtifactIndexRow) -
         target: slice.target.clone(),
         rustc_version: slice.rustc_version.clone(),
         host_side: row.unit_shape.side == crate::public_cache::UnitSide::Host,
+        profile: row.node_profile,
     }
 }
 
@@ -5488,6 +5551,7 @@ impl Substitution<'_> {
                 target: node.target.clone(),
                 rustc_version: node.rustc_version.clone(),
                 host_side: node.host_side,
+                profile: node.profile,
             },
             node.explicit_spelling,
             dependencies,
@@ -5641,6 +5705,7 @@ fn reemit_substituted_tree(
             target: node.identity.target.clone(),
             rustc_version: node.identity.rustc_version.clone(),
             host_side: node.identity.host_side,
+            profile: node.identity.profile,
             explicit_spelling: node.explicit_spelling,
             preserve_lockfile,
             dependency_identity,

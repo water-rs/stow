@@ -241,6 +241,7 @@ pub fn record_to_index_row(record: &ArtifactRecord) -> ArtifactIndexRow {
         artifact_kind: record.artifact_kind.clone(),
         crate_types: record.crate_types.clone(),
         profile: record.profile.clone(),
+        node_profile: record.node_profile,
         emit: record.emit.clone(),
         min_glibc: record.min_glibc,
         unit_shape: record.unit_shape,

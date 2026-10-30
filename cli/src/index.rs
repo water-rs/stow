@@ -871,6 +871,7 @@ pub fn index_test_row(c_metadata: &str) -> stow_types::index::ArtifactIndexRow {
             invocation: UnitInvocation::Native,
             kind: UnitKind::Linked,
         },
+        node_profile: stow_types::node_profile::NodeProfile::Dev,
     }
 }
 

@@ -254,6 +254,7 @@ fn published_task_ids(records: &[ArtifactRecord]) -> stow_types::error::Result<B
                 target: record.target.clone(),
                 rustc_version: record.rustc_version.clone(),
                 host_side: record.unit_shape.side == UnitSide::Host,
+                profile: record.node_profile,
             }
             .task_id(&record.dependency_identity()?))
         })

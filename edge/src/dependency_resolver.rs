@@ -7,6 +7,7 @@ use stow_types::api::{
     QueueTaskStatus, ResolvedDependencyGraphEntry, runner_family,
 };
 use stow_types::identity::{CrateName, CrateVersion, FeaturesJson, TargetTriple, WireRustcVersion};
+use stow_types::node_profile::NodeProfile;
 use stow_types::public_cache::ExplicitSpelling;
 use stow_types::task_graph::{DigestEntry, TaskNodeIdentity, shared_dependency_identities};
 
@@ -307,6 +308,7 @@ fn node_contexts(
                 version: entry.version.clone(),
             },
             host_side: entry.host_side,
+            profile: entry.profile,
         };
         let features_json = exact_graph.feature_json_by_key.get(&key).ok_or_else(|| {
             ResolverError::Invariant(format!(
@@ -321,6 +323,7 @@ fn node_contexts(
             target: node_target(&key, target_typed),
             rustc_version: rustc_version_typed.clone(),
             host_side: entry.host_side,
+            profile: entry.profile,
         });
     }
     let digest_entries = expanded_entries
@@ -343,6 +346,7 @@ fn node_contexts(
                 version: entry.version.clone(),
             },
             host_side: entry.host_side,
+            profile: entry.profile,
         };
         if context_by_key
             .insert(
@@ -417,6 +421,7 @@ fn build_enqueue_requests(
             dependency_subgraph: context.subgraph.clone(),
             preserve_lockfile: false,
             host_side: node_key.host_side,
+            profile: node_key.profile,
             explicit_spelling: context.explicit_spelling,
         };
         // The subgraph already resolved when the node's context was
@@ -521,6 +526,8 @@ struct ExpandedNodeKey {
     package: PackageKey,
     /// Whether the node compiles for the build host.
     host_side: bool,
+    /// The named profile the node builds under.
+    profile: NodeProfile,
 }
 
 struct ExactExpandedGraph {
@@ -564,6 +571,7 @@ fn exact_graph_from_request(
                 version: entry.version.clone(),
             },
             host_side: entry.host_side,
+            profile: entry.profile,
         };
         let features = normalize_feature_set(entry.features.clone())?;
         let features_json = serialize_feature_set(&features)?;
@@ -585,6 +593,7 @@ fn exact_graph_from_request(
                     version: dependency.version.clone(),
                 },
                 host_side: dependency.host_side,
+                profile: dependency.profile,
             })
             .collect::<BTreeSet<_>>();
         dependency_keys_by_key.insert(key.clone(), dependency_keys);
@@ -922,8 +931,10 @@ mod tests {
                         crate_name: libm_key.crate_name.clone(),
                         version: libm_key.version.clone(),
                         host_side: false,
+                        profile: stow_types::node_profile::NodeProfile::Dev,
                     }],
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: libm_key.crate_name.clone(),
@@ -933,6 +944,7 @@ mod tests {
                     explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 },
             ],
         )
@@ -941,10 +953,12 @@ mod tests {
         let humansize_node = ExpandedNodeKey {
             package: humansize_key,
             host_side: false,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         let libm_node = ExpandedNodeKey {
             package: libm_key,
             host_side: false,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         assert!(
             exact_graph
@@ -991,14 +1005,17 @@ mod tests {
                             crate_name: syn_key.crate_name.clone(),
                             version: syn_key.version.clone(),
                             host_side: false,
+                            profile: stow_types::node_profile::NodeProfile::Dev,
                         },
                         ResolvedDependencyGraphDependency {
                             crate_name: syn_key.crate_name.clone(),
                             version: syn_key.version.clone(),
                             host_side: true,
+                            profile: stow_types::node_profile::NodeProfile::Dev,
                         },
                     ],
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: syn_key.crate_name.clone(),
@@ -1008,6 +1025,7 @@ mod tests {
                     explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 },
                 ResolvedDependencyGraphEntry {
                     crate_name: syn_key.crate_name.clone(),
@@ -1017,6 +1035,7 @@ mod tests {
                     explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                     dependencies: Vec::new(),
                     dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                    profile: stow_types::node_profile::NodeProfile::Dev,
                 },
             ],
         )
@@ -1025,10 +1044,12 @@ mod tests {
         let target_node = ExpandedNodeKey {
             package: syn_key.clone(),
             host_side: false,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         let host_node = ExpandedNodeKey {
             package: syn_key,
             host_side: true,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         assert_eq!(
             exact_graph.feature_json_by_key.get(&target_node),
@@ -1041,6 +1062,7 @@ mod tests {
         let consumer_node = ExpandedNodeKey {
             package: consumer_key,
             host_side: false,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         assert_eq!(
             exact_graph.dependency_keys_by_key.get(&consumer_node),
@@ -1164,6 +1186,7 @@ mod tests {
             preserve_lockfile: false,
             host_side: false,
             explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -1228,6 +1251,7 @@ mod tests {
                     .flatten()
                     .map(wire_index)
                     .collect(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             })
             .collect();
         stow_types::api::TaskSubgraph {
@@ -1245,6 +1269,7 @@ mod tests {
         ExpandedNodeKey {
             package: key(name, "1.0.0"),
             host_side,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -1727,6 +1752,7 @@ mod sqlite_tests {
                 explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             })
             .collect::<Vec<_>>();
 
@@ -1777,6 +1803,7 @@ mod sqlite_tests {
                 explicit_spelling: stow_types::public_cache::ExplicitSpelling::KeysAsNative,
                 dependencies: Vec::new(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::default(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             })
             .collect::<Vec<_>>();
 
@@ -1856,6 +1883,7 @@ mod sqlite_tests {
             },
             rustc_version: rustc(),
             host_side,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         // Deterministic zed-shaped out-degrees: ~60% leaves, ~30% light
         // (1-3 deps), ~8% mid (4-8), ~2% hubs (9-24). A tenth of nodes
@@ -1895,11 +1923,13 @@ mod sqlite_tests {
                         crate_name: resolved.nodes()[dep].identity.crate_name.clone(),
                         version: resolved.nodes()[dep].identity.version.as_semver().clone(),
                         host_side: resolved.nodes()[dep].identity.host_side,
+                        profile: stow_types::node_profile::NodeProfile::Dev,
                     })
                     .collect(),
                 dependency_subgraph: stow_types::api::TaskSubgraph::from_resolved(&resolved, index)
                     .expect("subgraph"),
                 explicit_spelling: super::ExplicitSpelling::KeysAsNative,
+                profile: stow_types::node_profile::NodeProfile::Dev,
             })
             .collect::<Vec<_>>();
         let wire_nodes = entries

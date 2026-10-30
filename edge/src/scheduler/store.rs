@@ -757,16 +757,19 @@ mod tests {
             dependency_identity: DependencyIdentity::from_task_ids([name]).expect("dep identity"),
             deps: Vec::new(),
             downloads: 5,
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
-        node.task_id = stow_types::task_graph::canonical_task_id(
-            name,
-            "1.0.0",
-            &node.features_json.raw(),
-            TARGET,
-            RUSTC,
-            node.dependency_identity.as_str(),
-            false,
-        );
+        node.task_id =
+            stow_types::task_graph::canonical_task_id(&stow_types::task_graph::TaskIdFields {
+                crate_name: name,
+                version: "1.0.0",
+                features_json: &node.features_json.raw(),
+                target: TARGET,
+                rustc_version: RUSTC,
+                dependency_identity: node.dependency_identity.as_str(),
+                host_side: false,
+                profile: stow_types::node_profile::NodeProfile::Dev,
+            });
         node
     }
 
@@ -801,6 +804,7 @@ mod tests {
                 },
                 dependency_identity: DependencyIdentity::from_task_ids(["c"])
                     .expect("dep identity"),
+                node_profile: stow_types::node_profile::NodeProfile::Dev,
             })
             .into()
     }

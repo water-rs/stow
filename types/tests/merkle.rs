@@ -98,6 +98,7 @@ fn unit(
             .collect(),
         is_crates_io,
         deps,
+        profile: stow_types::node_profile::NodeProfile::Dev,
     }
 }
 

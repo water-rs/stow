@@ -1575,6 +1575,9 @@ async fn cargo_phase_args(
     if phase == CargoSubcommand::Test {
         args.push("--no-run".to_owned());
     }
+    // The node's named profile decides the cargo profile every unit builds
+    // under; the host side keeps that profile's own build-override.
+    args.extend(task.profile.cargo_args().iter().map(|&arg| arg.to_owned()));
     // Task feature flags never reach the cargo command line: the wrapper
     // package's dependency declaration already encodes the selection, and
     // the generated package declares no features of its own for them to
@@ -2919,6 +2922,7 @@ mod tests {
                 root_deps: Vec::new(),
                 nodes: Vec::new(),
             },
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
@@ -2937,6 +2941,7 @@ mod tests {
                 host_side: false,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             }],
         };
 
@@ -3137,6 +3142,7 @@ mod tests {
                 host_side: false,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
             SubgraphNode {
                 crate_name: CrateName::parse("syn").expect("crate name"),
@@ -3146,6 +3152,7 @@ mod tests {
                 host_side: true,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
         ]);
         let manifest: toml::Table =
@@ -3203,6 +3210,7 @@ mod tests {
             host_side: false,
             keys_apart: false,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }]);
         let manifest: toml::Table =
             toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
@@ -3245,6 +3253,7 @@ mod tests {
             host_side,
             keys_apart: false,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         };
         task.dependency_subgraph = leaf_pins(vec![
             pin("1.0.109", false),
@@ -3256,6 +3265,7 @@ mod tests {
                 host_side: false,
                 keys_apart: false,
                 deps: Vec::new(),
+                profile: stow_types::node_profile::NodeProfile::Dev,
             },
         ]);
         let manifest: toml::Table =
@@ -3303,6 +3313,7 @@ mod tests {
             host_side: false,
             keys_apart: false,
             deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
         }]);
         let manifest: toml::Table =
             toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))

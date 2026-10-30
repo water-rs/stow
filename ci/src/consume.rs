@@ -677,6 +677,7 @@ mod tests {
             emit: vec![],
             unit_shape: shape(side),
             min_glibc: None,
+            node_profile: stow_types::node_profile::NodeProfile::Dev,
         }
     }
 
