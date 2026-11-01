@@ -1563,10 +1563,9 @@ curl -fsS --max-time 10 -H "Authorization: Bearer ${registry_token}" \
 
 # stow#880 — one task id, one build, however many submissions.
 # `preheat manual` resolves unicode-ident and submits it through the
-# operations lane; `stow-admin submit` posts the identical task right
-# behind. The scheduler merges by task id, so the second submit
-# inserts nothing and exactly one run exists — `built` across the
-# task's runs counts exactly one.
+# operations lane in both profiles; `stow-admin submit` posts the identical
+# dev task right behind. The scheduler merges by task id, so the second
+# submit inserts nothing and each profile has exactly one built run.
 UNICODE_VERSION="$(curl -fsS --max-time 30 -H 'User-Agent: stow-mock-e2e' \
     'https://index.crates.io/un/ic/unicode-ident' \
     | jq -rs '[.[] | select(.yanked | not) | .vers] | sort_by(split(".") | map(tonumber)) | last // empty')"
@@ -1583,13 +1582,19 @@ isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     STOW_MOCK_PRIVATE_KEY_PATH="$WORK_DIR/keys/private.pem" \
     STOW_MOCK_REGISTRY_ROOT="$WORK_DIR/mock-registry" \
-    "$BIN/stow-admin" preheat manual \
+    "$BIN/stow-admin" --json preheat manual \
     --crates "$WORK_DIR/dual-crates.txt" \
     --rustc-version "$RUSTC_VERSION" \
     --targets "$HOST_TARGET" \
     --yes \
-    >"$LOG_DIR/preheat-manual-dual.log" 2>&1 \
+    >"$WORK_DIR/preheat-manual-dual.json" 2>"$LOG_DIR/preheat-manual-dual.log" \
     || { cat "$LOG_DIR/preheat-manual-dual.log"; die "stow-admin preheat manual (dual) failed"; }
+dual_ids="$(jq -ce '[.plan[].nodes[].task_id] | unique' "$WORK_DIR/preheat-manual-dual.json")"
+jq -e '[.plan[].nodes[] | [.crate_name, (.profile // "dev")]] | sort ==
+    [["unicode-ident", "dev"], ["unicode-ident", "release"]]' \
+    "$WORK_DIR/preheat-manual-dual.json" >/dev/null \
+    || die "dual wave must contain unicode-ident in both profiles"
+dual_total="$(jq 'length' <<<"$dual_ids")"
 
 # The identical task submitted the second way: the scheduler merges by
 # task id, so the operations submit behind it inserts nothing and no
@@ -1607,21 +1612,21 @@ fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
 grep -q "inserted 0" "$LOG_DIR/admin-submit-dual.log" \
     || { cat "$LOG_DIR/admin-submit-dual.log"; die "dual submit inserted a second task — the merge should hold one"; }
 
-# The task's one run exists and settles — the alarm dispatches it after
-# the submit returns, so "no open run" alone holds before it exists.
+# Both profiles exist and settle — the alarm dispatches after the
+# submit returns, so "no open run" alone holds before they exist.
 deadline=$((SECONDS + TASK_DEADLINE))
 while :; do
     check_children_alive
     read -r dual_seen open_runs <<<"$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
-        | jq -r '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident")))]
+        | jq -r --argjson ids "$dual_ids" '[.tasks[] | select(.task_id as $id | $ids | index($id))]
             | "\(length) \(map(select(.status != "completed")) | length)"')"
-    [ "$dual_seen" -ge 1 ] && [ "$open_runs" -eq 0 ] && break
+    [ "$dual_seen" -ge "$dual_total" ] && [ "$open_runs" -eq 0 ] && break
     [ "$SECONDS" -ge "$deadline" ] && die "dual task has $dual_seen run(s), $open_runs open, after ${TASK_DEADLINE}s"
     sleep 5
 done
 
 # The scheduler's own completion arrived over the run's webhook —
-# completed ticks up by exactly one and nothing failed.
+# completed covers both profiles and nothing failed.
 deadline=$((SECONDS + 300))
 while :; do
     status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status" 2>/dev/null || true)"
@@ -1629,20 +1634,22 @@ while :; do
         echo "[mock-e2e] scheduler (dual): $status_json"
         [ "$(( $(jq -r '.failed' <<<"$status_json") - BASE_FAILED ))" -ge 1 ] \
             && die "scheduler failed the dual task: $status_json"
-        [ "$(jq -r '.completed' <<<"$status_json")" -gt "$completed_before" ] && break
+        [ "$(jq -r '.completed' <<<"$status_json")" -ge "$((completed_before + dual_total))" ] && break
     fi
     [ "$SECONDS" -ge "$deadline" ] && die "scheduler did not complete the dual task within 300s"
     sleep 5
 done
 
 dual_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
-    | jq '[.tasks[] | select(.task_id != null and (.task_id | test("unicode-ident")))]')"
+    | jq --argjson ids "$dual_ids" '[.tasks[] | select(.task_id as $id | $ids | index($id))]')"
 dual_count="$(jq 'length' <<<"$dual_runs")"
 dual_built="$(jq '[.[] | select(.built)] | length' <<<"$dual_runs")"
 dual_failed="$(jq '[.[] | select(.conclusion != null and .conclusion != "success")] | length' <<<"$dual_runs")"
 echo "[mock-e2e] dual task: $dual_count dispatches, $dual_built compiled, $dual_failed non-success"
-[ "$dual_count" -eq 1 ] || die "expected exactly 1 dispatch for the dual-submitted task, saw $dual_count"
-[ "$dual_built" -eq 1 ] || die "dual task compiled $dual_built times across $dual_count dispatches — expected 1"
+jq -e --argjson ids "$dual_ids" '[.[].task_id] | sort == ($ids | sort)' <<<"$dual_runs" >/dev/null \
+    || die "expected exactly one dispatch per dual-wave node: $dual_runs"
+[ "$dual_built" -eq "$dual_total" ] \
+    || die "dual wave compiled $dual_built times across $dual_count dispatches — expected $dual_total"
 [ "$dual_failed" -eq 0 ] || die "a dual dispatch did not conclude success: $dual_runs"
 
 # Throwaway consumer pinned to the exact version the scheduler just built.
