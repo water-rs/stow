@@ -280,7 +280,7 @@ check_children_alive() {
 # what this lane tests.
 isolated_env() {
     local name
-    local -a dropped=()
+    local -a dropped=(-u CARGO_TARGET_DIR)
     for name in $(compgen -e); do
         case "$name" in
             CARGO_PROFILE_*) dropped+=(-u "$name") ;;

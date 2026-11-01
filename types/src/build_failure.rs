@@ -33,6 +33,8 @@ pub struct CompilationInputs {
     pub task: BuildTaskPayload,
     /// SHA-256 of the frozen Cargo.lock bytes.
     pub lock_sha256: String,
+    /// SHA-256 of the generated wrapper manifest bytes.
+    pub manifest_sha256: String,
     /// Cargo argv used by the phase, excluding the output directory.
     pub cargo_args: Vec<String>,
     /// Rust flags with workspace and output paths normalized.
@@ -101,6 +103,7 @@ mod tests {
                     profile: crate::node_profile::NodeProfile::Dev,
                 },
                 lock_sha256: "ab".repeat(32),
+                manifest_sha256: "ef".repeat(32),
                 cargo_args: vec!["check".to_owned(), "--frozen".to_owned()],
                 rustflags: String::new(),
             },
@@ -138,6 +141,12 @@ mod tests {
         let original = failure();
         let mut changed = original.clone();
         changed.inputs.lock_sha256 = "cd".repeat(32);
+        assert!(original.clone().verify_replay(Some(&changed)).is_none());
+        changed = original.clone();
+        changed.inputs.manifest_sha256 = "12".repeat(32);
+        assert!(original.clone().verify_replay(Some(&changed)).is_none());
+        changed = original.clone();
+        changed.inputs.rustflags = "--cfg changed".to_owned();
         assert!(original.clone().verify_replay(Some(&changed)).is_none());
         changed = original.clone();
         changed.inputs.task.attempt += 1;

@@ -14,6 +14,41 @@ pub struct FailureCandidate {
     pub lockfile: String,
 }
 
+/// Bind the untrusted handoff to one GitHub run attempt, including reruns.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct FailureReport {
+    pub build: stow_types::records::BuildRun,
+    pub candidate: FailureCandidate,
+}
+
+impl FailureReport {
+    pub fn for_run(
+        self,
+        expected: stow_types::records::BuildRun,
+    ) -> stow_types::error::Result<FailureCandidate> {
+        verify_run(self.build, expected)?;
+        Ok(self.candidate)
+    }
+}
+
+fn verify_run(
+    actual: stow_types::records::BuildRun,
+    expected: stow_types::records::BuildRun,
+) -> stow_types::error::Result<()> {
+    if actual != expected {
+        return Err(stow_types::stow_error!(
+            "failure candidate belongs to a different run attempt"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+pub struct VerifiedFailureReport {
+    pub build: stow_types::records::BuildRun,
+    pub failure: stow_types::build_failure::VerifiedSourceFailure,
+}
+
 /// Collect source diagnostics from Cargo's JSON stream. A process exit
 /// alone, a linker summary, or an error outside registry sources does
 /// not establish that a published crate's source failed to compile.
@@ -117,6 +152,28 @@ mod tests {
     use std::path::Path;
 
     use super::source_diagnostics;
+
+    #[test]
+    fn failure_reports_reject_previous_runs_and_attempts() {
+        use stow_types::records::BuildRun;
+        let expected = BuildRun {
+            run_id: 42,
+            run_attempt: 2,
+        };
+        assert!(super::verify_run(expected, expected).is_ok());
+        for actual in [
+            BuildRun {
+                run_id: 41,
+                run_attempt: 2,
+            },
+            BuildRun {
+                run_id: 42,
+                run_attempt: 1,
+            },
+        ] {
+            assert!(super::verify_run(actual, expected).is_err());
+        }
+    }
 
     #[test]
     fn source_diagnostics_cannot_hide_a_failing_tool() {

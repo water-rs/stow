@@ -1564,6 +1564,7 @@ fn compilation_inputs(
     target_dir: &Path,
     args: &[String],
     lockfile: &str,
+    manifest: &[u8],
     rustflags: &str,
 ) -> stow_types::build_failure::CompilationInputs {
     stow_types::build_failure::CompilationInputs {
@@ -1575,6 +1576,7 @@ fn compilation_inputs(
             .replace(&*target_dir.to_string_lossy(), "<target>"),
         task: task.clone(),
         lock_sha256: hex::encode(sha2::Sha256::digest(lockfile.as_bytes())),
+        manifest_sha256: hex::encode(sha2::Sha256::digest(manifest)),
         cargo_args: args
             .iter()
             .map(|arg| {
@@ -1607,7 +1609,10 @@ async fn run_phase(
     let lockfile =
         async_fs::read_to_string(setup.workspace.workspace_root().join("Cargo.lock")).await?;
     let rustflags = phase_rustflags(setup.rustflags, task.target.as_str(), target_dir);
-    let inputs = compilation_inputs(setup, task, target_dir, &args, &lockfile, &rustflags);
+    let manifest = async_fs::read(setup.workspace.manifest_path()).await?;
+    let inputs = compilation_inputs(
+        setup, task, target_dir, &args, &lockfile, &manifest, &rustflags,
+    );
 
     // A unit that links in more than one phase — a proc-macro's deps like
     // `defmt-parser`, or a build-script crate that `include!`s generated

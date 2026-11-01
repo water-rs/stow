@@ -1825,7 +1825,10 @@ fn untrusted_command(run: &TaskRun) -> async_process::Command {
     ] {
         command.env_remove(name);
     }
-    command.env("GITHUB_EVENT_PATH", &run.event_path);
+    command
+        .env("GITHUB_EVENT_PATH", &run.event_path)
+        .env("GITHUB_RUN_ID", run.workflow_run_id.to_string())
+        .env("GITHUB_RUN_ATTEMPT", RUN_ATTEMPT.to_string());
     command
 }
 

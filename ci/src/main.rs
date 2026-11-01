@@ -175,7 +175,10 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
         Err(candidate) => {
             async_fs::write(
                 output_dir.join("failure-candidate.json"),
-                serde_json::to_vec(&candidate)?,
+                serde_json::to_vec(&failure::FailureReport {
+                    build: build_run_from_env()?,
+                    candidate,
+                })?,
             )
             .await?;
             return Err(stow_types::stow_error!(
@@ -215,13 +218,18 @@ async fn verify_failure_stage(
     output_dir: &std::path::Path,
 ) -> stow_types::error::Result<()> {
     let task = load_task_payload()?;
-    let candidate =
+    let report: failure::FailureReport =
         serde_json::from_slice(&async_fs::read(input_dir.join("failure-candidate.json")).await?)?;
+    let build = build_run_from_env()?;
+    let candidate = report.for_run(build)?;
     async_fs::create_dir_all(output_dir).await?;
     let verified = task::verify_source_failure(&task, candidate, output_dir).await?;
     async_fs::write(
         output_dir.join("verified-source-failure.json"),
-        serde_json::to_vec(&verified)?,
+        serde_json::to_vec(&failure::VerifiedFailureReport {
+            build,
+            failure: verified,
+        })?,
     )
     .await?;
     tracing::info!(task_id = %task.task_id, "source failure reproduced without cached artifacts");
