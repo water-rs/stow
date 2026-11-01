@@ -1697,9 +1697,11 @@ async fn run_phase(
     collector.drain(phase.as_str(), unit_invocation)?;
 
     if !output.status.success() {
-        let mut diagnostics = crate::failure::source_diagnostics(&output.stdout, setup.cargo_home)?;
+        let compiler = crate::failure::source_diagnostics(&output.stdout, setup.cargo_home)?;
+        let mut diagnostics = compiler.source;
         diagnostics.extend(crate::failure::native_diagnostics(&output.stderr));
         if output.status.code() == Some(101)
+            && compiler.complete
             && !diagnostics.is_empty()
             && !crate::failure::has_tool_failure(&output.stderr)
         {

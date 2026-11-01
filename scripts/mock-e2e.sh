@@ -2236,7 +2236,7 @@ oversized_generation="$(curl -fsS --max-time 30 "$EDGE_URL/api/v1/admin/status" 
 echo "[mock-e2e] OK — a $OVERSIZED_ROWS-row slice report over the request-body limit reconciled in parts and the scheduler holds it at generation $oversized_generation"
 
 # A real registry source failure stays failed after a cache-free replay.
-fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
     STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
     STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
     "$BIN/stow-admin" submit --crate-name uuid --version 1.29.0 \

@@ -49,52 +49,61 @@ pub struct VerifiedFailureReport {
     pub failure: stow_types::build_failure::VerifiedSourceFailure,
 }
 
-/// Collect source diagnostics from Cargo's JSON stream. A process exit
-/// alone, a linker summary, or an error outside registry sources does
-/// not establish that a published crate's source failed to compile.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CompilerDiagnostics {
+    pub source: BTreeSet<SourceDiagnostic>,
+    /// False when any compiler error or non-JSON output is unclassified.
+    pub complete: bool,
+}
+
+/// Every compiler error must be attributed to registry source. Collecting
+/// only the recognized errors could hide a simultaneous linker, missing
+/// toolchain, or wrapper failure behind an otherwise reproducible error.
 pub fn source_diagnostics(
     output: &[u8],
     cargo_home: &Path,
-) -> std::io::Result<BTreeSet<SourceDiagnostic>> {
+) -> std::io::Result<CompilerDiagnostics> {
     let source_root = cargo_home.join("registry/src");
-    let messages = Message::parse_stream(output).collect::<std::io::Result<Vec<_>>>()?;
-    Ok(messages
-        .into_iter()
-        .filter_map(|message| match message {
+    let mut evidence = CompilerDiagnostics {
+        source: BTreeSet::new(),
+        complete: true,
+    };
+    for message in Message::parse_stream(output) {
+        match message? {
             Message::CompilerMessage(message)
                 if message.message.level == DiagnosticLevel::Error =>
             {
-                Some(message)
-            }
-            _ => None,
-        })
-        .flat_map(|message| {
-            let diagnostic = message.message;
-            diagnostic
-                .spans
-                .into_iter()
-                .filter(|span| span.is_primary)
-                .filter_map(|span| {
-                    let relative = Path::new(&span.file_name).strip_prefix(&source_root).ok()?;
-                    let mut components = relative.components();
-                    // Cargo's registry source layout is registry/package/source.
-                    components.next()?;
-                    components.next()?;
-                    let source = components.as_path();
-                    if source.as_os_str().is_empty() {
-                        return None;
-                    }
-                    Some(SourceDiagnostic {
+                let diagnostic = message.message;
+                let mut attributed = false;
+                for span in diagnostic.spans.into_iter().filter(|span| span.is_primary) {
+                    let relative = Path::new(&span.file_name).strip_prefix(&source_root).ok();
+                    let source = relative.and_then(|path| {
+                        let mut components = path.components();
+                        components.next()?;
+                        components.next()?;
+                        let source = components.as_path();
+                        (!source.as_os_str().is_empty()).then_some(source)
+                    });
+                    let Some(source) = source else {
+                        evidence.complete = false;
+                        continue;
+                    };
+                    attributed = true;
+                    evidence.source.insert(SourceDiagnostic {
                         package: message.package_id.to_string(),
                         source: source.to_string_lossy().replace('\\', "/"),
                         line: span.line_start as u64,
                         code: diagnostic.code.as_ref().map(|code| code.code.clone()),
                         message: diagnostic.message.clone(),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect())
+                    });
+                }
+                evidence.complete &= attributed;
+            }
+            Message::TextLine(line) if !line.trim().is_empty() => evidence.complete = false,
+            _ => {}
+        }
+    }
+    Ok(evidence)
 }
 
 /// A compiler diagnostic cannot hide a second failing tool. Cargo's
@@ -250,9 +259,27 @@ mod tests {
             Path::new("/replay"),
         )
         .expect("diagnostics");
-        assert_eq!(first.len(), 1);
+        assert_eq!(first.source.len(), 1);
+        assert!(first.complete);
         assert_eq!(first, second);
-        assert_eq!(first.first().expect("diagnostic").source, "src/rng.rs");
+        assert_eq!(
+            first.source.first().expect("diagnostic").source,
+            "src/rng.rs"
+        );
+    }
+
+    #[test]
+    fn a_source_error_does_not_hide_an_unclassified_compiler_error() {
+        let mut output = message(
+            "/cargo/registry/src/index/uuid-1.29.0/src/rng.rs",
+            "error",
+            true,
+        );
+        output.push(b'\n');
+        output.extend(message("<toolchain>", "error", true));
+        let evidence = source_diagnostics(&output, Path::new("/cargo")).expect("parse");
+        assert_eq!(evidence.source.len(), 1);
+        assert!(!evidence.complete);
     }
 
     #[test]
@@ -273,12 +300,14 @@ mod tests {
             assert!(
                 source_diagnostics(&message(file, level, primary), Path::new("/cargo"))
                     .expect("diagnostics")
+                    .source
                     .is_empty()
             );
         }
         assert!(
             source_diagnostics(b"error: could not compile uuid", Path::new("/cargo"))
                 .expect("diagnostics")
+                .source
                 .is_empty()
         );
     }
