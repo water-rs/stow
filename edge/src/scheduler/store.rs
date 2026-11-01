@@ -848,7 +848,17 @@ mod tests {
         let claims = graph.claim(45, 16, 0, 3_600_000).expect("claim c");
         let generation = claims[0].generation;
         graph.bind(&id("c"), generation, 700, 1_000);
-        graph.run_finished(&id("c"), 700, true, false, None, 10_000);
+        graph.run_finished(
+            &id("c"),
+            crate::scheduler::graph::RunCompletion {
+                run_id: 700,
+                success: true,
+                cancelled: false,
+                source_failure: None,
+                error: None,
+            },
+            10_000,
+        );
         graph.apply_slice_report(TARGET, RUSTC, None, 1, &c_rows(), &[]);
 
         // The log records the wave; the snapshot then drops it.
@@ -868,6 +878,7 @@ mod tests {
                 }],
             },
             SchedulerEvent::RunFinished {
+                source_failure: None,
                 run_id: "700".into(),
                 task_id: id("c"),
                 success: true,
@@ -947,6 +958,7 @@ mod tests {
                     }],
                 },
                 SchedulerEvent::RunFinished {
+                    source_failure: None,
                     run_id: "700".into(),
                     task_id: claims[0].task_id.clone(),
                     success: true,
@@ -1141,7 +1153,17 @@ mod tests {
             200,
         );
         assert_eq!(restored.status().running, 1);
-        let outcome = restored.run_finished(&id("solo"), 4242, true, false, None, 300);
+        let outcome = restored.run_finished(
+            &id("solo"),
+            crate::scheduler::graph::RunCompletion {
+                run_id: 4242,
+                success: true,
+                cancelled: false,
+                source_failure: None,
+                error: None,
+            },
+            300,
+        );
         assert_eq!(outcome, super::super::graph::FinishOutcome::Applied);
         assert_eq!(restored.status().completed, 1);
     }
@@ -1168,6 +1190,7 @@ mod tests {
                 }],
             },
             SchedulerEvent::RunFinished {
+                source_failure: None,
                 run_id: "909".into(),
                 task_id: id("solo"),
                 success: true,

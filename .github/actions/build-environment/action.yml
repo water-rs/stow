@@ -1,0 +1,156 @@
+name: Build environment
+description: Install the dispatched toolchain and platform inputs used by builds and clean replays.
+inputs:
+  task:
+    description: JSON-encoded BuildTaskPayload
+    required: true
+  github-token:
+    description: Read-only token for the pinned toolchain artifact
+    required: true
+runs:
+  using: composite
+  steps:
+    # The build pins RUSTUP_TOOLCHAIN=<task.rustc_version>, which rustup
+    # resolves as a distinct toolchain from `stable`; installing `stable`
+    # here would leave the pinned toolchain without the target's std.
+    - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      with:
+        toolchain: ${{ fromJSON(inputs.task).rustc_version }}
+        targets: ${{ fromJSON(inputs.task).target }}
+    # The sandboxed phases inherit these CARGO_TARGET_*/CC_*/AR_* variables
+    # through stow-build's toolchain passthrough; a variable that is not set
+    # for the task's target is simply absent there too.
+    #
+    # The linker a unit's artifacts pass through is part of its compile
+    # key, so it is a choice this job makes, not an observation of the
+    # runner image. GNU/Linux units link with mold — installed below and
+    # selected for host and target units alike by the capture wrapper,
+    # whose argv append is what lands the choice in the key — Android
+    # through the NDK clang pinned here, Apple targets through Xcode's
+    # `cc`, Windows through the MSVC toolchain lookup, and wasm32 through
+    # the rust-lld the toolchain itself ships.
+    # The debs ci/system-libs/install.sh verifies and extracts —
+    # one cache entry per lock version, restored like the glibc
+    # sysroot's, but re-verified against the lock's sha256 on every
+    # hit (stow#850). aarch64 only for now; B1/B2 extend the same
+    # mechanism to the toolchain sets and the x86_64 leg.
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: fromJSON(inputs.task).target == 'aarch64-unknown-linux-gnu'
+      id: system-debs
+      with:
+        path: ~/stow-system-debs
+        key: system-debs-${{ fromJSON(inputs.task).target }}-${{ hashFiles('ci/system-libs/lock.txt') }}
+    - name: Configure the cross toolchain
+      shell: bash
+      env:
+        TASK_TARGET: ${{ fromJSON(inputs.task).target }}
+      run: |
+        set -euo pipefail
+        target_key="$(echo "$TASK_TARGET" | tr 'a-z-' 'A-Z_')"
+        # Every Linux leg writes the sysroot shims, which exec the
+        # native GCC 12 driver pair (stow#693) — the 26.04 image ships
+        # GCC 13–15 only, so each Linux arm installs it (stow#946).
+        case "$TASK_TARGET" in
+          *-linux-android*)
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends gcc-12 g++-12
+            # The API level in the NDK clang wrapper name is WaterUI's
+            # android-min-api-level floor.
+            ndk_bin="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            linker="$ndk_bin/${TASK_TARGET}26-clang"
+            for exe in "$linker" "${linker}++" "$ndk_bin/llvm-ar"; do
+              [ -x "$exe" ] || { echo "::error::missing NDK tool $exe"; exit 1; }
+            done
+            cc_key="$(echo "$TASK_TARGET" | tr '-' '_')"
+            {
+              echo "CARGO_TARGET_${target_key}_LINKER=$linker"
+              echo "CC_${cc_key}=$linker"
+              echo "CXX_${cc_key}=${linker}++"
+              echo "AR_${cc_key}=$ndk_bin/llvm-ar"
+            } >> "$GITHUB_ENV"
+            ;;
+          x86_64-unknown-linux-gnu)
+            # The system libraries crate build scripts link through
+            # pkg-config — the image ships only some (stow#729). The
+            # script also refreshes the apt index.
+            ci/glibc-sysroot/system-libs.sh "$TASK_TARGET"
+            sudo apt-get install -y --no-install-recommends mold gcc-12 g++-12
+            ;;
+          aarch64-unknown-linux-gnu)
+            # Both architectures' system libraries come from the
+            # sha256 lock (stow#850): extracted into
+            # ~/stow-system-libs, never dpkg-installed, so the
+            # ports/multiarch coupling with the image is gone. The
+            # cross pkg-config is the sysroot-written
+            # aarch64-linux-gnu-pkg-config, not pkgconf:arm64.
+            ci/system-libs/install.sh "$TASK_TARGET" \
+              "$HOME/stow-system-debs" "$HOME/stow-system-libs"
+            # The sysroot shims drive GCC 12 (stow#693), native and
+            # cross — still the apt path until stow#862's B1 locks the
+            # toolchain too.
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu g++-aarch64-linux-gnu mold \
+              gcc-12 g++-12 gcc-12-aarch64-linux-gnu g++-12-aarch64-linux-gnu
+            # `-fuse-ld=mold` asks collect2 for `ld.mold` on the cross
+            # toolchain's own search path, which /usr/bin does not reach
+            # — link the apt install's `ld.mold` in where it looks.
+            sudo ln -sf /usr/bin/ld.mold /usr/aarch64-linux-gnu/bin/ld.mold
+            {
+              echo "CARGO_TARGET_${target_key}_LINKER=aarch64-linux-gnu-gcc"
+              echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc"
+              echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++"
+              echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar"
+              # Per target, so a build script compiling for the host
+              # keeps the native pkg-config.
+              echo "PKG_CONFIG_aarch64_unknown_linux_gnu=aarch64-linux-gnu-pkg-config"
+            } >> "$GITHUB_ENV"
+            ;;
+          wasm32-unknown-unknown)
+            sudo apt-get update -qq
+            sudo apt-get install -y --no-install-recommends gcc-12 g++-12
+            ;;
+          aarch64-apple-ios)
+            echo "SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_ENV"
+            ;;
+          aarch64-apple-ios-sim)
+            echo "SDKROOT=$(xcrun --sdk iphonesimulator --show-sdk-path)" >> "$GITHUB_ENV"
+            ;;
+        esac
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: fromJSON(inputs.task).target == 'aarch64-unknown-linux-gnu' && steps.system-debs.outputs.cache-hit != 'true'
+      with:
+        path: ~/stow-system-debs
+        key: ${{ steps.system-debs.outputs.cache-primary-key }}
+    # The sysroot setup — install, compiler wrappers, untrusted-build
+    # env — lives in ci/glibc-sysroot/*.sh so the mock end-to-end runs
+    # build the way this job builds (stow#336).
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: runner.os == 'Linux'
+      id: glibc-sysroot
+      with:
+        path: ~/stow-glibc-2.28
+        key: glibc-sysroot-${{ hashFiles('ci/glibc-sysroot-debs.txt') }}
+    - name: Install the glibc-2.28 sysroot
+      if: runner.os == 'Linux' && steps.glibc-sysroot.outputs.cache-hit != 'true'
+      shell: bash
+      run: ci/glibc-sysroot/install.sh "$HOME/stow-glibc-2.28"
+    - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: runner.os == 'Linux' && steps.glibc-sysroot.outputs.cache-hit != 'true'
+      with:
+        path: ~/stow-glibc-2.28
+        key: ${{ steps.glibc-sysroot.outputs.cache-primary-key }}
+    - name: Write the sysroot compiler wrappers
+      if: runner.os == 'Linux'
+      shell: bash
+      run: ci/glibc-sysroot/wrappers.sh "$HOME/stow-glibc-2.28" "$HOME/stow-system-libs"
+    # toolchain-publish.yml publishes stow-build and stow-cli (and on
+    # Linux stow-admin) once per main commit per host platform from the merge queue; this
+    # job pulls that artifact — digest-pinned, cosign-verified against the
+    # merge-queue identity and this commit — instead of compiling
+    # (stow#431). An absent artifact fails the step; there is no
+    # source-build fallback.
+    - uses: ./.github/actions/stow-toolchain
+      with:
+        binaries: stow-build stow-cli
+        github-token: ${{ inputs.github-token }}

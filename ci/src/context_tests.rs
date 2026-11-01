@@ -1514,7 +1514,7 @@ async fn capture_build_dep_keys(
         ipc_endpoint: &ipc_endpoint,
         msvc: &msvc,
     };
-    run_sandboxed_phase(
+    let failure = run_sandboxed_phase(
         &run,
         task,
         CargoSubcommand::Check,
@@ -1524,6 +1524,7 @@ async fn capture_build_dep_keys(
     )
     .await
     .expect("sandboxed check phase");
+    assert!(failure.is_none(), "sandboxed check compiled successfully");
     let records = collector.into_records().expect("capture records");
     let build_script = records
         .iter()

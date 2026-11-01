@@ -1010,6 +1010,17 @@ pub(crate) fn task_id_prefix(
     )
 }
 
+/// GitHub's successful, isolated cache-free verification job for this run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SourceFailureVerification {
+    /// The run whose failure was replayed.
+    pub run_id: u64,
+    /// Attempts cannot borrow verification from an earlier rerun.
+    pub run_attempt: u32,
+    /// The successful verification job.
+    pub job_id: u64,
+}
+
 /// Completion the edge's `POST /api/v1/github/workflow-run` handler
 /// forwards to the scheduler Durable Object's `POST /tasks/complete-run`
 /// for a finished `build-crate.yml` run.
@@ -1021,6 +1032,10 @@ pub struct WorkflowRunComplete {
     /// finished green *and* whose run's records artifact exists in GHCR
     /// counts as a completed build.
     pub success: bool,
+    /// Independent verification of a source failure; the build remains failed.
+    pub source_failure: Option<SourceFailureVerification>,
+    /// GitHub attempt used to locate this run's verification job.
+    pub github_run_attempt: u32,
     /// Failure description when `success` is false — the conclusion and,
     /// on a missing records artifact, which tag the edge looked for.
     pub error: Option<String>,
@@ -1148,12 +1163,11 @@ pub const DISPATCH_FREEZE_INCIDENT_KEY: &str = "dispatch-freeze";
 
 /// The longest a started `build-crate.yml` run lasts.
 ///
-/// Its `build` job's `timeout-minutes` plus its `publish` job's, both
-/// enforced by GitHub, so the run's `completed` delivery lands within
-/// it. The scheduler's
+/// Its `build` job's `timeout-minutes` plus the longer of `publish`
+/// and `verify-failure`, enforced by GitHub. The scheduler's
 /// health check (stow#860) calls deliveries stopped past it; the admin
 /// workflow tests pin it to the workflow file.
-pub const BUILD_CRATE_RUN_TIMEOUT_MINUTES: i64 = 120 + 60;
+pub const BUILD_CRATE_RUN_TIMEOUT_MINUTES: i64 = 120 + 120;
 
 /// How often, at most, the scheduler reconciles its run set against the
 /// CI listing.
@@ -5979,6 +5993,8 @@ pub enum SchedulerEvent {
         task_id: String,
         /// The mapped conclusion.
         success: bool,
+        /// Isolated source-failure verification tied to this run.
+        source_failure: Option<SourceFailureVerification>,
         /// The conclusion was `cancelled`.
         #[serde(default)]
         cancelled: bool,

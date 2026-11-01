@@ -879,7 +879,7 @@ pub fn evaluate_freeze_trip(
     let cutoff = now_ms - i64::from(settings.window_minutes) * 60_000;
     let mut by_target: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
     for outcome in &graph.attempt_outcomes {
-        if outcome.finished_at_ms < cutoff {
+        if outcome.finished_at_ms < cutoff || outcome.source_failure.is_some() {
             continue;
         }
         let entry = by_target.entry(outcome.target.as_str()).or_default();
@@ -902,7 +902,7 @@ pub fn evaluate_freeze_trip(
     let mut classes_map: BTreeMap<String, u64> = BTreeMap::new();
     let mut run_ids: Vec<(i64, String)> = Vec::new();
     for outcome in &graph.attempt_outcomes {
-        if outcome.finished_at_ms < cutoff {
+        if outcome.finished_at_ms < cutoff || outcome.source_failure.is_some() {
             continue;
         }
         if let Some(class) = &outcome.failure_class {
@@ -1024,6 +1024,47 @@ fn u64_to_u32(value: u64, field: &'static str) -> Result<u32, QueueError> {
 #[cfg(test)]
 mod tests {
     use super::seconds_until_utc_midnight;
+
+    #[test]
+    fn reproduced_source_failures_stay_in_history_but_not_the_breaker() {
+        use crate::scheduler::graph::{AttemptOutcome, Graph};
+        let mut graph = Graph::default();
+        let settings = crate::freeze::FreezeSettings {
+            window_minutes: 60,
+            min_outcomes: 2,
+            fail_percent: 50,
+        };
+        for run in 1..=2 {
+            graph.attempt_outcomes.push_back(AttemptOutcome {
+                task_id: format!("test-{run}"),
+                generation_id: "1".to_owned(),
+                attempt: 1,
+                target: "wasm32-unknown-unknown".to_owned(),
+                failure_class: Some("source failure".to_owned()),
+                source_failure: Some(stow_types::api::SourceFailureVerification {
+                    run_id: run,
+                    run_attempt: 1,
+                    job_id: run + 10,
+                }),
+                run_id: run.to_string(),
+                finished_at_ms: 1000,
+            });
+        }
+        assert!(
+            super::evaluate_freeze_trip(&graph, &settings, 1000)
+                .expect("evaluate")
+                .is_none()
+        );
+        assert_eq!(graph.attempt_outcomes.len(), 2);
+        for outcome in &mut graph.attempt_outcomes {
+            outcome.source_failure = None;
+        }
+        assert!(
+            super::evaluate_freeze_trip(&graph, &settings, 1000)
+                .expect("evaluate")
+                .is_some()
+        );
+    }
 
     #[test]
     fn seconds_until_midnight_counts_to_day_end() {

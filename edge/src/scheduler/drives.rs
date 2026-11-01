@@ -945,6 +945,8 @@ async fn complete_run_route(
 ) -> Result<(), String> {
     let bound = ctx.bound_run()?;
     let report = stow_types::api::WorkflowRunComplete {
+        source_failure: None,
+        github_run_attempt: 1,
         task_id: bound.task,
         success,
         error: (!success).then(|| "failure".to_owned()),
@@ -2730,6 +2732,8 @@ pub const DRIVES: &[Drive] = &[
                     ctx.loaded(),
                     db,
                     &stow_types::api::WorkflowRunComplete {
+                        source_failure: None,
+                        github_run_attempt: 1,
                         task_id: run_node_id(TAG_RUN_UPDATE),
                         success: true,
                         error: None,
@@ -2800,6 +2804,8 @@ pub const DRIVES: &[Drive] = &[
             Box::pin(async move {
                 let bound = ctx.bound_run()?;
                 let report = stow_types::api::WorkflowRunComplete {
+                    source_failure: None,
+                    github_run_attempt: 1,
                     task_id: bound.task,
                     success: true,
                     error: None,
@@ -3524,6 +3530,8 @@ pub const DRIVES: &[Drive] = &[
                     ctx.loaded(),
                     db,
                     &stow_types::api::WorkflowRunComplete {
+                        source_failure: None,
+                        github_run_attempt: 1,
                         task_id: snapshot_node_id(0),
                         success: true,
                         error: None,

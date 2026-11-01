@@ -351,6 +351,7 @@ impl LocalServerState {
     fn begin_job(&self, run_id: u64, name: String, steps: &[&str]) -> u64 {
         let job_id = self.allocate_id();
         let job = RecordedJob {
+            run_id,
             id: job_id,
             name,
             status: "in_progress",
@@ -420,6 +421,7 @@ impl LocalServerState {
             .entry(run_id)
             .or_default()
             .push(RecordedJob {
+                run_id,
                 id: job_id,
                 name,
                 status: "completed",
@@ -650,6 +652,7 @@ const PUBLISH_JOB_STEPS: &[&str] = &[VERDICT_STEPS[2]];
 /// fields `stow_types::runs::RunJobRow` reads.
 #[derive(Debug, Clone, serde::Serialize)]
 struct RecordedJob {
+    run_id: u64,
     id: u64,
     name: String,
     status: &'static str,
@@ -1638,6 +1641,9 @@ async fn drive_stages(run: &TaskRun) -> Result<(), String> {
                 &["failure", "success"],
             );
             state.skip_job(workflow_run_id);
+            if let Err(replay_error) = verify_failure_stage(run).await {
+                tracing::warn!(%replay_error, "failed build has no verified source failure");
+            }
             state.set_task(workflow_run_id, "completed", Some("failure"), Some(&error));
             return Err(error);
         }
@@ -1682,6 +1688,51 @@ async fn build_stage(run: &TaskRun) -> stow_types::error::Result<TaskLayout> {
         ));
     }
     Ok(layout)
+}
+
+async fn verify_failure_stage(run: &TaskRun) -> stow_types::error::Result<()> {
+    let layout = TaskLayout::create(&run.root).await?;
+    if !layout
+        .output_dir
+        .join("failure-candidate.json")
+        .try_exists()?
+    {
+        return Ok(());
+    }
+    let job = run.state.begin_job(
+        run.workflow_run_id,
+        stow_types::build_failure::VERIFICATION_JOB_NAME.to_owned(),
+        &["Replay without cached artifacts"],
+    );
+    let replay = async {
+        let _runner = run.state.runners.acquire().await.expect("runner pool open");
+        untrusted_command(run)
+            .arg("verify-failure")
+            .arg("--input-dir")
+            .arg(&layout.output_dir)
+            .arg("--output-dir")
+            .arg(layout.root.join("replay"))
+            .env(
+                "STOW_BUILD_WORKSPACE_ROOT",
+                layout.root.join("replay-workspace"),
+            )
+            .stderr(std::fs::File::create(layout.root.join("replay.log"))?)
+            .status()
+            .await
+    }
+    .await;
+    let conclusion = if replay.as_ref().is_ok_and(std::process::ExitStatus::success) {
+        "success"
+    } else {
+        "failure"
+    };
+    run.state
+        .finish_job(run.workflow_run_id, job, conclusion, &[conclusion]);
+    let status = replay?;
+    if !status.success() {
+        return Err(stow_types::stow_error!("source failure replay: {status}"));
+    }
+    Ok(())
 }
 
 /// The task's trusted publish stage: the checks `stow-build publish` makes
@@ -1749,23 +1800,36 @@ async fn run_build_stage(
     run: &TaskRun,
     layout: &TaskLayout,
 ) -> stow_types::error::Result<std::process::ExitStatus> {
-    Ok(async_process::Command::new(&run.exe)
+    Ok(untrusted_command(run)
         .arg("build")
         .arg("--output-dir")
         .arg(&layout.output_dir)
-        .env_remove("SCHEDULER_URL")
-        .env_remove("STOW_EDGE_URL")
-        .env_remove("STOW_GITHUB_WEBHOOK_SECRET")
-        .env_remove("GH_TOKEN")
-        .env_remove("GITHUB_TOKEN")
-        .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
-        .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
-        .env_remove("STOW_OIDC_AUDIENCE")
         .env("STOW_BUILD_WORKSPACE_ROOT", layout.root.join("workspace"))
-        .env("GITHUB_EVENT_PATH", &run.event_path)
         .stderr(std::fs::File::create(&layout.build_log_path)?)
         .status()
         .await?)
+}
+
+fn untrusted_command(run: &TaskRun) -> async_process::Command {
+    let mut command = async_process::Command::new(&run.exe);
+    for name in [
+        "SCHEDULER_URL",
+        "STOW_EDGE_URL",
+        "STOW_GITHUB_WEBHOOK_SECRET",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GHCR_TOKEN",
+        "ACTIONS_ID_TOKEN_REQUEST_URL",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "STOW_OIDC_AUDIENCE",
+    ] {
+        command.env_remove(name);
+    }
+    command
+        .env("GITHUB_EVENT_PATH", &run.event_path)
+        .env("GITHUB_RUN_ID", run.workflow_run_id.to_string())
+        .env("GITHUB_RUN_ATTEMPT", RUN_ATTEMPT.to_string());
+    command
 }
 
 /// Number of entries in the build stage's upload plan; a non-array or
@@ -2288,6 +2352,7 @@ mod tests {
     /// reads only the envelope and the rows.
     fn recorded_job(id: u64) -> RecordedJob {
         RecordedJob {
+            run_id: 1,
             id,
             name: format!("job {id}"),
             status: "completed",

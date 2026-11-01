@@ -83,7 +83,9 @@ pub fn parse_resolve_run_title(title: &str) -> Option<(u32, &str)> {
 /// `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` — so nothing
 /// overwrites a records tag and a rebuilt task's rows always reach the
 /// index (stow#655).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct BuildRun {
     /// The Actions workflow run id.
     pub run_id: u64,
