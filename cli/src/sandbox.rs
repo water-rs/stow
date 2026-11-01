@@ -864,8 +864,6 @@ async fn rustc_sysroot(rustc_executable: &Path) -> Option<PathBuf> {
 /// `resolve_on_path` grants the `cargo`/`rustc` directory.
 fn toolchain_grant_dirs() -> Vec<(PathBuf, Access, &'static str)> {
     const TOOLCHAIN_ROOT_VARS: &[&str] = &["SDKROOT", "DEVELOPER_DIR"];
-    const TOOLCHAIN_EXE_PREFIXES: &[&str] =
-        &["CARGO_TARGET_", "CC_", "CXX_", "AR_", "RANLIB_", "LD"];
     let mut dirs: Vec<(PathBuf, Access, &'static str)> = std::env::vars_os()
         .filter_map(|(name, value)| {
             if env_name::eq_any(&name, TOOLCHAIN_ROOT_VARS)
@@ -880,7 +878,7 @@ fn toolchain_grant_dirs() -> Vec<(PathBuf, Access, &'static str)> {
                     )
                 });
             }
-            if env_name::starts_with_any(&name, TOOLCHAIN_EXE_PREFIXES) {
+            if env_name::toolchain_executable(&name) {
                 // The value must name a real file: a bare name resolves
                 // through PATH (covered by the cargo/rustc dirs and the
                 // system rules), and a non-file value —

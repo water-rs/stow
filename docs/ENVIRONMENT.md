@@ -152,6 +152,12 @@ task from the dispatch event file `GITHUB_EVENT_PATH` names
 | `STOW_LOCAL_CI_STUB` | serve | **Mock/test-only.** When set (any value), the local CI server short-circuits each task's build and publish work — the dispatch POST the budget probe and the launch-load run measure stays real, while a stubbed run still pushes the task's (empty) records artifact and completes through the same signed `workflow_run` webhook. |
 | `RUST_LOG` | unset (defaults to `info,stow_oci::client=debug`) | Standard tracing-env-filter directive. The default keeps `stow_oci`'s per-attempt registry retry lines — `debug` for end users (stow#633), visible in CI logs here. |
 
+Toolchain environment passthrough does not itself grant filesystem access.
+Only executable settings (`CC`, `CXX`, `AR`, `RANLIB`, `LD`, their supported
+compiler/archiver target overrides, and Cargo target `_LINKER`, `_AR` or
+`_RUNNER` settings) grant their executable directory. `CARGO_TARGET_DIR`,
+`CARGO_TARGET_TMPDIR` and flag settings never grant their parent directory.
+
 ## Repack follow-up (`repack-followup.yml`)
 
 Repository variables (Settings, Actions, Variables), read by the workflow, not by a binary.

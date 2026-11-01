@@ -2321,7 +2321,6 @@ fn toolchain_grant_dirs(
         // read its headers, .pc files and libraries.
         "STOW_SYSTEM_LIBS",
     ];
-    const TOOLCHAIN_EXE_PREFIXES: &[&str] = &["CARGO_TARGET_", "CC_", "CXX_", "AR_", "RANLIB_"];
     let android = targets_android(target);
     let mut dirs: Vec<PathBuf> = vars
         .filter_map(|(name, value)| {
@@ -2330,7 +2329,7 @@ fn toolchain_grant_dirs(
             {
                 return Some(PathBuf::from(value));
             }
-            if env_name::starts_with_any(&name, TOOLCHAIN_EXE_PREFIXES) {
+            if env_name::toolchain_executable(&name) {
                 return PathBuf::from(value).parent().map(Path::to_path_buf);
             }
             None
@@ -4324,6 +4323,23 @@ checksum = "33"
         );
         let passed = toolchain_env_names("aarch64-linux-android", names().into_iter());
         assert_eq!(passed, ["ANDROID_HOME", "ANDROID_NDK_LATEST_HOME"]);
+    }
+
+    #[test]
+    fn cargo_output_directories_never_grant_their_parent() {
+        let checkout = TempDir::new().expect("checkout");
+        let output = checkout.path().join("target");
+        std::fs::create_dir(&output).expect("target directory");
+        let vars = [
+            "CARGO_TARGET_DIR",
+            "CARGO_TARGET_TMPDIR",
+            "CARGO_TARGET_X_RUSTFLAGS",
+        ]
+        .map(|name| (OsString::from(name), output.as_os_str().to_owned()));
+        assert_eq!(
+            toolchain_grant_dirs("aarch64-apple-darwin", vars.into_iter()),
+            [] as [PathBuf; 0]
+        );
     }
 
     /// The toolchain variables the build job exports for the task's own
