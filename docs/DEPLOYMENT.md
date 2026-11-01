@@ -567,6 +567,16 @@ on `main`, and forwards only the deliveries the scheduler consumes (see
 records artifact its publish job pushed (tagged by run id and attempt)
 exists in GHCR, so a spoofed success cannot mint a catalog entry.
 
+Failed completions carry the run id and attempt. The scheduler checks the
+attempt's `verify source failure` job before excluding an independently
+reproduced source failure from breaker counts. The failed build remains in
+history; unverified failures and verification lookup errors still count.
+The replay uses the original toolchain, manifest, lockfile and flags without
+stow cache artifacts. It runs only after a candidate source failure, so its
+additional compilation cost is confined to those failed builds. This does
+not clear an existing freeze: after addressing its cause, use
+`stow-admin watchdog clear`.
+
 ### newreleases.io webhook — `rust` releases
 
 A new stable rustc wakes the preheat wave through newreleases.io's

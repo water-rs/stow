@@ -73,6 +73,14 @@ impl CompilationFailure {
     }
 }
 
+impl VerifiedSourceFailure {
+    /// The exact failed compilation the verifier reproduced.
+    #[must_use]
+    pub const fn failure(&self) -> &CompilationFailure {
+        &self.failure
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CompilationFailure, CompilationInputs, SourceDiagnostic};
@@ -159,13 +167,5 @@ mod tests {
         diagnostic.message = "different compiler failure".to_owned();
         changed.diagnostics.insert(diagnostic);
         assert!(original.verify_replay(Some(&changed)).is_none());
-    }
-}
-
-impl VerifiedSourceFailure {
-    /// The exact failed compilation the verifier reproduced.
-    #[must_use]
-    pub const fn failure(&self) -> &CompilationFailure {
-        &self.failure
     }
 }

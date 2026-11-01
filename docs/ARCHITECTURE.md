@@ -599,6 +599,21 @@ run's outcome to the scheduler's `POST /tasks/complete-run`. A
 job pushed exists in GHCR; the edge checks that before it forwards. `stow-admin index export` rebuilds each index slice
 from those signed records — the slices are the only catalog.
 
+A failed build may run the separate `verify source failure` job. It rebuilds
+without stow cache artifacts using the same toolchain, wrapper manifest,
+frozen dependency lock and compilation flags. Only identical, nonempty
+source diagnostics produce verified evidence; mixed tool or unknown errors
+remain infrastructure failures. Artifacts and evidence are bound to the
+GitHub run id and attempt. The original build remains failed and publishes
+nothing.
+
+For each failed completion, the scheduler queries that attempt's GitHub
+jobs through the CI interface. A successful verification job excludes the
+failure from breaker counts while retaining its failure history. Missing
+or failed verification, including a failed jobs query, still counts. This
+adds a jobs query on failed completions, with pagination only when needed;
+it adds no idle polling or stored-graph scan.
+
 What each hop is allowed to do:
 
 | Hop | Reads | Writes |

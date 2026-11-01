@@ -1163,12 +1163,11 @@ pub const DISPATCH_FREEZE_INCIDENT_KEY: &str = "dispatch-freeze";
 
 /// The longest a started `build-crate.yml` run lasts.
 ///
-/// Its `build` job's `timeout-minutes` plus its `publish` job's, both
-/// enforced by GitHub, so the run's `completed` delivery lands within
-/// it. The scheduler's
+/// Its `build` job's `timeout-minutes` plus the longer of `publish`
+/// and `verify-failure`, enforced by GitHub. The scheduler's
 /// health check (stow#860) calls deliveries stopped past it; the admin
 /// workflow tests pin it to the workflow file.
-pub const BUILD_CRATE_RUN_TIMEOUT_MINUTES: i64 = 120 + 60;
+pub const BUILD_CRATE_RUN_TIMEOUT_MINUTES: i64 = 120 + 120;
 
 /// How often, at most, the scheduler reconciles its run set against the
 /// CI listing.
