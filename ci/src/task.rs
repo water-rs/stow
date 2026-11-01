@@ -323,7 +323,7 @@ struct Package {
     publish: bool,
 }
 
-#[derive(serde::Serialize)]
+#[derive(PartialEq, Eq, serde::Serialize)]
 struct Dependency {
     version: String,
     /// The real package name when the table key is an alias: dep pins key
@@ -383,12 +383,12 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
     // semver-incompatible versions of one crate (`syn` 1 and 2 is common)
     // — or a node that shares the task crate's name at another version —
     // would keep only the last insert. Each pin keys on a unique
-    // `<name>-v<version>` alias and names the package in `package`. Two
-    // pins of one crate+version cannot share a section: the subgraph
-    // comes from a single resolve, whose units key per
-    // (package, version, features) per side and platform — an alias
-    // collision inside a section is a real error, not an ambiguity to
-    // disambiguate.
+    // `<name>-v<version>` alias and names the package in `package`.
+    // Distinct nodes can require the same declaration: profiles,
+    // dependency context and invocation requirements are not fields in
+    // Cargo's dependency table. Reuse only an identical declaration;
+    // incompatible feature sets must never be unioned or overwritten.
+    // The dispatched subgraph stays intact for actual-graph validation.
     //
     // The one exception is a pin of the task's own package: cargo
     // requires every declaration from one package to one dependency
@@ -416,10 +416,18 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
         } else {
             pin_alias(node.crate_name.as_str(), &node.version.to_string())
         };
-        if section.insert(alias.clone(), pinned).is_some() {
-            return Err(stow_types::stow_error!(
-                "dep pin alias {alias} collides with an earlier entry in the wrapper manifest"
-            ));
+        match section.entry(alias) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(pinned);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                if entry.get() != &pinned {
+                    return Err(stow_types::stow_error!(
+                        "dep pin alias {} has conflicting declarations in the wrapper manifest",
+                        entry.key()
+                    ));
+                }
+            }
         }
     }
     toml::to_string(&WrapperManifest {
@@ -3066,6 +3074,38 @@ mod tests {
         manifest["dependencies"][name]
             .as_table()
             .expect("dependency entry is a table")
+    }
+
+    #[test]
+    fn wrapper_manifest_declares_identical_pins_once_across_node_identities() {
+        let mut task = task_with_features(&[]);
+        let dev = SubgraphNode {
+            crate_name: CrateName::parse("serde").expect("crate name"),
+            version: CrateVersion::new(semver::Version::parse("1.0.229").expect("version")),
+            features_json: FeaturesJson::canonicalize(vec!["std".to_owned()]).expect("features"),
+            host_side: true,
+            keys_apart: false,
+            deps: Vec::new(),
+            profile: stow_types::node_profile::NodeProfile::Dev,
+        };
+        let mut release = dev.clone();
+        release.profile = stow_types::node_profile::NodeProfile::Release;
+        let mut explicit = dev.clone();
+        explicit.keys_apart = true;
+        let mut contextual = dev.clone();
+        contextual.deps = vec![1];
+        task.dependency_subgraph = leaf_pins(vec![dev, release, explicit, contextual]);
+        let original = task.dependency_subgraph.clone();
+        let manifest: toml::Table =
+            toml::from_str(&wrapper_manifest(&task).expect("wrapper manifest"))
+                .expect("generated manifest parses");
+        assert_eq!(manifest["build-dependencies"].as_table().unwrap().len(), 1);
+        assert_eq!(task.dependency_subgraph, original);
+
+        task.dependency_subgraph.nodes[1].features_json =
+            FeaturesJson::canonicalize(vec!["alloc".to_owned()]).expect("features");
+        let error = wrapper_manifest(&task).expect_err("different feature sets conflict");
+        assert!(error.to_string().contains("conflicting declarations"));
     }
 
     #[test]

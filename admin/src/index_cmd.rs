@@ -461,22 +461,31 @@ struct ExportPass {
 type PullFut<'a, T> =
     std::pin::Pin<Box<dyn Future<Output = stow_types::error::Result<T>> + Send + 'a>>;
 
-/// Index rows keyed by the `(c_metadata, unit_shape, dependency_identity)`
+/// Index rows keyed by the `(c_metadata, profile, unit_shape, dependency_identity)`
 /// node a unit was published for. The `(c_metadata, unit_shape)` pair is
 /// what a consumer's key space identifies, but it is not the row key:
 /// two nodes that differ only in dependency context can compile to the
 /// same unit, and each keeps a row so the slice answers for both
 /// (stow#657).
-type RowsByIdentity = BTreeMap<(String, UnitShape, DependencyIdentity), ArtifactIndexRow>;
+type RowsByIdentity = BTreeMap<
+    (
+        String,
+        stow_types::node_profile::NodeProfile,
+        UnitShape,
+        DependencyIdentity,
+    ),
+    ArtifactIndexRow,
+>;
 
 /// Fold `row` into `rows` under its
-/// `(c_metadata, unit_shape, dependency_identity)` key — a rebuilt unit
+/// `(c_metadata, profile, unit_shape, dependency_identity)` key — a rebuilt unit
 /// replaces its node's row, a second node publishing the same unit adds
 /// a row beside it.
 fn fold_row(rows: &mut RowsByIdentity, row: ArtifactIndexRow) -> stow_types::error::Result<()> {
     rows.insert(
         (
             row.c_metadata.as_str().to_owned(),
+            row.node_profile,
             row.unit_shape,
             row.dependency_identity()?,
         ),
@@ -868,7 +877,7 @@ async fn read_prev_sidecar(
 /// The index file's semantic rows as [`PublishedSliceRow`]s — the
 /// scheduler's slice membership. Artifact rows collapse onto semantic
 /// identity + unit shape — several `c_metadata`/`compile_key` rows can name
-/// one `(crate, version, features, shape)` — so the report
+/// one `(crate, version, features, profile, shape)` — so the report
 /// deduplicates. Two rows of the same identity at different unit shapes
 /// stay separate: the gate compares each shape an edge requires against
 /// its own row. A measured row above the sysroot's glibc floor
@@ -896,13 +905,7 @@ fn semantic_rows(index: &ArtifactIndex) -> stow_types::error::Result<Vec<Publish
         })
         .filter(|row| {
             let Ok(row) = row else { return true };
-            seen.insert((
-                row.crate_name.as_str().to_owned(),
-                row.version.to_string(),
-                row.features_json.raw(),
-                row.dependency_identity.clone(),
-                row.unit_shape,
-            ))
+            seen.insert(row_key(row))
         })
         .collect()
 }
@@ -915,6 +918,7 @@ fn row_key(
     String,
     String,
     String,
+    stow_types::node_profile::NodeProfile,
     stow_types::identity::DependencyIdentity,
     stow_types::public_cache::UnitShape,
 ) {
@@ -922,6 +926,7 @@ fn row_key(
         row.crate_name.as_str().to_owned(),
         row.version.to_string(),
         row.features_json.raw(),
+        row.node_profile,
         row.dependency_identity.clone(),
         row.unit_shape,
     )
@@ -2189,6 +2194,73 @@ mod tests {
             .collect();
         assert!(identities.contains(&left.dependency_identity().expect("row digest")));
         assert!(identities.contains(&right.dependency_identity().expect("row digest")));
+    }
+
+    #[test]
+    fn fold_row_preserves_profiles_of_a_shared_unit() {
+        use stow_types::node_profile::NodeProfile;
+        let dev = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let mut release = dev.clone();
+        release.node_profile = NodeProfile::Release;
+        let mut rows = RowsByIdentity::new();
+        for row in [dev.clone(), release.clone(), dev.clone()] {
+            fold_row(&mut rows, row).expect("fold row");
+        }
+        assert_eq!(rows.len(), 2);
+        assert!(rows.values().any(|row| row == &dev));
+        assert!(rows.values().any(|row| row == &release));
+    }
+
+    #[test]
+    fn semantic_rows_preserves_each_profile() {
+        use stow_types::node_profile::NodeProfile;
+        let dev = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let mut release = dev.clone();
+        release.node_profile = NodeProfile::Release;
+        let rows =
+            semantic_rows(&prev_index(vec![dev.clone(), release, dev], 3)).expect("semantic rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.node_profile)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([NodeProfile::Dev, NodeProfile::Release]),
+        );
+    }
+
+    #[tokio::test]
+    async fn slice_report_tracks_profile_additions_and_retirements() {
+        use stow_types::node_profile::NodeProfile;
+        let dir = tempfile::tempdir().expect("report fixture dir");
+        let file = dir.path().join(index_tag(TARGET, RUSTC));
+        let dev = record_to_index_row(&shared_unit_record(&["dep-left"]));
+        let mut release = dev.clone();
+        release.node_profile = NodeProfile::Release;
+        for retain_dev in [true, false] {
+            let current = if retain_dev {
+                vec![dev.clone(), release.clone()]
+            } else {
+                vec![release.clone()]
+            };
+            std::fs::write(
+                &file,
+                stow_shim::encode_index(&prev_index(current, 3)).expect("encode index"),
+            )
+            .expect("write index");
+            std::fs::write(
+                prev_path(&file),
+                stow_shim::encode_index(&prev_index(vec![dev.clone()], 2)).expect("encode prev"),
+            )
+            .expect("write previous index");
+            let report = slice_report_for(&file, false).await.expect("delta report");
+            assert_eq!(report.base_generation, Some(2));
+            assert_eq!(report.added.len(), 1);
+            assert_eq!(report.added[0].node_profile, NodeProfile::Release);
+            assert_eq!(report.retired.len(), usize::from(!retain_dev));
+            if !retain_dev {
+                assert_eq!(report.retired[0].node_profile, NodeProfile::Dev);
+            }
+        }
     }
 
     /// The publish delta already diffs on the dependency identity: a
