@@ -1946,23 +1946,23 @@ while :; do
     sleep 5
 done
 fg publish_slices build-script
-jq -e '[.[] | select(.crate_name == "serde_core" and .artifact_kind == "build-script")] | length > 0' \
+jq -e '[.[] | select(.crate_name == "serde_core" and .artifact_kind == "BuildScript")] | length > 0' \
     "$WORK_DIR/catalog.json" >/dev/null || die "serde_core published no build-script artifact"
 SCRIPT_CONSUMER="$WORK_DIR/build-script-consumer"
 isolated_env cargo new --lib --vcs none "$SCRIPT_CONSUMER" >"$LOG_DIR/build-script-new.log" 2>&1
 printf 'serde_core = { version = "=1.0.229", default-features = false }\n' >>"$SCRIPT_CONSUMER/Cargo.toml"
 fg prepare_consumer "$SCRIPT_CONSUMER" build-script
 fg in_dir "$SCRIPT_CONSUMER" stow_cli index refresh >"$LOG_DIR/build-script-refresh.log" 2>&1
-fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-remote.log" 2>&1 \
+RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-remote.log" 2>&1 \
     || die "remote build-script consumer failed — see $LOG_DIR/build-script-remote.log"
 grep 'served rustc invocation from downloaded stow artifact cache' "$LOG_DIR/build-script-remote.log" \
     | grep 'crate_name=build_script_build' >/dev/null || die "build script was not served remotely"
 fg in_dir "$SCRIPT_CONSUMER" isolated_env cargo clean >"$LOG_DIR/build-script-clean.log" 2>&1
-fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-local.log" 2>&1 \
+RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-local.log" 2>&1 \
     || die "local build-script consumer failed — see $LOG_DIR/build-script-local.log"
 grep 'served rustc invocation from local stow artifact cache' "$LOG_DIR/build-script-local.log" \
     | grep 'crate_name=build_script_build' >/dev/null || die "build script was not served locally"
-fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-fresh.log" 2>&1 \
+RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-fresh.log" 2>&1 \
     || die "fresh build-script consumer failed — see $LOG_DIR/build-script-fresh.log"
 grep 'Fresh serde_core v1.0.229' "$LOG_DIR/build-script-fresh.log" >/dev/null \
     || die "Cargo did not keep the restored build script fresh"
