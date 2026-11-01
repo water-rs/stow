@@ -342,7 +342,7 @@ const SIGNALS: &[Signal] = &[
         id: "edge.do.overloaded",
         label: "`overloaded` fault events (Analytics Engine stow_cache_misses)",
         window: Window::Last(HOUR),
-        min_sample: 0,
+        min_sample: 1,
         threshold: 1.0,
         unit: "events",
         effect: Effect::Alert,
@@ -808,10 +808,9 @@ impl Watcher<'_> {
     /// writes `index1='#fault', blob1='overloaded'` points at every
     /// overload it detects: the platform's "Durable Object is
     /// overloaded" answer and its own queue-full refusals (stow#888).
-    /// `count()` over the same window is the liveness probe: a dataset
-    /// that received no points at all means the writer chain is down,
-    /// and the collector fails naming the dataset rather than reporting
-    /// a legitimate zero.
+    /// `count()` supplies the observation sample. Only consented misses
+    /// and overloads write points, so an empty window cannot establish
+    /// writer health or the absence of overloads; the signal abstains.
     async fn overloaded_reading(&self) -> Result<Vec<Reading>, String> {
         // `sumIf` keeps the additive estimate's shape — each point's
         // `_sample_interval * double1` — restricted to the overload
@@ -831,12 +830,6 @@ impl Watcher<'_> {
         let row = rows
             .first()
             .ok_or_else(|| "stow_cache_misses aggregate query returned no row".to_owned())?;
-        if row.points == 0 {
-            return Err(
-                "stow_cache_misses received no points in the last hour — the edge's analytics writer chain is down"
-                    .to_owned(),
-            );
-        }
         let signal = signal("edge.do.overloaded");
         Ok(vec![Reading {
             signal,
@@ -844,8 +837,8 @@ impl Watcher<'_> {
             sample: row.points,
             value: row.events,
             evidence: vec![format!(
-                "stow_cache_misses index1='#fault' blob1='overloaded' last hour: {}",
-                row.events
+                "stow_cache_misses index1='#fault' blob1='overloaded' last hour: {} events in {} points",
+                row.events, row.points
             )],
         }])
     }
@@ -2202,7 +2195,7 @@ struct AnalyticsRow {
     // JSON number (the quoted form is accepted too).
     #[serde(default, deserialize_with = "analytics::de_f64")]
     events: f64,
-    /// `count()` over the window — the liveness probe; `UInt64` arrives
+    /// `count()` over the observation window; `UInt64` arrives
     /// quoted on the wire.
     #[serde(default, deserialize_with = "analytics::de_u64")]
     points: u64,
@@ -4200,7 +4193,7 @@ mod tests {
     }
 
     /// The watchdog query must name the live dataset and carry both the
-    /// fault marker and the liveness aggregate — asserted off the
+    /// fault marker and the sample aggregate — asserted off the
     /// captured request, not presumed.
     fn assert_watchdog_sql(body: &[u8]) {
         let sql = std::str::from_utf8(body).expect("SQL body is UTF-8");
@@ -4266,15 +4259,37 @@ mod tests {
         assert_watchdog_sql(&server.join().await[0].body);
     }
 
-    /// A dataset that received no points at all in the window is a dead
-    /// writer chain — the collector fails and the error names
-    /// `stow_cache_misses`, never a silent zero.
+    /// No consented misses or overloads is a valid empty window. It
+    /// cannot establish writer health, so the signal abstains.
     #[tokio::test]
-    async fn overloaded_reading_fails_on_dead_dataset() {
+    async fn overloaded_reading_abstains_on_empty_window() {
         let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
             status: 200,
             retry_after: None,
             body: r#"{"meta":[],"data":[{"events":"0","points":"0"}],"rows":1}"#,
+        }])
+        .await;
+        let edge = sql_edge();
+        let watcher = sql_watcher(&edge, &server.url);
+        let readings = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            watcher.overloaded_reading(),
+        )
+        .await
+        .expect("read completes within the deadline")
+        .expect("an empty observation window reads");
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].sample, 0);
+        assert_eq!(verdict(&readings[0]), Verdict::Skipped);
+        assert_watchdog_sql(&server.join().await[0].body);
+    }
+
+    #[tokio::test]
+    async fn overloaded_reading_propagates_query_failure() {
+        let server = crate::test_server::Loopback::start(vec![crate::test_server::Step::Respond {
+            status: 403,
+            retry_after: None,
+            body: "forbidden",
         }])
         .await;
         let edge = sql_edge();
@@ -4285,9 +4300,9 @@ mod tests {
         )
         .await
         .expect("read completes within the deadline")
-        .expect_err("a pointless dataset is a collector failure");
-        assert!(error.contains("stow_cache_misses"), "{error}");
-        server.join().await;
+        .expect_err("a refused query remains a collector failure");
+        assert!(error.contains("403"), "{error}");
+        assert_watchdog_sql(&server.join().await[0].body);
     }
 
     /// A GraphQL `errors` array is a hard error — never a partial read.
