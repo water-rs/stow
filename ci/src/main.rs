@@ -197,6 +197,7 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
         &report.consumed,
         &dependency_task_ids,
         task.profile,
+        &report.programs,
     )
     .await?;
     stage::write_build_output(output_dir, &task, &report, &upload_plan).await?;
@@ -435,7 +436,10 @@ async fn publish(
         &task.rustc_version,
         &task.task_id,
         build_run_from_env()?,
-        &artifact_records,
+        &stow_types::records::BuildRecords {
+            artifacts: artifact_records.clone(),
+            local_programs: output.programs.completed.clone(),
+        },
     )
     .await?;
 
@@ -469,16 +473,21 @@ async fn validated_build_output(
     // trusting the untrusted job's copy. No claims means the old failure
     // surface: never require the network the publish path did not need
     // before.
-    let index_slices = if output.consumed.is_empty() {
+    let index_slices = if output.consumed.is_empty() && output.programs.compiled.is_empty() {
         Vec::new()
     } else {
         let config = stow_cli::build_consume::ConsumeConfig::load()
             .map_err(|error| error.wrap_err("load config to verify consumed artifact claims"))?;
-        consume::slices_for_task(&config, task)
-            .await
-            .map_err(|error| {
-                error.wrap_err("fetch index slices to verify consumed artifact claims")
-            })?
+        consume::slices_for_task(
+            &config,
+            task,
+            output
+                .consumed
+                .iter()
+                .any(|claim| claim.kind == stow_types::artifact::ArtifactKind::BuildScript),
+        )
+        .await
+        .map_err(|error| error.wrap_err("fetch index slices to verify consumed artifact claims"))?
     };
     validate::validate_plan(
         task,
@@ -487,6 +496,7 @@ async fn validated_build_output(
         &closure,
         &output.consumed,
         &index_slices,
+        &output.programs,
     )?;
     Ok(output)
 }

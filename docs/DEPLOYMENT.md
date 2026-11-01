@@ -422,9 +422,10 @@ crate with `contents: read` only — no secrets, no OIDC — and uploads
 its output directory as a workflow artifact. `publish` runs only when
 `build` succeeds: it downloads the output, validates it against the
 task and an independently resolved dependency closure, and only then
-pushes the bundle plus the build's `Vec<ArtifactRecord>` (as one signed
-OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`,
-one per task) to GHCR, signing both keyless in process — one Fulcio
+pushes bundles plus the build's `BuildRecords` to GHCR. The records contain
+bundle entries and declarations of nonrelocatable proc macros, in one signed
+OCI artifact tagged `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>`.
+Both are signed keyless in process — one Fulcio
 certificate per validity window, one Rekor entry per signature, the
 job's `id-token: write` identity — with every registry write held under
 `STOW_GHCR_WRITES_PER_MINUTE` (see [`ENVIRONMENT.md`](ENVIRONMENT.md)). The job never calls the edge — GitHub's
@@ -433,6 +434,16 @@ edge checks the records artifact each successful task published exists
 in GHCR before it forwards the completion. See
 [`ARCHITECTURE.md`](ARCHITECTURE.md#trust-boundaries) for what the
 publisher checks.
+
+Build-script executables are outputs of their owning crate node, keyed for
+the host that runs them and reusable across target builds. Index format 7
+keeps them separate from library nodes. A program whose compiler dep-info
+records `CARGO_MANIFEST_DIR` is not published: its local cache entry includes
+the source directory. For a proc macro, the signed records instead declare
+the completed node; consumers compile the program locally and use its signed
+identity to validate the dependency closure. Its library dependencies remain
+cached. Records use `application/vnd.stow.records.v2+json`; the deployment
+must reset the old record store and regenerate index slices for this schema.
 
 `build-crate.yml` reads no repository variables — `run-name` carries
 `<rustc>-<task_id>` so the webhook's `display_title` parses back into

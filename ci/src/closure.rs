@@ -52,12 +52,17 @@ use crate::task::{self, CargoSubcommand};
 /// workspace's own unit graphs verified against the task id (stow#588).
 #[derive(Debug)]
 pub struct DependencyClosure {
+    proc_macros: BTreeSet<(String, semver::Version)>,
     packages: BTreeSet<(String, semver::Version)>,
     lib_packages: BTreeSet<(String, semver::Version)>,
     dependency_identity: stow_types::identity::DependencyIdentity,
 }
 
 impl DependencyClosure {
+    pub fn is_proc_macro(&self, name: &str, version: &semver::Version) -> bool {
+        self.proc_macros
+            .contains(&(name.to_owned(), version.clone()))
+    }
     #[must_use]
     pub fn contains(&self, crate_name: &str, version: &semver::Version) -> bool {
         self.packages
@@ -88,8 +93,10 @@ impl DependencyClosure {
     pub(crate) fn from_packages(
         packages: BTreeSet<(String, semver::Version)>,
         lib_packages: BTreeSet<(String, semver::Version)>,
+        proc_macros: BTreeSet<(String, semver::Version)>,
     ) -> Self {
         Self {
+            proc_macros,
             packages,
             lib_packages,
             // Test closures carry no derived graph; the leaf digest stands
@@ -135,7 +142,7 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
     let unit_graphs =
         task::phase_unit_graphs(&cargo_home, task, &workspace, task::cargo_subcommand()?).await?;
     task::verify_dependency_context(task, &unit_graphs)?;
-    let (packages, lib_packages) = package_sets(task, &unit_graphs)?;
+    let (packages, lib_packages, proc_macros) = package_sets(task, &unit_graphs)?;
     let dependency_identity = task
         .verified_dependency_graph()?
         .dependency_identity(0)
@@ -148,6 +155,7 @@ pub async fn resolve(task: &BuildTaskPayload) -> stow_types::error::Result<Depen
         "resolved publishable dependency closure"
     );
     Ok(DependencyClosure {
+        proc_macros,
         packages,
         lib_packages,
         dependency_identity,
@@ -196,6 +204,7 @@ fn phase_units(
 type PackageSets = (
     BTreeSet<(String, semver::Version)>,
     BTreeSet<(String, semver::Version)>,
+    BTreeSet<(String, semver::Version)>,
 );
 
 /// `resolve`'s pure half: the projected phase graphs in, the publishable
@@ -204,7 +213,8 @@ pub fn package_sets(
     task: &BuildTaskPayload,
     unit_graphs: &[task::PhaseUnitGraph],
 ) -> stow_types::error::Result<PackageSets> {
-    closure_packages(task, &phase_units(task, unit_graphs)?)
+    let phases = phase_units(task, unit_graphs)?;
+    closure_packages(task, &phases)
 }
 
 /// The two sets a publish plan is checked against, from the phases' own
@@ -217,6 +227,14 @@ fn closure_packages(
     task: &BuildTaskPayload,
     phases: &[PhaseUnits],
 ) -> stow_types::error::Result<PackageSets> {
+    let proc_macros = phases
+        .iter()
+        .filter(|phase| phase.phase != CargoSubcommand::Test)
+        .flat_map(|phase| &phase.units)
+        .flat_map(|unit| &unit.deps)
+        .filter(|dep| dep.proc_macro)
+        .map(|dep| Ok((dep.name.clone(), semver::Version::parse(&dep.version)?)))
+        .collect::<stow_types::error::Result<BTreeSet<_>>>()?;
     let mut packages = BTreeSet::new();
     let mut lib_packages = BTreeSet::new();
     for phase in phases {
@@ -258,7 +276,7 @@ fn closure_packages(
             task.version
         ));
     }
-    Ok((packages, lib_packages))
+    Ok((packages, lib_packages, proc_macros))
 }
 
 #[cfg(test)]
@@ -347,7 +365,7 @@ mod tests {
     fn a_package_with_a_lib_unit_in_the_build_phase_must_be_covered() {
         // A lib unit in a `build` graph is a crate the pipeline compiles —
         // publishable, and the plan must carry its artifact.
-        let (packages, lib_packages) = closure_packages(
+        let (packages, lib_packages, _) = closure_packages(
             &task(),
             &[phase(
                 CargoSubcommand::Build,
@@ -367,7 +385,7 @@ mod tests {
         // A build-script compile unit is not the library target the cache
         // serves: the package is inside the graph, so an artifact naming it
         // is no fabrication, but the plan is not demanded to carry one.
-        let (packages, lib_packages) = closure_packages(
+        let (packages, lib_packages, _) = closure_packages(
             &task(),
             &[phase(
                 CargoSubcommand::Build,
@@ -386,7 +404,7 @@ mod tests {
     fn a_lib_unit_only_the_check_phase_holds_is_not_demanded() {
         // `cargo check` compiles libraries too, so a check-phase unit is
         // publishable — but it proves no `build` artifact exists to demand.
-        let (packages, lib_packages) = closure_packages(
+        let (packages, lib_packages, _) = closure_packages(
             &task(),
             &[
                 phase(
@@ -411,7 +429,7 @@ mod tests {
     fn a_unit_only_the_test_phase_holds_is_outside_the_closure() {
         // The `test` phase compiles dev-dependencies; nothing it alone
         // holds is publishable, and the phase contributes nothing.
-        let (packages, lib_packages) = closure_packages(
+        let (packages, lib_packages, _) = closure_packages(
             &task(),
             &[
                 phase(
@@ -437,7 +455,7 @@ mod tests {
         // The wrapper is the publisher's own scaffolding: its units compile
         // like the rest of the graph but no registry ever served them, so
         // they belong in no closure.
-        let (packages, lib_packages) = closure_packages(
+        let (packages, lib_packages, _) = closure_packages(
             &task(),
             &[phase(
                 CargoSubcommand::Build,
@@ -459,7 +477,7 @@ mod tests {
     /// demands neither an artifact for, nor publishes, `rustc_version`.
     #[test]
     fn a_package_no_unit_graph_holds_is_not_demanded() {
-        let (packages, lib_packages) = closure_packages(
+        let (packages, lib_packages, _) = closure_packages(
             &task(),
             &[
                 phase(

@@ -36,6 +36,7 @@ const BLOBS_DIR: &str = "blobs";
 /// blob digest re-derived.
 #[derive(Debug)]
 pub struct BuildOutput {
+    pub programs: crate::dep_scan::ProgramClaims,
     pub task: BuildTaskPayload,
     pub plan: Vec<PlannedArtifact>,
     /// The cache-consumption claims the build made — every one still has to
@@ -97,6 +98,11 @@ pub async fn write_build_output(
         relocated.push(artifact);
     }
 
+    write(
+        dir.join("programs.json"),
+        serde_json::to_vec(&scanned.programs)?,
+    )
+    .await?;
     write(dir.join(TASK_FILE), serde_json::to_vec_pretty(task)?).await?;
     write(dir.join(SCAN_FILE), serde_json::to_vec_pretty(scanned)?).await?;
     write(
@@ -169,6 +175,7 @@ pub async fn read_build_output(dir: &Path) -> stow_types::error::Result<BuildOut
         serde_json::from_str(&consumed_json).wrap_err_with(|| format!("parse {CONSUMED_FILE}"))?;
 
     Ok(BuildOutput {
+        programs: serde_json::from_slice(&read(dir.join("programs.json")).await?)?,
         task,
         plan,
         consumed,
@@ -217,6 +224,10 @@ mod tests {
     use crate::dep_scan::ScanReport;
 
     const EMPTY_SCAN: ScanReport = ScanReport {
+        programs: crate::dep_scan::ProgramClaims {
+            completed: Vec::new(),
+            compiled: Vec::new(),
+        },
         restorable_captures: 0,
         artifacts: Vec::new(),
         consumed: Vec::new(),
@@ -315,6 +326,10 @@ mod tests {
         // artifacts the scan planned.
         let output_dir = tempfile::tempdir().unwrap();
         let report = ScanReport {
+            programs: crate::dep_scan::ProgramClaims {
+                completed: Vec::new(),
+                compiled: Vec::new(),
+            },
             restorable_captures: 7,
             artifacts: Vec::new(),
             consumed: Vec::new(),

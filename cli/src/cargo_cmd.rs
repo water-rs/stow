@@ -1428,6 +1428,11 @@ fn predict_from_inputs(
     } else {
         BTreeSet::new()
     };
+    let local_programs = [&slice, &host_slice]
+        .into_iter()
+        .flatten()
+        .flat_map(|slice| slice.index.local_programs.iter().cloned())
+        .collect::<Vec<_>>();
     let rows = slice.map(|slice| slice.index.rows).unwrap_or_default();
     let mut map = tracing::debug_span!("stow.precargo.serve_map_build").in_scope(|| {
         build_serve_map(
@@ -1464,6 +1469,7 @@ fn predict_from_inputs(
         &project.target,
         &project.rustc_version,
         resolve::host_glibc(),
+        &local_programs,
     )?;
 
     // The wrapper's decision path resolves each compiled unit against
@@ -5961,6 +5967,8 @@ mod tests {
                     row_count: rows.len() as u64,
                 },
                 rows,
+                build_scripts: Vec::new(),
+                local_programs: Vec::new(),
             },
         }
     }

@@ -65,6 +65,8 @@ fn seed_empty_index_slice(cache_dir: &Path) {
             row_count: 0,
         },
         rows: Vec::new(),
+        build_scripts: Vec::new(),
+        local_programs: Vec::new(),
     };
     let blob = stow_shim::encode_index(&index).expect("encode index");
     let manifest_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";

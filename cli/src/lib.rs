@@ -590,14 +590,14 @@ async fn finish_rustc_compile(
                     if base.config.cache.local(&build.identity.source) {
                         log_nonfatal_result(
                             "failed to store locally built artifact in the stow cache",
-                            artifact_cache::store_local_build_outputs(
+                            store_local_build(
                                 &base.config,
                                 parsed,
                                 &build,
+                                &post.env,
                                 &base.host_target,
                             )
-                            .await
-                            .map(|_| ()),
+                            .await,
                         );
                     }
                     artifact = Some(build);
@@ -637,6 +637,56 @@ async fn finish_rustc_compile(
         }
     }
     Ok(artifact)
+}
+
+/// Store a freshly compiled unit's outputs in the local cache, under the
+/// entry key its compile earned: scoped to the manifest directory when a
+/// build script or proc macro read `CARGO_MANIFEST_DIR`.
+async fn store_local_build(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    build: &artifact_cache::LocalBuildArtifact,
+    env: &supervisor::protocol::InvocationEnv,
+    host: &str,
+) -> stow_types::error::Result<()> {
+    let c_metadata = build.identity.c_metadata.as_str();
+    let entry_key = if reads_manifest_dir(parsed).await? {
+        artifact_cache::LocalEntryKey::manifest_scoped(c_metadata, manifest_dir_bytes(env)?)
+    } else {
+        artifact_cache::LocalEntryKey::plain(c_metadata)
+    };
+    artifact_cache::store_local_build_outputs(config, parsed, build, host, &entry_key)
+        .await
+        .map(|_| ())
+}
+
+/// The invocation's `CARGO_MANIFEST_DIR`, which cargo sets on every rustc
+/// call; its absence is a broken invocation, not a case to default.
+fn manifest_dir_bytes(
+    env: &supervisor::protocol::InvocationEnv,
+) -> stow_types::error::Result<&[u8]> {
+    env.manifest_dir
+        .as_deref()
+        .ok_or_else(|| stow_types::stow_error!("the invocation carries no CARGO_MANIFEST_DIR"))
+}
+
+/// Whether the compile that just ran read `CARGO_MANIFEST_DIR` — only a
+/// build script or proc macro can embed it in an image that is not a
+/// library's relocatable metadata; rustc records every environment read
+/// as an `env-dep` line of the dep-info beside the output.
+async fn reads_manifest_dir(
+    parsed: &rustc_args::ParsedRustcArgs,
+) -> stow_types::error::Result<bool> {
+    if !(parsed.is_build_script() || parsed.is_proc_macro()) {
+        return Ok(false);
+    }
+    let path = parsed.output_dep_info_path().ok_or_else(|| {
+        stow_types::stow_error!("`{}` has no dep-info path to read", parsed.crate_name)
+    })?;
+    let dep_info = async_fs::read_to_string(&path)
+        .await
+        .wrap_err_with(|| format!("read dep-info {}", path.display()))?;
+    Ok(stow_types::rustc::dep_info_reads_manifest_dir(&dep_info))
 }
 
 /// A compiled build script must leave its binary behind for cargo's run
@@ -1873,12 +1923,20 @@ async fn serve_or_compile(
     // The stages only note what they saw; the one outcome the invocation
     // contributes is recorded here, where the chain ends (stow#696).
     let mut tally = LookupTally::default();
-    let (served, refused) =
-        match lookup_chain(parsed, env, ctx, exact_public_cache_allowed, &mut tally).await {
-            RemoteServe::Served(notifications) => (Some(notifications), false),
-            RemoteServe::Refused => (None, true),
-            RemoteServe::Bypass | RemoteServe::Miss => (None, false),
-        };
+    let (served, refused) = match lookup_chain(
+        parsed,
+        env,
+        ctx,
+        exact_public_cache_allowed,
+        invocation_env,
+        &mut tally,
+    )
+    .await
+    {
+        RemoteServe::Served(notifications) => (Some(notifications), false),
+        RemoteServe::Refused => (None, true),
+        RemoteServe::Bypass | RemoteServe::Miss => (None, false),
+    };
     record_unit_outcome(
         &env.env_base.config,
         parsed,
@@ -1911,6 +1969,7 @@ async fn lookup_chain(
     env: &WrapperEnvironment<'_>,
     ctx: &BuildContext,
     exact_public_cache_allowed: bool,
+    invocation_env: &supervisor::protocol::InvocationEnv,
     tally: &mut LookupTally,
 ) -> RemoteServe {
     let request = FetchRequest {
@@ -1918,9 +1977,15 @@ async fn lookup_chain(
         rustc_version: &env.rustc_version,
         c_metadata: env.request_c_metadata.as_str(),
     };
-    if let Some(notifications) =
-        try_serve_local_cached_bundle(&env.env_base.config, parsed, &env.source, &request, tally)
-            .await
+    if let Some(notifications) = try_serve_local_invocation(
+        &env.env_base.config,
+        parsed,
+        &env.source,
+        &request,
+        invocation_env,
+        tally,
+    )
+    .await
     {
         return RemoteServe::Served(notifications);
     }
@@ -2003,7 +2068,9 @@ struct WrapperEnvironment<'a> {
 struct SliceIndex {
     /// The decoded slice rows.
     slice: index::IndexSlice,
-    /// `c_metadata` → row position inside `slice.index.rows`.
+    /// `c_metadata` → row position inside `slice.index.rows` followed by
+    /// `slice.index.build_scripts`: a build script is an output of its
+    /// crate's node, so only this exact lookup reads those.
     exact: std::collections::HashMap<String, usize>,
 }
 
@@ -2013,6 +2080,7 @@ impl SliceIndex {
             .index
             .rows
             .iter()
+            .chain(&slice.index.build_scripts)
             .enumerate()
             .map(|(position, row)| (row.c_metadata.to_string(), position))
             .collect();
@@ -2021,9 +2089,11 @@ impl SliceIndex {
 
     /// The row at `c_metadata`, if the slice carries one.
     fn exact_row(&self, c_metadata: &str) -> Option<&stow_types::index::ArtifactIndexRow> {
-        self.exact
-            .get(c_metadata)
-            .map(|position| &self.slice.index.rows[*position])
+        self.exact.get(c_metadata).map(|position| {
+            let rows = &self.slice.index.rows;
+            rows.get(*position)
+                .unwrap_or_else(|| &self.slice.index.build_scripts[*position - rows.len()])
+        })
     }
 }
 
@@ -3343,11 +3413,12 @@ async fn decide_local_only(
             c_metadata: identity.c_metadata.as_str(),
         };
         let mut tally = LookupTally::default();
-        let served = try_serve_local_cached_bundle(
+        let served = try_serve_local_invocation(
             &prep.env_base.config,
             parsed,
             source,
             &request,
+            invocation_env,
             &mut tally,
         )
         .await;
@@ -3539,6 +3610,34 @@ async fn run_cc_wrapper(
     }
 }
 
+/// Both public and local-only builds query the same manifest-scoped
+/// program entries before proceeding to their other lookup stages.
+async fn try_serve_local_invocation(
+    config: &StowConfig,
+    parsed: &rustc_args::ParsedRustcArgs,
+    source: &UnitSource,
+    request: &FetchRequest<'_>,
+    invocation_env: &supervisor::protocol::InvocationEnv,
+    tally: &mut LookupTally,
+) -> Option<ArtifactNotifications> {
+    if let Some(notifications) =
+        try_serve_local_cached_bundle(config, parsed, source, request, tally).await
+    {
+        return Some(notifications);
+    }
+    if !(parsed.is_build_script() || parsed.is_proc_macro()) {
+        return None;
+    }
+    let manifest_dir = invocation_env.manifest_dir.as_deref()?;
+    let scoped = artifact_cache::LocalEntryKey::manifest_scoped(request.c_metadata, manifest_dir);
+    let scoped_request = FetchRequest {
+        target: request.target,
+        rustc_version: request.rustc_version,
+        c_metadata: scoped.as_str(),
+    };
+    try_serve_local_cached_bundle(config, parsed, source, &scoped_request, tally).await
+}
+
 async fn try_serve_local_cached_bundle(
     config: &StowConfig,
     parsed: &rustc_args::ParsedRustcArgs,
@@ -3582,6 +3681,11 @@ async fn try_serve_local_prefetched_graph_bundle(
     ctx: &BuildContext,
     tally: &mut LookupTally,
 ) -> Option<ArtifactNotifications> {
+    // A build script is an output of its crate's node: the prefetched
+    // graph holds nodes, never a node's build script.
+    if parsed.is_build_script() {
+        return None;
+    }
     // `Ok(None)` is the non-registry case, which can match no published
     // bundle.
     let (crate_name, version) = registry_unit_identity(parsed)?;
@@ -4894,6 +4998,12 @@ async fn build_semantic_fetch_request(
     rustc_version: &str,
     unit_nodes: Option<&unit_node::UnitNodeTable>,
 ) -> stow_types::error::Result<Option<fetch::SemanticFetchRequest>> {
+    // A build script is an output of its crate's node, never a node: the
+    // semantic fallback substitutes whole nodes and has no feature set to
+    // match a build script on.
+    if parsed.is_build_script() {
+        return Ok(None);
+    }
     let Some((crate_name, version)) = shared_detect_registry_crate_version(parsed)? else {
         return Ok(None);
     };
@@ -5121,10 +5231,9 @@ async fn resolve_local_build_artifact(
 ) -> stow_types::error::Result<LocalBuildResolution> {
     // Whether the cache can hold this unit at all — the same predicate
     // `artifact_cache::materialized_output_paths` gates on — comes first:
-    // a `bin` unit like `build_script_build` is never a cache unit, so it
-    // never waits on another unit's bookkeeping, never reads
-    // `materialized_outputs`, and never reaches an identity function,
-    // which would only fail on its crate type (stow#619).
+    // project binaries are never cache units, while build-script binaries
+    // are outputs of their owning crate. Excluded units never wait on
+    // dependency bookkeeping or enter artifact identity resolution.
     if !parsed.is_restorable_artifact() {
         return Ok(LocalBuildResolution::NotAnArtifactUnit);
     }
@@ -5200,7 +5309,11 @@ async fn resolve_local_build_artifact(
     // lookups. The scan only costs semantic matches for a crate whose
     // build script adds feature cfgs when its unit finished before the
     // analysis landed.
+    // A build script is compiled from the same source whatever features
+    // its crate is built with, so it carries no feature set of its own:
+    // the crate's unit in the table is the library's, not the script's.
     let features_json = unit_nodes
+        .filter(|_| !parsed.is_build_script())
         .and_then(|table| {
             resolved_unit_features_json(
                 table,
@@ -5537,6 +5650,9 @@ pub(crate) fn parsed_artifact_kind(
     parsed: &rustc_args::ParsedRustcArgs,
 ) -> stow_types::error::Result<stow_types::artifact::ArtifactKind> {
     let crate_types = parsed_crate_types(parsed)?;
+    if parsed.is_build_script() {
+        return Ok(stow_types::artifact::ArtifactKind::BuildScript);
+    }
     if crate_types
         .iter()
         .any(|crate_type| matches!(crate_type, stow_types::artifact::RustCrateType::ProcMacro))
@@ -5576,6 +5692,7 @@ pub(crate) fn parsed_crate_types(
             "cdylib" => Ok(stow_types::artifact::RustCrateType::Cdylib),
             "staticlib" => Ok(stow_types::artifact::RustCrateType::Staticlib),
             "proc-macro" => Ok(stow_types::artifact::RustCrateType::ProcMacro),
+            "bin" => Ok(stow_types::artifact::RustCrateType::Bin),
             other => Err(stow_types::stow_error!(
                 "unsupported rust crate type `{other}`"
             )),
@@ -6776,6 +6893,8 @@ mod tests {
                 row_count: 0,
             },
             rows: Vec::new(),
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
         }
     }
 
@@ -7989,15 +8108,14 @@ mod tests {
             );
         }
 
-        /// stow#619: a build script's `bin` unit is never an artifact
-        /// unit — its post-compile owes no wait on an in-flight extern,
-        /// no `materialized_outputs` read, no identity resolution, and
-        /// therefore no store and no warn. The dependency's flight stays
-        /// open for the whole test: a post-compile that waited on it
-        /// would never let the flush answer.
+        /// A build script is an output of its crate's node, so its
+        /// post-compile resolves the identity of the build-dependencies it
+        /// was compiled against like any other unit's: it holds while an
+        /// extern is in flight, and once that flight ends with no report it
+        /// stores nothing and names the unit in the debug line.
         #[tokio::test]
-        async fn a_build_script_units_post_compile_owes_nothing() {
-            let (log, _capture) = capture_logs(tracing::Level::WARN);
+        async fn a_build_script_units_post_compile_resolves_its_externs() {
+            let (log, _capture) = capture_logs(tracing::Level::DEBUG);
 
             let tempdir = tempfile::tempdir().expect("tempdir");
             let out_dir = tempdir.path().join("deps");
@@ -8057,24 +8175,29 @@ mod tests {
             let mut script_conn = connect_raw(&endpoint).await;
             send_observed(&mut script_conn, &token, &build_script_args, None).await;
             send_observed(&mut script_conn, &token, &build_script_args, Some(true)).await;
-            // The flush answers only once the report's bookkeeping has
-            // run to its end — a post-compile that waited on the
-            // in-flight extern would hold it forever.
-            tokio::time::timeout(
-                Duration::from_secs(10),
-                flush_frames(&mut script_conn, &token),
-            )
-            .await
-            .expect("the build-script unit's post-compile returned while its extern was in flight");
+            // The post-compile holds while the extern is in flight, so
+            // the flush stays unanswered until the flight ends.
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(500),
+                    flush_frames(&mut script_conn, &token),
+                )
+                .await
+                .is_err(),
+                "the build-script unit's post-compile must hold on its in-flight extern"
+            );
+            drop(dep_conn);
+            flush_frames(&mut script_conn, &token).await;
 
             assert!(
                 stored_crates(&config).await.is_empty(),
-                "a unit the cache cannot hold stores nothing"
+                "a build script whose extern never recorded is not stored"
             );
             let captured = log.text();
             assert!(
-                captured.is_empty(),
-                "a never-cacheable unit logs no warn:\n{captured}"
+                captured.contains("bookkeeping was never recorded")
+                    && captured.contains("build_script_build"),
+                "the unrecorded-dependency debug line names the build script:\n{captured}"
             );
         }
     }

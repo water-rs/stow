@@ -189,7 +189,9 @@ impl Scenario {
     fn assert_nothing_reported(&self, entries: &[StoredEntry], targets: &[&Path]) {
         std::thread::sleep(DRAIN_GRACE);
         let requests = self.requests.lock().expect("requests lock").clone();
-        for entry in entries {
+        // A public entry (a build script compiled from crates.io source
+        // alone) may legitimately reach the remote stage.
+        for entry in entries.iter().filter(|entry| entry.reach == LOCAL_ONLY) {
             for key in [&entry.compile_key, &entry.c_metadata] {
                 assert!(
                     !requests
@@ -260,6 +262,14 @@ fn commit_change(repo: &Path, home: &Path) {
     }
 }
 
+/// The build scripts of `proc-macro2` (once per feature set it was built
+/// with) and `quote` are compiled from their crates.io source alone, so
+/// they are the only public entries beside the git-bound units.
+fn assert_only_build_scripts_public(entries: &[StoredEntry]) {
+    let public = entries.iter().filter(|entry| entry.reach == PUBLIC).count();
+    assert_eq!(public, 3, "only the build scripts are public: {entries:#?}");
+}
+
 /// A consumer the cache has not seen, compiled over the served git
 /// unit, is local-only too: serving a local-only entry must not launder
 /// its reach into the consumers' bookkeeping. Returns the build's target
@@ -320,12 +330,20 @@ fn a_git_unit_and_its_crates_io_consumers_are_local_only() {
     let (first_build, first_target) = scenario.build(&first, &["build", "--offline"], &[]);
     let first_stderr = stderr_of(&first_build);
     let stored = scenario.entries();
-    for package in ["unicode-ident", "proc-macro2", "quote"] {
+    // `proc-macro2` and `quote` each also store their build script, which
+    // is compiled from the crate's own source and depends on no git unit,
+    // so it stays public; the library is the one over the git unit.
+    for (package, entries) in [("unicode-ident", 1), ("proc-macro2", 2), ("quote", 2)] {
         let rows = entries_for(&stored, package);
-        assert_eq!(rows.len(), 1, "{package} was not stored once: {stored:#?}");
         assert_eq!(
-            rows[0].reach, LOCAL_ONLY,
-            "{package} over a git unit must be local-only"
+            rows.len(),
+            entries,
+            "{package} was not stored as expected: {stored:#?}"
+        );
+        assert_eq!(
+            rows.iter().filter(|row| row.reach == LOCAL_ONLY).count(),
+            1,
+            "{package} over a git unit must be local-only exactly once: {stored:#?}"
         );
     }
     assert!(
@@ -382,10 +400,7 @@ fn a_git_unit_and_its_crates_io_consumers_are_local_only() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(keys.len(), 2, "two commits share one key: {after:#?}");
 
-    assert!(
-        after.iter().all(|entry| entry.reach == LOCAL_ONLY),
-        "an entry over a git unit is public: {after:#?}"
-    );
+    assert_only_build_scripts_public(&after);
 
     // A remote index that names the stored keys: a local-only unit
     // reaching the remote stage would fetch its row's bundle, and the
@@ -524,4 +539,75 @@ fn path_members_and_primary_packages_are_never_stored() {
         Vec::<StoredEntry>::new(),
         "the primary package was stored"
     );
+}
+
+/// A proc macro embedding its source directory is reused only at that
+/// directory, even when its git source identity is unchanged.
+#[test]
+fn a_manifest_relative_proc_macro_is_cached_per_source_directory() {
+    let mut scenario = Scenario::new();
+    let repo = scenario.root.path().join("manifest-probe");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        include_str!("fixtures/manifest-proc-macro/Cargo.toml"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("src/lib.rs"),
+        include_str!("fixtures/manifest-proc-macro/lib.rs"),
+    )
+    .unwrap();
+    let git_home = scenario.root.path().join("git-home");
+    std::fs::create_dir_all(&git_home).unwrap();
+    let url = commit_git_repo(&repo, &git_home);
+    let dependencies = toml::to_string(&std::collections::BTreeMap::from([(
+        "dependencies",
+        std::collections::BTreeMap::from([(
+            "manifest-probe",
+            std::collections::BTreeMap::from([("git", url)]),
+        )]),
+    )]))
+    .unwrap();
+    let project = scenario.project_dir("consumer");
+    let prepare = |scenario: &Scenario| {
+        write_project(
+            &project,
+            scenario.cargo_home.path(),
+            "consumer",
+            "",
+            &dependencies,
+        );
+        std::fs::write(
+            project.join("src/main.rs"),
+            include_str!("fixtures/manifest-proc-macro/consumer.rs"),
+        )
+        .unwrap();
+    };
+    prepare(&scenario);
+    scenario.build(&project, &["build", "--offline"], &[]);
+    let (repeat, _) = scenario.build(&project, &["build", "--offline"], &[]);
+    assert!(
+        logged(&stderr_of(&repeat), SERVED_LOCALLY, "manifest_probe"),
+        "{}",
+        stderr_of(&repeat)
+    );
+    scenario.cargo_home = tempfile::tempdir().unwrap();
+    prepare(&scenario);
+    let (moved, target) = scenario.build(&project, &["build", "--offline"], &[]);
+    assert!(!logged(
+        &stderr_of(&moved),
+        SERVED_LOCALLY,
+        "manifest_probe"
+    ));
+    let result = std::process::Command::new(
+        target
+            .join("debug")
+            .join(format!("consumer{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .arg(scenario.cargo_home.path())
+    .output()
+    .unwrap();
+    assert!(result.status.success(), "{}", stderr_of(&result));
+    assert_eq!(entries_for(&scenario.entries(), "manifest-probe").len(), 2);
 }

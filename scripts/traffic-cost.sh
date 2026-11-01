@@ -326,6 +326,7 @@ jq --arg rustc "$RUSTC_VERSION" --arg digest "$BUNDLE_DIGEST" --argjson size "$B
         | .oci_reference = "ghcr.io/water-rs/stow-cache-\($rustc):serde.1.0.219-x86_64-unknown-linux-gnu"
         | .bundle_digest = $digest
         | .bundle_size = $size)
+    | {artifacts: ., local_programs: []}
 ' "$REPO_ROOT/scripts/traffic-cost/index-records.json" >"$WORK_DIR/index-records.json"
 "$BIN/stow-mock-registry" index-from-records \
     --records "$WORK_DIR/index-records.json" \

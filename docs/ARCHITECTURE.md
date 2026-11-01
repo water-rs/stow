@@ -655,6 +655,16 @@ attacker-influenced, so the publisher (`ci/src/stage.rs`, `ci/src/closure.rs`,
 - every `oci_reference` equals the reference the artifact's own identity
   fields produce, so a plan cannot push under another artifact's name.
 
+Build-script executables belong to their crate node and are keyed for the
+host. The index stores them in `build_scripts`, separate from library rows;
+consuming a script never counts as completing its library. A script or proc
+macro whose compiler dep-info reads `CARGO_MANIFEST_DIR` stays in the local
+cache under a key that includes its source directory. A nonrelocatable proc
+macro completes with a signed `local_programs` declaration instead of a
+bundle. Consumers may compile that exact declared dependency locally while
+serving its library dependencies. The publisher checks the declaration
+against the resolved proc-macro closure and the signed index.
+
 Inside the build job, the untrusted half of the pipeline is additionally
 confined. `cargo fetch` resolves and downloads the dependency closure on the
 host, then each cargo phase runs inside a `heel` sandbox: the child starts
