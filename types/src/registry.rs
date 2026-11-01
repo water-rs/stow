@@ -275,6 +275,7 @@ pub fn oci_reference(key: &ArtifactKey, c_metadata: &str) -> String {
         crate::artifact::ArtifactKind::Rlib => "",
         crate::artifact::ArtifactKind::Dylib => "-dy",
         crate::artifact::ArtifactKind::ProcMacro => "-pm",
+        crate::artifact::ArtifactKind::BuildScript => "-bs",
     };
 
     let tail = format!("-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}");

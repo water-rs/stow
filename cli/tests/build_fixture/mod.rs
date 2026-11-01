@@ -506,6 +506,8 @@ pub fn seed_index_slice(
             row_count: rows.len() as u64,
         },
         rows,
+        build_scripts: Vec::new(),
+        local_programs: Vec::new(),
     };
     let blob = stow_shim::encode_index(&index).expect("encode index");
     let manifest_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));

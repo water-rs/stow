@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 use stow_types::artifact::{ArtifactKey, ArtifactKind, RustCrateType};
 use stow_types::bundle::{
-    ArtifactBundleFile, STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE,
-    STOW_RMETA_MEDIA_TYPE,
+    ArtifactBundleFile, STOW_BUILD_SCRIPT_MEDIA_TYPE, STOW_DYLIB_MEDIA_TYPE,
+    STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE,
 };
 use stow_types::crate_info::{CrateId, FeatureSet};
 use stow_types::error::Context;
@@ -32,8 +32,9 @@ pub async fn build_upload_plan(
     consumed: &[ConsumedArtifact],
     dependency_task_ids: &[String],
     node_profile: NodeProfile,
+    programs: &crate::dep_scan::ProgramClaims,
 ) -> stow_types::error::Result<Vec<PlannedArtifact>> {
-    validate_dependency_graph(scanned, consumed)?;
+    validate_dependency_graph(scanned, consumed, programs)?;
     let mut plans_by_compile_key =
         BTreeMap::<(String, TargetTriple, WireRustcVersion), PlannedArtifact>::new();
 
@@ -114,6 +115,7 @@ pub async fn build_upload_plan(
 fn validate_dependency_graph(
     scanned: &[ScannedArtifact],
     consumed: &[ConsumedArtifact],
+    programs: &crate::dep_scan::ProgramClaims,
 ) -> stow_types::error::Result<()> {
     let mut output_owner_by_path = BTreeMap::<PathBuf, usize>::new();
     let mut output_owner_by_compile_key = BTreeMap::<String, usize>::new();
@@ -152,6 +154,10 @@ fn validate_dependency_graph(
                             dependency.compile_key.as_str(),
                             dependency.stable_c_metadata.as_str(),
                         )
+                })
+                || programs.completed.iter().chain(&programs.compiled).any(|program| {
+                    program.compile_key == dependency.compile_key
+                        && program.c_metadata.as_str() == dependency.stable_c_metadata
                 })
             {
                 continue;
@@ -199,7 +205,7 @@ fn ensure_reconcilable_duplicate_compile_key(
     Ok(())
 }
 
-fn dependency_c_metadata_json(
+pub fn dependency_c_metadata_json(
     dependencies: &[ScannedArtifactDependency],
 ) -> stow_types::error::Result<DependencyCMetadataJson> {
     let mut identities = Vec::with_capacity(dependencies.len());
@@ -551,8 +557,11 @@ const fn output_media_type(
         ParsedFileKind::Rmeta => STOW_RMETA_MEDIA_TYPE,
         ParsedFileKind::DynamicLibrary => match artifact_kind {
             ArtifactKind::ProcMacro => STOW_PROC_MACRO_MEDIA_TYPE,
-            ArtifactKind::Dylib | ArtifactKind::Rlib => STOW_DYLIB_MEDIA_TYPE,
+            ArtifactKind::Dylib | ArtifactKind::Rlib | ArtifactKind::BuildScript => {
+                STOW_DYLIB_MEDIA_TYPE
+            }
         },
+        ParsedFileKind::Executable => STOW_BUILD_SCRIPT_MEDIA_TYPE,
     }
 }
 
@@ -633,6 +642,21 @@ mod tests {
         Vec::new()
     }
 
+    /// A build script's executable ships under its own media type, the
+    /// type the CLI writes back as a real file; a dynamic library of the
+    /// same build keeps the library type.
+    #[test]
+    fn a_build_script_executable_ships_as_a_build_script() {
+        assert_eq!(
+            super::output_media_type(ParsedFileKind::Executable, &ArtifactKind::BuildScript),
+            stow_types::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE
+        );
+        assert_eq!(
+            super::output_media_type(ParsedFileKind::DynamicLibrary, &ArtifactKind::ProcMacro),
+            stow_types::bundle::STOW_PROC_MACRO_MEDIA_TYPE
+        );
+    }
+
     #[tokio::test]
     async fn upload_plan_preserves_captured_exact_identity() {
         let output_path = std::env::temp_dir().join(format!(
@@ -657,6 +681,7 @@ mod tests {
             &[],
             &dependency_task_ids(),
             stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
         )
         .await
         .expect("build upload plan");
@@ -697,6 +722,7 @@ mod tests {
             &[],
             &dependency_task_ids(),
             stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
         )
         .await
         .expect("build upload plan");
@@ -830,6 +856,7 @@ mod tests {
             &[],
             &dependency_task_ids(),
             stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
         )
         .await
         .expect("build upload plan");
@@ -887,6 +914,7 @@ mod tests {
         let scanned = vec![rand_core];
 
         let served = vec![crate::dep_scan::ConsumedArtifact {
+            kind: ArtifactKind::Rlib,
             crate_name: "getrandom".to_owned(),
             crate_version: "0.2.17".to_owned(),
             compile_key: "served-getrandom".to_owned(),
@@ -900,6 +928,7 @@ mod tests {
             &served,
             &dependency_task_ids(),
             stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
         )
         .await
         .expect("consumed dependency resolves the plan");
@@ -911,6 +940,7 @@ mod tests {
             &mismatched,
             &dependency_task_ids(),
             stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
         )
         .await
         .expect_err("an identity the claim does not carry must not satisfy the edge");
@@ -966,6 +996,7 @@ mod tests {
             &[],
             &dependency_task_ids(),
             stow_types::node_profile::NodeProfile::Dev,
+            &crate::dep_scan::ProgramClaims::default(),
         )
         .await
         .expect_err("an x86-64 object must not publish under an arm64 task");

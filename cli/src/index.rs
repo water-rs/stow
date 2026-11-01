@@ -412,6 +412,8 @@ fn empty_slice(target: &str, rustc_version: &str) -> stow_types::error::Result<I
                 row_count: 0,
             },
             rows: Vec::new(),
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
         },
     })
 }
@@ -923,6 +925,8 @@ mod tests {
                 row_count: rows.len() as u64,
             },
             rows,
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
         }
     }
 

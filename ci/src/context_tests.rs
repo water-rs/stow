@@ -121,9 +121,13 @@ fn publish_manifest(reg: &Path, fixture: &Fixture, manifest: &Value) -> String {
     if fixture.proc_macro {
         lib.push_str("extern crate proc_macro;\n");
     }
+    publish_manifest_source(reg, fixture, manifest, &lib)
+}
+
+fn publish_manifest_source(reg: &Path, fixture: &Fixture, manifest: &Value, lib: &str) -> String {
     let build_script =
         !fixture.build_deps.is_empty() && manifest["package"]["build"] != json!(false);
-    let cksum = write_crate_tarball(reg, fixture, manifest, &lib, build_script);
+    let cksum = write_crate_tarball(reg, fixture, manifest, lib, build_script);
 
     // The index line's deps are the manifest's own tables, so the two
     // can never disagree: a `req` is the declared `version` made exact,
@@ -1474,6 +1478,26 @@ async fn capture_build_dep_keys(
     runtime: &Path,
     capture: &Path,
 ) -> (String, String) {
+    let records = capture_task_units(cargo_home, reg, task, runtime, capture).await;
+    let build_script = records
+        .iter()
+        .find(|record| record.crate_name == "build_script_build")
+        .expect("build-script rustc invocation recorded");
+    let bd = records
+        .iter()
+        .find(|record| record.crate_name == "bd")
+        .expect("bd rustc invocation recorded");
+    (build_script.compile_key.clone(), bd.c_metadata.clone())
+}
+
+/// Compile through the real sandbox and return the host collector's evidence.
+async fn capture_task_units(
+    cargo_home: &Path,
+    reg: &Path,
+    task: &BuildTaskPayload,
+    runtime: &Path,
+    capture: &Path,
+) -> Vec<stow_types::capture::CapturedRustcArtifact> {
     let (root, workspace) = wrapper_workspace(reg, task).await;
     let capture_dir = root.path().join(".stow-rustc-capture");
     std::fs::create_dir_all(&capture_dir).expect("capture dir");
@@ -1525,16 +1549,56 @@ async fn capture_build_dep_keys(
     .await
     .expect("sandboxed check phase");
     assert!(failure.is_none(), "sandboxed check compiled successfully");
-    let records = collector.into_records().expect("capture records");
-    let build_script = records
+    collector.into_records().expect("capture records")
+}
+
+#[test]
+fn manifest_relative_proc_macro_is_identified_by_real_capture() {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    let fixture = Fixture {
+        name: "manifest-probe",
+        version: "1.0.0",
+        deps: vec![],
+        build_deps: vec![],
+        features: &[],
+        proc_macro: true,
+    };
+    publish_manifest_source(
+        &reg,
+        &fixture,
+        &fixture_manifest(&fixture, &[]),
+        include_str!("../../cli/tests/fixtures/manifest-proc-macro/lib.rs"),
+    );
+    let manifest = consumer_project(
+        &scratch.path().join("consumer"),
+        &json!({ "manifest-probe": "1" }),
+        &json!({}),
+    );
+    let requests = resolve_requests(cargo_home.path(), &manifest);
+    let task = payload_for(&request_for(&requests, "manifest-probe"));
+    let (runtime, capture) = build_binaries();
+    let records = smol::block_on(capture_task_units(
+        cargo_home.path(),
+        &reg,
+        &task,
+        &runtime,
+        &capture,
+    ));
+    let program = records
         .iter()
-        .find(|record| record.crate_name == "build_script_build")
-        .expect("build-script rustc invocation recorded");
-    let bd = records
-        .iter()
-        .find(|record| record.crate_name == "bd")
-        .expect("bd rustc invocation recorded");
-    (build_script.compile_key.clone(), bd.c_metadata.clone())
+        .find(|record| record.crate_name == "manifest_probe")
+        .expect("macro was compiled");
+    assert!(program.reads_manifest_dir);
+    assert!(program.restorable);
+    assert!(program.crate_types.iter().any(|kind| kind == "proc-macro"));
+    assert!(
+        program
+            .outputs
+            .iter()
+            .any(|output| output.kind
+                == stow_types::capture::CapturedRustcOutputKind::DynamicLibrary)
+    );
 }
 
 /// `parent`'s target-side child crate names and node index in one task
@@ -1747,7 +1811,7 @@ fn a_build_edge_out_of_a_scriptless_package_mints_no_units() {
                 .await
                 .expect("phase unit graphs");
         task::verify_dependency_context(&task, &graphs).expect("the dispatched context verifies");
-        let (packages, lib_packages) =
+        let (packages, lib_packages, _) =
             crate::closure::package_sets(&task, &graphs).expect("closure");
         for demanded in ["derive_more", "derive_more-impl"] {
             assert!(

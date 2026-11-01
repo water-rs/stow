@@ -8,8 +8,9 @@
 use std::io::Cursor;
 
 use crate::bundle::{
-    ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_BUNDLE_MANIFEST_PATH,
-    STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE,
+    ArtifactBlobConfig, ArtifactBundleFile, ArtifactBundleManifest, STOW_BUILD_SCRIPT_MEDIA_TYPE,
+    STOW_BUNDLE_MANIFEST_PATH, STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE,
+    STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE,
 };
 use crate::public_cache::stable_c_metadata_for_compile_key;
 
@@ -81,6 +82,7 @@ fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), Bu
     let mut saw_canonical_rlib = false;
     let mut saw_canonical_rmeta = false;
     let mut saw_canonical_dynamic = false;
+    let mut saw_canonical_executable = false;
 
     for output in &config.outputs {
         let (stem, kind) = classify_bundle_output(config, output)?;
@@ -96,6 +98,10 @@ fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), Bu
         }
         let canonical_stem = format!("lib{stem}{extra}", extra = config.extra_filename);
         match kind {
+            BundleOutputKind::Executable => {
+                saw_canonical_executable |=
+                    output.file_name == canonical_executable_name(config, &stem);
+            }
             BundleOutputKind::Rlib => {
                 saw_canonical_rlib |= output.file_name == format!("{canonical_stem}.rlib");
             }
@@ -149,6 +155,18 @@ fn validate_bundle_config_identity(config: &ArtifactBlobConfig) -> Result<(), Bu
         )));
     }
 
+    if config
+        .outputs
+        .iter()
+        .any(|output| output.media_type == STOW_BUILD_SCRIPT_MEDIA_TYPE)
+        && !saw_canonical_executable
+    {
+        return Err(BundleSchemaError(format!(
+            "bundle is missing canonical executable output for stable metadata {}",
+            config.c_metadata
+        )));
+    }
+
     Ok(())
 }
 
@@ -157,6 +175,7 @@ enum BundleOutputKind {
     Rlib,
     Rmeta,
     Dynamic,
+    Executable,
 }
 
 /// Read one bundle output: its lib stem and which canonical kind it is,
@@ -183,6 +202,12 @@ fn classify_bundle_output(
             return Ok((
                 output_lib_stem(&output.file_name, "rmeta")?,
                 BundleOutputKind::Rmeta,
+            ));
+        }
+        STOW_BUILD_SCRIPT_MEDIA_TYPE => {
+            return Ok((
+                output_executable_stem(&output.file_name, config.target.is_windows())?,
+                BundleOutputKind::Executable,
             ));
         }
         STOW_DYLIB_MEDIA_TYPE | STOW_PROC_MACRO_MEDIA_TYPE => {
@@ -241,6 +266,29 @@ fn output_lib_stem(file_name: &str, ext: &str) -> Result<String, BundleSchemaErr
         .strip_prefix("lib")
         .and_then(|rest| rest.strip_suffix(&format!(".{ext}")))
         .ok_or_else(|| malformed_output(file_name))?;
+    artifact_stem(body, file_name)
+}
+
+/// The file name rustc gives a bundle's executable: `<crate><extra>`,
+/// with `.exe` on Windows.
+fn canonical_executable_name(config: &ArtifactBlobConfig, stem: &str) -> String {
+    let suffix = if config.target.is_windows() {
+        ".exe"
+    } else {
+        ""
+    };
+    format!("{stem}{extra}{suffix}", extra = config.extra_filename)
+}
+
+/// The crate stem of an executable output — `<crate>-<metadata>`, with
+/// `.exe` on Windows.
+fn output_executable_stem(file_name: &str, windows: bool) -> Result<String, BundleSchemaError> {
+    let body = if windows {
+        file_name.strip_suffix(".exe")
+    } else {
+        Some(file_name)
+    }
+    .ok_or_else(|| malformed_output(file_name))?;
     artifact_stem(body, file_name)
 }
 
@@ -495,5 +543,45 @@ mod tests {
             error.to_string().contains("missing canonical rlib output"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn validate_bundle_schema_accepts_a_build_script_executable() {
+        let mut config = stable_config(vec![
+            bundle_file(
+                "build_script_build-df1c5df8d44a9ede",
+                crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
+            ),
+            bundle_file(
+                "build_script_build-57f123ce754eb51b",
+                crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
+            ),
+        ]);
+        config.kind = ArtifactKind::BuildScript;
+        config.crate_types = vec![RustCrateType::Bin];
+        validate_bundle_schema(&bundle_bytes(config)).unwrap();
+    }
+
+    #[test]
+    fn validate_bundle_schema_rejects_a_build_script_without_its_canonical_name() {
+        let mut config = stable_config(vec![bundle_file(
+            "build_script_build-68afcc2f66100859",
+            crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
+        )]);
+        config.kind = ArtifactKind::BuildScript;
+        config.crate_types = vec![RustCrateType::Bin];
+        assert!(validate_bundle_schema(&bundle_bytes(config)).is_err());
+    }
+
+    #[test]
+    fn validate_bundle_schema_accepts_a_windows_build_script() {
+        let mut config = stable_config(vec![bundle_file(
+            "build_script_build-df1c5df8d44a9ede.exe",
+            crate::bundle::STOW_BUILD_SCRIPT_MEDIA_TYPE,
+        )]);
+        config.target = TargetTriple::parse("x86_64-pc-windows-msvc").unwrap();
+        config.kind = ArtifactKind::BuildScript;
+        config.crate_types = vec![RustCrateType::Bin];
+        validate_bundle_schema(&bundle_bytes(config)).unwrap();
     }
 }

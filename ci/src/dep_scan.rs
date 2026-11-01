@@ -22,6 +22,8 @@ use stow_types::capture::{
 /// record can never masquerade as a complete scan.
 #[derive(Debug, serde::Serialize)]
 pub struct ScanReport {
+    /// Completed local programs and signed dependencies compiled locally.
+    pub programs: ProgramClaims,
     /// Restorable rustc-unit records the host collector delivered.
     pub restorable_captures: usize,
     /// One planned artifact per restorable record — enforced, not assumed.
@@ -34,6 +36,15 @@ pub struct ScanReport {
     pub consumed: Vec<ConsumedArtifact>,
 }
 
+/// Program identities carried across the build/publish boundary.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProgramClaims {
+    /// This task's nonrelocatable proc-macro units.
+    pub completed: Vec<stow_types::records::LocalProcMacro>,
+    /// Dependency units compiled under a signed local-program declaration.
+    pub compiled: Vec<stow_types::records::LocalProcMacro>,
+}
+
 /// A verified published artifact the build served instead of compiling the
 /// crate: produced by no rustc invocation here, so nothing is planned from
 /// it. The record exists so dependents resolve `--extern` edges against
@@ -42,6 +53,8 @@ pub struct ScanReport {
 /// resolved closure is still refused.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ConsumedArtifact {
+    /// Distinguishes library coverage from a served build-script output.
+    pub kind: ArtifactKind,
     /// Canonical package name the capture attributed to.
     pub crate_name: String,
     /// The published artifact's crate version.
@@ -77,6 +90,19 @@ enum OutputOwner {
     Consumed(usize),
 }
 
+/// Manifest-relative build scripts remain local. Every other compiled
+/// script reaches the own-node check, so a dependency cache miss cannot
+/// silently compile a relocatable program again.
+fn scannable_captures(captures: &[CapturedRustcArtifact]) -> Vec<CapturedRustcArtifact> {
+    captures
+        .iter()
+        .filter(|captured| {
+            !(captured.restorable && captured.is_build_script() && captured.reads_manifest_dir)
+        })
+        .cloned()
+        .collect()
+}
+
 pub async fn scan_artifacts(
     built: &BuiltWorkspace,
     task: &BuildTaskPayload,
@@ -92,7 +118,8 @@ pub async fn scan_artifacts(
     let package_index = package_index(&metadata, task);
     // The records the host collector received over IPC — the only capture
     // source the scan trusts. Nothing the sandbox wrote to disk qualifies.
-    let captured_artifacts = built.captures();
+    let captured_artifacts = scannable_captures(built.captures());
+    let captured_artifacts = captured_artifacts.as_slice();
     let restorable_captures = captured_artifacts
         .iter()
         .filter(|captured| captured.restorable)
@@ -130,6 +157,7 @@ pub async fn scan_artifacts(
         &consumed_captures,
         &output_owners,
         &own_units,
+        built.local_programs(),
     )?;
     reject_unflagged_proc_macro_extern(task, &selected, &consumed_captures, &output_owners)?;
     let phase_units = phase_feature_sets(task, built)?;
@@ -145,18 +173,22 @@ pub async fn scan_artifacts(
         visiting: &mut visiting,
     };
 
-    let mut artifacts = Vec::with_capacity(selected.len());
-    for index in 0..selected.len() {
-        artifacts.push(
-            build_scanned_artifact(task, &rustc_version, &host_target, &mut cx, index).await?,
-        );
-    }
+    let (mut artifacts, programs) = plan_selected(
+        task,
+        &rustc_version,
+        &host_target,
+        &mut cx,
+        built.local_programs(),
+    )
+    .await?;
     // One artifact per restorable record is the completeness invariant the
     // whole scan exists to keep: every path that could drop one is an error
     // above, so reaching a different count is a bug in this file, not data.
     // The one deliberate exclusion is the proven-identical same-unit
     // captures a unit leaves in several phases.
-    if artifacts.len() != plan_eligible_captures {
+    if artifacts.len() + programs.completed.len() + programs.compiled.len()
+        != plan_eligible_captures
+    {
         return Err(stow_types::stow_error!(
             "dep_scan received {plan_eligible_captures} restorable capture records but planned {} artifacts",
             artifacts.len()
@@ -186,10 +218,54 @@ pub async fn scan_artifacts(
         .collect();
 
     Ok(ScanReport {
+        programs,
         restorable_captures,
         artifacts,
         consumed,
     })
+}
+
+async fn plan_selected(
+    task: &BuildTaskPayload,
+    rustc_version: &str,
+    host_target: &str,
+    cx: &mut ResolveCx<'_>,
+    local_programs: &[stow_types::records::LocalProcMacro],
+) -> stow_types::error::Result<(Vec<ScannedArtifact>, ProgramClaims)> {
+    let selected = cx.selected;
+    let mut artifacts = Vec::with_capacity(selected.len());
+    let mut programs = ProgramClaims::default();
+    for (index, selected_artifact) in selected.iter().enumerate() {
+        if let Some(program) = local_dependency(selected_artifact, local_programs) {
+            programs.compiled.push(program.clone());
+            continue;
+        }
+        let artifact = build_scanned_artifact(task, rustc_version, host_target, cx, index).await?;
+        if selected_artifact.artifact_kind == ArtifactKind::ProcMacro
+            && selected_artifact.captured.reads_manifest_dir
+        {
+            programs
+                .completed
+                .push(stow_types::records::LocalProcMacro {
+                    node: task.task_node_identity(),
+                    dependency_task_ids: task
+                        .verified_dependency_graph()?
+                        .dependency_task_ids(0)
+                        .ok_or_else(|| {
+                        stow_types::stow_error!("verified graph has no root")
+                    })?,
+                    dependency_c_metadata_json: crate::plan::dependency_c_metadata_json(
+                        &artifact.dependencies,
+                    )?,
+                    compile_key: artifact.captured_compile_key,
+                    c_metadata: stow_types::identity::CMetadata::parse(artifact.c_metadata)?,
+                    unit_shape: artifact.unit_shape,
+                });
+        } else {
+            artifacts.push(artifact);
+        }
+    }
+    Ok((artifacts, programs))
 }
 
 /// The consumable set: every registry unit this build's own cargo unit
@@ -228,6 +304,12 @@ pub fn consumable_packages(
             host_side: entry.host_side,
         })
         .collect()
+}
+
+/// The library nodes and build-script outputs this task may consume.
+pub struct ConsumablePackages {
+    pub libraries: Vec<ConsumablePackage>,
+    pub scripts: Vec<ConsumablePackage>,
 }
 
 /// One unit of the build workspace's own unit graph — a
@@ -406,7 +488,13 @@ fn select_captured_artifacts(
             artifact_kind.as_str().to_owned(),
             serde_json::to_string(&captured.emit)
                 .expect("captured emit serialization must succeed"),
-            captured.invocation,
+            // A build script's identity is its host: the spelling of the
+            // cargo invocation that compiled it is no part of it.
+            if artifact_kind == ArtifactKind::BuildScript {
+                None
+            } else {
+                captured.invocation
+            },
         );
         let candidate = SelectedCapturedArtifact {
             package: package.clone(),
@@ -665,7 +753,7 @@ fn captured_outputs_match(
         match output.kind {
             // The linker wrote the output path into the file; digest
             // equality is not the rule.
-            CapturedRustcOutputKind::DynamicLibrary => {}
+            CapturedRustcOutputKind::DynamicLibrary | CapturedRustcOutputKind::Executable => {}
             // The digest can only differ through the native members a
             // build script archived — the member-level check decides.
             CapturedRustcOutputKind::Rlib if output.sha256 != peer.sha256 => {
@@ -904,6 +992,22 @@ fn own_unit_record(
     Ok(phase.own_deps.iter().all(|key| possible.contains(&key)))
 }
 
+/// Match a captured nonrelocatable macro to its signed dependency declaration.
+fn local_dependency<'a>(
+    artifact: &SelectedCapturedArtifact,
+    programs: &'a [stow_types::records::LocalProcMacro],
+) -> Option<&'a stow_types::records::LocalProcMacro> {
+    if artifact.artifact_kind != ArtifactKind::ProcMacro || !artifact.captured.reads_manifest_dir {
+        return None;
+    }
+    programs.iter().find(|program| {
+        program.node.crate_name.as_str() == artifact.package.name
+            && program.node.version.as_semver() == &artifact.package.version
+            && program.compile_key == artifact.captured.compile_key
+            && program.c_metadata.as_str() == artifact.captured.c_metadata
+    })
+}
+
 /// The build's half of the graph contract: this task compiles its own
 /// unit and is *served* every other node. A restorable record attributed
 /// to any other package means cargo compiled a unit the consume store was
@@ -921,22 +1025,27 @@ fn own_unit_record(
 /// of registering under the task's rows.
 ///
 /// Only restorable records reach this check — the selected set — so the
-/// generated wrapper package, build-script compiles and binaries are out
-/// by construction rather than filtered by name: they are never restorable
-/// to begin with.
+/// generated wrapper package and project binaries are excluded. Build
+/// scripts belong to their named package; declared nonrelocatable macros
+/// may compile in a consumer task.
 fn reject_foreign_compiled_units(
     task: &BuildTaskPayload,
     selected: &[SelectedCapturedArtifact],
     consumed: &[ConsumedCapture],
     output_owners: &BTreeMap<PathBuf, OutputOwner>,
     own_units: &BTreeMap<PathBuf, PhaseOwnUnit>,
+    local_programs: &[stow_types::records::LocalProcMacro],
 ) -> stow_types::error::Result<()> {
     let mut units = Vec::new();
     for artifact in selected {
+        if local_dependency(artifact, local_programs).is_some() {
+            continue;
+        }
         let package = &artifact.package;
         if package.name == task.crate_name.as_str()
             && package.version == *task.version.as_semver()
-            && own_unit_record(task, artifact, selected, consumed, output_owners, own_units)?
+            && (artifact.artifact_kind == ArtifactKind::BuildScript
+                || own_unit_record(task, artifact, selected, consumed, output_owners, own_units)?)
         {
             continue;
         }
@@ -1032,6 +1141,9 @@ fn collect_consumed_captures(
             let index = captures.len();
             captures.push(ConsumedCapture {
                 artifact: ConsumedArtifact {
+                    kind: artifact_kind_for_capture(captured).ok_or_else(|| {
+                        stow_types::stow_error!("consumed capture has no artifact kind")
+                    })?,
                     crate_name: package.name.clone(),
                     crate_version: package.version.to_string(),
                     compile_key: captured.compile_key.clone(),
@@ -1092,6 +1204,7 @@ async fn build_scanned_artifact(
             task.target
         ));
     }
+    let build_script = artifact.artifact_kind == ArtifactKind::BuildScript;
     let resolved_artifact = resolve_artifact(cx, artifact_index)?;
     let dependencies = resolved_artifact.dependencies.clone();
     let mut outputs = Vec::with_capacity(artifact.captured.outputs.len());
@@ -1140,34 +1253,56 @@ async fn build_scanned_artifact(
         artifact_size,
         compile_millis: artifact.captured.compile_millis,
         kind: artifact.artifact_kind.clone(),
-        crate_types: artifact.package.crate_types.clone(),
+        crate_types: if build_script {
+            vec![RustCrateType::Bin]
+        } else {
+            artifact.package.crate_types.clone()
+        },
         outputs,
         // The shape the edge's gate checks: the task's own side, the
         // invocation spelling the collector stamped on the capture, and
         // the emit set's link membership.
-        unit_shape: stow_types::public_cache::UnitShape {
-            // Every registered unit is the task's own crate's library
-            // product — the own-node check bounds the registered set to
-            // the crate the task owns, and `restorable` keeps
-            // build-script compiles out — so the unit's side is the
-            // node's side. `--target` presence cannot name it: under a
-            // native invocation no unit carries one.
-            side: if task.host_side {
-                stow_types::public_cache::UnitSide::Host
-            } else {
-                stow_types::public_cache::UnitSide::Target
-            },
-            invocation: artifact.captured.invocation.ok_or_else(|| {
-                stow_types::stow_error!(
-                    "capture for {} {} carries no invocation stamp — the collector never saw it drain",
-                    artifact.captured.crate_name,
-                    artifact.captured.compile_key
-                )
-            })?,
-            kind: stow_types::public_cache::UnitKind::from_emit(&artifact.captured.emit),
-        },
+        unit_shape: unit_shape(task, artifact)?,
         build_script_out_dir: artifact.captured.build_script_out_dir.clone(),
         native: None,
+    })
+}
+
+/// The shape the edge's gate checks: the task's own side, the invocation
+/// spelling the collector stamped on the capture, and the emit set's link
+/// membership. A build script is keyed by the host it runs on, whichever
+/// spelling compiled it.
+fn unit_shape(
+    task: &BuildTaskPayload,
+    artifact: &SelectedCapturedArtifact,
+) -> stow_types::error::Result<stow_types::public_cache::UnitShape> {
+    use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+    if artifact.artifact_kind == ArtifactKind::BuildScript {
+        return Ok(UnitShape {
+            side: UnitSide::Host,
+            invocation: UnitInvocation::Native,
+            kind: UnitKind::Linked,
+        });
+    }
+    Ok(UnitShape {
+        // Every other registered unit is the task's own crate's library
+        // product — the own-node check bounds the registered set to the
+        // crate the task owns, and `restorable` keeps the rest out — so
+        // the unit's side is the node's side. `--target` presence cannot
+        // name it: under a native invocation no unit carries one.
+        side: if task.host_side {
+            UnitSide::Host
+        } else {
+            UnitSide::Target
+        },
+        invocation: artifact.captured.invocation.ok_or_else(|| {
+            stow_types::stow_error!(
+                "capture for {} {} carries no invocation stamp — the collector never saw it drain",
+                artifact.captured.crate_name,
+                artifact.captured.compile_key
+            )
+        })?,
+        kind: UnitKind::from_emit(&artifact.captured.emit),
     })
 }
 
@@ -1275,6 +1410,12 @@ fn unit_features_json(
     cx: &ResolveCx<'_>,
     artifact: &SelectedCapturedArtifact,
 ) -> stow_types::error::Result<String> {
+    // A build script has no unit-graph lib unit to label it: its features
+    // are the `--cfg feature` set cargo compiled it under, the same set
+    // its compile key was computed from.
+    if artifact.artifact_kind == ArtifactKind::BuildScript {
+        return stow_types::unit_graph::serialize_feature_set(&artifact.captured.features);
+    }
     let Some(phase) = cx.phase_units.get(&artifact.captured.target_dir) else {
         return Err(stow_types::stow_error!(
             "dep_scan capture of {} {} recorded target dir {}, which is no phase of this build",
@@ -1457,6 +1598,9 @@ fn reject_unflagged_proc_macro_extern(
         }
     };
     for artifact in selected {
+        if artifact.artifact_kind == ArtifactKind::BuildScript {
+            continue;
+        }
         for dependency in &artifact.captured.dependencies {
             let owner = output_owners.get(&dependency.path).copied();
             if owner.is_some_and(is_proc_macro) {
@@ -1630,6 +1774,15 @@ fn package_for_capture<'a>(
     index: &'a PackageIndex,
     captured: &CapturedRustcArtifact,
 ) -> Option<&'a IndexedPackage> {
+    if captured.is_build_script() {
+        // `--crate-name` names no package for a build script; the
+        // registry source path the wrapper read does.
+        let package = captured.package.as_deref()?;
+        let version = captured.crate_version.as_deref()?;
+        return index.values().flat_map(BTreeMap::values).find(|candidate| {
+            candidate.name == package && candidate.version.to_string() == version
+        });
+    }
     let by_version = index.get(captured.crate_name.as_str())?;
     match captured.crate_version.as_deref() {
         Some(version) => by_version.get(version),
@@ -1733,6 +1886,9 @@ fn artifact_kind(crate_types: &BTreeSet<RustCrateType>) -> Option<ArtifactKind> 
 }
 
 fn artifact_kind_for_capture(captured: &CapturedRustcArtifact) -> Option<ArtifactKind> {
+    if captured.is_build_script() {
+        return Some(ArtifactKind::BuildScript);
+    }
     if captured
         .crate_types
         .iter()
@@ -1762,6 +1918,7 @@ const fn parsed_file_kind(kind: CapturedRustcOutputKind) -> ParsedFileKind {
         CapturedRustcOutputKind::Rlib => ParsedFileKind::Rlib,
         CapturedRustcOutputKind::Rmeta => ParsedFileKind::Rmeta,
         CapturedRustcOutputKind::DynamicLibrary => ParsedFileKind::DynamicLibrary,
+        CapturedRustcOutputKind::Executable => ParsedFileKind::Executable,
     }
 }
 
@@ -1868,6 +2025,7 @@ pub enum ParsedFileKind {
     Rlib,
     Rmeta,
     DynamicLibrary,
+    Executable,
 }
 
 #[cfg(test)]
@@ -2048,6 +2206,8 @@ mod tests {
             consumed: false,
             invocation: Some(stow_types::public_cache::UnitInvocation::Target),
             compile_millis: 0,
+            package: None,
+            reads_manifest_dir: false,
         }
     }
 
@@ -2456,6 +2616,106 @@ mod tests {
         assert_eq!(selected.absorbed_duplicates, 0);
     }
 
+    /// A package's `build.rs` compile as the wrapper records it: the
+    /// crate name is always `build_script_build`, so the owning package
+    /// rides on the record.
+    fn build_script_capture(
+        package: &str,
+        version: &str,
+        target_dir: &str,
+        invocation: UnitInvocation,
+    ) -> CapturedRustcArtifact {
+        let out_dir = format!("{target_dir}/debug/build/{package}-0000/");
+        let mut capture = captured("build_script_build", "aaaaaaaaaaaaaaaa", &out_dir);
+        capture.target = None;
+        capture.crate_version = Some(version.to_owned());
+        capture.package = Some(package.to_owned());
+        capture.crate_types = vec!["bin".to_owned()];
+        capture.emit = vec!["dep-info".to_owned(), "link".to_owned()];
+        capture.compile_key = "cc".repeat(32);
+        capture.invocation = Some(invocation);
+        capture.target_dir = PathBuf::from(target_dir);
+        capture.outputs = vec![
+            CapturedRustcOutput {
+                kind: CapturedRustcOutputKind::Executable,
+                path: PathBuf::from(format!("{out_dir}build_script_build-aaaaaaaaaaaaaaaa")),
+                snapshot_path: None,
+                sha256: "11".repeat(32),
+            },
+            CapturedRustcOutput {
+                kind: CapturedRustcOutputKind::Executable,
+                path: PathBuf::from(format!("{out_dir}build_script_build-{invocation:?}")),
+                snapshot_path: None,
+                sha256: "11".repeat(32),
+            },
+        ];
+        capture
+    }
+
+    /// One build script compiled under the native and the `--target`
+    /// spelling is one host-keyed artifact: the spelling is no part of
+    /// its identity, and its executable's digest — the linker writes
+    /// paths into it — never separates the two.
+    #[test]
+    fn a_build_script_compiled_under_both_spellings_is_one_artifact() {
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("serde_json".to_owned())
+            .or_default()
+            .insert("1.0.149".to_owned(), indexed("serde_json", "1.0.149"));
+        let mut native = build_script_capture(
+            "serde_json",
+            "1.0.149",
+            "/tmp/w/target-native",
+            UnitInvocation::Native,
+        );
+        let mut targeted = build_script_capture(
+            "serde_json",
+            "1.0.149",
+            "/tmp/w/target-target",
+            UnitInvocation::Target,
+        );
+        // The linker wrote the output path into each image.
+        targeted.outputs[0].sha256 = "22".repeat(32);
+        targeted.outputs[1].sha256 = "22".repeat(32);
+        native.outputs[0].path =
+            PathBuf::from("/tmp/w/target-native/stable/build_script_build-aaaaaaaaaaaaaaaa");
+        targeted.outputs[0].path =
+            PathBuf::from("/tmp/w/target-target/stable/build_script_build-aaaaaaaaaaaaaaaa");
+
+        let selected =
+            select_captured_artifacts(&index, &[native, targeted]).expect("both spellings select");
+        assert_eq!(selected.artifacts.len(), 1);
+        assert_eq!(selected.absorbed_duplicates, 1);
+        let artifact = &selected.artifacts[0];
+        assert_eq!(artifact.artifact_kind, ArtifactKind::BuildScript);
+        assert_eq!(artifact.package.name, "serde_json");
+    }
+
+    /// Relocatable foreign scripts must reach the own-node check too.
+    #[test]
+    fn relocatable_build_scripts_reach_the_own_node_check() {
+        let own = build_script_capture(
+            "serde_json",
+            "1.0.149",
+            "/tmp/w/target",
+            UnitInvocation::Native,
+        );
+        let foreign =
+            build_script_capture("libc", "0.2.180", "/tmp/w/target", UnitInvocation::Native);
+        let mut manifest_dir = own.clone();
+        manifest_dir.reads_manifest_dir = true;
+        let library = captured("serde_json", "bbbbbbbbbbbbbbbb", "/tmp/w/target/debug/deps");
+
+        let kept = super::scannable_captures(&[
+            own.clone(),
+            foreign.clone(),
+            manifest_dir,
+            library.clone(),
+        ]);
+        assert_eq!(kept, vec![own, foreign, library]);
+    }
+
     #[test]
     fn a_restorable_record_with_no_package_in_the_index_fails() {
         // The record claims `itoa` but no such package is in cargo's
@@ -2634,9 +2894,15 @@ mod tests {
             std::slice::from_ref(&itoa),
             std::slice::from_ref(&itoa),
         );
-        let error =
-            super::reject_foreign_compiled_units(&task, &selected, &consumed, &owners, &own_units)
-                .expect_err("compiled foreign units fail the build");
+        let error = super::reject_foreign_compiled_units(
+            &task,
+            &selected,
+            &consumed,
+            &owners,
+            &own_units,
+            &[],
+        )
+        .expect_err("compiled foreign units fail the build");
         let message = error.to_string();
         assert!(message.contains("3 unit(s)"), "{message}");
         assert!(message.contains("itoa 1.0.18"), "{message}");
@@ -2703,9 +2969,9 @@ mod tests {
             std::slice::from_ref(&itoa),
             std::slice::from_ref(&itoa),
         );
-        super::reject_foreign_compiled_units(&task, &selected, &consumed, &owners, &own_units)
+        super::reject_foreign_compiled_units(&task, &selected, &consumed, &owners, &own_units, &[])
             .expect("a build compiling only the task's own crate is legal");
-        super::reject_foreign_compiled_units(&task, &[], &consumed, &owners, &own_units)
+        super::reject_foreign_compiled_units(&task, &[], &consumed, &owners, &own_units, &[])
             .expect("an empty compiled set carries no foreign unit");
     }
 
@@ -2775,6 +3041,7 @@ mod tests {
             &consumed,
             &owners,
             &own_units,
+            &[],
         )
         .expect_err("a compiled twin unit is foreign");
         assert!(error.to_string().contains("serde_json"), "{error}");
@@ -2784,6 +3051,7 @@ mod tests {
             &consumed,
             &owners,
             &own_units,
+            &[],
         )
         .expect("the own unit passes");
     }
@@ -2831,6 +3099,7 @@ mod tests {
         record.consumed = true;
         super::ConsumedCapture {
             artifact: super::ConsumedArtifact {
+                kind: ArtifactKind::Rlib,
                 crate_name: name.to_owned(),
                 crate_version: version.to_owned(),
                 compile_key: "served".to_owned(),
@@ -2969,6 +3238,8 @@ mod tests {
             consumed: false,
             invocation: Some(stow_types::public_cache::UnitInvocation::Target),
             compile_millis: 0,
+            package: None,
+            reads_manifest_dir: false,
         }
     }
 
@@ -3256,6 +3527,8 @@ mod tests {
             consumed: false,
             invocation: Some(stow_types::public_cache::UnitInvocation::Target),
             compile_millis: 0,
+            package: None,
+            reads_manifest_dir: false,
         }
     }
 
@@ -3300,6 +3573,8 @@ mod tests {
                 consumed: false,
                 invocation: Some(stow_types::public_cache::UnitInvocation::Target),
                 compile_millis: 0,
+                package: None,
+                reads_manifest_dir: false,
             },
             dependency_aliases: Vec::new(),
         }
@@ -3712,6 +3987,7 @@ mod tests {
         }];
         let consumed = vec![ConsumedCapture {
             artifact: super::ConsumedArtifact {
+                kind: ArtifactKind::ProcMacro,
                 crate_name: "derive".to_owned(),
                 crate_version: "1.0.0".to_owned(),
                 compile_key: "f".repeat(64),

@@ -110,6 +110,30 @@ pub struct CapturedRustcArtifact {
     /// existed carry no timing and count as zero.
     #[serde(default)]
     pub compile_millis: u64,
+    /// The package name the invocation's registry source path carries.
+    /// A build script's `--crate-name` is always `build_script_build`, so
+    /// the package that owns it can only be read from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<String>,
+    /// Whether the compile read `CARGO_MANIFEST_DIR` through `env!` —
+    /// recorded in the dep-info rustc wrote as an `env-dep` line. Its
+    /// output then carries the builder's checkout path, so it is not
+    /// relocatable to another machine.
+    #[serde(default)]
+    pub reads_manifest_dir: bool,
+}
+
+impl CapturedRustcArtifact {
+    /// Whether the record is a package's `build.rs` compile: a binary
+    /// crate cargo always names `build_script_build`.
+    #[must_use]
+    pub fn is_build_script(&self) -> bool {
+        self.crate_name == "build_script_build"
+            && self
+                .crate_types
+                .iter()
+                .any(|crate_type| crate_type == "bin")
+    }
 }
 
 /// One dependency edge of a captured invocation: which `--extern` it was
@@ -137,6 +161,8 @@ pub enum CapturedRustcOutputKind {
     Rmeta,
     /// A `lib*.{so,dylib,dll}` dynamic library output.
     DynamicLibrary,
+    /// A build script's executable.
+    Executable,
 }
 
 /// One file rustc wrote for a captured invocation.

@@ -160,6 +160,16 @@ pub fn observed_unit(parsed: &ParsedRustcArgs, build: &LocalBuildArtifact) -> Op
         );
         return None;
     }
+    // A build script is an output of its crate's node, not a node: its
+    // miss names nothing the admissions post could enqueue — the crate's
+    // library unit reports the node.
+    if parsed.is_build_script() {
+        tracing::debug!(
+            crate_name = %parsed.crate_name,
+            "build script; not journaled"
+        );
+        return None;
+    }
     let externs = match serde_json::from_str(&build.dependencies.c_metadata_json) {
         Ok(externs) => externs,
         Err(error) => {

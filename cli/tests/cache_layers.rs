@@ -34,8 +34,9 @@ const FIXTURE_DEPENDENCIES: &str = "cfg-if = \"1\"\n\
      proc-macro2 = \"1\"\n\
      quote = \"1\"\n";
 
-/// The units the fixture's all-miss build stores in the local cache.
-const CACHEABLE_UNITS: usize = 5;
+/// The units the fixture's all-miss build stores in the local cache: the
+/// five libraries plus the build scripts of `proc-macro2` and `quote`.
+const CACHEABLE_UNITS: usize = 7;
 
 /// The info event a local-cache serve emits.
 const SERVED_LOCALLY: &str = "served rustc invocation from local stow artifact cache";
@@ -536,7 +537,15 @@ fn each_local_switch_gates_only_its_source_kind() {
         case(
             "",
             &[][..],
-            &["proc_macro2", "quote", "unicode_ident"][..],
+            // The libraries, and the build scripts of the two crates that
+            // have one.
+            &[
+                "proc_macro2",
+                "proc_macro2",
+                "quote",
+                "quote",
+                "unicode_ident",
+            ][..],
             &["proc_macro2", "quote", "unicode_ident"][..],
         ),
         // The git unit is the only entry: the crates.io units compiled over
@@ -544,9 +553,10 @@ fn each_local_switch_gates_only_its_source_kind() {
         case(CRATES_IO_OFF, &[], &["unicode_ident"], &["unicode_ident"]),
         case("", &[NO_CRATES_IO], &["unicode_ident"], &["unicode_ident"]),
         // No git entry: a crates.io unit over it cannot bind its dependency,
-        // so none is stored either.
-        case(GIT_OFF, &[], &[], &[]),
-        case("", &[NO_GIT], &[], &[]),
+        // so none is stored either; the build scripts of the crates that
+        // have one depend on no git unit and still are.
+        case(GIT_OFF, &[], &["proc_macro2", "quote"], &[]),
+        case("", &[NO_GIT], &["proc_macro2", "quote"], &[]),
     ];
     for Case {
         config,
@@ -585,7 +595,13 @@ fn a_layer_off_does_not_serve_entries_another_run_stored() {
     git.build(&first, cache.path(), &[], "fill build");
     assert_eq!(
         packages(&stored_entries(&cache.path().join("state-v3.sqlite3"))),
-        ["proc_macro2", "quote", "unicode_ident"]
+        [
+            "proc_macro2",
+            "proc_macro2",
+            "quote",
+            "quote",
+            "unicode_ident"
+        ]
     );
 
     let second = git.project("second", "");

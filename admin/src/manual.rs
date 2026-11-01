@@ -447,21 +447,23 @@ pub async fn covered_nodes(
     let mut covered = BTreeSet::new();
     // Slice pulls are reads — fan them out under the bounded
     // concurrency every index pull in this crate shares.
-    let rows_per_target: Vec<Option<Vec<ArtifactIndexRow>>> = futures_util::stream::iter(
-        targets
-            .iter()
-            .map(|target| published_slice_rows(index, target, rustc_version)),
-    )
-    .buffered(SLICE_PULL_CONCURRENCY)
-    .try_collect()
-    .await?;
+    let rows_per_target: Vec<Option<stow_types::index::ArtifactIndex>> =
+        futures_util::stream::iter(
+            targets
+                .iter()
+                .map(|target| published_slice(index, target, rustc_version)),
+        )
+        .buffered(SLICE_PULL_CONCURRENCY)
+        .try_collect()
+        .await?;
     for (target, rows) in targets.iter().zip(rows_per_target) {
         let Some(rows) = rows else { continue };
         covered.extend(covered_slice_nodes(
-            &rows,
+            &rows.rows,
             target,
             rustc_version,
             spellings,
+            &rows.local_programs,
         )?);
     }
     Ok(covered)
@@ -472,6 +474,7 @@ fn covered_slice_nodes(
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
     spellings: &BTreeMap<String, stow_types::public_cache::ExplicitSpelling>,
+    local_programs: &[stow_types::records::LocalProcMacro],
 ) -> stow_types::error::Result<BTreeSet<String>> {
     let mut shapes = HashMap::<_, BTreeSet<_>>::new();
     for row in rows {
@@ -494,6 +497,15 @@ fn covered_slice_nodes(
             .entry((identity, dependency_identity.clone()))
             .or_default()
             .insert(shape);
+    }
+    for program in local_programs {
+        if program.node.target != *target || program.node.rustc_version != *rustc_version {
+            return Err(stow_error!("local program is in the wrong index slice"));
+        }
+        shapes
+            .entry((program.node.clone(), program.dependency_identity()?))
+            .or_default()
+            .insert(program.unit_shape);
     }
     let invocation = if host_triple(target) == target.as_str() {
         UnitInvocation::Native
@@ -566,20 +578,22 @@ pub async fn published_slices(
             repository: &repository,
             trust: &trust,
         };
-        let rows_per_target: Vec<Option<Vec<ArtifactIndexRow>>> = futures_util::stream::iter(
-            targets
-                .iter()
-                .map(|target| published_slice_rows(&index, target, rustc_version)),
-        )
-        .buffered(SLICE_PULL_CONCURRENCY)
-        .try_collect()
-        .await?;
+        let rows_per_target: Vec<Option<stow_types::index::ArtifactIndex>> =
+            futures_util::stream::iter(
+                targets
+                    .iter()
+                    .map(|target| published_slice(&index, target, rustc_version)),
+            )
+            .buffered(SLICE_PULL_CONCURRENCY)
+            .try_collect()
+            .await?;
         for (target, rows) in targets.iter().zip(rows_per_target) {
             if let Some(rows) = rows {
                 slices.push(stow_types::api::PublishedIndexSlice {
                     target: (*target).clone(),
                     rustc_version: rustc_version.clone(),
-                    rows,
+                    rows: rows.rows,
+                    local_programs: rows.local_programs,
                 });
             }
         }
@@ -615,11 +629,11 @@ pub struct Index<'a> {
 /// Pull and verify the published `index.<target>.<rustc>` slice —
 /// `None` when the tag does not exist (a fresh registry serves an empty
 /// catalog, not an error).
-pub async fn published_slice_rows(
+pub async fn published_slice(
     index: &Index<'_>,
     target: &TargetTriple,
     rustc_version: &WireRustcVersion,
-) -> stow_types::error::Result<Option<Vec<ArtifactIndexRow>>> {
+) -> stow_types::error::Result<Option<stow_types::index::ArtifactIndex>> {
     let tag = index_tag(target.as_str(), rustc_version.as_str());
     let reference = index.session.reference(&tag)?;
     let (bytes, manifest_digest) = match index.session.pull_manifest(&reference).await {
@@ -661,7 +675,7 @@ pub async fn published_slice_rows(
             index.header.rustc_version.as_str()
         ));
     }
-    Ok(Some(index.rows))
+    Ok(Some(index))
 }
 
 #[cfg(test)]
@@ -719,11 +733,11 @@ mod tests {
         );
     }
 
-    /// stow#844: `published_slice_rows` treats a package that does not
+    /// stow#844: `published_slice` treats a package that does not
     /// exist as the empty index — GHCR's `403 DENIED` on the anonymous
     /// token exchange reads `None`, the same answer a missing tag gives.
     #[tokio::test]
-    async fn published_slice_rows_reads_a_missing_package_as_none() {
+    async fn published_slice_reads_a_missing_package_as_none() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -762,7 +776,7 @@ mod tests {
             trust: &trust,
         };
 
-        let rows = published_slice_rows(
+        let rows = published_slice(
             &index,
             &TargetTriple::parse("x86_64-unknown-linux-gnu").expect("target"),
             &rustc_version,

@@ -521,6 +521,8 @@ fn setup_fetches_the_host_slice_and_plain_cargo_serves_through_it() {
             row_count: 1,
         },
         rows: vec![row],
+        build_scripts: Vec::new(),
+        local_programs: Vec::new(),
     };
     let index_blob = stow_shim::encode_index(&index).expect("encode index");
     let index_blob_digest = sha256_digest(&index_blob);

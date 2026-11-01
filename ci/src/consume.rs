@@ -44,6 +44,8 @@ const PREFETCH_CONCURRENCY: usize = 16;
 /// What [`prefetch`] staged for the capture wrapper to serve: the read-only
 /// store the sandbox grant covers and how many verified bundles it holds.
 pub struct Consumption {
+    /// Signed declarations permitting dependency proc macros to compile locally.
+    pub local_programs: Vec<stow_types::records::LocalProcMacro>,
     /// Compile-key-addressed bundle store, ready to grant the phases.
     pub store_dir: PathBuf,
     /// Verified bundles staged under `store_dir`.
@@ -62,8 +64,9 @@ pub struct Consumption {
 pub async fn slices_for_task(
     config: &ConsumeConfig,
     task: &BuildTaskPayload,
+    has_scripts: bool,
 ) -> stow_types::error::Result<Vec<IndexSlice>> {
-    slices_for_task_with(task, |target, rustc_version| {
+    slices_for_task_with(task, has_scripts, |target, rustc_version| {
         Box::pin(async move { build_consume::ensure_slice(config, &target, &rustc_version).await })
     })
     .await
@@ -74,6 +77,7 @@ pub async fn slices_for_task(
 /// real fetch produces needs no environment to reach the error path.
 pub async fn slices_for_task_with<'s>(
     task: &BuildTaskPayload,
+    has_scripts: bool,
     fetch: impl Fn(
         String,
         String,
@@ -86,7 +90,7 @@ pub async fn slices_for_task_with<'s>(
     if nodes.iter().any(|node| !node.host_side) {
         targets.insert(task.target.as_str().to_owned());
     }
-    if nodes.iter().any(|node| node.host_side) {
+    if has_scripts || nodes.iter().any(|node| node.host_side) {
         targets.insert(crate::task::compile_host(task).await?);
     }
     let rustc_version = task.rustc_version.as_str().to_owned();
@@ -118,7 +122,7 @@ pub async fn slices_for_task_with<'s>(
 /// is logged and skipped: it removes one candidate, never the task.
 pub async fn prefetch(
     task: &BuildTaskPayload,
-    packages: Vec<dep_scan::ConsumablePackage>,
+    packages: dep_scan::ConsumablePackages,
     store_dir: &Path,
 ) -> stow_types::error::Result<Consumption> {
     // Everything past here is the CLI's verified-download chain, and that
@@ -168,7 +172,7 @@ where
 /// index vouches for did not verify.
 async fn stage_candidates(
     task: &BuildTaskPayload,
-    packages: &[dep_scan::ConsumablePackage],
+    packages: &dep_scan::ConsumablePackages,
     store_dir: &Path,
 ) -> stow_types::error::Result<Consumption> {
     // Every slice named here holds a dependency the scheduler saw
@@ -176,8 +180,18 @@ async fn stage_candidates(
     // consumption up is not a cold cache: building on would compile what
     // the task was promised it would be served.
     let config = ConsumeConfig::load().wrap_err("load the cache-consumption config")?;
-    let slices = slices_for_task(&config, task).await?;
-    let candidates = candidates(&slices, packages);
+    let slices = slices_for_task(&config, task, !packages.scripts.is_empty()).await?;
+    let graph = task.verified_dependency_graph()?;
+    let dependencies = (1..graph.nodes().len())
+        .filter_map(|index| graph.task_id(index))
+        .collect::<BTreeSet<_>>();
+    let mut local_programs = Vec::new();
+    for program in slices.iter().flat_map(|slice| &slice.index.local_programs) {
+        if dependencies.contains(program.task_id()?.as_str()) {
+            local_programs.push(program.clone());
+        }
+    }
+    let candidates = candidates(&slices, &packages.libraries, &packages.scripts);
 
     // The prefetch pulls bundle blobs straight from GHCR by digest — the
     // offline-edge build never touches the byte path (stow#455). One
@@ -212,6 +226,7 @@ async fn stage_candidates(
         "cache-consumption prefetch staged verified bundles"
     );
     Ok(Consumption {
+        local_programs,
         store_dir: store_dir.to_path_buf(),
         artifacts: staged,
     })
@@ -279,21 +294,20 @@ where
 fn candidates<'a>(
     slices: &'a [IndexSlice],
     packages: &[dep_scan::ConsumablePackage],
+    scripts: &[dep_scan::ConsumablePackage],
 ) -> Vec<(&'a IndexSlice, &'a ArtifactIndexRow)> {
-    let packages_by_name: BTreeMap<String, Vec<&dep_scan::ConsumablePackage>> = {
-        let mut map: BTreeMap<String, Vec<&dep_scan::ConsumablePackage>> = BTreeMap::new();
-        for package in packages {
-            map.entry(canonical_crate_name(&package.crate_name))
-                .or_default()
-                .push(package);
-        }
-        map
-    };
+    let library_packages = packages_by_name(packages);
+    let scripts_by_name = packages_by_name(scripts);
     let mut selected = Vec::new();
     for slice in slices {
-        for row in &slice.index.rows {
+        for row in slice.index.rows.iter().chain(&slice.index.build_scripts) {
             let crate_name = canonical_crate_name(row.crate_name.as_str());
-            let Some(candidates) = packages_by_name.get(&crate_name) else {
+            let pool = if row.artifact_kind == stow_types::artifact::ArtifactKind::BuildScript {
+                &scripts_by_name
+            } else {
+                &library_packages
+            };
+            let Some(candidates) = pool.get(&crate_name) else {
                 continue;
             };
             let features = row
@@ -316,12 +330,25 @@ fn candidates<'a>(
     selected
 }
 
+fn packages_by_name(
+    packages: &[dep_scan::ConsumablePackage],
+) -> BTreeMap<String, Vec<&dep_scan::ConsumablePackage>> {
+    let mut map = BTreeMap::<_, Vec<_>>::new();
+    for package in packages {
+        map.entry(canonical_crate_name(&package.crate_name))
+            .or_default()
+            .push(package);
+    }
+    map
+}
+
 /// Whether the row's unit shape sits on the side the unit-graph entry
 /// needs — a host entry is served only by a host-side row (the
 /// proc-macro/build-dep shape), never by the same package's target-side
 /// row.
 fn package_matches_side(package: &dep_scan::ConsumablePackage, row: &ArtifactIndexRow) -> bool {
-    (row.unit_shape.side == stow_types::public_cache::UnitSide::Host) == package.host_side
+    row.artifact_kind == stow_types::artifact::ArtifactKind::BuildScript
+        || (row.unit_shape.side == stow_types::public_cache::UnitSide::Host) == package.host_side
 }
 
 /// One row through the CLI's own verified-download chain: the bundle blob
@@ -469,7 +496,7 @@ mod tests {
         ]);
 
         let slices = [slice];
-        let hits = super::candidates(&slices, &packages);
+        let hits = super::candidates(&slices, &packages, &[]);
         let staged = hits
             .iter()
             .map(|(_, row)| row.c_metadata.as_str())
@@ -479,6 +506,34 @@ mod tests {
             BTreeSet::from(["aaaaaaaaaaaaaaaa", "cccccccccccccccc", "dddddddddddddddd"]),
             "the host-shaped windows-link rows and the exactly-labelled tokio row stage; the target shape and the metadata-labelled row do not"
         );
+    }
+
+    #[test]
+    fn target_libraries_prefetch_their_host_build_script() {
+        let mut script = index_row(
+            "demo",
+            "1.0.0",
+            "aaaaaaaaaaaaaaaa",
+            &["std"],
+            UnitSide::Host,
+        );
+        script.artifact_kind = ArtifactKind::BuildScript;
+        script.crate_types = vec![RustCrateType::Bin];
+        let mut slice = index_slice(Vec::new());
+        slice.index.build_scripts.push(script);
+        let packages = [dep_scan::ConsumablePackage {
+            crate_name: "demo".to_owned(),
+            version: semver::Version::new(1, 0, 0),
+            features: BTreeSet::from(["std".to_owned()]),
+            host_side: false,
+        }];
+        let slices = [slice];
+        let hits = super::candidates(&slices, &[], &packages);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1.artifact_kind, ArtifactKind::BuildScript);
+        let mut different_features = packages;
+        different_features[0].features.clear();
+        assert!(super::candidates(&slices, &[], &different_features).is_empty());
     }
 
     /// stow#717: the candidates are independent round trips, so they
@@ -638,6 +693,8 @@ mod tests {
                     row_count: rows.len() as u64,
                 },
                 rows,
+                build_scripts: Vec::new(),
+                local_programs: Vec::new(),
             },
         }
     }

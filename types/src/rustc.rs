@@ -190,7 +190,7 @@ impl ParsedRustcArgs {
         target: &str,
     ) -> UnitClass {
         let extra_codegen = self.extra_codegen_for(target);
-        if !(self.produces_dynamic_library() || self.produces_rlib()) {
+        if !(self.produces_dynamic_library() || self.produces_rlib() || self.is_build_script()) {
             return UnitClass::Uncached(UncachedReason::UnrestorableCrateType(
                 self.crate_types.join(","),
             ));
@@ -259,11 +259,12 @@ impl ParsedRustcArgs {
             .any(|kind| matches!(kind.as_str(), "proc-macro" | "dylib" | "cdylib" | "bin"))
     }
 
-    /// Whether the invocation produces an artifact stow can restore: an rlib
-    /// or dynamic library with both `-C metadata` and `--out-dir` present.
+    /// Whether the invocation produces an artifact stow can restore: an
+    /// rlib, a dynamic library or a build-script executable with both
+    /// `-C metadata` and `--out-dir` present.
     #[must_use]
     pub fn is_restorable_artifact(&self) -> bool {
-        (self.produces_rlib() || self.produces_dynamic_library())
+        (self.produces_rlib() || self.produces_dynamic_library() || self.is_build_script())
             && self.c_metadata.is_some()
             && self.out_dir.is_some()
     }
@@ -363,6 +364,37 @@ impl ParsedRustcArgs {
         ))))
     }
 
+    /// Path of the build-script executable under `--out-dir`
+    /// (`build_script_build<extra-filename><exe-suffix>`), named per
+    /// `host` — build scripts run on the host and carry no `--target` —
+    /// or `Ok(None)` when this is not a build script or `--out-dir` is
+    /// absent.
+    ///
+    /// # Errors
+    /// Returns an error when the triple the output is named under is
+    /// unparseable.
+    pub fn output_build_script_path(&self, host: &str) -> Result<Option<PathBuf>, String> {
+        if !self.is_build_script() {
+            return Ok(None);
+        }
+        self.output_binary_path(host)
+    }
+
+    /// Path of the linked image stow stores beside the rlib and rmeta: the
+    /// dynamic library of a `proc-macro` or `dylib` unit, or a build
+    /// script's executable. `Ok(None)` when the invocation produces
+    /// neither.
+    ///
+    /// # Errors
+    /// Propagates [`Self::output_dynamic_library_path`]'s and
+    /// [`Self::output_build_script_path`]'s errors.
+    pub fn output_linked_image_path(&self, host: &str) -> Result<Option<PathBuf>, String> {
+        if let Some(path) = self.output_dynamic_library_path(host)? {
+            return Ok(Some(path));
+        }
+        self.output_build_script_path(host)
+    }
+
     /// Path of the emitted dep-info file under `--out-dir`
     /// (`<name><extra-filename>.d`), or `None` without `--out-dir`.
     #[must_use]
@@ -451,6 +483,27 @@ impl ParsedRustcArgs {
             opt_level,
         })
     }
+}
+
+/// The environment variable whose value a compile can embed as the
+/// builder's checkout path.
+pub const MANIFEST_DIR_ENV: &str = "CARGO_MANIFEST_DIR";
+
+/// Whether a rustc dep-info file records that the compile read
+/// `CARGO_MANIFEST_DIR` through `env!` or `option_env!`.
+///
+/// rustc writes one `# env-dep:NAME=value` line per environment variable
+/// the compile read (`# env-dep:NAME` when it was unset), after the
+/// make-rule lines. A unit that read the manifest directory carries the
+/// builder's absolute path in its output, so its executable is not
+/// relocatable to another machine.
+#[must_use]
+pub fn dep_info_reads_manifest_dir(dep_info: &str) -> bool {
+    dep_info.lines().any(|line| {
+        line.strip_prefix("# env-dep:").is_some_and(|rest| {
+            rest.split_once('=').map_or(rest, |(name, _)| name) == MANIFEST_DIR_ENV
+        })
+    })
 }
 
 /// The classification one rustc invocation gets: keyed under a source
@@ -1065,6 +1118,20 @@ fn next_str<'a>(
 
 #[cfg(test)]
 mod tests {
+    /// The dep-info rustc writes: `env-dep` lines are `# env-dep:NAME` for
+    /// a variable that was unset and `# env-dep:NAME=value` otherwise.
+    #[test]
+    fn dep_info_reports_a_manifest_dir_read() {
+        let read = "build.o: build.rs\n\nbuild.rs:\n# env-dep:CARGO_MANIFEST_DIR=/home/runner/itoa-1.0.0\n# env-dep:OUT_DIR\n";
+        assert!(super::dep_info_reads_manifest_dir(read));
+        assert!(super::dep_info_reads_manifest_dir(
+            "# env-dep:CARGO_MANIFEST_DIR\n"
+        ));
+        let other = "build.o: build.rs\n\n# env-dep:CARGO_PKG_VERSION=1.0.0\n# env-dep:CARGO_MANIFEST_DIR_X=1\n";
+        assert!(!super::dep_info_reads_manifest_dir(other));
+        assert!(!super::dep_info_reads_manifest_dir("build.o: build.rs\n"));
+    }
+
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
