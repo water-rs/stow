@@ -448,10 +448,13 @@ async fn rearm_restores_the_seeded_state() {
     let finished = cell.with(|graph| {
         graph.run_finished(
             &run.task_id,
-            run.run_id,
-            true,
-            false,
-            None,
+            crate::scheduler::graph::RunCompletion {
+                run_id: run.run_id,
+                success: true,
+                cancelled: false,
+                source_failure: None,
+                error: None,
+            },
             drives::HOST_NOW_MS,
         )
     });

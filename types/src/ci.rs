@@ -374,6 +374,69 @@ impl<T: CiTransport> CiInterface<T> {
         })
     }
 
+    /// Read the isolated verifier's conclusion for exactly this attempt.
+    /// A job from a previous attempt never exempts the current failure.
+    ///
+    /// # Errors
+    /// Refused requests, malformed pages, duplicate verification jobs, and
+    /// pagination outside this endpoint fail classification.
+    pub async fn source_failure_verification(
+        &self,
+        run: crate::records::BuildRun,
+    ) -> Result<Option<crate::api::SourceFailureVerification>, DispatchError> {
+        #[derive(serde::Deserialize)]
+        struct Job {
+            id: u64,
+            run_id: u64,
+            run_attempt: u32,
+            name: String,
+            status: String,
+            conclusion: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Page {
+            jobs: Vec<Job>,
+        }
+        let mut url = self.resolve(&format!(
+            "repos/{}/actions/runs/{}/attempts/{}/jobs?per_page=100",
+            self.repo(),
+            run.run_id,
+            run.run_attempt,
+        ))?;
+        let mut verification = None;
+        let mut seen = false;
+        loop {
+            let response = self
+                .send_checked(self.api_request("GET", &url, None))
+                .await?;
+            let page: Page = serde_json::from_slice(&response.body)
+                .map_err(|error| DispatchError::Response(error.to_string()))?;
+            for job in page.jobs {
+                if job.name != crate::build_failure::VERIFICATION_JOB_NAME {
+                    continue;
+                }
+                if seen || job.run_id != run.run_id || job.run_attempt != run.run_attempt {
+                    return Err(DispatchError::Response(
+                        "ambiguous source verification job".to_owned(),
+                    ));
+                }
+                seen = true;
+                if job.status == "completed" && job.conclusion.as_deref() == Some("success") {
+                    verification = Some(crate::api::SourceFailureVerification {
+                        run_id: run.run_id,
+                        run_attempt: run.run_attempt,
+                        job_id: job.id,
+                    });
+                }
+            }
+            let Some(next) = crate::runs::link_next(response.header("link")) else {
+                break;
+            };
+            url = self.resolve(next)?;
+        }
+        Ok(verification)
+    }
+
     /// `build-crate.yml` runs queued and in progress, per runner
     /// family — two API calls per query (`?status=queued` and
     /// `?status=in_progress` on the workflow's runs listing), plus one
@@ -749,6 +812,60 @@ mod tests {
                 .push((request.method.to_owned(), request.url));
             std::future::ready(Ok(self.answers.lock().expect("answers").remove(0)))
         }
+    }
+
+    #[test]
+    fn verification_is_bound_to_the_run_attempt_and_successful_job() {
+        futures_lite::future::block_on(async {
+            for (attempt, conclusion, expected) in [
+                (2, "success", true),
+                (2, "failure", false),
+                (2, "skipped", false),
+            ] {
+                let body = serde_json::json!({"jobs": [{"id": 9, "run_id": 42,
+                    "run_attempt": attempt, "name": crate::build_failure::VERIFICATION_JOB_NAME,
+                    "status": "completed", "conclusion": conclusion}]})
+                .to_string();
+                let transport = Stub {
+                    requests: Mutex::new(Vec::new()),
+                    answers: Mutex::new(vec![Stub::answer(200, &[], &body)]),
+                };
+                let ci = super::CiInterface::github("water-rs/stow", "test", transport);
+                let proof = ci
+                    .source_failure_verification(crate::records::BuildRun {
+                        run_id: 42,
+                        run_attempt: 2,
+                    })
+                    .await
+                    .expect("job query");
+                assert_eq!(proof.is_some(), expected);
+                assert!(
+                    ci.transport.requests.lock().unwrap()[0]
+                        .1
+                        .ends_with("/runs/42/attempts/2/jobs?per_page=100")
+                );
+            }
+            let body = serde_json::json!({"jobs": [{"id": 9, "run_id": 42,
+                "run_attempt": 1, "name": crate::build_failure::VERIFICATION_JOB_NAME,
+                "status": "completed", "conclusion": "success"}]})
+            .to_string();
+            let ci = super::CiInterface::github(
+                "water-rs/stow",
+                "test",
+                Stub {
+                    requests: Mutex::new(Vec::new()),
+                    answers: Mutex::new(vec![Stub::answer(200, &[], &body)]),
+                },
+            );
+            assert!(
+                ci.source_failure_verification(crate::records::BuildRun {
+                    run_id: 42,
+                    run_attempt: 2
+                })
+                .await
+                .is_err()
+            );
+        });
     }
 
     fn task_id() -> String {

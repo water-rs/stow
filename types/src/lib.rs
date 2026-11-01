@@ -10,6 +10,7 @@ pub mod admission;
 pub mod analytics;
 pub mod api;
 pub mod artifact;
+pub mod build_failure;
 pub mod bundle;
 pub mod bundle_schema;
 pub mod capture;

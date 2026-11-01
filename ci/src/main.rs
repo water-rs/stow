@@ -26,6 +26,7 @@ mod consume;
 #[cfg(test)]
 mod context_tests;
 mod dep_scan;
+mod failure;
 mod handle_copy;
 mod local_server;
 #[cfg(feature = "mock-compile")]
@@ -70,6 +71,13 @@ enum Stage {
     /// Untrusted stage: compile the task's crate and write the build output.
     Build {
         /// Directory to write the build output into (created if missing).
+        #[arg(long)]
+        output_dir: PathBuf,
+    },
+    /// Independently replay a failed compilation without stow cache artifacts.
+    VerifyFailure {
+        #[arg(long)]
+        input_dir: PathBuf,
         #[arg(long)]
         output_dir: PathBuf,
     },
@@ -126,6 +134,10 @@ fn main() -> stow_types::error::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Stage::Build { output_dir } => smol::block_on(build_stage(&output_dir)),
+        Stage::VerifyFailure {
+            input_dir,
+            output_dir,
+        } => smol::block_on(verify_failure_stage(&input_dir, &output_dir)),
         // `RegistrySession` drives reqwest/hyper, which needs a Tokio
         // reactor; the build stage is smol-only because cargo/rustc
         // capture never touches HTTP.
@@ -158,7 +170,20 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
     }
     let task = load_task_payload()?;
     async_fs::create_dir_all(output_dir).await?;
-    let built = task::build(&task, output_dir).await?;
+    let built = match task::build(&task, output_dir).await? {
+        Ok(built) => built,
+        Err(candidate) => {
+            async_fs::write(
+                output_dir.join("failure-candidate.json"),
+                serde_json::to_vec(&candidate)?,
+            )
+            .await?;
+            return Err(stow_types::stow_error!(
+                "compilation failed for {}; source diagnostics require independent replay",
+                task.task_id
+            ));
+        }
+    };
     let report = dep_scan::scan_artifacts(&built, &task).await?;
     let dependency_task_ids = task
         .verified_dependency_graph()?
@@ -182,6 +207,24 @@ async fn build_stage(output_dir: &std::path::Path) -> stow_types::error::Result<
         upload_plan_entries = upload_plan.len(),
         "build stage completed"
     );
+    Ok(())
+}
+
+async fn verify_failure_stage(
+    input_dir: &std::path::Path,
+    output_dir: &std::path::Path,
+) -> stow_types::error::Result<()> {
+    let task = load_task_payload()?;
+    let candidate =
+        serde_json::from_slice(&async_fs::read(input_dir.join("failure-candidate.json")).await?)?;
+    async_fs::create_dir_all(output_dir).await?;
+    let verified = task::verify_source_failure(&task, candidate, output_dir).await?;
+    async_fs::write(
+        output_dir.join("verified-source-failure.json"),
+        serde_json::to_vec(&verified)?,
+    )
+    .await?;
+    tracing::info!(task_id = %task.task_id, "source failure reproduced without cached artifacts");
     Ok(())
 }
 

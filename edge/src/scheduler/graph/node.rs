@@ -233,11 +233,12 @@ pub(super) struct State {
 /// the task until `bind` lands (the `pending_run_completions` fence,
 /// in memory).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ParkedCompletion {
-    pub(super) run_id: u64,
-    pub(super) success: bool,
-    pub(super) cancelled: bool,
-    pub(super) error: Option<String>,
+pub struct RunCompletion {
+    pub run_id: u64,
+    pub success: bool,
+    pub cancelled: bool,
+    pub source_failure: Option<stow_types::api::SourceFailureVerification>,
+    pub error: Option<String>,
 }
 
 /// The fields few nodes carry: a claim's generation and bound run, its
@@ -257,7 +258,7 @@ pub(super) struct Extra {
     pub(super) lease_at: i64,
     pub(super) not_before: i64,
     pub(super) error: Option<Box<str>>,
-    pub(super) parked: Option<ParkedCompletion>,
+    pub(super) parked: Option<RunCompletion>,
 }
 
 impl Extra {

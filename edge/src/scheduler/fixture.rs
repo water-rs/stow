@@ -377,6 +377,7 @@ fn build_completed(
         for n in lo..=hi {
             graph.apply(
                 &SchedulerEvent::RunFinished {
+                    source_failure: None,
                     run_id: n.to_string(),
                     task_id: fixture_task_id(u64::from(n)),
                     success: true,

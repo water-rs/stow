@@ -298,6 +298,7 @@ fn run_finished_event(
         ))
     })?;
     let event = SchedulerEvent::RunFinished {
+        source_failure: report.source_failure.clone(),
         run_id: report.github_run_id.clone(),
         task_id: report.task_id.clone(),
         success: report.success,
@@ -322,10 +323,13 @@ fn apply_run_finished(
         graph.last_run_update_ms = Some(now);
         graph.run_finished(
             &report.task_id,
-            run_id,
-            report.success,
-            report.cancelled,
-            report.error.clone(),
+            crate::scheduler::graph::RunCompletion {
+                run_id,
+                success: report.success,
+                cancelled: report.cancelled,
+                source_failure: report.source_failure.clone(),
+                error: report.error.clone(),
+            },
             now,
         )
     })
@@ -950,6 +954,8 @@ mod inline_dispatch_tests {
     fn report(k: u32) -> WorkflowRunComplete {
         let run = SHAPE.in_flight_run(k);
         WorkflowRunComplete {
+            source_failure: None,
+            github_run_attempt: 1,
             task_id: run.task_id,
             success: true,
             error: None,
@@ -1389,7 +1395,17 @@ mod inline_dispatch_tests {
         // The completion for one of the replayed claims binds and
         // finishes it — one build, once.
         let again = woken.with(|graph| {
-            graph.run_finished(&claims[0].task_id, 9_999, true, false, None, HOST_NOW_MS)
+            graph.run_finished(
+                &claims[0].task_id,
+                crate::scheduler::graph::RunCompletion {
+                    run_id: 9_999,
+                    success: true,
+                    cancelled: false,
+                    source_failure: None,
+                    error: None,
+                },
+                HOST_NOW_MS,
+            )
         });
         assert!(
             matches!(again, FinishOutcome::Applied),

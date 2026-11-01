@@ -1149,23 +1149,148 @@ fn first_context_difference(
         .to_owned()
 }
 
+trait CompilationMode: Sync {
+    fn workspace(
+        &self,
+        task: &BuildTaskPayload,
+        cargo_home: &Path,
+    ) -> impl std::future::Future<Output = stow_types::error::Result<BuildWorkspace>> + Send;
+    fn consumption(
+        &self,
+        task: &BuildTaskPayload,
+        graphs: &[PhaseUnitGraph],
+    ) -> impl std::future::Future<
+        Output = stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)>,
+    > + Send;
+    fn wrapper<'a>(&self, setup: &'a PhaseSetup<'_>) -> Option<&'a Path>;
+}
+
+struct CachedCompilation;
+
+impl CompilationMode for CachedCompilation {
+    async fn workspace(
+        &self,
+        task: &BuildTaskPayload,
+        cargo_home: &Path,
+    ) -> stow_types::error::Result<BuildWorkspace> {
+        let mirror_key = workspace_mirror::MirrorTaskKey {
+            target: task.target.as_str().to_owned(),
+            rustc_version: task.rustc_version.as_str().to_owned(),
+            preserve_lockfile: task.preserve_lockfile,
+        };
+        let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
+        fetch_workspace_dependencies(cargo_home, task, &workspace).await?;
+        Ok(workspace)
+    }
+
+    async fn consumption(
+        &self,
+        task: &BuildTaskPayload,
+        graphs: &[PhaseUnitGraph],
+    ) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
+        stage_consumption_store(task, graphs).await
+    }
+
+    fn wrapper<'a>(&self, setup: &'a PhaseSetup<'_>) -> Option<&'a Path> {
+        Some(&setup.wrappers.rustc_wrapper)
+    }
+}
+
+struct CleanCompilation<'a> {
+    lockfile: &'a str,
+}
+
+impl CompilationMode for CleanCompilation<'_> {
+    async fn workspace(
+        &self,
+        task: &BuildTaskPayload,
+        cargo_home: &Path,
+    ) -> stow_types::error::Result<BuildWorkspace> {
+        let workspace = create_workspace(task).await?;
+        let lock_path = workspace.workspace_root().join("Cargo.lock");
+        async_fs::write(&lock_path, self.lockfile).await?;
+        let status = Command::new("cargo")
+            .args(["fetch", "--locked", "--manifest-path"])
+            .arg(workspace.manifest_path())
+            .env("CARGO_HOME", cargo_home)
+            .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(stow_types::stow_error!(
+                "fetch frozen replay dependencies: {status}"
+            ));
+        }
+        if async_fs::read_to_string(lock_path).await? != self.lockfile {
+            return Err(stow_types::stow_error!(
+                "replay changed the frozen lockfile"
+            ));
+        }
+        Ok(workspace)
+    }
+
+    fn consumption(
+        &self,
+        _task: &BuildTaskPayload,
+        _graphs: &[PhaseUnitGraph],
+    ) -> impl std::future::Future<
+        Output = stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)>,
+    > + Send {
+        std::future::ready(Ok((None, None)))
+    }
+
+    fn wrapper<'a>(&self, _setup: &'a PhaseSetup<'_>) -> Option<&'a Path> {
+        None
+    }
+}
+
 pub async fn build(
     task: &BuildTaskPayload,
     output_dir: &Path,
-) -> stow_types::error::Result<BuiltWorkspace> {
+) -> stow_types::error::Result<Result<BuiltWorkspace, crate::failure::FailureCandidate>> {
+    compile_task(task, output_dir, &CachedCompilation).await
+}
+
+pub async fn verify_source_failure(
+    task: &BuildTaskPayload,
+    candidate: crate::failure::FailureCandidate,
+    output_dir: &Path,
+) -> stow_types::error::Result<stow_types::build_failure::VerifiedSourceFailure> {
+    if candidate.observation.inputs.task != *task
+        || candidate.observation.inputs.lock_sha256
+            != hex::encode(sha2::Sha256::digest(candidate.lockfile.as_bytes()))
+    {
+        return Err(stow_types::stow_error!(
+            "failure evidence does not match dispatched inputs"
+        ));
+    }
+    let replay = compile_task(
+        task,
+        output_dir,
+        &CleanCompilation {
+            lockfile: &candidate.lockfile,
+        },
+    )
+    .await?;
+    candidate
+        .observation
+        .verify_replay(replay.as_ref().err().map(|failure| &failure.observation))
+        .ok_or_else(|| {
+            stow_types::stow_error!("cache-free replay did not reproduce the source failure")
+        })
+}
+
+async fn compile_task(
+    task: &BuildTaskPayload,
+    output_dir: &Path,
+    mode: &impl CompilationMode,
+) -> stow_types::error::Result<Result<BuiltWorkspace, crate::failure::FailureCandidate>> {
     // Resolve and verify the run toolchain once per task — a name whose
     // rustc reports a different release than the pinned `rustc_version`
     // is refused here, before any phase runs cargo.
     verified_run_toolchain(task)?;
-    let mirror_key = workspace_mirror::MirrorTaskKey {
-        target: task.target.as_str().to_owned(),
-        rustc_version: task.rustc_version.as_str().to_owned(),
-        preserve_lockfile: task.preserve_lockfile,
-    };
-    let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
-
     let cargo_home = cargo_home()?;
-    fetch_workspace_dependencies(&cargo_home, task, &workspace).await?;
+    let workspace = mode.workspace(task, &cargo_home).await?;
 
     let cargo_subcommand = cargo_subcommand()?;
     // Cargo's own unit graphs are computed once for the whole build:
@@ -1175,7 +1300,7 @@ pub async fn build(
     // not just the cache path.
     let unit_graphs = phase_unit_graphs(&cargo_home, task, &workspace, cargo_subcommand).await?;
     verify_dependency_context(task, &unit_graphs)?;
-    let (_consume_store_dir, consume_store) = stage_consumption_store(task, &unit_graphs).await?;
+    let (_consume_store_dir, consume_store) = mode.consumption(task, &unit_graphs).await?;
 
     let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
         .map_err(|error| stow_types::stow_error!("open network audit log: {error}"))?;
@@ -1239,7 +1364,19 @@ pub async fn build(
     for &phase in phases {
         for &invocation in phase_invocations(task) {
             let target_dir = phase_target_dir(run_dir.path(), phase, invocation);
-            run_sandboxed_phase(&run, task, phase, invocation, &target_dir, &mut collector).await?;
+            if let Some(failure) = run_phase(
+                &run,
+                task,
+                phase,
+                invocation,
+                &target_dir,
+                &mut collector,
+                mode,
+            )
+            .await?
+            {
+                return Ok(Err(failure));
+            }
         }
     }
 
@@ -1252,12 +1389,12 @@ pub async fn build(
         "cargo phases finished"
     );
 
-    Ok(BuiltWorkspace {
+    Ok(Ok(BuiltWorkspace {
         workspace,
         run_dir,
         captures: collector.into_records()?,
         unit_graphs,
-    })
+    }))
 }
 
 /// The rustup *name* the phases run `cargo` under — a different fact
@@ -1400,6 +1537,7 @@ pub struct PhaseRun<'a> {
 /// records it delivered. A duplicate identity is fatal, and so is cargo
 /// exiting non-zero — the build compiles one crate, and a phase that
 /// cannot finish means the task failed.
+#[cfg(test)]
 pub async fn run_sandboxed_phase(
     run: &PhaseRun<'_>,
     task: &BuildTaskPayload,
@@ -1407,10 +1545,69 @@ pub async fn run_sandboxed_phase(
     invocation: CargoInvocation,
     target_dir: &Path,
     collector: &mut CaptureCollector,
-) -> stow_types::error::Result<()> {
+) -> stow_types::error::Result<Option<crate::failure::FailureCandidate>> {
+    run_phase(
+        run,
+        task,
+        phase,
+        invocation,
+        target_dir,
+        collector,
+        &CachedCompilation,
+    )
+    .await
+}
+
+fn compilation_inputs(
+    setup: &PhaseSetup<'_>,
+    task: &BuildTaskPayload,
+    target_dir: &Path,
+    args: &[String],
+    lockfile: &str,
+    rustflags: &str,
+) -> stow_types::build_failure::CompilationInputs {
+    stow_types::build_failure::CompilationInputs {
+        rustflags: rustflags
+            .replace(
+                &*setup.workspace.workspace_root().to_string_lossy(),
+                "<workspace>",
+            )
+            .replace(&*target_dir.to_string_lossy(), "<target>"),
+        task: task.clone(),
+        lock_sha256: hex::encode(sha2::Sha256::digest(lockfile.as_bytes())),
+        cargo_args: args
+            .iter()
+            .map(|arg| {
+                arg.replace(
+                    &setup
+                        .workspace
+                        .workspace_root()
+                        .to_string_lossy()
+                        .to_string(),
+                    "<workspace>",
+                )
+            })
+            .collect(),
+    }
+}
+
+async fn run_phase(
+    run: &PhaseRun<'_>,
+    task: &BuildTaskPayload,
+    phase: CargoSubcommand,
+    invocation: CargoInvocation,
+    target_dir: &Path,
+    collector: &mut CaptureCollector,
+    mode: &impl CompilationMode,
+) -> stow_types::error::Result<Option<crate::failure::FailureCandidate>> {
     let setup = run.setup;
     create_dir_all(target_dir).await?;
-    let args = cargo_phase_args(setup.workspace, task, phase, invocation).await?;
+    let mut args = cargo_phase_args(setup.workspace, task, phase, invocation).await?;
+    args.push("--message-format=json".to_owned());
+    let lockfile =
+        async_fs::read_to_string(setup.workspace.workspace_root().join("Cargo.lock")).await?;
+    let rustflags = phase_rustflags(setup.rustflags, task.target.as_str(), target_dir);
+    let inputs = compilation_inputs(setup, task, target_dir, &args, &lockfile, &rustflags);
 
     // A unit that links in more than one phase — a proc-macro's deps like
     // `defmt-parser`, or a build-script crate that `include!`s generated
@@ -1428,15 +1625,20 @@ pub async fn run_sandboxed_phase(
     // argv the boundary drops it from (MSVC CodeView S_OBJNAME embeds the
     // object's own absolute output path; without the remap the two phase
     // dirs hash differently on Windows even though the unit is identical).
-    let rustflags = phase_rustflags(setup.rustflags, task.target.as_str(), target_dir);
-
     let mut command = run
         .sandbox
         .command("cargo")
         .args(args)
         .env("RUSTUP_TOOLCHAIN", run_toolchain(task))
         .env("RUSTFLAGS", rustflags)
-        .env("RUSTC_WRAPPER", path_arg(&setup.wrappers.rustc_wrapper)?)
+        .env(
+            "RUSTC_WRAPPER",
+            mode.wrapper(setup)
+                .map(path_arg)
+                .transpose()?
+                .unwrap_or_default(),
+        )
+        .env("RUSTC_WORKSPACE_WRAPPER", "")
         .env("CARGO_TARGET_DIR", path_arg(target_dir)?)
         .env(
             STOW_BUILD_CAPTURE_DIR_ENV,
@@ -1472,9 +1674,10 @@ pub async fn run_sandboxed_phase(
             );
     }
     let passes_target = invocation_passes_target(task, invocation).await?;
-    let status = command.status().await.map_err(|error| {
+    let output = command.output().await.map_err(|error| {
         stow_types::stow_error!("run sandboxed cargo {}: {error}", phase.as_str())
     })?;
+    tracing::info!(stdout = %String::from_utf8_lossy(&output.stdout), stderr = %String::from_utf8_lossy(&output.stderr), "cargo phase output");
 
     // Absorb the records this phase delivered before looking at cargo's
     // exit status: a duplicate identity is fatal either way. The drain
@@ -1488,14 +1691,28 @@ pub async fn run_sandboxed_phase(
     };
     collector.drain(phase.as_str(), unit_invocation)?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let mut diagnostics = crate::failure::source_diagnostics(&output.stdout, setup.cargo_home)?;
+        diagnostics.extend(crate::failure::native_diagnostics(&output.stderr));
+        if output.status.code() == Some(101)
+            && !diagnostics.is_empty()
+            && !crate::failure::has_tool_failure(&output.stderr)
+        {
+            return Ok(Some(crate::failure::FailureCandidate {
+                observation: stow_types::build_failure::CompilationFailure {
+                    inputs,
+                    diagnostics,
+                },
+                lockfile,
+            }));
+        }
         return Err(stow_types::stow_error!(
             "cargo {} failed for {} {} on {} with status {}",
             phase.as_str(),
             task.crate_name,
             task.version,
             task.target,
-            status
+            output.status
         ));
     }
 
@@ -1508,7 +1725,7 @@ pub async fn run_sandboxed_phase(
         cargo_subcommand = phase.as_str(),
         "cargo phase completed"
     );
-    Ok(())
+    Ok(None)
 }
 
 /// How one phase's `cargo` invocation is spelled: whether `--target`

@@ -493,7 +493,7 @@ fg cargo build -p stow-cli --features mock-verify -p stow-build -p stow-mock-reg
 fg cargo build -p stow-mock-registry --example demand_feed_fixture \
     >>"$LOG_DIR/cargo-build.log" 2>&1 \
     || die "cargo build (demand_feed_fixture example) failed — see $LOG_DIR/cargo-build.log"
-BIN="$REPO_ROOT/target/debug"
+BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug"
 
 # stow#523: typed demand-feed fixtures — the example writes the
 # enqueue/queue document, per-hour provider documents, typed
@@ -2234,3 +2234,30 @@ oversized_generation="$(curl -fsS --max-time 30 "$EDGE_URL/api/v1/admin/status" 
 [ "$oversized_generation" = "1" ] \
     || die "the scheduler holds the oversized slice at generation $oversized_generation, expected 1"
 echo "[mock-e2e] OK — a $OVERSIZED_ROWS-row slice report over the request-body limit reconciled in parts and the scheduler holds it at generation $oversized_generation"
+
+# A real registry source failure stays failed after a cache-free replay.
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$EDGE_BEARER" \
+    STOW_REGISTRY_BASE_URL="http://${REGISTRY_ADDR}" \
+    STOW_MOCK_PUBLIC_KEY_PATH="$WORK_DIR/keys/public.pem" \
+    "$BIN/stow-admin" submit --crate-name uuid --version 1.29.0 \
+    --features-json '["rng","v4"]' --target wasm32-unknown-unknown \
+    --rustc-version "$RUSTC_VERSION" --yes \
+    >"$LOG_DIR/source-failure-submit.log" 2>&1 \
+    || die "source-failure submit failed — see $LOG_DIR/source-failure-submit.log"
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    source_runs="$(curl -fsS --max-time 10 "http://${LOCAL_CI_ADDR}/tasks" \
+        | jq '[.tasks[] | select((.task_id // "") | startswith("uuid-1.29.0-"))]')"
+    source_run="$(jq -r '[.[] | select(.status == "completed" and .conclusion == "failure")][0].workflow_run_id // empty' <<<"$source_runs")"
+    [ -n "$source_run" ] && break
+    [ "$SECONDS" -ge "$deadline" ] && die "source failure did not complete: $source_runs"
+    sleep 5
+done
+curl -fsS --max-time 10 \
+    "http://${LOCAL_CI_ADDR}/repos/water-rs/stow/actions/runs/$source_run/attempts/1/jobs" \
+    >"$WORK_DIR/source-failure-jobs.json"
+jq -e '[.jobs[] | select(.name == "verify source failure" and .conclusion == "success")] | length == 1' \
+    "$WORK_DIR/source-failure-jobs.json" >/dev/null \
+    || die "source failure had no successful independent replay — see $WORK_DIR/source-failure-jobs.json"
+echo "[mock-e2e] OK — uuid wasm source failure reproduced independently and remained a failed run"

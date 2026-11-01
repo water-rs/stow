@@ -626,6 +626,8 @@ async fn forward_run_complete(
     error: Option<String>,
 ) -> Result<(), GetArtifactError> {
     let completion = WorkflowRunComplete {
+        source_failure: None,
+        github_run_attempt: run.run_attempt.get(),
         task_id: task_id.to_owned(),
         success,
         error,

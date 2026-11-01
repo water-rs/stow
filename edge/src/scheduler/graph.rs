@@ -42,7 +42,8 @@ mod snapshot;
 
 use edges::Edges;
 use index::{Interner, IxTable, hash_of};
-use node::{Extra, Flags, Lane, NO_STATE, Node, ParkedCompletion, State, Status};
+pub use node::RunCompletion;
+use node::{Extra, Flags, Lane, NO_STATE, Node, State, Status};
 
 pub use snapshot::{ChunkSpan, SNAPSHOT_SPAN_ROWS, SnapshotLoader, SnapshotPlan, SpanEncoder};
 
@@ -382,6 +383,8 @@ pub struct AttemptOutcome {
     pub target: String,
     /// `Some(first error line)` on failure, `None` on success.
     pub failure_class: Option<String>,
+    /// Verified source failures stay in history but do not enter the breaker.
+    pub source_failure: Option<stow_types::api::SourceFailureVerification>,
     /// The platform run id, when the binding carried one.
     pub run_id: String,
     /// When the completion landed (unix ms).
@@ -2091,7 +2094,14 @@ impl Graph {
         if let Some(parked) = parked
             && parked.run_id == run_id
         {
-            self.finish_run_inner(ix, parked.success, parked.cancelled, parked.error, now);
+            self.finish_run_inner(
+                ix,
+                parked.success,
+                parked.cancelled,
+                parked.error,
+                parked.source_failure,
+                now,
+            );
         }
         true
     }
@@ -2220,12 +2230,16 @@ impl Graph {
     pub fn run_finished(
         &mut self,
         task_id: &str,
-        run_id: u64,
-        success: bool,
-        cancelled: bool,
-        error: Option<String>,
+        completion: RunCompletion,
         now: i64,
     ) -> FinishOutcome {
+        let RunCompletion {
+            run_id,
+            success,
+            cancelled,
+            source_failure,
+            error,
+        } = completion;
         let was_external = self.external_runs.remove(&run_id).is_some();
         let stale = if was_external {
             FinishOutcome::External
@@ -2245,10 +2259,11 @@ impl Graph {
                 // settle — the binding lands in this isolate, so the
                 // completion waits on it.
                 self.edit_extra(ix, |extra| {
-                    extra.parked = Some(ParkedCompletion {
+                    extra.parked = Some(RunCompletion {
                         run_id,
                         success,
                         cancelled,
+                        source_failure,
                         error,
                     });
                 });
@@ -2261,13 +2276,13 @@ impl Graph {
             // run itself, exactly as `run_started`'s `bound == 0`
             // path does (stow#940).
             self.edit_extra(ix, |extra| extra.run_id = run_id);
-            self.finish_run_inner(ix, success, cancelled, error, now);
+            self.finish_run_inner(ix, success, cancelled, error, source_failure, now);
             return FinishOutcome::Applied;
         }
         if bound != run_id {
             return FinishOutcome::Stale;
         }
-        self.finish_run_inner(ix, success, cancelled, error, now);
+        self.finish_run_inner(ix, success, cancelled, error, source_failure, now);
         FinishOutcome::Applied
     }
 
@@ -2279,6 +2294,7 @@ impl Graph {
         success: bool,
         cancelled: bool,
         error: Option<String>,
+        source_failure: Option<stow_types::api::SourceFailureVerification>,
         now: i64,
     ) {
         self.state_mut(ix).updated = now;
@@ -2292,6 +2308,7 @@ impl Graph {
                 attempt: u32::from(attempt.saturating_add(u8::from(!success))),
                 target: self.targets[usize::from(target)].name.to_string(),
                 failure_class: failure_class_of(success, error.as_deref()),
+                source_failure,
                 run_id: self.run_id_of(ix).to_string(),
                 finished_at_ms: now,
             });
@@ -3038,6 +3055,33 @@ impl Graph {
     /// Apply one decoded log event — the replay half of wake. The
     /// submit reassembly buffer lives in `store.rs`; this handles the
     /// one-row-per-event kinds.
+    fn apply_finished_event(&mut self, event: &SchedulerEvent, now: i64) {
+        if let SchedulerEvent::RunFinished {
+            run_id,
+            task_id,
+            success,
+            source_failure,
+            cancelled,
+            error,
+        } = event
+        {
+            self.last_run_update_ms = Some(now);
+            if let Ok(run_id) = run_id.parse::<u64>() {
+                self.run_finished(
+                    task_id,
+                    RunCompletion {
+                        run_id,
+                        success: *success,
+                        cancelled: *cancelled,
+                        source_failure: source_failure.clone(),
+                        error: error.clone(),
+                    },
+                    now,
+                );
+            }
+        }
+    }
+
     pub fn apply(&mut self, event: &SchedulerEvent, now: i64) {
         self.log_since_snapshot += 1;
         match event {
@@ -3077,18 +3121,7 @@ impl Graph {
                     self.external_runs.insert(run_id, 1u8 << (*family as u8));
                 }
             }
-            SchedulerEvent::RunFinished {
-                run_id,
-                task_id,
-                success,
-                cancelled,
-                error,
-            } => {
-                self.last_run_update_ms = Some(now);
-                if let Ok(run_id) = run_id.parse::<u64>() {
-                    self.run_finished(task_id, run_id, *success, *cancelled, error.clone(), now);
-                }
-            }
+            SchedulerEvent::RunFinished { .. } => self.apply_finished_event(event, now),
             // `Submit` parts are reassembled by the replay loop in
             // `store.rs` before this is reached.
             SchedulerEvent::StoreReset | SchedulerEvent::Submit { .. } => {}
@@ -4035,6 +4068,21 @@ mod tests {
     };
     use stow_types::public_cache::{UnitInvocation, UnitKind, UnitSide};
 
+    fn completion(
+        run_id: u64,
+        success: bool,
+        cancelled: bool,
+        error: Option<String>,
+    ) -> RunCompletion {
+        RunCompletion {
+            run_id,
+            success,
+            cancelled,
+            source_failure: None,
+            error,
+        }
+    }
+
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.85.0";
 
@@ -4066,6 +4114,44 @@ mod tests {
     /// The profile is part of a node's identity: the same crate under two
     /// profiles is two nodes with distinct ids, and a dispatched payload
     /// carries the node's own profile (stow#1008).
+    #[test]
+    fn source_verification_survives_event_replay_and_snapshot() {
+        let mut graph = Graph::default();
+        graph.merge(&solo(), 0).expect("merge");
+        let claim = graph.claim(45, 16, 0, 3_600_000).expect("claim");
+        let task_id = claim[0].task_id.clone();
+        graph.bind(&task_id, claim[0].generation, 77, 1000);
+        let proof = stow_types::api::SourceFailureVerification {
+            run_id: 77,
+            run_attempt: 2,
+            job_id: 88,
+        };
+        graph.apply(
+            &SchedulerEvent::RunFinished {
+                run_id: "77".to_owned(),
+                task_id,
+                success: false,
+                source_failure: Some(proof.clone()),
+                cancelled: false,
+                error: Some("workflow failed".to_owned()),
+            },
+            2000,
+        );
+        let restored = round_trip(&graph);
+        let failure = restored.attempt_outcomes.back().expect("failure retained");
+        assert_eq!(failure.source_failure.as_ref(), Some(&proof));
+        assert!(failure.failure_class.is_some());
+        let settings = crate::freeze::FreezeSettings {
+            min_outcomes: 1,
+            ..Default::default()
+        };
+        assert!(
+            queue::evaluate_freeze_trip(&restored, &settings, 2000)
+                .expect("evaluate")
+                .is_none()
+        );
+    }
+
     #[test]
     fn a_node_keeps_its_profile_in_its_id_and_payload() {
         let mut graph = Graph::default();
@@ -4507,7 +4593,7 @@ mod tests {
         let mut graph = Graph::default();
         graph.merge(&chain(), 0).expect("merge");
         graph.claim(45, 16, 0, 3_600_000).expect("claim c");
-        graph.run_finished(&id("c"), 100, true, false, None, 50_000);
+        graph.run_finished(&id("c"), completion(100, true, false, None), 50_000);
         let flips = publish(&mut graph, "c");
         assert_eq!(flips, 1, "b's edge to c flips");
         // b still depends on c, so c is retained without queue state.
@@ -4686,7 +4772,7 @@ mod tests {
         graph.merge(&solo(), 0).expect("merge");
         let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
         let generation = claimed[0].generation;
-        let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
+        let outcome = graph.run_finished(&id("solo"), completion(4242, true, false, None), 10_000);
         assert_eq!(outcome, FinishOutcome::Parked);
         assert!(graph.bind(&id("solo"), generation, 4242, 11_000));
         assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
@@ -4948,7 +5034,7 @@ mod tests {
         graph.merge(&solo(), 0).expect("merge");
         let ix = graph.node_ix(&id("solo")).expect("node");
         graph.mark_claimed(ix, 7, 0);
-        let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
+        let outcome = graph.run_finished(&id("solo"), completion(4242, true, false, None), 10_000);
         assert_eq!(outcome, FinishOutcome::Applied);
         assert_eq!(graph.run_id_of(ix), 4242);
         assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
@@ -4972,7 +5058,7 @@ mod tests {
         // The reclaim pass's settle never lands (an eviction, a lost
         // answer): a woken graph carries no settling set.
         graph.settling.clear();
-        let outcome = graph.run_finished(&id("solo"), 4242, true, false, None, 10_000);
+        let outcome = graph.run_finished(&id("solo"), completion(4242, true, false, None), 10_000);
         assert_eq!(outcome, FinishOutcome::Applied);
         assert_eq!(graph.run_id_of(ix), 4242);
         assert_eq!(status_of(&graph, "solo"), Some(Status::Completed));
@@ -5337,7 +5423,11 @@ mod tests {
         let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim c");
         graph.bind(&id("c"), claimed[0].generation, 77, 1_000);
         for _ in 1..queue::MAX_BUILD_ATTEMPTS {
-            graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 2_000);
+            graph.run_finished(
+                &id("c"),
+                completion(77, false, false, Some("boom".into())),
+                2_000,
+            );
             let ix = graph.node_ix(&id("c")).expect("node");
             assert_eq!(graph.node(ix).status, Status::Pending);
             graph.edit_extra(ix, |extra| extra.not_before = 0);
@@ -5345,7 +5435,11 @@ mod tests {
             let claimed = graph.claim(45, 16, 3_000, 3_600_000).expect("reclaim");
             graph.bind(&id("c"), claimed[0].generation, 77, 4_000);
         }
-        graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 5_000);
+        graph.run_finished(
+            &id("c"),
+            completion(77, false, false, Some("boom".into())),
+            5_000,
+        );
         assert_eq!(status_of(&graph, "c"), Some(Status::Failed));
         let b = graph.node_ix(&id("b")).expect("b");
         assert!(graph.node(b).flags.blocked());
@@ -5483,7 +5577,11 @@ mod tests {
         graph.bind(&id("c"), claimed[0].generation, 77, 1_000);
         assert_pending_index(&graph);
         for _ in 1..queue::MAX_BUILD_ATTEMPTS {
-            graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 2_000);
+            graph.run_finished(
+                &id("c"),
+                completion(77, false, false, Some("boom".into())),
+                2_000,
+            );
             assert_pending_index(&graph);
             let ix = graph.node_ix(&id("c")).expect("node");
             graph.edit_extra(ix, |extra| extra.not_before = 0);
@@ -5491,7 +5589,11 @@ mod tests {
             let claimed = graph.claim(45, 16, 3_000, 3_600_000).expect("reclaim");
             graph.bind(&id("c"), claimed[0].generation, 77, 4_000);
         }
-        graph.run_finished(&id("c"), 77, false, false, Some("boom".into()), 5_000);
+        graph.run_finished(
+            &id("c"),
+            completion(77, false, false, Some("boom".into())),
+            5_000,
+        );
         assert_pending_index(&graph);
         assert_eq!(graph.status().blocked, 1, "b waits on the failed c");
 
@@ -5529,7 +5631,7 @@ mod tests {
         let claimed = graph.claim(45, 16, 12_000, 3_600_000).expect("claim");
         for (run, task) in (100u64..).zip(&claimed) {
             graph.bind(&task.task_id, task.generation, run, 12_000);
-            graph.run_finished(&task.task_id, run, true, false, None, 13_000);
+            graph.run_finished(&task.task_id, completion(run, true, false, None), 13_000);
         }
         assert_pending_index(&graph);
         // A human node behind the purged h1's slot: the compaction
@@ -5589,7 +5691,7 @@ mod tests {
         let mut graph = Graph::default();
         graph.merge(&chain(), 0).expect("merge");
         graph.claim(45, 16, 0, 3_600_000).expect("claim");
-        graph.run_finished(&id("c"), 100, true, false, None, 10_000);
+        graph.run_finished(&id("c"), completion(100, true, false, None), 10_000);
         publish(&mut graph, "c");
         graph.meter.roll_to("2026-10-23");
         graph.meter.record("test", 7, 11);
@@ -5624,7 +5726,7 @@ mod tests {
         graph.merge(&solo(), 0).expect("merge");
         let claimed = graph.claim(45, 16, 0, 3_600_000).expect("claim");
         graph.bind(&id("solo"), claimed[0].generation, 9, 1_000);
-        let outcome = graph.run_finished(&id("solo"), 9, false, true, None, 2_000);
+        let outcome = graph.run_finished(&id("solo"), completion(9, false, true, None), 2_000);
         assert_eq!(outcome, FinishOutcome::Applied);
         let ix = graph.node_ix(&id("solo")).expect("node");
         assert_eq!(graph.node(ix).status, Status::Pending);
@@ -5637,7 +5739,7 @@ mod tests {
         let outcome = graph.run_started("nobodys-task", 555, RunnerFamily::Linux, 0);
         assert_eq!(outcome, StartOutcome::External);
         assert_eq!(graph.external_total(), 1);
-        graph.run_finished("nobodys-task", 555, true, false, None, 0);
+        graph.run_finished("nobodys-task", completion(555, true, false, None), 0);
         assert_eq!(graph.external_total(), 0);
     }
 
