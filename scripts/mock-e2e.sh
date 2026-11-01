@@ -1468,8 +1468,8 @@ index_rows="$(awk '/^rows: /{print $2}' "$LOG_DIR/index-status.log" | head -1)"
 # list in-process and submits one tree per source to the scheduler's
 # operations lane (stow#880) — the scheduler then claims and dispatches
 # to the local CI server, exactly as the stow-admin submit wave did.
-# walkdir carries one unix dep (same-file), so the wave holds two
-# tasks in two layers. `--json` puts the submitted plan, task ids
+# walkdir carries one unix dep (same-file), so each of the dev and
+# release graphs holds two tasks. `--json` puts the submitted plan, task ids
 # included, on stdout: the wait below follows exactly those ids.
 printf 'walkdir\n' >"$WORK_DIR/manual-crates.txt"
 fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
@@ -1487,8 +1487,10 @@ fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
 manual_ids="$(jq -c '[.plan[].nodes[].task_id] | unique' "$WORK_DIR/preheat-manual.json")" \
     || die "preheat manual printed no plan — see $WORK_DIR/preheat-manual.json"
 manual_total="$(jq 'length' <<<"$manual_ids")"
-[ "$manual_total" -eq 2 ] \
-    || die "manual wave planned $manual_total task(s), expected walkdir and same-file: $manual_ids"
+jq -e '[.plan[].nodes[] | [.crate_name, (.profile // "dev")]] | sort ==
+    [["same-file", "dev"], ["same-file", "release"], ["walkdir", "dev"], ["walkdir", "release"]]' \
+    "$WORK_DIR/preheat-manual.json" >/dev/null \
+    || die "manual wave must contain walkdir and same-file in both dev and release: $manual_ids"
 
 # How the scheduler releases this wave, layer by layer:
 #   - the submit claims nothing inline; it arms the alarm, whose pass
