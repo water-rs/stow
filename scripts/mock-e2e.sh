@@ -1300,14 +1300,14 @@ cap_json() {
 }
 
 echo "[mock-e2e] dispatch-cap: status reads the deploy bindings"
-cap_json status >"$WORK_DIR/dispatch-cap-status.json" 2>&1 \
+cap_json status >"$WORK_DIR/dispatch-cap-status.json" 2>"$LOG_DIR/dispatch-cap-status.log" \
     || die "dispatch-cap status failed — see $WORK_DIR/dispatch-cap-status.json"
 jq -e '.max_concurrent_jobs == 3 and .max_concurrent_macos_jobs == 11
        and (.setting | not)' "$WORK_DIR/dispatch-cap-status.json" >/dev/null \
     || die "dispatch-cap status before set: $(cat "$WORK_DIR/dispatch-cap-status.json")"
 
 # Without `--yes` the command prints the plan and changes nothing.
-cap_json set --jobs 2 >"$WORK_DIR/dispatch-cap-plan.json" 2>&1 \
+cap_json set --jobs 2 >"$WORK_DIR/dispatch-cap-plan.json" 2>"$LOG_DIR/dispatch-cap-plan.log" \
     || die "dispatch-cap set (plan only) failed — see $WORK_DIR/dispatch-cap-plan.json"
 jq -e '.dry_run == true and .plan.max_concurrent_jobs == 2' \
     "$WORK_DIR/dispatch-cap-plan.json" >/dev/null \
@@ -1349,7 +1349,7 @@ while :; do
     sleep 5
 done
 
-cap_json set --jobs 1 --macos 1 --yes >"$WORK_DIR/dispatch-cap-set.json" 2>&1 \
+cap_json set --jobs 1 --macos 1 --yes >"$WORK_DIR/dispatch-cap-set.json" 2>"$LOG_DIR/dispatch-cap-set.log" \
     || die "dispatch-cap set failed — see $WORK_DIR/dispatch-cap-set.json"
 jq -e '.dry_run == false and .result.max_concurrent_jobs == 1
        and .result.max_concurrent_macos_jobs == 1
@@ -1399,7 +1399,7 @@ wait_for "edge listener (restart)" "$READY_DEADLINE" "${CHILD_PIDS[$edge_index]}
     http_listening "$SCHEDULER_URL/status"
 wait_for "edge scheduler status (restart)" "$READY_DEADLINE" "${CHILD_PIDS[$edge_index]}" \
     curl -fsS "$SCHEDULER_URL/status"
-cap_json status >"$WORK_DIR/dispatch-cap-restart.json" 2>&1 \
+cap_json status >"$WORK_DIR/dispatch-cap-restart.json" 2>"$LOG_DIR/dispatch-cap-restart.log" \
     || die "dispatch-cap status after restart failed"
 jq -e '.max_concurrent_jobs == 1 and .max_concurrent_macos_jobs == 1
        and .setting.actor != null' "$WORK_DIR/dispatch-cap-restart.json" >/dev/null \
@@ -1441,7 +1441,7 @@ $saw_capped_wait \
 # Restore the binding values: a set has no clear, so the recorded
 # setting names exactly what the bindings say — the later waves read
 # the same caps either way.
-cap_json set --jobs 3 --macos 11 --yes >"$WORK_DIR/dispatch-cap-restore.json" 2>&1 \
+cap_json set --jobs 3 --macos 11 --yes >"$WORK_DIR/dispatch-cap-restore.json" 2>"$LOG_DIR/dispatch-cap-restore.log" \
     || die "dispatch-cap restore failed — see $WORK_DIR/dispatch-cap-restore.json"
 jq -e '.dry_run == false and .result.max_concurrent_jobs == 3
        and .result.max_concurrent_macos_jobs == 11' \
