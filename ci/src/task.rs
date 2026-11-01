@@ -385,8 +385,8 @@ fn wrapper_manifest(task: &BuildTaskPayload) -> stow_types::error::Result<String
     // would keep only the last insert. Each pin keys on a unique
     // `<name>-v<version>` alias and names the package in `package`.
     // Distinct nodes can require the same declaration: profiles,
-    // target spelling and dependency context belong to node identity,
-    // not Cargo's dependency table. Reuse only an identical declaration;
+    // dependency context and invocation requirements are not fields in
+    // Cargo's dependency table. Reuse only an identical declaration;
     // incompatible feature sets must never be unioned or overwritten.
     // The dispatched subgraph stays intact for actual-graph validation.
     //
