@@ -175,11 +175,11 @@ jobs:
   # runs the real build and publish stages with rustc answered by the
   # mock compiler, publish rounds release the graph layer by layer, and
   # the same lists are resubmitted the way the daily cron does.
-  # `scripts/preheat-cost.sh` fails on wave or resubmit rows over the
-  # preheat budget, a per-event cost that grows from the first layer to
-  # the last, a node dispatched before its dependencies were published, a
-  # node left unpublished, a resubmit that rebuilds, and any overloaded
-  # answer. The production wave's size is not counted here: resolving the
+  # `scripts/preheat-cost.sh` fails on a per-event cost that grows from
+  # the first layer to the last, a node dispatched before its dependencies
+  # were published, a node left unpublished, a resubmit that rebuilds, and
+  # any overloaded answer. Monthly projection gates the combined cost.
+  # The production wave's size is not counted here: resolving the
   # production lanes outran this job's timeout beside the wave's builds,
   # so the `Production wave` job counts it.
   preheat-cost:
