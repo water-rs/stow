@@ -2741,8 +2741,14 @@ mod tests {
             &std::fs::read(dir.path().join("captured-records.json")).unwrap(),
         )
         .unwrap();
-        assert!(records.artifacts.is_empty());
-        assert!(records.local_programs.is_empty());
+        assert_eq!(
+            records.artifacts,
+            [] as [stow_types::api::ArtifactRecord; 0]
+        );
+        assert_eq!(
+            records.local_programs,
+            [] as [stow_types::records::LocalProcMacro; 0]
+        );
     }
 
     /// A seeded id at or below one the server already allocated, a
