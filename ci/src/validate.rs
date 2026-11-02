@@ -635,8 +635,44 @@ mod tests {
         DependencyClosure::from_packages(to_set(packages), to_set(lib_packages), BTreeSet::new())
     }
 
+    #[test]
+    fn shared_host_plan_publishes_both_shapes_from_one_bundle() {
+        use stow_types::public_cache::{UnitInvocation, UnitKind, UnitShape, UnitSide};
+        let mut plan = planned("demo", "1.0.0");
+        plan.unit_shape = UnitShape {
+            side: UnitSide::Host,
+            invocation: UnitInvocation::Native,
+            kind: UnitKind::Linked,
+        };
+        plan.shared_invocations = true;
+        plan.node_profile = stow_types::node_profile::NodeProfile::Release;
+        let published = stow_types::upload_plan::PublishedArtifact {
+            oci_digest: format!("sha256:{}", "a".repeat(64)),
+            bundle_digest: format!("sha256:{}", "b".repeat(64)),
+            bundle_size: 123,
+        };
+        let coordinates =
+            std::collections::BTreeMap::from([(plan.oci_reference.clone(), published.clone())]);
+        let floors = std::collections::BTreeMap::from([(plan.oci_reference.clone(), None)]);
+        let records =
+            stow_types::upload_plan::build_artifact_records(&[plan], &coordinates, &floors)
+                .expect("shared records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].unit_shape.invocation, UnitInvocation::Native);
+        assert_eq!(records[1].unit_shape.invocation, UnitInvocation::Target);
+        for record in &records {
+            assert_eq!(record.compile_key, records[0].compile_key);
+            assert_eq!(record.bundle_digest, published.bundle_digest);
+            assert_eq!(
+                record.node_profile,
+                stow_types::node_profile::NodeProfile::Release
+            );
+        }
+    }
+
     fn planned(crate_name: &str, version: &str) -> PlannedArtifact {
         let mut artifact = PlannedArtifact {
+            shared_invocations: false,
             dependency_task_ids: Vec::new(),
             compile_key: "0".repeat(64),
             crate_name: CrateName::parse(crate_name).unwrap(),

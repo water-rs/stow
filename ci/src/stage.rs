@@ -255,6 +255,7 @@ mod tests {
 
     fn planned(path: PathBuf, bytes: &[u8]) -> PlannedArtifact {
         PlannedArtifact {
+            shared_invocations: false,
             dependency_task_ids: Vec::new(),
             compile_key: "0".repeat(64),
             crate_name: CrateName::parse("demo").unwrap(),

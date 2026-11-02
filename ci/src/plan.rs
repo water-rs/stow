@@ -92,6 +92,7 @@ pub async fn build_upload_plan(
                 .await
                 .wrap_err_with(|| format!("artifact {}", artifact.crate_name))?,
             unit_shape: artifact.unit_shape,
+            shared_invocations: artifact.shared_invocations,
             native: artifact.native.clone(),
             native_archive: build_native_archive(artifact, expected)
                 .await
@@ -190,6 +191,8 @@ fn ensure_reconcilable_duplicate_compile_key(
             != dependency_compile_keys_json(&candidate.dependencies)?
         || existing.target != candidate.target
         || existing.rustc_version != candidate.rustc_version
+        || existing.unit_shape.side != candidate.unit_shape.side
+        || existing.unit_shape.kind != candidate.unit_shape.kind
         || existing.profile != candidate.profile
         || existing.emit != candidate.emit
         || existing.kind != candidate.kind
@@ -268,13 +271,23 @@ fn reconcile_duplicate_plan(
 ) -> stow_types::error::Result<()> {
     ensure_duplicate_plan_identity(existing, &candidate)?;
 
+    let shared_invocations = existing.shared_invocations
+        || candidate.shared_invocations
+        || existing.unit_shape.invocation != candidate.unit_shape.invocation;
     match plan_preference(existing).cmp(&plan_preference(&candidate)) {
         Ordering::Less => {
             *existing = candidate;
+            existing.shared_invocations = shared_invocations;
             Ok(())
         }
-        Ordering::Greater => Ok(()),
-        Ordering::Equal if plans_share_outputs(existing, &candidate) => Ok(()),
+        Ordering::Greater => {
+            existing.shared_invocations = shared_invocations;
+            Ok(())
+        }
+        Ordering::Equal if plans_share_outputs(existing, &candidate) => {
+            existing.shared_invocations = shared_invocations;
+            Ok(())
+        }
         Ordering::Equal => Err(stow_types::stow_error!(
             "duplicate upload plan artifact {} {} {} remained ambiguous after stable exact identity normalization",
             existing.crate_name,
@@ -298,6 +311,8 @@ fn ensure_duplicate_plan_identity(
         || existing.dependency_compile_keys_json != candidate.dependency_compile_keys_json
         || existing.target != candidate.target
         || existing.rustc_version != candidate.rustc_version
+        || existing.unit_shape.side != candidate.unit_shape.side
+        || existing.unit_shape.kind != candidate.unit_shape.kind
         || existing.profile != candidate.profile
         || existing.emit != candidate.emit
         || existing.oci_reference != candidate.oci_reference
@@ -751,6 +766,7 @@ mod tests {
         output_path: std::path::PathBuf,
     ) -> ScannedArtifact {
         ScannedArtifact {
+            shared_invocations: false,
             crate_name: crate_name.to_owned(),
             crate_version: crate_version.to_owned(),
             target: "aarch64-apple-darwin".to_owned(),
@@ -810,6 +826,44 @@ mod tests {
         );
         artifact.features_json = "[\"std\"]".to_owned();
         artifact
+    }
+
+    #[tokio::test]
+    async fn upload_plan_merges_observed_invocations_without_another_bundle() {
+        let root = tempfile::tempdir().expect("directory");
+        let path = root.path().join("libdemo-0123456789abcdef.rlib");
+        fs::write(&path, b"artifact").expect("artifact");
+        let mut native = scanned_lib_artifact(
+            "demo",
+            "1.0.0",
+            "captured-demo",
+            "0123456789abcdef",
+            8,
+            path,
+        );
+        native.unit_shape.side = stow_types::public_cache::UnitSide::Host;
+        native.unit_shape.invocation = stow_types::public_cache::UnitInvocation::Native;
+        let mut plans = build_upload_plan(
+            &[native],
+            &[],
+            &dependency_task_ids(),
+            stow_types::node_profile::NodeProfile::Release,
+            &crate::dep_scan::ProgramClaims::default(),
+        )
+        .await
+        .expect("plan");
+        assert_eq!(plans.len(), 1);
+        let mut explicit = plans[0].clone();
+        explicit.unit_shape.invocation = stow_types::public_cache::UnitInvocation::Target;
+        super::reconcile_duplicate_plan(&mut plans[0], explicit).expect("merge shape coverage");
+        assert!(plans[0].shared_invocations);
+        assert_eq!(
+            plans[0]
+                .unit_shape
+                .invocation_shapes(plans[0].shared_invocations)
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

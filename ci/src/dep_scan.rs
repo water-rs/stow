@@ -186,7 +186,14 @@ pub async fn scan_artifacts(
     // above, so reaching a different count is a bug in this file, not data.
     // The one deliberate exclusion is the proven-identical same-unit
     // captures a unit leaves in several phases.
-    if artifacts.len() + programs.completed.len() + programs.compiled.len()
+    if artifacts.len()
+        + programs
+            .completed
+            .iter()
+            .map(|program| &program.compile_key)
+            .collect::<BTreeSet<_>>()
+            .len()
+        + programs.compiled.len()
         != plan_eligible_captures
     {
         return Err(stow_types::stow_error!(
@@ -244,23 +251,28 @@ async fn plan_selected(
         if selected_artifact.artifact_kind == ArtifactKind::ProcMacro
             && selected_artifact.captured.reads_manifest_dir
         {
-            programs
-                .completed
-                .push(stow_types::records::LocalProcMacro {
-                    node: task.task_node_identity(),
-                    dependency_task_ids: task
-                        .verified_dependency_graph()?
-                        .dependency_task_ids(0)
-                        .ok_or_else(|| {
-                        stow_types::stow_error!("verified graph has no root")
-                    })?,
-                    dependency_c_metadata_json: crate::plan::dependency_c_metadata_json(
-                        &artifact.dependencies,
-                    )?,
-                    compile_key: artifact.captured_compile_key,
-                    c_metadata: stow_types::identity::CMetadata::parse(artifact.c_metadata)?,
-                    unit_shape: artifact.unit_shape,
-                });
+            let program = stow_types::records::LocalProcMacro {
+                node: task.task_node_identity(),
+                dependency_task_ids: task
+                    .verified_dependency_graph()?
+                    .dependency_task_ids(0)
+                    .ok_or_else(|| stow_types::stow_error!("verified graph has no root"))?,
+                dependency_c_metadata_json: crate::plan::dependency_c_metadata_json(
+                    &artifact.dependencies,
+                )?,
+                compile_key: artifact.captured_compile_key,
+                c_metadata: stow_types::identity::CMetadata::parse(artifact.c_metadata)?,
+                unit_shape: artifact.unit_shape,
+            };
+            programs.completed.extend(
+                program
+                    .unit_shape
+                    .invocation_shapes(artifact.shared_invocations)
+                    .map(|unit_shape| stow_types::records::LocalProcMacro {
+                        unit_shape,
+                        ..program.clone()
+                    }),
+            );
         } else {
             artifacts.push(artifact);
         }
@@ -502,6 +514,7 @@ fn select_captured_artifacts(
             artifact_kind,
             captured: captured.clone(),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         match select_captured_artifact(&mut selected, key, candidate)? {
             Selection::Selected => {}
@@ -627,6 +640,8 @@ fn select_captured_artifact(
     // per-phase. The dropped half's output paths stay resolvable as
     // aliases, so a dependent whose `--extern` names the other phase's
     // `deps` dir still finds its owner.
+    existing.shared_invocations |= candidate.shared_invocations
+        || existing.captured.invocation != candidate.captured.invocation;
     let dropped_output_paths = candidate
         .captured
         .outputs
@@ -1264,6 +1279,7 @@ async fn build_scanned_artifact(
         // invocation spelling the collector stamped on the capture, and
         // the emit set's link membership.
         unit_shape: unit_shape(task, artifact)?,
+        shared_invocations: !build_script && artifact.shared_invocations,
         build_script_out_dir: artifact.captured.build_script_out_dir.clone(),
         native: None,
     })
@@ -1946,6 +1962,8 @@ pub struct ScannedArtifact {
     /// side, the invocation spelling the collector stamped, and the emit
     /// set's link membership.
     pub unit_shape: stow_types::public_cache::UnitShape,
+    /// Verified captures covered both outer Cargo invocations.
+    pub shared_invocations: bool,
     /// Exact build-script `OUT_DIR` recorded at capture time, when the crate
     /// has a build script.
     pub build_script_out_dir: Option<PathBuf>,
@@ -1987,6 +2005,7 @@ struct SelectedCapturedArtifact {
     artifact_kind: ArtifactKind,
     captured: CapturedRustcArtifact,
     dependency_aliases: Vec<PathBuf>,
+    shared_invocations: bool,
 }
 
 impl SelectedCapturedArtifact {
@@ -2085,6 +2104,7 @@ mod tests {
                 "/tmp/workspace/target-check/debug/deps",
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let mut duplicate = first.captured.clone();
         duplicate.out_dir = PathBuf::from("/tmp/workspace/target-build/debug/deps");
@@ -2096,6 +2116,7 @@ mod tests {
             package,
             artifact_kind: ArtifactKind::Rlib,
             captured: duplicate,
+            shared_invocations: false,
             dependency_aliases: vec![PathBuf::from(
                 "/tmp/workspace/target-check/debug/deps/libitoa-1234.rmeta",
             )],
@@ -2150,6 +2171,7 @@ mod tests {
                 &"cd".repeat(32),
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let second = SelectedCapturedArtifact {
             package,
@@ -2160,6 +2182,7 @@ mod tests {
                 &"ef".repeat(32),
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
 
         select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
@@ -2238,6 +2261,7 @@ mod tests {
                 "/tmp/workspace/target/debug/deps",
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let mut different_outputs = first.captured.clone();
         different_outputs.outputs[0].sha256 = "ff".repeat(32);
@@ -2246,6 +2270,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: different_outputs,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
 
         select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
@@ -2327,12 +2352,14 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: check_capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let second = SelectedCapturedArtifact {
             package,
             artifact_kind: ArtifactKind::Rlib,
             captured: build_capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
 
         select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
@@ -2390,6 +2417,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: first_capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let mut different_unit = first.captured.clone();
         different_unit.out_dir =
@@ -2400,6 +2428,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: different_unit,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
 
         select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
@@ -2535,6 +2564,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -2617,6 +2647,12 @@ mod tests {
             .expect("the two invocation spellings are two selected artifacts");
         assert_eq!(selected.artifacts.len(), 2);
         assert_eq!(selected.absorbed_duplicates, 0);
+        assert!(
+            selected
+                .artifacts
+                .iter()
+                .all(|artifact| !artifact.shared_invocations)
+        );
     }
 
     #[test]
@@ -2638,6 +2674,7 @@ mod tests {
 
         let selected = select_captured_artifacts(&index, &[native, explicit])
             .expect("identical host compilation survives both Cargo spellings");
+        assert!(selected.artifacts[0].shared_invocations);
         assert_eq!(selected.artifacts.len(), 1);
         assert_eq!(selected.absorbed_duplicates, 1);
         assert!(selected.rlib_pairs.is_empty());
@@ -2882,6 +2919,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -2987,6 +3025,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: link_capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         };
         let leaf_output = PathBuf::from(
             "/tmp/workspace/target/aarch64-apple-darwin/debug/deps/libitoa-raw.rmeta",
@@ -3044,6 +3083,7 @@ mod tests {
                 artifact_kind: ArtifactKind::Rlib,
                 captured,
                 dependency_aliases: Vec::new(),
+                shared_invocations: false,
             }
         };
         let mut twin = make(&twin_dep_path, "libserde_json-twin.rlib");
@@ -3201,6 +3241,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: raw_lib_capture("itoa", "leaf-raw", Vec::new(), leaf_output.to_owned()),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -3233,6 +3274,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -3398,6 +3440,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }];
         let phase_units = phase_units(
             "/tmp/workspace/target",
@@ -3445,6 +3488,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: capture,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }];
         let phase_units = phase_units(
             "/tmp/workspace/target",
@@ -3482,6 +3526,7 @@ mod tests {
                 "/tmp/workspace/target/deps",
             ),
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }];
         let phase_units = phase_units(
             "/tmp/workspace/target",
@@ -3608,6 +3653,7 @@ mod tests {
                 reads_manifest_dir: false,
             },
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }
     }
 
@@ -4045,6 +4091,7 @@ mod tests {
             artifact_kind: ArtifactKind::Rlib,
             captured: own,
             dependency_aliases: Vec::new(),
+            shared_invocations: false,
         }];
         let owners = output_owner_index(&selected, &consumed).expect("owners");
 

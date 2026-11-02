@@ -3143,6 +3143,7 @@ mod tests {
         let output_path = root.join(&file_name);
         std::fs::write(&output_path, &output_bytes).expect("output file");
         PlannedArtifact {
+            shared_invocations: false,
             compile_key: format!("{C_METADATA}{C_METADATA}"),
             crate_name: CrateName::parse("serde").expect("name"),
             crate_version: "1.0.0".parse().expect("version"),
