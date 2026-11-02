@@ -125,7 +125,7 @@ pub async fn scan_artifacts(
         .filter(|captured| captured.restorable)
         .count();
 
-    let selected = select_captured_artifacts(&package_index, captured_artifacts)?;
+    let selected = select_captured_artifacts(&package_index, captured_artifacts, &host_target)?;
     // Merges whose rlib digests differed are not settled yet: the
     // archives must agree on what rustc wrote before the merged halves
     // can be treated as one unit's captures.
@@ -456,17 +456,10 @@ async fn verify_rlib_pair(pair: &RlibPair) -> stow_types::error::Result<()> {
 fn select_captured_artifacts(
     package_index: &PackageIndex,
     captured_artifacts: &[CapturedRustcArtifact],
+    host_target: &str,
 ) -> stow_types::error::Result<SelectedCaptures> {
-    let mut selected = BTreeMap::<
-        (
-            String,
-            String,
-            String,
-            String,
-            Option<stow_types::public_cache::UnitInvocation>,
-        ),
-        SelectedCapturedArtifact,
-    >::new();
+    let mut selected =
+        BTreeMap::<(String, String, String, String), SelectedCapturedArtifact>::new();
     let mut absorbed_duplicates = 0usize;
     let mut rlib_pairs = Vec::new();
     for captured in captured_artifacts {
@@ -500,14 +493,6 @@ fn select_captured_artifacts(
             artifact_kind.as_str().to_owned(),
             serde_json::to_string(&captured.emit)
                 .expect("captured emit serialization must succeed"),
-            // Host units with the same compiler identity are shared by
-            // both outer Cargo spellings. Distinct host profiles remain
-            // separate through the full compile key above.
-            if artifact_kind == ArtifactKind::BuildScript || captured.target.is_none() {
-                None
-            } else {
-                captured.invocation
-            },
         );
         let candidate = SelectedCapturedArtifact {
             package: package.clone(),
@@ -516,7 +501,7 @@ fn select_captured_artifacts(
             dependency_aliases: Vec::new(),
             shared_invocations: false,
         };
-        match select_captured_artifact(&mut selected, key, candidate)? {
+        match select_captured_artifact(&mut selected, key, candidate, host_target)? {
             Selection::Selected => {}
             Selection::Merged(pairs) => {
                 absorbed_duplicates += 1;
@@ -583,24 +568,10 @@ enum Selection {
 /// whose digests differ defers to the member-level check the returned
 /// [`Selection::Merged`] still owes.
 fn select_captured_artifact(
-    selected: &mut BTreeMap<
-        (
-            String,
-            String,
-            String,
-            String,
-            Option<stow_types::public_cache::UnitInvocation>,
-        ),
-        SelectedCapturedArtifact,
-    >,
-    key: (
-        String,
-        String,
-        String,
-        String,
-        Option<stow_types::public_cache::UnitInvocation>,
-    ),
+    selected: &mut BTreeMap<(String, String, String, String), SelectedCapturedArtifact>,
+    key: (String, String, String, String),
     candidate: SelectedCapturedArtifact,
+    host_target: &str,
 ) -> stow_types::error::Result<Selection> {
     let Some(existing) = selected.get_mut(&key) else {
         selected.insert(key, candidate);
@@ -608,7 +579,7 @@ fn select_captured_artifact(
     };
     // Two restorable records under one selection key are a duplicate: the
     // key already carries every identity dimension (crate, stable
-    // compile key, kind, emit, invocation), so a second record claiming it
+    // compile key, kind, emit), so a second record claiming it
     // is either the same rustc unit seen twice — a unit that links in
     // every cargo phase, like a build dependency or a proc macro, is
     // captured once per phase into that phase's own `CARGO_TARGET_DIR`,
@@ -618,7 +589,8 @@ fn select_captured_artifact(
     // anything else is a collision and aborts the scan, with both
     // records in the error so the field that tells them apart is on
     // the page.
-    let Some(rlib_pairs) = same_captured_unit(&existing.captured, &candidate.captured) else {
+    let Some(rlib_pairs) = same_captured_unit(&existing.captured, &candidate.captured, host_target)
+    else {
         return Err(stow_types::stow_error!(
             "dep_scan captured two different restorable artifacts for {} {} (c_metadata {}) emit {:?} — a duplicate identity means a forged or colliding record:\n{}\n{}",
             candidate.captured.crate_name,
@@ -685,10 +657,12 @@ fn select_captured_artifact(
 fn same_captured_unit(
     left: &CapturedRustcArtifact,
     right: &CapturedRustcArtifact,
+    host_target: &str,
 ) -> Option<Vec<RlibPair>> {
     let same_unit = left.crate_version == right.crate_version
         && left.crate_types == right.crate_types
-        && left.target == right.target
+        && left.target.as_deref().unwrap_or(host_target)
+            == right.target.as_deref().unwrap_or(host_target)
         && left.compile_key == right.compile_key
         && left.extra_filename == right.extra_filename
         && left.profile == right.profile
@@ -2085,7 +2059,6 @@ mod tests {
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -2122,8 +2095,9 @@ mod tests {
             )],
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        select_captured_artifact(&mut selected, key.clone(), second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        select_captured_artifact(&mut selected, key.clone(), second, "aarch64-apple-darwin")
             .expect("the same unit in another phase dir merges");
 
         let stored = selected.get(&key).expect("selected capture");
@@ -2152,7 +2126,6 @@ mod tests {
             "0c5856ca18b3a9e0".to_owned(),
             ArtifactKind::ProcMacro.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -2185,8 +2158,9 @@ mod tests {
             shared_invocations: false,
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        select_captured_artifact(&mut selected, key.clone(), second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        select_captured_artifact(&mut selected, key.clone(), second, "aarch64-apple-darwin")
             .expect("the same unit in another phase dir merges");
 
         let stored = selected.get(&key).expect("selected capture");
@@ -2242,7 +2216,6 @@ mod tests {
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -2273,8 +2246,9 @@ mod tests {
             shared_invocations: false,
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let error = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect_err("different outputs under one key must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
         // Both records travel in the error: which field tells them apart
@@ -2300,7 +2274,6 @@ mod tests {
             "788c0f768456711f".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\",\"metadata\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -2362,8 +2335,9 @@ mod tests {
             shared_invocations: false,
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let outcome = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let outcome = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect("differing rlib digests defer to the member check");
         let Selection::Merged(pairs) = outcome else {
             panic!("the second capture merges: {outcome:?}");
@@ -2396,7 +2370,6 @@ mod tests {
             "ef4a079a8dc04c32".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Target),
         );
         let mut selected = BTreeMap::new();
         let package = IndexedPackage {
@@ -2431,8 +2404,9 @@ mod tests {
             shared_invocations: false,
         };
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let error = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect_err("a different compile key under one key must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
     }
@@ -2456,9 +2430,11 @@ mod tests {
             "a40c71aa8d26bf90",
         ));
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let merged = select_captured_artifact(&mut selected, key.clone(), second)
-            .expect("captures differing only in the alias name are one unit");
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let merged =
+            select_captured_artifact(&mut selected, key.clone(), second, "aarch64-apple-darwin")
+                .expect("captures differing only in the alias name are one unit");
         let Selection::Merged(pairs) = merged else {
             panic!("the second capture merges into the first");
         };
@@ -2490,8 +2466,9 @@ mod tests {
         build_capture.outputs[2].sha256 = "ff".repeat(32);
         let second = psm_selection(build_capture);
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let outcome = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let outcome = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect("differing alias bytes defer to the member check");
         let Selection::Merged(pairs) = outcome else {
             panic!("the second capture merges: {outcome:?}");
@@ -2534,20 +2511,20 @@ mod tests {
         );
         let second = psm_selection(build_capture);
 
-        select_captured_artifact(&mut selected, key.clone(), first).expect("select first");
-        let error = select_captured_artifact(&mut selected, key, second)
+        select_captured_artifact(&mut selected, key.clone(), first, "aarch64-apple-darwin")
+            .expect("select first");
+        let error = select_captured_artifact(&mut selected, key, second, "aarch64-apple-darwin")
             .expect_err("a stable output under another name must fail");
         assert!(error.to_string().contains("duplicate identity"), "{error}");
     }
 
     /// The selection key the `psm 0.1.24` host-side captures share.
-    fn psm_key() -> (String, String, String, String, Option<UnitInvocation>) {
+    fn psm_key() -> (String, String, String, String) {
         (
             "psm".to_owned(),
             "cc065d16221ef4be".to_owned(),
             ArtifactKind::Rlib.as_str().to_owned(),
             "[\"dep-info\",\"link\"]".to_owned(),
-            Some(UnitInvocation::Native),
         )
     }
 
@@ -2643,8 +2620,9 @@ mod tests {
         explicit.target = None;
         explicit.invocation = Some(stow_types::public_cache::UnitInvocation::Target);
 
-        let selected = select_captured_artifacts(&index, &[native, explicit])
-            .expect("the two invocation spellings are two selected artifacts");
+        let selected =
+            select_captured_artifacts(&index, &[native, explicit], "aarch64-apple-darwin")
+                .expect("the two invocation spellings are two selected artifacts");
         assert_eq!(selected.artifacts.len(), 2);
         assert_eq!(selected.absorbed_duplicates, 0);
         assert!(
@@ -2672,8 +2650,9 @@ mod tests {
         explicit.profile = native.profile.clone();
         explicit.invocation = Some(UnitInvocation::Target);
 
-        let selected = select_captured_artifacts(&index, &[native, explicit])
-            .expect("identical host compilation survives both Cargo spellings");
+        let selected =
+            select_captured_artifacts(&index, &[native, explicit], "aarch64-apple-darwin")
+                .expect("identical host compilation survives both Cargo spellings");
         assert!(selected.artifacts[0].shared_invocations);
         assert_eq!(selected.artifacts.len(), 1);
         assert_eq!(selected.absorbed_duplicates, 1);
@@ -2682,6 +2661,60 @@ mod tests {
             path.file_name()
                 .is_some_and(|name| name == "libpsm-a40c71aa8d26bf90.rlib")
         }));
+    }
+
+    #[test]
+    fn identical_target_release_units_merge_across_cargo_spellings() {
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("psm".to_owned())
+            .or_default()
+            .insert("0.1.24".to_owned(), indexed("psm", "0.1.24"));
+        let mut native = psm_capture("/tmp/workspace/target-native", "8e5bdc87bc91e8f0");
+        native.target = None;
+        native.profile.opt_level = "3".to_owned();
+        native.profile.debug_assertions = false;
+        native.profile.overflow_checks = false;
+        let mut explicit = native.clone();
+        explicit.target = Some("aarch64-apple-darwin".to_owned());
+        explicit.invocation = Some(UnitInvocation::Target);
+        explicit.outputs = psm_capture("/tmp/workspace/target-target", "a40c71aa8d26bf90").outputs;
+
+        let selected =
+            select_captured_artifacts(&index, &[native, explicit], "aarch64-apple-darwin")
+                .expect("identical target compilation survives both Cargo spellings");
+        assert_eq!(selected.artifacts.len(), 1);
+        assert_eq!(selected.absorbed_duplicates, 1);
+        assert!(selected.artifacts[0].shared_invocations);
+        assert!(selected.artifacts[0].dependency_aliases.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "libpsm-a40c71aa8d26bf90.rlib")
+        }));
+    }
+
+    #[test]
+    fn native_and_foreign_targets_with_one_compile_key_are_rejected() {
+        let mut selected = BTreeMap::new();
+        let mut native = psm_capture("/tmp/workspace/target-native", "8e5bdc87bc91e8f0");
+        native.target = None;
+        let mut foreign = native.clone();
+        foreign.target = Some("wasm32-unknown-unknown".to_owned());
+        foreign.invocation = Some(UnitInvocation::Target);
+        select_captured_artifact(
+            &mut selected,
+            psm_key(),
+            psm_selection(native),
+            "aarch64-apple-darwin",
+        )
+        .expect("select native unit");
+        let error = select_captured_artifact(
+            &mut selected,
+            psm_key(),
+            psm_selection(foreign),
+            "aarch64-apple-darwin",
+        )
+        .expect_err("a foreign target is a different compiler identity");
+        assert!(error.to_string().contains("duplicate identity"), "{error}");
     }
 
     /// A package's `build.rs` compile as the wrapper records it: the
@@ -2752,7 +2785,8 @@ mod tests {
             PathBuf::from("/tmp/w/target-target/stable/build_script_build-aaaaaaaaaaaaaaaa");
 
         let selected =
-            select_captured_artifacts(&index, &[native, targeted]).expect("both spellings select");
+            select_captured_artifacts(&index, &[native, targeted], "aarch64-apple-darwin")
+                .expect("both spellings select");
         assert_eq!(selected.artifacts.len(), 1);
         assert_eq!(selected.absorbed_duplicates, 1);
         let artifact = &selected.artifacts[0];
@@ -2797,7 +2831,7 @@ mod tests {
         );
         captured.crate_version = Some("1.0.15".to_owned());
 
-        let error = select_captured_artifacts(&index, &[captured])
+        let error = select_captured_artifacts(&index, &[captured], "aarch64-apple-darwin")
             .expect_err("an unattributable restorable record must fail");
         assert!(error.to_string().contains("could not attribute"), "{error}");
     }
@@ -2819,7 +2853,7 @@ mod tests {
         captured.crate_version = Some("1.0.15".to_owned());
         captured.crate_types = vec!["bin".to_owned()];
 
-        let error = select_captured_artifacts(&index, &[captured])
+        let error = select_captured_artifacts(&index, &[captured], "aarch64-apple-darwin")
             .expect_err("an unclassifiable restorable record must fail");
         assert!(error.to_string().contains("could not classify"), "{error}");
     }
