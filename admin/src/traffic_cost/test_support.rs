@@ -66,11 +66,6 @@ pub(super) fn fixture_cpu(scale: impl Fn(&str) -> f64) -> WorkerCpuReport {
         sampling_interval_us: 100,
         idle_window_ms: 3000,
         idle_cpu_ms: 0.0,
-        reference: ReferenceCpu {
-            rounds_before: vec![FIXTURE_REFERENCE_CPU_MS],
-            rounds_after: vec![FIXTURE_REFERENCE_CPU_MS],
-            cpu_ms: FIXTURE_REFERENCE_CPU_MS,
-        },
         rows: WORKER_CPU_BUDGETS
             .iter()
             .map(|budget| {
@@ -81,6 +76,12 @@ pub(super) fn fixture_cpu(scale: impl Fn(&str) -> f64) -> WorkerCpuReport {
                     events_per_round: 20,
                     rounds_cpu_ms: vec![cpu_ms],
                     cpu_ms,
+                    reference: ReferenceCpu {
+                        rounds_before: vec![FIXTURE_REFERENCE_CPU_MS],
+                        rounds_after: vec![FIXTURE_REFERENCE_CPU_MS],
+                        cpu_ms: FIXTURE_REFERENCE_CPU_MS,
+                        drift: 1.0,
+                    },
                     relative_cpu,
                     budget_relative_cpu: budget.relative_cpu,
                     budget_ms: budget.relative_cpu * FIXTURE_REFERENCE_CPU_MS,

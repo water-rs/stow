@@ -1,6 +1,6 @@
 // The Traffic cost CPU pass's reference workload (stow#932): a fixed
 // program `stow-admin traffic-cost cpu` evaluates in the edge isolate
-// through the inspector, before and after the lanes, so each lane's CPU
+// through the inspector, before and after every lane, so each lane's CPU
 // is gated relative to what this costs on the same runner. It does the
 // two kinds of work the lanes spend their CPU on, and changing anything
 // here changes every budget's unit: re-derive WORKER_CPU_BUDGETS and the
