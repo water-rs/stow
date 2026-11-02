@@ -449,12 +449,15 @@ RUSTC_VERSION="$(rustc --version | awk '{print $2}')"
 HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
 RUSTUP_HOME_REAL="$(rustup show home)"
 # The environment every stow process of this run gets: its own home,
-# config and cargo home, with the real rustup toolchains.
+# config and cargo home, with the real rustup toolchains. Log assertions
+# read tracing fields as text, so the caller's color policy cannot apply.
 ISOLATED_ENV=(
     HOME="$WORK_DIR/home"
     XDG_CONFIG_HOME="$WORK_DIR/config"
     CARGO_HOME="$WORK_DIR/cargo-home"
     RUSTUP_HOME="$RUSTUP_HOME_REAL"
+    NO_COLOR=1
+    CARGO_TERM_COLOR=never
 )
 [ -n "$RUSTC_VERSION" ] && [ -n "$HOST_TARGET" ] || die "could not detect rustc version/host"
 
