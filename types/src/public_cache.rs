@@ -677,6 +677,21 @@ pub struct UnitShape {
     pub kind: UnitKind,
 }
 
+impl UnitShape {
+    /// The observed shapes of one artifact. Sharing is recorded only after
+    /// captures from both Cargo invocations prove the same compiler identity.
+    pub fn invocation_shapes(self, shared_invocations: bool) -> impl Iterator<Item = Self> {
+        let other = Self {
+            invocation: match self.invocation {
+                UnitInvocation::Native => UnitInvocation::Target,
+                UnitInvocation::Target => UnitInvocation::Native,
+            },
+            ..self
+        };
+        std::iter::once(self).chain(shared_invocations.then_some(other))
+    }
+}
+
 /// The shapes a node's published artifact set must cover before a
 /// dependent may consume it.
 ///
