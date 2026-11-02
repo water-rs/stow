@@ -127,6 +127,19 @@ impl NodeProfile {
         self.definition().host
     }
 
+    /// Whether Cargo can share this profile's host unit with a target unit.
+    /// Cargo may promote deferred host debuginfo, but leaves all other
+    /// compile settings unchanged when interning native units.
+    #[must_use]
+    pub fn host_can_share_target(self, target: Self) -> bool {
+        let target = target.target_settings();
+        let host = ProfileSettings {
+            debuginfo: target.debuginfo,
+            ..self.host_settings()
+        };
+        host == target
+    }
+
     /// The named profile a unit compiled with `profile` belongs to, `None`
     /// when its settings are none of the defined profiles' — a custom
     /// profile with other settings has no node and is served from the

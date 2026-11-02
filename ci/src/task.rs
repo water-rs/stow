@@ -1088,7 +1088,8 @@ fn assert_native_sharing_verdicts(
             continue;
         }
         let cargo_shared = origin == twin_origin;
-        let predicate_shared = !kept_apart.contains(&unit.key);
+        let predicate_shared =
+            unit.profile.host_can_share_target(twin.profile) && !kept_apart.contains(&unit.key);
         if cargo_shared != predicate_shared {
             return Err(stow_types::stow_error!(
                 "cargo {} the `{}` {} host/target twin pair but the sharing predicate {} — a probe input the builder does not model disagreed",
