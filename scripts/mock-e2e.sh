@@ -396,6 +396,12 @@ prepare_consumer() {
         || die "stow setup wrote no $WORK_DIR/cargo-home/config.toml"
 }
 
+# Detached journal work can still hold the state database after a check
+# exits. Let SQLite wait for that transaction, with a bounded failure.
+read_cache_stats() {
+    sqlite3 -cmd '.timeout 5000' "$WORK_DIR/stow-cache/state-v3.sqlite3" "$@"
+}
+
 # crate_stats is the CLI's own evidence a unit was served from the
 # signed slice rather than compiled: every named crate (canonical rustc
 # spelling — dashes are underscores) must show at least $1 cumulative
@@ -407,8 +413,8 @@ assert_served() {
     [ -f "$state_db" ] || die "stow state DB missing at $state_db"
     for dep in "$@"; do
         canonical="${dep//-/_}"
-        hits="$(sqlite3 "$state_db" "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$canonical'")"
-        errors="$(sqlite3 "$state_db" "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$canonical'")"
+        hits="$(read_cache_stats "SELECT COALESCE(SUM(hits),0) FROM crate_stats WHERE crate_name='$canonical'")"
+        errors="$(read_cache_stats "SELECT COALESCE(SUM(errors),0) FROM crate_stats WHERE crate_name='$canonical'")"
         echo "[mock-e2e] $dep: hits=$hits errors=$errors"
         [ "$hits" -ge "$min_hits" ] \
             || die "$dep was not served from the cache (hits=$hits, expected at least $min_hits)"
@@ -1719,7 +1725,7 @@ fg publish_slices "superset"
 fg stow_cli index refresh >"$LOG_DIR/index-refresh-superset.log" 2>&1 \
     || die "stow index refresh (superset) failed — see $LOG_DIR/index-refresh-superset.log"
 
-superset_stats_before="$(sqlite3 "$WORK_DIR/stow-cache/state-v3.sqlite3" \
+superset_stats_before="$(read_cache_stats \
     "SELECT COALESCE(SUM(misses),0), COALESCE(SUM(local_dependency_builds),0) \
      FROM crate_stats WHERE crate_name='once_cell'")"
 SUPERSET_CONSUMER="$WORK_DIR/once_cell-subset-consumer"
@@ -1738,7 +1744,7 @@ inexact_enqueues_before="$(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log" 2>
 fg in_dir "$SUPERSET_CONSUMER" stow_cli check >"$LOG_DIR/stow-check-subset.log" 2>&1 \
     || die "stow check (subset) failed — see $LOG_DIR/stow-check-subset.log"
 
-superset_stats_after="$(sqlite3 "$WORK_DIR/stow-cache/state-v3.sqlite3" \
+superset_stats_after="$(read_cache_stats \
     "SELECT COALESCE(SUM(hits),0), COALESCE(SUM(misses),0), COALESCE(SUM(local_dependency_builds),0) \
      FROM crate_stats WHERE crate_name='once_cell'")"
 echo "[mock-e2e] once_cell subset serve: before={misses,local}=$superset_stats_before after={hits,misses,local}=$superset_stats_after"
@@ -1793,7 +1799,7 @@ rm -rf "$SUPERSET_CONSUMER/target"
 enqueues_before_exact="$(grep -c 'POST /api/v1/enqueue' "$LOG_DIR/edge.log")"
 fg in_dir "$SUPERSET_CONSUMER" stow_cli check >"$LOG_DIR/stow-check-exact.log" 2>&1 \
     || die "stow check (exact) failed — see $LOG_DIR/stow-check-exact.log"
-exact_stats="$(sqlite3 "$WORK_DIR/stow-cache/state-v3.sqlite3" \
+exact_stats="$(read_cache_stats \
     "SELECT COALESCE(SUM(hits),0), COALESCE(SUM(misses),0), COALESCE(SUM(local_dependency_builds),0) \
      FROM crate_stats WHERE crate_name='once_cell'")"
 echo "[mock-e2e] once_cell exact serve: after={hits,misses,local}=$exact_stats"

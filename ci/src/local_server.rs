@@ -497,7 +497,11 @@ impl LocalServerState {
     ) -> stow_types::error::Result<()> {
         let dir = tempfile::tempdir()?;
         let records_path = dir.path().join("records.json");
-        async_fs::write(&records_path, "[]").await?;
+        async_fs::write(
+            &records_path,
+            serde_json::to_vec(&stow_types::records::BuildRecords::default())?,
+        )
+        .await?;
         let pushes: Vec<_> = seeded
             .runs
             .iter()
@@ -1917,7 +1921,7 @@ async fn push_records(
             std::env::consts::EXE_SUFFIX
         ));
     // An empty plan leaves no records.json — the records artifact carries
-    // the empty set, exactly like production's `push_records(&[])`.
+    // the empty BuildRecords value, exactly like production.
     if !records_path.exists() {
         async_fs::write(
             records_path,
@@ -2720,6 +2724,30 @@ mod tests {
                 .publish_seeded_records(&succeeded, &ids, &exe)
                 .await
                 .is_err()
+        );
+
+        // Exercise the successful subprocess handoff too: its input must
+        // decode with the same schema the real mock registry reads.
+        std::fs::write(
+            dir.path().join("stow-mock-registry"),
+            include_str!("../tests/fixtures/capture-records.sh"),
+        )
+        .unwrap();
+        state
+            .publish_seeded_records(&succeeded, &ids, &exe)
+            .await
+            .unwrap();
+        let records: stow_types::records::BuildRecords = serde_json::from_slice(
+            &std::fs::read(dir.path().join("captured-records.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            records.artifacts,
+            [] as [stow_types::api::ArtifactRecord; 0]
+        );
+        assert_eq!(
+            records.local_programs,
+            [] as [stow_types::records::LocalProcMacro; 0]
         );
     }
 
