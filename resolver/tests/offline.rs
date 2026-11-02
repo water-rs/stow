@@ -1089,15 +1089,10 @@ fn a_resolver_two_host_unit_gates_its_platform_deps_on_the_host() {
     assert_eq!(dep_names(target), ["w"]);
 }
 
-/// `leaf` is a normal dep of the root and a normal dep of the proc-macro
-/// `pm`, at the same features: a native `cargo build` dedups it into one
-/// unit — the normal one — and `pm`'s extern resolves to that artifact.
-/// The emitted edge mirrors cargo: `pm`'s host unit names `leaf` at both
-/// sides — the host unit for the `--target` spelling under which the
-/// split stands, and the deduped normal unit the native spelling links
-/// (stow#506).
+/// Raw edges preserve Cargo's feature-resolution sides. Native sharing
+/// pins are added only after the projection selects a codegen profile.
 #[test]
-fn a_host_dep_shared_with_a_normal_one_emits_the_deduped_edge() {
+fn host_dependency_sharing_is_projected_per_profile() {
     let work = tempfile::tempdir().unwrap();
     let reg = work.path().join("registry");
     std::fs::create_dir_all(&reg).unwrap();
@@ -1149,14 +1144,29 @@ fn a_host_dep_shared_with_a_normal_one_emits_the_deduped_edge() {
         .filter(|dep| dep.name == "leaf")
         .map(|dep| dep.key.side)
         .collect();
-    assert!(
-        leaf_sides.contains(&StowSide::Target),
-        "the native spelling dedups `leaf` to the normal unit: {leaf_sides:?}"
-    );
-    assert!(
-        leaf_sides.contains(&StowSide::Host),
-        "the `--target` spelling keeps the host unit's edge: {leaf_sides:?}"
-    );
+    assert_eq!(leaf_sides, vec![StowSide::Host]);
+    for profile in stow_types::node_profile::NodeProfile::ALL {
+        let (requests, _) = stow_resolver::enqueue_requests_from_output(
+            &out[0].1.units,
+            pinned_rustc_version(),
+            stow_types::api::EnqueueSource::CrateUpdate,
+            0,
+            profile,
+        )
+        .unwrap();
+        let pm = requests
+            .iter()
+            .find(|request| request.crate_name.as_str() == "pm")
+            .unwrap();
+        let deps = pm.depends_on().unwrap();
+        let leaf_sides = deps
+            .iter()
+            .filter(|dep| dep.crate_name.as_str() == "leaf")
+            .map(|dep| dep.host_side)
+            .collect::<Vec<_>>();
+        assert!(leaf_sides.contains(&true));
+        assert_eq!(leaf_sides.contains(&false), profile == DEV);
+    }
 }
 
 /// The dedup is exact: `leaf`'s host and normal feature sets differ, so

@@ -254,8 +254,8 @@ impl<'u> UnitIndex<'u> {
     }
 }
 
-/// Every `(host lib, target twin)` pair cargo keeps apart under a
-/// native build (stow#723).
+/// Every profile-compatible `(host lib, target twin)` pair Cargo keeps
+/// apart because of its dependencies under a native build (stow#723).
 ///
 /// For each crates.io host lib unit `X_h` whose same-package,
 /// same-platform, same-features target-side twin `X_t` exists, the pair
@@ -267,7 +267,9 @@ impl<'u> UnitIndex<'u> {
 ///
 /// The twin lookup is the same `dedup_shadow_edges` performs: side
 /// flipped, package and platform identical, features compared as sets —
-/// a different-feature twin is never shared (stow#722). Whether cargo
+/// a different-feature twin is never shared (stow#722). Profiles whose
+/// host and target codegen differ cannot promote or share the host unit,
+/// so they need no self-twin context edge. Whether cargo
 /// merges the pair is the recursive interning rule of
 /// `traverse_and_share`: a host unit and a target unit intern to one
 /// unit only when every interned field matches, and `new_dep_hash`
@@ -296,7 +298,7 @@ pub fn self_twin_edges(units: &[TaskUnit]) -> Result<Vec<(&TaskUnit, &TaskUnit)>
         let Some(target) = index.lib(&target_key) else {
             continue;
         };
-        if !same_features(unit, target) {
+        if !same_features(unit, target) || !unit.profile.host_can_share_target(target.profile) {
             continue;
         }
         if !twins_shareable(&index, unit, target, &mut memo)? {
@@ -375,6 +377,7 @@ fn deps_pair<'u>(
         || host_dep.key.pkg != target_dep.key.pkg
         || host_dep.key.platform != target_dep.key.platform
         || !same_features(host_dep, target_dep)
+        || !host_dep.profile.host_can_share_target(target_dep.profile)
     {
         return Ok(false);
     }
@@ -604,7 +607,9 @@ pub fn resolved_task_graph(
 /// the target unit exists in the consumer's resolve either way — as
 /// the shared unit in outcome 2 and as the distinct unit in outcome 3
 /// (stow#723, where [`self_twin_edges`] decides sharing recursively) —
-/// so the task pins it whenever it resolves. A different-feature twin
+/// so the task pins it whenever its profile can share the two sides.
+/// Release host codegen cannot share the target codegen and needs no pin.
+/// A different-feature twin
 /// never shares and resolves as its own identity, so pinning it
 /// reproduces nothing a consumer computes and makes the task compile
 /// units no node publishes (stow#722).
@@ -639,6 +644,7 @@ fn dedup_shadow_edges<'u>(
             if dep_unit.is_crates_io
                 && let Some(target) = by_key(&target_key)
                 && target.is_crates_io
+                && dep_unit.profile.host_can_share_target(target.profile)
                 && target.features.iter().collect::<BTreeSet<_>>()
                     == dep_unit.features.iter().collect::<BTreeSet<_>>()
             {
@@ -781,6 +787,25 @@ mod tests {
         let deps = &edges[&owner_node];
         assert!(deps.contains(&host_dep_node));
         assert!(!deps.contains(&other_node));
+    }
+
+    /// Release host units cannot share target codegen, so a target twin
+    /// never changes a host dependency's identity or adds a shadow pin.
+    #[test]
+    fn release_twins_add_neither_shadow_nor_self_edges() {
+        let mut host = crates_io_lib("dep", "1.0.0", TaskUnitSide::Host, &[]);
+        let mut target = crates_io_lib("dep", "1.0.0", TaskUnitSide::Target, &[]);
+        let mut owner = crates_io_lib("owner", "1.0.0", TaskUnitSide::Host, &[]);
+        for unit in [&mut host, &mut target, &mut owner] {
+            unit.profile = crate::node_profile::NodeProfile::Release;
+        }
+        owner.deps.push(dep_on(&host));
+        let baseline = task_graph(&[host.clone(), owner.clone()]).unwrap();
+        let with_twin = task_graph(&[host.clone(), owner.clone(), target]).unwrap();
+        for unit in [host, owner] {
+            let node = task_node(&unit).unwrap();
+            assert_eq!(baseline.1[&node], with_twin.1[&node]);
+        }
     }
 
     /// One lib dep wired from a parent unit.
