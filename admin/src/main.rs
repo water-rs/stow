@@ -1137,6 +1137,7 @@ async fn submit_command(
         },
         &requests,
     )?];
+    let published = manual::coverage_for_trees(&trees).await?;
     render::mutation(
         output,
         trees,
@@ -1169,7 +1170,7 @@ async fn submit_command(
         },
         args.yes
             .then_some(async move |trees: &Vec<stow_types::api::SubmissionTree>| {
-                projects::submit_chunked(edge, trees).await
+                projects::submit_chunked(edge, trees, &published).await
             }),
     )
     .await

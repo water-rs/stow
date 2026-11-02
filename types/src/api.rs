@@ -4879,7 +4879,10 @@ impl SubmissionTree {
     /// # Errors
     /// `Error` when one node's dependency subtree alone serializes past
     /// `max_bytes` — no split can carry it.
-    pub fn into_bodies(trees: &[Self], max_bytes: usize) -> crate::error::Result<Vec<Vec<Self>>> {
+    pub fn into_bodies<'a>(
+        trees: impl IntoIterator<Item = &'a Self>,
+        max_bytes: usize,
+    ) -> crate::error::Result<Vec<Vec<Self>>> {
         // A body's `[` and `]`; trees inside it are `,`-separated.
         let budget = max_bytes
             .checked_sub(2)
