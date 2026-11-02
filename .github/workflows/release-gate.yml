@@ -272,7 +272,13 @@ jobs:
       # repo's 10 GB Actions allowance is not spent on per-request saves.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
-          path: ${{ runner.temp }}/stow-resolve-cargo
+          # Cargo recreates extracted sources and Git checkouts from these
+          # downloads. Saving the whole home duplicated both representations
+          # across every resolver worker (20.95 GB in run 41415926146).
+          path: |
+            ${{ runner.temp }}/stow-resolve-cargo/**/registry/index
+            ${{ runner.temp }}/stow-resolve-cargo/**/registry/cache
+            ${{ runner.temp }}/stow-resolve-cargo/**/git/db
           key: production-wave-cargo-${{ runner.os }}-${{ steps.rustc-version.outputs.version }}-${{ steps.cache-stamp.outputs.day }}
           restore-keys: |
             production-wave-cargo-${{ runner.os }}-${{ steps.rustc-version.outputs.version }}-
