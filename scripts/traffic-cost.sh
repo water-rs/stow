@@ -323,7 +323,7 @@ BUNDLE_DIGEST="$("$BIN/stow-mock-registry" put-blob --size "$BUNDLE_BYTES" \
     --registry-root "$WORK_DIR/mock-registry" | jq -r .digest)"
 jq --arg rustc "$RUSTC_VERSION" --arg digest "$BUNDLE_DIGEST" --argjson size "$BUNDLE_BYTES" '
     map(.rustc_version = $rustc
-        | .oci_reference = "ghcr.io/water-rs/stow-cache-\($rustc):serde.1.0.219-x86_64-unknown-linux-gnu"
+        | .oci_reference = "ghcr.io/water-rs/stow-cache-v2-\($rustc):serde.1.0.219-x86_64-unknown-linux-gnu"
         | .bundle_digest = $digest
         | .bundle_size = $size)
     | {artifacts: ., local_programs: []}

@@ -708,7 +708,7 @@ mod tests {
             .and_then(crate::file_lock::FileLock::shared)
             .expect("create lease lock");
         let manifest = ArtifactBundleManifest {
-            oci_reference: "ghcr.io/water-rs/stow-cache-1.91.1:itoa.test".to_owned(),
+            oci_reference: "ghcr.io/water-rs/stow-cache-v2-1.91.1:itoa.test".to_owned(),
             oci_digest: "sha256:test".to_owned(),
             config: ArtifactBlobConfig {
                 dependency_identity: stow_types::identity::DependencyIdentity::leaf()

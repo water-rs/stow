@@ -609,7 +609,7 @@ pub struct ArtifactRecord {
     /// are the node's task-graph edges: build-dependency libs and shadow
     /// twins included, which the `--extern` list never names.
     pub dependency_task_ids: Vec<String>,
-    /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache-<rustc>:serde.1.0.0-...").
+    /// OCI reference (e.g., "ghcr.io/water-rs/stow-cache-v2-<rustc>:serde.1.0.0-...").
     pub oci_reference: String,
     /// OCI manifest digest (e.g., "sha256:...").
     pub oci_digest: String,

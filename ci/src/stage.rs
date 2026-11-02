@@ -280,7 +280,7 @@ mod tests {
                 strip: stow_types::platform::StripLevel::None,
             },
             emit: vec!["link".to_owned()],
-            oci_reference: "ghcr.io/water-rs/stow-cache-1.91.1:demo.test".to_owned(),
+            oci_reference: "ghcr.io/water-rs/stow-cache-v2-1.91.1:demo.test".to_owned(),
             kind: ArtifactKind::Rlib,
             crate_types: vec![RustCrateType::Lib],
             artifact_size: bytes.len() as u64,

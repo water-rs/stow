@@ -101,7 +101,7 @@ pub enum IndexCommand {
     /// export so the next run converges on the published state.
     Reconcile(IndexReconcileArgs),
     /// Print every stable rustc with a published
-    /// `ghcr.io/water-rs/stow-cache-<rustc>` package, one per line: the
+    /// `ghcr.io/water-rs/stow-cache-v2-<rustc>` package, one per line: the
     /// releases `static.rust-lang.org/manifests.txt` lists, each probed
     /// through the registry's anonymous tag listing. `operations.yml`
     /// reports each one's slices after a scheduler reset. Fails when a
@@ -1336,11 +1336,12 @@ async fn probe_published(
     use futures_util::{StreamExt as _, TryStreamExt as _};
     let published: Vec<WireRustcVersion> = futures_util::stream::iter(candidates)
         .map(|rustc| async move {
+            let repository = cache_repository(&rustc);
             let holds_tags = base
-                .session(&cache_repository(&rustc), http)
+                .session(&repository, http)
                 .has_tags()
                 .await
-                .map_err(|error| stow_error!("probe stow-cache-{rustc}: {error}"))?;
+                .map_err(|error| stow_error!("probe {repository}: {error}"))?;
             Ok::<_, stow_types::error::Error>(holds_tags.then_some(rustc))
         })
         .buffered(concurrency)
@@ -1643,9 +1644,9 @@ mod tests {
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.88.0";
-    /// The canonical `ghcr.io/water-rs/stow-cache-<RUSTC>` signed
+    /// The canonical `ghcr.io/water-rs/stow-cache-v2-<RUSTC>` signed
     /// references bind.
-    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-1.88.0";
+    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-v2-1.88.0";
     /// A second rustc's tags the pass must never pull.
     const OTHER_RUSTC: &str = "1.99.0";
 
@@ -2536,7 +2537,7 @@ mod tests {
 
         // The transport pull reference the signature materials fetch
         // through — the value verification compared before the fix.
-        let transport = format!("127.0.0.1:28123/water-rs/stow-cache-1.88.0:{tag}");
+        let transport = format!("127.0.0.1:28123/water-rs/stow-cache-v2-1.88.0:{tag}");
         assert!(stow_oci::verify::verify_payload_identity(&payload, &transport, digest).is_err());
     }
 
@@ -2933,7 +2934,10 @@ mod tests {
                 steps.extend(probe_steps(
                     base,
                     respond(200, TOKEN),
-                    respond(200, r#"{"name":"water-rs/stow-cache-1.101.0","tags":null}"#),
+                    respond(
+                        200,
+                        r#"{"name":"water-rs/stow-cache-v2-1.101.0","tags":null}"#,
+                    ),
                 ));
                 steps.extend(probe_steps(
                     base,
@@ -2962,6 +2966,9 @@ mod tests {
             &["1.98.0"],
         ))
         .expect_err("a refusal is not 'unpublished'");
-        assert!(error.to_string().contains("stow-cache-1.98.0"), "{error}");
+        assert!(
+            error.to_string().contains("stow-cache-v2-1.98.0"),
+            "{error}"
+        );
     }
 }
