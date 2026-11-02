@@ -1208,8 +1208,7 @@ impl CompilationMode for CachedCompilation {
         cargo_home: &Path,
     ) -> stow_types::error::Result<BuildWorkspace> {
         let mirror_key = workspace_mirror::MirrorTaskKey {
-            target: task.target.as_str().to_owned(),
-            rustc_version: task.rustc_version.as_str().to_owned(),
+            task_id: task.task_id.clone(),
             preserve_lockfile: task.preserve_lockfile,
         };
         let workspace = stabilize_workspace(create_workspace(task).await?, &mirror_key).await?;
@@ -3173,6 +3172,63 @@ mod tests {
             workspace_root.path().join("demo-1.2.3/Cargo.lock").exists(),
             "unpack must not delete the bundled Cargo.lock; preserve_lockfile reads it verbatim"
         );
+    }
+
+    #[test]
+    fn distinct_node_profiles_preserve_each_others_capture_snapshots() {
+        smol::block_on(async {
+            async fn prepare(task: &BuildTaskPayload) -> BuildWorkspace {
+                let dir = TempDir::new().expect("source workspace");
+                let root = dir.path().to_path_buf();
+                std::fs::write(root.join("Cargo.toml"), wrapper_manifest(task).unwrap()).unwrap();
+                let workspace = BuildWorkspace {
+                    _tempdir: Some(dir),
+                    manifest_path: root.join("Cargo.toml"),
+                    workspace_root: root,
+                    capture_dir: PathBuf::new(),
+                    bundled_lockfile: None,
+                };
+                super::stabilize_workspace(
+                    workspace,
+                    &crate::workspace_mirror::MirrorTaskKey {
+                        task_id: task.task_id.clone(),
+                        preserve_lockfile: task.preserve_lockfile,
+                    },
+                )
+                .await
+                .expect("prepare stable workspace")
+            }
+
+            let namespace = TempDir::new().expect("test namespace");
+            let mut dev = task_with_features(&[]);
+            dev.task_id = format!("{}-dev", namespace.path().display());
+            let mut release = dev.clone();
+            release.profile = stow_types::node_profile::NodeProfile::Release;
+            release.task_id = format!("{}-release", namespace.path().display());
+            assert_eq!(
+                wrapper_manifest(&dev).unwrap(),
+                wrapper_manifest(&release).unwrap()
+            );
+
+            let first = prepare(&dev).await;
+            let snapshot = first.capture_dir().join("live-output.rmeta");
+            std::fs::write(&snapshot, b"first node output").unwrap();
+            let second = prepare(&release).await;
+            let survived = std::fs::read(&snapshot);
+            let distinct = first.workspace_root() != second.workspace_root();
+            std::fs::remove_dir_all(first.workspace_root()).unwrap();
+            if distinct {
+                std::fs::remove_dir_all(second.workspace_root()).unwrap();
+            }
+            assert_eq!(
+                survived.expect("second node must not delete the live snapshot"),
+                b"first node output"
+            );
+            assert!(
+                distinct,
+                "different nodes must own different mutable workspaces"
+            );
+        });
     }
 
     fn task_with_features(features: &[&str]) -> BuildTaskPayload {
