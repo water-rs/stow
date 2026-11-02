@@ -121,10 +121,10 @@ scheduler-budget tolerance, a fixed-size event exceeds its drive
 budget, a node is dispatched before its dependencies are published, a
 submitted node never publishes, the object answers `overloaded`, a
 build is dispatched while the edge restarts, or a
-lane's submit fails. The wave and resubmit totals are bounded where the
-production node count exists: the monthly projection scales them to
-`production-wave.json` against the preheat budget in
-`types/src/do_budgets.rs`. The full wave is CI-sized; locally, reduce
+lane's submit fails. The monthly projection scales wave and resubmit
+totals to `production-wave.json` and their monthly cadence, combines
+them with user traffic, and checks the total against 80% of each
+monthly allowance. The runtime daily breaker remains a separate guard. The full wave is CI-sized; locally, reduce
 it:
 
 ```sh

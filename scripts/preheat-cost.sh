@@ -37,8 +37,8 @@
 #      node never published, an `overloaded` answer, a failed submit, or
 #      a resubmit that rebuilt anything. The wave and resubmit totals it
 #      reports are bounded by the monthly projection — scaled to the
-#      production wave's node count against the preheat budget
-#      (types/src/do_budgets.rs)
+#      production wave's node count and monthly cadence, combined with
+#      user traffic against 80% of each monthly allowance.
 #
 # The monthly projection (`stow-admin traffic-cost project`, the release
 # gate's `Monthly projection` job) also needs the production wave's node
