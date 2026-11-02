@@ -627,6 +627,18 @@ fn consumer_project(dir: &Path, deps: &Value, build_deps: &Value) -> PathBuf {
 /// Resolve `manifest` on the host triple and return the minted
 /// `EnqueueRequest`s — the resolver path's task ids.
 fn resolve_requests(cargo_home: &Path, manifest: &Path) -> Vec<EnqueueRequest> {
+    resolve_requests_for_profile(
+        cargo_home,
+        manifest,
+        stow_types::node_profile::NodeProfile::Dev,
+    )
+}
+
+fn resolve_requests_for_profile(
+    cargo_home: &Path,
+    manifest: &Path,
+    profile: stow_types::node_profile::NodeProfile,
+) -> Vec<EnqueueRequest> {
     let resolver = resolver_at(cargo_home);
     let host = host_triple();
     let out = resolver
@@ -642,21 +654,17 @@ fn resolve_requests(cargo_home: &Path, manifest: &Path) -> Vec<EnqueueRequest> {
         .expect("host triple resolve")
         .1
         .units;
-    stow_resolver::resolved_task_graph(
-        units,
-        pinned_rustc_version(),
-        stow_types::node_profile::NodeProfile::Dev,
-    )
-    .and_then(|graph| {
-        stow_resolver::enqueue_requests_inner(
-            &graph,
-            &std::collections::BTreeSet::new(),
-            stow_types::api::EnqueueSource::CacheMiss,
-            0,
-        )
-    })
-    .map(|(requests, _uncovered)| requests)
-    .expect("enqueue requests")
+    stow_resolver::resolved_task_graph(units, pinned_rustc_version(), profile)
+        .and_then(|graph| {
+            stow_resolver::enqueue_requests_inner(
+                &graph,
+                &std::collections::BTreeSet::new(),
+                stow_types::api::EnqueueSource::CacheMiss,
+                0,
+            )
+        })
+        .map(|(requests, _uncovered)| requests)
+        .expect("enqueue requests")
 }
 
 /// The host triple this test binary runs on — the native target.
@@ -714,7 +722,7 @@ fn payload_for(request: &EnqueueRequest) -> BuildTaskPayload {
         host_side: request.host_side,
         explicit_spelling: request.explicit_spelling,
         dependency_subgraph: request.dependency_subgraph.clone(),
-        profile: stow_types::node_profile::NodeProfile::Dev,
+        profile: request.profile,
     }
 }
 
@@ -2150,5 +2158,49 @@ fn outcome3_host_task_mints_a_distinct_id_and_verifies() {
             host_task_ids[0], host_task_ids[2],
             "the outcome-3 self-twin edge re-mints the host task id"
         );
+    });
+}
+
+/// A release host lib keeps opt-level 0 even when its target twin uses
+/// opt-level 3. Resolve and verify both profiles through real Cargo.
+#[test]
+fn native_twin_contexts_preserve_each_profiles_host_settings() {
+    let (cargo_home, reg) = registry_home();
+    let scratch = tempfile::tempdir().unwrap();
+    for (name, deps) in [("leaf", vec![]), ("owner", vec![("leaf", "1", &[][..])])] {
+        publish(
+            &reg,
+            &Fixture {
+                name,
+                version: "1.0.0",
+                deps,
+                build_deps: vec![],
+                features: &[],
+                proc_macro: false,
+            },
+        );
+    }
+    let manifest = consumer_project(
+        scratch.path(),
+        &json!({ "owner": "1" }),
+        &json!({ "owner": "1" }),
+    );
+    smol::block_on(async {
+        for profile in stow_types::node_profile::NodeProfile::ALL {
+            let requests = resolve_requests_for_profile(cargo_home.path(), &manifest, profile);
+            let owners = requests
+                .iter()
+                .filter(|request| request.crate_name.as_str() == "owner")
+                .collect::<Vec<_>>();
+            assert_eq!(owners.len(), 2, "{profile} has host and target tasks");
+            for request in owners {
+                let task = payload_for(request);
+                let (_root, workspace) = wrapper_workspace(&reg, &task).await;
+                let own = verify(cargo_home.path(), &task, &workspace)
+                    .await
+                    .unwrap_or_else(|error| panic!("{profile} host={}: {error}", task.host_side));
+                assert_eq!(own.len(), if task.host_side { 4 } else { 2 });
+            }
+        }
     });
 }
