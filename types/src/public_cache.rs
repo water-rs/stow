@@ -1217,6 +1217,7 @@ mod tests {
             key_of(&[
                 "--remap-path-prefix=/Users/me/ws=stow-ci://workspace",
                 "--remap-path-prefix=/run/target=stow-ci://target",
+                "--remap-path-prefix=/run/target/build/generated/out=stow-ci://build-output",
             ])
         );
         assert_keys_apart(

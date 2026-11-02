@@ -788,7 +788,8 @@ fn executable_suffix(target: &str) -> Result<&'static str, String> {
 
 /// The prefix of the virtual roots stow's wrappers map real paths to.
 ///
-/// Those roots are `stow-ci://workspace` and `stow-ci://target`. A
+/// Those roots include `stow-ci://workspace`, `stow-ci://target` and
+/// `stow-ci://build-output`. A
 /// `--remap-path-prefix`
 /// whose target is one of them is stow's determinism remap, not a choice
 /// of the consumer: CI's rustflags and the consumer's wrapper both apply
@@ -796,6 +797,17 @@ fn executable_suffix(target: &str) -> Result<&'static str, String> {
 /// node is — identity-neutral by construction — and never enters the
 /// key. Any other remap changes the paths embedded in the output.
 pub const STOW_VIRTUAL_ROOT_PREFIX: &str = "stow-ci://";
+
+/// Give generated sources the same paths across Cargo invocation spellings.
+/// Append after broader workspace and target mappings: rustc uses the last match.
+pub fn remap_build_output(args: &mut Vec<OsString>, out_dir: Option<&std::ffi::OsStr>) {
+    if let Some(out_dir) = out_dir {
+        let mut mapping = OsString::from("--remap-path-prefix=");
+        mapping.push(out_dir);
+        mapping.push("=stow-ci://build-output");
+        args.push(mapping);
+    }
+}
 
 const REMAP_PATH_PREFIX: &str = "--remap-path-prefix=";
 const REMAP_PATH_SCOPE: &str = "--remap-path-scope=";
@@ -1118,6 +1130,23 @@ fn next_str<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn generated_source_remap_follows_broader_target_remaps() {
+        let mut args = vec![std::ffi::OsString::from(
+            "--remap-path-prefix=/target=stow-ci://target",
+        )];
+        super::remap_build_output(&mut args, None);
+        assert_eq!(args.len(), 1);
+        super::remap_build_output(
+            &mut args,
+            Some(std::ffi::OsStr::new("/target/build/unit/out")),
+        );
+        assert_eq!(
+            args.last().expect("generated source remap"),
+            "--remap-path-prefix=/target/build/unit/out=stow-ci://build-output"
+        );
+    }
+
     /// The dep-info rustc writes: `env-dep` lines are `# env-dep:NAME` for
     /// a variable that was unset and `# env-dep:NAME=value` otherwise.
     #[test]

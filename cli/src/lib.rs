@@ -1567,6 +1567,10 @@ async fn run_rustc_wrapper(
     command
         .wrapped_args
         .extend(rustc_args::extra_args_from_env()?);
+    stow_types::rustc::remap_build_output(
+        &mut command.wrapped_args,
+        std::env::var_os("OUT_DIR").as_deref(),
+    );
     // An endpoint that is set but unusable fails the build. A wrapper that
     // quietly compiled everything itself would leave a build that is
     // merely slow, which is the failure mode that hides.

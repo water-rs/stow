@@ -48,11 +48,12 @@ pub async fn run_rustc_capture_wrapper(
     if let Some(code) = answer_mock_host_probe(rustc, &args[3..]).await? {
         std::process::exit(code);
     }
-    let args = remapped_target_dir_args(
+    let mut args = remapped_target_dir_args(
         &args[3..],
         std::env::var_os(STOW_BUILD_TARGET_DIR_REMAP_ENV).as_deref(),
         std::env::var_os("CARGO_TARGET_DIR").as_deref(),
     );
+    stow_types::rustc::remap_build_output(&mut args, std::env::var_os("OUT_DIR").as_deref());
     let original_parsed = match ParsedRustcArgs::parse(&args) {
         Ok(mut parsed) => {
             // Cargo exports OUT_DIR on the rustc invocation of a links crate's
