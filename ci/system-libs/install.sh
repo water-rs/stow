@@ -20,6 +20,9 @@
 # keyed on the lock hash, and a poisoned or truncated deb fails
 # `sha256sum -c` before anything extracts. Needs curl, sha256sum and
 # dpkg-deb.
+# curl retries transient HTTP failures and refused connections for at
+# most 300 seconds; a final transfer has a 60-second bound. Other HTTP
+# errors and the following checksum verification fail immediately.
 set -euo pipefail
 
 target="${1:?usage: install.sh <target-triple> <debs-dir> <root>}"
@@ -57,7 +60,8 @@ files=()
 while read -r sname sha file url; do
     case " $libsets " in *" $sname "*) ;; *) continue;; esac
     files+=("$file")
-    [ -f "$debs/$file" ] || curl -fsSL --retry 3 -o "$debs/$file" "$url" \
+    [ -f "$debs/$file" ] || curl -fsSL --connect-timeout 15 --max-time 60 \
+        --retry 10 --retry-connrefused --retry-max-time 300 -o "$debs/$file" "$url" \
         || fail "downloading $url failed"
     printf '%s  %s\n' "$sha" "$file" >> "$manifest"
 done < <(grep -Ev '^[[:space:]]*(#|$)' "$lock")

@@ -26,6 +26,9 @@
 # symlink repointed, so a caller's `[ -d "$sysroot" ]` cache check
 # can never pick up a half-written tree. Repointed symlinks name
 # the final <sysroot-dir>, never the temp one.
+# curl retries transient HTTP failures and refused connections for at
+# most 300 seconds; a final transfer has a 60-second bound. Other HTTP
+# errors and the following checksum verification fail immediately.
 set -euo pipefail
 
 sysroot="${1:?usage: install.sh <sysroot-dir>}"
@@ -41,7 +44,8 @@ cd "$debs"
 # sha256, local filename, URL — one line per deb.
 while read -r sha file url; do
     case "$sha" in ''|\#*) continue;; esac
-    curl -fsSL --retry 3 -o "$file" "$url"
+    curl -fsSL --connect-timeout 15 --max-time 60 \
+        --retry 10 --retry-connrefused --retry-max-time 300 -o "$file" "$url"
     echo "$sha  $file" | sha256sum -c --quiet
 done < "$manifest"
 for arch in x86_64 aarch64; do
