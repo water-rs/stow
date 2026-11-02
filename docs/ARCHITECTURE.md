@@ -23,8 +23,10 @@ anyone integrating with or modifying the trust-critical paths.
   the admissions/enqueue endpoints, the Turnstile-admitted request lane
   and the trusted admin routes; `dependency_resolver.rs` holds the
   edge's crates.io reads; `scheduler/` is the DO — queue, dispatch
-  and request records (schema at
-  `edge/src/scheduler/schema.sql`).
+  and request state in an in-memory graph. SQLite persists the append-only
+  event log, chunked snapshots and metering checkpoint
+  (`edge/src/scheduler/schema.sql`); accepted events are appended before
+  acknowledgment.
   The crate is split by target: pure catalog/scheduler logic compiles
   and unit-tests on the host, Cloudflare-bound modules are
   `wasm32`-gated, and crates.io access goes through the
@@ -620,7 +622,7 @@ What each hop is allowed to do:
 |---|---|---|
 | stow CLI (`cli/`) | GHCR: signed `index.*` slices (anonymous pull); edge: bundle blobs streamed through `GET /api/v1/bundles/{rustc_version}/{digest}`, `/api/v1/admissions` + `/api/v1/enqueue` responses | local cache only |
 | edge worker (`edge/`) | crates.io, GHCR, Analytics Engine SQL API | scheduler queue (enqueue submits only); `stow_cache_misses` Analytics Engine points (every miss) |
-| scheduler DO | its SQLite store | its SQLite store; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
+| scheduler DO | its in-memory graph, restored from the SQLite snapshot and event log | its SQLite event log and snapshots; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — keyless signing) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
 | `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/published` when its `report` input is set |
@@ -955,7 +957,6 @@ unauthorized POSTs short-circuit before deserialization.
 | GET `/api/v1/admin/coverage/{crate_name}?version=&target=` | Bearer: repo-workflow OIDC or push user | — | `CrateCoverage` | Per-CI-target servable identities for one crate — `coverage` |
 | GET `/api/v1/admin/artifacts?rustc_version=&target=&crate=&limit=` | Bearer: repo-workflow OIDC or push user | — | `Vec<ArtifactRecord>` | Bounded catalog listing (≤1000) — the prune preview |
 | GET `/api/v1/admin/artifacts/{target}/{rustc_version}/{c_metadata}` | Bearer: repo-workflow OIDC or push user | — | `ArtifactInspection` | Catalog row plus the bundle's OCI manifest from GHCR — `artifacts inspect` |
-| POST `/api/v1/admin/artifacts/prune` | Bearer: repo-workflow OIDC or push user | `ArtifactPruneRequest` | `ArtifactPruneResponse` | Delete a retired toolchain's catalog rows; GHCR tags are not deleted — `artifacts prune` |
 | POST `/api/v1/admissions` | none | `AdmissionRequest` | `Vec<EnqueueAdmission>` | Mint enqueue admissions for a posted miss or inexact-hit report (`source`) — the only call that ships the dependency graph off the machine |
 | POST `/api/v1/enqueue` | HMAC challenge + proof-of-work | `EnqueueTicket` | `OkResponse` | Redeem a miss admission into a scheduler enqueue |
 | POST `/api/v1/requests` | Cloudflare Turnstile token | `CrateRequest` | `CrateRequestStatus` | Human request: admit and dispatch a `resolve-request.yml` run that enqueues the crate's closure on every CI target in the human lane |
