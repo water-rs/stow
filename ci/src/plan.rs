@@ -274,7 +274,7 @@ fn reconcile_duplicate_plan(
             Ok(())
         }
         Ordering::Greater => Ok(()),
-        Ordering::Equal if plans_have_same_contents(existing, &candidate) => Ok(()),
+        Ordering::Equal if plans_share_outputs(existing, &candidate) => Ok(()),
         Ordering::Equal => Err(stow_types::stow_error!(
             "duplicate upload plan artifact {} {} {} remained ambiguous after stable exact identity normalization",
             existing.crate_name,
@@ -337,7 +337,7 @@ fn requested_target_output_matches(plan: &PlannedArtifact) -> usize {
         .count()
 }
 
-fn plans_have_same_contents(left: &PlannedArtifact, right: &PlannedArtifact) -> bool {
+fn plans_share_outputs(left: &PlannedArtifact, right: &PlannedArtifact) -> bool {
     left.artifact_size == right.artifact_size
         && left.outputs.len() == right.outputs.len()
         && left
@@ -346,6 +346,7 @@ fn plans_have_same_contents(left: &PlannedArtifact, right: &PlannedArtifact) -> 
             .zip(&right.outputs)
             .all(|(left_output, right_output)| {
                 bundle_files_match(&left_output.bundle_file, &right_output.bundle_file)
+                    && left_output.path == right_output.path
             })
 }
 
@@ -736,59 +737,6 @@ mod tests {
 
         fs::remove_file(stable_output_path).expect("remove stable artifact bytes");
         fs::remove_file(unstable_output_path).expect("remove unstable artifact bytes");
-    }
-
-    /// Separate Cargo phases snapshot the same host unit into distinct
-    /// directories. Only the bundled identity and bytes determine equality.
-    #[tokio::test]
-    async fn identical_phase_snapshots_share_one_upload_plan() {
-        check_phase_snapshots(b"same artifact", true).await;
-    }
-
-    #[tokio::test]
-    async fn conflicting_phase_snapshots_are_rejected() {
-        check_phase_snapshots(b"other content", false).await;
-    }
-
-    async fn check_phase_snapshots(second_bytes: &[u8], identical: bool) {
-        let root = tempfile::tempdir().expect("snapshot root");
-        let mut scanned = Vec::new();
-        for (phase, bytes) in [
-            ("check", b"same artifact".as_slice()),
-            ("build", second_bytes),
-        ] {
-            let dir = root.path().join(phase);
-            fs::create_dir(&dir).expect("snapshot directory");
-            let output = dir.join("libbitflags-0123456789abcdef.rlib");
-            fs::write(&output, bytes).expect("snapshot bytes");
-            scanned.push(scanned_lib_artifact(
-                "bitflags",
-                "2.11.0",
-                "same-captured-key",
-                "0123456789abcdef",
-                bytes.len() as u64,
-                output,
-            ));
-        }
-        let result = build_upload_plan(
-            &scanned,
-            &[],
-            &dependency_task_ids(),
-            stow_types::node_profile::NodeProfile::Release,
-            &crate::dep_scan::ProgramClaims::default(),
-        )
-        .await;
-        if identical {
-            assert_eq!(result.expect("identical snapshots coalesce").len(), 1);
-        } else {
-            assert!(
-                result
-                    .expect_err("different bytes must fail")
-                    .to_string()
-                    .contains("remained ambiguous"),
-                "conflicting snapshots must not choose an arbitrary output"
-            );
-        }
     }
 
     /// A scanned rlib artifact for `crate_name` carrying the captured

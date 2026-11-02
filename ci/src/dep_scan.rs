@@ -484,13 +484,14 @@ fn select_captured_artifacts(
         })?;
         let key = (
             package.name.clone(),
-            captured.c_metadata.clone(),
+            captured.compile_key.clone(),
             artifact_kind.as_str().to_owned(),
             serde_json::to_string(&captured.emit)
                 .expect("captured emit serialization must succeed"),
-            // A build script's identity is its host: the spelling of the
-            // cargo invocation that compiled it is no part of it.
-            if artifact_kind == ArtifactKind::BuildScript {
+            // Host units with the same compiler identity are shared by
+            // both outer Cargo spellings. Distinct host profiles remain
+            // separate through the full compile key above.
+            if artifact_kind == ArtifactKind::BuildScript || captured.target.is_none() {
                 None
             } else {
                 captured.invocation
@@ -594,7 +595,7 @@ fn select_captured_artifact(
     };
     // Two restorable records under one selection key are a duplicate: the
     // key already carries every identity dimension (crate, stable
-    // metadata, kind, emit, invocation), so a second record claiming it
+    // compile key, kind, emit, invocation), so a second record claiming it
     // is either the same rustc unit seen twice — a unit that links in
     // every cargo phase, like a build dependency or a proc macro, is
     // captured once per phase into that phase's own `CARGO_TARGET_DIR`,
@@ -2599,6 +2600,7 @@ mod tests {
         );
         native.crate_version = Some("1.1.4".to_owned());
         native.compile_key = "aa".repeat(32);
+        native.target = None;
         native.invocation = Some(stow_types::public_cache::UnitInvocation::Native);
 
         let mut explicit = captured(
@@ -2608,12 +2610,41 @@ mod tests {
         );
         explicit.crate_version = Some("1.1.4".to_owned());
         explicit.compile_key = "bb".repeat(32);
+        explicit.target = None;
         explicit.invocation = Some(stow_types::public_cache::UnitInvocation::Target);
 
         let selected = select_captured_artifacts(&index, &[native, explicit])
             .expect("the two invocation spellings are two selected artifacts");
         assert_eq!(selected.artifacts.len(), 2);
         assert_eq!(selected.absorbed_duplicates, 0);
+    }
+
+    #[test]
+    fn identical_host_release_units_merge_across_cargo_spellings() {
+        let mut index = super::PackageIndex::new();
+        index
+            .entry("psm".to_owned())
+            .or_default()
+            .insert("0.1.24".to_owned(), indexed("psm", "0.1.24"));
+        let mut native = psm_capture("/tmp/workspace/target-native", "8e5bdc87bc91e8f0");
+        native.target = None;
+        native.profile.debug_assertions = false;
+        native.profile.overflow_checks = false;
+        native.invocation = Some(UnitInvocation::Native);
+        let mut explicit = psm_capture("/tmp/workspace/target-target", "a40c71aa8d26bf90");
+        explicit.target = None;
+        explicit.profile = native.profile.clone();
+        explicit.invocation = Some(UnitInvocation::Target);
+
+        let selected = select_captured_artifacts(&index, &[native, explicit])
+            .expect("identical host compilation survives both Cargo spellings");
+        assert_eq!(selected.artifacts.len(), 1);
+        assert_eq!(selected.absorbed_duplicates, 1);
+        assert!(selected.rlib_pairs.is_empty());
+        assert!(selected.artifacts[0].dependency_aliases.iter().any(|path| {
+            path.file_name()
+                .is_some_and(|name| name == "libpsm-a40c71aa8d26bf90.rlib")
+        }));
     }
 
     /// A package's `build.rs` compile as the wrapper records it: the
