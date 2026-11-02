@@ -71,8 +71,14 @@ build compiled; the rest of your graph stays on the machine.
 
 ## What is in the public cache
 
-Compiled library and proc-macro crates — rlibs, dylibs and proc-macros.
-Never binaries, and never your own code.
+Compiled library and proc-macro crates — rlibs, dylibs and proc-macros —
+and their reusable build-script executables. Project binaries and your
+own workspace code are not published.
+
+A cached build-script executable still runs when Cargo needs its output;
+stow skips compiling the script, not executing it. Scripts and proc macros
+that embed their source directory through `CARGO_MANIFEST_DIR` compile
+locally, with that directory included in their local cache key.
 
 A crate is cached at one exact identity: crate, version, feature set,
 target, rustc version, profile, host or target side, and the identities

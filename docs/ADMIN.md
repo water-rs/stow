@@ -2,8 +2,8 @@
 
 `stow-admin` is the operations CLI for cache operators. Not for end users. Nouns then verbs;
 `--json` is a global flag (machine-readable stdout instead of the human
-table), and every mutating command prints its plan and exits without
-acting unless `--yes` is given.
+table). Commands that take `--yes` require it before applying their plan;
+`watchdog clear` is an explicit recovery command.
 
 Run outside GitHub Actions, the mutating commands — `scheduler reset`,
 `scheduler demand-feed`, `queue retry|cancel|promote|purge`,
