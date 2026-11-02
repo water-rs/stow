@@ -22,8 +22,7 @@ const EXCLUDED_TOP_LEVEL_NAMES: &[&str] = &[".git", "target", ".stow-rustc-captu
 /// stomped by a concurrent task of another shape.
 #[derive(Debug, Clone)]
 pub struct MirrorTaskKey {
-    pub target: String,
-    pub rustc_version: String,
+    pub task_id: String,
     pub preserve_lockfile: bool,
 }
 
@@ -143,8 +142,7 @@ fn compute_workspace_hash(
 ) -> stow_types::error::Result<String> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"stow-workspace-v2");
-    hash_str_component(&mut hasher, &key.target);
-    hash_str_component(&mut hasher, &key.rustc_version);
+    hash_str_component(&mut hasher, &key.task_id);
     hasher.update(if key.preserve_lockfile {
         b"lockfile-preserved"
     } else {
