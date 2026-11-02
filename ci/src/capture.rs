@@ -409,6 +409,10 @@ async fn serve_consumed_artifact(
 
     stow_cli::build_consume::serve_bundle_outputs(original_parsed, &bundle, effective_target)
         .await?;
+    #[cfg(feature = "mock-compile")]
+    if crate::mock_compile::enabled() {
+        crate::mock_compile::materialize_build_script_run_alias(original_parsed, effective_target)?;
+    }
     let original_alias_source =
         Some(original_parsed).filter(|original| *original != rewritten_parsed);
     record_capture_output_identities(

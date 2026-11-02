@@ -204,9 +204,6 @@ pub fn compile(args: &[OsString]) -> stow_types::error::Result<Option<Vec<u8>>> 
     }
     let host = emulated_host()?;
     let outputs = planned_outputs(&parsed, &host)?;
-    if let Some(alias) = build_script_run_path(&parsed, &host) {
-        write_output(&alias, &parsed)?;
-    }
     let mut stderr = Vec::new();
     for output in &outputs {
         write_output(output, &parsed)?;
@@ -222,7 +219,27 @@ pub fn compile(args: &[OsString]) -> stow_types::error::Result<Option<Vec<u8>>> 
             stderr.push(b'\n');
         }
     }
+    materialize_build_script_run_alias(&parsed, &host)?;
     Ok(Some(stderr))
+}
+
+/// Restore the executable name the local cargo runs when the emulated
+/// runner uses a different suffix. Both compilation and cache hits must
+/// preserve the program bytes under that name.
+pub fn materialize_build_script_run_alias(
+    parsed: &ParsedRustcArgs,
+    host: &str,
+) -> stow_types::error::Result<()> {
+    if let Some(alias) = build_script_run_path(parsed, host) {
+        let source = alias.path.with_file_name(format!(
+            "{}{}{}",
+            parsed.crate_name,
+            parsed.extra_filename,
+            Naming::of(host).exe_suffix,
+        ));
+        std::fs::copy(&source, &alias.path)?;
+    }
+    Ok(())
 }
 
 /// One file the invocation emits, and which `--emit` kind names it.
@@ -431,8 +448,9 @@ mod tests {
     use stow_types::rustc::ParsedRustcArgs;
 
     use super::{
-        HostProbe, OutputKind, build_script_run_path, host_probe, planned_outputs, replaces,
-        rewrite_version_host, runner_host,
+        HostProbe, Naming, OutputKind, build_script_run_path, host_probe,
+        materialize_build_script_run_alias, planned_outputs, replaces, rewrite_version_host,
+        runner_host,
     };
 
     const LINUX_HOST: &str = "x86_64-unknown-linux-gnu";
@@ -613,5 +631,51 @@ mod tests {
             assert!(run.kind == OutputKind::Executable);
         }
         assert!(build_script_run_path(&parsed, LINUX_HOST).is_none() || cfg!(windows));
+    }
+
+    #[test]
+    fn a_restored_build_script_keeps_its_bytes_at_cargos_run_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = if cfg!(windows) {
+            LINUX_HOST
+        } else {
+            "x86_64-pc-windows-msvc"
+        };
+        let argv = args(&[
+            "--crate-name",
+            "build_script_build",
+            "build.rs",
+            "--crate-type",
+            "bin",
+            "--emit=dep-info,link",
+            "-C",
+            "extra-filename=-aa",
+            "--out-dir",
+            dir.path().to_str().expect("path"),
+        ]);
+        let parsed = ParsedRustcArgs::parse(&argv).expect("parse");
+        let source = dir.path().join(format!(
+            "build_script_build-aa{}",
+            Naming::of(host).exe_suffix
+        ));
+        let program = b"#!/bin/sh\nexit 23\n";
+        std::fs::write(&source, program).expect("restored program");
+        #[cfg(unix)]
+        super::make_executable(&source).expect("executable");
+        materialize_build_script_run_alias(&parsed, host).expect("run alias");
+        let alias = build_script_run_path(&parsed, host).expect("foreign suffix");
+        assert_eq!(std::fs::read(&alias.path).expect("program bytes"), program);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_ne!(
+                std::fs::metadata(&alias.path)
+                    .expect("metadata")
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0,
+            );
+        }
     }
 }
