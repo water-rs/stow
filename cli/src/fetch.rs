@@ -1204,7 +1204,7 @@ mod tests {
         }))
         .expect("serialize OCI manifest");
         let manifest = ArtifactBundleManifest {
-            oci_reference: "ghcr.io/water-rs/stow-cache-1.91.1:demo.test".to_owned(),
+            oci_reference: "ghcr.io/water-rs/stow-cache-v2-1.91.1:demo.test".to_owned(),
             oci_digest: sha256_prefixed(&oci_manifest_bytes),
             config,
             sigstore_signatures: vec![SigstoreSignature {

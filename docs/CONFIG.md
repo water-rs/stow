@@ -18,7 +18,7 @@ file values. A key the file does not model fails the command.
 edge_url = "https://stow.waterui.dev"
 
 # OCI registry root (scheme://host[:port]) the signed index slices are
-# pulled from — the pull appends /v2/water-rs/stow-cache-<rustc> for the
+# pulled from — the pull appends /v2/water-rs/stow-cache-v2-<rustc> for the
 # rustc's package (bundles stream through the edge). Defaults to the
 # production GHCR root; set it for mock runs.
 # May also be set via $STOW_REGISTRY_BASE_URL.

@@ -1559,11 +1559,11 @@ done
 # The mock registry, like GHCR, serves /v2 only to an anonymous bearer
 # minted by its token endpoint.
 registry_token="$(curl -fsS --max-time 10 \
-    "http://${REGISTRY_ADDR}/token?service=${REGISTRY_ADDR}&scope=repository:water-rs/stow-cache-${RUSTC_VERSION}:pull" \
+    "http://${REGISTRY_ADDR}/token?service=${REGISTRY_ADDR}&scope=repository:water-rs/stow-cache-v2-${RUSTC_VERSION}:pull" \
     | jq -er .token)" \
     || die "mock registry token exchange failed"
 curl -fsS --max-time 10 -H "Authorization: Bearer ${registry_token}" \
-    "http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-${RUSTC_VERSION}/manifests/index.${HOST_TARGET}.${RUSTC_VERSION}" \
+    "http://${REGISTRY_ADDR}/v2/water-rs/stow-cache-v2-${RUSTC_VERSION}/manifests/index.${HOST_TARGET}.${RUSTC_VERSION}" \
     -o /dev/null \
     || die "index slice index.${HOST_TARGET}.${RUSTC_VERSION} missing after the manual wave"
 

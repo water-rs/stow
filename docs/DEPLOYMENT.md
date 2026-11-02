@@ -78,7 +78,7 @@ non-secret `vars`, and the `stow.waterui.dev` Workers Custom Domain via
    the reset: once the reset succeeds, `operations.yml` runs
    `stow-admin index published-rustcs`, which probes every stable
    release `static.rust-lang.org/manifests.txt` lists for a published
-   `stow-cache-<rustc>` package through the registry's anonymous tag
+   `stow-cache-v2-<rustc>` package through the registry's anonymous tag
    listing, then dispatches `index-publish.yml` on `main` with
    `report=true` for each rustc found (not `full`: a reset leaves the
    slices in GHCR as they were) and `preheat-cron.yml` on `main` with
@@ -443,7 +443,10 @@ the source directory. For a proc macro, the signed records instead declare
 the completed node; consumers compile the program locally and use its signed
 identity to validate the dependency closure. Its library dependencies remain
 cached. Records use `application/vnd.stow.records.v2+json`; the deployment
-must reset the old record store and regenerate index slices for this schema.
+uses a fresh `stow-cache-v2-<rustc>` package for this schema. Publish empty
+index slices there before resetting the scheduler and submitting a new preheat
+wave. Readers and writers use only this namespace; old packages are retired
+separately and never used as a fallback.
 
 `build-crate.yml` reads no repository variables — `run-name` carries
 `<rustc>-<task_id>` so the webhook's `display_title` parses back into
@@ -474,10 +477,10 @@ slice published in a format the current `stow-admin` can no longer
 decode is replaced rather than read.
 
 Every artifact is a tag of its rustc's GHCR package
-`ghcr.io/water-rs/stow-cache-<rustc>` —
+`ghcr.io/water-rs/stow-cache-v2-<rustc>` —
 `{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`.
 The edge pulls the package with no credential at all — public GHCR
-packages grant `repository:water-rs/stow-cache-<rustc>:pull` to the
+packages grant `repository:water-rs/stow-cache-v2-<rustc>:pull` to the
 anonymous `GET /token` exchange that `edge/src/ghcr.rs` drives on every
 `401` challenge. A rustc's package is created by the first
 `build-crate.yml` push that lands on it: the package links to the
@@ -841,7 +844,7 @@ pending for re-dispatch).
   hostname down. `stow-admin maintenance status` prints all three
   rules' state.
 - **GHCR storage:** the whole cache is one
-  `ghcr.io/water-rs/stow-cache-<rustc>` package per rustc (every
+  `ghcr.io/water-rs/stow-cache-v2-<rustc>` package per rustc (every
   artifact a tag); monitor disk via the GitHub UI.
 - **Revoking trusted access:** there is no shared credential to rotate.
   A workflow's access to a mutating route is its entry in that route's
@@ -859,8 +862,8 @@ pending for re-dispatch).
 
 ### Cache packages
 
-The public cache is one GHCR package per rustc version:
-`ghcr.io/water-rs/stow-cache-<rustc>` holds every artifact, bundle,
+The public cache is one GHCR package per storage schema and rustc version:
+`ghcr.io/water-rs/stow-cache-v2-<rustc>` holds every artifact, bundle,
 signature, records artifact, index slice and folded set built for that
 rustc. A new rustc's package is created by the first `build-crate.yml`
 push that lands on it — the package links to the public `water-rs/stow`

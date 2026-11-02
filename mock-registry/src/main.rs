@@ -2614,7 +2614,7 @@ mod tests {
         split_reference, write, write_blob, write_manifest, write_mock_signature,
     };
 
-    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-1.98.0/manifests/latest";
+    const MANIFEST_URI: &str = "/v2/water-rs/stow-cache-v2-1.98.0/manifests/latest";
 
     fn manifest_request() -> Request<Body> {
         Request::builder()
@@ -2628,11 +2628,11 @@ mod tests {
     #[tokio::test]
     async fn challenge_exchange_then_served() {
         let root = tempfile::tempdir().expect("registry root");
-        std::fs::create_dir_all(root.path().join("manifests/water-rs/stow-cache-1.98.0"))
+        std::fs::create_dir_all(root.path().join("manifests/water-rs/stow-cache-v2-1.98.0"))
             .expect("manifest dir");
         std::fs::write(
             root.path()
-                .join("manifests/water-rs/stow-cache-1.98.0/latest"),
+                .join("manifests/water-rs/stow-cache-v2-1.98.0/latest"),
             b"{\"schemaVersion\":2}",
         )
         .expect("manifest file");
@@ -2646,7 +2646,7 @@ mod tests {
         for (request, challenge) in [
             (
                 manifest_request(),
-                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache-1.98.0:pull\"",
+                "Bearer realm=\"http://127.0.0.1:28123/token\",service=\"mock-registry\",scope=\"repository:water-rs/stow-cache-v2-1.98.0:pull\"",
             ),
             (
                 Request::builder()
@@ -2673,7 +2673,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache-1.98.0:pull")
+                    .uri("/token?service=mock-registry&scope=repository:water-rs/stow-cache-v2-1.98.0:pull")
                     .body(Body::empty())
                     .expect("token request builds"),
             )
@@ -2727,7 +2727,7 @@ mod tests {
     async fn a_missing_package_denies_the_anonymous_exchange() {
         let root = tempfile::tempdir().expect("registry root");
         let app = registry_app_with_probe("127.0.0.1:28123", root.path().to_path_buf(), None, None);
-        let scope = "repository:water-rs/stow-cache-9.99.9:pull";
+        let scope = "repository:water-rs/stow-cache-v2-9.99.9:pull";
 
         let response = app
             .clone()
@@ -2774,7 +2774,7 @@ mod tests {
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/v2/water-rs/stow-cache-9.99.9/tags/list")
+                    .uri("/v2/water-rs/stow-cache-v2-9.99.9/tags/list")
                     .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .expect("tags request builds"),
@@ -2941,10 +2941,10 @@ mod tests {
 
     const TARGET: &str = "x86_64-unknown-linux-gnu";
     const RUSTC: &str = "1.98.0";
-    /// The GHCR package `RUSTC` derives: `water-rs/stow-cache-<rustc>`.
-    const REPOSITORY: &str = "water-rs/stow-cache-1.98.0";
+    /// The GHCR package `RUSTC` derives: `water-rs/stow-cache-v2-<rustc>`.
+    const REPOSITORY: &str = "water-rs/stow-cache-v2-1.98.0";
     /// `ghcr.io/<repository>` — the base signed references are built on.
-    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-1.98.0";
+    const REFERENCE_BASE: &str = "ghcr.io/water-rs/stow-cache-v2-1.98.0";
     const C_METADATA: &str = "aabbccddeeff0011";
 
     /// `RUSTC`'s package as the session APIs want it.

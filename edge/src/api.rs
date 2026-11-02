@@ -1105,7 +1105,7 @@ pub async fn crate_features(
 /// GET /`api/v1/bundles/{rustc_version}/{digest}`
 ///
 /// The byte path: streams the `<tag>.bundle` blobs under the rustc's
-/// `ghcr.io/water-rs/stow-cache-<rustc>` package, handing workerd the
+/// `ghcr.io/water-rs/stow-cache-v2-<rustc>` package, handing workerd the
 /// upstream body as the registry's own stream so the bytes never enter
 /// wasm. The `sha256:<64 lowercase hex>` path segment is validated before
 /// any fetch; the answer's immutable `Cache-Control` is what Workers Cache

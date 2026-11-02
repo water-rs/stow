@@ -163,7 +163,7 @@ pub async fn store_downloaded_bundle_with_trust_marker(
 /// One valid signature is enough, matching the bundle path. `materials`
 /// come from the `sha256-<hex>.sig` image pulled next to the index
 /// manifest; `oci_reference` is the canonical
-/// `ghcr.io/water-rs/stow-cache-<rustc>:index.<target>.<rustc>` the
+/// `ghcr.io/water-rs/stow-cache-v2-<rustc>:index.<target>.<rustc>` the
 /// signer bound (the transport base never rewrites it).
 ///
 /// # Errors

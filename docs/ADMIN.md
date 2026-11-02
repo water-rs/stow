@@ -157,7 +157,7 @@ accept nothing else. See [`DEPLOYMENT.md`](DEPLOYMENT.md#operator-mutations).
   publish step instead, once every slice it reads is regenerated. `index targets` prints
   every `CI_TARGET_TRIPLES` entry.
   `index published-rustcs` prints every stable rustc release
-  (`static.rust-lang.org/manifests.txt`) whose `stow-cache-<rustc>`
+  (`static.rust-lang.org/manifests.txt`) whose `stow-cache-v2-<rustc>`
   package holds tags, probed through the registry's anonymous tag
   listing; `operations.yml` reports each one's slices after a
   scheduler reset.

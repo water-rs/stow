@@ -392,7 +392,7 @@ alone — nothing reads an older shape of a store.
 
 Every artifact is a tag of its rustc's GHCR package — one package per
 rustc version — referenced as
-`ghcr.io/water-rs/stow-cache-<rustc>:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
+`ghcr.io/water-rs/stow-cache-v2-<rustc>:{crate}.{version}-{target_short}-{rustc_short}-{feat_hash}-{c_metadata}{kind_suffix}`
 (see `types/src/registry.rs`). The crate name is the tag's first
 `.`-separated segment — crates.io names never contain `.`, so the split is
 unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). A new
@@ -469,7 +469,7 @@ id, so the scheduler logs the completion as an orphan run.
 Every servable artifact row is additionally published as a signed,
 per-slice index so a client resolves cache coverage locally instead of
 querying the edge (#188). One index exists per `(target, rustc_version)`
-pair: the tag `index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache-<rustc>`
+pair: the tag `index.<target>.<rustc>` on `ghcr.io/water-rs/stow-cache-v2-<rustc>`
 (`stow_types::index::index_tag`) names a single-layer OCI artifact whose
 layer is the zstd-compressed JSON `ArtifactIndex` (media type
 `application/vnd.stow.index.v1+zstd`; config
@@ -533,7 +533,7 @@ republish untags the previous manifest, a rebuilt task's older
 signature manifest accumulates under no retention of its own. GitHub's
 package-versions API cannot enumerate a package at the cache's size, so
 stow never deletes single versions: when a rustc is retired its whole
-`stow-cache-<rustc>` package is deleted, and a served rustc's cache
+`stow-cache-v2-<rustc>` package is deleted, and a served rustc's cache
 rebuilds into its package from empty if the package is ever reset.
 `docs/DEPLOYMENT.md` carries the procedure.
 
@@ -625,7 +625,7 @@ What each hop is allowed to do:
 | scheduler DO | its in-memory graph, restored from the SQLite snapshot and event log | its SQLite event log and snapshots; GitHub `workflow_dispatch` of `build-crate.yml` on `main` |
 | `stow-build build` (untrusted job) | crates.io tarball, the task | its own output directory (task, plan, content-addressed blobs) |
 | `stow-build publish` (trusted job) | the build output, crates.io (closure resolution), GHCR token, OIDC (`id-token: write` — keyless signing) | GHCR objects (bundles + `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` artifacts); sigstore signatures |
-| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/published` when its `report` input is set |
+| `index-publish.yml` (dispatched on `main` by `index-publish-cron.yml`) | GHCR manifests and the registry's `records-*` artifacts; OIDC (`id-token: write`) | `index.*` tags and their sigstore signatures on `ghcr.io/water-rs/stow-cache-v2-<rustc>`; the scheduler's published membership via `/api/v1/admin/index/published` when its `report` input is set |
 
 The edge's remaining crates.io reads are the request route's version and
 rustc lookups, the site pickers (`crates/search`, `crates/{name}/versions`,

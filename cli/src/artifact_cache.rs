@@ -4881,7 +4881,8 @@ pub mod tests {
             build_script,
         )
         .expect("compile key");
-        bundle.manifest.oci_reference = "ghcr.io/water-rs/stow-cache-1.91.1:ignore.test".to_owned();
+        bundle.manifest.oci_reference =
+            "ghcr.io/water-rs/stow-cache-v2-1.91.1:ignore.test".to_owned();
         let config = &bundle.manifest.config;
         let request = SemanticFetchRequest {
             crate_name: "ignore".to_owned(),
@@ -7265,7 +7266,7 @@ pub mod tests {
         let file_contents = b"demo-artifact".to_vec();
         ArtifactBundle {
             manifest: ArtifactBundleManifest {
-                oci_reference: "ghcr.io/water-rs/stow-cache-1.91.1:demo.test".to_owned(),
+                oci_reference: "ghcr.io/water-rs/stow-cache-v2-1.91.1:demo.test".to_owned(),
                 oci_digest: "sha256:test".to_owned(),
                 config: ArtifactBlobConfig {
                     dependency_identity: stow_types::identity::DependencyIdentity::leaf()
@@ -7319,7 +7320,7 @@ pub mod tests {
                     serde_json::to_vec(&serde_json::json!({
                         "critical": {
                             "identity": {
-                                "docker-reference": "ghcr.io/water-rs/stow-cache-1.91.1:demo.test"
+                                "docker-reference": "ghcr.io/water-rs/stow-cache-v2-1.91.1:demo.test"
                             },
                             "image": {
                                 "docker-manifest-digest": "sha256:test"

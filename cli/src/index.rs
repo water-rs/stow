@@ -392,9 +392,9 @@ async fn fetch_slice(
     })
 }
 
-/// The slice a missing `stow-cache-<rustc>` package resolves to: no
+/// The slice a missing `stow-cache-v2-<rustc>` package resolves to: no
 /// published manifest, zero rows — every lookup misses, which is exactly
-/// what a rustc nothing has published for means. `stow-cache-<rustc>`
+/// what a rustc nothing has published for means. `stow-cache-v2-<rustc>`
 /// deleted and rebuilt reads the same until the first publish lands.
 fn empty_slice(target: &str, rustc_version: &str) -> stow_types::error::Result<IndexSlice> {
     Ok(IndexSlice {
@@ -1246,7 +1246,7 @@ mod tests {
         );
     }
 
-    /// stow#844: a registry whose `stow-cache-<rustc>` package does not
+    /// stow#844: a registry whose `stow-cache-v2-<rustc>` package does not
     /// exist answers the anonymous token exchange `403 DENIED` — the
     /// slice it resolves to is the empty index, not an error, on every
     /// pull path.

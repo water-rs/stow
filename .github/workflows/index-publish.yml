@@ -9,7 +9,7 @@ name: Index publish
 # pushed to GHCR as single-layer OCI
 # artifacts (`index.<target>.<rustc>` plus the `folded.<target>.<rustc>`
 # companion listing every records tag already folded, both on the
-# rustc's `ghcr.io/water-rs/stow-cache-<rustc>` package) and
+# rustc's `ghcr.io/water-rs/stow-cache-v2-<rustc>` package) and
 # signed keyless under this
 # workflow's identity on `main`
 # (`stow_types::trusted_builder::INDEX_CERTIFICATE_IDENTITY`).
