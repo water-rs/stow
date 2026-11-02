@@ -607,6 +607,11 @@ drive_phase() {
     done
 }
 
+# Build-script consumption reads signed slices even for a node with no
+# library dependencies. Initialize the empty store before the measured wave
+# so its first builds never race the first nonempty index publication.
+publish_round bootstrap
+
 # --- the wave ---------------------------------------------------------------
 
 mkdir -p "$COST_DIR/wave" "$COST_DIR/resubmit"
