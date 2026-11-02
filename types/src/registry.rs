@@ -34,10 +34,11 @@ pub const GHCR_REGISTRY_URL: &str = concat!("https://", ghcr_host!());
 ///
 /// The public cache is one package per storage schema and rustc version:
 /// every artifact, bundle, signature, records artifact, index slice and folded set built
-/// for a rustc is a tag of its package. A new rustc's package is created
-/// by its first `build-crate.yml` push — the package links to the public
-/// `water-rs/stow` repository and inherits its visibility, so no manual
-/// step ever opens one. A retired rustc's package is deleted whole in the
+/// for a rustc is a tag of its package. The first push creates a private
+/// package linked to `water-rs/stow`. Repository access permissions are
+/// inherited, but visibility is not: an operator makes the new package
+/// public before anonymous readers can use it. A retired rustc's package
+/// is deleted whole in the
 /// package settings; single versions are never deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheRepository {
