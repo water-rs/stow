@@ -396,10 +396,10 @@ rustc version — referenced as
 (see `types/src/registry.rs`). The crate name is the tag's first
 `.`-separated segment — crates.io names never contain `.`, so the split is
 unambiguous (`sha-1.0.10.0-…` is crate `sha-1`, version `0.10.0`). A new
-rustc's package is created by its first `build-crate.yml` push: it links
-to the public `water-rs/stow` repository and inherits its visibility, so
-no manual step ever opens one, and a retired rustc's package is deleted
-whole. Before it exists — or after a deletion — GHCR answers an
+rustc's package is created by its first push: it links to `water-rs/stow`
+and inherits repository access permissions, but starts private. An operator
+sets its visibility to public before anonymous readers can use it. A retired
+rustc's package is deleted whole. Before it exists — or after a deletion — GHCR answers an
 anonymous pull of it with `403 DENIED` rather than `404`; every index
 reader treats that answer as the empty index, the same result a missing
 tag gives, so a fresh rustc's first builds can start it and a deleted

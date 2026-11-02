@@ -444,8 +444,9 @@ the completed node; consumers compile the program locally and use its signed
 identity to validate the dependency closure. Its library dependencies remain
 cached. Records use `application/vnd.stow.records.v2+json`; the deployment
 uses a fresh `stow-cache-v2-<rustc>` package for this schema. Publish empty
-index slices there before resetting the scheduler and submitting a new preheat
-wave. Readers and writers use only this namespace; old packages are retired
+index slices there with `index-publish.yml` and `report=false`. Set the new
+package's visibility to public before resetting the scheduler and submitting
+a new preheat wave. Readers and writers use only this namespace; old packages are retired
 separately and never used as a fallback.
 
 `build-crate.yml` reads no repository variables — `run-name` carries
@@ -482,10 +483,9 @@ Every artifact is a tag of its rustc's GHCR package
 The edge pulls the package with no credential at all — public GHCR
 packages grant `repository:water-rs/stow-cache-v2-<rustc>:pull` to the
 anonymous `GET /token` exchange that `edge/src/ghcr.rs` drives on every
-`401` challenge. A rustc's package is created by the first
-`build-crate.yml` push that lands on it: the package links to the
-public `water-rs/stow` repository and inherits its visibility, so no
-manual step ever opens one. Until it exists, GHCR answers an anonymous
+`401` challenge. The first push creates a private package linked to
+`water-rs/stow`. It inherits repository access permissions, not visibility;
+set the package to public before anonymous pulls can succeed. Until it exists, GHCR answers an anonymous
 pull — the token exchange or an asset request — with `403 DENIED`
 rather than `404` (a package made private answers the same way), and
 every index reader classifies that answer as the package's absence: the
@@ -865,10 +865,12 @@ pending for re-dispatch).
 The public cache is one GHCR package per storage schema and rustc version:
 `ghcr.io/water-rs/stow-cache-v2-<rustc>` holds every artifact, bundle,
 signature, records artifact, index slice and folded set built for that
-rustc. A new rustc's package is created by the first `build-crate.yml`
-push that lands on it — the package links to the public `water-rs/stow`
-repository and inherits its visibility, so it is public with no manual
-step. stow never deletes single versions; when a rustc is no longer
+rustc. The first push creates the package with private visibility.
+Repository access permissions are inherited separately. In the package's
+GitHub settings, use **Danger Zone → Change visibility → Public** and confirm
+the package name before opening the lanes. This applies to every new schema
+or rustc package; making a package public cannot be reversed. See GitHub's
+[package visibility documentation](https://docs.github.com/en/packages/learn-github-packages/configuring-a-packages-access-control-and-visibility#configuring-visibility-of-packages-for-an-organization). stow never deletes single versions; when a rustc is no longer
 served, delete its package whole in the package settings, or through
 GitHub support when one of its versions passed 5,000 downloads —
 GitHub refuses self-service deletion then.
