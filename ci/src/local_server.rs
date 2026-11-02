@@ -1753,7 +1753,7 @@ async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error:
         // the validation that gates them.
         let event = async_fs::read(&run.event_path).await?;
         let dispatched = crate::task_from_event(&event, &run.event_path)?;
-        crate::validated_build_output(&dispatched, &layout.output_dir)
+        let output = crate::validated_build_output(&dispatched, &layout.output_dir)
             .await
             .map_err(|error| error.wrap_err("publish-stage validation"))?;
         // `stow-build build` exits non-zero when any cargo phase failed —
@@ -1765,6 +1765,15 @@ async fn publish_stage(run: &TaskRun, layout: &TaskLayout) -> stow_types::error:
         if upload_plan_len(&layout.upload_plan_path).await? > 0 {
             populate_mock_registry(&run.exe, &run.state, layout).await?;
         }
+        let mut records = if layout.records_path.exists() {
+            serde_json::from_slice::<stow_types::records::BuildRecords>(
+                &async_fs::read(&layout.records_path).await?,
+            )?
+        } else {
+            stow_types::records::BuildRecords::default()
+        };
+        records.local_programs = output.programs.completed;
+        async_fs::write(&layout.records_path, serde_json::to_vec(&records)?).await?;
     }
     push_records(
         &run.state,
@@ -1910,7 +1919,11 @@ async fn push_records(
     // An empty plan leaves no records.json — the records artifact carries
     // the empty set, exactly like production's `push_records(&[])`.
     if !records_path.exists() {
-        async_fs::write(records_path, "[]").await?;
+        async_fs::write(
+            records_path,
+            serde_json::to_vec(&stow_types::records::BuildRecords::default())?,
+        )
+        .await?;
     }
     let status = async_process::Command::new(&mock_registry_exe)
         .arg("push-records")

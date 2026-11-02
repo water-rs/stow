@@ -279,6 +279,8 @@ mod tests {
                 row_count: 0,
             },
             rows: Vec::new(),
+            build_scripts: Vec::new(),
+            local_programs: Vec::new(),
         };
         let payload = serde_json::to_vec(&index).expect("index json");
         let zstd = stow_shim::encode_index(&index).expect("index encodes");

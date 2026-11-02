@@ -4052,6 +4052,7 @@ mod tests {
             DependencyIdentity::from_task_ids([d_task_id.as_str()]).expect("digest");
         let t_task_id = identity("dep", &["a", "b"]).task_id(&t_dep_identity);
         let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             rows: vec![
@@ -4167,6 +4168,7 @@ mod tests {
         let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
         let published = vec![
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: TARGET.parse().expect("target"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![
@@ -4182,6 +4184,7 @@ mod tests {
                 ],
             },
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: HOST.parse().expect("host"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![published_row(
@@ -4249,6 +4252,7 @@ mod tests {
         let dep_task_id = identity("dep", &["a", "b"], false).task_id(&dep_identity);
         let published = vec![
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: TARGET.parse().expect("target"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![
@@ -4264,6 +4268,7 @@ mod tests {
                 ],
             },
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: HOST.parse().expect("host"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![published_row("helper", &[], &[], Vec::new(), "33", true)],
@@ -4325,6 +4330,7 @@ mod tests {
         // `c_metadata` join binds it, the task-id join cannot.
         let published = vec![
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: TARGET.parse().expect("target"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![
@@ -4340,6 +4346,7 @@ mod tests {
                 ],
             },
             crate::api::PublishedIndexSlice {
+                local_programs: Vec::new(),
                 target: HOST.parse().expect("host"),
                 rustc_version: "1.85.0".parse().expect("rustc"),
                 rows: vec![published_row("helper", &[], &[], Vec::new(), "33", true)],
@@ -4382,6 +4389,7 @@ mod tests {
         x_h.host_side = true;
         let x_t = submission_node("x", &[], &[], "x-t");
         let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             rows: vec![published_row("x", &["std"], &[], Vec::new(), "33", true)],
@@ -4414,6 +4422,7 @@ mod tests {
             DependencyIdentity::from_task_ids([target_id.as_str()]).expect("host dep digest");
         let host_id = identity(true).task_id(&host_dep_identity);
         let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             rows: vec![
@@ -4460,6 +4469,7 @@ mod tests {
         let x_t = submission_node("x", &[], &[], "x-t");
         let parent = submission_node("p", &[], &[1, 2], "p");
         let published = vec![crate::api::PublishedIndexSlice {
+            local_programs: Vec::new(),
             target: "x86_64-unknown-linux-gnu".parse().expect("target"),
             rustc_version: "1.85.0".parse().expect("rustc"),
             rows: vec![published_row("x", &["std"], &[], Vec::new(), "66", false)],
@@ -5104,6 +5114,11 @@ impl SubmissionTree {
         // published slices, and the serving map over them: a set
         // contained in no other is built; every other set is served by
         // the smallest built set containing it.
+        let node_slices = published
+            .iter()
+            .map(PublishedIndexSlice::node_slice)
+            .collect::<Vec<_>>();
+        let published = node_slices.as_slice();
         let mut families = BTreeMap::<SubstitutionGroupKey, BTreeSet<Vec<String>>>::new();
         for tree in trees.iter() {
             for node in &tree.nodes {
@@ -5232,12 +5247,69 @@ impl SubmissionTree {
 /// slice's coordinates, which rows do not themselves carry.
 #[derive(Debug, Clone)]
 pub struct PublishedIndexSlice {
+    /// Signed nodes whose programs each consumer compiles locally.
+    pub local_programs: Vec<crate::records::LocalProcMacro>,
     /// The slice's target triple — every row's `TaskNodeIdentity.target`.
     pub target: TargetTriple,
     /// The slice's rustc — every row's `TaskNodeIdentity.rustc_version`.
     pub rustc_version: WireRustcVersion,
     /// The verified rows.
     pub rows: Vec<ArtifactIndexRow>,
+}
+
+/// Node-only projection shared by downloadable artifacts and local programs.
+struct PublishedNodeRow {
+    crate_name: CrateName,
+    version: CrateVersion,
+    features_json: FeaturesJson,
+    node_profile: NodeProfile,
+    unit_shape: crate::public_cache::UnitShape,
+    dependency_task_ids: Vec<String>,
+    proc_macro: bool,
+}
+
+impl PublishedNodeRow {
+    fn dependency_identity(&self) -> crate::error::Result<DependencyIdentity> {
+        DependencyIdentity::from_task_ids(self.dependency_task_ids.iter().map(String::as_str))
+    }
+}
+
+struct PublishedNodeSlice {
+    target: TargetTriple,
+    rustc_version: WireRustcVersion,
+    rows: Vec<PublishedNodeRow>,
+}
+
+impl PublishedIndexSlice {
+    fn node_slice(&self) -> PublishedNodeSlice {
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| PublishedNodeRow {
+                crate_name: row.crate_name.clone(),
+                version: row.version.clone(),
+                features_json: row.features_json.clone(),
+                node_profile: row.node_profile,
+                unit_shape: row.unit_shape,
+                dependency_task_ids: row.dependency_task_ids.clone(),
+                proc_macro: row.artifact_kind == ArtifactKind::ProcMacro,
+            })
+            .chain(self.local_programs.iter().map(|program| PublishedNodeRow {
+                crate_name: program.node.crate_name.clone(),
+                version: program.node.version.clone(),
+                features_json: program.node.features_json.clone(),
+                node_profile: program.node.profile,
+                unit_shape: program.unit_shape,
+                dependency_task_ids: program.dependency_task_ids.clone(),
+                proc_macro: true,
+            }))
+            .collect();
+        PublishedNodeSlice {
+            target: self.target.clone(),
+            rustc_version: self.rustc_version.clone(),
+            rows,
+        }
+    }
 }
 
 /// The identity group the superset-serving rule keys on (stow#881) —
@@ -5290,7 +5362,7 @@ type TwinPairKey = (
 #[allow(clippy::too_many_lines)] // one pass over both pools; split hurts the shape
 fn patch_twin_pair_serving(
     trees: &[SubmissionTree],
-    published: &[PublishedIndexSlice],
+    published: &[PublishedNodeSlice],
     by_task_id: &std::collections::HashMap<&str, (usize, usize)>,
     serving: &mut BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
 ) {
@@ -5445,8 +5517,8 @@ fn patch_twin_pair_serving(
 /// A published row's identity group — the slice supplies the two
 /// identity columns a row does not carry.
 fn substitution_row_key(
-    slice: &PublishedIndexSlice,
-    row: &ArtifactIndexRow,
+    slice: &PublishedNodeSlice,
+    row: &PublishedNodeRow,
 ) -> SubstitutionGroupKey {
     (
         row.crate_name.clone(),
@@ -5460,7 +5532,7 @@ fn substitution_row_key(
 
 /// A published row's task identity — same field split as
 /// [`substitution_row_key`].
-fn published_row_identity(slice: &PublishedIndexSlice, row: &ArtifactIndexRow) -> TaskNodeIdentity {
+fn published_row_identity(slice: &PublishedNodeSlice, row: &PublishedNodeRow) -> TaskNodeIdentity {
     TaskNodeIdentity {
         crate_name: row.crate_name.clone(),
         version: row.version.clone(),
@@ -5480,7 +5552,7 @@ fn published_row_identity(slice: &PublishedIndexSlice, row: &ArtifactIndexRow) -
 /// `dependency_task_ids` edges name (stow#919).
 #[allow(clippy::type_complexity)]
 fn published_pool_index(
-    published: &[PublishedIndexSlice],
+    published: &[PublishedNodeSlice],
     serving: &BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
 ) -> crate::error::Result<(
     BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize, String)>,
@@ -5518,7 +5590,7 @@ fn published_pool_index(
 /// and the memoized per-occurrence answers.
 struct Substitution<'a> {
     trees: &'a [SubmissionTree],
-    published: &'a [PublishedIndexSlice],
+    published: &'a [PublishedNodeSlice],
     serving: &'a BTreeMap<SubstitutionGroupKey, BTreeMap<Vec<String>, Vec<String>>>,
     representatives: &'a BTreeMap<(SubstitutionGroupKey, Vec<String>), (usize, usize)>,
     /// `(slice, row, task id)` of each serving set's published pick.
@@ -5673,8 +5745,7 @@ impl Substitution<'_> {
                 explicit_spelling: intern_key.1,
                 dependencies: intern_key.2.clone(),
             });
-            self.closure_pm
-                .push(row.artifact_kind == ArtifactKind::ProcMacro || keys_apart);
+            self.closure_pm.push(row.proc_macro || keys_apart);
             self.interned.insert(intern_key, index);
             index
         };

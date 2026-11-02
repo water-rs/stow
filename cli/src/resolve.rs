@@ -195,6 +195,7 @@ pub fn analyze_dependency_graph(
     target: &str,
     rustc_version: &str,
     host_glibc: Option<GlibcVersion>,
+    local_programs: &[stow_types::records::LocalProcMacro],
 ) -> stow_types::error::Result<GraphAnalysis> {
     if entries.is_empty() {
         return Ok(GraphAnalysis {
@@ -255,7 +256,7 @@ pub fn analyze_dependency_graph(
         })
         .collect::<Vec<_>>();
 
-    let plan = expanded_scheduler_plan(&exact_graph, rows, host_glibc)?;
+    let plan = expanded_scheduler_plan(&exact_graph, rows, host_glibc, local_programs)?;
 
     Ok(GraphAnalysis {
         entries: response_entries,
@@ -275,6 +276,7 @@ fn expanded_scheduler_plan(
     exact_graph: &ExactExpandedGraph,
     rows: &[ArtifactIndexRow],
     host_glibc: Option<GlibcVersion>,
+    local_programs: &[stow_types::records::LocalProcMacro],
 ) -> stow_types::error::Result<ExpandedSchedulerPlan> {
     let cached = cached_artifacts(
         rows,
@@ -282,6 +284,7 @@ fn expanded_scheduler_plan(
         &exact_graph.dependency_identity_by_key,
         &exact_graph.root_keys,
         host_glibc,
+        local_programs,
     )?;
     let expanded_total = exact_graph.feature_json_by_key.len();
     let expanded_cached = exact_graph
@@ -515,6 +518,7 @@ fn cached_artifacts(
     dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
     root_keys: &BTreeSet<PackageKey>,
     host_glibc: Option<GlibcVersion>,
+    local_programs: &[stow_types::records::LocalProcMacro],
 ) -> stow_types::error::Result<CachedArtifacts> {
     let key_pairs = feature_json_by_key
         .iter()
@@ -528,12 +532,32 @@ fn cached_artifacts(
         });
     }
 
-    let reachable = resolve_reachable_cached_rows(&key_pairs, dependency_identity_by_key, rows)?;
-    let semantic_keys = reachable
+    let reachable = resolve_reachable_cached_rows(
+        &key_pairs,
+        dependency_identity_by_key,
+        rows,
+        local_programs,
+    )?;
+    let mut semantic_keys = reachable
         .candidates
         .iter()
         .map(|candidate| candidate.semantic_key.clone())
         .collect::<BTreeSet<_>>();
+    for program in local_programs {
+        let key = PackageKey {
+            crate_name: program.node.crate_name.clone(),
+            version: program.node.version.as_semver().clone(),
+        };
+        let semantic = (key.clone(), program.node.features_json.raw());
+        if key_pairs.contains(&semantic)
+            && dependency_identity_by_key.get(&key) == Some(&program.dependency_identity()?)
+            && reachable
+                .chain_by_c_metadata
+                .contains_key(program.c_metadata.as_str())
+        {
+            semantic_keys.insert(semantic);
+        }
+    }
     // stow#882: a key covered only through a `superset` candidate is a
     // node served inexactly — its exact chain is the chain the inexact
     // report asks the scheduler to build.
@@ -554,8 +578,12 @@ fn cached_artifacts(
         .filter(|row| row_servable_on_host(row, host_glibc))
         .cloned()
         .collect::<Vec<_>>();
-    let servable_reachable =
-        resolve_reachable_cached_rows(&key_pairs, dependency_identity_by_key, &servable_rows)?;
+    let servable_reachable = resolve_reachable_cached_rows(
+        &key_pairs,
+        dependency_identity_by_key,
+        &servable_rows,
+        local_programs,
+    )?;
     let selected_prefetch_rows =
         select_prefetch_candidates(feature_json_by_key, root_keys, &servable_reachable)?;
     // Prefetch the full closure of every selected candidate: the CLI's
@@ -573,12 +601,34 @@ fn resolve_reachable_cached_rows<'a>(
     key_pairs: &BTreeSet<(PackageKey, String)>,
     dependency_identity_by_key: &BTreeMap<PackageKey, DependencyIdentity>,
     rows: &'a [ArtifactIndexRow],
+    local_programs: &[stow_types::records::LocalProcMacro],
 ) -> stow_types::error::Result<ReachableRows<'a>> {
     let IndexedRows {
         mut candidates,
-        chain_rows,
+        mut chain_rows,
     } = partition_cached_rows(key_pairs, dependency_identity_by_key, rows)?;
 
+    for program in local_programs {
+        if stable_c_metadata_for_compile_key(&program.compile_key)? != program.c_metadata.as_str() {
+            return Err(stow_types::stow_error!(
+                "local proc macro {} has inconsistent compile identity",
+                program.node.crate_name
+            ));
+        }
+        chain_rows.push(ChainRow {
+            row: None,
+            c_metadata: program.c_metadata.as_str().to_owned(),
+            dependency_identities: program
+                .dependency_c_metadata_json
+                .entries()
+                .iter()
+                .map(|dep| DepChainIdentity {
+                    crate_name: dep.crate_name.as_str().to_owned(),
+                    c_metadata: dep.c_metadata.as_str().to_owned(),
+                })
+                .collect(),
+        });
+    }
     let (reachable_candidates, _) = reachable_indices(&candidates, &chain_rows);
     // stow#881: a node whose exact chain is not published may still be
     // served — by the smallest published set containing its requested
@@ -607,8 +657,10 @@ fn resolve_reachable_cached_rows<'a>(
         }
     }
 
-    let candidate_by_c_metadata = by_c_metadata(&kept_candidates, |candidate| candidate.row);
-    let chain_by_c_metadata = by_c_metadata(&kept_chain, |chain_row| chain_row.row);
+    let candidate_by_c_metadata = by_c_metadata(&kept_candidates, |candidate| {
+        candidate.row.c_metadata.as_str()
+    });
+    let chain_by_c_metadata = by_c_metadata(&kept_chain, |chain_row| chain_row.c_metadata.as_str());
     Ok(ReachableRows {
         candidates: kept_candidates,
         candidate_by_c_metadata,
@@ -622,15 +674,10 @@ fn resolve_reachable_cached_rows<'a>(
 /// and a dependency edge — which records `c_metadata` alone — is
 /// satisfied by any of them (stow#578, mirroring the consume-side walk in
 /// stow#581).
-fn by_c_metadata<'a, Row>(
-    rows: &[Row],
-    row_of: impl Fn(&Row) -> &'a ArtifactIndexRow,
-) -> BTreeMap<String, Vec<usize>> {
+fn by_c_metadata<Row>(rows: &[Row], row_of: impl Fn(&Row) -> &str) -> BTreeMap<String, Vec<usize>> {
     let mut map = BTreeMap::<String, Vec<usize>>::new();
     for (index, entry) in rows.iter().enumerate() {
-        map.entry(row_of(entry).c_metadata.as_str().to_owned())
-            .or_default()
-            .push(index);
+        map.entry(row_of(entry).to_owned()).or_default().push(index);
     }
     map
 }
@@ -649,8 +696,9 @@ fn reachable_indices<'a>(
     candidates: &[ReachableCandidateRow<'a>],
     chain_rows: &[ChainRow<'a>],
 ) -> (BTreeSet<usize>, BTreeSet<usize>) {
-    let candidate_by_c_metadata = by_c_metadata(candidates, |candidate| candidate.row);
-    let chain_by_c_metadata = by_c_metadata(chain_rows, |chain_row| chain_row.row);
+    let candidate_by_c_metadata =
+        by_c_metadata(candidates, |candidate| candidate.row.c_metadata.as_str());
+    let chain_by_c_metadata = by_c_metadata(chain_rows, |chain_row| chain_row.c_metadata.as_str());
     let edge_reachable = |identity: &DepChainIdentity,
                           reachable_candidates: &BTreeSet<usize>,
                           reachable_chain: &BTreeSet<usize>| {
@@ -787,7 +835,8 @@ fn partition_cached_rows<'a>(
         }
         chain_index.insert(identity_key, chain_rows.len());
         chain_rows.push(ChainRow {
-            row,
+            row: Some(row),
+            c_metadata: row.c_metadata.as_str().to_owned(),
             dependency_identities,
         });
     }
@@ -943,7 +992,8 @@ struct ReachableCandidateRow<'a> {
 /// participates in candidates' dependency closures.
 #[derive(Debug)]
 struct ChainRow<'a> {
-    row: &'a ArtifactIndexRow,
+    row: Option<&'a ArtifactIndexRow>,
+    c_metadata: String,
     dependency_identities: Vec<DepChainIdentity>,
 }
 
@@ -989,16 +1039,18 @@ impl ReachableRows<'_> {
                     continue;
                 }
                 let candidate = &self.candidates[index];
-                (candidate.row, &candidate.dependency_identities)
+                (Some(candidate.row), &candidate.dependency_identities)
             };
-            artifacts.insert(
-                (
-                    canonical_crate_name(row.crate_name.as_str()),
-                    row.c_metadata.as_str().to_owned(),
-                    row.bundle_digest.as_str(),
-                ),
-                row,
-            );
+            if let Some(row) = row {
+                artifacts.insert(
+                    (
+                        canonical_crate_name(row.crate_name.as_str()),
+                        row.c_metadata.as_str().to_owned(),
+                        row.bundle_digest.as_str(),
+                    ),
+                    row,
+                );
+            }
             for identity in identities {
                 // The edge records `c_metadata` alone — every row carrying
                 // it (a slice may hold linked and unlinked unit shapes
@@ -1608,12 +1660,64 @@ mod tests {
         ];
 
         let reachable =
-            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows, &[])
+                .unwrap();
 
         assert_eq!(reachable.candidates.len(), 2);
         assert_eq!(reachable.candidates[0].row.crate_name.as_str(), "same-file");
         assert_eq!(reachable.candidates[1].row.crate_name.as_str(), "walkdir");
         assert!(reachable.chain_rows.is_empty());
+    }
+
+    #[test]
+    fn local_proc_macro_traverses_dependencies_without_a_download() {
+        let macro_row = row(
+            "derive",
+            "1.0.0",
+            "01f363aa41893bdd",
+            &[],
+            &[("leaf", "72e2ded9fa67e0a1")],
+        );
+        let program = stow_types::records::LocalProcMacro {
+            node: stow_types::task_graph::TaskNodeIdentity {
+                crate_name: macro_row.crate_name.clone(),
+                version: macro_row.version.clone(),
+                features_json: macro_row.features_json.clone(),
+                target: TARGET.parse().unwrap(),
+                rustc_version: RUSTC.parse().unwrap(),
+                host_side: true,
+                profile: stow_types::node_profile::NodeProfile::Dev,
+            },
+            dependency_task_ids: Vec::new(),
+            dependency_c_metadata_json: macro_row.dependency_c_metadata_json.clone(),
+            compile_key: macro_row.compile_key.clone(),
+            c_metadata: macro_row.c_metadata.clone(),
+            unit_shape: macro_row.unit_shape,
+        };
+        let programs = [program];
+        let keys = BTreeSet::from([(key("consumer", "1.0.0"), "[]".to_owned())]);
+        let digests = leaf_digests(&keys);
+        let mut rows = vec![row(
+            "consumer",
+            "1.0.0",
+            "1c0d7420b566b7a2",
+            &[],
+            &[("derive", "01f363aa41893bdd")],
+        )];
+        let missing = resolve_reachable_cached_rows(&keys, &digests, &rows, &programs).unwrap();
+        assert!(
+            missing.candidates.is_empty(),
+            "the local macro's missing library still blocks the chain"
+        );
+        rows.push(row("leaf", "1.0.0", "72e2ded9fa67e0a1", &[], &[]));
+        let reachable = resolve_reachable_cached_rows(&keys, &digests, &rows, &programs).unwrap();
+        assert_eq!(reachable.candidates.len(), 1);
+        let downloads = reachable.closure_artifacts(&BTreeSet::from([0]));
+        let names = downloads
+            .iter()
+            .map(|row| row.crate_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["consumer", "leaf"]);
     }
 
     #[test]
@@ -1629,7 +1733,8 @@ mod tests {
         )];
 
         let reachable =
-            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows, &[])
+                .unwrap();
 
         assert!(reachable.candidates.is_empty());
     }
@@ -1665,7 +1770,8 @@ mod tests {
         ];
 
         let reachable =
-            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows, &[])
+                .unwrap();
 
         assert_eq!(reachable.candidates.len(), 2);
         let consumer_index = reachable
@@ -1711,7 +1817,8 @@ mod tests {
         ];
 
         let reachable =
-            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows, &[])
+                .unwrap();
 
         assert_eq!(reachable.candidates.len(), 1);
         assert_eq!(reachable.chain_rows.len(), 2);
@@ -1746,12 +1853,20 @@ mod tests {
         ];
 
         let reachable =
-            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows, &[])
+                .unwrap();
 
         assert_eq!(reachable.candidates.len(), 1);
         assert_eq!(reachable.candidates[0].row.crate_name.as_str(), "walkdir");
         assert_eq!(reachable.chain_rows.len(), 1);
-        assert_eq!(reachable.chain_rows[0].row.crate_name.as_str(), "same-file");
+        assert_eq!(
+            reachable.chain_rows[0]
+                .row
+                .expect("artifact chain row")
+                .crate_name
+                .as_str(),
+            "same-file"
+        );
 
         let closure = reachable.closure_artifacts(&BTreeSet::from([0]));
         let names = closure
@@ -1798,7 +1913,8 @@ mod tests {
         ];
 
         let reachable =
-            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows).unwrap();
+            resolve_reachable_cached_rows(&key_pairs, &leaf_digests(&key_pairs), &rows, &[])
+                .unwrap();
 
         assert_eq!(reachable.candidates.len(), 2);
         assert_eq!(reachable.candidates[0].row.crate_name.as_str(), "ignore");
@@ -1916,7 +2032,7 @@ mod tests {
             },
         ];
         let analysis =
-            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, None)
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, None, &[])
                 .expect("analyze");
 
         assert_eq!(analysis.expanded_total, 3);
@@ -2113,7 +2229,7 @@ mod tests {
         });
 
         let analysis =
-            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, host)
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, host, &[])
                 .expect("analyze");
 
         // Both nodes stay covered — dep-b's row exists, it simply cannot
@@ -2206,7 +2322,7 @@ mod tests {
         ];
 
         let analysis =
-            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, None)
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, None, &[])
                 .expect("analyze");
         assert_eq!(analysis.expanded_total, 2);
         assert_eq!(
@@ -2224,7 +2340,7 @@ mod tests {
             row("dep-b", "1.0.0", "bbbbbbbbbbbbbbbb", &[], &[]),
         ];
         let analysis =
-            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, None)
+            analyze_dependency_graph(&rows, &entries, &expanded_entries, TARGET, RUSTC, None, &[])
                 .expect("analyze");
         assert_eq!(
             analysis.expanded_cached, 2,

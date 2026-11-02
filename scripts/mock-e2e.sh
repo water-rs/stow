@@ -361,12 +361,12 @@ for s in json.load(open(sys.argv[1])):
     [ -f "$WORK_DIR/index-export/new-records.json" ] \
         || die "index export wrote no new-records.json"
     if [ -f "$WORK_DIR/catalog.json" ]; then
-        jq -s add "$WORK_DIR/index-export/new-records.json" \
+        jq -s ".[0].artifacts + .[1]" "$WORK_DIR/index-export/new-records.json" \
             "$WORK_DIR/catalog.json" >"$WORK_DIR/catalog.next.json" \
             || die "catalog merge failed"
         mv "$WORK_DIR/catalog.next.json" "$WORK_DIR/catalog.json"
     else
-        cp "$WORK_DIR/index-export/new-records.json" "$WORK_DIR/catalog.json"
+        jq .artifacts "$WORK_DIR/index-export/new-records.json" > "$WORK_DIR/catalog.json"
     fi
 }
 
@@ -1928,6 +1928,53 @@ echo "[mock-e2e] uncovered graph: 1 admission with PoW challenge (expected)"
 
 echo "[mock-e2e] OK — $TASK_CRATE $TASK_VERSION served from the mock cache via the local index"
 
+# --- stow#1009: remote and local build-script binaries -----------------
+script_before="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")"
+fg isolated_env STOW_EDGE_URL="$EDGE_URL" GH_TOKEN="$(oidc operations.yml)" \
+    "$BIN/stow-admin" submit --crate-name serde_core --version 1.0.229 \
+    --features-json '[]' --target "$HOST_TARGET" --rustc-version "$RUSTC_VERSION" --yes \
+    >"$LOG_DIR/build-script-submit.log" 2>&1 \
+    || die "build-script submit failed — see $LOG_DIR/build-script-submit.log"
+deadline=$((SECONDS + TASK_DEADLINE))
+while :; do
+    check_children_alive
+    status_json="$(curl -fsS --max-time 10 "$SCHEDULER_URL/status")"
+    [ "$(jq -r '.failed' <<<"$status_json")" -eq "$(jq -r '.failed' <<<"$script_before")" ] \
+        || die "build-script task failed: $status_json"
+    [ "$(jq -r '.completed' <<<"$status_json")" -gt "$(jq -r '.completed' <<<"$script_before")" ] && break
+    [ "$SECONDS" -lt "$deadline" ] || die "build-script task exceeded ${TASK_DEADLINE}s"
+    sleep 5
+done
+fg publish_slices build-script
+jq -e '[.[] | select(.crate_name == "serde_core" and .artifact_kind == "BuildScript")] | length > 0' \
+    "$WORK_DIR/catalog.json" >/dev/null || die "serde_core published no build-script artifact"
+SCRIPT_CONSUMER="$WORK_DIR/build-script-consumer"
+isolated_env cargo new --lib --vcs none "$SCRIPT_CONSUMER" >"$LOG_DIR/build-script-new.log" 2>&1
+printf 'serde_core = { version = "=1.0.229", default-features = false }\n' >>"$SCRIPT_CONSUMER/Cargo.toml"
+fg prepare_consumer "$SCRIPT_CONSUMER" build-script
+fg in_dir "$SCRIPT_CONSUMER" stow_cli index refresh >"$LOG_DIR/build-script-refresh.log" 2>&1
+RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-remote.log" 2>&1 \
+    || die "remote build-script consumer failed — see $LOG_DIR/build-script-remote.log"
+grep 'served rustc invocation from downloaded stow artifact cache' "$LOG_DIR/build-script-remote.log" \
+    | grep 'crate_name=build_script_build' >/dev/null || die "build script was not served remotely"
+fg in_dir "$SCRIPT_CONSUMER" isolated_env cargo clean >"$LOG_DIR/build-script-clean.log" 2>&1
+RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-local.log" 2>&1 \
+    || die "local build-script consumer failed — see $LOG_DIR/build-script-local.log"
+grep 'served rustc invocation from local stow artifact cache' "$LOG_DIR/build-script-local.log" \
+    | grep 'crate_name=build_script_build' >/dev/null || die "build script was not served locally"
+RUST_LOG=stow_cli=info fg in_dir "$SCRIPT_CONSUMER" stow_cli build -vv >"$LOG_DIR/build-script-fresh.log" 2>&1 \
+    || die "fresh build-script consumer failed — see $LOG_DIR/build-script-fresh.log"
+grep 'Fresh serde_core v1.0.229' "$LOG_DIR/build-script-fresh.log" >/dev/null \
+    || die "Cargo did not keep the restored build script fresh"
+for stage in remote local; do
+    runs="$(grep -c 'Running .*build-script-build' "$LOG_DIR/build-script-$stage.log" || true)"
+    [ "$runs" -eq 1 ] || die "$stage script restore ran the script $runs times instead of once"
+done
+if grep -q 'Running .*build-script-build' "$LOG_DIR/build-script-fresh.log"; then
+    die "Cargo reran the fresh build script"
+fi
+echo "[mock-e2e] OK — build script served remotely and locally, then kept fresh by Cargo"
+
 # --- stow#774: host-side nodes ------------------------------------------
 #
 # The post-0.6.0 production failure shape (run 35995412018): a proc-macro
@@ -2210,7 +2257,8 @@ jq --arg target "$OVERSIZED_TARGET" --argjson rows "$OVERSIZED_ROWS" '
     | [range($rows) as $i
         | $base[$i % ($base | length)]
         | .target = $target
-        | .dependency_task_ids = ["oversized-report-\($i)"]]' \
+        | .dependency_task_ids = ["oversized-report-\($i)"]]
+    | {artifacts: ., local_programs: []}' \
     "$WORK_DIR/catalog.json" >"$WORK_DIR/oversized-records.json" \
     || die "building the oversized slice's records failed"
 isolated_env "$BIN/stow-mock-registry" index-from-records \

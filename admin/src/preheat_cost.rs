@@ -358,7 +358,10 @@ async fn phase(
     }
     let mut rounds = Vec::new();
     for round_dir in sorted_entries(&dir.join("rounds")).await? {
-        let records: Vec<ArtifactRecord> = read_json(&round_dir.join("new-records.json")).await?;
+        let records =
+            read_json::<stow_types::records::BuildRecords>(&round_dir.join("new-records.json"))
+                .await?
+                .artifacts;
         rounds.push(Round {
             before_report: read_json(&round_dir.join("before-report.json")).await?,
             end: read_json(&round_dir.join("end.json")).await?,

@@ -1,4 +1,4 @@
-//! The per-build records artifact: a build's `Vec<ArtifactRecord>` pushed,
+//! The per-build records artifact: a build's `BuildRecords` pushed,
 //! signed and read back as one OCI artifact in the same namespace the
 //! bundles use (stow#455). Each build publishes under its own
 //! `records-<rustc>-<task_id hash>-<run_id>-<run_attempt>` tag, so a
@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 
 use oci_client::client::{Config, ImageLayer};
 use oci_client::manifest::OciImageManifest;
-use stow_types::api::ArtifactRecord;
 use stow_types::identity::WireRustcVersion;
+use stow_types::records::BuildRecords;
 use stow_types::records::{
     BuildRun, RECORDS_ARTIFACT_TYPE, RECORDS_CONFIG_MEDIA_TYPE, RECORDS_TASK_ID_ANNOTATION,
     is_records_tag, published_tag, records_tag,
@@ -40,7 +40,7 @@ pub struct RecordsPublishOutcome {
 #[derive(Debug)]
 pub struct PulledRecords {
     /// The artifact's rows.
-    pub records: Vec<ArtifactRecord>,
+    pub records: BuildRecords,
     /// Full `registry/repo:tag` reference.
     pub oci_reference: String,
     /// Manifest digest — the input to `pull_signature_materials`.
@@ -64,7 +64,7 @@ pub async fn push_records(
     rustc_version: &WireRustcVersion,
     task_id: &str,
     build: BuildRun,
-    records: &[ArtifactRecord],
+    records: &BuildRecords,
 ) -> stow_types::error::Result<RecordsPublishOutcome> {
     let session = publisher.session(&cache_repository(rustc_version))?;
     let session = &session;
@@ -93,7 +93,7 @@ pub async fn push_records_with<S, Fut>(
     rustc_version: &WireRustcVersion,
     task_id: &str,
     build: BuildRun,
-    records: &[ArtifactRecord],
+    records: &BuildRecords,
     sign: S,
 ) -> stow_types::error::Result<RecordsPublishOutcome>
 where
@@ -146,7 +146,8 @@ where
         oci_reference = %reference,
         digest = %manifest_digest,
         task_id,
-        records = records.len(),
+        records = records.artifacts.len(),
+        local_programs = records.local_programs.len(),
         "pushed and signed records artifact"
     );
     Ok(RecordsPublishOutcome {
@@ -161,7 +162,7 @@ where
 /// The manifest under the records tag must declare
 /// [`RECORDS_ARTIFACT_TYPE`] and carry the task-id annotation naming the
 /// same task, then its single layer — digest-verified — decodes as the
-/// `Vec<ArtifactRecord>`.
+/// `BuildRecords`.
 ///
 /// # Errors
 ///
@@ -224,7 +225,7 @@ pub async fn pull_records_by_tag(
         ));
     }
     let bytes = pull_blob_verified(session, descriptor).await?;
-    let records: Vec<ArtifactRecord> = serde_json::from_slice(&bytes)
+    let records: BuildRecords = serde_json::from_slice(&bytes)
         .map_err(|error| stow_types::stow_error!("decode records layer of {reference}: {error}"))?;
     Ok(PulledRecords {
         records,

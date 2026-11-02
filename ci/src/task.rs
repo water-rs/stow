@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -83,6 +84,7 @@ impl BuildWorkspace {
 /// invocation it ran under, and that graph's units carry the resolved
 /// feature set the published row is labelled with (stow#611).
 pub struct BuiltWorkspace {
+    local_programs: Vec<stow_types::records::LocalProcMacro>,
     workspace: BuildWorkspace,
     run_dir: TempDir,
     captures: Vec<CapturedRustcArtifact>,
@@ -90,6 +92,9 @@ pub struct BuiltWorkspace {
 }
 
 impl BuiltWorkspace {
+    pub fn local_programs(&self) -> &[stow_types::records::LocalProcMacro] {
+        &self.local_programs
+    }
     pub const fn workspace(&self) -> &BuildWorkspace {
         &self.workspace
     }
@@ -676,19 +681,27 @@ fn lockfile_packages(
 async fn stage_consumption_store(
     task: &BuildTaskPayload,
     unit_graphs: &[PhaseUnitGraph],
-) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
-    if task.dependency_subgraph.nodes.is_empty() {
-        return Ok((None, None));
+) -> stow_types::error::Result<(
+    Option<TempDir>,
+    Option<PathBuf>,
+    Vec<stow_types::records::LocalProcMacro>,
+)> {
+    let packages = consumption_packages(task, unit_graphs)?;
+    if packages.libraries.is_empty() && packages.scripts.is_empty() {
+        return Ok((None, None, Vec::new()));
     }
     let store_dir = TempDir::new()?;
-    let packages = consumption_packages(task, unit_graphs);
     let consumption = consume::prefetch(task, packages, store_dir.path())
         .await
         .map_err(|error| error.wrap_err("stage cache consumption"))?;
     Ok(if consumption.artifacts > 0 {
-        (Some(store_dir), Some(consumption.store_dir))
+        (
+            Some(store_dir),
+            Some(consumption.store_dir),
+            consumption.local_programs,
+        )
     } else {
-        (None, None)
+        (None, None, consumption.local_programs)
     })
 }
 
@@ -870,12 +883,28 @@ pub async fn phase_unit_graphs(
 fn consumption_packages(
     task: &BuildTaskPayload,
     unit_graphs: &[PhaseUnitGraph],
-) -> Vec<dep_scan::ConsumablePackage> {
+) -> stow_types::error::Result<dep_scan::ConsumablePackages> {
+    let mut scripts = BTreeSet::new();
     let mut entries = Vec::new();
     for unit_graph in unit_graphs {
         entries.extend(unit_graph.graph.entries.iter().cloned());
+        for unit in unit_graph.task_units(runner_host_triple(task)?)? {
+            if unit.is_crates_io
+                && unit.key.kind == stow_types::unit_graph::TaskUnitKind::BuildScript
+            {
+                scripts.insert(dep_scan::ConsumablePackage {
+                    crate_name: unit.name,
+                    version: semver::Version::parse(&unit.version)?,
+                    features: unit.features.into_iter().collect(),
+                    host_side: true,
+                });
+            }
+        }
     }
-    dep_scan::consumable_packages(task, &entries)
+    Ok(dep_scan::ConsumablePackages {
+        libraries: dep_scan::consumable_packages(task, &entries),
+        scripts: scripts.into_iter().collect(),
+    })
 }
 
 /// The compiled dependency-context gate (stow#588): every phase×invocation
@@ -1160,7 +1189,11 @@ trait CompilationMode: Sync {
         task: &BuildTaskPayload,
         graphs: &[PhaseUnitGraph],
     ) -> impl std::future::Future<
-        Output = stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)>,
+        Output = stow_types::error::Result<(
+            Option<TempDir>,
+            Option<PathBuf>,
+            Vec<stow_types::records::LocalProcMacro>,
+        )>,
     > + Send;
     fn wrapper<'a>(&self, setup: &'a PhaseSetup<'_>) -> Option<&'a Path>;
 }
@@ -1187,7 +1220,11 @@ impl CompilationMode for CachedCompilation {
         &self,
         task: &BuildTaskPayload,
         graphs: &[PhaseUnitGraph],
-    ) -> stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)> {
+    ) -> stow_types::error::Result<(
+        Option<TempDir>,
+        Option<PathBuf>,
+        Vec<stow_types::records::LocalProcMacro>,
+    )> {
         stage_consumption_store(task, graphs).await
     }
 
@@ -1234,9 +1271,13 @@ impl CompilationMode for CleanCompilation<'_> {
         _task: &BuildTaskPayload,
         _graphs: &[PhaseUnitGraph],
     ) -> impl std::future::Future<
-        Output = stow_types::error::Result<(Option<TempDir>, Option<PathBuf>)>,
+        Output = stow_types::error::Result<(
+            Option<TempDir>,
+            Option<PathBuf>,
+            Vec<stow_types::records::LocalProcMacro>,
+        )>,
     > + Send {
-        std::future::ready(Ok((None, None)))
+        std::future::ready(Ok((None, None, Vec::new())))
     }
 
     fn wrapper<'a>(&self, _setup: &'a PhaseSetup<'_>) -> Option<&'a Path> {
@@ -1300,7 +1341,8 @@ async fn compile_task(
     // not just the cache path.
     let unit_graphs = phase_unit_graphs(&cargo_home, task, &workspace, cargo_subcommand).await?;
     verify_dependency_context(task, &unit_graphs)?;
-    let (_consume_store_dir, consume_store) = mode.consumption(task, &unit_graphs).await?;
+    let (_consume_store_dir, consume_store, local_programs) =
+        mode.consumption(task, &unit_graphs).await?;
 
     let audit_log = heel::NetworkAuditLog::file(output_dir.join("network-audit.jsonl"))
         .map_err(|error| stow_types::stow_error!("open network audit log: {error}"))?;
@@ -1390,6 +1432,7 @@ async fn compile_task(
     );
 
     Ok(Ok(BuiltWorkspace {
+        local_programs,
         workspace,
         run_dir,
         captures: collector.into_records()?,
@@ -3176,13 +3219,17 @@ mod tests {
             }],
         };
 
-        let error = smol::block_on(crate::consume::slices_for_task_with(&task, |_, _| {
-            Box::pin(async {
-                Err(stow_types::stow_error!(
-                    "ftp://127.0.0.1 is not a supported registry scheme"
-                ))
-            })
-        }))
+        let error = smol::block_on(crate::consume::slices_for_task_with(
+            &task,
+            false,
+            |_, _| {
+                Box::pin(async {
+                    Err(stow_types::stow_error!(
+                        "ftp://127.0.0.1 is not a supported registry scheme"
+                    ))
+                })
+            },
+        ))
         .expect_err("an unreadable slice fails the build");
         let text = format!("{error:#}");
         assert!(
@@ -3197,12 +3244,13 @@ mod tests {
     #[test]
     fn a_task_without_dependencies_consumes_nothing() {
         let cache_dir = TempDir::new().expect("cache dir");
-        let (store, path) = smol::block_on(super::stage_consumption_store(
+        let (store, path, programs) = smol::block_on(super::stage_consumption_store(
             &task_with_features(&[]),
             &[],
         ))
         .expect("nothing to consume is not a failure");
         assert!(store.is_none() && path.is_none());
+        assert_eq!(programs, []);
         assert!(
             std::fs::read_dir(cache_dir.path())
                 .expect("cache dir")

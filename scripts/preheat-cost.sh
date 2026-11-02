@@ -555,7 +555,7 @@ publish_round() {
         >>"$LOG_DIR/index-report.log" 2>&1 \
         || die "index report failed — see $LOG_DIR/index-report.log"
     snapshot "$dir/end.json"
-    log "$phase round $tag: $(jq length "$dir/new-records.json") records, $(jq length "$WORK_DIR/index-export/slices.json") slices"
+    log "$phase round $tag: $(jq ".artifacts | length" "$dir/new-records.json") records, $(jq length "$WORK_DIR/index-export/slices.json") slices"
 }
 
 # Drive a phase until its lanes are done and nothing is pending or in

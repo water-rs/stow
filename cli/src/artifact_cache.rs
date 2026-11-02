@@ -7,8 +7,9 @@ use semver::Version;
 use sqlx::FromRow;
 use stow_types::artifact::{ArtifactKind, RustCrateType};
 use stow_types::bundle::{
-    ArtifactBundleFile, STOW_BUNDLE_MANIFEST_PATH, STOW_DYLIB_MEDIA_TYPE,
-    STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE, SigstoreSignature,
+    ArtifactBundleFile, STOW_BUILD_SCRIPT_MEDIA_TYPE, STOW_BUNDLE_MANIFEST_PATH,
+    STOW_DYLIB_MEDIA_TYPE, STOW_PROC_MACRO_MEDIA_TYPE, STOW_RLIB_MEDIA_TYPE, STOW_RMETA_MEDIA_TYPE,
+    SigstoreSignature,
 };
 use stow_types::error::Context;
 use stow_types::identity::{CrateName, DependencyCompileKeyIdentity};
@@ -1186,6 +1187,41 @@ async fn merge_artifact_cache_outputs(
     Ok(())
 }
 
+/// The `c_metadata` slot a locally built unit's entry lives under.
+///
+/// A unit's stable `c_metadata` is its entry's identity everywhere the
+/// unit is published or served. A build script or proc macro whose
+/// compile read `CARGO_MANIFEST_DIR` embeds this checkout's path, so its
+/// output is only a hit for the same manifest directory: its local entry
+/// is keyed by the stable `c_metadata` scoped with a digest of that
+/// directory, and is never published. The entry's recorded `c_metadata`
+/// column stays the stable one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEntryKey(String);
+
+impl LocalEntryKey {
+    /// The key of a unit that embeds no path of this machine.
+    #[must_use]
+    pub fn plain(c_metadata: &str) -> Self {
+        Self(c_metadata.to_owned())
+    }
+
+    /// The key of a unit that read `CARGO_MANIFEST_DIR`, scoped to the
+    /// OS-encoded manifest directory it read.
+    #[must_use]
+    pub fn manifest_scoped(c_metadata: &str, manifest_dir: &[u8]) -> Self {
+        use sha2::Digest as _;
+        let digest = hex::encode(sha2::Sha256::digest(manifest_dir));
+        Self(format!("{c_metadata}-m{}", &digest[..16]))
+    }
+
+    /// The path segment and cache-key component.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Cache the outputs of a successful rustc passthrough build under the same
 /// identity a remote bundle would carry, so the next worktree / `cargo
 /// clean` / branch switch hits the local entry instead of recompiling.
@@ -1205,6 +1241,7 @@ pub async fn store_local_build_outputs(
     parsed: &ParsedRustcArgs,
     build: &LocalBuildArtifact,
     host: &str,
+    entry_key: &LocalEntryKey,
 ) -> stow_types::error::Result<bool> {
     if build.outputs.is_empty() {
         return Ok(false);
@@ -1224,7 +1261,7 @@ pub async fn store_local_build_outputs(
     let entry_relative_dir = PathBuf::from(BUNDLES_DIR)
         .join(ARTIFACT_CACHE_LAYOUT_VERSION)
         .join(&build.target)
-        .join(build.identity.c_metadata.as_str());
+        .join(entry_key.as_str());
     let entry_dir = version_dir.join(&entry_relative_dir);
     let entry_parent = entry_dir.parent().ok_or_else(|| {
         stow_types::stow_error!(
@@ -1240,7 +1277,7 @@ pub async fn store_local_build_outputs(
                 entry_parent.display()
             )
         })?;
-    let cache_key = artifact_cache_key(&build.target, build.identity.c_metadata.as_str());
+    let cache_key = artifact_cache_key(&build.target, entry_key.as_str());
     let connection = config.state_db_pool().await?;
 
     let write_lease = acquire_entry_exclusive_lock_async(&version_dir, &cache_key).await?;
@@ -1565,7 +1602,7 @@ pub fn materialized_output_paths(
         paths.push(path);
     }
     if let Some(path) = parsed
-        .output_dynamic_library_path(host)
+        .output_linked_image_path(host)
         .map_err(stow_types::error::Error::msg)?
     {
         paths.push(path);
@@ -2140,23 +2177,25 @@ pub fn local_build_output_specs(
             sha256: String::new(),
         });
     }
-    if parsed.emit.contains("link") && parsed.produces_dynamic_library() {
+    if parsed.emit.contains("link")
+        && (parsed.produces_dynamic_library() || parsed.is_build_script())
+    {
         let source = parsed
-            .output_dynamic_library_path(host)
+            .output_linked_image_path(host)
             .map_err(stow_types::error::Error::msg)?
             .ok_or_else(|| {
                 stow_types::stow_error!(
-                    "dynamic library output path unavailable for crate {}",
+                    "linked image output path unavailable for crate {}",
                     parsed.crate_name
                 )
             })?;
         let file_name = output_file_name(
             &stable_parsed
-                .output_dynamic_library_path(host)
+                .output_linked_image_path(host)
                 .map_err(stow_types::error::Error::msg)?
                 .ok_or_else(|| {
                     stow_types::stow_error!(
-                        "stable dynamic library output path unavailable for crate {}",
+                        "stable linked image output path unavailable for crate {}",
                         stable_parsed.crate_name
                     )
                 })?,
@@ -2166,6 +2205,7 @@ pub fn local_build_output_specs(
             file_name,
             media_type: match crate::parsed_artifact_kind(parsed)? {
                 ArtifactKind::ProcMacro => STOW_PROC_MACRO_MEDIA_TYPE,
+                ArtifactKind::BuildScript => STOW_BUILD_SCRIPT_MEDIA_TYPE,
                 ArtifactKind::Rlib | ArtifactKind::Dylib => STOW_DYLIB_MEDIA_TYPE,
             },
             sha256: String::new(),
@@ -4149,6 +4189,25 @@ pub fn artifact_cache_key(target: &str, c_metadata: &str) -> String {
 pub mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
+
+    /// An output that embeds its manifest directory is a hit only for that
+    /// directory: the scoped key follows the directory, never equals the
+    /// plain key a path-free unit lives under, and is stable.
+    #[test]
+    fn a_manifest_scoped_entry_key_follows_the_manifest_directory() {
+        use super::LocalEntryKey;
+        let plain = LocalEntryKey::plain("0123456789abcdef");
+        let here = LocalEntryKey::manifest_scoped("0123456789abcdef", b"/work/a/itoa-1.0.0");
+        let there = LocalEntryKey::manifest_scoped("0123456789abcdef", b"/work/b/itoa-1.0.0");
+        assert_eq!(plain.as_str(), "0123456789abcdef");
+        assert_ne!(here, plain);
+        assert_ne!(here, there);
+        assert_eq!(
+            here,
+            LocalEntryKey::manifest_scoped("0123456789abcdef", b"/work/a/itoa-1.0.0")
+        );
+        assert!(here.as_str().starts_with("0123456789abcdef-m"));
+    }
     use std::time::Duration;
 
     use sha2::Digest;
@@ -4495,9 +4554,15 @@ pub mod tests {
                 .await
                 .expect("prepare cache");
             assert!(
-                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
-                    .await
-                    .expect("store local build")
+                super::store_local_build_outputs(
+                    &config,
+                    &parsed,
+                    &build,
+                    "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
+                )
+                .await
+                .expect("store local build")
             );
 
             let staging = config
@@ -5419,10 +5484,15 @@ pub mod tests {
             prepare_local_cache(&config, "1.91.1")
                 .await
                 .expect("prepare cache");
-            let stored =
-                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
-                    .await
-                    .expect("store local build");
+            let stored = super::store_local_build_outputs(
+                &config,
+                &parsed,
+                &build,
+                "aarch64-apple-darwin",
+                &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
+            )
+            .await
+            .expect("store local build");
             assert!(stored);
 
             let entry_dir = config
@@ -5495,10 +5565,15 @@ pub mod tests {
             prepare_local_cache(&config, "1.91.1")
                 .await
                 .expect("prepare cache");
-            let stored =
-                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
-                    .await
-                    .expect("store must not error on a dirty build");
+            let stored = super::store_local_build_outputs(
+                &config,
+                &parsed,
+                &build,
+                "aarch64-apple-darwin",
+                &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
+            )
+            .await
+            .expect("store must not error on a dirty build");
             assert!(!stored);
 
             let version_dir = config.artifact_cache_version_dir("1.91.1");
@@ -5536,16 +5611,28 @@ pub mod tests {
                 .await
                 .expect("prepare cache");
             assert!(
-                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
-                    .await
-                    .expect("first store")
+                super::store_local_build_outputs(
+                    &config,
+                    &parsed,
+                    &build,
+                    "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
+                )
+                .await
+                .expect("first store")
             );
             // A second worktree building the same identity must not
             // double-store or error.
             assert!(
-                !super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
-                    .await
-                    .expect("second store")
+                !super::store_local_build_outputs(
+                    &config,
+                    &parsed,
+                    &build,
+                    "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
+                )
+                .await
+                .expect("second store")
             );
         });
     }
@@ -5597,9 +5684,15 @@ pub mod tests {
         )
         .await
         .expect("record dependency outputs");
-        super::store_local_build_outputs(config, parsed, build, "aarch64-apple-darwin")
-            .await
-            .expect("store dependency")
+        super::store_local_build_outputs(
+            config,
+            parsed,
+            build,
+            "aarch64-apple-darwin",
+            &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
+        )
+        .await
+        .expect("store dependency")
     }
 
     /// Resolve a dependent's externs through the materialized outputs, as
@@ -5621,10 +5714,15 @@ pub mod tests {
         let mut build = local_build_artifact(parsed, stable_c_metadata);
         build.target = target.to_owned();
         build.dependencies = dependencies;
-        let stored =
-            super::store_local_build_outputs(config, parsed, &build, "aarch64-apple-darwin")
-                .await
-                .expect("store dependent");
+        let stored = super::store_local_build_outputs(
+            config,
+            parsed,
+            &build,
+            "aarch64-apple-darwin",
+            &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
+        )
+        .await
+        .expect("store dependent");
         (stored, build)
     }
 
@@ -6180,9 +6278,15 @@ pub mod tests {
                 .await
                 .expect("prepare cache");
             assert!(
-                super::store_local_build_outputs(&config, &parsed, &build, "aarch64-apple-darwin")
-                    .await
-                    .expect("store local build")
+                super::store_local_build_outputs(
+                    &config,
+                    &parsed,
+                    &build,
+                    "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
+                )
+                .await
+                .expect("store local build")
             );
 
             // The remote later gains the same identity: the download must not
@@ -6244,6 +6348,7 @@ pub mod tests {
                     &parsed,
                     &build,
                     "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(build.identity.c_metadata.as_str()),
                 )
                 .await
                 .expect("store local build");
@@ -6309,6 +6414,7 @@ pub mod tests {
                     &local_parsed,
                     &local_build,
                     "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(local_build.identity.c_metadata.as_str())
                 )
                 .await
                 .expect("store local build")
@@ -6400,6 +6506,7 @@ pub mod tests {
                     &local_parsed,
                     &local_build,
                     "aarch64-apple-darwin",
+                    &super::LocalEntryKey::plain(local_build.identity.c_metadata.as_str())
                 )
                 .await
                 .expect("store local build")
