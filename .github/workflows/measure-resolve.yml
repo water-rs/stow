@@ -51,8 +51,10 @@ jobs:
             >"$RUNNER_TEMP/measurement/registry.log" 2>&1 &
           registry_pid=$!
           trap 'kill "$registry_pid" 2>/dev/null || true; wait "$registry_pid" 2>/dev/null || true' EXIT
-          curl --retry 10 --retry-connrefused --retry-delay 1 --max-time 2 --fail \
-            http://127.0.0.1:28123/v2/
+          status=$(curl --retry 10 --retry-connrefused --retry-delay 1 --max-time 2 \
+            --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            http://127.0.0.1:28123/v2/)
+          test "$status" = 401
           /usr/bin/time -v -o "$RUNNER_TEMP/measurement/time.txt" \
             timeout --kill-after=30 2100 "$RUNNER_TEMP/tools/stow-admin" --json \
             preheat projects submit --file preheat/projects.toml --rustc-version 1.99.1 \
