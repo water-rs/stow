@@ -37,7 +37,7 @@ The single source of repository instructions; `CLAUDE.md` is a symlink to it.
 ## Rules
 
 - Every residual cost is the product: remove a cost before presenting it as a trade-off, and never narrow a feature to avoid one.
-- Each metered Cloudflare resource stays under 80% of its monthly Workers Paid allowance.
+- Durable Object requests stay under 90% of their monthly Workers Paid allowance; every other metered Cloudflare resource stays under 80%.
 - Fail fast on inconsistent identity or schema; no fallbacks.
 - The repository carries no migration or compatibility code. Each store has one schema and the code is written against it alone; a schema change is an operator reset of the store, refilled from the signed records or the next wave.
 - Request code and the alarm never create, alter or backfill anything. Their cost scales with the event, never with stored data; idle cost is zero; independent outbound calls run concurrently under a stated bound; no runner is held by waiting. Each scheduler route and the alarm has a drive in `edge/src/scheduler/drives.rs`, gated by `scripts/traffic-cost.sh`, and a change on those paths states its cost.

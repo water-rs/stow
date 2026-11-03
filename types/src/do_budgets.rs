@@ -26,15 +26,17 @@ pub const LEDGER_OP_ALARM: &str = "alarm";
 /// every run's completion lands on one row.
 pub const LEDGER_OP_TASK_COMPLETE: &str = "POST /tasks/complete-run";
 
-/// The one cost line every allowance consumer derives from (stow#883):
-/// each metered Cloudflare resource stays under 80% of its monthly
-/// Workers Paid allowance (AGENTS.md).
+/// The default cost line: 80% of the monthly Workers Paid allowance.
+/// Durable Object requests use [`DO_REQUEST_ALLOWANCE_FRACTION`].
 ///
-/// The release gate's monthly projection bounds each product's total —
+/// The release gate's monthly projection bounds other dimensions' totals —
 /// user traffic plus preheat — at this fraction of its allowance
 /// (`stow-admin traffic-cost project`); the in-edge breaker derives
 /// its runtime daily guard from it through [`DAILY_SHARE`].
 pub const ALLOWANCE_FRACTION: f64 = 0.8;
+
+/// Monthly request budget for the scheduler Durable Object.
+pub const DO_REQUEST_ALLOWANCE_FRACTION: f64 = 0.9;
 
 /// One UTC day's share of the line — `ALLOWANCE_FRACTION / 30`.
 ///

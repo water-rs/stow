@@ -1,6 +1,6 @@
 //! `stow-admin traffic-cost project` — the monthly projection of each
 //! Cloudflare product against the stow#883 cost line (stow#452,
-//! stow#775): 80% of its monthly Workers Paid allowance.
+//! stow#775): 90% for Durable Object requests, 80% for other dimensions.
 //!
 //! The release gate's `Monthly projection` job runs it over what the
 //! Traffic cost, Preheat cost and Production wave jobs measured: the
@@ -46,7 +46,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 use stow_types::api::SchedulerBudgetReport;
-use stow_types::do_budgets::ALLOWANCE_FRACTION;
+use stow_types::do_budgets::{ALLOWANCE_FRACTION, DO_REQUEST_ALLOWANCE_FRACTION};
 use stow_types::forwards::{self, RunForwards};
 use stow_types::launch_model::{EventKind, LaunchModel};
 use stow_types::preheat_cost::{PreheatCostReport, ProductionWave};
@@ -87,8 +87,8 @@ pub struct ProjectArgs {
 }
 
 // The gate fires when a product's projected monthly usage exceeds
-// `ALLOWANCE_FRACTION` of its included allowance — the one line
-// declared in `stow-types` (stow#883), also used by the runtime breaker.
+// its dimension-specific fraction of the included allowance. The runtime
+// breaker retains the default fraction declared in `stow-types`.
 
 /// GB-s each serialized DO wall second is priced at. Cloudflare's
 /// billing rule is fixed — 128 MB of memory per Durable Object
@@ -590,6 +590,16 @@ pub struct UsageLine {
 }
 
 impl UsageLine {
+    /// The monthly budget for this product and dimension.
+    fn bound(&self) -> f64 {
+        let fraction = if self.product == "durable_objects" && self.dimension == "requests" {
+            DO_REQUEST_ALLOWANCE_FRACTION
+        } else {
+            ALLOWANCE_FRACTION
+        };
+        self.allowance * fraction
+    }
+
     /// Traffic plus preheat — what the bound is compared with.
     pub fn total(&self) -> f64 {
         self.traffic + self.preheat.unwrap_or(0.0)
@@ -637,7 +647,7 @@ pub struct Breach {
     pub traffic: f64,
     /// The preheat part of `projected`.
     pub preheat: f64,
-    /// The gate bound — `allowance × ALLOWANCE_FRACTION`.
+    /// The gate bound for the product and dimension.
     pub bound: f64,
     /// The route driving the projection.
     pub top_route: &'static str,
@@ -894,13 +904,13 @@ fn diagnostic_lines(projection: &Projection) -> Vec<UsageLine> {
     ]
 }
 
-/// Turn each usage line whose total is over `ALLOWANCE_FRACTION` of its
-/// allowance into a breach, attributed to the route that dominates the
+/// Turn each usage line whose total exceeds its budget into a breach,
+/// attributed to the route that dominates the
 /// breached dimension — or to preheat when it is the larger part.
 fn usage_breaches(usage: &[UsageLine], top_routes: &[RouteShare]) -> Vec<Breach> {
     let mut breaches = Vec::new();
     for line in usage {
-        let bound = line.allowance * ALLOWANCE_FRACTION;
+        let bound = line.bound();
         if line.total() > bound {
             // `RouteShare::dimension` keys the share dimension by
             // product prefix — `do_`, `worker_`.
@@ -1091,13 +1101,13 @@ fn render_usage(usage: &[UsageLine]) -> String {
         "preheat/mo",
         "total/mo",
         "allowance/mo",
-        "bound (80%)",
+        "bound",
         "share",
         "",
     ]);
     let mut unmeasured = Vec::new();
     for line in usage {
-        let bound = line.allowance * ALLOWANCE_FRACTION;
+        let bound = line.bound();
         table.push([
             line.product.to_owned(),
             line.dimension.to_owned(),
@@ -1303,6 +1313,32 @@ mod tests {
             .iter()
             .find(|line| line.product == product && line.dimension == dimension)
             .expect("usage line")
+    }
+
+    #[test]
+    fn only_durable_object_requests_use_the_ninety_percent_budget() {
+        for (product, dimension, limit) in [
+            ("durable_objects", "requests", 90.0),
+            ("workers", "requests", 80.0),
+            ("workers", "cpu_ms", 80.0),
+            ("durable_objects", "rows_read", 80.0),
+            ("durable_objects", "rows_written", 80.0),
+            ("durable_objects", "duration_gb_s", 80.0),
+        ] {
+            let mut line = super::UsageLine {
+                product,
+                dimension,
+                traffic: 0.0,
+                preheat: Some(limit),
+                allowance: 100.0,
+            };
+            assert!(super::usage_breaches(std::slice::from_ref(&line), &[]).is_empty());
+            line.traffic = 1.0;
+            let breaches = super::usage_breaches(std::slice::from_ref(&line), &[]);
+            assert_eq!(breaches.len(), 1, "{product}/{dimension}");
+            assert_eq!(breaches[0].bound, limit);
+            assert!(super::render_usage(&[line]).contains("OVER"));
+        }
     }
 
     #[test]
