@@ -167,10 +167,9 @@ log "resolve root: $RESOLVE_ROOT"
 log "rustc $RUSTC_VERSION; limit $LIMIT; targets $TARGETS; lane deadline ${LANE_DEADLINE}s"
 
 cd "$REPO_ROOT"
-log "building stow-admin"
-cargo build --release -p stow-admin >"$LOG_DIR/cargo-build.log" 2>&1 \
-    || die "cargo build failed — see $LOG_DIR/cargo-build.log"
-BIN="$REPO_ROOT/target/release"
+source "$REPO_ROOT/scripts/gate-tools.sh"
+gate_tools admin "$LOG_DIR/cargo-build.log" \
+    || die "gate tools unavailable — see $LOG_DIR/cargo-build.log"
 
 # One lane, plan-only: preheat-admin.yml's invocation without `--yes`.
 # A lane's failure is recorded in its `exit` file, never fatal here — the

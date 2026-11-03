@@ -219,6 +219,7 @@ mock's push check; every mutating call carries a token from
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `STOW_GATE_BIN_DIR` | unset | Prebuilt tool directory for the mock E2E, preheat-cost, traffic-cost and production-wave scripts. When unset the script builds its tools; when set every required executable must exist. The release gate supplies artifacts from its own tool-build jobs. |
 | `STOW_E2E_WORK_DIR` | fresh `mktemp -d` under `TMPDIR` | Work directory: keys, mock registry, edge state, stow cache, `logs/`, the local-CI dispatch tree. Must be empty when given. |
 | `STOW_E2E_TOOLCHAIN` | `stable` | rustup toolchain the run builds with (`RUSTUP_TOOLCHAIN`); must be a release — the build stage re-pins the task's rustc version as a toolchain name. |
 | `STOW_E2E_READY_DEADLINE` | `600` | Seconds to wait for each service to listen. |
