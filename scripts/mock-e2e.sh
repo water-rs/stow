@@ -495,14 +495,9 @@ for toolchain in "$RUSTUP_TOOLCHAIN" "$RUSTC_VERSION"; do
 done
 
 cd "$REPO_ROOT"
-echo "[mock-e2e] building stow-cli, stow-build, stow-mock-registry, stow-admin"
-fg cargo build -p stow-cli --features mock-verify -p stow-build -p stow-mock-registry -p stow-admin \
-    >"$LOG_DIR/cargo-build.log" 2>&1 \
-    || die "cargo build failed — see $LOG_DIR/cargo-build.log"
-fg cargo build -p stow-mock-registry --example demand_feed_fixture \
-    >>"$LOG_DIR/cargo-build.log" 2>&1 \
-    || die "cargo build (demand_feed_fixture example) failed — see $LOG_DIR/cargo-build.log"
-BIN="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug"
+source "$REPO_ROOT/scripts/gate-tools.sh"
+gate_tools mock "$LOG_DIR/cargo-build.log" fg \
+    || die "gate tools unavailable — see $LOG_DIR/cargo-build.log"
 
 # stow#523: typed demand-feed fixtures — the example writes the
 # enqueue/queue document, per-hour provider documents, typed
