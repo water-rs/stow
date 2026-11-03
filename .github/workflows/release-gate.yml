@@ -302,6 +302,9 @@ jobs:
         env:
           STOW_PRODUCTION_WAVE_WORK_DIR: ${{ runner.temp }}/stow-production-wave
           STOW_RESOLVE_CARGO_HOME: ${{ runner.temp }}/stow-resolve-cargo
+          # Full projects lane: 29m51s at 16 workers (run 41703355413);
+          # four workers had not completed the list after 55 minutes.
+          STOW_RESOLVE_CONCURRENCY: 16
       # The count is the run's number — kept on a pass too; the monthly
       # projection job downloads it.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
