@@ -531,15 +531,7 @@ pub(super) async fn claim_pass(
     bound: u32,
 ) -> Result<Vec<Claimed>, QueueError> {
     graph.with(|graph| graph.set_floor(settings.min_dispatch_value));
-    let claims = graph.with(|graph| {
-        let (total_free, macos_free) = graph.free_slots(settings);
-        graph.claim(
-            total_free.min(bound),
-            macos_free.min(bound),
-            now,
-            i64::from(settings.stale_dispatch_minutes) * 60_000,
-        )
-    })?;
+    let claims = graph.with(|graph| graph.claim(settings, now, bound))?;
     if claims.is_empty() {
         return Ok(claims);
     }
@@ -827,6 +819,44 @@ mod eviction_tests {
             .await
             .expect("seed");
         (db, cell)
+    }
+
+    #[tokio::test]
+    async fn expired_full_capacity_is_reclaimed_before_the_claim_budget() {
+        for bound in [1, u32::MAX] {
+            let (db, owner) = seeded().await;
+            let cell = owner.loaded().expect("seeded");
+            let settings = SchedulerSettings {
+                dispatch: queue::Dispatch::Limited(std::num::NonZeroU32::new(30).expect("30")),
+                ..settings()
+            };
+            assert_eq!(cell.with(|graph| graph.free_slots(&settings).0), 0);
+            let now =
+                HOST_NOW_MS + 86_400_000 + i64::from(settings.stale_dispatch_minutes) * 60_000;
+            let claims = claim_pass(cell, &db, &settings, now, bound)
+                .await
+                .expect("expired pass");
+            assert!(
+                !claims.is_empty(),
+                "expired claims must free this pass's budget"
+            );
+            assert!(claims.len() <= bound as usize);
+            assert!(claims.len() <= 30);
+            let woken_owner = wake(&db).await;
+            let woken = woken_owner.loaded().expect("woken");
+            let after_wake = claim_pass(woken, &db, &settings, now, bound)
+                .await
+                .expect("woken pass");
+            let live = claim_pass(cell, &db, &settings, now, bound)
+                .await
+                .expect("live pass");
+            assert_eq!(ids(&after_wake), ids(&live));
+            assert!(
+                ids(&after_wake)
+                    .iter()
+                    .all(|claim| !ids(&claims).contains(claim))
+            );
+        }
     }
 
     /// Evicted after the `Claims` row landed and before any dispatch

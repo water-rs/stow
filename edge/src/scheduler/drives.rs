@@ -2753,8 +2753,8 @@ pub const DRIVES: &[Drive] = &[
         // claim ran past `STOW_STALE_DISPATCH_MINUTES`: the claim pass's
         // stale sweep requeues it, bounded by the expired nodes the pass
         // finds — no run-status read, no cancel (stow#876). The cap is
-        // saturated at the in-flight count, so the pass claims nothing
-        // beyond the recovery.
+        // saturated before recovery; the expired lease must free one
+        // slot for a claim in this same pass.
         name: "alarm pass (stale recovery)",
         setup: Some(|db, _shape, settings, ctx| {
             Box::pin(async move {
@@ -2776,13 +2776,26 @@ pub const DRIVES: &[Drive] = &[
                     dispatch: queue::Dispatch::from_max_concurrent_jobs(inflight),
                     ..*settings
                 };
-                pass(db, &saturated, ctx).await.map(|_| ())
+                let claimed = pass(db, &saturated, ctx).await?;
+                let [task] = claimed.as_slice() else {
+                    return Err(format!(
+                        "expired lease freed one slot, claimed {}",
+                        claimed.len()
+                    ));
+                };
+                ctx.set_bound(BoundRun {
+                    task: task.clone(),
+                    run: 0,
+                });
+                Ok(())
             })
         },
         cleanup: Some(|db, _shape, _settings, ctx| {
-            Box::pin(
-                async move { cancel_submitted(ctx, db, vec![run_node_id(TAG_RUN_STALE)]).await },
-            )
+            Box::pin(async move {
+                let claimed = ctx.bound_run()?.task;
+                restore_claimed(ctx, db, vec![claimed]).await?;
+                cancel_submitted(ctx, db, vec![run_node_id(TAG_RUN_STALE)]).await
+            })
         }),
     },
     // The stow#940 dispatching request shapes: the request that frees a
