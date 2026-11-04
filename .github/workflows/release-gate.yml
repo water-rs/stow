@@ -209,8 +209,8 @@ jobs:
     needs: tools
     name: Preheat cost
     runs-on: ubuntu-26.04
-    # The wave measured 34 minutes; tool compilation runs separately.
-    timeout-minutes: 40
+    # The full wave exceeded 40 minutes; tool compilation runs separately.
+    timeout-minutes: 45
     permissions:
       # The local edge authenticates its trusted endpoints against the
       # credential's own repo permissions — GITHUB_TOKEN needs push
