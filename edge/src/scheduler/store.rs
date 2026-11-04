@@ -486,27 +486,30 @@ pub async fn write_snapshot_parts(
             sub += 1;
         }
         // The span's emitted rows stay; anything past them is a stale
-        // sub-row of a longer previous encoding — cleared with every
-        // span's tail in one statement below, not one per span.
-        stale.push((span.lo_key() + sub, span.hi_key()));
+        // sub-row of a longer previous encoding. Empty neighboring
+        // spans share a range, without deleting any newly emitted row.
+        let lo = span.lo_key() + sub;
+        if let Some((_, hi)) = stale.last_mut()
+            && *hi + 1 == lo
+        {
+            *hi = span.hi_key();
+        } else {
+            stale.push((lo, span.hi_key()));
+        }
     }
     flush_upserts(db, &mut pending).await?;
-    if !plan.all && !stale.is_empty() {
-        let mut clear = String::from("DELETE FROM snapshot_chunks WHERE ");
-        for at in 0..stale.len() {
-            if at != 0 {
-                clear.push_str(" OR ");
-            }
-            clear.push_str("(chunk >= ? AND chunk <= ?)");
-        }
-        let mut query = db.query(&clear);
+    if !plan.all {
+        // A fixed pair of bindings per range stays independent of the
+        // dirty-set size. Storage-only awaits retain the input gate;
+        // the watermark cannot commit until every stale tail is gone.
         for (lo, hi) in stale {
-            query = query.bind(lo).bind(hi);
+            db.query("DELETE FROM snapshot_chunks WHERE chunk BETWEEN ? AND ?")
+                .bind(lo)
+                .bind(hi)
+                .execute()
+                .await
+                .map_err(|error| QueueError::Sql(format!("snapshot span clear: {error}")))?;
         }
-        query
-            .execute()
-            .await
-            .map_err(|error| QueueError::Sql(format!("snapshot span clear: {error}")))?;
     }
     db.query(
         "INSERT INTO store_meta(key, value) VALUES ('snapshot_seq', ?) \
