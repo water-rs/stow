@@ -119,36 +119,8 @@ pub async fn create_workspace(
     task: &BuildTaskPayload,
 ) -> stow_types::error::Result<BuildWorkspace> {
     let (tempdir, workspace_root) = create_workspace_root().await?;
-    let (workspace_root, manifest_path, bundled_lockfile) = {
-        let archive = download_crate_archive(task).await?;
-        let crate_name = task.crate_name.as_str().to_owned();
-        let crate_version = task.version.to_string();
-        let unpack_root = workspace_root.clone();
-        let (task_manifest_path, crate_checksum) = smol::unblock(move || {
-            unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
-                .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
-        })
-        .await?;
-        let source_root = task_manifest_path
-            .parent()
-            .ok_or_else(|| {
-                stow_types::stow_error!(
-                    "downloaded crate manifest {} has no parent directory",
-                    task_manifest_path.display()
-                )
-            })?
-            .to_path_buf();
-
-        // Every task crate compiles as a registry dependency of the
-        // generated wrapper package. A binary-only crate is an invalid
-        // dependency that cargo ignores outright, so the task crate never
-        // compiles and the publish stage's closure resolution fails the
-        // task instead of publishing nothing.
-        let wrapper_root = workspace_root.join("wrapper");
-        let (manifest_path, bundled_lockfile) =
-            write_wrapper_package(task, &wrapper_root, &crate_checksum, &source_root).await?;
-        (wrapper_root, manifest_path, bundled_lockfile)
-    };
+    let (manifest_path, bundled_lockfile) = create_wrapper_workspace(task, &workspace_root).await?;
+    let workspace_root = workspace_root.join("wrapper");
     let capture_dir = workspace_root.join(".stow-rustc-capture");
     create_dir_all(&capture_dir).await?;
 
@@ -210,30 +182,12 @@ impl BuildWorkspace {
 ///
 /// Returns the wrapper manifest path and, under `preserve_lockfile`, the
 /// crate's bundled `Cargo.lock` verbatim for the post-fetch fidelity check.
-pub async fn write_wrapper_package(
+async fn write_wrapper_package(
     task: &BuildTaskPayload,
     wrapper_root: &Path,
     crate_checksum: &str,
-    source_root: &Path,
+    bundled_lockfile: Option<String>,
 ) -> stow_types::error::Result<(PathBuf, Option<String>)> {
-    let bundled_lockfile = if task.preserve_lockfile {
-        let bundled_path = source_root.join("Cargo.lock");
-        Some(
-            async_fs::read_to_string(&bundled_path)
-                .await
-                .map_err(|error| {
-                    stow_types::stow_error!(
-                        "{} {} ships no Cargo.lock to preserve ({}): {error}",
-                        task.crate_name,
-                        task.version,
-                        bundled_path.display()
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-
     let manifest_path = wrapper_root.join("Cargo.toml");
     async_fs::create_dir_all(wrapper_root.join("src")).await?;
     async_fs::write(&manifest_path, wrapper_manifest(task)?).await?;
@@ -2902,28 +2856,59 @@ pub async fn create_resolution_workspace(
     task: &BuildTaskPayload,
     root: &Path,
 ) -> stow_types::error::Result<PathBuf> {
-    let archive = download_crate_archive(task).await?;
-    let crate_name = task.crate_name.as_str().to_owned();
-    let crate_version = task.version.to_string();
-    let unpack_root = root.to_path_buf();
-    let (task_manifest_path, crate_checksum) = smol::unblock(move || {
-        unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
-            .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
-    })
-    .await?;
-    let source_root = task_manifest_path
-        .parent()
-        .ok_or_else(|| {
-            stow_types::stow_error!(
-                "downloaded crate manifest {} has no parent directory",
-                task_manifest_path.display()
-            )
-        })?
-        .to_path_buf();
-    let wrapper_root = root.join("wrapper");
-    let (manifest_path, _) =
-        write_wrapper_package(task, &wrapper_root, &crate_checksum, &source_root).await?;
+    let (manifest_path, _) = create_wrapper_workspace(task, root).await?;
     Ok(manifest_path)
+}
+
+/// Both trust domains download their own archive and generate their own wrapper.
+/// Cargo compiles its registry source; only a preserved lockfile needs extraction.
+async fn create_wrapper_workspace(
+    task: &BuildTaskPayload,
+    root: &Path,
+) -> stow_types::error::Result<(PathBuf, Option<String>)> {
+    let archive = download_crate_archive(task).await?;
+    write_wrapper_archive(task, root, archive).await
+}
+
+pub(super) async fn write_wrapper_archive(
+    task: &BuildTaskPayload,
+    root: &Path,
+    archive: Vec<u8>,
+) -> stow_types::error::Result<(PathBuf, Option<String>)> {
+    let archive_task = task.clone();
+    let archive_root = root.to_path_buf();
+    let (checksum, bundled_lockfile) =
+        smol::unblock(move || wrapper_archive_inputs(&archive_task, &archive_root, &archive))
+            .await?;
+    write_wrapper_package(task, &root.join("wrapper"), &checksum, bundled_lockfile).await
+}
+
+fn wrapper_archive_inputs(
+    task: &BuildTaskPayload,
+    root: &Path,
+    archive: &[u8],
+) -> stow_types::error::Result<(String, Option<String>)> {
+    let checksum = hex::encode(sha2::Sha256::digest(archive));
+    let bundled_lockfile = if task.preserve_lockfile {
+        let manifest = unpack_crate_archive(
+            root,
+            task.crate_name.as_str(),
+            &task.version.to_string(),
+            archive,
+        )?;
+        let bundled_path = manifest.with_file_name("Cargo.lock");
+        Some(std::fs::read_to_string(&bundled_path).map_err(|error| {
+            stow_types::stow_error!(
+                "{} {} ships no Cargo.lock to preserve ({}): {error}",
+                task.crate_name,
+                task.version,
+                bundled_path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    Ok((checksum, bundled_lockfile))
 }
 
 pub fn unpack_crate_archive(
@@ -3171,6 +3156,49 @@ mod tests {
         assert!(
             workspace_root.path().join("demo-1.2.3/Cargo.lock").exists(),
             "unpack must not delete the bundled Cargo.lock; preserve_lockfile reads it verbatim"
+        );
+    }
+
+    #[test]
+    fn wrapper_archive_extracts_only_for_a_preserved_lockfile() {
+        let archive = build_archive(
+            "itoa-1.0.15/Cargo.toml",
+            b"[package]\nname = \"itoa\"\nversion = \"1.0.15\"\n",
+            "itoa-1.0.15/Cargo.lock",
+            b"# bundled lockfile\n",
+        );
+        let mut task = task_with_features(&[]);
+        let ordinary = TempDir::new().unwrap();
+        let (ordinary_checksum, lockfile) =
+            super::wrapper_archive_inputs(&task, ordinary.path(), &archive).unwrap();
+        assert!(lockfile.is_none());
+        assert_eq!(std::fs::read_dir(ordinary.path()).unwrap().count(), 0);
+
+        task.preserve_lockfile = true;
+        let preserved = TempDir::new().unwrap();
+        let (preserved_checksum, lockfile) =
+            super::wrapper_archive_inputs(&task, preserved.path(), &archive).unwrap();
+        assert_eq!(ordinary_checksum, preserved_checksum);
+        assert_eq!(lockfile.as_deref(), Some("# bundled lockfile\n"));
+        assert!(preserved.path().join("itoa-1.0.15/Cargo.toml").exists());
+    }
+
+    #[test]
+    fn wrapper_archive_refuses_a_missing_preserved_lockfile() {
+        let archive = build_archive(
+            "itoa-1.0.15/Cargo.toml",
+            b"[package]\nname = \"itoa\"\nversion = \"1.0.15\"\n",
+            "itoa-1.0.15/src/lib.rs",
+            b"",
+        );
+        let mut task = task_with_features(&[]);
+        task.preserve_lockfile = true;
+        let root = TempDir::new().unwrap();
+        let error = super::wrapper_archive_inputs(&task, root.path(), &archive).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("ships no Cargo.lock to preserve")
         );
     }
 
