@@ -1,7 +1,7 @@
 //! stow#588 stage 4: the dependency-context machinery end to end,
 //! offline — a `local-registry` directory stands in for crates.io (the
 //! `resolver/tests/offline.rs` harness shape), the wrapper package is
-//! the real `write_wrapper_package` output, and the verification is the
+//! the real `write_wrapper_archive` output, and the verification is the
 //! real `cargo <phase> --unit-graph` + `verify_dependency_context`
 //! chain.
 //!
@@ -726,31 +726,15 @@ fn payload_for(request: &EnqueueRequest) -> BuildTaskPayload {
     }
 }
 
-/// The real wrapper workspace for `task`: its crate's `.crate` archive
-/// unpacked under `root`, `write_wrapper_package`'s manifest and
-/// lockfile, `BuildWorkspace` as the build job sees it.
+/// The real wrapper workspace for `task`, initialized from the local registry's
+/// archive through the same path as the build and publish jobs.
 async fn wrapper_workspace(reg: &Path, task: &BuildTaskPayload) -> (TempDir, BuildWorkspace) {
     let root = tempfile::tempdir().expect("workspace root");
     let archive = std::fs::read(reg.join(format!("{}-{}.crate", task.crate_name, task.version)))
         .expect("crate archive in local registry");
-    let crate_name = task.crate_name.as_str().to_owned();
-    let crate_version = task.version.to_string();
-    let unpack_root = root.path().to_path_buf();
-    let (manifest_path, checksum) = smol::unblock(move || {
-        task::unpack_crate_archive(&unpack_root, &crate_name, &crate_version, &archive)
-            .map(|manifest| (manifest, hex::encode(sha2::Sha256::digest(&archive))))
-    })
-    .await
-    .expect("unpack crate archive");
-    let source_root = manifest_path
-        .parent()
-        .expect("unpacked manifest has a parent")
-        .to_path_buf();
-    let wrapper_root = root.path().join("wrapper");
-    let (manifest_path, _) =
-        task::write_wrapper_package(task, &wrapper_root, &checksum, &source_root)
-            .await
-            .expect("write wrapper package");
+    let (manifest_path, _) = task::write_wrapper_archive(task, root.path(), archive)
+        .await
+        .expect("write wrapper archive");
     let workspace = task::resolution_build_workspace(
         manifest_path.clone(),
         manifest_path.parent().expect("wrapper dir").to_path_buf(),
