@@ -21,6 +21,11 @@ on:
           `["dispatch-freeze","engage","--yes"]`.
         required: true
         type: string
+      defer_refill:
+        description: Leave a reset store empty until the schema-changing deployment completes.
+        required: false
+        default: false
+        type: boolean
       files:
         description: >-
           A JSON object mapping bare file names to contents; each is
@@ -145,7 +150,7 @@ jobs:
       # (`index-publish.yml` with `full`), and a full re-export would pull
       # every records artifact of every rustc for nothing.
       - name: Refill the index report and the queue after a reset
-        if: success() && steps.command.outputs.refill == 'true'
+        if: success() && steps.command.outputs.refill == 'true' && !inputs.defer_refill
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
