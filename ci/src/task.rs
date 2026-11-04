@@ -2870,7 +2870,7 @@ async fn create_wrapper_workspace(
     write_wrapper_archive(task, root, archive).await
 }
 
-pub(super) async fn write_wrapper_archive(
+pub async fn write_wrapper_archive(
     task: &BuildTaskPayload,
     root: &Path,
     archive: Vec<u8>,
